@@ -2,9 +2,10 @@
 //!
 //! The adapter reads the lead before it takes the object's mutation lock and
 //! again under it. With the lock held, it reads the holder's map, releases
-//! the read lock, and writes the store. The holder writes its map
-//! and the registry under separate locks and reads the store with neither
-//! held.
+//! the read lock, and writes the store. The holder writes its map and the
+//! registry under separate locks. Its status mirror reads the row under
+//! the same mutation lock as the adapter and writes through the
+//! registry as the adapter does.
 
 use std::sync::Arc;
 

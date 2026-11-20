@@ -1,5 +1,6 @@
 //! The holder of a replica's worker objects: it follows the store's
-//! membership and writes the registry.
+//! membership and writes the registry. A host can also ask it to follow
+//! the rows' status.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -14,7 +15,7 @@ use smg_worker::{
     registry::{Generation, WorkerId as ObjectId, WorkerRegistry},
 };
 
-use super::object::{builder, object};
+use super::object::{builder, object, status};
 use crate::{
     store::{MembershipChange, MembershipTail, WorkerFacts, WorkerRow, WorkersStore},
     view::WorkerId,
@@ -77,13 +78,18 @@ struct Held {
 /// stands one object in the registry, and none beside.
 ///
 /// [`Self::follow`] is the one path, on a leader and on a standby: it reads
-/// what the store's membership did since its last read and does one of four
-/// things to a row's object. It builds the object of a row that arrived. It
-/// drops the object of a row that went. It replaces, under the same id in
-/// the registry, the object of a row whose facts changed. It does nothing at
-/// a write that moved no fact: a status change, a health write. A new
-/// incarnation of a key is another row: the old object is dropped and a new
-/// one is built under a new id.
+/// what the store's membership did since its last read. It builds the
+/// object of a row that arrived, drops the object of a row that went, and
+/// replaces the object of a row whose facts changed under the same id in
+/// the registry. A new incarnation of a key gets a new object and id.
+///
+/// By default a status change reads no row and leaves the object alone.
+/// With [`Self::with_status_followed`], the holder copies the row's status
+/// on a status change, on a build or replacement, and on a snapshot read
+/// that keeps the object. The registry makes the write, as it makes a
+/// health driver's: its subscribers hear the change once, and a promoted
+/// worker comes back as any promotion brings it, an open breaker on
+/// trial. The host's own vetoes stand.
 ///
 /// A row that leaves ends its object, even where a row stands under its id
 /// again by the time the change is read: a row registered again under the
@@ -118,6 +124,7 @@ pub struct Objects<G> {
     registry: Arc<WorkerRegistry<G>>,
     /// What makes an object's engine connection, where the host handed one.
     connector: Option<Arc<dyn EngineConnector>>,
+    status_followed: bool,
     /// Where the last read ended. Held through a read: one follows at a
     /// time.
     read_to: Mutex<Place>,
@@ -132,6 +139,16 @@ impl<G> fmt::Debug for Objects<G> {
     }
 }
 
+impl<G> Objects<G> {
+    /// For a host that drives no health of its own: an object's status
+    /// follows its row's.
+    #[must_use]
+    pub fn with_status_followed(mut self) -> Self {
+        self.status_followed = true;
+        self
+    }
+}
+
 impl<G: Generation> Objects<G> {
     /// A holder that writes `registry` and holds nothing yet: the first
     /// [`Self::follow`] builds an object for every row that stands.
@@ -139,6 +156,7 @@ impl<G: Generation> Objects<G> {
         Self {
             registry,
             connector: None,
+            status_followed: false,
             read_to: Mutex::new(Place::default()),
             held: RwLock::new(Held::default()),
         }
@@ -215,8 +233,10 @@ impl<G: Generation> Objects<G> {
     /// says a row left ends its object first, so a row that left and came
     /// back under its id is built anew.
     ///
-    /// Callers follow one at a time: a second waits for the first. The call
-    /// waits on nothing else and reads no clock.
+    /// Calls to `follow` run one at a time. A status mirror reads the row
+    /// and writes the object under the object's mutation lock.
+    /// A store notification inside a health write can still hold that lock.
+    /// Use the notification to wake the caller of `follow`.
     pub fn follow<S: WorkersStore + ?Sized>(&self, store: &S) {
         let mut place = self.read_to.lock();
         loop {
@@ -240,7 +260,7 @@ impl<G: Generation> Objects<G> {
                 }
                 MembershipTail::SnapshotRequired => {
                     let (epoch, rows) = store.snapshot();
-                    self.reconcile(&rows);
+                    self.reconcile(store, &rows);
                     *place = Place {
                         epoch: Some(epoch),
                         history,
@@ -251,28 +271,27 @@ impl<G: Generation> Objects<G> {
     }
 
     /// One change of the tail: a row it says left ends its object, then the
-    /// rows it names are settled as they stand now. A status change names no
-    /// fact and reads nothing.
+    /// rows it names are settled as they stand now.
     fn apply<S: WorkersStore + ?Sized>(&self, store: &S, change: MembershipChange) {
         match change {
-            MembershipChange::StatusChanged { .. } => {}
+            MembershipChange::StatusChanged { id, .. } => self.follow_status(store, id),
             // The old incarnation first: its object leaves the URL the new
             // one's is built under. It leaves whatever stands under its id
             // now: an incarnation a key takes again is another life.
             MembershipChange::Replaced { old, new } => {
                 self.end(old);
-                self.settle(old, store.get(old).as_ref());
-                self.settle(new, store.get(new).as_ref());
+                self.settle(store, old);
+                self.settle(store, new);
             }
             // The row left, so its object does, even where its id stands
             // again: that row is another life, at the first revision too.
             MembershipChange::Removed { id } => {
                 self.end(id);
-                self.settle(id, store.get(id).as_ref());
+                self.settle(store, id);
             }
             MembershipChange::Registered { id }
             | MembershipChange::Relabelled { id }
-            | MembershipChange::Resized { id } => self.settle(id, store.get(id).as_ref()),
+            | MembershipChange::Resized { id } => self.settle(store, id),
         }
     }
 
@@ -282,7 +301,7 @@ impl<G: Generation> Objects<G> {
     /// revision held is trusted alone here: behind a gap of the tail, as in
     /// another history, a row under a held id and revision may be another
     /// life with other facts. The facts are compared beside it.
-    fn reconcile(&self, rows: &[WorkerRow]) {
+    fn reconcile<S: WorkersStore + ?Sized>(&self, store: &S, rows: &[WorkerRow]) {
         let stand: HashSet<WorkerId> = rows.iter().map(|row| row.id).collect();
         let gone: Vec<WorkerId> = self
             .held
@@ -296,8 +315,10 @@ impl<G: Generation> Objects<G> {
             self.end(id);
         }
         for row in rows {
-            if !self.stands(row) {
-                self.lay(row);
+            if self.stands(row) {
+                self.follow_status(store, row.id);
+            } else {
+                self.lay(store, row);
             }
         }
     }
@@ -315,12 +336,11 @@ impl<G: Generation> Objects<G> {
                 .is_some_and(|laid| laid.standing.revision == row.revision)
     }
 
-    /// Bring the object of the row `id` to what `row` says: the row as the
-    /// store holds it, `None` for a row that went. A row whose object was
-    /// built from the revision it stands at is left alone: read change by
-    /// change, within one life of a row, the revision tells its facts.
-    fn settle(&self, id: WorkerId, row: Option<&WorkerRow>) {
-        let Some(row) = row else {
+    /// Settle the object of `id` against the row as the store holds it. A
+    /// row whose object was built at its current revision keeps it. Within
+    /// one life of a row, the revision tells its facts.
+    fn settle<S: WorkersStore + ?Sized>(&self, store: &S, id: WorkerId) {
+        let Some(row) = store.get(id) else {
             self.end(id);
             return;
         };
@@ -329,8 +349,44 @@ impl<G: Generation> Objects<G> {
             .and_then(|held| self.standing(&held))
             .map(|standing| standing.revision);
         if built_from != Some(row.revision) {
-            self.lay(row);
+            self.lay(store, &row);
         }
+    }
+
+    #[inline]
+    fn follow_status<S: WorkersStore + ?Sized>(&self, store: &S, row: WorkerId) {
+        if self.status_followed {
+            self.copy_status(store, row);
+        }
+    }
+
+    /// Read the row under the lock the health adapter writes under. The
+    /// object's entry must still name that row and its current revision.
+    /// The registry writes the status it is handed and tells it.
+    #[inline(never)]
+    fn copy_status<S: WorkersStore + ?Sized>(&self, store: &S, row: WorkerId) {
+        let Some(id) = self.object(row) else {
+            return;
+        };
+        let Some(object) = self.registry.get(&id) else {
+            return;
+        };
+        let write = |object: &Arc<dyn Worker>| {
+            let next = self
+                .standing_of(&id, object)
+                .and_then(|standing| {
+                    store
+                        .get(standing.row)
+                        .filter(|row| row.revision == standing.revision)
+                })
+                .map(|row| status(row.status));
+            // The registry writes it, as it writes the adapter's: one
+            // status event to its subscribers, and what goes with a
+            // promotion. A status that stands writes nothing.
+            ((), next)
+        };
+        self.registry
+            .apply_if_revision(&id, object.revision(), write);
     }
 
     /// Drop the object held for the row `id`, where one is.
@@ -351,7 +407,7 @@ impl<G: Generation> Objects<G> {
     /// one that stands there, under its id and with its running state. An
     /// object another row holds under the URL is dropped first: a row takes
     /// the place of its own object alone.
-    fn lay(&self, row: &WorkerRow) {
+    fn lay<S: WorkersStore + ?Sized>(&self, store: &S, row: &WorkerRow) {
         let built: Arc<dyn Worker> = match &self.connector {
             Some(connector) => {
                 Arc::new(builder(row).engine_connector(Arc::clone(connector)).build())
@@ -383,22 +439,30 @@ impl<G: Generation> Objects<G> {
             );
         }
         self.registry.register_or_replace(built);
+        self.follow_status(store, row.id);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::BTreeMap};
+    use std::{cell::RefCell, collections::BTreeMap, sync::mpsc, thread, time::Duration};
 
     use smg_worker::{
-        identity::builder::BasicWorkerBuilder, registry::event::WorkerEvent,
+        health::{
+            circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            port::HealthSink as _,
+        },
+        identity::builder::BasicWorkerBuilder,
+        registry::event::WorkerEvent,
+        runtime::StallReason,
         worker::WorkerStatus as ObjectStatus,
     };
     use tokio::sync::broadcast::Receiver;
 
     use super::*;
-    use crate::store::{
-        HealthSink, Kinds, Maker, MemoryStore, WorkerFacts, WorkerPatch, WorkerStatus,
+    use crate::{
+        store::{HealthSink, Kinds, Maker, MemoryStore, WorkerFacts, WorkerPatch, WorkerStatus},
+        worker_host::{HealthAdapter, SoleLead},
     };
 
     const A: &str = "http://a:8000";
@@ -454,7 +518,7 @@ mod tests {
 
     /// One replica: its store, its holder, and what its registry tells.
     struct Replica {
-        store: MemoryStore,
+        store: Arc<MemoryStore>,
         objects: Objects<Members>,
         events: Receiver<WorkerEvent>,
     }
@@ -464,14 +528,14 @@ mod tests {
             let registry = Arc::new(WorkerRegistry::new());
             let events = registry.subscribe_events();
             Self {
-                store: MemoryStore::new(),
+                store: Arc::new(MemoryStore::new()),
                 objects: Objects::new(registry),
                 events,
             }
         }
 
         fn follow(&self) {
-            self.objects.follow(&self.store);
+            self.objects.follow(self.store.as_ref());
         }
 
         /// What the registry told since the last call, in its order.
@@ -638,8 +702,7 @@ mod tests {
         }
     }
 
-    /// The fourth act: a health write and a status write move no fact. The
-    /// store's status is the truth, and the object keeps its first.
+    /// By default a health or status write leaves the object alone.
     #[test]
     fn a_write_that_moves_no_fact_leaves_the_same_object() {
         let mut replica = Replica::new();
@@ -653,11 +716,162 @@ mod tests {
         let moved = replica.store.set_status(row, WorkerStatus::Ready, revision);
         assert!(moved.is_some());
         assert_eq!(replica.row(A).revision, revision);
-        replica.follow();
+        let store = Late {
+            store: Arc::clone(&replica.store),
+            after_get: Mutex::new(Some(Box::new(|_| panic!("a status change reads no row")))),
+            ..Late::default()
+        };
+        replica.objects.follow(&store);
         assert!(Arc::ptr_eq(&before, &replica.at(A)));
         assert_eq!(replica.objects.standing(&id), standing);
         assert!(replica.told().is_empty());
         assert_eq!(replica.at(A).status(), ObjectStatus::Pending);
+    }
+
+    #[test]
+    fn a_followed_status_makes_a_worker_available_only_while_ready() {
+        let mut replica = Replica::new();
+        replica.objects = replica.objects.with_status_followed();
+        replica.follow();
+        replica.store.upsert(facts(A, 1));
+        replica.follow();
+        let row = replica.row(A);
+        let (id, worker) = (replica.id(A), replica.at(A));
+        assert_eq!(worker.status(), ObjectStatus::Pending);
+        assert!(!worker.is_available());
+        assert_eq!(replica.told(), [("registered", id.clone())]);
+
+        for (row_status, object_status, available) in [
+            (WorkerStatus::Ready, ObjectStatus::Ready, true),
+            (WorkerStatus::NotReady, ObjectStatus::NotReady, false),
+        ] {
+            assert!(replica
+                .store
+                .set_status(row.id, row_status, row.revision)
+                .is_some());
+            replica.follow();
+            assert!(Arc::ptr_eq(&worker, &replica.at(A)));
+            assert_eq!(worker.status(), object_status);
+            assert_eq!(worker.is_available(), available);
+            // The registry's subscribers hear each change once.
+            assert_eq!(replica.told(), [("status", id.clone())]);
+        }
+
+        for _ in 0..CircuitBreakerConfig::default().failure_threshold {
+            worker.record_circuit_breaker_outcome(false);
+        }
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+        assert!(replica
+            .objects
+            .registry()
+            .set_worker_overloaded(&worker, true));
+        assert!(worker.set_stall(Some(StallReason::Unreachable)));
+        assert!(replica
+            .store
+            .set_status(row.id, WorkerStatus::Ready, row.revision)
+            .is_some());
+        replica.told();
+        replica.follow();
+        assert_eq!(worker.status(), ObjectStatus::Ready);
+        assert_eq!(replica.told(), [("status", id)]);
+        // A promotion comes back as any promotion does: the open breaker
+        // goes on trial. The host's own vetoes stand.
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+        assert!(worker.is_overloaded());
+        assert_eq!(worker.stall_reason(), Some(StallReason::Unreachable));
+        assert!(!worker.is_available());
+    }
+
+    #[test]
+    fn a_status_at_a_new_row_revision_waits_for_the_new_object() {
+        let mut replica = Replica::new();
+        replica.objects = replica.objects.with_status_followed();
+        replica.store.upsert(facts(A, 1));
+        replica.follow();
+        let row = replica.row(A);
+        let before = replica.at(A);
+        let change = replica
+            .store
+            .set_status(row.id, WorkerStatus::Ready, row.revision)
+            .expect("the status moved");
+        replica.patch(A, labels("gold"));
+
+        replica.objects.apply(replica.store.as_ref(), change);
+        assert_eq!(before.status(), ObjectStatus::Pending);
+        replica.follow();
+        let after = replica.at(A);
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after.status(), ObjectStatus::Ready);
+    }
+
+    #[test]
+    fn a_status_change_leaves_an_object_the_holder_did_not_lay_alone() {
+        let mut replica = Replica::new();
+        replica.objects = replica.objects.with_status_followed();
+        replica.store.upsert(facts(A, 1));
+        replica.follow();
+        let row = replica.row(A);
+        assert!(replica
+            .store
+            .set_status(row.id, WorkerStatus::Ready, row.revision)
+            .is_some());
+        replica.follow();
+        let registry = replica.objects.registry();
+        let foreign = object(&row);
+        assert!(registry.replace(&replica.id(A), Arc::clone(&foreign)));
+        assert_eq!(foreign.status(), ObjectStatus::Ready);
+
+        assert!(replica
+            .store
+            .set_status(row.id, WorkerStatus::NotReady, row.revision)
+            .is_some());
+        replica.follow();
+        assert_eq!(foreign.status(), ObjectStatus::Ready);
+    }
+
+    #[test]
+    fn a_snapshot_follows_status_for_both_kept_and_replaced_objects() {
+        let mut replica = Replica::new();
+        replica.objects = replica.objects.with_status_followed();
+        replica.store.upsert(facts(A, 1));
+        replica.store.upsert(facts(B, 1));
+        replica.follow();
+        let (a, b) = (replica.at(A), replica.at(B));
+        let (id_a, id_b) = (replica.id(A), replica.id(B));
+        assert!(!a.is_available() && !b.is_available());
+        replica.told();
+
+        let other = MemoryStore::new();
+        other.upsert(facts(A, 1));
+        other.upsert(labelled(B, 1, "gold"));
+        for url in [A, B] {
+            let row = other.by_key(url).expect("a row in the snapshot");
+            assert!(other
+                .set_status(row.id, WorkerStatus::Ready, row.revision)
+                .is_some());
+        }
+        assert!(replica.store.restore_from(other.cut(Kinds::Watched)));
+        replica.follow();
+
+        assert!(Arc::ptr_eq(&a, &replica.at(A)));
+        assert!(a.is_available());
+        assert!(!Arc::ptr_eq(&b, &replica.at(B)));
+        assert!(replica.at(B).is_available());
+        // Each object's change is told, kept or laid again.
+        let told = replica.told();
+        for id in [&id_a, &id_b] {
+            assert!(told.contains(&("status", id.clone())), "{told:?}");
+        }
+
+        let row = other.by_key(A).expect("a row in the snapshot");
+        assert!(other
+            .set_status(row.id, WorkerStatus::NotReady, row.revision)
+            .is_some());
+        assert!(replica.store.restore_from(other.cut(Kinds::Watched)));
+        replica.follow();
+        assert!(Arc::ptr_eq(&a, &replica.at(A)));
+        assert!(!a.is_available());
+        assert_eq!(replica.told(), [("status", id_a)]);
     }
 
     #[test]
@@ -854,14 +1068,16 @@ mod tests {
         assert_eq!(replica.told().len(), 1);
     }
 
-    /// A store that takes a write while a read of it works: one more
-    /// registration the first time a row is read of it, and before its tail
-    /// is read another store's rows whole with one label write over a row.
+    /// A store that runs a callback after one row read and can take another
+    /// store's rows whole just before a tail read.
+    #[derive(Default)]
     struct Late {
-        store: MemoryStore,
-        late: Mutex<Option<WorkerFacts>>,
+        store: Arc<MemoryStore>,
+        after_get: Mutex<Option<AfterGet>>,
         turn: Mutex<Option<(MemoryStore, WorkerId)>>,
     }
+
+    type AfterGet = Box<dyn FnOnce(&MemoryStore) + Send>;
 
     impl WorkersStore for Late {
         fn upsert_by(&self, facts: WorkerFacts, maker: Maker) -> MembershipChange {
@@ -892,8 +1108,8 @@ mod tests {
 
         fn get(&self, id: WorkerId) -> Option<WorkerRow> {
             let row = self.store.get(id);
-            if let Some(facts) = self.late.lock().take() {
-                self.store.upsert(facts);
+            if let Some(after_get) = self.after_get.lock().take() {
+                after_get(&self.store);
             }
             row
         }
@@ -928,14 +1144,12 @@ mod tests {
     fn a_write_that_lands_while_a_read_works_is_read_before_the_read_returns() {
         let registry = Arc::new(WorkerRegistry::<Members>::new());
         let objects = Objects::new(Arc::clone(&registry));
-        let store = Late {
-            store: MemoryStore::new(),
-            late: Mutex::new(None),
-            turn: Mutex::new(None),
-        };
+        let store = Late::default();
         objects.follow(&store);
         store.upsert(facts(A, 1));
-        *store.late.lock() = Some(facts(B, 1));
+        *store.after_get.lock() = Some(Box::new(|store| {
+            store.upsert(facts(B, 1));
+        }));
         objects.follow(&store);
         assert!(registry.get_by_url(A).is_some());
         assert!(registry.get_by_url(B).is_some(), "the late row");
@@ -950,11 +1164,7 @@ mod tests {
         let registry = Arc::new(WorkerRegistry::<Members>::new());
         let mut events = registry.subscribe_events();
         let objects = Objects::new(Arc::clone(&registry));
-        let store = Late {
-            store: MemoryStore::new(),
-            late: Mutex::new(None),
-            turn: Mutex::new(None),
-        };
+        let store = Late::default();
         let old = store.upsert(facts(A, 1)).id();
         objects.follow(&store);
         let before = objects.object(old).expect("the old one's object");
@@ -981,6 +1191,67 @@ mod tests {
         let rest = seen.iter().skip(1);
         assert!(rest.clone().count() > 0 && rest.clone().all(|(_, object)| *object == after));
         assert_eq!((objects.len(), registry.len()), (1, 1));
+    }
+
+    #[test]
+    fn an_adapter_write_waits_for_the_holders_status_read() {
+        let registry = Arc::new(WorkerRegistry::<Members>::new());
+        let objects = Arc::new(Objects::new(Arc::clone(&registry)).with_status_followed());
+        let store = Late::default();
+        let row = store.upsert(facts(A, 1)).id();
+        objects.follow(&store);
+        let id = objects.object(row).expect("the row's object");
+        let worker = registry.get(&id).expect("a registered worker");
+        let revision = store.get(row).expect("the worker's row").revision;
+        assert!(store
+            .set_status(row, WorkerStatus::Ready, revision)
+            .is_some());
+        objects.follow(&store);
+        assert_eq!(worker.status(), ObjectStatus::Ready);
+
+        let adapter = HealthAdapter::new(
+            Arc::clone(&objects),
+            Arc::clone(&store.store),
+            Arc::new(SoleLead),
+            SoleLead::TERM,
+        );
+        assert!(store
+            .set_status(row, WorkerStatus::NotReady, revision)
+            .is_some());
+        let (reading, read) = mpsc::channel();
+        let (attempting, attempt) = mpsc::channel();
+        let (written, write) = mpsc::channel();
+        *store.after_get.lock() = Some(Box::new(move |_| {
+            reading.send(()).expect("the adapter waits for the read");
+            attempt
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the adapter starts its write");
+            assert_eq!(
+                write.recv_timeout(Duration::from_secs(1)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            );
+        }));
+        thread::scope(|scope| {
+            let connected = scope.spawn(move || {
+                read.recv_timeout(Duration::from_secs(5))
+                    .expect("the holder reads the row");
+                attempting.send(()).expect("the holder waits for the write");
+                let answer = adapter.connected(&id, worker.revision());
+                let _ = written.send(());
+                assert_eq!(answer, Some((ObjectStatus::NotReady, ObjectStatus::Ready)));
+                assert_eq!(worker.status(), ObjectStatus::Ready);
+            });
+            objects.follow(&store);
+            connected.join().expect("the adapter finished");
+        });
+        assert_eq!(
+            store.get(row).map(|row| row.status),
+            Some(WorkerStatus::Ready)
+        );
+        assert_eq!(
+            registry.get_by_url(A).expect("the worker").status(),
+            ObjectStatus::Ready
+        );
     }
 
     /// The holder is the registry's one writer.
