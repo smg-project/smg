@@ -1729,14 +1729,40 @@ impl PlanName {
 }
 
 /// A second profile for a binding of one profile, or a profile per side.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum ShadowSpec {
     /// The shadow of a binding that names one live profile.
     Profile(String),
     /// Shadow profiles by side. Validation currently refuses this form.
-    Sides(#[serde(deserialize_with = "keyed_once")] BTreeMap<String, String>),
+    Sides(BTreeMap<String, String>),
+}
+
+/// Read by form, so a value that is neither is refused by what the field
+/// takes, and a side written twice by its key.
+impl<'de> Deserialize<'de> for ShadowSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ShadowVisitor;
+
+        impl<'de> Visitor<'de> for ShadowVisitor {
+            type Value = ShadowSpec;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a profile name, or a map of sides to profile names")
+            }
+
+            fn visit_str<E: de::Error>(self, name: &str) -> Result<ShadowSpec, E> {
+                Ok(ShadowSpec::Profile(name.to_string()))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<ShadowSpec, A::Error> {
+                keyed_once(de::value::MapAccessDeserializer::new(map)).map(ShadowSpec::Sides)
+            }
+        }
+
+        deserializer.deserialize_any(ShadowVisitor)
+    }
 }
 
 /// A binding: the requests it matches, the profile or plan they resolve to,
@@ -4998,6 +5024,29 @@ mod tests {
         );
         let doubled = r#"{"profile":"p","shadow":{"single":"q","single":"q"}}"#;
         assert!(serde_json::from_str::<BindingSpec>(doubled).is_err());
+    }
+
+    /// A bad `shadow` value is refused by what is wrong with it: a side
+    /// written twice by its key, and a value of neither form by the forms
+    /// the field takes.
+    #[test]
+    fn shadow_refuses_a_bad_value_by_its_key_or_its_form() {
+        let doubled = r#"{"profile":"p","shadow":{"single":"q","single":"q"}}"#;
+        let refusal = serde_json::from_str::<BindingSpec>(doubled)
+            .expect_err("a side written twice")
+            .to_string();
+        assert!(
+            refusal.contains("the key `single` is written twice"),
+            "{refusal}"
+        );
+        let number = r#"{"profile":"p","shadow":5}"#;
+        let refusal = serde_json::from_str::<BindingSpec>(number)
+            .expect_err("a number in the field")
+            .to_string();
+        assert!(
+            refusal.contains("expected a profile name, or a map of sides to profile names"),
+            "{refusal}"
+        );
     }
 
     #[test]

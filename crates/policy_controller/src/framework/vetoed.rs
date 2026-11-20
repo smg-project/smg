@@ -111,6 +111,9 @@ impl Engine {
     /// mark the rule's own pick carries ([`Lifted::Overload`]), under a rule
     /// and under none.
     ///
+    /// `KEEPS` is the keeping entry's form ([`Engine::decide_keeping`]):
+    /// under a rule the decision also keeps what it read of the key.
+    ///
     /// Out of line: a kept key is the rare decision, and the engine's
     /// decision path keeps its code for every other.
     #[inline(never)]
@@ -118,7 +121,7 @@ impl Engine {
         clippy::too_many_arguments,
         reason = "the profile run's inputs, as run_profile takes them"
     )]
-    pub(super) fn keep(
+    pub(super) fn keep<const KEEPS: bool>(
         &self,
         profile: &Profile,
         index: u16,
@@ -130,7 +133,7 @@ impl Engine {
         scratch: &mut Scratch,
     ) -> Decision {
         if let Some(rule) = rule {
-            return self.decide_session::<true>(
+            return self.decide_session::<true, KEEPS>(
                 profile,
                 index,
                 rule,
