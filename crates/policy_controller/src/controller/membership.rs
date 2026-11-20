@@ -90,8 +90,8 @@ use crate::{
 use crate::{
     store::{membership::Past, WorkerFacts},
     worker_host::{
-        drain, lay, lay_one, lay_ready, refresh, stating, take, Expect, Membership, Over, Ready,
-        Refused as HostRefused, Remover, Standing, Stated, Turn, Wrote,
+        drain, lay, lay_one, lay_ready, refresh, stated, stating, take, Expect, Membership, Over,
+        Ready, Refused as HostRefused, Remover, Standing, Stated, Turn, Wrote,
     },
 };
 
@@ -869,7 +869,7 @@ impl Membership for Hosted {
         built: &[Arc<dyn Worker>],
         over: Option<Over<'_>>,
     ) -> Result<Vec<Wrote>, HostRefused> {
-        stating(built, over, |rows| self.rows(maker, expect, rows))
+        stating(built, over, stated, |rows| self.rows(maker, expect, rows))
     }
 
     fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, HostRefused> {
@@ -895,8 +895,13 @@ impl Membership for Hosted {
     ) -> Result<Wrote, HostRefused> {
         const CALL: &str = "worker label refresh";
         self.call(CALL, None, |term| {
-            refresh(&HostedTurn { host: self, term }, seen, built.as_ref())
-                .inspect(|wrote| self.audit(CALL, *wrote, None))
+            refresh(
+                &HostedTurn { host: self, term },
+                seen,
+                built.as_ref(),
+                stated,
+            )
+            .inspect(|wrote| self.audit(CALL, *wrote, None))
         })
     }
 }
