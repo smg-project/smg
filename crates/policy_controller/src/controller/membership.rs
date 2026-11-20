@@ -71,7 +71,8 @@ use crate::{
 use crate::{
     store::{membership::Past, WorkerFacts},
     worker_host::{
-        drain, lay, take, Membership, Refused as HostRefused, Remover, Standing, Turn, Wrote,
+        drain, lay, take, Expect, Membership, Refused as HostRefused, Remover, Standing, Turn,
+        Wrote,
     },
 };
 
@@ -508,6 +509,9 @@ impl Hosted {
                     HostRefused::Absent => (Code::NotFound, ABSENT),
                     HostRefused::NotLeading(why) => (Code::Unavailable, why.as_str()),
                     HostRefused::Moved => (Code::Aborted, MOVED),
+                    HostRefused::Stands => {
+                        (Code::AlreadyExists, "a worker is registered under the URL")
+                    }
                     HostRefused::OutOfScope => (Code::PermissionDenied, HostRefused::OUT_OF_SCOPE),
                 };
                 audit_refusal(call, &self.by, code, why, asker);
@@ -557,6 +561,7 @@ impl Membership for Hosted {
     fn found(
         &self,
         maker: &Maker,
+        expect: Expect,
         url: &str,
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
     ) -> Result<Wrote, HostRefused> {
@@ -567,6 +572,7 @@ impl Membership for Hosted {
                     term,
                 },
                 maker,
+                expect,
                 url,
                 state,
             )
@@ -669,8 +675,8 @@ pub(crate) mod tests {
         store::{GatewayId, Reachability, WorkerFacts, WorkerRow},
         view::{Role, WireModes},
         worker_host::{
-            check_guard, check_health_scope, check_maker, check_provider, Membership, Refused,
-            Remover, Standing, StoreDoor, Wrote,
+            check_expectations, check_guard, check_health_scope, check_maker, check_provider,
+            Expect, Membership, Refused, Remover, Standing, StoreDoor, Wrote,
         },
     };
 
@@ -1527,7 +1533,7 @@ pub(crate) mod tests {
             }),
         ];
         for (fact, state) in lost {
-            let answer = hosted.found(&maker, URL, &|_| {
+            let answer = hosted.found(&maker, Expect::Anything, URL, &|_| {
                 let mut facts = found_facts();
                 state(&mut facts);
                 facts
@@ -1541,7 +1547,7 @@ pub(crate) mod tests {
 
         // What the log carries is taken, and a standby reads it back whole.
         hosted
-            .found(&maker, URL, &|_| found_facts())
+            .found(&maker, Expect::Anything, URL, &|_| found_facts())
             .expect("found");
         let row = store.by_key(URL).expect("the found row");
         let back = worker_wire::told_row(&worker_wire::row(&row), std::time::Instant::now());
@@ -1566,7 +1572,12 @@ pub(crate) mod tests {
         let maker = found("pods/a");
         let epoch = store.epoch();
         for wire in [WireModes::ZMQ, WireModes::GRPC.union(WireModes::ZMQ)] {
-            let answer = hosted.found(&maker, URL, &stated(wire, Reachability::Any));
+            let answer = hosted.found(
+                &maker,
+                Expect::Anything,
+                URL,
+                &stated(wire, Reachability::Any),
+            );
             let Err(Refused::Past(past)) = answer else {
                 panic!("{wire:?}: wrong answer: {answer:?}")
             };
@@ -1577,7 +1588,7 @@ pub(crate) mod tests {
         // A row that names its gateway is in that gateway's pool alone.
         let one = Reachability::Gateway(GatewayId(7));
         hosted
-            .found(&maker, URL, &stated(WireModes::ZMQ, one))
+            .found(&maker, Expect::Anything, URL, &stated(WireModes::ZMQ, one))
             .expect("found");
         let row = store.by_key(URL).expect("the found row");
         assert_eq!(row.facts.reachable_from, one);
@@ -1586,6 +1597,7 @@ pub(crate) mod tests {
         let lone = Arc::new(MemoryStore::default());
         let wrote = StoreDoor::new(Arc::clone(&lone)).found(
             &maker,
+            Expect::Anything,
             URL,
             &stated(WireModes::ZMQ, Reachability::Any),
         );
@@ -1608,6 +1620,12 @@ pub(crate) mod tests {
             store,
             Box::new(Hosted::new(Arc::new(door), operator(), under(TERM))),
         )
+    }
+
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_registration_is_laid_over_what_it_expects() {
+        check_expectations(hosted_door);
     }
 
     #[cfg(feature = "worker-host")]
@@ -1642,7 +1660,7 @@ pub(crate) mod tests {
         let hosted = Hosted::new(Arc::clone(&door), operator(), under(TERM));
         let maker = found("pods/a");
         hosted
-            .found(&maker, URL, &|_| found_facts())
+            .found(&maker, Expect::Anything, URL, &|_| found_facts())
             .expect("found");
         let made = store.by_key(URL).expect("the found row");
         let other = "grpc://10.0.0.6:8000";
@@ -1695,7 +1713,7 @@ pub(crate) mod tests {
         assert_eq!(store.epoch(), epoch + 1);
         // The old guard still names the previous row at this URL.
         hosted
-            .found(&found("pods/c"), URL, &|_| found_facts())
+            .found(&found("pods/c"), Expect::Anything, URL, &|_| found_facts())
             .expect("found again");
         let again = store.by_key(URL).expect("the new row");
         assert_ne!(again.id, made.id);
@@ -1712,7 +1730,7 @@ pub(crate) mod tests {
         let door = Arc::new(door);
         let maker = found("pods/a");
         Hosted::new(Arc::clone(&door), operator(), under(TERM))
-            .found(&maker, URL, &|_| found_facts())
+            .found(&maker, Expect::Anything, URL, &|_| found_facts())
             .expect("registered");
         let row = store.by_key(URL);
         let seen = standing(row.as_ref().expect("the registered row"));
@@ -1728,7 +1746,7 @@ pub(crate) mod tests {
         });
         let refused = Err(Refused::NotLeading("this replica does not lead".to_owned()));
         assert_eq!(
-            hosted.found(&maker, URL, &|_| panic!(
+            hosted.found(&maker, Expect::Anything, URL, &|_| panic!(
                 "a follower does not ask for facts"
             )),
             refused
@@ -1752,13 +1770,16 @@ pub(crate) mod tests {
         let maker = found("pods/a");
         let stale = Hosted::new(Arc::clone(&door), operator(), under(TERM));
         let refusal = Err(Refused::NotLeading(super::LEADS_NO_TERM.to_owned()));
-        assert_eq!(stale.found(&maker, URL, &|_| found_facts()), refusal);
+        assert_eq!(
+            stale.found(&maker, Expect::Anything, URL, &|_| found_facts()),
+            refusal
+        );
         assert_eq!(store.epoch(), 0);
 
         let leading = Hosted::new(door, operator(), under(TERM + 1));
         let number = life(TERM + 1, 0);
         assert_eq!(
-            leading.found(&maker, URL, &|_| found_facts()),
+            leading.found(&maker, Expect::Anything, URL, &|_| found_facts()),
             Ok(Wrote::Registered(identity(URL, number)))
         );
         let row = store.by_key(URL).expect("the registered row");
@@ -1767,11 +1788,14 @@ pub(crate) mod tests {
             role: Role::Decode,
             ..found_facts()
         };
-        assert_eq!(stale.found(&maker, URL, &|_| replaced()), refusal);
+        assert_eq!(
+            stale.found(&maker, Expect::Anything, URL, &|_| replaced()),
+            refusal
+        );
         assert_eq!(store.by_key(URL), Some(row.clone()));
         let new = life(TERM + 1, 1);
         assert_eq!(
-            leading.found(&maker, URL, &|_| replaced()),
+            leading.found(&maker, Expect::Anything, URL, &|_| replaced()),
             Ok(Wrote::Another {
                 old: row.id,
                 new: identity(URL, new)
@@ -1825,12 +1849,12 @@ pub(crate) mod tests {
                 Err(Refused::Absent)
             );
             let registered = door
-                .found(&maker, URL, &|_| found_facts())
+                .found(&maker, Expect::Anything, URL, &|_| found_facts())
                 .expect("registered");
             let first = store.by_key(URL).expect("the first row");
             assert_eq!(registered, Wrote::Registered(first.id));
             assert_eq!(
-                door.found(&maker, URL, &|_| found_facts()),
+                door.found(&maker, Expect::Anything, URL, &|_| found_facts()),
                 Ok(Wrote::Unmoved(first.id))
             );
             let refresh = || WorkerFacts {
@@ -1838,11 +1862,11 @@ pub(crate) mod tests {
                 ..found_facts()
             };
             assert_eq!(
-                door.found(&maker, URL, &|_| refresh()),
+                door.found(&maker, Expect::Anything, URL, &|_| refresh()),
                 Ok(Wrote::InPlace(first.id))
             );
             let refreshed = store.by_key(URL).expect("the refreshed row");
-            let wrote = door.found(&maker, URL, &|_| WorkerFacts {
+            let wrote = door.found(&maker, Expect::Anything, URL, &|_| WorkerFacts {
                 role: Role::Decode,
                 ..refresh()
             });
@@ -2408,7 +2432,7 @@ pub(crate) mod tests {
         let (store, door) = hosted_door();
         let key = "private/health-key";
         let maker = found(key);
-        door.found(&maker, URL, &|_| found_facts())
+        door.found(&maker, Expect::Anything, URL, &|_| found_facts())
             .expect("registered");
         let row = store.by_key(URL).expect("the row health saw");
         let seen = Standing {
@@ -2453,21 +2477,21 @@ pub(crate) mod tests {
         let key = "private/provider-key";
         let maker = found(key);
         hosted
-            .found(&maker, URL, &|_| found_facts())
+            .found(&maker, Expect::Anything, URL, &|_| found_facts())
             .expect("registered");
         let id = store.by_key(URL).expect("the registered row").id.0;
         hosted
-            .found(&maker, URL, &|_| found_facts())
+            .found(&maker, Expect::Anything, URL, &|_| found_facts())
             .expect("unmoved");
         let resized = || WorkerFacts {
             dp_size: 2,
             ..found_facts()
         };
         hosted
-            .found(&maker, URL, &|_| resized())
+            .found(&maker, Expect::Anything, URL, &|_| resized())
             .expect("relabelled");
         hosted
-            .found(&maker, URL, &|_| WorkerFacts {
+            .found(&maker, Expect::Anything, URL, &|_| WorkerFacts {
                 role: Role::Decode,
                 ..resized()
             })

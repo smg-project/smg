@@ -98,10 +98,12 @@ mod objects;
 pub mod steps;
 
 #[cfg(all(test, feature = "controller"))]
-pub(crate) use door::tests::{check_guard, check_health_scope, check_maker, check_provider};
+pub(crate) use door::tests::{
+    check_expectations, check_guard, check_health_scope, check_maker, check_provider,
+};
 #[cfg(feature = "controller")]
 pub(crate) use door::{drain, lay, take, Turn};
-pub use door::{Membership, Refused, Remover, StoreDoor, Wrote};
+pub use door::{Expect, Membership, Refused, Remover, StoreDoor, Wrote};
 pub use found::facts;
 pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, NoFeed, Unfed};

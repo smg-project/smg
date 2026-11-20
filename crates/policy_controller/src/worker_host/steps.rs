@@ -4,8 +4,9 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use smg_worker::{
-    identity::endpoint::Endpoint,
+    identity::{basic::Worker, endpoint::Endpoint},
     jobs::{WorkerJobAsker, WorkerRegistrationMode},
+    registry::{Generation, WorkerId as ObjectId, WorkerRegistry},
     settings::{RegistrationSettings, UnhealthyRemovalScope},
     workflow::{
         pin, require_host, single_attempt, worker_registration_workflow, worker_removal_workflow,
@@ -20,7 +21,7 @@ use wfaas::{
     WorkflowDefinition, WorkflowError, WorkflowResult,
 };
 
-use super::{facts, Membership, Objects, Refused, Remover, Wrote};
+use super::{facts, Expect, Membership, Objects, Refused, Remover, Standing, Wrote};
 use crate::store::{Maker, Unmade};
 
 /// The provider name used by the host's own discovery source.
@@ -63,8 +64,9 @@ pub const DRAIN_WORKERS_AT_DOOR_STEP: &str = "drain_workers_at_door";
 pub const REMOVE_WORKERS_AT_DOOR_STEP: &str = "remove_workers_at_door";
 
 /// Write the workers the preceding registration steps created.
-pub struct WriteWorkersAtDoor {
+pub struct WriteWorkersAtDoor<G> {
     door: Arc<dyn Membership>,
+    objects: Arc<Objects<G>>,
 }
 
 /// Mark the rows that still stand for the workers this removal names.
@@ -90,10 +92,16 @@ pub struct RemoveWorkersAtDoor<G> {
 ///
 /// The write is a step of the local kind, as the creation is: it skips a
 /// registration of another kind, whose workers the host's own steps write.
+///
+/// A job's mode is what the write expects under each URL. An upsert
+/// expects anything and a create-only job expects nothing. A replacement
+/// by id expects the row behind the registry's worker of that id, read
+/// through `objects` at the revision the job names.
 pub fn registration_at_door<H: WorkflowHost>(
     settings: &RegistrationSettings,
     gates: RegistrationGates,
     door: Arc<dyn Membership>,
+    objects: Arc<Objects<H::Generation>>,
     behind: &[&'static str],
 ) -> WorkflowDefinition<WorkerRegistrationWorkflowData<H>> {
     let dependencies = if behind.is_empty() {
@@ -105,7 +113,7 @@ pub fn registration_at_door<H: WorkflowHost>(
         StepDefinition::new(
             WRITE_WORKERS_AT_DOOR_STEP,
             "Write workers at the membership door",
-            Arc::new(WriteWorkersAtDoor { door }),
+            Arc::new(WriteWorkersAtDoor { door, objects }),
         )
         .with_timeout(Duration::from_secs(5))
         .with_failure_action(FailureAction::FailWorkflow)
@@ -167,20 +175,60 @@ fn failed(step: &str, message: impl Into<String>) -> WorkflowError {
     }
 }
 
-fn registration_refusal(refusal: Refused) -> WorkflowError {
+fn registration_refusal(url: &str, refusal: Refused) -> WorkflowError {
     let message = match refusal {
         Refused::NotMaker(why) => why,
         Refused::Past(past) => format!("{}: {}", past.fact, past.why),
         Refused::Absent => ABSENT.to_owned(),
         Refused::NotLeading(_) => NOT_LEADING.to_owned(),
         Refused::Moved => MOVED.to_owned(),
+        Refused::Stands => format!("Worker {} already exists", Endpoint::redacted_str(url)),
         Refused::OutOfScope => Refused::OUT_OF_SCOPE.to_owned(),
     };
     failed(WRITE_WORKERS_AT_DOOR_STEP, message)
 }
 
+/// The row behind the worker a replacement by id names: the registry's
+/// worker of that id, where it still stands at the job's revision under the
+/// one built worker's URL, as the holder built it. The door checks the row
+/// again in its turn.
+fn replaced<G: Generation>(
+    registry: &WorkerRegistry<G>,
+    objects: &Objects<G>,
+    workers: &[Arc<dyn Worker>],
+    worker_id: &str,
+    expected_revision: u64,
+) -> WorkflowResult<Standing> {
+    let [worker] = workers else {
+        return Err(failed(
+            WRITE_WORKERS_AT_DOOR_STEP,
+            format!(
+                "Replacing worker {worker_id} needs exactly one worker, got {}",
+                workers.len()
+            ),
+        ));
+    };
+    let id = ObjectId::from_string(worker_id.to_owned());
+    registry
+        .get(&id)
+        .filter(|held| held.revision() == expected_revision && held.url() == worker.url())
+        .and_then(|held| objects.standing_of(&id, &held))
+        .ok_or_else(|| {
+            failed(
+                WRITE_WORKERS_AT_DOOR_STEP,
+                format!(
+                    "Worker {worker_id} at {} is no longer at revision {expected_revision}, \
+                     so the replacement was dropped",
+                    Endpoint::redacted_str(worker.url())
+                ),
+            )
+        })
+}
+
 #[async_trait]
-impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for WriteWorkersAtDoor {
+impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
+    for WriteWorkersAtDoor<H::Generation>
+{
     async fn execute(
         &self,
         context: &mut WorkflowContext<WorkerRegistrationWorkflowData<H>>,
@@ -193,25 +241,46 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for WriteW
             .actual_workers
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_owned()))?;
-        let unsupported = match data.registration_mode {
-            WorkerRegistrationMode::Upsert => None,
-            WorkerRegistrationMode::CreateOnly => Some("CreateOnly"),
-            WorkerRegistrationMode::ReplaceById { .. } => Some("ReplaceById"),
-        };
-        if let Some(mode) = unsupported {
-            return Err(failed(
-                WRITE_WORKERS_AT_DOOR_STEP,
-                format!("{mode} is not supported at the membership door"),
-            ));
-        }
         let maker = maker_of(&data.asker, &data.config.url)
             .map_err(|why| failed(WRITE_WORKERS_AT_DOOR_STEP, why.to_string()))?;
+        let expect = match &data.registration_mode {
+            WorkerRegistrationMode::Upsert => Expect::Anything,
+            // The door takes one row a call. An add refused at a later rank
+            // would leave the earlier ones, and its retry would be refused at
+            // the rank it wrote: no rank is written until the door lays a
+            // worker's ranks in one turn.
+            WorkerRegistrationMode::CreateOnly if workers.len() > 1 => {
+                return Err(failed(
+                    WRITE_WORKERS_AT_DOOR_STEP,
+                    format!(
+                        "Adding a worker of {} ranks needs them written in one turn, \
+                         which this door does not take yet",
+                        workers.len()
+                    ),
+                ));
+            }
+            WorkerRegistrationMode::CreateOnly => Expect::Nothing,
+            WorkerRegistrationMode::ReplaceById {
+                worker_id,
+                expected_revision,
+            } => {
+                let registry = require_host(data.host.as_ref())?.worker_registry();
+                Expect::Seen(replaced(
+                    registry,
+                    &self.objects,
+                    workers,
+                    worker_id,
+                    *expected_revision,
+                )?)
+            }
+        };
         for worker in workers {
+            let url = worker.url();
             self.door
-                .found(&maker, worker.url(), &|standing| {
+                .found(&maker, expect, url, &|standing| {
                     facts(worker.as_ref(), standing)
                 })
-                .map_err(registration_refusal)?;
+                .map_err(|refusal| registration_refusal(url, refusal))?;
         }
         data.workers = Some(WorkerList::from_workers(workers));
         Ok(StepResult::Success)
@@ -244,6 +313,7 @@ fn removal_answer(
         Err(Refused::OutOfScope) => {
             warn!(worker_url = %Endpoint::redacted_str(url), why = Refused::OUT_OF_SCOPE, "Worker left alone");
         }
+        Err(Refused::Stands) => return Err(failed(step, "the door answered a removal as an add")),
         Err(Refused::Past(past)) => {
             return Err(failed(step, format!("{}: {}", past.fact, past.why)))
         }
@@ -405,7 +475,8 @@ mod tests {
     use crate::{
         store::{Maker, MemoryStore, Unmade, WorkerFacts, WorkerStatus, WorkersStore},
         worker_host::{
-            facts, Members, Membership, Objects, Refused, Remover, Standing, StoreDoor, Wrote,
+            facts, Expect, Members, Membership, Objects, Refused, Remover, Standing, StoreDoor,
+            Wrote,
         },
     };
 
@@ -555,14 +626,17 @@ mod tests {
         fn seed(&self, maker: &Maker, worker: &dyn Worker) -> Result<Wrote, Refused> {
             let answer = self
                 .door
-                .found(maker, worker.url(), &|old| facts(worker, old))?;
+                .found(maker, Expect::Anything, worker.url(), &|old| {
+                    facts(worker, old)
+                })?;
             self.objects.follow(&*self.store);
             Ok(answer)
         }
 
-        fn write(&self) -> WriteWorkersAtDoor {
+        fn write(&self) -> WriteWorkersAtDoor<Members> {
             WriteWorkersAtDoor {
                 door: Arc::clone(&self.door),
+                objects: Arc::clone(&self.objects),
             }
         }
 
@@ -802,6 +876,7 @@ mod tests {
         fn found(
             &self,
             _: &Maker,
+            _: Expect,
             _: &str,
             _: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
         ) -> Result<Wrote, Refused> {
@@ -853,6 +928,7 @@ mod tests {
             let mut cx = f.registration(WorkerJobAsker::Api, vec![worker(URL, "model")]);
             let write = WriteWorkersAtDoor {
                 door: Arc::new(Shut(refusal)),
+                ..f.write()
             };
             let error = write.execute(&mut cx).await.expect_err("refused");
             assert!(matches!(&error, WorkflowError::StepFailed { step_id, .. }
@@ -865,32 +941,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_replacement_by_id_is_refused_by_name() {
+    async fn a_create_only_job_adds_a_row_and_fails_where_one_stands() {
         let f = Fixture::new();
         let mut cx = f.registration(WorkerJobAsker::Api, vec![worker(URL, "model")]);
+        cx.data.registration_mode = WorkerRegistrationMode::CreateOnly;
         let write = f.write();
-        for (mode, name) in [
+        assert_eq!(
+            write.execute(&mut cx).await.expect("added"),
+            StepResult::Success
+        );
+        let row = f.store.by_key(URL).expect("the added row");
+        assert_eq!(row.maker, Maker::Control);
+
+        let epoch = f.store.epoch();
+        let error = write.execute(&mut cx).await.expect_err("the URL stands");
+        assert_eq!(
+            error.to_string(),
+            "Step failed: write_workers_at_door - Worker http://worker:8000 already exists"
+        );
+        assert!(!StepExecutor::<Registration>::is_retryable(&write, &error));
+        assert_eq!(f.store.epoch(), epoch);
+
+        // Two ranks, the second standing: one door call a rank would write
+        // the first, and the add's retry would be refused there. None is.
+        let ranks =
+            ["http://worker:8000@0", "http://worker:8000@1"].map(|url| worker(url, "model"));
+        cx.data.actual_workers = Some(vec![Arc::clone(&ranks[1])]);
+        write.execute(&mut cx).await.expect("the second rank");
+        let epoch = f.store.epoch();
+        cx.data.actual_workers = Some(ranks.to_vec());
+        let error = write.execute(&mut cx).await.expect_err("two ranks");
+        assert!(error.to_string().contains("2 ranks"), "{error}");
+        assert_eq!(f.store.epoch(), epoch);
+    }
+
+    #[tokio::test]
+    async fn a_replacement_by_id_is_laid_over_the_row_behind_that_worker() {
+        let f = Fixture::new();
+        f.seed(&Maker::Control, worker(URL, "model").as_ref())
+            .expect("registered");
+        let id = f.host.registry.get_id_by_url(URL).expect("the worker's id");
+        let revision = f.host.registry.get(&id).expect("the worker").revision();
+        let before = f.store.by_key(URL).expect("the row");
+        let by_id = |worker_id: &str, expected_revision| WorkerRegistrationMode::ReplaceById {
+            worker_id: worker_id.to_owned(),
+            expected_revision,
+        };
+        let relabelled = || -> Arc<dyn Worker> {
+            let spec = WorkerSpec {
+                models: vec![ModelCard::new("model")].into(),
+                labels: [("tier".to_owned(), "silver".to_owned())].into(),
+                ..WorkerSpec::new(URL.to_owned())
+            };
+            Arc::new(<BasicWorkerBuilder>::from_spec(spec).build())
+        };
+        let write = f.write();
+
+        // Another revision than the job's, an id the registry does not
+        // hold, a built worker at another URL, or two built workers: the
+        // door is not asked.
+        for (mode, workers, said) in [
             (
-                WorkerRegistrationMode::ReplaceById {
-                    worker_id: "id".to_owned(),
-                    expected_revision: 1,
-                },
-                "ReplaceById",
+                by_id(id.as_str(), revision + 1),
+                vec![relabelled()],
+                "is no longer at revision",
             ),
-            (WorkerRegistrationMode::CreateOnly, "CreateOnly"),
+            (
+                by_id("no-such-id", revision),
+                vec![relabelled()],
+                "is no longer at revision",
+            ),
+            (
+                by_id(id.as_str(), revision),
+                vec![worker("http://other:8000", "model")],
+                "is no longer at revision",
+            ),
+            (
+                by_id(id.as_str(), revision),
+                vec![relabelled(), relabelled()],
+                "needs exactly one worker, got 2",
+            ),
         ] {
+            let mut cx = f.registration(WorkerJobAsker::Api, workers);
             cx.data.registration_mode = mode;
-            let error = write
-                .execute(&mut cx)
-                .await
-                .expect_err("only Upsert is supported");
-            assert!(
-                matches!(&error, WorkflowError::StepFailed { step_id, message }
-                if step_id == &StepId::new("write_workers_at_door") && message.contains(name))
-            );
+            let error = write.execute(&mut cx).await.expect_err("dropped");
+            assert!(error.to_string().contains(said), "{error}");
             assert!(!StepExecutor::<Registration>::is_retryable(&write, &error));
         }
-        assert_eq!(f.store.epoch(), 0);
+        assert_eq!(f.store.by_key(URL).as_ref(), Some(&before));
+
+        // The worker of that id at that revision: its row takes the new
+        // labels in place, and the worker keeps its id in the registry.
+        let mut cx = f.registration(WorkerJobAsker::Api, vec![relabelled()]);
+        cx.data.registration_mode = by_id(id.as_str(), revision);
+        assert_eq!(
+            write.execute(&mut cx).await.expect("replaced"),
+            StepResult::Success
+        );
+        let row = f.store.by_key(URL).expect("the row");
+        assert_eq!(row.id, before.id);
+        assert_eq!(
+            row.facts.labels.get("tier").map(String::as_str),
+            Some("silver")
+        );
+        f.objects.follow(&*f.store);
+        assert_eq!(f.host.registry.get_id_by_url(URL), Some(id));
     }
 
     #[tokio::test]
@@ -1099,7 +1254,7 @@ mod tests {
             f.seed(&Maker::Control, built.as_ref()).expect("registered");
             let live = f.host.registry.get_by_url(URL).expect("the held worker");
             f.door
-                .found(&Maker::Control, URL, &|old| WorkerFacts {
+                .found(&Maker::Control, Expect::Anything, URL, &|old| WorkerFacts {
                     priority: 5,
                     ..facts(built.as_ref(), old)
                 })
@@ -1143,7 +1298,7 @@ mod tests {
         assert_eq!(removal.data.drained_workers.len(), 1);
 
         f.door
-            .found(&Maker::Control, URL, &|old| WorkerFacts {
+            .found(&Maker::Control, Expect::Anything, URL, &|old| WorkerFacts {
                 priority: 5,
                 ..facts(built.as_ref(), old)
             })
@@ -1181,6 +1336,7 @@ mod tests {
                 f.host.registration_settings(),
                 RegistrationGates::default(),
                 Arc::clone(&f.door),
+                Arc::clone(&f.objects),
                 behind,
             );
             assert_eq!(workflow.id, WorkflowId::new("worker_registration"));
@@ -1235,6 +1391,7 @@ mod tests {
                 creation: Some("prepare_worker"),
             },
             Arc::clone(&f.door),
+            Arc::clone(&f.objects),
             &[],
         );
         assert_eq!(gated.steps[0].depends_on, [StepId::new("classify_worker")]);
