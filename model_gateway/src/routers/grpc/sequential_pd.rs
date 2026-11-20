@@ -712,6 +712,7 @@ pub(crate) async fn execute_sequential_pd(
             prefill_start,
             decode_sent,
             runtime,
+            dispatch_wait_micros: PdTiming::wait_from_entry(prefill_start),
         },
         prefill_input_logprobs,
     })

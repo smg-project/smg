@@ -308,8 +308,13 @@ fn duration_bucket_override_leaves_the_token_timing_families_alone() {
             "{suffix}"
         );
     }
+    // The PD dispatch wait ends in `_wait_seconds`: it is matched by its full
+    // name and follows the same list.
+    let dispatch_wait = Matcher::Full(String::from("smg_pd_dispatch_wait_seconds"));
+    assert_eq!(overridden[&dispatch_wait], custom);
     let defaults = histogram_bucket_overrides(None);
     let duration = &defaults[&Matcher::Suffix(String::from("duration_seconds"))];
+    assert_eq!(&defaults[&dispatch_wait], duration);
     assert_eq!(duration.len(), 29);
     assert_eq!(duration.first(), Some(&0.001));
     assert_eq!(duration.last(), Some(&7200.0));

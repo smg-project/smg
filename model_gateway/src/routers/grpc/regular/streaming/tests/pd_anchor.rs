@@ -60,6 +60,7 @@ fn pd_timing(prefill_offset: Duration) -> context::PdTiming {
         prefill_start: before(prefill_offset),
         decode_sent: before(DECODE_OFFSET),
         runtime: "test",
+        dispatch_wait_micros: None,
     }
 }
 
@@ -528,5 +529,42 @@ fn a_batched_single_completion_stream_anchors_at_its_earliest_dispatch() {
         &rendered,
         "batched single completions",
         metrics_labels::ENDPOINT_COMPLETIONS,
+    );
+}
+
+/// The dispatch wait is recorded with the PD TTFT, once and under the
+/// backend label the stream records its TTFT with, so the two families
+/// count the same requests and add up label for label. A timing whose
+/// dispatch ran outside the request's entry stamp carries no wait and
+/// records its TTFT alone.
+#[test]
+fn the_dispatch_wait_is_recorded_with_the_pd_ttft_under_its_labels() {
+    let rendered = render_with_recorder(|| {
+        let mut stamped = pd_timing(PREFILL_OFFSET);
+        stamped.dispatch_wait_micros = Some(17_000);
+        stamped.record_first_decode_token(metrics_labels::BACKEND_HARMONY, MODEL);
+        pd_timing(PREFILL_OFFSET).record_first_decode_token(metrics_labels::BACKEND_PD, MODEL);
+    });
+    let harmony = format!("backend_type=\"{}\"", metrics_labels::BACKEND_HARMONY);
+    let pd = format!("backend_type=\"{}\"", metrics_labels::BACKEND_PD);
+    for label in [&harmony, &pd] {
+        assert_eq!(
+            sample(&rendered, "smg_pd_ttft_seconds", "count", label),
+            Some(1.0),
+            "{label}:\n{rendered}"
+        );
+    }
+    assert_eq!(
+        sample(&rendered, "smg_pd_dispatch_wait_seconds", "count", &harmony),
+        Some(1.0),
+        "{rendered}"
+    );
+    let wait = sample(&rendered, "smg_pd_dispatch_wait_seconds", "sum", &harmony)
+        .expect("the stamped timing's wait");
+    assert!((wait - 0.017).abs() < 1e-9, "wait {wait}");
+    assert_eq!(
+        sample(&rendered, "smg_pd_dispatch_wait_seconds", "count", &pd),
+        None,
+        "{rendered}"
     );
 }

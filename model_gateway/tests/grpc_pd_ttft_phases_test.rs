@@ -47,6 +47,11 @@ const DECODE_DELAY: Duration = Duration::from_millis(400);
 /// absorbed the other worker's delay fails its upper bound.
 const SLACK: Duration = Duration::from_millis(250);
 
+/// How long before its dispatch the stamped request entered at the edge: the
+/// dispatch wait must reach it, so a wait counted from anywhere at or after
+/// the dispatch fails the test.
+const ENTRY_LEAD: Duration = Duration::from_millis(100);
+
 /// Serve a sequential-dispatch mock engine in-process; returns its port. The
 /// engine answers every generate call with `OUTPUT_TOKENS` chunks and a
 /// completion after its delay: `HeldHeadersEngine::holding` waits it out
@@ -282,8 +287,9 @@ fn sequential_dispatch_phases_add_up_to_the_pd_ttft() {
         let decode = start_mock_engine(HeldHeadersEngine::eager(DECODE_DELAY, OUTPUT_TOKENS)).await;
         let router = build_pd_router(prefill, decode, RuntimeType::Vllm).await;
         // The request runs under the edge's entry stamp, as the metrics layer
-        // runs every request: the dispatch wait is counted from it.
-        let body = RequestStarted::now()
+        // runs every request, here taken `ENTRY_LEAD` ago: the dispatch wait
+        // is counted from it.
+        let body = RequestStarted::at(std::time::Instant::now() - ENTRY_LEAD)
             .scope(one_streaming_chat(router.as_ref()))
             .await;
         let (deltas, completion_tokens) = chat_stream_counts(&body);
@@ -315,8 +321,9 @@ fn sequential_dispatch_phases_add_up_to_the_pd_ttft() {
         "ttft {ttft} != prefill {prefill} + relay {relay} + decode {decode}"
     );
     // The dispatch wait, from the request's entry at the edge to the prefill
-    // dispatch, is recorded once, carries no worker delay, and with the TTFT
-    // covers the request from the gateway's receipt of it.
+    // dispatch, is recorded once, with the TTFT and under its labels; it
+    // carries no worker delay, and with the TTFT covers the request from the
+    // gateway's receipt of it.
     let runtime = RuntimeType::Vllm.as_str();
     let wait = sample(&rendered, "smg_pd_dispatch_wait_seconds", "sum", runtime);
     let wait_count = sample(&rendered, "smg_pd_dispatch_wait_seconds", "count", runtime);
@@ -324,8 +331,8 @@ fn sequential_dispatch_phases_add_up_to_the_pd_ttft() {
         panic!("the PD dispatch wait is missing or not recorded once:\n{rendered}");
     };
     assert!(
-        wait >= 0.0 && wait < SLACK.as_secs_f64(),
-        "dispatch wait {wait} carries no worker delay"
+        within(wait, ENTRY_LEAD, SLACK),
+        "dispatch wait {wait} runs from the entry stamp and carries no worker delay"
     );
 }
 
@@ -520,8 +527,8 @@ fn a_collected_chat_answer_anchors_its_generation_at_the_prefill_dispatch() {
             "max_tokens": 8,
         }))
         .unwrap();
-        let response = router
-            .route_chat(None, &tenant(), Arc::new(request), MODEL)
+        let response = RequestStarted::now()
+            .scope(router.route_chat(None, &tenant(), Arc::new(request), MODEL))
             .await;
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
@@ -561,4 +568,15 @@ fn a_collected_chat_answer_anchors_its_generation_at_the_prefill_dispatch() {
         generation >= floor,
         "chat: generation duration {generation} s carries both workers' delays ({floor} s)"
     );
+    // A collected answer records no PD TTFT, so it records no dispatch wait
+    // either, though it ran under the entry stamp: the two families count
+    // the same requests.
+    let runtime = RuntimeType::Vllm.as_str();
+    for family in ["smg_pd_ttft_seconds", "smg_pd_dispatch_wait_seconds"] {
+        assert_eq!(
+            sample(&rendered, family, "count", runtime),
+            None,
+            "{family}:\n{rendered}"
+        );
+    }
 }

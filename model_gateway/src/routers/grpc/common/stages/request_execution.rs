@@ -30,7 +30,6 @@ use super::{
 };
 use crate::{
     config::GroupedDpSticky,
-    middleware::RequestStarted,
     observability::{
         cache_trace,
         metrics::{metrics_labels, Metrics},
@@ -493,7 +492,6 @@ pub(crate) async fn execute_plan(
     if let Some(deadline) = deadline {
         result.apply_deadline(deadline);
     }
-    record_pd_dispatch_wait(&result, model);
     if let Some(guards) = ctx.load_guards.take() {
         ctx.load_guards = Some(LoadGuards::traced(span, guards));
     }
@@ -501,41 +499,6 @@ pub(crate) async fn execute_plan(
     // Store result in context for response processing
     ctx.response.execution_result = Some(result);
     Ok(())
-}
-
-/// Records the dispatch wait of each disaggregated pair `result` holds:
-/// from the request's entry at the edge ([`RequestStarted`]) to the pair's
-/// prefill dispatch. That is the gateway's own time ahead of the engines,
-/// which the PD TTFT families leave out since they start at the prefill
-/// dispatch; with `smg_pd_ttft_seconds` it is the TTFT from the gateway's
-/// receipt of the request. A pair is in the result once its decode side is
-/// established, so the wait is counted for the requests the other
-/// success-only PD metrics count, once per pair, and a retry's wait runs to
-/// the attempt that succeeded.
-///
-/// The stamp is the request's task-local, read only for a result that holds
-/// a pair. A dispatch made outside the request's task (a Responses run that
-/// was spawned, each iteration of its tool loop) finds no stamp and records
-/// nothing: its wait would count time the client was already being answered.
-fn record_pd_dispatch_wait(result: &ExecutionResult, model: &str) {
-    match result {
-        ExecutionResult::PrefillDecode { pd_timing, .. } => {
-            if let Some(entered) = RequestStarted::current() {
-                Metrics::record_pd_dispatch_wait(
-                    metrics_labels::BACKEND_PD,
-                    model,
-                    pd_timing.runtime,
-                    pd_timing.prefill_start.saturating_duration_since(entered),
-                );
-            }
-        }
-        ExecutionResult::Batch { results } => {
-            for result in results {
-                record_pd_dispatch_wait(result, model);
-            }
-        }
-        ExecutionResult::Single { .. } | ExecutionResult::Embedding { .. } => {}
-    }
 }
 
 /// The client's answer for an attempt whose deadline passed before the
@@ -1682,6 +1645,7 @@ async fn execute_parallel_pd(
                     prefill_start,
                     decode_sent: prefill_start,
                     runtime,
+                    dispatch_wait_micros: PdTiming::wait_from_entry(prefill_start),
                 },
             )
             .await

@@ -735,7 +735,7 @@ pub(crate) fn init_metrics() {
     );
     describe_histogram!(
         "smg_pd_dispatch_wait_seconds",
-        "PD dispatch wait: from the request's entry at the edge to the prefill dispatch of the attempt that established the pair (body read, auth, admission, tokenize, template, worker selection, earlier attempts). With smg_pd_ttft_seconds it is the TTFT from the gateway's receipt of the request. Recorded with the success-only PD metrics, for a dispatch made in the request's own task"
+        "PD dispatch wait, gRPC router only: from the request's entry at the edge to the prefill dispatch (body read, auth, admission, tokenize, template, worker selection, an earlier attempt, and for an encode/prefill/decode push plan the encode call). Recorded with smg_pd_ttft_seconds, at the first decode token of a streamed request and under the same labels, so their sum is the TTFT from the gateway's receipt of the request. Not recorded for a dispatch made outside the request's task (a spawned Responses run)"
     );
     describe_histogram!(
         "smg_pd_kv_transfer_duration_seconds",
@@ -2129,9 +2129,10 @@ impl Metrics {
     /// Record the PD dispatch wait: from the request's entry at the edge
     /// (`middleware::RequestStarted`) to the prefill dispatch. It is the
     /// gateway's own time ahead of the engines, which the PD TTFT families
-    /// leave out since they start at the prefill dispatch, so
-    /// `smg_pd_dispatch_wait_seconds` + `smg_pd_ttft_seconds` is the TTFT from
-    /// the gateway's receipt of the request.
+    /// leave out since they start at the prefill dispatch. The gRPC router
+    /// records it where it records `smg_pd_ttft_seconds`
+    /// (`PdTiming::record_first_decode_token`), with the same labels, so the
+    /// two add up to the TTFT from the gateway's receipt of the request.
     /// Uses string interning for model_id; runtime is a static label.
     pub fn record_pd_dispatch_wait(
         backend_type: &'static str,

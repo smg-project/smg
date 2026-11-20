@@ -165,6 +165,7 @@ async fn stream_pd(
                 prefill_start: Instant::now(),
                 decode_sent: Instant::now(),
                 runtime: "test",
+                dispatch_wait_micros: None,
             },
             vec![None],
             None,
