@@ -1364,8 +1364,7 @@ impl<G: Generation> WorkerRegistry<G> {
             }
         }
 
-        let old_listed = self.models_left_by(&old_worker);
-        let old_models: HashSet<String> = old_listed.iter().cloned().collect();
+        let old_models: HashSet<String> = self.models_left_by(&old_worker).into_iter().collect();
         let new_models: HashSet<String> = worker_model_ids(&new_worker).into_iter().collect();
 
         // URL changes are not supported via replace — use remove + register instead
@@ -1417,6 +1416,7 @@ impl<G: Generation> WorkerRegistry<G> {
         old_worker.abort_background_tasks();
 
         // Diff model indexes: remove stale, add new.
+        let mut emptied = Vec::new();
         for removed_model in old_models.difference(&new_models) {
             self.remove_worker_from_model_index(removed_model, &old_worker);
             // Mirror `remove()`: drop any per-model retry override when
@@ -1429,6 +1429,7 @@ impl<G: Generation> WorkerRegistry<G> {
                 .is_none_or(|workers| workers.members().is_empty());
             if model_empty {
                 self.model_retry_configs.remove(removed_model);
+                emptied.push(removed_model.clone());
             }
         }
         for added_model in new_models.difference(&old_models) {
@@ -1442,7 +1443,7 @@ impl<G: Generation> WorkerRegistry<G> {
 
         // Update aliases after canonical indexes so alias removal can inspect
         // the final worker set for each canonical model.
-        for (alias, canonical_id) in self.aliases_of(&old_listed) {
+        for (alias, canonical_id) in self.aliases_left_by(&old_worker, &emptied) {
             self.remove_model_alias_if_unused(&alias, &canonical_id);
         }
         for model in new_worker.models() {
@@ -1769,6 +1770,32 @@ impl<G: Generation> WorkerRegistry<G> {
             .collect()
     }
 
+    /// The aliases a removal or a replacement asks after: the ones the
+    /// cards of `worker` declare, and every alias of a model the write
+    /// `emptied`.
+    ///
+    /// The second part is read from the alias index, since a refresh can
+    /// drop the card that declared an alias. It reads the emptied models
+    /// alone. A refresh writes cards with no alias, so where peers still
+    /// serve a model, their cards of the minute cannot tell an alias they
+    /// registered from a stale one, and the alias stays.
+    fn aliases_left_by(
+        &self,
+        worker: &Arc<dyn Worker>,
+        emptied: &[String],
+    ) -> Vec<(String, String)> {
+        let mut aliases = self.aliases_of(emptied);
+        for model in worker.models() {
+            aliases.extend(
+                model
+                    .aliases
+                    .into_iter()
+                    .map(|alias| (alias, model.id.clone())),
+            );
+        }
+        aliases
+    }
+
     /// Reserve (or retrieve) a stable UUID for a worker URL.
     ///
     /// Used by `WorkerService::create_worker()` to return a worker ID in
@@ -1898,19 +1925,20 @@ impl<G: Generation> WorkerRegistry<G> {
             self.worker_origins.remove(worker_id);
             self.import_records.remove(worker_id);
 
-            let left = self.models_left_by(&worker);
-            for model_id in &left {
-                self.remove_worker_from_model_index(model_id, &worker);
+            let mut emptied = Vec::new();
+            for model_id in self.models_left_by(&worker) {
+                self.remove_worker_from_model_index(&model_id, &worker);
                 // Drop the per-model retry config when the last worker leaves.
                 let model_empty = self
                     .model_index
-                    .get(model_id)
+                    .get(&model_id)
                     .is_none_or(|w| w.members().is_empty());
                 if model_empty {
-                    self.model_retry_configs.remove(model_id);
+                    self.model_retry_configs.remove(&model_id);
+                    emptied.push(model_id);
                 }
             }
-            for (alias, canonical_id) in self.aliases_of(&left) {
+            for (alias, canonical_id) in self.aliases_left_by(&worker, &emptied) {
                 self.remove_model_alias_if_unused(&alias, &canonical_id);
             }
             if let Some(mut type_workers) = self.type_workers.get_mut(worker.worker_type()) {

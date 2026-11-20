@@ -3412,6 +3412,63 @@ fn a_replaced_workers_alias_goes_with_a_model_its_refresh_left_out() {
     assert!(registry.get_by_model("qwen-latest").is_empty());
 }
 
+/// An alias stays while a peer still serves its model, though a refresh
+/// wrote the peer's cards with no alias: the cards of the minute cannot
+/// tell an alias the peer registered from a stale one. The alias goes
+/// with the model's last worker.
+#[test]
+fn an_alias_stays_while_a_refreshed_peer_still_serves_its_model() {
+    let registry = WorkerRegistry::new();
+    let (first, second) = two_refreshed_workers_of_an_aliased_model(&registry);
+
+    assert!(registry.remove(&first).is_some());
+    assert_eq!(
+        registry.resolve_model_alias("qwen-latest").as_deref(),
+        Some("qwen")
+    );
+    assert!(registry.remove(&second).is_some());
+    assert!(registry.resolve_model_alias("qwen-latest").is_none());
+}
+
+/// The same through a replacement whose cards do not declare the alias:
+/// the refreshed peer registered it, and it stays.
+#[test]
+fn an_alias_stays_through_a_replacement_while_a_refreshed_peer_serves_its_model() {
+    let registry = WorkerRegistry::new();
+    let (first, _second) = two_refreshed_workers_of_an_aliased_model(&registry);
+    let next: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://first:8080")
+            .model(ModelCard::new("qwen"))
+            .build(),
+    );
+
+    assert!(registry.replace(&first, next));
+    assert_eq!(
+        registry.resolve_model_alias("qwen-latest").as_deref(),
+        Some("qwen")
+    );
+}
+
+/// Two workers registered with one aliased model, each refreshed since:
+/// a refresh writes the cards an endpoint's model list names, with no
+/// alias. Returns their ids.
+fn two_refreshed_workers_of_an_aliased_model(registry: &WorkerRegistry) -> (WorkerId, WorkerId) {
+    let registered = |url: &str| {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("qwen").with_alias("qwen-latest"))
+                .build(),
+        );
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        assert!(registry.refresh_models(&worker, vec![ModelCard::new("qwen")]));
+        id
+    };
+    (
+        registered("http://first:8080"),
+        registered("http://second:8080"),
+    )
+}
+
 /// A removal frees its URL ahead of its walk of the index, so a
 /// registration of the same URL can stand in a model's slice already.
 /// The eviction takes the handle it is given, and the newcomer keeps its
