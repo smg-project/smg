@@ -34,8 +34,8 @@ mod tests {
             Controller,
         },
         store::{
-            Ask, GatewayId, Maker, MemoryStore, Named, Naming, Signals, ViewBuffers, WorkerFacts,
-            WorkerStatus, WorkersStore,
+            Ask, GatewayId, KvEventSink as _, Maker, MemoryStore, Named, Naming, Signals,
+            ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
         },
         view::{Role, WireModes, WorkerId as RowId},
         worker_host::{Expect, KvFeed, Members, Membership as _, Objects, StoreDoor},
@@ -390,9 +390,9 @@ mod tests {
             },
             ..MockConfig::default()
         };
+        // The row states no block size: the stream is the store's one word of it.
         let row = WorkerFacts {
             engine_kind: mock.grpc_wire.as_str().to_owned(),
-            kv_block_size: Some(block_size),
             ..facts(&url, WireModes::GRPC, true)
         };
         let (stop_mock, mock_stopped) = oneshot::channel();
@@ -505,6 +505,8 @@ mod tests {
                 }
                 sleep(POLL).await;
             }
+            // The store learned the model's size from the engine's stored block.
+            assert_eq!(store.block_size(MODEL), Some(block_size));
             stop.send(()).expect("the controller is still serving");
         };
         let (result, ()) = timeout(Duration::from_secs(15), async { tokio::join!(serve, case) })
