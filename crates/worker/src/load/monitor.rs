@@ -383,7 +383,7 @@ impl PushedFile {
         Metrics::record_engine_rank_load(
             url,
             model_id,
-            registered_engine_role(self.pusher.worker_type()),
+            registered_engine_role(*self.pusher.worker_type()),
             &self.report.loads[at],
         );
     }
@@ -435,7 +435,7 @@ fn write_sentinel(
     // so sentinel every model's series — not just the primary.
     let models = worker_model_ids(worker);
     // The worker's load series carry the role it is registered in.
-    let role = registered_engine_role(worker.worker_type());
+    let role = registered_engine_role(*worker.worker_type());
     for rank in ranks {
         Metrics::remove_engine_rank_metrics(url, &models, rank, role, |label, test| {
             live(label, rank, test)
@@ -977,7 +977,7 @@ impl<G: Generation> WorkerMonitor<G> {
                 Metrics::record_engine_load(
                     worker.url(),
                     model_id,
-                    registered_engine_role(worker.worker_type()),
+                    registered_engine_role(*worker.worker_type()),
                     load,
                 );
             }
@@ -1595,7 +1595,7 @@ impl<G: Generation> WorkerMonitor<G> {
             .map(|(source, load)| {
                 (
                     worker_model_ids(&source),
-                    registered_engine_role(source.worker_type()),
+                    registered_engine_role(*source.worker_type()),
                     load,
                 )
             });
@@ -1619,7 +1619,7 @@ impl<G: Generation> WorkerMonitor<G> {
             .map(|other| {
                 (
                     intern_model_label(other.pusher.model_id()),
-                    registered_engine_role(other.pusher.worker_type()),
+                    registered_engine_role(*other.pusher.worker_type()),
                     other,
                 )
             });

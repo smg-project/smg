@@ -3204,7 +3204,7 @@ fn polled(monitor: &WorkerMonitor, worker: &Arc<dyn Worker>, answer: WorkerLoadR
     Metrics::record_engine_load(
         "http://w:1",
         worker.model_id(),
-        registered_engine_role(worker.worker_type()),
+        registered_engine_role(*worker.worker_type()),
         &answer,
     );
     let reports = monitor.pushed_reports.lock();

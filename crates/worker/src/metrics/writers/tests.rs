@@ -293,10 +293,10 @@ fn a_load_series_carries_its_workers_registered_role() {
 #[test]
 fn the_registered_role_is_the_side_of_a_pair_or_null() {
     use crate::worker::WorkerType;
-    assert_eq!(registered_engine_role(&WorkerType::Prefill), "prefill");
-    assert_eq!(registered_engine_role(&WorkerType::Decode), "decode");
-    assert_eq!(registered_engine_role(&WorkerType::Regular), "null");
-    assert_eq!(registered_engine_role(&WorkerType::Encode), "null");
+    assert_eq!(registered_engine_role(WorkerType::Prefill), "prefill");
+    assert_eq!(registered_engine_role(WorkerType::Decode), "decode");
+    assert_eq!(registered_engine_role(WorkerType::Regular), "null");
+    assert_eq!(registered_engine_role(WorkerType::Encode), "null");
 }
 
 #[test]

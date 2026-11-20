@@ -1691,7 +1691,7 @@ pub(crate) type LoadTest<'t> =
 /// does. It is the registration's and not the load's: every engine's load
 /// then splits by role, one that reports none included, and a worker's
 /// series stand under one role for as long as it is registered.
-pub fn registered_engine_role(worker_type: &crate::worker::WorkerType) -> &'static str {
+pub fn registered_engine_role(worker_type: crate::worker::WorkerType) -> &'static str {
     match worker_type {
         crate::worker::WorkerType::Prefill => "prefill",
         crate::worker::WorkerType::Decode => "decode",
