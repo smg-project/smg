@@ -5,7 +5,7 @@ use smg_worker::{identity::basic::Worker, worker::ConnectionMode};
 use super::object::role;
 use crate::{
     store::{HealthPolicy, Overload, WorkerFacts},
-    view::{permille, WireModes},
+    view::{threshold_permille, WireModes},
 };
 
 /// The facts a provider states of a worker it found, from the object to the
@@ -66,7 +66,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
             kv_usage_permille: spec
                 .overload
                 .token_usage
-                .map(permille)
+                .map(threshold_permille)
                 .or(standing.overload.kv_usage_permille),
             waiting_requests: spec
                 .overload
@@ -85,7 +85,10 @@ fn milliseconds(seconds: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Instant};
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use smg_worker::{
         identity::{basic::Worker, builder::BasicWorkerBuilder},
@@ -98,10 +101,11 @@ mod tests {
         store::{
             encoding::{EncodeHandoff, EncodeOffer},
             pairing::PairingDescriptor,
-            GatewayId, HealthPolicy, Maker, Overload, Reachability, Signals, WorkerFacts,
-            WorkerRow, WorkerStatus,
+            Ask, GatewayId, HealthPolicy, LoadSink as _, LoadSource, Maker, MemoryStore, Overload,
+            Reachability, Signals, ViewBuffers, WorkerFacts, WorkerRow, WorkerStatus,
+            WorkersStore as _,
         },
-        view::{Role, WireModes, WorkerId},
+        view::{LoadRow, Role, WireModes, WorkerId},
         worker_host::object,
     };
 
@@ -248,6 +252,42 @@ mod tests {
             waiting_requests: Some(7),
         };
         assert_eq!(found.overload, stated);
+    }
+
+    /// A threshold of the object's own under half a permille is held as
+    /// one, as a document's is. At none the store reads every engine with
+    /// a rank on file as over it, so an idle worker would be vetoed.
+    #[test]
+    fn a_threshold_under_half_a_permille_is_held_as_one_and_vetoes_no_idle_worker() {
+        let spec = WorkerSpec {
+            models: vec![ModelCard::new("model")].into(),
+            overload: OverloadUpdate {
+                waiting_requests: None,
+                token_usage: Some(0.0004),
+            },
+            ..WorkerSpec::new(URL.to_owned())
+        };
+        let found = facts(&<BasicWorkerBuilder>::from_spec(spec).build(), None);
+        let stated = found.overload.kv_usage_permille;
+
+        let store = MemoryStore::with_publish_window(Duration::ZERO);
+        let now = Instant::now();
+        let id = store.upsert(found).id();
+        store.publish_now();
+        store.record(id, 0, LoadRow::default(), now, LoadSource::Stream);
+        store.publish_now();
+        let ask = Ask {
+            gateway: GatewayId(1),
+            now,
+            pinned: None,
+            affinity: false,
+        };
+        let mut view = ViewBuffers::default();
+        store
+            .build_view("model", Role::Single, &ask, &mut view)
+            .expect("the pool");
+        assert!(!view.candidates[0].health.overloaded, "idle, and read over");
+        assert_eq!(stated, Some(1));
     }
 
     #[test]
