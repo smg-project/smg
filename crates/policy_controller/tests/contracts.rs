@@ -780,6 +780,8 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "affinity_source",
                 // The record reads it from its count ([`Trace::drew_first`]).
                 "drew_first",
+                // The record marks this in `profile` ([`Trace::profile_ran`]).
+                "no_profile",
             ],
             wire: &[
                 ("profile", Type::Uint32),
@@ -795,6 +797,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("affinity_source", Type::Enum),
                 ("drew_first", Type::Bool),
                 ("lifted", Type::Enum),
+                ("no_profile", Type::Bool),
             ],
             repeated: &["top", "drops"],
             optional: &["survivors"],

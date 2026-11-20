@@ -34,7 +34,7 @@ pub struct Names {
     /// The binding's plan, spelled as in the policy document.
     pub plan: &'static str,
     /// The profile named by the trace. This and the stage names are empty
-    /// when the trace names no profile of the binding.
+    /// when no profile ran or the trace's profile is outside the binding.
     pub profile: String,
     /// The profile's picker.
     pub picker: String,
@@ -71,9 +71,9 @@ impl DecisionRecord {
             plan: plan.name(),
             ..Names::default()
         };
-        let at = trace.profile;
-        // A shed can precede the profile's run. Its trace can then hold
-        // zero even where the binding uses profiles at other positions.
+        let Some(at) = trace.profile_ran() else {
+            return Some(names);
+        };
         let bound = at == binding.profile
             || binding.decode_profile == Some(at)
             || matches!(binding.plan, Plan::Epd { encode } if encode == at);
@@ -270,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shed_ahead_of_its_profile_names_the_plan_alone() {
+    fn a_trace_for_a_profile_outside_its_binding_names_the_plan_alone() {
         let engine = naming_engine(7);
         let names = record(7, Some(2), 0).names(&engine).expect("a binding");
         assert_eq!(names.plan, "epd");

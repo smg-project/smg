@@ -7,7 +7,7 @@
 
 use crate::{
     counts::with_counts,
-    decision::{Decision, Target, Trace},
+    decision::{Decision, Target},
     lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
     plugins::{
         config::{Exposure, Reveal},
@@ -360,32 +360,6 @@ fn target(t: &Target) -> proto::Target {
     }
 }
 
-fn trace(t: &Trace) -> proto::Trace {
-    proto::Trace {
-        profile: u32::from(t.profile),
-        survivors: t.survivors.get(),
-        top: t.top[..usize::from(t.top_len)]
-            .iter()
-            .map(|(id, score)| proto::Scored {
-                worker_id: id.0,
-                score: *score,
-                contributions: Vec::new(),
-                dp_rank: 0,
-            })
-            .collect(),
-        seed: t.seed,
-        generation: t.generation,
-        plan: 0,
-        drops: Vec::new(),
-        picker: 0,
-        shadow_pick: 0,
-        fallback: false,
-        affinity_source: 0,
-        drew_first: t.drew_first(),
-        lifted: proto::LiftedVeto::from(t.lifted) as i32,
-    }
-}
-
 fn decision(d: &Decision, l: &Lease, exposure: &Exposure) -> proto::Decision {
     use proto::decision::Outcome;
     let (outcome, t) = match d {
@@ -423,7 +397,7 @@ fn decision(d: &Decision, l: &Lease, exposure: &Exposure) -> proto::Decision {
     proto::Decision {
         leases: vec![lease(l, exposure)],
         outcome: Some(outcome),
-        trace: Some(trace(t)),
+        trace: Some(t.wire()),
     }
 }
 
@@ -1182,14 +1156,14 @@ mod tests {
             generation: 6,
             ..Trace::default()
         };
-        let wire = super::trace(&counted);
+        let wire = counted.wire();
         assert_eq!((wire.survivors, wire.drew_first), (Some(5), false));
         assert_eq!((wire.profile, wire.seed, wire.generation), (3, 41, 6));
         let drawn = Trace {
             survivors: Survivors::NOT_COUNTED,
             ..counted
         };
-        let wire = super::trace(&drawn);
+        let wire = drawn.wire();
         assert_eq!((wire.survivors, wire.drew_first), (None, true));
     }
 
@@ -1202,13 +1176,24 @@ mod tests {
             lifted: Lifted::Overload,
             ..Trace::default()
         };
+        assert_eq!(steered.wire().lifted, proto::LiftedVeto::Overload as i32);
         assert_eq!(
-            super::trace(&steered).lifted,
-            proto::LiftedVeto::Overload as i32
-        );
-        assert_eq!(
-            super::trace(&Trace::default()).lifted,
+            Trace::default().wire().lifted,
             proto::LiftedVeto::None as i32
+        );
+    }
+
+    #[test]
+    fn the_plugin_decision_carries_the_no_profile_mark() {
+        use prost::Message as _;
+
+        use crate::{decision::ShedReason, lease::Lease, plugins::config::Exposure};
+
+        let shed = crate::door::shed(ShedReason::NoEndpoints, "wires", 0, 0);
+        let decision = super::decision(&shed, &Lease::default(), &Exposure::default());
+        assert_eq!(
+            decision.trace.expect("a trace").encode_to_vec(),
+            [0x10, 0, 0x70, 1]
         );
     }
 

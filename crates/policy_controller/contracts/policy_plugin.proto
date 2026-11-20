@@ -425,12 +425,12 @@ message Lease {
 
 // Serves the routing trace header and Explain; positions into the generation's
 // spec. The record carries the first five fields (its `top` at most three
-// entries, each only `worker_id` and `score`) and reads `drew_first` from
-// its count, which a decision that drew first does not hold, and `lifted`
-// from the all-vetoed rule's pick; the observability contract fills the
-// rest, unset until then.
+// entries, each only `worker_id` and `score`). It reads `drew_first` from its
+// count, `lifted` from the all-vetoed rule's pick, and `no_profile` from the
+// profile mark. The observability contract fills the rest, unset until then.
 message Trace {
-  // Zero-based position in the spec's profile names in ascending UTF-8 order.
+  // Read no_profile first. When a profile ran, this is its zero-based
+  // position in the spec's profile names in ascending UTF-8 order.
   uint32 profile = 1;  // u16
   // Candidates left after the filters, where the decision counted them:
   // unset, never a zero, when it drew first (`drew_first`).
@@ -465,6 +465,8 @@ message Trace {
   // and so does the pick of a session key kept on its worker. A host counts
   // both from this field.
   LiftedVeto lifted = 13;
+  // True when no profile ran. In that case profile is 0.
+  bool no_profile = 14;
 }
 
 // The soft vetoes the all-vetoed rule lifts, in the order it lifts them. The

@@ -2463,10 +2463,13 @@ mod tests {
             .expect("a valid document");
     }
 
-    async fn decide_for_explain(service: &Service, model: &str, id: u8) -> proto::Decision {
+    async fn decide_for_explain(
+        service: &Service,
+        request: proto::DecideRequest,
+    ) -> proto::Decision {
         let (answers, mut received) = mpsc::channel(1);
         let job = Job {
-            request: Checked::new(bed::frame_for(model, id, u64::from(id))).expect("a frame"),
+            request: Checked::new(request).expect("a frame"),
             gateway: gateway_id(EXPLAIN_GATEWAY),
             received: Instant::now(),
             answers,
@@ -2490,7 +2493,8 @@ mod tests {
         explain_spec(&control, "z-first", 1);
 
         for (model, id) in [(bed::MODEL, 1), ("empty", 2)] {
-            let mut decided = decide_for_explain(&control, model, id).await;
+            let frame = bed::frame_for(model, id, u64::from(id));
+            let mut decided = decide_for_explain(&control, frame).await;
             assert_eq!(!decided.leases.is_empty(), model == bed::MODEL);
             decided.leases.clear();
             let record = control
@@ -2522,7 +2526,7 @@ mod tests {
         assert_eq!(miss.code(), Code::NotFound);
 
         explain_spec(&control, "z-second", 0);
-        let _ = decide_for_explain(&control, bed::MODEL, 3).await;
+        let _ = decide_for_explain(&control, bed::frame(3, 3)).await;
         let miss = control
             .explain(explain_request(3))
             .await
@@ -2546,6 +2550,40 @@ mod tests {
             old.profile_name.is_empty() && old.plan_name.is_empty() && old.picker_name.is_empty()
         );
         assert!(old.filter_names.is_empty() && old.scorer_names.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explain_names_only_the_plan_for_a_shed_ahead_of_the_first_profile() {
+        let (_elector, _standing, control) = electing(true);
+        let _ = bed::fleet(&control.shared.store);
+        explain_spec(&control, "a-first", 1);
+
+        let mut frame = bed::frame(1, 1);
+        frame.constraints = Some(proto::Constraints {
+            subset_hint: Some(0),
+            ..proto::Constraints::default()
+        });
+        let decision = decide_for_explain(&control, frame).await;
+        assert!(matches!(
+            decision.outcome,
+            Some(proto::decision::Outcome::Shed(shed)) if shed.emptied_by == "subset-hint"
+        ));
+
+        let record = control
+            .explain(explain_request(1))
+            .await
+            .expect("the sampled shed")
+            .into_inner();
+        assert_eq!(record.plan_name, "single");
+        assert!(record.profile_name.is_empty(), "{}", record.profile_name);
+        assert!(record.picker_name.is_empty());
+        assert!(record.filter_names.is_empty());
+        assert!(record.scorer_names.is_empty());
+        let trace = record
+            .decision
+            .and_then(|decision| decision.trace)
+            .expect("the trace");
+        assert_eq!((trace.profile, trace.no_profile), (0, true));
     }
 
     #[tokio::test]
@@ -2581,7 +2619,7 @@ mod tests {
     async fn explain_is_for_the_leader_and_a_new_term_starts_empty() {
         let (mut elector, standing, control) = electing(true);
         explain_spec(&control, "z-first", 1);
-        let _ = decide_for_explain(&control, "empty", 1).await;
+        let _ = decide_for_explain(&control, bed::frame_for("empty", 1, 1)).await;
         assert!(control.explain(explain_request(1)).await.is_ok());
         let no_principal = control
             .explain(Request::new(explain_request(1).into_inner()))
@@ -2625,7 +2663,7 @@ mod tests {
             .await
             .expect_err("a new lead");
         assert_eq!(miss.code(), Code::NotFound);
-        let _ = decide_for_explain(&control, "empty", 2).await;
+        let _ = decide_for_explain(&control, bed::frame_for("empty", 2, 2)).await;
         assert!(control.explain(explain_request(2)).await.is_ok());
         let miss = control
             .explain(explain_request(1))

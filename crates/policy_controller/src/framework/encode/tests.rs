@@ -464,7 +464,10 @@ fn a_shed_of_the_pair_is_returned_as_the_pair_gave_it() {
 #[test]
 fn a_column_of_another_length_and_a_binding_of_another_plan_decline() {
     let declined = |bed: &Bed, engine: &Engine| match bed.decide_with(engine).0 {
-        Decision::Shed(shed) => (shed.reason, shed.emptied_by),
+        Decision::Shed(shed) => {
+            assert_eq!(shed.trace.profile_ran(), None);
+            (shed.reason, shed.emptied_by)
+        }
         other => panic!("a shed, not {other:?}"),
     };
     let column = (ShedReason::PolicyDeclined, "encode-column");
