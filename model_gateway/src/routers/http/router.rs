@@ -147,15 +147,6 @@ struct StreamRelayMode {
     rechunk: Option<RechunkPolicy>,
 }
 
-/// The regular HTTP router's rule at the host's commit: the membership of
-/// the classic pool it draws from. The router sends plain HTTP to a regular
-/// worker's URL, so a target of another wire or of another role is passed
-/// over.
-fn regular_http(worker: &dyn Worker) -> bool {
-    *worker.worker_type() == WorkerType::Regular
-        && *worker.connection_mode() == ConnectionMode::Http
-}
-
 /// One dispatch attempt of a typed request: the inputs every stage of
 /// `Router::route_typed_request_once` reads. The route builds it once and
 /// every retry attempt reads the same one; the lease, the ledger and the
@@ -811,9 +802,10 @@ impl Router {
         }
     }
 
-    /// Resolve an unnamed request to the one model this router's workers
-    /// serve. Use the no-model id when no worker has a model, and return
-    /// `None` when the workers serve several distinct models.
+    /// Resolve an unnamed request to the one primary model this router's
+    /// workers serve: the model a worker answers an unnamed request under.
+    /// Use the no-model id when no worker has a model, and return `None`
+    /// when the workers' primary models differ.
     fn model_of_an_unnamed_request(&self) -> Option<String> {
         let pool = self
             .worker_registry
@@ -828,7 +820,9 @@ impl Router {
 
     /// The attempt's placement by the policy controller, or the answer of a
     /// request it did not place. The commit keeps to this router's own pool
-    /// ([`regular_http`]) and to the workers the request's ledger admits: a
+    /// ([`RoutingPool::HttpRegular`]): the router sends plain HTTP to a
+    /// regular worker's URL, so a target of another wire or role is passed
+    /// over. It also keeps to the workers the request's ledger admits: a
     /// worker that answered the request definitively takes no later attempt,
     /// as on the classic arm. The controller reads the tried rows softly, so
     /// the rule is held here.
@@ -873,7 +867,7 @@ impl Router {
         let placed = host
             .place_where(
                 &ask,
-                |worker| regular_http(worker) && ledger.admits(worker),
+                |worker| RoutingPool::HttpRegular.matches(worker) && ledger.admits(worker),
                 Instant::now(),
             )
             .await;
@@ -1401,7 +1395,7 @@ impl Router {
 
     /// A transcription's placement by the policy controller, or its refusal.
     /// The route cannot pin a rank, so the commit passes over a data-parallel
-    /// worker, and it keeps to this router's own pool ([`regular_http`]).
+    /// worker, and it keeps to this router's own pool ([`RoutingPool::HttpRegular`]).
     async fn place_transcription(
         &self,
         host: &Host,
@@ -1433,7 +1427,7 @@ impl Router {
         };
         host.place_where(
             &ask,
-            |worker| regular_http(worker) && !worker.is_dp_aware(),
+            |worker| RoutingPool::HttpRegular.matches(worker) && !worker.is_dp_aware(),
             Instant::now(),
         )
         .await

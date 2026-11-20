@@ -9,12 +9,14 @@
 //! The setting starts the store with the policy document for the routing
 //! configuration. The context holds the membership feed over that store and
 //! a host over the feed's holder. A regular HTTP router with that host asks
-//! it to place typed requests for a model the registry serves, and a regular
-//! gRPC router asks it in its selection stage. The gateway's workflows leave
-//! the feed's door unused, so without a controller's address nothing feeds
-//! the store yet. Other router families mount a refusing router under their
-//! usual ids ([`undecided()`]). With the setting off, the context holds
-//! neither the store, its feed nor its host.
+//! it to place typed requests: for the model a request names, or for the one
+//! primary model the router's workers serve where it names none. A regular
+//! gRPC router asks it in its selection stage. Every other router family
+//! mounts a refusing router under its usual ids ([`undecided()`]) whenever
+//! the store started, with or without a controller's address. The gateway's
+//! workflows leave the feed's door unused, so without an address nothing
+//! feeds the store yet. With the setting off, the context holds neither the
+//! store, its feed nor its host.
 //!
 //! One site reads the setting, [`start_with`]. Every other site asks what
 //! the start left in the context.
