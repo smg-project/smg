@@ -131,7 +131,7 @@ fn a_start_whose_flags_and_document_disagree_is_refused_by_name() -> Case {
 #[test]
 fn a_setting_no_document_says_stops_the_start_by_its_name() -> Case {
     let mut config = picked(RouterConfig::default());
-    config.routing_key_override.enabled = true;
+    config.dp_minimum_tokens_scheduler = true;
     for supplied in [None, Some(PolicySpec::preset("round_robin")?)] {
         config.policy_spec = supplied;
         let refusal = start(&config)
@@ -140,7 +140,7 @@ fn a_setting_no_document_says_stops_the_start_by_its_name() -> Case {
         assert!(matches!(refusal, StartError::Document(_)), "{refusal:?}");
         assert_eq!(
             refusal.to_string(),
-            "routing_key_override.enabled = true: the controller holds no recorded form of the sticky sessions' rule yet"
+            "dp_minimum_tokens_scheduler = true: the document has no rank policy: under the controller a rank is a candidate of the profile"
         );
     }
     Ok(())
@@ -1225,11 +1225,11 @@ async fn a_starts_context_holds_the_store_where_the_controller_was_picked() -> C
         .map(|store| store.world().spec().generation());
     assert_eq!(generation, Some(1));
     let mut unsaid = picked(quiet());
-    unsaid.routing_key_override.enabled = true;
+    unsaid.dp_minimum_tokens_scheduler = true;
     let refusal = AppContext::from_config(unsaid, 30, None, None).await.err();
     assert_eq!(
         refusal.as_deref(),
-        Some("routing_key_override.enabled = true: the controller holds no recorded form of the sticky sessions' rule yet")
+        Some("dp_minimum_tokens_scheduler = true: the document has no rank policy: under the controller a rank is a candidate of the profile")
     );
     Ok(())
 }
