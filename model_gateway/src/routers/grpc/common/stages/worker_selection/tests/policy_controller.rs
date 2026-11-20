@@ -8,16 +8,19 @@ use serde_json::Value;
 use smg_policy_controller::{
     spec::{KeySourceSpec, RoutingKeySpec},
     store::{
-        BatchOutcome, GatewayId, KvEventSink, LeasesStore, LoadSink, LoadSource, MemoryStore,
+        BatchOutcome, EncodeHandoff as OfferedHandoff, EncodeOffer, GatewayId, KvEventSink,
+        LeasesStore, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus as RowStatus,
         WorkersStore,
     },
-    view::{fingerprint, LoadRow, WorkerId},
+    view::{fingerprint, LoadRow, Role, WireModes, WorkerId},
     worker_host, AppliedSpec, PolicySpec,
 };
 
 use super::*;
 use crate::{
-    config::{PolicyConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode},
+    config::{
+        ManualAssignmentMode, PolicyConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+    },
     middleware::request_id::RequestId,
     policy_controller::host::testing::MODEL,
     routers::grpc::context::LoadGuards,
@@ -845,7 +848,8 @@ async fn a_retry_under_a_binding_keyed_by_the_rid_is_placed_by_the_key() -> anyh
     let (stage, store) = stage_keyed_by_the_rid(&WORKERS)?;
     let host = stage.host.as_ref().expect("the stage's host");
     let plan = retained_plan(&[1]);
-    for turn in 0..8 {
+    let mut elsewhere_with_no_key = 0;
+    for turn in 0..16 {
         let rid = format!("conv-{turn}");
         let mut ctx = ingress(&stage.worker_registry);
         let RequestType::Generate(request) = &mut ctx.input.request_type else {
@@ -874,11 +878,28 @@ async fn a_retry_under_a_binding_keyed_by_the_rid_is_placed_by_the_key() -> anyh
             .expect("the key's next worker")
             .id();
 
+        // Where it places the same ask with no key.
+        let mark = host::mark();
+        let keyless = Ask {
+            tried: &ctx.tried_rows,
+            ..Ask::of(&mark, MODEL)
+        };
+        let by_none = host
+            .place(&keyless, Instant::now())
+            .await
+            .expect("a worker with no key")
+            .id();
+        elsewhere_with_no_key += usize::from(by_none != by_key);
+
         stage.reselect(&mut ctx, &plan).await.expect("the retry");
         let retried = ctx.placed.take().expect("the retry's placement").id();
         assert_eq!(retried, by_key, "{rid}");
-        assert_ne!(retried, first_row, "{rid}");
     }
+    // The key is what places a retry: with none, an ask lands elsewhere.
+    assert!(
+        elsewhere_with_no_key > 0,
+        "an ask with no key landed by the key at every turn"
+    );
     assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
     Ok(())
 }
@@ -926,6 +947,50 @@ async fn the_snapshot_keeps_the_rid_only_where_a_retry_reads_it() {
         sticky.policy_registry.derive_rid_key(rid.as_deref()),
         Some("conv")
     );
+}
+
+/// A classic retry derives its sticky key from the `rid` the first
+/// selection kept, so it lands on that selection's worker. With no key the
+/// rotation under the override would move on.
+#[tokio::test]
+async fn a_classic_retry_lands_by_the_key_of_the_kept_rid() {
+    let (hosted, _store) = stage_with_host(&URLS);
+    let sticky = WorkerSelectionStage::new(
+        Arc::clone(&hosted.worker_registry),
+        Arc::new(PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                assignment_mode: ManualAssignmentMode::Delegate,
+                ..RoutingKeyOverrideConfig::default()
+            },
+        )),
+        WorkerSelectionMode::Regular,
+        None,
+    );
+    let mut ctx = ingress(&sticky.worker_registry);
+    let RequestType::Generate(request) = &mut ctx.input.request_type else {
+        panic!("a generate request");
+    };
+    Arc::make_mut(request).rid = Some("conv_t1".to_owned());
+    sticky.execute(&mut ctx).await.expect("the first selection");
+    let Some(WorkerSelection::Single { worker }) = ctx.state.workers.as_ref() else {
+        panic!("a regular worker");
+    };
+    let first = worker.url().to_owned();
+    // The request is gone at the dispatch: a retry reads what was kept.
+    let mut ctx = Box::new(ctx).into_dispatch().expect("a dispatch context");
+    assert_eq!(ctx.routing.rid.as_deref(), Some("conv_t1"));
+    for _ in 0..2 {
+        sticky
+            .reselect(&mut ctx, &retained_plan(&[1]))
+            .await
+            .expect("the retry");
+        let Some(WorkerSelection::Single { worker }) = ctx.workers.as_ref() else {
+            panic!("a regular worker");
+        };
+        assert_eq!(worker.url(), first);
+    }
 }
 
 #[tokio::test]
@@ -1311,8 +1376,11 @@ async fn a_pinned_retry_passes_over_a_pair_of_another_runtime() {
     assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
 }
 
+/// A document whose plan places no encoder leaves a request's encode items
+/// with no worker: the request is refused by name, and its pair is let go.
 #[tokio::test]
-async fn a_request_with_encode_items_is_refused_by_name_under_a_host() -> anyhow::Result<()> {
+async fn encode_items_under_a_plan_that_places_no_encoder_are_refused_by_name() -> anyhow::Result<()>
+{
     let (stage, store) = one_pair_stage(WorkerSelectionMode::EncodePrefillDecode);
     let mut ctx = ingress(&stage.worker_registry);
     ctx.state.multimodal_intermediate = Some(image_intermediate(None));
@@ -1431,4 +1499,467 @@ async fn the_classic_pair_stage_is_unmoved_without_a_host() {
     assert!(classic.places_retry(&ctx));
     // No decision was asked of the controller.
     assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+}
+
+const ENCODER: &str = "http://e0:8000";
+/// The runtime whose encoder pushes an encoded item to its prefill.
+const PUSH: RuntimeType = RuntimeType::Vllm;
+/// The runtime whose encoder and prefill meet at a rendezvous.
+const MEET: RuntimeType = RuntimeType::TokenSpeed;
+/// The demand of a request whose items are processed images.
+const IMAGES: EpdDemands = EpdDemands {
+    wire: None,
+    encode: MediaDemands {
+        media_refs: false,
+        vision: true,
+        pipeline: PipelinePin::Any,
+    },
+    decode_vision: false,
+    image_fanout: false,
+};
+
+/// One worker of an encode fleet: its URL, its role and the runtime its
+/// registry object runs, and what its row states: its end of the encode
+/// handoff, that it takes images, that it processes references itself.
+#[derive(Clone, Copy)]
+struct Member {
+    url: &'static str,
+    role: WorkerType,
+    runtime: RuntimeType,
+    states_end: bool,
+    vision: bool,
+    references: bool,
+}
+
+impl Member {
+    /// A worker of `runtime` that states its end and takes images.
+    const fn of(url: &'static str, role: WorkerType, runtime: RuntimeType) -> Self {
+        Self {
+            url,
+            role,
+            runtime,
+            states_end: true,
+            vision: true,
+            references: false,
+        }
+    }
+}
+
+/// One prefill and one decode of `runtime` around `encoders`.
+fn fleet_around(runtime: RuntimeType, encoders: &[Member]) -> Vec<Member> {
+    let mut fleet = vec![
+        Member::of(PREFILL, WorkerType::Prefill, runtime),
+        Member::of(DECODE, WorkerType::Decode, runtime),
+    ];
+    fleet.extend_from_slice(encoders);
+    fleet
+}
+
+/// [`fleet_around`] with four encoders of `runtime`.
+fn fleet_of(runtime: RuntimeType) -> Vec<Member> {
+    let urls = [
+        ENCODER,
+        "http://e1:8000",
+        "http://e2:8000",
+        "http://e3:8000",
+    ];
+    let encoders = urls.map(|url| Member::of(url, WorkerType::Encode, runtime));
+    fleet_around(runtime, &encoders)
+}
+
+/// The stage in the encode mode over a host whose rows are `fleet` under a
+/// document of the encode plan: one gRPC worker a row. The rows report no
+/// capacity and no room, so each side of the pair keeps the two filters
+/// that read neither.
+fn encode_stage(fleet: &[Member]) -> anyhow::Result<(WorkerSelectionStage, Arc<MemoryStore>)> {
+    let store = Arc::new(MemoryStore::new());
+    let mut document = PolicySpec::epd_presets("consistent_hashing", "least_load", "least_load")?;
+    for side in ["prefill", "decode"] {
+        let profile = document
+            .profiles
+            .get_mut(side)
+            .context("the side's profile")?;
+        profile.filter = vec!["healthy".into(), "not-tried".into()];
+    }
+    store.apply(AppliedSpec::validate(&document)?)?;
+    let registry = Arc::new(WorkerRegistry::new());
+    for member in fleet {
+        let pushes = member.runtime == PUSH;
+        let stated = pushes && member.states_end;
+        let role = match member.role {
+            WorkerType::Encode => Role::Encode,
+            WorkerType::Prefill => Role::Prefill,
+            _ => Role::Decode,
+        };
+        let facts = WorkerFacts {
+            key: member.url.to_owned(),
+            engine: member.url.to_owned(),
+            engine_kind: format!("{:?}", member.runtime),
+            incarnation: 1,
+            role,
+            wire_modes: WireModes::GRPC,
+            models: vec![MODEL.to_owned()],
+            dp_size: 1,
+            max_running: Some(64),
+            vision: member.vision,
+            encode: EncodeOffer {
+                handoff: if pushes {
+                    OfferedHandoff::Push
+                } else {
+                    OfferedHandoff::Rendezvous
+                },
+                producer: stated && role == Role::Encode,
+                consumer: stated && role == Role::Prefill,
+                connector: stated.then(|| "c0".to_owned()),
+                references: member.references,
+            },
+            ..WorkerFacts::default()
+        };
+        let id = store.upsert(facts).id();
+        let row = WorkersStore::get(&*store, id).context("the row")?;
+        if row.status != RowStatus::Ready {
+            store
+                .set_status(id, RowStatus::Ready, row.revision)
+                .context("the row stands")?;
+        }
+        let mut builder = BasicWorkerBuilder::new(member.url)
+            .model(ModelCard::new(MODEL).with_context_length(WINDOW))
+            .worker_type(member.role)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(member.runtime)
+            .health_config(no_health_check());
+        if !member.vision {
+            builder = builder.label("supports_vision", "false");
+        }
+        if member.references {
+            builder = builder.label("mm_processor", "inprocess");
+        }
+        assert!(registry.register(Arc::new(builder.build())).is_some());
+    }
+    store.publish_now();
+    let host = Host::at_keys(Arc::clone(&store), Arc::clone(&registry));
+    let stage = WorkerSelectionStage::new(
+        registry,
+        Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+        WorkerSelectionMode::EncodePrefillDecode,
+        None,
+    )
+    .with_host(Some(Arc::new(host)));
+    Ok((stage, store))
+}
+
+/// Turns the row of `url` not ready, where a decision reads it.
+fn close(store: &MemoryStore, url: &str) -> anyhow::Result<()> {
+    let id = store.by_key(url).context("the worker's row")?.id;
+    let row = WorkersStore::get(store, id).context("the row")?;
+    store
+        .set_status(id, RowStatus::NotReady, row.revision)
+        .context("the row turns")?;
+    store.publish_now();
+    Ok(())
+}
+
+/// A first attempt's encode pair for `items` under `demand`, as the stage's
+/// helper answers it: the selection and any placement of the controller.
+async fn encode_attempt(
+    stage: &WorkerSelectionStage,
+    items: &[Vec<u8>],
+    demand: EpdDemands,
+) -> Result<EpdAttempt, Response> {
+    let ctx = ingress(&stage.worker_registry);
+    let inputs = PlacementInputs::default();
+    let first = Attempt::First(&ctx);
+    let attempt = stage.select_epd_attempt(MODEL, inputs, None, items, demand, first);
+    attempt.await.map(|(attempt, _guard)| attempt)
+}
+
+/// A response's status and its body.
+async fn status_and_body(response: Response) -> anyhow::Result<(StatusCode, Value)> {
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 4096).await?;
+    Ok((status, serde_json::from_slice(&body)?))
+}
+
+/// A request with items under the host is one decision: its pair, and an
+/// encoder for each item in the items' order. The classic placement is not
+/// asked: the selection is the controller's placement, under one lease.
+#[tokio::test]
+async fn a_hosted_encode_request_gets_its_pair_and_one_assignment_an_item() -> anyhow::Result<()> {
+    let (stage, store) = encode_stage(&fleet_of(MEET))?;
+    let items = [vec![1], vec![2], vec![3]];
+    let ((assignments, prefill, decode, runtime), placed) = encode_attempt(&stage, &items, IMAGES)
+        .await
+        .ok()
+        .context("a placed encode pair")?;
+    let placed = placed.context("the controller's placement")?;
+    assert_eq!(
+        (prefill.url(), decode.url(), runtime),
+        (PREFILL, DECODE, MEET)
+    );
+    assert!(Arc::ptr_eq(&prefill, placed.worker()));
+    assert!(!placed.one_key());
+    assert_eq!(assignments.len(), items.len());
+    for (at, (assignment, encoder)) in assignments.iter().zip(placed.encoders()).enumerate() {
+        assert_eq!(assignment.item_index, at, "the items' order");
+        assert!(Arc::ptr_eq(&assignment.worker, &encoder.worker));
+        assert_eq!(assignment.worker.worker_type(), &WorkerType::Encode);
+    }
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
+    drop(placed);
+
+    // Through the stage: a request with one processed image.
+    let (stage, store) = encode_stage(&fleet_of(PUSH))?;
+    let mut ctx = ingress(&stage.worker_registry);
+    ctx.state.multimodal_intermediate = Some(image_intermediate(None));
+    stage.execute(&mut ctx).await.expect("a placed encode pair");
+    let placed = ctx.state.placed.as_ref().context("the placement")?;
+    assert_eq!(placed.encoders().len(), 1);
+    assert!(ctx.state.pd_prefill_guard.is_some());
+    let Some(WorkerSelection::Disaggregated {
+        encode_assignments: Some(assignments),
+        prefill,
+        ..
+    }) = ctx.state.workers.as_ref()
+    else {
+        panic!("a pair with its assignments");
+    };
+    assert!(Arc::ptr_eq(prefill, placed.worker()));
+    assert_eq!(assignments.len(), 1);
+    assert!(Arc::ptr_eq(
+        &assignments[0].worker,
+        &placed.encoders()[0].worker
+    ));
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
+    Ok(())
+}
+
+/// Equal items carry one key, so one encoder takes them, and the keys of a
+/// fleet spread over more encoders than one.
+#[tokio::test]
+async fn equal_items_are_assigned_one_encoder() -> anyhow::Result<()> {
+    let (stage, _store) = encode_stage(&fleet_of(MEET))?;
+    let mut taken = Vec::new();
+    for key in 0..16_u8 {
+        let items = [vec![key], vec![key, key], vec![key]];
+        let ((assignments, ..), _placed) = encode_attempt(&stage, &items, IMAGES)
+            .await
+            .ok()
+            .context("a placed encode pair")?;
+        assert_eq!(assignments.len(), items.len());
+        let first = assignments[0].worker.url();
+        assert_eq!(first, assignments[2].worker.url(), "{key}");
+        if !taken.iter().any(|url| url == first) {
+            taken.push(first.to_owned());
+        }
+    }
+    assert!(taken.len() > 1, "every key landed on {taken:?}");
+    Ok(())
+}
+
+/// Under a class that pushes the one key is placed in the items' stead:
+/// one encoder stands for every item, in the form the classic hands on.
+/// Under an image fan-out no one key is stated, and each item has its own.
+#[tokio::test]
+async fn under_a_class_that_pushes_one_encoder_stands_for_every_item() -> anyhow::Result<()> {
+    let (stage, _store) = encode_stage(&fleet_of(PUSH))?;
+    let items = [vec![1], vec![2], vec![3]];
+    let ((assignments, _, _, runtime), placed) = encode_attempt(&stage, &items, IMAGES)
+        .await
+        .ok()
+        .context("a placed encode pair")?;
+    assert_eq!(runtime, PUSH);
+    assert!(placed.as_ref().is_some_and(Placed::one_key));
+    let places: Vec<usize> = assignments.iter().map(|one| one.item_index).collect();
+    assert_eq!(places, [0]);
+    drop(placed);
+
+    let fanout = EpdDemands {
+        image_fanout: true,
+        ..IMAGES
+    };
+    let ((assignments, ..), placed) = encode_attempt(&stage, &items, fanout)
+        .await
+        .ok()
+        .context("a placed encode pair")?;
+    assert!(placed.as_ref().is_some_and(|placed| !placed.one_key()));
+    let places: Vec<usize> = assignments.iter().map(|one| one.item_index).collect();
+    assert_eq!(places, [0, 1, 2]);
+    Ok(())
+}
+
+/// A shed of the controller's encode side is answered under the classic's
+/// own name: the status and the body of the classic's answer for it. A
+/// shed of the pair's own reads the host's answer. No lease is left.
+#[tokio::test]
+async fn each_shed_of_the_encode_side_is_answered_under_the_classics_name() -> anyhow::Result<()> {
+    type Name = fn() -> EpdSelectionFailure;
+    let references = EpdDemands {
+        encode: MediaDemands {
+            media_refs: true,
+            vision: false,
+            pipeline: PipelinePin::Any,
+        },
+        ..IMAGES
+    };
+    let decode_images = EpdDemands {
+        decode_vision: true,
+        ..IMAGES
+    };
+    let encoder = Member::of(ENCODER, WorkerType::Encode, MEET);
+    let mute = Member {
+        states_end: false,
+        ..Member::of(ENCODER, WorkerType::Encode, PUSH)
+    };
+    let blind_decode = vec![
+        Member::of(PREFILL, WorkerType::Prefill, MEET),
+        Member {
+            vision: false,
+            ..Member::of(DECODE, WorkerType::Decode, MEET)
+        },
+        encoder,
+    ];
+    let rows: [(&str, Vec<Member>, EpdDemands, Name); 3] = [
+        // No registered encoder processes a reference.
+        (
+            "encode-media",
+            fleet_around(MEET, &[encoder]),
+            references,
+            || EpdSelectionFailure::EncodeNotSupported,
+        ),
+        // A pushing encoder states no role.
+        ("ec-compatible", fleet_around(PUSH, &[mute]), IMAGES, || {
+            EpdSelectionFailure::EcIncompatible
+        }),
+        // No decode of the pair takes the images asked of it.
+        ("decode-vision", blind_decode, decode_images, || {
+            EpdSelectionFailure::DecodeVisionUnsupported
+        }),
+    ];
+    for (shed, fleet, demand, name) in rows {
+        let (stage, store) = encode_stage(&fleet)?;
+        let refused = encode_attempt(&stage, &[vec![1]], demand)
+            .await
+            .err()
+            .with_context(|| format!("{shed}: the request was placed"))?;
+        let classic = stage.epd_selection_failure(MODEL, name(), true);
+        assert_eq!(
+            status_and_body(refused).await?,
+            status_and_body(classic).await?,
+            "{shed}"
+        );
+        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0, "{shed}");
+    }
+
+    // The engine names `encode-vision` from the request's images, which no
+    // ask states yet: the name is held at the table.
+    let unseen = host::Unplaced::Shed {
+        reason: ShedReason::NoEndpoints,
+        emptied_by: "encode-vision",
+        retry_after_secs: 0,
+    };
+    assert!(matches!(
+        epd_shed(&unseen),
+        Some(EpdSelectionFailure::EncodeVisionUnsupported)
+    ));
+
+    // An encoder is registered and none is open: the classic's verdict by
+    // role.
+    let (stage, store) = encode_stage(&fleet_around(MEET, &[encoder]))?;
+    close(&store, ENCODER)?;
+    let refused = encode_attempt(&stage, &[vec![1]], IMAGES)
+        .await
+        .err()
+        .context("encoders: the request was placed")?;
+    let classic = stage.epd_selection_failure(MODEL, EpdSelectionFailure::Unavailable, true);
+    assert_eq!(
+        status_and_body(refused).await?,
+        status_and_body(classic).await?,
+        "encoders"
+    );
+
+    // A shed of the pair's own is the host's answer, as the pair stage reads
+    // it.
+    let (stage, store) = encode_stage(&fleet_around(MEET, &[encoder]))?;
+    close(&store, PREFILL)?;
+    let refused = encode_attempt(&stage, &[vec![1]], IMAGES)
+        .await
+        .err()
+        .context("the pair: the request was placed")?;
+    let hosts = host::Unplaced::Shed {
+        reason: ShedReason::NoEndpoints,
+        emptied_by: "healthy",
+        retry_after_secs: 0,
+    }
+    .answer(MODEL);
+    assert_eq!(refused.status(), hosts.status());
+    assert_eq!(
+        error::extract_error_code_from_response(&refused),
+        error::extract_error_code_from_response(&hosts)
+    );
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+    Ok(())
+}
+
+/// The ask states no pixel media yet, so an encoder that takes no image can
+/// be placed for a request with images. The gateway's own read of the
+/// encoder refuses it: the placement is let go as a failed commit, and the
+/// request reads the host's answer for an attempt no target holds.
+#[tokio::test]
+async fn an_encoder_the_route_cannot_send_to_is_given_up_as_a_failed_commit() -> anyhow::Result<()>
+{
+    let blind = Member {
+        vision: false,
+        ..Member::of(ENCODER, WorkerType::Encode, MEET)
+    };
+    let (stage, store) = encode_stage(&fleet_around(MEET, &[blind]))?;
+    let refused = encode_attempt(&stage, &[vec![1]], IMAGES)
+        .await
+        .err()
+        .context("the request was placed")?;
+    assert_no_target_holds(&refused, &store);
+    Ok(())
+}
+
+/// A request without items under the encode plan is its pair alone: no
+/// encoder is placed and no assignment is handed on.
+#[tokio::test]
+async fn a_request_without_items_under_the_encode_plan_is_placed_as_its_pair() -> anyhow::Result<()>
+{
+    let (stage, store) = encode_stage(&fleet_of(PUSH))?;
+    let mut ctx = ingress(&stage.worker_registry);
+    stage.execute(&mut ctx).await.expect("a placed pair");
+    let placed = ctx.state.placed.as_ref().context("the placement")?;
+    assert!(placed.decode().is_some() && placed.encoders().is_empty());
+    assert!(ctx.state.pd_prefill_guard.is_some());
+    assert!(matches!(
+        &ctx.state.workers,
+        Some(WorkerSelection::Disaggregated { encode_assignments: None, prefill, decode, .. })
+            if prefill.url() == PREFILL && decode.url() == DECODE
+    ));
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
+    Ok(())
+}
+
+/// Without a host the stage's encode mode is the classic selection: it
+/// places the items itself, leaves no placement and asks no decision.
+#[tokio::test]
+async fn the_classic_encode_stage_is_unmoved_without_a_host() -> anyhow::Result<()> {
+    let (hosted, store) = encode_stage(&fleet_of(MEET))?;
+    let classic = WorkerSelectionStage::new(
+        Arc::clone(&hosted.worker_registry),
+        Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+        WorkerSelectionMode::EncodePrefillDecode,
+        None,
+    );
+    let items = [vec![1], vec![2]];
+    let ((assignments, prefill, decode, _), placed) = encode_attempt(&classic, &items, IMAGES)
+        .await
+        .ok()
+        .context("the classic encode pair")?;
+    assert!(placed.is_none());
+    assert_eq!(assignments.len(), items.len());
+    assert_eq!((prefill.url(), decode.url()), (PREFILL, DECODE));
+    // No decision was asked of the controller.
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+    Ok(())
 }

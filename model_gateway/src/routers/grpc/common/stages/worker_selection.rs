@@ -12,7 +12,13 @@ use axum::{
 };
 use futures::{future::Either, FutureExt};
 use openai_protocol::common::CachePartition;
-use smg_policy_controller::{lease::ReleaseReason, view::Phase, WireModes};
+use smg_policy_controller::{
+    decision::ShedReason,
+    framework::EncodeItems,
+    lease::ReleaseReason,
+    view::{fingerprint, Identity, Phase},
+    WireModes,
+};
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 use tracing::{debug, error, warn};
 
@@ -125,6 +131,10 @@ type EncodePrefillDecodeWorkerSelection = (
     Arc<dyn Worker>,
     RuntimeType,
 );
+
+/// An encode pair attempt's workers and assignments, with the controller's
+/// placement where it placed them.
+type EpdAttempt = (EncodePrefillDecodeWorkerSelection, Option<Placed>);
 
 /// Client-visible, gateway-owned code for a request refused ahead of worker
 /// selection because it had already waited longer than the queue timeout
@@ -632,18 +642,7 @@ impl WorkerSelectionStage {
         let accepts_refs = |worker: &dyn Worker| media.accepts_refs(worker);
         let placement = inputs.placement(inputs.media_refs.then_some(&accepts_refs));
         let sticky_key = ctx.state.sticky_key.as_deref();
-        // Under a host the controller places no encode stage yet: a request
-        // with encode items is refused by name, and one with none is a pair.
-        let mode = match self.mode {
-            WorkerSelectionMode::EncodePrefillDecode if self.host.is_some() => {
-                if inputs.media_refs || inputs.intermediate.is_some() {
-                    return Err(policy_controller::refused("encode items"));
-                }
-                WorkerSelectionMode::PrefillDecode
-            }
-            mode => mode,
-        };
-        match mode {
+        match self.mode {
             WorkerSelectionMode::Regular => {
                 let (worker, placed) = self
                     .select_regular_attempt(
@@ -709,11 +708,11 @@ impl WorkerSelectionStage {
                         ));
                     }
                 };
-                let ((encode_assignments, prefill, decode, runtime_type), guard) = self
+                let (((encode_assignments, prefill, decode, runtime_type), placed), guard) = self
                     .admit_selection_within_budget(
                         ctx,
                         accepted,
-                        self.admit_encode_prefill_decode_workers(
+                        self.select_epd_attempt(
                             model_id,
                             placement,
                             sticky_key,
@@ -724,6 +723,7 @@ impl WorkerSelectionStage {
                                 decode_vision: inputs.demand.decode,
                                 image_fanout: ctx.state.image_anchor.is_some(),
                             },
+                            Attempt::First(ctx),
                         ),
                     )
                     .await?;
@@ -739,7 +739,7 @@ impl WorkerSelectionStage {
                         runtime_type,
                     },
                     Some(guard),
-                    None,
+                    placed,
                 ))
             }
         }
@@ -967,38 +967,57 @@ impl WorkerSelectionStage {
         .await
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |failure| {
-                match failure {
-                    EpdSelectionFailure::EncodeNotSupported => {
-                        return multimodal::MmRefsError::EncodeNotSupported.into_response()
-                    }
-                    EpdSelectionFailure::EncodeVisionUnsupported => {
-                        return self.vision_refusal(model_id, "encode workers")
-                    }
-                    EpdSelectionFailure::Placement(failure) => {
-                        return self.pair_failure(model_id, *failure)
-                    }
-                    EpdSelectionFailure::EcIncompatible => {
-                        warn!(model_id, "No compatible EC producer/consumer pair; check EC connector and role metadata");
-                        let mut response = error::service_unavailable("ec_incompatible_pair", "No compatible EC producer/consumer pair; check E/P connector and role configuration and update servicer/proto metadata");
-                        mark_non_retryable(&mut response);
-                        return response
-                    }
-                    EpdSelectionFailure::DecodeVisionUnsupported => {
-                        return self.vision_refusal(model_id, "decode workers")
-                    }
-                    EpdSelectionFailure::Unavailable => {}
-                }
+                self.epd_selection_failure(model_id, failure, !encode_item_hashes.is_empty())
+            })
+        })
+    }
+
+    /// The response for a failed encode pair selection, by the failure's
+    /// name. `needs_encode` says the request carries encode items. Both
+    /// arms of [`Self::select_epd_attempt`] answer through it, so a name
+    /// reads one status, one code and one message whoever placed.
+    fn epd_selection_failure(
+        &self,
+        model_id: &str,
+        failure: EpdSelectionFailure,
+        needs_encode: bool,
+    ) -> Response {
+        match failure {
+            EpdSelectionFailure::EncodeNotSupported => {
+                multimodal::MmRefsError::EncodeNotSupported.into_response()
+            }
+            EpdSelectionFailure::EncodeVisionUnsupported => {
+                self.vision_refusal(model_id, "encode workers")
+            }
+            EpdSelectionFailure::Placement(failure) => self.pair_failure(model_id, *failure),
+            EpdSelectionFailure::EcIncompatible => {
+                warn!(
+                    model_id,
+                    "No compatible EC producer/consumer pair; check EC connector and role metadata"
+                );
+                let mut response = error::service_unavailable(
+                    "ec_incompatible_pair",
+                    "No compatible EC producer/consumer pair; check E/P connector and role \
+                     configuration and update servicer/proto metadata",
+                );
+                mark_non_retryable(&mut response);
+                response
+            }
+            EpdSelectionFailure::DecodeVisionUnsupported => {
+                self.vision_refusal(model_id, "decode workers")
+            }
+            EpdSelectionFailure::Unavailable => {
                 // Encode is a demanded role only when the request carries
                 // encode items; an idle-but-vetoed encode pool must not shed
                 // a text-only request.
-                let roles: &[WorkerType] = if encode_item_hashes.is_empty() {
-                    &[WorkerType::Prefill, WorkerType::Decode]
-                } else {
+                let roles: &[WorkerType] = if needs_encode {
                     &[WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode]
+                } else {
+                    &[WorkerType::Prefill, WorkerType::Decode]
                 };
                 self.selection_failure(model_id, roles, None, MediaDemands::NONE)
-            })
-        })
+            }
+        }
     }
 
     /// The response for a failed admission: the selection's own verdict when
@@ -2229,6 +2248,164 @@ impl WorkerSelectionStage {
         Ok((((prefill, decode, runtime), Some(placed)), guard))
     }
 
+    /// An encode pair attempt's workers and encode assignments with the
+    /// prefill's admission guard: placed by the policy controller where the
+    /// stage holds a host, else selected by
+    /// [`Self::admit_encode_prefill_decode_workers`] with the same arguments
+    /// as before. Returned as a future with the hosted arm boxed, as
+    /// [`Self::select_pd_attempt`] is.
+    fn select_epd_attempt<'a>(
+        &'a self,
+        model_id: &'a str,
+        inputs: PlacementInputs<'a>,
+        sticky_key: Option<&'a str>,
+        encode_item_hashes: &'a [Vec<u8>],
+        demand: EpdDemands,
+        attempt: Attempt<'a>,
+    ) -> impl Future<Output = Result<(EpdAttempt, PrefillLoadGuard), Response>> + 'a {
+        match self.host.as_deref() {
+            Some(host) => Either::Left(Box::pin(self.place_epd_pair(
+                host,
+                model_id,
+                inputs,
+                sticky_key,
+                encode_item_hashes,
+                demand,
+                attempt,
+            ))),
+            None => Either::Right(
+                self.admit_encode_prefill_decode_workers(
+                    model_id,
+                    inputs,
+                    sticky_key,
+                    encode_item_hashes,
+                    demand,
+                )
+                .map(|admitted| admitted.map(|(selection, guard)| ((selection, None), guard))),
+            ),
+        }
+    }
+
+    /// An encode pair attempt placed by the controller through `host`: the
+    /// pair with the prefill's admission guard, and an encoder for each
+    /// placed key. The checks ahead of the ask are the pair helper's; the
+    /// encode plan states no context demand, and the request's items are
+    /// stated in the ask.
+    ///
+    /// The ask states the items as the classic selection reads them: each
+    /// item's key in order; the one key a class that pushes places in the
+    /// items' stead, and none under an image fan-out, where each item is
+    /// placed; whether the items are references; whether the decode must
+    /// take images. That the request carries pixel media has no word in the
+    /// ask yet: the encoders are held to it after the commit.
+    ///
+    /// The commit takes no rule of the route. So a pair or an encoder the
+    /// route cannot send to is given up as a failed commit and refused, as
+    /// the pair helper refuses its pair. Where the document's plan places
+    /// no encoder for a request with items, the request is refused by name.
+    /// An encoder holds no lease, so nothing more is said for it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the encode pair's selection threads every input the classic placement consumes"
+    )]
+    async fn place_epd_pair(
+        &self,
+        host: &Host,
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        sticky_key: Option<&str>,
+        encode_item_hashes: &[Vec<u8>],
+        demand: EpdDemands,
+        attempt: Attempt<'_>,
+    ) -> Result<(EpdAttempt, PrefillLoadGuard), Response> {
+        let (prefill_pool, decode_pool) = PdWire::Grpc.pools();
+        let under_rule =
+            matches!(attempt, Attempt::Retry(ctx) if ctx.constraint_decided_on.is_some());
+        let pools = [prefill_pool, decode_pool];
+        let context = ContextRequirements::default();
+        let shape = self.undecided(model_id, context, &pools, false, inputs.headers, under_rule);
+        if let Some(shape) = shape {
+            // The encode plan states no context demand, so no window's
+            // answer stands in the refusal's place.
+            return Err(shape.refusal(|| None));
+        }
+
+        let prompt = host::Prompt {
+            tokens: inputs.tokens,
+            namespace: inputs.cache_namespace,
+        };
+        let hashes = host.hashes(model_id, &prompt);
+        let id = host::mark();
+        let ledger = attempt.ledger();
+        let key = |hash: &[u8]| Identity::hashed(fingerprint(hash));
+        let keys: Vec<Identity<'_>> = encode_item_hashes.iter().map(|hash| key(hash)).collect();
+        let needs_encode = !keys.is_empty();
+        let one = (needs_encode && !demand.image_fanout)
+            .then(|| key(items_digest(encode_item_hashes).as_bytes()));
+        let ask = Ask {
+            phase: Phase::Prefill,
+            attempt: Some(attempt.number()),
+            items: EncodeItems {
+                keys: &keys,
+                one,
+                references: demand.encode.media_refs,
+                decode_images: demand.decode_vision,
+            },
+            ..attempt.ask(model_id, &id, &hashes)
+        };
+        let (mut placed, guard) = host
+            .place_pair(&ask, self.prefill_admission.as_deref(), sticky_key)
+            .await
+            .map_err(|unplaced| match epd_shed(&unplaced) {
+                Some(failure) => self.epd_selection_failure(model_id, failure, needs_encode),
+                None => unplaced.answer(model_id),
+            })?;
+        let prefill = Arc::clone(placed.worker());
+        let runtime = prefill.metadata().spec.runtime_type;
+        let holds = |pool, worker: &dyn Worker| on_route(pool, demand.wire, ledger)(worker);
+        let pair_holds = |decode: &Arc<dyn Worker>| {
+            holds(prefill_pool, prefill.as_ref())
+                && holds(decode_pool, decode.as_ref())
+                && decode.metadata().spec.runtime_type == runtime
+        };
+        // An encoder is held to the gateway's own read of it: its pool, the
+        // request's wire, the pair's runtime and the request's media.
+        let encoder_holds = |encoder: &host::PlacedEncoder| {
+            let worker = encoder.worker.as_ref();
+            holds(RoutingPool::GrpcEncode, worker)
+                && worker.metadata().spec.runtime_type == runtime
+                && demand.encode.accepts(worker)
+        };
+        let decode = placed
+            .decode()
+            .filter(|decode| pair_holds(decode) && placed.encoders().iter().all(encoder_holds))
+            .cloned();
+        let Some(decode) = decode else {
+            placed.released(ReleaseReason::CommitFailed, Instant::now());
+            return Err(host::Unplaced::NoTargetHolds.answer(model_id));
+        };
+        // One encoder a key, or one for the one key. A plan that places no
+        // encoder leaves the list empty: the items have no worker.
+        let expected = if placed.one_key() { 1 } else { keys.len() };
+        if placed.encoders().len() != expected {
+            placed.released(ReleaseReason::CommitFailed, Instant::now());
+            return Err(policy_controller::refused("encode items"));
+        }
+        let assignments = placed
+            .encoders()
+            .iter()
+            .enumerate()
+            .map(|(item_index, encoder)| EncodeWorkerAssignment {
+                item_index,
+                worker: Arc::clone(&encoder.worker),
+            })
+            .collect();
+        Ok((
+            ((assignments, prefill, decode, runtime), Some(placed)),
+            guard,
+        ))
+    }
+
     /// One attempt's single worker from the regular pool. One snapshot
     /// answers both: what its pool's windows leave of the context demand
     /// ([`ContextRequirements::left_by`]), and the candidates. `admits` is
@@ -2682,12 +2859,7 @@ impl WorkerSelectionStage {
         let prompt_hash;
         let hashes = if handoff == Some(EncodeHandoff::Push) && needs_encode && !demand.image_fanout
         {
-            let mut hash = blake3::Hasher::new();
-            for item in encode_item_hashes {
-                hash.update(&(item.len() as u64).to_le_bytes());
-                hash.update(item);
-            }
-            prompt_hash = [hash.finalize().as_bytes().to_vec()];
+            prompt_hash = [items_digest(encode_item_hashes).as_bytes().to_vec()];
             &prompt_hash[..]
         } else {
             encode_item_hashes
@@ -2717,6 +2889,40 @@ struct EpdDemands {
     encode: MediaDemands,
     decode_vision: bool,
     image_fanout: bool,
+}
+
+/// The digest over a request's encode items taken as one, in their order:
+/// the one key a class that pushes places in the items' stead.
+fn items_digest(item_hashes: &[Vec<u8>]) -> blake3::Hash {
+    let mut hash = blake3::Hasher::new();
+    for item in item_hashes {
+        hash.update(&(item.len() as u64).to_le_bytes());
+        hash.update(item);
+    }
+    hash.finalize()
+}
+
+/// The classic's name for a shed of the controller's encode side, by the
+/// stage that left no worker: the stages are the encode framework's.
+/// `None` for a shed of the pair's own, which the host answers as it
+/// answers a pair's.
+fn epd_shed(unplaced: &host::Unplaced) -> Option<EpdSelectionFailure> {
+    let host::Unplaced::Shed {
+        reason: ShedReason::NoEndpoints,
+        emptied_by,
+        ..
+    } = unplaced
+    else {
+        return None;
+    };
+    match *emptied_by {
+        "encode-media" => Some(EpdSelectionFailure::EncodeNotSupported),
+        "encode-vision" => Some(EpdSelectionFailure::EncodeVisionUnsupported),
+        "ec-compatible" => Some(EpdSelectionFailure::EcIncompatible),
+        "decode-vision" => Some(EpdSelectionFailure::DecodeVisionUnsupported),
+        "encoders" => Some(EpdSelectionFailure::Unavailable),
+        _ => None,
+    }
 }
 
 /// A configured connector must explicitly support the selected E/P role.
