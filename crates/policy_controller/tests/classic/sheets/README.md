@@ -56,6 +56,11 @@ model_gateway/src/         the gateway's recorders, each a test module beside th
   routers/common/classic_pair_select_rows.rs                                pair_select.json
   policies/bucket/classic_bucket_rows.rs                                    bucket.json
   routers/grpc/common/stages/request_execution/classic_sticky_rank_rows.rs  sticky_rank.json
+  routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs   retry_wire.json
+  routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs   media_refs.json
+  routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs   context_window.json
+  routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs   constraint_decider.json
+  routers/http/router/classic_rank_rows.rs                                  rank_pin.json
   policies/classic_cache_aware_rows.rs                                      cache_aware.json
   policies/classic_sticky_override_rows.rs                                  sticky_override.json
 crates/worker/src/         the worker crate's recorders, test modules beside the load monitor
@@ -271,6 +276,11 @@ directory. The sha256 is of the file as committed.
 | `bucket.json` | bucket: a size's range and its worker, the hand-down when that worker is not offered, the two parts of the balance rule, the window a booking leaves, the adjustment's cut, a worker that joins or leaves, a pool nobody listed | `d92647556e91a3601ef647f12ae5784df2080dc3` | 19: 18 sequence, 1 drawn | `71a533017809566486335bb9f212ea49712a833bbe5ebcbde7c5d6319ee764e4` | `classic_bucket_rows.rs` |
 | `minimum_tokens.json` | the minimum-tokens rank of one worker: a poll's answer, a rank it omits, an answer with no token capacity or no entry, a failed poll, an eviction, a worker that stands for one rank, used tokens beside context tokens | `615542c4c69bb28fb3cb3e9e4ee29a8e2be0a7bc` | 18: 18 sequence, 0 drawn | `1ab41e023fa4f9b507860655a3d917aee68686479d09eaa3b1e9cf8e71d56139` | `classic_minimum_tokens_rows.rs` |
 | `sticky_rank.json` | the rank of a sticky key on one grouped worker under hash placement: a key's rank, a request with no key, a worker of one engine or of no count, the ranks a connection places a pin on, how the keys keep and spread | `615542c4c69bb28fb3cb3e9e4ee29a8e2be0a7bc` | 8: 6 sequence, 2 drawn | `d8663087d143cb6d8f46777b2abf6b38e16153fb738c33240c8c7473c86805af` | `classic_sticky_rank_rows.rs` |
+| `retry_wire.json` | the wire of a retry: the runtime and the transport its retained plan was built for, a wire whose workers are down or over their thresholds, a wire no worker is on | `a4935a5acd15151641b1988e234016a95fd172da` | 8 demand rows | `5ab9e99211e10b2fd8e0d3fd8400fe207cfc9adc8e7b1603dd13c70177d7128c` | `classic_hard_demand_rows.rs` |
+| `media_refs.json` | media by reference and pixel media: the workers that process references, the pipeline a plan pins, the vision encoder, and each refusal where a demand leaves nobody | `a4935a5acd15151641b1988e234016a95fd172da` | 10 demand rows | `5c624c90b8b3195fa18b73390fb07e822b94876134c088aaccf359da6bdc7990` | `classic_hard_demand_rows.rs` |
+| `context_window.json` | the context window: the input and the completion budget each against the window, a scoring position, an unknown window, the widest window a refusal names | `a4935a5acd15151641b1988e234016a95fd172da` | 8 demand rows | `bf49bf479afab2621fa118ea07c35ff21cbbd0b06dcb499fa1d1318bd60e0f62` | `classic_hard_demand_rows.rs` |
+| `constraint_decider.json` | the constraint's decider on a retry: the workers that decide a constraint as the first attempt's worker did, and the pool's answer where none is left | `a4935a5acd15151641b1988e234016a95fd172da` | 5 demand rows | `5008922d28db1276f4a202de44b24935b8f10fe8d3581a0e9483d597358493c0` | `classic_hard_demand_rows.rs` |
+| `rank_pin.json` | the rank rule of a route that pins no rank: the workers that registered a data-parallel rank are left out, and the refusal where every worker registered one | `a4935a5acd15151641b1988e234016a95fd172da` | 11 demand rows | `774c494485af59153ef9579acde444459bc37f001741b7da95903679151c59f7` | `classic_rank_rows.rs` |
 | `cache_aware.json` | cache aware in single placement, under each of its three matchers: a holder kept, the count gate and its spill, its factor under the command line's defaults, a margin under its floor, a miss, a match at the threshold, a holder tried or not usable, the two KV gates, a request that ends, the blocks a worker stores and removes | `bfe189b332349c44cf7e3b6e1102a9b5a2699d9d` | 28: 26 sequence, 2 drawn | `f13a642dc9252e0328f8092b3ff322a03f270d918311c3b5c5dd29979ab8f085` | `classic_cache_aware_rows.rs` |
 | `sticky_override.json` | the routing-key override over a policy that reads no key: a pin under the cap and under its model, a key seen first under the map's modes and under `delegate`, each pin order after a failover, and at the cap a pin that follows, a pick on the pinned worker again, a pick on a worker at the cap, every worker at the cap, no other worker routable | `26f90083091e4dd791420febd88beda3bef3faac` | 18: 14 sequence, 4 drawn | `d74b5e3c8a31b4f1c8cd55cef5629acad0659658c830d937f94b056e9580562b` | `classic_sticky_override_rows.rs` |
 
@@ -301,6 +311,11 @@ The overload and minimum-tokens sheets' recorders are tests of the worker crate:
 | `bucket.json` | `policies::bucket::classic_bucket_rows` |
 | `minimum_tokens.json` | `load::monitor::classic_minimum_tokens_rows` |
 | `sticky_rank.json` | `request_execution::classic_sticky_rank_rows` |
+| `retry_wire.json` | `worker_selection::classic_hard_demand_rows` |
+| `media_refs.json` | `worker_selection::classic_hard_demand_rows` |
+| `context_window.json` | `worker_selection::classic_hard_demand_rows` |
+| `constraint_decider.json` | `worker_selection::classic_hard_demand_rows` |
+| `rank_pin.json` | `router::classic_rank_rows` |
 | `cache_aware.json` | `policies::classic_cache_aware_rows` |
 | `sticky_override.json` | `policies::classic_sticky_override_rows` |
 
