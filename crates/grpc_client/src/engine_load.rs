@@ -298,7 +298,8 @@ mod tests {
 
     /// A polled list is read whole, and the bounds a report holds it to keep
     /// what a pushed record of the same entries keeps, so what leaves the
-    /// polled list is counted as what the record's read leaves out is.
+    /// polled list is counted as what the record's read leaves out is. The
+    /// bound list holds no more room than the record's.
     #[test]
     fn a_polled_list_past_the_bounds_keeps_what_its_pushed_record_keeps() {
         let mut stated: Vec<_> = (0..70)
@@ -322,6 +323,7 @@ mod tests {
                 assert_eq!(polled.values.len(), 70);
                 assert_eq!(polled.bound_values(), 11);
                 assert_eq!(polled.values, pushed);
+                assert!(polled.values.capacity() <= pushed.capacity());
                 assert_eq!(record.values_sent() - pushed.len(), 11);
             }};
         }

@@ -40,7 +40,7 @@ use crate::{
     app_context::AppContext,
     config::RouterConfig,
     policy_controller::{
-        feed::signal_tests::{stages, SINGLE, SLOTS},
+        feed::signal_tests::{stages, values_read, Read, SINGLE, SLOTS},
         host::Ask,
     },
     routers::grpc::backend_client::{
@@ -171,11 +171,12 @@ impl EngineConnector for HostConnector {
     }
 }
 
-/// The host's engines that state their free slots, each at its address.
+/// The host's engines that state their free slots, each at its address,
+/// the least first.
 const STATING: [(&str, f64); 3] = [
     ("grpc://first.invalid:53177", 10.0),
-    ("grpc://second.invalid:53177", 70.0),
-    ("grpc://third.invalid:53177", 40.0),
+    ("grpc://second.invalid:53177", 40.0),
+    ("grpc://third.invalid:53177", 70.0),
 ];
 
 /// The host owns the [`STATING`] addresses, with no listener at any.
@@ -560,27 +561,35 @@ async fn the_load_port_publishes_the_host_connections_report() {
 }
 
 /// The gateway's context under the document of one declared signal, with
-/// the host's stage beside what else the host adds.
-async fn signal_gateway(extensions: Extensions) -> Arc<AppContext> {
+/// the host's stage beside what else the host adds, and what that stage's
+/// decisions read.
+async fn signal_gateway(extensions: Extensions) -> (Arc<AppContext>, Read) {
     let router = RouterConfig {
         policy_controller: true,
         policy_spec: Some(serde_yaml::from_str(SINGLE).unwrap()),
         ..RouterConfig::default()
     };
-    let extensions = extensions.stages(stages().unwrap());
-    build_app_context(&ServerConfig::minimal(router), extensions)
+    let (stages, read) = stages().unwrap();
+    let app = build_app_context(&ServerConfig::minimal(router), extensions.stages(stages))
         .await
-        .unwrap()
+        .unwrap();
+    (app, read)
 }
 
 /// The address the host places a request on after one poll of `engines`,
-/// each an address and its engine kind. A ready gRPC row is laid for each
-/// at the feed's door. The load monitor polls their group once, each engine
-/// through its connection, and the feed's sink hands the store what the
-/// answers state by name.
-async fn placed_after_one_poll(app: &AppContext, engines: &[(String, &str)]) -> String {
+/// each an address, its engine kind and the free slots it states, the
+/// least first. A ready gRPC row is laid for each at the feed's door. The
+/// load monitor polls their group once, each engine through its
+/// connection, and the feed's sink hands the store what the answers state
+/// by name. The decision then read each engine's own value: a tie's draw
+/// places no request here.
+async fn placed_after_one_poll(
+    app: &AppContext,
+    read: &Read,
+    engines: &[(String, &str, f64)],
+) -> String {
     let door: &dyn Membership = &*app.policy_feed.as_ref().unwrap().door;
-    for (url, kind) in engines {
+    for (url, kind, _) in engines {
         let facts = WorkerFacts {
             key: url.clone(),
             engine: url.clone(),
@@ -599,7 +608,7 @@ async fn placed_after_one_poll(app: &AppContext, engines: &[(String, &str)]) -> 
         let wrote = door.found(&Maker::Control, Expect::Nothing, url, &|_| facts.clone());
         assert!(matches!(wrote, Ok(Wrote::Registered(_))), "{wrote:?}");
     }
-    let (first, _) = &engines[0];
+    let (first, _, _) = &engines[0];
     let worker = app.worker_registry.get_by_url(first).unwrap();
     let key = WorkerGroupKey {
         model_id: worker.model_id().into(),
@@ -623,6 +632,8 @@ async fn placed_after_one_poll(app: &AppContext, engines: &[(String, &str)]) -> 
     let host = app.policy_host.as_ref().unwrap();
     let ask = Ask::of(b"polled", MODEL_ID);
     let placed = host.place(&ask, now + Duration::from_millis(10)).await;
+    let stated: Vec<_> = engines.iter().map(|&(_, _, free)| Some(free)).collect();
+    assert_eq!(values_read(read), stated);
     placed.unwrap().worker().url().to_owned()
 }
 
@@ -632,11 +643,12 @@ async fn placed_after_one_poll(app: &AppContext, engines: &[(String, &str)]) -> 
 /// host places on the engine that states the most.
 #[tokio::test]
 async fn a_placement_follows_the_values_a_host_connections_polled_answer_states() {
-    let app = signal_gateway(Extensions::new().connector(Arc::new(StatingConnector))).await;
-    let engines = STATING.map(|(url, _)| (url.to_owned(), "generic"));
-    let (second, _) = STATING[1];
-    assert_eq!(placed_after_one_poll(&app, &engines).await, second);
-    let worker = app.worker_registry.get_by_url(second).unwrap();
+    let host = Extensions::new().connector(Arc::new(StatingConnector));
+    let (app, read) = signal_gateway(host).await;
+    let engines = STATING.map(|(url, free)| (url.to_owned(), "generic", free));
+    let (most, _) = STATING[2];
+    assert_eq!(placed_after_one_poll(&app, &read, &engines).await, most);
+    let worker = app.worker_registry.get_by_url(most).unwrap();
     assert_host_connection(worker.as_ref()).await;
 }
 
@@ -651,17 +663,14 @@ async fn a_placement_follows_the_values_a_stock_grpc_polls_answer_states() {
         SchedulerWire::Vllm,
         SchedulerWire::Sglang,
     ] {
-        let app = signal_gateway(Extensions::new()).await;
+        let (app, read) = signal_gateway(Extensions::new()).await;
         let mut engines = Vec::new();
         for (_, free) in STATING {
             let url = mock_grpc_engine_stating(wire, SLOTS, "slots", free).await;
-            engines.push((url, wire.as_str()));
+            engines.push((url, wire.as_str(), free));
         }
-        let (second, _) = &engines[1];
-        assert_eq!(
-            &placed_after_one_poll(&app, &engines).await,
-            second,
-            "{wire:?}"
-        );
+        let placed = placed_after_one_poll(&app, &read, &engines).await;
+        let (most, _, _) = &engines[2];
+        assert_eq!(&placed, most, "{wire:?}");
     }
 }

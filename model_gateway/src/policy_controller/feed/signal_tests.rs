@@ -4,13 +4,21 @@
 //! and one stage of the host's own. The reports go through the feed's load
 //! sink, polled and pushed. The host places by them. The server's cases
 //! of a host's own connection borrow the stage and the document.
+//!
+//! A placement alone can pass by a tie's draw: where no row has a value
+//! every row scores the same, and the host draws a fresh seed for each
+//! placement. So the stage keeps what each decision read of each row, and
+//! each step says it beside the placement.
 
 use std::{
+    cmp::Ordering,
+    collections::BTreeMap,
     error::Error,
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use parking_lot::Mutex;
 use serde::Deserialize;
 use smg_policy_controller::{
     framework::{Scorer, TieBand},
@@ -76,8 +84,17 @@ bindings:
     profiles: { prefill: prefill, decode: decode }
 ";
 
+/// What the stage's decisions read: a row and its value, at each scoring.
+pub(crate) type Read = Arc<Mutex<Vec<(WorkerId, Option<f64>)>>>;
+
+/// Rows and the value a decision read of each, in the rows' order.
+type Rows = Vec<(WorkerId, Option<f64>)>;
+
 #[derive(Debug)]
-struct Most(SignalColumn);
+struct Most {
+    column: SignalColumn,
+    read: Read,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -106,8 +123,11 @@ impl Scorer for Most {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
+        let mut read = self.read.lock();
         for (&row, score) in kept.iter().zip(out) {
-            let value = self.0.read(facts, &candidates[row as usize]);
+            let row = &candidates[row as usize];
+            let value = self.column.read(facts, row);
+            read.push((row.id, value));
             // A row with no value scores under every row that has one.
             *score = value.map_or(0.0, |value| ((value + 1.0) / 1_000.0) as f32);
         }
@@ -115,14 +135,38 @@ impl Scorer for Most {
     }
 }
 
-/// The stock stages and the host's own one, [`MOST`].
-pub(crate) fn stages() -> Result<Catalog, CatalogError> {
+/// The stock stages and the host's own one, [`MOST`], with what its
+/// decisions read.
+pub(crate) fn stages() -> Result<(Catalog, Read), CatalogError> {
+    let read = Read::default();
+    let kept = Arc::clone(&read);
     let mut stages = Catalog::builtin();
-    stages.scorer_with(MOST, |build| {
+    stages.scorer_with(MOST, move |build| {
         let named: Named = build.params()?;
-        Ok(Box::new(Most(build.signal_column(&named.signal)?)))
+        Ok(Box::new(Most {
+            column: build.signal_column(&named.signal)?,
+            read: Arc::clone(&kept),
+        }))
     })?;
-    Ok(stages)
+    Ok((stages, read))
+}
+
+/// The value each row was last read at since the last call, in the rows'
+/// order: what the decisions between two calls were handed.
+pub(crate) fn last_read(read: &Read) -> Rows {
+    let rows: BTreeMap<_, _> = read.lock().drain(..).collect();
+    rows.into_iter().collect()
+}
+
+/// [`last_read`] as its values alone, the least first. A row read with no
+/// value stands ahead of every value.
+pub(crate) fn values_read(read: &Read) -> Vec<Option<f64>> {
+    let mut values: Vec<_> = last_read(read)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect();
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    values
 }
 
 /// A gateway's store started with a document given and the host's stage
@@ -133,6 +177,7 @@ struct Bed {
     feed: Feed,
     host: Host,
     sink: Arc<dyn LoadSink>,
+    read: Read,
 }
 
 impl Bed {
@@ -145,7 +190,8 @@ impl Bed {
             policy_spec,
             ..RouterConfig::default()
         };
-        let started = start_with(&config, Some(stages()?))?
+        let (stages, read) = stages()?;
+        let started = start_with(&config, Some(stages))?
             .ok_or("the controller was picked and no store started")?;
         let store = started.store;
         let registry = Arc::new(WorkerRegistry::new());
@@ -158,6 +204,7 @@ impl Bed {
             feed,
             host,
             sink,
+            read,
         })
     }
 
@@ -251,12 +298,19 @@ impl Bed {
         self.store.counts().signal_writes
     }
 
-    /// The row a regular request is placed on at `now`.
-    async fn placed(&self, id: &[u8], now: Instant) -> Result<WorkerId, Box<dyn Error>> {
+    /// The row a regular request is placed on at `now`, and what its
+    /// decision read of each row.
+    async fn placed(&self, id: &[u8], now: Instant) -> Result<(WorkerId, Rows), Box<dyn Error>> {
         let placed = self.host.place(&Ask::of(id, MODEL), now).await;
         let placed = placed.map_err(|unplaced| format!("not placed: {unplaced:?}"))?;
-        Ok(placed.id())
+        Ok((placed.id(), last_read(&self.read)))
     }
+}
+
+/// `rows` in the rows' order, as a decision's read is listed.
+fn read<const N: usize>(mut rows: [(WorkerId, Option<f64>); N]) -> Rows {
+    rows.sort_by_key(|&(id, _)| id);
+    rows.to_vec()
 }
 
 /// One rank's report that states `value` of the declared name under `unit`,
@@ -289,7 +343,7 @@ const fn ms(millis: u64) -> Duration {
 #[tokio::test]
 async fn a_single_placement_follows_each_workers_latest_declared_value_polled_or_pushed() -> Case {
     let bed = Bed::started(Some(SINGLE))?;
-    let (_, first) = bed.worker("http://a:8000", Role::Single)?;
+    let (a, first) = bed.worker("http://a:8000", Role::Single)?;
     let (b, second) = bed.worker("http://b:8000", Role::Single)?;
     let (c, third) = bed.worker("http://c:8000", Role::Single)?;
     let start = Instant::now();
@@ -299,19 +353,22 @@ async fn a_single_placement_follows_each_workers_latest_declared_value_polled_or
     bed.polled(&[(&second, slots(50.0))], start);
     bed.polled(&[(&third, slots(30.0))], start);
     assert_eq!(bed.taken(), [3, 0, 0, 0, 0, 0]);
-    assert_eq!(bed.placed(b"polled", start + ms(10)).await?, b);
+    let handed = read([(a, Some(10.0)), (b, Some(50.0)), (c, Some(30.0))]);
+    assert_eq!(bed.placed(b"polled", start + ms(10)).await?, (b, handed));
 
     // A record the third worker pushes later states more: each worker's
     // latest report stands, whichever way it came.
     let later = start + ms(1_000);
     bed.pushed(&third, 0, &slots(90.0), later);
-    assert_eq!(bed.placed(b"pushed", later + ms(10)).await?, c);
+    let handed = read([(a, Some(10.0)), (b, Some(50.0)), (c, Some(90.0))]);
+    let placed = bed.placed(b"pushed", later + ms(10)).await?;
+    assert_eq!(placed, (c, handed.clone()));
 
     // A value under another unit than the declared one is dropped and
     // counted: the first worker keeps the value it had.
     let wrong = later + ms(100);
     bed.pushed(&first, 0, &stating(0, "tokens", 500.0, None), wrong);
-    assert_eq!(bed.placed(b"unit", wrong + ms(10)).await?, c);
+    assert_eq!(bed.placed(b"unit", wrong + ms(10)).await?, (c, handed));
     assert_eq!(bed.taken(), [4, 0, 1, 0, 0, 0]);
     Ok(())
 }
@@ -325,31 +382,34 @@ async fn a_declared_values_age_is_its_own_and_its_reports_and_the_maximum_age_en
     bed.polled(&[(&first, slots(90.0))], start);
     bed.polled(&[(&second, slots(10.0))], start);
     assert_eq!(bed.taken(), [2, 0, 0, 0, 0, 0]);
-    assert_eq!(bed.placed(b"fresh", start + ms(10)).await?, a);
+    let handed = read([(a, Some(90.0)), (b, Some(10.0))]);
+    assert_eq!(bed.placed(b"fresh", start + ms(10)).await?, (a, handed));
 
     // Six seconds on, the first worker's value is past the signal's five
     // seconds and reads as none. The second states a value four seconds
     // old by its own word, which is still read.
     let aged = start + ms(6_000);
     bed.pushed(&second, 0, &stating(0, "slots", 20.0, Some(4_000)), aged);
-    assert_eq!(bed.placed(b"aged", aged + ms(10)).await?, b);
+    let handed = read([(a, None), (b, Some(20.0))]);
+    assert_eq!(bed.placed(b"aged", aged + ms(10)).await?, (b, handed));
 
     // Two seconds later that value is six seconds old, its own age and
     // the time since its report together, and reads as none. A smaller
     // fresh value of the first worker wins.
     let ended = aged + ms(2_000);
     bed.pushed(&first, 0, &slots(5.0), ended);
-    assert_eq!(bed.placed(b"ended", ended + ms(10)).await?, a);
+    let handed = read([(a, Some(5.0)), (b, None)]);
+    assert_eq!(bed.placed(b"ended", ended + ms(10)).await?, (a, handed));
     Ok(())
 }
 
 #[tokio::test]
 async fn each_side_of_a_placed_pair_follows_its_own_pools_declared_values() -> Case {
     let bed = Bed::started(Some(PAIR))?;
-    let (_, prefill_low) = bed.worker("http://p0:8000", Role::Prefill)?;
+    let (prefill_other, prefill_low) = bed.worker("http://p0:8000", Role::Prefill)?;
     let (prefill, prefill_high) = bed.worker("http://p1:8000", Role::Prefill)?;
     let (decode, decode_high) = bed.worker("http://d0:8000", Role::Decode)?;
-    let (_, decode_low) = bed.worker("http://d1:8000", Role::Decode)?;
+    let (decode_other, decode_low) = bed.worker("http://d1:8000", Role::Decode)?;
     let now = Instant::now();
     // The prefill pool by its engines' polls, the decode pool by pushed
     // records.
@@ -365,6 +425,14 @@ async fn each_side_of_a_placed_pair_follows_its_own_pools_declared_values() -> C
     };
     let placed = bed.host.place_pair(&ask, None, None).await;
     let (placed, _guard) = placed.map_err(|unplaced| format!("not placed: {unplaced:?}"))?;
+    // Each side read its own pool's rows, each row its own value.
+    let handed = read([
+        (prefill_other, Some(10.0)),
+        (prefill, Some(70.0)),
+        (decode, Some(60.0)),
+        (decode_other, Some(20.0)),
+    ]);
+    assert_eq!(last_read(&bed.read), handed);
     assert_eq!((placed.id(), placed.decode_id()), (prefill, Some(decode)));
     Ok(())
 }
@@ -375,7 +443,7 @@ async fn each_rank_of_an_engine_reads_its_own_declared_value() -> Case {
     let url = "http://ranked:8000";
     let (rank_zero, zero) = bed.rank("http://ranked:8000@0", url, Role::Single, 0, 2)?;
     let (rank_one, ranked) = bed.rank("http://ranked:8000@1", url, Role::Single, 1, 2)?;
-    let (_, other) = bed.worker("http://other:8000", Role::Single)?;
+    let (bystander, other) = bed.worker("http://other:8000", Role::Single)?;
     let start = Instant::now();
     // The ranked engine's one poll answers for both ranks, each rank's
     // answer its own, and rank 1 states the most.
@@ -386,14 +454,30 @@ async fn each_rank_of_an_engine_reads_its_own_declared_value() -> Case {
     bed.polled(&ranks, start);
     bed.polled(&[(&other, slots(8.0))], start);
     assert_eq!(bed.taken(), [3, 0, 0, 0, 0, 0]);
-    assert_eq!(bed.placed(b"ranks", start + ms(10)).await?, rank_one);
+    let handed = read([
+        (rank_zero, Some(10.0)),
+        (rank_one, Some(70.0)),
+        (bystander, Some(8.0)),
+    ]);
+    assert_eq!(
+        bed.placed(b"ranks", start + ms(10)).await?,
+        (rank_one, handed)
+    );
 
     // Rank 1 pushes a smaller value: its own row moves, and no other.
     // Rank 0 now states the most, above the other engine. Had the record
     // moved rank 0 as well, the other engine would.
     let later = start + ms(1_000);
     bed.pushed(&ranked, 1, &stating(1, "slots", 5.0, None), later);
-    assert_eq!(bed.placed(b"moved", later + ms(10)).await?, rank_zero);
+    let handed = read([
+        (rank_zero, Some(10.0)),
+        (rank_one, Some(5.0)),
+        (bystander, Some(8.0)),
+    ]);
+    assert_eq!(
+        bed.placed(b"moved", later + ms(10)).await?,
+        (rank_zero, handed)
+    );
     Ok(())
 }
 
@@ -405,6 +489,10 @@ async fn a_document_that_declares_no_signal_takes_no_value_and_places_as_before(
     bed.polled(&[(&worker, slots(10.0))], now);
     bed.pushed(&worker, 0, &slots(20.0), now + ms(100));
     assert_eq!(bed.taken(), [0; 6]);
-    assert_eq!(bed.placed(b"plain", now + ms(200)).await?, only);
+    // No stage of that document reads a signal, so its decision read none.
+    assert_eq!(
+        bed.placed(b"plain", now + ms(200)).await?,
+        (only, Rows::new())
+    );
     Ok(())
 }
