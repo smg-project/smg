@@ -28,7 +28,10 @@
 //! engine is that engine's stream's from its next batch: it begins from
 //! nothing there, and the stream that wrote it reaches it no longer. A
 //! feed's own row that becomes a rank of another engine is taken the same
-//! way, and its own stream, which is ending, leaves it alone.
+//! way, and its own stream, which is ending, leaves it alone. That stream
+//! writes no row of any rank from then on, and the holder answers it no
+//! rank once its row stands above rank 0. A ticket from before a row's
+//! object was laid again opens no feed.
 //!
 //! # The block size
 //!
@@ -53,6 +56,9 @@
 //! - A batch of a rank whose row the holder has not laid is passed over.
 //!   That row's index begins with the blocks stored once it is laid.
 //! - An adapter made with no holder writes every batch to its stream's row.
+//! - A feed's own row laid again in place as rank 0 of another engine is
+//!   written by its old stream until that stream ends. Its end clears
+//!   every row it wrote.
 
 use std::{
     collections::HashMap,
@@ -179,21 +185,23 @@ where
     S: store::KvEventSink<Batch = [KvEvent]> + ?Sized,
 {
     /// What `row`'s batches showed so far, for a batch on `id`'s stream.
-    /// `None` where the stream writes the row no longer: its engine's rank
-    /// 0 stream took the stream's own row. A row of another rank that the
-    /// stream writes for the first time, or that another stream wrote, is
-    /// taken.
+    /// `None` where the stream writes no row any longer: another stream
+    /// took its own row, so it is ending, and it writes no row of any
+    /// rank. A row of another rank that the stream writes for the first
+    /// time, or that another stream wrote, is taken.
     fn shown(&self, id: WorkerId, row: WorkerId) -> Option<GroupsShown> {
-        let known = self
-            .rows
-            .lock()
-            .get(&row)
-            .map(|written| (written.stream == id).then(|| written.groups.clone()));
+        let known = {
+            let rows = self.rows.lock();
+            if rows.get(&id).is_some_and(|own| own.stream != id) {
+                return None;
+            }
+            rows.get(&row)
+                .map(|written| (written.stream == id).then(|| written.groups.clone()))
+        };
         match known {
             Some(Some(groups)) => Some(groups),
             // No feed was opened for the stream's own row.
             None if row == id => Some(GroupsShown::default()),
-            Some(None) if row == id => None,
             _ => {
                 self.take(id, row);
                 Some(GroupsShown::default())
@@ -276,7 +284,7 @@ where
         // The batch is decoded against a copy of what the row showed. The
         // copy stands only where the store took the batch: one it skipped
         // shows nothing.
-        // Its engine's rank 0 stream took this stream's own row.
+        // Another stream took this stream's own row: it writes none now.
         let Some(shown) = self.shown(id, row) else {
             return BatchOutcome::Skipped;
         };
@@ -549,6 +557,15 @@ impl<G: Generation, S: ?Sized> KvHost<G, S> {
             upper_rank: AtomicU64::new(0),
         }
     }
+
+    /// The row `worker`'s object stands for: none where the holder keeps no
+    /// row for it, or has laid another object in its place.
+    fn row_of(&self, worker: &Arc<dyn Worker>) -> Option<WorkerId> {
+        let id = self.objects.registry().get_id_by_url(worker.url())?;
+        self.objects
+            .standing_of(&id, worker)
+            .map(|standing| standing.row)
+    }
 }
 
 impl<G, S: ?Sized> KvHost<G, S> {
@@ -585,17 +602,9 @@ where
         if worker.dp_rank().is_some_and(|rank| rank > 0) {
             return Err(NoFeed::UpperRank);
         }
-        let id = self
-            .objects
-            .registry()
-            .get_id_by_url(worker.url())
-            .ok_or(NoFeed::NoRow)?;
         // The row this very object stands for: one the holder has laid
         // another object in the place of has none.
-        self.objects
-            .standing_of(&id, worker)
-            .map(|standing| standing.row)
-            .ok_or(NoFeed::NoRow)
+        self.row_of(worker).ok_or(NoFeed::NoRow)
     }
 
     /// The feed names the worker's row. A subscription with no feed is
@@ -606,6 +615,15 @@ where
         worker: &Arc<dyn Worker>,
         model: &str,
     ) -> Option<KvEventFeed<Self::Sink>> {
+        // The ticket was written at the enrollment, and the feed opens
+        // later, on the subscription's task. A row laid again since is
+        // another object's, and may be another stream's by now: its ticket
+        // opens nothing.
+        let ticket = ticket.and_then(|row| {
+            (self.row_of(worker) == Some(row))
+                .then_some(row)
+                .ok_or(NoFeed::NoRow)
+        });
         match ticket {
             Ok(row) => {
                 // The model the row's stored blocks name a size for.
@@ -2009,6 +2027,8 @@ mod tests {
     const UPPER: &str = "http://a:8000#1";
 
     const OTHER: &str = "http://b:8000";
+    const THIRD: &str = "http://a:8000#2";
+    const FOURTH: &str = "http://b:8000#1";
 
     /// The row of one rank of the engine at `engine`, which asks for events.
     fn rank_facts(key: &str, engine: &str, dp_rank: u16) -> WorkerFacts {
@@ -2018,7 +2038,7 @@ mod tests {
             incarnation: 1,
             models: vec![MODEL.into()],
             dp_rank,
-            dp_size: 2,
+            dp_size: 3,
             signals: Signals {
                 events: true,
                 ..Signals::default()
@@ -2027,7 +2047,7 @@ mod tests {
         }
     }
 
-    /// An engine of two ranks: its rank 0 row, the host that follows the
+    /// An engine of three ranks: its rank 0 row, the host that follows the
     /// store, and the feed the host opened for that row.
     struct Ranked {
         store: Arc<MemoryStore>,
@@ -2282,32 +2302,84 @@ mod tests {
     }
 
     /// A feed's own row whose facts make it a rank of another engine is
-    /// that engine's stream's. Its own stream, which is ending, writes it
-    /// no longer, and that stream's removal leaves it alone.
+    /// that engine's stream's. Its own stream, which is ending, writes no
+    /// row of any rank from then on: not its own, and no row of the other
+    /// engine by its new facts. That stream's removal leaves what the
+    /// other engine's stream wrote.
     #[test]
     fn a_feeds_row_that_becomes_another_engines_rank_leaves_its_own_stream() {
         let f = Ranked::new();
         let own = f.other(OTHER);
+        let third = f.store.upsert(rank_facts(THIRD, URL, 2)).id();
+        f.host.objects.follow(f.store.as_ref());
         let store = |hash| Data::Stored(wide_store(hash, 16));
-        assert_eq!(
-            f.sink.admit(own, 0, facts(5), &batch([store(1)])),
-            BatchOutcome::Applied
-        );
+        // One batch on the row's own stream.
+        let late = |rank, sequence, hash| {
+            let one = batch([store(hash)]);
+            f.sink.admit(own, rank, facts(sequence), &one)
+        };
+        assert_eq!(late(0, 5, 1), BatchOutcome::Applied);
+        assert_eq!(f.admit(2, 5, store(9)), BatchOutcome::Applied);
+        let thirds = || f.store.indexed_blocks(third, 2);
+        assert_eq!(thirds(), 1);
 
-        // The same registration states rank 1 of the first engine now.
+        // The same registration states rank 1 of the first engine now. A
+        // late batch of the row's own stream reaches no row of that engine,
+        // before its stream takes the row and after.
         let moved = f.store.upsert(rank_facts(OTHER, URL, 1)).id();
         assert_eq!(moved, own);
         f.host.objects.follow(f.store.as_ref());
+        assert_eq!(late(2, 4, 7), BatchOutcome::Skipped);
         assert_eq!(f.admit(1, 2, store(2)), BatchOutcome::Applied);
         assert_eq!(f.store.indexed_blocks(own, 1), 1);
+        assert_eq!(late(0, 6, 3), BatchOutcome::Skipped);
+        assert_eq!(late(2, 4, 8), BatchOutcome::Skipped);
+        assert_eq!(thirds(), 1);
 
-        assert_eq!(
-            f.sink.admit(own, 0, facts(6), &batch([store(3)])),
-            BatchOutcome::Skipped
-        );
+        // Its facts state rank 0 of its first engine again and no feed was
+        // opened for that: the row is still the other stream's, so its old
+        // stream writes no rank of its first engine either.
+        let fourth = f.store.upsert(rank_facts(FOURTH, OTHER, 1)).id();
+        let back = f.store.upsert(rank_facts(OTHER, OTHER, 0)).id();
+        assert_eq!(back, own);
+        f.host.objects.follow(f.store.as_ref());
+        assert_eq!(late(1, 1, 4), BatchOutcome::Skipped);
+        assert_eq!(f.store.indexed_blocks(fourth, 1), 0);
+
         f.sink.removed(own);
-        assert_eq!(f.store.indexed_blocks(own, 1), 1);
+        assert_eq!(thirds(), 1);
         f.sink.removed(f.lower);
-        assert_eq!(f.store.indexed_blocks(own, 1), 0);
+        assert_eq!(thirds(), 0);
+    }
+
+    /// A ticket from before the row's object was laid again opens nothing
+    /// and is counted. The row is another stream's by then, and what that
+    /// stream wrote stands.
+    #[test]
+    fn a_ticket_from_before_the_row_was_laid_again_opens_nothing() {
+        let f = Ranked::new();
+        let row = f.store.upsert(rank_facts(OTHER, OTHER, 0)).id();
+        f.host.objects.follow(f.store.as_ref());
+        let worker = f
+            .host
+            .objects
+            .registry()
+            .get_by_url(OTHER)
+            .expect("the other engine's object");
+        let ticket = f.host.enroll(&worker, MODEL);
+        assert_eq!(ticket, Ok(row));
+
+        // Between the enrollment and the open the row becomes the first
+        // engine's rank 1, and that engine's stream writes it.
+        let moved = f.store.upsert(rank_facts(OTHER, URL, 1)).id();
+        assert_eq!(moved, row);
+        f.host.objects.follow(f.store.as_ref());
+        let store = Data::Stored(wide_store(1, 16));
+        assert_eq!(f.admit(1, 2, store), BatchOutcome::Applied);
+        assert_eq!(f.store.indexed_blocks(row, 1), 1);
+
+        assert!(f.host.open(ticket, &worker, MODEL).is_none());
+        assert_eq!(f.store.indexed_blocks(row, 1), 1);
+        assert_eq!(f.host.unfed().no_row, 1);
     }
 }

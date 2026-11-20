@@ -455,15 +455,20 @@ impl<G: Generation> Objects<G> {
         self.held.read().objects.get(&row).cloned()
     }
 
-    /// The row of rank `rank` of the engine that `row` is a rank of: `row`
-    /// itself where that is its own rank, else the row that dials the same
-    /// address under that rank. `None` where the holder laid no such row,
-    /// or holds no object for `row`. A writer that holds an engine's one
-    /// events stream routes a rank's batch by it.
+    /// The row of rank `rank` of the engine whose rank 0 row is `row`:
+    /// `row` itself for rank 0, else the row that dials the same address
+    /// under that rank. `None` where the holder laid no such row, holds no
+    /// object for `row`, or `row` stands above rank 0 by the facts it is
+    /// laid from. Only an engine's rank 0 row holds the engine's one events
+    /// stream, and the stream's writer routes a rank's batch by this
+    /// answer: a row laid again above rank 0 routes none.
     pub fn rank_row(&self, row: WorkerId, rank: u16) -> Option<WorkerId> {
         let held = self.held.read();
         let facts = held.facts.get(&row)?;
-        if facts.dp_rank == rank {
+        if facts.dp_rank != 0 {
+            return None;
+        }
+        if rank == 0 {
             return Some(row);
         }
         held.ranks
@@ -2693,9 +2698,9 @@ mod tests {
         WATCHED.set(None);
     }
 
-    /// An engine's ranks are answered by their rows, from either of them. A
-    /// rank no row holds is answered by none, and a row that is its own
-    /// engine has its one rank.
+    /// An engine's ranks are answered by their rows, asked of its rank 0
+    /// row. A rank no row holds is answered by none, a row above rank 0 is
+    /// answered none, and a row that is its own engine has its one rank.
     #[test]
     fn an_engines_ranks_are_answered_by_their_rows() {
         let replica = Replica::new();
@@ -2704,10 +2709,11 @@ mod tests {
         let alone = replica.store.upsert(facts(D, 1)).id();
         replica.follow();
         let objects = &replica.objects;
-        for row in [lower, upper] {
-            assert_eq!(objects.rank_row(row, 0), Some(lower));
-            assert_eq!(objects.rank_row(row, 1), Some(upper));
-            assert_eq!(objects.rank_row(row, 2), None);
+        assert_eq!(objects.rank_row(lower, 0), Some(lower));
+        assert_eq!(objects.rank_row(lower, 1), Some(upper));
+        assert_eq!(objects.rank_row(lower, 2), None);
+        for rank in 0..3 {
+            assert_eq!(objects.rank_row(upper, rank), None);
         }
         assert_eq!(objects.rank_row(alone, 0), Some(alone));
         assert_eq!(objects.rank_row(alone, 1), None);
