@@ -1646,7 +1646,7 @@ pub(crate) fn hand<A: Asked, R>(
         keyed,
         ..
     } = buffers;
-    let (wires, demands) = (request.wires(), request.demands());
+    let wires = request.wires();
     // No member serves the model in the role: the engine answers over no
     // candidate, as it answers any host that hands it none.
     let none = || PoolFacts {
@@ -1658,7 +1658,7 @@ pub(crate) fn hand<A: Asked, R>(
     // door writes with the counts on it for a plugin, which is shown a
     // row's bits and ages as the row's own fields. A request that states a
     // hard demand is handed written rows, as one that states wires is.
-    let by_door = wires.is_none() && request.subset() != Some(0) && demands.is_none();
+    let by_door = wires.is_none() && request.subset() != Some(0) && request.demands().is_none();
     // The last demand the rows a demand took failed first, where one took
     // a row of the build: the rows left are named within themselves then.
     let mut unmet: Option<Unmet> = None;
@@ -1701,6 +1701,9 @@ pub(crate) fn hand<A: Asked, R>(
                 // narrowing, all but the list's name: the rows the wires
                 // left are another list of the pool.
                 let mut pool: PoolFacts<'_> = built.pool_facts();
+                // The request's demands, read where a row is written: the
+                // path that writes none carries none of them past its test.
+                let demands = request.demands();
                 let took = if demands.is_none() {
                     Took {
                         undialed: narrow(view, wires, request.subset()),
@@ -1751,11 +1754,6 @@ pub(crate) fn hand<A: Asked, R>(
         pins: pins.map(|pins| pins as &dyn PinSource),
         signal_cells: cells,
     };
-    if candidates.is_empty() && pool.pool_size > 0 {
-        // The request's own narrowing left none of a pool that has rows.
-        let answer = emptied(request, lists, viewed, decide, &pool, scratch, unmet);
-        return (answer, built);
-    }
     // The store's sessions, where the decision's rule has an in-flight
     // cap: a keyed request reads its key's count there. Under any other
     // rule the engine is asked at once, past the key's read.
@@ -1807,6 +1805,10 @@ pub(crate) fn hand<A: Asked, R>(
         // them, at this arm's own call: a decision that names no row
         // meets no test for it.
         let answer = request.read(lists, viewed, name, |facts, constraints| {
+            if candidates.is_empty() && pool.pool_size > 0 {
+                let subset = request.subset();
+                return emptied(decide, facts, &pool, constraints, scratch, subset, unmet);
+            }
             // The engine's ask, written once for the two ways to it: at
             // once, or behind the key's read.
             let ask = |facts: &RequestFacts<'_>, constraints: &Constraints<'_>| {
@@ -1821,6 +1823,10 @@ pub(crate) fn hand<A: Asked, R>(
     }
     named.clear_sent();
     let answer = request.read(lists, viewed, unnamed, |facts, constraints| {
+        if candidates.is_empty() && pool.pool_size > 0 {
+            let subset = request.subset();
+            return emptied(decide, facts, &pool, constraints, scratch, subset, unmet);
+        }
         let ask = |facts: &RequestFacts<'_>, constraints: &Constraints<'_>| {
             decide.over(facts, &pool, candidates, constraints, scratch)
         };
@@ -1836,27 +1842,26 @@ pub(crate) fn hand<A: Asked, R>(
 /// left none, in the decider's form for it ([`Decides::emptied`]), under
 /// the stage that took the last of them: the request's hint of 0, the last
 /// demand its rows failed first, or its gateway's wires. A routine of its
-/// own, out of line: a pool that keeps a row pays one test for this answer
-/// and none of its code.
+/// own, out of line, asked inside the request's read where the decider is
+/// asked: a pool that keeps a row pays one test for this answer, the test
+/// its decider had, and the door's routine keeps the frame it had.
 #[cold]
 #[inline(never)]
-fn emptied<A: Asked, R>(
-    request: &A,
-    lists: &mut A::Lists,
-    viewed: Viewed<'_>,
+fn emptied<R>(
     decide: impl Decides<R>,
+    facts: &RequestFacts<'_>,
     pool: &PoolFacts<'_>,
+    constraints: &Constraints<'_>,
     scratch: &mut Scratch,
+    subset: Option<u32>,
     unmet: Option<Unmet>,
 ) -> R {
-    let stage = if request.subset() == Some(0) {
+    let stage = if subset == Some(0) {
         SUBSET_HINT
     } else {
         unmet.map_or(WIRES, Unmet::stage)
     };
-    request.read(lists, viewed, unnamed, |facts, constraints| {
-        decide.emptied(facts, pool, constraints, scratch, stage)
-    })
+    decide.emptied(facts, pool, constraints, scratch, stage)
 }
 
 /// The role whose pool decides a request of `phase`: the pool [`hand`]
