@@ -96,7 +96,7 @@ impl From<(u64, Option<Digest>)> for Generation {
 
 /// The answer of `GET /policy/spec`.
 #[derive(Serialize)]
-struct InForce<'a> {
+struct SpecInForce<'a> {
     generation: u64,
     digest: String,
     /// `yaml` or `json`: the form `document` is in.
@@ -136,7 +136,7 @@ pub(crate) async fn spec(State(state): State<Arc<AppState>>) -> Response {
     };
     let digest = digest.to_string();
     let etag = HeaderValue::from_str(&format!("\"{digest}\""));
-    let mut response = Json(InForce {
+    let mut response = Json(SpecInForce {
         generation,
         digest,
         format: format.as_str(),

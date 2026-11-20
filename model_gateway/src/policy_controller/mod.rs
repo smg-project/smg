@@ -121,12 +121,13 @@ pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, S
 /// `stages` is the catalog of a host's own stages. The stock gateway hands
 /// none, and the door then checks over the stock stages alone.
 ///
-/// The door is handed the document as YAML by the one function
-/// `--print-policy-spec` checks its own through ([`hosted`]), and it checks
-/// a later dry run over the same stages. A configuration the document
-/// cannot say, a routing setting that disagrees with a given document, and
-/// a document that check refuses, stop the start by name. None of them is
-/// served by the classic policies in silence.
+/// The start returns the store with the door that applied the document
+/// ([`Started`]). The door is handed the document as YAML by the one
+/// function `--print-policy-spec` checks its own through ([`hosted`]), and
+/// it checks a later dry run over the same stages. A configuration the
+/// document cannot say, a routing setting that disagrees with a given
+/// document, and a document that check refuses, stop the start by name.
+/// None of them is served by the classic policies in silence.
 pub(crate) fn start_with(
     config: &RouterConfig,
     stages: Option<Catalog>,
