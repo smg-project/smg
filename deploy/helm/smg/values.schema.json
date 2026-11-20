@@ -29,7 +29,8 @@
             "least_load",
             "manual",
             "consistent_hashing",
-            "prefix_hash"
+            "prefix_hash",
+            "bucket"
           ]
         },
         "policyController": { "enum": ["on", "off", true, false] },

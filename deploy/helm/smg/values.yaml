@@ -28,9 +28,8 @@ router:
   progressDeadlineSeconds: 1920
 
   # -- Routing policy: random, round_robin, passthrough, cache_aware, power_of_two,
-  #    least_load, manual, consistent_hashing or prefix_hash (the launcher's --policy
-  #    choices; values.schema.json lists them). bucket is a prefill-side policy:
-  #    router.disaggregation.prefillPolicy.
+  #    least_load, manual, consistent_hashing, prefix_hash or bucket (the launcher's
+  #    --policy choices; values.schema.json lists them).
   #    Empty renders --policy cache_aware without a document, and no --policy
   #    beside one: the document names the policy. A value beside a document
   #    fails the render. An upgrade with --reuse-values from an older chart
