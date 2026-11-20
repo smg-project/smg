@@ -13,7 +13,7 @@ pub use activate::ActivateWorkersStep;
 #[cfg(test)]
 pub(crate) use register::registration_hold;
 pub use register::{registered_entries, registered_in, RegisterWorkersStep};
-pub(crate) use register::{rows_written, RegisterBesideRowsStep, REGISTER_WORKERS_STEP};
+pub(crate) use register::{RegisterBesideRowsStep, REGISTER_WORKERS_STEP};
 use smg_worker::identity::basic::Worker;
 pub(crate) use update_policies::start_kv_stream;
 pub use update_policies::UpdatePoliciesStep;

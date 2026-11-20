@@ -33,9 +33,9 @@ use crate::{
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
         create_worker_removal_workflow_data, create_worker_update_workflow_data,
         create_worker_workflow_data, note_tokenizer_load_outcome, note_tokenizer_removed,
-        registered_entries, registered_in, steps::rows_written, McpServerConfigRequest,
-        TokenizerConfigRequest, TokenizerRemovalRequest, WasmModuleConfigRequest,
-        WasmModuleRemovalRequest, WorkerRegistrationMode, WorkflowEngines,
+        registered_entries, registered_in, McpServerConfigRequest, TokenizerConfigRequest,
+        TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
+        WorkerRegistrationMode, WorkflowEngines,
     },
 };
 
@@ -607,13 +607,9 @@ impl JobHost for AppContext {
                         // id and revision): a worker registered or replaced
                         // since is not this job's to remove, and the step
                         // record alone can be read before the step's end.
-                        let mut entries = registered_entries(&context.worker_registry, &state);
-                        // A row's object is the holder's, never the one the
-                        // job built: the door's write names this job's rows.
-                        if let Some(feed) = context.door_feed() {
-                            let rows = &feed.objects;
-                            entries.extend(rows_written(&context.worker_registry, rows, &state));
-                        }
+                        // A row's object is the one the job handed in at
+                        // the door, so the same read names a row's worker.
+                        let entries = registered_entries(&context.worker_registry, &state);
                         Err(if entries.is_empty() {
                             if registered_in(&state) {
                                 format!(
@@ -1930,15 +1926,17 @@ mod tests {
     }
 
     /// Under the policy controller a POST that fails behind its row's write
-    /// leaves no row. The job reads its rows from the holder where the state
-    /// records the door's write, and sends them out through the removal job.
-    /// A POST the door refused wrote no row, and the row that stood under its
-    /// URL is not its to remove.
+    /// leaves no row. The row's object is the worker the job built and
+    /// handed in at the door, so the job names it as it names a classic
+    /// worker, and sends it out through the removal job. A POST the door
+    /// refused wrote no row, and the row that stood under its URL is not its
+    /// to remove. Nor is a worker that another registration laid under the
+    /// URL between the write and the failure.
     #[tokio::test]
     async fn under_the_policy_controller_a_post_that_fails_behind_its_row_takes_the_row_out() {
         use smg_policy_controller::{
             store::{Maker, WorkersStore},
-            worker_host::{facts, Expect, WRITE_WORKERS_AT_DOOR_STEP},
+            worker_host::{Expect, WRITE_WORKERS_AT_DOOR_STEP},
         };
         use smg_worker::workflow::single_attempt;
         use wfaas::{
@@ -1953,26 +1951,40 @@ mod tests {
         let store = hosted.policy_store.as_ref().expect("the store");
         let registry = &hosted.worker_registry;
         let door = Arc::clone(&hosted.door_feed().expect("the feed").door);
-        // The door's write under its step's name, then a step that fails.
-        let write = FunctionStep::new(move |run: &mut WorkflowContext<WorkerWorkflowData>| {
-            let url = run.data.config.url.clone();
-            let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(&url).build());
-            let wrote = door
-                .found(&Maker::Control, Expect::Nothing, &url, &|row| {
-                    facts(worker.as_ref(), row)
+        let built =
+            |url: &str| -> Arc<dyn Worker> { Arc::new(BasicWorkerBuilder::new(url).build()) };
+        // The door's write under its step's name, with the built worker
+        // handed in, then a step that fails.
+        let write = FunctionStep::new({
+            let door = Arc::clone(&door);
+            move |run: &mut WorkflowContext<WorkerWorkflowData>| {
+                let worker = built(&run.data.config.url);
+                let wrote = door
+                    .found_built(&Maker::Control, Expect::Nothing, &worker, None)
+                    .is_ok();
+                run.data.actual_workers = Some(vec![worker]);
+                Box::pin(async move {
+                    Ok(if wrote {
+                        StepResult::Success
+                    } else {
+                        StepResult::Failure
+                    })
                 })
-                .is_ok();
-            run.data.actual_workers = Some(vec![worker]);
-            Box::pin(async move {
-                Ok(if wrote {
-                    StepResult::Success
-                } else {
-                    StepResult::Failure
-                })
-            })
+            }
         });
-        let fail = FunctionStep::new(|_: &mut WorkflowContext<WorkerWorkflowData>| {
-            Box::pin(async { Ok(StepResult::Failure) })
+        // Ahead of the failure another registration lays its own worker
+        // under one of the URLs: the row stands unmoved, the object is new.
+        let relaid = "http://relaid:8000";
+        let newer = built(relaid);
+        let fail = FunctionStep::new({
+            let newer = Arc::clone(&newer);
+            move |run: &mut WorkflowContext<WorkerWorkflowData>| {
+                if run.data.config.url == relaid {
+                    door.found_built(&Maker::Control, Expect::Anything, &newer, None)
+                        .expect("the newer registration");
+                }
+                Box::pin(async { Ok(StepResult::Failure) })
+            }
         });
         hosted
             .workflow_engines
@@ -1996,7 +2008,12 @@ mod tests {
             )
             .unwrap();
 
-        for (url, written) in [("http://fresh:8000", true), (standing.as_str(), false)] {
+        let posts = [
+            ("http://fresh:8000", true),
+            (standing.as_str(), false),
+            (relaid, false),
+        ];
+        for (url, taken) in posts {
             let id = registry.reserve_id_for_url(url);
             let job = Job::AddWorker {
                 config: Box::new(WorkerSpec::new(url)),
@@ -2008,11 +2025,15 @@ mod tests {
                 .expect_err("the registration fails");
             assert_eq!(
                 failure.contains("leave through a queued removal"),
-                written,
+                taken,
                 "{url}: {failure}"
             );
             assert!(store.by_key(url).is_some(), "{url}");
-            if written {
+            if url == relaid {
+                let stands = registry.get_by_url(url).expect("the newer worker");
+                assert!(Arc::ptr_eq(&stands, &newer), "the newer worker left");
+            }
+            if taken {
                 let laid = registry.get(&id).expect("the row's object");
                 let rows = HashMap::from([(id.as_str().to_string(), Some(laid.revision()))]);
                 assert!(
