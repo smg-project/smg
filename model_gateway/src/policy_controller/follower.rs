@@ -1,13 +1,23 @@
 //! A single task follows the controller's workers into the policy store.
 //! A watch may reopen or a connection may fail. The same watcher keeps its
 //! place and the store keeps its last fleet until a new snapshot replaces it.
+//!
+//! After each event the store takes at a place, the task settles the
+//! gateway's feed: the registry gets the rows' worker objects, and the
+//! store publishes what its build still owes. The gateway reports a fleet
+//! only after the first settle, so its workers stand when it turns ready.
+//!
+//! The store publishes a snapshot's rows as it lays them, and so it does
+//! a replaced incarnation and a status change. Between such an event and
+//! its settle a decision can name a row whose worker the registry does
+//! not hold yet. The host passes that target over and asks again.
 
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use smg_policy_controller::{
     client::{Client, Error, ANSWER_WAIT, KEEPALIVE},
-    store::{token, MemoryStore},
+    store::token,
     watcher::{Ended, Watcher},
 };
 use tokio::{
@@ -18,6 +28,7 @@ use tokio::{
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 use tracing::warn;
 
+use super::feed::Feed;
 use crate::config::RouterConfig;
 
 const FIRST_RETRY: Duration = Duration::from_millis(250);
@@ -28,7 +39,8 @@ const MAX_RETRY: Duration = Duration::from_secs(5);
 pub(crate) enum Followed {
     /// No snapshot was taken yet.
     Nothing,
-    /// A snapshot was taken: the store holds the fleet as of a place.
+    /// A snapshot was taken: the store holds the fleet as of a place, and
+    /// the registry holds a worker object for each of its rows.
     Fleet,
 }
 
@@ -106,9 +118,9 @@ pub(crate) struct Follower {
 }
 
 impl Follower {
-    /// Starts the task. `store` is the process's policy store, which the
-    /// watch alone writes from here.
-    pub(crate) fn start(settings: Settings, store: Arc<MemoryStore>) -> Self {
+    /// Starts the task. The watch alone writes the store of `feed` from
+    /// here, and the task settles `feed` after each event the store takes.
+    pub(crate) fn start(settings: Settings, feed: Feed) -> Self {
         let (stop, stopped) = oneshot::channel();
         let (progress, followed) = watch::channel(Followed::Nothing);
         #[expect(
@@ -119,7 +131,7 @@ impl Follower {
             tokio::select! {
                 biased;
                 _ = stopped => {}
-                () = run(settings, store, progress) => {}
+                () = run(settings, feed, progress) => {}
             }
         });
         Self {
@@ -164,8 +176,8 @@ fn named_leader(error: &anyhow::Error, followed: u32) -> Option<&str> {
     }
 }
 
-async fn run(settings: Settings, store: Arc<MemoryStore>, progress: watch::Sender<Followed>) {
-    let mut watcher = Watcher::new(store);
+async fn run(settings: Settings, feed: Feed, progress: watch::Sender<Followed>) {
+    let mut watcher = Watcher::new(Arc::clone(feed.store()));
     let mut delay = FIRST_RETRY;
     let mut redirect: Option<String> = None;
     // The leaders followed at once since the watch last held a place.
@@ -176,6 +188,7 @@ async fn run(settings: Settings, store: Arc<MemoryStore>, progress: watch::Sende
             Ok(mut client) => follow(
                 &mut client,
                 &mut watcher,
+                &feed,
                 &progress,
                 &mut delay,
                 &mut followed,
@@ -200,6 +213,7 @@ async fn run(settings: Settings, store: Arc<MemoryStore>, progress: watch::Sende
 async fn follow(
     client: &mut Client,
     watcher: &mut Watcher,
+    feed: &Feed,
     progress: &watch::Sender<Followed>,
     delay: &mut Duration,
     followed: &mut u32,
@@ -226,6 +240,11 @@ async fn follow(
                 Err(Ended::Client(error)) => return error,
             }
             if following.watcher().at().is_some() {
+                // The store holds the fleet as of a place. The registry
+                // takes the rows' objects and the store publishes what its
+                // build still owes. Only then does readiness hear of a
+                // fleet.
+                feed.settle();
                 placed = true;
                 *delay = FIRST_RETRY;
                 *followed = 0;
@@ -246,7 +265,7 @@ pub(crate) mod tests {
     use std::{
         net::{Ipv4Addr, SocketAddr},
         sync::Arc,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use openssl::{
@@ -265,6 +284,15 @@ pub(crate) mod tests {
     use super::{
         gateway_id, named_leader, next_delay, Error, Followed, Follower, Settings, FIRST_RETRY,
         REDIRECTS,
+    };
+    use crate::{
+        config::RouterConfig,
+        policy_controller::{
+            feed::{following, Feed},
+            host::{Ask, Host},
+            start,
+        },
+        routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BackendConnector},
     };
 
     const WAIT: Duration = Duration::from_secs(5);
@@ -320,6 +348,33 @@ pub(crate) mod tests {
         }
     }
 
+    fn url(port: u16) -> String {
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// The feed of a gateway under an address over `store`, with a registry
+    /// of its own.
+    fn fed(store: &Arc<MemoryStore>) -> Feed {
+        followed(store, &Arc::new(WorkerRegistry::new()))
+    }
+
+    /// The feed of a gateway under an address over `store`, for the workers
+    /// of `registry`, with the shipped connector.
+    fn followed(store: &Arc<MemoryStore>, registry: &Arc<WorkerRegistry>) -> Feed {
+        following(store, registry, BackendConnector::shared())
+    }
+
+    /// The addresses of the registry's workers, in order.
+    fn urls(registry: &WorkerRegistry) -> Vec<String> {
+        let mut urls: Vec<_> = registry
+            .get_all()
+            .iter()
+            .map(|worker| worker.url().to_owned())
+            .collect();
+        urls.sort_unstable();
+        urls
+    }
+
     fn operator<T>(body: T) -> Request<T> {
         let mut request = Request::new(body);
         request
@@ -336,7 +391,7 @@ pub(crate) mod tests {
         let event = control
             .register_worker(operator(proto::RegisterWorkerRequest {
                 spec: Some(proto::WorkerSpec {
-                    url: format!("http://127.0.0.1:{port}"),
+                    url: url(port),
                     wire: proto::WireMode::Http.into(),
                     role: proto::Role::Single.into(),
                     models: vec!["model".to_owned()],
@@ -436,16 +491,21 @@ pub(crate) mod tests {
             register(&mut controller.control, 31002, true).await;
             assert_eq!(rows(&controller.store).len(), 2);
             let store = Arc::new(MemoryStore::new());
-            let follower = Follower::start(settings(controller.address), store.clone());
+            let registry = Arc::new(WorkerRegistry::new());
+            let follower =
+                Follower::start(settings(controller.address), followed(&store, &registry));
             until("the first snapshot", || {
                 follower.followed() == Followed::Fleet
             })
             .await;
             assert_eq!(rows(&store), rows(&controller.store));
+            // The fleet is reported once each of its rows has its worker.
+            assert_eq!(urls(&registry), [url(31001), url(31002)]);
 
             register(&mut controller.control, 31003, false).await;
             until("the third registration", || rows(&store).len() == 3).await;
             assert_eq!(rows(&store), rows(&controller.store));
+            assert_eq!(urls(&registry), [url(31001), url(31002), url(31003)]);
 
             controller
                 .control
@@ -458,10 +518,91 @@ pub(crate) mod tests {
                 .unwrap();
             until("the removal", || store.get(WorkerId(first.id)).is_none()).await;
             assert_eq!(rows(&store), rows(&controller.store));
+            assert_eq!(urls(&registry), [url(31002), url(31003)]);
             follower.stop().await;
         })
         .await
         .expect("the fleet follows within five seconds");
+        controller.stop().await;
+    }
+
+    /// A decision names a followed row once the fleet is reported, and the
+    /// registry holds the worker to send to.
+    #[tokio::test]
+    async fn a_request_is_placed_on_a_followed_worker_once_the_fleet_is_reported() {
+        let mut controller = Serving::start().await;
+        time::timeout(WAIT, async {
+            let row = register(&mut controller.control, 31001, true).await;
+            let store = start(&RouterConfig {
+                policy_controller: true,
+                ..RouterConfig::default()
+            })
+            .unwrap()
+            .expect("the controller was picked");
+            let registry = Arc::new(WorkerRegistry::new());
+            let feed = followed(&store, &registry);
+            let host = Host::new(store, Arc::clone(&feed.objects));
+            let follower = Follower::start(settings(controller.address), feed);
+            until("the first snapshot", || {
+                follower.followed() == Followed::Fleet
+            })
+            .await;
+
+            let placed = host
+                .place(&Ask::of(b"first", "model"), Instant::now())
+                .await
+                .expect("a decision picks the followed worker");
+            assert_eq!(placed.id(), WorkerId(row.id));
+            assert_eq!(placed.worker().url(), url(31001));
+            follower.stop().await;
+        })
+        .await
+        .expect("the request is placed within five seconds");
+        controller.stop().await;
+    }
+
+    /// The gateway probes no followed worker: the controller's verdict on a
+    /// row is the status of the row's worker here.
+    #[tokio::test]
+    async fn a_followed_worker_is_sendable_only_while_its_row_is_ready() {
+        let mut controller = Serving::start().await;
+        time::timeout(WAIT, async {
+            let waiting = register(&mut controller.control, 31001, false).await;
+            let ready = register(&mut controller.control, 31002, true).await;
+            let store = Arc::new(MemoryStore::new());
+            let registry = Arc::new(WorkerRegistry::new());
+            let follower =
+                Follower::start(settings(controller.address), followed(&store, &registry));
+            until("the first snapshot", || {
+                follower.followed() == Followed::Fleet
+            })
+            .await;
+            let sendable = |port| registry.get_by_url(&url(port)).unwrap().is_healthy();
+            assert!(!sendable(31001));
+            assert!(sendable(31002));
+
+            // The controller's health write turns the waiting row ready.
+            controller
+                .store
+                .set_status(WorkerId(waiting.id), WorkerStatus::Ready, waiting.revision)
+                .expect("the status moves");
+            until("the promotion", || sendable(31001)).await;
+
+            // A drain takes the ready row out.
+            controller
+                .control
+                .deregister_worker(operator(proto::DeregisterWorkerRequest {
+                    worker_id: ready.id,
+                    revision: ready.revision,
+                    drain: true,
+                }))
+                .await
+                .unwrap();
+            until("the drain", || !sendable(31002)).await;
+            follower.stop().await;
+        })
+        .await
+        .expect("the status follows within five seconds");
         controller.stop().await;
     }
 
@@ -472,7 +613,7 @@ pub(crate) mod tests {
             .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .unwrap();
         let store = Arc::new(MemoryStore::new());
-        let follower = Follower::start(settings(socket.local_addr().unwrap()), store.clone());
+        let follower = Follower::start(settings(socket.local_addr().unwrap()), fed(&store));
         let progress = follower.followed.clone();
         time::sleep(Duration::from_millis(300)).await;
         assert_eq!(follower.followed(), Followed::Nothing);
@@ -491,7 +632,7 @@ pub(crate) mod tests {
             .unwrap();
         let expected = rows(&controller.store);
         let store = Arc::new(MemoryStore::new());
-        let follower = Follower::start(settings(controller.address), store.clone());
+        let follower = Follower::start(settings(controller.address), fed(&store));
         until("the first snapshot", || {
             follower.followed() == Followed::Fleet
         })
@@ -662,7 +803,7 @@ pub(crate) mod tests {
                     .add_routes(Routes::from(routes))
                     .serve_with_incoming(TcpIncoming::from(socket)),
             );
-            let follower = Follower::start(settings, Arc::new(MemoryStore::new()));
+            let follower = Follower::start(settings, fed(&Arc::new(MemoryStore::new())));
             until("the first snapshot over mutual TLS", || {
                 follower.followed() == Followed::Fleet
             })
@@ -862,7 +1003,8 @@ pub(crate) mod tests {
                         .serve_with_incoming(TcpIncoming::from(socket)),
                 );
             }
-            let follower = Follower::start(settings(seed_address), Arc::new(MemoryStore::new()));
+            let follower =
+                Follower::start(settings(seed_address), fed(&Arc::new(MemoryStore::new())));
             let mut progress = follower.followed.clone();
             assert_eq!(calls.recv().await, Some((0, 0, 1)));
             assert_eq!(calls.recv().await, Some((0, 0, 1)));

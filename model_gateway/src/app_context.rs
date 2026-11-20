@@ -946,9 +946,9 @@ impl AppContextBuilder {
         self
     }
 
-    /// Start the policy store with its membership feed and host and, when
-    /// configured, its worker watch. A start the store refuses stops this
-    /// one, by name.
+    /// Start the policy store with its membership feed and host and, under
+    /// a controller's address, the follower of that controller's workers.
+    /// A start the store refuses stops this one, by name.
     fn with_policy_controller(
         mut self,
         config: &RouterConfig,
@@ -960,20 +960,16 @@ impl AppContextBuilder {
             let registry = self.worker_registry.as_ref().ok_or_else(|| {
                 "worker_registry must be set before the policy controller".to_string()
             })?;
-            let feed =
-                policy_controller::feed::feed(store, registry, Arc::clone(&self.engine_connector));
+            let controller = config
+                .policy_controller_address
+                .as_ref()
+                .map(|address| Settings::new(address.clone(), config));
+            let connector = Arc::clone(&self.engine_connector);
+            let (feed, follower) = policy_controller::feeds(store, registry, connector, controller);
             let host = Host::new(Arc::clone(store), Arc::clone(&feed.objects));
             self.policy_feed = Some(feed);
             self.policy_host = Some(Arc::new(host));
-        }
-        if let (Some(address), Some(store)) =
-            (&config.policy_controller_address, &self.policy_store)
-        {
-            let settings = Settings::new(address.clone(), config);
-            self.policy_follower = Some(Arc::new(Mutex::new(Some(Follower::start(
-                settings,
-                Arc::clone(store),
-            )))));
+            self.policy_follower = follower.map(|follower| Arc::new(Mutex::new(Some(follower))));
         }
         Ok(self)
     }

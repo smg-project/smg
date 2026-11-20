@@ -21,7 +21,9 @@
 //!
 //! Under a controller's address a follower keeps the store's worker rows
 //! as that controller's watch tells them ([`follower`]). The gateway then
-//! discovers, registers and probes no worker of its own.
+//! discovers, registers and probes no worker of its own. Each row has its
+//! worker object in the registry before the gateway reports a fleet, and
+//! the object's status is the row's ([`feeds`]).
 
 use std::sync::Arc;
 
@@ -29,12 +31,13 @@ use smg_policy_controller::{
     store::{MemoryStore, StaleGeneration},
     Catalog, SpecError,
 };
+use smg_worker::connection::engine::EngineConnector;
 use tracing::info;
 
 use crate::{
     app_context::AppContext,
     config::{PolicyDocumentError, RouterConfig},
-    routers::RouterTrait,
+    routers::{common::snapshot::WorkerRegistry, RouterTrait},
 };
 
 // The follower dials through the controller crate's client, which two
@@ -61,6 +64,8 @@ pub(crate) mod feed;
 pub(crate) mod host;
 mod undecided;
 
+use feed::Feed;
+use follower::{Follower, Settings};
 pub(crate) use undecided::refused;
 use undecided::Undecided;
 
@@ -113,6 +118,30 @@ pub(crate) fn start_with(
     store.apply(generation)?;
     info!("The policy controller is picked for this gateway: no classic router is built");
     Ok(Some(Arc::new(store)))
+}
+
+/// The store's membership feed and, under a controller's address, the
+/// follower that writes the store in the door's place.
+///
+/// The two are made together because they are one rule. A gateway that
+/// follows a controller probes no worker, so its holder copies each row's
+/// status onto the row's object ([`feed::following`]), and its follower
+/// settles the feed after each event. Elsewhere the door is the store's
+/// writer, and it settles the feed itself.
+pub(crate) fn feeds(
+    store: &Arc<MemoryStore>,
+    registry: &Arc<WorkerRegistry>,
+    connector: Arc<dyn EngineConnector>,
+    controller: Option<Settings>,
+) -> (Feed, Option<Follower>) {
+    match controller {
+        Some(settings) => {
+            let feed = feed::following(store, registry, connector);
+            let follower = Follower::start(settings, feed.clone());
+            (feed, Some(follower))
+        }
+        None => (feed::feed(store, registry, connector), None),
+    }
 }
 
 /// The controller's router for this process: the one router its server
