@@ -56,6 +56,9 @@
 //! and sets the object's status to the status that stands there. The host
 //! supplies the [`Lead`] and the term the adapter writes under.
 //!
+//! [`LoadAdapter`] writes load records and poll answers to the store. The
+//! store decides when the collector polls and keeps the overload verdict.
+//!
 //! [`KvAdapter`] decodes the worker's KV events for the store's index, and
 //! [`KvHost`] gives each subscription its row in the store. Every replica
 //! runs the adapter over its own streams. The adapter keeps what a row's
@@ -79,6 +82,7 @@ mod found;
 mod health;
 mod kv;
 mod lead;
+mod loads;
 mod object;
 mod objects;
 
@@ -89,5 +93,6 @@ pub use found::facts;
 pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, NoFeed, Unfed};
 pub use lead::{Lead, SoleLead};
+pub use loads::LoadAdapter;
 pub use object::object;
 pub use objects::{Members, Objects, Standing};

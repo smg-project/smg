@@ -72,8 +72,8 @@
 //! - Behind the `ingest` feature, the ingestion drivers (`ingest`): the load
 //!   path (the `GetLoads` poll per engine under the store's poll
 //!   arbitration, the metrics scrape of an engine without a servicer) and
-//!   the load helpers (the row conversion, the scrape parser). The KV
-//!   subscription and the prober arrive in the step's later PRs.
+//!   the metrics parser. The load driver and the worker host's load adapter
+//!   share the `load_report` conversion.
 //!
 //! - Behind the `operator` feature, `operator::SpecDoor` applies a
 //!   host's start document and serves its status, document and dry run.
@@ -144,6 +144,8 @@ pub mod handle;
 #[cfg(feature = "ingest")]
 pub mod ingest;
 pub mod lease;
+#[cfg(any(feature = "ingest", feature = "worker-host"))]
+pub mod load_report;
 #[cfg(feature = "operator")]
 pub mod operator;
 #[cfg(any(feature = "wasm", feature = "controller"))]

@@ -84,6 +84,16 @@ pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
         .status(status(row.status))
 }
 
+/// The store's role for a worker object.
+pub(super) fn role(worker_type: WorkerType) -> Role {
+    match worker_type {
+        WorkerType::Regular => Role::Single,
+        WorkerType::Prefill => Role::Prefill,
+        WorkerType::Decode => Role::Decode,
+        WorkerType::Encode => Role::Encode,
+    }
+}
+
 /// The one wire an object speaks, of the set its row holds: gRPC first, then
 /// HTTP, then the host-local wire. A row that names none is dialed over
 /// HTTP, the object's own default.

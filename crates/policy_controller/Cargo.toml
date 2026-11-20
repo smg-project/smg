@@ -61,16 +61,14 @@ kube = { version = "3.0.1", default-features = false, features = ["client", "rus
 
 # The ingestion drivers (the `ingest` feature): the load path over the
 # store's ingress traits (the `GetLoads` poll through the engines' gRPC
-# clients, the metrics scrape over HTTP) and the load helpers (the row
-# conversion, the scrape parser).
+# clients and the metrics scrape over HTTP).
 openai-protocol = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["rustls-no-provider"], optional = true }
 smg-grpc-client = { workspace = true, optional = true }
 
-# A replica's worker objects (the `worker-host` feature): the worker crate's
-# object, its builder and its registry, for the host that keeps an object for
-# every row of the membership store.
-smg-worker = { workspace = true, features = ["runtime"], optional = true }
+# The load report type for `ingest` and `worker-host`. The worker host also
+# needs the runtime for worker objects, the registry and collector ports.
+smg-worker = { workspace = true, optional = true }
 # Worker discovery (the `discovery` feature): the discovery crate with its
 # four providers, each of which the controller's flags can select.
 smg-service-discovery = { workspace = true, features = ["consul", "file", "kubernetes", "slurm"], optional = true }
@@ -129,13 +127,13 @@ tonic-prost-build = { version = "0.14.6", optional = true }
 [features]
 # The ingestion drivers over the store: the load path (the `GetLoads` poll
 # per engine under the store's poll arbitration, the metrics scrape of an
-# engine without a servicer) and the load helpers. Off by default; the
-# controller turns it on.
+# engine without a servicer). Off by default. The controller turns it on.
 ingest = [
     "dep:openai-protocol",
     "dep:reqwest",
     "dep:rustls",
     "dep:smg-grpc-client",
+    "dep:smg-worker",
     "dep:tokio",
     "dep:tonic",
     "dep:tracing",
@@ -202,7 +200,7 @@ kubernetes = ["dep:k8s-openapi", "dep:kube", "tokio/rt"]
 # without it. Where the build holds the engine clients, as the controller's
 # does, it turns their engine port on: the controller hands each object the
 # gRPC connector.
-worker-host = ["dep:smg-worker", "dep:tracing", "smg-grpc-client?/engine-port"]
+worker-host = ["dep:smg-worker", "dep:tracing", "smg-grpc-client?/engine-port", "smg-worker/runtime"]
 
 # Worker discovery on the leading controller, over the replica's worker
 # objects. Off by default.
@@ -291,7 +289,7 @@ required-features = ["controller", "worker-host"]
 name = "spec_store"
 required-features = ["controller", "worker-host"]
 
-# Replays recorded rows through the row builder of `ingest`: a bare test run builds no part of it.
+# Replays recorded rows through the load report conversion under `ingest`.
 [[test]]
 name = "classic_rows"
 required-features = ["ingest"]

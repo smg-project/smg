@@ -1,13 +1,11 @@
 //! The facts a worker object states of its row.
 
-use smg_worker::{
-    identity::basic::Worker,
-    worker::{ConnectionMode, WorkerType},
-};
+use smg_worker::{identity::basic::Worker, worker::ConnectionMode};
 
+use super::object::role;
 use crate::{
     store::{HealthPolicy, WorkerFacts},
-    view::{Role, WireModes},
+    view::WireModes,
 };
 
 /// The facts a provider states of a worker it found, from the object to the
@@ -23,12 +21,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
         key: spec.url.clone(),
         engine: spec.dp_base_url.as_ref().unwrap_or(&spec.url).clone(),
         incarnation: standing.incarnation,
-        role: match spec.worker_type {
-            WorkerType::Regular => Role::Single,
-            WorkerType::Prefill => Role::Prefill,
-            WorkerType::Decode => Role::Decode,
-            WorkerType::Encode => Role::Encode,
-        },
+        role: role(spec.worker_type),
         wire_modes: match spec.connection_mode {
             ConnectionMode::Http => WireModes::HTTP,
             ConnectionMode::Grpc => WireModes::GRPC,
