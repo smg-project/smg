@@ -5122,7 +5122,8 @@ impl Engine {
     /// Decides the decode side for a held prefill. The model's pair binding
     /// runs its decode profile over that prefill's partners in `pools`.
     /// Each picked target names the held prefill and one of those decodes.
-    /// A missing prefill is shed under `prefill-gone`.
+    /// A missing prefill is shed under `prefill-gone`. A shed made once the
+    /// decode profile resolves names that profile.
     pub fn decide_decode(
         &self,
         facts: &RequestFacts<'_>,
@@ -5152,10 +5153,15 @@ impl Engine {
         };
         let shown = self.marks[usize::from(index)].scoped();
         if shown && !decode_cx.stalled.is_empty() {
-            return rows_not_written(bare);
+            return rows_not_written(bare, index);
         }
         let Some(prefill) = pools.prefills.iter().find(|row| row.id == prefill) else {
-            return shed(ShedReason::NoEndpoints, "prefill-gone", bare);
+            // The decode profile is resolved, so the shed names it.
+            let under = Trace {
+                profile: index,
+                ..bare
+            };
+            return shed(ShedReason::NoEndpoints, "prefill-gone", under);
         };
         // This call has one draw sequence, seeded by its own request.
         decode_facts.seed = facts.seed;
@@ -9404,6 +9410,7 @@ mod tests {
             shed_of(&decision),
             Some((ShedReason::NoEndpoints, "prefill-gone"))
         );
+        assert_eq!(decision.trace().made_under(), Some(0));
         assert_eq!(
             (decision.trace().seed, decision.trace().generation),
             (facts.seed, 8)
@@ -9535,6 +9542,10 @@ mod tests {
                 shed_of(&decision),
                 Some((ShedReason::PolicyDeclined, stage))
             );
+            // A decline ahead of the decode profile names none. One past it
+            // names it.
+            let under = (stage == "written-rows").then_some(0);
+            assert_eq!(decision.trace().made_under(), under, "{stage}");
         }
         assert!(phases.lock().expect("the phases shown").is_empty());
         assert!(decide(&engine, &facts, pools, &cx).pick().is_some());
