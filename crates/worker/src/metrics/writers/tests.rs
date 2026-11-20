@@ -9,8 +9,14 @@ use crate::{
     worker::{SchedulerLoadSnapshot, WorkerLoadResponse},
 };
 
-/// Core engine gauges share these labels for the snapshot fixtures.
-const CORE_LABELS: [&str; 3] = ["dp_rank=\"2\"", "model=\"m\"", "worker=\"http://w:1\""];
+/// Core engine gauges share these labels for the snapshot fixtures: a
+/// worker that is on neither side of a pair, whose engine reports no role.
+const CORE_LABELS: [&str; 4] = [
+    "dp_rank=\"2\"",
+    "model=\"m\"",
+    "worker=\"http://w:1\"",
+    "role=\"null\"",
+];
 
 #[test]
 fn record_engine_load_sets_core_gauges_per_dp_rank() {
@@ -30,7 +36,7 @@ fn record_engine_load_sets_core_gauges_per_dp_rank() {
     };
 
     let rendered = render_with_recorder(|| {
-        Metrics::record_engine_load("http://w:1", "m", &response);
+        Metrics::record_engine_load("http://w:1", "m", "null", &response);
     });
 
     // The exporter renders labels in insertion order, so assert on the
@@ -61,7 +67,7 @@ fn record_engine_load_sets_the_kv_capacity_when_the_engine_reports_it() {
         ..Default::default()
     };
     let rendered = render_with_recorder(|| {
-        Metrics::record_engine_load("http://w:1", "m", &response);
+        Metrics::record_engine_load("http://w:1", "m", "null", &response);
     });
     assert_metric(
         &rendered,
@@ -73,7 +79,7 @@ fn record_engine_load_sets_the_kv_capacity_when_the_engine_reports_it() {
 
     response.loads[0].max_total_num_tokens = 0;
     let rendered = render_with_recorder(|| {
-        Metrics::record_engine_load("http://w:1", "m", &response);
+        Metrics::record_engine_load("http://w:1", "m", "null", &response);
     });
     assert!(
         !rendered.contains("smg_engine_kv_capacity_tokens"),
@@ -121,7 +127,7 @@ fn record_engine_load_sets_pd_gauges_when_disagg_present() {
     };
 
     let rendered = render_with_recorder(|| {
-        Metrics::record_engine_load("http://w:1", "m", &response);
+        Metrics::record_engine_load("http://w:1", "m", "null", &response);
     });
 
     let pd_labels = ["role=\"prefill\"", "worker=\"http://w:1\"", "dp_rank=\"0\""];
@@ -179,9 +185,9 @@ fn the_engine_load_set_renders_the_same_through_kept_handles() {
         ..Default::default()
     };
     let records = || {
-        Metrics::record_engine_load("http://w:1", "m", &report(7, 0.25));
-        Metrics::record_engine_rank_load("http://w:1", "m", &report(8, 0.75).loads[0]);
-        Metrics::record_engine_load("http://w:2", "m2", &report(1, 0.5));
+        Metrics::record_engine_load("http://w:1", "m", "null", &report(7, 0.25));
+        Metrics::record_engine_rank_load("http://w:1", "m", "null", &report(8, 0.75).loads[0]);
+        Metrics::record_engine_load("http://w:2", "m2", "null", &report(1, 0.5));
     };
     let built = render_with_recorder(|| {
         handles::force_on_this_thread(Some(false));
@@ -195,14 +201,14 @@ fn the_engine_load_set_renders_the_same_through_kept_handles() {
     });
     assert_eq!(sorted_series(&kept), sorted_series(&built));
     for expected in [
-        "smg_engine_running_requests{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\"} 8",
-        "smg_engine_running_requests{worker=\"http://w:1\",model=\"m\",dp_rank=\"1\"} 8",
-        "smg_engine_cache_hit_rate{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\"} 0.75",
-        "smg_engine_cache_hit_rate{worker=\"http://w:1\",model=\"m\",dp_rank=\"1\"} 0.25",
-        "smg_engine_kv_capacity_tokens{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\"} 262144",
+        "smg_engine_running_requests{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\",role=\"null\"} 8",
+        "smg_engine_running_requests{worker=\"http://w:1\",model=\"m\",dp_rank=\"1\",role=\"null\"} 8",
+        "smg_engine_cache_hit_rate{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\",role=\"null\"} 0.75",
+        "smg_engine_cache_hit_rate{worker=\"http://w:1\",model=\"m\",dp_rank=\"1\",role=\"null\"} 0.25",
+        "smg_engine_kv_capacity_tokens{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\",role=\"null\"} 262144",
         "smg_engine_pd_kv_transfer_latency_ms{worker=\"http://w:1\",role=\"prefill\",dp_rank=\"0\"} 3.5",
         "smg_engine_pd_prefill_queue_reqs{worker=\"http://w:1\",role=\"prefill\",dp_rank=\"0\"} 9",
-        "smg_engine_running_requests{worker=\"http://w:2\",model=\"m2\",dp_rank=\"1\"} 2",
+        "smg_engine_running_requests{worker=\"http://w:2\",model=\"m2\",dp_rank=\"1\",role=\"null\"} 2",
     ] {
         assert!(
             kept.lines().any(|line| line == expected),
@@ -219,6 +225,78 @@ fn the_engine_load_set_renders_the_same_through_kept_handles() {
         !kept.contains("smg_engine_pd_kv_transfer_speed_gb_s"),
         "a figure no load carried has no series:\n{kept}"
     );
+}
+
+/// A worker's load series carry the role it is registered in, whether or
+/// not its engine reports one, so a pool's load splits by role for every
+/// engine. The pair series keep the role the engine reports.
+#[test]
+fn a_load_series_carries_its_workers_registered_role() {
+    let load = |disagg_mode: Option<&str>| WorkerLoadResponse {
+        timestamp: "t".to_string(),
+        dp_rank_count: 1,
+        loads: vec![SchedulerLoadSnapshot {
+            dp_rank: 0,
+            num_running_reqs: 5,
+            max_total_num_tokens: 1_024,
+            disagg_mode: disagg_mode.map(str::to_string),
+            prefill_queue_reqs: disagg_mode.map(|_| 3),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let rendered = render_with_recorder(|| {
+        Metrics::record_engine_load("http://d:1", "m", "decode", &load(None));
+        Metrics::record_engine_load("http://p:1", "m", "prefill", &load(Some("prefill")));
+        Metrics::record_engine_load("http://r:1", "m", "null", &load(None));
+    });
+    for (worker, role) in [
+        ("http://d:1", "decode"),
+        ("http://p:1", "prefill"),
+        ("http://r:1", "null"),
+    ] {
+        for (name, value) in [
+            ("smg_engine_running_requests", "5"),
+            ("smg_engine_kv_capacity_tokens", "1024"),
+        ] {
+            let expected = format!(
+                "{name}{{worker=\"{worker}\",model=\"m\",dp_rank=\"0\",role=\"{role}\"}} {value}"
+            );
+            assert!(
+                rendered.lines().any(|line| line == expected),
+                "missing {expected} in:\n{rendered}"
+            );
+        }
+    }
+    assert_eq!(
+        rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_engine_running_requests{"))
+            .count(),
+        3,
+        "one series a worker, under one role:\n{rendered}"
+    );
+    // The engine that reports its role has its pair series under it, and an
+    // engine that reports none has no pair series.
+    assert_eq!(
+        rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_engine_pd_prefill_queue_reqs{"))
+            .collect::<Vec<_>>(),
+        ["smg_engine_pd_prefill_queue_reqs{worker=\"http://p:1\",role=\"prefill\",dp_rank=\"0\"} 3"],
+        "{rendered}"
+    );
+}
+
+/// The registered role of each worker type: the two sides of a pair by
+/// name, and the engines' own `null` for a worker on neither.
+#[test]
+fn the_registered_role_is_the_side_of_a_pair_or_null() {
+    use crate::worker::WorkerType;
+    assert_eq!(registered_engine_role(&WorkerType::Prefill), "prefill");
+    assert_eq!(registered_engine_role(&WorkerType::Decode), "decode");
+    assert_eq!(registered_engine_role(&WorkerType::Regular), "null");
+    assert_eq!(registered_engine_role(&WorkerType::Encode), "null");
 }
 
 #[test]
