@@ -62,6 +62,10 @@ use crate::{
     },
     persistence_utils::persist_conversation_items,
     sse::{sse_channel, SseEncoder, SseSender},
+    upstream_body::{
+        error_body_text, read_response_body_limited, ReadBodyResult, ERROR_BODY_TOO_LARGE,
+        MAX_ERROR_RESPONSE_SIZE,
+    },
 };
 
 /// Apply all transformations to event data in-place (rewrite + transform)
@@ -677,9 +681,15 @@ pub(super) async fn handle_simple_streaming_passthrough(
     worker.record_outcome(status.as_u16());
 
     if !status.is_success() {
-        let error_body = response.text().await.unwrap_or_else(|err| {
-            format!("Failed to read upstream error body: {}", err.without_url())
-        });
+        let error_body = match read_response_body_limited(response, MAX_ERROR_RESPONSE_SIZE).await {
+            ReadBodyResult::Ok(body) => body,
+            ReadBodyResult::TooLarge => {
+                return error::create_error(status, "upstream_error", ERROR_BODY_TOO_LARGE);
+            }
+            // The reader's text of a failed read is the body stream's own, which
+            // carries no request URL.
+            ReadBodyResult::Error(err) => format!("Failed to read upstream error body: {err}"),
+        };
         let error_body = error::sanitize_error_body(&error_body);
         return (status, error_body).into_response();
     }
@@ -1084,8 +1094,7 @@ pub(super) fn handle_streaming_with_tool_interception(
 
             if !response.status().is_success() {
                 let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                let body = error::sanitize_error_body(&body);
+                let body = error_body_text(response).await;
                 let (code, message) = upstream_status_error(status, &body);
                 send_error_event(&tx, &mut sse_encoder, &mut sequence_number, &code, &message)
                     .await;
@@ -1645,11 +1654,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = text_of(response).await;
-        assert!(
-            body.contains("Failed to read upstream error body"),
-            "{body}"
+        assert_eq!(
+            body,
+            "Failed to read upstream error body: error decoding response body"
         );
-        assert!(!body.contains(&addr.to_string()), "{body}");
     }
 
     /// The plain streaming path's answer to a streamed request for the worker
