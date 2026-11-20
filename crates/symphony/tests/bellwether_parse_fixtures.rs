@@ -468,6 +468,7 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("hermes-4-14b", GenerationPrompt::Plain),
     ("granite-4.1-3b", GenerationPrompt::Plain),
     ("granite-switch-4.1-8b", GenerationPrompt::Plain),
+    ("granite-4.1-3b-llmon-preview", GenerationPrompt::Plain),
     ("ai21-jamba2-3b", GenerationPrompt::Plain),
     ("step-3.5-flash", GenerationPrompt::AlwaysOpensTheThought),
     // Step-5-Preview writes ChatML after a DeepSeek-style beginning-of-sentence marker, the tools
@@ -1198,6 +1199,9 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
         "granite-switch-4.1-8b",
         "<|start_of_role|>assistant<|end_of_role|>",
     ),
+    // The template writes two characters it draws anew at every render before the role
+    // header's close mark, so the replay starts at that mark, the last text every render shares.
+    ("granite-4.1-3b-llmon-preview", "<|close|>"),
     ("laguna-xs.2", "<assistant>"),
     ("spark-x2.6-4b", "<｜start▁of▁sentence｜><|Bot|>"),
     ("a.x-3.1-light", "<|im_start|><|assistant|>"),
