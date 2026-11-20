@@ -31,7 +31,9 @@
 //! the routing configuration means it, and the gateway's YAML of it where
 //! it was given. The door stays in the context beside the store. The
 //! control plane reads the document in force through it and checks another
-//! against it ([`operators`]). Nothing is applied after the start.
+//! against it ([`operators`]). After the start one thing applies a document
+//! again: a model's own policy, which its first worker's `policy` label
+//! names ([`labels`]).
 //!
 //! One site reads the setting, [`start_with`]. Every other site asks what
 //! the start left in the context.
@@ -82,6 +84,7 @@ pub(crate) mod feed;
     )
 )]
 pub(crate) mod host;
+pub(crate) mod labels;
 pub(crate) mod operators;
 mod undecided;
 pub(crate) mod upkeep;

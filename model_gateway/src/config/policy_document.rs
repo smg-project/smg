@@ -75,8 +75,8 @@ use smg_policy_controller::{
     spec::{
         BestWithTemperatureParams, BindingSpec, BoundedLoadParams, BucketParams,
         ConsistentHashParams, IndexKind, IndexSpec, KeySourceSpec, KvPressureParams,
-        LeastLoadParams, OverloadSpec, Pairing, PickStage, PrefixAffinityParams, ProfileSpec,
-        RoutingKeySpec, ScoreSpec, ScoreStage, SpillParams, WarmupSliceParams,
+        LeastLoadParams, OverloadSpec, Pairing, PickStage, PlanName, PrefixAffinityParams,
+        ProfileSpec, RoutingKeySpec, ScoreSpec, ScoreStage, SpillParams, WarmupSliceParams,
         MANUAL_SESSION_HEADER, MAX_KEY_SOURCES, OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS,
     },
     AppliedSpec, Assignment, Phase, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError,
@@ -168,6 +168,71 @@ impl RouterConfig {
             }
         }
         written(self, presets(self)?)
+    }
+
+    /// [`Self::policy_document`] with one binding more for each model of
+    /// `labelled`: a model and the name of the policy its first worker's
+    /// `policy` label gave it. The classic line builds such a model's policy
+    /// from its name alone, so the binding runs that policy's preset, at the
+    /// numbers the preset itself runs at. It matches the model's id alone,
+    /// and stands ahead of the binding of every other single worker's
+    /// request and behind a pair's, in the order the models are handed.
+    ///
+    /// The whole plan is written as the settings' own is, so a label's
+    /// policy shares the places the document holds once with every other
+    /// side. A label that names the main policy binds nothing: the settings
+    /// write that policy already. A label the document cannot say is left
+    /// out, and its model is decided as every other is. Each is answered
+    /// with why: a policy that names another value where the document holds
+    /// one for every side, a name no preset has, a model's id a binding
+    /// reads as a pattern, and a document that plans no single workers. A
+    /// label moves no family in or out: the families are settled with none.
+    ///
+    /// Each document with one label more is checked as the door checks a
+    /// document this gateway hosts ([`Self::hosted_policy`]). A label the
+    /// door would refuse is left out alone, with the door's reason, so it
+    /// never fails the documents of the labels behind it.
+    pub(crate) fn policy_document_labelled(
+        &self,
+        labelled: &[(String, &'static str)],
+    ) -> Result<(PolicySpec, Vec<(String, PolicyDocumentError)>), PolicyDocumentError> {
+        let settled = self.policy_document()?;
+        let both = both_families(self)?
+            .is_some_and(|(both, _)| both.bindings.len() == settled.bindings.len());
+        let mut document = settled.clone();
+        let mut bound: Vec<(&str, PolicyConfig)> = Vec::with_capacity(labelled.len());
+        let mut left = Vec::new();
+        for (model, name) in labelled {
+            if settled.profiles.contains_key(*name) {
+                continue;
+            }
+            let policy = match labelled_policy(model, name, &settled) {
+                Ok(policy) => policy,
+                Err(why) => {
+                    left.push((model.clone(), why));
+                    continue;
+                }
+            };
+            bound.push((model, policy));
+            let planned = match both_families(self)? {
+                Some(planned) if both => planned,
+                _ => presets(self)?,
+            };
+            let candidate = bind_labelled(planned, &bound)
+                .and_then(|planned| written(self, planned))
+                .and_then(|written| {
+                    self.hosted_policy(&written)?;
+                    Ok(written)
+                });
+            match candidate {
+                Ok(written) => document = written,
+                Err(why) => {
+                    bound.pop();
+                    left.push((model.clone(), why));
+                }
+            }
+        }
+        Ok((document, left))
     }
 
     /// The document this gateway runs. Without a supplied document, it is
@@ -331,6 +396,100 @@ fn first_difference(
 }
 
 /// The settings that decide a placement today and that no document says.
+/// The policy of a preset's name with every setting at its flag's default:
+/// the numbers that preset runs at. `None` where no preset has the name.
+fn at_flag_defaults(name: &str) -> Option<PolicyConfig> {
+    Some(match name {
+        "random" => PolicyConfig::Random,
+        "round_robin" => PolicyConfig::RoundRobin,
+        "passthrough" => PolicyConfig::Passthrough,
+        "consistent_hashing" => PolicyConfig::ConsistentHashing,
+        "cache_aware" => PolicyConfig::cache_aware(0.3, 64, 1.5, 120, 67_108_864),
+        "power_of_two" => PolicyConfig::PowerOfTwo {
+            load_metric: PowerOfTwoLoadMetric::ExpectedWait,
+        },
+        "least_load" => PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.15,
+            mean_prefill_tokens: 1024,
+            default_throughput: 2000.0,
+        },
+        "bucket" => PolicyConfig::Bucket {
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            bucket_adjust_interval_secs: 5,
+        },
+        "manual" => PolicyConfig::Manual {
+            eviction_interval_secs: 60,
+            max_idle_secs: 14_400,
+            assignment_mode: ManualAssignmentMode::Random,
+        },
+        "prefix_hash" => PolicyConfig::PrefixHash {
+            prefix_token_count: 256,
+            load_factor: 1.25,
+            balance_abs_threshold: 10,
+            cache_boundaries: Vec::new(),
+        },
+        _ => return None,
+    })
+}
+
+/// A worker's `policy` label, as a refusal names it.
+const POLICY_LABEL: &str = "worker label policy";
+
+/// The policy a label's name means, at the numbers its preset runs at, or
+/// why `settled`, the settings' document, binds no such model of its own.
+fn labelled_policy(
+    model: &str,
+    name: &'static str,
+    settled: &PolicySpec,
+) -> Result<PolicyConfig, PolicyDocumentError> {
+    let single = settled
+        .bindings
+        .last()
+        .is_some_and(|last| !matches!(last.plan, Some(PlanName::PdPair | PlanName::Epd)));
+    if !single {
+        return Err(unsaid(
+            POLICY_LABEL,
+            name,
+            "the document plans no single workers, and a side's policy is the mode's",
+        ));
+    }
+    if model.is_empty() || model.contains('*') {
+        return Err(unsaid(
+            POLICY_LABEL,
+            name,
+            "a binding matches no model of this id alone: it reads the id as a pattern",
+        ));
+    }
+    at_flag_defaults(name).ok_or_else(|| unsaid(POLICY_LABEL, name, "no preset has this name"))
+}
+
+/// A plan with one binding more for each labelled model: the model's id
+/// alone under the preset of its policy's name, ahead of the plan's last
+/// binding, the one of every other single worker's request. A preset's
+/// profile is taken once, however many models name it.
+fn bind_labelled<'a>(
+    (mut document, mut sides): Planned<'a>,
+    labelled: &'a [(&str, PolicyConfig)],
+) -> Result<Planned<'a>, PolicyDocumentError> {
+    for (model, policy) in labelled {
+        let name = policy.name();
+        let mut preset = PolicySpec::preset(name)?;
+        let mut binding = preset.bindings.pop().ok_or(PolicyDocumentError::NoPart {
+            policy: name,
+            part: "binding",
+        })?;
+        (*model).clone_into(&mut binding.matcher.model);
+        for (profile, written) in preset.profiles {
+            document.profiles.entry(profile).or_insert(written);
+        }
+        let last = document.bindings.len().saturating_sub(1);
+        document.bindings.insert(last, binding);
+        sides.insert(last, vec![(name, policy)]);
+    }
+    Ok((document, sides))
+}
+
 fn refuse_unsaid(config: &RouterConfig) -> Result<(), PolicyDocumentError> {
     if config.dp_minimum_tokens_scheduler {
         return Err(unsaid(
@@ -1184,43 +1343,11 @@ mod tests {
         }
     }
 
-    /// The policy of a preset's name with every setting at its flag's
-    /// default.
+    /// [`super::at_flag_defaults`] for a preset of this build.
     fn at_flag_defaults(name: &str) -> PolicyConfig {
-        match name {
-            "random" => PolicyConfig::Random,
-            "round_robin" => PolicyConfig::RoundRobin,
-            "passthrough" => PolicyConfig::Passthrough,
-            "consistent_hashing" => PolicyConfig::ConsistentHashing,
-            "cache_aware" => PolicyConfig::cache_aware(0.3, 64, 1.5, 120, 67_108_864),
-            "power_of_two" => PolicyConfig::PowerOfTwo {
-                load_metric: PowerOfTwoLoadMetric::ExpectedWait,
-            },
-            "least_load" => PolicyConfig::LeastLoad {
-                kv_pressure_weight: 0.15,
-                mean_prefill_tokens: 1024,
-                default_throughput: 2000.0,
-            },
-            "bucket" => PolicyConfig::Bucket {
-                balance_abs_threshold: 64,
-                balance_rel_threshold: 1.5,
-                bucket_adjust_interval_secs: 5,
-            },
-            "manual" => PolicyConfig::Manual {
-                eviction_interval_secs: 60,
-                max_idle_secs: 14_400,
-                assignment_mode: ManualAssignmentMode::Random,
-            },
-            "prefix_hash" => PolicyConfig::PrefixHash {
-                prefix_token_count: 256,
-                load_factor: 1.25,
-                balance_abs_threshold: 10,
-                cache_boundaries: Vec::new(),
-            },
-            other => {
-                panic!("the controller has a preset this module converts no policy to: {other}")
-            }
-        }
+        super::at_flag_defaults(name).unwrap_or_else(|| {
+            panic!("the controller has a preset this module converts no policy to: {name}")
+        })
     }
 
     fn preset(name: &str) -> PolicySpec {
@@ -2493,5 +2620,225 @@ mod tests {
         let pairs_alone = clash.policy_document();
         assert!(pairs_alone.is_ok(), "{pairs_alone:?}");
         assert_eq!(many_routers(clash).policy_document(), pairs_alone);
+    }
+
+    const LABELLED: &str = "qwen3";
+
+    fn labelled(models: &[(&str, &'static str)]) -> Vec<(String, &'static str)> {
+        models
+            .iter()
+            .map(|&(model, name)| (model.to_owned(), name))
+            .collect()
+    }
+
+    /// The labelled document of `config`, and the labels it left out, each
+    /// with the setting its refusal names.
+    fn bound(
+        config: &RouterConfig,
+        models: &[(&str, &'static str)],
+    ) -> (PolicySpec, Vec<(String, String)>) {
+        let (document, left) = config
+            .policy_document_labelled(&labelled(models))
+            .expect("the settings' document");
+        let left = left
+            .into_iter()
+            .map(|(model, why)| (model, why.to_string()))
+            .collect();
+        (document, left)
+    }
+
+    /// One model whose first worker's label names another policy than the
+    /// main one. Its binding stands ahead of the wildcard and is the
+    /// binding of that policy's own document but for the model it matches,
+    /// its profile is that document's, and nothing else of the settings'
+    /// document moves.
+    #[test]
+    fn a_labelled_model_is_bound_ahead_of_the_wildcard_under_its_policys_preset() {
+        let config = config(PolicyConfig::RoundRobin);
+        let settled = config.policy_document().expect("the settings' document");
+        let (document, left) = bound(&config, &[(LABELLED, "consistent_hashing")]);
+        assert_eq!(left, []);
+        let own = self::config(PolicyConfig::ConsistentHashing)
+            .policy_document()
+            .expect("the labelled policy's own document");
+        let mut of_model = own.bindings[0].clone();
+        assert!(of_model.routing_key.is_some(), "the ring reads a key");
+        of_model.matcher.model = LABELLED.to_owned();
+        assert_eq!(document.bindings, [of_model, settled.bindings[0].clone()]);
+        assert_eq!(
+            document.profiles["consistent_hashing"],
+            own.profiles["consistent_hashing"]
+        );
+        let mut rest = document.clone();
+        rest.bindings.remove(0);
+        rest.profiles.remove("consistent_hashing");
+        assert_eq!(rest, settled);
+        config
+            .hosted_policy(&document)
+            .expect("the labelled document validates");
+    }
+
+    /// The labelled bindings stand in the order the models are handed, and
+    /// two models of one label run one profile.
+    #[test]
+    fn labelled_models_stand_in_their_order_and_share_a_policys_profile() {
+        let config = config(PolicyConfig::RoundRobin);
+        let (document, left) = bound(
+            &config,
+            &[
+                ("a", "consistent_hashing"),
+                ("b", "least_load"),
+                ("c", "consistent_hashing"),
+            ],
+        );
+        assert_eq!(left, []);
+        let matched: Vec<_> = document
+            .bindings
+            .iter()
+            .map(|binding| (binding.matcher.model.as_str(), binding.profile.as_deref()))
+            .collect();
+        assert_eq!(
+            matched,
+            [
+                ("a", Some("consistent_hashing")),
+                ("b", Some("least_load")),
+                ("c", Some("consistent_hashing")),
+                ("*", Some("round_robin")),
+            ]
+        );
+        assert_eq!(document.profiles.len(), 3);
+        assert_eq!(
+            document.profiles["least_load"],
+            preset("least_load").profiles["least_load"]
+        );
+        config
+            .hosted_policy(&document)
+            .expect("the labelled document validates");
+    }
+
+    /// No label, and a label that names the main policy, write the
+    /// settings' document: the wildcard's profile is that policy already.
+    #[test]
+    fn a_label_naming_the_main_policy_binds_nothing() {
+        let config = config(at_flag_defaults("least_load"));
+        let settled = config.policy_document().expect("the settings' document");
+        assert_eq!(bound(&config, &[]), (settled.clone(), Vec::new()));
+        assert_eq!(
+            bound(&config, &[(LABELLED, "least_load")]),
+            (settled, Vec::new())
+        );
+    }
+
+    /// A label the document cannot say is left out with why, and the
+    /// labels beside it stand: a policy that names another value where the
+    /// document holds one for every side, a name no preset has, and a
+    /// model's id a binding reads as a pattern.
+    #[test]
+    fn a_label_the_document_cannot_say_is_left_out_with_why() {
+        // The main policy names two boundaries, and a cache-aware policy at
+        // its preset's numbers names none.
+        let config = config(PolicyConfig::PrefixHash {
+            prefix_token_count: 256,
+            load_factor: 1.25,
+            balance_abs_threshold: 10,
+            cache_boundaries: vec![64, 512],
+        });
+        let (document, left) = bound(
+            &config,
+            &[
+                ("a", "cache_aware"),
+                ("b", "round_robin"),
+                ("c", "no_such_policy"),
+                ("llama*", "round_robin"),
+                ("a*b", "round_robin"),
+                ("", "round_robin"),
+            ],
+        );
+        let models: Vec<_> = document
+            .bindings
+            .iter()
+            .map(|binding| binding.matcher.model.as_str())
+            .collect();
+        assert_eq!(models, ["b", "*"]);
+        let pattern = "worker label policy = round_robin: a binding matches no model of this id \
+                       alone: it reads the id as a pattern";
+        assert_eq!(
+            left,
+            [
+                (
+                    "a".to_owned(),
+                    "cache_boundaries = [] and [64,512]: two sides name two values and the \
+                     document holds one for every side"
+                        .to_owned()
+                ),
+                (
+                    "c".to_owned(),
+                    "worker label policy = no_such_policy: no preset has this name".to_owned()
+                ),
+                ("llama*".to_owned(), pattern.to_owned()),
+                ("a*b".to_owned(), pattern.to_owned()),
+                (String::new(), pattern.to_owned()),
+            ]
+        );
+    }
+
+    /// A label whose binding the door would refuse is left out with the
+    /// door's reason, and the label behind it binds. Here the tenant
+    /// header, which the gateway denies a document's view, is the header a
+    /// consistent hashing profile keys by.
+    #[test]
+    fn a_label_the_door_would_refuse_is_left_out_and_the_next_one_binds() {
+        let mut config = config(PolicyConfig::RoundRobin);
+        config.tenant_resolution.tenant_header_name = "x-smg-routing-key".to_owned();
+        let (document, left) = bound(&config, &[("a", "consistent_hashing"), ("b", "least_load")]);
+        let models: Vec<_> = document
+            .bindings
+            .iter()
+            .map(|binding| binding.matcher.model.as_str())
+            .collect();
+        assert_eq!(models, ["b", "*"]);
+        let [(model, why)] = left.as_slice() else {
+            panic!("one label is left out: {left:?}");
+        };
+        assert_eq!(model, "a");
+        assert!(why.contains("is on the deny-list"), "{why}");
+    }
+
+    /// A document of pairs alone plans no single workers, so it binds no
+    /// label. A gateway of many routers binds a labelled model behind its
+    /// pairs and ahead of every other single worker's request.
+    #[test]
+    fn a_labelled_binding_stands_behind_the_pairs_and_only_beside_single_workers() {
+        let pairs = RouterConfig {
+            mode: pair_mode(None, None),
+            ..config(PolicyConfig::RoundRobin)
+        };
+        let settled = pairs.policy_document().expect("the pair document");
+        assert_eq!(
+            bound(&pairs, &[(LABELLED, "consistent_hashing")]),
+            (
+                settled,
+                vec![(
+                    LABELLED.to_owned(),
+                    "worker label policy = consistent_hashing: the document plans no single \
+                     workers, and a side's policy is the mode's"
+                        .to_owned()
+                )]
+            )
+        );
+        let many = many_routers(config(PolicyConfig::RoundRobin));
+        let (document, left) = bound(&many, &[(LABELLED, "consistent_hashing")]);
+        assert_eq!(left, []);
+        let planned: Vec<_> = document
+            .bindings
+            .iter()
+            .map(|binding| (binding.matcher.model.as_str(), binding.plan))
+            .collect();
+        assert_eq!(
+            planned,
+            [("*", Some(PlanName::PdPair)), (LABELLED, None), ("*", None),]
+        );
+        many.hosted_policy(&document)
+            .expect("the labelled document validates");
     }
 }

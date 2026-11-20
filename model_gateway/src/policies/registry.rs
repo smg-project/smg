@@ -894,7 +894,7 @@ impl PolicyRegistry {
 
     /// Whether a policy hint names `config_name`, accepting the same
     /// underscore-stripped aliases as [`PolicyFactory::create_by_name`].
-    fn hint_matches_config(policy_type: &str, config_name: &str) -> bool {
+    pub(crate) fn hint_matches_config(policy_type: &str, config_name: &str) -> bool {
         let hint = policy_type.to_lowercase();
         hint == config_name || hint == config_name.replace('_', "")
     }
@@ -910,6 +910,19 @@ impl PolicyRegistry {
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().name().to_string()))
             .collect()
+    }
+
+    /// Each model with the name of its policy, in the models' order: the
+    /// model's own where its first worker's label named one, the main
+    /// policy's otherwise.
+    pub(crate) fn named_models(&self) -> Vec<(String, &'static str)> {
+        let mut named: Vec<_> = self
+            .model_policies
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().name()))
+            .collect();
+        named.sort_unstable();
+        named
     }
 
     /// Clear all policies (useful for testing)

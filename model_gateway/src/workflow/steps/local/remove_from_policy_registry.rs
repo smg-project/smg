@@ -22,6 +22,20 @@ use crate::{
 const MAX_CONCURRENT_CACHE_REMOVALS: usize = 4;
 static CACHE_REMOVAL_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_CACHE_REMOVALS);
 
+/// Every model a removed worker was registered with or lists now, not its
+/// primary alone: a worker listing several models can be the last to serve
+/// one whose own workers left first. The workers the registry step removed
+/// count as well as the ones found, since a same-URL replacement during
+/// the drain is the one removed.
+pub(crate) fn removed_models(data: &WorkerRemovalWorkflowData) -> HashSet<String> {
+    data.actual_workers_to_remove
+        .iter()
+        .flatten()
+        .chain(&data.removed_workers)
+        .flat_map(WorkerRegistry::policy_model_ids)
+        .collect()
+}
+
 /// Step to remove workers from the policy registry.
 ///
 /// Removes each worker from cache-aware policies and drops the policy of a
@@ -104,18 +118,9 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
         // node's workers serves any more loses its policy. Asked of the
         // registry rather than counted, so a worker registered again, or a
         // mesh import removed here, cannot keep a policy alive or end it
-        // early. Every model a worker was registered with or lists now is
-        // asked after, not its primary alone: a worker listing several
-        // models can be the last to serve one whose own workers left first.
-        // The workers the registry step removed count as well as the ones
-        // found, since a same-URL replacement during the drain is the one
-        // removed.
-        let models: HashSet<String> = workers_to_remove
-            .iter()
-            .chain(&context.data.removed_workers)
-            .flat_map(WorkerRegistry::policy_model_ids)
-            .collect();
-        for model_id in &models {
+        // early. Every model of a removed worker is asked after
+        // ([`removed_models`]).
+        for model_id in &removed_models(&context.data) {
             if !app_context.worker_registry.serves_model_locally(model_id) {
                 app_context.policy_registry.on_model_unserved(model_id);
             }

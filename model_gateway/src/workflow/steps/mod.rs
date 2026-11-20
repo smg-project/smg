@@ -21,8 +21,9 @@ pub use local::{
 };
 pub(crate) use local::{worker_removal_line, worker_update_line};
 use local::{
-    CheckLocalWorkerStep, DiscoverZmqLabelsStep, EnsureHarmonyEncodingStep, SubmitTokenizerJobStep,
-    CHECK_LOCAL_WORKER_STEP, ZMQ_LABELS_STEP,
+    BindModelPolicyStep, CheckLocalWorkerStep, ConfirmModelPolicyStep, DiscoverZmqLabelsStep,
+    EnsureHarmonyEncodingStep, SubmitTokenizerJobStep, BIND_MODEL_POLICY_STEP,
+    CHECK_LOCAL_WORKER_STEP, CONFIRM_MODEL_POLICY_STEP, ZMQ_LABELS_STEP,
 };
 use openai_protocol::worker::WorkerSpec;
 pub use shared::{
@@ -92,7 +93,7 @@ pub fn create_worker_registration_workflow(
 /// [`create_worker_registration_workflow`]'s.
 ///
 /// With a feed the gateway's local workers are rows of the policy
-/// controller's store, and the line differs in four things:
+/// controller's store, and the line differs in five things:
 /// ```text
 ///            classify_worker_type
 ///                    |
@@ -103,23 +104,33 @@ pub fn create_worker_registration_workflow(
 ///       |                               |
 ///  ensure_harmony_encoding       create_external_workers
 ///       |                               |
+///  bind_model_policy                    |
+///       |                               |
 ///  write_workers_at_door                |
 ///       +---------------+---------------+
 ///                        |
 ///                 register_workers
 ///                        |
-///                 +------+------+
-///                 |             |
-///            submit_tok   activate_workers
+///          +-------------+--------------+
+///          |             |              |
+///     submit_tok  confirm_model_policy  activate_workers
 /// ```
 /// - A local registration that states an API key registers as any other: a
 ///   row holds no credential, and the row's object holds the key.
-/// - The store crate's write at the feed's door stands behind the encoding
-///   step, and no other step waits on that step. It writes a local worker's
-///   row, and the holder lays the row's object in the registry.
+/// - One step tells the classic registry of the workers' models and their
+///   `policy` label ([`BindModelPolicyStep`]). The document in force binds
+///   a model by that registry's word, and the step stands ahead of the
+///   write at the door: a row states what the generation in force reads.
+///   A second step tells it again behind the registration, where the
+///   classic line's policy step stands ([`ConfirmModelPolicyStep`]): a
+///   leave that crossed the registration took the model's policy out, and
+///   a replacement left a model no worker serves.
+/// - The store crate's write at the feed's door stands behind that step,
+///   and no other step waits on it. It writes a local worker's row, and
+///   the holder lays the row's object in the registry.
 /// - The register step waits on that write and on the external branch. It
 ///   writes a provider's workers alone ([`RegisterBesideRowsStep`]).
-/// - No step writes the classic policies: they decide nothing there.
+/// - No other step writes the classic policies: they decide nothing there.
 pub(crate) fn worker_registration_line(
     router_config: &RouterConfig,
     feed: Option<&Feed>,
@@ -197,7 +208,7 @@ pub(crate) fn worker_registration_line(
             gates("classify_worker_type"),
             Arc::clone(&feed.door),
             Arc::clone(&feed.objects),
-            &["ensure_harmony_encoding"],
+            &[BIND_MODEL_POLICY_STEP],
         ),
     }
     // Step 0: Classify worker type (Local vs External)
@@ -286,9 +297,31 @@ pub(crate) fn worker_registration_line(
         .with_failure_action(FailureAction::ContinueNextStep)
         .depends_on(&[REGISTER_WORKERS_STEP]),
     );
-    // Step 5b: Update policies, where the classic policies decide
+    // Step 5b: Update policies, where the classic policies decide. Under a
+    // feed the registry is told which policy a model has, ahead of the
+    // write at the door, and told again where the classic step stands.
     let workflow = if feed.is_some() {
         workflow
+            .add_step(
+                StepDefinition::new(
+                    BIND_MODEL_POLICY_STEP,
+                    "Bind Model Policy",
+                    Arc::new(BindModelPolicyStep),
+                )
+                .with_timeout(Duration::from_secs(10))
+                .with_failure_action(FailureAction::FailWorkflow)
+                .depends_on(&["ensure_harmony_encoding"]),
+            )
+            .add_step(
+                StepDefinition::new(
+                    CONFIRM_MODEL_POLICY_STEP,
+                    "Confirm Model Policy",
+                    Arc::new(ConfirmModelPolicyStep),
+                )
+                .with_timeout(Duration::from_secs(10))
+                .with_failure_action(FailureAction::ContinueNextStep)
+                .depends_on(&[REGISTER_WORKERS_STEP]),
+            )
     } else {
         workflow.add_step(
             StepDefinition::new(
@@ -684,7 +717,7 @@ mod tests {
             ("discover_metadata", &["detect_backend"]),
             ("discover_dp_info", &["discover_metadata"]),
             ("create_local_worker", &["discover_zmq_labels"]),
-            ("write_workers_at_door", &["ensure_harmony_encoding"]),
+            ("write_workers_at_door", &["bind_model_policy"]),
             ("classify_worker_type", &[]),
             ("discover_zmq_labels", &["discover_dp_info"]),
             ("check_local_worker", &["create_local_worker"]),
@@ -696,6 +729,8 @@ mod tests {
                 &["write_workers_at_door", "create_external_workers"],
             ),
             ("submit_tokenizer_job", &["register_workers"]),
+            ("bind_model_policy", &["ensure_harmony_encoding"]),
+            ("confirm_model_policy", &["register_workers"]),
             ("activate_workers", &["register_workers"]),
         ]);
         assert_eq!(edges(&worker_registration_line(&config, Some(&feed))), line);
@@ -738,6 +773,7 @@ mod tests {
                     "register_workers".to_string(),
                     vec![
                         "submit_tokenizer_job".to_string(),
+                        "confirm_model_policy".to_string(),
                         "activate_workers".to_string()
                     ]
                 ),

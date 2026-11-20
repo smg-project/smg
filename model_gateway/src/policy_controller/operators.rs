@@ -6,9 +6,10 @@
 //! The three stand on the policy crate's operators' door ([`SpecDoor`])
 //! and its snapshot of the rows, which the start leaves in the context
 //! beside the controller's store. Under the classic policies none stands,
-//! and each route refuses by one code that names the setting. Nothing is
-//! applied in this process after the start: the document in force is the
-//! start's, and a restart reads the routing configuration again.
+//! and each route refuses by one code that names the setting. No route
+//! applies a document. After the start one write does: the settings'
+//! document with each model's own policy bound ([`super::labels`]). A
+//! restart reads the routing configuration again.
 //!
 //! A dry run validates a whole document and a snapshot copies rows. Each
 //! runs on the blocking pool, one at a time of its kind, and a bounded
@@ -27,11 +28,13 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use smg_policy_controller::{
     operator::{
         snapshot::{self, Asked, Rows},
-        Document, DryRun, Format, NeedsRow, SpecDoor, Turn, Unanswered, MAX_DOCUMENT_BYTES,
+        Applied, Document, DryRun, Format, NeedsRow, SpecDoor, SpecRejected, Turn, Unanswered,
+        MAX_DOCUMENT_BYTES,
     },
     spec::{Digest, Needs},
     store::MemoryStore,
@@ -64,6 +67,9 @@ pub(crate) struct Operators {
     store: Arc<MemoryStore>,
     dry_runs: Turn,
     snapshots: Turn,
+    /// One written document at a time: it is made and applied under this
+    /// lock.
+    written: Mutex<()>,
 }
 
 impl Operators {
@@ -73,7 +79,27 @@ impl Operators {
             store,
             dry_runs: Turn::new(DRY_RUNS_WAITING),
             snapshots: Turn::new(SNAPSHOTS_WAITING),
+            written: Mutex::new(()),
         }
+    }
+
+    /// Applies the document `written` makes, at the door the start applied
+    /// its own at. One such apply runs at a time and the document is made
+    /// inside its turn, so a document made from an older word never lands
+    /// over a newer one. `None` where `written` makes none.
+    pub(crate) fn apply_made(
+        &self,
+        written: impl FnOnce() -> Option<String>,
+    ) -> Option<Result<Applied, SpecRejected>> {
+        let _turn = self.written.lock();
+        let written = written()?;
+        Some(self.door.apply(written.into_bytes(), Format::Yaml))
+    }
+
+    /// The door, for a case's read of the document in force.
+    #[cfg(test)]
+    pub(crate) fn door(&self) -> &SpecDoor {
+        &self.door
     }
 }
 
@@ -136,7 +162,7 @@ pub(crate) async fn spec(State(state): State<Arc<AppState>>) -> Response {
         Ok(operators) => operators,
         Err(refused) => return refused,
     };
-    // The start's document stands: nothing is applied after it.
+    // The document in force: the start's, or the last one a label wrote.
     let held = match operators.door.document(0) {
         Ok(held) => held,
         Err(not_held) => {

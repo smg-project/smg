@@ -10,7 +10,10 @@
 //! we use the `WorkerRegistrationData` trait. This trait provides a common
 //! interface for accessing worker data while maintaining full type safety.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use openai_protocol::worker::WorkerUpdateRequest as ProtocolWorkerUpdateRequest;
 /// Re-export the protocol types for convenience
@@ -82,6 +85,11 @@ pub struct RegistrationNotes {
     /// resolves it from the model card and the names; none for an HTTP
     /// worker, the legacy parsers or a model no table reads).
     pub symphony_table: Option<&'static str>,
+    /// The models the workers this registration replaces serve, as the
+    /// policy step read them ahead of the write at the feed's door. The
+    /// step behind the registration tells the policy registry of each one
+    /// no worker serves any more.
+    pub policy_models_left: HashSet<String>,
 }
 
 /// Unified data for worker registration workflows (both local and external),

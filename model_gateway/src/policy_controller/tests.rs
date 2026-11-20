@@ -24,13 +24,14 @@ use smg_policy_controller::{
     lease::Lifecycle,
     operator::SpecRejected,
     store::{WorkerFacts, WorkerStatus as RowStatus, WorkersStore},
-    view::{Candidate, RequestFacts, Role, WireModes, WorkerId},
+    view::{Candidate, Phase, RequestFacts, Role, WireModes, WorkerId},
     AppliedSpec, Catalog, CatalogError, PolicySpec, SpecError,
 };
 use smg_worker::{connection::engine::EngineConnector, identity::basic::ConnectionMode};
 
 use super::{
-    operators::document_bytes, refused, start, start_with, undecided::ROUTER_TYPE, StartError,
+    labels, operators::document_bytes, refused, start, start_with, undecided::ROUTER_TYPE,
+    StartError,
 };
 use crate::{
     app_context::AppContext,
@@ -1477,5 +1478,322 @@ async fn a_followed_gateway_hands_its_worker_workflows_no_feed() -> Case {
     assert!(followed.follows_controller());
     assert!(followed.policy_feed.is_some());
     assert!(followed.door_feed().is_none());
+    Ok(())
+}
+
+/// A context under the controller whose main policy is round robin, with
+/// no document supplied.
+async fn round_robin_context() -> Result<AppContext, Box<dyn Error>> {
+    let config = RouterConfig {
+        policy: PolicyConfig::RoundRobin,
+        ..quiet()
+    };
+    Ok(AppContext::from_config(picked(config), 30, None, None).await?)
+}
+
+/// The generation the store runs, and the profile that decides `model`'s
+/// single requests under it.
+fn decided_by(context: &AppContext, model: &str) -> Result<(u64, String), Box<dyn Error>> {
+    let store = context
+        .policy_store
+        .as_ref()
+        .ok_or("the controller was not picked")?;
+    store.with_world(|world| {
+        let spec = world.spec();
+        let (_, profile) = spec
+            .engine()
+            .profile_for(model, Phase::Single)
+            .ok_or("no profile decides the model")?;
+        Ok((spec.generation(), profile.name.clone()))
+    })
+}
+
+/// A binding as a case reads it: the model it matches and its profile.
+type Binding = (String, Option<String>);
+
+/// The bindings of the document the operators' door holds.
+fn held_bindings(context: &AppContext) -> Result<Vec<Binding>, Box<dyn Error>> {
+    let operators = context
+        .policy_operators
+        .as_ref()
+        .ok_or("the context holds no operators' door")?;
+    let held = operators
+        .door()
+        .document(0)
+        .map_err(|_| "the door holds no document")?;
+    let document: PolicySpec = serde_yaml::from_slice(&held.document)?;
+    Ok(document
+        .bindings
+        .into_iter()
+        .map(|binding| (binding.matcher.model, binding.profile))
+        .collect())
+}
+
+const LABELLED: &str = "model-a";
+const UNLABELLED: &str = "model-b";
+
+fn one(model: &str) -> Vec<String> {
+    vec![model.to_owned()]
+}
+
+fn binding(model: &str, profile: &str) -> Binding {
+    (model.to_owned(), Some(profile.to_owned()))
+}
+
+/// A model's first worker whose `policy` label names another policy than
+/// the main one. The model is decided by that policy's profile under the
+/// next generation, every other model as before, and the document the door
+/// holds says the binding ahead of the wildcard. The registry holds the
+/// model's policy, which the explicit target's refusal reads.
+#[tokio::test]
+async fn a_models_first_labelled_worker_binds_the_model_by_its_policy() -> Case {
+    let context = round_robin_context().await?;
+    assert_eq!(
+        decided_by(&context, LABELLED)?,
+        (1, "round_robin".to_owned())
+    );
+    labels::registered(&context, &one(LABELLED), Some("consistent_hashing"));
+    assert_eq!(
+        decided_by(&context, LABELLED)?,
+        (2, "consistent_hashing".to_owned())
+    );
+    assert_eq!(
+        decided_by(&context, UNLABELLED)?,
+        (2, "round_robin".to_owned())
+    );
+    assert_eq!(
+        held_bindings(&context)?,
+        [
+            binding(LABELLED, "consistent_hashing"),
+            binding("*", "round_robin")
+        ]
+    );
+    let registry = &context.policy_registry;
+    assert_eq!(
+        registry.get_policy_or_default(LABELLED).name(),
+        "consistent_hashing"
+    );
+    assert_eq!(
+        registry.get_policy_or_default(UNLABELLED).name(),
+        "round_robin"
+    );
+    Ok(())
+}
+
+/// Each labelled apply is a new generation, and a generation's stages start
+/// empty. A standing model keeps its rows and is placed on them as before,
+/// and what its stages held starts again: here a rotation's place.
+#[tokio::test]
+async fn a_labelled_apply_keeps_a_standing_models_rows_and_starts_its_rotation_again() -> Case {
+    use std::time::Instant;
+
+    use smg_policy_controller::{
+        store::{HealthPolicy, Maker},
+        worker_host::{Expect, Wrote},
+    };
+
+    use super::host::Ask;
+
+    let context = round_robin_context().await?;
+    let feed = context.policy_feed.as_ref().ok_or("no feed")?;
+    let host = context.policy_host.as_ref().ok_or("no host")?;
+    for url in ["http://127.0.0.1:1", "http://127.0.0.1:2"] {
+        let wrote = feed
+            .door
+            .found(&Maker::Control, Expect::Nothing, url, &|_| WorkerFacts {
+                key: url.to_owned(),
+                engine: url.to_owned(),
+                role: Role::Single,
+                wire_modes: WireModes::HTTP,
+                models: vec![UNLABELLED.to_owned()],
+                dp_size: 1,
+                max_running: Some(64),
+                health: HealthPolicy {
+                    probes: false,
+                    ..HealthPolicy::default()
+                },
+                ..WorkerFacts::default()
+            });
+        if !matches!(wrote, Ok(Wrote::Registered(_))) {
+            return Err(format!("expected a registration, got {wrote:?}").into());
+        }
+    }
+    let mut placed = Vec::new();
+    for request in [b"r1", b"r2", b"r3"] {
+        let target = host
+            .place(&Ask::of(request, UNLABELLED), Instant::now())
+            .await
+            .map_err(|_| "the host placed no worker")?;
+        placed.push(target.id());
+    }
+    // The rotation walks the model's two rows in turn.
+    assert_ne!(placed[0], placed[1]);
+    assert_eq!(placed[0], placed[2]);
+
+    labels::registered(&context, &one(LABELLED), Some("consistent_hashing"));
+    assert_eq!(
+        decided_by(&context, UNLABELLED)?,
+        (2, "round_robin".to_owned())
+    );
+    // In turn the next place is the second row's. The new generation's
+    // rotation starts where the first one started.
+    let next = host
+        .place(&Ask::of(b"r4", UNLABELLED), Instant::now())
+        .await
+        .map_err(|_| "the host placed no worker under the new generation")?;
+    assert_eq!(next.id(), placed[0]);
+    Ok(())
+}
+
+/// The document is applied ahead of the write of the worker's row, so the
+/// row states what its model's own profile reads: a gRPC worker of a model
+/// labelled cache-aware streams its cache events, and a worker of a model
+/// with no label does not.
+#[tokio::test]
+async fn a_row_written_behind_the_label_states_what_its_models_profile_reads() -> Case {
+    use smg_policy_controller::{
+        store::{HealthPolicy, Maker},
+        worker_host::Expect,
+    };
+
+    let context = round_robin_context().await?;
+    let store = context.policy_store.as_ref().ok_or("no store")?;
+    let feed = context.policy_feed.as_ref().ok_or("no feed")?;
+    labels::registered(&context, &one(LABELLED), Some("cache_aware"));
+    let mut streams = Vec::new();
+    for (url, model) in [
+        ("grpc://127.0.0.1:1", LABELLED),
+        ("grpc://127.0.0.1:2", UNLABELLED),
+    ] {
+        feed.door
+            .found(&Maker::Control, Expect::Nothing, url, &|_| WorkerFacts {
+                key: url.to_owned(),
+                engine: url.to_owned(),
+                role: Role::Single,
+                wire_modes: WireModes::GRPC,
+                models: vec![model.to_owned()],
+                dp_size: 1,
+                health: HealthPolicy {
+                    probes: false,
+                    ..HealthPolicy::default()
+                },
+                ..WorkerFacts::default()
+            })
+            .map_err(|refusal| format!("the door refused the row: {refusal:?}"))?;
+        let row = store.by_key(url).ok_or("the store holds no row")?;
+        streams.push((model, row.facts.signals.events));
+    }
+    assert_eq!(streams, [(LABELLED, true), (UNLABELLED, false)]);
+    Ok(())
+}
+
+/// A later worker of the model moves nothing, whatever its label: no
+/// generation is written, and the model's policy stays its first worker's.
+#[tokio::test]
+async fn a_later_worker_with_another_label_moves_nothing() -> Case {
+    let context = round_robin_context().await?;
+    labels::registered(&context, &one(LABELLED), Some("consistent_hashing"));
+    for later in [Some("least_load"), None, Some("round_robin")] {
+        labels::registered(&context, &one(LABELLED), later);
+        assert_eq!(
+            decided_by(&context, LABELLED)?,
+            (2, "consistent_hashing".to_owned()),
+            "{later:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The model's last leave takes its binding out under the next generation,
+/// and the next first worker names the model's policy anew.
+#[tokio::test]
+async fn a_models_last_leave_takes_its_binding_out() -> Case {
+    let context = round_robin_context().await?;
+    labels::registered(&context, &one(LABELLED), Some("consistent_hashing"));
+    labels::left(&context, &one(LABELLED));
+    assert_eq!(
+        decided_by(&context, LABELLED)?,
+        (3, "round_robin".to_owned())
+    );
+    assert_eq!(held_bindings(&context)?, [binding("*", "round_robin")]);
+    assert!(context.policy_registry.get_policy(LABELLED).is_none());
+    labels::registered(&context, &one(LABELLED), Some("least_load"));
+    assert_eq!(
+        decided_by(&context, LABELLED)?,
+        (4, "least_load".to_owned())
+    );
+    Ok(())
+}
+
+/// No generation is written where the registry's word gives the model the
+/// main policy: a label that names it, no label, and a name no policy has.
+/// Nor at the leave of such a model.
+#[tokio::test]
+async fn a_model_under_the_main_policy_writes_no_generation() -> Case {
+    let context = round_robin_context().await?;
+    for (model, label) in [
+        ("named", Some("round_robin")),
+        ("unlabelled", None),
+        ("unknown", Some("no_such_policy")),
+    ] {
+        labels::registered(&context, &one(model), label);
+        assert_eq!(decided_by(&context, model)?, (1, "round_robin".to_owned()));
+        labels::left(&context, &one(model));
+        assert_eq!(decided_by(&context, model)?, (1, "round_robin".to_owned()));
+    }
+    assert_eq!(held_bindings(&context)?, [binding("*", "round_robin")]);
+    Ok(())
+}
+
+/// A supplied document is its author's whole word: no label binds a model
+/// beside it and no generation is written. The registry still holds the
+/// model's policy, which the explicit target's refusal reads.
+#[tokio::test]
+async fn beside_a_supplied_document_no_label_binds_a_model() -> Case {
+    let config = RouterConfig {
+        policy: PolicyConfig::RoundRobin,
+        ..quiet()
+    };
+    let config = running(config, PolicySpec::preset("round_robin")?);
+    let context = AppContext::from_config(config, 30, None, None).await?;
+    labels::registered(&context, &one(LABELLED), Some("consistent_hashing"));
+    assert_eq!(
+        decided_by(&context, LABELLED)?,
+        (1, "round_robin".to_owned())
+    );
+    let held = context
+        .policy_registry
+        .get_policy(LABELLED)
+        .ok_or("the registry holds no policy for the model")?;
+    assert_eq!(held.name(), "consistent_hashing");
+    Ok(())
+}
+
+/// One call tells every model of a registration and writes one generation,
+/// and the bindings stand in the models' order whatever order they came in.
+#[tokio::test]
+async fn one_call_writes_one_generation_and_the_bindings_stand_in_model_order() -> Case {
+    let context = round_robin_context().await?;
+    labels::registered(
+        &context,
+        &["z".to_owned(), "m".to_owned()],
+        Some("consistent_hashing"),
+    );
+    labels::registered(&context, &one("a"), Some("least_load"));
+    assert_eq!(
+        decided_by(&context, "z")?,
+        (3, "consistent_hashing".to_owned())
+    );
+    assert_eq!(
+        held_bindings(&context)?,
+        [
+            binding("a", "least_load"),
+            binding("m", "consistent_hashing"),
+            binding("z", "consistent_hashing"),
+            binding("*", "round_robin")
+        ]
+    );
+    labels::left(&context, &["m".to_owned(), "z".to_owned()]);
+    assert_eq!(decided_by(&context, "z")?, (4, "round_robin".to_owned()));
     Ok(())
 }

@@ -33,9 +33,9 @@ use crate::{
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
         create_worker_removal_workflow_data, create_worker_update_workflow_data,
         create_worker_workflow_data, note_tokenizer_load_outcome, note_tokenizer_removed,
-        registered_entries, registered_in, McpServerConfigRequest, TokenizerConfigRequest,
-        TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
-        WorkerRegistrationMode, WorkflowEngines,
+        registered_entries, registered_in, steps::local::forget_unfinished, McpServerConfigRequest,
+        TokenizerConfigRequest, TokenizerRemovalRequest, WasmModuleConfigRequest,
+        WasmModuleRemovalRequest, WorkerRegistrationMode, WorkflowEngines,
     },
 };
 
@@ -580,6 +580,12 @@ impl JobHost for AppContext {
                     .wait_for_terminal_state(instance_id, &label, timeout_duration)
                     .await?;
                 let outcome = wfaas::completion_outcome(&state, &label);
+                // Under the feed a registration tells the policy registry of
+                // its models ahead of the write at the door. One that did not
+                // finish tells of each model no worker serves, as a leave does.
+                if outcome.is_err() && context.door_feed().is_some() {
+                    forget_unfinished(&state.context.data).await;
+                }
                 // A POST's registration that put its worker in the registry
                 // and did not finish (a DELETE's cancel landing after the
                 // registry step, a later step's failure) leaves no worker
@@ -4602,7 +4608,7 @@ mod tests {
     /// classic line: the selection and the registry removal, 10 seconds
     /// each, the settle bound, then the policy cleanup under the workflow's
     /// default of 300 seconds and a 10 second tokenizer release. The line at
-    /// the store's door: two settle bounds, five steps of 10 seconds and the
+    /// the store's door: two settle bounds, six steps of 10 seconds and the
     /// cache cleanup's 300.
     #[tokio::test]
     async fn a_removal_job_waits_for_the_bound_of_every_step() {
@@ -4626,7 +4632,7 @@ mod tests {
         );
         assert_eq!(
             WorkflowEngines::with_feed(&config, Some(&feed)).worker_removal_wait,
-            SETTLE_STEP_TIMEOUT * 2 + Duration::from_secs(350)
+            SETTLE_STEP_TIMEOUT * 2 + Duration::from_secs(360)
         );
     }
 

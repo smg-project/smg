@@ -3,6 +3,7 @@ mod draining_door;
 mod ensure_harmony_encoding;
 mod find_worker_to_update;
 mod forget_cache_events;
+mod model_policy;
 mod provider_workers;
 mod rediscover_labels;
 mod release_tokenizer;
@@ -23,6 +24,11 @@ use draining_door::DrainingDoor;
 pub use ensure_harmony_encoding::EnsureHarmonyEncodingStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;
 use forget_cache_events::{ForgetCacheEventsStep, FORGET_CACHE_EVENTS_STEP};
+pub(crate) use model_policy::{
+    forget_unfinished, BindModelPolicyStep, ConfirmModelPolicyStep, BIND_MODEL_POLICY_STEP,
+    CONFIRM_MODEL_POLICY_STEP,
+};
+use model_policy::{UnbindModelPolicyStep, UNBIND_MODEL_POLICY_STEP};
 use openai_protocol::worker::WorkerUpdateRequest;
 use provider_workers::{
     ForProviderWorkers, DRAIN_PROVIDER_WORKERS_STEP, REMOVE_PROVIDER_WORKERS_STEP,
@@ -116,18 +122,20 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
 ///              |
 ///     remove_provider_workers
 ///              |
-///           +--+----------------+
-///           |                   |
-///  forget_cache_events  release_tokenizer
+///        +---------+---------+-------------------+
+///        |                   |                   |
+///  forget_cache_events  release_tokenizer  unbind_model_policy
 /// ```
 /// The door's steps leave a worker with no row alone. A provider's worker
 /// has none, and the two steps behind them are the registry's own: they
 /// drain it and take it out, as the classic line does. A removal that
 /// names workers of both kinds has each taken where it stands
-/// ([`ForProviderWorkers`]). The last two write nothing to the run's
+/// ([`ForProviderWorkers`]). The last three write nothing to the run's
 /// data, so they stand side by side, and a cleanup that fails or times out
-/// holds no other back. No step writes the classic policies: they decide
-/// nothing there.
+/// holds no other back. The classic policies decide nothing there, and one
+/// step tells their registry of the models no worker serves any more: the
+/// document in force binds a model by that registry's word
+/// ([`UnbindModelPolicyStep`]).
 pub(crate) fn worker_removal_line(
     door: Option<(&Feed, UnhealthyRemovalScope)>,
 ) -> WorkflowDefinition<WorkerRemovalWorkflowData> {
@@ -173,6 +181,16 @@ pub(crate) fn worker_removal_line(
             .depends_on(&[REMOVE_PROVIDER_WORKERS_STEP]),
         )
         .add_step(release_tokenizer_step(REMOVE_PROVIDER_WORKERS_STEP))
+        .add_step(
+            StepDefinition::new(
+                UNBIND_MODEL_POLICY_STEP,
+                "Tell the policy registry of the models no worker serves any more",
+                Arc::new(UnbindModelPolicyStep),
+            )
+            .with_timeout(Duration::from_secs(10))
+            .with_retry(single_attempt())
+            .depends_on(&[REMOVE_PROVIDER_WORKERS_STEP]),
+        )
 }
 
 /// The tokenizer release, behind the step that settles what it reads.
@@ -736,7 +754,7 @@ mod tests {
             ),
             ("release_tokenizer", &["remove_from_worker_registry"]),
         ];
-        let at_the_door: [(&str, &[&str]); 8] = [
+        let at_the_door: [(&str, &[&str]); 9] = [
             ("find_workers_to_remove", &[]),
             ("settle_drained_workers", &["drain_workers_at_door"]),
             ("drain_workers_at_door", &["find_workers_to_remove"]),
@@ -745,6 +763,7 @@ mod tests {
             ("remove_provider_workers", &["drain_provider_workers"]),
             ("forget_cache_events", &["remove_provider_workers"]),
             ("release_tokenizer", &["remove_provider_workers"]),
+            ("unbind_model_policy", &["remove_provider_workers"]),
         ];
         let registry = Arc::new(WorkerRegistry::new());
         let feed = feed(

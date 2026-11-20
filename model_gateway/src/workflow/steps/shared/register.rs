@@ -192,7 +192,10 @@ fn register_worker(
 /// ([`WorkerRegistry::policy_model_ids`]). Whether a worker of this node, the
 /// replacement included, still serves each one is asked once the
 /// registration is written.
-fn models_left(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -> HashSet<String> {
+pub(crate) fn models_left(
+    registry: &WorkerRegistry,
+    workers: &[Arc<dyn Worker>],
+) -> HashSet<String> {
     workers
         .iter()
         .filter_map(|worker| registry.get_by_url(worker.url()))
