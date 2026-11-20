@@ -4250,6 +4250,9 @@ pub(crate) mod tests {
         document.generation = 1;
         document.view.headers = manual.view.headers.clone();
         let binding = document.bindings.first_mut().expect("the preset's binding");
+        // The rule names the key's header, so the ring's own sources go: a
+        // binding names them once.
+        binding.routing_key = None;
         binding.sessions = Some(rule);
         binding.overload = Some(crate::spec::OverloadSpec {
             waiting_requests: Some(1),

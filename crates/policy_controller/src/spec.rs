@@ -1572,8 +1572,8 @@ impl Default for Match {
 /// its rows are vetoed where a binding's overload block names no count.
 pub const OVERLOAD_WAITING_REQUESTS: u32 = 8;
 
-/// The mean KV usage over an engine's ranks at or above which its rows are
-/// vetoed where a binding's overload block names no usage.
+/// The mean active KV usage over an engine's ranks at or above which its
+/// rows are vetoed where a binding's overload block names no usage.
 pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 
 /// The overload veto's defaults for the workers of the pools decided under
@@ -1591,8 +1591,9 @@ pub struct OverloadSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub waiting_requests: Option<u32>,
-    /// Mean KV usage over an engine's ranks at or above which a worker is
-    /// vetoed; above 0 and at most 1 (default 0.8).
+    /// Mean active KV usage over an engine's ranks at or above which a
+    /// worker is vetoed; above 0 and at most 1 (default 0.8). A rank that
+    /// reports no active share counts its whole usage.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(extend("exclusiveMinimum" = 0), range(max = 1.0))]
     pub token_usage: Option<f32>,
@@ -1744,7 +1745,9 @@ pub struct KeySourceSpec {
     #[serde(skip_serializing_if = "is_default")]
     pub rid: bool,
     /// The most bytes of a value this source hands, 8192 at most (default
-    /// 128). A longer value is passed over and the next source is read.
+    /// 128). A longer value is passed over and the next source is read. A
+    /// header is measured as sent, and the request's own id after the
+    /// block's `strip_lineage` took its suffixes off.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 8192))]
     pub max_bytes: Option<u32>,
@@ -3783,6 +3786,22 @@ pub const PRESETS: [&str; 10] = [
 /// routing-key header; the host feeds the key it resolved under it.
 pub const MANUAL_SESSION_HEADER: &str = "x-smg-routing-key";
 
+/// The routing key sources of a preset whose ring places by the key, as
+/// the gateway's policy of that name reads them at its defaults: the
+/// routing key header. `None` for every other preset: `manual` names its
+/// one header in its sessions rule, and no other preset's stage reads a
+/// key.
+fn preset_routing_key(name: &str) -> Option<RoutingKeySpec> {
+    matches!(name, "prefix_hash" | "consistent_hashing").then(|| RoutingKeySpec {
+        sources: vec![KeySourceSpec {
+            header: Some(MANUAL_SESSION_HEADER.to_string()),
+            rid: false,
+            max_bytes: None,
+        }],
+        strip_lineage: false,
+    })
+}
+
 fn standard_filters() -> Vec<FilterSpec> {
     vec![
         "healthy".into(),
@@ -3983,6 +4002,7 @@ impl PolicySpec {
             plans: PlansSpec::default(),
             bindings: vec![BindingSpec {
                 profile: Some(name.to_string()),
+                routing_key: preset_routing_key(name),
                 sessions,
                 ..BindingSpec::default()
             }],
@@ -4012,6 +4032,9 @@ impl PolicySpec {
         spec.bindings = vec![BindingSpec {
             plan: Some(PlanName::PdPair),
             profiles,
+            // One request, one key: the prefill side's sources where its
+            // preset reads a key, else the decode side's.
+            routing_key: preset_routing_key(prefill).or_else(|| preset_routing_key(decode)),
             ..BindingSpec::default()
         }];
         Ok(spec)
@@ -4191,6 +4214,14 @@ impl PolicySpec {
             profiles.len(),
             self.profiles.len(),
             "every profile is built once the deferred check has passed"
+        );
+        // A binding's routing key sources are kept by its place in the
+        // document and found by its place in the engine
+        // ([`AppliedSpec::key_sources_for`]): the two are one place.
+        debug_assert_eq!(
+            bindings.len(),
+            self.bindings.len(),
+            "every binding is built once the deferred check has passed"
         );
         if self.bindings.is_empty() {
             // One profile, refused above when there are more.
@@ -5053,11 +5084,11 @@ mod tests {
             ),
             (
                 "consistent_hashing",
-                "sha256:9efb2b93ae8ceb8ba7468c8a611facf8c6f532e7f60f912f944cd4ca2c66bde6",
+                "sha256:47f482157ac66931f8e0551a945183f3e8fd5b686d633411f6c3358e9ba6676b",
             ),
             (
                 "prefix_hash",
-                "sha256:f27dcbcd0d1adafc34c00bba709cad16f979a4d02c92da34e388fb1fe917e469",
+                "sha256:f5bc21e35bb782d5ee2a559ece6b18c0905cebcd20c354b294ecf1c1e1c5d871",
             ),
             (
                 "manual",
@@ -7261,6 +7292,19 @@ mod tests {
         ] {
             assert_eq!(refused(text), message);
         }
+        // A host's own denied name, its tenant header, is refused as a
+        // credential is.
+        let tenant = spec_with_binding(
+            r#"{"profile":"p","routing_key":{"sources":[{"header":"x-tenant-id"}]}}"#,
+        );
+        assert!(tenant.validate().is_ok());
+        assert_eq!(
+            tenant.validate_with(&["x-tenant-id"]).err(),
+            Some(SpecError::DeniedHeader {
+                path: "bindings[0].routing_key.sources[0].header".to_string(),
+                name: "x-tenant-id".to_string(),
+            })
+        );
         // One spelling or the other beside a sessions rule.
         let beside = |sessions: &str| {
             spec_with_binding(&format!(

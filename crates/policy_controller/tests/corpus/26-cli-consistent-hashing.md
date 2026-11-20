@@ -21,4 +21,7 @@ profiles:
 bindings:
   - match: { model: "*" }
     profile: consistent_hashing
+    routing_key:
+      sources:
+        - header: x-smg-routing-key
 ```

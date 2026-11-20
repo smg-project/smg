@@ -1339,7 +1339,7 @@
           "minimum": 1
         },
         "token_usage": {
-          "description": "Mean KV usage over an engine's ranks at or above which a worker is\nvetoed; above 0 and at most 1 (default 0.8).",
+          "description": "Mean active KV usage over an engine's ranks at or above which a\nworker is vetoed; above 0 and at most 1 (default 0.8). A rank that\nreports no active share counts its whole usage.",
           "type": [
             "number",
             "null"
@@ -1395,7 +1395,7 @@
           "type": "boolean"
         },
         "max_bytes": {
-          "description": "The most bytes of a value this source hands, 8192 at most (default\n128). A longer value is passed over and the next source is read.",
+          "description": "The most bytes of a value this source hands, 8192 at most (default\n128). A longer value is passed over and the next source is read. A\nheader is measured as sent, and the request's own id after the\nblock's `strip_lineage` took its suffixes off.",
           "type": [
             "integer",
             "null"
