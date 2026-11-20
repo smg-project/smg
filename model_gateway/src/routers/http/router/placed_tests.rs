@@ -13,6 +13,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg_policy_controller::{
+    spec::{KeySourceSpec, RoutingKeySpec},
     store::{GatewayId, HealthSink, LeasesStore, WorkerStatus as RowStatus, WorkersStore},
     AppliedSpec, PolicySpec, PowerOfTwoMetric,
 };
@@ -24,7 +25,7 @@ use super::{
     *,
 };
 use crate::{
-    config::PolicyConfig,
+    config::{PolicyConfig, RouterConfig},
     middleware::ReportedRefusal,
     policy_controller::host::testing::{bed_over, bed_over_models, MODEL},
     routers::{
@@ -485,6 +486,7 @@ fn a_failed_placement_adds_its_row_each_time() -> Case {
         ledger: &ledger,
         tried: &tried,
         tried_rows: &tried_rows,
+        rid: None,
     };
     router.account_attempt_outcome(
         &attempt,
@@ -764,5 +766,66 @@ async fn a_request_for_a_model_no_binding_covers_reads_declined_with_a_line() ->
         error["error"]["message"],
         format!("The policy declined the request for model '{MODEL}'")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_keyed_request_keeps_its_worker_through_the_router() -> Case {
+    const KEY_HEADER: &str = "x-conversation";
+    // The key's one source by row: a request header, then the request's own id.
+    for by_rid in [false, true] {
+        let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+        let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let (host, store, _) = bed_over(Arc::clone(&registry), &[&a, &b]);
+        let config = RouterConfig {
+            policy_controller: true,
+            policy: PolicyConfig::ConsistentHashing,
+            ..RouterConfig::default()
+        };
+        let mut document = config.policy_document()?;
+        document.generation += 1;
+        document.bindings[0].routing_key = Some(RoutingKeySpec {
+            sources: vec![KeySourceSpec {
+                header: (!by_rid).then(|| KEY_HEADER.to_owned()),
+                rid: by_rid,
+                ..KeySourceSpec::default()
+            }],
+            strip_lineage: false,
+        });
+        store.apply(config.hosted_policy(&document)?)?;
+        let router = router(registry, Some(host));
+        let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+        let hits = || [hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst)];
+
+        // One key sixteen times, then sixteen keys once each.
+        for turn in 0..32 {
+            let key = if turn < 16 {
+                "conv".to_owned()
+            } else {
+                format!("conv-{turn}")
+            };
+            let mut headers = HeaderMap::new();
+            let mut body = json!({"text": "hi"});
+            if by_rid {
+                body["rid"] = json!(key);
+            } else {
+                headers.insert(KEY_HEADER, HeaderValue::from_str(&key)?);
+            }
+            let request = serde_json::from_value(body)?;
+            let response = router
+                .route_generate(Some(&headers), &meta, request, MODEL)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            if turn == 15 {
+                assert!(hits().contains(&16), "by_rid {by_rid}: {:?}", hits());
+            }
+        }
+        assert!(
+            hits().iter().all(|&hit| hit > 0),
+            "by_rid {by_rid}: {:?}",
+            hits()
+        );
+    }
     Ok(())
 }

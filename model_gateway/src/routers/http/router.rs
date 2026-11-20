@@ -178,6 +178,9 @@ struct TypedAttempt<'a, T> {
     /// attempt. A retry names them in its ask, and their count is the ask's
     /// retry number. Classic policies leave it empty.
     tried_rows: &'a parking_lot::Mutex<Vec<WorkerId>>,
+    /// The request's own id, kept where the router's host asks: a source
+    /// of the request's routing key.
+    rid: Option<&'a str>,
 }
 
 /// The regular HTTP router places typed requests through its host or its
@@ -504,6 +507,12 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let routing = self.routing_derivatives(headers, &typed_req);
+        // The lease frees the parsed request at its dispatch, so the host's
+        // asks read the request's own id from here.
+        let rid = self
+            .host
+            .as_ref()
+            .and_then(|_| typed_req.rid().map(str::to_owned));
         // Resolve once, here, so every registry, policy and metrics lookup
         // below is keyed by the canonical model ID. Only `get_by_model`
         // understands aliases; retry configs, hash rings and policies do not,
@@ -551,6 +560,7 @@ impl Router {
                 ledger: &ledger,
                 tried: &tried,
                 tried_rows: &tried_rows,
+                rid: rid.as_deref(),
             };
 
             let response = if let Some(denied) = denial {
@@ -855,8 +865,8 @@ impl Router {
             id: &id,
             model: &model,
             streaming: attempt.is_stream,
-            headers: None,
-            rid: None,
+            headers: attempt.headers,
+            rid: attempt.rid,
             tried: &tried,
             hashes: None,
         };
@@ -3746,6 +3756,7 @@ mod tests {
             ledger: &ledger,
             tried: &tried,
             tried_rows: &tried_rows,
+            rid: None,
         };
         let select = || {
             let worker = router
