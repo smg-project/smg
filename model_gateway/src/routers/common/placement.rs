@@ -778,7 +778,9 @@ pub(crate) fn policy_declined(model: &str, declined_at: &str) -> Response {
 /// pools disagree on, `prefill` and `decode` each pool's pairing keys. The
 /// verdict reads membership alone, so the classic selection and the policy
 /// controller's host give one answer for one fleet. The line's reason is
-/// what the answer names: the mismatch and each pool's keys.
+/// what the answer names: the mismatch and each pool's keys. A retry reads
+/// the same membership, so the answer is final and no router tries it again
+/// in process.
 pub(crate) fn no_compatible_pair(
     model: &str,
     mismatches: &[String],
@@ -793,6 +795,7 @@ pub(crate) fn no_compatible_pair(
         ),
     );
     response.extensions_mut().insert(RefusalReason(found));
+    mark_non_retryable(&mut response);
     response
 }
 
@@ -4126,7 +4129,8 @@ mod tests {
 
     /// A fleet that pairs nothing is reported once, under an allowance of
     /// its own. Its line names what the answer names: the mismatch and each
-    /// pool's keys. The client's message is the sentence it always was.
+    /// pool's keys. The answer is final, and the client's message is the
+    /// sentence it always was.
     #[tokio::test]
     async fn a_fleet_that_pairs_nothing_is_reported_once_with_its_mismatch() {
         let lines = Arc::new(Mutex::new(Vec::new()));
@@ -4150,6 +4154,9 @@ mod tests {
             NO_COMPATIBLE_PD_PAIR_CODE
         );
         assert_eq!(refusal_reason(&refusal), Some(found));
+        assert!(!crate::routers::common::retry::is_retryable_response(
+            &refusal
+        ));
         let reported = report_refusal(&registry, site, None, MODEL, refusal);
         assert!(reported.extensions().get::<ReportedRefusal>().is_some());
         let reported = report_refusal(&registry, site, None, MODEL, reported);
@@ -4338,7 +4345,7 @@ mod tests {
             site,
             None,
             "m1",
-            error::service_unavailable("no_compatible_pd_pair", "no pair"),
+            error::service_unavailable("worker_overload_protection_shed", "shed"),
         );
         assert!(unrelated.extensions().get::<ReportedRefusal>().is_none());
         assert_eq!(count(), 6);

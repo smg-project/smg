@@ -1398,6 +1398,7 @@ async fn a_fleet_that_pairs_nothing_reads_the_classic_refusal_under_the_host() -
     assert_eq!(placement::refusal_reason(&refused), reason.as_deref());
     for answer in [&hosted, &refused] {
         assert!(answer.extensions().get::<ReportedRefusal>().is_some());
+        assert!(!is_retryable_response(answer));
     }
     let hosted: Value = serde_json::from_slice(&to_bytes(hosted.into_body(), 4096).await?)?;
     let refused: Value = serde_json::from_slice(&to_bytes(refused.into_body(), 4096).await?)?;
