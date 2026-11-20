@@ -1874,15 +1874,21 @@ impl Harness {
         )
         .await?
         .map_err(|error| error.to_string())?;
-        let gateway = GatewayId(fingerprint(GATEWAY.as_bytes()));
-        let store = self.store.as_ref();
         within("the store reads the lease dispatched", ROOM, || {
-            // By the trait's path, as `leases` reads the file.
-            smg_policy_controller::store::LeasesStore::get(store, gateway, LeaseId(lease))
-                .is_some_and(|record| matches!(record.state, LeaseState::Dispatched { .. }))
+            self.dispatched(GATEWAY, lease)
         })
         .await
         .map(|_| ())
+    }
+
+    /// Whether the store reads the lease `lease` of the gateway named
+    /// `gateway` dispatched: no dispatch deadline ends it then.
+    pub fn dispatched(&self, gateway: &str, lease: u64) -> bool {
+        let gateway = GatewayId(fingerprint(gateway.as_bytes()));
+        let store = self.store.as_ref();
+        // By the trait's path, as `leases` reads the file.
+        smg_policy_controller::store::LeasesStore::get(store, gateway, LeaseId(lease))
+            .is_some_and(|record| matches!(record.state, LeaseState::Dispatched { .. }))
     }
 
     /// The row the store's pin of record names for `session`, the value a

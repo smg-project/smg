@@ -76,7 +76,7 @@ pub(crate) mod wire;
 
 #[cfg(test)]
 pub(crate) use link::tests::{poll, Peer};
-pub use link::{Full, Link, Unanswered};
+pub use link::{Link, Unanswered};
 
 /// Frames the client may queue toward the controller.
 const SESSION_QUEUE: usize = 16;
@@ -179,15 +179,19 @@ pub enum Error {
     #[error("an ask's {0} is out of its range in this protocol version")]
     OutOfRange(&'static str),
     /// A link's report queue was full: its session took no report for as
-    /// long as the queue covers. The link ended, and the controller's
-    /// session grace covers the leases whose end was not said
-    /// ([`Link::report`]).
+    /// long as the queue covers. The session ended, and the reports its
+    /// queue held are lost with it ([`Link::report`]).
     #[error("the link's report queue was full")]
     ReportsFull,
-    /// A watch was asked of a link that had ended. [`Link::ended`] gives
-    /// the cause.
+    /// A watch was asked of a link with no session standing.
+    /// [`Link::ended`] gives the cause.
     #[error("the link has ended")]
     LinkEnded,
+    /// A link was dialed again while its session stood, or a dial found
+    /// its session let go ahead of its start. The next session took that
+    /// one's place, as it does at the controller ([`Link::redial`]).
+    #[error("the link was dialed again")]
+    Redialed,
     /// The decide stream has no credit left: the gateway decides this
     /// request itself. Nothing was sent, and the stream stands.
     #[error("the decide stream has no credit left: the gateway decides this request itself")]
