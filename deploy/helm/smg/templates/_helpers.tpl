@@ -211,6 +211,45 @@ it cannot start without. Renders nothing.
 {{- end -}}
 {{- end }}
 
+{{/* The ConfigMap that supplies the router's policy document, if given. */}}
+{{- define "smg.routerPolicyConfigMapName" -}}
+{{- if .Values.router.policySpec -}}
+{{- printf "%s-policy-spec" (include "smg.fullname" .) -}}
+{{- else -}}
+{{- .Values.router.policySpecConfigMap | default "" -}}
+{{- end -}}
+{{- end }}
+
+{{/* The value for --policy, empty when a document is given without a policy value. */}}
+{{- define "smg.routerPolicyArg" -}}
+{{- if .Values.router.policy -}}
+{{- .Values.router.policy -}}
+{{- else if not (include "smg.routerPolicyConfigMapName" .) -}}
+cache_aware
+{{- end -}}
+{{- end }}
+
+{{/* The policy document's file in the router pod. */}}
+{{- define "smg.routerPolicySpecPath" -}}
+/etc/smg/policy/spec.yaml
+{{- end }}
+
+{{/* The inline policy file, with its final newline, for the ConfigMap and checksum. */}}
+{{- define "smg.routerPolicySpec" -}}
+{{- toYaml .Values.router.policySpec | printf "%s\n" -}}
+{{- end }}
+
+{{/* A policy document needs the gateway's controller and one source. */}}
+{{- define "smg.validatePolicy" -}}
+{{- $router := .Values.router -}}
+{{- if and $router.policySpec $router.policySpecConfigMap -}}
+{{- fail "router.policySpec and router.policySpecConfigMap each supply a policy document. Use one source." -}}
+{{- end -}}
+{{- if and (include "smg.routerPolicyConfigMapName" .) (ne ($router.policyController | default "off") "on") -}}
+{{- fail "router.policySpec and router.policySpecConfigMap require router.policyController to be on." -}}
+{{- end -}}
+{{- end }}
+
 {{/*
 Consul TLS files -- the files of router.discovery.consul.tls.existingSecret
 the router pod mounts under /etc/smg/consul-tls, as a JSON list for
@@ -268,8 +307,18 @@ Called from the router Deployment template.
 - {{ . | quote }}
 {{- end }}
 {{- end }}
+{{- with include "smg.routerPolicyArg" . }}
 - "--policy"
-- {{ .Values.router.policy | quote }}
+- {{ . | quote }}
+{{- end }}
+{{- if eq (.Values.router.policyController | default "off") "on" }}
+- "--policy-controller"
+- {{ .Values.router.policyController | quote }}
+{{- end }}
+{{- if include "smg.routerPolicyConfigMapName" . }}
+- "--policy-spec"
+- {{ include "smg.routerPolicySpecPath" . | quote }}
+{{- end }}
 {{- with .Values.router.disaggregation }}
 {{- $mode := .mode | default "" }}
 {{- /* The role flags of disaggregated serving, typed: a role given without

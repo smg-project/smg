@@ -1,0 +1,11 @@
+{{- if .Values.router.policySpec }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "smg.routerPolicyConfigMapName" . }}
+  labels:
+    {{- include "smg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: router
+data:
+  {{ include "smg.routerPolicySpecPath" . | base }}: {{ include "smg.routerPolicySpec" . | quote }}
+{{- end }}
