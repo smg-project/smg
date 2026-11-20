@@ -1129,6 +1129,8 @@ impl<'a> RegularAttempt<'a> {
             id,
             model,
             streaming,
+            headers: None,
+            rid: None,
             tried,
             hashes: None,
         }

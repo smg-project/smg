@@ -2042,6 +2042,8 @@ mod tests {
                     id: b"placed",
                     model: "model-a",
                     streaming: false,
+                    headers: None,
+                    rid: None,
                     tried: &[],
                     hashes: None,
                 },
