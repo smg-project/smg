@@ -135,10 +135,8 @@ impl LoadRecord for common::EngineLoad {
     }
 
     #[inline]
-    fn snapshot(&self) -> SchedulerLoadSnapshot {
-        let mut snapshot = SchedulerLoadSnapshot::from(self);
-        snapshot.mark_stated(self.telemetry());
-        snapshot
+    fn fields(&self) -> SchedulerLoadSnapshot {
+        SchedulerLoadSnapshot::from(self)
     }
 
     #[inline]
