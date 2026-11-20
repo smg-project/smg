@@ -40,6 +40,14 @@
 //! its clear ends. A stream that would take one in between passes its
 //! batch over, so a removal clears nothing a new stream wrote.
 //!
+//! An open feed's own row that the holder stands at rank 0 is taken by no
+//! other stream: only a route read before the row was laid again asks for
+//! it, and that batch is passed over. A feed's open asks the holder
+//! whether its object still stands for the row in the hold that writes
+//! the row's entry. So a row laid again behind that answer is taken from
+//! the stale feed by the stream the holder then routes to it, and never
+//! by the stale feed from that stream.
+//!
 //! # The block size
 //!
 //! A batch the store takes names the model's block size: the widest block
@@ -121,6 +129,25 @@ struct Rows {
     /// own. A row stands in the list of the stream its entry names, and in
     /// no other.
     fed: HashMap<WorkerId, Vec<WorkerId>>,
+}
+
+impl Rows {
+    /// Write `stream` as `row`'s stream, from nothing shown: the row leaves
+    /// the list of the stream that wrote it. `false`, with nothing done,
+    /// where that stream is leaving and still clears the row.
+    fn claim(&mut self, stream: WorkerId, row: WorkerId) -> bool {
+        if self.written.get(&row).is_some_and(|before| before.leaving) {
+            return false;
+        }
+        let before = self.written.insert(row, Written::begun(stream));
+        if let Some(list) = before.and_then(|before| self.fed.get_mut(&before.stream)) {
+            list.retain(|&other| other != row);
+        }
+        if row != stream {
+            self.fed.entry(stream).or_default().push(row);
+        }
+        true
+    }
 }
 
 /// What the adapter keeps of a row a stream writes.
@@ -205,6 +232,14 @@ impl<S: ?Sized> KvAdapter<S> {
         let fed = rows.fed.get(&id).into_iter().flatten().copied();
         own.then_some(id).into_iter().chain(fed).collect()
     }
+
+    /// Whether the holder stands `row` at rank 0: the row of a feed of its
+    /// own, which no other stream's batch is routed to.
+    fn stands_lowest(&self, row: WorkerId) -> bool {
+        self.ranks
+            .as_ref()
+            .is_some_and(|ranks| ranks.row_of(row, 0).is_some())
+    }
 }
 
 impl<S> KvAdapter<S>
@@ -235,29 +270,65 @@ where
         }
     }
 
-    /// `stream` takes `row`. The row begins from nothing, as a feed's own
-    /// row does at its open: what the store kept of it was decided by
-    /// facts that are gone, or by another stream's batches. The stream
-    /// that wrote it reaches it no longer: the row changes lists in one
-    /// hold of the lock. `false`, with nothing done, where that stream is
-    /// leaving and still clears the row: the batch is passed over, and a
-    /// later one takes the row.
+    /// `stream` takes `row`, the row of another rank, for a batch. The row
+    /// begins from nothing, as a feed's own row does at its open: what the
+    /// store kept of it was decided by facts that are gone, or by another
+    /// stream's batches. The stream that wrote it reaches it no longer:
+    /// the row changes lists in one hold of the lock. `false`, with
+    /// nothing done, where the row is not this stream's to take, and the
+    /// batch is passed over. Its stream is leaving and still clears it: a
+    /// later batch takes the row. Or it is an open feed's own row that the
+    /// holder still stands at rank 0: only a route read before the row
+    /// was laid again asks for it.
     fn take(&self, stream: WorkerId, row: WorkerId) -> bool {
         {
             let mut rows = self.rows.lock();
-            let Rows { written, fed } = &mut *rows;
-            if written.get(&row).is_some_and(|before| before.leaving) {
+            let own_feed = rows
+                .written
+                .get(&row)
+                .is_some_and(|before| before.stream == row);
+            // The holder is asked in the hold, and for such a row alone.
+            if own_feed && self.stands_lowest(row) {
                 return false;
             }
-            let before = written.insert(row, Written::begun(stream));
-            if let Some(list) = before.and_then(|before| fed.get_mut(&before.stream)) {
-                list.retain(|&other| other != row);
-            }
-            if row != stream {
-                fed.entry(stream).or_default().push(row);
+            if !rows.claim(stream, row) {
+                return false;
             }
         }
         // Outside the lock, which every row's batch takes.
+        self.store.removed(row);
+        true
+    }
+
+    /// A feed's own row begins. `false`, with nothing done, where `stands`
+    /// says the feed's object stands for the row no longer. `stands` is
+    /// asked in the hold that writes the row's entry: a row laid again
+    /// behind its answer is taken from this feed by the stream the holder
+    /// then routes to it, and never by this feed from that stream.
+    ///
+    /// A row the adapter holds no facts for begins from nothing: what the
+    /// store kept of its stream was decided by facts that are gone. The
+    /// store drops the row's lane at whatever rank it keeps it, and a row
+    /// with none loses nothing. A row another stream wrote, as a rank of
+    /// its engine, begins from nothing too. One a leaving stream still
+    /// clears is left to it, and this feed's batches are passed over until
+    /// that ends.
+    fn begin(&self, row: WorkerId, stands: impl FnOnce() -> bool) -> bool {
+        {
+            let mut rows = self.rows.lock();
+            if !stands() {
+                return false;
+            }
+            let own = rows
+                .written
+                .get(&row)
+                .is_some_and(|written| written.stream == row);
+            if own || !rows.claim(row, row) {
+                return true;
+            }
+        }
+        // Outside the lock, which every row's batch takes, and on the
+        // caller's task: the clear ends before the feed is handed back.
         self.store.removed(row);
         true
     }
@@ -681,9 +752,10 @@ where
         // The ticket was written at the enrollment, and the feed opens
         // later, on the subscription's task. A row laid again since is
         // another object's, and may be another stream's by now: its ticket
-        // opens nothing.
+        // opens nothing. The holder is asked as the row begins.
         let ticket = ticket.and_then(|row| {
-            (self.row_of(worker) == Some(row))
+            self.sink
+                .begin(row, || self.row_of(worker) == Some(row))
                 .then_some(row)
                 .ok_or(NoFeed::NoRow)
         });
@@ -691,26 +763,6 @@ where
             Ok(row) => {
                 // The model the row's stored blocks name a size for.
                 self.sink.sizes.lock().models.insert(row, Arc::from(model));
-                // A row the adapter holds no facts for begins from nothing:
-                // what the store kept of its stream was decided by facts
-                // that are gone. The store drops the row's lane at whatever
-                // rank it keeps it, and a row with none loses nothing. The
-                // store is called outside the facts' lock, which every
-                // row's batch takes, and on this task: the clear ends
-                // before the feed is handed back. A row another stream
-                // wrote, as a rank of its engine, begins from nothing too.
-                // One a leaving stream still clears is left to it, and
-                // this feed's batches are passed over until that ends.
-                let own = self
-                    .sink
-                    .rows
-                    .lock()
-                    .written
-                    .get(&row)
-                    .is_some_and(|written| written.stream == row);
-                if !own {
-                    self.sink.take(row, row);
-                }
                 Some((Arc::clone(&self.sink), row))
             }
             Err(NoFeed::NoRow) => {
@@ -2485,5 +2537,45 @@ mod tests {
         assert_eq!(stream, Some(other));
         assert_eq!(rows.fed.get(&other), Some(&vec![upper]));
         assert_eq!(rows.fed.get(&f.lower), None);
+    }
+
+    /// A route read before a row was laid again takes no open feed's own
+    /// row. The row stands at rank 0 of its own engine and its feed is
+    /// open: the old stream's late batch is passed over, and the row's own
+    /// stream goes on writing it.
+    #[test]
+    fn a_stale_route_takes_no_open_feeds_own_row() {
+        let f = Ranked::new();
+        let upper = f.upper();
+        let store = |hash| Data::Stored(wide_store(hash, 16));
+        assert_eq!(f.admit(1, 5, store(1)), BatchOutcome::Applied);
+        // The row is laid again in place as rank 0 of its own engine, and
+        // its feed opens.
+        assert_eq!(f.other(UPPER), upper);
+
+        // A batch of the old stream that read its route before the lay.
+        assert_eq!(f.sink.shown(f.lower, upper), None);
+        let own = batch([store(2)]);
+        assert_eq!(
+            f.sink.admit(upper, 0, facts(1), &own),
+            BatchOutcome::Applied
+        );
+        assert_eq!(f.store.indexed_blocks(upper, 0), 1);
+    }
+
+    /// A feed's open asks whether its object still stands for the row in
+    /// the hold that writes the row's entry: the lock is taken while the
+    /// answer is read.
+    #[test]
+    fn a_feeds_open_asks_the_holder_in_the_hold_that_writes_its_row() {
+        let f = Fixture::single(Some(BLOCK_SIZE));
+        let sink = &f.sink;
+        assert!(sink.begin(f.row, || sink.rows.try_lock().is_none()));
+        let begun = Written::begun(f.row);
+        assert_eq!(sink.rows.lock().written.get(&f.row), Some(&begun));
+        // A row its object stands for no longer begins nothing.
+        sink.removed(f.row);
+        assert!(!sink.begin(f.row, || false));
+        assert!(sink.rows.lock().written.is_empty());
     }
 }
