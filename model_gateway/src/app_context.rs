@@ -1035,16 +1035,38 @@ impl AppContextBuilder {
             .as_ref()
             .ok_or_else(|| "policy_registry must be set before load monitor".to_string())?
             .clone();
-        let monitor = Arc::new(WorkerMonitor::new(
-            self.worker_registry
-                .as_ref()
-                .ok_or_else(|| "worker_registry must be set before load monitor".to_string())?
-                .clone(),
-            Arc::clone(&policy_registry),
-            config.load_monitor_interval_secs,
-            config.engine_metrics,
-            config.disable_load_monitoring,
-        ));
+        let registry = self
+            .worker_registry
+            .as_ref()
+            .ok_or_else(|| "worker_registry must be set before load monitor".to_string())?
+            .clone();
+        let interval = config.load_monitor_interval_secs;
+        let (engine_metrics, conditional) = (config.engine_metrics, config.disable_load_monitoring);
+        // Where the controller was picked the collector says its facts to
+        // the feed's sink, which writes the store, and no classic policy
+        // reads a load. Else it keeps the classic sink, and its snapshot
+        // feeds every policy that consumes it; the monitor polls every group
+        // by default, conditionally under `--disable-load-monitoring`.
+        let monitor = match &self.policy_feed {
+            Some(feed) => Arc::new(WorkerMonitor::with_sink(
+                registry,
+                feed.load_sink(Duration::from_secs(interval.max(1))),
+                interval,
+                engine_metrics,
+                conditional,
+            )),
+            None => {
+                let monitor = Arc::new(WorkerMonitor::new(
+                    registry,
+                    Arc::clone(&policy_registry),
+                    interval,
+                    engine_metrics,
+                    conditional,
+                ));
+                policy_registry.set_load_receiver(Some(monitor.subscribe()));
+                monitor
+            }
+        };
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
@@ -1054,10 +1076,6 @@ impl AppContextBuilder {
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
         pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
-        // Wire the backend load-snapshot feed into every policy that consumes
-        // it; the monitor polls every group by default, conditionally under
-        // `--disable-load-monitoring`.
-        policy_registry.set_load_receiver(Some(monitor.subscribe()));
         self.worker_monitor = Some(monitor);
         Ok(self)
     }
@@ -1445,6 +1463,76 @@ mod tests {
             .get_default_policy();
         let cache_aware = as_cache_aware(policy.as_ref()).expect("default policy is cache-aware");
         assert!(cache_aware.has_load_receiver_for_test());
+    }
+
+    /// Under the policy controller the monitor says its facts to the feed's
+    /// sink: a pushed record lands on the store's row, and no classic
+    /// policy is handed the monitor's load feed.
+    #[tokio::test]
+    async fn under_the_feed_the_collectors_sink_is_the_feeds() {
+        use smg_policy_controller::{
+            store::{HealthPolicy, LoadSink, Maker, WorkerFacts},
+            view::{Role, WireModes},
+            worker_host::{Expect, Wrote},
+        };
+        use smg_worker::common_proto::EngineLoad;
+
+        use crate::policies::as_cache_aware;
+
+        const URL: &str = "http://worker:8000";
+        let config = RouterConfig {
+            policy_controller: true,
+            ..config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000))
+        };
+        let builder = AppContextBuilder::new()
+            .with_client(&config, 5)
+            .expect("client builds")
+            .with_worker_registry()
+            .with_policy_registry(&config)
+            .with_policy_controller(&config, None)
+            .expect("the policy controller starts")
+            .with_worker_monitor(&config)
+            .expect("worker monitor builds");
+        let feed = builder.policy_feed.as_ref().expect("the store has a feed");
+        let store = builder.policy_store.as_ref().expect("the store started");
+        let monitor = builder.worker_monitor.as_ref().expect("the monitor");
+        let registry = builder.worker_registry.as_ref().expect("the registry");
+
+        let facts = WorkerFacts {
+            key: URL.to_owned(),
+            engine: URL.to_owned(),
+            role: Role::Single,
+            wire_modes: WireModes::HTTP,
+            models: vec!["model-a".to_owned()],
+            dp_size: 1,
+            health: HealthPolicy {
+                probes: false,
+                ..HealthPolicy::default()
+            },
+            ..WorkerFacts::default()
+        };
+        let Ok(Wrote::Registered(row)) =
+            feed.door
+                .found(&Maker::Control, Expect::Nothing, URL, &|_| facts.clone())
+        else {
+            panic!("the worker registers at the feed's door");
+        };
+        let worker = registry.get_by_url(URL).expect("the row's worker stands");
+        let record = EngineLoad {
+            waiting_requests: 6,
+            ..EngineLoad::default()
+        };
+        monitor.apply_pushed_load(&worker, 0, &record, std::time::Instant::now());
+        let sample = LoadSink::load(&**store, row, 0).expect("the row holds the pushed sample");
+        assert_eq!(sample.row.queued, 6);
+
+        let policy = builder
+            .policy_registry
+            .as_ref()
+            .expect("policy registry set")
+            .get_default_policy();
+        let cache_aware = as_cache_aware(policy.as_ref()).expect("default policy is cache-aware");
+        assert!(!cache_aware.has_load_receiver_for_test());
     }
 
     /// Every policy gets the monitor: a cache-aware one for its indexes, any
