@@ -1077,39 +1077,19 @@ pub(crate) struct PairBooking {
 /// first read, at that read's instant, from which [`DISPATCH_TTL`] runs
 /// for its gateway to name a dispatch. The lease books the count the
 /// decision's own world lays beside its target's row, and the engine that
-/// decided is told of it. A lease on file is a request on its way to that
-/// target: the record of sent prefixes takes the prefix `named` holds,
-/// where the target's pool keeps one ([`World::sent`]).
+/// decided is told of it by `told`, the telling its caller hands. A lease
+/// on file is a request on its way to that target: the record of sent
+/// prefixes takes the prefix `named` holds, where the target's pool keeps
+/// one ([`World::sent`]).
+///
+/// The store builds its issue for each telling, so a caller with a
+/// telling of its own leaves every other caller's issue as it was built.
 ///
 /// # Errors
 ///
 /// The store's refusal: it stands under another term, or mints no id
 /// under this one.
 pub(crate) fn issue<A: Asked>(
-    store: &MemoryStore,
-    world: &World,
-    taken: &Taken<'_, A>,
-    term: u64,
-    decision: &Decision,
-    booking: Booking,
-    named: &Named,
-) -> Result<Lease, LeaseRefused> {
-    let engine = world.spec().engine();
-    let told = |lease: &Lease| {
-        engine.on_decision_issued(lease, decision);
-    };
-    issue_told(store, world, taken, term, booking, named, told)
-}
-
-/// [`issue`] with the telling its caller hands, which tells the engine
-/// that decided of the lease. The store builds its issue for each
-/// telling, so a caller with a telling of its own leaves every other
-/// caller's issue as it was built.
-///
-/// # Errors
-///
-/// Those of [`issue`].
-pub(crate) fn issue_told<A: Asked>(
     store: &MemoryStore,
     world: &World,
     taken: &Taken<'_, A>,
@@ -3102,7 +3082,7 @@ impl Door {
     /// ([`Self::order`], [`Self::order_shadowed`]): a pick's lease is
     /// issued, the engine that decided is told of it, and the record of
     /// sent prefixes takes the prefix of `named`, the live decision's
-    /// naming ([`issue_told`]). A step that joins a single's commit is
+    /// naming ([`issue`]). A step that joins a single's commit is
     /// written here, once, and stands in both orders.
     ///
     /// Each order builds a copy of its own (`SHADOWED`), with a telling
@@ -3123,7 +3103,7 @@ impl Door {
             engine.on_decision_issued(lease, decision);
         };
         let lease = booking
-            .map(|booking| issue_told(&self.store, world, taken, term, booking, named, told))
+            .map(|booking| issue(&self.store, world, taken, term, booking, named, told))
             .transpose()
             .map_err(|_| Refused::Unleased)?;
         Ok(lease.map(|lease| Leased {

@@ -939,8 +939,13 @@ impl Deciding {
                 Entry::Single => {
                     let (decision, booking) = decide_in(world, &taken, buffers, own);
                     let named = &buffers.named;
+                    let engine = world.spec().engine();
                     let filed = booking
-                        .map(|booking| issue(store, world, &taken, term, &decision, booking, named))
+                        .map(|booking| {
+                            issue(store, world, &taken, term, booking, named, |lease| {
+                                engine.on_decision_issued(lease, &decision);
+                            })
+                        })
                         .transpose();
                     (decision, filed)
                 }
