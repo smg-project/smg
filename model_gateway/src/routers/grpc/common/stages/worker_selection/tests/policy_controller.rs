@@ -6,6 +6,7 @@ use kv_index::{salt::request_content_hashes_with_seed, XXH3_SEED};
 use llm_multimodal::MediaContentPart;
 use serde_json::Value;
 use smg_policy_controller::{
+    spec::{KeySourceSpec, RoutingKeySpec},
     store::{
         BatchOutcome, GatewayId, KvEventSink, LeasesStore, LoadSink, LoadSource, MemoryStore,
         WorkersStore,
@@ -16,7 +17,9 @@ use smg_policy_controller::{
 
 use super::*;
 use crate::{
-    middleware::request_id::RequestId, policy_controller::host::testing::MODEL,
+    config::{PolicyConfig, RouterConfig, RoutingKeyOverrideConfig},
+    middleware::request_id::RequestId,
+    policy_controller::host::testing::MODEL,
     routers::grpc::context::LoadGuards,
 };
 
@@ -68,6 +71,41 @@ fn stage_on_rows(
     }
     let host = Host::at_keys(Arc::clone(store), Arc::clone(&registry));
     regular_stage(registry).with_host(Some(Arc::new(host)))
+}
+
+/// The stage over a host whose document places by consistent hashing, with
+/// the body's `rid` as the one source of the key.
+fn stage_keyed_by_the_rid(
+    urls: &[&str],
+) -> anyhow::Result<(WorkerSelectionStage, Arc<MemoryStore>)> {
+    let config = RouterConfig {
+        policy_controller: true,
+        policy: PolicyConfig::ConsistentHashing,
+        ..RouterConfig::default()
+    };
+    let (_, store, rows) = host::testing::bed_under(PolicyConfig::ConsistentHashing, urls);
+    let mut document = config.policy_document()?;
+    document.generation += 1;
+    document.bindings[0].routing_key = Some(RoutingKeySpec {
+        sources: vec![KeySourceSpec {
+            rid: true,
+            ..KeySourceSpec::default()
+        }],
+        strip_lineage: false,
+    });
+    store.apply(config.hosted_policy(&document)?)?;
+    let workers: Vec<_> = urls
+        .iter()
+        .map(|url| {
+            (
+                *url,
+                WorkerType::Regular,
+                ConnectionMode::Grpc,
+                RuntimeType::Vllm,
+            )
+        })
+        .collect();
+    Ok((stage_on_rows(&workers, &store, &rows), store))
 }
 
 fn stage_with_cached_prompt(
@@ -491,13 +529,14 @@ async fn a_retry_names_the_rows_of_its_failed_attempts() {
     ctx.request_id = Some("retry-id".to_owned());
     ctx.streaming = true;
     ctx.headers = Some(HeaderMap::new());
+    ctx.routing.rid = Some("retained-rid".to_owned());
     let id = host::mark();
     let hashes = host::Hashes::default();
     let ask = Attempt::Retry(&ctx).ask(MODEL, &id, &hashes);
     assert!(ask.streaming);
-    // A retry states the headers it retained and no `rid`.
+    // A retry states the headers and the `rid` the request left behind.
     assert_eq!(ask.headers, ctx.headers.as_ref());
-    assert!(ask.rid.is_none());
+    assert_eq!(ask.rid, Some("retained-rid"));
     let plan = retained_plan(&[1]);
     stage
         .reselect(&mut ctx, &plan)
@@ -537,6 +576,104 @@ async fn a_retry_names_the_rows_of_its_failed_attempts() {
     };
     assert!(Arc::ptr_eq(worker, second.worker()));
     assert_the_lease_is_named_by_none_of(&store, &["retry-id", ""]);
+}
+
+/// A binding keyed by the body's `rid` keeps its key across a retry. The
+/// first selection retains the `rid` and the retry's ask states it, so each
+/// retry lands where the host places an ask of the same key with the same
+/// tried row. An ask with no key does not land there for every key.
+#[tokio::test]
+async fn a_retry_under_a_binding_keyed_by_the_rid_is_placed_by_the_key() -> anyhow::Result<()> {
+    const WORKERS: [&str; 4] = [
+        "http://w0:8000",
+        "http://w1:8000",
+        "http://w2:8000",
+        "http://w3:8000",
+    ];
+    let (stage, store) = stage_keyed_by_the_rid(&WORKERS)?;
+    let host = stage.host.as_ref().expect("the stage's host");
+    let plan = retained_plan(&[1]);
+    for turn in 0..8 {
+        let rid = format!("conv-{turn}");
+        let mut ctx = ingress(&stage.worker_registry);
+        let RequestType::Generate(request) = &mut ctx.input.request_type else {
+            panic!("a generate request");
+        };
+        Arc::make_mut(request).rid = Some(rid.clone());
+        stage.execute(&mut ctx).await.expect("the first attempt");
+        // The request is gone at the dispatch: a retry reads what was kept.
+        let mut ctx = Box::new(ctx).into_dispatch().expect("a dispatch context");
+        let first_row = ctx.placed.as_ref().expect("the first placement").id();
+        // The attempt fails ahead of its send, and its row is named as tried.
+        let failure = error::internal_error("attempt_failed", "Attempt failed");
+        ctx.release_attempt(&failure, Instant::now());
+        assert_eq!(*ctx.tried_rows, [first_row]);
+
+        // Where the host places the key with that row tried.
+        let id = host::mark();
+        let keyed = Ask {
+            rid: Some(&rid),
+            tried: &ctx.tried_rows,
+            ..Ask::of(&id, MODEL)
+        };
+        let by_key = host
+            .place(&keyed, Instant::now())
+            .await
+            .expect("the key's next worker")
+            .id();
+
+        stage.reselect(&mut ctx, &plan).await.expect("the retry");
+        let retried = ctx.placed.take().expect("the retry's placement").id();
+        assert_eq!(retried, by_key, "{rid}");
+        assert_ne!(retried, first_row, "{rid}");
+    }
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+    Ok(())
+}
+
+/// The routing snapshot keeps the body's `rid` only where a retry reads it.
+/// Under a host the retry's ask states it. On the classic line it stays
+/// where the sticky key derives from it, and a retry derives that key from
+/// it again. Elsewhere the classic line keeps no copy.
+#[tokio::test]
+async fn the_snapshot_keeps_the_rid_only_where_a_retry_reads_it() {
+    const RID: &str = "conv_t2_r1";
+    async fn kept(stage: &WorkerSelectionStage) -> Option<String> {
+        let mut ctx = ingress(&stage.worker_registry);
+        let RequestType::Generate(request) = &mut ctx.input.request_type else {
+            panic!("a generate request");
+        };
+        Arc::make_mut(request).rid = Some(RID.to_owned());
+        stage.execute(&mut ctx).await.expect("a selection");
+        ctx.state.routing_snapshot.expect("the snapshot").rid
+    }
+    let (hosted, _store) = stage_with_host(&URLS[..1]);
+    assert_eq!(kept(&hosted).await.as_deref(), Some(RID));
+
+    let registry = Arc::clone(&hosted.worker_registry);
+    let classic = regular_stage(Arc::clone(&registry));
+    assert_eq!(classic.policy_registry.derive_rid_key(Some(RID)), None);
+    assert_eq!(kept(&classic).await, None, "no retry reads it");
+
+    let sticky = WorkerSelectionStage::new(
+        registry,
+        Arc::new(PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                ..RoutingKeyOverrideConfig::default()
+            },
+        )),
+        WorkerSelectionMode::Regular,
+        None,
+    );
+    let rid = kept(&sticky).await;
+    assert_eq!(rid.as_deref(), Some(RID));
+    // A retry derives the first selection's key from it.
+    assert_eq!(
+        sticky.policy_registry.derive_rid_key(rid.as_deref()),
+        Some("conv")
+    );
 }
 
 #[tokio::test]
