@@ -373,8 +373,9 @@ impl MemoryStore {
     /// the same locks: a reader of the tables sees them before the restore
     /// or after it, never between. The KV lanes follow the rows: one that
     /// left gives up its lane, one that stays keeps what this replica heard
-    /// for it. The store's term rises to the cut's, as
-    /// following that term's start leaves it. The engine is told the
+    /// for it. The session pins take the steps of the writes the cut stands
+    /// for, as at a watch ([`Self::watch_from`]). The store's term rises to
+    /// the cut's, as following that term's start leaves it. The engine is told the
     /// members once, by id, as an apply tells a generation's
     /// ([`Membership::Snapshot`]), and the journal's listener once the
     /// restore's locks are let go. `false`, with nothing changed, where the
@@ -417,19 +418,24 @@ impl MemoryStore {
         // take lands whole ahead of the restore or whole behind it.
         let mut turns = self.every_turn();
         let term = cut.at.term;
-        if !self.lay_snapshot(cut, false) {
+        let Some(ended) = self.lay_snapshot(cut, false) else {
             return false;
-        }
+        };
         // The term rises and the leases on file are read under the turns.
         // Their releases are handed to the files once the turns are let go.
         self.rise(&mut turns, term);
         self.empty(turns);
+        self.forget_gone(&ended);
         true
     }
 
     /// Lays the worker rows and epoch of a `WatchWorkers` snapshot and
     /// builds the world at once. The store keeps its lease files and their
-    /// term and its session pins. A worker still present keeps its count
+    /// term. Its session pins take the steps of the writes the cut stands
+    /// for. A key the cut holds under a new id takes its pins where it is
+    /// the worker it was, and another worker's pins leave. A key the cut
+    /// drops is filed as gone by this store's own clock, as a followed
+    /// removal files it. A worker still present keeps its count
     /// slot, admission instant, gateway vetoes, completed-dispatch times
     /// and local loads, and the bits its own host wrote of it as the
     /// leader ([`HealthSink::leader_bits`]). Its KV lane stays while its
@@ -444,18 +450,27 @@ impl MemoryStore {
     /// The two terms are in step after a restore and not after this door.
     pub fn watch_from(&self, cut: Cut) -> bool {
         let _released = self.released();
-        self.lay_snapshot(cut, true)
+        let Some(ended) = self.lay_snapshot(cut, true) else {
+            return false;
+        };
+        self.forget_gone(&ended);
+        true
     }
 
     /// Lays the rows and publishes their world. A watch carries local
     /// state for the ids it sees again. A standby takes the cut's loads
-    /// and gives every row a fresh slot.
-    fn lay_snapshot(&self, cut: Cut, keep_local: bool) -> bool {
+    /// and gives every row a fresh slot. The session pins take the steps
+    /// of the writes the cut stands for ([`Workers::lay_gone`]). The ids
+    /// whose pins leave are returned, for the caller to forget behind its
+    /// locks ([`Self::forget_gone`]). `None`, with the store as it was,
+    /// where the journal refuses the cut's place.
+    fn lay_snapshot(&self, cut: Cut, keep_local: bool) -> Option<Vec<WorkerId>> {
         let mut workers = self.workers.lock();
         // The previous membership. A watch carries its local state for the
         // ids it sees again. A restore carries none of it: it reads the old
         // rows to retire the KV lanes of the ids that left, and to ask what
-        // the sent prefixes of an id it keeps still say.
+        // the sent prefixes of an id it keeps still say. Either door reads
+        // the rows the cut drops: their session pins take a leave's steps.
         let mut previous;
         // The ids the cut keeps under another offer or rank.
         let mut moved = Vec::new();
@@ -464,7 +479,7 @@ impl MemoryStore {
             let mut loads = self.loads.lock();
             if let Some(journal) = &self.journal {
                 if !journal.restart(cut.at) {
-                    return false;
+                    return None;
                 }
             }
             previous = mem::take(&mut workers.rows);
@@ -482,7 +497,6 @@ impl MemoryStore {
                 loads.ranks.clear();
             }
             workers.by_key.clear();
-            workers.gone.clear();
             workers.log.clear();
             workers.epoch = cut.epoch;
             workers.history += 1;
@@ -531,11 +545,11 @@ impl MemoryStore {
         // The index is this replica's own: a row that left gives up its
         // lane, a row that stays keeps what was heard for it, and a row the
         // cut brings takes the lane its facts ask for.
-        for id in previous.into_keys() {
-            if !workers.rows.contains_key(&id) {
-                self.kv.forget(id);
-                self.kv.forget_sent(id);
-            }
+        // The rows the cut drops stay in hand.
+        previous.retain(|id, _| !workers.rows.contains_key(id));
+        for &id in previous.keys() {
+            self.kv.forget(id);
+            self.kv.forget_sent(id);
         }
         // Its placements name pools it may stand in no longer, or another
         // rank's cache.
@@ -545,9 +559,20 @@ impl MemoryStore {
         for row in workers.rows.values() {
             self.kv.member(&row.row);
         }
+        // The session pins take the steps of the writes the cut stands
+        // for, ahead of the world that lists its rows: no decision reads
+        // a new row before its pins stand under its id. Until that world
+        // stands, a row the last one held under its old id reads as in no
+        // pool: a request of its key is placed by the rule, as inside a
+        // replacement ([`Self::pins_follow`]).
+        let left = previous.into_iter().map(|(id, held)| (id, held.row.facts));
+        let (follows, ended) = workers.lay_gone(left, Instant::now(), self.pins_absence());
+        for (old, new) in follows {
+            self.pins_follow(old, new);
+        }
         self.swap_world(&workers);
         self.tell_members(&workers);
-        true
+        Some(ended)
     }
 
     /// One of the leader's membership or status writes, applied as the
@@ -1436,9 +1461,9 @@ impl MemoryStore {
     /// the key's absence ([`Workers::gone`]) and leave where the key does
     /// not return as the worker it was ([`Self::forget_gone`]), at the
     /// store's own write and at a followed one. A row a snapshot drops
-    /// keeps them, and its key is filed nowhere: no decision takes one
-    /// while its worker is gone, and a worker that returns under the same
-    /// key and incarnation is pinned by them again. A standby is sent no
+    /// keeps them too: its key is filed as gone by this store's own
+    /// clock ([`Workers::lay_gone`]), and a worker that returns as the
+    /// one it was is pinned by them again. A standby is sent no
     /// pin, so its own are of a term this store led itself. Called under
     /// the workers lock: the health writers take it first and a load
     /// write goes into its worker's entry or nowhere, so a write racing
@@ -1501,8 +1526,13 @@ impl MemoryStore {
     /// name `new` where they named `old`, in the standing engine's table
     /// and of record. Under the workers lock and behind the
     /// registration's own word, at the store's own write and at a
-    /// followed one: no decision reads the new row before its pins stand
-    /// under its id.
+    /// followed one. A registration leaves its build owed: no decision
+    /// reads the new row before its pins stand under its id. A
+    /// replacement has paid its build, and a decision between that build
+    /// and this call reads a pin no pool holds: that one request is
+    /// placed by the rule. Renamed ahead of that build, the pin would
+    /// read as in no pool to the old world's decisions for the build's
+    /// whole time.
     fn pins_follow(&self, old: WorkerId, new: WorkerId) {
         self.world.load().spec().engine().pins_follow(old, new);
         self.follow_pins(old, new);
@@ -1606,9 +1636,12 @@ impl MemoryStore {
 
 // ---------------------------------------------------------------- workers
 
-/// The most keys the store files as gone ([`Workers::gone`]): past it the
-/// one that left first is forgotten.
-const GONE_KEYS: usize = 4_096;
+/// The most keys the store files as gone ([`Workers::gone`]). A leave
+/// past it forgets the one that left first ([`Workers::file_gone`]). A
+/// snapshot past it keeps the list and lets the pins of the keys it
+/// would add leave ([`Workers::lay_gone`]): its rows left at one
+/// instant, and none of them left before a key on file.
+pub(super) const GONE_KEYS: usize = 4_096;
 
 /// A key that left membership while its session pins stand
 /// ([`Workers::gone`]).
@@ -1637,8 +1670,8 @@ struct Workers {
     /// was, inside the absence's time ([`MemoryStore::pins_absence`]),
     /// takes its pins under its new id. One that is not, or that stays
     /// away longer, is forgotten. In no journal and no snapshot: a
-    /// follower files its own at the removals it follows, by its own
-    /// clock, and a snapshot's rows start the list empty.
+    /// follower files its own by its own clock, at the removals it
+    /// follows and at the rows a snapshot drops ([`Self::lay_gone`]).
     gone: HashMap<String, Gone>,
     epoch: u64,
     /// How often the rows were replaced whole by another store's
@@ -1752,6 +1785,58 @@ impl Workers {
             },
         );
         ended
+    }
+
+    /// A snapshot's rows are laid: the session pins take the steps of the
+    /// writes the snapshot stands for. `left` holds the rows it did not
+    /// keep, each by the id it had. A key the rows hold again, of `left`
+    /// or of the list, was registered again: its pins follow to its new
+    /// id where it is the worker it was, the pairs returned first.
+    /// Another worker's pins leave, with those of the keys gone longer
+    /// than `bound`: the ids returned second. A row of `left` whose key
+    /// the rows do not hold left: it is filed as gone at `now`, as a
+    /// followed removal files it, and where the list is full its pins
+    /// leave now.
+    fn lay_gone(
+        &mut self,
+        left: impl Iterator<Item = (WorkerId, WorkerFacts)>,
+        now: Instant,
+        bound: Duration,
+    ) -> (Vec<(WorkerId, WorkerId)>, Vec<WorkerId>) {
+        let mut follows = Vec::new();
+        let mut ended = self.ended_gone(now, bound);
+        let (rows, by_key) = (&self.rows, &self.by_key);
+        let same = |facts: &WorkerFacts, new: WorkerId| {
+            let held = rows.get(&new);
+            held.is_some_and(|held| same_worker(facts, &held.row.facts))
+        };
+        self.gone.retain(|key, gone| {
+            let Some(&new) = by_key.get(key) else {
+                return true;
+            };
+            if same(&gone.facts, new) {
+                follows.push((gone.id, new));
+            } else {
+                ended.push(gone.id);
+            }
+            false
+        });
+        for (old, facts) in left {
+            match by_key.get(&facts.key) {
+                Some(&new) if same(&facts, new) => follows.push((old, new)),
+                Some(_) => ended.push(old),
+                None if self.gone.len() < GONE_KEYS => {
+                    let gone = Gone {
+                        id: old,
+                        left: now,
+                        facts,
+                    };
+                    self.gone.insert(gone.facts.key.clone(), gone);
+                }
+                None => ended.push(old),
+            }
+        }
+        (follows, ended)
     }
 
     /// Every member as a build reads it: its row, the slot of its count
