@@ -4985,7 +4985,10 @@ impl Engine {
         }
     }
 
-    /// Records a dispatch in each profile tally that stages read.
+    /// Records a dispatch in each profile tally that stages read, where
+    /// `present` says the row still stands. The store's door asks its
+    /// world there, and `present` is asked only where a profile reads
+    /// sends.
     #[inline]
     pub(crate) fn dispatched_sent(
         &self,
@@ -4993,8 +4996,9 @@ impl Engine {
         target: &Target,
         side: Side,
         since_decision_micros: u32,
+        present: impl FnOnce() -> bool,
     ) {
-        if !self.sent_credits.is_empty() {
+        if !self.sent_credits.is_empty() && present() {
             self.credit_dispatch(lease, target, side, since_decision_micros);
         }
     }
@@ -5077,7 +5081,7 @@ impl Lifecycle for Engine {
         since_decision_micros: u32,
     ) {
         self.dispatched_table(lease, target, side);
-        self.dispatched_sent(lease, target, side, since_decision_micros);
+        self.dispatched_sent(lease, target, side, since_decision_micros, || true);
         self.dispatched_stages(lease, target, side, since_decision_micros);
     }
 

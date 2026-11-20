@@ -1270,10 +1270,13 @@ pub(crate) struct Viewed<'a> {
 /// lease's own engine. A dispatch also feeds the counts of sends of the
 /// generation `world` holds, whichever generation issued the lease: a
 /// send is the host's, whatever document decided it
-/// ([`Engine::dispatched_sent`]). A dispatch is told on the target its
-/// report names by index, as the record holds the pick, and the lease
-/// told names that index: the record was read before the door wrote it.
-/// A report that names no target of the pick tells nothing.
+/// ([`Engine::dispatched_sent`]). It feeds them where `world` lists the
+/// worker at the rank the report names ([`World::lists_rank`]): a row
+/// that left takes no send, so a late report enters no rank behind a
+/// removal. A dispatch is told on the target its report names by index,
+/// as the record holds the pick, and the lease told names that index:
+/// the record was read before the door wrote it. A report that names no
+/// target of the pick tells nothing.
 ///
 /// A pair's lease is told by side: a dispatch on the side its frame names,
 /// with that side's lease and on that side's worker, and an end once a
@@ -1344,6 +1347,7 @@ fn tell(store: &MemoryStore, world: &World, found: &Sides, said: Said) {
                 &target,
                 dispatch.side,
                 dispatch.since_decision_micros,
+                || world.lists_rank(id, dp_rank),
             );
             // The table hears first and the pin of record reads it.
             // The stages hear last, so nothing is held across their
@@ -1810,9 +1814,9 @@ impl Door {
     /// A door over `store`, with a seat for each of its files. The store
     /// is given the door's word to the engine: whoever applies a report
     /// to a lease tells the engine that issued it, and a dispatch feeds
-    /// the standing generation's counts of sends. A store that names no
-    /// decider has one file: the door decides there, and tells what is
-    /// said of its leases, as decider 0.
+    /// the standing generation's counts of sends for a row its world
+    /// still lists. A store that names no decider has one file: the door
+    /// decides there, and tells what is said of its leases, as decider 0.
     #[must_use]
     pub fn new(store: Arc<MemoryStore>) -> Self {
         let deciders = store.deciders();

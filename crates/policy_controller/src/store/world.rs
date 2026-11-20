@@ -1164,10 +1164,25 @@ impl World {
     /// there is read apart ([`World::unpooled_of`]). It searches every
     /// pool, for a lease written outside a decision.
     pub(crate) fn booked_of(&self, id: WorkerId) -> Option<Slot> {
-        let mut pools = self.rows.iter().zip(self.derived.pools.iter());
-        pools.find_map(|(rows, shape)| {
+        let (pool, row) = self.pooled_row(id)?;
+        self.derived.pools.get(pool)?.booked.get(row).copied()
+    }
+
+    /// Whether this world lists `id` at `rank`: asked of a dispatch
+    /// report's row, which may have left or changed its rank since its
+    /// decision. A member holds one rank in every pool that lists it, so
+    /// the first pool found answers.
+    pub(crate) fn lists_rank(&self, id: WorkerId, rank: u16) -> bool {
+        self.pooled_row(id)
+            .is_some_and(|(pool, row)| self.rows[pool][row].dp_rank == rank)
+    }
+
+    /// The first pool that lists `id`, with the member's row there: one
+    /// binary search a pool, as a pool's rows stand in id order.
+    fn pooled_row(&self, id: WorkerId) -> Option<(usize, usize)> {
+        self.rows.iter().enumerate().find_map(|(pool, rows)| {
             let row = rows.binary_search_by_key(&id, |row| row.id).ok()?;
-            shape.booked.get(row).copied()
+            Some((pool, row))
         })
     }
 

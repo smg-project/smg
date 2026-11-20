@@ -7,8 +7,8 @@ use crate::{
     door::{Door, Request},
     handle::Handle,
     store::{
-        Dispatch, GatewayId, MemoryStore, Said, StaleGeneration, WorkerFacts, WorkerStatus,
-        WorkersStore,
+        Dispatch, GatewayId, LeaseState, LeasesStore, MemoryStore, Said, StaleGeneration,
+        WorkerFacts, WorkerStatus, WorkersStore,
     },
     AppliedSpec, Candidate, Catalog, Constraints, Engine, Lease, Lifecycle, LoadRow, Membership,
     Pair, PolicySpec, RequestFacts, Scorer, Sent, SentCredit, Side, SpecError, Target, TieBand,
@@ -458,6 +458,36 @@ fn a_decision_holding_the_standing_world_reads_the_same_carried_entry() {
 }
 
 #[test]
+fn a_late_dispatch_adds_no_entry_for_a_row_that_left() {
+    for resize in [false, true] {
+        let (door, _, readers) = door();
+        let now = Instant::now();
+        let mut first = decide(&door, b"before", now);
+        let sent_to = chosen(&first);
+        let lease = first.lease().expect("the pick's lease").lease;
+        let store = door.store();
+        let worker = WorkersStore::get(&**store, sent_to.id).expect("the worker");
+        if resize {
+            let facts = WorkerFacts {
+                dp_rank: 6,
+                dp_size: 9,
+                ..worker.facts
+            };
+            assert_eq!(store.upsert(facts).id(), sent_to.id);
+            store.publish_now();
+        } else {
+            store.remove(sent_to.id, worker.revision).expect("removal");
+        }
+        first.dispatched(now);
+
+        let record = LeasesStore::get(&**store, GATEWAY, lease.id).expect("the filed lease");
+        assert!(matches!(record.state, LeaseState::Dispatched { .. }));
+        let tally = readers.lock()[0].credits.tally.load();
+        assert!(!tally.contains_key(&(sent_to.id, sent_to.dp_rank)));
+    }
+}
+
+#[test]
 fn a_generation_with_no_readers_leaves_sends_behind() {
     let (door, catalog, readers) = door();
     let now = Instant::now();
@@ -475,6 +505,15 @@ fn a_generation_with_no_readers_leaves_sends_behind() {
     door.store().deciding(|world| {
         let engine = world.spec().engine();
         assert!(engine.sent_credits.is_empty());
+        engine.dispatched_sent(
+            &Lease::default(),
+            &Target::default(),
+            Side::Single,
+            0,
+            || {
+                panic!("a dispatch with no readers checked membership");
+            },
+        );
     });
 
     next = next_document(None);
