@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use smg_grpc_client::engine_port::GrpcConnector;
-use smg_worker::registry::WorkerRegistry;
+use smg_worker::{connection::engine::EngineConnector, registry::WorkerRegistry};
 use tokio::sync::watch;
 
 use super::ObjectsWake;
@@ -28,14 +28,28 @@ impl WorkerObjects {
     /// The objects of `store`'s rows, none built yet: [`Self::run`] builds
     /// them. `wake` is the copy of the one the store's log tells.
     pub(crate) fn new(store: Arc<MemoryStore>, wake: ObjectsWake) -> Self {
+        Self::with_connector(store, wake, Arc::new(GrpcConnector))
+    }
+
+    /// [`Self::new`] with `connector` making each object's engine
+    /// connection.
+    pub(super) fn with_connector(
+        store: Arc<MemoryStore>,
+        wake: ObjectsWake,
+        connector: Arc<dyn EngineConnector>,
+    ) -> Self {
         Self {
             store,
             objects: Arc::new(
-                Objects::new(Arc::new(WorkerRegistry::new()))
-                    .with_connector(Arc::new(GrpcConnector)),
+                Objects::new(Arc::new(WorkerRegistry::new())).with_connector(connector),
             ),
             wake,
         }
+    }
+
+    /// The store the objects' rows stand in.
+    pub(crate) fn store(&self) -> Arc<MemoryStore> {
+        Arc::clone(&self.store)
     }
 
     /// The holder shared with readers of the replica's worker objects.

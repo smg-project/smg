@@ -165,6 +165,10 @@ pub struct Controller {
     workers: Arc<worker_objects::WorkerObjects>,
     #[cfg(feature = "worker-host")]
     kv_feed: KvFeed<Members>,
+    /// The health probes of the replica's workers: one task of the serve,
+    /// which probes while this replica leads.
+    #[cfg(feature = "worker-host")]
+    prober: worker_objects::Prober,
     /// Worker discovery, where the configuration names a provider: one task
     /// of the serve, which runs the provider while this replica leads.
     #[cfg(feature = "discovery")]
@@ -467,6 +471,8 @@ impl Controller {
         ));
         #[cfg(feature = "worker-host")]
         let kv_feed = KvFeed::new(Arc::clone(&journal.0), workers.holder());
+        #[cfg(feature = "worker-host")]
+        let prober = worker_objects::Prober::new(Arc::clone(&workers), elector.fence());
         let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
@@ -512,6 +518,8 @@ impl Controller {
             workers,
             #[cfg(feature = "worker-host")]
             kv_feed,
+            #[cfg(feature = "worker-host")]
+            prober,
             #[cfg(feature = "discovery")]
             discovery,
         })
@@ -833,6 +841,8 @@ impl Controller {
             workers,
             #[cfg(feature = "worker-host")]
             kv_feed,
+            #[cfg(feature = "worker-host")]
+            prober,
             #[cfg(feature = "discovery")]
             discovery,
             ..
@@ -957,6 +967,14 @@ impl Controller {
             let kv_stop = stop.subscribe();
             tasks.spawn(async move {
                 kv_feed.run(kv_stop).await;
+                Ok(())
+            });
+            // The probes run under the role's word on every replica: one
+            // that leads alone hears it from its own election, and one
+            // that does not lead dials no engine for its health.
+            let (probes_stop, leads) = (stop.subscribe(), shared.role.subscribe());
+            tasks.spawn(async move {
+                prober.run(probes_stop, leads).await;
                 Ok(())
             });
         }
@@ -1363,7 +1381,7 @@ mod tests {
         Error, NoFollow, Scope,
     };
     #[cfg(feature = "worker-host")]
-    use crate::store::{WorkerFacts, WorkersStore};
+    use crate::store::{HealthPolicy, WorkerFacts, WorkerStatus, WorkersStore};
     use crate::{
         door::TERM_MARK,
         elector::{
@@ -1612,6 +1630,60 @@ mod tests {
             store.remove(row, revision).expect("a removal");
             while !workers.objects().is_empty() {
                 assert!(begun.elapsed() < wait, "the object of a row that went");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            stop.send(()).expect("the serve waits for its stop");
+        };
+        let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })
+            .await
+            .expect("the serve ends at its stop");
+        served.expect("a serve that leaves by its signal");
+    }
+
+    /// The serve starts the probes of the replica's workers: a row written
+    /// while the controller leads is readied by the first probe its engine
+    /// passes, with no hand on its status.
+    #[cfg(feature = "worker-host")]
+    #[tokio::test]
+    async fn a_served_controller_probes_its_rows_while_it_leads() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let addr = listener.local_addr().expect("the port's address");
+        let engine = axum::Router::new().route("/health", axum::routing::get(|| async {}));
+        let mut engines = JoinSet::new();
+        engines.spawn(async move { axum::serve(listener, engine).await });
+
+        let controller = Controller::bind(valid()).await.expect("the listeners bind");
+        let (shared, store) = (Arc::clone(&controller.shared), controller.store());
+        let (stop, stopped) = oneshot::channel::<()>();
+        let serve = controller.serve(async {
+            let _ = stopped.await;
+        });
+        let case = async {
+            let (wait, begun) = (Duration::from_secs(20), Instant::now());
+            while shared.fence.leader_term(Instant::now()).is_none() {
+                assert!(begun.elapsed() < wait, "no first take");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let url = format!("http://{addr}");
+            let row = store
+                .upsert(WorkerFacts {
+                    key: url.clone(),
+                    engine: url,
+                    models: vec!["m".to_owned()],
+                    dp_size: 1,
+                    health: HealthPolicy {
+                        success_threshold: 1,
+                        ..HealthPolicy::default()
+                    },
+                    ..WorkerFacts::default()
+                })
+                .id();
+            assert_eq!(
+                store.get(row).map(|row| row.status),
+                Some(WorkerStatus::Pending)
+            );
+            while store.get(row).map(|row| row.status) != Some(WorkerStatus::Ready) {
+                assert!(begun.elapsed() < wait, "no probe readied the row");
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             stop.send(()).expect("the serve waits for its stop");

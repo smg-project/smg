@@ -19,7 +19,8 @@
 //! holds a figure measured for its rank, never an aggregate. A failed read
 //! writes no row: the row on file ages, the engine's overload verdict
 //! reads clear until the engine is heard again unless a rank of it is
-//! still heard on its stream, and health is the prober's (a later PR). A
+//! still heard on its stream, and health is the prober's: the controller
+//! probes its workers while it leads, under its `worker-host` feature. A
 //! read that lands after its worker left writes nothing: the store keeps
 //! a worker's load rows exactly as long as its row.
 //! A row reachable only through a gateway is never dialed: its records
