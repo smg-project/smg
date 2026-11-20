@@ -2624,6 +2624,13 @@ pub async fn startup_with(
         worker_monitor.start_event_loop();
         debug!("Started WorkerMonitor event loop");
     }
+    // Under the feed the collector writes the store from its own tasks. The
+    // feed's loop shows those writes when the store's instant comes.
+    let _publications = app_context
+        .policy_feed
+        .as_ref()
+        .filter(|_| app_context.worker_monitor.is_some())
+        .map(|feed| feed.publications());
 
     let admission_queue =
         if app_context.rate_limiter.is_some() && config.router_config.queue_size > 0 {

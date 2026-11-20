@@ -2646,6 +2646,17 @@ impl LoadSink for MemoryStore {
         }
     }
 
+    fn evict_unready(&self) {
+        // The workers lock first, as a membership write takes it: no row's
+        // status moves under the walk.
+        let workers = self.workers.lock();
+        for row in workers.rows.values() {
+            if row.row.status != WorkerStatus::Ready {
+                self.evict(row.row.id);
+            }
+        }
+    }
+
     fn publish_due(&self) -> Option<Instant> {
         self.loads.lock().writer.due()
     }
