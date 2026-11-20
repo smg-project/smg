@@ -671,8 +671,11 @@ pub(crate) struct SinceReport {
     /// How many of the held dispatches were recorded at no tokens: those
     /// of a lease that states no size, in a count of sends. As wide as the
     /// held word's count of requests, which bounds it. A word of its own,
-    /// written behind the held word at a record and at a release: a read
-    /// that crosses either may see one of the two without the other.
+    /// written behind the held word at a record and lowered ahead of it
+    /// at a release and at a retirement, so it never counts a dispatch
+    /// the held word does not. A read loads the two words apart: across a
+    /// record or a release it may see one without the other for the
+    /// dispatch in flight, and across a retirement for its batch.
     unsized_held: AtomicU16,
     /// The lowest of the lanes' front instants; `u64::MAX` when none. A
     /// dispatch lowers it under its lane's lock; a release recomputes it
@@ -941,9 +944,9 @@ impl SinceReport {
                 unsized_retired += u16::from(tokens == 0);
             }
         }
-        self.held.fetch_sub(retired, Ordering::Relaxed);
         self.unsized_held
             .fetch_sub(unsized_retired, Ordering::Relaxed);
+        self.held.fetch_sub(retired, Ordering::Relaxed);
         for (dispatches, lane) in held_lanes.iter().zip(&self.lanes) {
             lane.publish_oldest(dispatches);
         }
@@ -1033,7 +1036,9 @@ impl SinceReport {
     }
 
     /// The release of a row that holds a dispatch of no tokens: each one
-    /// that goes leaves that count too, behind the held word.
+    /// that goes leaves that count first and the held word next, so a
+    /// read that crosses the release misses the price of one dispatch at
+    /// most.
     #[cold]
     #[inline(never)]
     fn release_marked(
@@ -1041,19 +1046,18 @@ impl SinceReport {
         held_lanes: &mut [MutexGuard<'_, Dispatches>; DISPATCH_LANES],
         sampled_at_micros: u64,
     ) {
-        let mut unsized_released = 0;
         for (dispatches, lane) in held_lanes.iter_mut().zip(&self.lanes) {
             while let Some(&(at, tokens)) = dispatches.front() {
                 if at > sampled_at_micros {
                     break;
                 }
-                unsized_released += u16::from(tokens == 0);
+                if tokens == 0 {
+                    self.unsized_held.fetch_sub(1, Ordering::Relaxed);
+                }
                 self.pop_oldest(dispatches);
             }
             lane.publish_oldest(dispatches);
         }
-        self.unsized_held
-            .fetch_sub(unsized_released, Ordering::Relaxed);
     }
 
     /// Dispatches held over every lane, for tests and dumps.
@@ -6912,6 +6916,42 @@ mod tests {
             bound + 1,
             "the waiting dispatch retired a batch and landed"
         );
+    }
+
+    #[test]
+    fn a_read_across_a_release_counts_no_more_unsized_dispatches_than_dispatches() {
+        // One thread releases a row that holds dispatches of no tokens
+        // alone, and this one reads the row's two words as they stand. The
+        // count of those dispatches goes down ahead of the held word at
+        // each one, so no read sees more of them than dispatches. A round
+        // whose reads all land beside the release shows nothing: the
+        // rounds go on until a read lands inside one, a few at most.
+        const HELD: u64 = 6_000;
+        for _ in 0..32 {
+            let row = SinceReport::default();
+            for at in 1..=HELD {
+                row.record(at, 0);
+            }
+            let crossed = std::thread::scope(|s| {
+                let release = s.spawn(|| row.sent_through(HELD));
+                let mut crossed = false;
+                while !release.is_finished() {
+                    // An instant ahead of every dispatch releases none.
+                    let read = row.sent_through(0);
+                    assert!(
+                        read.unsized_requests <= read.requests,
+                        "{} dispatches of no tokens beside {} dispatches",
+                        read.unsized_requests,
+                        read.requests
+                    );
+                    crossed |= read.requests != 0 && u64::from(read.requests) != HELD;
+                }
+                crossed
+            });
+            if crossed {
+                return;
+            }
+        }
     }
 
     #[test]

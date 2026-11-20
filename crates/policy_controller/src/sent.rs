@@ -132,8 +132,9 @@ impl SentReads<'_> {
     /// The sends since the later of the row's sample and the time cutoff.
     /// A row without a report has a sample instant of zero.
     ///
-    /// Inlined into its caller's row loop: the three numbers come back in
-    /// no memory, and a stage that reads two of them pays for two.
+    /// Inlined into its caller's row loop, so the three numbers come back
+    /// in no memory. A stage that reads two of them still pays the third's
+    /// load, one word more for each row that holds sends.
     #[inline(always)]
     pub fn of(&self, row: &Candidate) -> Sent {
         self.tally
