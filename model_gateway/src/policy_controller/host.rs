@@ -879,6 +879,10 @@ impl Host {
 
     /// Takes the first sendable pair whose prefill has room. The admission
     /// lock can be held here, so every lookup happens in the ask.
+    ///
+    /// With encoders placed, a target holds only where each of them takes
+    /// a request too. They were placed for the first target's prefill, so
+    /// a target of another prefill is passed over.
     pub(crate) fn commit_pair(
         &self,
         asked: Asked,
@@ -912,16 +916,16 @@ impl Host {
         let mut failed = [[None; 2]; MAX_TARGETS];
         let mut no_room = false;
         let mut lost = Vec::new();
+        // A pick's alternates name its first target's prefill with another
+        // decode, so the encoders placed for that prefill hold for each.
+        let placed_for = targets.first().map(|target| target.id);
         for (index, (target, [prefill, decode])) in targets.iter().zip(pairs).enumerate() {
-            // The encoders were placed for the first target's prefill, and
-            // a later target can name a prefill they do not hand to. With
-            // items the commit takes the first target or none.
-            if index > 0 && !encoders.is_empty() {
-                break;
-            }
             let Some(pair) = target.pair else {
                 continue;
             };
+            if !encoders.is_empty() && Some(target.id) != placed_for {
+                continue;
+            }
             let sendable = |worker: &Arc<dyn Worker>| {
                 routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref())
             };
@@ -939,8 +943,9 @@ impl Host {
                 continue;
             }
             // The target holds where every placed encoder stands and takes
-            // a request. One that does not joins the misses: the next ask
-            // names it, and the engine places the items around it.
+            // a request. One that does not joins the misses and ends the
+            // pass, since every alternate has the same encoders. The next
+            // ask names it, and the engine places the items around it.
             let mut held = Vec::with_capacity(encoders.len());
             for encoder in &encoders {
                 let worker = encoder.worker.as_ref();
