@@ -28,7 +28,7 @@ use std::{
     cell::Cell,
     fmt,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Instant,
@@ -549,14 +549,31 @@ impl Host {
     ///
     /// Resolves both workers of each pair before admission can lock the
     /// queue. The door in this process decides on the calling thread.
-    #[expect(
-        clippy::unused_async,
-        reason = "a controller at an address is asked behind this call, over its session"
-    )]
+    ///
+    /// An attempt that keeps one list across its asks asks first with the
+    /// list empty: this ask counts as its first then.
     pub(crate) async fn ask(
         &self,
         ask: &Ask<'_>,
         missed: &[WorkerId],
+        now: Instant,
+    ) -> Result<Asked, Unplaced> {
+        self.ask_as(ask, missed, missed.is_empty(), now).await
+    }
+
+    /// [`Self::ask`] for an attempt that says itself whether this is its
+    /// `first` ask, the one that counts its key's source. A pair's attempt
+    /// decides again at each wake of the admission queue, from a list a
+    /// wait on room leaves empty: its list does not tell its first ask.
+    #[expect(
+        clippy::unused_async,
+        reason = "a controller at an address is asked behind this call, over its session"
+    )]
+    async fn ask_as(
+        &self,
+        ask: &Ask<'_>,
+        missed: &[WorkerId],
+        first: bool,
         now: Instant,
     ) -> Result<Asked, Unplaced> {
         let made = Made {
@@ -569,8 +586,9 @@ impl Host {
         let seconds = started.elapsed().as_secs_f64();
         // A key's source counts once an attempt, at its first ask, as a
         // keyed selection of the gateway's own policies counts it: an ask
-        // again behind a missed commit is the same attempt's.
-        if let Some(source) = made.source.get().filter(|_| missed.is_empty()) {
+        // again, behind a missed commit or at a pair's later wake, is the
+        // same attempt's.
+        if let Some(source) = made.source.get().filter(|_| first) {
             Metrics::record_routing_key_source(source);
         }
         let decision = decided.as_ref().ok().map(Handle::decision);
@@ -740,12 +758,16 @@ impl Host {
         routing_key: Option<&str>,
     ) -> Result<(Placed, PrefillLoadGuard), Unplaced> {
         let missed = Mutex::new(Vec::new());
+        // The attempt's first ask, whichever half makes it: each wake's
+        // decision starts from the attempt's list, which stays empty
+        // across a wait on room.
+        let first = AtomicBool::new(true);
         acquire_decided(
             admission,
             routing_key,
             Placed::worker,
-            || self.probe_pair(ask, &missed),
-            || self.decide_pair(ask, admission, missed.lock().clone()),
+            || self.probe_pair(ask, &missed, &first),
+            || self.decide_pair(ask, admission, missed.lock().clone(), &first),
             |asked, room| self.commit_pair(asked, room, &mut missed.lock(), Instant::now()),
         )
         .await
@@ -762,9 +784,11 @@ impl Host {
         ask: &Ask<'_>,
         admission: Option<&PrefillAdmission>,
         mut missed: Vec<WorkerId>,
+        first: &AtomicBool,
     ) -> Result<Asked, Unplaced> {
         for _ in 0..ASKS {
-            let mut asked = self.ask(ask, &missed, Instant::now()).await?;
+            let first = first.swap(false, Ordering::Relaxed);
+            let mut asked = self.ask_as(ask, &missed, first, Instant::now()).await?;
             let Some(admission) = admission else {
                 return Ok(asked);
             };
@@ -792,7 +816,12 @@ impl Host {
 
     /// A request behind a waiter asks only if a role has no sendable worker.
     /// A pick is released before the request joins the queue.
-    async fn probe_pair(&self, ask: &Ask<'_>, missed: &Mutex<Vec<WorkerId>>) -> Option<Unplaced> {
+    async fn probe_pair(
+        &self,
+        ask: &Ask<'_>,
+        missed: &Mutex<Vec<WorkerId>>,
+        first: &AtomicBool,
+    ) -> Option<Unplaced> {
         let workers = self.registry().generation(ask.model);
         let (mut prefill, mut decode) = (false, false);
         for worker in workers.iter() {
@@ -807,7 +836,8 @@ impl Host {
             }
         }
         let missed = missed.lock().clone();
-        match self.ask(ask, &missed, Instant::now()).await {
+        let first = first.swap(false, Ordering::Relaxed);
+        match self.ask_as(ask, &missed, first, Instant::now()).await {
             Ok(mut asked) => {
                 asked
                     .handle

@@ -5,14 +5,15 @@ use std::{
     collections::{BTreeSet, HashSet},
     convert::Infallible,
     error::Error,
-    future::ready,
+    future::{ready, Future},
     io,
     ops::Range,
+    pin::pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc, Arc, Barrier,
     },
-    task::Poll,
+    task::{Context, Poll},
     thread,
     time::{Duration, Instant},
 };
@@ -23,7 +24,7 @@ use axum::{
     response::Response,
 };
 use bytes::Bytes;
-use futures::{poll, FutureExt};
+use futures::{poll, task::noop_waker, FutureExt};
 use futures_util::{stream, StreamExt};
 use kv_index::compute_request_content_hashes;
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
@@ -1350,10 +1351,14 @@ fn pair_spec(
     generation: u64,
     calls: &PairCalls,
     publication: Option<Arc<Publication>>,
+    key: Option<&RoutingKeySpec>,
 ) -> Result<AppliedSpec, Box<dyn Error>> {
     let mut document = PolicySpec::pair_presets("least_load", "least_load")?;
     document.plans.pd_pair.pairing = mode;
     document.generation = generation;
+    for binding in &mut document.bindings {
+        binding.routing_key = key.cloned();
+    }
     let mut catalog = Catalog::builtin();
     let prefill = PairPicker {
         name: "ordered-prefill",
@@ -1471,7 +1476,7 @@ impl PairBed {
             decode_protocol,
         )?;
         let calls = PairCalls::default();
-        store.apply(pair_spec(mode, decode_targets, 1, &calls, None)?)?;
+        store.apply(pair_spec(mode, decode_targets, 1, &calls, None, None)?)?;
         store.publish_now();
         Ok(Self {
             host: Host::new(Arc::clone(&store), registry),
@@ -1806,6 +1811,55 @@ async fn a_queued_head_whose_decode_cannot_be_sent_to_asks_again_in_its_place() 
     assert_eq!(live(&bed.store, 1), 1);
 }
 
+/// A keyed pair counts the source of its key once an attempt. Admission
+/// decides again at each wake, from a list a wait on room leaves empty: the
+/// attempt's first ask counts, and the asks of a later wake count nothing.
+#[tokio::test]
+async fn a_keyed_pair_that_wakes_twice_counts_its_keys_source_once() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
+    let block = RoutingKeySpec {
+        sources: vec![header(KEY_HEADER)],
+        strip_lineage: false,
+    };
+    let keyed_pair = pair_spec(Pairing::Lenient, 1, 2, &bed.calls, None, Some(&block));
+    let applied = bed
+        .store
+        .apply(keyed_pair.expect("a keyed pair's document"));
+    applied.expect("a later generation");
+    let admission = PrefillAdmission::new(1, 2, Duration::from_secs(5));
+    let headers = keyed(KEY_HEADER, "conv-1");
+    let ask = Ask {
+        headers: Some(&headers),
+        ..pair_ask()
+    };
+    let prefill = &bed.prefills[0].1;
+    let rendered = render_with_recorder(|| {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        // The prefill reads full twice over: an admitted request holds it,
+        // and one more load stands beside.
+        let occupied = admission.admit(None, select_worker(prefill));
+        let occupied = occupied.now_or_never().expect("no waiter stands ahead");
+        let occupied = occupied.expect("held load");
+        let _beside = WorkerLoadGuard::with_key(Arc::clone(prefill), None);
+        let mut head = pin!(bed.host.place_pair(&ask, Some(&admission), None));
+        assert!(head.as_mut().poll(&mut cx).is_pending());
+        let decided = bed.issued(Side::Prefill).len();
+        assert_ne!(decided, 0, "the head decides as it arrives");
+        // The admitted request ends: the head wakes, decides again and
+        // still reads its prefill full.
+        drop(occupied);
+        assert!(head.as_mut().poll(&mut cx).is_pending());
+        assert!(bed.issued(Side::Prefill).len() > decided, "a second wake");
+    });
+    let counted: Vec<_> = rendered
+        .lines()
+        .filter(|line| line.starts_with("smg_routing_key_source_total"))
+        .collect();
+    let once = ["smg_routing_key_source_total{source=\"header\"} 1"];
+    assert_eq!(counted, once, "{rendered}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_queues_refusals_leave_no_lease_on_file() {
     let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
@@ -1999,7 +2053,7 @@ async fn a_commit_under_a_held_publication_returns() {
             entered,
             resume: Mutex::new(held),
         });
-        let spec = pair_spec(Pairing::Lenient, 1, 2, &bed.calls, Some(publication))
+        let spec = pair_spec(Pairing::Lenient, 1, 2, &bed.calls, Some(publication), None)
             .expect("a new generation");
         let store = &bed.store;
         let writer = scope.spawn(move || store.apply(spec));
