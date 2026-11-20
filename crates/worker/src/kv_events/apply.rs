@@ -508,6 +508,18 @@ pub fn stored_tier(stored: &KvBlocksStored) -> Option<IndexedTier> {
     indexed_tier(stored.tier, first_level)
 }
 
+/// The width a store names for its blocks, in tokens: its first block's,
+/// since an engine writes one width per store. A width of zero or less is
+/// unknown, and names none.
+#[inline]
+pub fn store_width(stored: &KvBlocksStored) -> Option<u32> {
+    stored
+        .blocks
+        .first()
+        .and_then(|block| u32::try_from(block.block_size).ok())
+        .filter(|&width| width > 0)
+}
+
 /// Cache-group kinds whose blocks hold the main attention KV, the ones the
 /// prefix index is built from. Every other kind goes to the worker's group
 /// view, where the sliding-window and state kinds bound a hit the way the

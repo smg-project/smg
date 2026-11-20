@@ -1282,3 +1282,29 @@ fn a_hybrid_workers_tokenful_window_store_stays_in_the_view() {
         (0, 1)
     );
 }
+
+/// A store's width is its first block's, and a width of zero or less names
+/// none.
+#[test]
+fn a_stores_width_is_its_first_blocks() {
+    let store = |widths: &[i32]| KvBlocksStored {
+        blocks: widths
+            .iter()
+            .map(|&block_size| KvBlock {
+                block_size,
+                ..KvBlock::default()
+            })
+            .collect(),
+        ..KvBlocksStored::default()
+    };
+    let rows: [(&[i32], Option<u32>); 5] = [
+        (&[], None),
+        (&[0], None),
+        (&[-16], None),
+        (&[16], Some(16)),
+        (&[16, 32], Some(16)),
+    ];
+    for (widths, width) in rows {
+        assert_eq!(store_width(&store(widths)), width, "{widths:?}");
+    }
+}
