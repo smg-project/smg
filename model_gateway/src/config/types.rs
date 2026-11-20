@@ -673,7 +673,9 @@ pub struct RouterConfig {
     /// the routing settings mean. Requires the policy controller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_spec_path: Option<String>,
-    /// Loaded from `policy_spec_path` during config creation.
+    /// The policy document the controller runs. The builder loads it from
+    /// `policy_spec_path`; a host may set it directly. Requires the policy
+    /// controller.
     #[serde(skip)]
     pub policy_spec: Option<PolicySpec>,
 }
