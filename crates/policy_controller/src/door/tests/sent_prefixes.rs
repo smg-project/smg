@@ -17,9 +17,13 @@ use super::{
 };
 use crate::{
     catalog::Catalog,
+    decision::ShadowKind,
     door::{decide_in, entry, Buffers, Decided, Taken},
     framework::Scorer,
-    spec::{AffinitySource, AppliedSpec, BindingSpec, Match, PolicySpec, ScoreSpec, ScoreStage},
+    spec::{
+        AffinitySource, AppliedSpec, BindingSpec, Match, PolicySpec, ScoreSpec, ScoreStage,
+        ShadowSpec,
+    },
     store::{
         BatchFacts, BatchOutcome, KvEvent, KvEventSink, LeasesStore, LoadSink, LoadSource,
         MemoryStore, Signals, StoredBlock, WorkerFacts, WorkerStatus, WorkersStore,
@@ -267,6 +271,53 @@ fn a_heard_lane_hands_its_row_to_the_index_and_a_worker_gone_hands_it_back() -> 
     KvEventSink::removed(&*store, a);
     decide_only(&door, &asked, later, &mut buffers);
     assert_eq!(depths(&buffers), vec![(row, 8)]);
+    Ok(())
+}
+
+/// Where a request's binding names a shadow, its order writes the record
+/// of sent prefixes as the plain order does. A prefix sent to a worker
+/// with no events returns to it past a lighter one under both documents,
+/// and the pool keeps the same slices.
+#[test]
+fn a_shadowed_order_records_the_prefixes_it_sent_as_the_plain_one() -> Case {
+    let returning = |shadowed: bool| -> Case<([bool; 2], Option<usize>, u64)> {
+        let store = fleet();
+        let a = worker(&store, "a", Role::Single, &[MODEL], false)?;
+        let b = worker(&store, "b", Role::Single, &[MODEL], false)?;
+        let mut document = merged(1)?;
+        if shadowed {
+            let live = document.profiles.values().next();
+            let twin = live.ok_or("the preset's profile")?.clone();
+            document.profiles.insert("twin".into(), twin);
+            document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+        }
+        store.apply(applied(&document)?)?;
+        let door = Door::new(store.clone());
+        let asked = token_request(&HASHES[..8]);
+        let placed = |now: Instant| -> Case<WorkerId> {
+            let decided = door.decide(GATEWAY, &asked, now);
+            let decided = decided.map_err(|word| format!("{word:?}"))?;
+            let lease = decided.lease.ok_or("a pick's lease")?.lease;
+            door.report(GATEWAY, lease.id, gone());
+            Ok(lease.booked)
+        };
+        let now = Instant::now() + Duration::from_secs(120);
+        load(&store, a, 0, now);
+        load(&store, b, 1, now);
+        let cold = placed(now)? == a;
+        let later = now + Duration::from_millis(20);
+        load(&store, a, 2, later);
+        load(&store, b, 0, later);
+        let back = placed(later)? == a;
+        let agreed = door.shadowed(0, ShadowKind::Agreed);
+        Ok(([cold, back], slices(&store, Role::Single), agreed))
+    };
+    let plain = returning(false)?;
+    assert_eq!(plain.0, [true, true], "the prefix returns to its worker");
+    assert_eq!(plain.2, 0, "no shadow is named");
+    let shadowed = returning(true)?;
+    assert_eq!((shadowed.0, shadowed.1), (plain.0, plain.1));
+    assert_eq!(shadowed.2, 2, "the twin is asked beside both decisions");
     Ok(())
 }
 

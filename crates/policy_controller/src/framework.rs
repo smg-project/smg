@@ -7557,10 +7557,11 @@ mod tests {
         assert!(run(&reused, "second").is_none());
     }
 
-    /// A host names rows for the live profile alone, by its cap and its
-    /// warm-up ruling. A shadow reads them where its own profile would be
-    /// named the same, reads the view without them where that profile
-    /// reads no column, and is not asked anywhere else.
+    /// A host names rows for the live profile alone, by its cap, its
+    /// warm-up ruling and the record of sent prefixes. A shadow reads them
+    /// where its own profile would be named the same, reads the view
+    /// without them where that profile reads no column, and is not asked
+    /// anywhere else.
     #[test]
     fn a_shadow_reads_its_live_rows_only_where_it_would_be_handed_them() {
         use crate::spec::{

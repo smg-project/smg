@@ -1095,9 +1095,10 @@ pub(crate) fn issue<A: Asked>(
     named: &Named,
 ) -> Result<Lease, LeaseRefused> {
     let engine = world.spec().engine();
-    issue_told(store, world, taken, term, booking, named, |lease: &Lease| {
+    let told = |lease: &Lease| {
         engine.on_decision_issued(lease, decision);
-    })
+    };
+    issue_told(store, world, taken, term, booking, named, told)
 }
 
 /// [`issue`] with the telling its caller hands, which tells the engine
@@ -3088,37 +3089,61 @@ impl Door {
         match entry {
             Entry::Single => {
                 let (decision, booking) = decide_in(world, taken, buffers, &self.parts[at]);
-                let named = &buffers.named;
-                let lease = booking
-                    .map(|booking| {
-                        issue(&self.store, world, taken, term, &decision, booking, named)
-                    })
-                    .transpose()
-                    .map_err(|_| Refused::Unleased)?;
-                Ok(Decided {
-                    decision,
-                    lease: lease.map(|lease| Leased {
-                        lease,
-                        due: taken.due(),
-                    }),
-                })
+                let lease =
+                    self.file::<false>(world, term, taken, &buffers.named, &decision, booking)?;
+                Ok(Decided { decision, lease })
             }
             Entry::Pair => self.pair(world, at, term, taken, buffers),
             Entry::Side => Err(Refused::PairSide),
         }
     }
 
+    /// What stands behind a single's decision, in both its orders
+    /// ([`Self::order`], [`Self::order_shadowed`]): a pick's lease is
+    /// issued, the engine that decided is told of it, and the record of
+    /// sent prefixes takes the prefix of `named`, the live decision's
+    /// naming ([`issue_told`]). A step that joins a single's commit is
+    /// written here, once, and stands in both orders.
+    ///
+    /// Each order builds a copy of its own (`SHADOWED`), with a telling
+    /// of its own: the store builds its issue for each telling, so
+    /// neither order's issue moves where the other's is built.
+    #[inline(always)]
+    fn file<const SHADOWED: bool>(
+        &self,
+        world: &World,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        named: &Named,
+        decision: &Decision,
+        booking: Option<Booking>,
+    ) -> Result<Option<Leased>, Refused> {
+        let engine = world.spec().engine();
+        let told = |lease: &Lease| {
+            engine.on_decision_issued(lease, decision);
+        };
+        let lease = booking
+            .map(|booking| issue_told(&self.store, world, taken, term, booking, named, told))
+            .transpose()
+            .map_err(|_| Refused::Unleased)?;
+        Ok(lease.map(|lease| Leased {
+            lease,
+            due: taken.due(),
+        }))
+    }
+
     /// [`Self::order`] for a request whose binding names a shadow
     /// (`due`, [`Engine::shadow_for`]). Such a binding is a single's: a
     /// pair's names none, and takes the plain order. The decision is made
     /// at the engine's keeping entries, and the shadow is asked over the
-    /// same view ahead of the commit ([`decide_shadowed_in`]). What the
-    /// shadow said comes back counted, behind a commit that held: a
-    /// decision whose lease the store refused counts none. A shadow that
-    /// panicked is counted with the door's faults and the scratch it
-    /// left is dropped, both behind the commit: the live decision is
-    /// issued as decided. The budget is the one its host stated at the
-    /// decision's instant: in process the door reads no clock.
+    /// same view ahead of the commit ([`decide_shadowed_in`]). The commit
+    /// is the plain order's ([`Self::file`]). What the shadow said comes
+    /// back counted, behind a commit that held: a decision whose lease
+    /// the store refused counts none. A shadow that panicked is counted
+    /// with the door's faults and the scratch it left is dropped, both
+    /// behind the commit: the live decision is issued as decided. The
+    /// budget is the one its host stated at the decision's instant: in
+    /// process the door reads no clock.
     fn order_shadowed(
         &self,
         world: &World,
@@ -3133,33 +3158,18 @@ impl Door {
             decide_shadowed_in(world, taken, buffers, own, (due.binding, due.rows), || {
                 taken.left
             });
-        let engine = world.spec().engine();
-        // This order's own telling ([`issue_told`]): the plain order's
-        // issue stays as it was built.
-        let told = |lease: &Lease| {
-            engine.on_decision_issued(lease, &decision);
-        };
-        let named = &buffers.named;
-        let lease = booking
-            .map(|booking| issue_told(&self.store, world, taken, term, booking, named, told))
-            .transpose();
+        let filed = self.file::<true>(world, term, taken, &buffers.named, &decision, booking);
         if shadow == Shadow::Faulted {
             // The next decision reads nothing the shadow left.
             buffers.scratch = Scratch::default();
             self.faults.fetch_add(1, Ordering::Relaxed);
         }
-        let Ok(lease) = lease else {
-            return Err(Refused::Unleased);
-        };
+        let lease = filed?;
         if let Shadow::Said(shadow) = shadow {
             let count = own.shadowed(shadow.binding, shadow.kind);
             count.fetch_add(1, Ordering::Relaxed);
             due.said = Some(shadow);
         }
-        let lease = lease.map(|lease| Leased {
-            lease,
-            due: taken.due(),
-        });
         Ok(Decided { decision, lease })
     }
 
