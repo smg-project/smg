@@ -220,7 +220,7 @@ it cannot start without. Renders nothing.
 {{- end -}}
 {{- end }}
 
-{{/* The value for --policy, empty when a document is given without a policy value. */}}
+{{/* The value for --policy, empty when a document is given. */}}
 {{- define "smg.routerPolicyArg" -}}
 {{- if .Values.router.policy -}}
 {{- .Values.router.policy -}}
@@ -239,7 +239,7 @@ cache_aware
 {{- toYaml .Values.router.policySpec | printf "%s\n" -}}
 {{- end }}
 
-{{/* A policy document needs the gateway's controller and one source. */}}
+{{/* A policy document needs the gateway's controller and one source, and no policy value beside it. */}}
 {{- define "smg.validatePolicy" -}}
 {{- $router := .Values.router -}}
 {{- if and $router.policySpec $router.policySpecConfigMap -}}
@@ -247,6 +247,9 @@ cache_aware
 {{- end -}}
 {{- if and (include "smg.routerPolicyConfigMapName" .) (ne ($router.policyController | default "off") "on") -}}
 {{- fail "router.policySpec and router.policySpecConfigMap require router.policyController to be on." -}}
+{{- end -}}
+{{- if and (include "smg.routerPolicyConfigMapName" .) $router.policy -}}
+{{- fail "router.policy is set beside a policy document. The document names the policy: set router.policy to \"\". An upgrade with --reuse-values keeps an older chart's cache_aware." -}}
 {{- end -}}
 {{- end }}
 

@@ -948,14 +948,17 @@ def test_no_document_and_no_policy_value_renders_the_line_as_before():
 )
 def test_a_document_and_no_policy_value_renders_no_policy_flag(settings):
     _, documents = render(POLICY_CONTROLLER_ON, *settings)
-    assert "--policy" not in router_container(documents)["args"]
+    args = router_container(documents)["args"]
+    assert "--policy" not in args
+    # The launcher refuses a routing option that is not at its default beside
+    # a document. The line's six routing numbers are the launcher's defaults.
+    assert launcher_args(args).options_a_document_replaces() == []
 
 
 @needs_helm
-@pytest.mark.parametrize("policy", ["random", "cache_aware"])
-def test_a_document_and_a_policy_value_renders_the_value(policy):
-    _, documents = render(POLICY_CONTROLLER_ON, NAMED_ROUTER_POLICY, f"router.policy={policy}")
-    assert has_run(router_container(documents)["args"], ["--policy", policy])
+def test_a_policy_value_beside_a_document_fails_the_render():
+    error = render_error(POLICY_CONTROLLER_ON, NAMED_ROUTER_POLICY, "router.policy=random")
+    assert "router.policy is set beside a policy document" in error
 
 
 @needs_helm
@@ -964,9 +967,8 @@ def test_a_document_and_a_policy_value_renders_the_value(policy):
     [
         ((), "cache_aware"),
         ((POLICY_CONTROLLER_ON, NAMED_ROUTER_POLICY), "the policy document"),
-        ((POLICY_CONTROLLER_ON, NAMED_ROUTER_POLICY, "router.policy=random"), "random"),
     ],
-    ids=["default", "document", "document-with-policy"],
+    ids=["default", "document"],
 )
 def test_the_notes_name_the_rendered_policy(settings, policy, tmp_path):
     # Helm template omits NOTES.txt from its output. Render the same text into a ConfigMap.
@@ -1022,7 +1024,6 @@ def test_the_switch_renders_its_flag():
 def test_an_inline_document_renders_its_configmap_mount_flag_and_checksum():
     settings = (
         POLICY_CONTROLLER_ON,
-        "router.policy=random",
         "router.podAnnotations.checksum/policy-spec=stale",
         "router.podAnnotations.owner=routing",
         *INLINE_ROUTER_POLICY,
@@ -1048,7 +1049,6 @@ def test_an_inline_document_renders_its_configmap_mount_flag_and_checksum():
     container = router_container(documents)
     assert has_run(container["args"], ["--policy-controller", "on"])
     assert has_run(container["args"], ["--policy-spec", "/etc/smg/policy/spec.yaml"])
-    assert has_run(container["args"], ["--policy", "random"])
     assert named(container["volumeMounts"], "policy-spec") == {
         "name": "policy-spec",
         "mountPath": "/etc/smg/policy",
@@ -1067,10 +1067,7 @@ def test_an_inline_document_renders_its_configmap_mount_flag_and_checksum():
 @needs_helm
 def test_a_named_configmap_renders_the_mount_and_no_checksum():
     _, documents = render(POLICY_CONTROLLER_ON, NAMED_ROUTER_POLICY)
-    assert not any(
-        d["kind"] == "ConfigMap" and "spec.yaml" in d.get("data", {})
-        for d in documents
-    )
+    assert not any(d["kind"] == "ConfigMap" and "spec.yaml" in d.get("data", {}) for d in documents)
     pod = router_pod(documents)
     container = router_container(documents)
     assert has_run(container["args"], ["--policy-controller", "on"])
