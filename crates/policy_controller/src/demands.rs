@@ -137,8 +137,9 @@ pub enum Unmet {
 impl Unmet {
     /// The stage a pool this demand left nobody is shed under. A runtime is
     /// the rest of a request's wire, and is shed as its gateway's wires
-    /// are. Vision is shed under the pairing plan's word for it: one
-    /// refusal has one name, whichever path met it.
+    /// are. Vision is shed under the word of the `epd` plan's vision rule.
+    /// An encode pair's decision names two stages of its own, by the side
+    /// that lacks it.
     #[must_use]
     pub const fn stage(self) -> &'static str {
         match self {
