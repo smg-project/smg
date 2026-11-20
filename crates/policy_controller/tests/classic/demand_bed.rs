@@ -211,6 +211,11 @@ impl Bed {
         })
     }
 
+    /// Each worker's id, by its place in the row.
+    pub fn ids(&self) -> &[WorkerId] {
+        &self.ids
+    }
+
     /// The answer to one request under `constraints`: the workers its
     /// decisions named, or the refusal of a request no decision placed, in
     /// the words `refusal` keeps for a shed's reason and stage.

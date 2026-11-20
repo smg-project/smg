@@ -72,6 +72,7 @@ mod classic {
     pub mod context_window;
     pub mod demand_bed;
     pub mod encode_pair;
+    pub mod explicit_target;
     pub mod manual;
     pub mod media_refs;
     pub mod minimum_tokens;
@@ -295,11 +296,11 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// An encode-pair row is replayed in its store part by its own module;
 /// its copied rows name no runtime either, and the pair index's rule
 /// holds them.
-/// A retry-wire row, a media row and a context-window row name the
-/// workers a request may take or its refusal, so each module brings its
-/// own replay too, over one bed; their copied rows name each runtime by
-/// a token, and the pair index's rule holds them as well.
-const MODULES: [Module; 15] = [
+/// A retry-wire row, a media row, a context-window row and an explicit-target
+/// row name the workers a request may take or its refusal, so each module
+/// brings its own replay too, over one bed; a copied row names each runtime
+/// it holds by a token, and the pair index's rule holds them as well.
+const MODULES: [Module; 16] = [
     module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
     module::<classic::bucket::Row>(classic::bucket::INLINE),
     module::<classic::cache_aware::Row>(classic::cache_aware::INLINE),
@@ -313,6 +314,12 @@ const MODULES: [Module; 15] = [
         policy: classic::encode_pair::POLICY,
         inline: classic::encode_pair::INLINE,
         replay: classic::encode_pair::replay_rows,
+        copied: classic::pair_index::copied_row_defects,
+    },
+    Module {
+        policy: classic::explicit_target::POLICY,
+        inline: classic::explicit_target::INLINE,
+        replay: classic::explicit_target::replay_rows,
         copied: classic::pair_index::copied_row_defects,
     },
     module::<classic::manual::Row>(classic::manual::INLINE),
@@ -1157,6 +1164,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "cache_aware.json",
             "context-window.json",
             "encode_pair.json",
+            "explicit-target.json",
             "manual.json",
             "media-refs.json",
             "minimum_tokens.json",

@@ -16,6 +16,10 @@
 //! candidate row carries none of them. The crate compares what the two
 //! sides state and derives nothing: it names no label and no runtime.
 //!
+//! A request can also name the one worker that takes it
+//! ([`Demands::target`]). Its host resolves the name, and a row meets it by
+//! being that worker: no fact is read for it.
+//!
 //! A request that demands nothing reads no column and pays one test.
 //!
 //! A request's context window is two bounds: what its input takes, and
@@ -30,7 +34,7 @@
 //! pool is shed under the last of those: where a host cuts a pool one
 //! demand after another, that is the demand that took its last worker.
 
-use crate::view::Role;
+use crate::view::{Role, WorkerId};
 
 /// Where a request's media by reference may be processed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -77,6 +81,10 @@ pub struct Demands {
     /// is. A prefill worker is not held to it ([`Self::held_by`]): a host
     /// states it whatever the request's phase. `0` demands none.
     pub output_window: u32,
+    /// The worker the request names, where it names one: only that worker
+    /// takes the request. Its host resolves the name before it asks, and a
+    /// row meets it by its id alone ([`Self::unmet_by_worker`]).
+    pub target: Option<WorkerId>,
 }
 
 impl Demands {
@@ -88,11 +96,13 @@ impl Demands {
             && matches!(self.references, References::None)
             && self.input_window == 0
             && self.output_window == 0
+            && self.target.is_none()
     }
 
     /// The demand a worker fails first, in the order of [`Unmet`]: `vision`
     /// is whether it takes images, the bit its row carries, and `facts`
     /// what it states beside its row. `None` where it meets every demand.
+    /// It reads no name: [`Self::unmet_by_worker`] judges a named worker.
     #[must_use]
     pub const fn unmet_by(self, vision: bool, facts: DemandFacts) -> Option<Unmet> {
         if self.runtime != 0 && self.runtime != facts.runtime {
@@ -146,6 +156,22 @@ impl Demands {
     pub const fn met_by(self, vision: bool, facts: DemandFacts) -> bool {
         self.unmet_by(vision, facts).is_none()
     }
+
+    /// The demand the worker `id` fails first: what its facts fail
+    /// ([`Self::unmet_by`]), then the name, where the request names
+    /// another worker. The door judges its rows by this.
+    #[must_use]
+    pub const fn unmet_by_worker(
+        self,
+        id: WorkerId,
+        vision: bool,
+        facts: DemandFacts,
+    ) -> Option<Unmet> {
+        match (self.unmet_by(vision, facts), self.target) {
+            (None, Some(target)) if target.0 != id.0 => Some(Unmet::Target),
+            (unmet, _) => unmet,
+        }
+    }
 }
 
 /// What a worker states for the hard demands of a request beside its row,
@@ -187,12 +213,16 @@ pub(crate) const PIPELINE: &str = "pipeline";
 /// window that holds less than the request needs ([`Unmet::Window`]).
 pub(crate) const CONTEXT_WINDOW: &str = "context-window";
 
+/// The stage a pool is shed under when the worker its request names is not
+/// among the rows the other demands left ([`Unmet::Target`]).
+pub(crate) const TARGET: &str = "target";
+
 /// The demand a worker fails first. The order is the order a host answers
 /// for them: a pool is cut to its request's runtime, then to the workers
 /// that take images, then to those that process media by reference, then
 /// to the pipeline the request names, then to the windows that hold the
-/// request. Further demands add their cases: a host's match keeps an arm
-/// for the rest.
+/// request, then to the worker it names. Further demands add their cases:
+/// a host's match keeps an arm for the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum Unmet {
@@ -207,6 +237,8 @@ pub enum Unmet {
     /// The worker's context window holds less than the request's input or
     /// its completion needs.
     Window,
+    /// The request names another worker.
+    Target,
 }
 
 impl Unmet {
@@ -223,6 +255,7 @@ impl Unmet {
             Self::References => REFERENCES,
             Self::Pipeline => PIPELINE,
             Self::Window => CONTEXT_WINDOW,
+            Self::Target => TARGET,
         }
     }
 }
@@ -230,6 +263,7 @@ impl Unmet {
 #[cfg(test)]
 mod tests {
     use super::{DemandFacts, Demands, References, Role, Unmet};
+    use crate::view::WorkerId;
 
     /// A request that demands nothing is met by every worker, and one that
     /// demands a runtime by the workers that registered its number alone: a
@@ -322,6 +356,41 @@ mod tests {
         };
         let every = asks(true, References::Host);
         assert_eq!(every.unmet_by(true, elsewhere), Some(Unmet::Runtime));
+        // The worker a request names is judged last: another worker fails
+        // the name, and the named one still fails what it does not meet.
+        let named = Demands {
+            target: Some(WorkerId(1)),
+            ..asks(false, References::Host)
+        };
+        let only_named = Demands {
+            target: named.target,
+            ..Demands::default()
+        };
+        assert!(!only_named.is_none());
+        for (id, (vision, facts), unmet) in [
+            (1, host, None),
+            (2, host, Some(Unmet::Target)),
+            (1, own, Some(Unmet::Pipeline)),
+            (2, own, Some(Unmet::Pipeline)),
+        ] {
+            let judged = named.unmet_by_worker(WorkerId(id), vision, facts);
+            assert_eq!(judged, unmet, "{id} {facts:?}");
+        }
+        // A worker's facts alone read no name.
+        assert_eq!(named.unmet_by(host.0, host.1), None);
+        // A window is judged ahead of the name, as a host cuts its pool.
+        let long = Demands {
+            input_window: 101,
+            ..only_named
+        };
+        let narrow = DemandFacts {
+            window: 100,
+            ..DemandFacts::default()
+        };
+        for id in [1, 2] {
+            let judged = long.unmet_by_worker(WorkerId(id), false, narrow);
+            assert_eq!(judged, Some(Unmet::Window), "{id}");
+        }
     }
 
     /// A window demand is two bounds, the input's and the completion's, and
@@ -385,6 +454,7 @@ mod tests {
             references: References::Host,
             input_window: 40,
             output_window: 400,
+            target: Some(WorkerId(3)),
         };
         let input_alone = Demands {
             output_window: 0,
@@ -411,6 +481,7 @@ mod tests {
             Unmet::References,
             Unmet::Pipeline,
             Unmet::Window,
+            Unmet::Target,
         ];
         assert!(order.is_sorted());
         assert_eq!(
@@ -420,7 +491,8 @@ mod tests {
                 "vision",
                 "references",
                 "pipeline",
-                "context-window"
+                "context-window",
+                "target"
             ]
         );
     }
