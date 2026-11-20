@@ -9,7 +9,7 @@ declares it: a filter that names no test, or a file no parent declares, runs non
 sheet. A sheet of picks states its sequence rows and its drawn rows; the pair sheet picks nothing
 and states its pair rows, each an outcome on both pair wires; the overload sheet picks nothing
 either and states its verdict rows, each a verdict after every step; a sheet of one hard demand
-runs no policy and states its demand rows, each the gateway's answer to every request of a pool.
+picks nothing and states its demand rows, each the gateway's answer to every request of a pool.
 
 A recorder stands under the source root its layout line is beneath: the gateway's, or the worker
 crate's for a recorder that is a child of code the crate holds. The README names the package of
@@ -129,7 +129,7 @@ def test_a_row_states_its_sheets_commit_row_counts_and_sha256():
                 asked = len(recorded["requests"]) if "requests" in recorded else 1
                 answers = recorded["answers"]
                 assert len(answers) == asked, (
-                    f"{name}: {recorded['name']}: a request with no answer"
+                    f"{name}: {recorded['name']}: {len(answers)} answers to {asked} requests"
                 )
                 assert all(set(answer) in ({"placed"}, {"refused"}) for answer in answers), (
                     f"{name}: {recorded['name']}: an answer that places nothing and refuses nothing"

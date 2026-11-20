@@ -979,7 +979,11 @@ pub(crate) fn decide_own_in<A: Asked>(
         world,
         gateway: taken.gateway,
         wires: taken.request.wires(),
-        cut: !taken.request.demands().is_none(),
+        cut: !taken
+            .request
+            .demands()
+            .held_by(role_of(taken.request.phase()))
+            .is_none(),
         named,
         column: engine.live_column_at(due.0, taken.request.phase()),
         binding: due.0,
@@ -2054,7 +2058,8 @@ pub(crate) fn hand<A: Asked, R>(
                 let mut pool: PoolFacts<'_> = built.pool_facts();
                 // The request's demands, read where a row is written: the
                 // path that writes none carries none of them past its test.
-                let demands = request.demands();
+                // A prefill's rows are held to the input alone.
+                let demands = request.demands().held_by(role);
                 let took = if demands.is_none() {
                     Took {
                         undialed: narrow(view, wires, request.subset()),
@@ -6862,6 +6867,48 @@ pub(crate) mod tests {
         assert_eq!(door.undialed(), 0);
     }
 
+    /// A prefill-phase request of a model no pair plan binds is decided
+    /// as a single over its prefill pool. Its rows are held to the input
+    /// alone: the completion's bound is a decode's to hold, and a host
+    /// states both bounds whatever the phase. A single is held to both.
+    #[test]
+    fn a_lone_prefill_is_held_to_the_input_and_a_single_to_both_bounds() {
+        let store = MemoryStore::new();
+        let window = DemandFacts {
+            window: 8,
+            ..DemandFacts::default()
+        };
+        let prefill = states_facts(&store, "p0", Role::Prefill, (false, window));
+        let single = states_facts(&store, "s0", Role::Single, (false, window));
+        store.publish_now();
+        let applied = store.apply(preset("random", 1));
+        applied.expect("above the unbound start");
+        let store = Arc::new(store);
+        let door = Door::new(Arc::clone(&store));
+        let decide = |id: &[u8], phase: Phase, (input_window, output_window): (u32, u32)| {
+            let mut asked = request(id, 7);
+            asked.facts.phase = phase;
+            asked.constraints.demands = Demands {
+                input_window,
+                output_window,
+                ..Demands::default()
+            };
+            let decided = door.decide(GATEWAY, &asked, Instant::now());
+            match decided.expect("a decision").decision {
+                Decision::Shed(shed) => Err((shed.reason, shed.emptied_by)),
+                decision => {
+                    let first = decision.pick().and_then(|pick| pick.targets.first());
+                    Ok(first.expect("a target").id)
+                }
+            }
+        };
+        let too_small = Err((ShedReason::NoEndpoints, "context-window"));
+        assert_eq!(decide(b"prefill", Phase::Prefill, (4, 64)), Ok(prefill));
+        assert_eq!(decide(b"long", Phase::Prefill, (16, 64)), too_small);
+        assert_eq!(decide(b"budget", Phase::Single, (4, 64)), too_small);
+        assert_eq!(decide(b"held", Phase::Single, (4, 8)), Ok(single));
+    }
+
     /// The store narrows a pair's sides by its gateway's wires and keeps no
     /// hard demand there yet. So a pair's request that states one is shed
     /// under the wires' name, whatever its sides state, and files
@@ -7173,6 +7220,7 @@ pub(crate) mod tests {
                 runtime: 7,
                 references,
                 host_pipeline,
+                ..DemandFacts::default()
             };
             (vision, stated)
         };
