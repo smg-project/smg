@@ -26,7 +26,7 @@ use crate::{
         TieBand, Unit, DRAW_BOUND,
     },
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
-    sent::{Sent, SentCredit, SentReads},
+    sent::{Sent, SentCounts, SentCredit, SentReads},
     spec::{CostMargin, Needs, Unreported},
     terms::{Coefficients, Term},
     view::{
@@ -278,7 +278,7 @@ impl HasRoomRule {
         facts: &RequestFacts<'_>,
         row: &Candidate,
         load: Option<&LoadRow>,
-        sent: impl FnOnce() -> (u64, u64),
+        sent: impl FnOnce() -> SentCounts,
     ) -> bool {
         let mut used = 0.0;
         if self.in_flight {
@@ -297,9 +297,9 @@ impl HasRoomRule {
         }
         used += asked;
         if self.sent.is_some() {
-            let (tokens, requests) = sent();
-            used += requests as f64 * self.terms.sent_requests;
-            used += tokens as f64 * self.terms.sent_tokens;
+            let sent = sent();
+            used += f64::from(sent.requests) * self.terms.sent_requests;
+            used += sent.tokens as f64 * self.terms.sent_tokens;
         }
         used <= self.bound
     }
@@ -309,7 +309,7 @@ impl HasRoomRule {
         let sent = || {
             self.sent
                 .as_ref()
-                .map_or((0, 0), |sent| sent.reads(facts).counts(row))
+                .map_or_else(SentCounts::default, |sent| sent.reads(facts).counts(row))
         };
         by_names!(self, fits(self.asked(facts), facts, row, load, sent))
     }
@@ -332,7 +332,11 @@ impl HasRoomRule {
         for at in 0..kept.len() {
             let i = kept[at];
             let row = &candidates[i as usize];
-            let sent = || sends.as_ref().map_or((0, 0), |sends| sends.counts(row));
+            let sent = || {
+                sends
+                    .as_ref()
+                    .map_or_else(SentCounts::default, |sends| sends.counts(row))
+            };
             let fits =
                 self.fits::<RESIDENT, WAITING, KV_OR_RUNNING>(asked, facts, row, load(row), sent);
             kept[held] = i;
