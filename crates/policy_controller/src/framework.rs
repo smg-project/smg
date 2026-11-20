@@ -28,7 +28,7 @@ mod encode;
 mod engines;
 mod vetoed;
 
-pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
+pub use encode::{encode_stage, EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
 use engines::{run_engines, run_owned};
 use vetoed::AllVetoed;
 

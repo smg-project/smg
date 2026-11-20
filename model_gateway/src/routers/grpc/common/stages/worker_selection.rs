@@ -14,6 +14,7 @@ use futures::{future::Either, FutureExt};
 use openai_protocol::common::CachePartition;
 use smg_policy_controller::{
     decision::ShedReason,
+    encode_stage,
     framework::EncodeItems,
     lease::ReleaseReason,
     view::{fingerprint, Identity, Phase},
@@ -2928,7 +2929,8 @@ fn items_digest(item_hashes: &[Vec<u8>]) -> blake3::Hash {
 }
 
 /// The classic's name for a shed of the controller's encode side, by the
-/// stage that left no worker: the stages are the encode framework's.
+/// stage that left no worker: the stages are the encode framework's, under
+/// the names the crate exports.
 /// `None` for a shed of the pair's own, which the host answers as it
 /// answers a pair's.
 fn epd_shed(unplaced: &host::Unplaced) -> Option<EpdSelectionFailure> {
@@ -2941,11 +2943,11 @@ fn epd_shed(unplaced: &host::Unplaced) -> Option<EpdSelectionFailure> {
         return None;
     };
     match *emptied_by {
-        "encode-media" => Some(EpdSelectionFailure::EncodeNotSupported),
-        "encode-vision" => Some(EpdSelectionFailure::EncodeVisionUnsupported),
-        "ec-compatible" => Some(EpdSelectionFailure::EcIncompatible),
-        "decode-vision" => Some(EpdSelectionFailure::DecodeVisionUnsupported),
-        "encoders" => Some(EpdSelectionFailure::Unavailable),
+        encode_stage::ENCODE_MEDIA => Some(EpdSelectionFailure::EncodeNotSupported),
+        encode_stage::ENCODE_VISION => Some(EpdSelectionFailure::EncodeVisionUnsupported),
+        encode_stage::EC_COMPATIBLE => Some(EpdSelectionFailure::EcIncompatible),
+        encode_stage::DECODE_VISION => Some(EpdSelectionFailure::DecodeVisionUnsupported),
+        encode_stage::ENCODERS => Some(EpdSelectionFailure::Unavailable),
         _ => None,
     }
 }

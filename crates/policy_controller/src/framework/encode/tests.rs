@@ -376,6 +376,28 @@ fn a_gap_no_retry_closes_is_named_by_membership() {
     assert_eq!(bed.stage(), "decode-vision");
 }
 
+/// A host answers a shed of the encode side by its stage's name, so the
+/// text of each exported name is held here.
+#[test]
+fn the_exported_stage_names_keep_their_text() {
+    assert_eq!(
+        [
+            ENCODERS,
+            ENCODE_VISION,
+            EC_COMPATIBLE,
+            ENCODE_MEDIA,
+            DECODE_VISION,
+        ],
+        [
+            "encoders",
+            "encode-vision",
+            "ec-compatible",
+            "encode-media",
+            "decode-vision",
+        ]
+    );
+}
+
 /// A hard filter that refuses one row, by its id.
 #[derive(Debug)]
 struct RefusesOne(WorkerId);

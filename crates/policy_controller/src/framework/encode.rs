@@ -34,22 +34,30 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
-/// The stage named when no encoder is open for the request though one that
-/// takes it is registered, or when none is registered at all: a retry may
-/// find one. Where the overload veto left none open, the veto's own stage,
-/// `not-overloaded`, is named in its stead ([`saturation`]).
-const ENCODERS: &str = "encoders";
-/// The stage named when the request carries images and the registered
-/// encoders that would take it otherwise take none.
-const ENCODE_VISION: &str = "encode-vision";
-/// The stage named when no registered encoder hands to a prefill of a pair:
-/// a pushing encoder states no role, or no prefill states its end.
-const EC_COMPATIBLE: &str = "ec-compatible";
-/// The stage named when no registered encoder takes the request's media.
-const ENCODE_MEDIA: &str = "encode-media";
-/// The stage named when the decode must take images and no decode of a pair
-/// an encoder serves does.
-const DECODE_VISION: &str = "decode-vision";
+/// The names the encode side's stages write in a shed's `emptied_by`. A
+/// host answers such a shed by its stage's name, so the text of each name
+/// is part of what the crate promises.
+pub mod encode_stage {
+    /// The stage named when no encoder is open for the request though one
+    /// that takes it is registered, or when none is registered at all: a
+    /// retry may find one. Where the overload veto left none open, the
+    /// veto's own stage, `not-overloaded`, is named in its stead.
+    pub const ENCODERS: &str = "encoders";
+    /// The stage named when the request carries images and the registered
+    /// encoders that would take it otherwise take none.
+    pub const ENCODE_VISION: &str = "encode-vision";
+    /// The stage named when no registered encoder hands to a prefill of a
+    /// pair: a pushing encoder states no role, or no prefill states its
+    /// end.
+    pub const EC_COMPATIBLE: &str = "ec-compatible";
+    /// The stage named when no registered encoder takes the request's
+    /// media.
+    pub const ENCODE_MEDIA: &str = "encode-media";
+    /// The stage named when the decode must take images and no decode of a
+    /// pair an encoder serves does.
+    pub const DECODE_VISION: &str = "decode-vision";
+}
+use encode_stage::{DECODE_VISION, EC_COMPATIBLE, ENCODERS, ENCODE_MEDIA, ENCODE_VISION};
 /// The stage named when a column of the encode pool is not one entry a row.
 const ENCODE_COLUMN: &str = "encode-column";
 /// The stage named when a request with items meets an encode profile that
