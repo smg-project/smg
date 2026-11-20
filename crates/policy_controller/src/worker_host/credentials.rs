@@ -18,9 +18,9 @@ use parking_lot::RwLock;
 /// exits. The membership store, its log, snapshots, watches and operator
 /// views carry no credential. It holds one entry for each address a
 /// registration was accepted at and no forgetting dropped, with or
-/// without a credential: as many as the host's rows dial, where each
-/// removal is followed by
-/// [`Objects::forget_credential`](super::Objects::forget_credential).
+/// without a credential. The holder's follow forgets an address when the
+/// last row that dials it leaves, so the entries are the addresses the
+/// host's rows dial and those of registrations no follow has read to.
 ///
 /// A registration makes three calls. It calls [`Self::keep`] before its
 /// write, with `None` where it has no credential. It writes the row. Then
@@ -50,12 +50,14 @@ use parking_lot::RwLock;
 /// meanwhile. Have the holder lay the address's objects again then: each
 /// takes what stood.
 ///
-/// Write the removal before calling
-/// [`Objects::forget_credential`](super::Objects::forget_credential). The
-/// holder reads the store first and forgets an entry once no row dials the
-/// address. A registration answered behind the start of that read may have
-/// written behind it: its entry stays for the next call, and so does the
+/// The holder forgets an entry in its own follow, when the last row that
+/// dials the address leaves, whoever wrote the removal. It reads the
+/// keeper's clock ahead of the store. A registration answered behind that
+/// read may have written behind it: its entry stays, and so does the
 /// credential of a registration in flight.
+/// [`Objects::forget_credential`](super::Objects::forget_credential)
+/// forgets an address by name, for a worker removed before its first
+/// object: write the removal before the call.
 ///
 /// Use the address as the registration writes it. The keeper compares
 /// addresses as written.
@@ -152,7 +154,7 @@ impl Error for RegistrationInFlight {}
 impl fmt::Debug for KeptCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KeptCredential")
-            .field("in_flight", &self.in_flight)
+            .field("differs", &self.differs)
             .finish_non_exhaustive()
     }
 }
@@ -675,7 +677,7 @@ mod tests {
         let shown = format!("{kept:?}");
         assert!(!shown.contains(KEY_A));
         assert!(!shown.contains(KEY_B));
-        assert_eq!(shown, "KeptCredential { in_flight: true, .. }");
+        assert_eq!(shown, "KeptCredential { differs: true, .. }");
         kept.accepted();
     }
 }

@@ -114,6 +114,12 @@ struct Held {
 /// which carries the standing object's running state over. An entry's
 /// revision never moves under an object that is kept.
 ///
+/// With a keeper ([`Self::with_credentials`]), a read that ends the last
+/// object that dialed an address forgets the keeper's entry there, whoever
+/// wrote the removal. The keeper's clock is read ahead of the store: a
+/// registration answered behind that read keeps its credential, and so
+/// does what a registration in flight stated.
+///
 /// The holder is the registry's one writer: an object any other writer left
 /// under a row's URL is replaced by the row's.
 ///
@@ -132,6 +138,10 @@ pub struct Objects<G> {
     status_followed: bool,
     /// What the host keeps for its workers, by the address they dial.
     credentials: Option<Arc<Credentials>>,
+    /// The addresses whose rows' objects ended since the last forgetting,
+    /// where a keeper was handed in. Written and drained under the
+    /// follow's turn.
+    left: Mutex<Vec<String>>,
     /// Where the last read ended. Held through a read: one follows at a
     /// time.
     read_to: Mutex<Place>,
@@ -165,6 +175,7 @@ impl<G: Generation> Objects<G> {
             connector: None,
             status_followed: false,
             credentials: None,
+            left: Mutex::new(Vec::new()),
             read_to: Mutex::new(Place::default()),
             held: RwLock::new(Held::default()),
         }
@@ -190,7 +201,9 @@ impl<G: Generation> Objects<G> {
         self
     }
 
-    /// Forget the credential the rows that left held at `address`. The
+    /// Forget the credential the rows that left held at `address`. A
+    /// follow forgets by itself the address its last row left: this call
+    /// names an address, for a worker removed before its first object. The
     /// call follows `store` first, so a removal just written is seen, and
     /// holds the follow's turn to its end: no object is built between its
     /// read and the forgetting. Return `true` if a credential was
@@ -208,7 +221,10 @@ impl<G: Generation> Objects<G> {
         };
         // The keeper's clock ahead of the read of the store.
         let read = credentials.taken();
-        self.follow_from(store, &mut place);
+        let forgotten = self.follow_from(store, &mut place);
+        if forgotten.iter().any(|left| left == address) {
+            return true;
+        }
         let held = self.held.read();
         if held
             .facts
@@ -329,9 +345,17 @@ impl<G: Generation> Objects<G> {
         self.follow_from(store, &mut self.read_to.lock());
     }
 
-    /// [`Self::follow`] for the caller that holds the turn.
-    fn follow_from<S: WorkersStore + ?Sized>(&self, store: &S, place: &mut Place) {
+    /// [`Self::follow`] for the caller that holds the turn. Return the
+    /// addresses at which a credential was forgotten.
+    fn follow_from<S: WorkersStore + ?Sized>(&self, store: &S, place: &mut Place) -> Vec<String> {
+        let mut forgotten = Vec::new();
         loop {
+            // The keeper's clock ahead of the read of the store: a
+            // registration answered behind it keeps its credential.
+            let read = self
+                .credentials
+                .as_ref()
+                .map(|credentials| credentials.taken());
             // The history ahead of the rows: a restore that lands behind
             // this read of it is seen by the next.
             let history = store.history();
@@ -343,7 +367,7 @@ impl<G: Generation> Objects<G> {
             match tail {
                 MembershipTail::Changes(changes) => {
                     let Some(&(last, _)) = changes.last() else {
-                        return;
+                        return forgotten;
                     };
                     for (_, change) in changes {
                         self.apply(store, change);
@@ -358,6 +382,28 @@ impl<G: Generation> Objects<G> {
                         history,
                     };
                 }
+            }
+            self.forget_left(read, &mut forgotten);
+        }
+    }
+
+    /// Forget what the rows that left in this read held: the keeper's
+    /// entry at each address no row dials any more, by the keeper's clock
+    /// as it read ahead of the store. An address whose credential went is
+    /// added to `forgotten`.
+    fn forget_left(&self, read: Option<u64>, forgotten: &mut Vec<String>) {
+        let (Some(credentials), Some(read)) = (&self.credentials, read) else {
+            return;
+        };
+        let left = std::mem::take(&mut *self.left.lock());
+        if left.is_empty() {
+            return;
+        }
+        let held = self.held.read();
+        let dialed: HashSet<&str> = held.facts.values().map(dial_address).collect();
+        for address in left {
+            if !dialed.contains(address.as_str()) && credentials.forget(&address, read) {
+                forgotten.push(address);
             }
         }
     }
@@ -491,7 +537,12 @@ impl<G: Generation> Objects<G> {
         let mut entries = self.held.write();
         entries.objects.remove(&id);
         entries.rows.remove(&held);
-        entries.facts.remove(&id);
+        let facts = entries.facts.remove(&id);
+        drop(entries);
+        // The address the row dialed, for the forgetting behind this read.
+        if let (Some(_), Some(facts)) = (&self.credentials, facts) {
+            self.left.lock().push(dial_address(&facts).to_owned());
+        }
     }
 
     /// Build `row`'s object and put it in the registry: registered under a
@@ -1032,6 +1083,63 @@ mod tests {
         replica.remove(A);
         assert_eq!(replica.objects.lay_again(replica.store.as_ref(), A), 0);
         assert!(replica.objects.registry().get_by_url(A).is_none());
+    }
+
+    #[test]
+    fn a_follow_forgets_the_credential_of_an_address_its_last_row_left() {
+        let replica = Replica::new();
+        replica.keep(A, Some(KEY_A));
+        replica.store.upsert(facts(A, 1));
+        replica.follow();
+
+        // The removal is another writer's: this host calls nothing.
+        replica.remove(A);
+        replica.follow();
+        assert!(replica.credentials.is_empty());
+
+        // A later worker at the address is built without the old key.
+        replica.store.upsert(facts(A, 2));
+        replica.follow();
+        assert!(replica.holds_credential(A, None));
+        // The forgetting was the follow's: none is left for the call.
+        replica.remove(A);
+        replica.follow();
+        assert!(!replica.objects.forget_credential(replica.store.as_ref(), A));
+    }
+
+    #[test]
+    fn a_follow_forgets_nothing_while_another_row_dials_the_address() {
+        let replica = Replica::new();
+        replica.keep(C, Some(KEY_C));
+        replica.store.upsert(rank_facts(A, C, 0));
+        replica.store.upsert(rank_facts(B, C, 1));
+        replica.follow();
+
+        replica.remove(A);
+        replica.follow();
+        assert_eq!(replica.credentials.len(), 1);
+        assert!(replica.holds_credential(B, Some(KEY_C)));
+        replica.remove(B);
+        replica.follow();
+        assert!(replica.credentials.is_empty());
+    }
+
+    #[test]
+    fn a_follow_keeps_what_a_registration_in_flight_stated() {
+        let replica = Replica::new();
+        replica.keep(A, Some(KEY_A));
+        replica.store.upsert(facts(A, 1));
+        replica.follow();
+
+        replica.remove(A);
+        let next = replica.kept(A, Some(KEY_B));
+        replica.follow();
+        // The removed row's credential goes. The one in flight stays.
+        assert_eq!(replica.credentials.len(), 1);
+        replica.store.upsert(facts(A, 2));
+        next.accepted();
+        replica.follow();
+        assert!(replica.holds_credential(A, Some(KEY_B)));
     }
 
     #[test]
