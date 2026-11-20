@@ -34,6 +34,10 @@
 //! of one grouped worker was pinned to by its key. Two hashes place no key
 //! alike, so it must replay with the requests of one key on one rank, and
 //! a counted row count for count or share for share.
+//! A retry-wire row holds the gateway's answer to each request of one
+//! pool, a retry that stays on its wire among them: the workers the
+//! request may be placed on, or its refusal. It must replay answer for
+//! answer, a refusal by its status and its code.
 //! No row is decided differently but where its module names it. The store
 //! judges an engine by rules of its own, and the overload module holds a
 //! recorded row they decide apart from the gateway to the verdicts its
@@ -70,6 +74,7 @@ mod classic {
     pub mod pair_index;
     pub mod power_of_two;
     pub mod prefix_hash;
+    pub mod retry_wire;
     pub mod sticky_override;
     pub mod sticky_rank;
 }
@@ -126,10 +131,6 @@ const OWED_SHEETS: &[OwedSheet] = &[
     OwedSheet {
         policy: "pair-select",
         by: "the placement of a prefill and decode pair",
-    },
-    OwedSheet {
-        policy: "retry-wire",
-        by: "a request's hard demands: the wire a retry stays on",
     },
     OwedSheet {
         policy: "media-refs",
@@ -297,7 +298,10 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// An encode-pair row is replayed in its store part by its own module;
 /// its copied rows name no runtime either, and the pair index's rule
 /// holds them.
-const MODULES: [Module; 12] = [
+/// A retry-wire row names the workers a request may take or its refusal,
+/// so its module brings its own replay too; its copied rows name each
+/// runtime by a token, and the pair index's rule holds them as well.
+const MODULES: [Module; 13] = [
     module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
     module::<classic::bucket::Row>(classic::bucket::INLINE),
     module::<classic::cache_aware::Row>(classic::cache_aware::INLINE),
@@ -332,6 +336,12 @@ const MODULES: [Module; 12] = [
         inline: classic::prefix_hash::INLINE,
         replay: classic::prefix_hash::replay_rows,
         copied: copied_row_defects,
+    },
+    Module {
+        policy: classic::retry_wire::POLICY,
+        inline: classic::retry_wire::INLINE,
+        replay: classic::retry_wire::replay_rows,
+        copied: classic::pair_index::copied_row_defects,
     },
     module::<classic::sticky_override::Row>(classic::sticky_override::INLINE),
     Module {
@@ -647,6 +657,13 @@ fn the_classic_cache_aware_rows_replay_pick_for_pick_and_share_for_share() {
 #[test]
 fn the_classic_sticky_rank_rows_replay_rank_for_rank_and_count_for_count() {
     let (rows, defects) = replay_sheet(classic::sticky_rank::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
+fn the_classic_retry_wire_rows_replay_answer_for_answer() {
+    let (rows, defects) = replay_sheet(classic::retry_wire::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");
     assert!(defects.is_empty(), "{defects:#?}");
 }
@@ -1121,6 +1138,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "pair-index.json",
             "power_of_two.json",
             "prefix_hash.json",
+            "retry-wire.json",
             "sticky_override.json",
             "sticky_rank.json",
             "stray.json",
