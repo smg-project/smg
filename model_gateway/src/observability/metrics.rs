@@ -726,10 +726,16 @@ pub(crate) fn init_metrics() {
     //   decode   smg_pd_decode_ttft_seconds          decode dispatch -> first decode token
     // The engines' own KV transfer runs inside the decode phase. Parallel
     // dispatch sends both sides together: the decode phase is the whole TTFT and
-    // there is no relay phase.
+    // there is no relay phase. Ahead of them all, `smg_pd_dispatch_wait_seconds`
+    // covers the gateway's own time before the prefill dispatch, so the wait
+    // plus the TTFT is the TTFT from the request's entry at the edge.
     describe_histogram!(
         "smg_pd_prefill_duration_seconds",
         "PD prefill phase: prefill dispatch to the end of the prefill response, the prefill engine's queueing and compute included, by backend_type, model, runtime"
+    );
+    describe_histogram!(
+        "smg_pd_dispatch_wait_seconds",
+        "PD dispatch wait: from the request's entry at the edge to the prefill dispatch of the attempt that established the pair (body read, auth, admission, tokenize, template, worker selection, earlier attempts). With smg_pd_ttft_seconds it is the TTFT from the gateway's receipt of the request. Recorded with the success-only PD metrics, for a dispatch made in the request's own task"
     );
     describe_histogram!(
         "smg_pd_kv_transfer_duration_seconds",
@@ -1217,6 +1223,11 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     let ttft_matcher = Matcher::Suffix(String::from("ttft_seconds"));
     let tpot_matcher = Matcher::Suffix(String::from("tpot_seconds"));
 
+    // The PD dispatch wait (edge entry to prefill dispatch) ends in
+    // `_wait_seconds`, not `duration_seconds`: it keeps the request-latency
+    // buckets for the same reason the TTFT families do.
+    let pd_dispatch_wait_matcher = Matcher::Full(String::from("smg_pd_dispatch_wait_seconds"));
+
     // The first-token and per-output-token families: their own log-spaced
     // edges, which `--prometheus-duration-buckets` does not replace.
     let first_token_matcher = Matcher::Full(String::from(TIME_TO_FIRST_TOKEN_SECONDS));
@@ -1254,7 +1265,8 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     HashMap::from([
         (duration_matcher, duration_bucket.clone()),
         (ttft_matcher, duration_bucket.clone()),
-        (tpot_matcher, duration_bucket),
+        (tpot_matcher, duration_bucket.clone()),
+        (pd_dispatch_wait_matcher, duration_bucket.clone()),
         (first_token_matcher, TIME_TO_FIRST_TOKEN_BUCKETS.to_vec()),
         (
             per_output_token_matcher,
@@ -2107,6 +2119,29 @@ impl Metrics {
         let model = intern_model_label(model_id);
         histogram!(
             "smg_pd_prefill_duration_seconds",
+            "backend_type" => backend_type,
+            "model" => model,
+            "runtime" => runtime
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Record the PD dispatch wait: from the request's entry at the edge
+    /// (`middleware::RequestStarted`) to the prefill dispatch. It is the
+    /// gateway's own time ahead of the engines, which the PD TTFT families
+    /// leave out since they start at the prefill dispatch, so
+    /// `smg_pd_dispatch_wait_seconds` + `smg_pd_ttft_seconds` is the TTFT from
+    /// the gateway's receipt of the request.
+    /// Uses string interning for model_id; runtime is a static label.
+    pub fn record_pd_dispatch_wait(
+        backend_type: &'static str,
+        model_id: &str,
+        runtime: &'static str,
+        duration: Duration,
+    ) {
+        let model = intern_model_label(model_id);
+        histogram!(
+            "smg_pd_dispatch_wait_seconds",
             "backend_type" => backend_type,
             "model" => model,
             "runtime" => runtime

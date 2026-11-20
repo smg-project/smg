@@ -28,7 +28,11 @@ use common::{
     },
     metrics_capture::{self, render_after},
 };
-use smg::{middleware::TenantRequestMeta, routers::RouterTrait, tenant::TenantKey};
+use smg::{
+    middleware::{RequestStarted, TenantRequestMeta},
+    routers::RouterTrait,
+    tenant::TenantKey,
+};
 use smg_test_harness as common;
 use smg_worker::identity::basic::{RuntimeType, WorkerType};
 
@@ -277,7 +281,11 @@ fn sequential_dispatch_phases_add_up_to_the_pd_ttft() {
             start_mock_engine(HeldHeadersEngine::eager(PREFILL_DELAY, OUTPUT_TOKENS)).await;
         let decode = start_mock_engine(HeldHeadersEngine::eager(DECODE_DELAY, OUTPUT_TOKENS)).await;
         let router = build_pd_router(prefill, decode, RuntimeType::Vllm).await;
-        let body = one_streaming_chat(router.as_ref()).await;
+        // The request runs under the edge's entry stamp, as the metrics layer
+        // runs every request: the dispatch wait is counted from it.
+        let body = RequestStarted::now()
+            .scope(one_streaming_chat(router.as_ref()))
+            .await;
         let (deltas, completion_tokens) = chat_stream_counts(&body);
         assert_eq!(
             deltas, OUTPUT_TOKENS,
@@ -305,6 +313,19 @@ fn sequential_dispatch_phases_add_up_to_the_pd_ttft() {
     assert!(
         (ttft - (prefill + relay + decode)).abs() < 1e-6,
         "ttft {ttft} != prefill {prefill} + relay {relay} + decode {decode}"
+    );
+    // The dispatch wait, from the request's entry at the edge to the prefill
+    // dispatch, is recorded once, carries no worker delay, and with the TTFT
+    // covers the request from the gateway's receipt of it.
+    let runtime = RuntimeType::Vllm.as_str();
+    let wait = sample(&rendered, "smg_pd_dispatch_wait_seconds", "sum", runtime);
+    let wait_count = sample(&rendered, "smg_pd_dispatch_wait_seconds", "count", runtime);
+    let (Some(wait), Some(1.0)) = (wait, wait_count) else {
+        panic!("the PD dispatch wait is missing or not recorded once:\n{rendered}");
+    };
+    assert!(
+        wait >= 0.0 && wait < SLACK.as_secs_f64(),
+        "dispatch wait {wait} carries no worker delay"
     );
 }
 
@@ -336,6 +357,14 @@ fn a_held_header_decode_side_stays_in_the_decode_phase() {
     assert!(
         (ttft - (prefill + relay + decode)).abs() < 1e-6,
         "ttft {ttft} != prefill {prefill} + relay {relay} + decode {decode}"
+    );
+    // This request ran outside the edge's entry stamp, so no dispatch wait
+    // is recorded for it: the wait has no start to count from.
+    let runtime = RuntimeType::Vllm.as_str();
+    assert_eq!(
+        sample(&rendered, "smg_pd_dispatch_wait_seconds", "count", runtime),
+        None,
+        "{rendered}"
     );
 }
 

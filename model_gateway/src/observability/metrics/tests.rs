@@ -654,6 +654,25 @@ fn test_record_pd_prefill_duration_emits_histogram() {
 }
 
 #[test]
+fn test_record_pd_dispatch_wait_emits_histogram() {
+    let (rendered, ()) = with_test_recorder(|| {
+        Metrics::record_pd_dispatch_wait(
+            metrics_labels::BACKEND_PD,
+            "test-model",
+            "vllm",
+            Duration::from_millis(17),
+        );
+    });
+    assert!(
+        rendered.contains("smg_pd_dispatch_wait_seconds_count{")
+            && rendered.contains(r#"backend_type="pd""#)
+            && rendered.contains(r#"model="test-model""#)
+            && rendered.contains(r#"runtime="vllm""#),
+        "dispatch wait histogram not emitted; rendered:\n{rendered}"
+    );
+}
+
+#[test]
 fn test_record_pd_kv_transfer_duration_emits_histogram() {
     let (rendered, ()) = with_test_recorder(|| {
         Metrics::record_pd_kv_transfer_duration(
