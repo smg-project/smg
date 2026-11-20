@@ -1808,13 +1808,6 @@ impl PDRouter {
             placed.decode_dispatched(dispatch_start);
         }
         let cut = Self::cut_mark_of(placed.as_deref_mut(), context.is_stream);
-        // The drain of a streamed pair's prefill outlives this attempt. It
-        // writes its end on the placement's mark, and the answer's body
-        // tells the prefill's end from it.
-        let drain_mark = placed
-            .as_deref_mut()
-            .filter(|_| context.is_stream && !context.return_logprob)
-            .map(Sent::drain_mark);
         let prefill_fut = async {
             let resp = send_with_stale_conn_retry(prefill_request)
                 .await
@@ -1825,6 +1818,10 @@ impl PDRouter {
                 // The drain owns both the permit and the outcome. It may finish
                 // before Decode sends headers; neither waits for the other.
                 *prefill_outcome = PrefillOutcome::Drained;
+                // The drain outlives this attempt, and it can outlive the
+                // answer's body. It tells its end to the placement through
+                // the end the two share.
+                let drain_end = placed.as_deref_mut().map(Sent::drain_end);
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "drains a prefill body concurrently with Decode; aborted before client commitment and detached after it"
@@ -1845,8 +1842,8 @@ impl PDRouter {
                         }
                     }
                     prefill.record_outcome(drained.as_u16());
-                    if let Some(mark) = drain_mark {
-                        mark.store(drained.as_u16(), Ordering::Relaxed);
+                    if let Some(end) = drain_end {
+                        end.tell(drained);
                     }
                     if drained.is_server_error() {
                         Metrics::record_worker_error(
@@ -5452,7 +5449,7 @@ mod tests {
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    async fn spawn_stub(app: axum::Router) -> String {
+    pub(super) async fn spawn_stub(app: axum::Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
