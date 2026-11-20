@@ -577,6 +577,10 @@ mod tests {
     #[test]
     fn a_checkpoint_a_group_lists_under_also_resolves_to_the_groups_table() {
         for (model, table) in [
+            (
+                "fixie-ai/turntaking-pretraining-it-multilingual-3c",
+                Table::Json,
+            ),
             ("moonshotai/Kimi-K3.1-Pro", Table::KimiK3),
             ("nvidia/Kimi-K3.1-Pro-NVFP4", Table::KimiK3),
             ("kimi-k3.1-pro", Table::KimiK3),
@@ -624,9 +628,360 @@ mod tests {
             ("openbmb/MiniCPM-OCR-1.0-AWQ", Table::Qwen3Tagged),
             ("openbmb/MiniCPM-OCR-1.0-GPTQ", Table::Qwen3Tagged),
             ("XHToken/Spark-X2.6-1.7B", Table::Glm),
+            ("Jundot/gemma-4-12B-it-oQ8e-mtp", Table::Gemma4),
+            ("google/gemma-4-12B-it-qat-q4_0-unquantized", Table::Gemma4),
+            ("google/gemma-4-31B-it", Table::Gemma4),
         ] {
             assert_eq!(table_for(model), Some(table), "{model}");
             assert!(for_model(model).is_some(), "{model}");
+        }
+    }
+
+    /// A checkpoint that bellwether records with the chat template and the parse cases of a
+    /// group the registry already reads has a row of its own on that group's table, with the
+    /// group's turn opener and text after the thought's close. Each pair is such a checkpoint
+    /// and the group it is recorded like.
+    #[test]
+    fn a_checkpoint_recorded_like_a_group_reads_like_that_group() {
+        for (model, group) in [
+            (
+                "ByteDance-Seed/BAGEL-7B-MoT",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            ("nvidia/Cosmos3-Super", "internlm/CapRL-Qwen3VL-4B"),
+            (
+                "inclusionAI/DR-Venus-4B-RL",
+                "inclusionAI/AReaL-SEA-235B-A22B",
+            ),
+            (
+                "inclusionAI/DR-Venus-4B-SFT",
+                "inclusionAI/AReaL-SEA-235B-A22B",
+            ),
+            ("nvidia/Eagle2-2B", "Salesforce/cogalign-internvl2_5-mpo-4b"),
+            ("nvidia/EGM-4B-SFT", "Qwen/Qwen3-VL-235B-A22B-Thinking"),
+            ("nvidia/EGM-8B", "Qwen/Qwen3-VL-235B-A22B-Thinking"),
+            (
+                "Salesforce/FARE-8B",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            (
+                "EleutherAI/finetuned-reworded-Qwen3-4B-public",
+                "openbmb/AgentCPM-Explore",
+            ),
+            (
+                "IQuestLab/Fleming-VL-8B",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            (
+                "allendou/Fun-ASR-Nano-2512-vllm",
+                "openbmb/AgentCPM-Explore",
+            ),
+            (
+                "OpenMOSS-Team/Game-RL-InternVL3-8B",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            (
+                "stepfun-ai/GELab-Zero-4B-preview",
+                "internlm/CapRL-Qwen3VL-4B",
+            ),
+            (
+                "microsoft/HARC-Llama-3.1-8B-Instruct",
+                "nvidia/Llama-3_1-Nemotron-Ultra-253B-CPT-v1",
+            ),
+            (
+                "microsoft/HARC-Qwen2.5-7B-Instruct",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            (
+                "NousResearch/Hermes-4.3-36B",
+                "NousResearch/ByteDance-Seed-OSS-36B-Alternate-Tokenizer",
+            ),
+            (
+                "NousResearch/Hermes-4.3-36B-centralized",
+                "NousResearch/ByteDance-Seed-OSS-36B-Alternate-Tokenizer",
+            ),
+            (
+                "FreedomIntelligence/HiMed-8B",
+                "nvidia/Llama-3_1-Nemotron-Ultra-253B-CPT-v1",
+            ),
+            ("FreedomIntelligence/HuatuoGPT-3-9B", "BAAI/AREX-Base"),
+            (
+                "thu-coai/IF-CRITIC-14B",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            ("internlm/Intern-Decision-0.8B", "Qwen/Qwen3.5-2B"),
+            ("internlm/Intern-Decision-4B", "BAAI/AREX-Base"),
+            (
+                "OpenGVLab/InternVL3_5-30B-A3B-Instruct",
+                "openbmb/AgentCPM-Explore",
+            ),
+            (
+                "OpenGVLab/InternVL3_5-8B-Instruct",
+                "openbmb/AgentCPM-Explore",
+            ),
+            ("PerceptronAI/Isaac-0.2-1B", "openbmb/AgentCPM-Explore"),
+            ("nvidia/Ising-Calibration-1-35B-A3B", "BAAI/AREX-Base"),
+            ("internlm/JanusCoder-14B", "inclusionAI/AReaL-boba-2-14B"),
+            ("xlangai/Jedi-3B-1080p", "baichuan-inc/BaichuanMed-OCR-7B"),
+            ("LiquidAI/LFM2.5-VL-3B", "LiquidAI/d1-3B"),
+            ("lightonai/LightOn-rerank-LW-2B", "Qwen/Qwen3.5-2B"),
+            ("lightonai/LightOn-rerank-LW-4B", "BAAI/AREX-Base"),
+            ("lightonai/LightOn-rerank-PW-2B", "Qwen/Qwen3.5-2B"),
+            ("lightonai/LightOn-rerank-PW-4B", "BAAI/AREX-Base"),
+            (
+                "RedHatAI/Llama-3.2-1B-Instruct-FP8",
+                "meta-llama/Llama-3.2-1B-Instruct",
+            ),
+            (
+                "imdatta0/llamathought_eurus_matheval",
+                "nvidia/Llama-3_1-Nemotron-Ultra-253B-CPT-v1",
+            ),
+            (
+                "nvidia/LocateAnything-3B",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            ("microsoft/MagenticBrain", "openbmb/AgentCPM-Explore"),
+            ("ATH-MaaS/Marco-DeepResearch-8B", "openbmb/AgentCPM-Explore"),
+            ("openbmb/MathForm-8B", "openbmb/AgentCPM-Explore"),
+            (
+                "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8",
+                "nvidia/Llama-3_1-Nemotron-Ultra-253B-CPT-v1",
+            ),
+            ("XiaomiMiMo/MiMo-7B-SFT", "baichuan-inc/BaichuanMed-OCR-7B"),
+            (
+                "lmms-lab/MMSearch-R1-7B-0807",
+                "baichuan-inc/BaichuanMed-OCR-7B",
+            ),
+            (
+                "Salesforce/moirai-agent",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            (
+                "microsoft/NextCoder-14B",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            (
+                "microsoft/NextCoder-7B",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            (
+                "ATH-MaaS/Ovis2-4B",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            ("JetLM/PI-Mem-35B-A3B", "BAAI/AREX-Base"),
+            (
+                "tencent/POINTS-Reader",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            ("nvidia/Privasis-Cleaner-4B", "openbmb/AgentCPM-Explore"),
+            ("Qwen/Qwen-Image-2.1-PE-I2I", "BAAI/AREX-Base"),
+            ("Qwen/Qwen-Image-2.1-PE-T2I", "BAAI/AREX-Base"),
+            (
+                "inclusionAI/Qwen3-32B-AWorld",
+                "inclusionAI/AReaL-boba-2-14B",
+            ),
+            ("OpenMOSS-Team/Qwen3-8B-ABC", "inclusionAI/AReaL-boba-2-14B"),
+            (
+                "EleutherAI/qwen3-8b-djinnsdf-dolci",
+                "openbmb/AgentCPM-Explore",
+            ),
+            ("lightonai/Qwen3-8B-FR", "inclusionAI/AReaL-SEA-235B-A22B"),
+            (
+                "nvidia/Qwen3-Nemotron-32B-RLBFF",
+                "openbmb/AgentCPM-Explore",
+            ),
+            ("nvidia/Qwen3-Nemotron-8B-BRRM", "openbmb/AgentCPM-Explore"),
+            ("codecho/Qwen3.5-0.8B-text-only", "Qwen/Qwen3.5-2B"),
+            ("codecho/Qwen3.5-35B-A3B-text-only", "BAAI/AREX-Base"),
+            (
+                "BAAI/Recon2Reason-Reasoning-4B",
+                "internlm/CapRL-Qwen3VL-4B",
+            ),
+            (
+                "openbmb/RLPR-Llama3.1-8B-Inst",
+                "nvidia/Llama-3_1-Nemotron-Ultra-253B-CPT-v1",
+            ),
+            ("inclusionAI/Rubicon-Preview", "openbmb/AgentCPM-Explore"),
+            (
+                "allenai/SAGE-MM-Qwen3-VL-4B-SFT_RL",
+                "internlm/CapRL-Qwen3VL-4B",
+            ),
+            (
+                "allenai/SAGE-MM-Qwen3-VL-8B-SFT",
+                "internlm/CapRL-Qwen3VL-4B",
+            ),
+            ("OpenGVLab/ScaleCUA-3B", "baichuan-inc/BaichuanMed-OCR-7B"),
+            ("OpenGVLab/ScaleCUA-7B", "baichuan-inc/BaichuanMed-OCR-7B"),
+            ("openbmb/SciCore-Mol", "openbmb/AgentCPM-Explore"),
+            (
+                "OpenMOSS-Team/SciThinker-30B",
+                "inclusionAI/AReaL-SEA-235B-A22B",
+            ),
+            (
+                "OpenMOSS-Team/SciThinker-4B",
+                "inclusionAI/AReaL-SEA-235B-A22B",
+            ),
+            ("JetLM/SDAR-30B-A3B-Chat", "inclusionAI/AReaL-boba-2-14B"),
+            ("allenai/SERA-32B", "inclusionAI/AReaL-boba-2-14B"),
+            ("allenai/SERA-8B", "openbmb/AgentCPM-Explore"),
+            (
+                "thu-coai/SeTox-Qwen2.5-3B",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            (
+                "thu-coai/ShieldAgent",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            ("inclusionAI/SingGuard-NSFA-0.8B", "Qwen/Qwen3.5-2B"),
+            ("inclusionAI/SingGuard-NSFA-4B", "BAAI/AREX-Base"),
+            ("Skywork/SkyCaptioner-V1", "baichuan-inc/BaichuanMed-OCR-7B"),
+            (
+                "Skywork/Skywork-SWE-32B",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            (
+                "internlm/Spatial-SSRL-Qwen3VL-4B",
+                "internlm/CapRL-Qwen3VL-4B",
+            ),
+            (
+                "OpenGVLab/stage2-InternVideo2-1B-Qwen2_5-7B-tome16_mlp",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            (
+                "zai-org/SWE-Dev-32B",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            (
+                "zai-org/SWE-Dev-7B",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            (
+                "internlm/SWE-Fixer-Retriever-7B",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            (
+                "Salesforce/SweRankLLM-Large",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            (
+                "Salesforce/SweRankLLM-Small",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            (
+                "ByteDance-Seed/Tar-1.5B",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            (
+                "ByteDance-Seed/Tar-7B",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            ("ByteDance-Seed/TaskMem", "Qwen/Qwen3-VL-235B-A22B-Thinking"),
+            ("allenai/tmax-27b", "Qwen/Qwen3.6-27B"),
+            ("allenai/tmax-2b", "Qwen/Qwen3.5-2B"),
+            ("tencent/UI-Mate-9B", "BAAI/AREX-Base"),
+            (
+                "ByteDance-Seed/UI-TARS-1.5-7B",
+                "baichuan-inc/BaichuanMed-OCR-7B",
+            ),
+            ("inclusionAI/UI-Venus-1.5-2B", "internlm/CapRL-Qwen3VL-4B"),
+            (
+                "inclusionAI/UI-Venus-Ground-7B",
+                "baichuan-inc/BaichuanMed-OCR-7B",
+            ),
+            (
+                "fixie-ai/ultravox-v0_5-llama-3_1-8b",
+                "nvidia/Llama-3_1-Nemotron-Ultra-253B-CPT-v1",
+            ),
+            (
+                "fixie-ai/ultravox-v0_6-llama-3_3-70b",
+                "nvidia/Llama-3_1-Nemotron-Ultra-253B-CPT-v1",
+            ),
+            (
+                "fixie-ai/ultravox-v0_6-qwen-3-32b",
+                "openbmb/AgentCPM-Explore",
+            ),
+            ("microsoft/UniRG-CXR", "internlm/CapRL-Qwen3VL-4B"),
+            ("OpenGVLab/VeBrain", "baichuan-inc/BaichuanMed-OCR-7B"),
+            ("BAAI/Video-XL-2", "Salesforce/cogalign-internvl2_5-mpo-4b"),
+            (
+                "BAAI/Video-XL-2-Stage3",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            ("inclusionAI/ViLaSR", "baichuan-inc/BaichuanMed-OCR-7B"),
+            ("inclusionAI/VISTA-9B", "BAAI/AREX-Base"),
+            ("microsoft/X-Reasoner-7B", "baichuan-inc/BaichuanMed-OCR-7B"),
+            (
+                "Salesforce/xRouter",
+                "Salesforce/cogalign-internvl2_5-mpo-4b",
+            ),
+            ("inclusionAI/ZwZ-4B", "internlm/CapRL-Qwen3VL-4B"),
+        ] {
+            assert!(for_model(model).is_some(), "{model}");
+            assert_eq!(
+                for_model(model),
+                for_model(group),
+                "{model}: reads like {group}"
+            );
+        }
+    }
+
+    /// A checkpoint that bellwether records with the chat template of a group the registry
+    /// already reads, and whose own recorded parse cases replay on that group's table, has a
+    /// row of its own on that table, with the group's turn opener and text after the
+    /// thought's close. Each pair is such a checkpoint and the group whose template it has.
+    #[test]
+    fn a_checkpoint_with_a_groups_chat_template_reads_like_that_group() {
+        for (model, group) in [
+            ("arcee-ai/arcee-blitz-caller-beta", "arcee-ai/Caller"),
+            (
+                "google/gemma-4-E2B-it-qat-q4_0-unquantized",
+                "google/gemma-4-E4B-it",
+            ),
+            (
+                "ibm-research/granite-4.0-h-3b-ar",
+                "ibm-granite/granite-4.1-3b",
+            ),
+            (
+                "ibm-granite/granite-guardian-4.1-8b",
+                "ibm-granite/granite-4.1-3b",
+            ),
+            (
+                "NousResearch/Hermes-4-405B",
+                "NousResearch/ByteDance-Seed-OSS-36B-Alternate-Tokenizer",
+            ),
+            (
+                "NousResearch/Hermes-4-70B",
+                "NousResearch/ByteDance-Seed-OSS-36B-Alternate-Tokenizer",
+            ),
+            (
+                "FreedomIntelligence/HuatuoGPT-3-8B",
+                "inclusionAI/AReaL-boba-2-14B",
+            ),
+            ("IFM/K2-Horizon-7B", "IFM/K2-Horizon-36B"),
+            ("LiquidAI/LFM2-24B-A2B", "LiquidAI/LFM2.5-1.2B-Instruct"),
+            ("LiquidAI/LFM2.5-2.6B", "LiquidAI/LFM2.5-24B-A2B"),
+            ("LiquidAI/LFM2.5-350M", "LiquidAI/LFM2.5-1.2B-Instruct"),
+            (
+                "Salesforce/Llama-xLAM-2-70b-fc-r",
+                "Salesforce/Llama-xLAM-2-8b-fc-r",
+            ),
+            ("openbmb/MiniCPM5-2B-Base", "lightonai/colgrep-agent-2B"),
+            ("openbmb/MiniCPM5-2B-SFT", "lightonai/colgrep-agent-2B"),
+            (
+                "allenai/Olmo-Hybrid-Instruct-DPO-7B",
+                "allenai/Olmo-3-7B-Instruct",
+            ),
+            (
+                "ByteDance-Seed/Seed-OSS-36B-Base",
+                "ByteDance-Seed/Seed-OSS-36B-Instruct",
+            ),
+        ] {
+            assert!(for_model(model).is_some(), "{model}");
+            assert_eq!(
+                for_model(model),
+                for_model(group),
+                "{model}: reads like {group}"
+            );
         }
     }
 
