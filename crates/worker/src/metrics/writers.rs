@@ -1520,70 +1520,111 @@ impl Metrics {
         STRING_INTERNER.remove(worker_url);
     }
 
-    /// Sentinel-out one rank's load series under one model: the six
-    /// `smg_engine_*` gauges that carry the worker, the model and the rank.
-    /// The collector sets them for a worker whose load feed ended while its
-    /// URL stays registered: its status left `Ready`, or a same-URL
-    /// replacement has not written them yet (see
+    /// Sentinel-out one rank's `smg_engine_*` series at a worker's URL: the
+    /// six load gauges under each of `models`, which carry the worker, the
+    /// model and the rank, and the four pair gauges under every role
+    /// (prefill/decode/null), which carry the worker, the engine's role
+    /// and the rank, and no model. The collector sets them for a worker
+    /// whose load feed ended while its URL stays registered: its status
+    /// left `Ready`, or a same-URL replacement took its place (see
     /// `WorkerMonitor::clear_series`). The worker series store keeps those
-    /// series, so the last load would read as live. Each gauge is set to -1,
-    /// an impossible value for gauges whose 0 is meaningful. A removed
+    /// series, so the last load would read as live. Each gauge is set to
+    /// -1, an impossible value for gauges whose 0 is meaningful. A removed
     /// worker needs no sentinel: the store drops every `worker`-labelled
     /// series with the registration ([`Self::remove_worker_metrics`]) and
-    /// no-ops the writes that follow, this one included. The label set must
-    /// exactly match `record_engine_load` (including `model` and `dp_rank`)
-    /// or a fresh series is created instead of overwriting the live one.
-    /// One call a rank: no rank between two is written.
-    pub(crate) fn remove_engine_rank_load_metrics(worker_url: &str, model_id: &str, dp_rank: i32) {
-        let worker = intern_string(worker_url);
-        let model = intern_model_label(model_id);
-        let dp_rank = intern_string(&dp_rank.to_string());
-        for name in [
-            "smg_engine_running_requests",
-            "smg_engine_waiting_requests",
-            "smg_engine_token_usage",
-            "smg_engine_gen_throughput",
-            "smg_engine_cache_hit_rate",
-            "smg_engine_kv_capacity_tokens",
-        ] {
-            gauge!(
-                name,
-                "worker" => Arc::clone(&worker),
-                "model" => Arc::clone(&model),
-                "dp_rank" => Arc::clone(&dp_rank),
-            )
-            .set(-1.0);
-        }
-    }
-
-    /// Sentinel-out one rank's pair series: the four `smg_engine_pd_*`
-    /// gauges, which carry the worker, the engine's role and the rank, and
-    /// no model. The role is unknown at teardown, so every role is cleared
-    /// (prefill/decode/null). They are a family apart from the load series
-    /// ([`Self::remove_engine_rank_load_metrics`]): a worker of any model
-    /// at the URL writes the same pair series, so the collector clears them
-    /// by the rank alone.
-    pub(crate) fn remove_engine_rank_pd_metrics(worker_url: &str, dp_rank: i32) {
+    /// no-ops the writes that follow, this one included.
+    ///
+    /// A series a live writer writes is left. `live` gives the loads that
+    /// live writers hold of this rank, under a model for the load gauges
+    /// and under any (`None`) for the pair gauges. A series is theirs
+    /// where [`Self::record_engine_rank_load`] writes it from such a load:
+    /// the five core gauges from any, the capacity gauge from one that
+    /// carries the capacity, a pair gauge from one that reports the role
+    /// and carries the figure. The label sets must match that writer's
+    /// exactly, or a fresh series is created instead of overwriting the
+    /// live one. One call a rank: no rank between two is written, and the
+    /// rank's label is built once.
+    pub(crate) fn remove_engine_rank_metrics<'l>(
+        worker_url: &str,
+        models: &[String],
+        dp_rank: i32,
+        live: impl Fn(Option<&str>) -> LiveLoads<'l>,
+    ) {
         let worker = intern_string(worker_url);
         let dp_rank = intern_string(&dp_rank.to_string());
-        for role in ["prefill", "decode", "null"] {
-            for name in [
-                "smg_engine_pd_kv_transfer_latency_ms",
-                "smg_engine_pd_kv_transfer_speed_gb_s",
-                "smg_engine_pd_prefill_queue_reqs",
-                "smg_engine_pd_decode_queue_reqs",
+        for model_id in models {
+            let held = live(Some(model_id.as_str()));
+            let core = held.iter().any(Option::is_some);
+            let capacity = held
+                .iter()
+                .flatten()
+                .any(|load| load.max_total_num_tokens > 0);
+            if core && capacity {
+                continue;
+            }
+            let model = intern_model_label(model_id);
+            for (name, written) in [
+                ("smg_engine_running_requests", core),
+                ("smg_engine_waiting_requests", core),
+                ("smg_engine_token_usage", core),
+                ("smg_engine_gen_throughput", core),
+                ("smg_engine_cache_hit_rate", core),
+                ("smg_engine_kv_capacity_tokens", capacity),
             ] {
-                gauge!(
-                    name,
-                    "worker" => Arc::clone(&worker),
-                    "role" => role,
-                    "dp_rank" => Arc::clone(&dp_rank),
-                )
-                .set(-1.0);
+                if !written {
+                    gauge!(
+                        name,
+                        "worker" => Arc::clone(&worker),
+                        "model" => Arc::clone(&model),
+                        "dp_rank" => Arc::clone(&dp_rank),
+                    )
+                    .set(-1.0);
+                }
+            }
+        }
+        let held = live(None);
+        for role in ["prefill", "decode", "null"] {
+            let carries = |figure: fn(&crate::worker::SchedulerLoadSnapshot) -> bool| {
+                held.iter()
+                    .flatten()
+                    .any(|load| load.disagg_mode.as_deref() == Some(role) && figure(load))
+            };
+            for (name, written) in [
+                (
+                    "smg_engine_pd_kv_transfer_latency_ms",
+                    carries(|load| load.kv_transfer_latency_ms.is_some()),
+                ),
+                (
+                    "smg_engine_pd_kv_transfer_speed_gb_s",
+                    carries(|load| load.kv_transfer_speed_gb_s.is_some()),
+                ),
+                (
+                    "smg_engine_pd_prefill_queue_reqs",
+                    carries(|load| load.prefill_queue_reqs.is_some()),
+                ),
+                (
+                    "smg_engine_pd_decode_queue_reqs",
+                    carries(|load| load.decode_queue_reqs.is_some()),
+                ),
+            ] {
+                if !written {
+                    gauge!(
+                        name,
+                        "worker" => Arc::clone(&worker),
+                        "role" => role,
+                        "dp_rank" => Arc::clone(&dp_rank),
+                    )
+                    .set(-1.0);
+                }
             }
         }
     }
 }
+
+/// The loads live writers hold of one rank at a worker's URL, for the
+/// sentinel's guard ([`Metrics::remove_engine_rank_metrics`]): at most a
+/// published row's and a pushed report's.
+pub(crate) type LiveLoads<'l> = [Option<&'l crate::worker::SchedulerLoadSnapshot>; 2];
 
 #[cfg(test)]
 mod tests;

@@ -87,7 +87,7 @@ use crate::{
         port::{GroupTick, LoadSink, PollMode, PolledMember, PolledRanks, PolledReport},
         state::{LoadReceiver, LoadSnapshot, LoadState},
     },
-    metrics::writers::Metrics,
+    metrics::writers::{LiveLoads, Metrics},
     registry::{event::WorkerEvent, worker_model_ids, Generation, WorkerRegistry},
     worker::{
         LoadRecord, LoadTelemetry, RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey,
@@ -376,51 +376,49 @@ impl PushedFile {
     fn write_rank_series(&self, at: usize, url: &str, model_id: &str) {
         Metrics::record_engine_rank_load(url, model_id, &self.report.loads[at]);
     }
-
-    /// The ranks the report holds at or past `width`, its worker's own
-    /// width. The sentinel of the worker's series covers the width and
-    /// each of these, and no rank between: a far rank costs one sentinel.
-    fn ranks_past(&self, width: usize) -> impl Iterator<Item = i32> + '_ {
-        self.report
-            .loads
-            .iter()
-            .map(|load| load.dp_rank)
-            .filter(move |rank| usize::try_from(*rank).is_ok_and(|rank| rank >= width))
-    }
 }
 
-/// Set `worker`'s `smg_engine_*` series to the sentinel, one by one, for
-/// its own width and each rank `file` holds past it: a rank's load series
+/// The ranks `report` holds at or past `width`, its worker's own width: a
+/// report taken off the file, or the load of a row the batch removed. The
+/// sentinel of the worker's series covers the width and each of these,
+/// and no rank between: a far rank costs one sentinel.
+fn ranks_past(report: &WorkerLoadResponse, width: usize) -> impl Iterator<Item = i32> + '_ {
+    report
+        .loads
+        .iter()
+        .map(|load| load.dp_rank)
+        .filter(move |rank| usize::try_from(*rank).is_ok_and(|rank| rank >= width))
+}
+
+/// Set `worker`'s `smg_engine_*` series to the sentinel, rank by rank, for
+/// its own width and each rank `ended` holds past it: a rank's load series
 /// under each of the worker's models, and its pair series, which carry no
-/// model. A series a live writer has written is left. `live` answers for
-/// a rank under a model, and under any model where it is given none. Its
-/// callers hold the lock of the reports, under which every series is
-/// written.
+/// model. `ended` is the report or the row that ends with the worker's
+/// feed, where there is one. A series a live writer writes is left:
+/// `live` gives the loads live writers hold of a rank, under a model or,
+/// given none, under any, and the writer leaves each series such a load
+/// carries ([`Metrics::remove_engine_rank_metrics`]). Its callers hold
+/// the lock of the reports, under which every series is written.
 #[cold]
-fn write_sentinel(
+fn write_sentinel<'l>(
     worker: &Arc<dyn Worker>,
-    file: Option<&PushedFile>,
-    live: impl Fn(Option<&str>, i32) -> bool,
+    ended: Option<&WorkerLoadResponse>,
+    live: impl Fn(Option<&str>, i32) -> LiveLoads<'l>,
 ) {
     let url = worker.url();
     let width = worker.dp_size().unwrap_or(1).max(1);
     let ranks = (0..width)
         .filter_map(|rank| i32::try_from(rank).ok())
-        .chain(file.into_iter().flat_map(|file| file.ranks_past(width)));
+        .chain(
+            ended
+                .into_iter()
+                .flat_map(|report| ranks_past(report, width)),
+        );
     // A worker can serve multiple models (one load group per model),
     // so sentinel every model's series — not just the primary.
     let models = worker_model_ids(worker);
     for rank in ranks {
-        for model_id in &models {
-            if !live(Some(model_id.as_str()), rank) {
-                Metrics::remove_engine_rank_load_metrics(url, model_id, rank);
-            }
-        }
-        // The pair series carry the engine's role and no model: a rank's
-        // are left where a live writer holds the rank under any model.
-        if !live(None, rank) {
-            Metrics::remove_engine_rank_pd_metrics(url, rank);
-        }
+        Metrics::remove_engine_rank_metrics(url, &models, rank, |model_id| live(model_id, rank));
     }
 }
 
@@ -715,7 +713,7 @@ impl<G: Generation> WorkerMonitor<G> {
                 // worker reports them. A series that a poll of this worker
                 // wrote, with the row it published, is not cleared.
                 self.sink.forget(&left.pusher);
-                self.clear_series(&reports, &left.pusher, Some(&left));
+                self.clear_series(&reports, &left.pusher, Some(&left.report));
             }
         }
         // On file: made just above when it was not.
@@ -1472,7 +1470,7 @@ impl<G: Generation> WorkerMonitor<G> {
                 // or without a published row: a record ahead of the first
                 // publish wrote them too.
                 if let Some(file) = &report {
-                    self.clear_series(&reports, worker, Some(file));
+                    self.clear_series(&reports, worker, Some(&file.report));
                 }
                 // Its place in the flush's queue goes too, where a held
                 // report waits: the queue keeps no worker that is gone.
@@ -1489,7 +1487,8 @@ impl<G: Generation> WorkerMonitor<G> {
     }
 
     /// Apply every queued eviction in one snapshot rebuild, and sentinel the
-    /// `smg_engine_*` series of workers whose own entry was removed. The
+    /// `smg_engine_*` series of workers whose own entry was removed, every
+    /// rank it held, or had gone under another worker's ahead of the batch. The
     /// sentinel matters for a worker that stays registered (its status left
     /// `Ready`, or a same-URL replacement has not published yet), whose series
     /// would otherwise read its last load as live. For a removed worker it is
@@ -1501,36 +1500,39 @@ impl<G: Generation> WorkerMonitor<G> {
     /// sentinel is written under the lock of the reports, and not where the
     /// series has a live owner ([`Self::clear_series`]).
     pub(crate) fn flush_pending_evictions(&self) {
-        for worker in self.load_state.apply_pending_evictions() {
+        for (worker, row) in self.load_state.apply_pending_evictions() {
             // One hold a worker: a removal wave does not keep the records
             // waiting behind every sentinel of the batch at once.
             let reports = self.pushed_reports.lock();
-            self.clear_series(&reports, &worker, None);
+            self.clear_series(&reports, &worker, row.as_deref());
         }
     }
 
     /// Set a worker's `smg_engine_*` series to the sentinel, one by one,
-    /// unless a live writer has written the series. The worker itself is
-    /// one, where it is the registry's `Ready` worker again: none is set.
-    /// Another `Ready` worker whose row stands at the URL is one for the
-    /// ranks in the row, under each of its models: a poll writes a
+    /// unless a live writer writes the series. The worker itself is one,
+    /// where it is the registry's `Ready` worker again: none is set.
+    /// Another `Ready` worker whose row stands at the URL is one for what
+    /// the row's load carries, under each of its models: a poll writes a
     /// worker's series with the row it publishes. Another worker whose
-    /// report stands at the URL with no record held is one for the ranks
-    /// on that report, under its own model. The pair series carry the
-    /// engine's role and no model: a rank's are left where a live writer
-    /// holds the rank under any model. A report with a held record
+    /// report stands at the URL with no record held is one for what that
+    /// report carries, under its own model. A series is a live writer's
+    /// where its load of the rank carries the series' figure. The pair
+    /// series carry the engine's role and no model: one is a live
+    /// writer's under the role its load reports, whatever its model. A
+    /// report with a held record
     /// is no live writer: its worker was not `Ready` at that record, and
     /// the flush that finds it `Ready` writes its series. `reports` is
     /// the locked map of the pushed reports, and every series is written
     /// under that lock, so a sentinel and a live write do not cross.
-    /// `file` is the report an eviction or a successor's first record
-    /// took off the file, where there was one: the sentinel covers the
-    /// worker's own width and each rank that report held past it.
+    /// `ended` is what ends with the worker's feed, where there is one:
+    /// the report an eviction or a successor's first record took off the
+    /// file, or the load of the row the batch removed. The sentinel covers
+    /// the worker's own width and each rank it held past that.
     fn clear_series(
         &self,
         reports: &FxHashMap<String, PushedFile>,
         worker: &Arc<dyn Worker>,
-        file: Option<&PushedFile>,
+        ended: Option<&WorkerLoadResponse>,
     ) {
         if self.load_state.is_current_incarnation(worker) {
             return;
@@ -1538,18 +1540,21 @@ impl<G: Generation> WorkerMonitor<G> {
         let row = self
             .load_state
             .another_live_workers_row(worker)
-            .map(|(source, ranks)| (worker_model_ids(&source), ranks));
+            .map(|(source, load)| (worker_model_ids(&source), load));
+        let row = row.as_ref();
         let other = reports
             .get(worker.url())
             .filter(|other| !Arc::ptr_eq(&other.pusher, worker) && !other.series_held);
-        write_sentinel(worker, file, |model_id, rank| {
-            row.as_ref().is_some_and(|(models, ranks)| {
-                ranks.contains(&rank)
-                    && model_id.is_none_or(|id| models.iter().any(|model| model == id))
-            }) || other.is_some_and(|other| {
-                model_id.is_none_or(|id| other.pusher.model_id() == id)
-                    && other.report.loads.iter().any(|load| load.dp_rank == rank)
-            })
+        write_sentinel(worker, ended, move |model_id, rank| {
+            [
+                row.filter(|(models, _)| {
+                    model_id.is_none_or(|id| models.iter().any(|model| model == id))
+                })
+                .and_then(|(_, load)| load.loads.iter().find(|load| load.dp_rank == rank)),
+                other
+                    .filter(|other| model_id.is_none_or(|id| other.pusher.model_id() == id))
+                    .and_then(|other| other.report.loads.iter().find(|load| load.dp_rank == rank)),
+            ]
         });
     }
 

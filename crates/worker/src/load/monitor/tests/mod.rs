@@ -3025,6 +3025,34 @@ async fn a_successors_first_record_clears_the_ranks_its_predecessor_reported() {
     );
 }
 
+/// A polled worker's row can hold more ranks than its worker's width, as
+/// a pushed report can. The batch that removes the row sets every rank it
+/// held to the sentinel.
+#[tokio::test]
+async fn the_batchs_sentinel_covers_every_rank_of_the_row() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        let mut answer = answer_of(0, 7);
+        answer.loads.push(SchedulerLoadSnapshot {
+            dp_rank: 1,
+            num_running_reqs: 8,
+            ..Default::default()
+        });
+        polled(&monitor, &worker, answer);
+        registry.transition_status(&id, WorkerStatus::NotReady);
+
+        monitor.evict_worker_loads(&worker);
+        monitor.flush_pending_evictions();
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+    assert!(
+        running_series_of(&rendered, 1).ends_with(" -1"),
+        "{rendered}"
+    );
+}
+
 /// A tick's poll of the worker at `http://w:1`, by what it leaves: the
 /// file's lay, the answer's series and the published row.
 fn polled(monitor: &WorkerMonitor, worker: &Arc<dyn Worker>, answer: WorkerLoadResponse) {
@@ -3226,6 +3254,196 @@ async fn an_eviction_clears_the_pair_series_with_the_load_series() {
         prefill_queue_series(&rendered).ends_with(" -1"),
         "{rendered}"
     );
+}
+
+/// An answer of a pair engine in the decode role that names rank 0 alone:
+/// `running` requests, and `queued` in its decode queue.
+fn a_decode_answer(running: i32, queued: i32) -> WorkerLoadResponse {
+    let mut answer = answer_of(0, running);
+    answer.loads[0].disagg_mode = Some("decode".to_string());
+    answer.loads[0].decode_queue_reqs = Some(queued);
+    answer
+}
+
+/// The series `name` of rank 0 of the worker at `http://w:1` whose labels
+/// hold `label`, as rendered.
+fn series_with<'a>(rendered: &'a str, name: &str, label: &str) -> &'a str {
+    rendered
+        .lines()
+        .find(|l| {
+            l.strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('{'))
+                && l.contains("http://w:1")
+                && l.contains(label)
+                && l.contains("dp_rank=\"0\"")
+        })
+        .unwrap_or_else(|| panic!("no {name} series with {label}:\n{rendered}"))
+}
+
+/// The decode-queue series of rank 0 of the worker at `http://w:1` under
+/// the decode role, as rendered.
+fn decode_queue_series(rendered: &str) -> &str {
+    series_with(
+        rendered,
+        "smg_engine_pd_decode_queue_reqs",
+        "role=\"decode\"",
+    )
+}
+
+/// The pair series carry the engine's role. A polled successor that
+/// reports another role has written none of its predecessor's: its row
+/// keeps no sentinel away from them, and its own stand. The predecessor
+/// was polled too, so its row went under its successor's: its series end
+/// at the batch all the same.
+#[tokio::test]
+async fn an_eviction_clears_the_pair_series_of_a_role_its_successor_does_not_report() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        polled(&monitor, &first, a_decode_answer(7, 5));
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        polled(&monitor, &next, a_pair_answer(9, 4));
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    assert!(
+        decode_queue_series(&rendered).ends_with(" -1"),
+        "{rendered}"
+    );
+    assert!(
+        prefill_queue_series(&rendered).ends_with(" 4"),
+        "{rendered}"
+    );
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+}
+
+/// The same for a predecessor whose stream pushed: the eviction takes
+/// its report off the file and clears the role its polled successor does
+/// not report.
+#[tokio::test]
+async fn a_pushers_eviction_clears_the_role_its_polled_successor_does_not_report() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        let record = pushed(7).disaggregation(3.5, 0.5, 0, 5, "decode");
+        monitor.apply_pushed_load(&first, 0, &record, Instant::now());
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        polled(&monitor, &next, a_pair_answer(9, 4));
+
+        monitor.evict_worker_loads(&first);
+    });
+    assert!(
+        decode_queue_series(&rendered).ends_with(" -1"),
+        "{rendered}"
+    );
+    assert!(
+        prefill_queue_series(&rendered).ends_with(" 4"),
+        "{rendered}"
+    );
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+}
+
+/// A successor with no pair section writes no pair series at all, and
+/// one that serves another model writes none of its predecessor's load
+/// series: the polled predecessor's read the sentinel.
+#[tokio::test]
+async fn an_eviction_clears_the_pair_series_a_successor_without_a_pair_section_leaves() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "a");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        polled(&monitor, &first, a_pair_answer(7, 4));
+        let next = ready_worker("http://w:1", "b");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        polled(&monitor, &next, answer_of(0, 9));
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    assert!(
+        prefill_queue_series(&rendered).ends_with(" -1"),
+        "{rendered}"
+    );
+    assert!(
+        running_series_under(&rendered, "a").ends_with(" -1"),
+        "{rendered}"
+    );
+    assert!(
+        running_series_under(&rendered, "b").ends_with(" 9"),
+        "{rendered}"
+    );
+}
+
+/// A series is its writer's where its load carries the figure. A
+/// successor in the same role and under the same model that reports no
+/// transfer latency and no capacity has written neither series: both
+/// read the sentinel, and the series it does write stand.
+#[tokio::test]
+async fn an_eviction_clears_the_series_of_a_figure_its_successor_does_not_report() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        let mut answer = a_pair_answer(7, 4);
+        answer.loads[0].kv_transfer_latency_ms = Some(3.0);
+        answer.loads[0].max_total_num_tokens = 1000;
+        polled(&monitor, &first, answer);
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        polled(&monitor, &next, a_pair_answer(9, 6));
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    let latency = series_with(
+        &rendered,
+        "smg_engine_pd_kv_transfer_latency_ms",
+        "role=\"prefill\"",
+    );
+    assert!(latency.ends_with(" -1"), "{rendered}");
+    let capacity = series_with(&rendered, "smg_engine_kv_capacity_tokens", "model=\"m\"");
+    assert!(capacity.ends_with(" -1"), "{rendered}");
+    assert!(
+        prefill_queue_series(&rendered).ends_with(" 6"),
+        "{rendered}"
+    );
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+}
+
+/// The guard reads a successor's report as it reads its row. A polled
+/// predecessor in the decode role is replaced by a worker whose stream
+/// pushes in the prefill role, and the batch runs ahead of the
+/// successor's row: the decode series read the sentinel and the
+/// successor's stand.
+#[tokio::test]
+async fn a_pushing_successor_of_another_role_keeps_no_sentinel_from_its_predecessors() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        polled(&monitor, &first, a_decode_answer(7, 5));
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        let record = pushed(9).disaggregation(3.5, 0.5, 4, 0, "prefill");
+        monitor.apply_pushed_load(&next, 0, &record, Instant::now());
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    assert!(
+        decode_queue_series(&rendered).ends_with(" -1"),
+        "{rendered}"
+    );
+    assert!(
+        prefill_queue_series(&rendered).ends_with(" 4"),
+        "{rendered}"
+    );
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
 }
 
 /// A poll's series and its rows go out under one hold of the lock of the
