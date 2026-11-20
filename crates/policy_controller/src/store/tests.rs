@@ -2028,7 +2028,7 @@ fn a_dispatch_on_a_chosen_side_books_it_once_as_it_lands() {
         decode.session = Session::from_raw(41);
         issue_pair(leases, (record, decode)).expect("the key is free");
         assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
-        assert!(leases.expire(now).is_empty());
+        assert!(leases.expire(now + DISPATCH_TTL).is_empty());
         assert_eq!(store.queued(), 0);
         let at = now + Duration::from_secs(8);
         assert!(leases.dispatched(gateway, id, on(Side::Decode, index), at));
@@ -5086,6 +5086,35 @@ fn the_sweep_applies_at_a_watched_file_whose_thread_waits() {
     assert_eq!(told_ids(), [(1, dispatch), (2, abandoned)]);
     assert_eq!(in_flight(&store), [(a, 1)]);
     assert_eq!(place.look(), Watch::Quiet, "the dispatched lease stands");
+}
+
+/// The sweep applies a release left by a thread that unwound even where
+/// the dispatched lease has no place left in the deadline queue.
+#[test]
+fn the_sweep_applies_a_release_left_before_an_unwind() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(1, now);
+    let hand = Hand::new(GatewayId(1));
+    let dispatch = Said::Dispatched(Dispatch::default(), now);
+    store.hand(&hand, ids[0], dispatch);
+    assert_eq!(told_ids(), [(1, dispatch)]);
+    assert!(LeasesStore::expire(&*store, now + Duration::from_secs(6)).is_empty());
+    assert_eq!(store.queued(), 0, "the dispatched lease's place is popped");
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut place = store.at_work();
+        assert_eq!(place.look(), Watch::Quiet);
+        store.hand(&hand, ids[0], GONE);
+        assert_eq!(told_ids(), []);
+        panic!("leave the release for the sweep");
+    }));
+    assert!(unwound.is_err());
+
+    assert!(LeasesStore::expire(&*store, now + Duration::from_secs(6)).is_empty());
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(1, GONE)], vec![(a, 0)])
+    );
 }
 
 /// A full ring under a watch: the hand that finds it applies where the

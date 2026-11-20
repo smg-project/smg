@@ -9,7 +9,10 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     mem,
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering::SeqCst},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -215,11 +218,7 @@ impl MemoryStore {
         let counts = writer.counts();
         // The files book their leases' keys in the store's own tables.
         let sessions = Arc::new(SessionTables::default());
-        let leases = Leases {
-            counts: Arc::clone(&counts),
-            sessions: Arc::clone(&sessions),
-            ..Leases::default()
-        };
+        let leases = Leases::empty(0, Arc::clone(&counts), Arc::clone(&sessions), origin);
         Self {
             workers: Mutex::default(),
             health: Mutex::default(),
@@ -2943,7 +2942,6 @@ impl MemoryStore {
 
 /// The leases on file, the ids the store mints for a decision's, and the
 /// order their dispatch deadlines fall due in.
-#[derive(Default)]
 struct Leases {
     term: u64,
     records: FxHashMap<Key, Held>,
@@ -2971,6 +2969,39 @@ struct Leases {
     /// dispatch deadline issued. One door reads it through, a request
     /// asked again's, for the lease its earlier ask was issued.
     due: VecDeque<(Instant, Key)>,
+    /// The first instant in `due`, shared with the file so a sweep can
+    /// pass a file without taking its turn. It may name a stale queue
+    /// place, which only causes an extra take; `end_due` confirms it.
+    next_due: Arc<NextDue>,
+}
+
+/// A file's next queued dispatch deadline, as microseconds from the
+/// store's origin plus one; zero means its queue is empty.
+struct NextDue {
+    origin: Instant,
+    at: AtomicU64,
+}
+
+impl NextDue {
+    fn new(origin: Instant) -> Self {
+        Self {
+            origin,
+            at: AtomicU64::new(0),
+        }
+    }
+
+    fn word(&self, at: Instant) -> u64 {
+        micros(self.origin, at).saturating_add(1)
+    }
+
+    fn set(&self, at: Option<Instant>) {
+        self.at.store(at.map_or(0, |at| self.word(at)), SeqCst);
+    }
+
+    fn reached(&self, now: Instant) -> bool {
+        let at = self.at.load(SeqCst);
+        at != 0 && at <= self.word(now)
+    }
 }
 
 /// A lease's key on file: its gateway and its id.
@@ -3155,6 +3186,26 @@ fn keyed_decode(counts: bool, decode: &DecodeSide) -> Option<(Session, WorkerId)
 }
 
 impl Leases {
+    /// An empty file under `term`, sharing its deadline hint with the
+    /// file that owns its turn.
+    fn empty(
+        term: u64,
+        counts: Arc<Counts>,
+        sessions: Arc<SessionTables>,
+        origin: Instant,
+    ) -> Self {
+        Self {
+            term,
+            records: FxHashMap::default(),
+            decodes: Decodes::default(),
+            counts,
+            sessions,
+            minted: Minted::default(),
+            due: VecDeque::new(),
+            next_due: Arc::new(NextDue::new(origin)),
+        }
+    }
+
     /// The next id under the store's term: the term in bits 32 to 62 over a
     /// counter that starts at 1 in each term, as the contract bounds a
     /// controller's ids. The counter comes from the block `file` holds of
@@ -3582,6 +3633,13 @@ impl Leases {
             let at = self.due.partition_point(|&(due, _)| due <= deadline);
             self.due.insert(at, (deadline, key));
         }
+        self.next_due.set(self.due.front().map(|&(due, _)| due));
+    }
+
+    /// Clears the deadline queue and its hint under the file's turn.
+    fn clear_due(&mut self) {
+        self.due.clear();
+        self.next_due.set(None);
     }
 
     /// Ends the first lease of the queue that stands issued past its
@@ -3607,6 +3665,7 @@ impl Leases {
                 return None;
             }
             self.due.pop_front();
+            self.next_due.set(self.due.front().map(|&(due, _)| due));
             *steps -= 1;
             if waits {
                 return self.abandon(&key);
@@ -3983,11 +4042,8 @@ impl MemoryStore {
             (leases.term, Arc::clone(&leases.counts))
         };
         let sessions = &self.sessions;
-        let files = turn::Files::of(deciders, &self.files, || Leases {
-            term,
-            counts: Arc::clone(&counts),
-            sessions: Arc::clone(sessions),
-            ..Leases::default()
+        let files = turn::Files::of(deciders, &self.files, || {
+            Leases::empty(term, Arc::clone(&counts), Arc::clone(sessions), self.origin)
         });
         self.files = files;
         self
@@ -4051,7 +4107,7 @@ impl MemoryStore {
         let removed = Said::Released(None, ReleaseReason::WorkerRemoved);
         let mut on_file: Vec<Key> = Vec::new();
         for leases in &mut turns {
-            leases.due.clear();
+            leases.clear_due();
             on_file.extend(leases.records.keys().copied());
         }
         drop(turns);
@@ -4130,18 +4186,22 @@ impl MemoryStore {
     }
 
     /// Ends the leases past their dispatch deadline at `now`
-    /// ([`LeasesStore::expire`]): each file's turn in the files' order,
-    /// one at a time, where the caller may act at the file: a decider at
-    /// work ends its own file's due leases at its issues. Each end is
-    /// told under the turn, as a frame's end is told. A file is passed
-    /// too where `settled` says no, asked under the file's turn behind
-    /// everything handed to it: a host that keeps what was said of a
-    /// file's leases beside its ring says no until it has handed that
-    /// on, so no lease is ended ahead of a dispatch said of it. Returns
-    /// both parts of each lease as the sweep left them.
+    /// ([`LeasesStore::expire`]): each file whose deadline hint is reached
+    /// or whose ring holds a frame takes its turn in the files' order, one
+    /// at a time, where the caller may act at the file. A decider at work
+    /// ends its own file's due leases at its issues. Each end is told under
+    /// the turn, as a frame's end is told. A file is passed too where
+    /// `settled` says no, asked under the file's turn behind everything
+    /// handed to it: a host that keeps what was said of a file's leases
+    /// beside its ring says no until it has handed that on, so no lease is
+    /// ended ahead of a dispatch said of it. Returns both parts of each
+    /// lease as the sweep left them.
     pub(crate) fn expire_where(&self, now: Instant, settled: impl Fn(usize) -> bool) -> Vec<Sides> {
         let mut ended = Vec::new();
         for at in 0..self.files.len() {
+            if !self.files[at].sweep_needed(now) {
+                continue;
+            }
             // A file whose decider works is passed with no wait for its
             // turn; the same is read again under the turn.
             if !self.may_act(at) {
@@ -4395,5 +4455,46 @@ impl LeasesStore for MemoryStore {
                 leases.records.iter().filter(live).count()
             })
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{decider::Decider, lease::Lease, store::leases::Picked, view::WorkerId};
+
+    #[test]
+    fn the_lease_sweep_takes_only_a_file_with_a_due_lease() {
+        let store = MemoryStore::new().with_deciders(256);
+        let clear_takes = || store.files.iter().for_each(turn::File::clear_takes);
+        let takes = || store.files.iter().map(turn::File::takes).sum::<usize>();
+        let now = Instant::now();
+
+        clear_takes();
+        assert!(LeasesStore::expire(&store, now).is_empty());
+        assert_eq!(takes(), 0, "empty files need no turn");
+
+        LeasesStore::set_term(&store, 1);
+        let record = LeaseRecord {
+            lease: Lease::default(),
+            gateway: GatewayId(1),
+            request: 1,
+            target: WorkerId(1),
+            picked: Picked::default(),
+            decode: None,
+            term: 1,
+            issued_at: now,
+            dispatch_deadline: now + Duration::from_secs(1),
+            state: LeaseState::ISSUED,
+        };
+        let _acting = Decider::new(173).enter();
+        let issued = store
+            .issue_decided(record, None, |_| {})
+            .expect("the lease is filed");
+        clear_takes();
+        let ended = LeasesStore::expire(&store, record.dispatch_deadline);
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].record.lease.id, issued.id);
+        assert_eq!(takes(), 1, "only the due lease's file is taken");
     }
 }
