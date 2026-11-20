@@ -4921,6 +4921,7 @@ mod tests {
         let mut scores = [0.0f32; 3];
         ll.score(&RequestFacts::default(), &pool, &kept(3), &mut scores);
         assert!(scores[1] > scores[0] && scores[0] > scores[2], "{scores:?}");
+        assert_eq!(ll.mean_rate(&pool, &kept(3), |c| c.load.as_ref()), 4_500.0);
     }
 
     /// Reports that state no rate at all drain at the default rate, a
@@ -4940,6 +4941,10 @@ mod tests {
         let mut scores = [0.0f32; 2];
         ll.score(&RequestFacts::default(), &pool, &kept(2), &mut scores);
         assert_eq!(scores, [0.0, 1.0]);
+        assert_eq!(
+            ll.mean_rate(&pool, &kept(2), |c| c.load.as_ref()),
+            ll.default_throughput
+        );
     }
 
     #[test]
