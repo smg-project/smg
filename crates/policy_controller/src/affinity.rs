@@ -1275,10 +1275,10 @@ impl WarmupSlice {
         if shallow {
             self.shallow_seen.store(true, Ordering::Relaxed);
         }
-        let hits = self.hits.fetch_add(1, Ordering::Relaxed) + 1;
+        let hits = self.hits.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let shallow_seen = self.shallow_seen.load(Ordering::Relaxed);
         let due = (hits >= self.divert_every && (shallow || !shallow_seen))
-            || hits >= 2 * self.divert_every;
+            || hits >= self.divert_every.saturating_mul(2);
         if !due {
             return None;
         }
@@ -1921,6 +1921,15 @@ mod tests {
         // The worker's window leaves with it.
         fresh.on_membership(&Membership::Removed(WorkerId(3)));
         assert!(fresh.divert_until.lock().is_empty());
+    }
+
+    #[test]
+    fn a_maximal_diversion_period_does_not_overflow() {
+        let slice = warmup(0.25, (1_u64 << 63) + 1);
+        let shallow = [sized(0, 2, 7, 64), sized(1, 1, 0, 64), sized(2, 0, 0, 0)];
+        for _ in 0..2 {
+            assert_eq!(scores(&slice, &facts(16), &shallow), vec![1.0, 1.0, 1.0]);
+        }
     }
 
     #[test]
