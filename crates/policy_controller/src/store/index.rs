@@ -81,7 +81,9 @@ use crate::{
     affinity::{WarmRule, Warming},
     predictor::Predictor,
     store::{
-        kv_events::{Admission, BatchFacts, BatchOutcome, KvCursor, RankCursor, ResyncReason},
+        kv_events::{
+            Admission, Admitted, BatchFacts, BatchOutcome, KvCursor, RankCursor, ResyncReason,
+        },
         workers::WorkerRow,
         world::Naming,
         GatewayId,
@@ -217,6 +219,8 @@ pub struct LaneWriter<'a> {
     /// Whether the body wrote: the lane says its row heard behind a body
     /// that did.
     wrote: Cell<bool>,
+    /// What the lane's cursor read ahead of the batch.
+    admitted: Admitted,
 }
 
 impl LaneWriter<'_> {
@@ -235,6 +239,15 @@ impl LaneWriter<'_> {
     /// where the next batch reads another.
     pub fn emptied(&self) -> u64 {
         self.held.emptied
+    }
+
+    /// What the lane's cursor read ahead of this batch: its answer to the
+    /// batch's header, the replay it had still asked for, and whether the
+    /// rank is degraded behind that answer. It is a copy, made under the
+    /// lane's lock as the batch was admitted and before the body ran: the
+    /// body writes nothing of the cursor through it.
+    pub fn admitted(&self) -> Admitted {
+        self.admitted
     }
 
     /// The row's blocks by the engine's hash: the reverse map the chain
@@ -300,13 +313,14 @@ struct Lent<'a> {
 }
 
 impl Lent<'_> {
-    /// Lend the lane's place to `body`, once, and say the row heard where
-    /// the body wrote.
-    fn lend(mut self, body: &mut dyn FnMut(&mut LaneWriter<'_>)) {
+    /// Lend the lane's place to `body`, once, with what the cursor read
+    /// ahead of the batch, and say the row heard where the body wrote.
+    fn lend(mut self, admitted: Admitted, body: &mut dyn FnMut(&mut LaneWriter<'_>)) {
         if let Some(held) = &mut self.lane.held {
             let mut writer = LaneWriter {
                 held: &mut *held,
                 wrote: Cell::new(false),
+                admitted,
             };
             body(&mut writer);
             let wrote = writer.wrote.get();
@@ -336,36 +350,53 @@ fn hear_written(held: &Held, wrote: bool) {
 
 /// Run one batch's header through `cursor`, with `clears` the fact that
 /// the batch carries the engine's own clear. `Ok` where the batch is
-/// admitted, with the reason when the cursor emptied the rank ahead of it.
-/// `Err` with the batch's outcome where it is not.
+/// admitted: the reason when the cursor emptied the rank ahead of it, and
+/// what the cursor read, as a lent body reads it. `Err` with the batch's
+/// outcome where it is not.
 fn admitted<B: Blocks>(
     cursor: &mut RankCursor,
     blocks: &mut B,
     facts: BatchFacts,
     clears: bool,
-) -> Result<Option<ResyncReason>, BatchOutcome> {
+) -> Result<(Option<ResyncReason>, Admitted), BatchOutcome> {
+    // Read ahead of the answer, which lets a pending replay go.
+    let pending = cursor.pending_gap();
     if let Some(chunk) = facts.snapshot {
         // A chunk only adds: the snapshot's start was said to the row, by
         // a resync, before its first block.
         cursor.resync_to(facts.sequence, chunk.unknown_before);
-        return Ok(None);
+        let read = Admitted {
+            admission: Admission::Apply,
+            pending,
+            degraded: cursor.view().degraded,
+        };
+        return Ok((None, read));
     }
-    match cursor.admit(facts.sequence, clears) {
-        Admission::Stale => Err(BatchOutcome::Skipped),
-        Admission::Replay { expected } => Err(BatchOutcome::Gap {
-            expected,
-            received: facts.sequence,
-        }),
+    let admission = cursor.admit(facts.sequence, clears);
+    let emptied = match admission {
+        Admission::Stale => return Err(BatchOutcome::Skipped),
+        Admission::Replay { expected } => {
+            return Err(BatchOutcome::Gap {
+                expected,
+                received: facts.sequence,
+            });
+        }
         Admission::Restart => {
             blocks.cleared();
-            Ok(Some(ResyncReason::PublisherRestart))
+            Some(ResyncReason::PublisherRestart)
         }
         Admission::Unrecovered { cleared: true, .. } => {
             blocks.cleared();
-            Ok(Some(ResyncReason::GapCleared))
+            Some(ResyncReason::GapCleared)
         }
-        Admission::Apply | Admission::Unrecovered { cleared: false, .. } => Ok(None),
-    }
+        Admission::Apply | Admission::Unrecovered { cleared: false, .. } => None,
+    };
+    let read = Admitted {
+        admission,
+        pending,
+        degraded: cursor.view().degraded,
+    };
+    Ok((emptied, read))
 }
 
 /// Run one batch through `cursor` and apply what it admits to `blocks`, in
@@ -383,7 +414,7 @@ fn admit<B: Blocks>(
     // before it, so the cursor may start over there.
     let clears = facts.clears || events.iter().any(|e| matches!(e, KvEvent::Cleared));
     let emptied = match admitted(cursor, blocks, facts, clears) {
-        Ok(emptied) => emptied,
+        Ok((emptied, _)) => emptied,
         Err(outcome) => return (outcome, None),
     };
     for event in events {
@@ -2211,8 +2242,8 @@ impl KvTables {
             return BatchOutcome::Skipped;
         };
         *heard = true;
-        let emptied = match admitted(cursor, held, facts, facts.clears) {
-            Ok(emptied) => emptied,
+        let (emptied, read) = match admitted(cursor, held, facts, facts.clears) {
+            Ok(read) => read,
             Err(outcome) => return outcome,
         };
         if let Some(reason) = emptied {
@@ -2222,7 +2253,7 @@ impl KvTables {
             lane: &mut lane,
             whole: false,
         }
-        .lend(body);
+        .lend(read, body);
         BatchOutcome::Applied
     }
 

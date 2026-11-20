@@ -13,8 +13,8 @@ use super::{
 use crate::{
     store::{
         kv_events::{RankCursor, GAP_CLEAR_THRESHOLD},
-        BatchFacts, BatchOutcome, KvEventSink, MemoryStore, ResyncReason, Signals, SnapshotChunk,
-        WorkerFacts, WorkersStore,
+        Admission, Admitted, BatchFacts, BatchOutcome, KvEventSink, MemoryStore, ResyncReason,
+        Signals, SnapshotChunk, WorkerFacts, WorkersStore,
     },
     view::WorkerId,
 };
@@ -1641,6 +1641,68 @@ fn a_lent_body_reads_each_emptying_of_its_rank() {
     let (cleared, held) = lent(3, false);
     assert_eq!(held, 0);
     assert_ne!(cleared, gone);
+}
+
+/// A lent body reads what its lane's cursor read ahead of the batch: the
+/// cursor's own answer, the replay it had still asked for, and whether the
+/// rank is degraded behind that answer. A batch the cursor refuses runs no
+/// body.
+#[test]
+fn a_lent_body_reads_what_its_cursor_read() {
+    let store = MemoryStore::new();
+    let a = admitted(&store, "a");
+    let lent = |facts: BatchFacts| {
+        let mut read = None;
+        let outcome = store.admit_through(a, 0, facts, &mut |lane| {
+            read = Some(lane.admitted());
+        });
+        (outcome, read)
+    };
+    let at = |sequence| BatchFacts {
+        sequence,
+        ..BatchFacts::default()
+    };
+    let plain = Admitted {
+        admission: Admission::Apply,
+        pending: 0,
+        degraded: false,
+    };
+    assert_eq!(lent(at(1)), (BatchOutcome::Applied, Some(plain)));
+    // A gap asks a replay and runs no body.
+    let gap = BatchOutcome::Gap {
+        expected: 2,
+        received: 5,
+    };
+    assert_eq!(lent(at(5)), (gap, None));
+    // A second gap is lost history: three batches were still asked for,
+    // five are missed, and the rank is degraded behind it.
+    let kept = Admitted {
+        admission: Admission::Unrecovered {
+            missed: 5,
+            cleared: false,
+        },
+        pending: 3,
+        degraded: true,
+    };
+    assert_eq!(lent(at(7)), (BatchOutcome::Applied, Some(kept)));
+    // A snapshot chunk reads as applied, and says the rank whole again.
+    let chunk = BatchFacts {
+        snapshot: Some(SnapshotChunk {
+            unknown_before: false,
+        }),
+        ..at(9)
+    };
+    assert_eq!(lent(chunk), (BatchOutcome::Applied, Some(plain)));
+    // A clear under the cursor is a restarted publisher.
+    let restart = BatchFacts {
+        clears: true,
+        ..at(3)
+    };
+    let restarted = Admitted {
+        admission: Admission::Restart,
+        ..plain
+    };
+    assert_eq!(lent(restart), (BatchOutcome::Applied, Some(restarted)));
 }
 
 /// The store makes a row's lane again under the row's id: here the row

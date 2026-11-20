@@ -92,7 +92,7 @@ pub use index::{
 };
 pub use journal::{Journal, Kinds, Position};
 pub use kv_events::{
-    Admission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
+    Admission, Admitted, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
     SnapshotChunk,
 };
 pub use leases::{

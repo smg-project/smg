@@ -6,7 +6,10 @@ use std::{collections::HashMap, time::Duration};
 use smg_grpc_client::common_proto::{KvEventBatch, KvSnapshotChunk};
 use smg_worker::{
     identity::endpoint::Endpoint,
-    kv_events::apply::{apply_cleared, apply_counted, WorkerIndexState},
+    kv_events::apply::{
+        apply_cleared, apply_counted, count_replay_asked, count_reset, count_restart, count_stale,
+        count_unrecovered, WorkerIndexState,
+    },
     metrics::writers::Metrics,
 };
 use tracing::{debug, info, warn};
@@ -175,7 +178,7 @@ impl KvEventMonitor {
             Admission::Apply => {}
             Admission::Stale => {
                 debug!(worker_url = %Endpoint::redacted_str(worker_url), rank, received = seq, "Skipping stale KV event batch");
-                Metrics::record_kv_event_batch(worker_url, "stale");
+                count_stale(worker_url);
                 return BatchOutcome::Skipped;
             }
             Admission::Restart if indexed => {
@@ -190,11 +193,7 @@ impl KvEventMonitor {
                 // this rank or on another whose cursor the clear reset: its
                 // batches count as missed here, once, as they do when the
                 // relay reports the restart as `DATA_LOSS` (`reset_worker`).
-                Metrics::record_kv_event_missed_batches(worker_url, pending + dropped);
-                Metrics::record_kv_event_resync(
-                    worker_url,
-                    ResyncReason::PublisherRestart.as_str(),
-                );
+                count_restart(worker_url, pending + dropped, true);
                 degraded_changed = true;
             }
             Admission::Restart => {
@@ -210,7 +209,7 @@ impl KvEventMonitor {
                     received = seq,
                     "KV event publisher of another rank restarted; this worker's index is kept"
                 );
-                Metrics::record_kv_event_missed_batches(worker_url, pending);
+                count_restart(worker_url, pending, false);
                 degraded_changed = true;
             }
             Admission::Replay { expected } => {
@@ -220,7 +219,7 @@ impl KvEventMonitor {
                 // outcome, or where a pending replay is dropped (`reset_worker`
                 // when the resume is refused, `clear_worker` when a publisher
                 // starts over or a gap is cleared, on this rank or another).
-                Metrics::record_kv_event_gap(worker_url, "replay_requested", 0);
+                count_replay_asked(worker_url);
                 return BatchOutcome::Gap {
                     expected,
                     received: seq,
@@ -234,25 +233,18 @@ impl KvEventMonitor {
                     cleared,
                     "KV event gap could not be replayed; continuing from the live stream"
                 );
-                if cleared && indexed {
-                    // The other ranks' cursors start over with the index: a
-                    // replay pending on one of them counts as missed here,
-                    // beside this rank's own unrecovered gap below. Another
-                    // rank's cleared gap leaves this worker's index: it holds
-                    // none of that rank's blocks.
-                    let dropped = Self::clear_worker(worker_id, indexer, state, rank);
-                    Metrics::record_kv_event_missed_batches(worker_url, dropped);
-                    Metrics::record_kv_event_resync(worker_url, ResyncReason::GapCleared.as_str());
-                }
-                Metrics::record_kv_event_gap(
-                    worker_url,
-                    if cleared {
-                        "unrecovered_cleared"
-                    } else {
-                        "unrecovered_kept"
-                    },
-                    missed,
-                );
+                // The other ranks' cursors start over with the index: a
+                // replay pending on one of them counts as missed here,
+                // beside this rank's own unrecovered gap. Another rank's
+                // cleared gap leaves this worker's index: it holds none of
+                // that rank's blocks.
+                let emptied = cleared && indexed;
+                let dropped = if emptied {
+                    Self::clear_worker(worker_id, indexer, state, rank)
+                } else {
+                    0
+                };
+                count_unrecovered(worker_url, missed, cleared, dropped, emptied);
                 degraded_changed = true;
             }
         }
@@ -447,10 +439,12 @@ impl KvEventMonitor {
             cursor.reset();
         }
         state.snapshot = None;
-        Metrics::record_kv_event_missed_batches(worker_url, pending);
-        Metrics::record_kv_event_resync(worker_url, reason.as_str());
-        Metrics::set_kv_event_degraded_ranks(worker_url, 0);
-        Metrics::set_kv_index_blocks(worker_url, indexer.worker_block_count(worker_id));
+        count_reset(
+            worker_url,
+            reason,
+            pending,
+            indexer.worker_block_count(worker_id),
+        );
     }
 }
 

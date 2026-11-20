@@ -244,6 +244,23 @@ impl Admission {
     }
 }
 
+/// What a lane's cursor read ahead of a batch it admitted, as the batch's
+/// lent body reads it ([`LaneWriter::admitted`](super::LaneWriter::admitted)):
+/// a copy made as the batch was admitted, under the lane's lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Admitted {
+    /// The cursor's answer to the batch's header: [`Admission::Apply`],
+    /// [`Admission::Restart`] or [`Admission::Unrecovered`], the three a
+    /// body runs behind. A snapshot chunk reads [`Admission::Apply`].
+    pub admission: Admission,
+    /// The batches of a replay the cursor had asked for and not seen when
+    /// the batch came; `0` where none was pending.
+    pub pending: u64,
+    /// Whether the rank is degraded behind this admission: the cursor's
+    /// state at that instant.
+    pub degraded: bool,
+}
+
 /// The admission cursor of one rank: the rules of [`KvEventSink`] as one
 /// state machine, shared by every store (the one-process store, a gateway
 /// host, the controller's moved monitor).

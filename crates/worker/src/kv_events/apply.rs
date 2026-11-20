@@ -21,6 +21,7 @@ use crate::{
         kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent, KvCacheLocality,
         KvCacheTier, KvEventBatch,
     },
+    kv_events::port::ResyncReason,
     metrics::writers::Metrics,
 };
 
@@ -178,6 +179,7 @@ pub fn apply_events<I: BlockIndex>(
         apply_event(event, worker_id, indexer, worker_blocks);
     }
 }
+
 /// Apply a batch a worker's index takes and account for it: the blocks it
 /// stored (under `stored_op`) and removed, the stores the index did not
 /// take as is, the batch's age, and the batch itself under `disposition`.
@@ -251,6 +253,58 @@ fn record_lag(worker_url: &str, published_at: f64) {
     if lag.is_finite() && lag >= 0.0 {
         Metrics::record_kv_event_lag(worker_url, lag);
     }
+}
+
+/// A batch behind its rank's cursor: counted, and never applied.
+pub fn count_stale(worker_url: &str) {
+    Metrics::record_kv_event_batch(worker_url, "stale");
+}
+
+/// A gap the cursor answers by asking a replay. It is a sighting, not a
+/// loss: the replay may bring every batch of the gap, so nothing counts as
+/// missed here. The loss counts once where it is known: at a gap no replay
+/// filled ([`count_unrecovered`]), or where a pending replay is dropped
+/// ([`count_restart`], [`count_reset`]).
+pub fn count_replay_asked(worker_url: &str) {
+    Metrics::record_kv_event_gap(worker_url, "replay_requested", 0);
+}
+
+/// A publisher that started over. The `lost` batches of the replays that
+/// went with the old publisher count as missed, once. Where the restart
+/// `emptied` the worker's index it is a reset, under its own reason.
+pub fn count_restart(worker_url: &str, lost: u64, emptied: bool) {
+    Metrics::record_kv_event_missed_batches(worker_url, lost);
+    if emptied {
+        Metrics::record_kv_event_resync(worker_url, ResyncReason::PublisherRestart.as_str());
+    }
+}
+
+/// A gap no replay filled: its `missed` batches are lost, and the rank's
+/// state was kept or `cleared`. Where the clear `emptied` the worker's
+/// index it is a reset, under its own reason, and the `lost` batches of
+/// the replays dropped with it count as missed beside the gap's own.
+pub fn count_unrecovered(worker_url: &str, missed: u64, cleared: bool, lost: u64, emptied: bool) {
+    if cleared && emptied {
+        Metrics::record_kv_event_missed_batches(worker_url, lost);
+        Metrics::record_kv_event_resync(worker_url, ResyncReason::GapCleared.as_str());
+    }
+    let outcome = if cleared {
+        "unrecovered_cleared"
+    } else {
+        "unrecovered_kept"
+    };
+    Metrics::record_kv_event_gap(worker_url, outcome, missed);
+}
+
+/// A reset of the worker's index for `reason`. The `lost` batches of the
+/// replays dropped with it count as missed, once, and the reset counts
+/// under its reason. No rank of the worker is degraded behind it, and the
+/// index holds `blocks` of the worker's.
+pub fn count_reset(worker_url: &str, reason: ResyncReason, lost: u64, blocks: usize) {
+    Metrics::record_kv_event_missed_batches(worker_url, lost);
+    Metrics::record_kv_event_resync(worker_url, reason.as_str());
+    Metrics::set_kv_event_degraded_ranks(worker_url, 0);
+    Metrics::set_kv_index_blocks(worker_url, blocks);
 }
 
 /// Convert proto `KvBlocksStored` and apply to the indexer.

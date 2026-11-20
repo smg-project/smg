@@ -78,11 +78,15 @@
 //! the batch itself. A rank's batch counts under that rank's worker, not
 //! under the stream's. The adapter adds what its own answers say: a live
 //! batch's pace, the row's index blocks, a batch behind its lane's
-//! cursor, a gap that asks a replay, and each reset by its reason. A
+//! cursor, a gap that asks a replay, and each reset by its reason. What
+//! the lane's cursor read ahead of a batch counts by the worker crate's
+//! routines for it: a publisher that started over, a gap no replay
+//! filled, with its missed batches, and the rank's degraded word. A
 //! snapshot its stream abandoned keeps the blocks and counts no reset. A
-//! row reads no index blocks behind a reset, where another stream takes
-//! it, and where it leaves with its stream. The series are the worker
-//! crate's, written to the recorder in scope as the collector's are.
+//! row reads no index blocks and no degraded rank behind a reset, where
+//! another stream takes it, and where it leaves with its stream. The
+//! series are the worker crate's, written to the recorder in scope as
+//! the collector's are.
 //!
 //! A row is named by its worker's object, asked at each write and held
 //! through that write alone: the worker the feed was opened for, for the
@@ -104,9 +108,9 @@
 //!   every row it wrote.
 //! - What a row's old stream had in flight as the row moved, a batch or a
 //!   reset, can land behind the new stream's clear.
-//! - What the store's cursor decides by itself is in no series: a gap kept
-//!   or cleared, the batches missed, the degraded ranks, and the reason it
-//!   emptied a rank ahead of a batch.
+//! - A replay still asked for at a reset is not counted as missed: the
+//!   store's reset says no count of what it dropped.
+//! - A rank's worker reads its own rank's degraded word alone.
 //! - A feed's own row that another stream wrote begins from nothing at
 //!   the feed's open. Its index-blocks gauge shows that at the feed's
 //!   first batch.
@@ -127,7 +131,10 @@ use smg_worker::{
     common_proto::{kv_cache_event::Data, KvEventBatch},
     identity::basic::Worker,
     kv_events::{
-        apply::{apply_counted, apply_events, BlockIndex, HeldBlocks, WorkerIndexState},
+        apply::{
+            apply_counted, apply_events, count_replay_asked, count_reset, count_restart,
+            count_stale, count_unrecovered, BlockIndex, HeldBlocks, WorkerIndexState,
+        },
         port::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         KvEventFeed, KvEventHost,
     },
@@ -232,6 +239,17 @@ struct Applied {
     /// batch that reads another resets the state first: the store emptied
     /// the rank in between.
     emptied: Option<u64>,
+    /// Whether the row's degraded-ranks gauge says its rank degraded: the
+    /// cursor's word behind the row's last batch, as last published.
+    degraded: bool,
+}
+
+/// A row that begins again under another stream, or that no stream
+/// writes any longer: it reads no index blocks and no degraded rank,
+/// under its worker.
+fn reads_none(worker_url: &str) {
+    Metrics::set_kv_index_blocks(worker_url, 0);
+    Metrics::set_kv_event_degraded_ranks(worker_url, 0);
 }
 
 /// The row's reverse map inside the rules' state. The map is the lane's,
@@ -394,6 +412,13 @@ impl<S: ?Sized> KvAdapter<S> {
         own.then_some(id).into_iter().chain(fed).collect()
     }
 
+    /// Whether `id`'s stream still writes its own row: no other stream
+    /// took it.
+    fn writes_own(&self, id: WorkerId) -> bool {
+        let rows = self.rows.lock();
+        rows.written.get(&id).is_none_or(|own| own.stream == id)
+    }
+
     /// Whether the holder stands `row` at rank 0: the row of a feed of its
     /// own, which no other stream's batch is routed to.
     fn stands_lowest(&self, row: WorkerId) -> bool {
@@ -415,6 +440,13 @@ impl<S: ?Sized> KvAdapter<S> {
     fn named(&self, id: WorkerId, row: WorkerId) -> Option<Arc<dyn Worker>> {
         let feed = self.feeds.lock().get(&id).cloned()?;
         self.named_by(&feed, id, row)
+    }
+
+    /// The state the table keeps of `row`, where `id`'s stream writes it.
+    fn state_of(&self, id: WorkerId, row: WorkerId) -> Option<Arc<Mutex<Applied>>> {
+        let rows = self.rows.lock();
+        let written = rows.written.get(&row)?;
+        (written.stream == id).then(|| Arc::clone(&written.applied))
     }
 
     /// [`Self::named`] for a stream whose feed was opened for `feed`.
@@ -459,11 +491,11 @@ where
             None if row == id => Some((Arc::default(), false)),
             _ => {
                 let applied = self.take(id, row)?;
-                // The row begins from nothing under its new stream, and
-                // its index blocks read none until that stream's batch is
-                // applied.
+                // The row begins from nothing under its new stream: its
+                // index blocks and its degraded rank read none until that
+                // stream's batch is applied.
                 if let Some(worker) = self.named(id, row) {
-                    Metrics::set_kv_index_blocks(worker.url(), 0);
+                    reads_none(worker.url());
                 }
                 Some((applied, true))
             }
@@ -624,7 +656,11 @@ where
         // the batch: inside the lane's turn, with the table's lock let go.
         let outcome = self.store.admit_through(row, rank, facts, &mut |lane| {
             let mut applied = applied.lock();
-            let Applied { state, emptied } = &mut *applied;
+            let Applied {
+                state,
+                emptied,
+                degraded,
+            } = &mut *applied;
             if *emptied != Some(lane.emptied()) {
                 // The store emptied the rank since the row's last batch, or
                 // the row begins: what the rules kept beside the map goes
@@ -637,6 +673,27 @@ where
                 }
             }
             let worker = lane.worker();
+            // What the cursor read ahead of the batch, counted under the
+            // row's worker. The lane is the rank's own: a restart loses the
+            // replay it had asked for, and a cleared gap drops no other
+            // rank's.
+            let read = lane.admitted();
+            if let Some(url) = url {
+                match read.admission {
+                    store::Admission::Restart => count_restart(url, read.pending, true),
+                    store::Admission::Unrecovered { missed, cleared } => {
+                        count_unrecovered(url, missed, cleared, 0, cleared);
+                    }
+                    store::Admission::Apply
+                    | store::Admission::Stale
+                    | store::Admission::Replay { .. } => {}
+                }
+                // The rank's own word, where it moved.
+                if *degraded != read.degraded {
+                    *degraded = read.degraded;
+                    Metrics::set_kv_event_degraded_ranks(url, usize::from(read.degraded));
+                }
+            }
             {
                 let lending = Lending::new(lane, state);
                 took = match &url {
@@ -691,14 +748,14 @@ where
                 // skips every batch and counts none.
                 let behind = || self.store.cursor(row, rank).is_some();
                 if let Some(url) = url.as_ref().filter(|_| behind()) {
-                    Metrics::record_kv_event_batch(url, "stale");
+                    count_stale(url);
                 }
                 BatchOutcome::Skipped
             }
             store::BatchOutcome::Gap { expected, received } => {
                 // The collector asks the publisher to replay from here.
                 if let Some(url) = &url {
-                    Metrics::record_kv_event_gap(url, "replay_requested", 0);
+                    count_replay_asked(url);
                 }
                 BatchOutcome::Gap { expected, received }
             }
@@ -714,15 +771,21 @@ where
     fn resync(&self, id: WorkerId, rank: Option<u16>, reason: ResyncReason) {
         let rows: Vec<WorkerId> = match rank {
             // One rank's reset is its own row's, and a rank with no row
-            // holds nothing to reset.
-            Some(rank) => self.routed(id, rank).into_iter().collect(),
+            // holds nothing to reset. The stream's own row that another
+            // stream took is that stream's: a reset here reaches it no
+            // longer, as a batch here does not.
+            Some(rank) => self
+                .routed(id, rank)
+                .filter(|&row| row != id || self.writes_own(id))
+                .into_iter()
+                .collect(),
             // The stream's reset reaches every row it writes, its own
             // first.
             None => self.written_by(id),
         };
         // A snapshot its stream abandoned keeps the blocks: it resets no
         // index, counts none and leaves the row's index blocks as they are.
-        let counted = (reason != ResyncReason::SnapshotAbandoned).then(|| reason.as_str());
+        let counted = (reason != ResyncReason::SnapshotAbandoned).then_some(reason);
         let reason = match reason {
             ResyncReason::OutOfRange => store::ResyncReason::OutOfRange,
             ResyncReason::DataLoss => store::ResyncReason::DataLoss,
@@ -734,11 +797,15 @@ where
         for row in rows {
             self.store.resync(row, rank, reason);
             // Any other reset empties the row's lane: it counts under the
-            // row's worker, and the row's index blocks read none behind it.
-            let Some(reason) = counted else { continue };
+            // row's worker, no rank of it is degraded behind it, and its
+            // index blocks read none. The store's reset says no count of a
+            // replay it dropped, so none counts as missed here.
+            let Some(counted) = counted else { continue };
+            if let Some(state) = self.state_of(id, row) {
+                state.lock().degraded = false;
+            }
             if let Some(worker) = self.named(id, row) {
-                Metrics::record_kv_event_resync(worker.url(), reason);
-                Metrics::set_kv_index_blocks(worker.url(), 0);
+                count_reset(worker.url(), counted, 0, 0);
             }
         }
     }
@@ -783,14 +850,15 @@ where
         for &row in &leaving {
             self.store.removed(row);
         }
-        // Each row that left with the stream reads no index blocks, under
-        // its worker: the feed's own for the stream's own row, and the
-        // object the holder still stands for a row of another rank. A row
-        // another stream took keeps its gauge: that stream writes it.
+        // Each row that left with the stream reads no index blocks and no
+        // degraded rank, under its worker: the feed's own for the stream's
+        // own row, and the object the holder still stands for a row of
+        // another rank. A row another stream took keeps its gauges: that
+        // stream writes them.
         if let Some(feed) = &feed {
             for &row in &leaving {
                 if let Some(worker) = self.named_by(feed, id, row) {
-                    Metrics::set_kv_index_blocks(worker.url(), 0);
+                    reads_none(worker.url());
                 }
             }
         }
@@ -2855,6 +2923,160 @@ mod tests {
                 // as the rank's last batch left it, with no write behind.
                 f.sink.removed(f.lower);
                 assert_eq!(series.read_of(UPPER, held, &[]), Some(1.0));
+            });
+        }
+
+        /// A gap no replay filled counts its missed batches under the
+        /// outcome that says the rank's state was kept, and the rank reads
+        /// degraded until a reset.
+        #[test]
+        fn a_gap_no_replay_filled_counts_its_missed_batches() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                let (_host, sink) = opened(&f);
+                let applied = BatchOutcome::Applied;
+                assert_eq!(sink.admit(f.row, 0, facts(1), &wide(1, 32)), applied);
+                let gap = BatchOutcome::Gap {
+                    expected: 2,
+                    received: 5,
+                };
+                assert_eq!(sink.admit(f.row, 0, facts(5), &wide(5, 32)), gap);
+                assert_eq!(sink.admit(f.row, 0, facts(7), &wide(7, 32)), applied);
+                let kept = &["outcome=\"unrecovered_kept\""];
+                assert_eq!(series.read("smg_kv_event_gaps_total", kept), Some(1.0));
+                let missed = "smg_kv_event_missed_batches_total";
+                assert_eq!(series.read(missed, &[]), Some(5.0));
+                let degraded = "smg_kv_event_degraded_ranks";
+                assert_eq!(series.read(degraded, &[]), Some(1.0));
+
+                sink.resync(f.row, None, ResyncReason::DataLoss);
+                assert_eq!(series.read(degraded, &[]), Some(0.0));
+            });
+        }
+
+        /// A gap too wide to keep the rank's state counts as cleared, and
+        /// as a reset under its own reason. The rank is not degraded: it
+        /// begins again from the batch.
+        #[test]
+        fn a_cleared_gap_counts_a_reset() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                let (_host, sink) = opened(&f);
+                let applied = BatchOutcome::Applied;
+                assert_eq!(sink.admit(f.row, 0, facts(1), &wide(1, 32)), applied);
+                let gap = BatchOutcome::Gap {
+                    expected: 2,
+                    received: 1_100,
+                };
+                assert_eq!(sink.admit(f.row, 0, facts(1_100), &wide(2, 32)), gap);
+                assert_eq!(sink.admit(f.row, 0, facts(1_101), &wide(3, 32)), applied);
+                let cleared = &["outcome=\"unrecovered_cleared\""];
+                assert_eq!(series.read("smg_kv_event_gaps_total", cleared), Some(1.0));
+                let missed = "smg_kv_event_missed_batches_total";
+                assert_eq!(series.read(missed, &[]), Some(1_099.0));
+                let reset = &["reason=\"gap_cleared\""];
+                assert_eq!(series.read("smg_kv_event_resyncs_total", reset), Some(1.0));
+                assert_eq!(series.read("smg_kv_event_degraded_ranks", &[]), None);
+                // The cleared rank holds the batch's block alone.
+                assert_eq!(series.read("smg_kv_index_blocks", &[]), Some(1.0));
+            });
+        }
+
+        /// A publisher that starts over counts as a reset under its own
+        /// reason, and the replay still asked of the old publisher counts
+        /// as missed, once.
+        #[test]
+        fn a_restarted_publisher_counts_a_reset_and_its_lost_replay() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                let (_host, sink) = opened(&f);
+                let applied = BatchOutcome::Applied;
+                assert_eq!(sink.admit(f.row, 0, facts(10), &wide(1, 32)), applied);
+                let gap = BatchOutcome::Gap {
+                    expected: 11,
+                    received: 14,
+                };
+                assert_eq!(sink.admit(f.row, 0, facts(14), &wide(2, 32)), gap);
+                let restart = BatchFacts {
+                    clears: true,
+                    ..facts(3)
+                };
+                assert_eq!(sink.admit(f.row, 0, restart, &wide(3, 32)), applied);
+                let reset = &["reason=\"publisher_restart\""];
+                assert_eq!(series.read("smg_kv_event_resyncs_total", reset), Some(1.0));
+                let missed = "smg_kv_event_missed_batches_total";
+                assert_eq!(series.read(missed, &[]), Some(3.0));
+            });
+        }
+
+        /// A row whose rank is degraded reads no degraded rank where
+        /// another stream takes it, and none where it leaves with its
+        /// stream.
+        #[test]
+        fn a_degraded_row_reads_no_degraded_rank_behind_its_stream() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Ranked::new();
+                let own = f.other(OTHER);
+                let store = |hash| Data::Stored(wide_store(hash, 16));
+                let applied = BatchOutcome::Applied;
+                let gap = |expected, received| BatchOutcome::Gap { expected, received };
+                let degraded = "smg_kv_event_degraded_ranks";
+                // A gap no replay filled, on the row's own stream.
+                let own_batch =
+                    |sequence, hash| f.sink.admit(own, 0, facts(sequence), &batch([store(hash)]));
+                assert_eq!(own_batch(1, 1), applied);
+                assert_eq!(own_batch(5, 2), gap(2, 5));
+                assert_eq!(own_batch(7, 3), applied);
+                assert_eq!(series.read_of(OTHER, degraded, &[]), Some(1.0));
+
+                // The same registration states rank 1 of the first engine,
+                // and that engine's stream takes the row.
+                let moved = f.store.upsert(rank_facts(OTHER, URL, 1)).id();
+                assert_eq!(moved, own);
+                f.host.objects.follow(f.store.as_ref());
+                assert_eq!(f.admit(1, 2, store(4)), applied);
+                assert_eq!(series.read_of(OTHER, degraded, &[]), Some(0.0));
+
+                // A gap no replay filled on that stream, which then leaves.
+                assert_eq!(f.admit(1, 6, store(5)), gap(3, 6));
+                assert_eq!(f.admit(1, 8, store(6)), applied);
+                assert_eq!(series.read_of(OTHER, degraded, &[]), Some(1.0));
+                f.sink.removed(f.lower);
+                assert_eq!(series.read_of(OTHER, degraded, &[]), Some(0.0));
+            });
+        }
+
+        /// A reset of rank 0 on a stream whose own row another stream took
+        /// reaches no row. It counts none, and the row keeps its index
+        /// blocks under its new stream.
+        #[test]
+        fn a_reset_on_a_stream_whose_own_row_was_taken_reaches_no_row() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Ranked::new();
+                let own = f.other(OTHER);
+                let store = |hash| Data::Stored(wide_store(hash, 16));
+                let held = "smg_kv_index_blocks";
+                // The same registration states rank 1 of the first engine,
+                // and that engine's stream takes the row.
+                let moved = f.store.upsert(rank_facts(OTHER, URL, 1)).id();
+                assert_eq!(moved, own);
+                f.host.objects.follow(f.store.as_ref());
+                assert_eq!(f.admit(1, 2, store(2)), BatchOutcome::Applied);
+                assert_eq!(series.read_of(OTHER, held, &[]), Some(1.0));
+
+                // The row's old feed is still open, and a reset of rank 0
+                // comes on it.
+                f.sink.resync(own, Some(0), ResyncReason::DataLoss);
+                assert_eq!(f.store.indexed_blocks(own, 1), 1);
+                assert_eq!(series.read_of(OTHER, held, &[]), Some(1.0));
+                let resets = "smg_kv_event_resyncs_total";
+                let lost = &["reason=\"data_loss\""];
+                assert_eq!(series.read_of(OTHER, resets, lost), None);
             });
         }
     }
