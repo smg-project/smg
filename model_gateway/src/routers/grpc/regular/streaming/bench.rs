@@ -56,7 +56,7 @@ use crate::routers::{
     grpc::{
         context::DispatchMetadata,
         proto_wrapper::ProtoStream,
-        regular::symphony::{assign_for, Asks, Assignment, Reading},
+        regular::symphony::{assign_for, Asks, Assignment, Forbids, Reading},
         spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
         utils::ParserResolver,
     },
@@ -305,7 +305,7 @@ impl StreamBench {
         let qwen3_assignment = || Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: "<|im_start|>assistant\n".to_string(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,

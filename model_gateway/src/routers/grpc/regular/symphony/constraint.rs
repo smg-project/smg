@@ -6,7 +6,7 @@ use std::{borrow::Cow, fmt, sync::Arc};
 
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{ResponseFormat, Tool, ToolChoice, ToolChoiceValue},
+    common::{ResponseFormat, Tool, ToolChoice, ToolChoiceValue, ToolReference},
     messages::{CreateMessageRequest, ToolChoice as MessagesToolChoice},
     profile::ProviderProfile,
     worker::ConstrainedDecoding,
@@ -591,7 +591,7 @@ impl<'a> Asks<'a> {
     /// provider that reads calls only with them: [`scans_for_tool_calls_for`]; a Messages request
     /// that declares no tools, an empty list being a declaration). A `tool_choice` of `none` is
     /// not this: the table keeps its calls and the reader delivers none of them
-    /// ([`Asks::forbids_calls_for`]). `provider` is the chat model's profile as the request's
+    /// ([`Asks::forbids_for`]). `provider` is the chat model's profile as the request's
     /// preparation derived it once.
     pub(super) fn no_calls_for(self, provider: ProviderProfile) -> bool {
         match self {
@@ -600,23 +600,40 @@ impl<'a> Asks<'a> {
         }
     }
 
-    /// The request forbids the calls its response would be scanned for (`tool_choice: none` over
-    /// declared tools, or over a provider that reads calls without any): the table keeps its
-    /// calls, so a call the model writes anyway is read whole, and the reader drops it, as the
-    /// engine's own server reads such a call and withholds it. The prompt declares the tools as
-    /// under `auto` (`utils::request_as_rendered`), so the model may well write one. `provider`
-    /// is the chat model's profile as the request's preparation derived it once.
-    pub(super) fn forbids_calls_for(self, provider: ProviderProfile) -> bool {
-        match self {
-            Self::Chat(request) => {
-                matches!(
-                    request.tool_choice,
-                    Some(ToolChoice::Value(ToolChoiceValue::None))
-                ) && scans_for_tool_calls_for(request, provider)
+    /// The calls the request's `tool_choice` forbids among those its response would be scanned
+    /// for (over declared tools, or over a provider that reads calls without any): every call
+    /// under `none`; under a named function, an allowed list or `required`, a call to a function
+    /// outside the tools the choice leaves callable ([`callable`]); none under `auto`. The table
+    /// keeps its calls, so a call the model writes anyway is read whole, and the reader drops
+    /// it, as the engine's own server reads a call under `none` and withholds it. Under `none`
+    /// the prompt declares the tools as under `auto` (`utils::request_as_rendered`), so the
+    /// model may well write one. `provider` is the chat model's profile as the request's
+    /// preparation derived it once.
+    pub(super) fn forbids_for(self, provider: ProviderProfile) -> Forbids {
+        let choice = self.choice();
+        let forbids = match choice.as_deref() {
+            None | Some(ToolChoice::Value(ToolChoiceValue::Auto)) => return Forbids::Nothing,
+            Some(ToolChoice::Value(ToolChoiceValue::None)) => Forbids::Every,
+            Some(ToolChoice::Value(ToolChoiceValue::Required)) => Forbids::Undeclared,
+            Some(ToolChoice::Function { function, .. }) => {
+                Forbids::AllBut([function.name.clone()].into())
             }
-            Self::Messages {
-                request, has_tools, ..
-            } => matches!(request.tool_choice, Some(MessagesToolChoice::None)) && has_tools,
+            Some(ToolChoice::AllowedTools { tools, .. }) => Forbids::AllBut(
+                tools
+                    .iter()
+                    .filter_map(ToolReference::function_name)
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+        };
+        let scanned = match self {
+            Self::Chat(request) => scans_for_tool_calls_for(request, provider),
+            Self::Messages { has_tools, .. } => has_tools,
+        };
+        if scanned {
+            forbids
+        } else {
+            Forbids::Nothing
         }
     }
 
@@ -670,6 +687,46 @@ pub(super) fn callable<'t>(choice: Option<&ToolChoice>, declared: &'t [Tool]) ->
             .narrow_tools(declared)
             .map_or(Cow::Borrowed(declared), Cow::Owned),
         None => Cow::Borrowed(declared),
+    }
+}
+
+/// The calls a request's `tool_choice` forbids among those the table reads
+/// ([`Asks::forbids_for`]), which the reader drops: a call is forbidden when its function is
+/// outside the tools the choice leaves callable ([`callable`]). `auto` narrows nothing and
+/// forbids nothing: a call to a function the request did not declare goes out under it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Forbids {
+    /// No call (`auto`, or no choice).
+    Nothing,
+    /// Every call (`none`).
+    Every,
+    /// A call to a function the request did not declare (`required`: every declared tool is
+    /// callable).
+    Undeclared,
+    /// A call to any function but these, the ones the choice names (a named function, an allowed
+    /// list), and a call to one of these the request did not declare.
+    AllBut(Arc<[String]>),
+}
+
+impl Forbids {
+    /// Whether the choice forbids a call to `function`, `declared` saying whether the request
+    /// declares that function.
+    pub(super) fn call_to(&self, function: &str, declared: bool) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Every => true,
+            Self::Undeclared => !declared,
+            Self::AllBut(named) => !declared || !named.iter().any(|name| name == function),
+        }
+    }
+
+    /// The choice as a reader of the `declared` tools asks it: with no tool declared none is
+    /// callable, so a choice that forbids some calls forbids them all.
+    pub(super) fn over(&self, declared: &[Tool]) -> Self {
+        match self {
+            Self::Undeclared | Self::AllBut(_) if declared.is_empty() => Self::Every,
+            forbids => forbids.clone(),
+        }
     }
 }
 
@@ -2690,7 +2747,7 @@ mod tests {
         .expect("assigned");
         assert_eq!(no_calls.format.name(), "qwen3");
         assert_eq!(no_calls.format.call_syntax(), None);
-        assert!(!no_calls.forbids_calls);
+        assert_eq!(no_calls.forbids_calls, Forbids::Nothing);
         let forbidden = super::super::assign(
             symphony,
             &plain,
@@ -2709,7 +2766,7 @@ mod tests {
             forbidden.format.call_syntax().is_some(),
             "the table keeps its calls under none over declared tools"
         );
-        assert!(forbidden.forbids_calls);
+        assert_eq!(forbidden.forbids_calls, Forbids::Every);
         // Past the route the request's own `tools` reads `None` (the route took them out while it
         // owned the request): the declaration the spec recorded is what the table reads.
         let taken = super::super::assign(
@@ -2730,7 +2787,7 @@ mod tests {
             taken.format.call_syntax().is_some(),
             "the declaration is read from the ask, not from the request's emptied field"
         );
-        assert!(taken.forbids_calls);
+        assert_eq!(taken.forbids_calls, Forbids::Every);
         let constrain = |extra: Value| {
             super::constraint(
                 symphony,
@@ -3721,5 +3778,73 @@ mod tests {
             );
             assert!(!decided.table && !decided.first_token && !decided.by_policy);
         }
+    }
+
+    /// A choice forbids exactly the calls outside the tools it leaves callable ([`callable`]),
+    /// for every form of the choice; `auto` narrows nothing and forbids nothing.
+    #[test]
+    fn a_choice_forbids_exactly_the_calls_outside_its_callable_tools() {
+        let tools = json!([
+            {"type": "function", "function": {"name": "save_note", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "delete_file", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}},
+        ]);
+        let choices = [
+            json!("auto"),
+            json!("none"),
+            json!("required"),
+            json!({"type": "function", "function": {"name": "save_note"}}),
+            json!({"type": "allowed_tools", "mode": "auto", "tools": [
+                {"type": "function", "name": "save_note"}, {"type": "function", "name": "lookup"}]}),
+            json!({"type": "allowed_tools", "mode": "required", "tools": [
+                {"type": "function", "name": "delete_file"}]}),
+        ];
+        for choice in choices {
+            let request = request(json!({"tools": tools.clone(), "tool_choice": choice.clone()}));
+            let declared = request.tools.as_deref().expect("the declared tools");
+            let forbids =
+                Asks::Chat(&request).forbids_for(ProviderProfile::for_model(&request.model));
+            let callable = callable(request.tool_choice.as_ref(), declared);
+            for function in ["save_note", "delete_file", "lookup", "undeclared"] {
+                let is = |tools: &[Tool]| tools.iter().any(|tool| tool.function.name == function);
+                let forbidden = forbids != Forbids::Nothing && !is(&callable);
+                assert_eq!(
+                    forbids.call_to(function, is(declared)),
+                    forbidden,
+                    "{choice}: {function}"
+                );
+            }
+            assert_eq!(
+                forbids.over(declared),
+                forbids,
+                "{choice}: over declared tools"
+            );
+            let over_none = match forbids {
+                Forbids::Nothing => Forbids::Nothing,
+                _ => Forbids::Every,
+            };
+            assert_eq!(forbids.over(&[]), over_none, "{choice}: over no tool");
+        }
+    }
+
+    /// A Messages choice forbids as the chat choice it converts to: `tool` all but the tool it
+    /// names, `any` the tools the request did not declare, `none` every call, `auto` none.
+    #[test]
+    fn a_messages_choice_forbids_as_its_chat_form() {
+        let forbids = |choice: Value| {
+            let request = message_request(json!({
+                "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}],
+                "tool_choice": choice
+            }));
+            Asks::for_messages(&request, false)
+                .forbids_for(ProviderProfile::for_model(&request.model))
+        };
+        assert_eq!(
+            forbids(json!({"type": "tool", "name": "lookup"})),
+            Forbids::AllBut(["lookup".to_string()].into())
+        );
+        assert_eq!(forbids(json!({"type": "any"})), Forbids::Undeclared);
+        assert_eq!(forbids(json!({"type": "none"})), Forbids::Every);
+        assert_eq!(forbids(json!({"type": "auto"})), Forbids::Nothing);
     }
 }
