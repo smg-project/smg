@@ -64,7 +64,8 @@ pub enum ResyncReason {
     /// The server lost batches it cannot name.
     DataLoss,
     StreamEnded,
-    /// The stream ended with a snapshot still arriving: a partial live set.
+    /// The stream ended with a snapshot still arriving: a partial live set,
+    /// kept until the next snapshot's start.
     SnapshotAbandoned,
     RelayRestart,
     EngineReplaced,
@@ -153,7 +154,9 @@ pub trait KvEventSink: Send + Sync {
 
     /// Reset the row's cursor for `reason`: its blocks go with it, and the
     /// next stream is taken from wherever it starts. A `rank` that is not
-    /// the row's resets nothing; `None` asks no check.
+    /// the row's resets nothing; `None` asks no check. A snapshot the
+    /// stream did not finish keeps the blocks it showed: the next
+    /// snapshot's start replaces them.
     fn resync(&self, id: WorkerId, rank: Option<u16>, reason: ResyncReason);
 
     /// The cursor of one rank, when the rank has been heard from.

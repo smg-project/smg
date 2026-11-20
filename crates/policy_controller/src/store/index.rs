@@ -16,7 +16,8 @@
 //! alone sees the engine's stream whole, says a snapshot's start to every
 //! row of the engine before its first block, the rows the snapshot holds
 //! nothing for included: a resync, which empties the lane and starts its
-//! cursor over. A chunk only adds.
+//! cursor over. A chunk only adds. A snapshot its stream did not finish
+//! starts the cursor over and keeps what its chunks showed.
 //!
 //! What a lane indexes is what its collector decoded ([`KvEvent`]): which
 //! blocks reach an index (their tier, their cache group, the namespace
@@ -1805,12 +1806,19 @@ impl KvTables {
         }
     }
 
+    /// Starts the lane's cursor over for `reason` and empties the lane. A
+    /// snapshot its stream did not finish is the one reason that keeps the
+    /// blocks: the stream cannot be trusted, so the next subscription asks
+    /// from zero, and what the chunks showed stays until the next
+    /// snapshot's start empties the lane.
     pub(super) fn resync(&self, id: WorkerId, rank: Option<u16>, reason: ResyncReason) {
         if let Some(lane) = self.lane(id, rank) {
             let mut lane = lane.lock();
             lane.cursor.reset();
-            if let Some(held) = &mut lane.held {
-                held.cleared();
+            if reason != ResyncReason::SnapshotAbandoned {
+                if let Some(held) = &mut lane.held {
+                    held.cleared();
+                }
             }
         }
         self.note(reason);
