@@ -379,7 +379,8 @@ pub enum DecodeRefused {
     NotChosen,
     /// The prefill side is waiting for dispatch or has ended.
     PrefillNotHeld,
-    /// The chosen side was already issued or dispatched, even if it has ended.
+    /// The chosen side was already issued or dispatched, even if it has
+    /// ended, or its host gave it up.
     DecodeStands,
 }
 

@@ -4141,7 +4141,8 @@ pub(crate) mod tests {
         assert_eq!(early, Err(mpsc::RecvTimeoutError::Timeout));
         word.send(()).expect("the other caller waits");
         assert_eq!(answer.recv_timeout(PATIENCE), Ok(Ok(Some(Side::Decode))));
-        assert!(other.join().is_ok() && caller.join().is_ok());
+        assert_eq!(other.join().ok(), Some(true));
+        assert!(caller.join().is_ok());
     }
 
     #[test]
