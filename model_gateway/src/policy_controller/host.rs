@@ -43,6 +43,7 @@ use rand::RngExt;
 use smg_policy_controller::{
     decision::{Decision, Lifted, Pair, ShadowKind, ShedReason, Targets, Trace, MAX_TARGETS},
     door::{Door, Maker, Refused, Request, Swept},
+    framework::PairSide,
     handle::Handle,
     lease::{Outcome, ReleaseReason, Side, TransportClass},
     spec::DecodePick,
@@ -510,6 +511,19 @@ impl Host {
     /// shows as a series.
     pub(crate) fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64 {
         self.door.shadowed(binding, kind)
+    }
+
+    /// [`Self::shadowed`] beside one side of a pair. The door counts a
+    /// pair's shadows by its sides, and none of them under
+    /// [`Self::shadowed`].
+    pub(crate) fn shadowed_side(&self, binding: u32, side: PairSide, kind: ShadowKind) -> u64 {
+        self.door.shadowed_side(binding, side, kind)
+    }
+
+    /// [`Self::shadowed_side`] beside a decode decided after its prefill:
+    /// a count of its own, of the calls that asked the decode again.
+    pub(crate) fn shadowed_later(&self, binding: u32, kind: ShadowKind) -> u64 {
+        self.door.shadowed_later(binding, kind)
     }
 
     /// How many decisions panicked, the shadows that did beside a live

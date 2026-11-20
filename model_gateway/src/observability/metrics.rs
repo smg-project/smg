@@ -804,7 +804,8 @@ pub(crate) fn init_metrics() {
         "Shadow decisions of the policy controller beside a live decision. A row is a \
          binding's position in the policy document: the last row also counts every binding \
          behind it, and a document applied later counts on in the same rows. By binding, side \
-         (single) and kind (agreed, other-target, other-outcome, skipped)"
+         (single, a pair's prefill and decode, decode-later for a decode decided after its \
+         prefill) and kind (agreed, other-target, other-outcome, skipped)"
     );
     describe_counter!(
         POLICY_DECISION_FAULTS_TOTAL,

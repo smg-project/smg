@@ -205,12 +205,18 @@ pub(crate) fn pair_bed(prefills: &[&str], decodes: &[&str]) -> Bed {
 /// [`pair_bed`] under a document that says when a pair's decode is picked
 /// (`plans.pd-pair.decode`).
 pub(crate) fn pair_bed_picking(decode: DecodePick, prefills: &[&str], decodes: &[&str]) -> Bed {
-    let store = Arc::new(MemoryStore::new());
     let mut document =
         PolicySpec::pair_presets("least_load", "least_load").expect("the pair presets");
     document.plans.pd_pair.decode = decode;
-    let applied = AppliedSpec::validate(&document).expect("the presets validate");
-    store.apply(applied).expect("the store takes the presets");
+    pair_bed_under(&document, prefills, decodes)
+}
+
+/// [`pair_bed`] under `document`: the stock pair presets with what a case
+/// wrote over them.
+pub(crate) fn pair_bed_under(document: &PolicySpec, prefills: &[&str], decodes: &[&str]) -> Bed {
+    let store = Arc::new(MemoryStore::new());
+    let applied = AppliedSpec::validate(document).expect("the document validates");
+    store.apply(applied).expect("the store takes the document");
     pair_rows(store, MODEL, prefills, decodes)
 }
 

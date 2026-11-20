@@ -10,7 +10,9 @@
 //!
 //! The door also counts what no request's series says: the shadow decisions
 //! beside its live ones, and the decisions that panicked. The timer sets a
-//! series to each of those counts at every turn.
+//! series to each of those counts at every turn. A shadow is counted where
+//! it was asked: beside a single's decision, beside one side of a pair, or
+//! beside a decode decided after its prefill.
 
 use std::{
     array,
@@ -19,11 +21,16 @@ use std::{
 };
 
 use metrics::Counter;
-use smg_policy_controller::{decision::ShadowKind, door::SHADOW_ROWS};
+use smg_policy_controller::{
+    decision::ShadowKind,
+    door::{Swept, SHADOW_ROWS},
+    framework::PairSide,
+};
 use tokio::{
     task::JoinHandle,
     time::{interval, MissedTickBehavior},
 };
+use tracing::debug;
 
 use super::host::Host;
 use crate::observability::metrics::Metrics;
@@ -33,9 +40,47 @@ use crate::observability::metrics::Metrics;
 /// second is ample.
 pub(crate) const EVERY: Duration = Duration::from_secs(1);
 
-/// The `side` label of a single decision's shadow: the policy document's
-/// own word for the one side of a `single` plan.
-const SINGLE: &str = "single";
+/// Where a shadow was asked. The door keeps a table of counts for each
+/// place, and the place is the `side` label of its series.
+#[derive(Clone, Copy)]
+enum Asked {
+    /// Beside a single's decision.
+    Single,
+    /// Beside one side of a pair, at the pair's decision.
+    Side(PairSide),
+    /// Beside a decode decided after its prefill.
+    Later,
+}
+
+impl Asked {
+    /// Every place, in the order of the timer's tables.
+    const ALL: [Self; 4] = [
+        Self::Single,
+        Self::Side(PairSide::Prefill),
+        Self::Side(PairSide::Decode),
+        Self::Later,
+    ];
+
+    /// The `side` label: the policy document's own word for a side, and a
+    /// word of its own for the decode decided later.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Side(side) => side.as_str(),
+            Self::Later => "decode-later",
+        }
+    }
+
+    /// The door's count of the shadows that said `kind` at this place,
+    /// for the binding at position `binding`.
+    fn count(self, host: &Host, binding: u32, kind: ShadowKind) -> u64 {
+        match self {
+            Self::Single => host.shadowed(binding, kind),
+            Self::Side(side) => host.shadowed_side(binding, side, kind),
+            Self::Later => host.shadowed_later(binding, kind),
+        }
+    }
+}
 
 /// A binding's row of handles, one a kind.
 type Row = [Counter; ShadowKind::ALL.len()];
@@ -50,9 +95,10 @@ type Row = [Counter; ShadowKind::ALL.len()];
 struct Series {
     /// The decisions that panicked.
     faults: Counter,
-    /// The shadows of single decisions. A row is laid at its binding's
-    /// first shadow, so a binding that shadows nothing shows no series.
-    singles: [Option<Row>; SHADOW_ROWS],
+    /// The shadows, a table a place ([`Asked::ALL`]). A row is laid at its
+    /// binding's first shadow of that place, so a binding that shadows
+    /// nothing there shows no series.
+    shadows: [[Option<Row>; SHADOW_ROWS]; Asked::ALL.len()],
 }
 
 impl Series {
@@ -60,33 +106,44 @@ impl Series {
     fn new() -> Self {
         Self {
             faults: Metrics::policy_decision_faults(),
-            singles: array::from_fn(|_| None),
+            shadows: array::from_fn(|_| array::from_fn(|_| None)),
         }
     }
 
     /// Set each series to the door's count of it.
     fn show(&mut self, host: &Host) {
         self.faults.absolute(host.faults());
-        for (binding, row) in (0..).zip(&mut self.singles) {
-            let counts = ShadowKind::ALL.map(|kind| host.shadowed(binding, kind));
-            if row.is_none() && counts.iter().all(|&count| count == 0) {
-                continue;
-            }
-            let handles = row.get_or_insert_with(|| {
-                ShadowKind::ALL
-                    .map(|kind| Metrics::policy_shadow_decisions(binding, SINGLE, kind.as_str()))
-            });
-            for (handle, count) in handles.iter().zip(counts) {
-                handle.absolute(count);
+        for (place, rows) in Asked::ALL.into_iter().zip(&mut self.shadows) {
+            for (binding, row) in (0..).zip(rows) {
+                let counts = ShadowKind::ALL.map(|kind| place.count(host, binding, kind));
+                if row.is_none() && counts.iter().all(|&count| count == 0) {
+                    continue;
+                }
+                let handles = row.get_or_insert_with(|| {
+                    ShadowKind::ALL.map(|kind| {
+                        Metrics::policy_shadow_decisions(binding, place.label(), kind.as_str())
+                    })
+                });
+                for (handle, count) in handles.iter().zip(counts) {
+                    handle.absolute(count);
+                }
             }
         }
     }
 }
 
 /// One turn of the timer at `now`: a pass of the door's clock, then the
-/// door's counts shown.
+/// door's counts shown. A pass that ended something says how much at
+/// debug: a lease it ends was abandoned by its request.
 fn turn(host: &Host, series: &mut Series, now: Instant) {
-    host.sweep(now);
+    let swept = host.sweep(now);
+    if swept != Swept::default() {
+        debug!(
+            leases = swept.leases,
+            pins = swept.pins,
+            "A pass of the policy door's clock ended what was past its time"
+        );
+    }
     series.show(host);
 }
 
@@ -121,6 +178,7 @@ pub(crate) fn start(host: &Arc<Host>) -> JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         sync::Arc,
         time::{Duration, Instant},
     };
@@ -128,8 +186,10 @@ mod tests {
     use futures::FutureExt;
     use smg_policy_controller::{
         decision::ShadowKind,
-        spec::ShadowSpec,
+        framework::PairSide,
+        spec::{DecodePick, ShadowSpec},
         store::{GatewayId, LeasesStore, MemoryStore},
+        view::Phase,
         AppliedSpec, PolicySpec,
     };
 
@@ -137,7 +197,7 @@ mod tests {
     use crate::{
         observability::metrics::test_support::render_with_recorder,
         policy_controller::host::{
-            testing::{bed, bed_with, MODEL},
+            testing::{bed, bed_with, pair_bed_under, MODEL},
             Ask, Host,
         },
         routers::common::snapshot::WorkerRegistry,
@@ -205,6 +265,15 @@ mod tests {
         host
     }
 
+    /// The line the series shows for the shadows of `kind` that the first
+    /// binding counts on `side`.
+    fn shadow_line(side: &str, kind: ShadowKind, count: u64) -> String {
+        let kind = kind.as_str();
+        format!(
+            "smg_policy_shadow_decisions_total{{binding=\"0\",side=\"{side}\",kind=\"{kind}\"}} {count}"
+        )
+    }
+
     /// A turn sets the series to the door's counts: the one shadow beside
     /// the one decision, under its binding's position, the single side and
     /// its kind, with the binding's other kinds at zero, and the faults.
@@ -228,10 +297,7 @@ mod tests {
             "one shadow beside the one decision"
         );
         for (kind, count) in ShadowKind::ALL.into_iter().zip(counts) {
-            let kind = kind.as_str();
-            let line = format!(
-                "smg_policy_shadow_decisions_total{{binding=\"0\",side=\"single\",kind=\"{kind}\"}} {count}"
-            );
+            let line = shadow_line("single", kind, count);
             assert!(rendered.contains(&line), "{line} is not in:\n{rendered}");
         }
         assert!(
@@ -239,5 +305,104 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("binding=\"1\""), "{rendered}");
+        assert!(!rendered.contains("side=\"prefill\""), "{rendered}");
+    }
+
+    /// The host of a bed of one prefill and one decode whose one binding
+    /// shadows a copy of each side's profile, under the document's word
+    /// for when a pair's decode is picked.
+    fn shadowing_pair(decode: DecodePick) -> Host {
+        let mut document =
+            PolicySpec::pair_presets("least_load", "least_load").expect("the pair presets");
+        document.plans.pd_pair.decode = decode;
+        let mut sides = BTreeMap::new();
+        for side in PairSide::BOTH {
+            let side = side.as_str();
+            let live = document.profiles.get(side).cloned();
+            let next = format!("{side}-next");
+            document
+                .profiles
+                .insert(next.clone(), live.expect("the side's profile"));
+            sides.insert(side.to_owned(), next);
+        }
+        let binding = document
+            .bindings
+            .first_mut()
+            .expect("the presets' one binding");
+        binding.shadow = Some(ShadowSpec::Sides(sides));
+        let (host, ..) = pair_bed_under(&document, &["http://p0:8000"], &["http://d0:8000"]);
+        host
+    }
+
+    /// A pair's ask, whose route asks its decode again or does not.
+    fn pair_ask(decode_again: bool) -> Ask<'static> {
+        Ask {
+            phase: Phase::Prefill,
+            prompt_tokens: 37,
+            decode_again,
+            ..Ask::of(b"r1", MODEL)
+        }
+    }
+
+    /// A pair's shadows are shown by side. One decision of a pair whose
+    /// binding shadows both sides sets a row under `prefill` and a row
+    /// under `decode`. A pair counts nothing under `single`.
+    #[test]
+    fn a_turn_shows_a_pairs_shadows_by_side() {
+        let host = shadowing_pair(DecodePick::WithPrefill);
+        let rendered = render_with_recorder(|| {
+            let mut series = Series::new();
+            let placed = host
+                .place_pair(&pair_ask(false), None, None)
+                .now_or_never()
+                .expect("a decision at once");
+            assert!(placed.is_ok(), "the bed's pair takes the request");
+            turn(&host, &mut series, Instant::now());
+        });
+        for side in PairSide::BOTH {
+            let counts = ShadowKind::ALL.map(|kind| host.shadowed_side(0, side, kind));
+            assert_eq!(
+                counts.iter().sum::<u64>(),
+                1,
+                "one shadow beside the {side:?} side"
+            );
+            for (kind, count) in ShadowKind::ALL.into_iter().zip(counts) {
+                let line = shadow_line(side.as_str(), kind, count);
+                assert!(rendered.contains(&line), "{line} is not in:\n{rendered}");
+            }
+        }
+        assert!(!rendered.contains("side=\"single\""), "{rendered}");
+        assert!(!rendered.contains("side=\"decode-later\""), "{rendered}");
+    }
+
+    /// A decode decided after its prefill counts a shadow of its own. The
+    /// series shows it under `decode-later`, beside the rows of the pair's
+    /// first decision.
+    #[test]
+    fn a_turn_shows_the_shadow_of_a_decode_decided_later() {
+        let host = shadowing_pair(DecodePick::AfterPrefill);
+        let rendered = render_with_recorder(|| {
+            let mut series = Series::new();
+            let ask = pair_ask(true);
+            let (mut placed, _room) = host
+                .place_pair(&ask, None, None)
+                .now_or_never()
+                .expect("a decision at once")
+                .expect("the bed's pair takes the request");
+            placed.dispatched(Instant::now());
+            placed.decode_again(&host, &ask, |_| true, Instant::now());
+            turn(&host, &mut series, Instant::now());
+        });
+        let counts = ShadowKind::ALL.map(|kind| host.shadowed_later(0, kind));
+        assert_eq!(
+            counts.iter().sum::<u64>(),
+            1,
+            "one shadow beside the decode decided later"
+        );
+        for (kind, count) in ShadowKind::ALL.into_iter().zip(counts) {
+            let line = shadow_line("decode-later", kind, count);
+            assert!(rendered.contains(&line), "{line} is not in:\n{rendered}");
+        }
+        assert!(!rendered.contains("side=\"single\""), "{rendered}");
     }
 }
