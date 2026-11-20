@@ -1173,7 +1173,8 @@ impl WarmupSlice {
     }
 
     /// How a pass tells a warming row over a host's column: `None` when
-    /// nobody warms.
+    /// nobody warms. It takes one pass over the column. The fleet's median
+    /// is read only where its smallest index is thin against its largest.
     #[inline(always)]
     fn ruled(&self, column: &[AffinityFacts]) -> Option<Warm<'static>> {
         let mut smallest = u32::MAX;
