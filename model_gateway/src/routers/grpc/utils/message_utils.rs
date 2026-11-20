@@ -669,9 +669,8 @@ fn process_message_content_format(
 
 /// Convert a `system`-role message's content to a chat-template JSON value,
 /// preserving its position in `messages[]`. System content is text; text blocks
-/// are concatenated. A server tool's result or a container upload is refused
-/// by name, as in a user or assistant turn (`server_tool_block_refusal`); the
-/// other non-text blocks are dropped, as before.
+/// are concatenated. An image, document, server tool result, or container upload
+/// is refused by name; the other non-text blocks are dropped.
 fn convert_system_message(index: usize, content: &InputContent) -> Result<Value, PromptError> {
     let text = match content {
         InputContent::String(text) => text.clone(),
@@ -680,6 +679,12 @@ fn convert_system_message(index: usize, content: &InputContent) -> Result<Value,
             for (position, block) in blocks.iter().enumerate() {
                 match block {
                     InputContentBlock::Text(t) => texts.push(t.text.as_str()),
+                    InputContentBlock::Image(_) => {
+                        return Err(user_turn_only_refusal("image", index, position));
+                    }
+                    InputContentBlock::Document(_) => {
+                        return Err(user_turn_only_refusal("document", index, position));
+                    }
                     InputContentBlock::WebFetchToolResult(_)
                     | InputContentBlock::CodeExecutionToolResult(_)
                     | InputContentBlock::BashCodeExecutionToolResult(_)
@@ -943,6 +948,13 @@ fn mcp_block_refusal(block: &InputContentBlock, index: usize, position: usize) -
     ))
 }
 
+/// The public API accepts image and document blocks only in user turns.
+fn user_turn_only_refusal(kind: &str, index: usize, position: usize) -> PromptError {
+    PromptError::Refused(format!(
+        "messages.{index}.content.{position}: {kind} blocks are supported in user messages only"
+    ))
+}
+
 /// The refusal of a block of the public API's server tools (a web fetch, code
 /// execution, bash or text editor result, a container upload) on an engine
 /// route, naming the block and its place. No engine route runs those tools, so
@@ -975,8 +987,8 @@ fn server_tool_block_refusal(
 /// Convert an assistant message content to a single JSON value.
 ///
 /// Extracts text content, tool calls, and reasoning/thinking into the
-/// appropriate JSON fields that the chat template expects. A replayed MCP
-/// block is refused by name (`mcp_block_refusal`).
+/// appropriate JSON fields that the chat template expects. An image, a
+/// document, or a replayed MCP block is refused by name rather than dropped.
 fn convert_assistant_message(
     index: usize,
     content: &InputContent,
@@ -1002,6 +1014,12 @@ fn convert_assistant_message(
                 }
             })),
             InputContentBlock::Thinking(t) => thinking_parts.push(t.thinking.clone()),
+            InputContentBlock::Image(_) => {
+                return Err(user_turn_only_refusal("image", index, position));
+            }
+            InputContentBlock::Document(_) => {
+                return Err(user_turn_only_refusal("document", index, position));
+            }
             // The exchange the public API puts in the assistant turn:
             // refused by name, never dropped from the prompt.
             InputContentBlock::McpToolUse(_) | InputContentBlock::McpToolResult(_) => {
@@ -1256,6 +1274,111 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["role"], "assistant");
         assert_eq!(result[0]["content"], "Hi there");
+    }
+
+    #[test]
+    fn an_image_in_an_assistant_turn_is_refused_naming_the_block() {
+        let messages: Vec<InputMessage> = serde_json::from_value(json!([{
+            "role": "assistant",
+            "content": [{
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "AAAA"
+                }
+            }]
+        }]))
+        .unwrap();
+
+        let error = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+            None,
+            MediaPartOrder::Authored,
+        )
+        .unwrap_err();
+
+        assert!(error.is_refusal(), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "messages.0.content.0: image blocks are supported in user messages only"
+        );
+    }
+
+    #[test]
+    fn an_image_in_a_system_turn_is_refused_naming_the_block() {
+        let messages: Vec<InputMessage> = serde_json::from_value(json!([{
+            "role": "system",
+            "content": [{
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "AAAA"
+                }
+            }]
+        }]))
+        .unwrap();
+
+        let error = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+            None,
+            MediaPartOrder::Authored,
+        )
+        .unwrap_err();
+
+        assert!(error.is_refusal(), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "messages.0.content.0: image blocks are supported in user messages only"
+        );
+    }
+
+    #[test]
+    fn a_document_in_a_system_turn_is_refused_naming_the_block() {
+        let content = serde_json::from_value(json!([{
+            "type": "document",
+            "source": {"type": "text", "media_type": "text/plain", "data": "the notes"}
+        }]))
+        .unwrap();
+        let error = convert_system_message(0, &content).unwrap_err();
+        assert!(error.is_refusal(), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "messages.0.content.0: document blocks are supported in user messages only"
+        );
+    }
+
+    #[test]
+    fn a_document_in_an_assistant_turn_is_refused_naming_the_block() {
+        let messages: Vec<InputMessage> = serde_json::from_value(json!([{
+            "role": "assistant",
+            "content": [{
+                "type": "document",
+                "source": {
+                    "type": "text",
+                    "media_type": "text/plain",
+                    "data": "the notes"
+                }
+            }]
+        }]))
+        .unwrap();
+
+        let error = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+            None,
+            MediaPartOrder::Authored,
+        )
+        .unwrap_err();
+
+        assert!(error.is_refusal(), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "messages.0.content.0: document blocks are supported in user messages only"
+        );
     }
 
     #[test]
