@@ -63,7 +63,7 @@ use crate::{
     },
     routers::{
         common::{
-            overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
+            overload::{routable_but_for_veto, WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE},
             placement::{self, no_available_workers_because},
             prefill_admission::{
                 acquire_decided, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
@@ -284,8 +284,8 @@ impl PrefillCandidateError for Unplaced {
         matches!(self, Self::NoRoom)
     }
 
-    /// A decision with no target the gateway can send to is asked again
-    /// with those targets named, until the attempt has had its three asks.
+    /// A decision with no target the gateway can send to is decided again
+    /// with those targets named, three passes at most at one wake.
     fn decides_again(&self, again: usize) -> bool {
         matches!(self, Self::NoTargetHolds) && again + 1 < ASKS
     }
@@ -409,10 +409,6 @@ fn hinted(mut response: Response, secs: u32) -> Response {
         .headers_mut()
         .insert(RETRY_AFTER, HeaderValue::from(secs.max(1)));
     response
-}
-
-fn can_send(worker: &dyn Worker) -> bool {
-    worker.is_healthy() && worker.circuit_breaker_can_execute()
 }
 
 /// A pick awaiting commit, with its targets and lease.
@@ -672,7 +668,7 @@ impl Host {
         for (index, target) in targets.iter().enumerate() {
             let sendable = self
                 .worker(target.id)
-                .filter(|worker| can_send(worker.as_ref()) && holds(worker.as_ref()));
+                .filter(|worker| routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref()));
             if let Some(worker) = sendable {
                 handle.take(index);
                 self.trace_decision(handle.decision(), Some(&worker));
@@ -712,8 +708,8 @@ impl Host {
             let Some(pair) = target.pair else {
                 continue;
             };
-            let prefill = prefill.filter(|worker| can_send(worker.as_ref()));
-            let decode = decode.filter(|worker| can_send(worker.as_ref()));
+            let prefill = prefill.filter(|worker| routable_but_for_veto(worker.as_ref()));
+            let decode = decode.filter(|worker| routable_but_for_veto(worker.as_ref()));
             let (Some(worker), Some(decode)) = (&prefill, decode.as_ref()) else {
                 failed[index] = [
                     prefill.is_none().then_some(target.id),
@@ -748,9 +744,11 @@ impl Host {
     }
 
     /// Places a pair and takes its prefill load guard. A commit that can
-    /// send to no target asks again in place, three asks at most: a queued
-    /// request keeps its place and its deadline. Admission can ask again at
-    /// each wake.
+    /// send to no target decides again in place, three passes at most at
+    /// one wake: a queued request keeps its place and its deadline. A pass
+    /// asks up to three times while every prefill it names reads full
+    /// ([`Self::decide_pair`]), so one wake asks nine times at most.
+    /// Admission can decide again at each wake.
     pub(crate) async fn place_pair(
         &self,
         ask: &Ask<'_>,
@@ -777,8 +775,9 @@ impl Host {
         })
     }
 
-    /// Full prefills are excluded for up to two more asks at this wake.
-    /// The next wake can use them again if load has fallen.
+    /// One pass of a pair's decision: full prefills are excluded for up to
+    /// two more asks of the pass. The next wake can use them again if load
+    /// has fallen.
     async fn decide_pair(
         &self,
         ask: &Ask<'_>,
@@ -797,7 +796,8 @@ impl Host {
                 let (Some(prefill), Some(decode)) = (prefill, decode) else {
                     continue;
                 };
-                if can_send(prefill.as_ref()) && can_send(decode.as_ref()) {
+                if routable_but_for_veto(prefill.as_ref()) && routable_but_for_veto(decode.as_ref())
+                {
                     if !admission.reads_full(prefill) {
                         return Ok(asked);
                     }
@@ -830,7 +830,7 @@ impl Host {
                 WorkerType::Decode => &mut decode,
                 WorkerType::Regular | WorkerType::Encode => continue,
             };
-            *found = *found || can_send(worker.as_ref());
+            *found = *found || routable_but_for_veto(worker.as_ref());
             if prefill && decode {
                 return None;
             }
@@ -1052,7 +1052,7 @@ impl Placed {
             };
             let Some(worker) = host
                 .worker(pair.decode_id)
-                .filter(|worker| can_send(worker.as_ref()))
+                .filter(|worker| routable_but_for_veto(worker.as_ref()))
             else {
                 continue;
             };
