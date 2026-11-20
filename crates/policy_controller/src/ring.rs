@@ -22,13 +22,16 @@
 //! ring holds, which is what a ring per model answers.
 //!
 //! Under the prefix form ([`ConsistentHash::keyed_by_prefix`]) a request
-//! with no routing key is keyed by its prefix: the hash of its last whole
-//! block at or under the form's depth in tokens. A block hash names the
-//! prefix that ends with its block, so the key is one read and requests that
-//! share that much of a prompt share an owner. The depth counts in the
-//! blocks the request was hashed by, text windows at four characters a token
-//! under the text kind. A request that carries no whole block has no key,
-//! and the tokens past a request's last whole block are not in its key.
+//! with no routing key is keyed by its prefix: the fold of its block
+//! hashes, from the first through its last whole block at or under the
+//! form's depth in tokens, started at its cache namespace
+//! ([`fold_block`]). A block hash is of its own block's content, so the fold
+//! is what names the prefix: requests that share that much of a prompt
+//! share an owner, and two that differ anywhere in it do not. It is the key
+//! the sent-prefix predictor keeps that prefix under. The depth counts in
+//! the blocks the request was hashed by, text windows at four characters a
+//! token under the text kind. A request that carries no whole block has no
+//! key, and the tokens past a request's last whole block are not in its key.
 //!
 //! Under the view's boundaries the prefix is keyed at the deepest boundary
 //! the request reaches, and the form's depth serves a request that reaches
@@ -55,7 +58,7 @@ use crate::{
     framework::{Scorer, TieBand, DRAW_BOUND},
     lease::{Lifecycle, Membership},
     spec::{BoundedLoadParams, Needs},
-    view::{Candidate, PoolFacts, RequestFacts, WorkerId},
+    view::{fold_block, Candidate, PoolFacts, RequestFacts, WorkerId},
     Draw,
 };
 
@@ -576,17 +579,27 @@ const FREE: u32 = u32::MAX;
 /// The member was ranked already.
 const TAKEN: u32 = 1 << 30;
 
-/// The key of a request's prefix at a depth of `tokens`: the hash of its
-/// last whole block at or under that depth, `0` where it carries no block
-/// that shallow. A request shorter than the depth is keyed at its own last
-/// whole block, and so is one whose hashes the host capped short of the
-/// depth.
+/// The key of a request's prefix at a depth of `tokens`: the fold of its
+/// block hashes through its last whole block at or under that depth, `0`
+/// where it carries no block that shallow. A request shorter than the
+/// depth is keyed at its own last whole block, and so is one whose hashes
+/// the host capped short of the depth.
 fn prefix_key(tokens: u32, gates: Gates, facts: &RequestFacts<'_>) -> u64 {
     let depth = gates.whole_blocks(tokens, facts) as usize;
-    depth
-        .min(facts.block_hashes.len())
-        .checked_sub(1)
-        .map_or(0, |last| facts.block_hashes[last])
+    match depth.min(facts.block_hashes.len()) {
+        0 => 0,
+        blocks => folded(facts, blocks),
+    }
+}
+
+/// The key of the request's first `blocks` blocks, one at least, which it
+/// carries: the fold of their hashes under its cache namespace
+/// ([`fold_block`]), one multiplication a block.
+// Out of line: a request with nothing to hash carries no part of the loop.
+#[inline(never)]
+fn folded(facts: &RequestFacts<'_>, blocks: usize) -> u64 {
+    let hashes = facts.block_hashes[..blocks].iter();
+    hashes.fold(facts.namespace_seed, |key, &hash| fold_block(key, hash))
 }
 
 /// The prefix form of the ring: how a request with no routing key is keyed.
@@ -602,18 +615,20 @@ struct Prefix {
 }
 
 impl Prefix {
-    /// The request's prefix at `boundary`, where it reaches it: the hash of
-    /// the boundary's last whole block. A request reaches a boundary by
-    /// carrying that block.
+    /// The request's prefix at `boundary`, where it reaches it: the fold
+    /// through the boundary's last whole block ([`folded`]), made when the
+    /// boundary's turn comes. A request reaches a boundary by carrying
+    /// that block.
     fn at(&self, boundary: u32, facts: &RequestFacts<'_>) -> Option<u64> {
         let blocks = self.gates.whole_blocks(boundary, facts) as usize;
-        facts.block_hashes.get(blocks.checked_sub(1)?).copied()
+        let reached = blocks != 0 && blocks <= facts.block_hashes.len();
+        reached.then(|| folded(facts, blocks))
     }
 }
 
 /// The keys a decision is tried at, in order: a routing key alone, or under
 /// the prefix form the request's prefix at each boundary it reaches, the
-/// deepest first, and at the form's depth when it reaches none. A hash of
+/// deepest first, and at the form's depth when it reaches none. A fold of
 /// zero is no key. One decision walks them, and only past a passed owner,
 /// so the walk reads a boundary when its turn comes and holds no list.
 struct Keys<'a> {
@@ -706,8 +721,9 @@ impl ConsistentHash {
 
     /// The prefix form: a request with no routing key is keyed by its
     /// prefix, at the block size `gates` reads for the request. The key is
-    /// the hash of its last whole block at the deepest of `boundaries` it
-    /// reaches, and at or under `tokens` when it reaches none.
+    /// the fold of its block hashes through its last whole block at the
+    /// deepest of `boundaries` it reaches, and at or under `tokens` when
+    /// it reaches none.
     #[must_use]
     pub fn keyed_by_prefix(mut self, tokens: u32, gates: Gates, boundaries: &[u32]) -> Self {
         self.prefix = Some(Prefix {
@@ -1751,23 +1767,30 @@ mod tests {
         }
     }
 
+    /// The key of a prefix of these blocks under no cache namespace, as
+    /// the ring folds it.
+    fn through(hashes: &[u64]) -> u64 {
+        hashes.iter().fold(0, |key, &hash| fold_block(key, hash))
+    }
+
     fn prefixed(tokens: u32) -> ConsistentHash {
         ConsistentHash::new(None).keyed_by_prefix(tokens, Gates::default(), &[])
     }
 
     #[test]
-    fn the_prefix_key_is_the_last_whole_block_at_or_under_the_depth() {
+    fn the_prefix_key_folds_the_blocks_through_the_last_whole_one_under_the_depth() {
         let hashes = [11, 22, 33, 44, 55, 66];
         let gates = Gates::default();
+        let key = |tokens: u32| prefix_key(tokens, gates, &hashed(&hashes));
         // Blocks of 16 tokens: a depth of 64 tokens ends with the fourth
-        // block, and a depth inside a block keys on the block before it.
-        assert_eq!(prefix_key(64, gates, &hashed(&hashes)), 44);
-        assert_eq!(prefix_key(79, gates, &hashed(&hashes)), 44);
-        assert_eq!(prefix_key(80, gates, &hashed(&hashes)), 55);
-        // A request shorter than the depth keys on its own last block. A
-        // request with no whole block has no key, and neither has a depth
-        // under one block.
-        assert_eq!(prefix_key(256, gates, &hashed(&hashes)), 66);
+        // block, and a depth inside a block ends with the block before it.
+        assert_eq!(key(64), through(&hashes[..4]));
+        assert_eq!(key(79), through(&hashes[..4]));
+        assert_eq!(key(80), through(&hashes[..5]));
+        // A request shorter than the depth is keyed through its own last
+        // block. A request with no whole block has no key, and neither
+        // has a depth under one block.
+        assert_eq!(key(256), through(&hashes));
         assert_eq!(prefix_key(256, gates, &hashed(&[])), 0);
         assert_eq!(prefix_key(15, gates, &hashed(&hashes)), 0);
         // The block size the request was counted with leads the view's.
@@ -1775,7 +1798,7 @@ mod tests {
             block_size: 32,
             ..hashed(&hashes)
         };
-        assert_eq!(prefix_key(64, gates, &learned), 22);
+        assert_eq!(prefix_key(64, gates, &learned), through(&hashes[..2]));
         // Under the text kind the depth is in windows at four characters a
         // token: 64 tokens are 256 characters, sixteen windows of sixteen.
         let windows: Vec<u64> = (1..=20).collect();
@@ -1783,7 +1806,49 @@ mod tests {
             hash_kind: crate::view::HashKind::Text,
             ..hashed(&windows)
         };
-        assert_eq!(prefix_key(64, gates, &text), 16);
+        assert_eq!(prefix_key(64, gates, &text), through(&windows[..16]));
+    }
+
+    /// A key names its whole prefix. Two requests that differ in their
+    /// first block alone and share every block behind it take two keys, at
+    /// the depth and at a boundary: nothing one prompt left in a cache
+    /// serves the other. Equal prefixes take one key under any tail, and
+    /// the same blocks in another cache namespace are another prefix.
+    #[test]
+    fn requests_that_differ_in_their_first_block_alone_take_two_keys() {
+        let one = [11, 22, 33, 44, 55];
+        let other = [12, 22, 33, 44, 55];
+        let tailed = [11, 22, 33, 44, 99, 77];
+        let gates = Gates::default();
+        let at_depth = |hashes: &[u64]| prefix_key(64, gates, &hashed(hashes));
+        assert_ne!(at_depth(&one), at_depth(&other));
+        assert_eq!(at_depth(&one), at_depth(&tailed));
+        // The boundary at 64 tokens ends with the fourth block.
+        let scorer = levelled(None);
+        let at_boundary = |hashes: &[u64]| keys_of(&scorer, &hashed(hashes));
+        assert_ne!(at_boundary(&one), at_boundary(&other));
+        assert_eq!(at_boundary(&one), at_boundary(&tailed));
+        let apart = RequestFacts {
+            namespace_seed: 9,
+            ..hashed(&one)
+        };
+        assert_ne!(prefix_key(64, gates, &apart), at_depth(&one));
+        assert_ne!(keys_of(&scorer, &apart), at_boundary(&one));
+    }
+
+    /// The ring's key of a prefix is the key the sent-prefix predictor
+    /// keeps that prefix under: one fold, one number.
+    #[test]
+    fn a_prefix_has_one_key_on_the_ring_and_in_the_predictor() {
+        let hashes = [11, 22, 33, 44, 55, 66];
+        let facts = RequestFacts {
+            namespace_seed: 9,
+            ..hashed(&hashes)
+        };
+        let mut keys = Vec::new();
+        crate::predictor::Predictor::fold_into(&mut keys, facts.namespace_seed, &hashes);
+        assert_eq!(prefix_key(64, Gates::default(), &facts), keys[3]);
+        assert_eq!(keys_of(&levelled(None), &facts), [keys[3]]);
     }
 
     #[test]
@@ -1797,10 +1862,11 @@ mod tests {
         let owner = leader(&scores);
         assert_eq!(scores[owner], 1.0);
         assert_eq!(leader(&scored(&scorer, &hashed(&other), &pool)), owner);
-        // The key is the block's hash: a routing key of that value has the
-        // same owner under the plain form.
+        // The key is the fold of the four blocks: a routing key of that
+        // value has the same owner under the plain form.
         let plain = ConsistentHash::new(None);
-        assert_eq!(leader(&scored(&plain, &keyed(44), &pool)), owner);
+        let key = through(&one[..4]);
+        assert_eq!(leader(&scored(&plain, &keyed(key), &pool)), owner);
     }
 
     #[test]
@@ -2005,7 +2071,7 @@ mod tests {
             };
             // The blocks a host is told to hash give the key the whole
             // list gives, and one block fewer gives another: the last one
-            // told is the block the key reads.
+            // told is the block the key ends with.
             let key = prefix_key(256, gates, &handed(hashes.len()));
             let told = prefix_key(256, gates, &handed(read));
             let short = prefix_key(256, gates, &handed(read - 1));
@@ -2084,18 +2150,22 @@ mod tests {
         // Blocks of 16 tokens: the boundaries end with the 16th block and
         // with the 4th. A request that reaches both is tried at both, and
         // one that reaches the shallower alone is tried there.
-        assert_eq!(keys_of(&scorer, &hashed(&hashes)), [16, 4]);
-        assert_eq!(keys_of(&scorer, &hashed(&hashes[..15])), [4]);
-        assert_eq!(keys_of(&scorer, &hashed(&hashes[..4])), [4]);
+        let (deep, shallow) = (through(&hashes[..16]), through(&hashes[..4]));
+        assert_eq!(keys_of(&scorer, &hashed(&hashes)), [deep, shallow]);
+        assert_eq!(keys_of(&scorer, &hashed(&hashes[..15])), [shallow]);
+        assert_eq!(keys_of(&scorer, &hashed(&hashes[..4])), [shallow]);
         // A request that reaches no boundary is keyed at the form's depth,
         // at its own last whole block when it is shorter. A request that
         // reaches a boundary is not keyed at the depth: 128 tokens end with
         // the 8th block.
-        assert_eq!(keys_of(&scorer, &hashed(&hashes[..3])), [3]);
+        assert_eq!(
+            keys_of(&scorer, &hashed(&hashes[..3])),
+            [through(&hashes[..3])]
+        );
         assert!(keys_of(&scorer, &hashed(&[])).is_empty());
         // A boundary under one block is reached by no request.
         let thin = ConsistentHash::new(None).keyed_by_prefix(128, Gates::default(), &[8, 64]);
-        assert_eq!(keys_of(&thin, &hashed(&hashes)), [4]);
+        assert_eq!(keys_of(&thin, &hashed(&hashes)), [shallow]);
         // A routing key stands alone, and without the form nothing else
         // keys a request.
         let routed = RequestFacts {
@@ -2111,7 +2181,7 @@ mod tests {
             hash_kind: crate::view::HashKind::Text,
             ..hashed(&hashes)
         };
-        assert_eq!(keys_of(&scorer, &text), [16]);
+        assert_eq!(keys_of(&scorer, &text), [deep]);
     }
 
     #[test]
@@ -2119,16 +2189,20 @@ mod tests {
         let pool: Vec<Candidate> = (0..4).map(|i| candidate(i, 0)).collect();
         let plain = ConsistentHash::new(None);
         let ranks = |key: u64| scored(&plain, &keyed(key), &pool);
-        // Two block hashes that two workers own: the request's 16th block
-        // and its 4th.
-        let deep = 7;
-        let shallow = (8..)
-            .find(|&key| leader(&ranks(key)) != leader(&ranks(deep)))
-            .expect("a key another worker owns");
+        // A request whose two boundaries' keys two workers own: the fold
+        // through its 16th block, and the fold through its 4th.
+        let blocks = |last: u64| {
+            let mut hashes = [100u64; 16];
+            hashes[15] = last;
+            hashes
+        };
+        let shallow = through(&blocks(0)[..4]);
+        let hashes = (1..)
+            .map(blocks)
+            .find(|hashes| leader(&ranks(through(hashes))) != leader(&ranks(shallow)))
+            .expect("a sixteenth block that hands the deep key to another worker");
+        let deep = through(&hashes);
         let (deep_owner, shallow_owner) = (leader(&ranks(deep)), leader(&ranks(shallow)));
-        let mut hashes = [100u64; 16];
-        hashes[15] = deep;
-        hashes[3] = shallow;
         let under = |scorer: &ConsistentHash, deep_load: u32, shallow_load: u32| {
             let mut pool = pool.clone();
             pool[deep_owner].in_flight = deep_load;

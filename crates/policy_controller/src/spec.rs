@@ -2518,10 +2518,10 @@ fn depth_edge(
     }
 }
 
-/// A consistent-hash stage's prefix depths against the view. A key is the
-/// last whole block at or under its depth, so `prefix_tokens` and each of
-/// the view's boundaries hold at least one block and no more blocks than a
-/// request carries.
+/// A consistent-hash stage's prefix depths against the view. A key ends
+/// with the last whole block at or under its depth, so `prefix_tokens` and
+/// each of the view's boundaries hold at least one block and no more blocks
+/// than a request carries.
 fn check_prefix_depth(
     stage: &ScoreStage,
     gates: Gates,
