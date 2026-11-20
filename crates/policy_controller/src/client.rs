@@ -9,7 +9,8 @@
 //! [`Client`] is the reference client. It asks for a decision one request at
 //! a time ([`Client::decide`]). [`Link`] shares the session and one decide
 //! stream across a host's requests and releases the leases of a decision
-//! its caller never takes. The host makes its own fallback decisions.
+//! its caller never takes. [`Handle::asked`](crate::handle::Handle::asked)
+//! holds a linked decision and sends its reports on that session.
 //!
 //! A watch of the controller's workers opens on either client's channel
 //! ([`Client::watch_workers`], [`Link::watch_workers`]). Once open it has
@@ -71,6 +72,10 @@ use crate::{
 };
 
 mod link;
+pub(crate) mod wire;
+
+#[cfg(test)]
+pub(crate) use link::tests::{poll, Peer};
 pub use link::{Full, Link, Unanswered};
 
 /// Frames the client may queue toward the controller.
@@ -169,13 +174,17 @@ pub enum Error {
     /// ([`Link::report`]).
     #[error("the link's report queue was full")]
     ReportsFull,
+    /// A watch was asked of a link that had ended. [`Link::ended`] gives
+    /// the cause.
+    #[error("the link has ended")]
+    LinkEnded,
     /// The decide stream has no credit left: the gateway decides this
     /// request itself. Nothing was sent, and the stream stands.
     #[error("the decide stream has no credit left: the gateway decides this request itself")]
     NoCredit,
-    /// The decide stream answered an ask with a frame that is no answer
-    /// to it: one that names another request's id, or carries no answer
-    /// this client reads. The stream is dropped.
+    /// The decide stream answered an ask with no usable decision. The
+    /// reference client drops its stream on a mismatched id or missing
+    /// answer. A handle that cannot read its decision gives back its leases.
     #[error("the decide stream answered an ask with no answer to it: {0}")]
     NoDecision(String),
     /// The blocking form could not build its runtime.

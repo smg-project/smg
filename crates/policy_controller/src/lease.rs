@@ -59,8 +59,8 @@ pub struct Lease {
     /// lease, and the worker it moved to behind one. A stage that books at
     /// the issue reads it at the dispatch ([`Lifecycle::on_dispatched`]),
     /// where `target_index` names the target the dispatch took.
-    /// `WorkerId(0)` where a host names none. In-process only: no contract
-    /// carries it.
+    /// `WorkerId(0)` where a host names none. A controller answer gives
+    /// the worker by `target_index` into its pick.
     pub booked: WorkerId,
     pub generation: u64,
     /// The request's session ([`crate::RequestFacts::session`]: its key
@@ -68,9 +68,7 @@ pub struct Lease {
     /// request, whatever rule governed it, so the commit moves that
     /// session's pins and a sticky in-flight cap counts per session per
     /// worker from leases; [`Session::NONE`] when the request carried no
-    /// key. The wire carries [`Session::get`], in the field both contracts
-    /// still spell `session_key`: the change that first reads a lease from
-    /// the wire renames it in both.
+    /// key. The wire carries [`Session::get`] in its `session_key` field.
     pub session: Session,
     /// What the decision did with the session key, copied from its pick, so
     /// the commit moves the key's pins by its own decision alone.

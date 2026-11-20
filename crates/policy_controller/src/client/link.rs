@@ -46,8 +46,8 @@ pub struct Link {
     shared: Arc<Shared>,
 }
 
-/// Why an ask has no decision from the controller. The host decides the
-/// request itself.
+/// Why an ask has no usable decision from the controller. The host can
+/// decide the request itself.
 #[derive(Debug)]
 pub enum Unanswered {
     /// The stream holds no credit. Nothing was sent.
@@ -63,8 +63,8 @@ pub enum Unanswered {
     /// The link ended or the request queue closed. [`Link::ended`] tells
     /// the cause once the link has ended.
     Ended,
-    /// The request's id, its size or a field out of its range prevents
-    /// sending it. Nothing was sent, and the link stands.
+    /// The request could not be sent, or a handle could not read the
+    /// decision it got back. An unread decision's leases are released as late.
     Unsent(Error),
 }
 
@@ -129,8 +129,23 @@ impl Link {
     ///
     /// The watch can outlive the link. Wait for [`Self::closed`] alongside
     /// [`Watch::next`] to stop following it when the link ends.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::LinkEnded`] where the link had ended: it lets its channel
+    /// go at its end, and nothing is dialed. Otherwise what the open
+    /// answers.
     pub async fn watch_workers(&self, request: WatchWorkersRequest) -> Result<Watch, Error> {
-        let mut stub = self.shared.stub.clone();
+        let stub = self
+            .shared
+            .state
+            .lock()
+            .open
+            .as_ref()
+            .map(|open| open.stub.clone());
+        let Some(mut stub) = stub else {
+            return Err(Error::LinkEnded);
+        };
         Watch::open(&mut stub, request, ANSWER_WAIT).await
     }
 
@@ -186,6 +201,11 @@ impl Link {
     pub fn report(&self, frame: gateway_frame::Frame) -> Result<(), Full> {
         self.shared.report(frame)
     }
+
+    /// Gives back the leases of a decision its host could not read.
+    pub(crate) fn release_late(&self, decision: Decision) {
+        self.shared.release(decision);
+    }
 }
 
 /// The ranges the controller's check reads in a request's facts, by that
@@ -202,7 +222,6 @@ fn in_range(request: &DecideRequest) -> Result<(), Error> {
 
 #[derive(Debug)]
 struct Shared {
-    stub: Stub,
     state: Mutex<State>,
     stopped: watch::Receiver<()>,
 }
@@ -230,6 +249,9 @@ impl State {
 
 #[derive(Debug)]
 struct Open {
+    // The link's channel, kept for a watch opened on it. It leaves with
+    // the queues, so an ended link holds no connection open.
+    stub: Stub,
     reports: mpsc::Sender<gateway_frame::Frame>,
     // Every queued request has spent credit. A grant can exceed the
     // welcome's window, so the queue has no separate limit.
@@ -265,10 +287,10 @@ impl Shared {
     ) -> Arc<Self> {
         let (stop, stopped) = watch::channel(());
         Arc::new(Self {
-            stub,
             state: Mutex::new(State {
                 floor,
                 open: Some(Open {
+                    stub,
                     reports,
                     requests,
                     credit: 0,
@@ -492,7 +514,8 @@ impl Shared {
             let frame = gateway_frame::Frame::Released(Released {
                 what: Some(released::What::LeaseId(lease.id)),
                 reason: released::Reason::LateDecision.into(),
-                side: lease.side,
+                // An unknown side gives back the whole lease.
+                side: lease.side().into(),
             });
             if self.report(frame).is_err() {
                 // The controller's session grace covers leases still on file.
@@ -522,7 +545,7 @@ impl Drop for Pending<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::{
         future::Future,
         pin::Pin,
@@ -549,17 +572,17 @@ mod tests {
     /// One change of a request's facts.
     type Edit = fn(&mut RequestFacts);
 
-    struct Peer {
-        link: Link,
-        reports: Pin<Box<dyn Stream<Item = GatewayFrame>>>,
-        requests: Pin<Box<dyn Stream<Item = DecideRequest>>>,
+    pub(crate) struct Peer {
+        pub(crate) link: Link,
+        pub(crate) reports: Pin<Box<dyn Stream<Item = GatewayFrame>>>,
+        pub(crate) requests: Pin<Box<dyn Stream<Item = DecideRequest>>>,
         controller: Option<mpsc::UnboundedSender<Result<ControllerFrame, Status>>>,
         decide: Option<mpsc::UnboundedSender<Result<DecideAnswer, Status>>>,
         readers: [JoinHandle<()>; 2],
     }
 
     impl Peer {
-        fn new(window: u32) -> Self {
+        pub(crate) fn new(window: u32) -> Self {
             Self::over(window, Endpoint::from_static("http://127.0.0.1:1"))
         }
 
@@ -594,7 +617,7 @@ mod tests {
             }
         }
 
-        fn controller(&self, term: u64, frame: Option<controller_frame::Frame>) {
+        pub(crate) fn controller(&self, term: u64, frame: Option<controller_frame::Frame>) {
             self.controller
                 .as_ref()
                 .expect("the controller stream is open")
@@ -606,7 +629,7 @@ mod tests {
                 .expect("the session reader takes the frame");
         }
 
-        fn answer(&self, id: u8, term: u64, answer: decide_answer::Answer) {
+        pub(crate) fn answer(&self, id: u8, term: u64, answer: decide_answer::Answer) {
             self.decide
                 .as_ref()
                 .expect("the decide stream is open")
@@ -632,7 +655,7 @@ mod tests {
             .await;
         }
 
-        async fn read_hello(&mut self) {
+        pub(crate) async fn read_hello(&mut self) {
             let first = within(self.reports.next()).await.expect("the hello");
             assert_eq!((first.seq, first.term_floor), (1, LEADER_TERM));
             assert!(matches!(first.frame, Some(gateway_frame::Frame::Hello(_))));
@@ -649,7 +672,7 @@ mod tests {
         timeout(WAIT, future).await.expect("the wait ends in time")
     }
 
-    fn poll<T>(future: Pin<&mut impl Future<Output = T>>) -> Poll<T> {
+    pub(crate) fn poll<T>(future: Pin<&mut impl Future<Output = T>>) -> Poll<T> {
         future.poll(&mut Context::from_waker(Waker::noop()))
     }
 
@@ -1168,6 +1191,41 @@ mod tests {
             "{opened:?}"
         );
         assert!(peer.link.stands());
+    }
+
+    /// An ended link holds no channel. The connection its channel made
+    /// closes at the link's end though a clone of the link still stands,
+    /// and a watch asked of the ended link is refused with no dial.
+    #[tokio::test]
+    async fn an_ended_link_lets_its_channel_go_and_refuses_a_watch() {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a listener that answers nothing");
+        let address = listener.local_addr().expect("the listener's address");
+        let endpoint = Endpoint::from_shared(format!("http://{address}")).expect("a URI");
+        let peer = Peer::over(1, endpoint);
+        let link = peer.link.clone();
+        // The first call on the channel dials it. The listener takes the
+        // connection and answers nothing, so the call is left once the
+        // connection stands.
+        let (accepted, unanswered) = {
+            let open = pin!(link.watch_workers(WatchWorkersRequest::default()));
+            tokio::join!(listener.accept(), timeout(Duration::from_millis(200), open))
+        };
+        assert!(unanswered.is_err(), "the listener answers nothing");
+        let (mut connection, _) = accepted.expect("the channel dialed the listener");
+
+        closes(&link, || peer.controller(LEADER_TERM - 1, None)).await;
+        let mut sent = Vec::new();
+        let closed = timeout(WAIT, connection.read_to_end(&mut sent)).await;
+        assert!(
+            closed.is_ok(),
+            "the connection stays open behind an ended link"
+        );
+        let refused = link.watch_workers(WatchWorkersRequest::default()).await;
+        assert!(matches!(refused, Err(Error::LinkEnded)), "{refused:?}");
     }
 
     #[tokio::test]

@@ -44,9 +44,9 @@
 //! dropped at the check, so a frame that waits in a queue holds none.
 //!
 //! A pick's answer carries the lease its decider had the store file for it
-//! ([`decided`]): one a decision, minted under the answer's term, a credit
-//! on the pick's first target, with the time its gateway has to name the
-//! dispatch. A shed and a queue ticket carry none.
+//! ([`decided`]), with the time its gateway has to name the dispatch.
+//! A pair carries two sides under one id, prefill first. A shed and a
+//! queue ticket carry no lease.
 
 use std::{
     mem,
