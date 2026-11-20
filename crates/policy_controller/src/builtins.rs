@@ -1239,31 +1239,32 @@ impl SinceReport {
     /// reflects them, or a time limit ends them. An instant that reaches
     /// none of them reads the word alone. Inlined into a reader's row
     /// loop: two loads and a compare a row, the release behind a call
-    /// that hands the count back, so the loop keeps nothing of the row
-    /// across it.
+    /// that hands the held word back, so the loop keeps nothing of the
+    /// row across it.
     #[inline(always)]
     pub(crate) fn credit_through(&self, through_micros: u64) -> (u64, u64) {
         if self.reaches(through_micros) {
-            let (held, _) = self.release_through(through_micros);
-            return Self::credit_of(held);
+            return Self::credit_of(self.release_through(through_micros));
         }
         self.held_credit()
     }
 
     /// [`Self::credit_through`] with the count of the held dispatches of
-    /// no tokens: a third load.
+    /// no tokens: a third load. The held word is loaded with `Acquire`,
+    /// against the `Release` of a release's and a retirement's
+    /// subtraction: the count is read as it stood at that write or later,
+    /// so no read finds more dispatches of no tokens than dispatches
+    /// across a release, on any target.
     #[inline(always)]
     pub(crate) fn sent_through(&self, through_micros: u64) -> Sent {
-        let (held, unsized_held) = if self.reaches(through_micros) {
-            self.release_through(through_micros)
-        } else {
-            self.words()
-        };
-        let (tokens, requests) = Self::credit_of(held);
+        if self.reaches(through_micros) {
+            self.release_through(through_micros);
+        }
+        let held = self.held.load(Ordering::Acquire);
         Sent {
-            requests: requests as u32,
-            tokens,
-            unsized_requests: u32::from(unsized_held),
+            requests: (held & REQUEST_MASK) as u32,
+            tokens: held >> REQUEST_BITS,
+            unsized_requests: u32::from(self.unsized_held.load(Ordering::Relaxed)),
         }
     }
 
@@ -1286,29 +1287,17 @@ impl SinceReport {
         (held >> REQUEST_BITS, held & REQUEST_MASK)
     }
 
-    /// The count's two words: the held word, then the count of the held
-    /// dispatches of no tokens. The held word is loaded with `Acquire`,
-    /// against the `Release` of a release's and a retirement's
-    /// subtraction: the count is read as it stood at that write or later,
-    /// so no read finds more dispatches of no tokens than dispatches
-    /// across a release, on any target.
-    #[inline(always)]
-    fn words(&self) -> (u64, u16) {
-        let held = self.held.load(Ordering::Acquire);
-        (held, self.unsized_held.load(Ordering::Relaxed))
-    }
-
     /// Releases every lane's dispatches made at or before the sample and
     /// recomputes the row's oldest, under every lane's lock in lane order,
     /// so no dispatch lands between the lanes' reads and the store. Hands
-    /// back the count's two words as they stand once the locks are free.
-    /// Out of line: a decision reads a row far more often than a report
-    /// releases from it, and with this body inlined the read was too
-    /// large to stay in a second scorer's row loop. A read that takes its
-    /// numbers from the answer keeps nothing of the row across the call.
+    /// back the held word as it stands once the locks are free: a read of
+    /// two numbers takes them from it and keeps nothing of the row across
+    /// the call. Out of line: a decision reads a row far more often than
+    /// a report releases from it, and with this body inlined the read was
+    /// too large to stay in a second scorer's row loop.
     #[cold]
     #[inline(never)]
-    fn release_through(&self, sampled_at_micros: u64) -> (u64, u16) {
+    fn release_through(&self, sampled_at_micros: u64) -> u64 {
         let mut held_lanes = self.lock_lanes();
         // No dispatch lands under every lane's lock, so the count of the
         // held dispatches of no tokens stands still here: a row that
@@ -1334,10 +1323,10 @@ impl SinceReport {
             .min()
             .unwrap_or(u64::MAX);
         self.oldest_micros.store(oldest, Ordering::Release);
-        // Loaded behind the locks, as a reader's own loads are: under
-        // them the two values would be carried across the unlocking.
+        // Loaded behind the locks, as a reader's own load is: under them
+        // the value would be carried across the unlocking.
         drop(held_lanes);
-        self.words()
+        self.held.load(Ordering::Relaxed)
     }
 
     /// The release of a row that holds a dispatch of no tokens: each one
@@ -2440,7 +2429,7 @@ impl ResidentWork {
     #[cold]
     #[inline(never)]
     fn release(&self, since: &SinceReport, row: &Candidate) -> (u64, u64) {
-        let (held, _) = since.release_through(row.load_sampled_at_micros);
+        let held = since.release_through(row.load_sampled_at_micros);
         if since.keeps_before(row.load_sampled_at_micros) {
             self.settle(None, since, row, Slot::NONE);
         }

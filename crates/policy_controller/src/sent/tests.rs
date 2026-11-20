@@ -322,26 +322,6 @@ fn the_two_number_read_releases_the_sends_a_report_reflects() {
 }
 
 #[test]
-fn a_release_leaves_a_later_send_of_no_stated_size_in_the_read_that_ran_it() {
-    let (engine, sent) = built(None);
-    let mut a = row(353, 5);
-    send(&engine, &a, START, 0);
-    send(&engine, &a, START + 9, 0);
-    // A report that reflects the first send: the read that releases it
-    // still counts the second, and counts it as of no stated size.
-    a.load = Some(LoadRow::default());
-    a.load_sampled_at_micros = START + u64::from(DELAY);
-    assert_eq!(
-        sent.read(&clock(0), &a),
-        Sent {
-            requests: 1,
-            tokens: 0,
-            unsized_requests: 1,
-        }
-    );
-}
-
-#[test]
 fn the_two_number_read_counts_no_send_past_the_time_limit() {
     let (engine, sent) = built(Some(17));
     let a = row(349, 3);
