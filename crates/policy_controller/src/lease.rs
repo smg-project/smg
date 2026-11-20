@@ -287,6 +287,11 @@ pub trait Lifecycle: Send + Sync {
     /// The engine issued `decision` under `lease`. Its host filed the
     /// lease as it issued it, in process as behind a served controller:
     /// the lease books its first target from here.
+    ///
+    /// A pair's decode side whose request asked for it later is not issued
+    /// with the pair, and no call here names it then. A decode call issues
+    /// it and is told here, where the lease's generation still stands. A
+    /// side no call issued is first heard at its dispatch.
     fn on_decision_issued(&self, _lease: &Lease, _decision: &Decision) {}
 
     /// The host dispatched to `target` (one of the decision's targets), on
@@ -295,7 +300,9 @@ pub trait Lifecycle: Send + Sync {
     /// decision a queue may have held. The untaken targets are released by
     /// the host's commit. The lease told names the target the dispatch
     /// took: its `target_index` is that target's index in the pick, and its
-    /// [`Lease::booked`] is still the worker its issue booked.
+    /// [`Lease::booked`] is still the worker its issue booked. A decode
+    /// side no call issued booked no worker before: this dispatch books the
+    /// target it names.
     fn on_dispatched(
         &self,
         _lease: &Lease,

@@ -1491,10 +1491,20 @@ pub(crate) fn told(
     store.call_faulted()
 }
 
+/// The engine that hears a lease's words under `spec`: the one of the
+/// generation the lease was issued under, where that generation still
+/// stands. A later generation's engine heard no issue of the lease and
+/// hears nothing of it: no dispatch, no end, and no issue of a side a call
+/// decides later.
+#[inline]
+fn issuing<'a>(spec: &'a AppliedSpec, lease: &Lease) -> Option<&'a Engine> {
+    (spec.generation() == lease.generation).then(|| spec.engine())
+}
+
 /// What [`told`] tells, under its catch.
 fn tell(store: &MemoryStore, world: &World, found: &Sides, said: Said) {
     let spec = world.spec();
-    let issuing = || (spec.generation() == found.record.lease.generation).then(|| spec.engine());
+    let issuing = || issuing(spec, &found.record.lease);
     match said {
         Said::Dispatched(dispatch, at) => {
             // The side the frame names: its lease, and its worker at
@@ -1797,6 +1807,13 @@ trait Stated {
     /// The model the request is for. The door takes its seat by it, ahead
     /// of the load.
     fn model(&self) -> &str;
+    /// The seat the request decides at, where it names one
+    /// ([`Called`]). `None` for a request that decides at its caller's
+    /// own seat: every request but a decode call.
+    #[inline(always)]
+    fn own_seat(&self) -> Option<usize> {
+        None
+    }
     /// Hands `order` the request as it stands under `world`.
     fn under<R>(&self, world: &World, order: impl FnOnce(&Request<'_>) -> R) -> R;
 }
@@ -1811,6 +1828,29 @@ impl Stated for Request<'_> {
     #[inline(always)]
     fn under<R>(&self, _: &World, order: impl FnOnce(&Request<'_>) -> R) -> R {
         order(self)
+    }
+}
+
+/// A decode call's request with the seat of its lease's file. The call
+/// decides at that seat, behind the decision that stands there: a caller
+/// that takes up a seat's work applies what was handed to its file, so a
+/// prefill's dispatch that waits there is applied ahead of the call's read.
+/// From another seat the call would read a file that applies nothing while
+/// its own caller decides, and a sent prefill would read as not sent.
+struct Called<'r, 'q>(&'r Request<'q>, usize);
+
+impl Stated for Called<'_, '_> {
+    fn model(&self) -> &str {
+        self.0.facts.model
+    }
+
+    fn own_seat(&self) -> Option<usize> {
+        Some(self.1)
+    }
+
+    #[inline(always)]
+    fn under<R>(&self, _: &World, order: impl FnOnce(&Request<'_>) -> R) -> R {
+        order(self.0)
     }
 }
 
@@ -2210,6 +2250,12 @@ impl Door {
     /// A shed files nothing: the side stays chosen, and the host keeps the
     /// decode the first pick named.
     ///
+    /// The call decides at the seat of its lease's file, behind the
+    /// decision that stands there: a prefill's dispatch handed to that file
+    /// is applied ahead of the call's read. Under an engine that keeps its
+    /// deciders the call decides at its model's seat, which is the lease's
+    /// unless a reload turned the keeping on between the two decisions.
+    ///
     /// # Errors
     ///
     /// [`Refused::Decode`] says why the lease takes no decode side, and
@@ -2223,10 +2269,11 @@ impl Door {
     ) -> Result<Decided, Refused> {
         // The call mints no id: it spends no term and raises none.
         let term = self.term.load(Ordering::Relaxed);
+        let called = Called(request, self.store.file_of(lease));
         self.at_a_seat(
             term,
             gateway,
-            request,
+            &called,
             now,
             |world, at, _, taken, buffers| self.decode(world, at, taken, buffers, lease),
         )
@@ -2389,6 +2436,8 @@ impl Door {
         loop {
             let (at, mut slot) = if seen & KEEPS_DECIDERS != 0 {
                 self.home(request.model())
+            } else if let Some(at) = request.own_seat() {
+                (at, self.seats[at].slot.lock())
             } else {
                 self.seat()
             };
@@ -2723,9 +2772,16 @@ impl Door {
                 lease: None,
             });
         };
-        let engine = world.spec().engine();
+        let spec = world.spec();
         let lease = store
             .issue_decided_decode(taken.gateway, lease, side, slot, taken.now, |lease| {
+                // The lease keeps the generation of its first decision, and
+                // the engine of that generation alone hears its words
+                // ([`issuing`]). Behind a reload the engine of this instant
+                // decided the side and hears nothing of the lease.
+                let Some(engine) = issuing(spec, lease) else {
+                    return;
+                };
                 // The side is on file by now. A stage that panics while it
                 // hears of the issue is held and counted, as under a
                 // report: the host still gets the pick the file holds.
@@ -2853,7 +2909,15 @@ pub(crate) mod tests {
         prefills: usize,
         decodes: usize,
     ) -> Result<Arc<MemoryStore>, Box<dyn Error>> {
-        let store = MemoryStore::new();
+        pair_fleet_over(MemoryStore::new(), prefills, decodes)
+    }
+
+    /// [`pair_fleet`] over `store`.
+    fn pair_fleet_over(
+        store: MemoryStore,
+        prefills: usize,
+        decodes: usize,
+    ) -> Result<Arc<MemoryStore>, Box<dyn Error>> {
         for n in 0..prefills {
             member(&store, &format!("p{n}"), Role::Prefill);
         }
@@ -3924,6 +3988,160 @@ pub(crate) mod tests {
             (LeaseState::Dispatched { at: now }, workers[1])
         );
         assert_eq!(pair_counts(&store, workers), [1, 1]);
+    }
+
+    /// Applies the pair presets to `store` as `generation`, the decode side
+    /// picking through a stage that keeps every word it hears of leases in
+    /// `heard`: a stage hears the words of both sides.
+    fn hearing_pair(store: &MemoryStore, generation: u64, heard: &Arc<Mutex<Vec<&'static str>>>) {
+        #[derive(Debug)]
+        struct Hears(Arc<Mutex<Vec<&'static str>>>);
+
+        impl Lifecycle for Hears {
+            fn on_decision_issued(&self, _: &Lease, _: &Decision) {
+                self.0.lock().push("issued");
+            }
+
+            fn on_dispatched(&self, _: &Lease, _: &Target, _: Side, _: u32) {
+                self.0.lock().push("dispatched");
+            }
+
+            fn on_completed(&self, _: &Lease, _: &Outcome) {
+                self.0.lock().push("completed");
+            }
+
+            fn on_released(&self, _: &Lease, _: ReleaseReason) {
+                self.0.lock().push("released");
+            }
+        }
+
+        impl Picker for Hears {
+            fn name(&self) -> &'static str {
+                "hears-all"
+            }
+
+            fn pick(
+                &self,
+                facts: &RequestFacts<'_>,
+                rows: &[Candidate],
+                kept: &[u32],
+                scores: &[f32],
+                band: TieBand,
+                out: &mut Targets,
+            ) {
+                Best.pick(facts, rows, kept, scores, band, out);
+            }
+        }
+
+        let kept = Arc::clone(heard);
+        let mut catalog = Catalog::builtin();
+        let added = catalog.picker("hears-all", move || Box::new(Hears(Arc::clone(&kept))));
+        added.expect("a free picker name");
+        let mut document = PolicySpec::pair_presets("least_load", "least_load").expect("a spec");
+        document.generation = generation;
+        for profile in document.profiles.values_mut() {
+            profile.filter.clear();
+        }
+        let decode = document.profiles.get_mut("decode");
+        decode.expect("the decode profile").pick = "hears-all".into();
+        let digest = document.digest().expect("a digest");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+        let applied = store.apply(spec.expect("a valid spec"));
+        applied.expect("a later generation");
+    }
+
+    /// A reload between a pair's two decisions. The generation of the
+    /// call's instant decides the side, and its engine hears nothing of
+    /// the lease: an older engine heard the lease's issue. One rule says
+    /// which engine hears a lease's word, at the call as in the telling.
+    #[test]
+    fn a_decode_called_behind_a_reload_is_told_to_no_engine() {
+        let store = pair_fleet(1, 1).expect("a pair fleet");
+        let first = Arc::new(Mutex::new(Vec::new()));
+        hearing_pair(&store, 2, &first);
+        let door = Door::new(Arc::clone(&store));
+        let now = Instant::now();
+        let asked = later_request(b"pair");
+        let answer = door.decide(GATEWAY, &asked, now).expect("the pair");
+        let lease = answer.lease.expect("a lease").lease.id;
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+        assert_eq!(*first.lock(), ["issued", "dispatched"]);
+        let reloaded = Arc::new(Mutex::new(Vec::new()));
+        hearing_pair(&store, 3, &reloaded);
+        let answer = door.decide_decode(GATEWAY, &asked, lease, now);
+        let leased = answer.expect("a decode decision").lease;
+        assert_eq!(leased.map(|leased| leased.lease.side), Some(Side::Decode));
+        door.report(GATEWAY, lease, pair_dispatch(Side::Decode, now));
+        let gone = Said::Released(None, ReleaseReason::ClientGone);
+        door.report(GATEWAY, lease, gone);
+        assert!(store.sides(GATEWAY, lease).is_none());
+        assert_eq!(*reloaded.lock(), [""; 0]);
+        assert_eq!(*first.lock(), ["issued", "dispatched"]);
+    }
+
+    /// A decode call decides at the seat of its lease's file, behind the
+    /// decision that stands there. A prefill's dispatch handed while
+    /// another caller decided at that file waits for that caller, and the
+    /// call reads it as sent: from a free seat of its own it would read
+    /// the file as it stood and be refused.
+    #[test]
+    fn a_decode_call_decides_behind_what_waits_at_its_leases_file() {
+        struct Stands {
+            stood: mpsc::Sender<()>,
+            go: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl Maker for Stands {
+            fn model(&self) -> &str {
+                MODEL
+            }
+
+            fn make<'w>(&'w self, _: &'w World) -> Request<'w> {
+                self.stood.send(()).expect("the case waits for the seat");
+                let word = self.go.lock().recv_timeout(PATIENCE);
+                word.expect("the case sends the caller on");
+                request(b"held", 7)
+            }
+        }
+
+        let files = MemoryStore::new().with_deciders(2);
+        let store = pair_fleet_over(files, 1, 1).expect("a pair fleet of two files");
+        let door = Arc::new(Door::new(Arc::clone(&store)));
+        let now = Instant::now();
+        seated(0);
+        let answer = door.decide(GATEWAY, &later_request(b"pair"), now);
+        let lease = answer.expect("the pair").lease.expect("a lease").lease.id;
+        assert_eq!(store.file_of(lease), 0);
+        // Another caller decides at the lease's file and stands there.
+        let (stood, at_seat) = mpsc::channel();
+        let (word, go) = mpsc::channel();
+        let other = Arc::clone(&door);
+        let other = thread::spawn(move || {
+            seated(0);
+            let go = Mutex::new(go);
+            let held = other.decide_under(GATEWAY, &Stands { stood, go }, Instant::now());
+            held.is_ok()
+        });
+        at_seat.recv_timeout(PATIENCE).expect("the other caller");
+        // The prefill's dispatch is handed meanwhile and waits at the file.
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+        let prefill =
+            |store: &MemoryStore| store.sides(GATEWAY, lease).map(|sides| sides.record.state);
+        assert_eq!(prefill(&store), Some(LeaseState::ISSUED));
+        // The call comes from a thread whose own seat is free.
+        let (answered, answer) = mpsc::channel();
+        let caller = Arc::clone(&door);
+        let caller = thread::spawn(move || {
+            seated(1);
+            let decided = caller.decide_decode(GATEWAY, &later_request(b"pair"), lease, now);
+            let side = decided.map(|decided| decided.lease.map(|leased| leased.lease.side));
+            answered.send(side).ok();
+        });
+        let early = answer.recv_timeout(Duration::from_millis(100));
+        assert_eq!(early, Err(mpsc::RecvTimeoutError::Timeout));
+        word.send(()).expect("the other caller waits");
+        assert_eq!(answer.recv_timeout(PATIENCE), Ok(Ok(Some(Side::Decode))));
+        assert!(other.join().is_ok() && caller.join().is_ok());
     }
 
     #[test]
