@@ -43,6 +43,8 @@
 //!   no `kind`), its validator and the [`Needs`] summary the host reads at
 //!   apply, before any request exists. A binding names where a request's
 //!   routing key comes from, and one function derives it ([`routing_key`]).
+//!   A host hashes a request's prompt for the cache stages by one type
+//!   ([`prompt`]).
 //!
 //! - 5.1 and appendix A, the store ingress ([`store`]): the traits through
 //!   which the controller's store is fed (membership, health, loads, KV
@@ -156,6 +158,7 @@ pub mod operator;
 #[cfg(any(feature = "wasm", feature = "controller"))]
 pub mod plugins;
 pub mod predictor;
+pub mod prompt;
 #[cfg(feature = "controller")]
 pub mod proto;
 pub mod replication;

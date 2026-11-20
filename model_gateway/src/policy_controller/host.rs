@@ -79,7 +79,8 @@ use crate::{
 
 mod hashes;
 
-pub(crate) use hashes::{Hashes, Prompt};
+pub(crate) use hashes::Prompt;
+pub(crate) use smg_policy_controller::prompt::Hashes;
 
 /// The gateway of this process, as the controller's store names it: the
 /// crate's own name for the one gateway that decides in its own process.
@@ -247,13 +248,7 @@ impl<'a> Ask<'a> {
             ..RequestFacts::default()
         };
         if let Some(hashes) = self.hashes {
-            facts.block_hashes = &hashes.blocks;
-            facts.hash_kind = hashes.kind;
-            facts.block_size = hashes.block_size;
-            facts.namespace_seed = hashes.namespace_seed;
-            if facts.prompt_tokens == 0 {
-                facts.prompt_tokens = hashes.prompt_tokens;
-            }
+            hashes.state(&mut facts);
         }
         Request {
             id: self.id,
@@ -539,7 +534,7 @@ impl Host {
     /// The stage holding the tokens calls this once before the first ask.
     /// Each ask borrows the same result through [`Ask::hashes`].
     pub(crate) fn hashes(&self, model: &str, prompt: &Prompt<'_>) -> Hashes {
-        Hashes::of(self.door.store(), model, prompt)
+        prompt.hashes(self.door.store(), model)
     }
 
     /// The host of a bed that registers its workers by hand in `registry`.
