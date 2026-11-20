@@ -1718,7 +1718,10 @@ mod tests {
             hash_ring::HashRing, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
             LeastLoadPolicy, PowerOfTwoPolicy, RoundRobinPolicy,
         },
-        routers::{common::pair_index::PdWire, grpc::backend_client::BasicWorkerBuilder},
+        routers::{
+            common::{pair_index::PdWire, retry::is_retryable_response},
+            grpc::backend_client::BasicWorkerBuilder,
+        },
     };
 
     const MODEL: &str = "m";
@@ -4154,9 +4157,7 @@ mod tests {
             NO_COMPATIBLE_PD_PAIR_CODE
         );
         assert_eq!(refusal_reason(&refusal), Some(found));
-        assert!(!crate::routers::common::retry::is_retryable_response(
-            &refusal
-        ));
+        assert!(!is_retryable_response(&refusal));
         let reported = report_refusal(&registry, site, None, MODEL, refusal);
         assert!(reported.extensions().get::<ReportedRefusal>().is_some());
         let reported = report_refusal(&registry, site, None, MODEL, reported);
