@@ -799,6 +799,29 @@ mod tests {
         }
     }
 
+    /// The converted answer stands on the worker's own parts. So a mark the
+    /// router left on the worker's answer is still on the converted one,
+    /// whether the adapter mapped the answer or refused it as malformed.
+    #[tokio::test]
+    async fn a_converted_answer_keeps_the_marks_of_the_workers_answer() {
+        use crate::routers::common::attempt_ledger::mark_upstream_answer;
+        for (answer, status) in [
+            (Json(upstream()).into_response(), StatusCode::OK),
+            (
+                Response::new(Body::from("not json")),
+                StatusCode::BAD_GATEWAY,
+            ),
+        ] {
+            let mut answer = answer;
+            mark_upstream_answer(&mut answer);
+            let adapter =
+                SglangDecisionAdapter::new(&request(json!("Evidence"), all_questions())).unwrap();
+            let converted = adapter.convert_response(answer, 100_000).await;
+            assert_eq!(converted.status(), status);
+            assert!(converted.extensions().get::<UpstreamAnswer>().is_some());
+        }
+    }
+
     /// The gateway's own failed send or body read reaches the adapter as an
     /// error without the worker's answer marker: its code keeps naming the
     /// reason (a transport fault stays one), the status does not take over.

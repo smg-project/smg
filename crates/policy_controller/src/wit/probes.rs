@@ -83,6 +83,12 @@ wit! {
     // Host-only: a guest reads a candidate's requests in flight as the
     // candidate's own field, whichever feed its host read them from.
     Option<&crate::LentCounts<'_>> => "host-only",
+    // Host-only: a guest reads a candidate's count of the request's session
+    // key as the candidate's own field, written there or lent beside it.
+    Option<&[crate::KeyedRow]> => "host-only",
+    // Host-only: the signal cells stand beside the rows of the host that
+    // decides, and no contract carries them yet.
+    Option<&crate::SignalCells> => "host-only",
     // Host-only: the engines a host lists beside its rows name the rows by
     // position, and a guest is shown rows.
     Engines<'_> => "host-only",
@@ -208,10 +214,11 @@ pub(crate) fn all() -> Vec<Probe> {
             model, namespace_seed, tenant, priority, streaming, max_output_tokens,
             prompt_tokens, block_hashes, hash_kind, session_key, phase, attempt, tried,
             budget_micros, headers, media, seed, block_size, now_micros, pinned_at,
-            lent_in_flight, session_counted, affinity, named, model_fingerprint,
+            lent_in_flight, lent_session_in_flight, session_counted, affinity, named,
+            model_fingerprint, signal_cells, client_key,
         } host [
-            now_micros, pinned_at, lent_in_flight, session_counted, affinity, named,
-            model_fingerprint
+            now_micros, pinned_at, lent_in_flight, lent_session_in_flight, session_counted,
+            affinity, named, model_fingerprint, signal_cells, client_key
         ],
         &request),
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),
@@ -220,8 +227,9 @@ pub(crate) fn all() -> Vec<Probe> {
             reported, engines,
         } host [reach, reported, engines], &pool),
         // The lease's session crosses under the name both contracts still
-        // spell, `session-key`: the change that first reads a lease from the
-        // wire renames the field in both and takes this pair out.
+        // spell, `session-key`. A gateway's client reads it under that name.
+        // A change that renames the field renames it in both contracts and
+        // takes this pair out.
         probe!("lease", before [], Lease {
             id, kind, side, target_index, booked, generation, session as "session-key",
             session_verdict, issued_micros, tokens,
@@ -307,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn the_probes_cover_every_record_the_host_does_not_compose() {
+    fn the_probes_cover_every_record_that_mirrors_a_struct() {
         let probed: Vec<&str> = all().into_iter().map(|p| p.record).collect();
         let records: Vec<&str> = super::super::types::TYPES
             .iter()
@@ -315,8 +323,10 @@ mod tests {
             .map(|i| i.name())
             .collect();
         for record in records {
+            // The host composes `dispatched` and the guest `score-answer`:
+            // neither mirrors a struct of the crate.
             assert!(
-                record == "dispatched" || probed.contains(&record),
+                matches!(record, "dispatched" | "score-answer") || probed.contains(&record),
                 "{record} has no probe"
             );
         }

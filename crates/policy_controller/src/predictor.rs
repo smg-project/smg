@@ -8,10 +8,12 @@
 //! This is the `tree` kind of the document's index settings
 //! ([`IndexKind`](crate::spec::IndexKind)). The `hash` kind is not built.
 //!
-//! Under the served controller one model has one decider, and the model's
-//! predictor is that decider's own state: one thread reads it and writes
-//! it, under the decider's turn. Nothing here is shared, locked or ordered
-//! against another thread.
+//! Nothing here is locked or ordered against another thread. A read takes
+//! the predictor by a shared reference and writes nothing, so an owner may
+//! lend it to many readers at once. A write takes it alone. A caller folds
+//! a request's keys once, in a buffer of its own
+//! ([`Predictor::fold_into`]), and hands them to the read and to the write
+//! behind it.
 //!
 //! The in-process door ([`Door`](crate::door::Door)) seats a request by
 //! its calling thread unless the generation holds a stage that keeps
@@ -29,6 +31,13 @@
 //! the request. So the deepest block is found by halving: one probe for a
 //! request sent before, and at most one more than the logarithm of its
 //! blocks for any other. The fold itself is one multiplication a block.
+//!
+//! A block keeps the tick of its last use: the tick it was made at, and
+//! the tick of each write that ended at it. The tick is the caller's clock
+//! in steps of the caller's choice, and the predictor reads no clock. A
+//! read says whether its deepest block is fresh at a tick
+//! ([`Deepest::fresh`]), so an owner can pass no write for a request sent
+//! a moment ago.
 //!
 //! What is forgotten. The bound is a count of placements, a block for a
 //! worker. Blocks leave by last use, a block that none follows first. The
@@ -60,7 +69,7 @@ use std::{mem, slice};
 
 use rustc_hash::FxHashMap;
 
-use crate::view::WorkerId;
+use crate::view::{fold_block, WorkerId};
 
 /// No block: the end of a list, and the block before a request's first.
 const NONE: u32 = u32::MAX;
@@ -78,12 +87,6 @@ const CHUNK: usize = 1 << 12;
 const MAPS: usize = 1 << 8;
 /// The places of room a list of workers keeps while no block uses it.
 const POOLED: usize = 8;
-
-/// The key of a prefix one block longer: the key before it folded with the
-/// block's hash. The key's top bits take every bit of both.
-const fn fold(key: u64, hash: u64) -> u64 {
-    (key.rotate_left(23) ^ hash).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-}
 
 /// The map a key is found through.
 const fn map_of(key: u64) -> usize {
@@ -113,6 +116,9 @@ struct Block {
     /// The one worker sent the block; `NOBODY` under a group, and where
     /// none is left.
     lone: u16,
+    /// The caller's tick at the block's last use: when it was made, and at
+    /// each write that ended at it.
+    touched: u16,
 }
 
 impl Block {
@@ -125,6 +131,7 @@ impl Block {
         newer: UNLISTED,
         group: NONE,
         lone: NOBODY,
+        touched: 0,
     };
 
     /// Whether no worker is left of the block.
@@ -141,11 +148,13 @@ impl Block {
 
 /// What a probe asks of a block it finds.
 #[derive(Clone, Copy)]
-enum Ask {
+enum Ask<'a> {
     /// That it is there.
     Any,
     /// That a worker of the pool was sent it.
     Live,
+    /// That a worker of the pool that the reader may use was sent it.
+    Among(&'a dyn Fn(WorkerId) -> bool),
     /// That the worker of this place was sent it.
     Holds(u16),
 }
@@ -199,12 +208,6 @@ pub struct Predictor {
     blocks: usize,
     /// The placements a write did not make, for the bound or for places.
     dropped: u64,
-    /// The seed of the request folded last.
-    seed: u64,
-    /// Its hashes.
-    request: Vec<u64>,
-    /// Its keys, one a block.
-    keys: Vec<u64>,
 }
 
 /// What a read found: the deepest block of the request that a worker of
@@ -223,6 +226,20 @@ impl<'a> Deepest<'a> {
     /// where none was sent its first block.
     pub fn blocks(&self) -> u32 {
         self.blocks
+    }
+
+    /// Whether the deepest block's last use was at `tick`: it was made at
+    /// that tick, or a write at that tick ended at it. `false` where no
+    /// worker was sent the request's first block.
+    ///
+    /// An owner passes no write where a read finds the whole request
+    /// ([`Self::blocks`] is the count of its keys), its end fresh at the
+    /// owner's tick and the picked worker among [`Self::holders`]: that
+    /// write would move nothing a reader can see. The list of ends is then
+    /// true to one tick. A tick is sixteen bits: a block last used 65,536
+    /// ticks ago reads fresh once, and one move of the list is passed.
+    pub fn fresh(&self, tick: u16) -> bool {
+        self.at != NONE && self.predictor.block(self.at).touched == tick
     }
 
     /// The workers of the pool that were sent that many, in no order.
@@ -268,9 +285,6 @@ impl Predictor {
             placements: 0,
             blocks: 0,
             dropped: 0,
-            seed: 0,
-            request: Vec::new(),
-            keys: Vec::new(),
         }
     }
 
@@ -308,14 +322,25 @@ impl Predictor {
         self.dropped
     }
 
-    /// Reads a request: the deepest of its blocks that a worker of the
-    /// pool was sent, and the workers sent it. `seed` is the request's
-    /// cache namespace ([`RequestFacts::namespace_seed`](crate::RequestFacts::namespace_seed)):
-    /// the same blocks under another seed are another prefix. Nothing is
-    /// written but the request's keys, which the issue's write reads back.
-    pub fn deepest(&mut self, seed: u64, hashes: &[u64]) -> Deepest<'_> {
-        self.fold_request(seed, hashes);
-        let (blocks, at) = self.depth(hashes.len(), Ask::Live);
+    /// A request's keys into `keys`, one a block: each is the fold of the
+    /// hashes up to its block under `seed`, the request's cache namespace
+    /// ([`RequestFacts::namespace_seed`](crate::RequestFacts::namespace_seed)).
+    /// The same blocks under another seed are another prefix. `keys` is
+    /// cleared and filled, and allocates only while it grows.
+    pub fn fold_into(keys: &mut Vec<u64>, seed: u64, hashes: &[u64]) {
+        keys.clear();
+        let mut key = seed;
+        keys.extend(hashes.iter().map(|&hash| {
+            key = fold_block(key, hash);
+            key
+        }));
+    }
+
+    /// Reads a request by its keys ([`Self::fold_into`]): the deepest of
+    /// its blocks that a worker of the pool was sent, and the workers sent
+    /// it. Nothing is written.
+    pub fn deepest(&self, keys: &[u64]) -> Deepest<'_> {
+        let (blocks, at) = self.depth(keys, keys.len(), Ask::Live);
         Deepest {
             predictor: self,
             at,
@@ -323,9 +348,32 @@ impl Predictor {
         }
     }
 
-    /// Records a request as sent to `worker`: the blocks past what the
-    /// worker was already sent of it, and the request as the newest use
-    /// of its path. A request the worker was sent before adds nothing.
+    /// [`Self::deepest`] for a reader that may use only some of the pool's
+    /// workers: the deepest of the request's blocks that a worker `usable`
+    /// passes was sent. A worker the reader cannot use, sent more of the
+    /// request, hides no worker it can. [`Deepest::holders`] lists every
+    /// worker sent that block, so the reader passes over the others once
+    /// more. A block's workers are asked only where the read probes it.
+    pub fn deepest_among(&self, keys: &[u64], usable: &dyn Fn(WorkerId) -> bool) -> Deepest<'_> {
+        let (blocks, at) = self.depth(keys, keys.len(), Ask::Among(usable));
+        Deepest {
+            predictor: self,
+            at,
+            blocks: blocks as u32,
+        }
+    }
+
+    /// Records a request, by its keys ([`Self::fold_into`]), as sent to
+    /// `worker` at the caller's `tick`: the blocks past what the worker
+    /// was already sent of it, and the request as the newest use of its
+    /// path. A request the worker was sent before adds nothing. A block
+    /// the write makes takes the tick, and so does the block it ends at.
+    ///
+    /// Below the bound, a write of a longer leading part of a request at
+    /// one tick, behind a write of a shorter one at that tick, leaves what
+    /// one write of the longer leaves, so an owner may write a long request
+    /// in parts. At the bound each part makes its own room, so the parts
+    /// may forget other blocks than one write would.
     ///
     /// At the bound the blocks that wait leave first, then the oldest that
     /// none follows, never a block of the request itself. The write takes
@@ -339,8 +387,8 @@ impl Predictor {
     /// place, and only [`Predictor::forget`] takes the place back: a write
     /// for a worker told gone gives it a place again, and nothing takes
     /// that one back until the worker is told gone once more.
-    pub fn sent(&mut self, seed: u64, hashes: &[u64], worker: WorkerId) {
-        let blocks = hashes.len();
+    pub fn sent(&mut self, keys: &[u64], worker: WorkerId, tick: u16) {
+        let blocks = keys.len();
         if blocks == 0 {
             return;
         }
@@ -348,13 +396,12 @@ impl Predictor {
             self.dropped += blocks as u64;
             return;
         };
-        self.fold_request(seed, hashes);
         // What anyone was sent of the request, and what the worker was.
-        let (have, end) = self.depth(blocks, Ask::Any);
-        let (held, mut before) = self.depth(have, Ask::Holds(place));
+        let (have, end) = self.depth(keys, blocks, Ask::Any);
+        let (held, mut before) = self.depth(keys, have, Ask::Holds(place));
         let need = blocks - held;
         if need == 0 {
-            self.touch(before);
+            self.end_at(before, tick);
             return;
         }
         // The request's own path is the newest before any block leaves for
@@ -371,8 +418,7 @@ impl Predictor {
         self.make_room(need, end);
         let room = need.min(self.bound.saturating_sub(self.placements));
         self.dropped += (need - room) as u64;
-        for at in held..held + room {
-            let key = self.keys[at];
+        for (at, &key) in keys.iter().enumerate().take(held + room).skip(held) {
             before = match self.find(key) {
                 Some(block) => {
                     if self.add(block, place) {
@@ -381,7 +427,7 @@ impl Predictor {
                     block
                 }
                 None => {
-                    let Some(block) = self.take(key, before, place) else {
+                    let Some(block) = self.take(key, before, place, tick) else {
                         self.dropped += (held + room - at) as u64;
                         break;
                     };
@@ -391,7 +437,7 @@ impl Predictor {
             };
         }
         if before != NONE {
-            self.touch(before);
+            self.end_at(before, tick);
         }
         // A block no worker is left of that the write stood on and gave
         // nothing waits again: the next step takes it.
@@ -399,6 +445,12 @@ impl Predictor {
             self.unlink(end);
             self.link_waiting(end);
         }
+    }
+
+    /// Whether the record holds a place for the worker: it was sent a
+    /// block and was not forgotten since.
+    pub fn holds(&self, worker: WorkerId) -> bool {
+        self.places.contains_key(&worker)
     }
 
     /// A worker left the pool, or was replaced: the next read skips it.
@@ -465,11 +517,14 @@ impl Predictor {
         }
     }
 
-    fn passes(&self, block: &Block, ask: Ask) -> bool {
+    fn passes(&self, block: &Block, ask: Ask<'_>) -> bool {
         let holders = self.holders(block);
         match ask {
             Ask::Any => true,
             Ask::Holds(place) => holders.contains(&place),
+            Ask::Among(usable) => holders.iter().any(|&place| {
+                place != NOBODY && self.is_live(place) && usable(self.workers[place as usize])
+            }),
             // Between two sweeps of leavers every holder is of the pool.
             Ask::Live if self.clearing.is_empty() && self.gone.is_empty() => {
                 holders.first().is_some_and(|&place| place != NOBODY)
@@ -480,26 +535,26 @@ impl Predictor {
         }
     }
 
-    /// The block of the folded request's place `at`, where it passes.
-    fn probe(&self, at: usize, ask: Ask) -> Option<u32> {
-        let block = self.find(self.keys[at])?;
+    /// The block of the request's key at place `at`, where it passes.
+    fn probe(&self, keys: &[u64], at: usize, ask: Ask<'_>) -> Option<u32> {
+        let block = self.find(keys[at])?;
         self.passes(self.block(block), ask).then_some(block)
     }
 
-    /// How many of the folded request's first `within` blocks pass, and
-    /// the last of them. The blocks that pass are a leading part of the
-    /// request, so the last one first, then by halves.
-    fn depth(&self, within: usize, ask: Ask) -> (usize, u32) {
+    /// How many of the request's first `within` blocks pass, and the last
+    /// of them. The blocks that pass are a leading part of the request, so
+    /// the last one first, then by halves.
+    fn depth(&self, keys: &[u64], within: usize, ask: Ask<'_>) -> (usize, u32) {
         let Some(last) = within.checked_sub(1) else {
             return (0, NONE);
         };
-        if let Some(block) = self.probe(last, ask) {
+        if let Some(block) = self.probe(keys, last, ask) {
             return (within, block);
         }
         let (mut low, mut high, mut found) = (0, last, NONE);
         while low < high {
             let middle = low + (high - low) / 2;
-            match self.probe(middle, ask) {
+            match self.probe(keys, middle, ask) {
                 Some(block) => {
                     low = middle + 1;
                     found = block;
@@ -508,23 +563,6 @@ impl Predictor {
             }
         }
         (low, found)
-    }
-
-    /// The keys of a request, kept: the write that follows a read of the
-    /// same request folds nothing again.
-    fn fold_request(&mut self, seed: u64, hashes: &[u64]) {
-        if self.seed == seed && self.request.as_slice() == hashes {
-            return;
-        }
-        self.seed = seed;
-        self.request.clear();
-        self.request.extend_from_slice(hashes);
-        self.keys.clear();
-        let mut key = seed;
-        self.keys.extend(hashes.iter().map(|&hash| {
-            key = fold(key, hash);
-            key
-        }));
     }
 
     /// The worker's place, a new one where it has none; `None` past the
@@ -587,9 +625,9 @@ impl Predictor {
         true
     }
 
-    /// A new block of one worker behind `before`; `None` past the entries
-    /// a link can name.
-    fn take(&mut self, key: u64, before: u32, place: u16) -> Option<u32> {
+    /// A new block of one worker behind `before`, made at `tick`; `None`
+    /// past the entries a link can name.
+    fn take(&mut self, key: u64, before: u32, place: u16, tick: u16) -> Option<u32> {
         let at = if self.free == NONE {
             if self.span == UNLISTED {
                 return None;
@@ -610,6 +648,7 @@ impl Predictor {
             before,
             after: 0,
             lone: place,
+            touched: tick,
             ..Block::BLANK
         };
         self.maps[map_of(key)].insert(key, at);
@@ -700,6 +739,13 @@ impl Predictor {
             self.unlink(at);
         }
         self.link_newest(at);
+    }
+
+    /// A write at `tick` ended at the block: it is the newest of the list,
+    /// and its last use is that tick.
+    fn end_at(&mut self, at: u32, tick: u16) {
+        self.touch(at);
+        self.block_mut(at).touched = tick;
     }
 
     /// One step of forgetting, never past `keep`. A block that waits

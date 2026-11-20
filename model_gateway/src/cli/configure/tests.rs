@@ -1,5 +1,5 @@
 //! The configuration a command line assembles, as a policy document: the
-//! policy controller's corpus through the binary's own parser.
+//! policy controller's corpus through the command-line parser.
 //!
 //! The corpus (`crates/policy_controller/tests/corpus`) holds one item a
 //! routing configuration of the gateway: its input, and under `## Expected
@@ -9,11 +9,13 @@
 use std::{borrow::Cow, fs, path::Path};
 
 use clap::Parser;
-use smg::config::{PolicyDocumentError, RouterConfig};
 use smg_policy_controller::{PolicySpec, SpecError, PRESETS};
 
-use super::PolicySpecPrint;
-use crate::{cli::url_port::CommandLine, Cli, CliArgs, Commands};
+use super::{
+    super::{url_port::CommandLine, Cli, CliArgs, Commands},
+    PolicySpecPrint,
+};
+use crate::config::{PolicyDocumentError, RouterConfig, RoutingMode};
 
 /// The urls of a side that the binary reads ahead of clap, each with its
 /// bootstrap port.
@@ -47,6 +49,91 @@ fn routed(argv: &[String]) -> Result<Converted, String> {
         .routing_config(prefill_urls, encode_urls)
         .map_err(|refused| format!("the routing part of {argv:?} is refused: {refused}"))?;
     Ok(config.policy_document())
+}
+
+#[test]
+fn every_routing_default_means_the_plain_document_but_the_policy() {
+    for (flags, mode) in [
+        (&[][..], RouterConfig::default().mode),
+        (
+            &["--pd-disaggregation"][..],
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+        ),
+        (
+            &["--epd-disaggregation"][..],
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![],
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            },
+        ),
+        (
+            &["--backend", "openai"][..],
+            RoutingMode::OpenAI {
+                worker_urls: vec![],
+            },
+        ),
+        (
+            &["--backend", "anthropic"][..],
+            RoutingMode::Anthropic {
+                worker_urls: vec![],
+            },
+        ),
+        (
+            &["--backend", "gemini"][..],
+            RoutingMode::Gemini {
+                worker_urls: vec![],
+            },
+        ),
+    ] {
+        let argv: Vec<String> = ["smg", "--policy-spec", "routing.yaml"]
+            .into_iter()
+            .chain(flags.iter().copied())
+            .map(str::to_owned)
+            .collect();
+        let (args, prefill_urls, encode_urls) = parsed(&argv).expect("the binary takes the line");
+        let mut config = args
+            .routing_config(prefill_urls, encode_urls)
+            .expect("the routing configuration");
+        let plain = RouterConfig {
+            mode,
+            ..RouterConfig::default()
+        };
+        assert_eq!(config.mode_type(), plain.mode_type(), "{flags:?}");
+        match plain.policy_document() {
+            Ok(document) => {
+                config.policy_spec = Some(document.clone());
+                assert_eq!(config.policy_document_in_force(), Ok(document), "{flags:?}");
+            }
+            Err(refusal) => assert_eq!(config.policy_document(), Err(refusal), "{flags:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_banner_names_the_document_where_one_decides() {
+    for (flags, line) in [
+        (
+            &["--policy-spec", "routing.yaml"][..],
+            "Policy: document routing.yaml",
+        ),
+        (&[][..], "Policy: cache_aware"),
+    ] {
+        let argv: Vec<String> = std::iter::once("smg")
+            .chain(flags.iter().copied())
+            .map(str::to_owned)
+            .collect();
+        let (args, ..) = parsed(&argv).expect("the binary takes the line");
+        assert_eq!(args.policy_line(), line, "{flags:?}");
+    }
 }
 
 /// Holds the routing part of a command line to the document its whole
@@ -470,6 +557,12 @@ const ROUTING_FLAGS: &[Row] = &[
     lands("worker-warmup-thin-ratio", &[], &["0.25"]),
     lands("worker-warmup-divert-every", &[], &["4"]),
     kept(
+        "policy-controller",
+        &[],
+        &["on"],
+        "it chooses who runs the policy document and leaves the flags' meaning alone",
+    ),
+    kept(
         "print-policy-spec",
         &[],
         &[],
@@ -565,7 +658,13 @@ fn every_routing_flag_lands_is_refused_by_name_or_is_kept_with_its_reason() {
         })
         .filter_map(|arg| arg.get_long())
         .collect();
-    let mut listed: Vec<&str> = ROUTING_FLAGS.iter().map(|row| row.flag).collect();
+    // The input file supplies a document at start-up. Its own cases check
+    // the loaded document and the conflict with printing.
+    let mut listed: Vec<&str> = ROUTING_FLAGS
+        .iter()
+        .map(|row| row.flag)
+        .chain(["policy-spec"])
+        .collect();
     flags.sort_unstable();
     listed.sort_unstable();
     assert_eq!(
@@ -611,8 +710,6 @@ fn the_print_option_answers_with_the_document_a_command_line_means() {
         "--worker-urls",
         "http://worker-a:8000",
         "http://worker-b:8000",
-        "--policy",
-        "cache_aware",
         "--print-policy-spec",
     ]);
     assert_eq!(answer.refusal(), None);

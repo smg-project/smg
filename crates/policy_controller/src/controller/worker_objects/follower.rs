@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use smg_grpc_client::engine_port::GrpcConnector;
-use smg_worker::registry::WorkerRegistry;
+use smg_worker::{connection::engine::EngineConnector, registry::WorkerRegistry};
 use tokio::sync::watch;
 
 use super::ObjectsWake;
@@ -17,10 +17,11 @@ use crate::{
 /// wake of its one task. The registry is built here, and the holder alone
 /// writes it. Each object connects to its engine through the engine clients'
 /// gRPC connector, so a worker of the host-local wire has no connection
-/// here.
+/// here. The replica cannot dial a row that one gateway alone reaches: such
+/// a row's object is built with its checks off, and no probe is sent to it.
 pub(crate) struct WorkerObjects {
     store: Arc<MemoryStore>,
-    objects: Objects<Members>,
+    objects: Arc<Objects<Members>>,
     wake: ObjectsWake,
 }
 
@@ -28,12 +29,35 @@ impl WorkerObjects {
     /// The objects of `store`'s rows, none built yet: [`Self::run`] builds
     /// them. `wake` is the copy of the one the store's log tells.
     pub(crate) fn new(store: Arc<MemoryStore>, wake: ObjectsWake) -> Self {
+        Self::with_connector(store, wake, Arc::new(GrpcConnector))
+    }
+
+    /// [`Self::new`] with `connector` making each object's engine
+    /// connection.
+    pub(super) fn with_connector(
+        store: Arc<MemoryStore>,
+        wake: ObjectsWake,
+        connector: Arc<dyn EngineConnector>,
+    ) -> Self {
         Self {
             store,
-            objects: Objects::new(Arc::new(WorkerRegistry::new()))
-                .with_connector(Arc::new(GrpcConnector)),
+            objects: Arc::new(
+                Objects::new(Arc::new(WorkerRegistry::new()))
+                    .with_connector(connector)
+                    .with_host_local_unchecked(),
+            ),
             wake,
         }
+    }
+
+    /// The store the objects' rows stand in.
+    pub(crate) fn store(&self) -> Arc<MemoryStore> {
+        Arc::clone(&self.store)
+    }
+
+    /// The holder shared with readers of the replica's worker objects.
+    pub(crate) fn holder(&self) -> Arc<Objects<Members>> {
+        Arc::clone(&self.objects)
     }
 
     /// The holder, for a case that reads what stands.

@@ -13,7 +13,9 @@
 //! - 4.1, the view ([`view`]): [`RequestFacts`], [`Candidate`] rows with their
 //!   [`LoadRow`], the [`AffinityFacts`] column beside the rows, [`Constraints`]
 //!   and [`PoolFacts`]. Built once per decision by the host into a reused
-//!   buffer; no handle, no callback into the host.
+//!   buffer; no handle, no callback into the host. The values a report
+//!   states under a name the document declares stand beside the rows too
+//!   ([`signals`]): a stage reads one by its [`SignalColumn`].
 //! - 4.2, the decision ([`decision`]): an ordered [`Pick`] of up to
 //!   [`MAX_TARGETS`] targets, a [`Shed`] with its reason and the stage that
 //!   emptied the pool, or a [`Queue`] ticket (specified in v1; no built-in
@@ -28,15 +30,17 @@
 //!   a request; the [`Engine`] resolves a request to its binding and decides.
 //!   A scorer or picker allocates nothing per decision. The consistent-hash
 //!   scorer owns its ring ([`ring`]), fed by the membership hooks. The
-//!   prefixes sent to a model's workers are kept by the sent-prefix
-//!   predictor ([`predictor`]), which no decision reads yet.
+//!   prefixes sent to a model's workers without cache events are kept by
+//!   the sent-prefix predictor ([`predictor`]). A profile that reads sent
+//!   prefixes reads that record at the naming through the in-process door.
 //! - 4.5, the stages in code ([`catalog`]): the [`Catalog`] of the stages a
 //!   build knows by name, the stock build's and the ones a host registers.
 //!   A document names either kind the same way, and the validator resolves
 //!   every name once ([`PolicySpec::validate_in`]).
 //! - 4.6, the schema ([`spec`]): [`PolicySpec`] (`apiVersion: smg.policy/v1`,
 //!   no `kind`), its validator and the [`Needs`] summary the host reads at
-//!   apply, before any request exists.
+//!   apply, before any request exists. A binding names where a request's
+//!   routing key comes from, and one function derives it ([`routing_key`]).
 //!
 //! - 5.1 and appendix A, the store ingress ([`store`]): the traits through
 //!   which the controller's store is fed (membership, health, loads, KV
@@ -71,9 +75,12 @@
 //! - Behind the `ingest` feature, the ingestion drivers (`ingest`): the load
 //!   path (the `GetLoads` poll per engine under the store's poll
 //!   arbitration, the metrics scrape of an engine without a servicer) and
-//!   the load helpers (the row conversion, the scrape parser). The KV
-//!   subscription, the prober and discovery arrive in the step's later PRs.
+//!   the metrics parser. The load driver and the worker host's load adapter
+//!   share the `load_report` conversion.
 //!
+//! - Behind the `operator` feature, `operator::SpecDoor` applies a
+//!   host's start document and serves its status, document and dry run.
+//!   The feature also serves worker snapshots over the host's store.
 //! - The door ([`door`]): the order of one decision's calls, written once
 //!   for every host. A host that embeds the engine asks [`door::Door`],
 //!   which runs the order on the caller's thread over a
@@ -82,22 +89,20 @@
 //!   handle, and its timer calls the door's clock ([`door::Door::sweep`]).
 //!   The standalone controller runs the same order on its deciders'
 //!   threads.
-//! - The handle ([`handle`]): one decision of the door, held until its
-//!   request ends. A host that holds a [`handle::Handle`] says the target
-//!   it took, the dispatch, and the completion or the release, and the
-//!   handle says each report to the door once, whatever way the request
-//!   ends.
+//! - The handle ([`handle`]): one decision held until its request ends.
+//!   A host that holds a [`handle::Handle`] says the target it took, the
+//!   dispatch, and the completion or the release. The handle reports to
+//!   the in-process door or, with the `client` feature, over a link.
 //! - Behind the `controller` feature, the standalone controller
 //!   (`controller`): the listeners with their credentialed scopes, the
-//!   health service on each, the admin endpoints, readiness and the drain,
-//!   the load driver over the store, and the binary of the package's name
-//!   over them. The scopes' calls and the election arrive in the step's
-//!   later PRs.
-//! - Behind the `client` feature, the reference client of the controller's
-//!   protocol (`client`): one gateway's side of it (the dial, `Leader`,
-//!   the session's `Hello` answered by a `Welcome`, a request's lifecycle
-//!   reports on that session, and the watch of the workers' rows), with a
-//!   blocking form. No shipped binary builds it.
+//!   health service on each, the admin endpoints, readiness, the drain and
+//!   the load driver over the store. The stock binary also requires the
+//!   `worker-host` feature so it can read cache events.
+//! - Behind the `client` feature, the gateway's side of the controller's
+//!   protocol (`client`). The reference client (`client::Client`) asks
+//!   one request at a time, reports its lifecycle and watches workers'
+//!   rows, with a blocking form. A host's requests share `client::Link`
+//!   for concurrent asks on one decide stream and reports on one session.
 //! - Behind the same feature, the watcher (`watcher`): a gateway's copy of
 //!   the controller's workers. It takes the watch's events in their order
 //!   into a [`store::MemoryStore`] of its own, through the door a
@@ -110,13 +115,17 @@
 //!   follows its own store, on a leader and on a standby alike, and hands
 //!   each object a gRPC connector: an object connects to its engine at its
 //!   first use.
+//! - Behind the `discovery` feature, worker discovery under the controller:
+//!   the binary takes the discovery flags, and the replica that leads runs
+//!   the selected provider over the replica's worker objects. A pass asks
+//!   the job queue the host was handed, and defers what it found while none
+//!   stands.
 //!
-//! What this step does not hold: the gRPC plugin service, the operator calls,
-//! the other ingestion drivers and the gRPC API; they arrive in later
-//! steps and build on these types. The
-//! in-process view carries two host instants (the decision's clock and a
+//! The in-process view carries two host instants (the decision's clock and a
 //! report's sample instant); the wire carries durations only.
 
+#[cfg(any(feature = "ingest", feature = "operator"))]
+mod address;
 pub mod affinity;
 pub mod bucket;
 pub mod builtins;
@@ -128,6 +137,7 @@ pub mod controller;
 pub mod counts;
 pub mod decider;
 pub mod decision;
+pub mod demands;
 pub mod door;
 pub mod elector;
 pub mod framework;
@@ -137,16 +147,25 @@ pub mod handle;
 #[cfg(feature = "ingest")]
 pub mod ingest;
 pub mod lease;
+#[cfg(any(feature = "ingest", feature = "worker-host"))]
+pub mod load_report;
+#[cfg(feature = "operator")]
+pub mod operator;
 #[cfg(any(feature = "wasm", feature = "controller"))]
 pub mod plugins;
 pub mod predictor;
 #[cfg(feature = "controller")]
 pub mod proto;
 pub mod replication;
+pub mod reports;
 pub mod ring;
+pub mod routing_key;
+pub mod sent;
 pub mod sessions;
+pub mod signals;
 pub mod spec;
 pub mod store;
+mod terms;
 pub mod view;
 #[cfg(feature = "wasm")]
 pub mod wasm;
@@ -156,12 +175,14 @@ pub mod wit;
 #[cfg(feature = "worker-host")]
 pub mod worker_host;
 
-pub use catalog::{Catalog, CatalogError, StageKind};
+pub use catalog::{Catalog, CatalogError, StageBuild, StageError, StageKind};
 pub use counts::{KeptCounts, LentCounts};
 pub use decision::{
-    Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace,
-    MAX_TARGETS, TRACE_TOP,
+    Decision, Lifted, Overlap, OverlapSource, Pair, Pick, Queue, Shed, ShedReason, Survivors,
+    Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
+pub use demands::{DemandFacts, Demands};
+pub use door::{DecisionRecord, Explained, Names};
 pub use framework::{
     Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
     Front, Narrowed, PairPools, PairTable, PairTableError, Picker, Plan, Profile, Scorer, Scratch,
@@ -171,18 +192,22 @@ pub use lease::{
     EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason,
     Side, Signal, TransportClass,
 };
+pub use reports::{ReportReads, Reports};
 pub use ring::{ConsistentHash, Ring};
+pub use routing_key::{DerivedKey, KeySource, KeySources};
+pub use sent::{Sent, SentCredit};
 pub use sessions::{
     Assignment, Forgets, Pins, Recovery, SessionRule, SessionTable, SessionVerdict,
 };
+pub use signals::{SignalCell, SignalCells, SignalColumn};
 pub use spec::{
     AppliedSpec, Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION, PRESETS,
 };
 pub use view::{
     fingerprint, AffinityFacts, Candidate, Constraints, Engines, HashKind, Header, Health,
-    Identity, LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder, OverloadRegime,
-    Phase, PinSource, PoolFacts, RequestFacts, Role, Session, SignalSource, WireModes, WorkerId,
-    ZoneCapacity,
+    Identity, KeyedRow, LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder,
+    OverloadRegime, Phase, PinSource, PoolFacts, RequestFacts, Role, Session, SignalSource,
+    WireModes, WorkerId, ZoneCapacity,
 };
 
 /// SplitMix64 over a decision's seed: the only randomness a stage gets, so a

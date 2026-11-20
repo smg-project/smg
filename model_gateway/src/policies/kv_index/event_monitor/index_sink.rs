@@ -14,12 +14,14 @@ use kv_index::WorkerIdExhausted;
 use parking_lot::Mutex;
 use rustc_hash::FxBuildHasher;
 use smg_grpc_client::common_proto::{kv_cache_event, KvEventBatch};
-use smg_worker::metrics::writers::Metrics;
+use smg_worker::{
+    kv_events::apply::{WorkerIndexCounters, WorkerIndexState},
+    metrics::writers::Metrics,
+};
 use tracing::{debug, info};
 
 use super::{
     admission::{self, WorkerStreamState},
-    apply::{WorkerIndexCounters, WorkerIndexState},
     port::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
     KvBlockSize, KvEventMonitor,
 };
@@ -286,10 +288,10 @@ impl KvEventSink for IndexSink {
             }
         }
         if reason == ResyncReason::SnapshotAbandoned {
-            // The chunks the stream brought are a partial live set: the
-            // cursors start over, so the next subscription asks from zero,
-            // and the blocks stay until the next snapshot's first chunk
-            // clears them. No resync is counted for it.
+            // The snapshot stream cannot be trusted: the cursors start over,
+            // so the next subscription asks from zero, and the blocks stay
+            // until the next snapshot's first chunk clears them. No resync is
+            // counted for it.
             state.abandon_snapshot();
             return;
         }
@@ -526,6 +528,34 @@ mod tests {
 
         sink.resync(id, Some(1), ResyncReason::DataLoss);
         assert_eq!(index.current_size(), 0);
+    }
+
+    /// Malformed-snapshot recovery starts every cursor over even when the
+    /// sink already counted the preceding snapshot as complete.
+    #[test]
+    fn an_abandoned_snapshot_resets_cursors_after_the_sink_closed_its_snapshot() {
+        let (index, sink, _row, id) = opened(None);
+        let chunk = KvEventBatch {
+            snapshot: Some(KvSnapshotChunk {
+                index: 0,
+                count: 1,
+                ..Default::default()
+            }),
+            ..stored(6, 1_000, None)
+        };
+        assert_eq!(admit(&sink, id, &chunk), BatchOutcome::Applied);
+        assert_eq!(applied(&sink, id, 0), Some(6));
+        let blocks = index.current_size();
+        assert_ne!(blocks, 0);
+
+        sink.resync(id, None, ResyncReason::SnapshotAbandoned);
+
+        assert_eq!(sink.cursor(id, 0), Some(KvCursor::default()));
+        assert_eq!(
+            index.current_size(),
+            blocks,
+            "the completed chunk's blocks stay"
+        );
     }
 
     /// A snapshot's start said ahead of its first chunk changes nothing by

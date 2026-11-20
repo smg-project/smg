@@ -276,7 +276,10 @@ message RequestFacts {
   bool streaming = 5;
   uint32 max_output_tokens = 6;
   uint32 prompt_tokens = 7;  // the host's count or estimate
-  // Prefix block hashes, capped by `view.max_block_hashes` (1 to 8,190): a
+  // One hash a whole block of the prompt, in order from the first. A hash is
+  // of its own block's content and of nothing ahead of it: a prefix is named
+  // by the fold of its blocks' hashes, which a stage that keys by one makes.
+  // The list is capped by `view.max_block_hashes` (1 to 8,190): a
   // controller reads the first of a longer list, as many as the stages of
   // its generation read and that many at most, and refuses no list for its
   // length under the frame's bound. A DecideRequest over that bound, 64 KiB
@@ -317,8 +320,8 @@ message RequestFacts {
 
 // What only the deciding gateway knows now. Its standing vetoes are not here:
 // the controller applies them to that gateway's candidate rows before any stage
-// runs (there alone the vetoed worker reads breaker-open for a breaker veto,
-// stalled for a liveness veto).
+// runs (there alone the vetoed worker reads stalled, and breaker-open too
+// under a breaker veto).
 message Constraints {
   // Ids this gateway just failed to connect to.
   repeated fixed64 excluded = 1 [packed = true];
@@ -425,12 +428,13 @@ message Lease {
 
 // Serves the routing trace header and Explain; positions into the generation's
 // spec. The record carries the first five fields (its `top` at most three
-// entries, each only `worker_id` and `score`) and reads `drew_first` from
-// its count, which a decision that drew first does not hold, and `lifted`
-// from the all-vetoed rule's pick; the observability contract fills the
-// rest, unset until then.
+// entries, each only `worker_id` and `score`). It reads `drew_first` from its
+// count, `lifted` from the all-vetoed rule's pick, and `no_profile` from the
+// profile mark. The observability contract fills the rest, unset until then.
 message Trace {
-  // Zero-based position in the spec's profile names in ascending UTF-8 order.
+  // Read no_profile first. Where the decision was made under a profile, this
+  // is its zero-based position in the spec's profile names in ascending
+  // UTF-8 order.
   uint32 profile = 1;  // u16
   // Candidates left after the filters, where the decision counted them:
   // unset, never a zero, when it drew first (`drew_first`).
@@ -465,6 +469,9 @@ message Trace {
   // and so does the pick of a session key kept on its worker. A host counts
   // both from this field.
   LiftedVeto lifted = 13;
+  // True when the decision was made ahead of every profile, where no binding
+  // resolved one. In that case profile is 0.
+  bool no_profile = 14;
 }
 
 // The soft vetoes the all-vetoed rule lifts, in the order it lifts them. The
@@ -476,6 +483,10 @@ enum LiftedVeto {
   LIFTED_VETO_NONE = 0;
   // Every usable worker was over its overload thresholds.
   LIFTED_VETO_OVERLOAD = 1;
+  // No worker stood until the liveness veto was lifted: the pick is of the
+  // workers the liveness check doubts. A reader built before this value
+  // reads a number it does not name.
+  LIFTED_VETO_LIVENESS = 2;
 }
 
 message FilterDrop {
@@ -635,9 +646,9 @@ message Signal {
     // while any gateway holds one, the micros are the longest remaining, 0
     // only when none remains; the veto's end instant is host-only. The
     // deciding gateway's own veto is applied before any stage runs: in that
-    // gateway's candidate rows alone the worker reads breaker-open (a breaker
-    // veto) or stalled (a liveness veto), so a plugin never needs this signal
-    // to honour it.
+    // gateway's candidate rows alone the worker reads stalled, and
+    // breaker-open too under a breaker veto, so a plugin never needs this
+    // signal to honour it.
     uint32 gateway_veto_micros = 5;
   }
 }
@@ -784,9 +795,12 @@ message Decline {
 // for and left unanswered is declined. A frame that declines a stage in
 // `decline.stage` and fills that stage's answer field is invalid: refused
 // as malformed like any other invalid frame (the decision falls back, the
-// breaker counts it), never read one way or the other. `counters` holds no
-// more increments than the hello declared counters; a longer list is
-// invalid the same way.
+// breaker counts it), never read one way or the other. When SCORE is asked
+// for, a set `tie_band` must be finite, in [0, 1], and beside `scores`.
+// A band beside a named SCORE decline or without scores makes the frame
+// malformed. The host ignores the band and scores for an unasked SCORE.
+// `counters` holds no more increments than the hello declared counters.
+// A longer list is invalid the same way.
 message PluginDecision {
   fixed64 decision_id = 1;
   Survivors survivors = 2;
@@ -795,6 +809,9 @@ message PluginDecision {
   Decline decline = 5;
   // Counter increments by declared id, applied by the controller.
   repeated CounterDelta counters = 6;
+  // The tie band on the scores' 0 to 1 scale. Rows within this band of the
+  // best score tie. The host uses its default band when the field is unset.
+  optional float tie_band = 7;
 }
 
 message CounterDelta {

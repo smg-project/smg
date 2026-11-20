@@ -5,8 +5,8 @@
 //! A prompt is runs of consecutive token ids, `[first, count]` each. The
 //! classic policy hashes the tokens themselves. A decision here reads block
 //! hashes a host made, so this side plays that host: whole blocks of the
-//! view's block size, each block's hash made from the hash before it and the
-//! block's ids, so a hash names the prefix that ends with its block. A prompt
+//! view's block size, each block's hash made from the block's own ids and
+//! nothing ahead of them, as the gateway's host hashes a prompt. A prompt
 //! as text is each id spelled as four hex digits, and its blocks are windows
 //! of as many characters as a token block has tokens.
 //!
@@ -162,19 +162,10 @@ fn ids(runs: &[[u32; 2]]) -> Vec<u32> {
         .collect()
 }
 
-/// The hashes of `bytes` in whole blocks of `block` bytes, as a host chains
-/// them: each is made from the hash before it and its own block.
-fn chain(bytes: &[u8], block: usize) -> Vec<u64> {
-    let mut parent = 0u64;
-    bytes
-        .chunks_exact(block)
-        .map(|block| {
-            let mut named = parent.to_le_bytes().to_vec();
-            named.extend_from_slice(block);
-            parent = fingerprint(&named);
-            parent
-        })
-        .collect()
+/// The hashes of `bytes` in whole blocks of `block` bytes, as a host
+/// states them: each is of its own block's content.
+fn blocks(bytes: &[u8], block: usize) -> Vec<u64> {
+    bytes.chunks_exact(block).map(fingerprint).collect()
 }
 
 /// A request as a host hands it to a decision: its block hashes, what they
@@ -194,7 +185,7 @@ impl Hashed {
         let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
         Self {
             key: None,
-            hashes: chain(&bytes, 4 * BLOCK),
+            hashes: blocks(&bytes, 4 * BLOCK),
             kind: HashKind::Token,
             tokens: ids.len() as u32,
             tried: Vec::new(),
@@ -207,7 +198,7 @@ impl Hashed {
         let text: String = ids.iter().map(|id| format!("{id:04x}")).collect();
         Self {
             key: None,
-            hashes: chain(text.as_bytes(), BLOCK),
+            hashes: blocks(text.as_bytes(), BLOCK),
             kind: HashKind::Text,
             tokens: ids.len() as u32,
             tried: Vec::new(),
@@ -554,9 +545,9 @@ struct Apart {
 
 /// The rows decided apart. The gateway hashes a prompt's own tokens, so
 /// every token of a prompt under the depth is in its key. A key here is the
-/// hash of a request's last whole block: the tokens past that block are
-/// outside the key, and a request under one block has no key and is placed
-/// as one with nothing to hash, on the fewest requests.
+/// fold of a request's whole blocks: the tokens past its last whole block
+/// are outside the key, and a request under one block has no key and is
+/// placed as one with nothing to hash, on the fewest requests.
 const APART: &[Apart] = &[
     Apart {
         row: "a-ten-token-prompt-keeps-its-key-s-worker-over-the-fewest-requests",
@@ -566,8 +557,7 @@ const APART: &[Apart] = &[
     Apart {
         row: "the-last-token-of-a-prompt-under-256-tokens-is-in-the-key",
         here: Here::Counts(&[64, 0]),
-        rule:
-            "a key is a whole block's hash, so the tokens past the last whole block are outside it",
+        rule: "a key folds whole blocks, so the tokens past the last whole block are outside it",
     },
 ];
 

@@ -2493,6 +2493,7 @@ const GROUPS: &[Group] = &[
         slug: "qwen2.5-0.5b-instruct",
         model: "Qwen/Qwen2.5-0.5B-Instruct",
         also: &[
+            "EssentialAI/eai-distill-0.5b",
             "Qwen2.5-1.5B-Instruct",
             "Qwen2.5-3B-Instruct",
             "Qwen2.5-7B-Instruct",
@@ -2853,7 +2854,10 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "qwen3.8-flash-next",
         model: "Qwen/Qwen3.8-Flash-Next",
-        also: &["nvidia/Qwen3.8-Flash-Next-FP4-Local"],
+        also: &[
+            "autotrust/Qwen3.8-Flash-Next-E384-FP4-Local",
+            "nvidia/Qwen3.8-Flash-Next-FP4-Local",
+        ],
         released: "2026-08-24",
         smg: (Some("qwen_xml"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),

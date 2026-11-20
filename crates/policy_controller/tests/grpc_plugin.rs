@@ -197,6 +197,8 @@ fn binding(plan: Plan, decode_profile: Option<u16>) -> Binding {
         plan,
         profile: 0,
         decode_profile,
+        shadow: None,
+        decode_shadow: None,
         sessions: None,
         overload: None,
     }
@@ -772,6 +774,61 @@ fn a_scorer_alone_is_asked_for_scores_alone() {
     assert_eq!(plugin.stats().answered, 1);
 }
 
+// The best scores of the four rows are 1/2 and 1/3, followed by 1/4.
+const SCORES_WITH_BAND: Behaviour = Behaviour::ScoreBand(210);
+const BAND_ROUNDS: u64 = 64;
+
+#[test]
+fn a_plugins_band_widens_the_tie_the_built_in_picker_draws_from() {
+    let served = TestPlugin::serve();
+    served.behave(SCORES_WITH_BAND);
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "scorer");
+    let engine = single_engine(profile(&plugin, SCORE));
+    let candidates = pool(4);
+    let mut led = [false; 2];
+    for seed in 0..BAND_ROUNDS {
+        let picked = lead(&decide(&engine, &candidates, seed));
+        assert!(matches!(picked, Some(102 | 103)), "seed {seed}: {picked:?}");
+        led[0] |= picked == Some(102);
+        led[1] |= picked == Some(103);
+    }
+    assert_eq!(led, [true; 2], "each row in the band led");
+    assert_eq!(plugin.stats().answered, BAND_ROUNDS);
+}
+
+#[test]
+fn a_plugin_that_sends_no_band_decides_as_before() {
+    let served = TestPlugin::serve();
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "scorer");
+    let engine = single_engine(profile(&plugin, SCORE));
+    let candidates = pool(4);
+    for seed in 0..BAND_ROUNDS {
+        assert_eq!(
+            lead(&decide(&engine, &candidates, seed)),
+            Some(103),
+            "seed {seed}"
+        );
+    }
+    assert_eq!(plugin.stats().answered, BAND_ROUNDS);
+}
+
+#[test]
+fn a_band_is_not_carried_to_the_next_decision() {
+    let served = TestPlugin::serve();
+    served.behave(SCORES_WITH_BAND);
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "scorer");
+    let engine = single_engine(profile(&plugin, SCORE));
+    let candidates = pool(4);
+    let seed = 13;
+    assert_eq!(lead(&decide(&engine, &candidates, seed)), Some(102));
+    served.behave(Behaviour::Honest);
+    assert_eq!(lead(&decide(&engine, &candidates, seed)), Some(103));
+    assert_eq!(plugin.stats().answered, 2);
+}
+
 #[test]
 fn a_picker_alone_is_asked_at_the_pick_with_the_combined_scores() {
     let served = TestPlugin::serve();
@@ -1340,15 +1397,6 @@ fn a_budget_decline_is_busy_and_a_frame_that_answers_nothing_declines_every_stag
 
 #[test]
 fn each_invalid_answer_is_one_fault_and_the_frame_falls_back_whole() {
-    let served = TestPlugin::serve();
-    let runtime = runtime();
-    let mut spec = spec(&served, "sloppy");
-    spec.breaker = BreakerSpec {
-        failures: 100,
-        ..BreakerSpec::default()
-    };
-    let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
-    let engine = single_engine(profile(&plugin, ALL));
     let behaviours = [
         Behaviour::SurvivorOutOfRange,
         Behaviour::SurvivorTwice,
@@ -1356,7 +1404,24 @@ fn each_invalid_answer_is_one_fault_and_the_frame_falls_back_whole() {
         Behaviour::ScoreNan,
         Behaviour::PickOutsideOwnSurvivors,
         Behaviour::DeclinedAndAnswered,
+        Behaviour::BandNan,
+        Behaviour::BandAboveOne,
+        Behaviour::BandBelowZero,
+        Behaviour::BandWithoutScores,
+        Behaviour::BandWithScoreDecline,
     ];
+    let failures = behaviours.len();
+    let served = TestPlugin::serve();
+    served.script(|s| s.counters = vec![(0, 1)]);
+    let runtime = Runtime::with_clock(&OpenDecisions::new(), || 1_234).expect("a runtime");
+    let mut spec = spec(&served, "sloppy");
+    spec.breaker = BreakerSpec {
+        failures: failures as u32,
+        ..BreakerSpec::default()
+    };
+    spec.metrics = vec!["answers".to_owned()];
+    let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
     for (i, behaviour) in behaviours.into_iter().enumerate() {
         served.behave(behaviour);
         assert_eq!(
@@ -1366,12 +1431,17 @@ fn each_invalid_answer_is_one_fault_and_the_frame_falls_back_whole() {
         );
         let stats = plugin.stats();
         assert_eq!(
-            (stats.invalid, stats.answered),
-            (i as u64 + 1, 0),
+            (
+                stats.invalid,
+                stats.answered,
+                stats.declined,
+                stats.breaker_opens
+            ),
+            (i as u64 + 1, 0, 0, u64::from(i + 1 == failures)),
             "{behaviour:?}"
         );
     }
-    assert_eq!(plugin.stats().breaker_opens, 0, "under the threshold");
+    assert!(plugin.counters().read().all(|(_, value)| value == 0));
 }
 
 #[test]

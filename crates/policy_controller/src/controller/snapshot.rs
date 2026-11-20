@@ -8,8 +8,7 @@
 //! nothing of the kind. A request that names no slice asks for every one,
 //! so it is refused too until every slice is served.
 //!
-//! The answer is redacted. A worker's address is told without its userinfo
-//! in each field that carries it ([`redacted`]). Identifiers in clear are
+//! The answer is redacted ([`snapshot`]). Identifiers in clear are
 //! an admin's to ask and this build holds no role, so that request is
 //! refused by its name: it is never answered redacted in silence.
 //!
@@ -53,22 +52,19 @@
 //! No standby is restored from the answer: redacted, and cut where a bound
 //! bit, it names no place of the log.
 
-use std::{
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    time::Instant,
-};
+use std::time::Instant;
 
-use tokio::sync::Mutex;
+use prost::encoding::message;
 use tonic::Status;
 
-use super::{generations::Generations, replication::age_ms, watch_workers, worker_wire};
+use super::{generations::Generations, watch_workers, wire, worker_wire};
 use crate::{
-    ingest::loads::{split, Address, UNPARSABLE},
+    operator::{
+        snapshot::{self, Asked as RowsAsked, Rows},
+        Turn,
+    },
     proto::{self, snapshot_request::Slice},
-    store::{Cut, MemoryStore, WorkerRow},
+    store::MemoryStore,
 };
 
 /// Every slice of the contract, in its order.
@@ -118,107 +114,25 @@ fn names(keep: impl Fn(Slice) -> bool) -> String {
         .join(", ")
 }
 
-/// One snapshot at a time, off the runtime's workers. A snapshot builds its
-/// answer from the rows it reads ([`read`]). The first read behind a write
-/// that somebody can share copies every worker row under the membership
-/// lock: tens of milliseconds and megabytes at ten thousand rows. A
-/// second call waits its turn, in the order the calls came, and a call past
-/// the [`SNAPSHOTS_WAITING`] that wait is told to ask again. The take holds
-/// the turn, so a caller that leaves frees it no earlier than its take
-/// ends. The last call out is told ([`Place`]): the one that leaves no
-/// other call let in.
-#[derive(Debug, Default)]
-pub(crate) struct Turn {
-    /// The calls let in: the one that is taken and the ones that wait.
-    let_in: Arc<AtomicUsize>,
-    turn: Arc<Mutex<()>>,
-}
-
-/// A call's place in the turn. It goes back when the call's take ends, or
-/// when its caller leaves before the take began. The call whose place goes
-/// back while no other call is let in is the last call out, and its `out`
-/// runs then: what the calls shared is let go by the last of them. The
-/// place goes back and the count is read in one step, so of calls that
-/// leave together one alone is the last.
-pub(crate) struct Place<Out: FnOnce()> {
-    let_in: Arc<AtomicUsize>,
-    out: Option<Out>,
-}
-
-impl<Out: FnOnce()> Drop for Place<Out> {
-    fn drop(&mut self) {
-        let last = self.let_in.fetch_sub(1, Ordering::AcqRel) == 1;
-        if let Some(out) = self.out.take().filter(|_| last) {
-            out();
-        }
-    }
-}
-
-impl Turn {
-    /// A place for one call more, or none where [`SNAPSHOTS_WAITING`] wait
-    /// behind the one that is taken. `out` runs where the place is the
-    /// last one back.
-    fn enter<Out: FnOnce()>(&self, out: Option<Out>) -> Option<Place<Out>> {
-        self.let_in
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |let_in| {
-                (let_in <= SNAPSHOTS_WAITING).then_some(let_in + 1)
-            })
-            .ok()?;
-        Some(Place {
-            let_in: Arc::clone(&self.let_in),
-            out,
-        })
-    }
-
-    /// What `take` answers, run in its turn on a thread of the runtime's
-    /// blocking pool; or the refusal of a call no place is left for, or of
-    /// one whose take did not end. `out` runs where this call is the last
-    /// one out: its place goes back and no other call is let in, whether
-    /// its take ended or its caller left while it waited.
-    pub(crate) async fn run<T: Send + 'static>(
-        &self,
-        take: impl FnOnce() -> T + Send + 'static,
-        out: impl FnOnce() + Send + 'static,
-    ) -> Result<T, Status> {
-        let Some(place) = self.enter(Some(out)) else {
-            return Err(Status::resource_exhausted(format!(
-                "{SNAPSHOTS_WAITING} snapshots wait their turn: ask again later"
-            )));
-        };
-        let turn = Arc::clone(&self.turn).lock_owned().await;
-        let taking = tokio::task::spawn_blocking(move || {
-            let _held = (turn, place);
-            take()
-        });
-        taking
-            .await
-            .map_err(|join| Status::internal(format!("the snapshot did not end: {join}")))
-    }
-
-    /// The calls let in at this instant: the one taken and the ones that
-    /// wait.
-    pub(crate) fn let_in(&self) -> usize {
-        self.let_in.load(Ordering::Acquire)
-    }
-
-    /// Every place left, taken for a case: the next call is told to ask
-    /// again while the case holds them.
-    #[cfg(test)]
-    pub(crate) fn fill(&self) -> Vec<Place<fn()>> {
-        std::iter::from_fn(|| self.enter(None)).collect()
-    }
-
-    /// One place, taken for a case: a call beside it is not the last out.
-    #[cfg(test)]
-    pub(crate) fn place(&self) -> Place<fn()> {
-        self.enter(None).expect("a place is free")
-    }
-
-    /// The turn, held for a case: a call let in waits behind it.
-    #[cfg(test)]
-    pub(crate) async fn hold(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        Arc::clone(&self.turn).lock_owned().await
-    }
+/// Takes a snapshot off the runtime's workers, with its turn held until
+/// the take ends. `out` runs when the last place goes back, including
+/// where a caller leaves while it waits.
+pub(super) async fn in_turn<T: Send + 'static>(
+    turn: &Turn,
+    take: impl FnOnce() -> T + Send + 'static,
+    out: impl FnOnce() + Send + 'static,
+) -> Result<T, Status> {
+    let Some(held) = turn.take_with(out).await else {
+        return Err(Status::resource_exhausted(format!(
+            "{SNAPSHOTS_WAITING} snapshots wait their turn: ask again later"
+        )));
+    };
+    tokio::task::spawn_blocking(move || {
+        let _held = held;
+        take()
+    })
+    .await
+    .map_err(|join| Status::internal(format!("the snapshot did not end: {join}")))
 }
 
 /// What a snapshot's caller asked for, once the request holds this build's
@@ -227,10 +141,7 @@ impl Turn {
 pub(crate) struct Asked {
     workers: bool,
     spec: bool,
-    /// The models whose rows are told; none is every model.
-    models: Vec<String>,
-    /// The rows a slice tells at most.
-    limit: usize,
+    rows: RowsAsked,
 }
 
 impl Asked {
@@ -294,22 +205,15 @@ pub(crate) fn asked(request: proto::SnapshotRequest) -> Result<Asked, Status> {
     Ok(Asked {
         workers: named & bit(Slice::Workers) != 0,
         spec: named & bit(Slice::Spec) != 0,
-        models: request.models,
-        // No limit of the caller's leaves the bound of a page's bytes alone.
-        limit: match request.limit {
-            0 => usize::MAX,
-            limit => usize::try_from(limit).unwrap_or(usize::MAX),
+        rows: RowsAsked {
+            models: request.models,
+            // Zero leaves the bound of a page's bytes alone.
+            limit: match request.limit {
+                0 => usize::MAX,
+                limit => usize::try_from(limit).unwrap_or(usize::MAX),
+            },
         },
     })
-}
-
-/// The rows a take reads ([`read`]).
-pub(crate) enum Rows {
-    /// The feed's cut at the log's head, shared.
-    Shared(Arc<Cut>),
-    /// The limit's worth of the rows that serve the asked models, in key
-    /// order, and the count that serve.
-    Told(Vec<WorkerRow>, usize),
 }
 
 /// The rows of one take, by the cheapest road that keeps calls that come
@@ -329,26 +233,12 @@ pub(crate) fn read(
     if let Some(cut) = feed.kept_at_head() {
         return Rows::Shared(cut);
     }
-    let every = asked.limit == usize::MAX && asked.models.is_empty();
+    let every = asked.rows.limit == usize::MAX && asked.rows.models.is_empty();
     if every || turn.let_in() > 1 || watchers.open() {
         return Rows::Shared(feed.rows_at_head(store));
     }
-    let (rows, serving) = store.rows_serving(&asked.models, asked.limit);
+    let (rows, serving) = store.rows_serving(&asked.rows.models, asked.rows.limit);
     Rows::Told(rows, serving)
-}
-
-/// What [`rows`] tells of a cut, told of the rows one call read for itself:
-/// `read` is the limit's worth of the `serving` rows that serve the asked
-/// models, in key order.
-fn read_rows(
-    read: &[WorkerRow],
-    serving: usize,
-    asked: &Asked,
-    now: Instant,
-) -> (Vec<proto::WorkerRow>, bool) {
-    let told = watch_workers::fill_within(asked.limit, read.iter(), |row| redacted(row, now));
-    let truncated = told.len() < serving;
-    (told, truncated)
 }
 
 /// The snapshot `asked` for, as this replica holds it at `now` under
@@ -371,15 +261,12 @@ pub(crate) fn taken(
         let status = generations
             .status()
             .ok_or_else(|| Status::unimplemented(NO_SOURCE))?;
-        Some(status)
+        Some(wire::spec_status(status))
     } else {
         None
     };
     let (workers, truncated) = if asked.workers {
-        match read() {
-            Rows::Shared(cut) => rows(&cut.rows, asked, now),
-            Rows::Told(read, serving) => read_rows(&read, serving, asked, now),
-        }
+        rows(&asked.rows, read(), now)
     } else {
         (Vec::new(), false)
     };
@@ -396,57 +283,13 @@ pub(crate) fn taken(
     })
 }
 
-/// The rows of `cut` that serve an asked model, each as an operator reads
-/// it at `now`, and whether a bound left one of them out: the caller's
-/// limit, or a page's bytes ([`watch_workers::fill_within`]).
-fn rows(cut: &[WorkerRow], asked: &Asked, now: Instant) -> (Vec<proto::WorkerRow>, bool) {
-    let serving = || {
-        cut.iter()
-            .filter(|row| watch_workers::serves(&asked.models, row))
-    };
-    let told = watch_workers::fill_within(asked.limit, serving(), |row| redacted(row, now));
-    let truncated = told.len() < serving().count();
-    (told, truncated)
-}
-
-/// A store row as an operator reads it at `now`: the wire's row
-/// ([`worker_wire::row`]) with its age, and its address without userinfo in
-/// each field that carries it. A row tells its address three times: the
-/// URL, the registration key, which is the URL, and the engine, which is
-/// the key for a single rank. An operator loses no handle by it: a patch
-/// and a removal name a row by its id and its revision.
-fn redacted(row: &WorkerRow, now: Instant) -> proto::WorkerRow {
-    let mut told = worker_wire::row(row);
-    told.admitted_age_ms = age_ms(now, row.admitted_at);
-    for address in [&mut told.url, &mut told.registration_key, &mut told.engine] {
-        if let Some(clean) = without_userinfo(address) {
-            *address = clean;
-        }
-    }
-    told
-}
-
-/// `address` without its userinfo, or `None` where it carries none: the
-/// userinfo goes, and every other byte stays as registered. The crate's one
-/// split tells the userinfo from the address ([`split`]): an address it
-/// cannot split is told as [`UNPARSABLE`], the marker a log line writes for
-/// it. The scheme is told beside the host, and the split reads one by its
-/// form alone: any other text before a `://` is the address's own, read
-/// for its userinfo with the rest.
-///
-/// The userinfo is the one credential a URL carries by its form. A secret a
-/// registrant wrote into a path or a query is not known as one here.
-fn without_userinfo(address: &str) -> Option<String> {
-    let Some(Address {
-        scheme,
-        userinfo,
-        host,
-        tail,
-    }) = split(address)
-    else {
-        return Some(UNPARSABLE.to_owned());
-    };
-    userinfo.then(|| format!("{scheme}{host}{tail}"))
+/// A controller page keeps its bound on the encoded rows' bytes.
+fn rows(asked: &RowsAsked, read: Rows, now: Instant) -> (Vec<proto::WorkerRow>, bool) {
+    snapshot::told_with(asked, read, now, true, |row| {
+        let told = wire::snapshot_row(&row, now);
+        let framed = message::encoded_len(1, &told);
+        (told, framed)
+    })
 }
 
 #[cfg(test)]
@@ -465,27 +308,40 @@ mod tests {
     use tonic::Code;
 
     use super::{
-        asked, read_rows, rows, served, taken, without_userinfo, Asked, Rows, Turn, SLICES,
-        SNAPSHOTS_WAITING, UNPARSABLE,
+        asked, in_turn, served, taken, Asked, Rows, RowsAsked, Turn, SLICES, SNAPSHOTS_WAITING,
     };
     use crate::{
+        address::UNPARSABLE,
         catalog::Catalog,
         controller::{
             generations::{tests::LEAST_LOAD, Format, Generations},
             watch_workers::PAGE_BYTES,
             worker_wire,
         },
+        operator::snapshot::without_userinfo,
         proto::{self, snapshot_request::Slice},
-        store::{Kinds, MemoryStore, WorkerFacts, WorkersStore},
+        store::{Cut, Kinds, MemoryStore, WorkerFacts, WorkerRow, WorkersStore},
     };
 
     /// The rows slice alone: every model, no limit.
     const ROWS: Asked = Asked {
         workers: true,
         spec: false,
-        models: Vec::new(),
-        limit: usize::MAX,
+        rows: RowsAsked {
+            models: Vec::new(),
+            limit: usize::MAX,
+        },
     };
+
+    fn rows(cut: &[WorkerRow], asked: &Asked, now: Instant) -> (Vec<proto::WorkerRow>, bool) {
+        let cut = Arc::new(Cut {
+            rows: cut.to_vec(),
+            at: Default::default(),
+            epoch: 0,
+            loads: Vec::new(),
+        });
+        super::rows(&asked.rows, Rows::Shared(cut), now)
+    }
 
     /// A request for `slices`.
     fn naming(slices: &[Slice]) -> proto::SnapshotRequest {
@@ -592,8 +448,8 @@ mod tests {
     fn the_served_slices_are_asked_alone_or_together() {
         let both = asked(naming(&[Slice::Spec, Slice::Workers, Slice::Spec])).expect("served");
         assert!(both.workers && both.spec);
-        assert_eq!(both.limit, usize::MAX);
-        assert!(both.models.is_empty());
+        assert_eq!(both.rows.limit, usize::MAX);
+        assert!(both.rows.models.is_empty());
 
         let rows = asked(proto::SnapshotRequest {
             models: vec!["model-a".to_owned()],
@@ -602,7 +458,10 @@ mod tests {
         })
         .expect("served");
         assert!(rows.workers && !rows.spec);
-        assert_eq!((rows.models, rows.limit), (vec!["model-a".to_owned()], 7));
+        assert_eq!(
+            (rows.rows.models, rows.rows.limit),
+            (vec!["model-a".to_owned()], 7)
+        );
 
         let status = asked(naming(&[Slice::Spec])).expect("served");
         assert!(!status.workers && status.spec);
@@ -687,71 +546,6 @@ mod tests {
         assert!(asked(request).is_ok());
     }
 
-    /// An address is told without its userinfo and with every other byte as
-    /// registered. One with no userinfo is told as it is. One whose `@`
-    /// stands past the authority's end is told by the marker: no part of
-    /// what may be a userinfo is told.
-    #[test]
-    fn an_address_is_told_without_its_userinfo() {
-        for (address, told) in [
-            (
-                "grpc://user:secret@10.0.0.5:8000",
-                Some("grpc://10.0.0.5:8000"),
-            ),
-            (
-                "https://user@host.example:8443/v1?x=1#top",
-                Some("https://host.example:8443/v1?x=1#top"),
-            ),
-            ("user:secret@10.0.0.5:8000", Some("10.0.0.5:8000")),
-            // An `@` inside the userinfo: the authority's last one ends it.
-            (
-                "grpc://us@er:se@cret@10.0.0.5:8000",
-                Some("grpc://10.0.0.5:8000"),
-            ),
-            (
-                "grpc+tls://user@10.0.0.5:8000",
-                Some("grpc+tls://10.0.0.5:8000"),
-            ),
-            // A `://` behind the authority is no scheme's: the authority
-            // starts at the address's first byte, and its userinfo goes.
-            (
-                "user:secret@10.0.0.5:8000/next/http://other",
-                Some("10.0.0.5:8000/next/http://other"),
-            ),
-            (
-                "user:secret@10.0.0.5:8000?next=http://other",
-                Some("10.0.0.5:8000?next=http://other"),
-            ),
-            (
-                "user:secret@10.0.0.5:8000#http://other",
-                Some("10.0.0.5:8000#http://other"),
-            ),
-            (
-                "grpc://user:secret@10.0.0.5:8000?next=http://other",
-                Some("grpc://10.0.0.5:8000?next=http://other"),
-            ),
-            // No userinfo: every byte stays.
-            ("grpc://10.0.0.5:8000", None),
-            ("10.0.0.5:8000?next=http://other", None),
-            ("http://[::1]:8000/v1?x=1", None),
-            ("10.0.0.5:8000", None),
-            ("1http://10.0.0.5:8000", None),
-            ("", None),
-            // A userinfo that holds a raw `/`, `?` or `#` reads like these,
-            // and so does a path that holds an `@`.
-            ("http://user:se/cret@10.0.0.5:8000", Some(UNPARSABLE)),
-            ("http://user:se?cret@10.0.0.5:8000", Some(UNPARSABLE)),
-            ("http://user:se#cret@10.0.0.5:8000", Some(UNPARSABLE)),
-            ("http://10.0.0.5:8000/a@b", Some(UNPARSABLE)),
-            // No scheme by its form stands before `://`: its `/` ends the
-            // authority, and the `@` behind it stands past that end.
-            ("user:se://cret@10.0.0.5:8000", Some(UNPARSABLE)),
-            ("1http://user:secret@10.0.0.5:8000", Some(UNPARSABLE)),
-        ] {
-            assert_eq!(without_userinfo(address).as_deref(), told, "{address}");
-        }
-    }
-
     /// A row tells its address in three fields, each without the userinfo,
     /// and no byte of the row an operator reads holds the userinfo: a field
     /// that carries the key later fails this until it is redacted too. The
@@ -793,6 +587,58 @@ mod tests {
         assert_eq!(cut.rows[0].facts.key, key);
     }
 
+    /// A provider's key for a worker is its own text and may hold an
+    /// address with a credential: a redacted row tells a key that is a URL
+    /// without its userinfo, and any other key that holds an `@` as the
+    /// marker. A key with no `@` is told as it stands, and a control
+    /// call's row names no maker.
+    #[test]
+    fn a_makers_key_is_told_without_its_userinfo() {
+        use crate::store::Maker;
+
+        let store = MemoryStore::new();
+        register(&store, &url(1), "model-a");
+        let mut row = store.cut(Kinds::Watched).rows[0].clone();
+        let page = |row: &WorkerRow| {
+            let (mut told, _) = rows(std::slice::from_ref(row), &ROWS, Instant::now());
+            told.pop().expect("one row")
+        };
+        let told = |row: &WorkerRow| page(row).maker.map(|maker| maker.key);
+        assert_eq!(told(&row), None, "a control call's row names no maker");
+        row.maker = Maker::provider(
+            "pool",
+            "http://operator-name:s3cret-word@pool.example/pods/a",
+        )
+        .expect("a whole maker");
+        assert_eq!(
+            told(&row).as_deref(),
+            Some("http://pool.example/pods/a"),
+            "the key keeps its userinfo"
+        );
+        let bytes = page(&row).encode_to_vec();
+        for secret in ["s3cret-word", "operator-name"] {
+            assert!(
+                !bytes
+                    .windows(secret.len())
+                    .any(|window| window == secret.as_bytes()),
+                "the row tells {secret}"
+            );
+        }
+        // A key with no `@` is told whole. One with an `@` and no scheme
+        // is no URL to clean: it reads as the marker, never as a part of
+        // itself.
+        for (key, reads) in [
+            ("pods/a", "pods/a"),
+            ("model-a@pool/pods/a", UNPARSABLE),
+            ("pods/a@node-3", UNPARSABLE),
+            ("operator-name:s3cret-word@", UNPARSABLE),
+            ("http://pool.example/pods/a@node-3", UNPARSABLE),
+        ] {
+            row.maker = Maker::provider("pool", key).expect("a whole maker");
+            assert_eq!(told(&row).as_deref(), Some(reads), "the key {key}");
+        }
+    }
+
     /// The caller's limit leaves rows out, and the mark says so: the rows
     /// told are the first by their keys. A limit the rows are within sets
     /// no mark.
@@ -805,7 +651,14 @@ mod tests {
         let cut = store.cut(Kinds::Watched);
         let now = Instant::now();
         let told = |limit| {
-            let (page, truncated) = rows(&cut.rows, &Asked { limit, ..ROWS }, now);
+            let (page, truncated) = rows(
+                &cut.rows,
+                &Asked {
+                    rows: RowsAsked { limit, ..ROWS.rows },
+                    ..ROWS
+                },
+                now,
+            );
             let urls: Vec<String> = page.into_iter().map(|row| row.url).collect();
             (urls, truncated)
         };
@@ -832,9 +685,12 @@ mod tests {
         assert_eq!((page.len(), truncated), (1, true));
         assert!(page[0].url.starts_with("grpc://0."));
         // A lone call's own read is held to the same bytes.
-        let asked = Asked { limit: 3, ..ROWS };
+        let asked = RowsAsked {
+            models: Vec::new(),
+            limit: 3,
+        };
         let (read, serving) = store.rows_serving(&asked.models, asked.limit);
-        let (page, truncated) = read_rows(&read, serving, &asked, Instant::now());
+        let (page, truncated) = super::rows(&asked, Rows::Told(read, serving), Instant::now());
         assert_eq!((page.len(), truncated), (1, true));
         assert!(page[0].url.starts_with("grpc://0."));
     }
@@ -865,8 +721,10 @@ mod tests {
         let cut = store.cut(Kinds::Watched);
         let told = |limit| {
             let asked = Asked {
-                models: vec!["model-b".to_owned(), "model-c".to_owned()],
-                limit,
+                rows: RowsAsked {
+                    models: vec!["model-b".to_owned(), "model-c".to_owned()],
+                    limit,
+                },
                 ..ROWS
             };
             let (page, truncated) = rows(&cut.rows, &asked, Instant::now());
@@ -905,15 +763,17 @@ mod tests {
         for models in filters {
             for limit in [0, 1, 2, 3, 5, 6, usize::MAX] {
                 let asked = Asked {
-                    models: models.clone(),
-                    limit,
+                    rows: RowsAsked {
+                        models: models.clone(),
+                        limit,
+                    },
                     ..ROWS
                 };
                 let now = Instant::now();
-                let (read, serving) = store.rows_serving(&asked.models, asked.limit);
+                let (read, serving) = store.rows_serving(&asked.rows.models, asked.rows.limit);
                 assert!(read.len() <= limit, "models {models:?}, limit {limit}");
                 assert_eq!(
-                    read_rows(&read, serving, &asked, now),
+                    super::rows(&asked.rows, Rows::Told(read, serving), now),
                     rows(&cut.rows, &asked, now),
                     "models {models:?}, limit {limit}"
                 );
@@ -1023,7 +883,7 @@ mod tests {
     /// waits for the case's word: a take on that thread could not be told.
     #[tokio::test]
     async fn one_snapshot_is_taken_at_a_time_and_a_call_past_the_wait_is_told_to_ask_again() {
-        let turn = Arc::new(Turn::default());
+        let turn = Arc::new(Turn::new(SNAPSHOTS_WAITING));
         let runtime = thread::current().id();
         let (release, word) = mpsc::channel::<()>();
         let word = Arc::new(std::sync::Mutex::new(word));
@@ -1052,7 +912,7 @@ mod tests {
                     assert!(told.is_ok(), "the case's word came");
                     n
                 };
-                turn.run(take, || ()).await
+                in_turn(&turn, take, || ()).await
             });
         }
         // Every call is let in: one is taken, the others wait their turn.
@@ -1065,7 +925,7 @@ mod tests {
             "a take ran on the runtime's thread"
         );
         assert_eq!(turn.let_in(), SNAPSHOTS_WAITING + 1);
-        let past = tokio::time::timeout(Duration::from_secs(5), turn.run(|| (), || ()))
+        let past = tokio::time::timeout(Duration::from_secs(5), in_turn(&turn, || (), || ()))
             .await
             .expect("an answer at once")
             .expect_err("no place is left");
@@ -1096,7 +956,7 @@ mod tests {
     /// the word comes.
     #[tokio::test]
     async fn a_caller_that_leaves_frees_the_turn_no_earlier_than_its_take_ends() {
-        let turn = Arc::new(Turn::default());
+        let turn = Arc::new(Turn::new(SNAPSHOTS_WAITING));
         let (release, word) = mpsc::channel::<()>();
         let (started, at_work) = mpsc::channel::<()>();
         let mut calls = JoinSet::new();
@@ -1107,7 +967,7 @@ mod tests {
                     started.send(()).expect("the case listens");
                     word.recv_timeout(Duration::from_secs(30)).is_ok()
                 };
-                turn.run(take, || ()).await.map(|_told| ())
+                in_turn(&turn, take, || ()).await.map(|_told| ())
             }
         });
         // The first take is at work on the blocking pool.
@@ -1129,10 +989,7 @@ mod tests {
         let ran = Arc::new(AtomicBool::new(false));
         calls.spawn({
             let (turn, ran) = (Arc::clone(&turn), Arc::clone(&ran));
-            async move {
-                turn.run(move || ran.store(true, Ordering::SeqCst), || ())
-                    .await
-            }
+            async move { in_turn(&turn, move || ran.store(true, Ordering::SeqCst), || ()).await }
         });
         let since = Instant::now();
         while turn.let_in() < 2 {
@@ -1172,7 +1029,7 @@ mod tests {
     /// waited. A call that leaves another let in is not the last.
     #[tokio::test]
     async fn the_last_call_out_is_the_one_that_leaves_no_call_let_in() {
-        let turn = Arc::new(Turn::default());
+        let turn = Arc::new(Turn::new(SNAPSHOTS_WAITING));
         let outs = Arc::new(AtomicUsize::new(0));
         let counted = || {
             let outs = Arc::clone(&outs);
@@ -1181,7 +1038,7 @@ mod tests {
             }
         };
         // A call alone is the last out.
-        turn.run(|| (), counted()).await.expect("its turn");
+        in_turn(&turn, || (), counted()).await.expect("its turn");
         assert_eq!(outs.load(Ordering::SeqCst), 1);
 
         // Two calls are let in: the first out leaves the second let in.
@@ -1189,7 +1046,7 @@ mod tests {
         let mut calls = JoinSet::new();
         for _ in 0..2 {
             let (turn, out) = (Arc::clone(&turn), counted());
-            calls.spawn(async move { turn.run(|| (), out).await });
+            calls.spawn(async move { in_turn(&turn, || (), out).await });
         }
         let since = Instant::now();
         while turn.let_in() < 2 {
@@ -1209,7 +1066,7 @@ mod tests {
         let held = turn.hold().await;
         let waiting = calls.spawn({
             let (turn, out) = (Arc::clone(&turn), counted());
-            async move { turn.run(|| (), out).await }
+            async move { in_turn(&turn, || (), out).await }
         });
         let since = Instant::now();
         while turn.let_in() < 1 {
@@ -1230,42 +1087,73 @@ mod tests {
         drop(held);
     }
 
-    /// Of calls that leave together one alone is the last out: a place
-    /// goes back and the count is read in one step. Two places go back
-    /// from two threads at one instant, round after round.
     #[test]
-    fn of_calls_that_leave_together_one_alone_is_the_last_out() {
-        let turn = Turn::default();
-        let outs = Arc::new(AtomicUsize::new(0));
-        for round in 1..=2_000 {
-            let (go, ready) = (AtomicBool::new(false), AtomicUsize::new(0));
-            thread::scope(|scope| {
-                for _ in 0..2 {
-                    let outs = Arc::clone(&outs);
-                    let counted = move || {
-                        outs.fetch_add(1, Ordering::SeqCst);
-                    };
-                    let place = turn.enter(Some(counted)).expect("a place is free");
-                    let (go, ready) = (&go, &ready);
-                    scope.spawn(move || {
-                        ready.fetch_add(1, Ordering::SeqCst);
-                        while !go.load(Ordering::SeqCst) {
-                            std::hint::spin_loop();
-                        }
-                        drop(place);
-                    });
-                }
-                while ready.load(Ordering::SeqCst) < 2 {
-                    thread::yield_now();
-                }
-                go.store(true, Ordering::SeqCst);
-            });
-            assert_eq!(turn.let_in(), 0, "each place went back");
-            assert_eq!(
-                outs.load(Ordering::SeqCst),
-                round,
-                "one last call out a round"
-            );
+    fn plain_snapshot_rows_map_to_the_previous_wire_rows() {
+        use crate::operator::snapshot::{told, Asked as RowsAsked, Rows as ReadRows};
+
+        let store = MemoryStore::new();
+        for (key, model) in [
+            ("grpc://user:secret@host-a:8000", "a"),
+            ("grpc://host-b:8000", "b"),
+            ("grpc://user:se/cret@host-c:8000", "a"),
+            ("grpc://host-d:8000", "b"),
+        ] {
+            register(&store, key, model);
         }
+        let cut = Arc::new(store.cut(Kinds::Watched));
+        let now = Instant::now() + Duration::from_secs(1);
+        for models in [Vec::new(), vec!["a".to_owned()], vec!["none".to_owned()]] {
+            for limit in [0, 1, 2, 3, usize::MAX] {
+                let asked = RowsAsked {
+                    models: models.clone(),
+                    limit,
+                };
+                let read = || store.rows_serving(&models, limit);
+                let (rows, serving) = read();
+                let expected = legacy_rows(&cut.rows, &models, limit, now);
+                for read in [
+                    ReadRows::Shared(Arc::clone(&cut)),
+                    ReadRows::Told(rows, serving),
+                ] {
+                    let found = told(&asked, read, now);
+                    let mapped: Vec<_> = found
+                        .rows
+                        .iter()
+                        .map(|row| super::wire::snapshot_row(row, now))
+                        .collect();
+                    assert_eq!((mapped, found.truncated), expected, "{models:?}, {limit}");
+                }
+            }
+        }
+    }
+
+    // The wire page that preceded the plain operator rows.
+    fn legacy_rows(
+        cut: &[WorkerRow],
+        models: &[String],
+        limit: usize,
+        now: Instant,
+    ) -> (Vec<proto::WorkerRow>, bool) {
+        let serving = || {
+            cut.iter().filter(|row| {
+                models.is_empty() || row.facts.models.iter().any(|model| models.contains(model))
+            })
+        };
+        let rows = super::watch_workers::fill_within(limit, serving(), |row| {
+            let mut told = worker_wire::row(row);
+            told.admitted_age_ms = super::super::replication::age_ms(now, row.admitted_at);
+            let maker = told.maker.as_mut().map(|maker| &mut maker.key);
+            for address in [&mut told.url, &mut told.registration_key, &mut told.engine]
+                .into_iter()
+                .chain(maker)
+            {
+                if let Some(clean) = without_userinfo(address) {
+                    *address = clean;
+                }
+            }
+            told
+        });
+        let truncated = rows.len() < serving().count();
+        (rows, truncated)
     }
 }

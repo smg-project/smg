@@ -991,6 +991,7 @@ fn config(deciders: usize) -> Config {
         load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
         decide_shards: deciders,
         election: Election::default(),
+        discovery: None,
     }
 }
 
@@ -1421,6 +1422,7 @@ fn request(id: u64, models: &[String], pair: bool) -> DecideRequest {
             ..WireFacts::default()
         }),
         constraints: None,
+        again: false,
     }
 }
 

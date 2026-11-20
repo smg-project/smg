@@ -39,8 +39,8 @@ use openai_protocol::{
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
     validated::{ValidatedJson, ValidatedPath, ValidatedQuery, ValueBody},
     worker::{
-        ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerListFormat, WorkerSpec,
-        WorkerUpdateRequest,
+        ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerErrorResponse,
+        WorkerListFormat, WorkerSpec, WorkerUpdateRequest,
     },
 };
 use serde::Deserialize;
@@ -48,6 +48,7 @@ use smg_mesh::{
     ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
     PreparedMeshServer,
 };
+use smg_policy_controller::Catalog;
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
@@ -67,7 +68,11 @@ pub use smg_worker::connection::client_factory::{
     blocking_http_client, http_client, http_client_builder, install_crypto_provider,
 };
 use smg_worker::{
-    health::manager::{WorkerManager, WorkerManagerConfig},
+    connection::engine::EngineConnector,
+    health::{
+        manager::{WorkerManager, WorkerManagerConfig},
+        port::HealthSink,
+    },
     identity::{basic::ConnectionMode, endpoint::Endpoint},
     jobs::WorkerJobs,
 };
@@ -97,7 +102,7 @@ use crate::{
         logging::LoggingConfig, metrics, metrics::PrometheusConfig, metrics_server, otel_trace,
         runtime_metrics,
     },
-    policy_controller,
+    policy_controller::follower::Follower,
     routers::{
         common::realtime::ws::RealtimeQueryParams,
         error as route_error,
@@ -127,9 +132,7 @@ pub struct AppState {
     pub gateway: Option<Arc<Gateway>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
     pub mesh_adapters: Option<Arc<MeshAdapters>>,
-    /// Cached O(1) readiness state shared with the optional dedicated
-    /// probe listener. Maintained event-driven by
-    /// [`crate::server::health::spawn_readiness_maintainer`].
+    /// Readiness state shared with the optional dedicated probe listener.
     pub probe_state: Arc<ProbeState>,
     /// Where this start read its secrets (the command line, the environment
     /// or a file), for the configuration view; the values are not here.
@@ -187,11 +190,7 @@ async fn liveness() -> Response {
     liveness_response()
 }
 
-/// O(1) readiness: reads the event-maintained snapshot (see
-/// [`crate::server::health::spawn_readiness_maintainer`]) and the drain flag — no registry
-/// scan per probe. The decision logic lives in
-/// [`crate::server::health::ProbeState::recompute`] and is unchanged from the previous
-/// inline implementation, plus the drain gate (not-ready while draining).
+/// Read the readiness state shared by all probe routes.
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     state.probe_state.readiness_response()
 }
@@ -1002,6 +1001,18 @@ async fn replace_worker(
     }
 }
 
+async fn refuse_worker_write(_: Request, _: axum::middleware::Next) -> impl IntoResponse {
+    (
+        StatusCode::CONFLICT,
+        Json(WorkerErrorResponse {
+            error:
+                "With --policy-controller-address, add, change and remove workers at the controller"
+                    .to_owned(),
+            code: "CONFLICT".to_owned(),
+        }),
+    )
+}
+
 // ============================================================================
 // Tokenize / Detokenize Handlers
 // ============================================================================
@@ -1126,6 +1137,56 @@ impl ServerConfig {
             secret_files: Default::default(),
             secrets_auto_reload: false,
         }
+    }
+}
+
+/// What a host binary adds to the gateway at startup.
+#[non_exhaustive]
+pub struct Extensions {
+    stages: Option<Catalog>,
+    connector: Option<Arc<dyn EngineConnector>>,
+}
+
+impl Extensions {
+    /// Use the stock stages and connector.
+    pub fn new() -> Self {
+        Self {
+            stages: None,
+            connector: None,
+        }
+    }
+
+    /// Set the catalog of stages a policy document may name. Start with
+    /// [`Catalog::builtin`] and register the host's stages on it. The
+    /// catalog is read only when startup selects the policy controller.
+    #[must_use]
+    pub fn stages(mut self, stages: Catalog) -> Self {
+        self.stages = Some(stages);
+        self
+    }
+
+    /// Set the connector workers of this gateway use to probe and connect
+    /// to their engines. Delegate to [`BackendConnector::shared`] for engines
+    /// you want the gateway to connect to as usual.
+    ///
+    /// For gRPC or ZMQ inference, and for a ZMQ worker's label refresh, the
+    /// gateway requires a [`BackendClient`]. It refuses other connections with
+    /// `its engine connection is not the gateway's backend client`.
+    /// If the connection supplies load reports, let the worker runtime be
+    /// the only poller of that engine's load.
+    ///
+    /// [`BackendConnector::shared`]: crate::routers::grpc::backend_client::BackendConnector::shared
+    /// [`BackendClient`]: crate::routers::grpc::backend_client::BackendClient
+    #[must_use]
+    pub fn connector(mut self, connector: Arc<dyn EngineConnector>) -> Self {
+        self.connector = Some(connector);
+        self
+    }
+}
+
+impl Default for Extensions {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1483,16 +1544,23 @@ pub fn build_apps(
             get(v1_tokenizers_status),
         );
 
-    // Build worker routes
-    let worker_routes = Router::new()
-        .route("/workers", post(create_worker).get(list_workers_rest))
-        .route(
-            "/workers/{worker_id}",
-            get(get_worker)
-                .put(replace_worker)
-                .patch(update_worker)
-                .delete(delete_worker),
-        );
+    let mut worker_writes = Router::new().route("/workers", post(create_worker)).route(
+        "/workers/{worker_id}",
+        axum::routing::put(replace_worker)
+            .patch(update_worker)
+            .delete(delete_worker),
+    );
+    if app_state
+        .context
+        .router_config
+        .policy_controller_address
+        .is_some()
+    {
+        worker_writes = worker_writes.route_layer(axum::middleware::from_fn(refuse_worker_write));
+    }
+    let worker_routes = worker_writes
+        .route("/workers", get(list_workers_rest))
+        .route("/workers/{worker_id}", get(get_worker));
 
     // Fallback (no control-plane auth) normally uses `admin_auth_config`.
     // If only tenant keys are configured (no shared `--api-key`), there's no
@@ -1687,11 +1755,10 @@ fn supervise_discovery(
 /// store connections are behind us; the mesh TLS material, the apps and the
 /// listener addresses can still fail the start after this, with these
 /// listeners bound) and before the admin and HTTP listeners: the O(1)
-/// readiness state the probes read (maintained from
-/// WorkerRegistry events plus a short checkpoint for what no event carries,
-/// served by `/readiness` on the main listener and on the optional
-/// probe listener); the metrics listener (the recorder exists since the top of
-/// start-up, the port binds only now, eagerly, so a conflict or a bad address
+/// readiness state the probes read (the controller's first snapshot when
+/// following, or the cached state from worker registry events and a short
+/// checkpoint for what no event carries); the metrics listener (the recorder
+/// exists since the top of start-up, the port binds only now, eagerly, so a conflict or a bad address
 /// fails the start before the HTTP listener) with the Tokio runtime observer
 /// on it (event-loop canary and sampler; `startup` runs on the main runtime,
 /// so the observer lands on, and measures, the runtime that serves requests);
@@ -1709,13 +1776,18 @@ async fn start_observability(
     app_context: &Arc<AppContext>,
     metrics_handle: Option<PrometheusHandle>,
 ) -> Result<Arc<ProbeState>, Box<dyn std::error::Error>> {
-    let probe_state = ProbeState::new(app_context.inflight_tracker.clone());
-    let _readiness_maintainer = spawn_readiness_maintainer(
-        probe_state.clone(),
-        app_context.worker_registry.clone(),
-        app_context.tokenizer_registry.clone(),
-        config.router_config.clone(),
+    let probe_state = ProbeState::with_follower(
+        app_context.inflight_tracker.clone(),
+        app_context.policy_follower.as_ref().map(Arc::downgrade),
     );
+    if app_context.policy_follower.is_none() {
+        let _readiness_maintainer = spawn_readiness_maintainer(
+            probe_state.clone(),
+            app_context.worker_registry.clone(),
+            app_context.tokenizer_registry.clone(),
+            config.router_config.clone(),
+        );
+    }
 
     if let (Some(handle), Some(prometheus_config)) = (metrics_handle, &config.prometheus_config) {
         let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
@@ -1756,7 +1828,9 @@ async fn start_discovery(
 ) -> DiscoveryTasks {
     let mut discovery_tasks = DiscoveryTasks::default();
 
-    if let Some(service_discovery_config) = service_discovery_config {
+    if app_context.follows_controller() {
+        info!("Skipping worker discovery because --policy-controller-address is set");
+    } else if let Some(service_discovery_config) = service_discovery_config {
         let app_context_arc = Arc::clone(app_context);
         match start_service_discovery(service_discovery_config, app_context_arc).await {
             Ok(handle) => {
@@ -1805,7 +1879,8 @@ async fn start_discovery(
 /// The job queue and the typed workflow engines, then the start-up jobs on
 /// them, in this order: the tokenizer (when a tokenizer or model path is
 /// configured and autoload is on; before the workers, so the tokenizer is
-/// there when they arrive), the workers from the configuration, and the MCP
+/// there when they arrive), the workers from the configuration where the
+/// controller does not supply them, and the MCP
 /// servers when an MCP configuration is given (the orchestrator then refreshes
 /// its inventory on its own channel, by `inventory.refresh_interval`). Each
 /// job completes in the background; a job the queue refuses fails the start.
@@ -1892,12 +1967,6 @@ async fn start_workflow_engines(
         info!("Startup tokenizer job submitted (will complete in background)");
     }
 
-    info!(
-        "Initializing workers for routing mode: {:?}",
-        config.router_config.mode
-    );
-
-    // Submit worker initialization job to queue
     #[expect(
         clippy::expect_used,
         reason = "JobQueue was initialized above; absence is unreachable"
@@ -1906,15 +1975,23 @@ async fn start_workflow_engines(
         .worker_job_queue
         .get()
         .expect("JobQueue should be initialized");
-    let job = Job::InitializeWorkersFromConfig {
-        router_config: Box::new(config.router_config.clone()),
-    };
-    job_queue
-        .submit(job)
-        .await
-        .map_err(|e| format!("Failed to submit worker initialization job: {e}"))?;
+    if app_context.follows_controller() {
+        info!("Skipping startup worker registration because --policy-controller-address is set");
+    } else {
+        info!(
+            "Initializing workers for routing mode: {:?}",
+            config.router_config.mode
+        );
+        let job = Job::InitializeWorkersFromConfig {
+            router_config: Box::new(config.router_config.clone()),
+        };
+        job_queue
+            .submit(job)
+            .await
+            .map_err(|e| format!("Failed to submit worker initialization job: {e}"))?;
 
-    info!("Worker initialization job submitted (will complete in background)");
+        info!("Worker initialization job submitted (will complete in background)");
+    }
 
     if let Some(mcp_config) = &config.router_config.mcp_config {
         info!("Found {} MCP server(s) in config", mcp_config.servers.len());
@@ -1966,24 +2043,34 @@ async fn prepare_mesh_server(
     Ok(Some(prepared))
 }
 
-/// [`startup`] on `runtime` to its end, then the process-wide observability
+/// Run the gateway on `runtime` with the stock stages. See [`run_with`] for
+/// shutdown behavior.
+pub fn run(
+    runtime: &tokio::runtime::Runtime,
+    config: ServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_with(runtime, config, Extensions::default())
+}
+
+/// [`startup_with`] on `runtime` to its end, then the process-wide observability
 /// closed behind it, on every exit alike: the log writers are flushed and
 /// stopped, then the tracer is flushed and shut down (a bounded wait, see
 /// [`otel_trace::shutdown_otel`]), and only then is the result read. A
 /// failed start-up used to return before the tracer's shutdown, and the
 /// spans the batch exporter still held were lost with the process. The
-/// result is `startup`'s own: the error line and the exit code are the
+/// result is `startup_with`'s own: the error line and the exit code are the
 /// caller's, as before. The runtime stays up throughout: the exporter's
 /// connection lives on it, and the shutdown is driven from it, so a
 /// current-thread runtime serves as well as a multi-thread one.
 ///
 /// For a caller whose process goes on after the server (a language
-/// binding), [`startup`] alone is the entry point.
-pub fn run(
+/// binding), [`startup_with`] alone is the entry point.
+pub fn run_with(
     runtime: &tokio::runtime::Runtime,
     config: ServerConfig,
+    extensions: Extensions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let served = runtime.block_on(Box::pin(startup(config)));
+    let served = runtime.block_on(Box::pin(startup_with(config, extensions)));
     // The writer threads outlive `startup` (a process may start more than one
     // router); flush and stop them now that this process is done logging.
     logging::close_logging();
@@ -2188,27 +2275,80 @@ fn serve_listeners(
     Ok((data_serving, admin_serving))
 }
 
-/// The one router this server answers with, and the gateway object behind it
-/// where one is built.
-///
-/// A process the policy controller was picked for answers with the
-/// controller's router ([`policy_controller::router`]) and builds no gateway
-/// object. So no classic router is built, and no selection of the gateway
-/// object runs ahead of the controller's answer.
-pub(crate) async fn serving_router(
-    config: &ServerConfig,
-    context: &Arc<AppContext>,
-) -> Result<(Arc<dyn RouterTrait>, Option<Arc<Gateway>>), String> {
-    if let Some(router) = policy_controller::router(context) {
-        return Ok((router, None));
+/// Start the local health loop and keep its handle until the server stops.
+fn start_worker_health_checks(app_context: &AppContext) -> Option<WorkerManager> {
+    if app_context.follows_controller() {
+        info!("Skipping worker health checks because --policy-controller-address is set");
+        return None;
     }
-    let gateway = Gateway::from_config(config, context).await?;
-    let router: Arc<dyn RouterTrait> = gateway.clone();
-    Ok((router, Some(gateway)))
+    let config = &app_context.router_config;
+    // With a feed the loop writes through the feed's sink, so each worker's
+    // health keeps one writer.
+    let health_sink: Arc<dyn HealthSink> = match &app_context.policy_feed {
+        Some(feed) => feed.health_sink(),
+        None => app_context.worker_registry.clone(),
+    };
+    WorkerManager::maybe_start_with_sink(
+        app_context.worker_registry.clone(),
+        health_sink,
+        WorkerManagerConfig {
+            default_check_interval_secs: config.health_check.check_interval_secs,
+            remove_unhealthy: config.unhealthy_removal_scope(),
+        },
+        app_context
+            .worker_job_queue
+            .get()
+            .map(|queue| Arc::clone(queue) as Arc<dyn WorkerJobs>),
+        !config.health_check.disable_health_check,
+        config.connection_mode == ConnectionMode::Zmq,
+    )
+}
+
+/// End the watch if startup exits while another task still holds the context.
+struct FollowerOnExit<'a>(&'a AppContext);
+
+impl FollowerOnExit<'_> {
+    fn take(&self) -> Option<Follower> {
+        self.0.policy_follower.as_ref()?.lock().take()
+    }
+}
+
+impl Drop for FollowerOnExit<'_> {
+    fn drop(&mut self) {
+        // The follower leaves the context here, and its task ends with it.
+        let _follower = self.take();
+    }
+}
+
+/// The context of this process, built over what the host added: its stages
+/// and its worker connector.
+async fn build_app_context(
+    config: &ServerConfig,
+    extensions: Extensions,
+) -> Result<Arc<AppContext>, String> {
+    Ok(Arc::new(
+        AppContext::from_config_with_extensions(
+            config.router_config.clone(),
+            config.router_config.request_timeout_secs,
+            config.webrtc_bind_addr,
+            config.webrtc_stun_server.clone(),
+            extensions.stages,
+            extensions.connector,
+        )
+        .await?,
+    ))
 }
 
 /// Start the gateway listeners and drain them within the configured shutdown budget.
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    Box::pin(startup_with(config, Extensions::default())).await
+}
+
+/// [`startup`] with the host's extensions.
+pub async fn startup_with(
+    config: ServerConfig,
+    extensions: Extensions,
+) -> Result<(), Box<dyn std::error::Error>> {
     install_crypto_provider();
 
     // Defense in depth: the CLI and Python bindings both validate via
@@ -2220,6 +2360,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // of construction path — a bypassed empty/duplicate tenant key would
     // otherwise silently reach `AuthConfig`.
     config.router_config.validate()?;
+    if config.router_config.policy_controller_address.is_some()
+        && config.service_discovery_config.is_some()
+    {
+        return Err("--policy-controller-address conflicts with service_discovery_config (--service-discovery or --discovery-provider)".into());
+    }
     // The mesh listener's port against the others: the mesh configuration is
     // not part of `RouterConfig`, so the validator cannot see it, and this is
     // the one place the CLI, the Python binding and a library caller all pass.
@@ -2408,15 +2553,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.max_payload_size / (1024 * 1024)
     );
 
-    let app_context = Arc::new(
-        AppContext::from_config(
-            config.router_config.clone(),
-            config.router_config.request_timeout_secs,
-            config.webrtc_bind_addr,
-            config.webrtc_stun_server.clone(),
-        )
-        .await?,
-    );
+    let app_context = build_app_context(&config, extensions).await?;
+    let follower_on_exit = app_context
+        .follows_controller()
+        .then(|| FollowerOnExit(&app_context));
     // The history store's size on /metrics, from the stores that can count.
     if config.prometheus_config.is_some() {
         history_metrics::spawn_sampler(Arc::clone(&app_context));
@@ -2440,8 +2580,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     }
 
     // The job queue, the typed workflow engines and the start-up jobs on
-    // them: the tokenizer, the workers from the configuration, the MCP
-    // servers; the jobs complete in the background.
+    // them. The jobs complete in the background.
     start_workflow_engines(&app_context, &config).await?;
 
     // Note: MCP orchestrator handles background refresh internally via refresh channel
@@ -2453,29 +2592,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         worker_stats.total_workers, worker_stats.healthy_workers
     );
 
-    let (router, gateway) = serving_router(&config, &app_context).await?;
+    let gateway = Gateway::from_config(&config, &app_context).await?;
 
-    // WorkerManager owns the background health check loop. Its handle must
-    // outlive the server to keep the task alive — bind it here so its Drop
-    // (which aborts the task) runs at server shutdown. `maybe_start` decides
-    // whether the loop has any work to do (health polling and/or promoting
-    // workers that wait on the connect signal) and skips it otherwise. ZMQ
-    // workers are promoted only by the connect signal, so pass the configured
-    // transport up front: config workers register in the background after this
-    // point, so the registry cannot yet reveal them.
-    let _worker_manager = WorkerManager::maybe_start(
-        app_context.worker_registry.clone(),
-        WorkerManagerConfig {
-            default_check_interval_secs: config.router_config.health_check.check_interval_secs,
-            remove_unhealthy: config.router_config.unhealthy_removal_scope(),
-        },
-        app_context
-            .worker_job_queue
-            .get()
-            .map(|queue| Arc::clone(queue) as Arc<dyn WorkerJobs>),
-        !config.router_config.health_check.disable_health_check,
-        config.router_config.connection_mode == ConnectionMode::Zmq,
-    );
+    let _worker_manager = start_worker_health_checks(&app_context);
 
     // WorkerMonitor subscribes to registry events. Starting its event
     // loop here (after the synchronous worker population in
@@ -2486,6 +2605,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         worker_monitor.start_event_loop();
         debug!("Started WorkerMonitor event loop");
     }
+    // Under the feed the collector writes the store from its own tasks. The
+    // feed's loop shows those writes when the store's instant comes.
+    let _publications = app_context
+        .policy_feed
+        .as_ref()
+        .filter(|_| app_context.worker_monitor.is_some())
+        .map(|feed| feed.publications());
 
     let admission_queue =
         if app_context.rate_limiter.is_some() && config.router_config.queue_size > 0 {
@@ -2575,10 +2701,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     };
 
     let app_state = Arc::new(AppState {
-        router,
+        router: gateway.clone(),
         context: app_context.clone(),
         admission_queue,
-        gateway,
+        gateway: Some(gateway),
         mesh_handler,
         mesh_adapters,
         probe_state,
@@ -2600,13 +2726,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     )
     .await;
 
-    info!(
-        "Router ready | workers: {:?}",
-        WorkerManager::get_worker_urls(&app_state.context.worker_registry)
-            .iter()
-            .map(|url| Endpoint::redacted_str(url))
-            .collect::<Vec<_>>()
-    );
+    if !app_state.context.follows_controller() {
+        info!(
+            "Router ready | workers: {:?}",
+            WorkerManager::get_worker_urls(&app_state.context.worker_registry)
+                .iter()
+                .map(|url| Endpoint::redacted_str(url))
+                .collect::<Vec<_>>()
+        );
+    }
 
     let request_id_headers = config
         .router_config
@@ -2772,6 +2900,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     info!("HTTP server stopped. Starting component cleanup...");
 
     drop(discovery_tasks);
+
+    let follower = follower_on_exit.as_ref().and_then(FollowerOnExit::take);
+    if let Some(follower) = follower {
+        follower.stop().await;
+    }
 
     // This triggers background task cancellation, waits for tools, and denies approvals
     if let Some(orchestrator) = app_context.mcp_orchestrator.get() {
@@ -3635,6 +3768,8 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
 
 #[cfg(test)]
 mod tests {
+    mod connector;
+
     use std::convert::Infallible;
 
     use axum::response::sse::{Event, Sse};
@@ -3644,6 +3779,276 @@ mod tests {
 
     use super::*;
     use crate::config::TenantApiKeyEntry;
+
+    fn worker_app_state(context: Arc<AppContext>, probe_state: Arc<ProbeState>) -> Arc<AppState> {
+        Arc::new(AppState {
+            router: Arc::new(Gateway::new(context.worker_registry.clone())),
+            context,
+            admission_queue: None,
+            gateway: None,
+            mesh_handler: None,
+            mesh_adapters: None,
+            probe_state,
+            secret_sources: Default::default(),
+            secrets: None,
+        })
+    }
+
+    fn worker_test_app(context: Arc<AppContext>, probe_state: Arc<ProbeState>) -> Router {
+        build_app(
+            worker_app_state(context, probe_state),
+            AuthConfig::new(None),
+            AuthConfig::new(None),
+            None,
+            4096,
+            vec![],
+            vec![],
+        )
+        .unwrap()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn worker_writes_are_refused_only_while_following_a_controller() {
+        use axum::body::{to_bytes, Body};
+        use tower::ServiceExt;
+
+        use crate::{
+            app_context::testing::app_context_for_tests, routers::common::snapshot::WorkerRegistry,
+        };
+
+        let missing = "/workers/00000000-0000-0000-0000-000000000001";
+        for following in [true, false] {
+            let config = RouterConfig {
+                policy_controller: true,
+                policy_controller_address: following.then(|| "controller:30100".to_owned()),
+                ..Default::default()
+            };
+            let context = app_context_for_tests(config, Arc::new(WorkerRegistry::new()), None);
+            let probes = ProbeState::new(context.inflight_tracker.clone());
+            let app = worker_test_app(context, probes);
+            for (method, path, body, classic) in [
+                (
+                    "POST",
+                    "/workers",
+                    r#"{"url":"http://worker:8000"}"#,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                ),
+                (
+                    "PUT",
+                    missing,
+                    r#"{"url":"http://worker:8000"}"#,
+                    StatusCode::NOT_FOUND,
+                ),
+                ("PATCH", missing, "{}", StatusCode::NOT_FOUND),
+                ("DELETE", missing, "", StatusCode::NOT_FOUND),
+                ("GET", "/workers", "", StatusCode::OK),
+                ("GET", missing, "", StatusCode::INTERNAL_SERVER_ERROR),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        http::Request::builder()
+                            .method(method)
+                            .uri(path)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                if following && method != "GET" {
+                    assert_eq!(response.status(), StatusCode::CONFLICT, "{method} {path}");
+                    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert!(
+                        body["error"]
+                            .as_str()
+                            .unwrap()
+                            .contains("--policy-controller-address"),
+                        "{body}"
+                    );
+                } else {
+                    assert_eq!(response.status(), classic, "{method} {path}");
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn readiness_waits_for_the_first_snapshot_on_both_routers() {
+        use axum::body::{to_bytes, Body};
+        use smg_policy_controller::controller::Scope;
+        use tokio::{sync::oneshot, time};
+        use tower::ServiceExt;
+
+        use crate::policy_controller::follower::tests::bind_controller;
+
+        time::timeout(Duration::from_secs(5), async {
+            let controller = bind_controller().await;
+            let config = ServerConfig::minimal(RouterConfig {
+                policy_controller: true,
+                policy_controller_address: Some(
+                    controller
+                        .addresses()
+                        .of(Scope::Gateway)
+                        .unwrap()
+                        .to_string(),
+                ),
+                ..Default::default()
+            });
+            let context = Arc::new(
+                AppContext::from_config(config.router_config.clone(), 10, None, None)
+                    .await
+                    .unwrap(),
+            );
+            let probes = start_observability(&config, &context, None).await.unwrap();
+            let apps = [
+                worker_test_app(context.clone(), probes.clone()),
+                health::probe_router(probes),
+            ];
+            let ready = |app: Router| async move {
+                app.oneshot(
+                    http::Request::builder()
+                        .uri("/readiness")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            };
+            for app in &apps {
+                let response = ready(app.clone()).await;
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let body = to_bytes(response.into_body(), 4096).await.unwrap();
+                assert!(std::str::from_utf8(&body)
+                    .unwrap()
+                    .contains("controller's first snapshot"));
+            }
+            let (stop, stopped) = oneshot::channel::<()>();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the case stops and joins the controller"
+            )]
+            let serving = spawn(controller.serve(async {
+                let _ = stopped.await;
+            }));
+            for app in &apps {
+                while ready(app.clone()).await.status() != StatusCode::OK {
+                    time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            assert!(context.worker_registry.get_all().is_empty());
+            assert!(context.worker_monitor.is_none());
+            stop.send(()).unwrap();
+            serving.await.unwrap().unwrap();
+            for app in &apps {
+                assert_eq!(ready(app.clone()).await.status(), StatusCode::OK);
+            }
+            // A draining gateway is not ready, whatever it follows: load
+            // balancers are told for the whole settle window.
+            context.inflight_tracker.begin_drain();
+            for app in apps {
+                let response = ready(app).await;
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let body = to_bytes(response.into_body(), 4096).await.unwrap();
+                assert!(std::str::from_utf8(&body).unwrap().contains("draining"));
+            }
+        })
+        .await
+        .expect("both routers report the first snapshot within five seconds");
+    }
+
+    fn file_discovery() -> RuntimeDiscoveryConfig {
+        use smg_service_discovery::Roles;
+
+        use crate::config::FileDiscoveryConfig;
+
+        RuntimeDiscoveryConfig::from_config(
+            &FileDiscoveryConfig {
+                path: "fleet.yaml".into(),
+                check_interval_secs: 1,
+            }
+            .into(),
+            Some(Roles::Regular),
+        )
+        .unwrap()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn startup_refuses_runtime_worker_discovery_beside_a_controller_address() {
+        let mut config = ServerConfig::minimal(RouterConfig {
+            policy_controller: true,
+            policy_controller_address: Some("controller:30100".to_owned()),
+            ..Default::default()
+        });
+        config.service_discovery_config = Some(file_discovery());
+        let error = tokio::time::timeout(Duration::from_secs(1), Box::pin(startup(config)))
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("--policy-controller-address")
+                && error.contains("service_discovery_config"),
+            "{error}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn following_skips_startup_registration_health_load_and_worker_discovery() {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        for following in [false, true] {
+            let config = ServerConfig::minimal(RouterConfig {
+                policy_controller: true,
+                policy_controller_address: following
+                    .then(|| socket.local_addr().unwrap().to_string()),
+                ..Default::default()
+            });
+            let context = Arc::new(
+                AppContext::from_config(config.router_config.clone(), 10, None, None)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(context.follows_controller(), following);
+            start_workflow_engines(&context, &config).await.unwrap();
+            assert_eq!(
+                context
+                    .worker_job_queue
+                    .get()
+                    .unwrap()
+                    .get_status("startup")
+                    .is_none(),
+                following
+            );
+            assert_eq!(start_worker_health_checks(&context).is_none(), following);
+            assert_eq!(context.worker_monitor.is_none(), following);
+            let discovery =
+                start_discovery(Some(file_discovery()), None, &context, None, None).await;
+            assert_eq!(discovery.0.is_empty(), following);
+            if following {
+                let follower = context.policy_follower.as_ref().unwrap();
+                assert!(follower.lock().is_some());
+                drop(FollowerOnExit(&context));
+                assert!(follower.lock().is_none());
+            }
+        }
+        for component in [
+            "startup worker registration",
+            "worker health checks",
+            "worker load monitoring",
+            "worker discovery",
+        ] {
+            assert!(logs_contain(&format!(
+                "Skipping {component} because --policy-controller-address is set"
+            )));
+        }
+    }
 
     /// The not-found fallback sits inside the edge layers: an unknown route
     /// gets a request id (and a log line and a metric) like a known one.
@@ -5231,7 +5636,7 @@ mod tests {
 
         // The refusal named, not any error: a listener that failed to bind
         // would also be one.
-        let error = startup(ServerConfig::minimal(router_config))
+        let error = Box::pin(startup(ServerConfig::minimal(router_config)))
             .await
             .expect_err("startup must validate router_config even when constructed directly");
         assert!(

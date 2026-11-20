@@ -65,7 +65,10 @@ use std::{
     borrow::Cow,
     cell::{RefCell, RefMut},
     ops::Range,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        OnceLock,
+    },
     time::Instant,
 };
 
@@ -84,6 +87,7 @@ mod block;
 mod byte_split;
 mod cased;
 mod chain;
+mod learned_pieces;
 mod long_entries;
 mod merge;
 mod nfc;
@@ -94,13 +98,14 @@ mod short_pieces;
 mod unicode;
 mod wide_pieces;
 
+use learned_pieces::LearnedPieces;
 use long_entries::LongEntryFilter;
 use merge::{ByteTokens, MergeTable};
 use nfc::NfcQuick;
 use pattern::Pattern;
 use sentencepiece::{CharSymbols, Marker, WORD_MARKER};
 use short_pieces::{
-    ShortPieceKey, ShortPieceTable, Vacancy, SHORT_PIECE_MAX_BYTES, THREAD_BACKING_SLOTS,
+    Entry, ShortPieceKey, ShortPieceTable, Vacancy, SHORT_PIECE_MAX_BYTES, THREAD_BACKING_SLOTS,
 };
 use wide_pieces::{WideKey, WidePieceTable};
 
@@ -222,7 +227,14 @@ const ASCII_HEAD_BYTES: usize = 256;
 const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// Entries all threads together hold for one encoder: a thread's own cap is
 /// this divided by the number of threads that have encoded with the encoder
-/// (and never more than `PIECE_CACHE_CAPACITY`). A thread's packed table starts
+/// (and never more than `PIECE_CACHE_CAPACITY`). Where the threads share
+/// what they merge (once `LEARNED_FROM_THREADS` threads call an encoder
+/// whose misses wait), a thread keeps a quarter of that cap and the encoder keeps
+/// what the threads merge in one table for all of them, half of the entries
+/// (see `GROWN_SHARE_PART`): the figures below are then ceilings the threads
+/// stay under, three quarters of them in packed slots, the table's
+/// included, and a quarter in the maps and the wide tables. A thread's packed
+/// table starts
 /// at 64 slots (2 KiB) and grows as the thread meets pieces (by four up to
 /// 4,096 slots, by two above), up to the slots for its cap, and is cut back to
 /// the slots of a smaller cap when it is cleared (made anew only past its
@@ -246,10 +258,12 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// however many threads share the total), toward 352 + 560 MiB with
 /// the rounding of more threads (the packed part toward twice its 352 MiB past
 /// some 680 threads, as above); the long pieces add `LONG_PIECE_BYTES_TOTAL` at
-/// most (a thread's long tier keeps its map's slots through an eviction's
-/// clear when they fit four times its share and gives them back when they
-/// do not; a share that fell below a quarter of what the tier holds, entries
-/// and empty slots together, makes it anew at the thread's next call). A
+/// most once every thread has added one under its present share, and can
+/// add more until then, see that constant (a thread's long tier keeps its map's
+/// slots through an eviction's clear when they fit four times its share and
+/// gives them back when they do not; a share that fell below a quarter of
+/// what the tier holds, entries and empty slots together, makes it anew at
+/// the thread's next call). A
 /// thread reads its share at the start of every encode call and keeps
 /// it for that call's misses (a call that was running when threads joined keeps
 /// its earlier share until it ends; the long tier reads the live share at every
@@ -259,22 +273,130 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// `THREAD_BACKING_SLOTS` slots at most, 33 bytes each, about 528 KiB per
 /// thread: more than the share's slots only once those fall under the
 /// reservation, a share under 6,144 entries, some 680 threads on this total),
-/// and holds at most its earlier share until then, or until it exits if it
-/// never encodes again: right after a join the total is the earlier share times
+/// and holds at most its earlier share until then, or while the encoder
+/// lives if it never encodes again (its exit frees nothing, the encoder owns
+/// the caches): right after a join the total is the earlier share times
 /// the threads that had it plus the new share times the rest, and settles as
 /// they encode. Before this bound the same ceilings were a sixteenth of these.
 /// All of it is freed with the encoder.
 const PIECE_CACHE_TOTAL_CAPACITY: usize = 16 * PIECE_CACHE_CAPACITY;
+/// The part of its share a thread keeps where the threads share what they
+/// merge, which is once `LEARNED_FROM_THREADS` threads call an encoder
+/// whose misses wait (`NativeEncoder::misses_wait`: no other miss asks the
+/// learned table, so no other encoder's threads give up a part of their
+/// share for it): a quarter, from
+/// a thread's first call (a share cut only at a thread's first clear left
+/// the memory of sixteen threads where it was: measured). What such
+/// threads merge is kept for all of them in the encoder's learned table
+/// ([`LearnedPieces`]), which is made at the first ask for twice the
+/// entries the threads that have encoded by then keep themselves: half of
+/// what they held before the table (`PIECE_CACHE_TOTAL_CAPACITY` at the
+/// most, so 2,097,152 entries: its 64 parts of 65,536 slots are 132 MiB of
+/// packed slots, and the ids past four an entry in their spills). The
+/// quarter of every thread and that half are three quarters of the
+/// entries, and of the packed slots, the threads held before the table: a
+/// thread of eight to sixteen holds 131,072 packed slots, and the table
+/// 262,144 for each of them, where a thread held 524,288; the maps and the
+/// wide tables, bounded by the same share, hold a quarter. An encoder that
+/// fewer threads call, or whose misses do not wait (the sentencepiece path,
+/// and a byte-level table that does not merge every short piece), is as it
+/// was: the whole share, and no learned table.
+const GROWN_SHARE_PART: usize = 4;
+/// The threads that must call an encoder before its threads share what
+/// they merge: eight, and only on an encoder whose misses wait
+/// (`NativeEncoder::misses_wait`), since no other miss asks the learned
+/// table: the threads of any other encoder keep their whole share and
+/// share nothing, however many call. A thread is counted at its first
+/// encode with the encoder, where it takes its piece cache
+/// (`NativeEncoder::thread_piece_cache`), unless it is a thread of a pool
+/// then: the
+/// threads of a pool encode the cuts of a caller's long text, and a wide
+/// pool behind few callers is no reason to share (measured where the
+/// pool's threads counted: four callers whose long texts a pool encoded, a
+/// fifth of the text new, 3.8 % fewer tokens a second). So two kinds of
+/// thread encode and are not counted. A caller whose every text is long
+/// enough to be cut for the pool (`PARALLEL_MIN_BYTES`) takes no piece
+/// cache of its own: the pool's threads take theirs. And a thread of any
+/// pool is left out, so the workers of a batch encode, each of which
+/// encodes whole inputs, are not counted. An encoder that only such
+/// callers and threads use shares nothing and is as it was, every thread
+/// with its whole share; counting them is left for a change of its own
+/// (where the pool's threads counted, the cell above read slower). The
+/// count never falls: it is of the
+/// threads that have called, not of those that call at one time, so a
+/// process whose eight threads have each encoded once shares from then on,
+/// however little it encodes, until the encoder is dropped. Once eight
+/// threads are counted, a
+/// thread, a pool's too, keeps a part of its share (`GROWN_SHARE_PART`),
+/// and one that has cleared asks the learned table before it merges a piece
+/// and tells it after (`PieceCache::shares`). The learned table of fewer
+/// threads is small (131,072 entries a thread), and on a stream a fifth of
+/// whose text is new it answered under four misses in ten, which cost more
+/// than the merges it saved (measured at one, two and four threads); from
+/// eight threads on it answers enough.
+const LEARNED_FROM_THREADS: usize = 8;
+/// The asks of the learned table a thread judges together
+/// (`PieceCache::judge_asks`). An ask is of use only when the table
+/// answers it: a miss it does not answer has waited and asked for
+/// nothing, whether or not the table takes what the thread then merges
+/// and tells.
+const ASKS_JUDGED: u32 = 256;
+/// A thread rests when the table answers fewer than one in this many of
+/// the asks it judges, which is under one ask in two: it shares no more
+/// (`PieceCache::shares`), so its misses neither wait for the learned
+/// table nor ask it nor tell it, as before the thread shared. An ask the
+/// table does not answer pays the wait and the ask and saves no merge:
+/// sixteen callers of text that is all new encode faster where their
+/// threads rest so than where none rests (measured).
+const ASKS_OF_USE_PART: u32 = 2;
+/// The entries the count-bounded tiers of a resting thread take before
+/// the thread asks again and judges the next asks as it judged the last:
+/// of the misses the table never answers, one in seventeen still asks. A
+/// clear ends the rest, since the thread has lost its own words: the
+/// thread shares again from its next call, because sharing is turned on
+/// only at the start of a call (`PieceCache::shares`).
+const ASKS_RESTED: usize = 4_096;
 /// Bytes of long pieces (each piece, its ids and their slot) a thread holds
 /// for one encoder before its long entries are cleared, at most; see
-/// `LONG_PIECE_BYTES_TOTAL`.
-const LONG_PIECE_BYTES_CAPACITY: usize = 2 << 20;
-/// Bytes of long pieces all threads together hold for one encoder, shared
-/// the way `PIECE_CACHE_TOTAL_CAPACITY` is. The long pieces of a prompt (its
-/// clauses, in a script without word spaces) are few in number and large,
-/// and each one that misses goes through the model's merges, so they are
-/// bounded by what they take rather than counted.
-const LONG_PIECE_BYTES_TOTAL: usize = 32 << 20;
+/// `LONG_PIECE_BYTES_TOTAL`. This is the cliff of a repeated document for
+/// its long pieces, as `PIECE_CACHE_CAPACITY` is for the others: a text
+/// whose long pieces fit is encoded again at the cost of their lookups, one
+/// with more merges them again on every pass, since the clear takes the
+/// pieces that recur with the rest. By this count the 33 documents of
+/// 128,000 tokens of the README's benchmark hold 2.8 to 3.0 MiB of long
+/// pieces in all and its 33 documents of 500,000 tokens 5.6 to 6.0 MiB
+/// (three byte-level vocabularies, some 14,000 and 29,000 entries of about
+/// 220 bytes), so the bound holds either set whole; at 2 MiB the tier was
+/// cleared once or twice in a pass over the first set and five or six
+/// times in a pass over the second, and a second pass merged most of the
+/// long pieces again (measured).
+/// Memory: a thread holds what the long pieces it met take, so one that
+/// meets few holds little; the count leaves out what the allocator rounds
+/// each box up by and the empty slots of the map.
+const LONG_PIECE_BYTES_CAPACITY: usize = 8 << 20;
+/// Bytes of long pieces the threads of one encoder share, the way they
+/// share `PIECE_CACHE_TOTAL_CAPACITY`: a thread's share is this total
+/// divided by the threads that have encoded with the encoder,
+/// `LONG_PIECE_BYTES_CAPACITY` at most, so sixteen threads have the full
+/// bound each and more threads a smaller share. A thread is held to its
+/// share in two places: where it adds a long piece, its long entries are
+/// cleared first when the piece would take them past the share read at
+/// that miss, and the start of a call makes anew a long tier that holds
+/// more than four times the share. Nothing reaches into another thread's
+/// cache, so the threads together are within this total only once each
+/// has added a long piece under the present share. A thread that filled a
+/// larger share and has added none since keeps what it holds, up to four
+/// times its share while it encodes and all of it while it does not, for
+/// as long as the encoder lives (a thread's exit frees nothing), and the
+/// threads together can stand above this total for that time: sixteen
+/// threads that filled 8 MiB each and a seventeenth that fills its share
+/// hold 135.5 MiB. At the worst, every thread filling its share as it
+/// joins and adding nothing after, the n-th keeps the total divided by n
+/// and the sum is 215 MiB at 32 threads, 302 MiB at 64. The long pieces
+/// of a prompt (its clauses, in a script without word spaces) are few in
+/// number and large, and each one that misses goes through the model's
+/// merges, so they are bounded by what they take rather than counted.
+const LONG_PIECE_BYTES_TOTAL: usize = 128 << 20;
 /// What an entry of the long tier takes beyond its piece and ids.
 const LONG_PIECE_ENTRY_BYTES: usize = size_of::<(Box<[u8]>, Box<[u32]>)>();
 
@@ -466,6 +588,20 @@ struct PieceCache {
     /// a waiting piece's vacancy is of the table as it was before the next
     /// clear.
     clears: usize,
+    /// Whether the thread's misses ask the encoder's learned table before
+    /// they are merged and tell it after (`NativeEncoder::learned_pieces`):
+    /// the thread has cleared, and the encoder's threads share what they
+    /// merge (`NativeEncoder::enough_callers`), and the thread does not
+    /// rest (`Self::judge_asks`). Set at the start of a call, and cleared
+    /// where the thread starts to rest; the share does not hang on it.
+    shares: bool,
+    /// The asks of the learned table since the thread last judged them
+    /// (`Self::judge_asks`), and those of them the table answered.
+    asked: u32,
+    of_use: u32,
+    /// The entries the count-bounded tiers must hold before a thread that
+    /// rests asks again; zero for a thread that does not rest.
+    asks_from: usize,
 }
 
 impl PieceCache {
@@ -486,6 +622,10 @@ impl PieceCache {
             answer: Vec::new(),
             last_miss: 0,
             clears: 0,
+            shares: false,
+            asked: 0,
+            of_use: 0,
+            asks_from: 0,
         }
     }
 
@@ -524,6 +664,27 @@ impl PieceCache {
         self.packed.len() + self.wide.len() + self.short.len()
     }
 
+    /// Counts `asked` asks of the learned table, `of_use` of them answered
+    /// by it, and judges every `ASKS_JUDGED` of them: where the table
+    /// answered fewer than one in `ASKS_OF_USE_PART`, under one ask in
+    /// two, the thread rests, which is to share no more until its
+    /// count-bounded tiers hold `ASKS_RESTED` entries more
+    /// (`NativeEncoder::piece_cache_for_call` reads it) or are cleared
+    /// (`Self::clear_short`). The counts are the thread's own, so a caller
+    /// and a thread of a pool are judged alike.
+    fn judge_asks(&mut self, asked: u32, of_use: u32) {
+        self.asked += asked;
+        self.of_use += of_use;
+        if self.asked >= ASKS_JUDGED {
+            if self.of_use < self.asked / ASKS_OF_USE_PART {
+                self.shares = false;
+                self.asks_from = self.short_entries() + ASKS_RESTED;
+            }
+            self.asked = 0;
+            self.of_use = 0;
+        }
+    }
+
     fn wide_slots(&self) -> usize {
         self.wide.slots()
     }
@@ -551,6 +712,13 @@ impl PieceCache {
     /// slots, or gives them back when it has more than the share takes.
     fn clear_short(&mut self, share: usize) {
         self.clears += 1;
+        // The thread has lost its own words: a rest ends, and the asks it
+        // makes from here are judged by themselves. `shares` is turned on
+        // only at the start of a call, so a thread that rested shares
+        // again from its next call.
+        self.asked = 0;
+        self.of_use = 0;
+        self.asks_from = 0;
         self.packed.clear(share);
         self.wide.clear(share);
         if self.short.capacity() > 2 * share {
@@ -1260,6 +1428,11 @@ pub(crate) struct NativeEncoder {
     /// has not met, before the piece is merged (see
     /// [`Self::seed_vocabulary`]).
     seed: ShortPieceTable,
+    /// What the threads have merged, kept for all of them: asked by a
+    /// thread that shares (`PieceCache::shares`), for a piece its own table
+    /// and the seed do not hold, before the merge
+    /// ([`Self::learned_pieces`]).
+    learned: OnceLock<LearnedPieces>,
     /// Whether the seed holds every vocabulary entry of up to
     /// `SHORT_PIECE_MAX_BYTES` raw bytes: the ids `0..vocab_size` were all
     /// entries when it was read. Then a short piece the seed misses is no
@@ -1271,7 +1444,9 @@ pub(crate) struct NativeEncoder {
     /// ([`Self::waits`]). The waiting pieces are answered with no model at
     /// hand, so they wait only where none is asked: on an encoder whose
     /// table merges every short piece
-    /// ([`Self::merges_every_short_piece`]).
+    /// ([`Self::merges_every_short_piece`]). Only a miss that waits asks
+    /// the learned table, so only such an encoder's threads share what
+    /// they merge ([`Self::enough_callers`]).
     misses_wait: bool,
     /// The vocabulary's entries longer than the seed's keys as a filter,
     /// read with the seed when the pass read every entry (`None` on the
@@ -1303,6 +1478,10 @@ pub(crate) struct NativeEncoder {
     cut_spans: ThreadLocal<RefCell<CutSpans>>,
     /// Threads that hold a piece cache of this encoder.
     threads: AtomicUsize,
+    /// Those of them that call: the threads that were no thread of a pool
+    /// at their first encode with this encoder ([`Self::thread_piece_cache`]
+    /// counts them, `LEARNED_FROM_THREADS` asks for them).
+    callers: AtomicUsize,
 }
 
 impl std::fmt::Debug for NativeEncoder {
@@ -1414,6 +1593,7 @@ impl NativeEncoder {
             frame,
             alphabet,
             seed: ShortPieceTable::for_entries(0),
+            learned: OnceLock::new(),
             seed_covers_short_entries: false,
             misses_wait: false,
             long_entries: None,
@@ -1422,6 +1602,7 @@ impl NativeEncoder {
             piece_cache: ThreadLocal::new(),
             cut_spans: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
+            callers: AtomicUsize::new(0),
         })
     }
 
@@ -1497,6 +1678,7 @@ impl NativeEncoder {
             frame,
             alphabet: bytes_char(),
             seed: ShortPieceTable::for_entries(0),
+            learned: OnceLock::new(),
             seed_covers_short_entries: false,
             misses_wait: false,
             long_entries: None,
@@ -1505,6 +1687,7 @@ impl NativeEncoder {
             piece_cache: ThreadLocal::new(),
             cut_spans: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
+            callers: AtomicUsize::new(0),
         })
     }
 
@@ -2195,6 +2378,7 @@ impl NativeEncoder {
             frame: Frame::default(),
             alphabet: bytes_char(),
             seed: Self::ranks_seed(ranks),
+            learned: OnceLock::new(),
             seed_covers_short_entries: false,
             misses_wait: Self::merges_every_short_piece(Some(&merges), false),
             long_entries: None,
@@ -2203,6 +2387,7 @@ impl NativeEncoder {
             piece_cache: ThreadLocal::new(),
             cut_spans: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
+            callers: AtomicUsize::new(0),
         })
     }
 
@@ -3701,12 +3886,16 @@ impl NativeEncoder {
         self.tokenize_piece_at(model, text, piece, mapped, ids, cache)
     }
 
-    /// The wait of a young thread's miss ([`Self::seeded`] asks). A first
-    /// sight reads lines of the seed that are far from the thread, and a
-    /// piece answered where it is met waits for its own lines alone. A miss
-    /// within [`WAITING_GAP`] ids of the last one takes a hole of one id in
-    /// the output and waits, and up to [`WAITING_PIECES`] are answered
-    /// together ([`Self::answer_waiting`]), their lines read at once
+    /// The wait of a miss of a young thread or of one that shares
+    /// (`PieceCache::shares`; [`Self::seeded`] asks). A first sight reads
+    /// lines of the seed that are far from the thread, as are the lines of
+    /// the learned table a thread that shares asks, and a piece answered
+    /// where it is met waits for its own lines alone. A miss within
+    /// [`WAITING_GAP`] ids of the last one, or any miss of a thread that
+    /// shares (each asks the learned table, however far apart they fall),
+    /// takes a hole of
+    /// one id in the output and waits, and up to [`WAITING_PIECES`] are
+    /// answered together ([`Self::answer_waiting`]), their lines read at once
     /// (measured: a first sight of a word list 15 to 17 % faster, new text
     /// of 16 tokens 5 to 10 %, of 256 tokens 8 to 12 %). False for a miss
     /// that stands alone: the seed answers it where it is met. True for a
@@ -3717,7 +3906,7 @@ impl NativeEncoder {
     #[inline(never)]
     fn waits(&self, vacancy: Vacancy, ids: &mut Vec<u32>, cache: &mut PieceCache) -> bool {
         let at = ids.len();
-        let close = at.wrapping_sub(cache.last_miss) <= WAITING_GAP;
+        let close = cache.shares || at.wrapping_sub(cache.last_miss) <= WAITING_GAP;
         cache.last_miss = at;
         if !close && cache.waiting.is_empty() {
             return false;
@@ -3757,6 +3946,13 @@ impl NativeEncoder {
     /// long text the thread knows, that text moved once for each word.) A
     /// piece the seed does not hold asks the thread's table once more
     /// before it is merged: one met twice while it waited is merged once.
+    /// A thread that shares (`PieceCache::shares`) then asks what the
+    /// threads have merged
+    /// ([`Self::learned_pieces`], its lines read early behind the seed's):
+    /// a piece it holds is kept the way a seeded piece is, and one it does
+    /// not hold is merged and told to it. The thread counts these asks and
+    /// those the table answers, and rests where it answers under one in
+    /// two (`PieceCache::judge_asks`).
     /// The merge is the table's and asks no model, so the answer comes
     /// wherever it is due: a piece waits only on an encoder whose table
     /// merges every short piece ([`Self::merges_every_short_piece`]).
@@ -3769,11 +3965,19 @@ impl NativeEncoder {
         for piece in &waiting {
             touched ^= self.seed.touch(piece.vacancy.key());
         }
+        let learned = cache.shares.then(|| self.learned_pieces());
+        if let Some(learned) = learned {
+            for piece in &waiting {
+                touched ^= learned.touch(piece.vacancy.key());
+            }
+        }
         std::hint::black_box(touched);
         // The answers that are not one id: the hole of each and where its ids
         // begin in the scratch list, the last hole first.
         let mut late = [(0usize, 0usize); WAITING_PIECES];
         let mut late_len = 0;
+        // The asks of the learned table here, and those it answers.
+        let (mut asked, mut of_use) = (0u32, 0u32);
         answer.clear();
         for piece in waiting.iter().rev() {
             let key = piece.vacancy.key();
@@ -3792,34 +3996,48 @@ impl NativeEncoder {
             if let Some(vacancy) = vacancy {
                 match self.seed.probe(key) {
                     Ok(entry) => {
-                        one = self.seed.one_or_append(entry, &mut answer);
-                        if cache.short_entries() >= cache.share
-                            || !cache.packed.keep(vacancy, entry)
-                        {
-                            // Not kept as a copy: remembered from its ids.
-                            answer.extend(one);
-                            self.remember_seeded(vacancy, from, &answer, cache);
-                            if one.is_some() {
-                                answer.truncate(from);
-                            }
-                        }
+                        one =
+                            self.keep_answer(&self.seed, entry, vacancy, from, &mut answer, cache);
                     }
                     Err(_) => match cache.packed.probe(key) {
                         Ok(entry) => one = cache.packed.one_or_append(entry, &mut answer),
                         Err(fresh) => {
-                            // Neither holds it: the table merges it as the
-                            // slow call merges a piece, from its pre-formed
-                            // characters when it has them, and the thread
-                            // remembers it.
-                            let (bytes, len) = key.bytes();
-                            let piece = &bytes[..len];
-                            debug_assert!(self.misses_wait, "the table merges every short piece");
-                            if let Some(table) = &self.merges {
-                                if piece.is_ascii() || !table.merge_preformed(piece, &mut answer) {
-                                    table.merge(piece, &mut answer);
+                            let part = learned.and_then(|learned| learned.read(key));
+                            let held = part
+                                .as_deref()
+                                .and_then(|table| Some((table, table.probe(key).ok()?)));
+                            asked += 1;
+                            if let Some((table, entry)) = held {
+                                // Another thread, or this one before a
+                                // clear, has merged it.
+                                one =
+                                    self.keep_answer(table, entry, fresh, from, &mut answer, cache);
+                                of_use += 1;
+                            } else {
+                                // A writer needs the part to itself.
+                                drop(part);
+                                // Nobody holds it: the table merges it as
+                                // the slow call merges a piece, from its
+                                // pre-formed characters when it has them,
+                                // and the thread remembers it.
+                                let (bytes, len) = key.bytes();
+                                let piece = &bytes[..len];
+                                debug_assert!(
+                                    self.misses_wait,
+                                    "the table merges every short piece"
+                                );
+                                if let Some(table) = &self.merges {
+                                    if piece.is_ascii()
+                                        || !table.merge_preformed(piece, &mut answer)
+                                    {
+                                        table.merge(piece, &mut answer);
+                                    }
+                                }
+                                self.remember_piece(piece, Some(fresh), from, &answer, cache);
+                                if let Some(learned) = learned {
+                                    learned.learn(key, &answer[from..]);
                                 }
                             }
-                            self.remember_piece(piece, Some(fresh), from, &answer, cache);
                         }
                     },
                 }
@@ -3865,6 +4083,36 @@ impl NativeEncoder {
         cache.waiting = waiting;
         cache.waiting.clear();
         cache.answer = answer;
+        if learned.is_some() {
+            cache.judge_asks(asked, of_use);
+        }
+    }
+
+    /// The answer of a waiting piece that `table` holds as `entry` (the
+    /// seed, or a part of the learned table): its one id returned, or its
+    /// ids appended to `answer`, and the entry kept in the thread's table
+    /// at `vacancy` as a copy ([`ShortPieceTable::keep`]) or, where that
+    /// table takes no copy, remembered from its ids.
+    #[inline(always)]
+    fn keep_answer(
+        &self,
+        table: &ShortPieceTable,
+        entry: &Entry,
+        vacancy: Vacancy,
+        from: usize,
+        answer: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Option<u32> {
+        let one = table.one_or_append(entry, answer);
+        if cache.short_entries() >= cache.share || !cache.packed.keep(vacancy, entry) {
+            // Not kept as a copy: remembered from its ids.
+            answer.extend(one);
+            self.remember_seeded(vacancy, from, answer, cache);
+            if one.is_some() {
+                answer.truncate(from);
+            }
+        }
+        one
     }
 
     /// The pieces that still wait when the units of an encode call are done
@@ -3896,14 +4144,18 @@ impl NativeEncoder {
         // a thread whose table has outgrown its reservation knows the common
         // words, most of what it misses is merged, and a merge gains nothing
         // by waiting (counted: waiting cost new text of 32k tokens 15
-        // instructions a token and of 500k tokens 2 to 5). Nor does a miss
-        // wait where a short piece may need the model (`Self::misses_wait`).
-        // The tests are two compares in front of the seed's read and not a
+        // instructions a token and of 500k tokens 2 to 5), until the thread
+        // shares (`PieceCache::shares`): from then on a miss asks the
+        // learned table before its merge, whose lines are far, and waits
+        // for the others. Nor
+        // does a miss wait where a short piece may need the model
+        // (`Self::misses_wait`).
+        // The tests are three compares in front of the seed's read and not a
         // call of their own: two first sights in a row read their far lines
         // together only while both fit the processor's window, and a first
         // sight with a few dozen instructions more in front of the read was
         // 4 to 25 % slower (measured on first sights of word lists).
-        if cache.packed.slots() <= THREAD_BACKING_SLOTS
+        if (cache.packed.slots() <= THREAD_BACKING_SLOTS || cache.shares)
             && self.misses_wait
             && self.waits(vacancy, ids, cache)
         {
@@ -4201,13 +4453,18 @@ impl NativeEncoder {
 
     /// The calling thread's piece cache for this encoder, made at the
     /// thread's first encode with it (from then on the thread counts toward
-    /// every thread's share, see [`Self::piece_cache_share`]); that first
+    /// every thread's share, see [`Self::piece_cache_share`], and, unless it
+    /// is a thread of a pool then, among the threads that call, see
+    /// `LEARNED_FROM_THREADS`); that first
     /// encode also reads the merge table through once
     /// (`MergeTable::read_through`), so the thread's first-sight pieces find
     /// its lines in the caches.
     fn thread_piece_cache(&self) -> &RefCell<PieceCache> {
         self.piece_cache.get_or(|| {
             self.threads.fetch_add(1, Ordering::Relaxed);
+            if rayon::current_thread_index().is_none() {
+                self.callers.fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(merges) = &self.merges {
                 merges.read_through();
             }
@@ -4226,17 +4483,30 @@ impl NativeEncoder {
     /// tier anew when it holds more than four times the long share, entries
     /// and empty slots together (see `PieceCache::remake_long`), so
     /// every thread that still encodes is within the share
-    /// from its next call on (the share is read here once and kept in the
+    /// from its next call on, its long tier within four times the long
+    /// share until it next adds a long piece (the share is read here once
+    /// and kept in the
     /// cache for the call's misses, so a call that was running when threads
     /// joined keeps the share it started with until it ends; a thread that
-    /// never encodes again holds what it had until it exits). Two relaxed
-    /// loads, two stores and five compares per call. A call that ended on
+    /// never encodes again holds what it had while the encoder lives, see
+    /// `LONG_PIECE_BYTES_TOTAL`). Whether the
+    /// thread shares what it merges is set here as well
+    /// (`PieceCache::shares`): a thread that rests
+    /// (`PieceCache::judge_asks`) shares again once its tiers hold the
+    /// entries its rest lasts. It is set before the clear below and turned
+    /// on nowhere else, so it holds for the rest of the call unless the
+    /// thread starts to rest: a thread whose rest a clear ends, here or
+    /// where it remembers a piece, shares again from its next call.
+    /// Four relaxed loads, three stores and eleven
+    /// compares per call at the most. A call that ended on
     /// a declined piece or unwound left its waiting pieces behind
     /// (`Self::waits`): they are dropped here, their holes stood in ids
     /// that are gone.
     fn piece_cache_for_call(&self) -> RefMut<'_, PieceCache> {
         let mut cache = self.thread_piece_cache().borrow_mut();
         let share = self.piece_cache_share();
+        cache.shares =
+            cache.clears > 0 && self.enough_callers() && cache.short_entries() >= cache.asks_from;
         cache.share = share;
         cache.waiting.clear();
         let slots = ShortPieceTable::slots_for(share);
@@ -4279,10 +4549,43 @@ impl NativeEncoder {
 
     /// Entries one thread's piece cache may hold: the total shared among the
     /// threads that have encoded with this encoder, `PIECE_CACHE_CAPACITY` at
-    /// most.
+    /// most, and where the threads share what they merge
+    /// ([`Self::enough_callers`]) a part of that (`GROWN_SHARE_PART`),
+    /// beside the table that keeps it for all of them
+    /// ([`Self::learned_pieces`]).
     fn piece_cache_share(&self) -> usize {
-        (PIECE_CACHE_TOTAL_CAPACITY / self.threads.load(Ordering::Relaxed).max(1))
-            .clamp(1, PIECE_CACHE_CAPACITY)
+        let threads = self.threads.load(Ordering::Relaxed).max(1);
+        let share = (PIECE_CACHE_TOTAL_CAPACITY / threads).clamp(1, PIECE_CACHE_CAPACITY);
+        if self.enough_callers() {
+            // The threads share what they merge: each keeps a part.
+            (share / GROWN_SHARE_PART).max(1)
+        } else {
+            share
+        }
+    }
+
+    /// Whether the threads of this encoder share what they merge: a miss of
+    /// theirs can ask the learned table, which only a miss that waits does
+    /// (`Self::misses_wait`), and enough threads call
+    /// (`LEARNED_FROM_THREADS`). The cut of a thread's share
+    /// ([`Self::piece_cache_share`]) and `PieceCache::shares` both follow
+    /// it, so an encoder whose misses never reach the table keeps every
+    /// thread's whole share.
+    fn enough_callers(&self) -> bool {
+        self.misses_wait && self.callers.load(Ordering::Relaxed) >= LEARNED_FROM_THREADS
+    }
+
+    /// What the threads have merged ([`LearnedPieces`]), made at the first
+    /// ask, which is the first miss of a thread that shares
+    /// (`PieceCache::shares`): for twice the entries the threads that have
+    /// encoded with this encoder by then keep themselves, half of what they
+    /// held before the table (see `GROWN_SHARE_PART`). Threads that join
+    /// later share the table as it was made.
+    fn learned_pieces(&self) -> &LearnedPieces {
+        self.learned.get_or_init(|| {
+            let threads = self.threads.load(Ordering::Relaxed).max(1);
+            LearnedPieces::for_entries(2 * self.piece_cache_share() * threads)
+        })
     }
 
     /// Bytes of long pieces one thread may hold: the total shared among the

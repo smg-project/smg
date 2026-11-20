@@ -172,6 +172,19 @@ impl ShortPieceKey {
         )
     }
 
+    /// Which of `parts` tables (a power of two) a key belongs to, by bits
+    /// of the hash that neither the slot nor the tag of a table reads (the
+    /// low bits and the top seven), so the keys of one part spread over its
+    /// slots and tags like the keys of a whole table.
+    #[inline]
+    pub(super) fn part(self, parts: usize) -> usize {
+        let low = self.0 as u64 ^ LOW_SALT;
+        let high = (self.0 >> 64) as u64 ^ HIGH_SALT;
+        let product = u128::from(low) * u128::from(high);
+        let hash = (product as u64) ^ ((product >> 64) as u64);
+        (hash >> 36) as usize & (parts - 1)
+    }
+
     /// The length of the piece the key stands for.
     #[cfg(test)]
     fn len(self) -> usize {

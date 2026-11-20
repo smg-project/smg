@@ -844,11 +844,14 @@ mod tests {
     };
     use http_body_util::BodyExt;
     use tower::ServiceExt;
-    use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
+    use tracing_subscriber::Layer;
 
     use super::*;
     use crate::{
-        middleware::HttpMetricsLayer, observability::inflight_tracker::InFlightRequestTracker,
+        middleware::HttpMetricsLayer,
+        observability::{
+            inflight_tracker::InFlightRequestTracker, logging::test_support::test_subscriber,
+        },
     };
 
     /// Counts how often any span is entered on this thread's subscriber.
@@ -867,9 +870,7 @@ mod tests {
     #[tokio::test]
     async fn a_streamed_body_does_not_enter_the_request_span_per_frame() {
         let enters = Arc::new(AtomicUsize::new(0));
-        let _guard = tracing::subscriber::set_default(
-            Registry::default().with(EnterCounter(enters.clone())),
-        );
+        let _subscriber = test_subscriber(EnterCounter(enters.clone()));
         let frames = 64usize;
         let app = Router::new()
             .route(
@@ -928,9 +929,7 @@ mod tests {
     #[tokio::test]
     async fn a_reported_refusal_is_not_logged_again_at_error() {
         let errors = Arc::new(AtomicUsize::new(0));
-        let _guard = tracing::subscriber::set_default(
-            Registry::default().with(LevelCounter(tracing::Level::ERROR, errors.clone())),
-        );
+        let _subscriber = test_subscriber(LevelCounter(tracing::Level::ERROR, errors.clone()));
         let refused = || async {
             let mut response = Response::new(Body::empty());
             *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
@@ -1023,7 +1022,7 @@ mod tests {
     #[tokio::test]
     async fn the_access_log_carries_the_path_without_the_query_string() {
         let fields = Fields::default();
-        let _guard = tracing::subscriber::set_default(Registry::default().with(fields.clone()));
+        let _subscriber = test_subscriber(fields.clone());
         let app = Router::new()
             .route("/v1/models", get(|| async { "ok" }))
             .layer(create_logging_layer(AccessLogFields::NONE))
@@ -1282,7 +1281,7 @@ mod field_tests {
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
     use tower::ServiceExt;
-    use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt, Registry};
+    use tracing_subscriber::{fmt::MakeWriter, Layer, Registry};
 
     use super::*;
     use crate::{
@@ -1294,6 +1293,7 @@ mod field_tests {
         observability::{
             inflight_tracker::InFlightRequestTracker,
             log_format::{JsonLine, SpanFields, TextFields, TextLine},
+            logging::test_support::test_subscriber,
         },
     };
 
@@ -1336,25 +1336,21 @@ mod field_tests {
     }
 
     /// The gateway's JSON line format, into `capture`.
-    fn json_subscriber(capture: &Capture) -> impl tracing::Subscriber + Send + Sync {
-        Registry::default().with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(capture.clone())
-                .fmt_fields(SpanFields)
-                .event_format(JsonLine::new()),
-        )
+    fn json_subscriber(capture: &Capture) -> impl Layer<Registry> + Send + Sync {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .fmt_fields(SpanFields)
+            .event_format(JsonLine::new())
     }
 
     /// The gateway's text format, into `capture`.
-    fn text_subscriber(capture: &Capture) -> impl tracing::Subscriber + Send + Sync {
-        Registry::default().with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(capture.clone())
-                .fmt_fields(TextFields)
-                .event_format(TextLine::new()),
-        )
+    fn text_subscriber(capture: &Capture) -> impl Layer<Registry> + Send + Sync {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .fmt_fields(TextFields)
+            .event_format(TextLine::new())
     }
 
     fn routed(mut response: Response) -> Response {
@@ -1489,7 +1485,7 @@ mod field_tests {
     #[tokio::test]
     async fn the_default_record_keeps_its_fields_under_the_json_format() {
         let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+        let _subscriber = test_subscriber(json_subscriber(&capture));
         let response = app(AccessLogFields::NONE, None)
             .oneshot(request("/v1/chat/completions"))
             .await
@@ -1516,7 +1512,7 @@ mod field_tests {
     #[tokio::test]
     async fn the_latency_runs_from_the_edge_s_entry_stamp() {
         let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+        let _subscriber = test_subscriber(json_subscriber(&capture));
         let app = Router::new()
             .route("/v1/chat/completions", post(|| async { "ok" }))
             .layer(create_logging_layer(AccessLogFields::NONE));
@@ -1547,7 +1543,7 @@ mod field_tests {
     #[tokio::test]
     async fn every_selected_field_is_on_the_finish_line_under_the_json_format() {
         let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+        let _subscriber = test_subscriber(json_subscriber(&capture));
         let response = app(AccessLogFields::all(), None)
             .oneshot(request("/v1/chat/completions"))
             .await
@@ -1594,7 +1590,7 @@ mod field_tests {
     async fn a_streamed_response_gets_its_bytes_on_an_end_line() {
         for (fields, expected_lines) in [(AccessLogFields::all(), 3), (AccessLogFields::NONE, 2)] {
             let capture = Capture::default();
-            let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+            let _subscriber = test_subscriber(json_subscriber(&capture));
             let frames = futures::stream::iter(
                 (0..3).map(|_| Ok::<_, Infallible>(Bytes::from_static(FRAME))),
             );
@@ -1634,7 +1630,7 @@ mod field_tests {
     #[tokio::test(start_paused = true)]
     async fn a_keep_alive_frame_counts_in_the_streamed_bytes() {
         let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+        let _subscriber = test_subscriber(json_subscriber(&capture));
         let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
         let response = app(
             AccessLogFields::all(),
@@ -1674,7 +1670,7 @@ mod field_tests {
     #[tokio::test]
     async fn a_client_that_leaves_mid_stream_gets_the_bytes_out_so_far() {
         let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+        let _subscriber = test_subscriber(json_subscriber(&capture));
         let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
         let response = app(
             AccessLogFields::all(),
@@ -1712,7 +1708,7 @@ mod field_tests {
     #[tokio::test]
     async fn a_declared_body_cut_short_keeps_the_length_once_and_adds_the_bytes_sent() {
         let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(text_subscriber(&capture));
+        let _subscriber = test_subscriber(text_subscriber(&capture));
         let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
         let response = app(
             AccessLogFields::all(),
@@ -1761,7 +1757,7 @@ mod field_tests {
     #[tokio::test]
     async fn a_stream_that_fails_keeps_the_length_once_and_adds_the_bytes_sent() {
         let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(text_subscriber(&capture));
+        let _subscriber = test_subscriber(text_subscriber(&capture));
         let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
         let response = app(
             AccessLogFields::all(),
@@ -1812,7 +1808,7 @@ mod field_tests {
             (AccessLogFields::all(), true),
         ] {
             let capture = Capture::default();
-            let _guard = tracing::subscriber::set_default(text_subscriber(&capture));
+            let _subscriber = test_subscriber(text_subscriber(&capture));
             let response = app(fields, None)
                 .oneshot(request("/v1/chat/completions"))
                 .await

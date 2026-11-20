@@ -16,6 +16,7 @@ use serde_json::json;
 use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts};
 use smg_worker::{
     identity::basic::{BasicWorker, ConnectionMode, RuntimeType},
+    jobs::WorkerJobAsker,
     workflow::WorkerKind,
 };
 use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
@@ -137,6 +138,29 @@ async fn the_attempt_deadline_is_armed_only_by_grpc_request_timeout_secs() {
     }
 }
 
+/// A store has one host, the context's. The router's stages ask that one,
+/// and the router builds none of its own.
+#[tokio::test]
+async fn a_router_asks_the_host_of_its_context() {
+    use crate::policy_controller::host::testing::bed;
+
+    let config = grpc_config(regular_routing_mode()).build_unchecked();
+    let mut ctx = grpc_ctx_from(&config, mcp_orchestrator().await);
+    let (host, _store, _workers) = bed(&[]);
+    let host = Arc::new(host);
+    Arc::get_mut(&mut ctx)
+        .expect("the context is not shared yet")
+        .policy_host = Some(Arc::clone(&host));
+    assert_eq!(Arc::strong_count(&host), 2);
+
+    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+    assert!(
+        Arc::strong_count(&host) > 2,
+        "the router's stages hold the context's host"
+    );
+    drop(router);
+}
+
 /// `--grouped-dp-sticky` reaches every pipeline a regular or PD router
 /// builds, so a sticky request is pinned alike on every endpoint (a PD one
 /// through its bootstrap room): off by default, and the configured placement
@@ -236,17 +260,24 @@ async fn count_tokens_is_answered_from_the_tokenizer() {
 /// capability matrix is refused with the sentence `/v1/messages` gives,
 /// instead of counted, before any media is fetched; to an engine that
 /// takes images the count goes on into media resolution (here, to the
-/// config lookup the test's model directory cannot satisfy).
+/// config lookup the test's model directory cannot satisfy: the
+/// deployment's fault, answered in the server's class).
 #[tokio::test]
 async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
     let model_dir = unreadable_model_dir();
-    for (runtime, code, message) in [
+    for (runtime, status, code, message) in [
         (
             RuntimeType::Mlx,
+            StatusCode::BAD_REQUEST,
             "multimodal_not_supported",
             Some("backend mlx does not support image inputs"),
         ),
-        (RuntimeType::Sglang, "invalid_multimodal_request", None),
+        (
+            RuntimeType::Sglang,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "multimodal_processing_failed",
+            None,
+        ),
     ] {
         let (_ctx, router) = regular_router_over_m(Some(runtime), Some(model_dir.path())).await;
         let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
@@ -264,7 +295,7 @@ async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
         let response = router
             .route_messages_count_tokens(None, &tenant_meta, request, "m")
             .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{runtime}");
+        assert_eq!(response.status(), status, "{runtime}");
         assert_eq!(
             error::extract_error_code_from_response(&response),
             code,
@@ -463,6 +494,7 @@ fn tokenizer_step_input(
         WorkerSpec::new("grpc://worker:30000"),
         WorkerRegistrationMode::Upsert,
         ctx.clone(),
+        WorkerJobAsker::Api,
     );
     data.worker_kind = Some(WorkerKind::Local);
     data.connection_mode = Some(ConnectionMode::Grpc);

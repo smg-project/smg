@@ -41,7 +41,15 @@ use crate::{
 const V41_MODELS: [&str; 2] = ["deepseek-v4.1-flash", "deepseek-v4.1-flash-1017"];
 
 pub(super) fn matches_model(segment: &str) -> bool {
-    ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"]
+    const NAMES: [&str; 3] = ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"];
+    // A segment reaches this test under the letter `d` only, in
+    // `ProviderProfile::from_model_segments`: a name under another letter
+    // does not build before it has its arm there.
+    const _: () = assert!(
+        super::every_name_starts_with(&NAMES, b"d")
+            && super::every_name_starts_with(&V41_MODELS, b"d")
+    );
+    NAMES
         .iter()
         .chain(&V41_MODELS)
         .any(|model| segment.eq_ignore_ascii_case(model))
@@ -119,11 +127,12 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
     // Never let a malformed override block projection and make validation
     // disagree with a renderer that ignores that value.
     if let Some(kwargs) = &req.chat_template_kwargs {
-        for key in ["thinking", "enable_thinking"] {
-            if kwargs
-                .get(key)
-                .is_some_and(|value| !value.is_null() && !value.is_boolean())
-            {
+        // Each override is looked up once: the type check and the agreement
+        // check read the same two values.
+        let thinking = kwargs.get("thinking");
+        let alias = kwargs.get("enable_thinking");
+        for value in [thinking, alias].into_iter().flatten() {
+            if !value.is_null() && !value.is_boolean() {
                 return Err(invalid(
                     "invalid_thinking_override",
                     "DeepSeek thinking template overrides must be booleans or null",
@@ -131,8 +140,8 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
             }
         }
         if let (Some(thinking), Some(alias)) = (
-            kwargs.get("thinking").and_then(Value::as_bool),
-            kwargs.get("enable_thinking").and_then(Value::as_bool),
+            thinking.and_then(Value::as_bool),
+            alias.and_then(Value::as_bool),
         ) {
             if thinking != alias {
                 return Err(invalid(

@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
     identity::basic::{ConnectionMode, Worker},
-    jobs::WorkerRegistrationMode,
+    jobs::{WorkerJobAsker, WorkerRegistrationMode},
     model_card::ModelCard,
     worker::WorkerSpec,
 };
@@ -47,6 +47,8 @@ impl WorkerList {
 #[serde(bound = "")]
 pub struct WorkerRemovalWorkflowData<H> {
     pub config: WorkerRemovalRequest,
+    /// Who asked for the removal. A host's own step reads it.
+    pub asker: WorkerJobAsker,
     pub workers_to_remove: Option<WorkerList>,
     /// URLs of workers being removed
     pub worker_urls: Vec<String>,
@@ -59,6 +61,10 @@ pub struct WorkerRemovalWorkflowData<H> {
     /// Actual worker objects to remove (transient, not serialized)
     #[serde(skip, default)]
     pub actual_workers_to_remove: Option<Vec<Arc<dyn Worker>>>,
+    /// The workers marked `Draining` by the registry drain or the host's
+    /// drain. The settle reads its window from them. The list stays in memory.
+    #[serde(skip, default)]
+    pub drained_workers: Vec<Arc<dyn Worker>>,
     /// The workers the registry step removed at those URLs, a same-URL
     /// replacement that landed during the drain rather than the worker found
     /// (transient, not serialized)
@@ -71,11 +77,13 @@ impl<H> Clone for WorkerRemovalWorkflowData<H> {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
+            asker: self.asker.clone(),
             workers_to_remove: self.workers_to_remove.clone(),
             worker_urls: self.worker_urls.clone(),
             affected_models: self.affected_models.clone(),
             host: self.host.clone(),
             actual_workers_to_remove: self.actual_workers_to_remove.clone(),
+            drained_workers: self.drained_workers.clone(),
             removed_workers: self.removed_workers.clone(),
         }
     }
@@ -133,6 +141,8 @@ pub struct WorkerRegistrationWorkflowData<H: WorkflowHost> {
     /// their historical registration behavior when deserialized.
     #[serde(default)]
     pub registration_mode: WorkerRegistrationMode,
+    /// Who asked for the registration. A host's own step reads it.
+    pub asker: WorkerJobAsker,
     /// Which kind of worker this is, set by the host's first step.
     pub worker_kind: Option<WorkerKind>,
     // -- Local-only fields --
@@ -176,6 +186,7 @@ impl<H: WorkflowHost> Clone for WorkerRegistrationWorkflowData<H> {
         Self {
             config: self.config.clone(),
             registration_mode: self.registration_mode.clone(),
+            asker: self.asker.clone(),
             worker_kind: self.worker_kind,
             connection_mode: self.connection_mode,
             http2: self.http2,
@@ -194,16 +205,19 @@ impl<H: WorkflowHost> Clone for WorkerRegistrationWorkflowData<H> {
 }
 
 impl<H: WorkflowHost> WorkerRegistrationWorkflowData<H> {
-    /// A registration of `config` as it enters the workflow: nothing found
-    /// out about the worker yet, and the host's notes at their default.
+    /// A registration of `config` as it enters the workflow, asked by
+    /// `asker`: nothing found out about the worker yet, and the host's notes
+    /// at their default.
     pub fn new(
         config: WorkerSpec,
         registration_mode: WorkerRegistrationMode,
         host: Arc<H>,
+        asker: WorkerJobAsker,
     ) -> Self {
         Self {
             config,
             registration_mode,
+            asker,
             worker_kind: None,
             connection_mode: None,
             http2: None,

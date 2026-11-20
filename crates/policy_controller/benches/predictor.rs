@@ -16,7 +16,10 @@
 //!
 //! Ids: `policy_predictor/<call>/<request>/<blocks>`. The requests go
 //! round in the order they were sent, so the oldest path is always the
-//! request's own or, on a cold turn, the oldest request's.
+//! request's own or, on a cold turn, the oldest request's. A read folds
+//! the request's keys into its caller's buffer and then reads by them, as
+//! a decision does, and the write behind it takes the same keys at a new
+//! tick.
 
 use std::hint::black_box;
 
@@ -70,11 +73,26 @@ fn worker(of: usize) -> WorkerId {
     WorkerId(of as u64 % WORKERS)
 }
 
+/// A read as a decision makes it: the request's keys folded into the
+/// caller's buffer, then the read by them.
+fn read(held: &Predictor, keys: &mut Vec<u64>, request: &[u64]) -> u32 {
+    Predictor::fold_into(keys, SEED, request);
+    held.deepest(keys).blocks()
+}
+
+/// The write behind a read, by the keys the read folded, at a new tick.
+fn write(held: &mut Predictor, keys: &[u64], worker: WorkerId, tick: &mut u16) {
+    *tick = tick.wrapping_add(1);
+    held.sent(keys, worker, *tick);
+}
+
 /// The predictor that holds every request's first turn, at its bound.
 fn sent_before() -> Predictor {
     let mut predictor = Predictor::new(usize::MAX);
+    let (mut keys, mut tick) = (Vec::new(), 0);
     for of in 0..REQUESTS {
-        predictor.sent(SEED, &request(of, 1), worker(of));
+        Predictor::fold_into(&mut keys, SEED, &request(of, 1));
+        write(&mut predictor, &keys, worker(of), &mut tick);
     }
     predictor.set_bound(predictor.len());
     predictor
@@ -85,8 +103,10 @@ fn sent_before() -> Predictor {
 fn cold(blocks: u64) -> (Predictor, u64) {
     let held = COLD_BLOCKS / blocks;
     let mut predictor = Predictor::new(usize::MAX);
+    let (mut keys, mut tick) = (Vec::new(), 0);
     for of in 0..held {
-        predictor.sent(SEED, &apart(of, blocks), WorkerId(of % WORKERS));
+        Predictor::fold_into(&mut keys, SEED, &apart(of, blocks));
+        write(&mut predictor, &keys, WorkerId(of % WORKERS), &mut tick);
     }
     predictor.set_bound(predictor.len());
     (predictor, held)
@@ -100,25 +120,26 @@ fn predictor(c: &mut Criterion) {
         .collect();
     let mut held = sent_before();
     let mut next = 0;
+    let (mut keys, mut tick) = (Vec::new(), 0);
 
     group.bench_function("read/sent_before/64", |b| {
         b.iter(|| {
             next = (next + 1) % REQUESTS;
-            black_box(held.deepest(SEED, black_box(&requests[next])).blocks())
+            black_box(read(&held, &mut keys, black_box(&requests[next])))
         });
     });
     group.bench_function("read/cold/64", |b| {
         b.iter(|| {
             next = (next + 1) % REQUESTS;
-            black_box(held.deepest(SEED, black_box(&never[next])).blocks())
+            black_box(read(&held, &mut keys, black_box(&never[next])))
         });
     });
     next = REQUESTS - 1;
     group.bench_function("turn/sent_before/64", |b| {
         b.iter(|| {
             next = (next + 1) % REQUESTS;
-            let depth = held.deepest(SEED, black_box(&requests[next])).blocks();
-            held.sent(SEED, &requests[next], worker(next));
+            let depth = read(&held, &mut keys, black_box(&requests[next]));
+            write(&mut held, &keys, worker(next), &mut tick);
             black_box(depth)
         });
     });
@@ -132,8 +153,8 @@ fn predictor(c: &mut Criterion) {
                 (request(next, turn), worker(next))
             },
             |(request, worker)| {
-                let depth = held.deepest(SEED, &request).blocks();
-                held.sent(SEED, &request, worker);
+                let depth = read(&held, &mut keys, &request);
+                write(&mut held, &keys, worker, &mut tick);
                 black_box(depth)
             },
             BatchSize::SmallInput,
@@ -148,8 +169,8 @@ fn predictor(c: &mut Criterion) {
                     (apart(of, blocks), WorkerId(of % WORKERS))
                 },
                 |(request, worker)| {
-                    let depth = held.deepest(SEED, &request).blocks();
-                    held.sent(SEED, &request, worker);
+                    let depth = read(&held, &mut keys, &request);
+                    write(&mut held, &keys, worker, &mut tick);
                     black_box(depth)
                 },
                 BatchSize::SmallInput,

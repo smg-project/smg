@@ -11,27 +11,31 @@ use std::{
 
 use super::{
     run_of, seek, side_of, Ask, Built, Classes, GatewayRun, OutsideLists, PairBuffers, PoolVeto,
-    PoolVetoes, StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
+    PoolVetoes, StaleGeneration, VetoEnds, ViewBuffers, World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
 };
 use crate::{
+    builtins::ResidentWork,
     counts::Slot,
+    lease::{Lease, Lifecycle, Side},
     spec::{BindingSpec, Match, OverloadSpec, Pairing},
     store::{
-        loads::LoadSample, pairing::Refusal, GatewayId, HealthSink, LeasesStore, LoadSink,
-        LoadSource, MembershipTail, MemoryStore, Overload, PairingDescriptor, Reachability,
-        VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        loads::LoadSample, pairing::Refusal, GatewayId, HealthSink, LeaderBits, LeasesStore,
+        LoadSink, LoadSource, MembershipTail, MemoryStore, Overload, PairingDescriptor,
+        Reachability, VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
         WireModes, WorkerId,
     },
-    AppliedSpec, PairPools, PairTable, PolicySpec, Scratch,
+    AppliedSpec, PairPools, PairTable, PolicySpec, Scorer, Scratch, Target,
 };
 
 mod encode_classes;
 mod encode_door;
 mod engines;
+mod leader_bits;
 mod list_room;
+mod load_call;
 mod membership_call;
 mod mode_and_overload;
 mod owed;
@@ -40,20 +44,107 @@ mod repeated_models;
 mod unnamed_rank;
 mod written;
 
+mod sent_prefixes {
+    use super::*;
+    use crate::{
+        door::tests::sent_prefixes::{applied, merged},
+        spec::{IndexKind, IndexSpec},
+        store::{index::Predicted, KvEventSink},
+    };
+
+    type Case = Result<(), Box<dyn std::error::Error>>;
+
+    fn record(store: &MemoryStore) -> Option<Arc<Predicted>> {
+        store.deciding(|world| world.standing(MODEL, Role::Single)?.predicted())
+    }
+
+    #[test]
+    fn a_generation_that_reads_no_sent_prefix_drops_the_record() -> Case {
+        let store = MemoryStore::new();
+        member(&store, "a");
+        store.apply(applied(&merged(1)?)?)?;
+        assert_eq!(record(&store).map(|record| record.bound()), Some(4_194_304));
+        let mut idle = PolicySpec::preset("least_load")?;
+        idle.generation = 2;
+        store.apply(applied(&idle)?)?;
+        assert!(record(&store).is_none());
+        store.apply(applied(&merged(3)?)?)?;
+        assert!(record(&store).is_some());
+        let mut hash = merged(4)?;
+        hash.view.boundaries = vec![16];
+        hash.index.insert(
+            MODEL.into(),
+            IndexSpec {
+                kind: IndexKind::Hash,
+                ..IndexSpec::default()
+            },
+        );
+        hash.plans.pd_pair.pairing = Pairing::Off;
+        store.apply(applied(&hash)?)?;
+        assert!(record(&store).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_changed_bound_applies_in_place() -> Case {
+        let store = MemoryStore::new();
+        member(&store, "a");
+        let mut document = merged(1)?;
+        document.view.block_size = Some(8);
+        document.index.insert(
+            "*".into(),
+            IndexSpec {
+                max_size: 1024,
+                ..IndexSpec::default()
+            },
+        );
+        store.apply(applied(&document)?)?;
+        let first = record(&store).ok_or("the model's record")?;
+        assert_eq!(first.bound(), 128, "the generation's block size");
+
+        store.set_block_size(MODEL, 32);
+        // A refresh carries the classes, but the model's block size moved.
+        member(&store, "a");
+        assert_eq!(first.bound(), 32, "the model's block size of record");
+
+        document.generation = 2;
+        document.index.insert(
+            MODEL.into(),
+            IndexSpec {
+                max_size: 16,
+                ..IndexSpec::default()
+            },
+        );
+        store.apply(applied(&document)?)?;
+        let next = record(&store).ok_or("the model's record")?;
+        assert!(Arc::ptr_eq(&first, &next));
+        assert_eq!(
+            next.bound(),
+            1,
+            "the exact key wins and the bound stays positive"
+        );
+        Ok(())
+    }
+}
+
 const MODEL: &str = "m";
 const ASKER: GatewayId = GatewayId(1);
 
 /// A store's write gives each member its slot. The cases here hand a writer
 /// rows no store filed and read no count of theirs, so a row is given the
-/// next slot of the writer's counts where it is handed.
+/// next slot of the writer's counts where it is handed. No leader said a
+/// word of such a row.
 trait Filed {
-    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot)>;
+    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot, LeaderBits)>;
 }
 
 impl Filed for [WorkerRow] {
-    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot)> {
+    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot, LeaderBits)> {
         let counts = writer.counts();
-        let filed: Vec<_> = self.iter().map(|row| (row, counts.claim())).collect();
+        let filed: Vec<_> = self
+            .iter()
+            .map(|row| (row, counts.claim(), LeaderBits::default()))
+            .collect();
         filed.into_iter()
     }
 }
@@ -138,8 +229,24 @@ fn lent_agrees(store: &MemoryStore, ask: &Ask) {
             }
         }
         assert!(view.stalled.is_sorted(), "the mask is in the rows' order");
+        // The rows of the mask a hold stands on, asked apart. A held row is
+        // a row of the mask. The build writes every row of the mask the
+        // stalled bit, and a held one the breaker bit beside it.
+        let mut buffer = Vec::new();
+        let holds = world.held(&view, ask, &mut buffer);
+        // Strictly: the all-vetoed rule reads the two lists by their
+        // lengths, so the held list names a row once.
+        let rising = holds.windows(2).all(|pair| pair[0] < pair[1]);
+        assert!(rising, "the held rows are in the rows' order, each once");
+        let held = |position: &u32| holds.binary_search(position).is_ok();
+        let masked = |position: &u32| view.stalled.binary_search(position).is_ok();
+        assert!(holds.iter().all(masked), "a held row is masked");
         for &position in view.stalled {
-            rows[position as usize].health.stalled = true;
+            let health = &mut rows[position as usize].health;
+            health.stalled = true;
+            if held(&position) {
+                health.breaker_open = true;
+            }
         }
         if let Some(at) = view.pinned_at.checked_sub(1) {
             rows[at as usize].session_hit = true;
@@ -157,7 +264,9 @@ fn running(store: &MemoryStore, now: Instant) -> Option<u32> {
     view(store, &ask(now)).0[0].load.map(|load| load.running)
 }
 
-/// The workers of the pool that `gateway`'s vetoes mask at `now`, by id.
+/// The workers of the pool that `gateway`'s vetoes mask at `now`, by id: a
+/// build writes a veto's row the stalled bit, and the breaker bit beside
+/// it while its hold stands.
 fn stalled(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerId> {
     let asked = Ask {
         gateway,
@@ -167,6 +276,38 @@ fn stalled(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerI
         .0
         .iter()
         .filter(|row| row.health.stalled)
+        .map(|row| row.id)
+        .collect()
+}
+
+/// The workers of the pool `gateway` doubts at `now`, by id: the rows a
+/// build writes the stalled bit alone on.
+fn doubted(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerId> {
+    let asked = Ask {
+        gateway,
+        ..ask(now)
+    };
+    view(store, &asked)
+        .0
+        .iter()
+        .filter(|row| row.health.stalled && !row.health.breaker_open)
+        .map(|row| row.id)
+        .collect()
+}
+
+/// The workers of the pool a hold of `gateway` stands on at `now`, by id:
+/// the rows a build writes the breaker bit on, each beside the stalled
+/// bit.
+fn held(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerId> {
+    let asked = Ask {
+        gateway,
+        ..ask(now)
+    };
+    view(store, &asked)
+        .0
+        .iter()
+        .filter(|row| row.health.breaker_open)
+        .inspect(|row| assert!(row.health.stalled, "a held row is masked"))
         .map(|row| row.id)
         .collect()
 }
@@ -299,6 +440,56 @@ fn another_gateways_host_local_row_is_not_written_and_the_slice_is_its_own_index
         },
     );
     assert!(rows.iter().all(|row| !row.session_hit));
+}
+
+/// What each row states for a request's hard demands is read beside the
+/// rows a build writes for the asking gateway, one entry a row in the rows'
+/// order: another gateway's host-local row has no entry there.
+#[test]
+fn the_demand_facts_stand_beside_the_rows_written_for_the_asking_gateway() {
+    use crate::demands::DemandFacts;
+
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let stating = |key: &str, runtime: u32, reachable_from: Reachability| {
+        admit(
+            &store,
+            WorkerFacts {
+                reachable_from,
+                demand_facts: DemandFacts { runtime },
+                ..facts(key, Role::Single, &[MODEL])
+            },
+        )
+    };
+    let open = stating("http://a:8000", 7, Reachability::Any);
+    let theirs = stating("unix:///b", 8, Reachability::Gateway(GatewayId(2)));
+    let ours = stating("unix:///c", 9, Reachability::Gateway(GatewayId(1)));
+    let last = stating("http://d:8000", 0, Reachability::Any);
+    let stated_to = |gateway: u64| {
+        let ask = Ask {
+            gateway: GatewayId(gateway),
+            ..ask(now)
+        };
+        let (mut out, mut stated) = (ViewBuffers::default(), Vec::new());
+        store.with_world(|world| {
+            let built = world.build(MODEL, Role::Single, &ask, &mut out);
+            world.demand_facts(&built.expect("the pool"), &ask, &mut stated);
+        });
+        assert_eq!(stated.len(), out.candidates.len());
+        let rows = out.candidates.iter().zip(&stated);
+        rows.map(|(row, facts)| (row.id, facts.runtime))
+            .collect::<Vec<_>>()
+    };
+    let sorted = |mut rows: Vec<(WorkerId, u32)>| {
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(stated_to(1), sorted(vec![(open, 7), (ours, 9), (last, 0)]));
+    assert_eq!(
+        stated_to(2),
+        sorted(vec![(open, 7), (theirs, 8), (last, 0)])
+    );
+    assert_eq!(stated_to(3), sorted(vec![(open, 7), (last, 0)]));
 }
 
 #[test]
@@ -1148,6 +1339,88 @@ fn the_age_is_the_decisions_own_and_saturates() {
 }
 
 #[test]
+fn an_older_stamped_poll_keeps_the_report_that_released_dispatch_credit() {
+    let store = MemoryStore::new();
+    let id = member(&store, "worker-a");
+    let pushed_at = Instant::now() + Duration::from_millis(67);
+    let dispatch_at = pushed_at - Duration::from_millis(13);
+    let polled_at = pushed_at + PUBLISH_WINDOW * 2;
+    let pushed = load(7, 0);
+    let scorer = ResidentWork::new(3);
+    scorer.on_dispatched(
+        &Lease {
+            issued_micros: store.micros(dispatch_at),
+            tokens: 43,
+            ..Lease::default()
+        },
+        &Target {
+            id,
+            ..Target::default()
+        },
+        Side::Single,
+        0,
+    );
+    assert_eq!(scorer.held_at(id, 0), 1);
+    store.record(id, 0, pushed, pushed_at, LoadSource::Stream);
+    store.publish(pushed_at + PUBLISH_WINDOW);
+
+    let score = |at| {
+        let (rows, _, built) = view(&store, &ask(at));
+        assert_eq!(rows[0].load.map(|load| load.running), Some(pushed.running));
+        assert_eq!(rows[0].load_sampled_at_micros, store.micros(pushed_at));
+        let facts = RequestFacts {
+            now_micros: built.now_micros,
+            ..RequestFacts::default()
+        };
+        scorer.score(&facts, &rows, &[0], &mut [0.0]);
+        assert_eq!(scorer.held_at(id, 0), 0);
+    };
+    score(pushed_at);
+
+    let saved = store.load(id, 0);
+    let passed = store.report_sampled(
+        &[(id, 0, Some(load(19, 0)))],
+        polled_at,
+        dispatch_at - Duration::from_millis(2),
+        LoadSource::Poll,
+    );
+    assert_eq!(store.load(id, 0), saved);
+    assert_eq!(passed, [0]);
+    store.publish(polled_at + PUBLISH_WINDOW);
+    score(polled_at);
+}
+
+#[test]
+fn a_stamped_poll_replaces_an_older_or_equal_sample() {
+    let store = MemoryStore::new();
+    let id = member(&store, "worker-a");
+    let pushed_at = Instant::now();
+    store.record(id, 0, load(7, 0), pushed_at, LoadSource::Stream);
+    let sampled_at = pushed_at + Duration::from_millis(13);
+    for (offset, running) in [(31, 6), (43, 8)] {
+        let polled_at = pushed_at + Duration::from_millis(offset);
+        let row = load(running, 0);
+        assert!(store
+            .report_sampled(
+                &[(id, 0, Some(row))],
+                polled_at,
+                sampled_at,
+                LoadSource::Poll
+            )
+            .is_empty());
+        assert_eq!(
+            store.load(id, 0),
+            Some(LoadSample {
+                row,
+                received_at: polled_at,
+                sampled_at,
+                source: LoadSource::Poll
+            })
+        );
+    }
+}
+
+#[test]
 fn a_membership_write_keeps_the_instant_of_a_record_on_file() {
     let store = MemoryStore::new();
     let t0 = Instant::now();
@@ -1218,20 +1491,116 @@ fn a_noted_veto_is_shown_and_lifted_in_the_published_world() {
     let t0 = Instant::now();
     let vetoed = member(&store, "http://a:8000");
     let until = t0 + Duration::from_secs(1);
-    let written = store.gateway_veto_noted(ASKER, vetoed, Some(until), false, t0);
+    let written = store.gateway_veto_noted(ASKER, vetoed, Some(until), None, false, t0);
     assert_eq!(written, VetoWrite::Written);
     assert_eq!(stalled(&store, ASKER, t0), [vetoed]);
     assert_eq!(stalled(&store, GatewayId(2), t0), []);
     assert_eq!(stalled(&store, ASKER, until), []);
 
     let later = until + Duration::from_secs(1);
-    let written = store.gateway_veto_noted(ASKER, vetoed, Some(later), true, t0);
+    let written = store.gateway_veto_noted(ASKER, vetoed, Some(later), None, true, t0);
     assert_eq!(written, VetoWrite::Written);
     assert_eq!(stalled(&store, ASKER, until), [vetoed]);
 
-    let written = store.gateway_veto_noted(ASKER, vetoed, None, true, t0);
+    let written = store.gateway_veto_noted(ASKER, vetoed, None, None, true, t0);
     assert_eq!(written, VetoWrite::Written);
     assert_eq!(stalled(&store, ASKER, t0), []);
+}
+
+/// The store keeps no kind of a veto and two ends. While the hold stands
+/// the worker reads to its gateway as behind an open breaker, and not as
+/// doubted. From the hold's end to the veto's it reads as doubted, and past
+/// the veto's end it reads clear. A veto written with no hold is a doubt
+/// from its first instant. A membership write keeps both ends, a later
+/// write moves the hold alone, and a hold handed past the veto's end is cut
+/// to it.
+#[test]
+fn a_veto_reads_as_an_open_breaker_while_its_hold_stands_and_as_a_doubt_after() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let (first, second) = (
+        member(&store, "http://a:8000"),
+        member(&store, "http://b:8000"),
+    );
+    let mut both = [first, second];
+    both.sort_unstable();
+    let (hold, until) = (t0 + Duration::from_secs(1), t0 + Duration::from_secs(2));
+    let written = store.gateway_veto_noted(ASKER, first, Some(until), Some(hold), false, t0);
+    assert_eq!(written, VetoWrite::Written);
+    let written = store.gateway_veto_noted(ASKER, second, Some(until), None, false, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(held(&store, ASKER, t0), [first]);
+    assert_eq!(doubted(&store, ASKER, t0), [second]);
+    assert_eq!(held(&store, GatewayId(2), t0), []);
+    assert_eq!(doubted(&store, GatewayId(2), t0), []);
+    // A membership write builds every run again from the writer's lists.
+    member(&store, "http://c:8000");
+    assert_eq!(held(&store, ASKER, t0), [first]);
+    assert_eq!(doubted(&store, ASKER, t0), [second]);
+    // From the hold's end to the veto's: a doubt.
+    assert_eq!(held(&store, ASKER, hold), []);
+    assert_eq!(doubted(&store, ASKER, hold), both);
+    assert_eq!(held(&store, ASKER, until), []);
+    assert_eq!(doubted(&store, ASKER, until), []);
+    // The hold lifted under a veto that stands: a doubt at once.
+    let written = store.gateway_veto_noted(ASKER, first, Some(until), None, true, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(held(&store, ASKER, t0), []);
+    assert_eq!(doubted(&store, ASKER, t0), both);
+    // A hold handed past the veto's end is cut to it.
+    let past = until + Duration::from_secs(9);
+    let written = store.gateway_veto_noted(ASKER, first, Some(until), Some(past), true, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(held(&store, ASKER, t0), [first]);
+    assert_eq!(held(&store, ASKER, until), []);
+    assert_eq!(doubted(&store, ASKER, until), []);
+}
+
+#[test]
+fn a_veto_with_no_kind_told_holds_to_its_end() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let first = member(&store, "http://a:8000");
+    member(&store, "http://b:8000");
+    let until = t0 + Duration::from_secs(2);
+    // The plain door tells no kind, and no rule lifts a veto it cannot
+    // name: the whole of it holds.
+    store.gateway_veto(ASKER, first, Some(until));
+    assert_eq!(held(&store, ASKER, t0), [first]);
+    assert_eq!(doubted(&store, ASKER, t0), []);
+    assert_eq!(held(&store, GatewayId(2), t0), []);
+    // Across a membership write, and to its own end.
+    member(&store, "http://c:8000");
+    assert_eq!(held(&store, ASKER, t0), [first]);
+    assert_eq!(held(&store, ASKER, until), []);
+    assert_eq!(doubted(&store, ASKER, until), []);
+    store.gateway_veto(ASKER, first, None);
+    assert_eq!(stalled(&store, ASKER, t0), []);
+}
+
+/// A hold never outlasts its veto: one noted with a hold past the veto's
+/// own end reads held up to that end and clear at it. A hold that stood on
+/// would name a row no mask names, beside another worker's standing doubt.
+#[test]
+fn a_hold_noted_past_its_vetos_end_is_cut_to_that_end() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let first = member(&store, "http://a:8000");
+    let second = member(&store, "http://b:8000");
+    let until = t0 + Duration::from_secs(2);
+    let past = until + Duration::from_secs(2);
+    let written = store.gateway_veto_noted(ASKER, first, Some(until), Some(past), false, t0);
+    assert_eq!(written, VetoWrite::Written);
+    // A doubt of another worker that stands on: the mask is not empty when
+    // the first veto ends.
+    let written = store.gateway_veto_noted(ASKER, second, Some(past), None, false, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(held(&store, ASKER, t0), [first]);
+    assert_eq!(doubted(&store, ASKER, t0), [second]);
+    // At the veto's end its row is clear and the lent view names no held
+    // row, though the hold as it was told would stand two seconds more.
+    assert_eq!(held(&store, ASKER, until), []);
+    assert_eq!(stalled(&store, ASKER, until), [second]);
 }
 
 #[test]
@@ -1518,7 +1887,7 @@ fn a_probes_verdict_and_a_connect_signal_are_read_at_once() {
     assert!(!healthy());
 
     // The connect signal of a handshake-promoted worker.
-    assert!(store.connected(id, revision()).moved().is_some());
+    assert!(store.connected(id, revision(), &|| true).moved().is_some());
     assert!(healthy());
 
     // The prober takes a ready worker out after its failure threshold.
@@ -1529,7 +1898,7 @@ fn a_probes_verdict_and_a_connect_signal_are_read_at_once() {
         .failure_threshold;
     for _ in 0..threshold {
         assert!(healthy());
-        store.probe_outcome(id, false, revision());
+        store.probe_outcome(id, false, revision(), &|| true);
     }
     assert!(!healthy());
 }
@@ -1591,7 +1960,7 @@ fn a_veto_masks_its_workers_row_in_every_pool_it_serves() {
             .expect("the pool");
         out.candidates
             .iter()
-            .filter(|row| row.health.stalled)
+            .filter(|row| row.health.breaker_open)
             .map(|row| row.id)
             .collect::<Vec<_>>()
     };
@@ -1850,7 +2219,7 @@ fn a_publication_before_a_departing_workers_row_leaves_still_shows_its_veto() {
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
     writer.rebuild(1, members.filed(&writer), |_, _| None, Classes::Derive);
     let vetoed = writer
-        .veto(ASKER, leaving, Some(t0 + Duration::from_secs(60)))
+        .veto(ASKER, leaving, Some(t0 + Duration::from_secs(60)), None)
         .expect("a new veto");
     assert_eq!(masked(&vetoed), [leaving]);
     // Another worker's load write publishes while the removal is under
@@ -2000,13 +2369,13 @@ fn a_gateways_run_is_found_by_the_walk_and_by_the_search_and_none_where_it_holds
         3 * WALKED_RUNS,
     ] {
         let runs: Vec<GatewayRun> = (0..count)
-            .map(|place| GatewayRun {
-                gateway: GatewayId(3 * place as u64 + 3),
-                vetoes: Arc::from([PoolVeto {
+            .map(|place| {
+                let veto = PoolVeto {
                     row: place as u32,
                     id: WorkerId(place as u64),
-                    until,
-                }]),
+                    ends: VetoEnds::new(until, None),
+                };
+                GatewayRun::new(GatewayId(3 * place as u64 + 3), Arc::from([veto]))
             })
             .collect();
         for asker in 0..=3 * count as u64 + 4 {
@@ -2168,7 +2537,7 @@ fn a_vetos_write_builds_its_own_gateways_run_and_shares_every_other() {
     let (writing, other) = (GatewayId(3), GatewayId(7));
     for (gateway, id) in [(other, 2), (other, 6), (writing, 3)] {
         writer
-            .veto(gateway, WorkerId(id), Some(until))
+            .veto(gateway, WorkerId(id), Some(until), None)
             .expect("a new veto");
     }
     let run = |runs: &PoolVetoes, gateway: GatewayId| {
@@ -2180,7 +2549,7 @@ fn a_vetos_write_builds_its_own_gateways_run_and_shares_every_other() {
     // alone.
     let before = Arc::clone(&writer.pool_vetoes);
     writer
-        .veto(writing, WorkerId(7), Some(until))
+        .veto(writing, WorkerId(7), Some(until), None)
         .expect("a new veto");
     let after = Arc::clone(&writer.pool_vetoes);
     let mut whole = 0;
@@ -2203,7 +2572,9 @@ fn a_vetos_write_builds_its_own_gateways_run_and_shares_every_other() {
     // gateway takes its run out of the pool, and the last of the store
     // leaves no list at all.
     let before = Arc::clone(&writer.pool_vetoes);
-    writer.veto(writing, WorkerId(7), None).expect("a clear");
+    writer
+        .veto(writing, WorkerId(7), None, None)
+        .expect("a clear");
     let after = Arc::clone(&writer.pool_vetoes);
     assert_eq!(
         before
@@ -2213,13 +2584,17 @@ fn a_vetos_write_builds_its_own_gateways_run_and_shares_every_other() {
             .count(),
         1
     );
-    writer.veto(writing, WorkerId(3), None).expect("a clear");
+    writer
+        .veto(writing, WorkerId(3), None, None)
+        .expect("a clear");
     assert!(writer
         .pool_vetoes
         .iter()
         .all(|runs| run(runs, writing).is_none()));
     for id in [2, 6] {
-        writer.veto(other, WorkerId(id), None).expect("a clear");
+        writer
+            .veto(other, WorkerId(id), None, None)
+            .expect("a clear");
     }
     assert!(writer.pool_vetoes.is_empty());
 }
@@ -2260,10 +2635,9 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
             0 => {
                 let n = next(12) as usize;
                 present[n] = !present[n];
-                let members = all
-                    .iter()
-                    .zip(present)
-                    .filter_map(|(row, here)| here.then_some((row, counts.claim())));
+                let members = all.iter().zip(present).filter_map(|(row, here)| {
+                    here.then_some((row, counts.claim(), LeaderBits::default()))
+                });
                 writer.rebuild(step + 2, members, |_, _| None, Classes::Derive);
             }
             // A window's publication, which drops what its instant ended.
@@ -2272,9 +2646,9 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
                 writer.publish_window(at(clock));
             }
             // A clear, of a veto that stands or of none.
-            2..=5 => drop(writer.veto(gateway, worker, None)),
+            2..=5 => drop(writer.veto(gateway, worker, None, None)),
             // A veto, new or with a new end.
-            _ => drop(writer.veto(gateway, worker, Some(at(clock + 1 + next(60))))),
+            _ => drop(writer.veto(gateway, worker, Some(at(clock + 1 + next(60))), None)),
         }
         let left = runs_of(&writer);
         for runs in &left {
@@ -2301,7 +2675,7 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
     // leaves what a derive builds, the last one no list at all.
     for gateway in (0..5).map(|n| GatewayId(n * 11 + 2)) {
         for worker in (1..=12).map(WorkerId) {
-            if writer.veto(gateway, worker, None).is_none() {
+            if writer.veto(gateway, worker, None, None).is_none() {
                 continue;
             }
             let left = runs_of(&writer);
@@ -2501,7 +2875,7 @@ fn an_applied_generation_is_published_at_once_with_the_rows_as_they_stand() {
     let (rows, _, built) = view(&store, &ask(t0));
     assert_eq!((built.generation, built.membership_epoch), (1, epoch));
     assert_eq!(rows[0].load.map(|load| load.running), Some(2));
-    assert!(rows[0].health.healthy && rows[0].health.stalled);
+    assert!(rows[0].health.healthy && rows[0].health.breaker_open);
 }
 
 #[test]
@@ -4583,7 +4957,7 @@ fn a_pool_every_gateway_reaches_whole_is_lent_where_it_stands_and_copied_when_as
         let bits = |id: WorkerId| {
             let found = view.candidates.iter().find(|row| row.id == id);
             let row = found.expect("a member");
-            (row.health.stalled, row.session_hit)
+            (row.health.breaker_open, row.session_hit)
         };
         assert_eq!((bits(first), bits(second)), ((false, true), (true, false)));
     });

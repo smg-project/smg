@@ -126,22 +126,13 @@ impl CircuitBreaker {
         Self::with_config_and_label(CircuitBreakerConfig::default(), String::new())
     }
 
-    /// Create a new circuit breaker with custom configuration and metric label
+    /// Create a new circuit breaker with custom configuration and metric
+    /// label.
+    ///
+    /// Construction writes no series. A worker's breaker publishes where the
+    /// worker enters a registry: [`Self::publish_zero_counters`], then
+    /// [`Self::publish_metrics`].
     pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
-        let init_state = CircuitState::Closed;
-        Metrics::set_worker_cb_state(&metric_label, init_state.as_int());
-        // Every transition this state machine can make, at zero, so the
-        // family is on the first scrape and `increase()` sees the first trip.
-        for (from, to) in [
-            (CircuitState::Closed, CircuitState::Open),
-            (CircuitState::Open, CircuitState::HalfOpen),
-            (CircuitState::Open, CircuitState::Closed),
-            (CircuitState::HalfOpen, CircuitState::Closed),
-            (CircuitState::HalfOpen, CircuitState::Open),
-        ] {
-            Metrics::init_worker_cb_transition(&metric_label, from.as_str(), to.as_str());
-        }
-        Metrics::init_worker_cb_health_readmissions(&metric_label);
         Self {
             state: AtomicU8::new(STATE_CLOSED),
             consecutive_failures: AtomicU32::new(0),
@@ -426,12 +417,28 @@ impl CircuitBreaker {
         }
     }
 
-    /// Publish this breaker's state and counters to the per-worker gauges.
+    /// Publish at zero every counter this breaker can move: each transition
+    /// its state machine can make, and the health readmissions. The families
+    /// are then on the first scrape, and `increase()` sees the first trip. A
+    /// counter that has moved keeps its count.
+    pub fn publish_zero_counters(&self) {
+        for (from, to) in [
+            (CircuitState::Closed, CircuitState::Open),
+            (CircuitState::Open, CircuitState::HalfOpen),
+            (CircuitState::Open, CircuitState::Closed),
+            (CircuitState::HalfOpen, CircuitState::Closed),
+            (CircuitState::HalfOpen, CircuitState::Open),
+        ] {
+            Metrics::init_worker_cb_transition(&self.metric_label, from.as_str(), to.as_str());
+        }
+        Metrics::init_worker_cb_health_readmissions(&self.metric_label);
+    }
+
+    /// Publish this breaker's state and counts to the per-worker gauges.
     ///
-    /// Constructing a breaker sets the state gauge for its label to closed,
-    /// so a replacement worker built for the same URL resets the gauge of
-    /// the live breaker it is about to adopt; the adopter calls this to put
-    /// the adopted state back.
+    /// Construction writes none of them, and neither does the adoption of a
+    /// live breaker by a replacement: the worker that holds the breaker
+    /// calls this where it enters a registry.
     pub fn publish_metrics(&self) {
         self.publish_state_gauge();
         self.publish_gauge_metrics();

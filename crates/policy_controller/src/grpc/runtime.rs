@@ -278,8 +278,8 @@ struct Stand {
     /// How many settled streams stand on it: with none the version is free.
     standing: usize,
     /// The settles that fixed a version, the last one with them. A stream
-    /// that settles and ends between two looks of the events task shows in
-    /// this count alone.
+    /// that settles where none stands and ends between two looks of the
+    /// events task shows in this count alone.
     settles: u64,
 }
 
@@ -1241,7 +1241,8 @@ where
     // asked for again a pause later. No decision asks for this stream, as
     // one does for a `Decide` stream.
     let mut said = Said::default();
-    // The event a call took and could not write, kept for the next call.
+    // The event a turn took and could not write: the next turn to find room
+    // writes it first, in the same call or the next.
     let mut kept = None;
     while let Err(panicked) = Caught(Box::pin(observe_streams(
         lane, &mut queue, &mut kept, &mut sent, &mut lost, &mut said, &mut open,
@@ -1394,7 +1395,7 @@ async fn observe_streams<O, F, C, T>(
         if said.ended(ended.stood) {
             lane.failed(&ended.why);
         }
-        // The pause runs from the instant the end was seen: a send's wait
+        // The pause runs from the instant the end was seen: a turn's wait
         // for the call's outcome is inside it.
         tokio::time::sleep_until(ended.at + frame).await;
     }
@@ -1420,16 +1421,18 @@ struct Requests<'a> {
     version: u32,
     /// The plugin's version, as its `Decide` streams stand on it.
     spoken: &'a Spoken,
-    /// The word the call before took and could not carry: this call writes
-    /// it first, or keeps it in turn.
+    /// The event a turn took and could not write, in this call or the one
+    /// before: the next turn to find room writes it first, or keeps it in
+    /// turn.
     kept: &'a mut Option<Kept>,
 }
 
-/// An event an events call took and could not write, kept for the call that
-/// opens next: a word its version has no kind for, or any event that found
-/// the call's window full or its receiver gone. It holds the settles its
-/// plugin had seen as it was kept: a later count says a stream settled
-/// since, though none may stand.
+/// An event an events call took and could not write: a word its version
+/// has no kind for, kept for the call that opens next, or any event that
+/// found the call's window full or its receiver gone, which the next turn
+/// to find room writes first, in the same call or the next. It holds the
+/// settles its plugin had seen as it was kept: a later count says a stream
+/// settled since, though none may stand.
 struct Kept {
     word: proto::ObserveRequest,
     settles: u64,
@@ -1455,7 +1458,7 @@ struct Ended {
     /// Whether the call stood: [`STAND`] or longer from its open to the
     /// instant its end was seen.
     stood: bool,
-    /// When the end was seen, by the call's outcome or by a send.
+    /// When the end was seen, by the call's outcome or by a turn.
     at: tokio::time::Instant,
 }
 
@@ -2900,8 +2903,8 @@ mod tests {
     /// A dropped plugin's call ends though its window is full. Here the
     /// call's peer reads nothing: the window fills and one more event waits
     /// for the stream's room. The plugin is then dropped. The wait for room
-    /// is cut each frame and reads the drop there, so the task does not
-    /// outlive its plugin.
+    /// is cut each frame and reads the drop there, so the task ends within
+    /// two frames of it.
     #[tokio::test(start_paused = true)]
     async fn a_dropped_plugins_call_ends_though_its_window_is_full() {
         let (raise, mut queue) = mpsc::channel(OBSERVE_WINDOW + 1);
@@ -2924,11 +2927,11 @@ mod tests {
                 "the window is full: the turn waits for room"
             );
             drop(raise);
-            tokio::time::timeout(Duration::from_secs(60), &mut turn).await
+            tokio::time::timeout(2 * RECONNECT_PAUSE, &mut turn).await
         };
         assert!(
             matches!(ended, Ok(None)),
-            "the dropped plugin's call ends within the minute"
+            "the dropped plugin's call ends within two frames"
         );
         assert_eq!(
             u64::try_from(OBSERVE_WINDOW).ok(),
@@ -3212,9 +3215,9 @@ mod tests {
     }
 
     /// The pause before the next call runs from the instant the end was
-    /// seen: a send's wait for the call's outcome is inside it. Here a call
+    /// seen: a turn's wait for the call's outcome is inside it. Here a call
     /// lets its receiver go and says no outcome, and the next call opens
-    /// one frame after the send saw the end, not two.
+    /// one frame after the turn saw the end, not two.
     #[tokio::test(start_paused = true)]
     async fn the_pause_runs_from_the_instant_an_end_was_seen() {
         let (_events, lane, raise) = told(0);

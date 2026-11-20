@@ -5,17 +5,20 @@
 //!
 //! One namespace covers the three kinds. A built-in whose parameters are a
 //! struct of the spec (every scorer, the `best-with-temperature` picker) is
-//! held by name and built by the validator from what the document wrote. A
-//! stage with no parameters is built by its factory: once when it is
-//! registered, to ask the stage its name, and once for each place a document
-//! names it, each time a document becomes an engine. An engine owns its
-//! stages, and state shared across engines rides the factory's closure.
+//! held by name and built by the validator from what the document wrote.
+//! A factory that takes no parameters builds a stage at registration to
+//! check its name and again for each use during validation. A factory that
+//! takes parameters builds during validation from each entry that names it.
+//! Each validated policy owns its stages.
 //!
 //! A stage in code is the host's own binary, trusted as a built-in is: no
 //! sandbox and no budget. A policy that must change without a rebuild is a
 //! plugin.
 
-use std::fmt;
+use std::{convert::Infallible, fmt, sync::Arc};
+
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value};
 
 use crate::{
     builtins::{
@@ -23,29 +26,235 @@ use crate::{
         Passthrough, PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
     },
     framework::{Filter, Picker, Scorer},
-    spec::SCORERS,
+    reports::Reports,
+    sent::SentCredit,
+    signals::SignalColumn,
+    spec::{Needs, SpecError, SCORERS},
 };
 
 /// Builds one stage: once at its registration, then once for each place a
 /// document names it in each engine.
 type Factory<T> = Box<dyn Fn() -> Box<T> + Send + Sync>;
 
+type ScorerFactory =
+    dyn Fn(&mut StageBuild<'_>) -> Result<Box<dyn Scorer>, StageError> + Send + Sync;
+type ScorerBuild = Build<dyn Scorer, Box<ScorerFactory>>;
+pub(crate) type FilterFactory =
+    dyn Fn(&mut StageBuild<'_>) -> Result<Box<dyn Filter>, StageError> + Send + Sync;
+type FilterBuild = Build<dyn Filter, Box<FilterFactory>>;
+
 /// How a held name becomes a stage.
-enum Build<T: ?Sized> {
+enum Build<T: ?Sized, F = Infallible> {
     /// By the validator, from the parameters the document writes under the
     /// name.
     Typed,
     /// By its factory.
     Factory(Factory<T>),
+    /// By its factory, once the validator has read the parameters.
+    With(F),
 }
 
 /// What the validator gets for a name the catalog holds.
-pub(crate) enum Found<T: ?Sized> {
+pub(crate) enum Found<T: ?Sized, F = Infallible> {
     /// A built-in with typed parameters: the validator builds it.
     Typed,
     /// The stage, built for the engine under validation.
     Built(Box<T>),
+    /// The factory the validator calls with the parameters.
+    With(F),
 }
+
+/// The parameters and profile state available to a stage's factory.
+/// The factory borrows the parameters for the call. A stage owns any
+/// parameters it keeps.
+pub struct StageBuild<'a> {
+    written: &'a Map<String, Value>,
+    profile: &'a str,
+    sent_ttl_ms: Option<u32>,
+    sent: &'a mut Option<Arc<SentCredit>>,
+    reports: Reports,
+    /// The document's signals, resolved, in name order.
+    signals: &'a [SignalColumn],
+    resolved_signal: bool,
+}
+
+impl<'a> StageBuild<'a> {
+    /// The stage `build` makes under a context of its own, held to its own
+    /// word on the signal cells: its needs (`needs`) set them exactly where
+    /// its factory resolved a signal ([`Self::signal_column`]). A stage
+    /// that kept a column and does not say so would be handed no cells and
+    /// read no value, in silence. One that says so and kept none would
+    /// have a host hand cells nothing reads. The one maker of a context: a
+    /// stage of any kind a factory builds comes through here.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the context's parts, the factory and the stage's own word on its needs"
+    )]
+    pub(crate) fn built<S: ?Sized>(
+        written: &'a Map<String, Value>,
+        profile: &'a str,
+        sent_ttl_ms: Option<u32>,
+        sent: &'a mut Option<Arc<SentCredit>>,
+        reports: Reports,
+        signals: &'a [SignalColumn],
+        build: impl FnOnce(&mut Self) -> Result<Box<S>, StageError>,
+        needs: impl FnOnce(&S) -> Needs,
+    ) -> Result<Box<S>, StageError> {
+        let mut context = Self {
+            written,
+            profile,
+            sent_ttl_ms,
+            sent,
+            reports,
+            signals,
+            resolved_signal: false,
+        };
+        let stage = build(&mut context)?;
+        match (context.resolved_signal, needs(&stage).signal_cells) {
+            (true, false) => Err(StageError::other(
+                "the stage keeps a signal's column: its needs must set signal_cells",
+            )),
+            (false, true) => Err(StageError::other(
+                "the stage's needs set signal_cells and its build resolved no signal: \
+                 resolve one or leave the need unset",
+            )),
+            _ => Ok(stage),
+        }
+    }
+}
+
+impl StageBuild<'_> {
+    /// Reads the parameters into `T`. A bare name supplies an empty map.
+    /// The validator removes a scorer's `weight`, so it appears in
+    /// neither `T`'s input nor [`Self::written`]; a filter's map is
+    /// handed whole. Derive
+    /// `#[serde(deny_unknown_fields)]` on `T`: otherwise a misspelled
+    /// parameter is ignored and its default runs.
+    pub fn params<T: DeserializeOwned>(&self) -> Result<T, StageError> {
+        serde_json::from_value(Value::Object(self.written.clone())).map_err(StageError::from)
+    }
+
+    /// The document's parameter map, a scorer's with `weight` removed,
+    /// the keys of every map in order: the order of the canonical bytes,
+    /// whatever order the document wrote them in.
+    pub fn written(&self) -> &Map<String, Value> {
+        self.written
+    }
+
+    /// The profile's count of sends. The first call for a profile makes
+    /// its tally under that profile's `sent_ttl_ms`.
+    pub fn sent(&mut self) -> Arc<SentCredit> {
+        profile_sent(self.sent, self.profile, self.sent_ttl_ms)
+    }
+
+    /// The view's reading of a row's load report, for a stage that reads
+    /// one: a report older than the document's `view.max_report_age_ms`
+    /// reads as none, as it does for the built-in stages. A stage that
+    /// reads `row.load` itself sees the report at any age. The value is
+    /// `Copy`, and asking for it makes nothing.
+    pub fn reports(&self) -> Reports {
+        self.reports
+    }
+
+    /// The column of a signal the document declares, by its name. A name
+    /// the document does not declare is refused at the stage's entry. A
+    /// stage that keeps a column says so in its needs
+    /// ([`Needs::signal_cells`](crate::Needs::signal_cells)), and a stage
+    /// that keeps none does not: the validator refuses either mismatch, so
+    /// a host hands the cells to the profiles that read them and to no
+    /// other.
+    pub fn signal_column(&mut self, name: &str) -> Result<SignalColumn, StageError> {
+        let found = self
+            .signals
+            .binary_search_by(|column| column.name().cmp(name));
+        let column = found.map_err(|_| {
+            StageError::other(format!("{name} is not a signal the document declares"))
+        })?;
+        self.resolved_signal = true;
+        Ok(self.signals[column].clone())
+    }
+}
+
+/// The count of sends in a profile's slot, made at the first ask under the
+/// profile's `sent_ttl_ms`. A factory's context and a typed stage both ask
+/// here, so a profile holds one count.
+pub(crate) fn profile_sent(
+    slot: &mut Option<Arc<SentCredit>>,
+    profile: &str,
+    sent_ttl_ms: Option<u32>,
+) -> Arc<SentCredit> {
+    Arc::clone(slot.get_or_insert_with(|| Arc::new(SentCredit::new(profile, sent_ttl_ms))))
+}
+
+/// Why a factory refuses what the document wrote. It displays as the
+/// refusal reads in a document's error, without the stage's path.
+#[derive(Debug)]
+pub struct StageError(StageRefusal);
+
+#[derive(Debug)]
+enum StageRefusal {
+    Field {
+        field: String,
+        value: String,
+        reason: &'static str,
+    },
+    Other(String),
+}
+
+impl StageError {
+    /// Refuses `value` in `field`, with `reason` describing what it must be.
+    pub fn bad(field: &str, value: impl fmt::Display, reason: &'static str) -> Self {
+        Self(StageRefusal::Field {
+            field: field.to_owned(),
+            value: value.to_string(),
+            reason,
+        })
+    }
+
+    /// Refuses the stage's parameters in the factory's own words.
+    pub fn other(reason: impl Into<String>) -> Self {
+        Self(StageRefusal::Other(reason.into()))
+    }
+
+    pub(crate) fn at(self, path: &str) -> SpecError {
+        match self.0 {
+            StageRefusal::Field {
+                field,
+                value,
+                reason,
+            } => SpecError::BadField {
+                path: format!("{path}.{field}"),
+                value,
+                reason,
+            },
+            StageRefusal::Other(reason) => SpecError::BadStage {
+                path: path.to_owned(),
+                reason,
+            },
+        }
+    }
+}
+
+impl From<serde_json::Error> for StageError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::other(error.to_string())
+    }
+}
+
+impl fmt::Display for StageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            StageRefusal::Field {
+                field,
+                value,
+                reason,
+            } => write!(f, "{field} = {value} is not {reason}"),
+            StageRefusal::Other(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for StageError {}
 
 /// What a stage is in a profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,8 +295,8 @@ pub enum CatalogError {
 /// build's; a host adds its own under new names and hands the catalog to
 /// the validator ([`crate::PolicySpec::validate_in`]).
 pub struct Catalog {
-    filters: Vec<(&'static str, Factory<dyn Filter>)>,
-    scorers: Vec<(&'static str, Build<dyn Scorer>)>,
+    filters: Vec<(&'static str, FilterBuild)>,
+    scorers: Vec<(&'static str, ScorerBuild)>,
     pickers: Vec<(&'static str, Build<dyn Picker>)>,
     /// Whether the host makes the lifecycle's calls: a stage that needs
     /// them ([`crate::Lifecycle::needs_lifecycle`]) is in no other build.
@@ -98,14 +307,9 @@ pub struct Catalog {
     sent_prefixes: bool,
 }
 
-/// The factory of a built-in that takes no parameter.
-fn factory<T: ?Sized + 'static>(build: fn() -> Box<T>) -> Factory<T> {
-    Box::new(build)
-}
-
-/// A built-in its factory builds.
-fn of<T: ?Sized + 'static>(build: fn() -> Box<T>) -> Build<T> {
-    Build::Factory(factory(build))
+/// A built-in that takes no parameter: its factory builds it.
+fn of<T: ?Sized + 'static, F>(build: fn() -> Box<T>) -> Build<T, F> {
+    Build::Factory(Box::new(build))
 }
 
 impl Catalog {
@@ -115,11 +319,11 @@ impl Catalog {
     pub fn builtin() -> Self {
         Self {
             filters: vec![
-                ("healthy", factory(|| Box::new(Healthy))),
-                ("not-overloaded", factory(|| Box::new(NotOverloaded))),
-                ("has-capacity", factory(|| Box::new(HasCapacity))),
-                ("has-room", factory(|| Box::new(HasRoom))),
-                ("not-tried", factory(|| Box::new(NotTried))),
+                ("healthy", of(|| Box::new(Healthy))),
+                ("not-overloaded", of(|| Box::new(NotOverloaded))),
+                ("has-capacity", of(|| Box::new(HasCapacity))),
+                ("has-room", of(|| Box::new(HasRoom))),
+                ("not-tried", of(|| Box::new(NotTried))),
             ],
             // Every scorer takes its weight, and most take more: each is
             // built from its typed parameters.
@@ -172,13 +376,36 @@ impl Catalog {
     }
 
     /// Adds a filter under `name`: a document names it as it names a
-    /// built-in. Refused when the name is held or is not the filter's own.
+    /// built-in. It takes no parameter: a map written under its name is
+    /// refused. Refused when the name is held or is not the filter's own.
     pub fn filter<F>(&mut self, name: &'static str, factory: F) -> Result<&mut Self, CatalogError>
     where
         F: Fn() -> Box<dyn Filter> + Send + Sync + 'static,
     {
         self.admit(StageKind::Filter, name, || factory().name())?;
-        self.filters.push((name, Box::new(factory)));
+        self.filters.push((name, Build::Factory(Box::new(factory))));
+        Ok(self)
+    }
+
+    /// Adds a filter that reads parameters under `name`: a document writes
+    /// `{ name: { .. } }`, and a bare name supplies an empty map. Returns
+    /// [`CatalogError::Held`] when any stage already holds the name.
+    ///
+    /// The factory runs once for each place the document names the filter
+    /// at every validation, including a start, an apply, and a dry run.
+    /// It must have no effect outside the filter it returns.
+    pub fn filter_with<F>(
+        &mut self,
+        name: &'static str,
+        build: F,
+    ) -> Result<&mut Self, CatalogError>
+    where
+        F: Fn(&mut StageBuild<'_>) -> Result<Box<dyn Filter>, StageError> + Send + Sync + 'static,
+    {
+        if let Some(held) = self.held(name) {
+            return Err(CatalogError::Held { name, held });
+        }
+        self.filters.push((name, Build::With(Box::new(build))));
         Ok(self)
     }
 
@@ -191,6 +418,28 @@ impl Catalog {
     {
         self.admit(StageKind::Scorer, name, || factory().name())?;
         self.scorers.push((name, Build::Factory(Box::new(factory))));
+        Ok(self)
+    }
+
+    /// Adds a scorer that reads parameters beside `weight` under `name`.
+    /// A bare name supplies an empty map. Returns [`CatalogError::Held`]
+    /// when any stage already holds the name.
+    ///
+    /// The factory runs once for each place the document names the scorer
+    /// at every validation, including a start, an apply, and a dry run.
+    /// It must have no effect outside the scorer it returns.
+    pub fn scorer_with<F>(
+        &mut self,
+        name: &'static str,
+        build: F,
+    ) -> Result<&mut Self, CatalogError>
+    where
+        F: Fn(&mut StageBuild<'_>) -> Result<Box<dyn Scorer>, StageError> + Send + Sync + 'static,
+    {
+        if let Some(held) = self.held(name) {
+            return Err(CatalogError::Held { name, held });
+        }
+        self.scorers.push((name, Build::With(Box::new(build))));
         Ok(self)
     }
 
@@ -257,32 +506,33 @@ impl Catalog {
         Ok(())
     }
 
-    /// The filter a document names, built for one engine.
-    pub(crate) fn find_filter(&self, name: &str) -> Option<Box<dyn Filter>> {
-        self.filters
-            .iter()
-            .find(|(held, _)| *held == name)
-            .map(|(_, factory)| factory())
+    /// The filter a document names, or how the validator builds it.
+    pub(crate) fn find_filter(&self, name: &str) -> Option<Found<dyn Filter, &FilterFactory>> {
+        find(&self.filters, name, Box::as_ref)
     }
 
-    /// The scorer a document names: built for one engine, or the validator's
-    /// to build from its parameters.
-    pub(crate) fn find_scorer(&self, name: &str) -> Option<Found<dyn Scorer>> {
-        find(&self.scorers, name)
+    /// The scorer a document names, or how the validator builds it.
+    pub(crate) fn find_scorer(&self, name: &str) -> Option<Found<dyn Scorer, &ScorerFactory>> {
+        find(&self.scorers, name, Box::as_ref)
     }
 
     /// The picker a document names, as [`Self::find_scorer`].
     pub(crate) fn find_picker(&self, name: &str) -> Option<Found<dyn Picker>> {
-        find(&self.pickers, name)
+        find(&self.pickers, name, |&never| match never {})
     }
 }
 
-fn find<T: ?Sized>(held: &[(&'static str, Build<T>)], name: &str) -> Option<Found<T>> {
+fn find<'a, T: ?Sized, B, F>(
+    held: &'a [(&'static str, Build<T, B>)],
+    name: &str,
+    factory_ref: impl FnOnce(&'a B) -> F,
+) -> Option<Found<T, F>> {
     held.iter()
         .find(|(held, _)| *held == name)
         .map(|(_, build)| match build {
             Build::Typed => Found::Typed,
             Build::Factory(factory) => Found::Built(factory()),
+            Build::With(factory) => Found::With(factory_ref(factory)),
         })
 }
 
@@ -748,7 +998,7 @@ profiles:
                 answers: "worst",
             })
         );
-        assert!(catalog.scorers().eq(SCORERS));
+        assert!(catalog.scorers().eq(SCORERS.iter().copied()));
     }
 
     #[test]
@@ -964,7 +1214,10 @@ profiles:
     fn each_stock_stage_answers_the_name_it_is_held_under() {
         let stock = Catalog::builtin();
         for name in FILTERS {
-            let filter = stock.find_filter(name).expect("a stock filter");
+            // Every stock filter is built by its factory.
+            let Some(Found::Built(filter)) = stock.find_filter(name) else {
+                panic!("{name}: a stock filter takes no parameter");
+            };
             assert_eq!(filter.name(), name);
         }
         for name in PICKERS {
@@ -975,7 +1228,7 @@ profiles:
             }
         }
         // Every scorer is the validator's to build.
-        for name in SCORERS {
+        for &name in SCORERS {
             assert!(
                 matches!(stock.find_scorer(name), Some(Found::Typed)),
                 "{name}"
@@ -987,7 +1240,7 @@ profiles:
     fn the_stock_catalog_is_the_lists_the_spec_publishes() {
         let stock = Catalog::builtin();
         assert!(stock.filters().eq(FILTERS), "{stock:?}");
-        assert!(stock.scorers().eq(SCORERS), "{stock:?}");
+        assert!(stock.scorers().eq(SCORERS.iter().copied()), "{stock:?}");
         assert!(stock.pickers().eq(PICKERS), "{stock:?}");
         // Every bare name of the lists is held: whatever else a document
         // that names it is refused for, it is not an unknown name.
@@ -1006,6 +1259,711 @@ profiles:
             {
                 panic!("{name}: {unknown:?}");
             }
+        }
+    }
+
+    const PRICE_PATH: &str = "profiles.default.score[0].queue-price";
+    const PRICE_FIELD: &str = "profiles.default.score[0].queue-price.per_request";
+    const BAD_PRICE: &str = "[{ queue-price: { per_request: -11 } }]";
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct QueuePrice {
+        per_request: i32,
+    }
+
+    impl Lifecycle for QueuePrice {}
+
+    impl Scorer for QueuePrice {
+        fn name(&self) -> &'static str {
+            "queue-price"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            for (&row, score) in kept.iter().zip(out) {
+                let cost = candidates[row as usize].in_flight as f32 * self.per_request as f32;
+                *score = 1.0 / (1.0 + cost);
+            }
+            TieBand::NORMALIZED
+        }
+    }
+
+    fn price_catalog() -> Catalog {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .scorer_with("queue-price", |build| {
+                let price: QueuePrice = build.params()?;
+                if price.per_request <= 0 {
+                    return Err(crate::StageError::bad(
+                        "per_request",
+                        price.per_request,
+                        "above zero",
+                    ));
+                }
+                Ok(Box::new(price))
+            })
+            .expect("a free name");
+        catalog
+    }
+
+    fn score_document(score: &str) -> PolicySpec {
+        let version = crate::API_VERSION;
+        serde_yaml::from_str(&format!(
+            "apiVersion: {version}\nprofiles:\n  default:\n    score: {score}\n    pick: best\n"
+        ))
+        .expect("a well-formed document")
+    }
+
+    #[test]
+    fn a_scorer_keeps_its_typed_parameter_and_the_profile_keeps_its_weight() {
+        let engine = score_document("[{ queue-price: { weight: 3.5, per_request: 137 } }]")
+            .validate_in(&price_catalog(), &[])
+            .expect("the scorer reads its price");
+        let weighted = &engine.profiles()[0].scorers[0];
+        assert_eq!(weighted.weight, 3.5);
+        let row = Candidate {
+            in_flight: 1,
+            ..Candidate::default()
+        };
+        let mut out = [0.0];
+        weighted
+            .scorer
+            .score(&RequestFacts::default(), &[row], &[0], &mut out);
+        assert_eq!(out, [1.0 / 138.0]);
+    }
+
+    #[test]
+    fn weight_is_absent_from_both_views_of_the_parameters() {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Price {
+            per_request: i32,
+            flat: u32,
+        }
+
+        let mut catalog = Catalog::builtin();
+        catalog
+            .scorer_with("queue-price", |build| {
+                let written = build.written();
+                assert!(written
+                    .keys()
+                    .map(String::as_str)
+                    .eq(["flat", "per_request"]));
+                let price: Price = build.params()?;
+                assert_eq!((price.per_request, price.flat), (41, 13));
+                Ok(Box::new(QueuePrice {
+                    per_request: price.per_request,
+                }))
+            })
+            .expect("a free name");
+        score_document("[{ queue-price: { weight: 6.25, per_request: 41, flat: 13 } }]")
+            .validate_in(&catalog, &[])
+            .expect("the weight is outside the parameters");
+    }
+
+    /// A factory reads its parameters in one order whatever order the
+    /// document wrote their keys in, at every depth: the order of the
+    /// canonical bytes, which the digest reads. Two files that are one
+    /// document by their digest hand a factory the same map.
+    #[test]
+    fn a_factory_reads_its_parameters_in_key_order() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heard = Arc::clone(&seen);
+        let mut catalog = Catalog::builtin();
+        catalog
+            .scorer_with("queue-price", move |build| {
+                let written = serde_json::to_string(build.written()).expect("serializes");
+                heard.lock().expect("no panic under the lock").push(written);
+                Ok(Box::new(QueuePrice { per_request: 0 }))
+            })
+            .expect("a free name");
+        let one = score_document(
+            "[{ queue-price: { weight: 2, per_request: 500, costs: [{ unit: 17, flat: 3 }] } }]",
+        );
+        let other = score_document(
+            "[{ queue-price: { costs: [{ flat: 3, unit: 17 }], per_request: 500, weight: 2 } }]",
+        );
+        assert_eq!(
+            one.digest().expect("digests"),
+            other.digest().expect("digests")
+        );
+        one.validate_in(&catalog, &[]).expect("validates");
+        other.validate_in(&catalog, &[]).expect("validates");
+        let seen = seen.lock().expect("no panic under the lock");
+        assert_eq!(seen[0], seen[1], "two orders of one map");
+        assert_eq!(
+            seen[0],
+            r#"{"costs":[{"flat":3,"unit":17}],"per_request":500}"#
+        );
+    }
+
+    #[test]
+    fn a_bare_name_builds_from_an_empty_map_at_weight_one() {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .scorer_with("high-id", |build| {
+                assert!(build.written().is_empty());
+                let typed: serde_json::Map<String, serde_json::Value> = build.params()?;
+                assert!(typed.is_empty());
+                Ok(Box::new(HighId))
+            })
+            .expect("a free name");
+        for score in ["[high-id]", "[{ high-id: {} }]"] {
+            let engine = score_document(score)
+                .validate_in(&catalog, &[])
+                .expect("the scorer needs no parameters");
+            assert_eq!(engine.profiles()[0].scorers[0].weight, 1.0);
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_mistyped_parameter_is_refused_at_the_stage() {
+        let catalog = price_catalog();
+        for (score, message) in [
+            ("[{ queue-price: { spare: 17 } }]", "unknown field `spare`"),
+            ("[{ queue-price: { per_request: 'many' } }]", "invalid type"),
+        ] {
+            let error = score_document(score)
+                .validate_in(&catalog, &[])
+                .expect_err("the parameter is refused");
+            let SpecError::BadStage { path, reason } = error else {
+                panic!("{error}");
+            };
+            assert_eq!(path, PRICE_PATH);
+            assert!(reason.contains(message), "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_factory_can_refuse_a_value_at_its_field() {
+        let error = score_document(BAD_PRICE)
+            .validate_in(&price_catalog(), &[])
+            .expect_err("a negative price is refused");
+        assert_eq!(
+            error,
+            SpecError::BadField {
+                path: PRICE_FIELD.into(),
+                value: "-11".into(),
+                reason: "above zero",
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("{PRICE_FIELD} = -11 is not above zero")
+        );
+    }
+
+    #[test]
+    fn a_factory_refusal_names_the_field_to_edit() {
+        let catalog = price_catalog();
+        for (score, path) in [("[queue-price]", PRICE_PATH), (BAD_PRICE, PRICE_FIELD)] {
+            let error = score_document(score)
+                .validate_in(&catalog, &[])
+                .expect_err("the factory refuses the parameters");
+            assert_eq!(error.field_path(), path);
+        }
+    }
+
+    #[test]
+    fn a_refusal_displays_without_the_stages_path() {
+        let field = crate::StageError::bad("per_request", 0, "above zero");
+        assert_eq!(field.to_string(), "per_request = 0 is not above zero");
+        let other = crate::StageError::other("no price list");
+        assert_eq!(other.to_string(), "no price list");
+        let error: &dyn std::error::Error = &other;
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn a_held_name_is_refused_without_running_the_factory() {
+        let mut catalog = price_catalog();
+        let called = Arc::new(AtomicUsize::new(0));
+        for (name, held) in [
+            ("healthy", StageKind::Filter),
+            ("least-requests", StageKind::Scorer),
+            ("best", StageKind::Picker),
+            ("queue-price", StageKind::Scorer),
+        ] {
+            let calls = Arc::clone(&called);
+            assert_eq!(
+                catalog
+                    .scorer_with(name, move |_| {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        Ok(Box::new(HighId))
+                    })
+                    .map(|_| ()),
+                Err(CatalogError::Held { name, held })
+            );
+            assert_eq!(called.load(Ordering::Relaxed), 0);
+        }
+        assert_eq!(catalog.scorers().count(), SCORERS.len() + 1);
+    }
+
+    #[test]
+    fn a_factory_runs_only_for_valid_entries_that_name_it() {
+        let mut catalog = Catalog::builtin();
+        let called = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&called);
+        catalog
+            .scorer_with("high-id", move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::new(HighId))
+            })
+            .expect("a free name");
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        assert!(catalog.find_scorer("high-id").is_some());
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        score_document("[least-requests]")
+            .validate_in(&catalog, &[])
+            .expect("the document names another scorer");
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+
+        let refused = |score: &str| {
+            score_document(score)
+                .validate_in(&catalog, &[])
+                .expect_err("refused")
+        };
+        assert_eq!(
+            refused("[{ absent: [17] }]"),
+            SpecError::UnknownScorer {
+                profile: "default".into(),
+                name: "absent".into(),
+            }
+        );
+        let path = "profiles.default.score[0].high-id";
+        for (score, value) in [
+            ("[{ high-id: [17] }]", "[17]"),
+            ("[{ high-id: null }]", "null"),
+        ] {
+            assert_eq!(
+                refused(score),
+                SpecError::BadField {
+                    path: path.into(),
+                    value: value.into(),
+                    reason: "a map of the scorer's weight: { weight }",
+                }
+            );
+        }
+        for (weight, value) in [("-7", "-7"), ("9e70", "9e+70"), ("'many'", "\"many\"")] {
+            let error = refused(&format!("[{{ high-id: {{ weight: {weight} }} }}]"));
+            assert_eq!(
+                error,
+                SpecError::BadField {
+                    path: format!("{path}.weight"),
+                    value: value.into(),
+                    reason: "a finite number above zero",
+                }
+            );
+        }
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+
+        let named = score_document("[high-id, high-id, high-id]");
+        for expected in [3, 6] {
+            named.validate_in(&catalog, &[]).expect("validates again");
+            assert_eq!(called.load(Ordering::Relaxed), expected);
+        }
+    }
+
+    #[test]
+    fn each_build_checks_the_scorers_name() {
+        let mut catalog = Catalog::builtin();
+        let called = AtomicUsize::new(0);
+        catalog
+            .scorer_with(
+                "high-id",
+                move |_| -> Result<Box<dyn Scorer>, crate::StageError> {
+                    if called.fetch_add(1, Ordering::Relaxed) == 0 {
+                        Ok(Box::new(HighId))
+                    } else {
+                        Ok(Box::new(LowId))
+                    }
+                },
+            )
+            .expect("a free name");
+        let document = score_document("[high-id]");
+        document
+            .validate_in(&catalog, &[])
+            .expect("the name agrees");
+        let error = document
+            .validate_in(&catalog, &[])
+            .expect_err("the name disagrees");
+        let SpecError::BadStage { path, reason } = error else {
+            panic!("{error}");
+        };
+        assert_eq!(path, "profiles.default.score[0].high-id");
+        assert!(
+            reason.contains("high-id") && reason.contains("low-id"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_refused_profile_drops_the_stages_built_for_the_document() {
+        #[derive(Debug)]
+        struct CountDrop(Arc<AtomicUsize>);
+
+        impl Lifecycle for CountDrop {}
+
+        impl Scorer for CountDrop {
+            fn name(&self) -> &'static str {
+                "count-drop"
+            }
+
+            fn score(
+                &self,
+                facts: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                kept: &[u32],
+                out: &mut [f32],
+            ) -> TieBand {
+                HighId.score(facts, candidates, kept, out)
+            }
+        }
+
+        impl Drop for CountDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let mut catalog = Catalog::builtin();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::clone(&dropped);
+        catalog
+            .scorer_with("count-drop", move |_| {
+                Ok(Box::new(CountDrop(Arc::clone(&drops))))
+            })
+            .and_then(|catalog| {
+                catalog.scorer_with("refused", |_| Err(crate::StageError::other("no price")))
+            })
+            .expect("two free names");
+        let standing = score_document("[count-drop]")
+            .validate_in(&catalog, &[])
+            .expect("a valid document");
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        let version = crate::API_VERSION;
+        let invalid: PolicySpec = serde_yaml::from_str(&format!(
+            "apiVersion: {version}
+profiles:
+  before: {{ score: [count-drop], pick: best }}
+  later: {{ score: [refused], pick: best }}
+bindings: [{{ profile: before }}]
+"
+        ))
+        .expect("a well-formed document");
+        assert_eq!(
+            invalid
+                .validate_in(&catalog, &[])
+                .expect_err("a later profile is refused"),
+            SpecError::BadStage {
+                path: "profiles.later.score[0].refused".into(),
+                reason: "no price".into(),
+            }
+        );
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            standing.profiles()[0].scorers[0].scorer.name(),
+            "count-drop"
+        );
+        drop(standing);
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_plain_scorer_reports_that_it_takes_only_weight() {
+        let error = score_document("[{ high-id: { weight: 3.5, spread: 17 } }]")
+            .validate_in(&catalog(), &[])
+            .expect_err("the plain scorer accepts only weight");
+        assert!(matches!(&error, SpecError::BadField { .. }));
+        assert_eq!(
+            error.to_string(),
+            "profiles.default.score[0].high-id.spread = 17 is not a parameter of a scorer added in code, which takes its weight alone"
+        );
+    }
+
+    const FREE_PATH: &str = "profiles.default.filter[1].min-free";
+    const FREE_FIELD: &str = "profiles.default.filter[1].min-free.slots";
+
+    /// Keeps the workers with `slots` of their eight request slots free.
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MinFree {
+        slots: u32,
+    }
+
+    impl Filter for MinFree {
+        fn name(&self) -> &'static str {
+            "min-free"
+        }
+
+        fn keep(&self, _: &RequestFacts<'_>, candidate: &Candidate, _: &Constraints<'_>) -> bool {
+            candidate.in_flight.saturating_add(self.slots) <= 8
+        }
+    }
+
+    fn free_catalog() -> Catalog {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter_with("min-free", |build| {
+                let rule: MinFree = build.params()?;
+                if rule.slots == 0 {
+                    return Err(crate::StageError::bad("slots", rule.slots, "above zero"));
+                }
+                Ok(Box::new(rule))
+            })
+            .expect("a free name");
+        catalog
+    }
+
+    fn filter_document(filter: &str) -> PolicySpec {
+        let version = crate::API_VERSION;
+        serde_yaml::from_str(&format!(
+            "apiVersion: {version}\nprofiles:\n  default:\n    filter: {filter}\n    pick: random\n"
+        ))
+        .expect("a well-formed document")
+    }
+
+    #[test]
+    fn a_filter_keeps_the_rows_its_typed_parameter_says() {
+        let catalog = free_catalog();
+        let busy = |in_flight| Candidate {
+            in_flight,
+            ..Candidate::default()
+        };
+        for (slots, kept, cut) in [(2, 6, 7), (5, 3, 4)] {
+            let filter = format!("[healthy, {{ min-free: {{ slots: {slots} }} }}]");
+            let engine = filter_document(&filter)
+                .validate_in(&catalog, &[])
+                .expect("the filter reads its slots");
+            let filters = &engine.profiles()[0].filters;
+            assert!(filters
+                .iter()
+                .map(|filter| filter.name())
+                .eq(["healthy", "min-free"]));
+            let keeps = |row: Candidate| {
+                filters[1].keep(&RequestFacts::default(), &row, &Constraints::default())
+            };
+            assert!(keeps(busy(kept)), "{slots} free at {kept} in flight");
+            assert!(!keeps(busy(cut)), "{slots} free at {cut} in flight");
+        }
+    }
+
+    #[test]
+    fn a_bare_filter_name_builds_from_an_empty_map() {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter_with("odd-ids", |build| {
+                assert!(build.written().is_empty());
+                let typed: serde_json::Map<String, serde_json::Value> = build.params()?;
+                assert!(typed.is_empty());
+                Ok(Box::new(OddIds))
+            })
+            .expect("a free name");
+        for filter in ["[odd-ids]", "[{ odd-ids: {} }]"] {
+            let engine = filter_document(filter)
+                .validate_in(&catalog, &[])
+                .expect("the filter needs no parameters");
+            assert_eq!(engine.profiles()[0].filters[0].name(), "odd-ids");
+        }
+    }
+
+    /// A filter's factory reads its parameters in the one order a scorer's
+    /// does, whatever order the document wrote their keys in, at every
+    /// depth: two files that are one document by their digest hand the
+    /// factory the same map. A filter has no weight, so the map is handed
+    /// whole.
+    #[test]
+    fn a_filters_factory_reads_its_whole_map_in_key_order() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heard = Arc::clone(&seen);
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter_with("odd-ids", move |build| {
+                let written = serde_json::to_string(build.written()).expect("serializes");
+                heard.lock().expect("no panic under the lock").push(written);
+                Ok(Box::new(OddIds))
+            })
+            .expect("a free name");
+        let one = filter_document(
+            "[{ odd-ids: { weight: 2, slots: 500, zones: [{ unit: 17, flat: 3 }] } }]",
+        );
+        let other = filter_document(
+            "[{ odd-ids: { zones: [{ flat: 3, unit: 17 }], slots: 500, weight: 2 } }]",
+        );
+        assert_eq!(
+            one.digest().expect("digests"),
+            other.digest().expect("digests")
+        );
+        one.validate_in(&catalog, &[]).expect("validates");
+        other.validate_in(&catalog, &[]).expect("validates");
+        let seen = seen.lock().expect("no panic under the lock");
+        assert_eq!(seen[0], seen[1], "two orders of one map");
+        assert_eq!(
+            seen[0],
+            r#"{"slots":500,"weight":2,"zones":[{"flat":3,"unit":17}]}"#
+        );
+    }
+
+    #[test]
+    fn whatever_stands_under_a_filter_that_takes_no_parameter_is_refused_by_its_name() {
+        // `odd-ids` is registered with no parameter, and the stock's
+        // filters take none.
+        let catalog = catalog();
+        let refused = |filter: &str| {
+            filter_document(filter)
+                .validate_in(&catalog, &[])
+                .expect_err("refused")
+        };
+        for (filter, path, value) in [
+            (
+                "[{ odd-ids: { slots: 2 } }]",
+                "profiles.default.filter[0].odd-ids",
+                r#"{"slots":2}"#,
+            ),
+            (
+                "[healthy, { healthy: {} }]",
+                "profiles.default.filter[1].healthy",
+                "{}",
+            ),
+            (
+                "[healthy, odd-ids, { not-tried: null }]",
+                "profiles.default.filter[2].not-tried",
+                "null",
+            ),
+        ] {
+            let error = refused(filter);
+            assert_eq!(
+                error,
+                SpecError::BadField {
+                    path: path.into(),
+                    value: value.into(),
+                    reason: "left out: this filter takes no parameter, write its bare name",
+                }
+            );
+            assert_eq!(error.field_path(), path);
+        }
+        assert_eq!(
+            refused("[{ odd-ids: { slots: 2 } }]").to_string(),
+            r#"profiles.default.filter[0].odd-ids = {"slots":2} is not left out: this filter takes no parameter, write its bare name"#
+        );
+        // A name no catalog holds is unknown, whatever stands under it.
+        assert_eq!(
+            refused("[{ absent: { slots: 2 } }]"),
+            SpecError::UnknownFilter {
+                profile: "default".into(),
+                name: "absent".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_filters_factory_refuses_a_value_at_its_field() {
+        let catalog = free_catalog();
+        let refused = |filter: &str| {
+            filter_document(filter)
+                .validate_in(&catalog, &[])
+                .expect_err("the factory refuses the parameters")
+        };
+        let error = refused("[healthy, { min-free: { slots: 0 } }]");
+        assert_eq!(
+            error,
+            SpecError::BadField {
+                path: FREE_FIELD.into(),
+                value: "0".into(),
+                reason: "above zero",
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("{FREE_FIELD} = 0 is not above zero")
+        );
+        assert_eq!(error.field_path(), FREE_FIELD);
+        // What the factory's type does not read is refused at the entry in
+        // the type's own words. A bare name supplies an empty map.
+        for (filter, message) in [
+            (
+                "[healthy, { min-free: { slots: 2, spare: 17 } }]",
+                "unknown field `spare`",
+            ),
+            ("[healthy, { min-free: { slots: 'many' } }]", "invalid type"),
+            ("[healthy, min-free]", "missing field `slots`"),
+        ] {
+            let SpecError::BadStage { path, reason } = refused(filter) else {
+                panic!("{filter}");
+            };
+            assert_eq!(path, FREE_PATH);
+            assert!(reason.contains(message), "{reason}");
+        }
+        // What stands under the name is a map.
+        for (filter, value) in [
+            ("[healthy, { min-free: [17] }]", "[17]"),
+            ("[healthy, { min-free: null }]", "null"),
+        ] {
+            assert_eq!(
+                refused(filter),
+                SpecError::BadField {
+                    path: FREE_PATH.into(),
+                    value: value.into(),
+                    reason: "a map of the filter's parameters",
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_filter_that_answers_another_name_is_refused_at_its_entry() {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter_with("min-free", |_| Ok(Box::new(OddIds)))
+            .expect("a free name");
+        assert_eq!(
+            filter_document("[healthy, min-free]")
+                .validate_in(&catalog, &[])
+                .expect_err("the name disagrees"),
+            SpecError::BadStage {
+                path: FREE_PATH.into(),
+                reason: r#"filter registered as "min-free" answers the name "odd-ids""#.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_filters_factory_runs_once_an_entry_and_never_under_a_held_name() {
+        let mut catalog = free_catalog();
+        let called = Arc::new(AtomicUsize::new(0));
+        let counted = |called: &Arc<AtomicUsize>| {
+            let calls = Arc::clone(called);
+            move |_: &mut crate::StageBuild<'_>| -> Result<Box<dyn Filter>, crate::StageError> {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::new(OddIds))
+            }
+        };
+        for (name, held) in [
+            ("healthy", StageKind::Filter),
+            ("least-requests", StageKind::Scorer),
+            ("best", StageKind::Picker),
+            ("min-free", StageKind::Filter),
+        ] {
+            assert_eq!(
+                catalog.filter_with(name, counted(&called)).map(|_| ()),
+                Err(CatalogError::Held { name, held })
+            );
+        }
+        assert_eq!(catalog.filters().count(), FILTERS.len() + 1);
+        catalog
+            .filter_with("odd-ids", counted(&called))
+            .expect("a free name");
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        let named = filter_document("[odd-ids, healthy, odd-ids]");
+        for expected in [2, 4] {
+            named.validate_in(&catalog, &[]).expect("validates");
+            assert_eq!(called.load(Ordering::Relaxed), expected);
         }
     }
 }

@@ -7,7 +7,7 @@
 use std::fmt;
 
 #[cfg(feature = "controller")]
-use crate::proto::LiftedVeto;
+use crate::proto::{self, LiftedVeto};
 use crate::{sessions::SessionVerdict, view::WorkerId};
 
 /// Targets a decision carries at most: the pick and its alternates.
@@ -44,6 +44,9 @@ pub struct Pair {
 pub struct Targets {
     items: [Target; MAX_TARGETS],
     len: u8,
+    /// What the profile's prefix stage says of the first target
+    /// ([`Pick::overlap`]), in the bytes the count left spare.
+    overlap: Overlap,
 }
 
 impl Targets {
@@ -56,7 +59,14 @@ impl Targets {
                 pair: None,
             }; MAX_TARGETS],
             len: 0,
+            overlap: Overlap::NONE,
         }
+    }
+
+    /// States what the first target holds of the request. A list led anew
+    /// ([`Self::lead`]) says nothing of its new first target.
+    pub(crate) fn state(&mut self, overlap: Overlap) {
+        self.overlap = overlap;
     }
 
     /// Append a target; a list already full keeps what it has.
@@ -67,8 +77,11 @@ impl Targets {
         }
     }
 
+    /// Empties the list. What was stated of its first target goes with it
+    /// ([`Pick::overlap`]).
     pub fn clear(&mut self) {
         self.len = 0;
+        self.overlap = Overlap::NONE;
     }
 
     /// Puts `target` first and keeps the others behind it in their order; a
@@ -183,6 +196,9 @@ pub enum Lifted {
     None,
     /// The overload veto: every usable worker was over its thresholds.
     Overload,
+    /// The liveness veto: no worker stood until it was lifted, and the pick
+    /// is of the workers the liveness check doubts.
+    Liveness,
 }
 
 /// The contract's word for the mark: the one mapper, for every writer of a
@@ -193,6 +209,7 @@ impl From<Lifted> for LiftedVeto {
         match mark {
             Lifted::None => Self::None,
             Lifted::Overload => Self::Overload,
+            Lifted::Liveness => Self::Liveness,
         }
     }
 }
@@ -201,9 +218,10 @@ impl From<Lifted> for LiftedVeto {
 /// This is the first step's subset of the record; per-filter drops,
 /// per-scorer contributions, the plan, the picker and the shadow pick join it
 /// with the observability contract.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Trace {
-    /// The profile that decided.
+    /// The position of the profile the decision was made under, or
+    /// [`Self::NO_PROFILE`] where it was made ahead of every profile.
     pub profile: u16,
     /// Candidates after the filters, where the decision counted them
     /// ([`Survivors`]).
@@ -229,7 +247,39 @@ pub struct Trace {
     pub lifted: Lifted,
 }
 
+impl Default for Trace {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            profile: Self::NO_PROFILE,
+            survivors: Survivors::default(),
+            top: Default::default(),
+            top_len: 0,
+            seed: 0,
+            generation: 0,
+            lifted: Lifted::default(),
+        }
+    }
+}
+
 impl Trace {
+    /// The value of `profile` where the decision was made ahead of every
+    /// profile: no binding resolved one. An engine holds at most this many
+    /// profiles, so the value is no profile's position.
+    pub const NO_PROFILE: u16 = u16::MAX;
+
+    /// The position of the profile the decision was made under: none where
+    /// it was made ahead of every profile. A shed made once a profile is
+    /// resolved names it, though no stage of it ran.
+    #[must_use]
+    pub const fn made_under(&self) -> Option<u16> {
+        if self.profile == Self::NO_PROFILE {
+            None
+        } else {
+            Some(self.profile)
+        }
+    }
+
     /// Whether the decision drew first: its picker drew the rows it hands
     /// out and every filter of the profile was asked about each of them
     /// alone ([`Picker::draw_first`](crate::Picker::draw_first)). No pass
@@ -239,6 +289,86 @@ impl Trace {
     pub const fn drew_first(&self) -> bool {
         self.survivors.get().is_none()
     }
+
+    /// The trace on the wire. Ahead of every profile the position stays zero.
+    #[cfg(feature = "controller")]
+    pub(crate) fn wire(&self) -> proto::Trace {
+        let profile = self.made_under();
+        proto::Trace {
+            profile: u32::from(profile.unwrap_or_default()),
+            no_profile: profile.is_none(),
+            survivors: self.survivors.get(),
+            drew_first: self.drew_first(),
+            top: self
+                .top
+                .iter()
+                .take(usize::from(self.top_len))
+                .map(|&(id, score)| proto::Scored {
+                    worker_id: id.0,
+                    score,
+                    ..proto::Scored::default()
+                })
+                .collect(),
+            seed: self.seed,
+            generation: self.generation,
+            lifted: LiftedVeto::from(self.lifted) as i32,
+            ..proto::Trace::default()
+        }
+    }
+}
+
+/// Where the blocks a pick's first target holds were read ([`Overlap`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OverlapSource {
+    /// Nothing is held, or no stage said.
+    #[default]
+    None,
+    /// The event index.
+    Index,
+    /// The sent-prefix predictor.
+    Predictor,
+}
+
+/// What a profile's prefix stage says of a pick's first target: how many
+/// leading blocks of the request the worker holds, of how many, and where
+/// they were read. A host observes its cache series from it: the share
+/// held is `blocks` over `of`, and a miss reads zero of `of`. `of` is zero
+/// only where no stage said: the profile holds no such stage, or the
+/// decision was made at an entry that asks none
+/// ([`Engine::decide_stated`](crate::Engine::decide_stated) asks). A
+/// stage counts a request as one block at the least.
+///
+/// Six bytes, in bytes a pick's targets had spare behind their count: a
+/// pick is no larger for it ([`Pick::overlap`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Overlap {
+    /// The leading blocks the worker holds, by the stage's source: the
+    /// index's, the predictor's past the stage's threshold, the larger of
+    /// the two under `merged`. Halved with `of` where the request's count
+    /// is past sixteen bits.
+    pub blocks: u16,
+    /// The request's blocks as the stage counts them. A request of more
+    /// than 65,535 halves this count and `blocks` together until it fits,
+    /// so their share stays true.
+    pub of: u16,
+    /// Where `blocks` was read: the index on a tie under `merged`.
+    pub source: OverlapSource,
+    /// The held prefix's price kept the worker in front: a deepest holder
+    /// that stood over the swing's margin and under the priced one, at the
+    /// mean its pass judged by. `false` under a document that prices no
+    /// margin, and for a decode phase.
+    pub margin_held: bool,
+}
+
+impl Overlap {
+    /// No stage said.
+    pub const NONE: Self = Self {
+        blocks: 0,
+        of: 0,
+        source: OverlapSource::None,
+        margin_held: false,
+    };
 }
 
 /// A pick: ordered targets, the trace, and what a sessions rule did with
@@ -251,6 +381,14 @@ pub struct Pick {
     pub targets: Targets,
     pub trace: Trace,
     pub session_verdict: SessionVerdict,
+}
+
+impl Pick {
+    /// What the profile's prefix stage says of the first target
+    /// ([`Overlap`]); nothing where no stage said.
+    pub const fn overlap(&self) -> Overlap {
+        self.targets.overlap
+    }
 }
 
 /// A shed: the reason, the stage that emptied the pool, and the pacing hint.
@@ -303,9 +441,153 @@ impl Decision {
     }
 }
 
+/// How a shadow's decision stands beside the live one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ShadowKind {
+    /// The same first target, or the same outcome without a pick.
+    Agreed,
+    /// Both picked, with different first targets.
+    OtherTarget,
+    /// One picked, shed or queued where the other did something else.
+    OtherOutcome,
+    /// No shadow decision was made.
+    Skipped,
+}
+
+impl ShadowKind {
+    /// Compare the outcomes and, for two picks, their first targets.
+    pub fn of(live: &Decision, shadow: &Decision) -> Self {
+        use Decision::{Pick, Queue, Shed};
+
+        match (live, shadow) {
+            (Pick(a), Pick(b)) => {
+                if a.targets.first() == b.targets.first() {
+                    Self::Agreed
+                } else {
+                    Self::OtherTarget
+                }
+            }
+            (Shed(_), Shed(_)) | (Queue(_), Queue(_)) => Self::Agreed,
+            (Pick(_), Shed(_) | Queue(_))
+            | (Shed(_), Pick(_) | Queue(_))
+            | (Queue(_), Pick(_) | Shed(_)) => Self::OtherOutcome,
+        }
+    }
+
+    /// The comparison's label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Agreed => "agreed",
+            Self::OtherTarget => "other-target",
+            Self::OtherOutcome => "other-outcome",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shadow_kind_compares_the_outcome_and_first_target() {
+        let first = Target {
+            id: WorkerId(73),
+            ..Target::default()
+        };
+        let second = Target {
+            id: WorkerId(91),
+            position: 1,
+            ..Target::default()
+        };
+        let rank = Target {
+            dp_rank: 5,
+            ..first
+        };
+        let pick = |items: &[Target]| {
+            let mut targets = Targets::new();
+            for &target in items {
+                targets.push(target);
+            }
+            Decision::Pick(Pick {
+                targets,
+                ..Pick::default()
+            })
+        };
+        let shed = Decision::Shed(Shed {
+            reason: ShedReason::NoEndpoints,
+            emptied_by: "healthy",
+            retry_after_secs: 0,
+            wait_allowed: false,
+            trace: Trace::default(),
+        });
+        let queue = |ticket| {
+            Decision::Queue(Queue {
+                ticket,
+                max_wait_micros: 113,
+                trace: Trace::default(),
+            })
+        };
+        for (a, b, kind) in [
+            (pick(&[first]), pick(&[first, second]), ShadowKind::Agreed),
+            (
+                pick(&[first, second]),
+                pick(&[second, first]),
+                ShadowKind::OtherTarget,
+            ),
+            (pick(&[first]), pick(&[rank]), ShadowKind::OtherTarget),
+            (pick(&[first]), shed, ShadowKind::OtherOutcome),
+            (pick(&[first]), queue(67), ShadowKind::OtherOutcome),
+            (shed, queue(67), ShadowKind::OtherOutcome),
+            (
+                shed,
+                Decision::Shed(Shed {
+                    reason: ShedReason::Saturated,
+                    emptied_by: "not-overloaded",
+                    retry_after_secs: 3,
+                    wait_allowed: false,
+                    trace: Trace::default(),
+                }),
+                ShadowKind::Agreed,
+            ),
+            (queue(67), queue(79), ShadowKind::Agreed),
+        ] {
+            assert_eq!(ShadowKind::of(&a, &b), kind);
+            assert_eq!(ShadowKind::of(&b, &a), kind);
+        }
+        for (kind, label) in [
+            (ShadowKind::Agreed, "agreed"),
+            (ShadowKind::OtherTarget, "other-target"),
+            (ShadowKind::OtherOutcome, "other-outcome"),
+            (ShadowKind::Skipped, "skipped"),
+        ] {
+            assert_eq!(kind.as_str(), label);
+        }
+    }
+
+    #[test]
+    fn a_default_trace_marks_no_profile_and_keeps_its_other_defaults() {
+        let trace = Trace::default();
+        assert_eq!(
+            trace,
+            Trace {
+                profile: u16::MAX,
+                survivors: Survivors::counted(0),
+                top: [(WorkerId(0), 0.0); TRACE_TOP],
+                top_len: 0,
+                seed: 0,
+                generation: 0,
+                lifted: Lifted::None,
+            }
+        );
+        assert_eq!(trace.made_under(), None);
+        let last = Trace {
+            profile: u16::MAX - 1,
+            ..trace
+        };
+        assert_eq!(last.made_under(), Some(u16::MAX - 1));
+    }
 
     /// The mark of a lifted veto costs the trace no byte: it sits in one the
     /// record had spare, and a trace no rule wrote reads none.
@@ -314,6 +596,48 @@ mod tests {
         assert_eq!(size_of::<Lifted>(), 1);
         assert_eq!(size_of::<Trace>(), 72);
         assert_eq!(Trace::default().lifted, Lifted::None);
+    }
+
+    /// The overlap costs the pick no byte: it shares the eight bytes the
+    /// targets' count stood alone in, a pick no stage spoke of reads none,
+    /// and a list led anew or cleared says nothing of a first target.
+    #[test]
+    fn the_overlap_costs_the_pick_no_byte() {
+        assert_eq!(size_of::<Overlap>(), 6);
+        assert_eq!(size_of::<Targets>(), MAX_TARGETS * size_of::<Target>() + 8);
+        assert_eq!(
+            size_of::<Pick>(),
+            size_of::<Targets>() + size_of::<Trace>() + size_of::<SessionVerdict>()
+        );
+        assert_eq!(Pick::default().overlap(), Overlap::NONE);
+        assert_eq!(Overlap::default(), Overlap::NONE);
+        let held = Overlap {
+            blocks: 3,
+            of: 4,
+            source: OverlapSource::Index,
+            margin_held: false,
+        };
+        let mut targets = Targets::new();
+        for position in 0..2u32 {
+            targets.push(Target {
+                position,
+                id: WorkerId(u64::from(position) + 1),
+                dp_rank: 0,
+                pair: None,
+            });
+        }
+        targets.state(held);
+        let mut pick = Pick {
+            targets,
+            ..Pick::default()
+        };
+        assert_eq!(pick.overlap(), held);
+        let second = *pick.targets.as_slice().last().expect("two targets");
+        pick.targets.lead(second);
+        assert_eq!(pick.overlap(), Overlap::NONE);
+        pick.targets.state(held);
+        pick.targets.clear();
+        assert_eq!(pick.overlap(), Overlap::NONE);
     }
 
     #[test]

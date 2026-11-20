@@ -555,6 +555,7 @@ fn config() -> Config {
         load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
         decide_shards: 2,
         election: Election::default(),
+        discovery: None,
     }
 }
 

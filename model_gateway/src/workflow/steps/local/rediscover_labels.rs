@@ -11,16 +11,19 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use smg_worker::{identity::basic::ConnectionMode, workflow::discover_engine_labels};
+use smg_worker::{
+    identity::basic::ConnectionMode,
+    workflow::{discover_engine_labels, WorkflowHost},
+};
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
     routers::grpc::{
-        backend_client::{backend_client_if_initialized, BackendClient, BackendConnector},
+        backend_client::{backend_client_if_initialized, BackendClient},
         zmq_client,
     },
-    workflow::data::WorkerUpdateWorkflowData,
+    workflow::data::{require_app_context, WorkerUpdateWorkflowData},
 };
 
 /// Step to re-read a worker's labels from its engine for a label refresh.
@@ -83,6 +86,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
             return Ok(StepResult::Success);
         }
         let spec = &worker.metadata().spec;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
         // A strict read: an endpoint that fails is an error (the step retries,
         // then the next transition into service tries again), never a gap
         // that would read as labels the engine dropped. Through the worker's
@@ -90,7 +94,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
         // HTTP/2 setting); the gRPC read ignores it.
         let (fresh, _) = discover_engine_labels(
             worker.http_client(),
-            BackendConnector::shared().as_ref(),
+            app_context.engine_connector().as_ref(),
             worker.base_url(),
             connection_mode,
             spec.runtime_type.as_str(),
@@ -126,7 +130,7 @@ mod tests {
     use std::sync::Arc;
 
     use openai_protocol::worker::{WorkerStatus, WorkerUpdateRequest};
-    use smg_worker::identity::basic::Worker;
+    use smg_worker::{identity::basic::Worker, jobs::WorkerJobAsker};
     use wfaas::WorkflowInstanceId;
 
     use super::*;
@@ -140,6 +144,11 @@ mod tests {
         refresh: bool,
     ) -> WorkflowContext<WorkerUpdateWorkflowData> {
         let data = WorkerUpdateWorkflowData {
+            asker: if refresh {
+                WorkerJobAsker::Health
+            } else {
+                WorkerJobAsker::Api
+            },
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,

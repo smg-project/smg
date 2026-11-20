@@ -426,11 +426,15 @@ message SpecPush {
 
 // --- Decide: one stream per gateway runtime thread --------------------------
 
-// Idempotent on (verified gateway id, request_id) for the lease's lifetime: a
-// repeated Decide after a stream reset returns the standing decision. A
-// frame is at most 64 KiB as encoded, and one over it is refused whole: a
-// sender cuts its block hashes at the tail until its frame fits, and
-// counts the cut on its own side.
+// One lease stands for one request. A gateway that sends a request again,
+// because the stream that carried it ended before its answer arrived, says
+// so (`again`): the lease its earlier decision was issued ends there, where
+// no Dispatched named it, and the request is decided anew. The word reaches
+// the asking gateway's own waiting leases alone, and of a pair's lease each
+// side that waits ends. A request sent twice without the word is two
+// requests. A frame is at most 64 KiB as encoded, and one over it is refused
+// whole: a sender cuts its block hashes at the tail until its frame fits,
+// and counts the cut on its own side.
 message DecideRequest {
   // 1 to 256 bytes: the gateway's own key of one request among those it has
   // standing, carried back on every answer. A longer id is sent as a digest
@@ -440,6 +444,17 @@ message DecideRequest {
   // name and is out of its range.
   RequestFacts facts = 2;
   Constraints constraints = 3;
+  // The gateway sent this request before under this id and holds no answer
+  // to it, and the stream that carried it has ended: the gateway reads
+  // nothing more from that stream. The word is not said while that stream
+  // is open: an answer on its way is not held back, and it would carry a
+  // lease the word has ended, which no Dispatched can name. The controller
+  // finds the earlier lease by the id's 64-bit fingerprint, among the
+  // gateway's leases that wait for a dispatch: two ids of one gateway that
+  // share a fingerprint read as one request. A repeat its stream answers
+  // Busy before a decider takes it (no credit, a full queue, a budget of 0)
+  // ends nothing: the earlier lease waits out its dispatch deadline.
+  bool again = 4;
 }
 
 message DecideAnswer {
@@ -503,9 +518,9 @@ message WorkerEvent {
   // kinds a watcher can ask for when the rows were read (a standby's
   // snapshot stands at the log's head, at or after it; the rows are the
   // same at both); the tail starts after it. A registration call's answer
-  // carries the position of the call's write, and where the call wrote
-  // nothing the last position of those kinds: a watcher that has passed it
-  // holds the row as answered or a later one.
+  // carries a position at or after the call's write, and where the call
+  // wrote nothing the last position of those kinds: a watcher that has
+  // passed it holds the row as answered or a later one.
   uint64 seq = 1;
   uint64 membership_epoch = 2;
   oneof event {
@@ -638,7 +653,10 @@ message Maker {
   // The provider's name: one token of visible ASCII (0x21 to 0x7E) with no
   // comma, at most 128 bytes, the form of a principal's stated name.
   string provider = 1;
-  // The provider's own key for the worker, at most 2048 bytes.
+  // The provider's own key for the worker, at most 2048 bytes. A redacted
+  // snapshot does not tell it verbatim where it may hold a credential: a key
+  // with a scheme loses its userinfo as a URL does, and any other key that
+  // holds an `@` reads as `<unparsable address>`.
   string key = 2;
 }
 
@@ -801,7 +819,9 @@ message RegisterWorkerRequest {
     // and answer the row unmoved, a change of role, wire or models is a new
     // incarnation, any other change is made in place. The models change
     // when their set does: the same ids in another order are written in
-    // place, and the row tells the stated order. A caller that did not make
+    // place, and the row tells the stated order. Over a draining row every
+    // registration is the URL's next incarnation, whatever its facts: a
+    // drain ends with the registration it named. A caller that did not make
     // the standing row is PERMISSION_DENIED, whatever the facts.
     MODE_UPSERT = 3;
   }

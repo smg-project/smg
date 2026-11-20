@@ -331,6 +331,7 @@ async fn the_controller_runs_the_driver_and_renders_its_counters() {
         load_poll_interval: Duration::from_secs(10),
         decide_shards: 2,
         election: Election::default(),
+        discovery: None,
     })
     .await
     .expect("the controller binds");

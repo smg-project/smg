@@ -24,7 +24,8 @@ which a `wasm32-wasip2` build of the standard library carries.
 - `filter`: the surviving positions. With no usable worker the list is empty
   and the request is shed.
 - `score`: one score per candidate, scaled to stay within 0 to 1, where the
-  host clamps.
+  host clamps. The answer carries no tie band, so the host draws within its
+  default one.
 - `pick`: a position among the survivors.
 - `observe`: the lifecycle of issued decisions. It counts completed
   dispatches in a counter the plugin's spec declares. The host calls it with
@@ -59,6 +60,8 @@ What the host enforces:
   rebuilt.
 - `filter` returns positions that are unique and in range.
 - `score` returns one finite value per candidate. The host clamps it to 0..1.
+  A tie band beside the scores is optional: a finite value from 0 to 1, the
+  gap within which the best scores tie.
 - `pick` returns a position among the survivors: the host passes the scores
   back, and a score below zero marks a row a filter removed.
 - A stage that cannot judge a request declines (`Err(Decline::...)`). That is

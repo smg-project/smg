@@ -21,7 +21,9 @@
 //! parks its waker with the feed. A watched write wakes one task of the
 //! feed, once its store has let its locks go, and that task wakes the
 //! parked streams, as it does at the role's word: a write pays one wake
-//! however many watch, and none of it under the membership lock. The task
+//! however many watch, and none of it under the membership lock. Where the
+//! replica hosts worker objects the same write wakes their follower too,
+//! once and the same way. The task
 //! is the feed's. It is started with the feed's first watch, on that
 //! watch's runtime, and ended with the last feed; the serve does not tell
 //! it the stop and the drain does not join it, since it holds nothing a
@@ -65,8 +67,10 @@ use tonic::{codegen::tokio_stream::Stream, Status};
 use tracing::{info, warn};
 
 use super::{principal::Principal, worker_wire};
+pub(super) use crate::operator::snapshot::PAGE_BYTES;
 use crate::{
     elector::Fence,
+    operator::snapshot::serves,
     proto,
     replication::{Entry, Event, Log, Stamp},
     store::{Cut, GatewayId, Kinds, MemoryStore, Position, WorkerRow},
@@ -74,10 +78,6 @@ use crate::{
 
 /// The rows of one snapshot page.
 const PAGE: usize = 128;
-
-/// The bytes of one snapshot page's rows on the wire: half a frame of 4 MiB.
-/// A page of [`PAGE`] rows at the door's bound of a row is cut here.
-pub(super) const PAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// The log entries a stream takes at one read: what it holds of the log
 /// until its watcher took them.
@@ -146,12 +146,13 @@ impl Feed {
     /// another runtime is woken by no write from that end until that next
     /// watch. The task wakes the parked streams after each watched write
     /// and at each word of `role`, off the writer and under no lock of the
-    /// store: a write wakes this task alone, however many watch.
+    /// store: of the feed a write wakes this task alone, however many
+    /// watch.
     ///
     /// The task takes nothing of a watch. `role` is the replica's word, one
     /// for every watch: the watch that starts the task hands it a handle of
     /// its own.
-    fn start(&self, mut role: watch::Receiver<bool>) {
+    fn start(&self, mut role: watch::Receiver<Option<u64>>) {
         let mut teller = self.teller.lock();
         // A live task alone counts. The set keeps one that ended until it
         // is joined: those are taken out first.
@@ -304,12 +305,12 @@ pub(crate) struct Source {
     pub(crate) store: Arc<MemoryStore>,
     pub(crate) feed: Feed,
     pub(crate) fence: Arc<Fence>,
-    /// Whether this replica leads. That it does is told at the change; that
-    /// it does not is told again at every move of the serve, since the word
-    /// a stream found at its start may be the one before the lead it was
-    /// admitted under. A stream ends at the word that this replica does not
-    /// lead, whatever the word before it was.
-    pub(crate) role: watch::Receiver<bool>,
+    /// The term this replica leads, if it leads one. A term is told at its
+    /// start; that the replica leads none is told again at every move of
+    /// the serve, since the word a stream found at its start may be the one
+    /// before the lead it was admitted under. A stream ends at the word
+    /// that this replica does not lead, whatever the word before it was.
+    pub(crate) role: watch::Receiver<Option<u64>>,
     /// The term the watch was admitted under.
     pub(crate) term: u64,
 }
@@ -415,7 +416,7 @@ impl Watching {
     fn left(&mut self) -> bool {
         match self.source.role.has_changed() {
             Ok(false) => false,
-            Ok(true) => !*self.source.role.borrow_and_update(),
+            Ok(true) => self.source.role.borrow_and_update().is_none(),
             Err(_) => true,
         }
     }
@@ -578,12 +579,6 @@ pub(crate) fn open(
     })
 }
 
-/// Whether `row` serves one of `models`, the ids a caller asked for; none
-/// asked is every model. A watch and the operators' snapshot ask alike.
-pub(super) fn serves(models: &[String], row: &WorkerRow) -> bool {
-    models.is_empty() || row.facts.models.iter().any(|model| models.contains(model))
-}
-
 /// The models a watcher asked for; none is every model.
 #[derive(Debug)]
 struct Asked {
@@ -650,8 +645,7 @@ pub(super) fn fill<'a>(
 
 /// [`fill`] under a count of the caller's: at most `most` of `rows` while
 /// they take at most [`PAGE_BYTES`] on the wire, the first whatever it
-/// weighs. The operators' snapshot is one such page, under its caller's
-/// limit.
+/// weighs.
 pub(super) fn fill_within<'a>(
     most: usize,
     rows: impl IntoIterator<Item = &'a WorkerRow>,
@@ -858,7 +852,7 @@ pub(crate) mod tests {
         store: Arc<MemoryStore>,
         feed: Feed,
         elector: Elector,
-        role: watch::Sender<bool>,
+        role: watch::Sender<Option<u64>>,
         /// Who watches it: a table of two principals.
         watchers: Arc<Watchers>,
     }
@@ -880,7 +874,7 @@ pub(crate) mod tests {
             Tick::Acquired { term: 1 }
         );
         store.set_term(1);
-        let (role, _) = watch::channel(true);
+        let (role, _) = watch::channel(Some(1));
         Leader {
             store,
             feed,
@@ -1479,7 +1473,7 @@ pub(crate) mod tests {
         let mut stream = leader.watch(Start::Snapshot, &[]);
         next(&mut stream).await;
         // The fence is open still: the word alone ends the stream.
-        leader.role.send_replace(false);
+        leader.role.send_replace(None);
         assert_eq!(last_word(&mut stream).await.code(), Code::Aborted);
         assert!(stream.next().await.is_none(), "the end");
     }
@@ -1807,7 +1801,7 @@ pub(crate) mod tests {
         parks(&mut stream, &waker);
         // The fence is open still, and nothing was written: the word alone
         // wakes the stream, by the feed's task.
-        leader.role.send_replace(false);
+        leader.role.send_replace(None);
         woken.reads(1).await;
         leader.register(0, 1, "model-a");
         assert_eq!(last_word(&mut stream).await.code(), Code::Aborted);
@@ -2126,7 +2120,7 @@ pub(crate) mod tests {
         // One of the eight is taken: seven are in hand.
         next(&mut stream).await;
         // The fence is open still: the word alone ends the stream.
-        leader.role.send_replace(false);
+        leader.role.send_replace(None);
         let (taken, word) = to_the_last_word(&mut stream, written).await;
         assert_eq!(word.code(), Code::Aborted);
         assert_eq!(taken, 0, "an entry in hand told after the word");
@@ -2146,7 +2140,7 @@ pub(crate) mod tests {
         leader.register(0, 1, "model-a");
         // The word is told while the watcher takes nothing, the fence open
         // still.
-        leader.role.send_replace(false);
+        leader.role.send_replace(None);
         time::sleep(STALL + Duration::from_secs(1)).await;
         assert!(
             stream.next().await.is_none(),
@@ -2168,7 +2162,7 @@ pub(crate) mod tests {
         }
         // The word is told while the watcher takes nothing, the fence open
         // still.
-        leader.role.send_replace(false);
+        leader.role.send_replace(None);
         time::sleep(STALL / 2).await;
         let (taken, word) = to_the_last_word(&mut stream, written).await;
         assert_eq!(word.code(), Code::Aborted);
@@ -2229,7 +2223,7 @@ pub(crate) mod tests {
         let leader = leader();
         let mut stream = leader.watch(Start::Snapshot, &[]);
         // The task has not run yet, and the fence is open still.
-        leader.role.send_replace(false);
+        leader.role.send_replace(None);
         assert_eq!(last_word(&mut stream).await.code(), Code::Aborted);
         assert!(stream.next().await.is_none(), "the end");
     }
@@ -2240,12 +2234,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_word_told_again_ends_a_stream_that_started_under_it() {
         let leader = leader();
-        leader.role.send_replace(false);
+        leader.role.send_replace(None);
         let mut stream = leader.watch(Start::Snapshot, &[]);
         // The fence is open: the stream is served under the word it found.
         let page = next(&mut stream).await;
         assert!(matches!(page.event, Some(Event::Snapshot(_))), "{page:?}");
-        leader.role.send_replace(false);
+        leader.role.send_replace(None);
         assert_eq!(last_word(&mut stream).await.code(), Code::Aborted);
         assert!(stream.next().await.is_none(), "the end");
     }

@@ -21,8 +21,10 @@ use openai_protocol::{
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
+use parking_lot::Mutex;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_grpc_client::RequestDeadline;
+use smg_policy_controller::{lease::TransportClass, view::WorkerId};
 use smg_worker::identity::basic::{RuntimeType, Worker, WorkerLoadGuard};
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, error};
@@ -52,13 +54,14 @@ use super::{
         symphony::{PromptReplay, Reading},
     },
     spec::{MessagesTools, ResponseSpec},
-    utils::{Names, ParserResolver, WorkerDecoding},
+    utils::{tonic_ext::transport_class_of, Names, ParserResolver, WorkerDecoding},
 };
 use crate::{
     config::ParserChoice,
     middleware::TenantRequestMeta,
     observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
+    policy_controller::host::{End, Held, Placed},
     routers::{
         common::{
             attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard,
@@ -347,6 +350,8 @@ pub(crate) struct ProcessingState {
 
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
+    /// The controller's placement, held through client acquisition and request building.
+    pub placed: Option<Placed>,
 
     /// Effective sticky key (header wins, rid-derived falls back), recorded by
     /// worker selection so load guards account keyed load identically.
@@ -446,6 +451,10 @@ pub(crate) struct DispatchContext {
     /// a retry's re-selection skips them while another available worker is
     /// left (see `placement::PlacementInputs::tried`).
     pub tried: Vec<String>,
+    /// The store rows of the attempts that failed, which a retry names as
+    /// tried: one an attempt at most. A boxed slice, two words: the context
+    /// fills its size class, and a failed attempt alone rebuilds it.
+    pub tried_rows: Box<[WorkerId]>,
     /// Canonical model ID (routing, registries).
     pub model_id: String,
     /// Model the response reports, captured from the request at the build
@@ -465,6 +474,9 @@ pub(crate) struct DispatchContext {
     pub constraint_decided_on: Option<WorkerDecoding>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub workers: Option<WorkerSelection>,
+    /// The attempt's placement, taken when the dispatch creates its load guards.
+    // Pending placement stays out of the inline dispatch allocation.
+    pub placed: Option<Box<Placed>>,
     pub sticky_key: Option<String>,
     pub clients: Option<ClientSelection>,
     /// Consumed by the first dispatch; a rendezvous retry re-dispatches only the
@@ -489,10 +501,54 @@ pub(crate) struct DispatchContext {
     pub response: ResponseState,
 }
 
+// Enforce the same allocator class in a production build, where test trace
+// fields are absent. The original unit test also checks its test-build shape.
+#[cfg(all(not(test), target_pointer_width = "64"))]
+const _: () = {
+    use std::mem::size_of;
+
+    assert!(size_of::<DispatchContext>() <= 2560);
+};
+
 impl DispatchContext {
     /// Cached tokenizer (cheap Arc clone).
     pub fn tokenizer_arc(&self) -> Option<Arc<dyn Tokenizer>> {
         self.tokenizer.clone()
+    }
+
+    /// The placement of this dispatch, which its guards hold after a send.
+    pub(crate) fn placement(&self) -> Option<&Placement> {
+        self.load_guards.as_ref().and_then(LoadGuards::placement)
+    }
+
+    /// A failed attempt says its end, lets its worker go and names its row
+    /// as tried. After a send the guards hold the placement: it is told the
+    /// failure's status and class at `now`, with no tokens, and the row is
+    /// its own. Ahead of a send the placement is still on the context: it
+    /// goes unsent and reports itself as abandoned, and its row is named all
+    /// the same. The guards go, and with them the worker's load and any
+    /// admission claim.
+    pub(crate) fn release_attempt(&mut self, failure: &axum::response::Response, now: Instant) {
+        let row = self
+            .placement()
+            .map(|placement| {
+                placement.ended(
+                    failure.status().as_u16(),
+                    transport_class_of(failure),
+                    0,
+                    0,
+                    now,
+                );
+                placement.id()
+            })
+            .or_else(|| self.placed.as_deref().map(Placed::id));
+        self.load_guards = None;
+        self.placed = None;
+        if let Some(row) = row {
+            let mut rows = std::mem::take(&mut self.tried_rows).into_vec();
+            rows.push(row);
+            self.tried_rows = rows.into_boxed_slice();
+        }
     }
 }
 
@@ -1038,11 +1094,85 @@ pub(crate) struct DispatchMetadata {
     pub weight_version: Option<String>,
 }
 
+/// A response's shared hold on the decision's lease and the worker's load.
+/// Dropping the last hold reports any end still owed.
+#[derive(Clone)]
+pub(crate) struct Placement {
+    cell: Arc<Mutex<Held>>,
+    sent: Instant,
+    /// The ends said, kept for the cases: a closed lease leaves the store,
+    /// so no case can read its end there.
+    #[cfg(test)]
+    ends: Arc<Mutex<Vec<End>>>,
+}
+
+impl Placement {
+    fn new(held: Held, sent: Instant) -> Self {
+        Self {
+            cell: Arc::new(Mutex::new(held)),
+            sent,
+            #[cfg(test)]
+            ends: Arc::default(),
+        }
+    }
+
+    /// The store's row of the placed worker, which a retry names as tried.
+    pub(crate) fn id(&self) -> WorkerId {
+        self.cell.lock().placed().id()
+    }
+
+    /// Report the dispatch's status, transport class and token counts at
+    /// `now`. The lease takes its first end. The router has no time to the
+    /// first token for this report and sends zero.
+    pub(crate) fn ended(
+        &self,
+        status: u16,
+        class: TransportClass,
+        tokens_in: u32,
+        tokens_out: u32,
+        now: Instant,
+    ) {
+        let micros = now.saturating_duration_since(self.sent).as_micros();
+        let end = End {
+            status,
+            class,
+            ttft_micros: 0,
+            tokens_in,
+            tokens_out,
+            duration_micros: u32::try_from(micros).unwrap_or(u32::MAX),
+        };
+        self.cell.lock().placed().completed(end, now);
+        #[cfg(test)]
+        self.ends.lock().push(end);
+    }
+
+    /// The dispatch ended whole, with these token counts.
+    pub(crate) fn completed(&self, tokens_in: u32, tokens_out: u32) {
+        self.ended(
+            200,
+            TransportClass::Ok,
+            tokens_in,
+            tokens_out,
+            Instant::now(),
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn ends(&self) -> Arc<Mutex<Vec<End>>> {
+        Arc::clone(&self.ends)
+    }
+}
+
 /// Load guards for worker load tracking
 /// Automatically decrements load when dropped
 pub(crate) enum LoadGuards {
     Single {
         _guard: WorkerLoadGuard,
+    },
+    /// A single worker placed by the controller. The pointer keeps the
+    /// classic dispatch's guard size unchanged.
+    Placed {
+        placement: Placement,
     },
     /// Disaggregated guards cover the decode side only. The Prefill load is
     /// a `PrefillLoadGuard` that drops when the Prefill phase ends.
@@ -1125,6 +1255,63 @@ impl LoadGuards {
                     .map(|_| Self::new(selection, routing_key))
                     .collect(),
             }
+        }
+    }
+
+    /// One load guard per sub-request. The first guard holds the dispatch's
+    /// one lease, so the controller counts the batch as one request.
+    pub fn placed(
+        selection: &WorkerSelection,
+        routing_key: Option<&str>,
+        count: usize,
+        placed: Placed,
+        sent: Instant,
+    ) -> Self {
+        let first = Self::Placed {
+            placement: Placement::new(
+                Held::new(placed, |worker| {
+                    WorkerLoadGuard::with_key(Arc::clone(worker), routing_key)
+                }),
+                sent,
+            ),
+        };
+        if count <= 1 {
+            first
+        } else {
+            Self::Batch {
+                _guards: std::iter::once(first)
+                    .chain((1..count).map(|_| Self::new(selection, routing_key)))
+                    .collect(),
+            }
+        }
+    }
+
+    /// The guards of a dispatch at its send, at `now`. A placement of the
+    /// controller is told the send and rides them. With none they are the
+    /// classic guards of [`Self::scaled`].
+    pub fn at_dispatch(
+        selection: &WorkerSelection,
+        routing_key: Option<&str>,
+        count: usize,
+        placed: Option<Placed>,
+        now: Instant,
+    ) -> Self {
+        match placed {
+            Some(mut placed) => {
+                placed.dispatched(now);
+                Self::placed(selection, routing_key, count, placed, now)
+            }
+            None => Self::scaled(selection, routing_key, count),
+        }
+    }
+
+    /// The placement these guards hold, when the controller placed the dispatch.
+    pub fn placement(&self) -> Option<&Placement> {
+        match self {
+            Self::Placed { placement } => Some(placement),
+            Self::Batch { _guards } => _guards.first().and_then(Self::placement),
+            Self::Admitted { _guards, .. } | Self::Traced { _guards, .. } => _guards.placement(),
+            Self::Single { .. } | Self::Disaggregated { .. } => None,
         }
     }
 }
@@ -1304,6 +1491,7 @@ impl RequestContext {
             attempt: 0,
             ledger: AttemptLedger::default(),
             tried: Vec::new(),
+            tried_rows: Box::default(),
             model_id,
             dispatch_model,
             streaming,
@@ -1315,6 +1503,7 @@ impl RequestContext {
             constraint_decided_on: self.state.constraint_decided_on,
             tokenizer: self.state.tokenizer,
             workers: self.state.workers,
+            placed: self.state.placed.map(Box::new),
             sticky_key: self.state.sticky_key,
             clients: self.state.clients,
             encode_outputs: self.state.encode_outputs,
@@ -1911,14 +2100,242 @@ pub(crate) enum FinalResponse {
 }
 
 #[cfg(test)]
-mod tests {
-    use smg_grpc_client::VllmEngineClient;
+pub(super) mod test_support {
+    use smg_policy_controller::store::{GatewayId, LeasesStore, MemoryStore};
+    use smg_worker::identity::basic::ConnectionMode;
 
     use super::*;
-    use crate::routers::{
-        common::prefill_admission::test_support::select_worker,
-        grpc::{client::GrpcClient, test_engine::mock_engine},
+    use crate::policy_controller::host::{testing, Ask};
+
+    pub(in crate::routers::grpc) async fn place_worker() -> (Placed, Arc<MemoryStore>) {
+        let (host, store, _) = testing::bed(&["http://placed:8000"]);
+        let placed = host
+            .place(&Ask::of(b"placed", testing::MODEL), Instant::now())
+            .await
+            .expect("a placement");
+        (placed, store)
+    }
+
+    pub(in crate::routers::grpc) fn dispatch_context(placed: Placed) -> DispatchContext {
+        DispatchContext {
+            root_request_id: None,
+            request_id: None,
+            cache_trace: None,
+            parser: None,
+            attempt: 0,
+            ledger: Default::default(),
+            tried: Vec::new(),
+            tried_rows: Box::default(),
+            model_id: testing::MODEL.to_string(),
+            dispatch_model: testing::MODEL.to_string(),
+            streaming: false,
+            created: 0,
+            headers: None,
+            rate_limit_cell: None,
+            routing: RoutingSnapshot {
+                context_requirements: Default::default(),
+                routing_text: None,
+                rid_key: None,
+                cache_namespace: None,
+                needs_vision: false,
+                decode_needs_vision: false,
+            },
+            wire: WireConstraint {
+                runtime: RuntimeType::Vllm,
+                connection: ConnectionMode::Grpc,
+                requires_media_refs: false,
+                pipeline: PipelinePin::Any,
+            },
+            constraint_decided_on: None,
+            tokenizer: None,
+            workers: Some(WorkerSelection::Single {
+                worker: Arc::clone(placed.worker()),
+            }),
+            placed: Some(Box::new(placed)),
+            sticky_key: None,
+            clients: None,
+            encode_outputs: None,
+            encode_watch: None,
+            dispatch: None,
+            load_guards: None,
+            multimodal_inflight: None,
+            pd_prefill_guard: None,
+            response: ResponseState::default(),
+        }
+    }
+
+    pub(in crate::routers::grpc) fn dispatched(placed: Placed, sent: Instant) -> LoadGuards {
+        let selection = WorkerSelection::Single {
+            worker: Arc::clone(placed.worker()),
+        };
+        LoadGuards::at_dispatch(&selection, None, 1, Some(placed), sent)
+    }
+
+    pub(in crate::routers::grpc) fn assert_end(
+        ends: &Mutex<Vec<End>>,
+        store: &MemoryStore,
+        status: u16,
+        class: TransportClass,
+        tokens_in: u32,
+        tokens_out: u32,
+    ) {
+        let ends = ends.lock();
+        let [end] = ends.as_slice() else {
+            panic!("expected one end, got {ends:?}");
+        };
+        assert_eq!(
+            (
+                end.status,
+                end.class,
+                end.ttft_micros,
+                end.tokens_in,
+                end.tokens_out
+            ),
+            (status, class, 0, tokens_in, tokens_out)
+        );
+        assert_eq!(LeasesStore::live(store, GatewayId::LOCAL), 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smg_grpc_client::VllmEngineClient;
+    use smg_policy_controller::store::{GatewayId, LeasesStore};
+
+    use super::{
+        test_support::{dispatched, place_worker},
+        *,
     };
+    use crate::routers::{
+        common::{pd_admission::admit_decode, prefill_admission::test_support::select_worker},
+        grpc::{backend_client::BasicWorkerBuilder, client::GrpcClient, test_engine::mock_engine},
+    };
+
+    #[tokio::test]
+    async fn a_placement_says_its_end_with_the_time_since_its_send() {
+        use std::time::Duration;
+
+        for (elapsed, micros) in [
+            (Duration::from_micros(347), 347),
+            (Duration::from_secs(5_000), u32::MAX),
+        ] {
+            let (placed, store) = place_worker().await;
+            let sent = Instant::now();
+            let guards = dispatched(placed, sent);
+            let placement = guards.placement().expect("the dispatch's placement");
+            placement.ended(200, TransportClass::Ok, 17, 5, sent + elapsed);
+            assert!(matches!(
+                placement.ends().lock().as_slice(),
+                [End {
+                    status: 200,
+                    class: TransportClass::Ok,
+                    ttft_micros: 0,
+                    tokens_in: 17,
+                    tokens_out: 5,
+                    duration_micros,
+                }] if *duration_micros == micros
+            ));
+            assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_placed_dispatch_says_its_send() {
+        // A lease no dispatch names ends at its dispatch deadline.
+        let (placed, store) = place_worker().await;
+        let late = Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(store.expire(late).len(), 1);
+        drop(placed);
+
+        // A dispatched lease has no such deadline, and it rides the guards.
+        let (placed, store) = place_worker().await;
+        let selection = WorkerSelection::Single {
+            worker: Arc::clone(placed.worker()),
+        };
+        let guards = LoadGuards::at_dispatch(&selection, None, 1, Some(placed), Instant::now());
+        assert!(guards.placement().is_some());
+        assert!(store.expire(late).is_empty());
+        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
+        drop(guards);
+        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+
+        // With no placement the guards are the classic ones.
+        let guards = LoadGuards::at_dispatch(&selection, None, 1, None, Instant::now());
+        assert!(guards.placement().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_guards_of_a_placed_dispatch_carry_the_placement() {
+        let (placed, store) = place_worker().await;
+        let id = placed.id();
+        let worker = Arc::clone(placed.worker());
+        let selection = WorkerSelection::Single {
+            worker: Arc::clone(&worker),
+        };
+        let guards = LoadGuards::placed(&selection, None, 1, placed, Instant::now());
+        assert_eq!(guards.placement().map(Placement::id), Some(id));
+
+        let guards = LoadGuards::traced(tracing::Span::none(), guards);
+        assert_eq!(guards.placement().map(Placement::id), Some(id));
+
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://admission:9000")
+                .label("max_running_requests", "1")
+                .build(),
+        );
+        let admission = admit_decode(&decode, "model-a", 1).await.expect("admitted");
+        assert!(admission.is_some());
+        let guards = LoadGuards::admitted(admission, guards);
+        let placement = guards
+            .placement()
+            .expect("the placement under both wrappers")
+            .clone();
+        assert_eq!(placement.id(), id);
+        drop(guards);
+        assert_eq!(
+            (LeasesStore::live(&*store, GatewayId::LOCAL), worker.load()),
+            (1, 1)
+        );
+        drop(placement);
+        assert_eq!(
+            (LeasesStore::live(&*store, GatewayId::LOCAL), worker.load()),
+            (0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_placed_batch_holds_one_lease_beside_its_guards() {
+        let (placed, store) = place_worker().await;
+        let id = placed.id();
+        let worker = Arc::clone(placed.worker());
+        let selection = WorkerSelection::Single {
+            worker: Arc::clone(&worker),
+        };
+        let guards = LoadGuards::placed(&selection, Some("batch"), 3, placed, Instant::now());
+        assert_eq!(guards.placement().map(Placement::id), Some(id));
+        let LoadGuards::Batch { _guards: batch } = &guards else {
+            panic!("a batch of load guards");
+        };
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch.iter().filter_map(LoadGuards::placement).count(), 1);
+        assert_eq!(
+            (LeasesStore::live(&*store, GatewayId::LOCAL), worker.load()),
+            (1, 3)
+        );
+        assert_eq!(worker.routing_key_inflight("batch"), 3);
+        drop(guards);
+        assert_eq!(
+            (LeasesStore::live(&*store, GatewayId::LOCAL), worker.load()),
+            (0, 0)
+        );
+        assert_eq!(worker.routing_key_inflight("batch"), 0);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn the_guards_keep_their_size() {
+        assert_eq!(size_of::<LoadGuards>(), 48);
+    }
 
     /// Only multimodal vLLM EPD owns EC state absent from its retained plan.
     /// The plan's kind, its media and the handoff kind each decide it

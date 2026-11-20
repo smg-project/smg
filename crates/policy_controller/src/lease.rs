@@ -11,6 +11,7 @@
 use std::fmt;
 
 use crate::{
+    counts::Slot,
     decision::{Decision, Target},
     sessions::SessionVerdict,
     view::{Health, LoadRow, Session, WorkerId},
@@ -58,8 +59,8 @@ pub struct Lease {
     /// lease, and the worker it moved to behind one. A stage that books at
     /// the issue reads it at the dispatch ([`Lifecycle::on_dispatched`]),
     /// where `target_index` names the target the dispatch took.
-    /// `WorkerId(0)` where a host names none. In-process only: no contract
-    /// carries it.
+    /// `WorkerId(0)` where a host names none. A controller answer gives
+    /// the worker by `target_index` into its pick.
     pub booked: WorkerId,
     pub generation: u64,
     /// The request's session ([`crate::RequestFacts::session`]: its key
@@ -67,9 +68,7 @@ pub struct Lease {
     /// request, whatever rule governed it, so the commit moves that
     /// session's pins and a sticky in-flight cap counts per session per
     /// worker from leases; [`Session::NONE`] when the request carried no
-    /// key. The wire carries [`Session::get`], in the field both contracts
-    /// still spell `session_key`: the change that first reads a lease from
-    /// the wire renames it in both.
+    /// key. The wire carries [`Session::get`] in its `session_key` field.
     pub session: Session,
     /// What the decision did with the session key, copied from its pick, so
     /// the commit moves the key's pins by its own decision alone.
@@ -165,14 +164,26 @@ pub enum Membership<'a> {
     },
 }
 
-/// A signal about one worker.
+/// A signal about one worker. The named values a document declares under
+/// `signals` are the other thing of that name: numbers read beside the
+/// rows ([`SignalCells`](crate::SignalCells)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signal {
-    /// A load row for one rank of a worker.
+    /// A load row for one rank of a worker, as the host shows it to its
+    /// decisions.
     Load {
         worker: WorkerId,
         dp_rank: u16,
         row: LoadRow,
+        /// The place of the rank's count in the host's counts: a stage that
+        /// keeps a number a member finds the member's cell by it.
+        /// In-process only; [`Slot::NONE`] from a host that keeps no
+        /// counts.
+        slot: Slot,
+        /// The sample instant of `row` on the host's clock, in microseconds
+        /// since the host's origin, as the rank's row names it to a
+        /// decision. In-process only; the wire carries the row's age.
+        sampled_at_micros: u64,
     },
     Health {
         worker: WorkerId,
@@ -278,6 +289,11 @@ pub trait Lifecycle: Send + Sync {
     /// The engine issued `decision` under `lease`. Its host filed the
     /// lease as it issued it, in process as behind a served controller:
     /// the lease books its first target from here.
+    ///
+    /// A pair's decode side whose request asked for it later is not issued
+    /// with the pair, and no call here names it then. A decode call issues
+    /// it and is told here, where the lease's generation still stands. A
+    /// side no call issued is first heard at its dispatch.
     fn on_decision_issued(&self, _lease: &Lease, _decision: &Decision) {}
 
     /// The host dispatched to `target` (one of the decision's targets), on
@@ -286,7 +302,9 @@ pub trait Lifecycle: Send + Sync {
     /// decision a queue may have held. The untaken targets are released by
     /// the host's commit. The lease told names the target the dispatch
     /// took: its `target_index` is that target's index in the pick, and its
-    /// [`Lease::booked`] is still the worker its issue booked.
+    /// [`Lease::booked`] is still the worker its issue booked. A decode
+    /// side no call issued booked no worker before: this dispatch books the
+    /// target it names.
     fn on_dispatched(
         &self,
         _lease: &Lease,
@@ -309,6 +327,19 @@ pub trait Lifecycle: Send + Sync {
     fn on_membership(&self, _change: &Membership<'_>) {}
 
     fn on_signal(&self, _signal: &Signal) {}
+
+    /// Whether the stage keeps a number of each rank's report, which a host
+    /// tells it before it shows a decision that report ([`Signal::Load`]
+    /// with the rank's slot and the report's sample instant). `false` by
+    /// default: a host tells no report to an engine none of whose stages
+    /// keeps one, and such a stage decides the same untold. The engine asks
+    /// once, at its build: the answer is the stage's for the engine's life.
+    /// A host tells such a stage under its own locks, as the policy store
+    /// does under its membership and load locks: a stage that calls from
+    /// that word a door of the host that takes one of them waits on itself.
+    fn keeps_loads(&self) -> bool {
+        false
+    }
 
     /// Whether the stage decides wrong under a host that makes none of
     /// these calls: `true` for one whose state the calls keep, as the
@@ -358,10 +389,17 @@ impl<T: Lifecycle + ?Sized> Lifecycle for Box<T> {
         (**self).on_signal(signal);
     }
 
+    fn keeps_loads(&self) -> bool {
+        (**self).keeps_loads()
+    }
+
     fn needs_lifecycle(&self) -> bool {
         (**self).needs_lifecycle()
     }
 }
+
+#[cfg(feature = "controller")]
+pub(crate) mod wire;
 
 #[cfg(test)]
 mod tests {

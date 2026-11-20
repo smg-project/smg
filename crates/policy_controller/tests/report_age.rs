@@ -294,6 +294,25 @@ fn the_warmup_slice_ignores_stale_reports_in_the_kv_gate() {
 }
 
 #[test]
+fn a_report_age_limit_preserves_the_built_in_scorers_refusal_flags() {
+    for stage in [
+        r#""least-load""#,
+        r#"{"resident-work":{"request_tokens":63}}"#,
+        r#"{"least-cost":{"terms":{"candidate.in_flight":3}}}"#,
+        r#""prefix-affinity""#,
+        r#""warmup-slice""#,
+    ] {
+        let bare = policy(stage, None);
+        let limited = policy(stage, Some(41));
+        assert_eq!(
+            limited.profiles()[0].scorers[0].scorer.refuses_by_reports(),
+            bare.profiles()[0].scorers[0].scorer.refuses_by_reports(),
+            "{stage}"
+        );
+    }
+}
+
+#[test]
 fn a_report_age_limit_keeps_dispatch_credit_until_membership_removes_it() {
     let engine = policy(r#""least-load""#, Some(LIMIT_MS));
     assert!(engine.needs().loads);

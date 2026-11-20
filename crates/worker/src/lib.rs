@@ -26,6 +26,7 @@
 //! cross them. The collector itself comes with the `runtime` feature: it
 //! keeps one subscription task a worker, over the engine handle's two stream
 //! calls, for a host that says what an events subscription feeds.
+//! The `runtime` feature also adds the rules for applying events to an index.
 //!
 //! The `metrics` feature adds `metrics`, the mechanism those writers share
 //! with a host's: the bounded label set, the model labels' one set and the
@@ -40,17 +41,20 @@
 //! its pairing descriptor (`pd`), the registry with its events (`registry`),
 //! the metric writers with their series store (`metrics`), and `connection`:
 //! the engine handle a host implements, the HTTP client factory and the cache
-//! of worker-directed clients. Beside them stand the errors a worker
-//! operation reports (`identity::error`), `periodic_task`, a task on a thread
+//! of worker-directed clients. The `jobs` module holds a queue that runs the
+//! jobs its host supplies and takes requests through the worker jobs port.
+//! Beside them stand the errors a worker operation reports
+//! (`identity::error`), `periodic_task`, a task on a thread
 //! of its own, and the merge of the metrics scraped from the workers. The
 //! gateway re-exports each module at the path it had there. `test-util` adds
 //! `test_support`, what a test builds its workers with, and opens the test
 //! readers and hooks the registry, the series store, the label interner and
-//! the KV event collector keep for their own cases.
+//! the KV event collector and job queue keep for their own cases.
 //!
 //! The `workflow` feature adds `workflow`, the worker side of the workflows
 //! a host runs over its workers on the workflow engine: the steps of a
-//! worker's removal, the data they pass along and the host trait they read.
+//! worker's removal and of a registration's detection and creation. It holds
+//! their order, the data they pass along and the host trait they read.
 //!
 //! The `proto` feature adds `common_proto`, the messages every engine's gRPC
 //! service shares, and the conversion of the engine load record into the
@@ -91,6 +95,7 @@ pub mod runtime;
 pub mod settings;
 #[cfg(all(feature = "runtime", any(test, feature = "test-util")))]
 pub mod test_support;
+mod value_bounds;
 pub mod worker;
 #[cfg(feature = "workflow")]
 pub mod workflow;

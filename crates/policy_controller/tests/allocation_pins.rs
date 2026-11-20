@@ -1,9 +1,11 @@
 //! What a decision allocates, pinned at zero: once a first decision has sized
 //! the per-thread scratch, a decision of every preset over a reporting fleet
-//! of 64 and of 512 rows, a decision over rows with a credit held in the
-//! least-load tally, and a pair decision allocate nothing (design 4.4: a
-//! scorer or picker allocates nothing per decision; the host keeps one scratch
-//! per thread so the framework allocates nothing after the first). The
+//! of 64 and of 512 rows, a least-cost decision over mixed reports and sends, a
+//! decision over rows with a credit held in the least-load tally, a decision
+//! over a pool doubted on every row, and a pair decision allocate nothing
+//! (design 4.4: a scorer or picker allocates nothing per decision; the host
+//! keeps one scratch per thread so the framework allocates nothing after the
+//! first). The
 //! store's pins stand beside them: a build from the store allocates nothing
 //! after the first, and two membership writes are held to each other, a
 //! write that moves an offer to one that moves none and a registration into
@@ -116,6 +118,101 @@ fn a_decision_after_the_first_allocates_nothing_for_any_preset() {
     }
 }
 
+#[test]
+fn a_least_cost_decision_after_the_first_allocates_nothing() {
+    let profile = serde_yaml::from_str(
+        "filter: [healthy]\nscore: [{least-cost: {terms: {load.running: 7, load.queued: 13, sent.requests: 3, sent.tokens: 1}, unreported: {over-least: {request_cost: 11}}}}]\npick: best",
+    )
+    .expect("a least-cost profile");
+    let engine = PolicySpec::new([("p".to_string(), profile)].into())
+        .validate()
+        .expect("the profile validates");
+    let n = 512;
+    let mut view = fleet(n);
+    for (i, row) in (0u32..).zip(&mut view) {
+        row.health.healthy = true;
+        if i.is_multiple_of(3) {
+            row.load = None;
+        }
+    }
+    // Every row holds a send later than its report.
+    let lease = Lease {
+        issued_micros: 1_000_000,
+        tokens: 512,
+        ..Lease::default()
+    };
+    for row in &view {
+        let target = Target {
+            position: row.position,
+            id: row.id,
+            dp_rank: row.dp_rank,
+            pair: None,
+        };
+        engine.on_dispatched(&lease, &target, Side::Single, 0);
+    }
+    let cx = Constraints::default();
+    let mut scratch = Scratch::new();
+    let pool = pool(n);
+    assert!(engine
+        .decide(&facts(1), &pool, &view, &cx, &mut scratch)
+        .pick()
+        .is_some());
+    let (decision, allocations) =
+        allocations_during(|| engine.decide(&facts(2), &pool, &view, &cx, &mut scratch));
+    assert!(decision.pick().is_some());
+    assert_eq!(allocations, 0);
+}
+
+/// `has-room` by a rule reads every row's report and its sends. A decision
+/// after the first allocates nothing at 512 rows, under a picker that
+/// reads the whole pool and under one that draws first.
+#[test]
+fn a_decision_under_a_has_room_rule_allocates_nothing_after_the_first() {
+    for picker in ["round-robin", "random"] {
+        let profile = serde_yaml::from_str(&format!(
+            "filter: [healthy, {{has-room: {{used: {{load.running: 1, load.queued: 1, request.prompt_tokens: 1, sent.tokens: 1}}, capacity: 2000, headroom: 0.05}}}}]\npick: {picker}",
+        ))
+        .expect("a profile with the rule");
+        let engine = PolicySpec::new([("p".to_string(), profile)].into())
+            .validate()
+            .expect("the profile validates");
+        let n = 512;
+        let mut view = fleet(n);
+        for (i, row) in (0u32..).zip(&mut view) {
+            row.health.healthy = true;
+            if i.is_multiple_of(3) {
+                row.load = None;
+            }
+        }
+        // Every row holds a send later than its report.
+        let lease = Lease {
+            issued_micros: 1_000_000,
+            tokens: 512,
+            ..Lease::default()
+        };
+        for row in &view {
+            let target = Target {
+                position: row.position,
+                id: row.id,
+                dp_rank: row.dp_rank,
+                pair: None,
+            };
+            engine.on_dispatched(&lease, &target, Side::Single, 0);
+        }
+        let cx = Constraints::default();
+        let mut scratch = Scratch::new();
+        let pool = pool(n);
+        assert!(engine
+            .decide(&facts(1), &pool, &view, &cx, &mut scratch)
+            .pick()
+            .is_some());
+        let (decision, allocations) =
+            allocations_during(|| engine.decide(&facts(2), &pool, &view, &cx, &mut scratch));
+        assert!(decision.pick().is_some());
+        assert_eq!(allocations, 0, "{picker}");
+    }
+}
+
 /// A decision asked by rank allocates nothing after the thread's first of
 /// its size, whatever that first was: by rank where no row holds the
 /// request's prefix, a draw for a request that names rows, or the whole
@@ -137,7 +234,7 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
     for profile in bare.profiles.values_mut() {
         profile
             .filter
-            .retain(|name| name != "not-tried" && name != "has-room");
+            .retain(|entry| !matches!(entry.name(), "not-tried" | "has-room"));
     }
     let engines = [
         (true, engine_of("cache_aware")),
@@ -271,6 +368,31 @@ fn a_decision_after_a_soft_filter_fallback_allocates_nothing() {
         allocations_during(|| engine.decide(&next, &pool(64), &view, &cx, &mut scratch));
     assert!(decision.pick().is_some());
     assert_eq!(allocations, 0, "the decision after a fallback allocated");
+}
+
+#[test]
+fn a_decision_over_a_doubted_pool_allocates_nothing_after_the_first() {
+    // Every ready row doubted: the pass that lifts the liveness veto reads
+    // the rows with no doubt from one buffer of the scratch. The first such
+    // decision sizes it and the next finds it sized.
+    let engine = engine_of("least_load");
+    let mut view = fleet(64);
+    for row in &mut view {
+        row.health.stalled = true;
+    }
+    let cx = Constraints::default();
+    let mut scratch = Scratch::new();
+    engine
+        .decide(&facts(1), &pool(64), &view, &cx, &mut scratch)
+        .pick()
+        .expect("the doubted fleet routes");
+    let (decision, allocations) =
+        allocations_during(|| engine.decide(&facts(2), &pool(64), &view, &cx, &mut scratch));
+    assert!(decision.pick().is_some());
+    assert_eq!(
+        allocations, 0,
+        "the second decision over a doubted pool allocated"
+    );
 }
 
 #[test]

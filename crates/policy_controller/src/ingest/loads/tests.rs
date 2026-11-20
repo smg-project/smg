@@ -5,10 +5,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
 
@@ -331,9 +328,10 @@ async fn a_poll_carries_its_sample_time_and_keeps_the_poll_start_for_arbitration
         );
     };
     for (reported, sampled, age) in [
-        (None, started, 0),
         (Some(before), before, 750),
         (Some(during), during, 350),
+        // An unstamped poll uses its start even after a later sample.
+        (None, started, 0),
         (Some(received + Duration::from_millis(1)), received, 0),
     ] {
         write(reported);
@@ -344,7 +342,7 @@ async fn a_poll_carries_its_sample_time_and_keeps_the_poll_start_for_arbitration
     }
 
     store.record(id, 0, LoadRow::default(), during, LoadSource::Stream);
-    write(Some(before));
+    write(Some(received));
     assert_eq!(
         store.load(id, 0).expect("the pushed row").source,
         LoadSource::Stream
@@ -1883,13 +1881,13 @@ async fn the_polls_group_the_membership_anew_at_a_take_after_a_restore_to_the_sa
     probe.answers("grpc://x:1", &[figures]);
     let driver = Arc::new(driver(&store, &probe, TEN));
     let (_stop, stopped) = watch::channel(false);
-    let (leads, polls) = watch::channel(true);
+    let (leads, polls) = watch::channel(Some(1));
     let mut tasks = JoinSet::new();
     let running = Arc::clone(&driver);
-    tasks.spawn(async move { running.run_while(stopped, polls, || 1).await });
+    tasks.spawn(async move { running.run_while(stopped, polls).await });
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(row(&store, own, 0).is_some());
-    leads.send_replace(false);
+    leads.send_replace(None);
     // It follows: a leader's cut of as many writes, of another engine.
     let leader = MemoryStore::new();
     let theirs = ready(
@@ -1907,7 +1905,7 @@ async fn the_polls_group_the_membership_anew_at_a_take_after_a_restore_to_the_sa
     tokio::time::sleep(TEN + TEN).await;
     assert_eq!(probe.polls().len(), before, "a follower polled");
     // The take: the polls start at once, over the membership as it stands.
-    leads.send_replace(true);
+    leads.send_replace(Some(2));
     tokio::time::sleep(TEN + TEN).await;
     let polled = probe.polls().split_off(before);
     assert!(
@@ -1921,9 +1919,9 @@ async fn the_polls_group_the_membership_anew_at_a_take_after_a_restore_to_the_sa
 }
 
 /// A loss and the take after it, both told before the loop looked, leave
-/// the watch one word, `true` as it read before. The term beside it moved:
-/// the run of polls ends and the next starts over the membership a restore
-/// between the two left, at the epoch the last run grouped at.
+/// the watch one word, a term as it read before. The word names another
+/// term: the run of polls ends and the next starts over the membership a
+/// restore between the two left, at the epoch the last run grouped at.
 #[tokio::test(start_paused = true)]
 async fn a_take_whose_word_folded_over_a_loss_starts_the_polls_anew() {
     let store = Arc::new(MemoryStore::new());
@@ -1938,20 +1936,16 @@ async fn a_take_whose_word_folded_over_a_loss_starts_the_polls_anew() {
     probe.answers("grpc://x:1", &[figures]);
     let driver = Arc::new(driver(&store, &probe, TEN));
     let (_stop, stopped) = watch::channel(false);
-    let (leads, polls) = watch::channel(true);
-    let term = Arc::new(AtomicU64::new(1));
+    let (leads, polls) = watch::channel(Some(1));
     let mut tasks = JoinSet::new();
-    let (running, led) = (Arc::clone(&driver), Arc::clone(&term));
-    tasks.spawn(async move {
-        let led = move || led.load(Ordering::Relaxed);
-        running.run_while(stopped, polls, led).await;
-    });
+    let running = Arc::clone(&driver);
+    tasks.spawn(async move { running.run_while(stopped, polls).await });
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(row(&store, own, 0).is_some());
     // The loss, a leader's cut of as many writes of another engine, and
     // the take under the next term: nothing is awaited between them, so
     // the loop reads one word.
-    leads.send_replace(false);
+    leads.send_replace(None);
     let leader = MemoryStore::new();
     let theirs = ready(
         &leader,
@@ -1964,8 +1958,7 @@ async fn a_take_whose_word_folded_over_a_loss_starts_the_polls_anew() {
     );
     assert_eq!(leader.epoch(), store.epoch());
     assert!(store.restore_from(leader.cut(Kinds::All)));
-    term.store(2, Ordering::Relaxed);
-    leads.send_replace(true);
+    leads.send_replace(Some(2));
     let before = probe.polls().len();
     tokio::time::sleep(TEN + TEN).await;
     let polled = probe.polls().split_off(before);
@@ -1987,10 +1980,10 @@ async fn a_followers_loop_pays_the_stores_publications_and_polls_no_engine() {
     let probe = Arc::new(FakeProbe::default());
     let driver = Arc::new(driver(&store, &probe, TEN));
     let (_stop, stopped) = watch::channel(false);
-    let (leads, polls) = watch::channel(false);
+    let (leads, polls) = watch::channel(None);
     let mut tasks = JoinSet::new();
     let running = Arc::clone(&driver);
-    tasks.spawn(async move { running.run_while(stopped, polls, || 1).await });
+    tasks.spawn(async move { running.run_while(stopped, polls).await });
     // What a decision reads of the worker's load; `None` while the worker
     // is no member of the published world.
     let seen = |id: WorkerId| {
@@ -2048,7 +2041,7 @@ async fn a_followers_loop_pays_the_stores_publications_and_polls_no_engine() {
     assert_eq!(seen(id), Some(Some(7)), "a followed load row");
     assert!(probe.polls().is_empty(), "a follower polled");
     // The take: the first tick polls the worker that joined meanwhile.
-    leads.send_replace(true);
+    leads.send_replace(Some(1));
     tokio::time::sleep(Duration::from_millis(1)).await;
     assert_eq!(probe.polls(), ["grpc://a:1"]);
 }

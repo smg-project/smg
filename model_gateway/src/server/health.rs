@@ -36,9 +36,12 @@
 //!    extra listener. The listener is plain HTTP and serves until process
 //!    exit, so probes stay answerable through the entire drain window.
 //!
+//! With `--policy-controller-address`, both listeners return 503 until the
+//! first complete worker snapshot and 200 once it has arrived.
+//!
 //! # The per-model section
 //!
-//! Both readiness bodies carry `models`: one entry per served model with the
+//! The registry-based readiness bodies carry `models`: one entry per served model with the
 //! gateway's own predicates applied to that model's workers (`ready`, a
 //! `reason` when it is not, its healthy and registered worker counts), so a
 //! rollout or a traffic switch can ask about one model from the same probe
@@ -47,8 +50,9 @@
 //!
 //! # Drain semantics
 //!
-//! Once graceful shutdown begins (`InFlightRequestTracker::begin_drain`),
-//! `/readiness` reports `503` with reason `"draining"` on **both** listeners
+//! For registry-based readiness, once graceful shutdown begins
+//! (`InFlightRequestTracker::begin_drain`), `/readiness` reports `503` with
+//! reason `"draining"` on all listeners
 //! while `/liveness` and `/health` keep returning `200`, so the load balancer
 //! or orchestrator stops routing new connections during the
 //! endpoint-propagation window without restarting the process.
@@ -58,7 +62,11 @@
 //! accepts connections, so a new probe is answered there alone:
 //! `/readiness` with the same `503`, until the process exits.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use arc_swap::ArcSwap;
 use axum::{
@@ -73,6 +81,7 @@ use openai_protocol::{
     worker::{MmProcessingMode, WorkerStatus},
     UNKNOWN_MODEL_ID,
 };
+use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::json;
 use smg_worker::{
@@ -92,6 +101,7 @@ use crate::{
     config::{bind_socket_addr, ReadinessRoleConfig, RouterConfig, RoutingMode},
     middleware::ProbeResponse,
     observability::inflight_tracker::InFlightRequestTracker,
+    policy_controller::follower::{Followed, Follower},
     routers::{
         common::snapshot::{WorkerRegistry, WorkerRegistryExt},
         grpc::multimodal::{mm_settings, models_without_media_processing},
@@ -265,12 +275,13 @@ pub struct ReadinessRolesSnapshot {
     pub decode: ReadinessRoleSnapshot,
 }
 
-/// Shared O(1) probe state: the cached readiness snapshot plus the drain
-/// flag. Handlers on the main listener and on the dedicated probe listener
-/// read the same instance.
+/// Shared O(1) probe state. The main, admin and dedicated probe listeners
+/// read either the worker watch or the cached readiness and drain flag.
 pub struct ProbeState {
     readiness: ArcSwap<ReadinessSnapshot>,
     inflight_tracker: Arc<InFlightRequestTracker>,
+    // The dedicated listener can outlive the context on startup failure.
+    follower: Option<Weak<Mutex<Option<Follower>>>>,
 }
 
 impl std::fmt::Debug for ProbeState {
@@ -287,9 +298,17 @@ impl ProbeState {
     /// previous behaviour for an empty registry). The first recompute by
     /// the maintainer replaces it.
     pub fn new(inflight_tracker: Arc<InFlightRequestTracker>) -> Arc<Self> {
+        Self::with_follower(inflight_tracker, None)
+    }
+
+    pub(super) fn with_follower(
+        inflight_tracker: Arc<InFlightRequestTracker>,
+        follower: Option<Weak<Mutex<Option<Follower>>>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             readiness: ArcSwap::from_pointee(ReadinessSnapshot::default()),
             inflight_tracker,
+            follower,
         })
     }
 
@@ -474,18 +493,20 @@ impl ProbeState {
         }));
     }
 
-    /// Build the `/readiness` response from cached state only: one drain
-    /// flag load plus one snapshot pointer load — no registry access.
+    /// Build the `/readiness` response from the follower's first snapshot
+    /// or the cached registry state.
     ///
-    /// While draining, readiness reports not-ready with reason `"draining"`
-    /// so load balancers stop routing new connections during shutdown
-    /// (liveness intentionally stays OK). Under worker-side media placement,
+    /// Draining yields reason `"draining"` under either source, read ahead
+    /// of both, so load balancers stop routing new connections during
+    /// shutdown (liveness intentionally stays OK). Under worker-side media placement,
     /// the ready body names models no worker processes media for under
     /// `models_without_media_processing`; status stays ready because the pod
     /// serves everything else. PD/EPD responses additionally expose the
-    /// cached per-role capacity decision. Both bodies carry the per-model
+    /// cached per-role capacity decision. The registry-based bodies carry the per-model
     /// section (`models`).
     pub fn readiness_response(&self) -> Response {
+        // Ahead of either source: a gateway that drains is not ready,
+        // whatever it follows.
         if self.inflight_tracker.is_draining() {
             return mark_probe(
                 (
@@ -497,6 +518,22 @@ impl ProbeState {
                 )
                     .into_response(),
             );
+        }
+        if let Some(follower) = &self.follower {
+            let followed = follower
+                .upgrade()
+                .and_then(|running| running.lock().as_ref().map(Follower::followed))
+                .unwrap_or(Followed::Nothing);
+            let response = match followed {
+                Followed::Nothing => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(
+                        json!({"status": "not ready", "reason": "waiting for the controller's first snapshot"}),
+                    ),
+                ),
+                Followed::Fleet => (StatusCode::OK, Json(json!({"status": "ready"}))),
+            };
+            return mark_probe(response.into_response());
         }
 
         let snapshot = self.readiness.load();
@@ -558,7 +595,7 @@ fn mark_probe(mut response: Response) -> Response {
 /// event can fall between snapshot and subscription): workers registered
 /// before this call are reflected the moment it returns.
 ///
-/// The task holds the worker and tokenizer registries by [`Weak`](std::sync::Weak) and
+/// The task holds the worker and tokenizer registries by [`Weak`] and
 /// `upgrade()`s them each iteration, stopping the moment the owning server
 /// drops them. Holding strong `Arc`s would form a reference cycle — the
 /// registry owns the event `Sender`, so a task that also owned a registry

@@ -1,5 +1,4 @@
-//! The router of a process the policy controller was picked for, while the
-//! controller decides nothing.
+//! Refusals for requests the policy controller does not decide.
 
 use std::{any::Any, sync::Arc};
 
@@ -35,18 +34,21 @@ const CODE: &str = "not_decided_by_policy_controller";
 /// The router's type, as the trait names a router.
 pub(crate) const ROUTER_TYPE: &str = "policy_controller_undecided";
 
-/// The one router of a process the policy controller was picked for, while
-/// the controller decides nothing. The server answers with it in the gateway
-/// object's place, so it refuses each request by name. No gateway object and
-/// no classic router is built beside it, so no classic policy decides.
+/// The router a family mounts when the policy controller cannot place its
+/// requests. It refuses every request the gateway sends to it.
 #[derive(Debug)]
 pub(crate) struct Undecided;
 
-/// The refusal: the request is not served, and a retry changes nothing.
+/// The refusal for a whole router family.
 fn refusal() -> Response {
+    refused("requests for this router")
+}
+
+/// The refusal for a named request shape.
+pub(crate) fn refused(shape: &'static str) -> Response {
     error::not_implemented(
         CODE,
-        "The policy controller is picked for this gateway and decides no request yet",
+        format!("The policy controller is picked for this gateway and does not decide {shape} yet"),
     )
 }
 

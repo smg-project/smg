@@ -39,10 +39,14 @@ pub mod admin;
 pub mod config;
 mod decide;
 mod deciders;
+#[cfg(feature = "discovery")]
+mod discovery;
 pub mod election;
 mod floor;
 mod gateways;
 mod generations;
+#[cfg(all(test, feature = "worker-host"))]
+mod kv_feed;
 mod lifecycle;
 mod membership;
 pub mod metrics;
@@ -54,11 +58,12 @@ mod service;
 mod session;
 mod snapshot;
 mod spec_file;
-mod spec_store;
+pub(crate) use crate::operator::spec_store;
+pub use crate::operator::SpecRejected;
 mod standby;
 pub mod tls;
 mod watch_workers;
-mod wire;
+pub(crate) mod wire;
 mod worker_objects;
 pub(crate) mod worker_wire;
 
@@ -85,7 +90,6 @@ pub use self::{
     admin::{Version, VERSION},
     config::{Config, ConfigError, Listener, Scope, Tls},
     election::{Election, LeaseError, LeasePlace},
-    generations::SpecRejected,
     principal::ENTRY as PRINCIPAL_ENTRY,
     readiness::{Readiness, State},
     run::run,
@@ -101,6 +105,8 @@ use self::{
     spec_store::SpecStore,
     standby::{Lag, Standby},
 };
+#[cfg(feature = "worker-host")]
+use crate::worker_host::{KvFeed, Members};
 use crate::{
     catalog::Catalog,
     elector::{Elector, Fence},
@@ -157,6 +163,16 @@ pub struct Controller {
     /// of the store, followed by one task of the serve.
     #[cfg(feature = "worker-host")]
     workers: Arc<worker_objects::WorkerObjects>,
+    #[cfg(feature = "worker-host")]
+    kv_feed: KvFeed<Members>,
+    /// The health probes of the replica's workers: one task of the serve,
+    /// which probes while this replica leads.
+    #[cfg(feature = "worker-host")]
+    prober: worker_objects::Prober,
+    /// Worker discovery, where the configuration names a provider: one task
+    /// of the serve, which runs the provider while this replica leads.
+    #[cfg(feature = "discovery")]
+    discovery: Option<Box<discovery::Discovery>>,
 }
 
 /// Sets an accepted socket to send at once. An answer is a few small writes
@@ -453,6 +469,10 @@ impl Controller {
             Arc::clone(&journal.0),
             woken,
         ));
+        #[cfg(feature = "worker-host")]
+        let kv_feed = KvFeed::new(Arc::clone(&journal.0), workers.holder());
+        #[cfg(feature = "worker-host")]
+        let prober = worker_objects::Prober::new(Arc::clone(&workers), elector.fence());
         let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
@@ -466,6 +486,18 @@ impl Controller {
         shared.lag = Arc::new(Lag::new(standby::synced_within(config.load_poll_interval)));
         let (phase, readiness) =
             readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag));
+        #[cfg(feature = "discovery")]
+        let discovery = config.discovery.as_ref().map(|settings| {
+            let host = Arc::new(discovery::Host::new(
+                Arc::clone(workers.holder().registry()),
+                settings.credential().cloned(),
+            ));
+            Box::new(discovery::Discovery::new(
+                settings.runtime().clone(),
+                host,
+                Arc::clone(&shared.fence),
+            ))
+        });
         let shared = Arc::new(shared);
         let probe = Arc::new(EngineProbe::new());
         Ok(Self {
@@ -484,6 +516,12 @@ impl Controller {
             admin_addr,
             #[cfg(feature = "worker-host")]
             workers,
+            #[cfg(feature = "worker-host")]
+            kv_feed,
+            #[cfg(feature = "worker-host")]
+            prober,
+            #[cfg(feature = "discovery")]
+            discovery,
         })
     }
 
@@ -801,6 +839,12 @@ impl Controller {
             admin,
             #[cfg(feature = "worker-host")]
             workers,
+            #[cfg(feature = "worker-host")]
+            kv_feed,
+            #[cfg(feature = "worker-host")]
+            prober,
+            #[cfg(feature = "discovery")]
+            discovery,
             ..
         } = self;
         let store = Arc::clone(&shared.store);
@@ -882,15 +926,11 @@ impl Controller {
         // needs. The loop itself runs on every replica: it pays the store's
         // publications, so a followed row reaches the published world.
         let polls = follows.map(|_| shared.role.subscribe());
-        let fence = Arc::clone(&shared.fence);
         tasks.spawn(async move {
             match polls {
-                // The fence's term moves at a take alone: a word that
-                // reads `true` again under another term is another lead.
-                Some(polls) => {
-                    let led = move || fence.term();
-                    driver.run_while(driver_stop, polls, led).await;
-                }
+                // The word names the term led: a take under another term
+                // is another lead, and another run of polls.
+                Some(polls) => driver.run_while(driver_stop, polls).await,
                 None => driver.run(driver_stop).await,
             }
             Ok(())
@@ -918,6 +958,28 @@ impl Controller {
             let workers_stop = stop.subscribe();
             tasks.spawn(async move {
                 workers.run(workers_stop).await;
+                Ok(())
+            });
+            let kv_stop = stop.subscribe();
+            tasks.spawn(async move {
+                kv_feed.run(kv_stop).await;
+                Ok(())
+            });
+            // The probes run under the role's word on every replica: one
+            // that leads alone hears it from its own election, and one
+            // that does not lead dials no engine for its health.
+            let (probes_stop, led) = (stop.subscribe(), shared.role.subscribe());
+            tasks.spawn(async move {
+                prober.run(probes_stop, led).await;
+                Ok(())
+            });
+        }
+        #[cfg(feature = "discovery")]
+        if let Some(discovery) = discovery {
+            let standing = shared.standing.clone();
+            let discovery_stop = stop.subscribe();
+            tasks.spawn(async move {
+                discovery.run(standing, discovery_stop).await;
                 Ok(())
             });
         }
@@ -1127,22 +1189,28 @@ impl Controller {
 /// word that nobody leads here. The word told again ends it, the drain's
 /// included; told at the change alone, the drain would leave that watch
 /// open to the end of the grace period.
+///
+/// The word names the term led, and a term is told once. A release and the
+/// take behind it can both fall between two reads of this loop: the replica
+/// leads at each read, under another term at the second. That term is
+/// another word, so a task that runs for one term hears where it ended.
 async fn tell_role(
     mut role: Readiness,
     mut stop: watch::Receiver<bool>,
     doors: Vec<HealthReporter>,
-    told: watch::Sender<bool>,
+    told: watch::Sender<Option<u64>>,
 ) {
     let (mut last, mut left) = (None, false);
     loop {
-        let (state, turn) = role.read();
-        let leads = !left && state == State::Leader;
+        let (led, turn) = role.led();
+        let led = led.filter(|_| !left);
+        let leads = led.is_some();
         // The watches first: nothing is awaited between the read of the
         // fence and their word.
         if leads {
-            told.send_if_modified(|was| !std::mem::replace(was, true));
+            told.send_if_modified(|was| std::mem::replace(was, led) != led);
         } else {
-            told.send_replace(false);
+            told.send_replace(None);
         }
         if last != Some(leads) {
             let word = if leads {
@@ -1315,7 +1383,7 @@ mod tests {
         Error, NoFollow, Scope,
     };
     #[cfg(feature = "worker-host")]
-    use crate::store::{WorkerFacts, WorkersStore};
+    use crate::store::{HealthPolicy, WorkerFacts, WorkerStatus, WorkersStore};
     use crate::{
         door::TERM_MARK,
         elector::{
@@ -1574,6 +1642,60 @@ mod tests {
         served.expect("a serve that leaves by its signal");
     }
 
+    /// The serve starts the probes of the replica's workers: a row written
+    /// while the controller leads is readied by the first probe its engine
+    /// passes, with no hand on its status.
+    #[cfg(feature = "worker-host")]
+    #[tokio::test]
+    async fn a_served_controller_probes_its_rows_while_it_leads() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let addr = listener.local_addr().expect("the port's address");
+        let engine = axum::Router::new().route("/health", axum::routing::get(|| async {}));
+        let mut engines = JoinSet::new();
+        engines.spawn(async move { axum::serve(listener, engine).await });
+
+        let controller = Controller::bind(valid()).await.expect("the listeners bind");
+        let (shared, store) = (Arc::clone(&controller.shared), controller.store());
+        let (stop, stopped) = oneshot::channel::<()>();
+        let serve = controller.serve(async {
+            let _ = stopped.await;
+        });
+        let case = async {
+            let (wait, begun) = (Duration::from_secs(20), Instant::now());
+            while shared.fence.leader_term(Instant::now()).is_none() {
+                assert!(begun.elapsed() < wait, "no first take");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let url = format!("http://{addr}");
+            let row = store
+                .upsert(WorkerFacts {
+                    key: url.clone(),
+                    engine: url,
+                    models: vec!["m".to_owned()],
+                    dp_size: 1,
+                    health: HealthPolicy {
+                        success_threshold: 1,
+                        ..HealthPolicy::default()
+                    },
+                    ..WorkerFacts::default()
+                })
+                .id();
+            assert_eq!(
+                store.get(row).map(|row| row.status),
+                Some(WorkerStatus::Pending)
+            );
+            while store.get(row).map(|row| row.status) != Some(WorkerStatus::Ready) {
+                assert!(begun.elapsed() < wait, "no probe readied the row");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            stop.send(()).expect("the serve waits for its stop");
+        };
+        let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })
+            .await
+            .expect("the serve ends at its stop");
+        served.expect("a serve that leaves by its signal");
+    }
+
     /// The serve starts the restores' clock: a restore whose stream took no
     /// part for a minute is let go at the clock's next beat, with no look
     /// of that stream and no restore behind it.
@@ -1804,12 +1926,15 @@ mod tests {
         let (phase, readiness) =
             readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (stop, stopped) = watch::channel(false);
-        let (told, mut role) = watch::channel(false);
+        let (told, mut role) = watch::channel(None);
         let mut teller = JoinSet::new();
         teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
         let mut told_as = async |leads: bool| {
-            let reached =
-                timeout(Duration::from_secs(5), role.wait_for(|told| *told == leads)).await;
+            let reached = timeout(
+                Duration::from_secs(5),
+                role.wait_for(|told| told.is_some() == leads),
+            )
+            .await;
             assert!(
                 matches!(reached, Ok(Ok(_))),
                 "the role was not told as {leads}"
@@ -1860,12 +1985,15 @@ mod tests {
         let (phase, readiness) =
             readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (_stop, stopped) = watch::channel(false);
-        let (told, mut role) = watch::channel(false);
+        let (told, mut role) = watch::channel(None);
         let mut teller = JoinSet::new();
         teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
         let mut told_as = async |leads: bool| {
-            let reached =
-                timeout(Duration::from_secs(5), role.wait_for(|told| *told == leads)).await;
+            let reached = timeout(
+                Duration::from_secs(5),
+                role.wait_for(|told| told.is_some() == leads),
+            )
+            .await;
             assert!(
                 matches!(reached, Ok(Ok(_))),
                 "the role was not told as {leads}"
@@ -1897,9 +2025,12 @@ mod tests {
     /// once a renew period.
     #[tokio::test]
     async fn a_step_under_a_standing_leader_tells_the_watches_nothing() {
-        async fn told_as(role: &mut watch::Receiver<bool>, leads: bool) {
-            let reached =
-                timeout(Duration::from_secs(5), role.wait_for(|told| *told == leads)).await;
+        async fn told_as(role: &mut watch::Receiver<Option<u64>>, leads: bool) {
+            let reached = timeout(
+                Duration::from_secs(5),
+                role.wait_for(|told| told.is_some() == leads),
+            )
+            .await;
             assert!(
                 matches!(reached, Ok(Ok(_))),
                 "the role was not told as {leads}"
@@ -1911,7 +2042,7 @@ mod tests {
         let (phase, readiness) =
             readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (_stop, stopped) = watch::channel(false);
-        let (told, mut role) = watch::channel(false);
+        let (told, mut role) = watch::channel(None);
         let mut teller = JoinSet::new();
         teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
 
@@ -1940,6 +2071,48 @@ mod tests {
         told_as(&mut role, false).await;
     }
 
+    /// A release and the take behind it, both between two reads of the
+    /// teller: the replica leads at each read, under another term at the
+    /// second. The word names that term, so a task that runs for one term
+    /// is told where it ended.
+    #[tokio::test]
+    async fn a_take_under_another_term_between_two_reads_is_another_word() {
+        async fn names(role: &mut watch::Receiver<Option<u64>>, term: u64) {
+            let told = |told: &Option<u64>| *told == Some(term);
+            let reached = timeout(Duration::from_secs(5), role.wait_for(told)).await;
+            assert!(matches!(reached, Ok(Ok(_))), "term {term} was not told");
+        }
+        let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
+            .expect("the default settings are in order");
+        let (steps, stepped) = watch::channel(Standing::default());
+        let (phase, readiness) =
+            readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
+        let (_stop, stopped) = watch::channel(false);
+        let (told, mut role) = watch::channel(None);
+        let mut teller = JoinSet::new();
+        teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
+
+        phase.send_replace(Phase::Serving);
+        assert!(matches!(
+            elector.tick(Instant::now()),
+            Ok(Tick::Acquired { .. })
+        ));
+        steps.send_replace(Standing::default());
+        let first = elector.fence().term();
+        names(&mut role, first).await;
+        // The release and the take with nothing awaited between them: the
+        // teller runs on this thread, so it reads the fence at neither.
+        assert!(elector.release().expect("a release"));
+        assert!(matches!(
+            elector.tick(Instant::now()),
+            Ok(Tick::Acquired { .. })
+        ));
+        let second = elector.fence().term();
+        assert_ne!(second, first, "a take is another term");
+        steps.send_replace(Standing::default());
+        names(&mut role, second).await;
+    }
+
     /// A serve whose lead opened with no step of the election since: the
     /// take of a lease with no holder to wait for leads one renew deadline
     /// after its write, between two steps. The fence admits a watch from
@@ -1950,7 +2123,7 @@ mod tests {
         steps: watch::Sender<Standing>,
         phase: watch::Sender<Phase>,
         /// The role's word, as a watch admitted now holds it.
-        watch: watch::Receiver<bool>,
+        watch: watch::Receiver<Option<u64>>,
         /// The serve's stop, never said, and the teller's task.
         _serve: (watch::Sender<bool>, JoinSet<()>),
     }
@@ -1972,7 +2145,7 @@ mod tests {
             let (phase, readiness) =
                 readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
             let (stop, stopped) = watch::channel(false);
-            let (told, role) = watch::channel(false);
+            let (told, role) = watch::channel(None);
             let mut teller = JoinSet::new();
             teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
 
@@ -1999,7 +2172,7 @@ mod tests {
             steps.send_replace(Standing::default());
             let mut first = role.clone();
             first.changed().await.expect("the teller tells the step");
-            assert!(!*first.borrow());
+            assert!(first.borrow().is_none());
             // The lead opens by itself and the fence admits a watch. The
             // teller sleeps to that instant: this thread, the runtime's
             // one, is held across it with nothing awaited, so the opening
@@ -2008,7 +2181,7 @@ mod tests {
             thread::sleep(settings.renew_deadline);
             assert_eq!(elector.fence().leader_term(Instant::now()), Some(1));
             let mut watch = role.clone();
-            assert!(!*watch.borrow_and_update());
+            assert!(watch.borrow_and_update().is_none());
             Self {
                 elector,
                 steps,
@@ -2025,7 +2198,7 @@ mod tests {
                 matches!(heard, Ok(Ok(()))),
                 "{what} was not told to a watch that stood under the word: {heard:?}"
             );
-            assert!(!*self.watch.borrow());
+            assert!(self.watch.borrow().is_none());
         }
     }
 

@@ -3,10 +3,14 @@
 //! fewer in flight of two drawn workers, the fewest in flight over every
 //! worker, and the least resident work over every worker, that last one
 //! also with a dispatch credit held per row, as between two reports under
-//! load. Ids: `policy_engine/power_of_two/<form>/<n>`. The fleet is the one
+//! load, and the expected wait once more over reports that state no drain
+//! rate. Ids: `policy_engine/power_of_two/<form>/<n>`. The fleet is the one
 //! the `decision` bench decides over, with the resident tokens a report of
 //! that fleet would carry; the decision runs with a fresh seed per iteration
 //! so the drawing forms draw.
+//! The same fleet supplies the `policy_engine/least_cost/<form>/<n>` cells.
+//! They measure a sum of resident tokens, queued requests and requests in
+//! flight, the sum with a wide margin, and the sum with every report missing.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer; a form that fails to validate is a bug the unit tests catch"
@@ -21,8 +25,8 @@ use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
 };
 use smg_policy_controller::{
-    Candidate, Constraints, Engine, Lease, Lifecycle, PolicySpec, PoolFacts, PowerOfTwoMetric,
-    RequestFacts, Scratch, Side, Target,
+    Candidate, Catalog, Constraints, Engine, Lease, Lifecycle, PolicySpec, PoolFacts,
+    PowerOfTwoMetric, RequestFacts, Scratch, Side, Target,
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -122,8 +126,53 @@ fn forms(c: &mut Criterion) {
         }
         decide_over(&mut group, "resident_tokens_credited", &engine, &view);
     }
+    // The expected-wait form over reports that state no drain rate: no
+    // drawn row's own rate prices it, so every decision reads the mean
+    // rate of the kept rows.
+    let engine = engine_of("power_of_two");
+    for &n in &SIZES {
+        let mut view = view_of(n);
+        for c in &mut view {
+            if let Some(row) = &mut c.load {
+                row.live_rate = 0;
+            }
+        }
+        decide_over(&mut group, "expected_wait_unrated", &engine, &view);
+    }
     group.finish();
 }
 
-criterion_group!(benches, forms);
+fn least_cost(c: &mut Criterion) {
+    if !Catalog::builtin()
+        .scorers()
+        .any(|name| name == "least-cost")
+    {
+        return;
+    }
+    let mut group = c.benchmark_group("policy_engine/least_cost");
+    for (form, margin, reports) in [
+        ("sum", 0, true),
+        ("wide_tie", 83_400, true),
+        ("unreported", 0, false),
+    ] {
+        let mut spec = PolicySpec::power_of_two(RESIDENT).expect("a form of the preset");
+        let profile = spec.profiles.values_mut().next().expect("one profile");
+        profile.score = serde_yaml::from_str(&format!(
+            "- least-cost:\n    terms: {{load.resident_tokens: 0.75, load.queued: 43, candidate.in_flight: 177}}\n    margin: {{absolute: {margin}}}\n    unreported: {{over-least: {{request_cost: 211}}}}"
+        )).expect("a least-cost scorer");
+        let engine = spec.validate().expect("the form validates");
+        for &n in &SIZES {
+            let mut view = view_of(n);
+            if !reports {
+                for row in &mut view {
+                    row.load = None;
+                }
+            }
+            decide_over(&mut group, form, &engine, &view);
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(benches, forms, least_cost);
 criterion_main!(benches);

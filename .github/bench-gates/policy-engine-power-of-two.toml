@@ -4,10 +4,12 @@
 # built with (every function on a 64-byte boundary) and why.
 #
 # The gate runs the whole file: one decision under each form of the `power_of_two` preset at 8, 64 and 512
-# candidates (`policy_engine/power_of_two/<form>/<n>`): the expected wait of two drawn workers, the fewer in
-# flight of two drawn workers, the fewest in flight over every worker, the least resident work over every
-# worker, and that last form with a dispatch credit held per row. 15 single-threaded rows, a fresh seed per
-# iteration, about two and a half minutes a run, so three interleaved runs a side take about fifteen minutes.
+# candidates (`policy_engine/power_of_two/<form>/<n>`): the expected wait of two drawn workers, that form over
+# reports that state no drain rate, the fewer in flight of two drawn workers, the fewest in flight over every
+# worker, the least resident work over every worker, and that last form with a dispatch credit held per row.
+# 18 single-threaded rows, a fresh seed per iteration, about three minutes a run, so three interleaved runs a
+# side take about eighteen minutes. The three rows without a drain rate came after the readings below: they
+# take the threshold by the filter's pattern, and no identical-build spread was read on them.
 #
 # Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) / median of
 # the per-run criterion medians of one build, was read twice, and the threshold follows the lower reading:

@@ -1,13 +1,13 @@
 //! The committed `policyspec.schema.json` is generated from the spec types.
-//! The first test fails when the two drift; `SMG_POLICY_SCHEMA_WRITE=1`
-//! rewrites the file from the types instead. The second pins the schema's
-//! shape: every section named, no unknown property anywhere, no `kind`.
+//! The tests hold the artifact to the generated schema and check its
+//! document shapes. `SMG_POLICY_SCHEMA_WRITE=1` writes the generated
+//! schema to the file.
 
 use std::{collections::BTreeSet, fs, path::Path};
 
 use serde_json::Value;
 use smg_policy_controller::{
-    spec::{MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS, MAX_ZONES},
+    spec::{MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS, MAX_SIGNALS, MAX_ZONES},
     Catalog, PolicySpec,
 };
 
@@ -31,6 +31,106 @@ fn the_committed_schema_matches_the_spec_types() {
          and commit the file",
         path.display()
     );
+}
+
+#[test]
+fn the_committed_schema_admits_least_cost_with_terms_and_a_margin() {
+    let committed = fs::read_to_string(schema_path()).expect("the committed schema");
+    let schema: Value = serde_json::from_str(&committed).expect("a JSON schema");
+    let defs = &schema["$defs"];
+    let entries = defs["ScoreStage"]["oneOf"]
+        .as_array()
+        .expect("the scorer entries");
+    let entry = entries
+        .iter()
+        .find(|entry| entry["properties"].get("least-cost").is_some())
+        .expect("the least-cost entry");
+    assert_eq!(entry["required"], serde_json::json!(["least-cost"]));
+    assert_eq!(
+        entry["properties"]["least-cost"]["$ref"],
+        "#/$defs/LeastCostParams"
+    );
+    let params = &defs["LeastCostParams"];
+    assert_eq!(params["required"], serde_json::json!(["terms"]));
+    let terms = &params["properties"]["terms"];
+    assert_eq!(
+        terms["propertyNames"]["enum"],
+        serde_json::json!([
+            "candidate.in_flight",
+            "load.active_kv_permille",
+            "load.kv_usage_permille",
+            "load.queued",
+            "load.resident_tokens",
+            "load.running",
+            "load.waiting_uncached_tokens",
+            "sent.requests",
+            "sent.tokens",
+        ])
+    );
+    let coefficient = &terms["additionalProperties"];
+    assert_eq!(coefficient["type"], "number");
+    assert_eq!(coefficient["minimum"], -1e15);
+    assert_eq!(coefficient["maximum"], 1e15);
+    assert_eq!(coefficient["not"]["const"], 0);
+    assert_eq!(params["properties"]["margin"]["$ref"], "#/$defs/CostMargin");
+    assert_eq!(defs["CostMargin"]["properties"]["absolute"]["default"], 0.0);
+    assert_eq!(defs["CostMargin"]["properties"]["relative"]["default"], 0.0);
+    assert_eq!(
+        params["properties"]["unreported"]["anyOf"][0]["$ref"],
+        "#/$defs/Unreported"
+    );
+    let unreported = &defs["Unreported"]["oneOf"];
+    assert_eq!(unreported[1]["const"], "missing-as-zero");
+    let over_least = &unreported[0]["properties"]["over-least"];
+    assert_eq!(over_least["required"], serde_json::json!(["request_cost"]));
+    assert_eq!(over_least["properties"]["request_cost"]["type"], "number");
+    let bare = defs["ScoreSpec"]["anyOf"][0]["enum"]
+        .as_array()
+        .expect("the bare names");
+    assert!(!bare.iter().any(|name| name == "least-cost"));
+}
+
+#[test]
+fn the_committed_schema_admits_a_filter_by_its_name_and_by_its_name_with_parameters() {
+    let committed = fs::read_to_string(schema_path()).expect("the committed schema");
+    let schema: Value = serde_json::from_str(&committed).expect("a JSON schema");
+    let defs = &schema["$defs"];
+    assert_eq!(
+        defs["ProfileSpec"]["properties"]["filter"]["items"]["$ref"],
+        "#/$defs/FilterSpec"
+    );
+    // A bare name is any string: a host adds names. A built-in with
+    // parameters has a schema of its own. A host's name with parameters
+    // is one key, no built-in's, mapped to a map.
+    assert_eq!(
+        defs["FilterSpec"]["anyOf"],
+        serde_json::json!([
+            { "type": "string" },
+            { "$ref": "#/$defs/FilterStage" },
+            {
+                "type": "object",
+                "minProperties": 1,
+                "maxProperties": 1,
+                "propertyNames": { "not": { "const": "has-room" } },
+                "additionalProperties": { "type": "object" }
+            }
+        ])
+    );
+    // The rule of `has-room`: its two required parts, no other key, and
+    // the names it may sum.
+    let rule = &defs["HasRoomParams"];
+    assert_eq!(rule["required"], serde_json::json!(["used", "capacity"]));
+    assert_eq!(rule["additionalProperties"], false);
+    let names = rule["properties"]["used"]["propertyNames"]["enum"]
+        .as_array()
+        .expect("the names the rule may sum");
+    for name in [
+        "load.resident_tokens",
+        "request.prompt_tokens",
+        "sent.tokens",
+    ] {
+        assert!(names.iter().any(|listed| listed == name), "{name}");
+    }
 }
 
 /// Every object schema under `root` either lists its properties and refuses
@@ -68,6 +168,7 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
         "generation",
         "view",
         "index",
+        "signals",
         "profiles",
         "plans",
         "bindings",
@@ -133,7 +234,7 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
     let stock = Catalog::builtin();
     let scorers: Vec<&str> = stock
         .scorers()
-        .filter(|name| *name != "resident-work")
+        .filter(|name| !matches!(*name, "resident-work" | "least-cost"))
         .collect();
     assert_eq!(bare("ScoreSpec"), scorers);
     assert_eq!(
@@ -189,5 +290,18 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
     assert_eq!(
         field("ViewSpec", "max_block_hashes")["maximum"],
         MAX_BLOCK_HASHES
+    );
+    assert_eq!(field("SignalSpec", "max_age_ms")["minimum"], 1);
+    assert_eq!(field("SignalSpec", "max_age_ms")["maximum"], 3_599_999);
+    // A unit's length and its alphabet, as the validator takes them.
+    assert_eq!(field("SignalSpec", "unit")["minLength"], 1);
+    assert_eq!(field("SignalSpec", "unit")["maxLength"], 31);
+    assert_eq!(field("SignalSpec", "unit")["pattern"], "^[!-~]*$");
+    // A signal's name and the count of signals, as the validator takes them.
+    let signals = &root["properties"]["signals"];
+    assert_eq!(signals["maxProperties"], MAX_SIGNALS);
+    assert_eq!(
+        signals["propertyNames"]["pattern"],
+        "^[a-z][a-z0-9_]{0,62}$"
     );
 }

@@ -38,13 +38,20 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("WorkersStore", "epoch", Fate::Read),
     ("WorkersStore", "snapshot", Fate::Read),
     ("WorkersStore", "changes_since", Fate::Read),
-    // A replica's own count of the restores it took: nothing of it crosses.
+    // Each replica counts the snapshots it takes.
     ("WorkersStore", "history", Fate::Read),
     // The status a verdict moves is journaled as the status write it makes.
     // The streak between two moves is the prober's own count: a promoted
     // standby's prober starts it again.
     ("HealthSink", "probe_outcome", Fate::Journaled),
     ("HealthSink", "connected", Fate::Journaled),
+    // What the leader's own worker object knows is that replica's alone: a
+    // standby holds none of it.
+    (
+        "HealthSink",
+        "leader_bits",
+        Fate::Rebuilt("a new leader writes what its own worker objects know"),
+    ),
     ("HealthSink", "gateway_veto", Fate::Rebuilt(HELLO)),
     ("HealthSink", "gateway_veto_noted", Fate::Rebuilt(HELLO)),
     ("HealthSink", "vetoed", Fate::Read),
@@ -71,10 +78,16 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ),
     ("LoadSink", "load", Fate::Read),
     ("LoadSink", "ranks", Fate::Read),
+    // The load adapter of a host with no standby is the one caller.
     (
         "LoadSink",
         "evict",
-        Fate::NotYet("no caller yet: its first caller brings its event"),
+        Fate::NotYet("the first host with a standby beside the load adapter brings its event"),
+    ),
+    (
+        "LoadSink",
+        "evict_unready",
+        Fate::Rebuilt("each replica's collector says its own reset, under its own lead"),
     ),
     ("LoadSink", "publish_due", Fate::Read),
     ("LoadSink", "publish", Fate::Rebuilt(PUBLISHED)),
@@ -86,6 +99,11 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("KvEventSink", "removed", Fate::Rebuilt(SUBSCRIPTION)),
     ("KvEventSink", "block_size", Fate::Read),
     ("KvEventSink", "set_block_size", Fate::Rebuilt(SUBSCRIPTION)),
+    (
+        "KvEventSink",
+        "forget_block_size",
+        Fate::Rebuilt(SUBSCRIPTION),
+    ),
     ("ReservationStore", "window", Fate::Read),
     ("ReservationStore", "try_reserve", Fate::NotYet(PINS)),
     ("ReservationStore", "release", Fate::NotYet(PINS)),
@@ -104,6 +122,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("LeasesStore", "set_term", Fate::Journaled),
     ("LeasesStore", "issue", Fate::NotYet(PINS)),
     ("LeasesStore", "issue_pair", Fate::NotYet(PINS)),
+    ("LeasesStore", "issue_decode", Fate::NotYet(PINS)),
     ("LeasesStore", "dispatched", Fate::Rebuilt(DISPATCHED)),
     ("LeasesStore", "completed", Fate::NotYet(PINS)),
     ("LeasesStore", "released", Fate::NotYet(PINS)),
@@ -124,6 +143,11 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
         "MemoryStore",
         "restore_from",
         Fate::Rebuilt("the journal starts again: a reader re-syncs from this store's own snapshot"),
+    ),
+    (
+        "MemoryStore",
+        "watch_from",
+        Fate::Rebuilt("a follower takes the worker rows from a watch snapshot"),
     ),
     // The three doors for a followed write, one a kind of the leader's
     // events: each is the standby's side of a journaled write.

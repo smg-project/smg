@@ -7,19 +7,20 @@ use std::{
 };
 
 use smg_grpc_client::common_proto::{kv_cache_event, KvEventBatch, KvSnapshotChunk};
-use smg_worker::{identity::endpoint::Endpoint, metrics::writers::Metrics};
+use smg_worker::{
+    identity::endpoint::Endpoint,
+    kv_events::apply::{apply_cleared, apply_events, WorkerIndexCounters, WorkerIndexState},
+    metrics::writers::Metrics,
+};
 use tracing::{debug, info, warn};
 
-use super::{
-    apply::{WorkerIndexCounters, WorkerIndexState},
-    KvEventMonitor,
-};
+use super::KvEventMonitor;
 use crate::policies::kv_index::{
     event_monitor::{
         port::{BatchFacts, ResyncReason},
         recovery::{Admission, RankState},
     },
-    index_backend::KvIndex,
+    index_backend::{KvIndex, WorkerBlocks},
 };
 
 /// A worker's subscription state: one admission cursor per data-parallel
@@ -29,7 +30,7 @@ use crate::policies::kv_index::{
 #[derive(Default)]
 pub(super) struct WorkerStreamState {
     pub(super) ranks: HashMap<i32, RankState>,
-    pub(super) index: WorkerIndexState,
+    pub(super) index: WorkerIndexState<WorkerBlocks>,
     /// A relay snapshot whose chunks are still arriving on the stream.
     pub(super) snapshot: Option<SnapshotProgress>,
     /// The data-parallel rank this worker stands for under `--dp-aware`,
@@ -108,19 +109,18 @@ impl WorkerStreamState {
         }
     }
 
-    /// The stream ended with a snapshot still arriving: what was applied is
-    /// a partial live set, so the next subscription asks from zero (and gets
-    /// a whole snapshot) instead of resuming after the last chunk's stamp.
-    /// Returns whether a snapshot was abandoned.
+    /// A stream's snapshot was abandoned: start every cursor over so the next
+    /// subscription asks from zero, whether or not this sink still considers
+    /// the snapshot open. Returns whether a snapshot was open.
     pub(super) fn abandon_snapshot(&mut self) -> bool {
-        let Some(progress) = self.snapshot.take() else {
-            return false;
-        };
         for cursor in self.ranks.values_mut() {
             cursor.reset();
         }
-        debug_assert!(progress.applied < progress.count);
-        true
+        let progress = self.snapshot.take();
+        if let Some(progress) = progress {
+            debug_assert!(progress.applied < progress.count);
+        }
+        progress.is_some()
     }
 }
 
@@ -335,7 +335,7 @@ impl KvEventMonitor {
                      the engine (rank degraded)"
                 );
             }
-            Self::apply_cleared(worker_id, indexer, &mut state.index);
+            apply_cleared(worker_id, indexer, &mut state.index);
             for cursor in state.ranks.values_mut() {
                 cursor.reset();
             }
@@ -410,7 +410,7 @@ impl KvEventMonitor {
                 _ => {}
             }
         }
-        Self::apply_events(&batch.events, worker_id, indexer, &mut state.index);
+        apply_events(&batch.events, worker_id, indexer, &mut state.index);
         let took = started.elapsed();
         Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
         if stored_blocks > 0 {
@@ -437,7 +437,7 @@ impl KvEventMonitor {
         state: &mut WorkerStreamState,
         rank: i32,
     ) -> u64 {
-        Self::apply_cleared(worker_id, indexer, &mut state.index);
+        apply_cleared(worker_id, indexer, &mut state.index);
         let mut dropped = 0;
         for (other, cursor) in &mut state.ranks {
             if *other != rank {
@@ -481,7 +481,7 @@ impl KvEventMonitor {
         worker_url: &str,
         reason: ResyncReason,
     ) {
-        Self::apply_cleared(worker_id, indexer, &mut state.index);
+        apply_cleared(worker_id, indexer, &mut state.index);
         let pending: u64 = state.ranks.values().map(RankState::pending_gap).sum();
         for cursor in state.ranks.values_mut() {
             cursor.reset();
@@ -519,9 +519,9 @@ mod tests {
     use smg_grpc_client::common_proto::{
         KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheCleared, KvCacheEvent, KvCacheTier,
     };
-    use smg_worker::kv_events::batch_facts;
+    use smg_worker::kv_events::{apply::convert_kv_block, batch_facts};
 
-    use super::{super::apply::convert_kv_block, *};
+    use super::*;
     use crate::{
         policies::kv_index::event_monitor::recovery::{
             Cursor, GAP_CLEAR_THRESHOLD, RESTART_WINDOW,

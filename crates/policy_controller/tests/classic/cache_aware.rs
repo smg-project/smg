@@ -35,7 +35,7 @@ use kv_index::{compute_content_hash, request_prefix_hashes, ContentHash};
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use smg_policy_controller::{
-    ingest::rows,
+    load_report,
     store::{
         Ask, BatchFacts, BatchOutcome, GatewayId, KvEvent, KvEventSink, MemoryStore, Named, Naming,
         Signals, StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
@@ -286,7 +286,7 @@ fn wire(report: Report) -> WorkerLoadResponse {
 /// the instant it was sampled.
 fn load_row(report: Report) -> LoadRow {
     let now = Instant::now();
-    rows::load_row(&wire(report), Role::Single, now, now, SignalSource::Poll)
+    load_report::load_row(&wire(report), Role::Single, now, now, SignalSource::Poll)
 }
 
 /// The worker the row lists at `i`, as the view names it.
@@ -415,6 +415,7 @@ impl Served {
             let naming = Naming {
                 gateway: GATEWAY,
                 block_hashes: &hashes,
+                namespace_seed: 0,
                 seed,
                 cap: world.spec().engine().named_for(MODEL, Phase::Single),
                 wires: None,

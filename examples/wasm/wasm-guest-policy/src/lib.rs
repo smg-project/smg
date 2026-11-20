@@ -17,7 +17,7 @@ wit_bindgen::generate!({
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use exports::smg::policy::plugin::{
-    Candidate, Decline, Guest, GuestDecision, LifecycleEvent, Pool, Request,
+    Candidate, Decline, Guest, GuestDecision, LifecycleEvent, Pool, Request, ScoreAnswer,
 };
 use smg::policy::{host, types::Health};
 
@@ -126,10 +126,11 @@ impl GuestDecision for Decision {
     /// One finite score per candidate (a NaN is a trap), 0 to 1: idle
     /// workers score high, the session's worker higher. The host clamps a
     /// score to that range, which would level an idle worker with the
-    /// session's idle worker, so the sum is scaled back into it.
-    fn score(&self) -> Result<Vec<f32>, Decline> {
+    /// session's idle worker, so the sum is scaled back into it. The answer
+    /// carries no tie band: the host draws within its default one.
+    fn score(&self) -> Result<ScoreAnswer, Decline> {
         let bonus = SESSION_BONUS_MILLIS.load(Ordering::Relaxed) as f32 / 1000.0;
-        Ok(self
+        let scores = self
             .rows
             .iter()
             .map(|row| {
@@ -137,7 +138,11 @@ impl GuestDecision for Decision {
                 let held = if row.session_hit { bonus } else { 0.0 };
                 (idle + held) / (1.0 + bonus)
             })
-            .collect())
+            .collect();
+        Ok(ScoreAnswer {
+            scores,
+            tie_band: None,
+        })
     }
 
     /// A position within the surviving set. The host passes the combined

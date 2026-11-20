@@ -1,6 +1,6 @@
 //! The policy controller's two wire contracts, compiled and parsed at test
 //! time (`contracts/README.md`): the gRPC protocol in package `smg.policy.v1`
-//! and the WebAssembly world `smg:policy@1.1.0`. Nothing at run time reads
+//! and the WebAssembly world `smg:policy@1.2.0`. Nothing at run time reads
 //! the files; the world's `types` interface is rendered from the crate's
 //! types by the `wit` module and held to the committed file by `tests/wit.rs`.
 //! The tests here hold four things: the
@@ -27,8 +27,8 @@ use prost_types::{
 use smg_policy_controller::{
     fingerprint, spec::DENIED_HEADERS, AffinityFacts, Candidate, Constraints, HashKind, Health,
     Identity, Lease, LeaseKind, Lifted, LoadRow, MediaCounts, Membership, Outcome, OverloadRegime,
-    Pair, Phase, PoolFacts, Queue, ReleaseReason, RequestFacts, Role, Shed, ShedReason, Side,
-    Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
+    Pair, Phase, PolicySpec, PoolFacts, Queue, ReleaseReason, RequestFacts, Role, Shed, ShedReason,
+    Side, Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
@@ -39,7 +39,7 @@ const WORLD_WIT: &str = "smg-policy.wit";
 const PACKAGE: &str = "smg.policy.v1";
 const WIT_NAMESPACE: &str = "smg";
 const WIT_PACKAGE: &str = "policy";
-const WIT_VERSION: &str = "1.1.0";
+const WIT_VERSION: &str = "1.2.0";
 
 /// The header deny-list of design section 4.6: the names no view may read
 /// and no routing-key override may key on, lowercase, in this order, each
@@ -166,10 +166,13 @@ fn request_record() -> &'static [&'static str] {
             now_micros,
             pinned_at,
             lent_in_flight,
+            lent_session_in_flight,
             session_counted,
             affinity,
             named,
             model_fingerprint,
+            signal_cells,
+            client_key,
         }
     )
 }
@@ -200,8 +203,11 @@ fn constraints_record() -> &'static [&'static str] {
             excluded,
             wire_modes,
             overload_lifted,
+            decode_later,
             subset_hint,
+            demands,
             stalled,
+            held,
             pins
         }
     )
@@ -323,8 +329,8 @@ fn trace_record() -> &'static [&'static str] {
 }
 
 /// The lease's session crosses under the name both contracts still spell,
-/// `session_key`: the change that first reads a lease from the wire renames
-/// the field in both and takes this pair out.
+/// `session_key`. A gateway's client reads it under that name. A change that
+/// renames the field renames it in both contracts and takes this pair out.
 fn lease_record() -> &'static [&'static str] {
     record!(
         Lease,
@@ -643,10 +649,13 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "now_micros",
                 "pinned_at",
                 "lent_in_flight",
+                "lent_session_in_flight",
                 "session_counted",
                 "affinity",
                 "named",
                 "model_fingerprint",
+                "signal_cells",
+                "client_key",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -676,7 +685,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Constraints",
             record: constraints_record(),
-            host_only: &["stalled", "pins"],
+            host_only: &["decode_later", "demands", "stalled", "held", "pins"],
             wire_only: &[],
             wire: &[
                 ("excluded", Type::Fixed64),
@@ -777,6 +786,8 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "affinity_source",
                 // The record reads it from its count ([`Trace::drew_first`]).
                 "drew_first",
+                // The record marks this in `profile` ([`Trace::made_under`]).
+                "no_profile",
             ],
             wire: &[
                 ("profile", Type::Uint32),
@@ -792,6 +803,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("affinity_source", Type::Enum),
                 ("drew_first", Type::Bool),
                 ("lifted", Type::Enum),
+                ("no_profile", Type::Bool),
             ],
             repeated: &["top", "drops"],
             optional: &["survivors"],
@@ -881,10 +893,13 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "now_micros",
                 "pinned_at",
                 "lent_in_flight",
+                "lent_session_in_flight",
                 "session_counted",
                 "affinity",
                 "named",
                 "model_fingerprint",
+                "signal_cells",
+                "client_key",
             ],
             before: &[],
             beside: &[],
@@ -1181,6 +1196,41 @@ fn message<'a>(file: &'a FileDescriptorProto, name: &str) -> Option<&'a Descript
         .find(|message| message.name() == name)
 }
 
+#[test]
+fn least_cost_term_names_match_the_plugin_contract_fields() {
+    let set = compile_protocol().expect("the protocol compiles");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin contract");
+    for (prefix, record, terms) in [
+        (
+            "load",
+            "LoadRow",
+            &[
+                "running",
+                "queued",
+                "waiting_uncached_tokens",
+                "kv_usage_permille",
+                "active_kv_permille",
+                "resident_tokens",
+            ][..],
+        ),
+        ("candidate", "Candidate", &["in_flight"][..]),
+    ] {
+        let record = message(plugin, record).expect("the term's record");
+        for field in terms {
+            assert!(
+                record.field.iter().any(|f| f.name() == *field),
+                "{prefix}.{field}"
+            );
+            let profile = serde_yaml::from_str(&format!(
+                "score: [{{least-cost: {{terms: {{{prefix}.{field}: 7}}, unreported: missing-as-zero}}}}]\npick: best"
+            )).expect("a profile with one term");
+            let spec = PolicySpec::new([("p".to_string(), profile)].into());
+            spec.validate()
+                .unwrap_or_else(|err| panic!("{prefix}.{field}: {err}"));
+        }
+    }
+}
+
 fn service<'a>(file: &'a FileDescriptorProto, name: &str) -> Option<&'a ServiceDescriptorProto> {
     file.service.iter().find(|service| service.name() == name)
 }
@@ -1473,14 +1523,21 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
     // The lifted veto: the mark's variants in order, numbered from zero.
     // Its zero is none, a case, on purpose: the enum's comment says why.
     let found = enum_values(plugin, "LiftedVeto").expect("LiftedVeto is an enum");
-    let expected: Vec<(String, i32)> = cases!(Lifted, Lifted { None, Overload })
-        .iter()
-        .enumerate()
-        .map(|(i, case)| {
-            let number = i32::try_from(i).unwrap_or(i32::MAX);
-            (format!("LIFTED_VETO_{}", screaming_case(case)), number)
-        })
-        .collect();
+    let expected: Vec<(String, i32)> = cases!(
+        Lifted,
+        Lifted {
+            None,
+            Overload,
+            Liveness
+        }
+    )
+    .iter()
+    .enumerate()
+    .map(|(i, case)| {
+        let number = i32::try_from(i).unwrap_or(i32::MAX);
+        (format!("LIFTED_VETO_{}", screaming_case(case)), number)
+    })
+    .collect();
     assert_eq!(
         found, expected,
         "the lifted vetoes are the mark's, from none"

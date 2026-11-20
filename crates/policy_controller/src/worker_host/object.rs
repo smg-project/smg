@@ -26,12 +26,12 @@ pub fn object(row: &WorkerRow) -> Arc<dyn Worker> {
     Arc::new(builder(row).build())
 }
 
-/// [`object`] before its build: what the holder builds from where its host
-/// handed it a connector, which no row holds.
+/// [`object`] before its build. The holder can give it the host's connector
+/// and credential.
 pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
     let WorkerFacts {
         key,
-        engine,
+        engine: _,
         incarnation: _,
         role,
         wire_modes,
@@ -52,6 +52,8 @@ pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
         signals: _,
         health,
         overload: _,
+        drain_settle_secs,
+        demand_facts: _,
     } = &row.facts;
     let mut spec = WorkerSpec::new(key.clone());
     spec.models = models.iter().map(ModelCard::new).collect::<Vec<_>>().into();
@@ -69,19 +71,47 @@ pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
         .collect();
     spec.kv_block_size = kv_block_size.and_then(|size| usize::try_from(size).ok());
     spec.bootstrap_port = *bootstrap_port;
-    // The object dials its base address where it has one, else its URL: a
-    // rank's row names its engine there, and a row that is its own engine
-    // dials its key.
-    if !engine.is_empty() && engine != key {
-        spec.dp_base_url = Some(engine.clone());
+    let address = dial_address(&row.facts);
+    if address != key {
+        spec.dp_base_url = Some(address.to_owned());
     }
     if *dp_size > 1 {
         spec.dp_rank = Some(usize::from(*dp_rank));
         spec.dp_size = Some(usize::from(*dp_size));
     }
     <BasicWorkerBuilder>::from_spec(spec)
-        .health_config(checks(health))
+        .health_config(checks(health, *drain_settle_secs))
         .status(status(row.status))
+}
+
+/// [`builder`] with the checks off, whatever the row's policy says: what
+/// the holder builds from for a row its host cannot dial.
+pub(super) fn unchecked(row: &WorkerRow) -> BasicWorkerBuilder {
+    let facts = &row.facts;
+    builder(row).health_config(HealthCheckConfig {
+        disable_health_check: true,
+        ..checks(&facts.health, facts.drain_settle_secs)
+    })
+}
+
+/// The store's role for a worker object.
+pub(super) fn role(worker_type: WorkerType) -> Role {
+    match worker_type {
+        WorkerType::Regular => Role::Single,
+        WorkerType::Prefill => Role::Prefill,
+        WorkerType::Decode => Role::Decode,
+        WorkerType::Encode => Role::Encode,
+    }
+}
+
+/// The address the row's object dials, as written. A row that names no
+/// engine dials its key.
+pub(super) fn dial_address(facts: &WorkerFacts) -> &str {
+    if facts.engine.is_empty() {
+        &facts.key
+    } else {
+        &facts.engine
+    }
 }
 
 /// The one wire an object speaks, of the set its row holds: gRPC first, then
@@ -97,16 +127,17 @@ fn wire(modes: WireModes) -> ConnectionMode {
     }
 }
 
-/// The object's health checks under the row's policy. Every other setting of
-/// the checks is the object's default.
-fn checks(policy: &HealthPolicy) -> HealthCheckConfig {
+/// The object's health checks under the row's policy, with the row's drain
+/// window where it states one: else the window is the object's default.
+fn checks(policy: &HealthPolicy, drain_settle_secs: Option<u32>) -> HealthCheckConfig {
+    let default = HealthCheckConfig::default();
     HealthCheckConfig {
         timeout_secs: seconds(policy.timeout_ms),
         check_interval_secs: seconds(policy.check_interval_ms),
         success_threshold: policy.success_threshold,
         failure_threshold: policy.failure_threshold,
         disable_health_check: !policy.probes,
-        ..HealthCheckConfig::default()
+        drain_settle_secs: drain_settle_secs.map_or(default.drain_settle_secs, u64::from),
     }
 }
 
@@ -116,7 +147,7 @@ fn seconds(milliseconds: u32) -> u64 {
     u64::from(milliseconds).div_ceil(1_000).max(1)
 }
 
-fn status(status: WorkerStatus) -> ObjectStatus {
+pub(super) fn status(status: WorkerStatus) -> ObjectStatus {
     match status {
         WorkerStatus::Pending => ObjectStatus::Pending,
         WorkerStatus::Ready => ObjectStatus::Ready,

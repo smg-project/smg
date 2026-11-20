@@ -21,7 +21,6 @@ use crate::{
         resilience::ResolvedResilience,
     },
     identity::basic::Worker,
-    metrics::writers::Metrics,
     model_card::ModelCard,
     pd::pairing::PdPairing,
     registry::event::WorkerConnected,
@@ -396,7 +395,11 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
         self
     }
 
-    /// Build the BasicWorker instance
+    /// Build the BasicWorker instance.
+    ///
+    /// Building writes no metric series: a worker publishes its own where it
+    /// enters a registry ([`Worker::publish_series`]). A worker that is built
+    /// and never enters leaves the series of its address as they stood.
     pub fn build(mut self) -> BasicWorker {
         use std::sync::atomic::AtomicBool;
 
@@ -420,7 +423,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
         let metadata = WorkerMetadata {
             overload: OverloadThresholds::resolve(&self.spec.overload, self.overload_defaults),
             pd_pairing: PdPairing::derive(&self.spec),
-            redacted_url: Endpoint::redacted_url(&self.spec.url),
+            redacted_url: self.spec.redacted_url(),
             decoding: DecodingLabels::of(&self.spec),
             spec: Arc::new(self.spec),
             health_config,
@@ -456,8 +459,6 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
                 } else {
                     WorkerStatus::Pending
                 });
-        Metrics::set_worker_health(&metadata.spec.url, initial_status == WorkerStatus::Ready);
-        Metrics::set_worker_http2(&metadata.spec.url, metadata.http2);
 
         let http_client = Arc::new(match self.http_client {
             Some(client) => LazyHttpClient::ready(client),
@@ -578,6 +579,40 @@ mod tests {
             .build();
         assert_eq!(with_secret.url(), "http://user:secret@worker:8080@2");
         assert_eq!(with_secret.redacted_url(), "http://***@worker:8080@2");
+    }
+
+    /// A rank is read out of an address by its spec's own fields alone. An
+    /// address that ends in an `@` and digits beside no base, or beside a
+    /// base it is not built from, is a userinfo before a host: it is
+    /// rendered with the userinfo masked, never raw.
+    #[test]
+    fn the_rendered_url_reads_no_rank_out_of_an_address_its_spec_does_not_rank() {
+        let alone = BasicWorkerBuilder::new("http://pebble@2130706433").build();
+        assert_eq!(alone.redacted_url(), "http://***@2130706433");
+        let mut spec = WorkerSpec::new("http://pebble@2130706433");
+        spec.dp_base_url = Some("http://other:8000".to_string());
+        let beside = BasicWorkerBuilder::from_spec(spec).build();
+        assert_eq!(beside.redacted_url(), "http://***@2130706433");
+    }
+
+    /// An IPC address holds no userinfo: an `@` and digits at its end are
+    /// bytes of its path. A socket its spec does not rank renders as it
+    /// stands, so two such sockets render apart.
+    #[test]
+    fn the_rendered_url_keeps_a_socket_path_that_ends_like_a_rank() {
+        for url in ["ipc:///tmp/w", "ipc:///tmp/w@0", "ipc:///tmp/w@00"] {
+            let alone = BasicWorkerBuilder::new(url).build();
+            assert_eq!(alone.redacted_url(), url);
+            let mut spec = WorkerSpec::new(url);
+            spec.dp_base_url = Some("ipc:///tmp/g".to_string());
+            let beside = BasicWorkerBuilder::from_spec(spec).build();
+            assert_eq!(beside.redacted_url(), url);
+        }
+        // A socket's rank still renders with its base.
+        let mut spec = WorkerSpec::new("ipc:///tmp/g@1");
+        spec.dp_base_url = Some("ipc:///tmp/g".to_string());
+        let ranked = BasicWorkerBuilder::from_spec(spec).build();
+        assert_eq!(ranked.redacted_url(), "ipc:///tmp/g@1");
     }
 
     #[test]

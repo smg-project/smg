@@ -7,6 +7,7 @@ use smg_grpc_client::{
     dial_failure_without_peer, is_constraint_failure, is_constraint_refusal, is_request_timeout,
     is_transport_failure, WorkerMediaFault,
 };
+use smg_policy_controller::lease::TransportClass;
 use tonic::Code;
 
 use super::metrics::mark_error_reason;
@@ -52,8 +53,18 @@ pub(crate) trait TonicStatusExt {
     /// status code. The response carries the status's
     /// [`error_reason`](TonicStatusExt::error_reason), so the router that
     /// counts it reads the cause the status named (see
-    /// `error_reason_for_response`).
+    /// `error_reason_for_response`), and its
+    /// [`transport_class`](TonicStatusExt::transport_class), which the end
+    /// of a placed attempt reports (see [`transport_class_of`]).
     fn to_http_error(&self, code: &str, msg: String) -> Response;
+
+    /// The transport class of a dispatch that ended with this status, which
+    /// the policy controller reads beside the status: a failed connection
+    /// where the status is no answer of the worker's (its connection failed
+    /// under the call, its side ended the call, or the dial failed), else
+    /// the class of the HTTP status it maps to. The same status is the same
+    /// class on either side of the first chunk.
+    fn transport_class(&self) -> TransportClass;
 
     /// This status's message as an answer to a client carries it: the
     /// message itself, except for a dial that failed. That status names the
@@ -226,7 +237,18 @@ impl TonicStatusExt for tonic::Status {
             error::create_error(self.http_status(), code, msg)
         };
         mark_error_reason(&mut response, self.error_reason());
+        response.extensions_mut().insert(self.transport_class());
         response
+    }
+
+    fn transport_class(&self) -> TransportClass {
+        if is_transport_failure(self)
+            || self.code() == Code::Cancelled
+            || dial_failure_without_peer(self).is_some()
+        {
+            return TransportClass::ConnectFailed;
+        }
+        status_class(self.http_status())
     }
 
     fn client_message(&self) -> &str {
@@ -307,6 +329,28 @@ impl TonicStatusExt for tonic::Status {
         mark_non_retryable(&mut response);
         Some(response)
     }
+}
+
+/// The transport class of an HTTP status alone.
+fn status_class(status: StatusCode) -> TransportClass {
+    match status {
+        status if status < StatusCode::BAD_REQUEST => TransportClass::Ok,
+        StatusCode::GATEWAY_TIMEOUT => TransportClass::Timeout,
+        status if status.is_client_error() => TransportClass::ClientError,
+        _ => TransportClass::ServerError,
+    }
+}
+
+/// The transport class of the dispatch that `response` ended: the class its
+/// worker's status named, where the response was made of one (see
+/// [`TonicStatusExt::to_http_error`]), else the class of the response's own
+/// status, for an answer the router made itself.
+pub(crate) fn transport_class_of(response: &Response) -> TransportClass {
+    response
+        .extensions()
+        .get::<TransportClass>()
+        .copied()
+        .unwrap_or_else(|| status_class(response.status()))
 }
 
 /// Whether `status` is the engine's own report that the request failed (its
@@ -530,6 +574,86 @@ mod tests {
         );
         let plain = error::internal_error("no_response_produced", "No response produced");
         assert!(plain.extensions().get::<ErrorReason>().is_none());
+    }
+
+    /// The transport class a status names for the policy controller: a
+    /// failed connection where the status is no answer of the worker's (an
+    /// HTTP/2 fault under the call, the worker's side cancelling, a dial
+    /// that failed), else the class of its HTTP status. The HTTP answer made
+    /// of the status carries the class. An answer the router made itself is
+    /// classed by its own status.
+    #[tokio::test]
+    async fn a_status_names_its_transport_class() {
+        use smg_grpc_client::h2::{Error, Reason};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let closed = format!("grpc://{}", listener.local_addr().expect("its address"));
+        drop(listener);
+        let Err(refused) = smg_grpc_client::connect_channel(&closed).await else {
+            panic!("nothing listens on {closed}");
+        };
+        for (status, class) in [
+            (
+                tonic::Status::from_error(Box::new(Error::from(Reason::PROTOCOL_ERROR))),
+                TransportClass::ConnectFailed,
+            ),
+            (
+                tonic::Status::cancelled("operation was canceled"),
+                TransportClass::ConnectFailed,
+            ),
+            (
+                tonic::Status::from_error(refused),
+                TransportClass::ConnectFailed,
+            ),
+            (
+                tonic::Status::internal("the servicer failed"),
+                TransportClass::ServerError,
+            ),
+            (
+                tonic::Status::unavailable("draining"),
+                TransportClass::ServerError,
+            ),
+            (
+                tonic::Status::unimplemented("no"),
+                TransportClass::ServerError,
+            ),
+            (
+                tonic::Status::deadline_exceeded("too slow"),
+                TransportClass::Timeout,
+            ),
+            (
+                tonic::Status::invalid_argument("bad"),
+                TransportClass::ClientError,
+            ),
+            (
+                tonic::Status::resource_exhausted("kv cache full"),
+                TransportClass::ClientError,
+            ),
+        ] {
+            assert_eq!(status.transport_class(), class, "{status:?}");
+            let answer = status.to_http_error("start_generation_failed", String::new());
+            assert_eq!(transport_class_of(&answer), class, "{status:?}");
+        }
+        for (answer, class) in [
+            (
+                error::internal_error("no_response_produced", "No response produced"),
+                TransportClass::ServerError,
+            ),
+            (
+                error::bad_gateway("bad_response", "The answer could not be read"),
+                TransportClass::ServerError,
+            ),
+            (
+                error::gateway_timeout("silent_worker", "The worker said nothing"),
+                TransportClass::Timeout,
+            ),
+            (
+                error::bad_request("bad_prompt", "The prompt is empty"),
+                TransportClass::ClientError,
+            ),
+        ] {
+            assert_eq!(transport_class_of(&answer), class, "{}", answer.status());
+        }
     }
 
     #[test]

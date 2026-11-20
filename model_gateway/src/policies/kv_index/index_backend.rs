@@ -13,12 +13,14 @@
 //! feed the production apply path to both and compare answers. Nothing
 //! selects it at runtime: the gateway builds chain indexes only.
 
-use std::{collections::BTreeSet, fmt};
+use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use kv_index::{
     request_prefix_hashes, ApplyError, ChainBlockMap, ChainIndexStats, ContentHash, GroupCap,
-    GroupViews, OverlapScores, SequenceHash, ShardedChainIndex, StoredBlock, WorkerIdExhausted,
+    GroupViews, OverlapScores, SequenceHash, ShardedChainIndex, StoredBlock, WorkerGroups,
+    WorkerIdExhausted,
 };
+use smg_worker::kv_events::apply::{BlockIndex, HeldBlocks};
 
 /// Workers one chain index interns at once: the index's own ceiling per shard.
 /// Ids are handed back when a worker is removed, so this bounds the workers
@@ -402,6 +404,53 @@ impl KvIndex {
     }
 }
 
+impl BlockIndex for KvIndex {
+    type Held = WorkerBlocks;
+
+    #[inline]
+    fn apply_stored(
+        &self,
+        worker: u32,
+        blocks: &[StoredBlock],
+        parent: Option<SequenceHash>,
+        held: &mut WorkerBlocks,
+    ) -> Result<(), ApplyError> {
+        KvIndex::apply_stored(self, worker, blocks, parent, held)
+    }
+
+    #[inline]
+    fn apply_removed(&self, worker: u32, hashes: &[SequenceHash], held: &mut WorkerBlocks) {
+        KvIndex::apply_removed(self, worker, hashes, held);
+    }
+
+    #[inline]
+    fn apply_cleared(&self, worker: u32, held: &mut WorkerBlocks) {
+        KvIndex::apply_cleared(self, worker, held);
+    }
+
+    #[inline]
+    fn groups(&self, worker: u32) -> Arc<WorkerGroups> {
+        KvIndex::groups(self).get_or_create(worker)
+    }
+}
+
+impl HeldBlocks for WorkerBlocks {
+    #[inline]
+    fn contains_key(&self, hash: SequenceHash) -> bool {
+        WorkerBlocks::contains_key(self, hash)
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        WorkerBlocks::len(self)
+    }
+
+    #[inline]
+    fn hashes(&self) -> Vec<SequenceHash> {
+        WorkerBlocks::hashes(self)
+    }
+}
+
 impl fmt::Debug for KvIndex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KvIndex")
@@ -410,6 +459,9 @@ impl fmt::Debug for KvIndex {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod apply_tests;
 
 #[cfg(test)]
 mod exactness;

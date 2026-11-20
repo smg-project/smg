@@ -97,11 +97,11 @@ pub struct SlurmProviderConfig {
 }
 
 impl SlurmProviderConfig {
-    /// The host's validation has checked the mapping against the routing
-    /// mode; a mode with no worker pools to fill is still refused here.
-    /// `routing` is the roles the routing mode accepts: `roles` here names
-    /// the provider's own map of job names.
-    pub fn new(
+    /// Resolve Slurm settings that have passed [`crate::DiscoveryConfig::validate`].
+    /// `routing` supplies the required worker roles the host accepts. The
+    /// crate alone calls it: [`crate::RuntimeDiscoveryConfig::from_config`]
+    /// is the one way to these settings, and it checks them first.
+    pub(crate) fn new(
         config: &SlurmDiscoveryConfig,
         routing: Option<Roles>,
     ) -> DiscoveryConfigResult<Self> {

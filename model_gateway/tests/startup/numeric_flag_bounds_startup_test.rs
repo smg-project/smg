@@ -41,8 +41,8 @@ struct Launch {
 /// until it exits, binds its port or `EXIT_TIMEOUT` passes.
 fn launch(args: &[&str], log_path: &Path) -> Launch {
     // The binary's launches run one at a time: the ports picked here are
-    // released for the gateway to bind, and another test's pick or listener
-    // must not take one meanwhile.
+    // for this gateway to bind, and another test's pick or listener must
+    // not take one meanwhile.
     let _serial = serial();
     let [port, metrics_port] = free_ports();
     let ip = IP.to_string();
@@ -81,8 +81,8 @@ fn launch(args: &[&str], log_path: &Path) -> Launch {
 
 /// Whether the gateway answers `GET /health` with 200 on `address`: the
 /// positive proof that the gateway itself serves there, where a bare connect
-/// would also pass for another process that took the port in the gap after
-/// `free_ports` released it.
+/// would also pass for another process on the port (`free_ports` keeps a
+/// picked port from one on Linux alone).
 fn answers_health(address: &SocketAddr) -> bool {
     let Ok(mut stream) = TcpStream::connect_timeout(address, Duration::from_millis(200)) else {
         return false;

@@ -142,8 +142,24 @@ impl Readiness {
         (sample.state, turn)
     }
 
+    /// [`Readiness::read`] for the teller of the role: the term this
+    /// replica leads at the instant of the read, if it leads one, and the
+    /// instant the clock alone next turns the state. The term is the one
+    /// the state was read under, by one read of the fence.
+    pub(crate) fn led(&self) -> (Option<u64>, Option<Instant>) {
+        let now = Instant::now();
+        let term = self.fence.leader_term(now);
+        let (sample, turn) = self.sample_under(term, now);
+        (term.filter(|_| sample.state == State::Leader), turn)
+    }
+
     fn sample_at(&self, now: Instant) -> (Sample, Option<Instant>) {
-        let leads = self.fence.leader_term(now).is_some();
+        self.sample_under(self.fence.leader_term(now), now)
+    }
+
+    /// The sample at `now` under `term`, the fence's word at that instant.
+    fn sample_under(&self, term: Option<u64>, now: Instant) -> (Sample, Option<Instant>) {
+        let leads = term.is_some();
         // A leader follows nobody: it has no lag and no sync to lapse.
         let (lag, lapse) = match self.lag.read(now) {
             Some((age, lapse)) if !leads => (Some(age), lapse),
@@ -214,7 +230,7 @@ impl Readiness {
 
 /// Resolves at `turn`, at once where it is past; never where there is
 /// none.
-async fn reached(turn: Option<Instant>) {
+pub(super) async fn reached(turn: Option<Instant>) {
     match turn {
         Some(turn) => tokio::time::sleep_until(turn.into()).await,
         None => std::future::pending().await,

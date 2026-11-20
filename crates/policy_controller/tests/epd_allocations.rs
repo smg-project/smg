@@ -211,7 +211,7 @@ fn an_encode_pair_decision_allocates_nothing_after_its_first_32() {
             PolicySpec::epd_presets(preset, "round_robin", "round_robin").expect("an epd spec");
         if unfiltered {
             let encode = spec.profiles.get_mut("encode").expect("the encode profile");
-            encode.filter.retain(|name| name != "healthy");
+            encode.filter.retain(|entry| entry.name() != "healthy");
         }
         let engine = spec.validate().expect("validates");
         for n in [8u32, 64, 512] {
@@ -245,6 +245,7 @@ fn an_encode_pair_decision_allocates_nothing_after_its_first_32() {
                     facts: &of_encoders,
                     prefill_classes: &prefill_classes,
                     affinity: &[],
+                    ..EncodePool::default()
                 };
                 let pool_facts = PoolFacts {
                     pool_size: n,

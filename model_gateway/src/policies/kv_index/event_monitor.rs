@@ -16,9 +16,10 @@
 //! task a worker and runs it (the slots, connecting, reconnecting, the
 //! stream read loop, the pushed load records, the worker's departure);
 //! `admission.rs` keeps one stream's state (per-rank cursors, gap recovery,
-//! relay snapshots, and the metrics around an applied batch); `apply.rs`
-//! takes one event into the index (tiers, cache groups, namespaces, and the
-//! physical copies of a block, counted per worker).
+//! relay snapshots, and the metrics around an applied batch);
+//! [`smg_worker::kv_events::apply`] takes one event into the index (tiers,
+//! cache groups, namespaces, and the physical copies of a block, counted per
+//! worker).
 //!
 //! The task and the index meet at the worker crate's port: the task says
 //! what its stream brought, and `index_sink.rs`, the sink over the models'
@@ -40,14 +41,11 @@ use tracing::{error, warn};
 use super::index_backend::KvIndex;
 
 mod admission;
-mod apply;
 #[cfg(test)]
 mod gateway_tests;
 mod index_sink;
 mod recovery;
 
-#[cfg(any(test, feature = "test-util"))]
-pub(crate) use apply::WorkerIndexState;
 use index_sink::{IndexSink, OpenRow};
 // The worker crate's port, at the path it had here.
 use smg_worker::kv_events::port;
@@ -345,8 +343,10 @@ pub mod bench_support {
 
     use kv_index::WorkerIdExhausted;
     use smg_grpc_client::common_proto::KvEventBatch;
+    use smg_worker::kv_events::apply::{apply_events, WorkerIndexState};
 
-    use super::{KvEventMonitor, KvIndex, WorkerIndexState};
+    use super::KvEventMonitor;
+    use crate::policies::kv_index::index_backend::{KvIndex, WorkerBlocks};
 
     impl KvEventMonitor {
         /// Make `index` the model's index, as a worker's first subscription
@@ -359,7 +359,7 @@ pub mod bench_support {
     /// One worker's feed into an index.
     pub struct IndexFeed {
         worker: u32,
-        state: WorkerIndexState,
+        state: WorkerIndexState<WorkerBlocks>,
     }
 
     impl IndexFeed {
@@ -377,7 +377,7 @@ pub mod bench_support {
 
         /// Apply every event of `batch`, as an admitted batch is applied.
         pub fn apply(&mut self, index: &KvIndex, batch: &KvEventBatch) {
-            KvEventMonitor::apply_events(&batch.events, self.worker, index, &mut self.state);
+            apply_events(&batch.events, self.worker, index, &mut self.state);
         }
 
         /// The worker leaves: its blocks go with it.

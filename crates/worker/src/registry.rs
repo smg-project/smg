@@ -19,7 +19,7 @@ use std::{
 use arc_swap::ArcSwap;
 use dashmap::{mapref::entry::Entry, DashMap};
 use rustc_hash::FxBuildHasher;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Notify};
 use uuid::Uuid;
 
 use crate::{
@@ -140,6 +140,15 @@ struct GlobalRoutingSnapshot<G> {
 /// and node maps the same way.
 type ModelIndex<G> = Arc<DashMap<String, Arc<G>, FxBuildHasher>>;
 
+/// Shards of the maps that hold one entry a model and are iterated on
+/// request paths, on any host: the model index
+/// ([`WorkerRegistry::model_count`]) and the per-model retry overrides
+/// ([`WorkerRegistry::any_model_retry_override_enables_retries`]). Iterating
+/// a map costs one lock and one allocation a shard, whether the shard holds
+/// an entry or not: the count must not follow the CPUs the process sees, as
+/// the library's default does (four shards a CPU).
+const MODEL_MAP_SHARDS: usize = 16;
+
 /// Model alias to canonical model ID.
 type ModelAliasIndex = Arc<DashMap<String, Arc<str>, FxBuildHasher>>;
 
@@ -184,8 +193,8 @@ pub struct WorkerRegistry<G> {
     /// once, with the registry.
     empty_generation: Arc<G>,
 
-    /// Monotonic membership generation; bumped on every register / replace /
-    /// remove.
+    /// Membership generation; bumped on every register / replace / remove.
+    /// `usize::MAX` is reserved for the stale snapshot marker.
     global_epoch: AtomicUsize,
 
     /// Orders membership writes against rebuild scans. Mutators hold the
@@ -271,10 +280,17 @@ pub struct WorkerRegistry<G> {
     /// and dynamically-registered workers need it long after.
     connect_signal_tx: mpsc::UnboundedSender<WorkerConnected>,
 
-    /// Receiver drained by the manager's health loop. Taken once via
-    /// [`Self::take_connect_signal_receiver`]; `None` thereafter (and when
-    /// no manager runs, e.g. health checks globally disabled).
+    /// Receiver drained by the manager's health loop. One loop holds it at
+    /// a time: [`Self::take_connect_signal_receiver`] hands it out, and the
+    /// loop hands it back at its end
+    /// ([`Self::return_connect_signal_receiver`]). It waits here while no
+    /// loop runs: health checks globally disabled, or between two loops of
+    /// a host that starts one for each term of its lead.
     connect_signal_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<WorkerConnected>>>,
+
+    /// Wakes a loop that started while another held the receiver: told each
+    /// time the receiver comes back.
+    connect_signal_home: Notify,
 
     /// What makes the engine connection of a worker this registry builds
     /// from a peer's published state (see [`Self::with_engine_connector`]).
@@ -298,7 +314,10 @@ impl<G: Generation> WorkerRegistry<G> {
         let empty_generation = Arc::new(G::of(Arc::from(Self::EMPTY_WORKERS)));
         Self {
             workers: Arc::new(DashMap::new()),
-            model_index: Arc::new(DashMap::with_hasher(FxBuildHasher)),
+            model_index: Arc::new(DashMap::with_hasher_and_shard_amount(
+                FxBuildHasher,
+                MODEL_MAP_SHARDS,
+            )),
             global_routing_snapshot: ArcSwap::from_pointee(GlobalRoutingSnapshot {
                 epoch: 0,
                 snapshot: Arc::clone(&empty_generation),
@@ -317,7 +336,10 @@ impl<G: Generation> WorkerRegistry<G> {
             model_overloaded: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             overload_shed: Arc::new(AtomicBool::new(false)),
             overload_transitions: Arc::new(parking_lot::Mutex::new(())),
-            model_retry_configs: Arc::new(DashMap::with_hasher(FxBuildHasher)),
+            model_retry_configs: Arc::new(DashMap::with_hasher_and_shard_amount(
+                FxBuildHasher,
+                MODEL_MAP_SHARDS,
+            )),
             worker_origins: Arc::new(DashMap::new()),
             import_records: Arc::new(DashMap::new()),
             // Sized for fleet-scale bursts (startup registration, probe
@@ -327,6 +349,7 @@ impl<G: Generation> WorkerRegistry<G> {
             event_tx: broadcast::Sender::new(1024),
             connect_signal_tx,
             connect_signal_rx: parking_lot::Mutex::new(Some(connect_signal_rx)),
+            connect_signal_home: Notify::new(),
             engine_connector: None,
         }
     }
@@ -396,11 +419,32 @@ impl<G: Generation> WorkerRegistry<G> {
         self.connect_signal_tx.clone()
     }
 
-    /// Take the connect-signal receiver. Returns `Some` exactly once (the
-    /// manager takes it at startup); `None` on any later call. Holds the
+    /// Take the connect-signal receiver: `Some` for the one loop that holds
+    /// it, `None` while another does. A loop hands it back at its end, and
+    /// the next take gets it with every signal sent meanwhile. Holds the
     /// receiver lock briefly.
     pub fn take_connect_signal_receiver(&self) -> Option<mpsc::UnboundedReceiver<WorkerConnected>> {
         self.connect_signal_rx.lock().take()
+    }
+
+    /// Hand the connect-signal receiver back, at the end of the loop that
+    /// took it, and wake a loop that waits for it
+    /// ([`Self::connect_signal_receiver_returned`]). Holds the receiver lock
+    /// briefly.
+    pub(crate) fn return_connect_signal_receiver(
+        &self,
+        receiver: mpsc::UnboundedReceiver<WorkerConnected>,
+    ) {
+        *self.connect_signal_rx.lock() = Some(receiver);
+        self.connect_signal_home.notify_one();
+    }
+
+    /// Resolves once the receiver was handed back. A loop that started
+    /// without it awaits this, then takes. A hand-back nobody awaited is
+    /// kept for the next await, so a loop that takes nothing on waking
+    /// awaits again.
+    pub(crate) async fn connect_signal_receiver_returned(&self) {
+        self.connect_signal_home.notified().await;
     }
 
     /// True if any registered worker is Pending and depends on the connect
@@ -638,7 +682,7 @@ impl<G: Generation> WorkerRegistry<G> {
     /// and the shared runtime but installs a new worker object with a possibly
     /// different model card, and the replaced handle must not be allowed to
     /// attribute a counter move to the model set it used to carry.
-    fn is_current_handle(&self, worker: &Arc<dyn Worker>) -> bool {
+    pub(crate) fn is_current_handle(&self, worker: &Arc<dyn Worker>) -> bool {
         let Some(worker_id) = self.url_to_id.get(worker.url()).map(|id| id.clone()) else {
             return false;
         };
@@ -1355,6 +1399,12 @@ impl<G: Generation> WorkerRegistry<G> {
         // the URL drops those writes until the old instance is gone too.
         Metrics::worker_replaced(old_worker.url(), Arc::downgrade(&old_worker));
 
+        // The replacement's series are its own from here: its HTTP/2 flag,
+        // and the breaker it ends with, the adopted one or one of its own.
+        // Its build wrote none, so a replacement that never got here left
+        // the old worker's series as they stood.
+        new_worker.publish_series();
+
         // The replacement owns its handshake driver. Release any binds the
         // retired instance still holds while waiting for the engine.
         old_worker.abort_background_tasks();
@@ -2037,14 +2087,10 @@ impl<G: Generation> WorkerRegistry<G> {
         }
 
         // The worker's series are kept for the time its address is
-        // registered (see `metrics::series`). The builder's
-        // writes for health, HTTP/2 and breaker state preceded this
-        // registration and were dropped if the address was retired by an
-        // earlier removal, so they are repeated here.
+        // registered (see `metrics::series`), and building a worker writes
+        // none of them: they start here, where the worker enters.
         Metrics::worker_registered(worker.url());
-        Metrics::set_worker_health(worker.url(), worker.is_healthy());
-        Metrics::set_worker_http2(worker.url(), worker.http2());
-        Metrics::set_worker_cb_state(worker.url(), worker.circuit_breaker_state().as_int());
+        worker.publish_series();
         worker.republish_state();
 
         // The worker's request counter starts at zero with its registration,
@@ -2127,7 +2173,15 @@ impl<G: Generation> WorkerRegistry<G> {
     /// worker-map mutation and this bump, so the rebuild scan cannot observe
     /// a half-applied write.
     fn bump_global_routing_epoch(&self) {
-        self.global_epoch.fetch_add(1, Ordering::Release);
+        self.global_epoch
+            .update(Ordering::Release, Ordering::Relaxed, |epoch| {
+                let next = epoch.wrapping_add(1);
+                if next == usize::MAX {
+                    0
+                } else {
+                    next
+                }
+            });
         let previous = self
             .global_routing_snapshot
             .swap(Arc::new(GlobalRoutingSnapshot {

@@ -155,6 +155,10 @@ pub struct Tags {
     /// never the model's text, and is dropped as the engine drops its own terminals' held
     /// prefixes. Empty where the tags are text the model can write (`</parameter>`).
     pub structural_tokens: &'static [&'static str],
+    /// A tag sentinel that, when written alone immediately before a whole parameter opener, is
+    /// that opener's stutter. It is still counted and dropped as text between tags, but does not
+    /// cost the call its close. `None` unless a format's table names one.
+    pub(crate) stuttered_marker: Option<&'static str>,
     /// Whether the arguments may be one JSON object between the invoke tag and its close, in
     /// place of the parameter tags (DSML: one serving engine's parser for the family reads an
     /// invoke so, and the structural tag that engine builds writes one): read as the JSON
@@ -177,6 +181,7 @@ impl Tags {
         tag_end: TagEnd::Angle,
         indexed_calls: false,
         structural_tokens: &[],
+        stuttered_marker: None,
         json_arguments: false,
     };
     /// dots3's: MiniMax M2's tags, a block around each call, every value on a line of its own.
@@ -193,6 +198,7 @@ impl Tags {
         tag_end: TagEnd::Angle,
         indexed_calls: false,
         structural_tokens: &[],
+        stuttered_marker: None,
         json_arguments: false,
     };
     /// MiniCPM5's: `<param name="…">`, `</param>` and `</function>`, a value a CDATA section when
@@ -210,6 +216,7 @@ impl Tags {
         tag_end: TagEnd::Angle,
         indexed_calls: false,
         structural_tokens: &[],
+        stuttered_marker: None,
         json_arguments: false,
     };
     /// DeepSeek's DSML: `<｜DSML｜ parameter name="…" string="…">`, `</｜DSML｜ parameter>`
@@ -229,6 +236,7 @@ impl Tags {
         tag_end: TagEnd::Angle,
         indexed_calls: false,
         structural_tokens: &[],
+        stuttered_marker: None,
         json_arguments: true,
     };
     /// DeepSeek's DSML as V4 spells it, before V4.1 put a space after the sentinel:
@@ -249,6 +257,7 @@ impl Tags {
         tag_end: TagEnd::Angle,
         indexed_calls: false,
         structural_tokens: &[],
+        stuttered_marker: None,
         json_arguments: true,
     };
     /// Kimi K3's XTML: `<|open|>argument key="…" type="…"<|sep|>`, `<|close|>argument<|sep|>` and
@@ -267,6 +276,7 @@ impl Tags {
         tag_end: TagEnd::Marker("<|sep|>"),
         indexed_calls: true,
         structural_tokens: &["<|open|>", "<|close|>"],
+        stuttered_marker: None,
         json_arguments: false,
     };
 
@@ -325,8 +335,13 @@ pub struct Assembler {
     /// Whether the syntax refused bytes inside the started call (a word between tags, a tag out
     /// of its place, cut short or with a tail, a value held for its close that the end cut): the
     /// model's call had something in it the client will not get, so it is no whole call, and
-    /// nothing is made up for its close ([`Self::close`]).
+    /// nothing is made up for its close ([`Self::close`]). The table's stuttered marker written
+    /// right before a parameter opener is the exception: it is reported and dropped without
+    /// refusing the call.
     refused: bool,
+    /// The static prefix of the table's stuttered marker held between tags. What follows decides
+    /// whether it is the opening tag's stutter or ordinary refused text.
+    marker_held: Option<&'static str>,
     /// Whether the closing brace of arguments written as one JSON object is held back
     /// ([`Self::json_text`]): the object closed whole, and its brace leaves at the call's end, as
     /// the arguments' last fragment where nothing was refused after the object, and with the
@@ -417,6 +432,7 @@ impl Assembler {
             function: None,
             released: false,
             refused: false,
+            marker_held: None,
             close_held: false,
             done: false,
             scratch: Events::new(),
@@ -450,10 +466,13 @@ impl Assembler {
     /// value, which is how a client that reads them as JSON is told, as a cut call tells it. (The
     /// engine's own parser hands such a call out whole with the members its reader matched, `{}`
     /// when none; a client read a well-formed call with no word that the model's call had failed.)
+    /// The table's stuttered marker written right before a parameter opener is the exception: it
+    /// is reported and dropped without refusing the call.
     pub fn close(mut self, terminal: &str, out: &mut Events) {
         if self.done {
             return;
         }
+        self.release_held_marker(out);
         if self.json.is_some() {
             self.end_json(terminal, out);
             return;
@@ -535,6 +554,7 @@ impl Assembler {
         if self.done {
             return;
         }
+        self.release_held_marker(out);
         if self.json.is_some() {
             self.end_json("", out);
             return;
@@ -684,6 +704,7 @@ impl Assembler {
         if self.done {
             return;
         }
+        self.release_held_marker(out);
         // Arguments written as one JSON object are the model's own, braces and all: nothing is
         // closed for it, so an object the stop found open ends as a cut ends it, and one that
         // closed ends the call with nothing announced, as the JSON assembler ends one.
@@ -806,6 +827,13 @@ impl Assembler {
     /// closing tag has no place, and neither does a parameter before the function's name closed.
     fn tag_between(&mut self, tag: usize, out: &mut Events) {
         let bytes = self.tags.text(tag);
+        match self.marker_held.take() {
+            Some(marker) if tag == OPEN && Some(marker) == self.tags.stuttered_marker => {
+                self.report_between(marker, MalformedReason::TextBetweenTags, out);
+            }
+            Some(marker) => self.release(marker, MalformedReason::TextBetweenTags, out),
+            None => {}
+        }
         if tag == OPEN && self.started() {
             self.object.carried.push_str(bytes);
             self.stage = Stage::ParameterName {
@@ -925,6 +953,7 @@ impl Assembler {
             && self.started()
             && !self.refused
             && !self.released
+            && self.marker_held.is_none()
             && self.object.is_empty()
             && word.starts_with('{')
     }
@@ -1037,7 +1066,7 @@ impl Assembler {
     fn text_or_object<'d>(&mut self, text: &'d str, out: &mut Events<'d>) {
         let word = text.trim_start_matches(char::is_whitespace);
         if word.is_empty() {
-            self.object.carried.push_str(text);
+            self.text_between(text, out);
         } else if self.opens_json(word) {
             self.object
                 .carried
@@ -1049,14 +1078,43 @@ impl Assembler {
     }
 
     /// Text where the syntax has tags: whitespace is carried, since whose it is depends on what
-    /// follows ([`Self::release`]), anything else is released.
+    /// follows ([`Self::release`]); a prefix of the table's stuttered marker is held for the tag
+    /// that may follow; anything else is released after the held bytes.
     fn text_between(&mut self, text: &str, out: &mut Events) {
         for (run, space) in runs(text) {
+            if !space && self.hold_marker_prefix(run) {
+                continue;
+            }
+            self.release_held_marker(out);
             if space {
                 self.object.carried.push_str(run);
             } else {
                 self.release(run, MalformedReason::TextBetweenTags, out);
             }
+        }
+    }
+
+    /// Hold `run` when it continues the configured marker between two tags of a started call.
+    fn hold_marker_prefix(&mut self, run: &str) -> bool {
+        if !matches!(self.stage, Stage::Between) || !self.started() {
+            return false;
+        }
+        let held = self.marker_held.map_or(0, str::len);
+        let Some(prefix) = self.tags.stuttered_marker.and_then(|marker| {
+            marker[held..]
+                .starts_with(run)
+                .then(|| &marker[..held + run.len()])
+        }) else {
+            return false;
+        };
+        self.marker_held = Some(prefix);
+        true
+    }
+
+    /// Release a held marker prefix once what follows proves it is ordinary text between tags.
+    fn release_held_marker(&mut self, out: &mut Events) {
+        if let Some(marker) = self.marker_held.take() {
+            self.release(marker, MalformedReason::TextBetweenTags, out);
         }
     }
 
@@ -1073,8 +1131,16 @@ impl Assembler {
     /// brace of arguments written as one JSON object, held back for the call's end
     /// ([`Self::json_text`]), is refused with the first text released after the object, the
     /// whitespace between them included: the call is no whole call, and its arguments stay the
-    /// strict JSON prefix the fragments wrote.
+    /// strict JSON prefix the fragments wrote. The table's configured stuttered marker is the
+    /// exception: [`Self::report_between`] reports and drops it without refusing the call once the
+    /// following whole parameter opener proves it is a stutter.
     fn release(&mut self, text: &str, why: MalformedReason, out: &mut Events) {
+        self.report_between(text, why, out);
+        self.refused |= self.started();
+    }
+
+    /// Report text between tags without deciding whether it invalidates the enclosing call.
+    fn report_between(&mut self, text: &str, why: MalformedReason, out: &mut Events) {
         if std::mem::take(&mut self.close_held) {
             self.object.carried.insert(0, '}');
             self.released = true;
@@ -1085,7 +1151,6 @@ impl Assembler {
         self.object.carried.push_str(text);
         self.object.refuse(why, out);
         self.released = true;
-        self.refused |= self.started();
     }
 
     /// The carried bytes refused with `why` ([`Object::refuse`]: the counted event of no bytes,
@@ -1561,6 +1626,73 @@ mod tests {
         }
         assembler.stop(as_marker, &mut out);
         out.drain()
+    }
+
+    /// A marker stutter changes the close only when the format table opts in. The shared tag
+    /// spelling remains strict, while an otherwise identical opted-in table closes the object.
+    #[test]
+    fn a_stutter_is_enabled_only_by_the_format_table() {
+        const CALL: &str = concat!(
+            "f\">\n<｜DSML｜parameter name=\"a\" string=\"false\">7</｜DSML｜parameter>\n",
+            "｜DSML｜<｜DSML｜parameter name=\"b\" string=\"false\">4</｜DSML｜parameter>\n"
+        );
+        let opted_in = Tags {
+            stuttered_marker: Some("｜DSML｜"),
+            ..Tags::DSML_V4
+        };
+        for (tags, written) in [
+            (Tags::DSML_V4, r#"{"a": 7, "b": 4"#),
+            (opted_in, r#"{"a": 7, "b": 4}"#),
+        ] {
+            let events = run_with(tags, &[CALL], false);
+            assert_eq!(arguments(&events), written, "{tags:?}");
+            assert_eq!(
+                malformed(&events),
+                [(String::new(), MalformedReason::TextBetweenTags)],
+                "{tags:?}"
+            );
+            assert_eq!(refused(&events), ["｜DSML｜"], "{tags:?}");
+        }
+    }
+
+    #[test]
+    fn a_held_marker_prefix_is_refused_when_the_stream_ends() {
+        let tags = Tags {
+            stuttered_marker: Some("｜DSML｜"),
+            ..Tags::DSML_V4
+        };
+        let events = run_with(
+            tags,
+            &["f\">\n<｜DSML｜parameter name=\"a\" string=\"false\">7</｜DSML｜parameter>\n｜DSM"],
+            true,
+        );
+        assert_eq!(
+            (arguments(&events), shown(&events)),
+            (r#"{"a": 7"#.to_string(), String::new())
+        );
+        assert_eq!(refused(&events), ["｜DSM"]);
+    }
+
+    #[test]
+    fn a_held_marker_prefix_is_refused_when_the_stream_stops() {
+        let tags = Tags {
+            stuttered_marker: Some("｜DSML｜"),
+            ..Tags::DSML_V4
+        };
+        let events = stopped(
+            tags,
+            &["f\">\n<｜DSML｜parameter name=\"a\" string=\"false\">7</｜DSML｜parameter>\n｜DSM"],
+            false,
+        );
+        assert_eq!(
+            (arguments(&events), shown(&events)),
+            (r#"{"a": 7"#.to_string(), String::new())
+        );
+        assert_eq!(refused(&events), ["｜DSM"]);
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::TextBetweenTags)]
+        );
     }
 
     /// An object-typed value nested past the bound the crate's JSON reader puts on a call's

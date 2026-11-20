@@ -10,14 +10,11 @@
 //! its object is dropped. A leader and a standby run the same path over the
 //! same rows.
 //!
-//! The holder is the registry's one writer. No job step writes it: under a
-//! host that keeps a store a registration ends at the membership door, and
-//! the row's change builds the object here.
-//!
 //! # The one table
 //!
-//! [`object()`] makes the object from a row. Each fact of the row lands in
-//! one field of the object, or is not carried:
+//! [`object()`] reads the table from row to object and [`facts()`] reads it
+//! back. Each fact of the row lands in one field of the object, or is not
+//! carried:
 //!
 //! | The row's fact | The object's field |
 //! |---|---|
@@ -33,26 +30,97 @@
 //! | `kv_block_size` | `kv_block_size` |
 //! | `bootstrap_port` | `bootstrap_port` |
 //! | `health` | the health checks: the two thresholds, the interval and the timeout in whole seconds, the checks off where the policy's probes are |
-//! | `signals`, `reachable_from` | not carried: the object has no field for them, and a collector reads them of the row by the id the holder keeps |
-//! | `zone`, `pairing`, `encode`, `vision`, `max_running`, `priority`, `overload` | not carried: a decision's facts, read of the store's rows and never of an object |
+//! | `drain_settle_secs` | the checks' drain window, where the row states one; else the object's default |
+//! | `signals`, `reachable_from` | not carried: the object has no field for them, and a collector reads them of the row by the id the holder keeps. A host that is no gateway has the object of a row one gateway alone reaches built with its checks off ([`Objects::with_host_local_unchecked`]) |
+//! | `zone`, `pairing`, `encode`, `vision`, `max_running`, `priority`, `demand_facts` | not carried: a decision's facts, read of the store's rows and never of an object |
+//! | `overload` | not carried to the object: a decision's fact, read of the store's rows. [`facts()`] states the thresholds of the object's own registration over the standing row's |
 //!
-//! Of the row's own columns, the status is the object's first status and is
-//! not followed after: the store's status is the truth, and what drives it
-//! writes the store. An object built in the place of a standing one takes
-//! that one's running state, its status with it, and not its row's status.
+//! A new object starts at its row's status. A replacement takes the
+//! standing object's running state, including its status. A host that gets
+//! health from the rows can use [`Objects::with_status_followed`] to copy
+//! their status on tail changes and snapshots, for objects kept or laid
+//! again. The holder checks the row's revision under the object's
+//! mutation lock and hands the registry the status, as the health
+//! adapter does: the registry's subscribers hear the change, and a
+//! promotion comes back as any promotion does. The host's vetoes stand.
 //! The id and the revision stand beside the object in the
 //! holder ([`Standing`]). No credential and no connector is a row's fact. A
-//! host hands the holder its connector ([`Objects::with_connector`]); a
-//! credential has no door yet.
+//! host hands the holder its connector ([`Objects::with_connector`]). It
+//! keeps its workers' credentials in [`Credentials`] and hands the keeper
+//! to the holder ([`Objects::with_credentials`]). A credential is bound to
+//! the rows its registrations wrote: a row no registration of this host
+//! stated takes none. Where a registration's answer says so, the host has
+//! the holder lay the address's objects again ([`Objects::lay_again`]).
+//!
+//! # The adapters
+//!
+//! [`HealthAdapter`] writes probe outcomes and connect signals to the store
+//! and sets the object's status to the status that stands there. The host
+//! supplies the [`Lead`] and the term the adapter writes under. Its
+//! projection ([`HealthAdapter::project`]) writes what the object knows of
+//! its worker onto the row: the object's liveness veto is the row's stalled
+//! bit, for every gateway. The host calls it at each change of that veto,
+//! and for an object it lays over another.
+//!
+//! [`LoadAdapter`] writes load records and poll answers to the store. The
+//! store decides when the collector polls and keeps the overload verdict.
+//!
+//! [`KvAdapter`] decodes the worker's KV events for the store's index, and
+//! [`KvHost`] gives each subscription its row in the store. Every replica
+//! runs the adapter over its own streams. The adapter keeps what a row's
+//! stream showed of its cache groups, as the gateway's index does. A row
+//! above rank 0 of a data-parallel worker gets no feed yet ([`NoFeed`]).
+//! The module `kv` names the decode's limits.
+//!
+//! # The door
+//!
+//! The host hands out a [`Membership`] door. A host without election uses
+//! [`StoreDoor`]. A replica that may lead uses the controller's door.
+//!
+//! [`registration_at_door`] writes the created workers' rows.
+//! [`removal_at_door`] marks the selected rows draining, waits for the
+//! workers to settle and removes their rows. The steps write the store
+//! through the door. [`Objects`] remains the registry's one writer.
 //!
 //! # What the module does not hold
 //!
-//! It builds no registry, no engine and no task. The host builds the
-//! registry and hands it in, and calls [`Objects::follow`] where the store
-//! moved. It names nothing of the controller.
+//! It builds no registry and no engine. The host builds the registry and
+//! hands it in, and calls [`Objects::follow`] where the store moved.
+//! [`KvFeed::run`], its follow of the cache events, is a future the host
+//! drives. The collector under it starts a task for each worker it streams
+//! and ends them at the stop. It names nothing of the controller.
 
+mod credentials;
+mod door;
+mod found;
+mod health;
+mod kv;
+mod kv_feed;
+mod lead;
+mod loads;
 mod object;
 mod objects;
+pub mod steps;
 
+pub use credentials::{Credentials, KeptCredential, RegistrationInFlight};
+#[cfg(all(test, feature = "controller"))]
+pub(crate) use door::tests::{
+    check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
+    check_provider,
+};
+#[cfg(feature = "controller")]
+pub(crate) use door::{drain, lay, take, Turn};
+pub use door::{Expect, Membership, Refused, Remover, StoreDoor, Wrote};
+pub use found::facts;
+pub use health::HealthAdapter;
+pub use kv::{KvAdapter, KvHost, NoFeed, Unfed};
+pub use kv_feed::KvFeed;
+pub use lead::{Lead, SoleLead};
+pub use loads::LoadAdapter;
 pub use object::object;
 pub use objects::{Members, Objects, Standing};
+pub use steps::{
+    maker_of, registration_at_door, removal_at_door, remover_of, DrainWorkersAtDoor,
+    RemoveWorkersAtDoor, Unasked, WriteWorkersAtDoor, DISCOVERY, DRAIN_WORKERS_AT_DOOR_STEP,
+    REMOVE_WORKERS_AT_DOOR_STEP, WRITE_WORKERS_AT_DOOR_STEP,
+};

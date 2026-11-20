@@ -3,11 +3,16 @@
 //! binary calls [`run`] with the stock catalog, a host's own binary with
 //! the stages it added. The command line is the operator's surface: the
 //! controller's identity, its listeners, their TLS, the election, the
-//! shutdown bounds and the logging; the routing policy itself is the spec's
-//! and arrives over the control scope.
+//! shutdown bounds, logging and worker discovery. The routing policy
+//! arrives over the control scope.
 
 use std::{
-    ffi::OsStr, future::pending, io::IsTerminal, net::SocketAddr, path::PathBuf, process::ExitCode,
+    ffi::{OsStr, OsString},
+    future::pending,
+    io::IsTerminal,
+    net::SocketAddr,
+    path::PathBuf,
+    process::ExitCode,
     time::Duration,
 };
 
@@ -18,6 +23,8 @@ use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+#[cfg(feature = "discovery")]
+use super::discovery::DiscoveryFlags;
 use super::{
     Config, ConfigError, Controller, Election, Error, LeasePlace, Listener, Scope, Tls, VERSION,
 };
@@ -257,6 +264,10 @@ struct Cli {
     /// Output logs as JSON
     #[arg(long, default_value_t = false, help_heading = "Logging")]
     log_json: bool,
+
+    #[cfg(feature = "discovery")]
+    #[command(flatten)]
+    discovery: DiscoveryFlags,
 }
 
 /// A duration in whole milliseconds, as the election's flags take it.
@@ -289,6 +300,19 @@ impl Cli {
     /// listener, one client authority per scope, one credential rule per
     /// listener.
     fn config(&self) -> Result<Config, ConfigError> {
+        self.config_with(|name| std::env::var_os(name))
+    }
+
+    /// [`Cli::config`] over `env`, the read of one environment variable.
+    /// The worker key of a selected discovery provider alone is read so.
+    #[cfg_attr(
+        not(feature = "discovery"),
+        expect(
+            unused_variables,
+            reason = "only the discovery flags read the environment"
+        )
+    )]
+    fn config_with(&self, env: impl Fn(&str) -> Option<OsString>) -> Result<Config, ConfigError> {
         let identity = match (&self.tls_cert, &self.tls_key) {
             (Some(cert), Some(key)) => Some((cert, key)),
             (None, None) => None,
@@ -396,6 +420,10 @@ impl Cli {
                 },
                 advertise: self.advertise_address.clone(),
             },
+            #[cfg(feature = "discovery")]
+            discovery: self.discovery.configured(env)?,
+            #[cfg(not(feature = "discovery"))]
+            discovery: None,
         })
     }
 }
@@ -690,8 +718,138 @@ mod tests {
         Cli::try_parse_from(argv).is_err()
     }
 
+    /// The configuration of `args` under an empty environment: a case
+    /// reads nothing of the process's own.
     fn config(args: &[&str]) -> Result<Config, ConfigError> {
-        parse(args).config()
+        parse(args).config_with(|_| None)
+    }
+
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn the_discovery_flags_reach_the_configuration() {
+        use smg_service_discovery::RuntimeDiscoveryConfig;
+
+        let args = [
+            "--discovery-provider",
+            "file",
+            "--discovery-file",
+            "/run/workers.json",
+            "--discovery-check-interval-secs",
+            "13",
+            "--api-key",
+            "worker-key",
+        ];
+        let configured = config(&args).expect("discovery configuration");
+        let settings = configured.discovery.as_ref().expect("selected provider");
+        let RuntimeDiscoveryConfig::File(file) = settings.runtime() else {
+            panic!("expected the file provider");
+        };
+        assert_eq!(file.path, Path::new("/run/workers.json"));
+        assert_eq!(file.check_interval, Duration::from_secs(13));
+        assert!(settings.credential().is_some());
+        assert_eq!(configured, config(&args).expect("the same settings"));
+        assert_ne!(configured, config(&args[..6]).expect("without a key"));
+        let mut other_file = args;
+        other_file[3] = "/run/other.json";
+        assert_ne!(configured, config(&other_file).expect("another manifest"));
+        let disaggregated = [&args[..], &["--prefill-selector", "role=prefill"]].concat();
+        assert_ne!(
+            configured,
+            config(&disaggregated).expect("another set of roles")
+        );
+        assert!(config(&[]).expect("the defaults").discovery.is_none());
+        assert!(matches!(
+            config(&["--discovery-provider", "file"]),
+            Err(ConfigError::DiscoveryFlag {
+                flag: "--discovery-file",
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn the_worker_key_is_read_only_for_a_selected_provider() {
+        use std::ffi::OsString;
+
+        let file = [
+            "--discovery-provider",
+            "file",
+            "--discovery-file",
+            "/run/workers.json",
+        ];
+        let key = |name: &str| (name == "SMG_API_KEY").then(|| OsString::from("worker-key"));
+        let keyed = parse(&file).config_with(key).expect("a key to send");
+        assert!(keyed
+            .discovery
+            .as_ref()
+            .is_some_and(|settings| settings.credential().is_some()));
+        assert_ne!(keyed, config(&file).expect("no key to send"));
+
+        // A key file that is not there fails every read of the key.
+        let missing =
+            |name: &str| (name == "SMG_API_KEY_FILE").then(|| OsString::from("/missing/key"));
+        assert!(matches!(
+            parse(&file).config_with(missing),
+            Err(ConfigError::DiscoveryFlag {
+                flag: "--api-key-file",
+                ..
+            })
+        ));
+        let unread = parse(&[]).config_with(missing).expect("no key is read");
+        assert!(unread.discovery.is_none());
+
+        for flag in [
+            ["--api-key", "worker-key"],
+            ["--api-key-file", "/missing/key"],
+        ] {
+            assert!(
+                matches!(
+                    config(&flag),
+                    Err(ConfigError::DiscoveryFlag { flag: refused, .. }) if refused == flag[0]
+                ),
+                "{flag:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn a_slurm_job_name_under_two_roles_is_refused_at_the_start() {
+        let shared = [
+            "--discovery-provider",
+            "slurm",
+            "--slurm-prefill-job-name",
+            "shared",
+            "--slurm-decode-job-name",
+            "shared",
+            "--slurm-port",
+            "8000",
+        ];
+        let Err(ConfigError::DiscoveryFlag { flag, reason }) = config(&shared) else {
+            panic!("one job name under two roles was taken");
+        };
+        assert_eq!(flag, "--discovery-provider");
+        assert!(
+            reason.contains("'shared' maps to both prefill and decode workers"),
+            "{reason}"
+        );
+        let apart = [&shared[..5], &["other", "--slurm-port", "8000"]].concat();
+        assert!(config(&apart).expect("two names").discovery.is_some());
+    }
+
+    #[cfg(not(feature = "discovery"))]
+    #[test]
+    fn a_build_without_discovery_refuses_its_flags() {
+        for flags in [
+            &["--service-discovery"][..],
+            &["--discovery-provider", "file"],
+            &["--discovery-file", "workers.json"],
+            &["--api-key", "worker-key"],
+            &["--api-key-file", "worker-key.txt"],
+        ] {
+            assert!(refuses(flags), "{flags:?}");
+        }
     }
 
     const IDENTITY: [&str; 4] = ["--tls-cert", "server.pem", "--tls-key", "server.key"];

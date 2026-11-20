@@ -1,0 +1,158 @@
+//! The operator calls over the same store a host uses in process.
+
+use std::{error::Error, sync::Arc, time::Instant};
+
+use smg_policy_controller::{
+    operator::{
+        snapshot::{told, Asked, Rows},
+        Applied, Format, SpecDoor, SpecRejected, Unanswered, MAX_DOCUMENT_BYTES,
+    },
+    store::{MemoryStore, StaleGeneration, WorkerFacts, WorkersStore},
+    Catalog,
+};
+
+const START: &[u8] = br#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"pick":"random"}}}"#;
+
+#[test]
+fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
+    let store = Arc::new(MemoryStore::new());
+    let door = SpecDoor::new(Arc::clone(&store), Arc::new(Catalog::builtin()), Vec::new());
+    let changed = br#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"score":["least-load"],"pick":"best"}}}"#;
+    assert_eq!(door.status(), None);
+
+    let dry = door.dry_run("", START, Format::Json).expect("no guard");
+    let (generation, digest) = dry.would_run.expect("the start would run");
+    assert_eq!((dry.standing, generation), ((0, None), 1));
+    assert_eq!(door.standing(), (0, None));
+    assert_eq!(
+        door.apply(START.to_vec(), Format::Json),
+        Ok(Applied::Generation(1))
+    );
+
+    let status = door.status().expect("the start's status");
+    assert_eq!((status.generation, status.digest), (1, Some(digest)));
+    assert!(status.applied.is_some());
+    assert!(status.retained.is_empty() && !status.writable);
+    let held = door.document(0).expect("the start's document");
+    assert_eq!(held.document, START);
+    assert_eq!(held.format, Format::Json);
+    assert_eq!(Some(held.applied), status.applied);
+
+    let dry = door.dry_run("", changed, Format::Json).expect("no guard");
+    assert_eq!(dry.would_run.expect("the changed document would run").0, 2);
+    let refused = door
+        .enforce("", changed.to_vec(), Format::Json)
+        .expect("no guard");
+    assert_eq!(
+        refused.ran,
+        Err(SpecRejected::Unpersisted(
+            "no spec store is bound".to_owned()
+        ))
+    );
+    // A roll back is a write too: with no spec store bound it is refused in
+    // an enforce's words, and each refusal is counted.
+    assert!(!door.writable());
+    let rolled = door.roll_back(1).expect("a refusal of the write");
+    assert_eq!(rolled.standing, (1, Some(digest)));
+    assert_eq!(rolled.ran, refused.ran);
+    assert_eq!(door.document(0), Ok(held));
+    assert_eq!((door.counts().applied, door.counts().rejected), (1, 2));
+
+    for (key, model) in [
+        ("grpc://b:8000", "served"),
+        ("grpc://a:8000", "other"),
+        ("grpc://operator:secret@c:8000", "served"),
+    ] {
+        store.upsert(WorkerFacts {
+            key: key.to_owned(),
+            engine: key.to_owned(),
+            incarnation: 1,
+            models: vec![model.to_owned()],
+            dp_size: 1,
+            ..WorkerFacts::default()
+        });
+    }
+    let asked = Asked {
+        models: vec!["served".to_owned()],
+        limit: 1,
+    };
+    let (rows, serving) = store.rows_serving(&asked.models, asked.limit);
+    let page = told(&asked, Rows::Told(rows, serving), Instant::now());
+    let [row] = page.rows.as_slice() else {
+        panic!("one row fits the limit");
+    };
+    assert_eq!(row.facts.key, "grpc://b:8000");
+    assert!(page.truncated);
+
+    let asked = Asked { limit: 2, ..asked };
+    let page = told(
+        &asked,
+        Rows::Shared(Arc::new(
+            store.cut(smg_policy_controller::store::Kinds::Watched),
+        )),
+        Instant::now(),
+    );
+    assert!(!page.truncated);
+    let last = page.rows.last().expect("the second matching row");
+    assert_eq!(last.facts.key, "grpc://c:8000");
+    assert_eq!(last.facts.engine, "grpc://c:8000");
+}
+
+/// A refusal is an error a host can box and print, and a missing document
+/// says what was asked, what is held and what stands.
+#[test]
+fn a_host_reads_a_refusal_as_an_error() {
+    let store = Arc::new(MemoryStore::new());
+    let door = SpecDoor::new(store, Arc::new(Catalog::builtin()), Vec::new());
+    let guarded: Box<dyn Error> = Box::new(
+        door.dry_run("another digest", START, Format::Json)
+            .expect_err("no digest stands"),
+    );
+    assert_eq!(guarded.to_string(), "expected_digest: no generation stands");
+
+    door.apply(START.to_vec(), Format::Json)
+        .expect("the start runs");
+    let missing = door.document(2).expect_err("generation 1 alone is held");
+    assert_eq!(
+        (
+            missing.asked,
+            missing.held,
+            missing.standing,
+            missing.on_file
+        ),
+        (2, Some(1), 1, None)
+    );
+    let words = missing.to_string();
+    assert!(
+        words.starts_with("no document is held for generation 2: "),
+        "{words}"
+    );
+    let unanswered: Box<dyn Error> = Box::new(Unanswered::NotHeld(missing));
+    assert_eq!(unanswered.to_string(), words);
+}
+
+/// A host's refused apply counts once: by the form's reader, by the bound
+/// a host reads, and by the host's own publication.
+#[test]
+fn a_host_counts_each_document_it_cannot_apply() {
+    let store = Arc::new(MemoryStore::new());
+    let door = SpecDoor::new(store, Arc::new(Catalog::builtin()), Vec::new());
+    let json = Format::named("json").expect("a form's name");
+    let unread = door.apply(b"[".to_vec(), json);
+    assert!(
+        matches!(unread, Err(SpecRejected::Unparsed { .. })),
+        "{unread:?}"
+    );
+    let long = vec![b' '; MAX_DOCUMENT_BYTES as usize + 1];
+    assert_eq!(
+        door.apply(long, Format::Yaml),
+        Err(SpecRejected::TooLarge(MAX_DOCUMENT_BYTES + 1))
+    );
+    let stale = StaleGeneration {
+        offered: 1,
+        standing: 1,
+    };
+    let unpublished = door.apply_where(START.to_vec(), json, |_| None, |_, _| Err(stale));
+    assert_eq!(unpublished, Err(SpecRejected::Stale(stale)));
+    assert_eq!((door.counts().applied, door.counts().rejected), (0, 3));
+}
