@@ -306,7 +306,9 @@ impl HasRoomRule {
     /// [`Filter::keep`] of one row, by the report `load` hands.
     fn keep_with(&self, facts: &RequestFacts<'_>, row: &Candidate, load: Option<&LoadRow>) -> bool {
         // One row's word reads the count as it stands, behind the rule's
-        // flag: the two numbers come back in registers.
+        // flag, so the two numbers come back in registers. Mapped straight
+        // into the `Option`, this closure hands the pair back through
+        // memory: 12 instructions more for each row drawn.
         let sent = || {
             self.sent
                 .as_ref()

@@ -5583,7 +5583,8 @@ impl Engine {
         }
     }
 
-    /// Out of line: an engine with no tally keeps its caller short.
+    /// Out of line: a document of several counts is rare. One count is
+    /// told in line ([`Self::dispatched_sent`]).
     #[inline(never)]
     fn credit_dispatch(
         &self,
