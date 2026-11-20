@@ -1338,7 +1338,12 @@ impl LeastLoad {
 
     /// The mean rate of the kept rows that report one, which a report
     /// without a rate drains at: the default where none reports one.
-    #[cold]
+    ///
+    /// A scan first asks whether any row states a rate, and only then
+    /// does the sum run: a fleet whose reports state none asks this at
+    /// every decision, and its walk keeps no sum. Out of line and not
+    /// cold: the pass that never asks it holds none of it, and the pass
+    /// that asks it at every decision gets it built for speed.
     #[inline(never)]
     fn mean_rate(
         &self,
@@ -1346,12 +1351,16 @@ impl LeastLoad {
         kept: &[u32],
         load: impl Fn(&Candidate) -> Option<&LoadRow>,
     ) -> f32 {
+        let rate_of = |i: u32| load(&candidates[i as usize]).map_or(0, |r| r.live_rate);
+        if !kept.iter().any(|&i| rate_of(i) > 0) {
+            return self.default_throughput;
+        }
         let (sum, n) = kept
             .iter()
-            .filter_map(|&i| load(&candidates[i as usize]))
-            .filter(|r| r.live_rate > 0)
-            .fold((0.0f32, 0u32), |(s, n), r| (s + r.live_rate as f32, n + 1));
-        if n > 0 && sum.is_finite() {
+            .map(|&i| rate_of(i))
+            .filter(|&rate| rate > 0)
+            .fold((0.0f32, 0u32), |(s, n), rate| (s + rate as f32, n + 1));
+        if sum.is_finite() {
             sum / n as f32
         } else {
             self.default_throughput
@@ -4982,6 +4991,57 @@ mod tests {
         let mut scores = [0.0f32; 3];
         ll.score(&RequestFacts::default(), &pool, &kept(3), &mut scores);
         assert!(scores[0] > scores[1] && scores[1] > scores[2], "{scores:?}");
+    }
+
+    /// A row whose report states no rate drains at the mean rate of the
+    /// rows that state one, wherever it stands among them: here it is the
+    /// first kept row. Its peers state 8,000 and 1,000 tokens a second, so
+    /// its four running requests wait 4 x 1,024 / 4,500 = 0.91 s, ahead of
+    /// the peer whose one request waits 1.02 s. At the default of 2,000
+    /// they would wait 2.05 s, behind it.
+    #[test]
+    fn a_first_row_without_a_rate_drains_at_the_mean_of_the_rows_behind_it() {
+        let ll = LeastLoad::new(0.15, 1024, 2000.0);
+        let mut pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
+        pool[0].load = Some(LoadRow {
+            live_rate: 0,
+            ..report(4, 0)
+        });
+        pool[1].load = Some(LoadRow {
+            live_rate: 8_000,
+            ..report(0, 0)
+        });
+        pool[2].load = Some(LoadRow {
+            live_rate: 1_000,
+            ..report(1, 0)
+        });
+        let mut scores = [0.0f32; 3];
+        ll.score(&RequestFacts::default(), &pool, &kept(3), &mut scores);
+        assert!(scores[1] > scores[0] && scores[0] > scores[2], "{scores:?}");
+        assert_eq!(ll.mean_rate(&pool, &kept(3), |c| c.load.as_ref()), 4_500.0);
+    }
+
+    /// Reports that state no rate at all drain at the default rate, a
+    /// number: the rows rank by their work.
+    #[test]
+    fn a_fleet_whose_reports_state_no_rate_ranks_by_its_work() {
+        let ll = LeastLoad::new(0.15, 1024, 2000.0);
+        let mut pool = [candidate(0, 0), candidate(1, 0)];
+        pool[0].load = Some(LoadRow {
+            live_rate: 0,
+            ..report(2, 0)
+        });
+        pool[1].load = Some(LoadRow {
+            live_rate: 0,
+            ..report(1, 0)
+        });
+        let mut scores = [0.0f32; 2];
+        ll.score(&RequestFacts::default(), &pool, &kept(2), &mut scores);
+        assert_eq!(scores, [0.0, 1.0]);
+        assert_eq!(
+            ll.mean_rate(&pool, &kept(2), |c| c.load.as_ref()),
+            ll.default_throughput
+        );
     }
 
     #[test]
