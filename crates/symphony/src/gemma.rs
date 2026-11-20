@@ -45,7 +45,7 @@
 //! [`formats::gemma4`]: crate::formats::gemma4()
 
 use crate::{
-    event::{release_between, runs, DropReason, Event, Events, MalformedReason, Text},
+    event::{release_between, runs, CallEnd, DropReason, Event, Events, MalformedReason, Text},
     json::PartialJson,
     tagged::{
         assembler::{push_escaped, push_quoted},
@@ -234,6 +234,7 @@ impl Assembler {
             out.push(Event::ToolCallEnd {
                 index: self.index,
                 source: Text::uncounted(terminal.to_owned()),
+                ended: CallEnd::Closed,
             });
         } else if !terminal.is_empty() {
             out.push(Event::Malformed {
@@ -278,6 +279,7 @@ impl Assembler {
                 out.push(Event::ToolCallEnd {
                     index: self.index,
                     source: Text::default(),
+                    ended: CallEnd::Closed,
                 });
             }
             self.done = true;
