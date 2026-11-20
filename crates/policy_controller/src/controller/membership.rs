@@ -678,8 +678,8 @@ pub(crate) mod tests {
         store::{GatewayId, Reachability, WorkerFacts, WorkerRow},
         view::{Role, WireModes},
         worker_host::{
-            check_expectations, check_guard, check_health_scope, check_maker, check_provider,
-            Expect, Membership, Refused, Remover, Standing, StoreDoor, Wrote,
+            check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
+            check_provider, Expect, Membership, Refused, Remover, Standing, StoreDoor, Wrote,
         },
     };
 
@@ -1629,6 +1629,12 @@ pub(crate) mod tests {
     #[test]
     fn a_registration_is_laid_over_what_it_expects() {
         check_expectations(hosted_door);
+    }
+
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_found_row_states_its_event_signal() {
+        check_event_signal(hosted_door);
     }
 
     #[cfg(feature = "worker-host")]

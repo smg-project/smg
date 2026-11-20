@@ -5,7 +5,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use smg_worker::settings::UnhealthyRemovalScope;
 
-use super::Standing;
+use super::{kv_feed::asks_events, Standing};
 use crate::{
     store::{
         membership::{self, NotMaker, Past},
@@ -91,7 +91,8 @@ pub trait Membership: Send + Sync + 'static {
     /// stand there. The callback states facts for `url` during the door's
     /// turn and must leave writes to the door. Facts whose key is not `url`
     /// are refused: the maker was asked of the row under `url`, and the
-    /// store writes by the facts' key.
+    /// store writes by the facts' key. The door states the row's event
+    /// signal itself, by the generation in force, whatever the facts state.
     fn found(
         &self,
         maker: &Maker,
@@ -135,7 +136,8 @@ fn seen_row(store: &MemoryStore, url: &str, seen: Standing) -> Result<WorkerRow,
 }
 
 /// Lay a registration over what it expects to stand while the door holds
-/// its turn.
+/// its turn. The row's event signal is stated here, over the facts the
+/// callback states ([`asks_events`]).
 pub(crate) fn lay(
     turn: &impl Turn,
     maker: &Maker,
@@ -170,6 +172,9 @@ pub(crate) fn lay(
             why: "the facts name the URL of the call",
         }));
     }
+    // The host states the row's stream in the write that makes the row: the
+    // follow is told of a worker once, and reads the row then.
+    facts.signals.events = store.deciding(|world| asks_events(&facts, world.spec().engine()));
     if let Some(row) = &standing {
         facts.incarnation = row.facts.incarnation;
     }
@@ -378,8 +383,9 @@ pub(super) mod tests {
         },
         spec::{AppliedSpec, PolicySpec},
         store::{
+            index::indexed_under,
             membership::{self, Past},
-            Maker, MemoryStore, WorkerFacts, WorkerRow, WorkerStatus, WorkersStore,
+            Maker, MemoryStore, Signals, WorkerFacts, WorkerRow, WorkerStatus, WorkersStore,
         },
         view::{Role, WireModes, WorkerId},
     };
@@ -423,6 +429,88 @@ pub(super) mod tests {
     #[test]
     fn a_registration_is_laid_over_what_it_expects() {
         check_expectations(local_door);
+    }
+
+    #[test]
+    fn a_found_row_states_its_event_signal() {
+        check_event_signal(local_door);
+    }
+
+    /// A generation whose prefill profile of `pd/*` reads the index, and no
+    /// other profile of it.
+    fn prefill_reads_the_index() -> crate::AppliedSpec {
+        let text = r#"{
+          "apiVersion": "smg.policy/v1",
+          "profiles": {
+            "default": { "filter": ["healthy"], "pick": "round-robin" },
+            "prefill": { "filter": ["healthy"], "score": ["prefix-affinity"], "pick": "best" },
+            "decode": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" }
+          },
+          "bindings": [
+            { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "decode" } },
+            { "match": { "model": "*" }, "profile": "default" }
+          ]
+        }"#;
+        let mut spec: crate::PolicySpec =
+            serde_json::from_str(text).expect("a well-formed document");
+        spec.generation = 1;
+        crate::AppliedSpec::validate(&spec).expect("the document validates")
+    }
+
+    /// The door states a found row's event signal itself, whatever the
+    /// facts state: what the generation in force reads for the row's first
+    /// model in the phase of its role, and only for a gRPC worker. A write
+    /// under a later generation states it again.
+    pub(crate) fn check_event_signal(open: impl Fn() -> (Arc<MemoryStore>, Box<dyn Membership>)) {
+        const PAIRED: &str = "pd/x";
+        // The row's model, role and wire, what its facts state, and what the
+        // door states.
+        let rows = [
+            (PAIRED, Role::Prefill, WireModes::GRPC, false, true),
+            (PAIRED, Role::Decode, WireModes::GRPC, true, false),
+            (PAIRED, Role::Single, WireModes::GRPC, true, false),
+            (PAIRED, Role::Prefill, WireModes::HTTP, true, false),
+            ("other", Role::Prefill, WireModes::GRPC, true, false),
+        ];
+        for (model, role, wire_modes, events, asked) in rows {
+            let (store, door) = open();
+            store
+                .apply(prefill_reads_the_index())
+                .expect("the first generation");
+            let found = WorkerFacts {
+                models: vec![model.to_owned()],
+                role,
+                wire_modes,
+                signals: Signals {
+                    events,
+                    ..Signals::default()
+                },
+                ..stated()
+            };
+            door.found(&Maker::Control, Expect::Nothing, URL, &|_| found.clone())
+                .expect("registered");
+            let row = store.by_key(URL).expect("the found row");
+            assert_eq!(
+                row.facts.signals.events, asked,
+                "{model} {role:?} {wire_modes:?}"
+            );
+            assert_eq!(indexed_under(&row).is_some(), asked);
+
+            // Every profile of the cache-aware preset reads the index.
+            let mut later = crate::PolicySpec::preset("cache_aware").expect("the preset");
+            later.generation = 2;
+            store
+                .apply(crate::AppliedSpec::validate(&later).expect("the preset validates"))
+                .expect("the second generation");
+            door.found(&Maker::Control, Expect::Anything, URL, &|_| found.clone())
+                .expect("laid again");
+            let row = store.by_key(URL).expect("the row laid again");
+            assert_eq!(
+                row.facts.signals.events,
+                wire_modes == WireModes::GRPC,
+                "{model} {role:?} {wire_modes:?} under the later generation"
+            );
+        }
     }
 
     /// An add registers an absent URL, and a standing row refuses it before

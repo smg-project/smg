@@ -99,7 +99,8 @@ pub mod steps;
 
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use door::tests::{
-    check_expectations, check_guard, check_health_scope, check_maker, check_provider,
+    check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
+    check_provider,
 };
 #[cfg(feature = "controller")]
 pub(crate) use door::{drain, lay, take, Turn};
