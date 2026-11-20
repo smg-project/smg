@@ -584,15 +584,35 @@ mod tests {
     /// A rank is read out of an address by its spec's own fields alone. An
     /// address that ends in an `@` and digits beside no base, or beside a
     /// base it is not built from, is a userinfo before a host: it is
-    /// rendered as a marker, never raw.
+    /// rendered with the userinfo masked, never raw.
     #[test]
     fn the_rendered_url_reads_no_rank_out_of_an_address_its_spec_does_not_rank() {
         let alone = BasicWorkerBuilder::new("http://pebble@2130706433").build();
-        assert!(!alone.redacted_url().contains("pebble"));
+        assert_eq!(alone.redacted_url(), "http://***@2130706433");
         let mut spec = WorkerSpec::new("http://pebble@2130706433");
         spec.dp_base_url = Some("http://other:8000".to_string());
         let beside = BasicWorkerBuilder::from_spec(spec).build();
-        assert!(!beside.redacted_url().contains("pebble"));
+        assert_eq!(beside.redacted_url(), "http://***@2130706433");
+    }
+
+    /// An IPC address holds no userinfo: an `@` and digits at its end are
+    /// bytes of its path. A socket its spec does not rank renders as it
+    /// stands, so two such sockets render apart.
+    #[test]
+    fn the_rendered_url_keeps_a_socket_path_that_ends_like_a_rank() {
+        for url in ["ipc:///tmp/w", "ipc:///tmp/w@0", "ipc:///tmp/w@00"] {
+            let alone = BasicWorkerBuilder::new(url).build();
+            assert_eq!(alone.redacted_url(), url);
+            let mut spec = WorkerSpec::new(url);
+            spec.dp_base_url = Some("ipc:///tmp/g".to_string());
+            let beside = BasicWorkerBuilder::from_spec(spec).build();
+            assert_eq!(beside.redacted_url(), url);
+        }
+        // A socket's rank still renders with its base.
+        let mut spec = WorkerSpec::new("ipc:///tmp/g@1");
+        spec.dp_base_url = Some("ipc:///tmp/g".to_string());
+        let ranked = BasicWorkerBuilder::from_spec(spec).build();
+        assert_eq!(ranked.redacted_url(), "ipc:///tmp/g@1");
     }
 
     #[test]

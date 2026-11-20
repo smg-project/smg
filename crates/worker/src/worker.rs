@@ -764,16 +764,6 @@ impl GrammarStart {
 
 const REDACTED_API_KEY: &str = "<redacted>";
 
-/// An address that carries no rank, in its redacted form. One the parser
-/// refuses, as it refuses an `@` and digits at the end, is written as a
-/// marker and never raw.
-fn redacted_unranked(address: &str) -> String {
-    Endpoint::parse(address).map_or_else(
-        |_| "<unparsable address>".to_string(),
-        |address| address.redacted(),
-    )
-}
-
 /// Core worker identity and configuration.
 ///
 /// The single canonical representation of "what is a worker". Used as the
@@ -968,11 +958,11 @@ impl std::fmt::Debug for WorkerSpec {
         // a credential. A rank is read out of the address alone that is
         // its base, an `@` and digits: in any other, an `@` and digits at
         // the end are a userinfo and a host, and read as a rank they would
-        // print the userinfo.
+        // print the userinfo. In an IPC address they are bytes of its path.
         let url = if self.url_is_ranked() {
             Endpoint::redacted_str(url)
         } else {
-            redacted_unranked(url)
+            Endpoint::redacted_str_unranked(url)
         };
         f.debug_struct("WorkerSpec")
             .field("url", &url)
@@ -989,7 +979,7 @@ impl std::fmt::Debug for WorkerSpec {
             .field("bootstrap_host", bootstrap_host)
             .field(
                 "dp_base_url",
-                &dp_base_url.as_deref().map(redacted_unranked),
+                &dp_base_url.as_deref().map(Endpoint::redacted_str_unranked),
             )
             .field("dp_rank", dp_rank)
             .field("dp_size", dp_size)
@@ -1052,8 +1042,8 @@ impl WorkerSpec {
     /// Whether [`Self::url`] carries a rank: it is the spec's base
     /// ([`Self::dp_base_url`]), an `@` and digits, as a registration writes
     /// a rank's address beside its base. In any other address an `@` and
-    /// digits at the end are a userinfo and a host, and no rank is read
-    /// out of it.
+    /// digits at the end are a userinfo and a host, or bytes of an IPC
+    /// path, and no rank is read out of it.
     pub fn url_is_ranked(&self) -> bool {
         self.dp_base_url
             .as_deref()
@@ -1068,18 +1058,14 @@ impl WorkerSpec {
     /// string byte for byte where it holds no userinfo, query or fragment,
     /// and its redacted form otherwise ([`Endpoint::redacted_url`]). A
     /// rank is read out of the address by the spec's own fields alone
-    /// ([`Self::url_is_ranked`]). An address that ends in an `@` and
-    /// digits beside no such base is a userinfo before a host: it is
-    /// written as a marker, never raw.
+    /// ([`Self::url_is_ranked`]). In any other address nothing is split
+    /// off the end: an `@` and digits there are a userinfo before a host,
+    /// which is masked, or bytes of an IPC path, which is written whole.
     pub fn redacted_url(&self) -> String {
         if self.url_is_ranked() {
-            return Endpoint::redacted_url(&self.url);
-        }
-        match Endpoint::parse(&self.url) {
-            Ok(address) if !address.has_credentials() && !self.url.contains(['?', '#']) => {
-                self.url.clone()
-            }
-            _ => redacted_unranked(&self.url),
+            Endpoint::redacted_url(&self.url)
+        } else {
+            Endpoint::redacted_url_unranked(&self.url)
         }
     }
 }
@@ -2762,11 +2748,15 @@ mod debug_tests {
             assert!(text.contains(r#""http://***@worker:8000""#), "{text}");
         }
 
-        // A base that itself ends in an `@` and digits reads as no rank.
+        // The address built from a base that itself ends in an `@` and
+        // digits keeps its rank. The base alone reads as none: its `@`
+        // parts a userinfo from a host of digits.
         spec.url = "http://cedar@8001@1".to_string();
         spec.dp_base_url = Some("http://cedar@8001".to_string());
         for text in [format!("{spec:?}"), format!("{spec:#?}")] {
             assert!(!text.contains("cedar"), "{text}");
+            assert!(text.contains(r#"url: "http://***@8001@1""#), "{text}");
+            assert!(text.contains(r#""http://***@8001""#), "{text}");
         }
     }
 
@@ -2782,11 +2772,27 @@ mod debug_tests {
     }
 
     #[test]
+    fn a_spec_prints_a_socket_path_that_ends_like_a_rank_as_it_stands() {
+        // An IPC address holds no userinfo: the `@` and the digits at its
+        // end are bytes of its path, in an address and in a base.
+        let mut spec = WorkerSpec::new("ipc:///tmp/w@0");
+        spec.dp_base_url = Some("ipc:///tmp/g@00".to_string());
+        assert!(!spec.url_is_ranked());
+        assert_eq!(spec.redacted_url(), "ipc:///tmp/w@0");
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(text.contains(r#"url: "ipc:///tmp/w@0""#), "{text}");
+            assert!(text.contains(r#""ipc:///tmp/g@00""#), "{text}");
+            assert!(!text.contains("unparsable"), "{text}");
+        }
+    }
+
+    #[test]
     fn a_spec_ranks_the_address_that_is_its_base_and_digits_alone() {
         let mut spec = WorkerSpec::new("http://worker:8000@1");
-        // No base: no rank is read, and the address is no plain one.
+        // No base: no rank is read, and the `@` parts a userinfo from a
+        // host of digits.
         assert!(!spec.url_is_ranked());
-        assert_eq!(spec.redacted_url(), "<unparsable address>");
+        assert_eq!(spec.redacted_url(), "http://***@1");
         spec.dp_base_url = Some("http://worker:8000".to_string());
         assert!(spec.url_is_ranked());
         assert_eq!(spec.redacted_url(), "http://worker:8000@1");
@@ -2809,9 +2815,9 @@ mod debug_tests {
         // A plain address is the registered string, byte for byte.
         let plain = WorkerSpec::new("http://Worker:8080/");
         assert_eq!(plain.redacted_url(), "http://Worker:8080/");
-        // A userinfo before a host of digits is masked as a marker.
+        // A userinfo before a host of digits is masked.
         let token = WorkerSpec::new("http://pebble@2130706433");
-        assert!(!token.redacted_url().contains("pebble"));
+        assert_eq!(token.redacted_url(), "http://***@2130706433");
     }
 
     #[test]

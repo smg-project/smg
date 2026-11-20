@@ -196,8 +196,21 @@ impl Endpoint {
     /// stays put — it is split off as userinfo further down, not treated as a
     /// rank marker.
     pub fn parse_with_rank(input: &str) -> Result<(Self, Option<usize>), EndpointError> {
-        let trimmed = input.trim();
-        let (body, rank) = split_rank(trimmed);
+        let (body, rank) = split_rank(input.trim());
+        Ok((Self::parse_body(body)?, rank))
+    }
+
+    /// Parse an address that carries no rank: nothing is split off its end.
+    /// An `@` and digits there are a userinfo before a host of digits, or
+    /// bytes of an IPC path. A worker's spec says which of its addresses
+    /// carries a rank (`WorkerSpec::url_is_ranked`).
+    fn parse_unranked(input: &str) -> Result<Self, EndpointError> {
+        Self::parse_body(input.trim())
+    }
+
+    /// The address behind the rank's split: an IPC path whole, or an
+    /// authority and the path behind it.
+    fn parse_body(body: &str) -> Result<Self, EndpointError> {
         let (scheme, rest) = match Scheme::split_from(body) {
             Some((scheme, rest)) => (Some(scheme), rest),
             None => (None, body),
@@ -207,16 +220,13 @@ impl Endpoint {
         }
 
         if scheme.is_some_and(Scheme::is_ipc) {
-            return Ok((
-                Endpoint {
-                    scheme,
-                    userinfo: None,
-                    host: Host::IpcPath(rest.to_string()),
-                    port: None,
-                    path: None,
-                },
-                rank,
-            ));
+            return Ok(Endpoint {
+                scheme,
+                userinfo: None,
+                host: Host::IpcPath(rest.to_string()),
+                port: None,
+                path: None,
+            });
         }
 
         let (authority, path) = split_path(rest);
@@ -231,16 +241,13 @@ impl Endpoint {
             return Err(EndpointError::Empty);
         }
         let (host, port) = split_host_port(hostport)?;
-        Ok((
-            Endpoint {
-                scheme,
-                userinfo,
-                host,
-                port,
-                path,
-            },
-            rank,
-        ))
+        Ok(Endpoint {
+            scheme,
+            userinfo,
+            host,
+            port,
+            path,
+        })
     }
 
     pub fn scheme(&self) -> Option<Scheme> {
@@ -354,6 +361,16 @@ impl Endpoint {
         }
     }
 
+    /// [`Self::redacted_str`] for an address that carries no rank: nothing
+    /// is split off its end. A userinfo before a host of digits is masked,
+    /// and a socket path that ends in an `@` and digits is written whole.
+    pub(crate) fn redacted_str_unranked(input: &str) -> String {
+        Self::parse_unranked(input).map_or_else(
+            |_| "<unparsable address>".to_string(),
+            |endpoint| endpoint.redacted(),
+        )
+    }
+
     /// The address as a request's success path shows it: the routed-worker
     /// response header, the cache-trace header and the request-sent event.
     /// An address without userinfo, query or fragment is the registered
@@ -361,16 +378,30 @@ impl Endpoint {
     /// address it registered does not change; one with userinfo is
     /// [`Self::redacted_str`]'s form (the userinfo masked whole, a DP rank
     /// kept), one with a query or fragment is cut at its path like it (they
-    /// may carry a token), and so is one the parser refuses. A worker
-    /// computes it once at registration (`WorkerMetadata::redacted_url`);
-    /// nothing on a request path parses.
+    /// may carry a token), and so is one the parser refuses. It reads a
+    /// rank out of any address it is handed. A worker's own address is
+    /// rendered by its spec's rule (`WorkerSpec::redacted_url`), once at
+    /// registration, and nothing on a request path parses.
     pub fn redacted_url(input: &str) -> String {
         match Self::parse_with_rank(input) {
-            Ok((endpoint, _)) if endpoint.userinfo.is_none() && !input.contains(['?', '#']) => {
-                input.to_string()
-            }
+            Ok((endpoint, _)) if endpoint.shows_as_written(input) => input.to_string(),
             _ => Self::redacted_str(input),
         }
+    }
+
+    /// [`Self::redacted_url`] for an address that carries no rank, over
+    /// [`Self::redacted_str_unranked`]'s parse.
+    pub(crate) fn redacted_url_unranked(input: &str) -> String {
+        match Self::parse_unranked(input) {
+            Ok(endpoint) if endpoint.shows_as_written(input) => input.to_string(),
+            _ => Self::redacted_str_unranked(input),
+        }
+    }
+
+    /// Whether the address shows as the string it was parsed from, byte for
+    /// byte: it holds no userinfo, and the string no query or fragment.
+    fn shows_as_written(&self, input: &str) -> bool {
+        self.userinfo.is_none() && !input.contains(['?', '#'])
     }
 
     /// Whether the address carries userinfo: a username, a password or a
@@ -1079,6 +1110,37 @@ mod tests {
         );
         assert_eq!(
             Endpoint::redacted_url("not an address"),
+            "<unparsable address>"
+        );
+    }
+
+    /// An address that carries no rank has nothing split off its end: a
+    /// socket path stays whole, and an `@` before a host of digits parts a
+    /// userinfo from it. The byte-for-byte rule and the marker are the
+    /// ranked form's.
+    #[test]
+    fn an_unranked_address_has_nothing_split_off_its_end() {
+        for socket in ["ipc:///tmp/w", "ipc:///tmp/w@0", "ipc:///tmp/w@00"] {
+            assert_eq!(Endpoint::redacted_url_unranked(socket), socket);
+            assert_eq!(Endpoint::redacted_str_unranked(socket), socket);
+        }
+        for (address, masked) in [
+            ("http://pebble@2130706433", "http://***@2130706433"),
+            ("http://worker:8000@1", "http://***@1"),
+            ("http://user:secret@worker:3000", "http://***@worker:3000"),
+        ] {
+            assert_eq!(Endpoint::redacted_url_unranked(address), masked);
+            assert_eq!(Endpoint::redacted_str_unranked(address), masked);
+        }
+        for plain in ["http://Worker:3000/", "worker:3000"] {
+            assert_eq!(Endpoint::redacted_url_unranked(plain), plain);
+        }
+        assert_eq!(
+            Endpoint::redacted_url_unranked("http://worker:3000/v1?token=abc"),
+            "http://worker:3000/v1"
+        );
+        assert_eq!(
+            Endpoint::redacted_url_unranked("not an address"),
             "<unparsable address>"
         );
     }
