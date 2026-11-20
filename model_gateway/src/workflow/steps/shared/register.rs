@@ -6,7 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use smg_policy_controller::worker_host::Objects;
+use smg_policy_controller::worker_host::{Objects, WRITE_WORKERS_AT_DOOR_STEP};
 use smg_worker::{
     health::bootstrap_probe,
     identity::basic::Worker,
@@ -95,6 +95,39 @@ pub fn registered_entries<D: WorkerRegistrationData>(
             let id = registry.get_id_by_url(worker.url())?;
             let entry = registry.get(&id)?;
             Arc::ptr_eq(&entry, worker).then(|| (id.as_str().to_string(), entry.revision()))
+        })
+        .collect()
+}
+
+/// [`registered_entries`] for the rows of a line that writes at the store's
+/// door: the registration's workers whose rows stand now, by the id and
+/// revision of the objects the holder laid for them. The holder's object is
+/// never the one the job built, so the state says whether the door's write
+/// was this registration's: a row that stood before a refused add is not.
+/// A cancellation written while the write ran reads as no write.
+pub(crate) fn rows_written<D: WorkerRegistrationData>(
+    registry: &WorkerRegistry,
+    rows: &Objects<ModelWorkerSnapshot>,
+    state: &WorkflowState<D>,
+) -> HashMap<String, u64> {
+    let wrote = state
+        .step_states
+        .get(&StepId::new(WRITE_WORKERS_AT_DOOR_STEP))
+        .is_some_and(|step| step.status == StepStatus::Succeeded);
+    if !wrote {
+        return HashMap::new();
+    }
+    state
+        .context
+        .data
+        .get_actual_workers()
+        .into_iter()
+        .flatten()
+        .filter_map(|worker| {
+            let id = registry.get_id_by_url(worker.url())?;
+            let entry = registry.get(&id)?;
+            rows.standing_of(&id, &entry)?;
+            Some((id.as_str().to_string(), entry.revision()))
         })
         .collect()
 }

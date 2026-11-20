@@ -15,7 +15,10 @@ use smg_worker::{
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::check_local_worker::{validate_parser_overrides, warn_on_conflicting_parser_overrides};
+use super::{
+    check_local_worker::{validate_parser_overrides, warn_on_conflicting_parser_overrides},
+    update_at_door::UpdateAtDoorStep,
+};
 use crate::{
     admin::worker_service::MAX_WORKER_LABELS,
     routers::grpc::backend_client::BasicWorkerBuilder,
@@ -35,6 +38,22 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
     async fn execute(
         &self,
         context: &mut WorkflowContext<WorkerUpdateWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        Self::update(context, None)
+    }
+
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        false
+    }
+}
+
+impl UpdateWorkerPropertiesStep {
+    /// The update of the workers the find step selected. Where the line
+    /// writes at a door, a worker a row stands for is written there, and
+    /// the holder lays its object: the registry takes every other worker.
+    pub(super) fn update(
+        context: &mut WorkflowContext<WorkerUpdateWorkflowData>,
+        at_door: Option<&UpdateAtDoorStep>,
     ) -> WorkflowResult<StepResult> {
         let request = &context.data.config;
         // A label refresh replaces what discovery read before with what the
@@ -72,6 +91,19 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
         );
 
         let mut updated_workers: Vec<Arc<dyn Worker>> = Vec::with_capacity(workers_to_update.len());
+
+        // The row behind each worker, where the line writes at a door. What
+        // no row holds is refused before any worker is written.
+        let rows = at_door
+            .map(|door| door.rows_behind(snapshot.as_deref(), &workers_to_update))
+            .unwrap_or_default();
+        let first_row = workers_to_update
+            .iter()
+            .zip(&rows)
+            .find(|(_, row)| row.is_some());
+        if let Some((worker, _)) = first_row {
+            UpdateAtDoorStep::refuse_unheld(request, worker.as_ref())?;
+        }
 
         // The labels each worker ends up with: the request's merged into its
         // own. The admin check held the cap against the labels the worker had
@@ -188,6 +220,14 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
         for (index, (worker, (updated_labels, models, card_fields))) in
             workers_to_update.iter().zip(merged).enumerate()
         {
+            let row = at_door.zip(rows.get(index).copied().flatten());
+            if refresh && row.is_some() {
+                debug!(
+                    worker_url = %worker.redacted_url(),
+                    "The door takes the engine's labels from no writer yet; the row's worker is kept as it is"
+                );
+                continue;
+            }
             if refresh {
                 // The engine's id is the worker's live id from here, rebuilt
                 // or not (a rebuilt worker shares the cell): the id a handoff
@@ -316,6 +356,14 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             }
             let new_worker: Arc<dyn Worker> = Arc::new(new_worker);
 
+            // A row's worker is written at the store's door, and the holder
+            // lays its object over the one that stands, under its id.
+            if let Some((door, standing)) = row {
+                door.lay(&context.data.asker, standing, new_worker.as_ref())?;
+                updated_workers.extend(app_context.worker_registry.get_by_url(worker.url()));
+                continue;
+            }
+
             // Replace the worker in the registry (overwrite-then-diff),
             // against the id and revision the find step captured: a worker
             // updated or replaced meanwhile (a provider registering its
@@ -378,10 +426,6 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
         context.data.updated_workers = Some(updated_workers);
 
         Ok(StepResult::Success)
-    }
-
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        false
     }
 }
 

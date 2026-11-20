@@ -19,12 +19,15 @@ pub use local::{
     ReleaseTokenizerStep, RemoveFromPolicyRegistryStep, UpdatePoliciesForWorkerStep,
     UpdateRemainingPoliciesStep, UpdateWorkerPropertiesStep,
 };
-pub(crate) use local::{worker_removal_line, WORKER_KEY_UNSUPPORTED};
+pub(crate) use local::{
+    worker_removal_line, worker_update_line, WORKER_FIELD_UNSUPPORTED, WORKER_KEY_UNSUPPORTED,
+};
 use local::{
     CheckLocalWorkerStep, DiscoverZmqLabelsStep, EnsureHarmonyEncodingStep, RefuseWorkerKeyStep,
     SubmitTokenizerJobStep, CHECK_LOCAL_WORKER_STEP, REFUSE_WORKER_KEY_STEP, ZMQ_LABELS_STEP,
 };
 use openai_protocol::worker::WorkerSpec;
+pub(crate) use shared::rows_written;
 pub use shared::{
     registered_entries, registered_in, ActivateWorkersStep, RegisterWorkersStep,
     UpdatePoliciesStep, WorkerList,
@@ -114,8 +117,9 @@ pub fn create_worker_registration_workflow(
 ///                 |             |
 ///            submit_tok   activate_workers
 /// ```
-/// - A local registration that states an API key is refused by name ahead
-///   of every probe: a row holds no credential.
+/// - A local registration that states an API key is refused by name
+///   behind the classification and ahead of the detection's probes: a row
+///   holds no credential.
 /// - The store crate's write at the feed's door stands behind the encoding
 ///   step, and no other step waits on that step. It writes a local worker's
 ///   row, and the holder lays the row's object in the registry.

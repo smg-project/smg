@@ -12,6 +12,7 @@ mod remove_from_policy_registry;
 mod submit_tokenizer_job;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod update_at_door;
 mod update_policies_for_worker;
 mod update_remaining_policies;
 mod update_worker_properties;
@@ -46,6 +47,8 @@ use smg_worker::{
     },
 };
 pub use submit_tokenizer_job::SubmitTokenizerJobStep;
+use update_at_door::UpdateAtDoorStep;
+pub(crate) use update_at_door::WORKER_FIELD_UNSUPPORTED;
 pub use update_policies_for_worker::UpdatePoliciesForWorkerStep;
 pub use update_remaining_policies::UpdateRemainingPoliciesStep;
 pub use update_worker_properties::UpdateWorkerPropertiesStep;
@@ -259,6 +262,60 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
         )
 }
 
+/// The update line. With no feed it is [`create_worker_update_workflow`]'s.
+///
+/// With a feed the gateway's local workers are rows of the policy
+/// controller's store. The update step writes a row's worker at the feed's
+/// door, and the holder lays its object over the one that stands
+/// ([`UpdateAtDoorStep`]). A provider's worker stays in the registry
+/// alone, and the step writes it there. No step writes the classic
+/// policies: they decide nothing there.
+pub(crate) fn worker_update_line(
+    feed: Option<&Feed>,
+) -> WorkflowDefinition<WorkerUpdateWorkflowData> {
+    let Some(feed) = feed else {
+        return create_worker_update_workflow();
+    };
+    WorkflowDefinition::new("worker_update", "Update worker properties")
+        .add_step(
+            StepDefinition::new(
+                "find_worker_to_update",
+                "Find worker to update",
+                Arc::new(FindWorkerToUpdateStep),
+            )
+            .with_timeout(Duration::from_secs(10))
+            .with_retry(single_attempt()),
+        )
+        .add_step(
+            StepDefinition::new(
+                "rediscover_labels",
+                "Re-read the worker's labels from its engine (label refresh only)",
+                Arc::new(RediscoverLabelsStep),
+            )
+            .with_timeout(Duration::from_secs(10))
+            // As in the classic line: one more try for an engine that is
+            // still warming up.
+            .with_retry(RetryPolicy {
+                max_attempts: 2,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(3)),
+            })
+            .depends_on(&["find_worker_to_update"]),
+        )
+        .add_step(
+            StepDefinition::new(
+                "update_worker_properties",
+                "Update worker properties",
+                Arc::new(UpdateAtDoorStep::new(
+                    Arc::clone(&feed.door),
+                    Arc::clone(&feed.objects),
+                )),
+            )
+            .with_timeout(Duration::from_secs(10))
+            .with_retry(single_attempt())
+            .depends_on(&["rediscover_labels"]),
+        )
+}
+
 /// Helper to create initial workflow data for worker removal
 pub fn create_worker_removal_workflow_data(
     url: String,
@@ -318,9 +375,9 @@ mod tests {
         workflow::find_workers_by_url,
     };
     use wfaas::{
-        StepExecutor, StepId, StepResult, StepStatus, WorkflowContext, WorkflowEngine,
-        WorkflowError, WorkflowId, WorkflowInstanceId, WorkflowResult, WorkflowState,
-        WorkflowStatus,
+        StepExecutor, StepId, StepResult, StepStatus, WorkflowContext, WorkflowData,
+        WorkflowEngine, WorkflowError, WorkflowId, WorkflowInstanceId, WorkflowResult,
+        WorkflowState, WorkflowStatus,
     };
 
     use super::*;
@@ -579,9 +636,7 @@ mod tests {
     }
 
     /// A line's steps and the steps each waits on, in the line's order.
-    fn edges(
-        workflow: &WorkflowDefinition<WorkerRemovalWorkflowData>,
-    ) -> Vec<(String, Vec<String>)> {
+    fn edges<D: WorkflowData>(workflow: &WorkflowDefinition<D>) -> Vec<(String, Vec<String>)> {
         workflow
             .steps
             .iter()
@@ -591,6 +646,49 @@ mod tests {
                 (step.id.to_string(), waits_on)
             })
             .collect()
+    }
+
+    /// A table of steps and the steps each waits on, as [`edges`] reads a
+    /// line.
+    fn written(table: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
+        table
+            .iter()
+            .map(|(id, waits_on)| {
+                let waits_on = waits_on.iter().map(ToString::to_string).collect();
+                ((*id).to_string(), waits_on)
+            })
+            .collect()
+    }
+
+    /// With no feed the update line is the one it was. Under a feed it
+    /// keeps its first three steps, the third writing at the door, and has
+    /// no step that writes the classic policies.
+    #[test]
+    fn the_update_line_is_todays_with_no_feed_and_writes_no_classic_policy_under_one() {
+        let todays: [(&str, &[&str]); 4] = [
+            ("find_worker_to_update", &[]),
+            ("rediscover_labels", &["find_worker_to_update"]),
+            ("update_worker_properties", &["rediscover_labels"]),
+            ("update_policies_for_worker", &["update_worker_properties"]),
+        ];
+        let registry = Arc::new(WorkerRegistry::new());
+        let feed = feed(
+            &Arc::new(MemoryStore::default()),
+            &registry,
+            BackendConnector::shared(),
+        );
+
+        assert_eq!(edges(&create_worker_update_workflow()), written(&todays));
+        assert_eq!(edges(&worker_update_line(None)), written(&todays));
+        let at_the_door: [(&str, &[&str]); 3] = [
+            ("find_worker_to_update", &[]),
+            ("rediscover_labels", &["find_worker_to_update"]),
+            ("update_worker_properties", &["rediscover_labels"]),
+        ];
+        assert_eq!(
+            edges(&worker_update_line(Some(&feed))),
+            written(&at_the_door)
+        );
     }
 
     /// With no feed the line is the one it was. Under a feed it is the
@@ -620,15 +718,6 @@ mod tests {
             ("refresh_pool_sizes", &["remove_provider_workers"]),
             ("release_tokenizer", &["remove_provider_workers"]),
         ];
-        let written = |table: &[(&str, &[&str])]| -> Vec<(String, Vec<String>)> {
-            table
-                .iter()
-                .map(|(id, waits_on)| {
-                    let waits_on = waits_on.iter().map(ToString::to_string).collect();
-                    ((*id).to_string(), waits_on)
-                })
-                .collect()
-        };
         let registry = Arc::new(WorkerRegistry::new());
         let feed = feed(
             &Arc::new(MemoryStore::default()),

@@ -10,9 +10,8 @@ use wfaas::{EventSubscriber, InMemoryStore, WorkflowEngine};
 use super::{
     create_mcp_registration_workflow, create_tokenizer_registration_workflow,
     create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
-    create_worker_update_workflow,
     job_queue::run_bound,
-    steps::{worker_registration_line, worker_removal_line},
+    steps::{worker_registration_line, worker_removal_line, worker_update_line},
     McpWorkflowData, TokenizerWorkflowData, WasmRegistrationWorkflowData, WasmRemovalWorkflowData,
     WorkerRemovalWorkflowData, WorkerUpdateWorkflowData,
 };
@@ -90,8 +89,8 @@ impl WorkflowEngines {
         Self::with_feed(router_config, None)
     }
 
-    /// [`Self::new`], with the two worker workflows writing at the door of
-    /// `feed` where one stands: a local worker of such a gateway is a row
+    /// [`Self::new`], with the three worker workflows writing at the door
+    /// of `feed` where one stands: a local worker of such a gateway is a row
     /// of the policy controller's store. Every other engine is the same.
     #[expect(
         clippy::expect_used,
@@ -117,7 +116,7 @@ impl WorkflowEngines {
         // Create worker update engine
         let worker_update = WorkflowEngine::new();
         worker_update
-            .register_workflow(create_worker_update_workflow())
+            .register_workflow(worker_update_line(feed))
             .expect("worker_update workflow should be valid");
 
         // Create MCP engine
