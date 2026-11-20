@@ -46,8 +46,8 @@
 //! by one bit of its model's index (`Index`), which a decision reads with
 //! no lock: no publication follows a lane's first event. Naming lists the
 //! record's holders beside the index's under one cap: after them, in the
-//! room they leave, or ahead of them where the profile's prefix stage
-//! reads the record alone. Issuing a lease writes the blocks sent to its
+//! room they leave, or ahead of them where no prefix stage of the profile
+//! reads cache events. Issuing a lease writes the blocks sent to its
 //! first target while the record speaks for it: token blocks, or windows
 //! of a request's text, which the index of cache events is never asked
 //! for. Once a lane is heard the index alone speaks for its row, and what
@@ -392,8 +392,8 @@ pub(super) struct Predict {
     /// The record's bound, in placements.
     pub(super) bound: usize,
     /// Whether the record's holders are named ahead of the index's: where
-    /// a stage of the pool's profile reads sent prefixes and no cache
-    /// events, so the index's holders must not take its room.
+    /// the pool's profile reads sent prefixes and no prefix stage of it
+    /// reads cache events, so the index's holders must not take the room.
     pub(super) ahead: bool,
 }
 
@@ -953,8 +953,8 @@ impl PoolIndex {
     ///
     /// Where the pool holds a record of sent prefixes, its rows with no
     /// heard lane are named beside the index's holders under the same cap: after
-    /// them, in the room they leave, or ahead of them where the profile's
-    /// prefix stage reads the record alone. That lookup finds the deepest
+    /// them, in the room they leave, or ahead of them where no prefix stage
+    /// of the profile reads cache events. That lookup finds the deepest
     /// block a worker of the view was sent. The index is asked for a token
     /// request alone, the record for a request of either kind.
     #[inline]
@@ -1047,8 +1047,8 @@ impl PoolIndex {
             let blocks = predicted.name(naming, pool_at, &usable, named);
             name_predicted(row_of, (blocks, cap), named, draw);
         };
-        // A profile whose prefix stage reads the record alone takes the
-        // record's holders first: that stage reads no overlap, so the
+        // A profile no prefix stage of which reads cache events takes the
+        // record's holders first: its prefix stage reads no overlap, so the
         // index's holders must not take its room under the cap.
         let ahead = self.predict.is_some_and(|predict| predict.ahead);
         if ahead {

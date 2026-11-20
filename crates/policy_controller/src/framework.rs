@@ -723,9 +723,16 @@ impl Profile {
     /// Whether a scorer of this profile reads sent prefixes and no cache
     /// events ([`Engine::reads_sent_alone_for`]): asked of its scorers at
     /// the engine's build.
+    ///
+    /// The cache events meant are a request's holders, which a scorer
+    /// reads from the index where it declares token hashes beside the
+    /// events. One scorer that reads them there keeps the index's holders
+    /// first, whatever another reads. A scorer that reads the events for a
+    /// row's warm-up reads no holder and turns nothing here.
     fn reads_sent_alone(&self) -> bool {
-        let mut scorers = self.scorers.iter().map(|stage| stage.scorer.needs());
-        scorers.any(|needs| needs.sent_prefixes && !needs.events)
+        let needs = || self.scorers.iter().map(|stage| stage.scorer.needs());
+        needs().any(|needs| needs.sent_prefixes)
+            && !needs().any(|needs| needs.events && needs.token_hashes)
     }
 
     /// Whether any stage holds a [`DecisionScope`].
@@ -4102,9 +4109,14 @@ impl Engine {
             })
     }
 
-    /// Whether a scorer of that profile reads sent prefixes and no cache
-    /// events: the prefix stage under the source that reads the record
-    /// alone. A host names the record's holders ahead of the index's then.
+    /// Whether that profile reads a request's holders from the record of
+    /// sent prefixes alone: a scorer of it reads the record, as the prefix
+    /// stage does under the source that reads the record alone, and no
+    /// prefix stage reads the index. A host names the record's holders
+    /// ahead of the index's then. One prefix stage that reads cache events
+    /// keeps the index's holders first, whatever another reads: under a
+    /// cap it would lose them. A stage that reads cache events for a row's
+    /// warm-up reads no holder and turns nothing here.
     /// Kept at the build, as [`Self::reads_sent_for`] is.
     pub(crate) fn reads_sent_alone_for(&self, model: &str, phase: Phase) -> bool {
         self.resolve(model, phase)

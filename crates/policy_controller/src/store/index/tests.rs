@@ -769,6 +769,104 @@ mod sent_prefixes {
     }
 
     #[test]
+    fn a_restore_that_keeps_a_worker_at_another_rank_forgets_its_placements() -> Case {
+        let store = MemoryStore::new();
+        let id = store
+            .upsert(WorkerFacts {
+                signals: Signals::default(),
+                dp_size: 2,
+                ..publisher("a", &[MODEL])
+            })
+            .id();
+        store.publish_now();
+        store.apply(applied(&merged(1)?)?)?;
+        let (cold, _) = named(&store, None, 16, 7);
+        store.deciding(|world| world.sent(&cold, id));
+        let (warm, _) = named(&store, None, 16, 7);
+        assert_eq!(warm.holders.len(), 1);
+        // A replica that recorded while it led restores a cut that holds
+        // the worker at another rank: a cache of its own.
+        let mut cut = store.cut(Kinds::All);
+        let rows = &mut cut.rows;
+        let row = rows.iter_mut().find(|row| row.id == id);
+        let row = row.ok_or("the cut's row")?;
+        row.facts.dp_rank = 1;
+        row.revision += 1;
+        cut.epoch += 1;
+        assert!(store.restore_from(cut));
+        assert_eq!(store.get(id).ok_or("the restored row")?.facts.dp_rank, 1);
+        let (read, _) = named(&store, None, 16, 7);
+        assert!(read.holders.is_empty(), "rank 1 was never sent this prefix");
+        Ok(())
+    }
+
+    #[test]
+    fn a_stage_that_reads_cache_events_keeps_the_index_holders_first() -> Case {
+        use crate::spec::{BestParams, PickStage, PolicySpec, PrefixAffinityParams, ScoreStage};
+
+        let store = MemoryStore::new();
+        let sent = plain(&store, "sent", WireModes::GRPC, Reachability::Any);
+        let indexed = admitted(&store, "indexed");
+        // The stock document's prefix stage reads cache events. A second
+        // one of little weight reads the record alone, under a sample of 1.
+        let mut document = PolicySpec::preset("cache_aware")?;
+        document.generation = 1;
+        for profile in document.profiles.values_mut() {
+            profile.pick = PickStage::Best(BestParams { sample: 1 }).into();
+            let second = ScoreStage::PrefixAffinity(PrefixAffinityParams {
+                weight: 0.01,
+                source: Some(AffinitySource::Predictor),
+                ..Default::default()
+            });
+            profile.score.push(second.into());
+        }
+        let spec = applied(&document)?;
+        let cap = spec.engine().named_for(MODEL, crate::view::Phase::Single);
+        assert_eq!(cap, 1);
+        store.apply(spec)?;
+        publish(&store, indexed);
+        let (cold, rows) = named(&store, None, 1, 0);
+        assert_eq!(rows[cold.holders[0].row as usize], indexed);
+        store.deciding(|world| world.sent(&cold, sent));
+        let (warm, rows) = named(&store, None, 1, 0);
+        let held = rows[warm.holders[0].row as usize];
+        assert_eq!(held, indexed, "the stage of weight 4 keeps its one holder");
+        Ok(())
+    }
+
+    #[test]
+    fn a_write_reads_its_permission_under_the_guard() -> Case {
+        let store = Arc::new(MemoryStore::new());
+        let id = plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        plain(&store, "b", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        let (cold, rows) = named(&store, None, 16, 7);
+        let row = rows.iter().position(|&row| row == id).ok_or("the row")?;
+        let record = record(&store).ok_or("the model's record")?;
+        let standing = store.deciding(|world| world.standing(MODEL, Role::Single));
+        let allowed = Arc::clone(&standing.ok_or("the pool's standing")?.tables.allowed[row]);
+        // This case holds the guard a write waits for. A removal's first
+        // step lands meanwhile: the worker's word is cleared.
+        let held = record.record.write();
+        let (started, on) = mpsc::channel();
+        let writer = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || {
+                let _ = started.send(());
+                store.deciding(|world| world.sent(&cold, id));
+            })
+        };
+        on.recv()?;
+        thread::sleep(Duration::from_millis(50));
+        allowed.store(false, Ordering::Relaxed);
+        drop(held);
+        writer.join().map_err(|_| "the writer's thread")?;
+        let blocks = record.record.read().deepest(&keys(&HASHES)).blocks();
+        assert_eq!(blocks, 0, "a worker that left is not written back");
+        Ok(())
+    }
+
+    #[test]
     fn a_fresh_prefix_still_writes_for_a_new_target() -> Case {
         let store = MemoryStore::new();
         let a = plain(&store, "a", WireModes::GRPC, Reachability::Any);

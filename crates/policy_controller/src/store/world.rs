@@ -1641,8 +1641,8 @@ impl World {
     /// the holders' lookup lists nothing of the pool's length. Where the
     /// pool holds a record of sent prefixes, its rows with no heard lane are
     /// named beside the index's holders under the same cap: after them, in
-    /// the room they leave, or ahead of them where the profile's prefix
-    /// stage reads the record alone. That lookup finds the deepest block a
+    /// the room they leave, or ahead of them where no prefix stage of the
+    /// profile reads cache events. That lookup finds the deepest block a
     /// worker of the view was sent. The
     /// warming rows are read where the publication holds them: they are
     /// copied only for a view that is not the pool whole, and past the

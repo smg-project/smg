@@ -441,11 +441,12 @@ impl MemoryStore {
     /// and gives every row a fresh slot.
     fn lay_snapshot(&self, cut: Cut, keep_local: bool) -> bool {
         let mut workers = self.workers.lock();
-        // A watch matches incoming ids against the previous membership.
-        // A restore only needs the previous ids to retire their KV lanes.
-        let mut previous = FxHashMap::default();
-        let mut previous_ids = Vec::new();
-        // The ids a watch's cut keeps under another offer or rank.
+        // The previous membership. A watch carries its local state for the
+        // ids it sees again. A restore carries none of it: it reads the old
+        // rows to retire the KV lanes of the ids that left, and to ask what
+        // the sent prefixes of an id it keeps still say.
+        let mut previous;
+        // The ids the cut keeps under another offer or rank.
         let mut moved = Vec::new();
         {
             let mut health = self.health.lock();
@@ -455,13 +456,10 @@ impl MemoryStore {
                     return false;
                 }
             }
-            if keep_local {
-                previous = mem::take(&mut workers.rows);
-            } else {
+            previous = mem::take(&mut workers.rows);
+            if !keep_local {
                 health.vetoes.clear();
                 health.ok_at.clear();
-                previous_ids.extend(workers.rows.keys().copied());
-                workers.rows.clear();
                 // An unpublished build over no row drops the restore's old
                 // vetoes and the state derived from its membership and loads.
                 drop(loads.writer.rebuild(
@@ -484,6 +482,10 @@ impl MemoryStore {
                 let kept = if keep_local {
                     previous.remove(&id).or_else(|| workers.rows.remove(&id))
                 } else {
+                    let before = previous.get(&id);
+                    if before.is_some_and(|before| !same_cache(&before.row.facts, &row.facts)) {
+                        moved.push(id);
+                    }
                     None
                 };
                 let held = if let Some(kept) = kept {
@@ -518,7 +520,7 @@ impl MemoryStore {
         // The index is this replica's own: a row that left gives up its
         // lane, a row that stays keeps what was heard for it, and a row the
         // cut brings takes the lane its facts ask for.
-        for id in previous_ids.into_iter().chain(previous.into_keys()) {
+        for id in previous.into_keys() {
             if !workers.rows.contains_key(&id) {
                 self.kv.forget(id);
                 self.kv.forget_sent(id);
