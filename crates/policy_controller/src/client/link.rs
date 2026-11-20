@@ -26,7 +26,7 @@ use crate::{
     controller::wire::{self, Refusal},
     proto::{
         busy, controller_frame, decide_answer, gateway_frame, released, Busy, ControllerFrame,
-        DecideAnswer, DecideRequest, Decision, GatewayFrame, Released, WatchWorkersRequest,
+        DecideAnswer, DecideRequest, Decision, GatewayFrame, Released, Side, WatchWorkersRequest,
         Welcome,
     },
 };
@@ -171,7 +171,19 @@ impl Link {
     /// stream it is sent on, and the link's stream is every caller's.
     pub async fn ask(
         &self,
+        request: DecideRequest,
+        budget: Duration,
+    ) -> Result<Decision, Unanswered> {
+        self.ask_cut(request, 0, budget).await
+    }
+
+    /// [`Self::ask`] for a request whose maker left `left_out` block hashes
+    /// out of it already. They are counted with the frame's own cut once
+    /// the ask is queued ([`Self::hashes_cut`]).
+    pub(crate) async fn ask_cut(
+        &self,
         mut request: DecideRequest,
+        left_out: usize,
         budget: Duration,
     ) -> Result<Decision, Unanswered> {
         let cut = match fit(&mut request).and_then(|cut| in_range(&request).map(|()| cut)) {
@@ -180,7 +192,7 @@ impl Link {
             Err(error) => return Err(Unanswered::Unsent(error)),
         };
         let deadline = Instant::now().checked_add(budget);
-        let mut pending = self.shared.begin(request, deadline, cut)?;
+        let mut pending = self.shared.begin(request, deadline, cut + left_out)?;
         if budget.is_zero() {
             return Err(Unanswered::Late);
         }
@@ -510,12 +522,22 @@ impl Shared {
     }
 
     fn release(&self, decision: Decision) {
-        for lease in decision.leases {
+        let mut leases = decision.leases.iter().peekable();
+        while let Some(lease) = leases.next() {
+            // A pair's two sides come under one id. One frame that names no
+            // side gives back both bookings, whatever label each came
+            // under.
+            let pair = leases.next_if(|next| next.id == lease.id).is_some();
+            let side = if pair {
+                Side::Unspecified
+            } else {
+                lease.side()
+            };
             let frame = gateway_frame::Frame::Released(Released {
                 what: Some(released::What::LeaseId(lease.id)),
                 reason: released::Reason::LateDecision.into(),
                 // An unknown side gives back the whole lease.
-                side: lease.side().into(),
+                side: side.into(),
             });
             if self.report(frame).is_err() {
                 // The controller's session grace covers leases still on file.
@@ -965,13 +987,16 @@ pub(super) mod tests {
             Err(Unanswered::Late)
         ));
         assert_eq!(within(peer.requests.next()).await, Some(request(1)));
+        // A pair is given back whole, in one frame that names no side.
         peer.answer(1, 4, decision(7, &[Side::Prefill, Side::Decode]));
-        for side in [Side::Prefill, Side::Decode] {
-            assert_eq!(
-                within(peer.reports.next()).await.expect("a release").frame,
-                Some(release(7, side, released::Reason::LateDecision))
-            );
-        }
+        assert_eq!(
+            within(peer.reports.next()).await.expect("a release").frame,
+            Some(release(
+                7,
+                Side::Unspecified,
+                released::Reason::LateDecision
+            ))
+        );
 
         let mut dropped = Box::pin(peer.link.ask(request(2), WAIT));
         assert!(poll(dropped.as_mut()).is_pending());
@@ -1212,10 +1237,15 @@ pub(super) mod tests {
         // connection stands.
         let (accepted, unanswered) = {
             let open = pin!(link.watch_workers(WatchWorkersRequest::default()));
-            tokio::join!(listener.accept(), timeout(Duration::from_millis(200), open))
+            tokio::join!(
+                timeout(WAIT, listener.accept()),
+                timeout(Duration::from_millis(200), open)
+            )
         };
         assert!(unanswered.is_err(), "the listener answers nothing");
-        let (mut connection, _) = accepted.expect("the channel dialed the listener");
+        let (mut connection, _) = accepted
+            .expect("the channel dials inside the wait")
+            .expect("the channel dialed the listener");
 
         closes(&link, || peer.controller(LEADER_TERM - 1, None)).await;
         let mut sent = Vec::new();

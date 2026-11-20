@@ -325,8 +325,8 @@ fn trace_record() -> &'static [&'static str] {
 }
 
 /// The lease's session crosses under the name both contracts still spell,
-/// `session_key`: the change that first reads a lease from the wire renames
-/// the field in both and takes this pair out.
+/// `session_key`. A gateway's client reads it under that name. A change that
+/// renames the field renames it in both contracts and takes this pair out.
 fn lease_record() -> &'static [&'static str] {
     record!(
         Lease,

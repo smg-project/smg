@@ -468,13 +468,23 @@ impl<D: Deref<Target = Door>> Handle<D> {
     ///
     /// [`Unanswered`] if the link has no answer or the handle cannot read it.
     /// The link releases the leases of an unread answer as late decisions.
+    ///
+    /// A request whose `budget_micros` is 0 is answered
+    /// [`Unanswered::Late`] before anything is sent. Over a link that
+    /// budget says the request's time is spent, and the controller would
+    /// answer busy at its receipt. A request built for the door in process
+    /// carries that budget unless its host states one.
     pub async fn asked(
         link: &Link,
         request: &Request<'_>,
         now: Instant,
         budget: Duration,
     ) -> Result<Self, Unanswered> {
-        let told = link.ask(wire::request(request), budget).await?;
+        if request.facts.budget_micros == 0 {
+            return Err(Unanswered::Late);
+        }
+        let (asked, left_out) = wire::request(request);
+        let told = link.ask_cut(asked, left_out, budget).await?;
         match wire::decided(&told, now) {
             Ok(decided) => Ok(Self::hold(Arm::Link(link.clone()), decided, now)),
             Err(unread) => {
@@ -1862,24 +1872,28 @@ mod tests {
         }
 
         #[tokio::test(start_paused = true)]
-        async fn a_pair_with_an_unreadable_decode_releases_both_sides_late() {
-            let mut peer = Peer::new(1);
-            let mut told = paired();
-            told.leases[1].target_index = 2;
-            let answer = answered(&mut peer, told, Instant::now()).await;
-            assert!(
-                matches!(&answer, Err(Unanswered::Unsent(Error::NoDecision(why))) if why.starts_with("leases.target_index:")),
-                "{answer:?}"
-            );
-            reports(
-                &mut peer,
-                [
-                    released(proto::Side::Prefill, Reason::LateDecision),
-                    released(proto::Side::Decode, Reason::LateDecision),
-                ],
-            )
-            .await;
-            assert!(peer.link.stands());
+        async fn an_unreadable_pair_is_released_whole_whatever_its_labels() {
+            let mut index = paired();
+            index.leases[1].target_index = 2;
+            // The prefill lease under the decode side's label: a release by
+            // the labels would give the decode side back twice and keep the
+            // prefill booking.
+            let mut label = paired();
+            label.leases[0].side = proto::Side::Decode.into();
+            for (told, path) in [(index, "leases.target_index:"), (label, "leases")] {
+                let mut peer = Peer::new(1);
+                let answer = answered(&mut peer, told, Instant::now()).await;
+                assert!(
+                    matches!(&answer, Err(Unanswered::Unsent(Error::NoDecision(why))) if why.starts_with(path)),
+                    "{answer:?}"
+                );
+                reports(
+                    &mut peer,
+                    [released(proto::Side::Unspecified, Reason::LateDecision)],
+                )
+                .await;
+                assert!(peer.link.stands());
+            }
         }
 
         #[tokio::test(start_paused = true)]
@@ -1923,6 +1937,35 @@ mod tests {
             .expect("the ask returns");
             assert!(matches!(answer, Err(Unanswered::Late)), "{answer:?}");
             assert_eq!(tokio::time::Instant::now(), before);
+        }
+
+        /// Over a link a budget of 0 says the request's time is spent, and
+        /// the controller answers busy at its receipt. The handle answers
+        /// such a request late before anything is sent: no credit goes, and
+        /// no time passes.
+        #[tokio::test(start_paused = true)]
+        async fn a_request_with_no_budget_is_late_before_anything_is_sent() {
+            let mut peer = Peer::new(1);
+            let ask = request(&[1], 7);
+            assert_eq!(ask.facts.budget_micros, 0);
+            let before = tokio::time::Instant::now();
+            let answer = timeout(
+                PATIENCE,
+                pin!(Handle::<&Door>::asked(
+                    &peer.link,
+                    &ask,
+                    Instant::now(),
+                    PATIENCE
+                )),
+            )
+            .await
+            .expect("the ask returns");
+            assert!(matches!(answer, Err(Unanswered::Late)), "{answer:?}");
+            assert_eq!(tokio::time::Instant::now(), before);
+            assert!(
+                poll(pin!(peer.requests.next())).is_pending(),
+                "nothing went out"
+            );
         }
     }
 }

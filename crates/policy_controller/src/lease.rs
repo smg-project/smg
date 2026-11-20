@@ -389,6 +389,9 @@ impl<T: Lifecycle + ?Sized> Lifecycle for Box<T> {
     }
 }
 
+#[cfg(feature = "controller")]
+pub(crate) mod wire;
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};

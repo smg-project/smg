@@ -85,6 +85,10 @@ const SESSION_QUEUE: usize = 16;
 /// list.
 const HASH: usize = 8;
 
+/// The most block hashes one frame can hold. A frame's other fields take
+/// room too, so the fit may cut a few more.
+pub(crate) const MAX_HASHES: usize = MAX_FRAME / HASH;
+
 /// The bound on each wait of the client for its peer: an answer a leader
 /// under load can give, and a wait a blocking caller can afford. The client
 /// lays it over the dial and over each call whole, since an endpoint's own

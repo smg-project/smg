@@ -6,15 +6,15 @@
 use std::time::{Duration, Instant};
 
 use crate::{
+    client::MAX_HASHES,
     decision::{
         Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace,
         MAX_TARGETS, TRACE_TOP,
     },
     door::{self, Leased},
-    lease::{Lease, LeaseId, LeaseKind, ReleaseReason, Side, TransportClass},
+    lease::{self, Lease, LeaseId, LeaseKind, Side},
     proto::{
         self,
-        completed::Class,
         decision::Outcome,
         gateway_frame::Frame,
         identity::Form,
@@ -24,11 +24,17 @@ use crate::{
     view::{HashKind, Identity, Phase, Session, WorkerId},
 };
 
-/// A request as the wire carries it. The controller builds the view it
-/// decides over.
-pub(crate) fn request(request: &door::Request<'_>) -> proto::DecideRequest {
+/// A request as the wire carries it, and the block hashes left out of the
+/// copy. The controller builds the view it decides over.
+///
+/// The list is copied no further than one frame can hold. The link cuts a
+/// frame to its size from the list's tail, so a longer copy would wait in
+/// the link's queue for nothing. The link counts the hashes left out with
+/// its own cut.
+pub(crate) fn request(request: &door::Request<'_>) -> (proto::DecideRequest, usize) {
     let (facts, constraints) = (&request.facts, &request.constraints);
-    proto::DecideRequest {
+    let held = facts.block_hashes.len().min(MAX_HASHES);
+    let asked = proto::DecideRequest {
         request_id: request.id.to_vec(),
         facts: Some(proto::RequestFacts {
             model: facts.model.to_owned(),
@@ -38,7 +44,7 @@ pub(crate) fn request(request: &door::Request<'_>) -> proto::DecideRequest {
             streaming: facts.streaming,
             max_output_tokens: facts.max_output_tokens,
             prompt_tokens: facts.prompt_tokens,
-            block_hashes: facts.block_hashes.to_vec(),
+            block_hashes: facts.block_hashes[..held].to_vec(),
             hash_kind: match facts.hash_kind {
                 HashKind::Token => proto::HashKind::Token,
                 HashKind::Text => proto::HashKind::Text,
@@ -80,7 +86,8 @@ pub(crate) fn request(request: &door::Request<'_>) -> proto::DecideRequest {
             subset_hint: constraints.subset_hint,
         }),
         again: false,
-    }
+    };
+    (asked, facts.block_hashes.len() - held)
 }
 
 /// The hash form carries a tenant's fingerprint or the value of a session
@@ -89,9 +96,13 @@ fn identity(key: Identity<'_>, hash: impl FnOnce() -> u64) -> Option<proto::Iden
     if key.is_none() {
         return None;
     }
-    let form = key
-        .plain
-        .map_or_else(|| Form::Hash(hash()), |plain| Form::Plain(plain.to_owned()));
+    // The controller reads an empty text as no key, and the door in process
+    // reads it as a key. So the empty key crosses as its hash, and the two
+    // doors decide alike.
+    let form = match key.plain {
+        Some(plain) if !plain.is_empty() => Form::Plain(plain.to_owned()),
+        _ => Form::Hash(hash()),
+    };
     Some(proto::Identity { form: Some(form) })
 }
 
@@ -218,7 +229,7 @@ fn leased(
     targets: &Targets,
     now: Instant,
 ) -> Result<Leased, Unread> {
-    if told.side != i32::from(wire_side(side)) {
+    if told.side != i32::from(proto::Side::from(side)) {
         return Err(unread("leases.side", "unexpected side for the pick"));
     }
     let target_index = narrow(told.target_index, "leases.target_index")?;
@@ -288,8 +299,21 @@ fn trace(told: &proto::Trace) -> Result<Trace, Unread> {
         Ok(proto::LiftedVeto::Liveness) => Lifted::Liveness,
         Err(_) => return Err(unread("trace.lifted", "unknown veto")),
     };
+    // The mark is read first: ahead of every profile the position on the
+    // wire stays zero. The writer sends neither the mark over a position
+    // nor the mark's own number as a position, so both are refused.
+    let profile = match (
+        told.no_profile,
+        narrow::<u16>(told.profile, "trace.profile")?,
+    ) {
+        (true, 0) => Trace::NO_PROFILE,
+        (true, _) | (false, Trace::NO_PROFILE) => {
+            return Err(unread("trace.profile", "out of range"));
+        }
+        (false, at) => at,
+    };
     Ok(Trace {
-        profile: narrow(told.profile, "trace.profile")?,
+        profile,
         survivors,
         top,
         top_len: u8::try_from(told.top.len()).unwrap_or_default(),
@@ -306,55 +330,20 @@ pub(crate) fn frame(lease: LeaseId, side: Side, said: Said) -> Frame {
         Said::Dispatched(dispatch, _) => Frame::Dispatched(proto::Dispatched {
             lease_id: lease.0,
             target_index: u32::from(dispatch.target_index),
-            side: wire_side(dispatch.side).into(),
+            side: proto::Side::from(dispatch.side).into(),
             since_decision_micros: dispatch.since_decision_micros,
         }),
-        Said::Completed(outcome) => Frame::Completed(proto::Completed {
-            lease_id: lease.0,
-            side: wire_side(outcome.side).into(),
-            served: outcome.served.0,
-            status: u32::from(outcome.status),
-            class: match outcome.class {
-                TransportClass::Ok => Class::Ok,
-                TransportClass::ClientError => Class::ClientError,
-                TransportClass::ServerError => Class::ServerError,
-                TransportClass::ConnectFailed => Class::ConnectFailed,
-                TransportClass::Timeout => Class::Timeout,
-                TransportClass::Cancelled => Class::Cancelled,
-            }
-            .into(),
-            ttft_micros: outcome.ttft_micros,
-            tokens_in: outcome.tokens_in,
-            tokens_out: outcome.tokens_out,
-            duration_micros: outcome.duration_micros,
-        }),
+        Said::Completed(outcome) => Frame::Completed(lease::wire::completed(lease, &outcome)),
         Said::Released(released, reason) => Frame::Released(proto::Released {
             what: Some(What::LeaseId(lease.0)),
-            reason: match reason {
-                ReleaseReason::Abandoned => Reason::Abandoned,
-                ReleaseReason::LateDecision => Reason::LateDecision,
-                ReleaseReason::ClientGone => Reason::ClientGone,
-                ReleaseReason::CommitFailed => Reason::CommitFailed,
-                ReleaseReason::Expired => Reason::Expired,
-                ReleaseReason::WorkerRemoved => Reason::WorkerRemoved,
-            }
-            .into(),
+            reason: Reason::from(reason).into(),
             side: match (released, side) {
-                (Some(released), _) => wire_side(released),
+                (Some(released), _) => proto::Side::from(released),
                 (None, Side::Single) => proto::Side::Single,
                 (None, Side::Prefill | Side::Decode | Side::Encode) => proto::Side::Unspecified,
             }
             .into(),
         }),
-    }
-}
-
-const fn wire_side(side: Side) -> proto::Side {
-    match side {
-        Side::Single => proto::Side::Single,
-        Side::Prefill => proto::Side::Prefill,
-        Side::Decode => proto::Side::Decode,
-        Side::Encode => proto::Side::Encode,
     }
 }
 
@@ -364,6 +353,7 @@ mod tests {
 
     use super::{decided, frame, request};
     use crate::{
+        client::MAX_HASHES,
         controller::wire::{Checked, Decided, Leased, Lists, Viewed},
         decision::{
             Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
@@ -458,7 +448,8 @@ mod tests {
             asked.facts.phase = phase;
             asked.facts.hash_kind = hash_kind;
             let want = &asked.facts;
-            let sent = request(&asked);
+            let (sent, left_out) = request(&asked);
+            assert_eq!(left_out, 0);
             let facts = sent.facts.as_ref().expect("request facts");
             if tenant.is_none() {
                 assert!(facts.tenant.is_none());
@@ -517,6 +508,64 @@ mod tests {
                 assert_eq!(constraints.subset_hint, asked.constraints.subset_hint);
             });
         }
+    }
+
+    /// A list longer than a frame holds is copied no further than a frame's
+    /// worth, and the rest is counted for the link's cut.
+    #[test]
+    fn a_request_copies_no_more_hashes_than_a_frame_holds() {
+        let blocks = vec![7; MAX_HASHES + 1_000];
+        let asked = door::Request {
+            id: b"a request",
+            facts: RequestFacts {
+                model: "model-a",
+                block_hashes: &blocks,
+                budget_micros: 2_000,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints::default(),
+        };
+        let (sent, left_out) = request(&asked);
+        let copied = sent.facts.expect("request facts").block_hashes;
+        assert_eq!((copied.len(), copied.capacity()), (MAX_HASHES, MAX_HASHES));
+        assert_eq!(left_out, 1_000);
+    }
+
+    /// An empty text is a key at the door in process, and the controller
+    /// reads an empty text as no key. The empty key crosses as its hash, so
+    /// the controller decides over the same tenant and session.
+    #[test]
+    fn an_empty_plain_key_reads_over_the_link_as_the_key_it_is() {
+        let asked = door::Request {
+            id: b"a request",
+            facts: RequestFacts {
+                model: "model-a",
+                tenant: Identity::plain(""),
+                session_key: Identity::plain(""),
+                budget_micros: 2_000,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints::default(),
+        };
+        let want = &asked.facts;
+        assert!(!want.tenant.is_none() && !want.session_key.is_none());
+        let (sent, _) = request(&asked);
+        let checked = Checked::new(sent).expect("the controller reads the request");
+        let view = Viewed {
+            now_micros: 88,
+            budget_micros: 1_500,
+            affinity: &[],
+            stalled: &[],
+            held: &[],
+            in_flight: None,
+            max_block_hashes: 0,
+            named: None,
+            pins: None,
+        };
+        checked.read(&mut Lists::default(), view, |facts, _| {
+            assert_eq!(facts.tenant.hash, want.tenant.hash);
+            assert_eq!(facts.session().get(), want.session().get());
+        });
     }
 
     fn trace(survivors: Survivors) -> Trace {
@@ -677,6 +726,34 @@ mod tests {
         assert!(read.lease.is_none());
     }
 
+    /// A shed made ahead of every profile goes out with the mark over a
+    /// zero position. Its record names no profile, and a decision under the
+    /// first profile still names that one.
+    #[test]
+    fn a_shed_made_ahead_of_every_profile_names_none_over_a_link() {
+        let now = Instant::now();
+        let ahead = door::shed(ShedReason::NoEndpoints, "wires", 0, 6);
+        let wire = told(ahead, None);
+        let sent = wire.trace.as_ref().expect("a trace");
+        assert!(sent.no_profile);
+        assert_eq!(sent.profile, 0);
+        let read = decided(&wire, now).expect("a shed");
+        assert_eq!(read.decision.trace().made_under(), None);
+
+        let first = Decision::Shed(Shed {
+            reason: ShedReason::Saturated,
+            emptied_by: "not-overloaded",
+            retry_after_secs: 3,
+            wait_allowed: true,
+            trace: Trace {
+                profile: 0,
+                ..trace(Survivors::counted(0))
+            },
+        });
+        let read = decided(&told(first, None), now).expect("a shed");
+        assert_eq!(read.decision.trace().made_under(), Some(0));
+    }
+
     #[test]
     fn a_lease_keeps_the_kind_it_carries() {
         use crate::lease::LeaseKind;
@@ -826,8 +903,15 @@ mod tests {
             }
             refuses(bad, path);
         }
-        let checks: [(_, fn(&mut proto::Trace)); 4] = [
+        let checks: [(_, fn(&mut proto::Trace)); 6] = [
             ("trace.profile", |trace| trace.profile = 65_536),
+            // The mark's own number is no position, and the mark stands
+            // over no position but zero.
+            ("trace.profile", |trace| trace.profile = 65_535),
+            ("trace.profile", |trace| {
+                trace.no_profile = true;
+                trace.profile = 1;
+            }),
             ("trace.top", |trace| {
                 trace.top.resize(4, proto::Scored::default());
             }),
@@ -931,13 +1015,9 @@ mod tests {
             (ReleaseReason::Expired, Reason::Expired),
             (ReleaseReason::WorkerRemoved, Reason::WorkerRemoved),
         ] {
-            for side in [Some(Side::Decode), None] {
+            for side in [Some(Side::Prefill), Some(Side::Decode), None] {
                 let report = frame(lease, Side::Prefill, Said::Released(side, reason));
-                let side = if side.is_some() {
-                    proto::Side::Decode
-                } else {
-                    proto::Side::Unspecified
-                };
+                let side = side.map_or(proto::Side::Unspecified, proto::Side::from);
                 assert_eq!(
                     report,
                     Frame::Released(proto::Released {
