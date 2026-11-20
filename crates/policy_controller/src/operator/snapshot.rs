@@ -124,9 +124,8 @@ fn page<'a, T>(
 }
 
 /// Only copy a shared row here if an address or timestamp needs changing.
-/// A provider's row tells its maker's key too: the provider's own text,
-/// which may hold an address with a credential, so it is read as the row's
-/// addresses are.
+/// A provider's row tells its maker's key too, the provider's own text,
+/// which may hold an address with a credential ([`key_without_userinfo`]).
 fn redacted(mut row: Cow<'_, WorkerRow>, now: Instant) -> Cow<'_, WorkerRow> {
     if let Some(key) = without_userinfo(&row.facts.key) {
         row.to_mut().facts.key = key;
@@ -136,7 +135,7 @@ fn redacted(mut row: Cow<'_, WorkerRow>, now: Instant) -> Cow<'_, WorkerRow> {
     }
     let maker = match &row.maker {
         Maker::Provider(maker) => {
-            without_userinfo(maker.key()).map(|key| told_maker(maker.provider(), key))
+            key_without_userinfo(maker.key()).map(|key| told_maker(maker.provider(), key))
         }
         Maker::Control => None,
     };
@@ -149,15 +148,35 @@ fn redacted(mut row: Cow<'_, WorkerRow>, now: Instant) -> Cow<'_, WorkerRow> {
     row
 }
 
-/// The maker a row tells in place of one whose key held a userinfo: the
-/// provider's name with the clean key. A key that was all userinfo cleans
-/// to no text, which no maker holds ([`Maker::provider`]), so it reads as
-/// [`UNPARSABLE`]. The marker is inside a key's rule: the last arm is
-/// never told.
+/// The maker a row tells in place of one whose key is not told as it
+/// stands: the provider's name with the key a snapshot tells
+/// ([`key_without_userinfo`]). That key is inside a key's rule
+/// ([`Maker::provider`]), never empty and never past the bound, so the
+/// last arm is never told.
 fn told_maker(provider: &str, key: String) -> Maker {
-    Maker::provider(provider, key)
-        .or_else(|_| Maker::provider(provider, UNPARSABLE))
-        .unwrap_or_default()
+    Maker::provider(provider, key).unwrap_or_default()
+}
+
+/// A provider's key as a snapshot tells it, or `None` where it is told as
+/// it stands. The key is the provider's own text and need be no address,
+/// so no part is cut off a key that is none: that would tell a key the
+/// provider never wrote. A key with a scheme is read as a URL and loses
+/// its userinfo. Any other key that holds an `@` may hide a credential
+/// before it, and reads as [`UNPARSABLE`], which says so. A key with no
+/// `@` holds no userinfo and is told whole.
+fn key_without_userinfo(key: &str) -> Option<String> {
+    match split(key) {
+        Some(Address {
+            userinfo: false, ..
+        }) => None,
+        Some(Address {
+            scheme,
+            userinfo: true,
+            host,
+            tail,
+        }) if !scheme.is_empty() => Some(format!("{scheme}{host}{tail}")),
+        _ => Some(UNPARSABLE.to_owned()),
+    }
 }
 
 /// `address` without its userinfo, or `None` where it carries none: the
