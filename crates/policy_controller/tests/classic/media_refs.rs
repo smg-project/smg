@@ -5,8 +5,9 @@
 //! answer to each request: the workers it may be placed on, or its refusal.
 //!
 //! The rows replay on the hard demands' bed ([`Bed`]). A worker states the
-//! three facts its row records: whether it takes pixel media, whether it
-//! processes media by reference, and whether by the gateway's own pipeline.
+//! three facts its row records: whether it takes images, which is its own
+//! vision bit, whether it processes media by reference, and whether by the
+//! gateway's own pipeline.
 //! The labels a row also records are the gateway's source of those facts,
 //! and the replay reads none. A request states its media as hard demands
 //! ([`Demands`]): `any` worker that processes references, `only` one that
@@ -51,6 +52,7 @@ struct Asked {
     wire: Option<Wire>,
     /// Absent where the request carries no media by reference.
     references: Option<Pin>,
+    /// Whether the request carries pixel media: it needs vision.
     #[serde(default)]
     pixels: bool,
 }
@@ -74,7 +76,7 @@ impl Asked {
 /// unsupported. Any other shed is the pool's ([`pool_refusal`]).
 fn refusal(demands: Demands, reason: ShedReason, emptied_by: &str) -> Refusal {
     match (emptied_by, demands.references) {
-        ("pixels", _) | ("pipeline", References::Worker) => {
+        ("vision", _) | ("pipeline", References::Worker) => {
             Refusal::of(400, "multimodal_not_supported")
         }
         ("references", _) => Refusal::of(503, "no_media_ref_capable_worker"),
@@ -109,9 +111,9 @@ impl Replayed for Row {
             pooled.push(Pooled {
                 wire_modes: wire_of(&worker.transport)?,
                 state: worker.state,
+                vision: worker.vision,
                 facts: DemandFacts {
                     runtime: runtimes.number(&worker.runtime),
-                    pixels: worker.vision,
                     references: worker.processes_references,
                     host_pipeline: worker.gateway_pipeline,
                 },
@@ -123,7 +125,7 @@ impl Replayed for Row {
             let (wire_modes, runtime) = runtimes.stays_on(asked.wire.as_ref())?;
             let demands = Demands {
                 runtime,
-                pixels: asked.pixels,
+                vision: asked.pixels,
                 references: asked.references(),
             };
             let constraints = Constraints {

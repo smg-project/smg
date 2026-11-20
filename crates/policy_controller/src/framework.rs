@@ -1706,7 +1706,7 @@ fn filter(
         }
         kept.retain(|&i| vision_fits(facts, &candidates[i as usize]));
         if kept.is_empty() {
-            return Some("vision");
+            return Some(VISION);
         }
     }
     for hard in profile.filters.iter().filter(|f| !f.soft()) {
@@ -2053,6 +2053,12 @@ impl<'a> Set<'a> {
         }
     }
 }
+
+/// The stage a pool is shed under when none of its rows takes the images
+/// its request carries: the `epd` plan's vision rule sheds under it, and so
+/// does a request's vision demand
+/// ([`Unmet::Vision`](crate::demands::Unmet::Vision)).
+pub(crate) const VISION: &str = "vision";
 
 /// The `epd` plan's vision rule: a request carrying images takes an encoder
 /// with a vision encoder; a request without them takes any.

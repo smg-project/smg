@@ -127,6 +127,8 @@ pub fn pool_refusal(reason: ShedReason, emptied_by: &str) -> Refusal {
 pub struct Pooled {
     pub wire_modes: WireModes,
     pub state: State,
+    /// Whether it takes images: its row's own bit.
+    pub vision: bool,
     pub facts: DemandFacts,
 }
 
@@ -168,6 +170,7 @@ impl Bed {
                     models: vec![MODEL.to_string()],
                     dp_size: 1,
                     wire_modes: worker.wire_modes,
+                    vision: worker.vision,
                     demand_facts: worker.facts,
                     ..WorkerFacts::default()
                 })

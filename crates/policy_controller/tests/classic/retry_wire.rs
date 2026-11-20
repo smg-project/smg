@@ -60,6 +60,7 @@ impl Replayed for Row {
             pooled.push(Pooled {
                 wire_modes: wire_of(&worker.transport)?,
                 state: worker.state,
+                vision: false,
                 facts: DemandFacts {
                     runtime: runtimes.number(&worker.runtime),
                     ..DemandFacts::default()

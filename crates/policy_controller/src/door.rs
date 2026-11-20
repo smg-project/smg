@@ -178,7 +178,8 @@ pub(crate) fn summed(parts: &[Part], count: impl Fn(&Part) -> &AtomicU64) -> u64
 }
 
 /// The stage a decision is shed under when its pool has rows and its
-/// gateway shares a wire with none of them.
+/// gateway shares a wire with none of them, or its request's runtime is
+/// none of theirs ([`Unmet::Runtime`]).
 pub(crate) const WIRES: &str = "wires";
 
 /// The stage a decision is shed under when its gateway hints a subset of 0
@@ -1875,11 +1876,11 @@ pub(crate) struct Took {
 
 /// [`narrow`] for a request that states hard demands ([`Demands`]): one
 /// pass keeps the rows that share a wire with the gateway and meet every
-/// demand, each by its entry of `facts`, the build's column
-/// ([`World::demand_facts`]). A row with no entry states nothing, and meets
-/// no demand. The kept rows keep their order and take their positions, and
-/// every column beside them follows in the same step: the affinity column,
-/// the signal cells and the facts. A hint of 0 keeps none.
+/// demand, each by its own vision bit and its entry of `facts`, the
+/// build's column ([`World::demand_facts`]). A row with no entry states
+/// nothing there. The kept rows keep their order and take their positions,
+/// and every column beside them follows in the same step: the affinity
+/// column, the signal cells and the facts. A hint of 0 keeps none.
 ///
 /// The rows a demand took are named by their places in the build's list
 /// ([`Took::demanded`]), never by what the demand states: two requests
@@ -1914,7 +1915,7 @@ pub(crate) fn narrow_demanded(
         }
         // A row with no entry states nothing.
         let stated = facts.get(at).copied().unwrap_or_default();
-        if let Some(unmet) = demands.unmet_by(stated) {
+        if let Some(unmet) = demands.unmet_by(row.vision, stated) {
             // One more than the place: the first row's taking is no zero.
             // Each place turns the fold by a product of the places' own
             // word: the name is of these places in their order, and of
@@ -6154,9 +6155,15 @@ pub(crate) mod tests {
         assert_eq!(first.map(|target| target.id), Some(members[1]));
     }
 
-    /// A ready member of [`MODEL`] under `role` that states `stated` for a
-    /// request's hard demands, in `store`.
-    fn states_facts(store: &MemoryStore, name: &str, role: Role, stated: DemandFacts) -> WorkerId {
+    /// A ready member of [`MODEL`] under `role` in `store` that takes images
+    /// where `vision`, and states `stated` beside it for a request's hard
+    /// demands.
+    fn states_facts(
+        store: &MemoryStore,
+        name: &str,
+        role: Role,
+        (vision, stated): (bool, DemandFacts),
+    ) -> WorkerId {
         let key = format!("http://{name}:8000");
         let facts = WorkerFacts {
             key: key.clone(),
@@ -6166,6 +6173,7 @@ pub(crate) mod tests {
             models: vec![MODEL.to_owned()],
             dp_size: 1,
             max_running: Some(4_096),
+            vision,
             demand_facts: stated,
             ..WorkerFacts::default()
         };
@@ -6185,21 +6193,25 @@ pub(crate) mod tests {
             runtime,
             ..DemandFacts::default()
         };
-        states_facts(store, name, role, stated)
+        states_facts(store, name, role, (false, stated))
     }
 
     /// [`stating_facts`] for members that state a runtime and no more.
     fn stating(stated: &[u32]) -> (Arc<MemoryStore>, Vec<WorkerId>) {
-        let facts = stated.iter().map(|&runtime| DemandFacts {
-            runtime,
-            ..DemandFacts::default()
+        let facts = stated.iter().map(|&runtime| {
+            let stated = DemandFacts {
+                runtime,
+                ..DemandFacts::default()
+            };
+            (false, stated)
         });
         stating_facts(&facts.collect::<Vec<_>>())
     }
 
     /// A store under the `random` preset whose ready members of [`MODEL`]
-    /// state the facts of `stated`, one a member, in that order.
-    fn stating_facts(stated: &[DemandFacts]) -> (Arc<MemoryStore>, Vec<WorkerId>) {
+    /// state the facts of `stated`, one a member, in that order: its vision
+    /// bit, then what it states beside it.
+    fn stating_facts(stated: &[(bool, DemandFacts)]) -> (Arc<MemoryStore>, Vec<WorkerId>) {
         let store = MemoryStore::new();
         let ids = stated.iter().enumerate().map(|(place, &stated)| {
             states_facts(&store, &format!("r{place}"), Role::Single, stated)
@@ -6571,18 +6583,22 @@ pub(crate) mod tests {
         assert_eq!(warming, [short]);
     }
 
-    /// Media is a demand as a runtime is: a request that carries pixel media
-    /// or media by reference is decided over the members that take it. A
-    /// pool that holds none is shed under the last demand its members
-    /// failed first, in a host's order of answers, and one its runtime
-    /// emptied under the wires.
+    /// Media is a demand as a runtime is: a request that needs vision or
+    /// carries media by reference is decided over the members that take it.
+    /// Vision is read of a member's own bit, the one a pairing plan reads,
+    /// and the rest of what it states beside it. A pool that holds none is
+    /// shed under the last demand its members failed first, in a host's
+    /// order of answers: under the plan's own word where that is vision, and
+    /// under the wires where its runtime emptied it.
     #[test]
     fn a_media_demand_keeps_the_members_that_take_it_and_names_its_shed() {
-        let member = |pixels: bool, references: bool, host_pipeline: bool| DemandFacts {
-            runtime: 7,
-            pixels,
-            references,
-            host_pipeline,
+        let member = |vision: bool, references: bool, host_pipeline: bool| {
+            let stated = DemandFacts {
+                runtime: 7,
+                references,
+                host_pipeline,
+            };
+            (vision, stated)
         };
         let (store, ids) = stating_facts(&[
             member(true, false, false),
@@ -6608,8 +6624,8 @@ pub(crate) mod tests {
             }
             Ok(placed)
         };
-        let asks = |pixels: bool, references: References| Demands {
-            pixels,
+        let asks = |vision: bool, references: References| Demands {
+            vision,
             references,
             ..Demands::default()
         };
@@ -6621,8 +6637,8 @@ pub(crate) mod tests {
         assert_eq!(decide(2, asks(false, References::Any)), kept(&[host, own]));
         assert_eq!(decide(3, asks(false, References::Host)), kept(&[host]));
         assert_eq!(decide(4, asks(false, References::Worker)), kept(&[own]));
-        // One member takes no pixel media, one processes no reference and
-        // one runs the other pipeline: the last of the three is the pipeline.
+        // One member takes no images, one processes no reference and one
+        // runs the other pipeline: the last of the three is the pipeline.
         let nobody = |stage: &'static str| Err((ShedReason::NoEndpoints, stage));
         assert_eq!(
             decide(5, asks(true, References::Worker)),
@@ -6635,6 +6651,21 @@ pub(crate) mod tests {
         };
         assert_eq!(decide(6, elsewhere), nobody(super::WIRES));
         assert_eq!(door.undialed(), 0);
+        // A pool none of whose members takes images is shed under the word
+        // the pairing plan sheds under.
+        let (blind, _) = stating_facts(&[member(false, true, true), member(false, false, false)]);
+        let blind = Door::new(blind);
+        let mut asked = request(b"blind", 1);
+        asked.constraints.demands = asks(true, References::Any);
+        let decided = blind.decide(GATEWAY, &asked, Instant::now());
+        let shed = match decided.expect("a decision").decision {
+            Decision::Shed(shed) => Ok((shed.reason, shed.emptied_by)),
+            decision => Err(decision.pick().is_some()),
+        };
+        assert_eq!(
+            shed,
+            Ok((ShedReason::NoEndpoints, crate::framework::VISION))
+        );
     }
 
     /// One pass narrows a built view by its gateway's wires and its

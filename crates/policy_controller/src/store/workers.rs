@@ -151,7 +151,9 @@ pub struct WorkerFacts {
     /// connector and reads its name past its blanks.
     pub encode: EncodeOffer,
     /// The worker takes images, as its registration states: an encoder
-    /// encodes them and a decode attends to them.
+    /// encodes them and a decode attends to them. A request that needs
+    /// vision ([`Demands::vision`](crate::demands::Demands::vision)) takes
+    /// no other worker.
     pub vision: bool,
     /// The engine's admission window (maximum running requests); `None`
     /// when it reports none.
@@ -167,9 +169,10 @@ pub struct WorkerFacts {
     /// registration states another window than the default. A host that
     /// builds the worker's object from the row gives the object this window.
     pub drain_settle_secs: Option<u32>,
-    /// What the worker states for a request's hard demands
-    /// ([`DemandFacts`]), in its registering host's own numbers. A host
-    /// that states none registers a worker that meets no demand.
+    /// What the worker states for a request's hard demands beside its
+    /// vision ([`DemandFacts`]), in its registering host's own numbers. A
+    /// host that states none registers a worker that meets no demand that
+    /// reads them.
     pub demand_facts: DemandFacts,
 }
 
