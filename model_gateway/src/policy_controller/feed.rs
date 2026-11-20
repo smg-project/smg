@@ -11,11 +11,9 @@ use smg_policy_controller::{
     store::{Maker, MemoryStore, WorkerFacts},
     worker_host::{Expect, Membership, Objects, Refused, Remover, Standing, StoreDoor, Wrote},
 };
+use smg_worker::connection::engine::EngineConnector;
 
-use crate::routers::{
-    common::snapshot::{ModelWorkerSnapshot, WorkerRegistry},
-    grpc::backend_client::BackendConnector,
-};
+use crate::routers::common::snapshot::{ModelWorkerSnapshot, WorkerRegistry};
 
 /// The feed of a gateway that decides in its own process: the door its
 /// worker workflows write at, and the holder that keeps the registry as
@@ -35,10 +33,10 @@ pub(crate) struct Feed {
 
 impl Feed {
     /// Bring the registry to the store's rows, then publish them: the two
-    /// calls the door's listener makes after each write. A follower that
-    /// applies a served controller's events calls this after each event.
-    /// It takes the feed's turn, so it never runs between a write at the
-    /// door and that write's listener.
+    /// calls the door's listener makes after each write. It is here for a
+    /// follower that applies a served controller's events; no product line
+    /// calls it yet. It takes the feed's turn, so it never runs between a
+    /// write at the door and that write's listener.
     pub(crate) fn settle(&self) {
         let _turn = self.turn.lock();
         settle(&self.objects, &self.store);
@@ -52,10 +50,14 @@ fn settle(objects: &Objects<ModelWorkerSnapshot>, store: &MemoryStore) {
     store.publish_now();
 }
 
-/// The feed over `store`, for the workers of `registry`.
-pub(crate) fn feed(store: &Arc<MemoryStore>, registry: &Arc<WorkerRegistry>) -> Feed {
-    let objects =
-        Arc::new(Objects::new(Arc::clone(registry)).with_connector(BackendConnector::shared()));
+/// The feed over `store`, for the workers of `registry`. The holder lays
+/// each object with `connector`, the one the gateway was started with.
+pub(crate) fn feed(
+    store: &Arc<MemoryStore>,
+    registry: &Arc<WorkerRegistry>,
+    connector: Arc<dyn EngineConnector>,
+) -> Feed {
+    let objects = Arc::new(Objects::new(Arc::clone(registry)).with_connector(connector));
     let door = StoreDoor::new(Arc::clone(store)).telling({
         let objects = Arc::clone(&objects);
         let store = Arc::clone(store);

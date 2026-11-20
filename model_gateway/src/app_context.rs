@@ -247,6 +247,10 @@ pub struct AppContextBuilder {
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
     policy_store: Option<Arc<MemoryStore>>,
+    /// The membership feed, built with the policy store.
+    policy_feed: Option<Feed>,
+    /// The host over the feed's holder, built with the feed.
+    policy_host: Option<Arc<Host>>,
     policy_follower: Option<Arc<Mutex<Option<Follower>>>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
@@ -395,6 +399,8 @@ impl AppContextBuilder {
             wasm_manager: None,
             kv_event_monitor: None,
             policy_store: None,
+            policy_feed: None,
+            policy_host: None,
             policy_follower: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
@@ -613,10 +619,6 @@ impl AppContextBuilder {
         let worker_registry = self
             .worker_registry
             .ok_or(AppContextBuildError::MissingField("worker_registry"))?;
-        let policy_feed = self
-            .policy_store
-            .as_ref()
-            .map(|store| policy_controller::feed::feed(store, &worker_registry));
         let policy_registry = self
             .policy_registry
             .ok_or(AppContextBuildError::MissingField("policy_registry"))?;
@@ -665,11 +667,6 @@ impl AppContextBuilder {
         );
 
         let rl = rl_adapter::build_rl_state(&worker_registry, &worker_client_cache, &router_config);
-        let policy_host = self
-            .policy_store
-            .as_ref()
-            .map(|store| Arc::new(Host::new(Arc::clone(store), Arc::clone(&worker_registry))));
-
         Ok(AppContext {
             gateway_auth,
             client: self
@@ -719,8 +716,8 @@ impl AppContextBuilder {
             kv_event_monitor: self.kv_event_monitor,
             policy_store: self.policy_store,
             policy_follower: self.policy_follower,
-            policy_host,
-            policy_feed,
+            policy_host: self.policy_host,
+            policy_feed: self.policy_feed,
             rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
@@ -953,8 +950,9 @@ impl AppContextBuilder {
         self
     }
 
-    /// Start the policy store and, when configured, its worker watch. A start
-    /// the store refuses stops this one, by name.
+    /// Start the policy store with its membership feed and host and, when
+    /// configured, its worker watch. A start the store refuses stops this
+    /// one, by name.
     fn with_policy_controller(
         mut self,
         config: &RouterConfig,
@@ -963,6 +961,16 @@ impl AppContextBuilder {
         self.policy_store =
             policy_controller::start_with(config, stages, RouterConfig::policy_document)
                 .map_err(|refusal| refusal.to_string())?;
+        if let Some(store) = &self.policy_store {
+            let registry = self.worker_registry.as_ref().ok_or_else(|| {
+                "worker_registry must be set before the policy controller".to_string()
+            })?;
+            let feed =
+                policy_controller::feed::feed(store, registry, Arc::clone(&self.engine_connector));
+            let host = Host::new(Arc::clone(store), Arc::clone(&feed.objects));
+            self.policy_feed = Some(feed);
+            self.policy_host = Some(Arc::new(host));
+        }
         if let (Some(address), Some(store)) =
             (&config.policy_controller_address, &self.policy_store)
         {

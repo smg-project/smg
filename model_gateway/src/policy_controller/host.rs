@@ -3,11 +3,10 @@
 //!
 //! An attempt has two halves. The ask ([`Host::ask`]) states what the
 //! attempt knows of its request and gets a decision through the
-//! controller's handle. The commit ([`Host::commit`]) walks the decision's
-//! targets under the gateway's own locks and takes the first it can send
-//! to. [`Host::place`] is their loop for the regular shapes. The store
-//! builds the candidates: the gateway sends none and keeps no view of the
-//! rows.
+//! controller's handle. The commit ([`Host::commit`]) looks up the decision's
+//! targets and takes the first it can send to. [`Host::place`] is their loop
+//! for the regular shapes. The store builds the candidates: the gateway
+//! sends none and keeps no view of the rows.
 //!
 //! The ask is the one function that may wait. In process the door decides
 //! on the calling thread and the ask is ready at once. A controller at an
@@ -45,12 +44,15 @@ use smg_policy_controller::{
     door::{Door, Maker, Refused, Request},
     handle::Handle,
     lease::{Outcome, ReleaseReason, Side, TransportClass},
-    store::{GatewayId, MemoryStore, WorkersStore, World},
+    store::{GatewayId, MemoryStore, World},
     view::{Constraints, HashKind, Identity, Phase, RequestFacts, WorkerId},
+    worker_host::Objects,
     AppliedSpec, DerivedKey, KeySource,
 };
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard};
 
+#[cfg(test)]
+use crate::routers::common::snapshot::WorkerRegistry;
 use crate::{
     middleware::{
         ADMISSION_QUEUE_FULL_CODE, ADMISSION_QUEUE_FULL_STATUS, ADMISSION_QUEUE_TIMEOUT_CODE,
@@ -65,7 +67,7 @@ use crate::{
             overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
             placement::{self, no_available_workers_because},
             retry::mark_non_retryable,
-            snapshot::WorkerRegistry,
+            snapshot::ModelWorkerSnapshot,
         },
         error,
     },
@@ -410,33 +412,56 @@ pub(crate) struct Asked {
 }
 
 /// The policy controller's host in this process: the door over the
-/// controller's store, and the registry the gateway's workers stand in.
+/// controller's store, and the holder of the gateway's worker objects.
 pub(crate) struct Host {
     door: Arc<Door>,
-    registry: Arc<WorkerRegistry>,
+    workers: Workers,
+}
+
+/// Where the host finds the worker of a target's row.
+enum Workers {
+    /// The object the feed's holder laid for the row.
+    Held(Arc<Objects<ModelWorkerSnapshot>>),
+    /// The registry's worker at the row's key, for a bed that registers its
+    /// workers by hand. A key is not one life of a worker.
+    #[cfg(test)]
+    AtKey(Arc<WorkerRegistry>),
 }
 
 impl Host {
-    /// The host over the controller's `store`, for the workers of
-    /// `registry`.
-    pub(crate) fn new(store: Arc<MemoryStore>, registry: Arc<WorkerRegistry>) -> Self {
+    /// The host over the controller's `store` and the holder of its worker
+    /// `objects`.
+    pub(crate) fn new(store: Arc<MemoryStore>, objects: Arc<Objects<ModelWorkerSnapshot>>) -> Self {
         Self {
             door: Arc::new(Door::new(store)),
-            registry,
+            workers: Workers::Held(objects),
         }
     }
 
-    /// The gateway's worker of a target: the one function that resolves a
-    /// row of the store to a worker. `None` where the row is gone, or the
-    /// registry holds no worker at its key.
-    ///
-    /// This body reads the row whole and looks its key up as a URL. A URL is
-    /// not one life of a worker, and the read clones the row: the host
-    /// resolves by the row's id, through the registry's projection of the
-    /// store, before a router calls it.
+    /// The host of a bed that registers its workers by hand in `registry`.
+    #[cfg(test)]
+    pub(crate) fn at_keys(store: Arc<MemoryStore>, registry: Arc<WorkerRegistry>) -> Self {
+        Self {
+            door: Arc::new(Door::new(store)),
+            workers: Workers::AtKey(registry),
+        }
+    }
+
+    /// The gateway's worker of a target, found by the row's id: the one
+    /// function that resolves a row of the store to a worker. `None` where
+    /// the holder has laid no object for the row or the object has left the
+    /// registry. So a row the store shows ahead of its object, as a
+    /// replacement inside its own write, takes no request.
     fn worker(&self, id: WorkerId) -> Option<Arc<dyn Worker>> {
-        let row = WorkersStore::get(&**self.door.store(), id)?;
-        self.registry.get_by_url(&row.facts.key)
+        match &self.workers {
+            Workers::Held(objects) => objects.registry().get(&objects.object(id)?),
+            #[cfg(test)]
+            Workers::AtKey(registry) => {
+                use smg_policy_controller::store::WorkersStore;
+                let row = WorkersStore::get(&**self.door.store(), id)?;
+                registry.get_by_url(&row.facts.key)
+            }
+        }
     }
 
     fn profile_name(&self, trace: &Trace) -> Option<Arc<str>> {
@@ -555,10 +580,8 @@ impl Host {
     }
 
     /// The commit: walks the targets of `asked`, best first, and takes the
-    /// first the gateway can send to. It awaits nothing. It reads each
-    /// target's row under the store's membership lock, which a publication
-    /// holds through a rebuild: until the host resolves a target by its id,
-    /// a caller holds no lock of its own across it.
+    /// first the gateway can send to. It awaits nothing and takes the
+    /// holder's read lock once for each target it looks up.
     ///
     /// Where no target holds, the decision's lease is given up by name at
     /// `now` and its targets join `missed`: the next ask names them.

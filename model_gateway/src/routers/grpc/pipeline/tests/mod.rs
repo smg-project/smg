@@ -2949,7 +2949,7 @@ async fn placed_harmony_responses_context() -> (ResponsesContext, Arc<MemoryStor
         None,
         Duration::from_secs(60),
     )
-    .with_host(Some(Arc::new(Host::new(Arc::clone(&store), registry))));
+    .with_host(Some(Arc::new(Host::at_keys(Arc::clone(&store), registry))));
     let ctx = responses_context_with_deps(Endpoint::Harmony, Mode::Regular, &deps, 0).await;
     (ctx, store, row)
 }

@@ -18,7 +18,7 @@ use smg_policy_controller::{
     view::{Role, WireModes, WorkerId},
     worker_host::{Expect, Membership, Refused, Remover, Standing, StoreDoor, Wrote},
 };
-use smg_worker::registry::event::WorkerEvent;
+use smg_worker::{connection::engine::EngineConnector, registry::event::WorkerEvent};
 
 use super::{feed, Feed, FeedDoor};
 use crate::{
@@ -35,7 +35,7 @@ const MODEL: &str = "model-a";
 
 fn bed(store: &Arc<MemoryStore>) -> (Arc<WorkerRegistry>, Feed) {
     let registry = Arc::new(WorkerRegistry::new());
-    let feed = feed(store, &registry);
+    let feed = feed(store, &registry, BackendConnector::shared());
     (registry, feed)
 }
 
@@ -72,20 +72,20 @@ fn start_store() -> Result<Arc<MemoryStore>, Box<dyn Error>> {
 }
 
 fn ask(id: &[u8]) -> Ask<'_> {
-    Ask {
-        id,
-        model: MODEL,
-        streaming: false,
-        headers: None,
-        rid: None,
-        tried: &[],
-        hashes: None,
-    }
+    Ask::of(id, MODEL)
 }
 
 #[test]
 fn a_write_at_the_door_puts_the_workers_object_in_the_registry() {
-    let (registry, feed) = bed(&Arc::new(MemoryStore::default()));
+    // A connector of the case's own: the object's is the one handed over,
+    // and no stock one by name.
+    let handed: Arc<dyn EngineConnector> = Arc::new(BackendConnector);
+    let registry = Arc::new(WorkerRegistry::new());
+    let feed = feed(
+        &Arc::new(MemoryStore::default()),
+        &registry,
+        Arc::clone(&handed),
+    );
     let row = register(&*feed.door).expect("the worker registers");
     let worker = registry.get_by_url(URL).expect("the worker stands");
     let object = feed.objects.object(row).expect("the row has an object");
@@ -93,14 +93,14 @@ fn a_write_at_the_door_puts_the_workers_object_in_the_registry() {
     let connector = worker
         .engine_connector()
         .expect("the worker has a connector");
-    assert!(Arc::ptr_eq(&connector, &BackendConnector::shared()));
+    assert!(Arc::ptr_eq(&connector, &handed));
 }
 
 #[tokio::test]
 async fn a_written_row_is_in_force_for_the_next_decision() {
     let store = start_store().expect("the store starts");
-    let (registry, feed) = bed(&store);
-    let host = Host::new(store, registry);
+    let (_, feed) = bed(&store);
+    let host = Host::new(store, Arc::clone(&feed.objects));
     let row = register(&*feed.door).expect("the worker registers");
     let placed = host
         .place(&ask(b"first"), Instant::now())
@@ -119,6 +119,45 @@ fn settle_brings_a_row_written_past_the_door_into_the_registry() {
     feed.settle();
     let object = feed.objects.object(row).expect("the row has an object");
     assert_eq!(registry.get_id_by_url(URL), Some(object));
+}
+
+/// The store shows a replacement inside its own write, and with probes
+/// off the door readies it there, ahead of the listener. A door with no
+/// listener leaves that state standing: the registry holds the old object.
+#[tokio::test]
+async fn a_replacement_takes_no_request_until_its_object_is_laid() {
+    let store = start_store().expect("the store starts");
+    let (registry, feed) = bed(&store);
+    let host = Host::new(Arc::clone(&store), Arc::clone(&feed.objects));
+    register(&*feed.door).expect("the worker registers");
+    let old = registry.get_by_url(URL).expect("the first object stands");
+
+    let replaced =
+        StoreDoor::new(Arc::clone(&store)).found(&Maker::Control, Expect::Anything, URL, &|_| {
+            WorkerFacts {
+                models: vec![MODEL.to_owned(), "model-b".to_owned()],
+                ..stated()
+            }
+        });
+    assert!(
+        matches!(replaced, Ok(Wrote::Another { .. })),
+        "{replaced:?}"
+    );
+    let stale = registry.get_by_url(URL).expect("the old object stands");
+    assert!(Arc::ptr_eq(&stale, &old));
+
+    let gap = host
+        .place(&ask(b"gap"), Instant::now())
+        .await
+        .expect_err("a row with no object takes no request");
+    assert!(matches!(gap, Unplaced::NoTargetHolds), "{gap:?}");
+
+    feed.settle();
+    let placed = host
+        .place(&ask(b"laid"), Instant::now())
+        .await
+        .expect("the replacement's object takes the request");
+    assert!(!Arc::ptr_eq(placed.worker(), &old));
 }
 
 struct TurnAtRegistration {
@@ -173,7 +212,7 @@ fn a_second_write_of_the_same_facts_moves_nothing() {
 async fn a_drained_row_takes_no_decision_and_a_gone_row_leaves_the_registry() {
     let store = start_store().expect("the store starts");
     let (registry, feed) = bed(&store);
-    let host = Host::new(store, Arc::clone(&registry));
+    let host = Host::new(store, Arc::clone(&feed.objects));
     let row = register(&*feed.door).expect("the worker registers");
     let before = host
         .place(&ask(b"first"), Instant::now())

@@ -130,7 +130,7 @@ fn bed_with<'a>(
         workers.push(worker);
     }
     store.publish_now();
-    (Host::new(Arc::clone(&store), registry), store, workers)
+    (Host::at_keys(Arc::clone(&store), registry), store, workers)
 }
 
 /// Stores a chain of content hashes in one batch on `id`, through the
