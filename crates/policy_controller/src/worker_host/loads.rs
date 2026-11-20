@@ -15,7 +15,10 @@
 //! calls no collector.
 
 use std::{
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc, OnceLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -47,10 +50,17 @@ struct KeptMember {
     worker: Arc<dyn Worker>,
     id: ObjectId,
     member: Member,
+    /// The rank of the worker's last report of one rank, while the entry
+    /// has no keeper, or [`NO_RANK`]: a report of one rank behind one of
+    /// another rank is a sign of several ranks.
+    alone: AtomicI64,
     /// What each rank of the worker last stated of the declared signals,
-    /// made at its first report of several ranks. It goes with the entry.
+    /// made at its first sign of several ranks. It goes with the entry.
     keeper: OnceLock<Keeper>,
 }
+
+/// No report of one rank came yet. A rank is an `i32`.
+const NO_RANK: i64 = i64::MIN;
 
 /// What each rank of one worker last stated, behind the worker's own lock.
 type Keeper = Arc<Mutex<RankValues>>;
@@ -63,9 +73,13 @@ struct Heard<'a> {
 
 impl KeptMember {
     /// The entry's keeper for `heard`'s report: the one it has, or one
-    /// made at the worker's first report of several ranks. A worker of one
-    /// rank has none, and allocates nothing. Under a document that
-    /// declares no signal nothing is read.
+    /// made at the first sign that the worker stands over several ranks.
+    /// The signs are a report of several ranks, and a report of one rank
+    /// behind a report of another rank: answers can list one rank each, a
+    /// different one at a time, and what such an answer states counts
+    /// from then on. A worker of one rank has no keeper and allocates
+    /// nothing: its record reads the rank it last noted, and takes no
+    /// lock. Under a document that declares no signal nothing is read.
     fn keeper_for(&self, heard: &Heard<'_>) -> Option<Keeper> {
         if heard.columns.is_empty() {
             return None;
@@ -73,7 +87,18 @@ impl KeptMember {
         if let Some(keeper) = self.keeper.get() {
             return Some(Arc::clone(keeper));
         }
-        RankValues::keeps(heard.report, heard.columns)
+        let another = match heard.report.loads.as_slice() {
+            [only] if only.worker.is_none() => {
+                let rank = i64::from(only.dp_rank);
+                let last = self.alone.load(Ordering::Relaxed);
+                if last != rank {
+                    self.alone.store(rank, Ordering::Relaxed);
+                }
+                last != NO_RANK && last != rank
+            }
+            _ => false,
+        };
+        (another || RankValues::keeps(heard.report, heard.columns))
             .then(|| Arc::clone(self.keeper.get_or_init(Keeper::default)))
     }
 }
@@ -109,7 +134,8 @@ impl KeptMember {
 /// is one rank's, and its report lists every rank at its latest record. So
 /// that worker's values are made over what each rank last stated, each
 /// statement under its own sample instant ([`RankValues`]). The statements
-/// are kept in the worker's entry from its first report of several ranks:
+/// are kept in the worker's entry from its first sign of several ranks, a
+/// report of several ranks or a report of one rank behind one of another:
 /// a worker of one rank allocates nothing. The collector writes each
 /// entry's sample instant where it writes the entry, so the keeper reads
 /// another rank's entry under the instant the entry says. The statements
@@ -183,6 +209,7 @@ impl<G: Generation, S: StoreLoadSink + SignalSink + ?Sized> LoadAdapter<G, S> {
                 rank: u16::try_from(worker.dp_rank().unwrap_or(0)).ok()?,
                 role: role(*worker.worker_type()),
             },
+            alone: AtomicI64::new(NO_RANK),
             keeper: OnceLock::new(),
         })
     }
@@ -462,9 +489,12 @@ mod tests {
 
     use parking_lot::Mutex;
     use smg_worker::{
-        load::port::GroupTick,
+        load::{monitor::WorkerMonitor, port::GroupTick},
         registry::WorkerRegistry,
-        worker::{LoadTelemetry, NamedValue, SchedulerLoadSnapshot, WorkerStatus as ObjectStatus},
+        worker::{
+            LoadRecord, LoadTelemetry, NamedValue, SchedulerLoadSnapshot,
+            WorkerStatus as ObjectStatus,
+        },
     };
 
     use super::*;
@@ -1892,6 +1922,31 @@ mod tests {
         assert_eq!(depth(&replica, id), Some((7.0, micros(at(0)))));
     }
 
+    /// Answers can list one rank each, a different one at a time, so that
+    /// no report lists two. A report of one rank behind one of another
+    /// rank is a sign of several ranks too: the keeper is made there, and
+    /// what that answer states counts when a later answer lists both.
+    #[test]
+    fn answers_of_one_rank_each_are_a_sign_of_several_ranks() {
+        let replica = Replica::new();
+        let (id, worker) = replica.add(facts(URL));
+        declare(&replica);
+        let adapter = replica.lead();
+        let start = Instant::now() + Duration::from_secs(1);
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let micros = |at: Instant| replica.store.memory.micros(at);
+        let first = file(&[(0, None)]);
+        adapter.report(&[polled(&worker, Some(&first))], at(0));
+        let second = file(&[(1, Some(2.0))]);
+        adapter.report(&[polled(&worker, Some(&second))], at(1_000));
+        assert_eq!(depth(&replica, id), Some((2.0, micros(at(1_000)))));
+        // Rank 0 states 5 beside a rank 1 with no depth: rank 1 counts
+        // what its own answer stated.
+        let both = file(&[(0, Some(5.0)), (1, None)]);
+        adapter.report(&[polled(&worker, Some(&both))], at(2_000));
+        assert_eq!(depth(&replica, id), Some((7.0, micros(at(1_000)))));
+    }
+
     /// An answer's entry is laid over a rank's entry on the pushed report,
     /// though the rank pushed a record while the poll was out. What the
     /// answer stated of the rank is as old as the poll, whatever the rank
@@ -2005,6 +2060,69 @@ mod tests {
         declare_as(&replica, 4, &DECLARED);
         pushed.record(0, Some(7.0), at(7_000));
         assert_eq!(depth(&replica, id), Some((67.0, micros(at(1_000)))));
+    }
+
+    /// A record as a rank's stream pushes it: the depth it states by name,
+    /// where it states one.
+    struct Stream(Option<f64>);
+
+    impl LoadRecord for Stream {
+        fn age(&self) -> Duration {
+            Duration::ZERO
+        }
+
+        fn telemetry(&self) -> LoadTelemetry {
+            LoadTelemetry::empty()
+        }
+
+        fn fields(&self) -> SchedulerLoadSnapshot {
+            file(&[(0, self.0)]).loads.remove(0)
+        }
+
+        fn values_sent(&self) -> usize {
+            usize::from(self.0.is_some())
+        }
+
+        fn engine_silence(&self) -> Option<Duration> {
+            None
+        }
+
+        fn reports_every_step(&self) -> bool {
+            false
+        }
+
+        fn prefill_pending(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    /// The collector's own report through the adapter: nothing here lays
+    /// an entry by hand. Each rank's record goes to the collector, which
+    /// keeps the worker's report, writes each entry's sample instant and
+    /// hands the report to its sink. Rank 1 states its depth once, ahead
+    /// of rank 0's first record, and falls silent. It counts at rank 0's
+    /// first record, and the row's value stays as old as rank 1's own.
+    #[tokio::test]
+    async fn the_collectors_report_dates_each_rank_by_its_own_record() {
+        let replica = Replica::new();
+        let (id, worker) = replica.add(facts(URL));
+        declare(&replica);
+        let registry = Arc::clone(replica.objects.registry());
+        let sink = Arc::new(replica.lead());
+        let monitor = Arc::new(WorkerMonitor::with_sink(registry, sink, 1, false, false));
+        let start = Instant::now() + Duration::from_secs(1);
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        monitor.apply_pushed_load(&worker, 1, &Stream(Some(100.0)), at(0));
+        for second in 1..=9 {
+            let received = at(second * 1_000);
+            monitor.apply_pushed_load(&worker, 0, &Stream(Some(1.0)), received);
+        }
+        let (value, sampled) = depth(&replica, id).expect("the row's depth");
+        assert_eq!(value, 101.0);
+        // A record is sampled a little ahead of its receipt. Rank 1's was
+        // received at the start, and rank 0's first a second later.
+        let silent = replica.store.memory.micros(at(0));
+        assert!(sampled <= silent && silent - sampled < 500_000, "{sampled}");
     }
 
     /// A rank worker's report is one rank's, by a record and by a poll:

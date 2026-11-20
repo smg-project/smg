@@ -292,11 +292,13 @@ fn joined(across: AcrossRanks, so_far: f64, next: f64) -> f64 {
 /// rank's record and at a polled answer laid on the report. The keeper
 /// reads an entry under the instant it says, and works out no instant by
 /// a rule of its own. An entry that says none is read as the report's own
-/// sample. So a source can make a keeper at any report and nothing stated
-/// before is lost: the report holds each rank's latest entry. A source
-/// makes one at a worker's first report of several ranks. A worker of one
-/// rank needs none: its report is one sample, handed as it is, and the
-/// store's cell holds its last value.
+/// sample, once. So a source can make a keeper at any pushed report and
+/// nothing a record stated before is lost: the report holds each rank's
+/// latest entry. What an answer states is kept by the keeper that hears
+/// it. A source makes one at a worker's first sign of several ranks: a
+/// report of several ranks, or a report of one rank behind one of another
+/// rank. A worker of one rank needs none: its report is one sample,
+/// handed as it is, and the store's cell holds its last value.
 ///
 /// What is kept is one statement a declared signal and a rank, for
 /// [`MAX_RANKS`] ranks at the most. A statement ends with its keeper, and
@@ -485,7 +487,8 @@ impl RankValues {
     /// under the instant the entry says, where that is not the instant the
     /// keeper last read of the rank: the entry was written since, by the
     /// rank's record or by an answer laid on the report. An entry that
-    /// says no instant is read as the record's own sample, at `sampled_at`.
+    /// says no instant is read once, as the record's own sample at
+    /// `sampled_at`: a later record of another rank does not date it anew.
     ///
     /// A rank's statement takes the place of its last one of that name,
     /// unless that one was sampled later: a later report of an older
@@ -520,7 +523,13 @@ impl RankValues {
             if let ReportOf::OneRank { .. } = of {
                 // A pushed report's entry: another rank's is read where it
                 // says another instant than the one last read of the rank.
-                if !own && kept.read_at == Some(at) {
+                // One that says none is read once: a record of another
+                // rank is no news of it, and dates it no fresher.
+                let read = match entry.sampled_at {
+                    Some(said) => kept.read_at == Some(said),
+                    None => kept.read_at.is_some(),
+                };
+                if !own && read {
                     continue;
                 }
                 kept.read_at = Some(at);
@@ -1079,8 +1088,8 @@ mod tests {
 
     /// A record states its own rank under its own instant, and another
     /// rank's entry is read under the instant the entry says. An entry
-    /// that says none is read as the record's own sample. A polled answer
-    /// is one sample of every rank.
+    /// that says none is read once, as the record's own sample. A polled
+    /// answer is one sample of every rank.
     #[test]
     fn a_record_states_its_own_rank_and_a_polled_answer_every_rank() {
         let start = Instant::now();
@@ -1093,11 +1102,14 @@ mod tests {
         let file = report(vec![ranked(0, depth(1.0)), first.clone()]);
         let pushed = kept(&mut keeper, &file, Some(0), &columns, (at(9_000), now));
         assert_eq!(pushed, [value("depth", "items", 51.0, 9_000)]);
-        // An entry that says no instant is one sample with the record.
+        // An entry that says no instant is one sample with the record
+        // that first lists it. Rank 0's next record does not date it anew.
         let mut unsaid = RankValues::default();
         let bare = report(vec![ranked(0, depth(1.0)), ranked(1, depth(50.0))]);
         let one = kept(&mut unsaid, &bare, Some(0), &columns, (at(9_000), now));
         assert_eq!(one, [value("depth", "items", 51.0, 1_000)]);
+        let again = kept(&mut unsaid, &bare, Some(0), &columns, (at(9_500), now));
+        assert_eq!(again, [value("depth", "items", 51.0, 1_000)]);
         // A polled answer is one sample of every rank.
         let answer = report(vec![ranked(0, depth(4.0)), ranked(1, depth(6.0))]);
         let polled = kept(&mut keeper, &answer, None, &columns, (at(9_500), now));
