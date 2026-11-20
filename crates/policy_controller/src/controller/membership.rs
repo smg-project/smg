@@ -98,6 +98,7 @@ fn invalid(refused: Refused) -> Status {
 
 const ABSENT: &str = "no worker is registered under the URL";
 const MOVED: &str = "the row moved under the call";
+#[cfg(feature = "worker-host")]
 const DRAINING: &str = "the worker under the URL is draining";
 
 /// A `REPLACE` of a URL no row stands under.

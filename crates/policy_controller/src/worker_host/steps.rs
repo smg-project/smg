@@ -307,7 +307,8 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
 enum Held {
     /// The object under the id.
     Is(Arc<dyn Worker>),
-    /// No object under the id and none under the URL: the worker left.
+    /// No live object under the id or the URL: the worker left, or a
+    /// replacement is still being laid.
     Gone,
     /// No object under the id and another under the URL: the worker was
     /// registered anew between the two reads.
@@ -392,8 +393,14 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
             let (id, revision) = match pin(registry, pins, url) {
                 Pin::Held { id, revision } => (id, revision),
                 // A worker gone altogether stays the job's, as the
-                // registry's drain keeps it.
+                // registry's drain keeps it. One registered anew between
+                // the pin's own two reads stands under the URL again, and
+                // leaves the job.
                 Pin::Absent => {
+                    if registry.get_id_by_url(url).is_some() {
+                        skipped(url, "the worker moved after selection");
+                        continue;
+                    }
                     skipped(url, "no worker stands in the registry");
                     kept.push(Arc::clone(worker));
                     continue;
