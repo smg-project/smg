@@ -275,6 +275,7 @@ fn status_json(e: &Engine) -> Value {
         "duplicate_pending": s.duplicate_pending,
         "duplicated_total": s.duplicated_total,
         "swap_pending": s.swap_pending,
+        "swap_waiting": s.swap_waiting,
         "swapped_total": s.swapped_total,
         "stream_cuts": s.stream_cuts,
         "delay_ms": s.delay_ms,

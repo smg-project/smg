@@ -48,7 +48,7 @@ use zeromq::{
     PubSocket, RouterSocket, ZmqError, ZmqMessage,
 };
 
-use crate::engine::{unix_seconds, Engine};
+use crate::engine::{unix_seconds, Engine, Place};
 
 /// The engines' end-of-replay marker: `(-1).to_bytes(8, "big", signed=True)`.
 const END_SEQ: [u8; 8] = [0xff; 8];
@@ -158,7 +158,7 @@ async fn run(
                     generation = item.generation;
                     state.restart();
                 }
-                let message = state.publish(&item.batch, &item.spans);
+                let message = state.publish_placed(&item.batch, &item.spans, item.place);
                 if item.dropped {
                     continue; // lost on the wire; replay still has it
                 }
@@ -192,6 +192,9 @@ async fn recv_replay(replay: &mut Option<RouterSocket>) -> Result<ZmqMessage, Zm
 struct Publisher {
     topic: Vec<u8>,
     seq: u64,
+    /// The sequence the second of a swapped pair left for the first, which
+    /// is handed over right behind it.
+    owed: Option<u64>,
     buffer: VecDeque<(u64, Vec<u8>)>,
     buffer_steps: usize,
     dp_rank: i32,
@@ -203,6 +206,7 @@ impl Publisher {
         Self {
             topic,
             seq: 0,
+            owed: None,
             buffer: VecDeque::new(),
             buffer_steps: buffer_steps.max(1),
             dp_rank,
@@ -219,10 +223,43 @@ impl Publisher {
     /// Encode `batch`, assign it the next sequence, keep it for replay and
     /// return the PUB message.
     fn publish(&mut self, batch: &common::KvEventBatch, spans: &[(usize, Vec<u32>)]) -> ZmqMessage {
+        self.publish_placed(batch, spans, Place::InTurn)
+    }
+
+    /// [`Self::publish`] for a batch a sequence hook may have released out
+    /// of its turn. This publisher numbers what it is handed, so the batch
+    /// takes the sequence of its turn in the engine's order, and the wire
+    /// shows the fault the hook names. A copy repeats the last sequence and
+    /// the buffer keeps one. Of a swapped pair the second, handed over
+    /// first, leaves the first its sequence and its place in the buffer.
+    fn publish_placed(
+        &mut self,
+        batch: &common::KvEventBatch,
+        spans: &[(usize, Vec<u32>)],
+        place: Place,
+    ) -> ZmqMessage {
         let payload = encode_batch(batch, self.dp_rank, self.wire, spans);
-        let seq = self.seq;
-        self.seq += 1;
-        self.buffer.push_back((seq, payload.clone()));
+        let seq = match (place, self.owed.take()) {
+            (Place::Again, _) if self.seq > 0 => {
+                return frame(&self.topic, self.seq - 1, payload);
+            }
+            (Place::Behind, Some(first)) => {
+                // In front of the pair's second, the buffer's last.
+                let second = self.buffer.len().saturating_sub(1);
+                self.buffer.insert(second, (first, payload.clone()));
+                first
+            }
+            _ => {
+                if place == Place::Ahead {
+                    self.owed = Some(self.seq);
+                    self.seq += 1;
+                }
+                let seq = self.seq;
+                self.seq += 1;
+                self.buffer.push_back((seq, payload.clone()));
+                seq
+            }
+        };
         while self.buffer.len() > self.buffer_steps {
             self.buffer.pop_front();
         }
@@ -232,6 +269,7 @@ impl Publisher {
     /// A publisher restart: the sequence starts over and the buffer is gone.
     fn restart(&mut self) {
         self.seq = 0;
+        self.owed = None;
         self.buffer.clear();
     }
 
@@ -924,6 +962,53 @@ mod tests {
             publisher.replay(&request).len(),
             1,
             "the buffer is gone after a restart"
+        );
+    }
+
+    /// A sequence hook's batches keep the sequence of their turn in the
+    /// engine's order: a copy repeats its sequence and replays once; a
+    /// swapped pair goes out second first, each under its own sequence, and
+    /// replays in order.
+    #[test]
+    fn a_copy_repeats_its_sequence_and_a_swapped_pair_keeps_its_turns() {
+        let mut publisher = Publisher::new(b"kv".to_vec(), 8, 0, Wire::Vllm);
+        // The payload carries the batch's time, which tells the batches apart.
+        let batch = |at: f64| common::KvEventBatch {
+            timestamp: at,
+            ..sample_batch()
+        };
+        let seq_of = |message: &ZmqMessage, frame: usize| {
+            let seq = message.get(frame).expect("seq");
+            u64::from_be_bytes(seq.as_ref().try_into().expect("8 bytes"))
+        };
+
+        let once = publisher.publish(&batch(1.0), &[]);
+        let again = publisher.publish_placed(&batch(1.0), &[], Place::Again);
+        assert_eq!((seq_of(&once, 1), seq_of(&again, 1)), (0, 0));
+        // The engine's second and third batches as a pair: the third first.
+        let ahead = publisher.publish_placed(&batch(3.0), &[], Place::Ahead);
+        let behind = publisher.publish_placed(&batch(2.0), &[], Place::Behind);
+        assert_eq!((seq_of(&ahead, 1), seq_of(&behind, 1)), (2, 1));
+        let next = publisher.publish(&batch(4.0), &[]);
+        assert_eq!(seq_of(&next, 1), 3);
+        assert_eq!(publisher.next_seq(), 4);
+
+        let mut request = ZmqMessage::from(b"peer".to_vec());
+        request.push_back(Vec::new().into());
+        request.push_back(0u64.to_be_bytes().to_vec().into());
+        let replies = publisher.replay(&request);
+        let replayed: Vec<(u64, Vec<u8>)> = replies[..replies.len() - 1]
+            .iter()
+            .map(|m| (seq_of(m, 3), m.get(4).expect("payload").to_vec()))
+            .collect();
+        let in_order: Vec<(u64, Vec<u8>)> = [1.0, 2.0, 3.0, 4.0]
+            .into_iter()
+            .zip(0..)
+            .map(|(at, seq)| (seq, encode_batch(&batch(at), 0, Wire::Vllm, &[])))
+            .collect();
+        assert_eq!(
+            replayed, in_order,
+            "one entry a sequence, in the engine's order"
         );
     }
 

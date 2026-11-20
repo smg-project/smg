@@ -755,7 +755,7 @@ struct Faults {
     swapped_total: AtomicU64,
     /// The first batch of a pair under way: it goes out behind the next.
     swap_held: Mutex<Option<(Published, Instant)>>,
-    /// Times the hook cut the event streams.
+    /// Event streams the cut hook ended.
     stream_cuts: AtomicU64,
     /// Publishing delay after a pass ends, in ms.
     delay_ms: AtomicU64,
@@ -838,6 +838,8 @@ pub(crate) struct FaultStatus {
     pub duplicate_pending: u32,
     pub duplicated_total: u64,
     pub swap_pending: u32,
+    /// A batch waits for its pair: `swap?pairs=0` releases it.
+    pub swap_waiting: bool,
     pub swapped_total: u64,
     pub stream_cuts: u64,
     pub delay_ms: u64,
@@ -878,6 +880,25 @@ pub(crate) struct Published {
     pub dropped: bool,
     /// The publisher generation the batch belongs to.
     pub generation: u64,
+    /// Where a sequence hook put the batch among its neighbours.
+    pub place: Place,
+}
+
+/// Where a duplicate or swap hook put a batch among its neighbours. A batch
+/// of the event stream carries the engine's sequence, so the fault shows
+/// there by itself. A transport that numbers the batches it is handed reads
+/// the place, and gives each batch the sequence of its turn in the engine's
+/// order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Place {
+    /// In its turn.
+    InTurn,
+    /// A second copy of the batch released just ahead of it.
+    Again,
+    /// The second of a swapped pair, released ahead of the first.
+    Ahead,
+    /// The first of a swapped pair, released behind the second.
+    Behind,
 }
 
 /// Messages into the engine actor.
@@ -1177,25 +1198,26 @@ impl Engine {
         let faults = &self.shared.faults;
         faults.swap_pairs.store(pairs, Ordering::Relaxed);
         if pairs == 0 {
-            let held = faults
-                .swap_held
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take();
-            if let Some(held) = held {
-                let _ = self.shared.publish_tx.send(held);
+            let mut held = faults.swap_held.lock().unwrap_or_else(|p| p.into_inner());
+            // Sent under the lock, so no batch the engine releases passes it.
+            if let Some(first) = held.take() {
+                let _ = self.shared.publish_tx.send(first);
             }
         }
     }
 
-    /// End every open event stream of the engine with `UNAVAILABLE`, as a
-    /// cut connection does. The engine, its sequence and its replay buffer
-    /// stay, so a subscriber that comes back resumes after its cursor.
+    /// End every open `SubscribeKvEvents` stream of the engine, the
+    /// loads-only kind too, with `UNAVAILABLE`, as a cut connection does. The
+    /// engine, its sequence and its replay buffer stay, so a subscriber that
+    /// comes back resumes after its cursor. A ZMQ subscriber holds no stream
+    /// of its own to end: the hook leaves that wire alone, and `stream_cuts`
+    /// counts the streams it ended.
     pub(crate) fn fault_cut_streams(&self) {
+        let open = self.shared.cut_streams.receiver_count();
         self.shared
             .faults
             .stream_cuts
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(u64::try_from(open).unwrap_or(u64::MAX), Ordering::Relaxed);
         self.shared.cut_streams.send_modify(|cuts| *cuts += 1);
     }
 
@@ -1403,6 +1425,11 @@ impl Engine {
             duplicate_pending: f.duplicate_batches.load(Ordering::Relaxed),
             duplicated_total: f.duplicated_total.load(Ordering::Relaxed),
             swap_pending: f.swap_pairs.load(Ordering::Relaxed),
+            swap_waiting: f
+                .swap_held
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some(),
             swapped_total: f.swapped_total.load(Ordering::Relaxed),
             stream_cuts: f.stream_cuts.load(Ordering::Relaxed),
             delay_ms: f.delay_ms.load(Ordering::Relaxed),
@@ -1561,37 +1588,46 @@ impl Engine {
                 .collect()
         };
         let replay_stream = stream::iter(replay.into_iter().map(Ok));
-        let cut = self.shared.cut_streams.subscribe();
-        let live_stream = stream::unfold(Some((live_rx, cut)), |open| async move {
-            let (mut rx, mut cut) = open?;
+        let live_stream = stream::unfold(live_rx, |mut rx| async move {
             loop {
-                tokio::select! {
-                    changed = cut.changed() => {
-                        return match changed {
-                            // The cut hook ends the stream as a lost connection
-                            // does: nothing follows the status.
-                            Ok(()) => Some((
-                                Err(Status::unavailable("mock-worker: the event streams were cut")),
-                                None,
-                            )),
-                            // The engine is gone: the stream ends as it did.
-                            Err(_) => None,
-                        };
-                    }
-                    item = rx.recv() => match item {
-                        // A batch lost on the wire (drop hook) never reaches a live
-                        // subscriber; it waits in the replay buffer.
-                        Ok(item) if item.dropped => {}
-                        Ok(item) => return Some((Ok(item.batch), Some((rx, cut)))),
-                        // A lagged slow consumer leaves a gap; the gateway detects it
-                        // and reconnects, replaying from the buffer. Skip and continue.
-                        Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => return None,
-                    },
+                match rx.recv().await {
+                    // A batch lost on the wire (drop hook) never reaches a live
+                    // subscriber; it waits in the replay buffer.
+                    Ok(item) if item.dropped => continue,
+                    Ok(item) => return Some((Ok(item.batch), rx)),
+                    // A lagged slow consumer leaves a gap; the gateway detects it
+                    // and reconnects, replaying from the buffer. Skip and continue.
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
                 }
             }
         });
-        Box::pin(replay_stream.chain(live_stream))
+        self.until_cut(Box::pin(replay_stream.chain(live_stream)))
+    }
+
+    /// `events` until the cut hook fires: the stream then ends with
+    /// `UNAVAILABLE`, as a lost connection reads, and nothing follows the
+    /// status. Every `SubscribeKvEvents` stream goes through here, so one
+    /// hook ends them all.
+    pub(crate) fn until_cut(&self, events: KvEventStream) -> KvEventStream {
+        let cut = self.shared.cut_streams.subscribe();
+        Box::pin(stream::unfold(Some((events, cut)), |open| async move {
+            let (mut events, mut cut) = open?;
+            tokio::select! {
+                biased;
+                () = async {
+                    // Its engine gone, the hook cuts nothing: the stream
+                    // ends as it did.
+                    if cut.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                } => Some((
+                    Err(Status::unavailable("mock-worker: the event streams were cut")),
+                    None,
+                )),
+                item = events.next() => item.map(|item| (item, Some((events, cut)))),
+            }
+        }))
     }
 }
 
@@ -1714,6 +1750,7 @@ async fn run(
                 spans: step.spans,
                 dropped,
                 generation: faults.generation.load(Ordering::Relaxed),
+                place: Place::InTurn,
             };
             release(&shared, item, release_at);
         }
@@ -1724,8 +1761,10 @@ async fn run(
 }
 
 /// Hand a batch to the publisher task: twice, or behind the next one, where
-/// a hook says so. A batch a drop hook lost reaches no live subscriber, so
-/// it goes out once and in its turn.
+/// a hook says so, each marked with its place. A batch a drop hook lost
+/// reaches no live subscriber: it goes out once and waits for no pair. It
+/// is still the second of a pair whose first waits, so nothing else passes
+/// a batch that waits.
 fn release(shared: &EngineShared, item: Published, release_at: Instant) {
     let faults = &shared.faults;
     let take = |counter: &AtomicU32| {
@@ -1733,16 +1772,19 @@ fn release(shared: &EngineShared, item: Published, release_at: Instant) {
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
             .is_ok()
     };
-    if item.dropped {
-        let _ = shared.publish_tx.send((item, release_at));
-        return;
-    }
+    let send = |item: Published, place: Place, at: Instant| {
+        let _ = shared.publish_tx.send((Published { place, ..item }, at));
+    };
     let mut held = faults.swap_held.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((first, first_at)) = held.take() {
         // The second of a pair goes out ahead of the first.
         faults.swapped_total.fetch_add(1, Ordering::Relaxed);
-        let _ = shared.publish_tx.send((item, release_at));
-        let _ = shared.publish_tx.send((first, release_at.max(first_at)));
+        send(item, Place::Ahead, release_at);
+        send(first, Place::Behind, release_at.max(first_at));
+        return;
+    }
+    if item.dropped {
+        send(item, Place::InTurn, release_at);
         return;
     }
     if take(&faults.swap_pairs) {
@@ -1750,11 +1792,12 @@ fn release(shared: &EngineShared, item: Published, release_at: Instant) {
         return;
     }
     drop(held);
-    if take(&faults.duplicate_batches) {
+    let again = take(&faults.duplicate_batches).then(|| item.clone());
+    send(item, Place::InTurn, release_at);
+    if let Some(again) = again {
         faults.duplicated_total.fetch_add(1, Ordering::Relaxed);
-        let _ = shared.publish_tx.send((item.clone(), release_at));
+        send(again, Place::Again, release_at);
     }
-    let _ = shared.publish_tx.send((item, release_at));
 }
 
 /// Release batches to every transport in order, each at its release time.
@@ -5387,6 +5430,23 @@ mod tests {
             .and_then(Result::ok)
     }
 
+    /// The sequence and the place of each of the next `n` batches, as a
+    /// transport that numbers the batches itself is handed them.
+    async fn next_places(
+        published: &mut Pin<Box<dyn Stream<Item = Published> + Send>>,
+        n: usize,
+    ) -> Vec<(u64, Place)> {
+        let mut places = Vec::with_capacity(n);
+        for _ in 0..n {
+            let item = tokio::time::timeout(Duration::from_secs(5), published.next())
+                .await
+                .expect("a published batch")
+                .expect("the engine lives");
+            places.push((item.batch.sequence_number, item.place));
+        }
+        places
+    }
+
     /// The published rate expires at the read: an idle engine builds no new
     /// snapshot after the one it published when its last pass ended, so the
     /// poll (`Engine::load`, what `GetLoads`, `/v1/loads` and the pushed
@@ -5471,6 +5531,7 @@ mod tests {
     async fn duplicate_hook_publishes_a_batch_twice_and_keeps_one_for_replay() {
         let engine = live();
         let mut live_stream = engine.subscribe_kv(0);
+        let mut published = engine.subscribe_published();
         engine.fault_duplicate(1);
         let _rx = submit(&engine, "a", vec![1; 64]);
         let first = next_batch(&mut live_stream, Duration::from_secs(5))
@@ -5480,6 +5541,11 @@ mod tests {
             .await
             .expect("the same batch a second time");
         assert_eq!((first.sequence_number, again.sequence_number), (1, 1));
+        assert_eq!(
+            next_places(&mut published, 2).await,
+            [(1, Place::InTurn), (1, Place::Again)],
+            "the copy is marked for a transport that numbers the batches itself"
+        );
         let mut replay = engine.subscribe_kv(0);
         let replayed = next_batch(&mut replay, Duration::from_secs(1))
             .await
@@ -5499,6 +5565,7 @@ mod tests {
     async fn swap_hook_publishes_the_second_batch_of_a_pair_first() {
         let engine = live();
         let mut live_stream = engine.subscribe_kv(0);
+        let mut published = engine.subscribe_published();
         engine.fault_swap(1);
         let mut rx1 = submit(&engine, "a", vec![1; 64]);
         while let Some(event) = tokio::time::timeout(Duration::from_secs(5), rx1.recv())
@@ -5515,6 +5582,7 @@ mod tests {
                 .is_none(),
             "the first batch of the pair waits for the second"
         );
+        assert!(engine.fault_status().swap_waiting, "the state says so");
         let _rx2 = submit(&engine, "b", vec![2; 64]);
         let first = next_batch(&mut live_stream, Duration::from_secs(5))
             .await
@@ -5523,8 +5591,48 @@ mod tests {
             .await
             .expect("the first batch, behind it");
         assert_eq!((first.sequence_number, second.sequence_number), (2, 1));
+        assert_eq!(
+            next_places(&mut published, 2).await,
+            [(2, Place::Ahead), (1, Place::Behind)],
+            "the pair is marked for a transport that numbers the batches itself"
+        );
         let status = engine.fault_status();
-        assert_eq!((status.swap_pending, status.swapped_total), (0, 1));
+        assert_eq!(
+            (
+                status.swap_pending,
+                status.swap_waiting,
+                status.swapped_total
+            ),
+            (0, false, 1)
+        );
+    }
+
+    /// A batch a drop hook loses is still the second of the pair it follows:
+    /// nothing else passes a batch that waits, so the two marks alone tell
+    /// the engine's order.
+    #[tokio::test]
+    async fn a_lost_batch_still_releases_the_first_of_a_pair() {
+        let engine = live();
+        let mut live_stream = engine.subscribe_kv(0);
+        let mut published = engine.subscribe_published();
+        engine.fault_swap(1);
+        let _rx1 = submit(&engine, "a", vec![1; 64]);
+        // The first batch waits for its pair before the drop is armed.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !engine.fault_status().swap_waiting {
+            assert!(Instant::now() < deadline, "the first batch never waited");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        engine.fault_drop(1);
+        let _rx2 = submit(&engine, "b", vec![2; 64]);
+        let released = next_batch(&mut live_stream, Duration::from_secs(5))
+            .await
+            .expect("the first batch, released by the lost one");
+        assert_eq!(released.sequence_number, 1);
+        assert_eq!(
+            next_places(&mut published, 2).await,
+            [(2, Place::Ahead), (1, Place::Behind)]
+        );
     }
 
     #[tokio::test]
@@ -5555,6 +5663,10 @@ mod tests {
             .await
             .expect("the next batch");
         assert_eq!(next.sequence_number, 2);
+        assert_eq!(engine.fault_status().stream_cuts, 1);
+        // With no stream open the hook ends none and counts none.
+        drop(resumed);
+        engine.fault_cut_streams();
         assert_eq!(engine.fault_status().stream_cuts, 1);
     }
 
