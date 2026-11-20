@@ -142,7 +142,7 @@ impl Sent {
         &mut self,
         host: &Host,
         ask: &Ask<'_>,
-        holds: impl Fn(&dyn Worker) -> bool,
+        holds: impl Fn(&Arc<dyn Worker>) -> bool,
         now: Instant,
     ) -> Option<&Arc<dyn Worker>> {
         self.placed.decode_again(host, ask, holds, now)

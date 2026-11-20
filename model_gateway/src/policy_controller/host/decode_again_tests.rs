@@ -18,7 +18,7 @@ use smg_worker::identity::basic::{Worker, WorkerType};
 
 use super::{
     testing::{pair_bed_picking, pair_in_flight, MODEL},
-    Ask, End, Host, Placed, GATEWAY,
+    Ask, End, Host, KeptAsk, Placed, GATEWAY,
 };
 
 const PREFILL: &str = "http://prefill-0:8000";
@@ -188,7 +188,7 @@ async fn a_second_ask_no_decode_of_which_the_route_admits_sends_the_first_decode
     placed.dispatched(now);
 
     // The route's rule refuses every decode the second ask names.
-    let no_decode = |worker: &dyn Worker| *worker.worker_type() != WorkerType::Decode;
+    let no_decode = |worker: &Arc<dyn Worker>| *worker.worker_type() != WorkerType::Decode;
     let again = placed.decode_again(&host, &asked, no_decode, Instant::now());
     assert!(again.is_none());
     assert_eq!(decode_of(&placed), first, "the first pick's decode is sent");
@@ -200,6 +200,85 @@ async fn a_second_ask_no_decode_of_which_the_route_admits_sends_the_first_decode
 
     end(placed, Instant::now());
     assert_eq!(live(&store, 0), 0, "the request ended well");
+}
+
+/// A route whose second ask is stages behind its first keeps the ask in
+/// the placement. The second ask then goes under the rule the route kept
+/// and under the rule of the call's own instant, both.
+#[tokio::test]
+async fn a_kept_ask_is_asked_again_under_the_routes_rule_and_the_calls() {
+    let other = |worker: &dyn Worker| worker.url() != DECODES[1];
+    for (kept_rule, call_rule) in [(true, false), (false, true)] {
+        let (host, store, [d0, d1]) = bed(DecodePick::AfterPrefill);
+        let host = Arc::new(host);
+        report(&store, d1, d0);
+        let asked = ask(b"pair", true);
+        let mut placed = place(&host, &asked).await;
+        assert_eq!(decode_of(&placed), d0);
+        // One of the two rules refuses the second decode, the other nobody.
+        let kept = move |worker: &dyn Worker| !kept_rule || other(worker);
+        placed.keep_ask(KeptAsk::of(&host, &asked, kept));
+        placed.dispatched(Instant::now());
+        let answered = report(&store, d0, d1);
+        let call = |worker: &Arc<dyn Worker>| !call_rule || other(worker.as_ref());
+        // The loads favour the second decode, and a rule refuses it: the
+        // request stays on the first.
+        let moved = placed
+            .decode_again_kept(call, answered)
+            .map(|decode| decode.url().to_owned());
+        assert_ne!(
+            moved.as_deref(),
+            Some(DECODES[1]),
+            "{kept_rule} {call_rule}"
+        );
+        assert_eq!(decode_of(&placed), d0, "{kept_rule} {call_rule}");
+        assert_eq!(pair_in_flight(&store, d1), 0);
+        // The kept ask is spent.
+        assert!(placed.decode_again_kept(|_| true, answered).is_none());
+        end(placed, answered);
+        assert_eq!(live(&store, 0), 0);
+    }
+}
+
+/// A placement keeps an ask for a decode that waits, and for no other. A
+/// route that knows the decode cannot move lets the kept ask go, and the
+/// first decision's decode is booked at that word.
+#[tokio::test]
+async fn a_placement_keeps_an_ask_for_a_waiting_decode_alone() {
+    // A decode decided with its prefill keeps nothing.
+    let (host, store, [d0, d1]) = bed(DecodePick::WithPrefill);
+    let host = Arc::new(host);
+    report(&store, d1, d0);
+    let asked = ask(b"pair", true);
+    let mut placed = place(&host, &asked).await;
+    placed.keep_ask(KeptAsk::of(&host, &asked, |_| true));
+    placed.dispatched(Instant::now());
+    let answered = report(&store, d0, d1);
+    assert!(placed.decode_again_kept(|_| true, answered).is_none());
+    assert_eq!(decode_of(&placed), d0);
+    end(placed, answered);
+    assert_eq!(live(&store, 0), 0);
+
+    // A waiting decode whose route lets the kept ask go keeps its first
+    // decode, booked there and then: nothing asks it again.
+    let (host, store, [d0, d1]) = bed(DecodePick::AfterPrefill);
+    let host = Arc::new(host);
+    report(&store, d1, d0);
+    let mut placed = place(&host, &asked).await;
+    placed.keep_ask(KeptAsk::of(&host, &asked, |_| true));
+    let sent = Instant::now();
+    placed.dispatched(sent);
+    assert_eq!(pair_in_flight(&store, d0), 0, "a chosen decode is booked");
+    placed.keep_first_decode(sent);
+    assert!(!placed.decode_waits());
+    let booked = [d0, d1].map(|decode| pair_in_flight(&store, decode));
+    assert_eq!(booked, [1, 0]);
+    let answered = report(&store, d0, d1);
+    assert!(placed.decode_again_kept(|_| true, answered).is_none());
+    assert_eq!(decode_of(&placed), d0);
+    placed.completed(SERVED, answered);
+    placed.decode_completed(SERVED, answered);
+    assert_eq!(live(&store, 0), 0);
 }
 
 #[tokio::test]

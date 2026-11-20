@@ -39,7 +39,7 @@ use super::{
         stages::{
             encode::EncodeDispatchPlan,
             helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask, ToolConstraintStamp},
-            pd_protocol::{EncodeHandoff, PdProtocol},
+            pd_protocol::{EncodeHandoff, PdDispatch, PdProtocol},
             request_execution::EncodeWatch,
             RateLimitCell,
         },
@@ -542,7 +542,7 @@ impl DispatchContext {
         &mut self,
         sub_requests: usize,
     ) -> Result<Option<PdAdmissionGuard>, axum::response::Response> {
-        self.commit_pair(Instant::now());
+        self.commit_pair(Instant::now(), sub_requests);
         match self
             .workers
             .as_ref()
@@ -553,14 +553,30 @@ impl DispatchContext {
         }
     }
 
-    /// Both sides of a placed pair say their dispatch at `now`.
-    fn commit_pair(&mut self, now: Instant) {
+    /// Both sides of a placed pair say their dispatch at `now`, but for one
+    /// decode: a decode that stands chosen on a sequential dispatch of one
+    /// request. That one is asked again behind its prefill's answer and
+    /// says its dispatch at its own send ([`Placement::decode_dispatched`]):
+    /// it holds no booking that could end ahead of that send. Every other
+    /// decode keeps the first decision's worker and is booked here: on a
+    /// dispatch that sends both sides at once, and in a batch, whose
+    /// sub-requests ride the one placement on that worker.
+    fn commit_pair(&mut self, now: Instant, sub_requests: usize) {
+        let sequential = self
+            .workers
+            .as_ref()
+            .and_then(WorkerSelection::disaggregated_runtime_type)
+            .and_then(|runtime| PdProtocol::for_runtime(*runtime))
+            .is_some_and(|protocol| protocol.dispatch == PdDispatch::Sequential);
         let Some(placed) = self.placed.as_mut() else {
             return;
         };
         if placed.decode().is_some() {
             placed.dispatched(now);
-            placed.decode_dispatched(now);
+            let asked_again = sequential && sub_requests <= 1 && placed.decode_waits();
+            if !asked_again {
+                placed.keep_first_decode(now);
+            }
         }
     }
 
@@ -1165,6 +1181,10 @@ struct Hold {
     prefills: usize,
     /// The prompt tokens the ended phases read, said with the side's end.
     prompt_tokens: u32,
+    /// The claim at the decode's admission gate of a pair whose decode is
+    /// asked again: held here, beside the load guard, so the claim moves
+    /// with the decode ([`Placement::claim_moved`]).
+    claim: Option<PdAdmissionGuard>,
 }
 
 impl Hold {
@@ -1181,6 +1201,7 @@ impl Placement {
             held,
             prefills,
             prompt_tokens: 0,
+            claim: None,
         };
         Self {
             cell: Arc::new(Mutex::new(hold)),
@@ -1199,6 +1220,50 @@ impl Placement {
     /// names as tried beside the prefill's. A single has none.
     pub(crate) fn decode_id(&self) -> Option<WorkerId> {
         self.cell.lock().placed().decode_id()
+    }
+
+    /// Whether the placed pair's decode stands chosen and unbooked
+    /// ([`Placed::decode_waits`]): its ask stated the later decode, and its
+    /// dispatch is said at its own send.
+    pub(crate) fn decode_waits(&self) -> bool {
+        self.cell.lock().placed().decode_waits()
+    }
+
+    /// Asks the placed pair's decode again at `now`, with the ask its stage
+    /// kept ([`Held::decode_again`]) and `holds` beside the stage's rule.
+    /// The decode the placement moved to comes back, with the load guard
+    /// moved to it, and `None` where the placement keeps the one it named.
+    pub(crate) fn decode_again(
+        &self,
+        holds: impl Fn(&Arc<dyn Worker>) -> bool,
+        now: Instant,
+    ) -> Option<Arc<dyn Worker>> {
+        self.cell.lock().held.decode_again(holds, now)
+    }
+
+    /// The pair's decode moved behind a second ask: `claim`, taken at the
+    /// moved decode's gate, takes the place of the first decode's claim,
+    /// and `None` does where the moved decode's engine reports no window.
+    /// The new claim was taken first, so for this instant the request holds
+    /// rooms at both gates. The first worker's rooms are given back here.
+    pub(crate) fn claim_moved(&self, claim: Option<PdAdmissionGuard>) {
+        let first = std::mem::replace(&mut self.cell.lock().claim, claim);
+        drop(first);
+    }
+
+    /// The placed pair's decode was sent at `now`. Said once: a decode that
+    /// said its dispatch where the dispatch began says nothing again.
+    pub(crate) fn decode_dispatched(&self, now: Instant) {
+        self.cell.lock().placed().decode_dispatched(now);
+    }
+
+    /// `selection` with the decode this placement names now, where a second
+    /// ask moved the pair's decode off the one the selection holds. `None`
+    /// where the two name one worker, and for a single.
+    pub(crate) fn moved(&self, selection: &WorkerSelection) -> Option<WorkerSelection> {
+        let decode = self.cell.lock().placed().decode().cloned()?;
+        let first = selection.decode_worker()?;
+        (!Arc::ptr_eq(first, &decode)).then(|| selection.with_decode(decode))
     }
 
     /// One prefill phase of a placed pair ended whole at `now`, having read
@@ -1369,13 +1434,21 @@ impl LoadGuards {
     /// Bind an admission claim to the dispatch's guards, so the rooms it
     /// reserved outlive nothing else. `None` (the engine reports no window)
     /// returns the guards untouched.
+    ///
+    /// A placed pair whose decode is asked again holds its claim in the
+    /// placement, beside the decode's load guard: where the decode moves,
+    /// the claim moves with it ([`Placement::claim_moved`]).
     pub fn admitted(admission: Option<PdAdmissionGuard>, guards: Self) -> Self {
-        match admission {
-            Some(admission) => Self::Admitted {
+        match (admission, guards) {
+            (Some(admission), Self::Placed { placement }) if placement.decode_waits() => {
+                placement.cell.lock().claim = Some(admission);
+                Self::Placed { placement }
+            }
+            (Some(admission), guards) => Self::Admitted {
                 _admission: admission,
                 _guards: Box::new(guards),
             },
-            None => guards,
+            (None, guards) => guards,
         }
     }
 
@@ -2001,6 +2074,28 @@ impl WorkerSelection {
         }
     }
 
+    /// The selection with `decode` as its decode worker: a pair whose decode
+    /// was asked again behind its prefill's answer and moved. A single
+    /// worker's selection stands.
+    pub(crate) fn with_decode(&self, decode: Arc<dyn Worker>) -> Self {
+        match self {
+            Self::Disaggregated {
+                encode_assignments,
+                prefill,
+                runtime_type,
+                ..
+            } => Self::Disaggregated {
+                encode_assignments: encode_assignments.clone(),
+                prefill: Arc::clone(prefill),
+                decode,
+                runtime_type: *runtime_type,
+            },
+            Self::Single { worker } => Self::Single {
+                worker: Arc::clone(worker),
+            },
+        }
+    }
+
     /// Get the runtime type for disaggregated mode.
     pub fn disaggregated_runtime_type(&self) -> Option<&RuntimeType> {
         match self {
@@ -2249,13 +2344,97 @@ pub(crate) enum FinalResponse {
 #[cfg(test)]
 pub(super) mod test_support {
     use smg_policy_controller::{
+        spec::DecodePick,
         store::{GatewayId, LeasesStore, MemoryStore},
         view::Phase,
     };
     use smg_worker::identity::basic::ConnectionMode;
 
     use super::*;
-    use crate::policy_controller::host::{testing, Ask};
+    use crate::{
+        policy_controller::host::{testing, Ask, KeptAsk},
+        routers::grpc::backend_client::BasicWorkerBuilder,
+    };
+
+    /// The two decodes of [`place_pair_waiting`].
+    pub(crate) const DECODES: [&str; 2] = ["http://decode-0:8000", "http://decode-1:8000"];
+
+    /// A pair under a document that picks the decode after the prefill, over
+    /// one prefill and two decodes whose loads name the first, with the ask
+    /// kept for its second ask as the selection stage keeps it. The
+    /// prefill's admission guard and the store come with it.
+    pub(super) async fn place_pair_waiting() -> (Placed, PrefillLoadGuard, Arc<MemoryStore>) {
+        let (host, store, _) =
+            testing::pair_bed_picking(DecodePick::AfterPrefill, &["http://prefill:8000"], &DECODES);
+        let host = Arc::new(host);
+        testing::report_loads(&store, DECODES[1], DECODES[0]);
+        let ask = Ask {
+            phase: Phase::Prefill,
+            decode_again: true,
+            ..Ask::of(b"placed", testing::MODEL)
+        };
+        let (mut placed, guard) = host
+            .place_pair(&ask, None, None)
+            .await
+            .expect("a placed pair");
+        placed.keep_ask(KeptAsk::of(&host, &ask, |_| true));
+        (placed, guard, store)
+    }
+
+    /// A sequential pair as its dispatch holds it behind its prefill's
+    /// answer, under a document that picks the decode after the prefill:
+    /// placed over one prefill and the two decodes `shaped` makes of
+    /// [`DECODES`], its ask kept, committed, and through the first decode's
+    /// admission gate. The loads have turned over since the first decision:
+    /// the first decode is deep in its queue now and the second is free.
+    /// The guards, the selection the dispatch began with and the two decode
+    /// workers come back.
+    pub(crate) async fn pair_behind_its_prefill(
+        shaped: impl Fn(&str, BasicWorkerBuilder) -> BasicWorkerBuilder,
+    ) -> (LoadGuards, WorkerSelection, [Arc<dyn Worker>; 2]) {
+        let prefills = ["http://prefill:8000"];
+        let bed = testing::pair_bed_shaped(DecodePick::AfterPrefill, shaped, &prefills, &DECODES);
+        let (host, store, workers) = bed;
+        let host = Arc::new(host);
+        testing::report_loads(&store, DECODES[1], DECODES[0]);
+        let ask = Ask {
+            phase: Phase::Prefill,
+            decode_again: true,
+            ..Ask::of(b"placed", testing::MODEL)
+        };
+        let (mut placed, room) = host
+            .place_pair(&ask, None, None)
+            .await
+            .expect("a placed pair");
+        placed.keep_ask(KeptAsk::of(&host, &ask, |_| true));
+        let WorkerSelection::Disaggregated {
+            encode_assignments,
+            prefill,
+            decode,
+            ..
+        } = pair_selection(&placed)
+        else {
+            panic!("a pair");
+        };
+        let mut ctx = dispatch_context(placed);
+        ctx.workers = Some(WorkerSelection::Disaggregated {
+            encode_assignments,
+            prefill,
+            decode,
+            runtime_type: RuntimeType::Vllm,
+        });
+        let admission = ctx.admit(1).await.expect("no shed");
+        let selection = ctx.workers.take().expect("the pair");
+        let sent = Instant::now();
+        let guards = LoadGuards::at_dispatch(&selection, Some("pair"), 1, ctx.placed.take(), sent);
+        let guards = LoadGuards::admitted(admission, guards);
+        // The prefill phase ends ahead of the answer, and its slot goes.
+        drop(room);
+        testing::report_loads(&store, DECODES[0], DECODES[1]);
+        let [_, first, second] =
+            <[Arc<dyn Worker>; 3]>::try_from(workers).expect("one prefill and two decodes");
+        (guards, selection, [first, second])
+    }
 
     /// A pair the controller placed over one prefill and one decode, with
     /// the prefill's admission guard and the store.
@@ -2376,16 +2555,19 @@ pub(super) mod test_support {
 mod tests {
     use smg_grpc_client::VllmEngineClient;
     use smg_policy_controller::{
-        store::{GatewayId, LeasesStore, MemoryStore},
+        store::{GatewayId, LeasesStore, MemoryStore, WorkersStore},
         LeaseId, Side,
     };
 
     use super::{
-        test_support::{dispatch_context, dispatched, pair_selection, place_pair, place_worker},
+        test_support::{
+            dispatch_context, dispatched, pair_selection, place_pair, place_pair_waiting,
+            place_worker, DECODES,
+        },
         *,
     };
     use crate::{
-        policy_controller::host::testing,
+        policy_controller::host::{testing, testing::report_loads},
         routers::{
             common::{pd_admission::admit_decode, prefill_admission::test_support::select_worker},
             grpc::{
@@ -2547,6 +2729,116 @@ mod tests {
         drop(guards);
         assert_eq!((decode.load(), decode.routing_key_inflight("pair")), (0, 0));
         assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+    }
+
+    /// The guards of a pair whose decode stands chosen, as a dispatch of
+    /// `runtime`'s shape and of `count` sub-requests makes them at its
+    /// commit, with the selection the dispatch began with.
+    async fn committed_waiting(
+        runtime: RuntimeType,
+        count: usize,
+    ) -> (LoadGuards, WorkerSelection, Arc<MemoryStore>) {
+        let (placed, room, store) = place_pair_waiting().await;
+        let WorkerSelection::Disaggregated {
+            encode_assignments,
+            prefill,
+            decode,
+            ..
+        } = pair_selection(&placed)
+        else {
+            panic!("a pair");
+        };
+        let mut ctx = dispatch_context(placed);
+        ctx.workers = Some(WorkerSelection::Disaggregated {
+            encode_assignments,
+            prefill,
+            decode,
+            runtime_type: runtime,
+        });
+        let admission = ctx.admit(count).await.expect("no shed");
+        assert!(admission.is_none(), "no window is reported");
+        let selection = ctx.workers.take().expect("the pair");
+        let sent = Instant::now();
+        let placed = ctx.placed.take();
+        let guards = LoadGuards::at_dispatch(&selection, Some("pair"), count, placed, sent);
+        // The prefill phase ends ahead of the answer, and its slot goes.
+        drop(room);
+        (guards, selection, store)
+    }
+
+    /// Under a document that picks the decode after the prefill, a
+    /// sequential pair's commit says the prefill's dispatch alone. The
+    /// decode is asked again behind the prefill's answer and follows the
+    /// loads of that instant. Its row, its load guard and the dispatch's
+    /// selection move with it, and both sides end with the answer.
+    #[tokio::test]
+    async fn a_sequential_pairs_decode_is_asked_again_and_moves_whole() {
+        let (guards, selection, store) = committed_waiting(RuntimeType::Vllm, 1).await;
+        let placement = guards.placement().expect("the pair's placement");
+        let first = Arc::clone(selection.decode_worker().expect("the first decode"));
+        assert_eq!(first.url(), DECODES[0]);
+        assert!(
+            placement.decode_waits(),
+            "the commit said the decode's dispatch"
+        );
+        assert_eq!(first.load(), 1);
+
+        // The loads turn over while the prefill runs.
+        let answered = report_loads(&store, DECODES[0], DECODES[1]);
+        let moved = placement
+            .decode_again(|_| true, answered)
+            .expect("the decode moved");
+        assert_eq!(moved.url(), DECODES[1]);
+        let row = store.by_key(DECODES[1]).map(|row| row.id);
+        assert_eq!(placement.decode_id(), row);
+        // The load guard went with the decode, under the first guard's key.
+        assert_eq!((first.load(), moved.load()), (0, 1));
+        assert_eq!(
+            (
+                first.routing_key_inflight("pair"),
+                moved.routing_key_inflight("pair")
+            ),
+            (0, 1)
+        );
+        // The selection of the dispatch names the decode that is sent.
+        let turned = placement.moved(&selection).expect("the selection moved");
+        let sent_to = turned.decode_worker().expect("a pair's decode");
+        assert!(Arc::ptr_eq(sent_to, &moved));
+        assert!(placement.moved(&turned).is_none());
+        // A decode asked once is not asked twice.
+        assert!(placement.decode_again(|_| true, answered).is_none());
+
+        // The words in a sequential dispatch's order: the decode's dispatch,
+        // the prefill's end, the answer's end.
+        placement.decode_dispatched(answered);
+        assert!(!placement.decode_waits());
+        placement.prefill_ended(37, answered);
+        placement.completed(37, 4);
+        drop(guards);
+        assert_eq!(moved.load(), 0);
+        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+    }
+
+    /// A dispatch that will not ask its decode again says both dispatches
+    /// at its commit, under a document that picks the decode after the
+    /// prefill too: one that sends both sides at once, and a sequential
+    /// batch. The first decision's decode is booked there, and nothing asks
+    /// it again.
+    #[tokio::test]
+    async fn a_commit_that_asks_no_second_time_says_both_dispatches() {
+        for (runtime, count) in [(RuntimeType::Sglang, 1), (RuntimeType::Vllm, 2)] {
+            let (guards, selection, store) = committed_waiting(runtime, count).await;
+            let placement = guards.placement().expect("the pair's placement");
+            assert!(!placement.decode_waits(), "{runtime:?} x{count}");
+            let answered = report_loads(&store, DECODES[0], DECODES[1]);
+            assert!(placement.decode_again(|_| true, answered).is_none());
+            assert!(placement.moved(&selection).is_none());
+            let row = store.by_key(DECODES[0]).map(|row| row.id);
+            assert_eq!(placement.decode_id(), row, "{runtime:?} x{count}");
+            placement.completed(37, 4);
+            drop(guards);
+            assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+        }
     }
 
     /// The guards of a placed pair for `count` sub-requests, as a dispatch

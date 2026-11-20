@@ -6,7 +6,7 @@ use kv_index::{salt::request_content_hashes_with_seed, XXH3_SEED};
 use llm_multimodal::MediaContentPart;
 use serde_json::Value;
 use smg_policy_controller::{
-    spec::{KeySourceSpec, RoutingKeySpec},
+    spec::{DecodePick, KeySourceSpec, RoutingKeySpec},
     store::{
         BatchOutcome, GatewayId, KvEventSink, LeasesStore, LoadSink, LoadSource, MemoryStore,
         WorkersStore,
@@ -1125,6 +1125,55 @@ async fn a_hosted_pair_selection_is_the_controllers_prefill_and_decode() {
     let leases = store.expire(Instant::now() + Duration::from_secs(60));
     assert!(!leases.is_empty());
     assert!(leases.iter().all(|sides| sides.record.lease.tokens == 3));
+}
+
+/// Under a document that picks the decode after the prefill, the stage's
+/// pair ask states that its route can ask again, and the placement keeps
+/// that ask with the route's rule for a decode. The second ask is made by
+/// it stages later: it reads the loads of its own instant, and it takes a
+/// decode of the prefill's runtime alone. Where the loads name a decode of
+/// another runtime alone, the request stays on the first decode.
+#[tokio::test]
+async fn the_pair_stage_keeps_its_ask_for_a_decode_that_waits() {
+    const OTHER: &str = "http://d1:8000";
+    for (other_runtime, moved_to) in [
+        (RuntimeType::Vllm, Some(OTHER)),
+        (RuntimeType::Sglang, None),
+    ] {
+        let (stage, store) = pair_stage(
+            WorkerSelectionMode::PrefillDecode,
+            &[(PREFILL, RuntimeType::Vllm)],
+            &[(DECODE, RuntimeType::Vllm), (OTHER, other_runtime)],
+        );
+        let document = PolicySpec::pair_presets("least_load", "least_load");
+        let mut document = document.expect("the pair presets");
+        document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+        document.generation = store.with_world(|world| world.spec().generation()) + 1;
+        let applied = AppliedSpec::validate(&document).expect("the document validates");
+        store.apply(applied).expect("a later generation");
+        // The other decode reports a deep queue: the first decision names
+        // the first one.
+        host::testing::report_loads(&store, OTHER, DECODE);
+        let mut ctx = ingress(&stage.worker_registry);
+        stage.execute(&mut ctx).await.expect("a placed pair");
+        let placed = ctx.state.placed.as_mut().expect("the pair's placement");
+        assert!(placed.decode_waits(), "the ask stated no later decode");
+        assert_eq!(placed.decode().map(|decode| decode.url()), Some(DECODE));
+
+        // The prefill is sent, and the loads turn over while it runs.
+        placed.dispatched(Instant::now());
+        let answered = host::testing::report_loads(&store, DECODE, OTHER);
+        let moved = placed
+            .decode_again_kept(|_| true, answered)
+            .map(|decode| decode.url().to_owned());
+        assert_eq!(moved.as_deref(), moved_to, "{other_runtime:?}");
+        // The second ask was made by what the stage kept: its decision
+        // ended the decode's wait, on the worker it took or with the
+        // side's lease given up.
+        assert!(!placed.decode_waits(), "the stage kept no ask");
+        let decode = placed.decode().map(|decode| decode.url());
+        assert_eq!(decode, Some(moved_to.unwrap_or(DECODE)));
+    }
 }
 
 #[tokio::test]

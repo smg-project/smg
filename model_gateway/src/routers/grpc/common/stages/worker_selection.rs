@@ -2127,7 +2127,7 @@ impl WorkerSelectionStage {
         demand: PairDemands,
         attempt: Attempt<'a>,
     ) -> impl Future<Output = Result<(PdAttempt, PrefillLoadGuard), Response>> + 'a {
-        match self.host.as_deref() {
+        match self.host.as_ref() {
             Some(host) => Either::Left(Box::pin(self.place_pd_pair(
                 host, model_id, inputs, sticky_key, wire, media, demand, attempt,
             ))),
@@ -2157,7 +2157,7 @@ impl WorkerSelectionStage {
     )]
     async fn place_pd_pair(
         &self,
-        host: &Host,
+        host: &Arc<Host>,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
@@ -2206,6 +2206,9 @@ impl WorkerSelectionStage {
         let ledger = attempt.ledger();
         let ask = Ask {
             phase: Phase::Prefill,
+            // The sequential dispatch asks the decode again behind its
+            // prefill's answer.
+            decode_again: true,
             attempt: Some(attempt.number()),
             wires: route_wires(wire),
             ..attempt.ask(model_id, &id, &hashes)
@@ -2233,6 +2236,19 @@ impl WorkerSelectionStage {
             placed.released(ReleaseReason::CommitFailed, Instant::now());
             return Err(host::Unplaced::NoTargetHolds.answer(model_id));
         };
+        // Under a document that picks the decode after the prefill the
+        // decode stands chosen, and the dispatch asks it again stages from
+        // here. The placement keeps the ask for that, with the route's rule
+        // of this commit for a decode: its pool, its wire, the prefill's
+        // runtime. The request's ledger is read at the second ask.
+        if placed.decode_waits() {
+            let on_decode_route = move |worker: &dyn Worker| {
+                on_route(decode_pool, wire, None)(worker)
+                    && worker.metadata().spec.runtime_type == runtime
+            };
+            let kept = host::KeptAsk::of(host, &ask, on_decode_route);
+            placed.keep_ask(kept.with_hashes(hashes));
+        }
         Ok((((prefill, decode, runtime), Some(placed)), guard))
     }
 
