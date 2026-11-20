@@ -39,7 +39,6 @@ use smg_worker::{
         basic::{
             ConnectionMode, RuntimeType, Worker, WorkerMetadata, WorkerRoutingKeyLoad, WorkerType,
         },
-        endpoint::Endpoint,
         error::WorkerResult,
         metadata::DecodingLabels,
     },
@@ -79,7 +78,7 @@ impl GrpcWorker {
 
         let metadata = WorkerMetadata {
             pd_pairing: PdPairing::derive(&spec),
-            redacted_url: Endpoint::redacted_url(&endpoint),
+            redacted_url: spec.redacted_url(),
             decoding: DecodingLabels::of(&spec),
             spec: Arc::new(spec),
             discovered_labels: Arc::default(),
