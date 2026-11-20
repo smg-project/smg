@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use smg_worker::settings::UnhealthyRemovalScope;
+use smg_worker::{identity::basic::Worker, settings::UnhealthyRemovalScope};
 
-use super::{kv_feed::asks_events, Standing};
+use super::{found::facts, kv_feed::asks_events, Standing};
 use crate::{
     store::{
         membership::{self, NotMaker, Past},
@@ -99,6 +99,29 @@ pub trait Membership: Send + Sync + 'static {
         expect: Expect,
         url: &str,
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
+    ) -> Result<Wrote, Refused>;
+
+    /// Lay the registration of a worker its asker built, under the
+    /// worker's URL. The facts are the ones `built` states over the
+    /// standing row ([`facts`]).
+    ///
+    /// Each door says what it does with the object. A door whose host
+    /// keeps built objects hands `built` to the holder in the write's turn
+    /// ([`Objects::handing`](super::Objects::handing)). A door over a door
+    /// passes the call on. Any other door writes the facts alone, and its
+    /// host's holder builds the object from the row.
+    ///
+    /// `over` is the object a guarded write replaces: the one its asker
+    /// read and built from. A kept object can change while its row's
+    /// revision stands, so a door that hands `built` in refuses the write
+    /// as moved where another object stands for the row by then. A door
+    /// that keeps no object has nothing to hold it against.
+    fn found_built(
+        &self,
+        maker: &Maker,
+        expect: Expect,
+        built: &Arc<dyn Worker>,
+        over: Option<&Arc<dyn Worker>>,
     ) -> Result<Wrote, Refused>;
 
     /// Mark the row the asker saw as draining. Its revision stays the same.
@@ -349,6 +372,19 @@ impl Membership for StoreDoor {
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
     ) -> Result<Wrote, Refused> {
         self.call(|| lay(self, maker, expect, url, state))
+    }
+
+    // This door has no holder. The row takes the facts alone.
+    fn found_built(
+        &self,
+        maker: &Maker,
+        expect: Expect,
+        built: &Arc<dyn Worker>,
+        _: Option<&Arc<dyn Worker>>,
+    ) -> Result<Wrote, Refused> {
+        self.found(maker, expect, built.url(), &|standing| {
+            facts(built.as_ref(), standing)
+        })
     }
 
     fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {

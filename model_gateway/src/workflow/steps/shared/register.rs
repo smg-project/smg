@@ -46,8 +46,9 @@ pub(crate) const REGISTER_WORKERS_STEP: &str = "register_workers";
 /// The register step of a line whose local workers are rows of the policy
 /// controller's store.
 ///
-/// The holder lays a row's object in the registry, so the step writes no
-/// local worker: it keeps what a registration does beside that write. A
+/// The holder lays a row's object in the registry, the one the job built,
+/// so the step writes no local worker: it keeps what a registration does
+/// beside that write. A
 /// provider's workers stay outside the store: the step writes them, and
 /// refuses one at a URL a row's object holds. It writes no classic policy,
 /// which decides nothing there.
@@ -456,8 +457,8 @@ impl StepExecutor<WorkerWorkflowData> for RegisterBesideRowsStep {
         let symphony_table = context.data.symphony_table();
 
         match kind {
-            // The door wrote these workers' rows, and the holder laid their
-            // objects in the registry.
+            // The door wrote these workers' rows, and the holder laid these
+            // objects in the registry as the rows'.
             WorkerKind::Local => {
                 for worker in workers {
                     pd_admission::announce_decode_window(worker.as_ref());

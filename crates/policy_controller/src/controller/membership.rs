@@ -51,6 +51,8 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+#[cfg(feature = "worker-host")]
+use smg_worker::identity::basic::Worker;
 use tonic::{Code, Status};
 use tracing::info;
 
@@ -72,8 +74,8 @@ use crate::{
 use crate::{
     store::{membership::Past, WorkerFacts},
     worker_host::{
-        drain, lay, take, Expect, Membership, Refused as HostRefused, Remover, Standing, Turn,
-        Wrote,
+        drain, facts, lay, take, Expect, Membership, Refused as HostRefused, Remover, Standing,
+        Turn, Wrote,
     },
 };
 
@@ -581,6 +583,19 @@ impl Membership for Hosted {
                 url,
                 state,
             )
+        })
+    }
+
+    // The controller builds each object from its row: the facts alone.
+    fn found_built(
+        &self,
+        maker: &Maker,
+        expect: Expect,
+        built: &Arc<dyn Worker>,
+        _: Option<&Arc<dyn Worker>>,
+    ) -> Result<Wrote, HostRefused> {
+        self.found(maker, expect, built.url(), &|standing| {
+            facts(built.as_ref(), standing)
         })
     }
 

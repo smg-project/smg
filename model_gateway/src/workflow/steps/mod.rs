@@ -345,17 +345,23 @@ mod policy_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::{
+        collections::{BTreeMap, BTreeSet, HashSet},
+        time::Instant,
+    };
 
     use http::StatusCode;
     use openai_protocol::worker::{ConnectionMode, RuntimeType, WorkerStatus};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use smg_policy_controller::store::{
         Maker, MemoryStore, WorkerStatus as RowStatus, WorkersStore,
     };
-    use smg_worker::workflow::{
-        DETECT_CONNECTION_MODE_STEP, DETECT_RUNTIME_STEP, DISCOVER_METADATA_STEP,
-        WORKER_REGISTRATION_WORKFLOW,
+    use smg_worker::{
+        identity::basic::{BasicWorker, Worker},
+        workflow::{
+            DETECT_CONNECTION_MODE_STEP, DETECT_RUNTIME_STEP, DISCOVER_METADATA_STEP,
+            WORKER_REGISTRATION_WORKFLOW,
+        },
     };
     use wfaas::{StepId, StepStatus, WorkflowEngine, WorkflowId, WorkflowState, WorkflowStatus};
 
@@ -363,7 +369,7 @@ mod tests {
     use crate::{
         app_context::testing::app_context_for_tests,
         policy_controller::{
-            feed::feed,
+            feed::{feed, following},
             host::{Ask, Host},
             start,
         },
@@ -764,10 +770,21 @@ mod tests {
         feed: &Feed,
         spec: WorkerSpec,
     ) -> Result<WorkflowState<WorkerWorkflowData>, String> {
+        registered_on(config, registry, Some(feed), spec).await
+    }
+
+    /// A registration on the line of `feed`, the classic line with none,
+    /// run through the engine to its end.
+    async fn registered_on(
+        config: &RouterConfig,
+        registry: &Arc<WorkerRegistry>,
+        feed: Option<&Feed>,
+        spec: WorkerSpec,
+    ) -> Result<WorkflowState<WorkerWorkflowData>, String> {
         let host = app_context_for_tests(config.clone(), Arc::clone(registry), None);
         let engine = WorkflowEngine::new();
         engine
-            .register_workflow(worker_registration_line(config, Some(feed)))
+            .register_workflow(worker_registration_line(config, feed))
             .map_err(|invalid| invalid.to_string())?;
         let url = spec.url.clone();
         let id = engine
@@ -787,9 +804,247 @@ mod tests {
             .await
     }
 
+    /// What a worker object holds, by field: its spec as it serializes,
+    /// then what its builder was handed beside the spec.
+    fn fields(worker: &dyn Worker) -> BTreeMap<String, Value> {
+        let meta = worker.metadata();
+        let spec = serde_json::to_value(&*meta.spec).expect("a spec serializes");
+        let mut fields: BTreeMap<String, Value> = spec
+            .as_object()
+            .expect("a spec is an object")
+            .iter()
+            .map(|(name, value)| (format!("spec.{name}"), value.clone()))
+            .collect();
+        let resilience = worker.resilience();
+        let sorted = |codes: &HashSet<u16>| format!("{:?}", codes.iter().collect::<BTreeSet<_>>());
+        let breaker = worker
+            .as_any()
+            .downcast_ref::<BasicWorker>()
+            .map(|basic| format!("{:?}", basic.circuit_breaker.load().config()));
+        let handed = worker.http_client_handle_if_initialized().is_some();
+        for (name, value) in [
+            ("cards", format!("{:?}", worker.models())),
+            ("health_config", format!("{:?}", meta.health_config)),
+            ("health_endpoint", meta.health_endpoint.clone()),
+            (
+                "zmq_startup_timeout",
+                format!("{:?}", meta.zmq_startup_timeout),
+            ),
+            (
+                "zmq_request_timeout",
+                format!("{:?}", meta.zmq_request_timeout),
+            ),
+            ("retry", format!("{:?}", resilience.retry)),
+            ("retry_enabled", resilience.retry_enabled.to_string()),
+            (
+                "breaker_enabled",
+                resilience.circuit_breaker_enabled.to_string(),
+            ),
+            (
+                "retryable_codes",
+                sorted(&resilience.retryable_status_codes),
+            ),
+            ("capacity_codes", sorted(&resilience.capacity_status_codes)),
+            ("breaker", format!("{breaker:?}")),
+            ("http2", worker.http2().to_string()),
+            ("http_client_handed", handed.to_string()),
+            (
+                "engine_connector",
+                worker.engine_connector().is_some().to_string(),
+            ),
+            (
+                "max_running",
+                format!("{:?}", worker.max_running_requests()),
+            ),
+        ] {
+            fields.insert(name.to_owned(), Value::String(value));
+        }
+        fields
+    }
+
+    /// The names of the fields two worker objects hold differently.
+    fn differing(one: &dyn Worker, other: &dyn Worker) -> Vec<String> {
+        let (one, other) = (fields(one), fields(other));
+        let names: BTreeSet<&String> = one.keys().chain(other.keys()).collect();
+        names
+            .into_iter()
+            .filter(|name| one.get(*name) != other.get(*name))
+            .cloned()
+            .collect()
+    }
+
+    /// A worker's routes as a registration probes them.
+    async fn serving_worker() -> String {
+        serve_json_routes(vec![
+            ("/health", StatusCode::OK, json!({"status": "ok"})),
+            (
+                "/model_info",
+                StatusCode::OK,
+                json!({"model_path": "m", "is_generation": true}),
+            ),
+            ("/server_info", StatusCode::OK, json!({"version": "test"})),
+        ])
+        .await
+    }
+
+    /// A job that states what no row holds: a priority, a cost, the two
+    /// transfer names and the two parser labels, under a gateway whose
+    /// breaker and retry settings are not the defaults.
+    fn stated_beside_the_row(url: &str) -> (RouterConfig, WorkerSpec) {
+        let mut config = picked(config_with(5, 1));
+        config.circuit_breaker.failure_threshold = 7;
+        config.circuit_breaker.success_threshold = 5;
+        config.circuit_breaker.timeout_duration_secs = 11;
+        config.circuit_breaker.window_duration_secs = 13;
+        config.retry.max_retries = 9;
+        config.retry.initial_backoff_ms = 17;
+        let mut spec = WorkerSpec::new(url);
+        spec.priority = 7;
+        spec.cost = 2.5;
+        spec.bootstrap_port = Some(8998);
+        spec.kv_connector = Some("connector-a".into());
+        spec.kv_role = Some("role-a".into());
+        spec.labels.insert("tool_parser".into(), "parser-a".into());
+        spec.labels
+            .insert("reasoning_parser".into(), "parser-b".into());
+        (config, spec)
+    }
+
+    /// The object a registration leaves in the registry, field by field,
+    /// beside the object the classic line leaves for the same job.
+    ///
+    /// In process the two read the same: the holder keeps the object the
+    /// job built. Under a controller's address no job runs, so the holder
+    /// builds the object from the row, and the fields no row states read
+    /// as the defaults. Their names are pinned here.
+    #[tokio::test]
+    async fn a_rows_object_reads_as_the_classic_lines_object_field_by_field() {
+        let url = serving_worker().await;
+        let (config, spec) = stated_beside_the_row(&url);
+
+        let mut classic_config = config.clone();
+        classic_config.policy_controller = false;
+        let classic_registry = Arc::new(WorkerRegistry::new());
+        let state = registered_on(&classic_config, &classic_registry, None, spec.clone())
+            .await
+            .expect("the classic run ends");
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        let classic = classic_registry.get_by_url(&url).expect("the object");
+
+        let (store, registry, feed) = started(&config).expect("the store starts");
+        let state = registered_on(&config, &registry, Some(&feed), spec)
+            .await
+            .expect("the run ends");
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        let hosted = registry.get_by_url(&url).expect("the row's object");
+        let built = state.context.data.actual_workers.as_deref();
+        assert!(matches!(built, Some([built]) if Arc::ptr_eq(built, &hosted)));
+        assert_eq!(
+            differing(classic.as_ref(), hosted.as_ref()),
+            Vec::<String>::new()
+        );
+        assert_eq!(feed.objects.unhanded(), 0);
+
+        let row = store.by_key(&url).expect("the worker's row");
+        let served = start(&config).ok().flatten().expect("a second store");
+        served.upsert_by(row.facts, row.maker);
+        let followed = Arc::new(WorkerRegistry::new());
+        following(&served, &followed, BackendConnector::shared()).settle();
+        let followed = followed.get_by_url(&url).expect("the followed object");
+        assert_eq!(
+            differing(classic.as_ref(), followed.as_ref()),
+            [
+                "breaker",
+                "cards",
+                "http_client_handed",
+                "retry",
+                "spec.cost",
+                "spec.kv_connector",
+                "spec.kv_role",
+                "spec.models",
+                "spec.priority",
+                "zmq_request_timeout",
+            ]
+        );
+    }
+
+    /// The registry's object is the one the job built, by pointer, once
+    /// the gateway's own line ran. It is still that object after a status
+    /// change and a publication, and its entry names the row. A second
+    /// job that moves no fact leaves its own object there.
+    #[tokio::test]
+    async fn the_jobs_object_stands_until_the_next_job_hands_its_own() {
+        let url = serving_worker().await;
+        let (config, spec) = stated_beside_the_row(&url);
+        let (store, registry, feed) = started(&config).expect("the store starts");
+        let stands = |state: &WorkflowState<WorkerWorkflowData>| {
+            let built = state.context.data.actual_workers.as_deref();
+            let held = registry.get_by_url(&url).expect("the row's object");
+            matches!(built, Some([built]) if Arc::ptr_eq(built, &held))
+        };
+
+        let first = registered_on(&config, &registry, Some(&feed), spec.clone())
+            .await
+            .expect("the first run ends");
+        assert!(stands(&first));
+
+        let row = store.by_key(&url).expect("the worker's row");
+        let moved = store.set_status(row.id, RowStatus::NotReady, row.revision);
+        assert!(moved.is_some());
+        feed.settle();
+        assert!(stands(&first));
+        let id = registry.get_id_by_url(&url).expect("the object's id");
+        let entry = feed.objects.standing(&id).expect("the object's entry");
+        assert_eq!((entry.row, entry.revision), (row.id, row.revision));
+
+        let second = registered_on(&config, &registry, Some(&feed), spec)
+            .await
+            .expect("the second run ends");
+        assert_eq!(second.status, WorkflowStatus::Completed);
+        assert!(stands(&second));
+        assert!(!stands(&first));
+        assert_eq!(
+            store.by_key(&url).map(|row| row.revision),
+            Some(row.revision)
+        );
+        assert_eq!(feed.objects.unhanded(), 0);
+    }
+
+    /// Two jobs for one URL at once, on two threads. Each hands the door
+    /// the object it built in its own turn: one row stands, the registry
+    /// holds the object of one of the two jobs, and no lay missed its
+    /// object.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the case joins both tasks before it ends"
+    )]
+    async fn two_jobs_for_one_url_at_once_each_hand_their_object_in() {
+        let url = serving_worker().await;
+        let (config, spec) = stated_beside_the_row(&url);
+        let (store, registry, feed) = started(&config).expect("the store starts");
+
+        let jobs = [spec.clone(), spec].map(|spec| {
+            let (config, registry, feed) = (config.clone(), Arc::clone(&registry), feed.clone());
+            tokio::spawn(async move { registered_on(&config, &registry, Some(&feed), spec).await })
+        });
+        let mut built = Vec::new();
+        for job in jobs {
+            let state = job.await.expect("the job's task").expect("the run ends");
+            assert_eq!(state.status, WorkflowStatus::Completed);
+            built.extend(state.context.data.actual_workers.iter().flatten().cloned());
+        }
+
+        assert_eq!(built.len(), 2);
+        let object = registry.get_by_url(&url).expect("the row's object");
+        assert!(built.iter().any(|built| Arc::ptr_eq(built, &object)));
+        assert_eq!(store.snapshot().1.len(), 1);
+        assert_eq!(feed.objects.unhanded(), 0);
+    }
+
     /// A start-up job for a plain HTTP worker, with the health checks off:
     /// the store holds one Ready row at the worker's URL, the registry holds
-    /// the object the holder laid from it and not the one the job built, and
+    /// the object the job built, which the holder keeps as the row's, and
     /// the host's next decision picks the row.
     #[tokio::test]
     async fn a_local_workers_job_ends_as_a_ready_row_and_the_holders_object() {
@@ -826,7 +1081,8 @@ mod tests {
         assert_eq!(object.status(), WorkerStatus::Ready);
         let data = &state.context.data;
         let built = data.actual_workers.as_deref().expect("the built workers");
-        assert!(built.iter().all(|built| !Arc::ptr_eq(built, &object)));
+        assert!(matches!(built, [built] if Arc::ptr_eq(built, &object)));
+        assert_eq!(feed.objects.unhanded(), 0);
         let written = data.workers.as_ref().expect("the written workers");
         assert_eq!(written.worker_urls, [url]);
 

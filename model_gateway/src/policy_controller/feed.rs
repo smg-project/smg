@@ -1,10 +1,16 @@
 //! The membership door writes the store. Its listener brings the worker
 //! registry up to date and publishes membership for decisions in that order.
-//! Each membership write asks for publication before it returns. A row
-//! holds no credential, so its worker object carries none.
+//! Each membership write asks for publication before it returns.
+//!
+//! A registration of this process hands the door the worker it built, and
+//! the holder keeps that object as the row's ([`FeedDoor`]). It holds what
+//! no row states: the worker's credential, its connection settings and its
+//! model cards.
 //!
 //! Under a controller's address the follower writes the store in the door's
 //! place, and settles the feed after each event it takes ([`following`]).
+//! No registration runs there, so the holder builds each object from its
+//! row, and such an object holds no credential.
 //!
 //! The load collector writes the store through the feed's sink. Those
 //! writes come from the collector's tasks and name no instant to a host, so
@@ -316,14 +322,16 @@ fn settle(objects: &Objects<ModelWorkerSnapshot>, store: &MemoryStore, at: Optio
     }
 }
 
-/// The feed over `store`, for the workers of `registry`. The holder lays
-/// each object with `connector`, the one the gateway was started with.
+/// The feed over `store`, for the workers of `registry`. The holder keeps
+/// the object each registration hands the door. A row laid with no object
+/// handed in gets one built from it with `connector`, the one the gateway
+/// was started with, and the holder warns.
 pub(crate) fn feed(
     store: &Arc<MemoryStore>,
     registry: &Arc<WorkerRegistry>,
     connector: Arc<dyn EngineConnector>,
 ) -> Feed {
-    over(store, holder(registry, connector))
+    over(store, holder(registry, connector).with_built_kept())
 }
 
 /// The feed of a gateway that follows a controller at an address.
@@ -360,6 +368,8 @@ fn over(store: &Arc<MemoryStore>, objects: Objects<ModelWorkerSnapshot>) -> Feed
         door: Arc::new(FeedDoor {
             door,
             turn: Arc::clone(&turn),
+            objects: Arc::clone(&objects),
+            store: Arc::clone(store),
         }),
         objects,
         store: Arc::clone(store),
@@ -371,9 +381,17 @@ fn over(store: &Arc<MemoryStore>, objects: Objects<ModelWorkerSnapshot>) -> Feed
 /// The store door releases its turn before calling the listener. Hold the
 /// feed's turn through that call, so neither a later write nor a settle
 /// can publish a row the holder has yet to read.
+///
+/// A built worker is on offer at the holder through its write, inside the
+/// same turn: the listener's read lays the row with it, and a write that
+/// moved no fact has the holder lay it too. The offer ends with the turn.
+/// A guarded write names the object it replaces, and the holder refuses it
+/// in that turn where another object stands.
 struct FeedDoor {
     door: StoreDoor,
     turn: Arc<Mutex<()>>,
+    objects: Arc<Objects<ModelWorkerSnapshot>>,
+    store: Arc<MemoryStore>,
 }
 
 impl FeedDoor {
@@ -395,6 +413,20 @@ impl Membership for FeedDoor {
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
     ) -> Result<Wrote, Refused> {
         self.write(|door| door.found(maker, expect, url, state))
+    }
+
+    fn found_built(
+        &self,
+        maker: &Maker,
+        expect: Expect,
+        built: &Arc<dyn Worker>,
+        over: Option<&Arc<dyn Worker>>,
+    ) -> Result<Wrote, Refused> {
+        self.write(|door| {
+            self.objects.handing(self.store.as_ref(), built, over, || {
+                door.found_built(maker, expect, built, None)
+            })
+        })
     }
 
     fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {

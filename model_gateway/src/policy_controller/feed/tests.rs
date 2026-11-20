@@ -22,7 +22,7 @@ use smg_policy_controller::{
         PUBLISH_WINDOW,
     },
     view::{Role, WireModes, WorkerId},
-    worker_host::{Expect, Membership, Refused, Remover, Standing, StoreDoor, Wrote},
+    worker_host::{Expect, Membership, Objects, Refused, Remover, Standing, StoreDoor, Wrote},
 };
 use smg_worker::{
     connection::engine::EngineConnector,
@@ -429,6 +429,51 @@ fn a_second_write_of_the_same_facts_moves_nothing() {
     assert!(Arc::ptr_eq(&before, &after));
 }
 
+/// A built worker handed to the feed's door is the row's object when its
+/// write returns. So is the next one, whose equal facts move no row. A
+/// guarded write passes only over the object that stands.
+#[test]
+fn a_built_worker_is_the_rows_object_when_its_write_returns() {
+    let store = Arc::new(MemoryStore::default());
+    let (registry, feed) = bed(&store);
+    let built = || -> Arc<dyn Worker> {
+        let worker = BasicWorkerBuilder::new(URL).model(ModelCard::new(MODEL));
+        Arc::new(worker.api_key("key").build())
+    };
+    let held = |built: &Arc<dyn Worker>| {
+        let held = registry.get_by_url(URL);
+        held.is_some_and(|held| Arc::ptr_eq(&held, built))
+    };
+
+    let first = built();
+    let wrote = feed
+        .door
+        .found_built(&Maker::Control, Expect::Anything, &first, None);
+    assert!(matches!(wrote, Ok(Wrote::Registered(_))), "{wrote:?}");
+    assert!(held(&first));
+
+    let second = built();
+    let wrote = feed
+        .door
+        .found_built(&Maker::Control, Expect::Anything, &second, None);
+    assert!(matches!(wrote, Ok(Wrote::Unmoved(_))), "{wrote:?}");
+    assert!(held(&second));
+    assert_eq!(second.api_key().map(String::as_str), Some("key"));
+
+    // A guarded write names the object it replaces. The first is gone, so
+    // a write over it is refused as moved though the row never moved.
+    let third = built();
+    let guarded = |over| {
+        feed.door
+            .found_built(&Maker::Control, Expect::Anything, &third, Some(over))
+    };
+    assert_eq!(guarded(&first), Err(Refused::Moved));
+    assert!(held(&second));
+    assert!(matches!(guarded(&second), Ok(Wrote::Unmoved(_))));
+    assert!(held(&third));
+    assert_eq!(feed.objects.unhanded(), 0);
+}
+
 #[tokio::test]
 async fn a_drained_row_takes_no_decision_and_a_gone_row_leaves_the_registry() {
     let store = start_store().expect("the store starts");
@@ -525,6 +570,8 @@ fn a_membership_write_holds_the_feed_turn_through_its_listener() {
                 calls.fetch_add(1, Ordering::Relaxed);
             }),
             turn: Arc::new(Mutex::new(())),
+            objects: Arc::new(Objects::new(Arc::new(WorkerRegistry::new()))),
+            store: Arc::clone(&store),
         }
     });
     let row = register(&*door).expect("the worker registers");

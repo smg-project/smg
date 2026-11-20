@@ -12,7 +12,7 @@ use smg_worker::{
         validate_constrained_decoding_label, DP_WIDTH_LABELS,
     },
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::{
@@ -246,21 +246,11 @@ impl UpdateWorkerPropertiesStep {
                 continue;
             }
             if !card_fields.is_empty() {
-                if row.is_some() {
-                    // The holder builds a row's object with a card of its id
-                    // alone: the labels are written, and the card stays.
-                    warn!(
-                        worker_url = %worker.redacted_url(),
-                        fields = ?card_fields,
-                        "A row's model card holds its id alone and does not follow these labels yet"
-                    );
-                } else {
-                    info!(
-                        worker_url = %worker.redacted_url(),
-                        fields = ?card_fields,
-                        "The worker's model card follows its labels"
-                    );
-                }
+                info!(
+                    worker_url = %worker.redacted_url(),
+                    fields = ?card_fields,
+                    "The worker's model card follows its labels"
+                );
             }
             // A key an update sets is the operator's from then on, whatever
             // value it carries: it leaves the discovered set, so a later
@@ -367,18 +357,13 @@ impl UpdateWorkerPropertiesStep {
             let new_worker: Arc<dyn Worker> = Arc::new(new_worker);
 
             // A row's worker is written at the store's door, and the holder
-            // lays its object over the one that stands, under its id.
+            // lays this worker over the one that stands, under its id.
             if let Some((door, standing)) = row {
-                door.lay(&context.data.asker, standing, new_worker.as_ref())?;
-                let registry = &app_context.worker_registry;
                 // The door promotes a row whose checks the update turned
-                // off, and no probe will promote the registry's object. It
-                // follows here, as on the classic way out below.
-                let captured = snapshot.as_ref().and_then(|entries| entries.get(index));
-                let off = updated_health_config.disable_health_check;
-                if let Some((id, _)) = captured.filter(|_| off) {
-                    let _ = registry.transition_status(id, WorkerStatus::Ready);
-                }
+                // off, and the holder sets the worker it lays to its row's
+                // status: no promotion follows here.
+                door.lay(&context.data.asker, standing, &new_worker, worker)?;
+                let registry = &app_context.worker_registry;
                 updated_workers.extend(registry.get_by_url(worker.url()));
                 continue;
             }

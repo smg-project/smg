@@ -3,10 +3,10 @@
 //!
 //! The holder is the one writer of a row's object in the registry, so the
 //! step writes a row's worker at the store's door: the row takes the
-//! worker's labels and health checks, and the holder lays its object over
-//! the one that stands, under its id. A provider's worker stays outside
-//! the store, and the step writes it in the registry as the classic line
-//! does.
+//! worker's labels and health checks. The door hands the rebuilt worker to
+//! the holder, which lays it over the one that stands, under its id. A
+//! provider's worker stays outside the store, and the step writes it in
+//! the registry as the classic line does.
 //!
 //! A row holds no credential, no priority and no cost yet. The worker API
 //! refuses an update that states one before it queues a job. A job that
@@ -19,7 +19,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use openai_protocol::worker::WorkerUpdateRequest;
 use smg_policy_controller::worker_host::{
-    facts, maker_of, Expect, Membership, Objects, Refused, Standing,
+    maker_of, Expect, Membership, Objects, Refused, Standing,
 };
 use smg_worker::{identity::basic::Worker, jobs::WorkerJobAsker, registry::WorkerId};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
@@ -96,22 +96,24 @@ impl UpdateAtDoorStep {
     }
 
     /// Lay the labels and the health checks of `updated` over the row
-    /// `standing` names. The job writes as its asker's maker, and the door
-    /// is the judge: another maker's row answers by the store's sentence.
+    /// `standing` names, and hand `updated` in as the row's object in the
+    /// place of `found`, the worker it was rebuilt from. An update that
+    /// moves no fact of the row still lays its worker. The job writes as
+    /// its asker's maker, and the door is the judge: another maker's row
+    /// answers by the store's sentence, and a worker replaced since the
+    /// update found it drops the update.
     pub(super) fn lay(
         &self,
         asker: &WorkerJobAsker,
         standing: Standing,
-        updated: &dyn Worker,
+        updated: &Arc<dyn Worker>,
+        found: &Arc<dyn Worker>,
     ) -> WorkflowResult<()> {
-        let url = updated.url();
-        let maker = maker_of(asker, url).map_err(|why| step_failed(why.to_string()))?;
+        let maker = maker_of(asker, updated.url()).map_err(|why| step_failed(why.to_string()))?;
         self.door
-            .found(&maker, Expect::Seen(standing), url, &|row| {
-                facts(updated, row)
-            })
+            .found_built(&maker, Expect::Seen(standing), updated, Some(found))
             .map(drop)
-            .map_err(|refusal| step_failed(dropped(updated, refusal)))
+            .map_err(|refusal| step_failed(dropped(updated.as_ref(), refusal)))
     }
 }
 

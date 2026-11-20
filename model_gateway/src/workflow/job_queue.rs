@@ -2065,8 +2065,9 @@ mod tests {
 
     /// Under the policy controller a PATCH moves a row's labels and its
     /// health checks. The update job lays them over the row at the store's
-    /// door as the control maker, in place, and the holder lays the row's
-    /// object under the same id.
+    /// door as the control maker, in place, and hands its rebuilt worker
+    /// in: the holder lays that worker under the same id, and no lay
+    /// misses its object.
     #[tokio::test]
     async fn under_the_policy_controller_a_patch_moves_a_rows_labels_and_health_checks() {
         use smg_policy_controller::store::WorkersStore;
@@ -2106,6 +2107,9 @@ mod tests {
         );
         assert_eq!(metadata.health_config.failure_threshold, 7);
         assert_eq!(metadata.health_config.drain_settle_secs, 9);
+        let feed = hosted.door_feed().expect("the feed");
+        assert_eq!(feed.objects.standing(&id).map(|at| at.row), Some(row.id));
+        assert_eq!(feed.objects.unhanded(), 0);
     }
 
     /// Under the policy controller a PATCH that turns a row's health checks
@@ -2152,6 +2156,55 @@ mod tests {
         assert!(!row.facts.health.probes);
         assert_eq!(row.status, RowStatus::Ready);
         let laid = registry.get(&id).expect("the row's object");
+        assert_eq!(laid.status(), WorkerStatus::Ready);
+    }
+
+    /// Under the policy controller a PUT that turns a row's health checks
+    /// off leaves its worker in service. The door promotes the row. The
+    /// holder lays the job's object over one that was out of service, and
+    /// the activation step promotes it as far as its row.
+    #[tokio::test]
+    async fn under_the_policy_controller_a_put_that_turns_checks_off_promotes_a_rows_worker() {
+        use openai_protocol::worker::WorkerStatus;
+        use smg_policy_controller::store::{WorkerStatus as RowStatus, WorkersStore};
+
+        let (hosted, url, _, mut next_job) = a_hosted_gateway_with_a_row().await;
+        let store = hosted.policy_store.as_ref().expect("the store");
+        let registry = &hosted.worker_registry;
+        let service = &hosted.worker_service;
+        let id = registry.get_id_by_url(&url).expect("the worker's id");
+        let marks = DashSet::new();
+        let checks_off = |off: bool| {
+            let mut spec = WorkerSpec::new(&url);
+            spec.health.disable_health_check = Some(off);
+            spec
+        };
+
+        // Checks on, then the worker out of service, as behind failed probes.
+        service
+            .replace_worker(id.as_str(), checks_off(false))
+            .await
+            .expect("the 202");
+        let done = execute_job(&next_job(), &hosted, &marks, None).await;
+        assert!(done.is_ok(), "{done:?}");
+        let checked = store.by_key(&url).expect("the worker's row");
+        assert!(checked.facts.health.probes);
+        let _ = registry.transition_status(&id, WorkerStatus::NotReady);
+        let out = registry.get(&id).expect("the row's object");
+        assert_eq!(out.status(), WorkerStatus::NotReady);
+
+        service
+            .replace_worker(id.as_str(), checks_off(true))
+            .await
+            .expect("the 202");
+        let done = execute_job(&next_job(), &hosted, &marks, None).await;
+        assert!(done.is_ok(), "{done:?}");
+
+        let row = store.by_key(&url).expect("the worker's row");
+        assert!(!row.facts.health.probes);
+        assert_eq!(row.status, RowStatus::Ready);
+        let laid = registry.get(&id).expect("the row's object");
+        assert!(!Arc::ptr_eq(&laid, &out));
         assert_eq!(laid.status(), WorkerStatus::Ready);
     }
 
