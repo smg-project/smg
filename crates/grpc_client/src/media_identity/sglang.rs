@@ -226,6 +226,13 @@ pub fn validate(identity: &MediaIdentity, req: &GenerateRequest, key: &str) -> b
     {
         return false;
     }
+    // Version 1 carries one whole-bundle hash. The SGLang ingress splits
+    // image bundles before padding, deriving a different hash per image.
+    // A pixel-less identity cannot recover those hashes, so retain the
+    // original references for processing on both PD workers instead.
+    if mm.modalities[0] == "image" && mm.mm_placeholders.len() > 1 {
+        return false;
+    }
     let mut previous_end = 0;
     for range in &mm.mm_placeholders {
         let start = range.offset as usize;
@@ -328,6 +335,46 @@ mod tests {
         assert!(!reusable_request(&req));
         identity.request_digest = request_digest(&req);
         assert!(!validate(&identity, &req, &identity.processor_key));
+    }
+
+    /// A v1 bundle hash cannot represent the per-image hashes used for padding.
+    #[test]
+    fn bundled_images_decline_reuse_without_consuming_references() {
+        let (mut req, mut identity) = fixture();
+        req.mm_inputs
+            .as_mut()
+            .unwrap()
+            .image_urls
+            .push("https://example.test/b.png".into());
+        identity.request_digest = request_digest(&req);
+        identity.input_ids = vec![1, 7, 7, 2, 7, 7, 3];
+        let mm = identity.mm_inputs.as_mut().unwrap();
+        mm.mm_placeholders.push(PlaceholderRange {
+            offset: 4,
+            length: 2,
+        });
+        let grid = mm.model_specific_tensors.get_mut("image_grid_thw").unwrap();
+        grid.shape = vec![2, 3];
+        grid.data = [1i64, 2, 2, 1, 2, 2]
+            .into_iter()
+            .flat_map(i64::to_le_bytes)
+            .collect::<Vec<_>>()
+            .into();
+        let original = req.clone();
+        assert!(reusable_request(&req));
+        assert!(!validate(&identity, &req, "key"));
+        assert_eq!(req, original, "both workers retain the ordered references");
+
+        // Video keeps its existing bundle representation at the SGLang ingress.
+        let refs = req.mm_inputs.as_mut().unwrap();
+        refs.video_urls = std::mem::take(&mut refs.image_urls);
+        identity.request_digest = request_digest(&req);
+        let mm = identity.mm_inputs.as_mut().unwrap();
+        mm.modalities = vec!["video".into()];
+        let grid = mm.model_specific_tensors.remove("image_grid_thw").unwrap();
+        mm.model_specific_tensors
+            .insert("video_grid_thw".into(), grid);
+        assert!(validate(&identity, &req, "key"));
     }
 
     /// Construct a minimal bound image identity with valid placeholders and grid bytes.
