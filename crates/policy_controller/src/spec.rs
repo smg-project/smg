@@ -705,7 +705,7 @@ pub struct ConsistentHashParams {
     #[schemars(extend("exclusiveMinimum" = 0))]
     pub weight: f32,
     /// The depth in tokens at which a request with no routing key is keyed
-    /// by its prefix: the last whole block at or under the depth, so at
+    /// by its prefix through the last whole block at or under the depth, so at
     /// least one block of the view's block size and at most the blocks a
     /// request carries. Under the view's `boundaries` a request that reaches
     /// one is keyed there instead, at the deepest it reaches. The depth is

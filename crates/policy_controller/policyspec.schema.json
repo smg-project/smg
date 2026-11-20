@@ -714,7 +714,7 @@
           "exclusiveMinimum": 0
         },
         "prefix_tokens": {
-          "description": "The depth in tokens at which a request with no routing key is keyed\nby its prefix: the last whole block at or under the depth, so at\nleast one block of the view's block size and at most the blocks a\nrequest carries. Under the view's `boundaries` a request that reaches\none is keyed there instead, at the deepest it reaches. The depth is\nchecked in the view's token blocks and read in the blocks a request\nwas hashed by. A text request's windows are `block_size` characters,\na quarter of a token block, so it carries a quarter of the checked\ndepth and a deeper depth keys at its last window. Under a block size\nan engine published above the depth a request has no key. Absent, a\nrequest with no routing key has none.",
+          "description": "The depth in tokens at which a request with no routing key is keyed\nby its prefix through the last whole block at or under the depth, so at\nleast one block of the view's block size and at most the blocks a\nrequest carries. Under the view's `boundaries` a request that reaches\none is keyed there instead, at the deepest it reaches. The depth is\nchecked in the view's token blocks and read in the blocks a request\nwas hashed by. A text request's windows are `block_size` characters,\na quarter of a token block, so it carries a quarter of the checked\ndepth and a deeper depth keys at its last window. Under a block size\nan engine published above the depth a request has no key. Absent, a\nrequest with no routing key has none.",
           "type": [
             "integer",
             "null"

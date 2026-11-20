@@ -25,7 +25,7 @@
 //! with no routing key is keyed by its prefix: the fold of its block
 //! hashes, from the first through its last whole block at or under the
 //! form's depth in tokens, started at its cache namespace
-//! ([`fold_block`]). A block hash is of its own block's content, so the fold
+//! (`fold_block`). A block hash is of its own block's content, so the fold
 //! is what names the prefix: requests that share that much of a prompt
 //! share an owner, and two that differ anywhere in it do not. It is the key
 //! the sent-prefix predictor keeps that prefix under. The depth counts in
@@ -582,8 +582,8 @@ const TAKEN: u32 = 1 << 30;
 /// The key of a request's prefix at a depth of `tokens`: the fold of its
 /// block hashes through its last whole block at or under that depth, `0`
 /// where it carries no block that shallow. A request shorter than the
-/// depth is keyed at its own last whole block, and so is one whose hashes
-/// the host capped short of the depth.
+/// depth is keyed through its own last whole block, and so is one whose
+/// hashes the host capped short of the depth.
 fn prefix_key(tokens: u32, gates: Gates, facts: &RequestFacts<'_>) -> u64 {
     let depth = gates.whole_blocks(tokens, facts) as usize;
     match depth.min(facts.block_hashes.len()) {
