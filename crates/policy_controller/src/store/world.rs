@@ -1717,12 +1717,20 @@ impl World {
         }
     }
 
-    /// Records the prefixes of a naming on the lease's first target.
-    #[inline]
+    /// Records the prefixes of a naming on the lease's first target. A
+    /// naming that sent none ends at this test, in its caller's line: a
+    /// decision whose profile keeps no record pays no call for it.
+    #[inline(always)]
     pub(crate) fn sent(&self, named: &Named, target: WorkerId) {
-        let Some(pool) = named.sent_pool() else {
-            return;
-        };
+        if let Some(pool) = named.sent_pool() {
+            self.sent_to(pool, named, target);
+        }
+    }
+
+    /// [`Self::sent`] for a naming that sent prefixes to the pool at
+    /// `pool`. Out of line: both of a single's orders write the record.
+    #[inline(never)]
+    fn sent_to(&self, pool: usize, named: &Named, target: WorkerId) {
         let (Some(rows), Some(Some(held))) = (self.rows.get(pool), self.indexes.get(pool)) else {
             return;
         };
