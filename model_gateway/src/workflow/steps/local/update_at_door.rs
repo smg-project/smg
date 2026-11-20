@@ -11,9 +11,11 @@
 //! A row holds no credential and no cost, and its priority is a fact of
 //! the store's own, not the worker's. The rebuilt worker holds a key, a
 //! priority and a cost, so an update that states one moves the object the
-//! holder keeps, though it moves no fact of the row. A label refresh
-//! leaves a row's worker as it is: the door takes the engine's labels from
-//! no writer yet.
+//! holder keeps, though it moves no fact of the row.
+//!
+//! A label refresh writes at the door's entry for it. The labels are the
+//! engine's word, so the entry asks no maker: the row takes the labels and
+//! no other fact, and the holder lays the worker the refresh rebuilt.
 
 use std::sync::Arc;
 
@@ -91,6 +93,26 @@ impl UpdateAtDoorStep {
             .map(drop)
             .map_err(|refusal| step_failed(dropped(updated.as_ref(), refusal)))
     }
+
+    /// Lay the labels of `rebuilt` over the row `standing` names, and hand
+    /// `rebuilt` in as the row's object in the place of `found`, the worker
+    /// a label refresh rebuilt it from. A refresh that moves no label still
+    /// lays its worker: it can fill a field no row states. Whether the
+    /// door laid it: a worker replaced or removed since the refresh found
+    /// it, or one that is draining, drops the refresh, and the next
+    /// transition into service refreshes again.
+    pub(super) fn refresh(
+        &self,
+        standing: Standing,
+        rebuilt: &Arc<dyn Worker>,
+        found: &Arc<dyn Worker>,
+    ) -> WorkflowResult<bool> {
+        match self.door.refreshed(standing, rebuilt, found) {
+            Ok(_) => Ok(true),
+            Err(Refused::Moved | Refused::Absent | Refused::Draining) => Ok(false),
+            Err(refusal) => Err(step_failed(dropped(rebuilt.as_ref(), refusal))),
+        }
+    }
 }
 
 /// Why the door dropped the update of `worker`.
@@ -105,6 +127,10 @@ fn dropped(worker: &dyn Worker, refusal: Refused) -> String {
              update was dropped"
         ),
         Refused::Draining => format!("worker {url} is draining, so the update was dropped"),
+        Refused::NotLabelsAlone => format!(
+            "the label refresh of worker {url} states another fact than its labels, so it \
+             was dropped"
+        ),
         other => format!("the membership door refused the update of worker {url}: {other:?}"),
     }
 }

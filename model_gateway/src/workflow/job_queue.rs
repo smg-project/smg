@@ -323,19 +323,6 @@ fn add_worker_in_flight(queue: &JobQueue, url: &str) -> bool {
     })
 }
 
-/// Under the policy controller a row keeps the labels of its registration:
-/// the door takes the engine's labels from no writer yet. A label refresh
-/// leaves a row's worker alone, and this is the job's answer. `None` where
-/// the refresh runs.
-fn left_to_the_store(context: &AppContext, url: &str) -> Option<String> {
-    context.holds_row_at(url).then(|| {
-        format!(
-            "{} is a row of the policy controller's store, which takes no label refresh yet",
-            Job::workflow_label(url)
-        )
-    })
-}
-
 /// The workflow engines, or the refusal a job answers while they are not
 /// built yet.
 fn workflow_engines(context: &AppContext) -> Result<&WorkflowEngines, String> {
@@ -668,10 +655,6 @@ impl JobHost for AppContext {
                 .await
             }
             Job::RefreshWorkerLabels { url, asker } => {
-                // A refresh is the health loop's follow-up: it ends well.
-                if let Some(left) = left_to_the_store(context, url) {
-                    return Ok(left);
-                }
                 let engines = workflow_engines(context)?;
 
                 let mut workflow_data = create_worker_update_workflow_data(
@@ -1098,7 +1081,7 @@ mod tests {
     use crate::{
         app_context::testing::create_test_app_context,
         wasm::{WasmModuleDescriptor, WasmModuleType},
-        workflow::create_worker_removal_workflow,
+        workflow::{create_worker_removal_workflow, steps::local::test_support::MovingBody},
     };
 
     type QueueTest<'a> = queue::testing::QueueTest<'a, AppContext>;
@@ -1595,21 +1578,28 @@ mod tests {
     /// and the metadata a registration reads, a 404 elsewhere. Its
     /// `host:port`.
     async fn a_registering_engine() -> String {
+        an_engine_whose_report_moves().await.0
+    }
+
+    /// The same engine with the cell of its server info. A case moves it
+    /// as an engine that restarts with other settings moves its report.
+    async fn an_engine_whose_report_moves() -> (String, MovingBody) {
         use http::StatusCode;
         use serde_json::json;
 
-        use crate::workflow::steps::local::test_support::serve_json_routes;
-        let base = serve_json_routes(vec![
+        use crate::workflow::steps::local::test_support::serve_json_routes_and_a_moving_one;
+        let routes = vec![
             ("/health", StatusCode::OK, json!({"status": "ok"})),
             (
                 "/model_info",
                 StatusCode::OK,
                 json!({"model_path": "m", "is_generation": true}),
             ),
-            ("/server_info", StatusCode::OK, json!({"version": "test"})),
-        ])
-        .await;
-        base.trim_start_matches("http://").to_string()
+        ];
+        let report = json!({"version": "test"});
+        let (base, report) =
+            serve_json_routes_and_a_moving_one(routes, "/server_info", report).await;
+        (base.trim_start_matches("http://").to_string(), report)
     }
 
     /// The text a worker job's wait ends with names the worker by its address
@@ -1778,7 +1768,14 @@ mod tests {
     /// its job: the context, the worker's URL, the registration job and
     /// the queue's reader, which keeps the queue open.
     async fn a_hosted_gateway_with_a_row() -> (Arc<AppContext>, String, Job, impl FnMut() -> Job) {
-        let url = format!("http://{}", a_registering_engine().await);
+        a_hosted_gateway_with_a_row_at(a_registering_engine().await).await
+    }
+
+    /// The same gateway, its worker at the engine `host`.
+    async fn a_hosted_gateway_with_a_row_at(
+        host: String,
+    ) -> (Arc<AppContext>, String, Job, impl FnMut() -> Job) {
+        let url = format!("http://{host}");
         let mut config = RouterConfig::builder()
             .mode(RoutingMode::Regular {
                 worker_urls: vec![url.clone()],
@@ -1807,36 +1804,75 @@ mod tests {
         (hosted, url, registration, next_job)
     }
 
-    /// Under the policy controller a label refresh leaves a row's worker
-    /// alone and ends well: the door takes the engine's labels from no
-    /// writer yet. An update job that states an API key, a priority or a
-    /// cost moves the object the holder keeps, though no fact of the row
-    /// moves: each job hands its rebuilt worker in. The removal behind
-    /// them still takes the worker.
+    /// Under the policy controller a label refresh writes a row's labels
+    /// at the store's door. The health loop asks it, and the door asks no
+    /// maker: a start-up worker's row takes the engine's word. A refresh
+    /// that reads the report the worker holds keeps the worker as it is.
+    /// One that reads another report lays its rebuilt worker under the
+    /// worker's id, with the running state of the one it replaces, and
+    /// the row takes the labels in place.
     #[tokio::test]
-    async fn under_the_policy_controller_an_update_moves_a_rows_key_priority_and_cost() {
-        let (hosted, url, _, _jobs) = a_hosted_gateway_with_a_row().await;
+    async fn under_the_policy_controller_a_label_refresh_moves_a_rows_labels() {
+        use smg_policy_controller::store::WorkersStore;
+
+        let (host, report) = an_engine_whose_report_moves().await;
+        let (hosted, url, _, _jobs) = a_hosted_gateway_with_a_row_at(host).await;
         let registry = &hosted.worker_registry;
+        let store = hosted.policy_store.as_ref().expect("the store");
+        let version = |labels: Option<&String>| labels.cloned();
         let laid = registry.get_by_url(&url).expect("the row's object");
+        let id = registry.get_id_by_url(&url).expect("the worker's id");
+        let row = store.by_key(&url).expect("the worker's row");
+        let held = version(row.facts.labels.get("version"));
+        assert_eq!(held.as_deref(), Some("test"));
+        laid.increment_load();
         let marks = DashSet::new();
         let refresh = Job::RefreshWorkerLabels {
             url: url.clone(),
             asker: WorkerJobAsker::Health,
         };
+
+        let kept = execute_job(&refresh, &hosted, &marks, None).await;
+        assert!(kept.is_ok(), "{kept:?}");
+        let stands = registry.get_by_url(&url).expect("the worker");
+        assert!(Arc::ptr_eq(&stands, &laid));
+        let unmoved = store.by_key(&url).expect("the row");
+        assert_eq!(unmoved.revision, row.revision);
+
+        *report.lock() = serde_json::json!({"version": "restarted"});
+        let moved = execute_job(&refresh, &hosted, &marks, None).await;
+        assert!(moved.is_ok(), "{moved:?}");
+        let stands = registry.get_by_url(&url).expect("the worker");
+        assert!(!Arc::ptr_eq(&stands, &laid));
+        assert_eq!(registry.get_id_by_url(&url), Some(id));
+        assert_eq!(stands.load(), 1, "the running state");
+        let held = version(stands.metadata().spec.labels.get("version"));
+        assert_eq!(held.as_deref(), Some("restarted"));
+        let now = store.by_key(&url).expect("the row");
+        let held = version(now.facts.labels.get("version"));
+        assert_eq!(held.as_deref(), Some("restarted"));
+        assert_eq!(now.id, row.id);
+        assert_eq!(now.status, row.status);
+        assert_eq!(now.maker, row.maker);
+        assert_ne!(now.revision, row.revision);
+        let feed = hosted.door_feed().expect("the feed");
+        assert_eq!(feed.objects.unhanded(), 0);
+    }
+
+    /// Under the policy controller an update job that states an API key, a
+    /// priority or a cost moves the object the holder keeps, though no
+    /// fact of the row moves: each job hands its rebuilt worker in. The
+    /// removal behind them still takes the worker.
+    #[tokio::test]
+    async fn under_the_policy_controller_an_update_moves_a_rows_key_priority_and_cost() {
+        let (hosted, url, _, _jobs) = a_hosted_gateway_with_a_row().await;
+        let registry = &hosted.worker_registry;
+        let marks = DashSet::new();
         let update = |body: serde_json::Value| Job::UpdateWorker {
             url: url.clone(),
             update: Box::new(serde_json::from_value(body).expect("an update")),
             asker: WorkerJobAsker::Api,
         };
-
-        let refreshed = execute_job(&refresh, &hosted, &marks, None).await;
-        let left = "is a row of the policy controller's store";
-        assert!(
-            refreshed.as_ref().is_ok_and(|text| text.contains(left)),
-            "{refreshed:?}"
-        );
-        let stands = registry.get_by_url(&url).expect("the worker");
-        assert!(Arc::ptr_eq(&stands, &laid));
 
         // One job a field. Each object is the job's rebuilt worker and
         // keeps what the jobs before it set.

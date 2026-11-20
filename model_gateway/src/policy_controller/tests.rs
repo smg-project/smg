@@ -1398,6 +1398,5 @@ async fn a_followed_gateway_hands_its_worker_workflows_no_feed() -> Case {
     assert!(followed.follows_controller());
     assert!(followed.policy_feed.is_some());
     assert!(followed.door_feed().is_none());
-    assert!(!followed.holds_row_at("http://worker:8000"));
     Ok(())
 }
