@@ -114,11 +114,23 @@ pub trait HealthSink: Send + Sync {
     /// probe's outcome: the answer is the status that stands
     /// ([`HealthWrite::Stood`]), a revision the row left, or no row.
     ///
+    /// `leads` is the writer's last word. The store asks it behind the
+    /// last lock the write waits for, as an admitted apply asks its own.
+    /// Where it says no, nothing is written and the write is stale: a term
+    /// that ended while the write waited writes nothing. It is asked under
+    /// the store's locks and takes none of them.
+    ///
     /// The bits are the leader's own and no journal carries them: a
     /// standby holds none, and a new leader writes what its own objects
     /// know. They stand with the row across its revisions and leave with
     /// it: a key's new incarnation starts with none.
-    fn leader_bits(&self, id: WorkerId, revision: u64, bits: LeaderBits) -> HealthWrite;
+    fn leader_bits(
+        &self,
+        id: WorkerId,
+        revision: u64,
+        bits: LeaderBits,
+        leads: &dyn Fn() -> bool,
+    ) -> HealthWrite;
 
     /// A gateway's standing veto on a worker until `until`; `None` clears
     /// it. A veto standing across a reconnect is re-asserted in the

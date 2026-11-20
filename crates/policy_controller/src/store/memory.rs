@@ -421,8 +421,9 @@ impl MemoryStore {
     /// builds the world at once. The store keeps its lease files and their
     /// term and its session pins. A worker still present keeps its count
     /// slot, admission instant, gateway vetoes, completed-dispatch times
-    /// and local loads. Its KV lane stays while its cache events still
-    /// belong to the same model and rank.
+    /// and local loads, and the bits its own host wrote of it as the
+    /// leader ([`HealthSink::leader_bits`]). Its KV lane stays while its
+    /// cache events still belong to the same model and rank.
     ///
     /// Loads in the cut are ignored. Returns `false` with the store as it
     /// was if the journal refuses the snapshot's place.
@@ -1196,15 +1197,6 @@ impl MemoryStore {
     fn show_status(&self, id: WorkerId, status: WorkerStatus) {
         let mut loads = self.loads.lock();
         let world = loads.writer.fold_status(id, status);
-        self.show(&mut loads.writer, world);
-    }
-
-    /// Fold what the leader's own worker object knows of a worker into the
-    /// world and publish it at once. Called under the workers lock, as the
-    /// bits were written.
-    fn show_leader(&self, id: WorkerId, bits: LeaderBits) {
-        let mut loads = self.loads.lock();
-        let world = loads.writer.fold_leader(id, bits);
         self.show(&mut loads.writer, world);
     }
 
@@ -2045,16 +2037,31 @@ impl HealthSink for MemoryStore {
         }
     }
 
-    fn leader_bits(&self, id: WorkerId, revision: u64, bits: LeaderBits) -> HealthWrite {
+    fn leader_bits(
+        &self,
+        id: WorkerId,
+        revision: u64,
+        bits: LeaderBits,
+        leads: &dyn Fn() -> bool,
+    ) -> HealthWrite {
         // The membership lock with no word to the journal: the bits are
         // this replica's own, and no standby applies them.
         let mut workers = self.workers.lock();
         let Some(row) = workers.guarded(id, revision) else {
             return workers.unjudged(id);
         };
+        let mut loads = self.loads.lock();
+        // The writer's last word, behind both locks this write waits for:
+        // what follows waits for nothing.
+        if !leads() {
+            return HealthWrite::Stale;
+        }
         let status = row.row.status;
         if mem::replace(&mut row.leader, bits) != bits {
-            self.show_leader(id, bits);
+            // Folded into the world and published at once, under the
+            // workers lock, as the bits were written.
+            let world = loads.writer.fold_leader(id, bits);
+            self.show(&mut loads.writer, world);
         }
         HealthWrite::Stood(status)
     }

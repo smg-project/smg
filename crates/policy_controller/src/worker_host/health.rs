@@ -17,7 +17,11 @@
 //! The projection ([`HealthAdapter::project`]) writes what the object knows
 //! of its worker onto the row, under the same lock and the same fences. It
 //! reads the object at its write and is handed no reading, so of two
-//! projections the later one's reading stands on the row.
+//! projections the later one's reading stands on the row. The store asks
+//! the lead once more behind its own locks, as an admitted apply asks its
+//! own: a term that ended while the write waited there writes nothing. A
+//! projection moves no status: the object's follows its row through the
+//! holder's mirror and through a verdict's write.
 
 use std::sync::Arc;
 
@@ -55,26 +59,36 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
     /// the row it stands for ([`StoreHealthSink::leader_bits`]): its
     /// liveness veto ([`Worker::stall_reason`]) is the row's stalled bit.
     /// The fences are a health write's: the term, the object the holder
-    /// laid, and the revision that object was built from. The object is
-    /// read under its mutation lock, at the write. A host calls this at
-    /// each change of the object's veto, and for an object it lays over
+    /// laid, and the revision that object was built from. The term has the
+    /// last word: the store asks it once more behind its own locks. The
+    /// object is read under its mutation lock, at the write. It is called
+    /// at each change of the object's veto, and for an object laid over
     /// another: a replacement takes the running state of the object it
     /// replaces, its veto with the rest.
     ///
+    /// A projection moves no status, of the row or of the object. Its
+    /// answer says the status that stands on the row
+    /// ([`HealthWrite::Stood`]), and the object keeps its own.
+    ///
     /// Stale where the adapter's term ended, where no object stands under
     /// the id, where the holder laid another, and where the row left the
-    /// revision the object was built from.
+    /// revision the object was built from. No row where the row left while
+    /// its object still stands: removed, or replaced by its key's next
+    /// incarnation.
     pub fn project(&self, worker_id: &ObjectId) -> HealthWrite {
         // The revision of the object that stands now: the guard under the
         // lock refuses the call where another took its place since.
         let Some(object) = self.objects.registry().get(worker_id) else {
             return HealthWrite::Stale;
         };
-        self.write(worker_id, object.revision(), |store, standing, object| {
+        self.fenced(worker_id, object.revision(), |store, standing, object| {
             let bits = LeaderBits {
                 stalled: object.stall_reason().is_some(),
             };
-            store.leader_bits(standing.row, standing.revision, bits)
+            let write = store.leader_bits(standing.row, standing.revision, bits, &|| self.leads());
+            // No status goes back to the registry: a verdict's write moves
+            // the object, and this is none.
+            (write, None)
         })
     }
 
@@ -82,11 +96,30 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
         self.lead.term() == Some(self.term)
     }
 
+    /// A verdict's write, under the fences. The status that stands on the
+    /// row goes back to the registry, which sets a lagging object to it.
     fn write(
         &self,
         worker_id: &ObjectId,
         revision: u64,
-        write_row: impl FnOnce(&S, Standing, &dyn Worker) -> HealthWrite,
+        write_row: impl FnOnce(&S, Standing) -> HealthWrite,
+    ) -> HealthWrite {
+        self.fenced(worker_id, revision, |store, standing, _| {
+            let write = write_row(store, standing);
+            (write, write.stands().map(status))
+        })
+    }
+
+    /// Runs `write_row` under the fences of a health write: the lead, read
+    /// before the object's mutation lock and again under it, the object
+    /// the holder laid, and the revision that object was built from. The
+    /// closure answers its write, and the status the registry sets the
+    /// object to where it sets one.
+    fn fenced(
+        &self,
+        worker_id: &ObjectId,
+        revision: u64,
+        write_row: impl FnOnce(&S, Standing, &dyn Worker) -> (HealthWrite, Option<ObjectStatus>),
     ) -> HealthWrite {
         if !self.leads() {
             return HealthWrite::Stale;
@@ -100,8 +133,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
             let Some(standing) = self.objects.standing_of(worker_id, object) else {
                 return (HealthWrite::Stale, None);
             };
-            let write = write_row(self.store.as_ref(), standing, object.as_ref());
-            (write, write.stands().map(status))
+            write_row(self.store.as_ref(), standing, object.as_ref())
         };
         self.objects
             .registry()
@@ -120,7 +152,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized + 'static> HealthSink for Health
         revision: u64,
         _launched: ObjectStatus,
     ) -> ProbeAnswer {
-        match self.write(worker_id, revision, |store, standing, _| {
+        match self.write(worker_id, revision, |store, standing| {
             store.probe_outcome(standing.row, passed, standing.revision)
         }) {
             HealthWrite::Moved { from, to } => ProbeAnswer::Moved {
@@ -137,7 +169,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized + 'static> HealthSink for Health
         worker_id: &ObjectId,
         revision: u64,
     ) -> Option<(ObjectStatus, ObjectStatus)> {
-        self.write(worker_id, revision, |store, standing, _| {
+        self.write(worker_id, revision, |store, standing| {
             store.connected(standing.row, standing.revision)
         })
         .moved()
@@ -253,14 +285,27 @@ mod tests {
         }
     }
 
-    /// A lead whose term ends between its first reading and its second.
-    struct TurningLead(Mutex<u32>);
+    /// A lead whose term ends behind a count of its readings. The adapter
+    /// reads it before the object's lock and again under it.
+    struct TurningLead {
+        readings: Mutex<u32>,
+        leads_for: u32,
+    }
+
+    impl TurningLead {
+        fn after(leads_for: u32) -> Arc<Self> {
+            Arc::new(Self {
+                readings: Mutex::new(0),
+                leads_for,
+            })
+        }
+    }
 
     impl Lead for TurningLead {
         fn term(&self) -> Option<u64> {
-            let mut readings = self.0.lock();
+            let mut readings = self.readings.lock();
             *readings += 1;
-            Some(if *readings == 1 { 1 } else { 2 })
+            Some(if *readings <= self.leads_for { 1 } else { 2 })
         }
     }
 
@@ -385,6 +430,75 @@ mod tests {
             adapter.project(&replica.id),
             HealthWrite::Stood(RowStatus::Pending)
         );
+        assert!(replica.doubted());
+    }
+
+    /// The store has the term's last word. A projection that passed the
+    /// adapter's two readings and waited at the store's locks through its
+    /// term's end writes nothing there.
+    #[test]
+    fn a_projection_whose_term_ended_at_the_stores_locks_writes_nothing() {
+        let replica = Replica::new(1, true).expect("a laid worker");
+        assert!(replica.object().set_stall(Some(StallReason::Wedged)));
+        let adapter = HealthAdapter::new(
+            Arc::clone(&replica.objects),
+            Arc::clone(&replica.store),
+            TurningLead::after(2),
+            1,
+        );
+        assert_eq!(adapter.project(&replica.id), HealthWrite::Stale);
+        assert!(!replica.doubted());
+        // Under a term that stands the same projection writes the doubt.
+        assert_eq!(
+            replica.adapter().project(&replica.id),
+            HealthWrite::Stood(RowStatus::Pending)
+        );
+        assert!(replica.doubted());
+    }
+
+    /// A projection moves no status. Its answer says the row's, and an
+    /// object that lags its row keeps its own: the holder's mirror and a
+    /// verdict's write move it, never a projection.
+    #[test]
+    fn a_projection_moves_no_status_of_its_object() {
+        let replica = Replica::new(1, true).expect("a laid worker");
+        let row = replica.store.by_key(URL).expect("a row");
+        assert!(
+            StoreHealthSink::connected(replica.store.as_ref(), row.id, row.revision)
+                .moved()
+                .is_some()
+        );
+        replica.assert_statuses(Some(RowStatus::Ready), ObjectStatus::Pending);
+        let mut events = replica.objects.registry().subscribe_events();
+
+        assert_eq!(
+            replica.adapter().project(&replica.id),
+            HealthWrite::Stood(RowStatus::Ready)
+        );
+        replica.assert_statuses(Some(RowStatus::Ready), ObjectStatus::Pending);
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// The object is read under its lock, at the write. A projection that
+    /// waited for the lock while the veto rose and another projection
+    /// wrote it writes the veto too: no reading from before its wait.
+    #[test]
+    fn a_projection_that_waited_for_the_lock_writes_the_reading_under_it() {
+        let replica = Replica::new(1, true).expect("a laid worker");
+        let adapter = replica.adapter();
+        let stood = HealthWrite::Stood(RowStatus::Pending);
+        let waited = replica
+            .objects
+            .registry()
+            .with_another_write_before_the_lock(
+                |_| adapter.project(&replica.id),
+                |_| {
+                    assert!(replica.object().set_stall(Some(StallReason::Unreachable)));
+                    assert_eq!(adapter.project(&replica.id), stood);
+                    assert!(replica.doubted());
+                },
+            );
+        assert_eq!(waited, stood);
         assert!(replica.doubted());
     }
 
@@ -550,7 +664,7 @@ mod tests {
             HealthAdapter::new(
                 Arc::clone(&replica.objects),
                 Arc::clone(&replica.store),
-                Arc::new(TurningLead(Mutex::new(0))),
+                TurningLead::after(1),
                 1,
             )
         };
