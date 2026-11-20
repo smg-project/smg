@@ -91,11 +91,47 @@ impl BoundedLabels {
             Entry::Vacant(entry) => Arc::clone(&*entry.insert(Arc::from(s))),
         }
     }
+
+    /// `s`'s label where a test reads the set as full: its own where the
+    /// set admitted it, the sentinel where not.
+    #[cfg(test)]
+    fn admitted(&self, s: &str) -> Arc<str> {
+        self.map.get(s).map_or_else(
+            || Arc::clone(&BOUNDED_LABEL_SENTINEL_ARC),
+            |entry| Arc::clone(entry.value()),
+        )
+    }
 }
 
 /// Intern a client-supplied model label, bounded by `MAX_MODEL_LABELS`.
 pub fn intern_model_label(model_id: &str) -> Arc<str> {
+    #[cfg(test)]
+    if model_labels_full::on_this_thread() {
+        return MODEL_LABELS.admitted(model_id);
+    }
     MODEL_LABELS.intern(model_id)
+}
+
+/// For this crate's tests: a thread's say that the set of model labels is
+/// full. A model the set has not admitted then gets the sentinel, as it
+/// does past `MAX_MODEL_LABELS`, and the process-wide set is not filled
+/// under the other tests.
+#[cfg(test)]
+pub(crate) mod model_labels_full {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FULL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Have this thread read the set as full, or as it is.
+    pub(crate) fn force_on_this_thread(full: bool) {
+        FULL.set(full);
+    }
+
+    pub(super) fn on_this_thread() -> bool {
+        FULL.get()
+    }
 }
 
 /// Per-thread caches of the handles the per-request records go through.
@@ -378,5 +414,18 @@ mod tests {
         let b2 = labels.intern("m2");
         assert!(Arc::ptr_eq(&b, &b2));
         assert_ne!(&*a, BOUNDED_LABEL_SENTINEL);
+    }
+
+    #[test]
+    fn a_thread_reads_the_set_of_model_labels_as_full() {
+        let admitted = intern_model_label("a-model-admitted-ahead");
+        model_labels_full::force_on_this_thread(true);
+        let again = intern_model_label("a-model-admitted-ahead");
+        assert!(Arc::ptr_eq(&again, &admitted));
+        let met = intern_model_label("a-model-met-while-full");
+        assert_eq!(&*met, BOUNDED_LABEL_SENTINEL);
+        model_labels_full::force_on_this_thread(false);
+        let met = intern_model_label("a-model-met-while-full");
+        assert_eq!(&*met, "a-model-met-while-full");
     }
 }
