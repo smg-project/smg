@@ -3,14 +3,17 @@
 //! and marks the answer, so the pipeline's stage line and the access log's response line stay at
 //! DEBUG; a refusal no stage writes a line for is left to the access log's WARN line. A stage
 //! writes that WARN only for a cause typed as the request's own. Every other failure keeps an
-//! ERROR line: the stage's own where it answers 400 for a fault of the deployment (a model
-//! configuration that does not load, a vocabulary without the placeholder token, a tokenizer
-//! with no chat template), the pipeline's too in the server's class.
+//! ERROR line: the stage's own where it answers 400 (a model configuration found nowhere, a
+//! tokenizer with no chat template), the pipeline's too in the server's class (a model
+//! configuration this host holds and cannot load, a vocabulary without the placeholder token).
 
 use tracing::Level;
 
 use super::*;
-use crate::observability::logging::test_support::{test_subscriber, LinesAtWarnOrAbove};
+use crate::{
+    observability::logging::test_support::{test_subscriber, LinesAtWarnOrAbove},
+    routers::grpc::multimodal::{hub_answering, HubEnv},
+};
 
 fn marked(response: &Response) -> bool {
     response.extensions().get::<ReportedRefusal>().is_some()
@@ -42,22 +45,27 @@ async fn a_refusal_no_stage_reports_is_left_to_the_access_logs_line() {
     assert!(lines.lines().is_empty(), "{:?}", lines.lines());
 }
 
-/// The answer to one image for a model whose directory holds `config` as its `config.json`,
-/// under router-side processing over the mock tokenizer, with the lines at WARN or above the
-/// request wrote. The directory is a local one and lives to the end of the awaited call: the
-/// configuration is read on this host, with no fetch.
+/// The answer to one image for a model whose directory holds `config` as its `config.json`
+/// ([`image_answer_over_model_dir`]). The directory is a local one and lives to the end of the
+/// awaited call: the configuration is read on this host, with no fetch.
 async fn image_answer_over_model_config(config: &str) -> (Response, Vec<(Level, String)>) {
     let model_dir = tempfile::tempdir().expect("a model directory");
     std::fs::write(model_dir.path().join("config.json"), config).expect("the model's config");
-    let (pipeline, pooled, _) =
-        chat_pipeline_over(RuntimeType::Sglang, &[], model_dir.path()).await;
+    image_answer_over_model_dir(model_dir.path()).await
+}
+
+/// The answer to one image for a model whose source is the local directory `model_dir`, under
+/// router-side processing over the mock tokenizer, with the lines at WARN or above the request
+/// wrote.
+async fn image_answer_over_model_dir(model_dir: &Path) -> (Response, Vec<(Level, String)>) {
+    let (pipeline, pooled, _) = chat_pipeline_over(RuntimeType::Sglang, &[], model_dir).await;
     let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
     let tokenizer_registry = Arc::new(TokenizerRegistry::new());
     tokenizer_registry
         .load(
             "tokenizer-id",
             MODEL,
-            model_dir.path().to_str().expect("a UTF-8 path"),
+            model_dir.to_str().expect("a UTF-8 path"),
             || async move { Ok(tokenizer) },
         )
         .await
@@ -105,33 +113,41 @@ async fn media_the_preparation_refuses_is_one_warn_and_marked() {
     );
 }
 
-/// A fault of the deployment in the same preparation, whose 400 names `cause`: the stage's line
-/// stays ERROR and the answer unmarked, so an operator still reads it.
+/// A fault of the deployment in the same preparation is answered in the server's class: a 500
+/// under the pipeline's own code, whose sentence does not carry `cause`. The stage's line
+/// stays ERROR and the answer unmarked, so an operator still reads it, and the pipeline adds
+/// its own line as for every failure of that class.
 async fn a_deployment_fault_keeps_the_stages_error_line(config: &str, cause: &str) {
     let (response, lines) = image_answer_over_model_config(config).await;
 
-    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
         error::extract_error_code_from_response(&response),
-        "invalid_multimodal_request"
+        "multimodal_processing_failed"
     );
     assert!(!marked(&response));
+    assert_eq!(lines.len(), 2, "{lines:?}");
     assert_eq!(
-        lines,
-        [(
+        lines[0],
+        (
             Level::ERROR,
             "Failed to prepare the multimodal prompt plan".to_string()
-        )]
+        )
+    );
+    assert!(
+        lines[1].0 == Level::ERROR && lines[1].1.starts_with("Stage "),
+        "{lines:?}"
     );
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("the answer's body");
     let body = String::from_utf8_lossy(&body);
-    assert!(body.contains(cause), "{body}");
+    assert!(!body.contains(cause), "{body}");
+    assert!(body.contains("the request is not at fault"), "{body}");
 }
 
 /// Media to a model whose configuration this host cannot load (a `config.json` that does not
-/// parse) is the deployment's to fix, though its answer is a 400.
+/// parse) is the deployment's to fix, and its answer is a 500.
 #[tokio::test]
 async fn media_of_a_model_whose_config_cannot_be_loaded_keeps_the_stages_error_line() {
     a_deployment_fault_keeps_the_stages_error_line("{", "Failed to parse config.json").await;
@@ -146,6 +162,63 @@ async fn media_for_a_vocabulary_without_the_placeholder_token_keeps_the_stages_e
         "placeholder token '<image>' is missing from the tokenizer vocabulary",
     )
     .await;
+}
+
+/// Media to a model whose configuration is found nowhere keeps the answer it had: no
+/// `config.json` in the model's directory on this host, and a hub that answers that it has none
+/// (404) or does not open it (401, 403). The gateway cannot tell whether such a model takes
+/// media, so the request may be the one at fault: a 400 that names the cause, unmarked, with the
+/// stage's ERROR line and none of the pipeline's. A hub that fails to serve the file (503) is
+/// the hub's fault, a 502. No network: the hub is a loopback listener.
+#[tokio::test]
+async fn media_of_a_model_whose_config_is_found_nowhere_keeps_the_answer_it_had() {
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    let home = tempfile::tempdir().expect("a hub cache");
+    let model_dir = tempfile::tempdir().expect("a model directory with no config.json");
+    let hub_answer = Arc::new(AtomicU16::new(404));
+    let endpoint = hub_answering(hub_answer.clone()).await;
+    let _env = HubEnv::set(home.path(), &endpoint).await;
+    let stage_line = [(
+        Level::ERROR,
+        "Failed to prepare the multimodal prompt plan".to_string(),
+    )];
+
+    for status in [404, 401, 403] {
+        hub_answer.store(status, Ordering::SeqCst);
+        let (response, lines) = image_answer_over_model_dir(model_dir.path()).await;
+
+        assert_eq!(
+            response.status(),
+            http::StatusCode::BAD_REQUEST,
+            "the hub's {status}"
+        );
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "invalid_multimodal_request",
+            "the hub's {status}"
+        );
+        assert!(!marked(&response), "the hub's {status}");
+        assert_eq!(lines, stage_line, "the hub's {status}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the answer's body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("Failed to resolve model config directory"),
+            "the hub's {status}: {body}"
+        );
+    }
+
+    hub_answer.store(503, Ordering::SeqCst);
+    let (response, lines) = image_answer_over_model_dir(model_dir.path()).await;
+    assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        error::extract_error_code_from_response(&response),
+        "multimodal_config_unavailable"
+    );
+    assert!(!marked(&response));
+    assert_eq!(lines.first(), stage_line.first(), "{lines:?}");
 }
 
 /// The chat and the Messages pipelines over `tokenizer` and no worker: both render the

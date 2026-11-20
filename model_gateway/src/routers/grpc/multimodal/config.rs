@@ -18,6 +18,7 @@ use tracing::{debug, warn};
 use super::{
     inflight::MultimodalInflight,
     pixel_cache::{pixel_cache_with_budget, PixelCache},
+    plan::DeploymentFault,
     process::preprocessor_config_for,
     settings::MultimodalSettings,
 };
@@ -299,12 +300,25 @@ impl MultimodalConfigRegistry {
             format!("Failed to resolve model config directory for '{tokenizer_source}'")
         })?;
 
+        // From here the configuration is one this gateway holds, in the
+        // model's directory or in its hub cache: a failure to read or parse
+        // it is the deployment's own whatever the request holds, and carries
+        // the mark the preparation's stage answers by. Failures to resolve
+        // the directory left above, unmarked.
         let config_path = base_dir.join("config.json");
         let config: serde_json::Value = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read config.json at {}", config_path.display()))
+            .with_context(|| {
+                DeploymentFault(format!(
+                    "Failed to read config.json at {}",
+                    config_path.display()
+                ))
+            })
             .and_then(|s| {
                 serde_json::from_str(&s).with_context(|| {
-                    format!("Failed to parse config.json at {}", config_path.display())
+                    DeploymentFault(format!(
+                        "Failed to parse config.json at {}",
+                        config_path.display()
+                    ))
                 })
             })?;
 
@@ -611,7 +625,7 @@ impl MultimodalComponents {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         fs,
         sync::atomic::{AtomicU16, Ordering},
@@ -710,8 +724,8 @@ mod tests {
     /// A Hub that answers `status` to every file request, so a checkpoint's
     /// processor-config fetches fail or are refused without a network: the
     /// Hub client asks for a file its cache lacks with one GET and reads the
-    /// status before anything else.
-    async fn hub_answering(status: Arc<AtomicU16>) -> String {
+    /// status before anything else. Shared with the pipeline's tests.
+    pub(crate) async fn hub_answering(status: Arc<AtomicU16>) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -769,7 +783,7 @@ mod tests {
     /// back when the test ends, so a failing assertion leaves no other test on
     /// this Hub. The variables are process-wide, so the tests that set them
     /// take turns: the guard holds the turn until the variables are restored.
-    struct HubEnv {
+    pub(crate) struct HubEnv {
         previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
         _turn: tokio::sync::MutexGuard<'static, ()>,
     }
@@ -777,7 +791,7 @@ mod tests {
     static HUB_ENV_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     impl HubEnv {
-        async fn set(home: &Path, endpoint: &str) -> Self {
+        pub(crate) async fn set(home: &Path, endpoint: &str) -> Self {
             let turn = HUB_ENV_TURN.lock().await;
             let previous = ["HF_HOME", "HF_ENDPOINT"]
                 .into_iter()
