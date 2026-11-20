@@ -695,7 +695,7 @@ async fn spawn_held_body_stub(hold: Duration, whole: bool) -> String {
     spawn_stub(app).await
 }
 
-/// The held body of the three cases below ends this long after its head.
+/// The held body of the two cases below ends this long after its head.
 const DRAIN_HOLD: Duration = Duration::from_millis(800);
 
 /// Whether the prefill still holds its lease, read well inside its body's
@@ -772,12 +772,73 @@ async fn a_client_that_leaves_mid_stream_leaves_the_prefill_to_its_drain() -> Ca
     Ok(())
 }
 
+/// What a held server waits on: its case lets the answer go.
+type Release = Arc<tokio::sync::Notify>;
+
+/// Whether `seen` came true inside a long patience of short looks. The
+/// server a look waits ahead of is held until the look ends, so a late look
+/// reads the same as an early one.
+async fn shown(seen: impl Fn() -> bool) -> bool {
+    for _ in 0..1_000 {
+        if seen() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    false
+}
+
+/// A server whose answer's head and first bytes leave at once, with a frame
+/// of white space every few milliseconds behind them, and whose body ends
+/// whole once its case lets it go.
+async fn spawn_released_body_stub(release: Release) -> String {
+    let app = axum::Router::new().fallback(axum::routing::any(move || {
+        let release = Arc::clone(&release);
+        async move {
+            let first = futures_util::stream::iter([Ok(Bytes::from_static(b"{\"partial\":"))]);
+            let rest = futures_util::stream::unfold(Some(release), |release| async move {
+                let release = release?;
+                let frame = Duration::from_millis(5);
+                tokio::select! {
+                    () = release.notified() => Some((Ok(Bytes::from_static(b"1}")), None)),
+                    () = tokio::time::sleep(frame) => {
+                        Some((Ok::<_, std::io::Error>(Bytes::from_static(b" ")), Some(release)))
+                    }
+                }
+            });
+            (
+                [(CONTENT_TYPE, "application/json")],
+                Body::from_stream(first.chain(rest)),
+            )
+        }
+    }));
+    spawn_stub(app).await
+}
+
+/// A server that holds its answer until its case lets it go, and the count
+/// of the requests that reached it.
+async fn spawn_released_stub(reply: Value, release: Release) -> (String, Arc<AtomicUsize>) {
+    let reached = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&reached);
+    let app = axum::Router::new().fallback(axum::routing::any(move || {
+        let (count, reply, release) = (Arc::clone(&count), reply.clone(), Arc::clone(&release));
+        async move {
+            count.fetch_add(1, Ordering::Release);
+            release.notified().await;
+            axum::Json(reply)
+        }
+    }));
+    (spawn_stub(app).await, reached)
+}
+
 /// While the answer's body runs, a drained prefill ends at the answer's
-/// next frame: its row hears the success well ahead of the answer's end.
+/// next frame: its row hears the success ahead of the answer's end. The
+/// answer's body runs until the case saw that, or gave up.
 #[tokio::test]
 async fn a_drained_prefill_ends_at_the_answers_next_frame() -> Case {
     let (prefill, _) = spawn_recording_stub("{}").await;
-    let decode = spawn_held_body_stub(DRAIN_HOLD, true).await;
+    let release = Release::default();
+    let decode = spawn_released_body_stub(Arc::clone(&release)).await;
     let registry = Arc::new(WorkerRegistry::new());
     let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
     let row = store
@@ -792,16 +853,11 @@ async fn a_drained_prefill_ends_at_the_answers_next_frame() -> Case {
 
     assert_eq!(response.status(), StatusCode::OK);
     let early = async {
-        // The patience ends inside the answer's hold: a prefill that ends
-        // with the answer is read as not ended here.
-        let deadline = start + DRAIN_HOLD / 2;
-        while Instant::now() < deadline {
-            if HealthSink::completed_ok_since(&*store, GATEWAY, row.id, start) {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        false
+        // The answer's body ends behind this look: a prefill that ends with
+        // the answer is not seen ended here.
+        let ended = shown(|| HealthSink::completed_ok_since(&*store, GATEWAY, row.id, start)).await;
+        release.notify_one();
+        ended
     };
     let whole = axum::body::to_bytes(response.into_body(), usize::MAX);
     let (_, ended) = tokio::join!(whole, early);
@@ -811,16 +867,16 @@ async fn a_drained_prefill_ends_at_the_answers_next_frame() -> Case {
 }
 
 /// A prefill that is read whole ends where its guard drops, ahead of the
-/// answer its decode writes. The decode here holds its answer, and the
-/// prefill's row hears its success well inside that hold. Both shapes: the
+/// answer its decode writes. The decode here holds its answer until the
+/// case saw the prefill's row hear its success, or gave up. Both shapes: the
 /// two sides sent together, and the decode sent behind its prefill.
 #[tokio::test]
 async fn a_prefill_read_whole_ends_ahead_of_its_decodes_answer() -> Case {
-    let hold = Duration::from_millis(600);
     for runtime in [RuntimeType::default(), RuntimeType::Vllm] {
         let (prefill, _) = spawn_recording_stub("{}").await;
         let reply = json!({"object": "chat.completion"});
-        let (decode, decode_seen) = spawn_delayed_stub(StatusCode::OK, reply, hold).await;
+        let release = Release::default();
+        let (decode, reached) = spawn_released_stub(reply, Arc::clone(&release)).await;
         let registry = Arc::new(WorkerRegistry::new());
         let bed = pair_bed_running(runtime, Arc::clone(&registry), &[&prefill], &[&decode]);
         let (host, store, _) = bed;
@@ -831,17 +887,15 @@ async fn a_prefill_read_whole_ends_ahead_of_its_decodes_answer() -> Case {
         let start = Instant::now();
 
         let early = async {
-            // The patience ends inside the decode's hold: a prefill that
-            // ends with the answer is read as not ended here.
-            let deadline = start + hold / 2;
-            while Instant::now() < deadline {
-                let held = decode_seen.lock().is_ok_and(|seen| !seen.is_empty());
-                if held && HealthSink::completed_ok_since(&*store, GATEWAY, row.id, start) {
-                    return true;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            false
+            // The decode answers behind this look: a prefill that ends with
+            // the answer is not seen ended here.
+            let ended = shown(|| {
+                let held = reached.load(Ordering::Acquire) > 0;
+                held && HealthSink::completed_ok_since(&*store, GATEWAY, row.id, start)
+            })
+            .await;
+            release.notify_one();
+            ended
         };
         let (response, ended) = tokio::join!(chat(&router), early);
 
