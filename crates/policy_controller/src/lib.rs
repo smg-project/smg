@@ -153,6 +153,7 @@ pub mod predictor;
 #[cfg(feature = "controller")]
 pub mod proto;
 pub mod replication;
+pub mod reports;
 pub mod ring;
 pub mod routing_key;
 pub mod sent;
@@ -185,6 +186,7 @@ pub use lease::{
     EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason,
     Side, Signal, TransportClass,
 };
+pub use reports::{ReportReads, Reports};
 pub use ring::{ConsistentHash, Ring};
 pub use routing_key::{DerivedKey, KeySource, KeySources};
 pub use sent::{Sent, SentCredit};
