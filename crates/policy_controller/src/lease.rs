@@ -297,9 +297,19 @@ pub trait Lifecycle: Send + Sync {
     /// side no call issued goes out as the first pick's, and its dispatch
     /// is its issue: a store that files leases tells it here just ahead of
     /// that dispatch's own word. The decision told then is the pair's pick
-    /// as the lease's record keeps it, every target's workers and ranks
-    /// with no position and no trace. The lease names the target the
-    /// dispatch took, and its instant is the dispatch's.
+    /// as the lease's record keeps it: every target's workers and ranks,
+    /// with no trace. The record keeps no position, and each target bears
+    /// the default one, 0, as the target of a dispatch's word does: a
+    /// stage reads the worker by its id. The lease names the target the
+    /// dispatch took.
+    ///
+    /// A lease told here bears the instant its side was filed, on the
+    /// clock of every `issued_micros`. A later decode's is the instant of
+    /// its decode call, or the instant its dispatch was told: never the
+    /// pair's first decision, and never the date a gateway gives the
+    /// dispatch. In process the host states that instant with its call.
+    /// The lease's later words keep the instant of the pair's first
+    /// decision.
     fn on_decision_issued(&self, _lease: &Lease, _decision: &Decision) {}
 
     /// The host dispatched to `target` (one of the decision's targets), on
@@ -310,7 +320,10 @@ pub trait Lifecycle: Send + Sync {
     /// took: its `target_index` is that target's index in the pick, and its
     /// [`Lease::booked`] is still the worker its issue booked. A decode
     /// side no call issued was told issued just ahead of this word, on the
-    /// target it names ([`Self::on_decision_issued`]).
+    /// target it names ([`Self::on_decision_issued`]). That word was dated
+    /// at its telling. This one, and every later word of the lease, keeps
+    /// the decision's `issued_micros`, so `issued_micros +
+    /// since_decision_micros` still dates the dispatch.
     fn on_dispatched(
         &self,
         _lease: &Lease,

@@ -2132,50 +2132,64 @@ mod tests {
     /// A pair's decode that goes out with no decode call is told issued at
     /// its dispatch, on the target the dispatch took, and then dispatched
     /// as booked there, as a store tells both words: no position, the
-    /// issue dated at the dispatch. One booking stands on the worker that
-    /// serves, whichever target was taken.
+    /// issue dated when the store is told. One booking stands on the
+    /// worker that serves, whichever target was taken, and a booking made
+    /// since the dispatch stands with it. Dated as the gateway dates the
+    /// dispatch, more than a window behind that booking, the same issue
+    /// would end it: a clock that went back.
     #[test]
-    fn a_decode_issued_at_its_dispatch_is_booked_once_on_the_target_taken() {
+    fn a_decode_issued_at_its_dispatch_books_once_and_ends_no_newer_booking() {
+        // The pair was decided at one second and its decode sent 250
+        // microseconds later. The store is told at three seconds, behind
+        // a booking of the fourth row made then, under a window of one.
+        let datings = [(3 * SECOND, 1_000_u64), (SECOND + 250, 0)];
         for taken in [0_u8, 1] {
-            let scorer = scorer(NEVER, 1.5, 5);
-            let pool = pool(3);
-            led(&scorer, &pool, 0, SECOND);
-            // Each target names the one prefill, the first row, with
-            // another decode: the second row, then the third.
-            let target = |decode: usize| Target {
-                id: pool[0].id,
-                pair: Some(Pair {
-                    decode_id: pool[decode].id,
-                    ..Pair::default()
-                }),
-                ..Target::default()
-            };
-            let mut targets = Targets::new();
-            targets.push(target(1));
-            targets.push(target(2));
-            let decision = Decision::Pick(Pick {
-                targets,
-                ..Pick::default()
-            });
-            let serves = 1 + usize::from(taken);
-            let lease = |issued_micros: u64| Lease {
-                side: Side::Decode,
-                target_index: taken,
-                booked: pool[serves].id,
-                tokens: 300,
-                issued_micros,
-                ..Lease::default()
-            };
-            scorer.on_decision_issued(&lease(SECOND + 250), &decision);
-            let sent = Target {
-                id: pool[serves].id,
-                ..Target::default()
-            };
-            scorer.on_dispatched(&lease(SECOND), &sent, Side::Decode, 250);
-            let mut booked = vec![0, 0, 0];
-            booked[serves] = 300;
-            assert_eq!(loads(&scorer), (booked, 300), "target {taken}");
-            assert_eq!(last_booked_at(&scorer), Some(SECOND + 250));
+            for (issued_micros, stands) in datings {
+                let scorer = scorer(NEVER, 1.5, 1);
+                let pool = pool(4);
+                led(&scorer, &pool, 0, SECOND);
+                book(&scorer, &pool, 3, 1_000, 3 * SECOND);
+                // Each target names the one prefill, the first row, with
+                // another decode: the second row, then the third.
+                let target = |decode: usize| Target {
+                    id: pool[0].id,
+                    pair: Some(Pair {
+                        decode_id: pool[decode].id,
+                        ..Pair::default()
+                    }),
+                    ..Target::default()
+                };
+                let mut targets = Targets::new();
+                targets.push(target(1));
+                targets.push(target(2));
+                let decision = Decision::Pick(Pick {
+                    targets,
+                    ..Pick::default()
+                });
+                let serves = 1 + usize::from(taken);
+                let lease = |issued_micros: u64| Lease {
+                    side: Side::Decode,
+                    target_index: taken,
+                    booked: pool[serves].id,
+                    tokens: 300,
+                    issued_micros,
+                    ..Lease::default()
+                };
+                scorer.on_decision_issued(&lease(issued_micros), &decision);
+                let sent = Target {
+                    id: pool[serves].id,
+                    ..Target::default()
+                };
+                scorer.on_dispatched(&lease(SECOND), &sent, Side::Decode, 250);
+                let mut booked = vec![0, 0, 0, stands];
+                booked[serves] = 300;
+                let read = loads(&scorer);
+                assert_eq!(
+                    read,
+                    (booked, 300 + stands),
+                    "target {taken} at {issued_micros}"
+                );
+            }
         }
     }
 
