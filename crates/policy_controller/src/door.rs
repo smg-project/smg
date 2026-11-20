@@ -2255,6 +2255,8 @@ impl Door {
     /// is applied ahead of the call's read. Under an engine that keeps its
     /// deciders the call decides at its model's seat, which is the lease's
     /// unless a reload turned the keeping on between the two decisions.
+    /// Behind such a reload the call first stands at its lease's seat for
+    /// no decision, so what waits at that file is applied all the same.
     ///
     /// # Errors
     ///
@@ -2416,7 +2418,9 @@ impl Door {
     /// Takes the seat the last generation called for and checks it
     /// against the world loaded there. If an apply changed which seat
     /// the request belongs at, it takes that seat and loads again. The
-    /// same world governs the decision and its sampling.
+    /// same world governs the decision and its sampling. A call that names
+    /// its lease's seat and decides at its model's applies what waits at
+    /// the lease's file first ([`Door::stand_at`]).
     fn at_a_seat(
         &self,
         term: u64,
@@ -2435,6 +2439,14 @@ impl Door {
         let mut seen = self.seat_flags.load(Ordering::Relaxed);
         loop {
             let (at, mut slot) = if seen & KEEPS_DECIDERS != 0 {
+                // A decode call's lease stands at another seat's file
+                // where a reload turned the keeping on between the pair's
+                // two decisions: the call reads that file from its
+                // model's seat, behind what was handed there.
+                let away = |own: &usize| *own != decider_of(request.model(), self.seats.len());
+                if let Some(own) = request.own_seat().filter(away) {
+                    self.stand_at(own);
+                }
                 self.home(request.model())
             } else if let Some(at) = request.own_seat() {
                 (at, self.seats[at].slot.lock())
@@ -2525,6 +2537,21 @@ impl Door {
         if self.kept[at].waits.load(Ordering::SeqCst) != 0 {
             self.hand_kept(at);
         }
+    }
+
+    /// Stands at seat `at` for no decision, behind the decision that
+    /// stands there: the thread takes up the work at the seat's file, which
+    /// applies what was handed to it, and leaves. For a call that reads a
+    /// lease on file there and decides at another seat.
+    #[cold]
+    fn stand_at(&self, at: usize) {
+        let mut slot = self.seats[at].slot.lock();
+        // The store lays at most one file for each byte-sized name.
+        debug_assert!(at < Decider::COUNT);
+        let _acting = Decider::new(at as u8).enter();
+        let at_file = slot.at_file.get_or_insert_with(|| self.store.at_work());
+        at_file.work();
+        self.leave(at, at_file);
     }
 
     /// Takes the seat of `model`'s decider and waits for it: a model's
@@ -4079,6 +4106,26 @@ pub(crate) mod tests {
         assert_eq!(*first.lock(), ["issued", "dispatched"]);
     }
 
+    /// A caller that stands at its seat until the case sends it on: it
+    /// says when it stands there, with its seat's file at work.
+    struct Stands {
+        stood: mpsc::Sender<()>,
+        go: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl Maker for Stands {
+        fn model(&self) -> &str {
+            MODEL
+        }
+
+        fn make<'w>(&'w self, _: &'w World) -> Request<'w> {
+            self.stood.send(()).expect("the case waits for the seat");
+            let word = self.go.lock().recv_timeout(PATIENCE);
+            word.expect("the case sends the caller on");
+            request(b"held", 7)
+        }
+    }
+
     /// A decode call decides at the seat of its lease's file, behind the
     /// decision that stands there. A prefill's dispatch handed while
     /// another caller decided at that file waits for that caller, and the
@@ -4086,24 +4133,6 @@ pub(crate) mod tests {
     /// the file as it stood and be refused.
     #[test]
     fn a_decode_call_decides_behind_what_waits_at_its_leases_file() {
-        struct Stands {
-            stood: mpsc::Sender<()>,
-            go: Mutex<mpsc::Receiver<()>>,
-        }
-
-        impl Maker for Stands {
-            fn model(&self) -> &str {
-                MODEL
-            }
-
-            fn make<'w>(&'w self, _: &'w World) -> Request<'w> {
-                self.stood.send(()).expect("the case waits for the seat");
-                let word = self.go.lock().recv_timeout(PATIENCE);
-                word.expect("the case sends the caller on");
-                request(b"held", 7)
-            }
-        }
-
         let files = MemoryStore::new().with_deciders(2);
         let store = pair_fleet_over(files, 1, 1).expect("a pair fleet of two files");
         let door = Arc::new(Door::new(Arc::clone(&store)));
@@ -4129,6 +4158,84 @@ pub(crate) mod tests {
             |store: &MemoryStore| store.sides(GATEWAY, lease).map(|sides| sides.record.state);
         assert_eq!(prefill(&store), Some(LeaseState::ISSUED));
         // The call comes from a thread whose own seat is free.
+        let (answered, answer) = mpsc::channel();
+        let caller = Arc::clone(&door);
+        let caller = thread::spawn(move || {
+            seated(1);
+            let decided = caller.decide_decode(GATEWAY, &later_request(b"pair"), lease, now);
+            let side = decided.map(|decided| decided.lease.map(|leased| leased.lease.side));
+            answered.send(side).ok();
+        });
+        let early = answer.recv_timeout(Duration::from_millis(100));
+        assert_eq!(early, Err(mpsc::RecvTimeoutError::Timeout));
+        word.send(()).expect("the other caller waits");
+        assert_eq!(answer.recv_timeout(PATIENCE), Ok(Ok(Some(Side::Decode))));
+        assert_eq!(other.join().ok(), Some(true));
+        assert!(caller.join().is_ok());
+    }
+
+    /// A reload turns the keeping of deciders on between a pair's two
+    /// decisions, so the call decides at its model's seat while its lease
+    /// stands at the file of the seat its first decision took. A prefill's
+    /// dispatch handed while another caller decided at that file waits for
+    /// that caller. The call stands behind that caller first and reads the
+    /// dispatch as sent: straight from its model's seat it would read the
+    /// file as it stood and be refused.
+    #[test]
+    fn a_decode_call_under_kept_deciders_first_applies_what_waits_at_its_leases_file() {
+        // A count of files under which the model's seat is not the first,
+        // where the pair's first decision is made.
+        let files = (2..=8).find(|&files| decider_of(MODEL, files) != 0);
+        let files = files.expect("the model names a later file under some count");
+        let home = decider_of(MODEL, files);
+        let store = MemoryStore::new().with_deciders(files);
+        let store = pair_fleet_over(store, 1, 1).expect("a pair fleet");
+        let door = Arc::new(Door::new(Arc::clone(&store)));
+        let now = Instant::now();
+        seated(0);
+        let answer = door.decide(GATEWAY, &later_request(b"pair"), now);
+        let lease = answer.expect("the pair").lease.expect("a lease").lease.id;
+        assert_eq!(store.file_of(lease), 0, "no stage keeps state a decider");
+        // Another caller decides at the lease's file and stands there.
+        let (stood, at_seat) = mpsc::channel();
+        let (word, go) = mpsc::channel();
+        let other = Arc::clone(&door);
+        let other = thread::spawn(move || {
+            seated(0);
+            let go = Mutex::new(go);
+            let held = other.decide_under(GATEWAY, &Stands { stood, go }, Instant::now());
+            held.is_ok()
+        });
+        at_seat.recv_timeout(PATIENCE).expect("the other caller");
+        // The reload: the decode profile picks through a stage that keeps
+        // state a decider. The next decision finds the stage and leaves
+        // the door's word that requests decide at their model's seat.
+        let mut catalog = Catalog::builtin();
+        let added = catalog.picker("scoped", || Box::new(Scoped));
+        added.expect("a free picker name");
+        let mut document = PolicySpec::pair_presets("least_load", "least_load").expect("a spec");
+        document.generation = 3;
+        for profile in document.profiles.values_mut() {
+            profile.filter.clear();
+        }
+        let decode = document.profiles.get_mut("decode");
+        decode.expect("the decode profile").pick = "scoped".into();
+        let digest = document.digest().expect("a digest");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+        let applied = store.apply(spec.expect("a valid spec"));
+        applied.expect("a later generation");
+        let kept = door.decide(GATEWAY, &later_request(b"kept"), now);
+        let kept = kept
+            .expect("a pair under the reload")
+            .lease
+            .expect("a lease");
+        assert_eq!(store.file_of(kept.lease.id), home, "the model's seat");
+        // The prefill's dispatch is handed meanwhile and waits at the file.
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+        let prefill =
+            |store: &MemoryStore| store.sides(GATEWAY, lease).map(|sides| sides.record.state);
+        assert_eq!(prefill(&store), Some(LeaseState::ISSUED));
+        // The call's own seat is its model's, and that seat is free.
         let (answered, answer) = mpsc::channel();
         let caller = Arc::clone(&door);
         let caller = thread::spawn(move || {
