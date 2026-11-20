@@ -961,9 +961,12 @@ pub struct RequestFacts<'a> {
     /// The signal cells beside the rows of this decision, by the row's
     /// position: handed by a host for a profile whose stages read a signal
     /// ([`Needs::signal_cells`](crate::Needs::signal_cells)), and for no
-    /// other. `None` reads as no value for every row. One word for every
-    /// signal the document declares: a second signal adds none. In-process
-    /// only: the contract's facts gain nothing.
+    /// other. `None` reads as no value for every row. A pair decision takes
+    /// each side's cells from its pool ([`PairPools`](crate::PairPools)),
+    /// and an encode pair its encoders' from theirs: cells here are not
+    /// read there. One word for every signal the document declares: a
+    /// second signal adds none. In-process only: the contract's facts gain
+    /// nothing.
     pub signal_cells: Option<&'a crate::signals::SignalCells>,
 }
 

@@ -894,6 +894,56 @@ fn each_admitted_row_and_each_encoder_reads_its_own_cells() {
     }
 }
 
+/// The decision of a bed whose admission narrows both sides, as the case
+/// above lays it, with `prefill` and `decode` cells handed for two rows a
+/// side.
+#[cfg(debug_assertions)]
+fn decided_over_cells(prefill: usize, decode: usize) {
+    let cell = SignalCell {
+        value: 1.0,
+        sampled_at_micros: 0,
+    };
+    let mut bed = Bed::new();
+    bed.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 9)];
+    bed.prefill_classes = vec![1, 2];
+    bed.decodes = vec![
+        Candidate {
+            vision: false,
+            ..row(0, Role::Decode, 1, 0)
+        },
+        row(1, Role::Decode, 1, 9),
+    ];
+    bed.encoders = vec![
+        unready(row(0, Role::Encode, 0, 0)),
+        row(1, Role::Encode, 0, 3),
+    ];
+    bed.facts = vec![pushing(1), pushing(2)];
+    bed.decode_images = true;
+    bed.prefill_cells = vec![cell; prefill];
+    bed.decode_cells = vec![cell; decode];
+    bed.encode_cells = vec![cell; 2];
+    let (facts, pool) = bed.asked();
+    let _ = bed.decide_asked(&engine(), &facts, &pool);
+}
+
+/// A debug build refuses a side's cells of another shape at the entry,
+/// whatever the admission. The copy for the admitted rows pads a short
+/// set with cells of no value, and the pair's own assertion then reads
+/// the copy.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "the signal cells are those of the rows the decision was given")]
+fn a_debug_build_refuses_the_prefills_cells_of_another_shape_at_the_encode_entry() {
+    decided_over_cells(1, 2);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "the signal cells are those of the rows the decision was given")]
+fn a_debug_build_refuses_the_decodes_cells_of_another_shape_at_the_encode_entry() {
+    decided_over_cells(2, 3);
+}
+
 /// A release build asserts no shape, so the host's cells may end before an
 /// admitted row. The scratch is one a side for every pass: a pass's cells
 /// are its own rows' alone.

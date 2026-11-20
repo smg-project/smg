@@ -275,6 +275,10 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
     );
     assert_eq!(field("SignalSpec", "max_age_ms")["minimum"], 1);
     assert_eq!(field("SignalSpec", "max_age_ms")["maximum"], 3_599_999);
+    // A unit's length and its alphabet, as the validator takes them.
+    assert_eq!(field("SignalSpec", "unit")["minLength"], 1);
+    assert_eq!(field("SignalSpec", "unit")["maxLength"], 31);
+    assert_eq!(field("SignalSpec", "unit")["pattern"], "^[ -~]*$");
     // A signal's name and the count of signals, as the validator takes them.
     let signals = &root["properties"]["signals"];
     assert_eq!(signals["maxProperties"], MAX_SIGNALS);

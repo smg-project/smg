@@ -538,6 +538,10 @@ impl Engine {
         }
         debug_assert_indexed(encode.encoders);
         debug_assert_cells(encode.signal_cells, encode.encoders);
+        // Both pools' cells too, here: the copy for the admitted rows pads
+        // a short set, so past this line nothing says a host's wrong shape.
+        debug_assert_cells(pools.prefill_signal_cells, pools.prefills);
+        debug_assert_cells(pools.decode_signal_cells, pools.decodes);
         let needs = !items.keys.is_empty();
         // A profile that shows its rows to a plugin answers inside a scope
         // opened over the rows of one decision. None is opened over the

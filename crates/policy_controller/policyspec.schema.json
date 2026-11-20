@@ -196,10 +196,11 @@
       "type": "object",
       "properties": {
         "unit": {
-          "description": "The unit a source states for its value to be taken: 1 to 31 bytes.",
+          "description": "The unit a source states for its value to be taken: 1 to 31\nprintable ASCII characters.",
           "type": "string",
           "minLength": 1,
-          "maxLength": 31
+          "maxLength": 31,
+          "pattern": "^[ -~]*$"
         },
         "max_age_ms": {
           "description": "A value older than this reads as no value: 1 to 3,599,999, the\nbound of the view's `max_report_age_ms`. A store's clock keeps one\nhour, and a sample older than that stands at the clock's origin:\nunder a longer limit it would read as fresh. Absent: a value does\nnot end by its age.",

@@ -208,10 +208,19 @@ fn the_signals_section_refuses_each_bad_entry_by_its_path() {
         .map(|n| format!("  s{n}: {{ unit: tokens }}\n"))
         .collect();
     assert_eq!(refusal(&many), "signals lists 65 entries; at most 64");
-    for unit in [String::new(), "u".repeat(32)] {
+    // Printable ASCII alone, so a unit's bytes are its characters: the
+    // third is two characters and three bytes, the last holds a tab.
+    for unit in [
+        String::new(),
+        "u".repeat(32),
+        "\u{b5}s".into(),
+        "a\\tb".into(),
+    ] {
         assert_eq!(
             refusal(&format!("  held: {{ unit: \"{unit}\" }}\n")),
-            format!("signals.held.unit = \"{unit}\" is not a unit of 1 to 31 bytes")
+            format!(
+                "signals.held.unit = \"{unit}\" is not a unit of 1 to 31 printable ASCII characters"
+            )
         );
     }
     assert_eq!(
@@ -225,10 +234,11 @@ fn the_signals_section_refuses_each_bad_entry_by_its_path() {
     );
     // The longest name, the longest unit, the longest age and the most
     // signals are taken.
+    // The unit holds both ends of its alphabet: a space and a tilde.
     let longest = format!(
-        "  {}: {{ unit: {}, max_age_ms: 3599999 }}\n",
+        "  {}: {{ unit: \"{} ~\", max_age_ms: 3599999 }}\n",
         "a".repeat(63),
-        "u".repeat(31)
+        "u".repeat(29)
     );
     let most: String = (1..MAX_SIGNALS)
         .map(|n| format!("  s{n}: {{ unit: tokens }}\n"))
