@@ -955,8 +955,7 @@ impl AppContextBuilder {
         stages: Option<Catalog>,
     ) -> Result<Self, String> {
         self.policy_store =
-            policy_controller::start_with(config, stages, RouterConfig::policy_document)
-                .map_err(|refusal| refusal.to_string())?;
+            policy_controller::start_with(config, stages).map_err(|refusal| refusal.to_string())?;
         if let Some(store) = &self.policy_store {
             let registry = self.worker_registry.as_ref().ok_or_else(|| {
                 "worker_registry must be set before the policy controller".to_string()

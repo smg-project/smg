@@ -139,6 +139,7 @@ const PLAIN: &[&str] = &[
     "policy_controller_tls_ca_cert",
     "policy_controller_tls_cert",
     "policy_controller_tls_key",
+    "policy_spec_path",
 ];
 
 /// The fields `redacted` rewrites before they leave, as the classification

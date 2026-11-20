@@ -31,7 +31,24 @@ router:
   #    least_load, manual, consistent_hashing or prefix_hash (the launcher's --policy
   #    choices; values.schema.json lists them). bucket is a prefill-side policy:
   #    router.disaggregation.prefillPolicy.
-  policy: cache_aware
+  #    Empty renders --policy cache_aware without a document, and no --policy
+  #    beside one: the document names the policy. A value beside a document
+  #    fails the render. An upgrade with --reuse-values from an older chart
+  #    keeps that chart's cache_aware: set router.policy="" with it.
+  policy: ""
+
+  # -- Worker selection inside the gateway. "off" uses the classic policies.
+  #    "on" selects the policy controller. This switch configures only the
+  #    gateway process. Use the top-level policyController.enabled for the
+  #    separate controller service. A bare on or off works too: YAML reads
+  #    it as a boolean, and the chart takes both forms.
+  policyController: "off"
+  # -- Inline policy document. An empty map supplies no document.
+  policySpec: {}
+  # -- Name of your ConfigMap in the release's namespace, with the policy
+  #    document under spec.yaml. An empty name supplies no document. An edit
+  #    of your ConfigMap rolls no pod: restart the router pods to read it.
+  policySpecConfigMap: ""
 
   # -- Disaggregated serving: the roles the gateway's --pd-disaggregation and
   #    --epd-disaggregation take. mode "" (the default) is a regular fleet, "pd"
@@ -164,7 +181,9 @@ router:
   tokenizerPath: ""        # override tokenizer (defaults to model)
   chatTemplate: ""         # custom chat template path
 
-  # -- Cache-aware routing tuning
+  # -- Cache-aware routing tuning. A policy document replaces these: beside one
+  #    the router's line carries none of them, and a value moved from its default
+  #    fails the render.
   cacheThreshold: 0.3
   balanceAbsThreshold: 64
   balanceRelThreshold: 1.5

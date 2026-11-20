@@ -1,14 +1,13 @@
-//! The routing configuration as a policy document:
-//! [`RouterConfig::policy_document`], one function from the configuration to
-//! the policy controller's [`PolicySpec`].
+//! The policy document the gateway gives to its controller.
 //!
 //! # Why this exists
 //!
-//! The policy controller decides by a document, not by flags. This function
-//! writes the document that today's routing settings mean, so a gateway can
-//! hand its routing to the controller and keep the routing its flags asked
-//! for. The store applies the document at startup when the controller is
-//! selected. No request path calls this module.
+//! [`RouterConfig::policy_document`] converts the routing settings into the
+//! controller's [`PolicySpec`]. At start-up, [`RouterConfig::policy_document_in_force`]
+//! takes a supplied document when the settings are at their configuration
+//! defaults or describe that same document. The store applies the document
+//! in force at startup when the controller is selected. No request path
+//! calls this module.
 //!
 //! # Where a setting lands
 //!
@@ -42,6 +41,7 @@
 //! each policy reads its own.
 
 use serde::Serialize;
+use serde_json::Value;
 use smg_policy_controller::{
     affinity::{
         Gates, DEFAULT_THRESHOLD, DEFAULT_WARMUP_BLOCKS, DEFAULT_WARMUP_DIVERT_EVERY,
@@ -68,7 +68,7 @@ use crate::policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY;
 /// placement follows an item's content, not the request's main policy.
 static ENCODE_DEFAULT: PolicyConfig = PolicyConfig::ConsistentHashing;
 
-/// Why a routing configuration has no policy document.
+/// Why a routing configuration has no policy document to run.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum PolicyDocumentError {
     /// A setting decides a placement and the document has no place for it.
@@ -95,9 +95,19 @@ pub enum PolicyDocumentError {
         policy: &'static str,
         part: &'static str,
     },
-    /// The controller knows no preset of a policy's name.
+    /// A failure to produce or validate a policy document.
     #[error(transparent)]
     Preset(#[from] SpecError),
+    /// The flags change the default document and differ from the supplied one.
+    #[error("the routing flags and the policy document disagree at {at}: the flags mean {flags}, the document says {document}")]
+    Disagree {
+        /// Where the documents first differ, in their own field names.
+        at: String,
+        /// The value from the routing flags.
+        flags: String,
+        /// The value from the supplied document.
+        document: String,
+    },
 }
 
 fn unsaid(
@@ -146,6 +156,60 @@ impl RouterConfig {
         Ok(document)
     }
 
+    /// The document this gateway runs. Without a supplied document, it is
+    /// the one the routing settings mean. A supplied document takes effect
+    /// if the settings describe the same document or the default
+    /// configuration's document for this mode. A conflict names the first
+    /// difference and the two values.
+    ///
+    /// Both launchers refuse a routing setting beside a document before
+    /// this runs, so the comparison judges a configuration built by hand.
+    /// The generation is no part of it: it numbers the document, and no
+    /// routing setting says it. A document that names none is this
+    /// gateway's first and takes number 1, since a store applies only a
+    /// number above the one it holds.
+    pub fn policy_document_in_force(&self) -> Result<PolicySpec, PolicyDocumentError> {
+        let mut said = self.policy_document()?;
+        let Some(given) = &self.policy_spec else {
+            return Ok(said);
+        };
+        let mut given = given.clone();
+        if given.generation == 0 {
+            given.generation = 1;
+        }
+        let plain = RouterConfig {
+            mode: self.mode.with_defaults(),
+            ..RouterConfig::default()
+        }
+        .policy_document()?;
+        if said == plain {
+            return Ok(given);
+        }
+        said.generation = given.generation;
+        if said == given {
+            return Ok(given);
+        }
+
+        let written = |spec| {
+            serde_json::to_value(spec)
+                .map_err(|error| SpecError::NoCanonicalForm(error.to_string()))
+        };
+        let flags = written(&said)?;
+        let document = written(&given)?;
+        if let Some(difference) = first_difference(Some(&flags), Some(&document), String::new()) {
+            return Err(difference);
+        }
+
+        // A field the reader accepts to report a validation error can be
+        // absent from the written form. Let the document name that error.
+        given.validate()?;
+        Err(PolicyDocumentError::Disagree {
+            at: "document".to_owned(),
+            flags: flags.to_string(),
+            document: document.to_string(),
+        })
+    }
+
     /// Validates the document over the stock stages, with the gateway's
     /// tenant header denied to the view.
     pub fn hosted_policy(&self, document: &PolicySpec) -> Result<AppliedSpec, SpecError> {
@@ -161,6 +225,83 @@ impl RouterConfig {
         match stages {
             Some(stages) => AppliedSpec::validate_in(document, stages, &denied_headers),
             None => AppliedSpec::validate_with(document, &denied_headers),
+        }
+    }
+}
+
+impl RoutingMode {
+    /// Start with empty pools and clear any side policies, so the default
+    /// document for this mode carries none of the configured side settings.
+    fn with_defaults(&self) -> Self {
+        match self {
+            Self::Regular { .. } => Self::Regular {
+                worker_urls: vec![],
+            },
+            Self::PrefillDecode { .. } => Self::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            Self::EncodePrefillDecode { .. } => Self::EncodePrefillDecode {
+                encode_urls: vec![],
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            Self::OpenAI { .. } => Self::OpenAI {
+                worker_urls: vec![],
+            },
+            Self::Anthropic { .. } => Self::Anthropic {
+                worker_urls: vec![],
+            },
+            Self::Gemini { .. } => Self::Gemini {
+                worker_urls: vec![],
+            },
+        }
+    }
+}
+
+/// Walk each object in the flags' written order, then through keys that
+/// appear only in the supplied document. Walk lists by index.
+fn first_difference(
+    flags: Option<&Value>,
+    document: Option<&Value>,
+    at: String,
+) -> Option<PolicyDocumentError> {
+    match (flags, document) {
+        (Some(Value::Object(flags)), Some(Value::Object(document))) => flags
+            .keys()
+            .chain(document.keys().filter(|key| !flags.contains_key(*key)))
+            .find_map(|key| {
+                let path = if at.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{at}.{key}")
+                };
+                first_difference(flags.get(key), document.get(key), path)
+            }),
+        (Some(Value::Array(flags)), Some(Value::Array(document))) => {
+            (0..flags.len().max(document.len())).find_map(|index| {
+                first_difference(
+                    flags.get(index),
+                    document.get(index),
+                    format!("{at}[{index}]"),
+                )
+            })
+        }
+        _ if flags == document => None,
+        _ => {
+            let written = |value: Option<&Value>| {
+                value.map_or_else(|| "nothing".to_owned(), Value::to_string)
+            };
+            Some(PolicyDocumentError::Disagree {
+                at,
+                flags: written(flags),
+                document: written(document),
+            })
         }
     }
 }
@@ -734,7 +875,7 @@ fn overload(config: &RouterConfig) -> Result<Option<OverloadSpec>, PolicyDocumen
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{json, Value};
+    use serde_json::json;
     use smg_policy_controller::PRESETS;
 
     use super::*;
@@ -787,6 +928,158 @@ mod tests {
 
     fn preset(name: &str) -> PolicySpec {
         PolicySpec::preset(name).expect("a preset of this build")
+    }
+
+    #[test]
+    fn with_no_document_the_flags_document_is_in_force() {
+        let config = config(PolicyConfig::RoundRobin);
+        assert_eq!(config.policy_document_in_force(), Ok(preset("round_robin")));
+    }
+
+    #[test]
+    fn a_given_document_wins_where_no_routing_setting_is_set() {
+        for (mode, document) in [
+            (RouterConfig::default().mode, preset("round_robin")),
+            (
+                RoutingMode::PrefillDecode {
+                    prefill_urls: vec![],
+                    decode_urls: vec![],
+                    prefill_policy: None,
+                    decode_policy: None,
+                },
+                PolicySpec::pair_presets("round_robin", "random").expect("paired presets"),
+            ),
+        ] {
+            let config = RouterConfig {
+                mode,
+                policy_spec: Some(document.clone()),
+                ..RouterConfig::default()
+            };
+            assert_eq!(config.policy_document_in_force(), Ok(document));
+        }
+    }
+
+    #[test]
+    fn a_given_document_that_the_flags_mean_too_is_in_force() {
+        let document = preset("round_robin");
+        let config = RouterConfig {
+            policy_spec: Some(document.clone()),
+            ..config(PolicyConfig::RoundRobin)
+        };
+        assert_eq!(config.policy_document_in_force(), Ok(document));
+    }
+
+    #[test]
+    fn the_generation_numbers_the_document_and_is_no_part_of_the_comparison() {
+        for (written, runs) in [(0, 1), (1, 1), (7, 7)] {
+            let mut document = preset("round_robin");
+            document.generation = written;
+            let mut in_force = document.clone();
+            in_force.generation = runs;
+            for settings in [RouterConfig::default(), config(PolicyConfig::RoundRobin)] {
+                let config = RouterConfig {
+                    policy_spec: Some(document.clone()),
+                    ..settings
+                };
+                assert_eq!(
+                    config.policy_document_in_force().as_ref(),
+                    Ok(&in_force),
+                    "generation {written}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_routing_flag_that_says_something_else_is_refused_with_both_values() {
+        let mut document = preset("bucket");
+        let profile = document.profiles.remove("bucket").expect("the profile");
+        document.profiles.insert("power_of_two".to_owned(), profile);
+        document.bindings[0].profile = Some("power_of_two".to_owned());
+        let config = RouterConfig {
+            policy_spec: Some(document),
+            ..config(at_flag_defaults("power_of_two"))
+        };
+        let refusal = config
+            .policy_document_in_force()
+            .expect_err("different stages");
+        assert_eq!(
+            refusal.to_string(),
+            r#"the routing flags and the policy document disagree at profiles.power_of_two.score[0]: the flags mean "least-load", the document says "bucket""#
+        );
+    }
+
+    #[test]
+    fn a_side_policy_that_says_something_else_is_refused_with_both_values() {
+        let config = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: None,
+            },
+            policy_spec: Some(
+                PolicySpec::pair_presets("random", "random").expect("paired presets"),
+            ),
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            config.policy_document_in_force(),
+            Err(PolicyDocumentError::Disagree {
+                at: "profiles.prefill.pick".to_owned(),
+                flags: r#""round-robin""#.to_owned(),
+                document: r#""random""#.to_owned(),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_part_one_side_lacks_reads_nothing() {
+        let document = edited(preset("round_robin"), |form| {
+            form["bindings"][0]["shadow"] = json!("round_robin");
+        });
+        let mut config = RouterConfig {
+            policy_spec: Some(document),
+            ..config(PolicyConfig::RoundRobin)
+        };
+        assert_eq!(
+            config.policy_document_in_force(),
+            Err(PolicyDocumentError::Disagree {
+                at: "bindings[0].shadow".to_owned(),
+                flags: "nothing".to_owned(),
+                document: r#""round_robin""#.to_owned(),
+            }),
+        );
+
+        let mut document = preset("round_robin");
+        let binding = serde_json::to_string(&document.bindings[0]).expect("the binding serializes");
+        document.bindings.clear();
+        config.policy_spec = Some(document);
+        assert_eq!(
+            config.policy_document_in_force(),
+            Err(PolicyDocumentError::Disagree {
+                at: "bindings[0]".to_owned(),
+                flags: binding,
+                document: "nothing".to_owned(),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_kind_in_an_otherwise_equal_document_is_refused_by_name() {
+        let document = edited(preset("round_robin"), |form| {
+            form["kind"] = json!("PolicySpec");
+        });
+        let config = RouterConfig {
+            policy_spec: Some(document),
+            ..config(PolicyConfig::RoundRobin)
+        };
+        assert_eq!(
+            config.policy_document_in_force(),
+            Err(PolicyDocumentError::Preset(SpecError::Kind(
+                "PolicySpec".to_owned()
+            )))
+        );
     }
 
     /// A document with places of its JSON form written over.

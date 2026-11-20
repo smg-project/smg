@@ -1945,7 +1945,7 @@ impl ConfigValidator {
             return Ok(());
         };
         if !config.policy_controller {
-            return refuse("--policy-controller-address requires the policy_controller setting (--policy-controller)");
+            return refuse("--policy-controller-address requires the policy_controller setting (--policy-controller on)");
         }
         // The follower dials through the controller crate's client, which
         // the gateway's manifest takes on these two targets alone.
@@ -1981,6 +1981,32 @@ impl ConfigValidator {
     }
 
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        // A launcher gives the document's path, and a host may hand the
+        // document itself. Either one, with the switch off, would be dropped
+        // and the classic policies would serve.
+        if !config.policy_controller
+            && (config.policy_spec_path.is_some() || config.policy_spec.is_some())
+        {
+            return Err(ConfigError::invalid_value(
+                "policy_spec",
+                config
+                    .policy_spec_path
+                    .as_deref()
+                    .unwrap_or("the given document"),
+                "a policy document is run by the policy controller: set --policy-controller on",
+            ));
+        }
+        // The path is written with the configuration and the document is
+        // not. A configuration that was not built by its builder holds the
+        // path alone, and would run the routing settings' document.
+        if let (Some(path), None) = (&config.policy_spec_path, &config.policy_spec) {
+            return Err(ConfigError::invalid_value(
+                "policy_spec",
+                path,
+                "the policy document of this path is not loaded: the builder reads it, or set policy_spec",
+            ));
+        }
+
         let has_service_discovery = config.discovery.is_some();
         let invalid_decode_policy = match &config.mode {
             RoutingMode::PrefillDecode { decode_policy, .. } if !config.enable_igw => {
