@@ -325,6 +325,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `InteractionsTool` gains `ComputerUse`, `GoogleMaps` and `Retrieval`, `GoogleSearch` gains
   `search_types`, `McpServer.allowed_tools` is a `Vec<AllowedTools>`, and `ToolChoiceType`, which
   the SDK keeps open as it does the tools' other sets, gains `Other` and is `#[non_exhaustive]`.
+- Interactions content keeps the fields the public API added: an audio part's `channels` and
+  `sample_rate` (and an audio delta's), a video part's `processing` and `name`, and a text
+  annotation's `type` and that kind's fields (a URL citation's `url` and `title`, a file
+  citation's `file_name` and `page_number`, ...). Each was dropped on the way to the upstream.
+  Breaking: `Content::Audio`, `Delta::Audio` and `Content::Video` gain the fields, and
+  `Annotation` gains `other`.
 - `EmbeddingRequest` and `ClassifyRequest` run the public API's shape rule on `input` (a string,
   an array of strings, an array of token ids or an array of token id arrays; nothing empty; a
   member of another kind than the first is refused by its index), and `EmbeddingRequest` the
