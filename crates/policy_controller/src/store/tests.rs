@@ -241,9 +241,12 @@ fn probe_outcomes_follow_the_rows_thresholds_and_a_stale_outcome_is_dropped() {
     let health: &dyn HealthSink = &store;
     let id = store.upsert(facts("http://w:8000", 1)).id();
     let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-    assert_eq!(health.probe_outcome(id, true, revision()).moved(), None);
     assert_eq!(
-        health.probe_outcome(id, true, revision()).moved(),
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
+        None
+    );
+    assert_eq!(
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Ready)),
         "two passes promote a pending worker"
     );
@@ -252,40 +255,62 @@ fn probe_outcomes_follow_the_rows_thresholds_and_a_stale_outcome_is_dropped() {
     let stale = revision();
     WorkersStore::patch(&store, id, WorkerPatch::default(), stale).expect("the patch");
     assert_eq!(
-        health.probe_outcome(id, false, stale).moved(),
+        health.probe_outcome(id, false, stale, &|| true).moved(),
         None,
         "a stale outcome is dropped"
     );
-    assert_eq!(health.probe_outcome(id, false, revision()).moved(), None);
-    assert_eq!(health.probe_outcome(id, false, revision()).moved(), None);
     assert_eq!(
-        health.probe_outcome(id, false, revision()).moved(),
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
+        None
+    );
+    assert_eq!(
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
+        None
+    );
+    assert_eq!(
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
         Some((WorkerStatus::Ready, WorkerStatus::NotReady)),
         "three failures demote"
     );
     for _ in 0..8 {
-        assert_eq!(health.probe_outcome(id, false, revision()).moved(), None);
+        assert_eq!(
+            health
+                .probe_outcome(id, false, revision(), &|| true)
+                .moved(),
+            None
+        );
     }
     assert_eq!(
-        health.probe_outcome(id, false, revision()).moved(),
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
         Some((WorkerStatus::NotReady, WorkerStatus::Failed)),
         "nine more fail it"
     );
-    assert_eq!(health.probe_outcome(id, true, revision()).moved(), None);
     assert_eq!(
-        health.probe_outcome(id, true, revision()).moved(),
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
+        None
+    );
+    assert_eq!(
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
         Some((WorkerStatus::Failed, WorkerStatus::Ready)),
         "two passes bring a failed worker back"
     );
     let fresh = store.upsert(facts("http://f:8000", 1)).id();
     let fresh_revision = WorkersStore::get(&store, fresh).expect("the row").revision;
     assert_eq!(
-        health.connected(fresh, fresh_revision).moved(),
+        health.connected(fresh, fresh_revision, &|| true).moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Ready)),
         "the connect signal promotes at once"
     );
     assert_eq!(
-        health.connected(fresh, fresh_revision).moved(),
+        health.connected(fresh, fresh_revision, &|| true).moved(),
         None,
         "a ready row takes no second promotion"
     );
@@ -305,20 +330,27 @@ fn a_threshold_past_the_counters_range_is_never_met_early() {
         // far under it.
         for _ in 0..5 {
             assert_eq!(
-                health.probe_outcome(id, false, revision()).moved(),
+                health
+                    .probe_outcome(id, false, revision(), &|| true)
+                    .moved(),
                 None,
                 "pending under {threshold}"
             );
         }
-        assert_eq!(health.probe_outcome(id, true, revision()).moved(), None);
         assert_eq!(
-            health.probe_outcome(id, true, revision()).moved(),
+            health.probe_outcome(id, true, revision(), &|| true).moved(),
+            None
+        );
+        assert_eq!(
+            health.probe_outcome(id, true, revision(), &|| true).moved(),
             Some((WorkerStatus::Pending, WorkerStatus::Ready))
         );
         // And a ready one stays ready through failures under the threshold.
         for _ in 0..5 {
             assert_eq!(
-                health.probe_outcome(id, false, revision()).moved(),
+                health
+                    .probe_outcome(id, false, revision(), &|| true)
+                    .moved(),
                 None,
                 "ready under {threshold}"
             );
@@ -337,17 +369,29 @@ fn a_counter_at_its_ranges_end_stays_there() {
     // A pending worker's cap is held at the counter's end: met there, and
     // one probe short of it not yet.
     store.probed(id, 0, 0, u32::MAX - 2);
-    assert_eq!(health.probe_outcome(id, false, revision()).moved(), None);
     assert_eq!(
-        health.probe_outcome(id, false, revision()).moved(),
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
+        None
+    );
+    assert_eq!(
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Failed))
     );
     // Each counter at its end takes one probe more and stays there.
     store.probed(id, u32::MAX, u32::MAX, u32::MAX);
-    assert_eq!(health.probe_outcome(id, false, revision()).moved(), None);
+    assert_eq!(
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
+        None
+    );
     store.probed(id, 0, u32::MAX, u32::MAX);
     assert_eq!(
-        health.probe_outcome(id, true, revision()).moved(),
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
         Some((WorkerStatus::Failed, WorkerStatus::Ready))
     );
 }
@@ -363,23 +407,30 @@ fn a_threshold_whose_triple_passes_the_counters_range_fails_no_row_early() {
     stated.health.failure_threshold = threshold;
     let id = store.upsert(stated).id();
     let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-    assert_eq!(health.probe_outcome(id, true, revision()).moved(), None);
     assert_eq!(
-        health.probe_outcome(id, true, revision()).moved(),
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
+        None
+    );
+    assert_eq!(
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Ready))
     );
     // Ready, the row is not ready at the threshold's own count of failed
     // probes: the count is set one short of it.
     store.probed(id, threshold - 1, 0, 0);
     assert_eq!(
-        health.probe_outcome(id, false, revision()).moved(),
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
         Some((WorkerStatus::Ready, WorkerStatus::NotReady))
     );
     // Not ready, it fails at three thresholds of failed probes: five are
     // far under them.
     for _ in 0..5 {
         assert_eq!(
-            health.probe_outcome(id, false, revision()).moved(),
+            health
+                .probe_outcome(id, false, revision(), &|| true)
+                .moved(),
             None,
             "not ready under the triple"
         );
@@ -394,7 +445,7 @@ fn a_connect_signal_read_under_a_revision_the_row_left_is_dropped() {
     let read = WorkersStore::get(&store, id).expect("the row").revision;
     WorkersStore::patch(&store, id, WorkerPatch::default(), read).expect("the patch");
     assert_eq!(
-        health.connected(id, read).moved(),
+        health.connected(id, read, &|| true).moved(),
         None,
         "a stale signal is dropped"
     );
@@ -404,7 +455,7 @@ fn a_connect_signal_read_under_a_revision_the_row_left_is_dropped() {
         "and the row stays as it stood"
     );
     assert_eq!(
-        health.connected(id, read + 1).moved(),
+        health.connected(id, read + 1, &|| true).moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Ready)),
         "the signal read under the row's revision promotes"
     );
@@ -420,11 +471,11 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     let revision = || WorkersStore::get(&store, id).expect("the row").revision;
     // A write that moves nothing is judged, and says the status that stands.
     assert_eq!(
-        health.probe_outcome(id, true, revision()),
+        health.probe_outcome(id, true, revision(), &|| true),
         Stood(WorkerStatus::Pending)
     );
     assert_eq!(
-        health.probe_outcome(id, true, revision()),
+        health.probe_outcome(id, true, revision(), &|| true),
         Moved {
             from: WorkerStatus::Pending,
             to: WorkerStatus::Ready
@@ -434,13 +485,16 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     // failures ahead of it and one behind it are the threshold's three.
     for _ in 0..2 {
         assert_eq!(
-            health.probe_outcome(id, false, revision()),
+            health.probe_outcome(id, false, revision(), &|| true),
             Stood(WorkerStatus::Ready)
         );
     }
-    assert_eq!(health.connected(id, revision()), Stood(WorkerStatus::Ready));
     assert_eq!(
-        health.probe_outcome(id, false, revision()),
+        health.connected(id, revision(), &|| true),
+        Stood(WorkerStatus::Ready)
+    );
+    assert_eq!(
+        health.probe_outcome(id, false, revision(), &|| true),
         Moved {
             from: WorkerStatus::Ready,
             to: WorkerStatus::NotReady
@@ -452,15 +506,15 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     // threshold's two.
     let left = revision();
     WorkersStore::patch(&store, id, WorkerPatch::default(), left).expect("the patch");
-    assert_eq!(health.probe_outcome(id, true, left), Stale);
-    assert_eq!(health.connected(id, left), Stale);
+    assert_eq!(health.probe_outcome(id, true, left, &|| true), Stale);
+    assert_eq!(health.connected(id, left, &|| true), Stale);
     assert_eq!(
-        health.probe_outcome(id, true, revision()),
+        health.probe_outcome(id, true, revision(), &|| true),
         Stood(WorkerStatus::NotReady),
         "the stale pass was not counted"
     );
     assert_eq!(
-        health.probe_outcome(id, true, revision()),
+        health.probe_outcome(id, true, revision(), &|| true),
         Moved {
             from: WorkerStatus::NotReady,
             to: WorkerStatus::Ready
@@ -469,14 +523,14 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     // A draining row stands at the signal too.
     WorkersStore::set_status(&store, id, WorkerStatus::Draining, revision()).expect("drained");
     assert_eq!(
-        health.connected(id, revision()),
+        health.connected(id, revision(), &|| true),
         Stood(WorkerStatus::Draining)
     );
     // A write for a worker whose row is gone says no row.
     let last = revision();
     store.remove(id, last).expect("removed");
-    assert_eq!(health.probe_outcome(id, true, last), NoRow);
-    assert_eq!(health.connected(id, last), NoRow);
+    assert_eq!(health.probe_outcome(id, true, last, &|| true), NoRow);
+    assert_eq!(health.connected(id, last, &|| true), NoRow);
 }
 
 #[test]
@@ -2973,7 +3027,7 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     assert_eq!(store.kv().held_blocks("m"), 1);
     assert_eq!(WorkersStore::get(&store, id), Some(expected));
     assert_eq!(
-        store.probe_outcome(id, false, revision),
+        store.probe_outcome(id, false, revision, &|| true),
         HealthWrite::Moved {
             from: WorkerStatus::Ready,
             to: WorkerStatus::NotReady

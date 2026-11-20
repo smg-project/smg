@@ -95,13 +95,29 @@ pub trait HealthSink: Send + Sync {
     /// write: the status moved; it stood, and the probe is counted;
     /// `revision` moved (a stale outcome is dropped, never applied to a
     /// successor, and not counted); or the worker has no row.
-    fn probe_outcome(&self, id: WorkerId, ok: bool, revision: u64) -> HealthWrite;
+    ///
+    /// `leads` is the writer's last word. The store asks it behind the
+    /// lock the write waits for, before the probe is counted. Where it
+    /// says no, the outcome is stale: a term that ended while the write
+    /// waited there counts nothing, moves no status and tells the journal
+    /// nothing. It is asked under the store's lock and takes none of the
+    /// store's: a lock it takes is never held by its writer across a write
+    /// of the store. A writer with no term to end hands a word that always
+    /// holds.
+    fn probe_outcome(
+        &self,
+        id: WorkerId,
+        ok: bool,
+        revision: u64,
+        leads: &dyn Fn() -> bool,
+    ) -> HealthWrite;
 
     /// The connect signal of a handshake-promoted worker (a worker whose
     /// checks are off, a host-local wire): ready at once, under the same
-    /// revision guard. A ready or a draining row stands, and its counters
-    /// with it.
-    fn connected(&self, id: WorkerId, revision: u64) -> HealthWrite;
+    /// revision guard and the same last word of its writer
+    /// ([`probe_outcome`](Self::probe_outcome)). A ready or a draining row
+    /// stands, and its counters with it.
+    fn connected(&self, id: WorkerId, revision: u64, leads: &dyn Fn() -> bool) -> HealthWrite;
 
     /// What the leader's own worker object knows of the worker, written
     /// whole. Its liveness veto is the row's stalled bit, for every

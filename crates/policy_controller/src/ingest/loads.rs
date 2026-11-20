@@ -19,7 +19,8 @@
 //! holds a figure measured for its rank, never an aggregate. A failed read
 //! writes no row: the row on file ages, the engine's overload verdict
 //! reads clear until the engine is heard again unless a rank of it is
-//! still heard on its stream, and health is the prober's (a later PR). A
+//! still heard on its stream, and health is the prober's: the controller
+//! probes its workers while it leads, under its `worker-host` feature. A
 //! read that lands after its worker left writes nothing: the store keeps
 //! a worker's load rows exactly as long as its row.
 //! A row reachable only through a gateway is never dialed: its records
@@ -409,7 +410,7 @@ async fn at(instant: Option<Instant>) {
 }
 
 /// The gate's next word; for ever once its teller is gone.
-async fn turned(polls: &mut watch::Receiver<bool>) -> bool {
+async fn turned(polls: &mut watch::Receiver<Option<u64>>) -> Option<u64> {
     if polls.changed().await.is_err() {
         std::future::pending::<()>().await;
     }
@@ -462,35 +463,35 @@ where
     /// its own rows alone, never the fleet's or the stop, which cancels the
     /// calls still out.
     pub async fn run(&self, stop: watch::Receiver<bool>) {
-        // No role to read: the polls run for the loop's length.
-        let (_always, polls) = watch::channel(true);
-        self.run_while(stop, polls, || 0).await;
+        // No role to read: the polls run for the loop's length, as under
+        // one term.
+        let (_always, polls) = watch::channel(Some(0));
+        self.run_while(stop, polls).await;
     }
 
     /// [`LoadDriver::run`] on a replica that may follow a leader: the loop
-    /// runs for the process's life and polls only while `polls` reads
-    /// `true`. It pays the store's publications either way, whoever wrote
-    /// the rows: a follower's applier writes them, and the instant the
-    /// store names is read again at each tick. A turn to `false` ends the
-    /// run of polls, with its calls still out and its grouping of the
-    /// membership; a turn to `true` starts the next with a tick at once.
+    /// runs for the process's life and polls only while `polls` names a
+    /// term, the one the replica leads. It pays the store's publications
+    /// either way, whoever wrote the rows: a follower's applier writes
+    /// them, and the instant the store names is read again at each tick. A
+    /// turn to no term ends the run of polls, with its calls still out and
+    /// its grouping of the membership; a turn to a term starts the next
+    /// with a tick at once.
     ///
-    /// `led` says the term the replica last took, read beside each word.
     /// The watch keeps its last word alone: a loss and the take after it,
-    /// told before the loop looked, read as one `true`. Under another
-    /// term that word ends the run of polls and starts the next all the
-    /// same, so no call of the last lead lands on a store restored since.
+    /// told before the loop looked, read as one word. It names another
+    /// term, so it ends the run of polls and starts the next all the same,
+    /// and no call of the last lead lands on a store restored since.
     pub async fn run_while(
         &self,
         mut stop: watch::Receiver<bool>,
-        mut polls: watch::Receiver<bool>,
-        led: impl Fn() -> u64,
+        mut polls: watch::Receiver<Option<u64>>,
     ) {
         let mut ticker = tokio::time::interval(self.config.tick);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut schedule = Schedule::default();
-        // The word, and the term it was read under: one run of polls.
-        let (mut polling, mut under) = (*polls.borrow_and_update(), led());
+        // The term the polls run under, where they run: one run of polls.
+        let mut under = *polls.borrow_and_update();
         // A write of another task can leave the store an instant this loop
         // read none of (a registration's build): the store wakes the loop,
         // which reads the instant again.
@@ -512,13 +513,10 @@ where
                 biased;
                 _ = stop.wait_for(|stop| *stop) => return,
                 word = turned(&mut polls) => {
-                    // The term is read after the word: a take sets it
-                    // before its word is told.
-                    let term = led();
-                    if (word, term) != (polling, under) {
-                        (polling, under) = (word, term);
+                    if word != under {
+                        under = word;
                         schedule = Schedule::default();
-                        if polling {
+                        if under.is_some() {
                             self.tick(&mut schedule);
                         }
                     }
@@ -527,7 +525,7 @@ where
                 () = woken.notified() => {}
                 () = at(due) => self.store.publish(now()),
                 _ = ticker.tick() => {
-                    if polling {
+                    if under.is_some() {
                         self.tick(&mut schedule);
                     }
                 }
