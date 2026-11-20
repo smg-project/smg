@@ -58,7 +58,7 @@ use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerS
 use super::*;
 use crate::{
     config::types::PolicyConfig,
-    policy_controller::host::testing as host_testing,
+    policy_controller::engine::testing as engine_testing,
     routers::{
         common::{
             openai_bridge::FormatRegistry, prefill_admission::test_support::select_worker,
@@ -146,7 +146,7 @@ async fn a_failed_attempt_ends_its_lease_before_its_guards_go() {
 
 #[tokio::test]
 async fn a_retry_the_selection_cannot_place_does_not_follow() {
-    let pipeline_over = |host| {
+    let pipeline_over = |policy_engine| {
         let deps = PipelineDeps::pair(
             Arc::new(WorkerRegistry::new()),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
@@ -154,12 +154,12 @@ async fn a_retry_the_selection_cannot_place_does_not_follow() {
             None,
             Duration::from_secs(60),
         )
-        .with_host(host);
+        .with_policy_engine(policy_engine);
         RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
             .expect("completion pipeline")
     };
-    let (host, _, _) = host_testing::bed(&[]);
-    let hosted = pipeline_over(Some(Arc::new(host)));
+    let (policy_engine, _, _) = engine_testing::bed(&[]);
+    let hosted = pipeline_over(Some(Arc::new(policy_engine)));
 
     let (placed, _store) = place_worker().await;
     let plain = dispatch_context(placed);
@@ -2951,8 +2951,8 @@ async fn a_pair_gateway_serves_a_pair_under_the_policy_controller() {
     let registry = Arc::new(WorkerRegistry::new());
     let prefill = register_worker(&registry, prefill_port, WorkerType::Prefill);
     let decode = register_worker(&registry, decode_port, WorkerType::Decode);
-    let (_, store, _) = host_testing::pair_bed_started(MODEL, &[prefill.url()], &[decode.url()]);
-    let host = Host::at_keys(Arc::clone(&store), Arc::clone(&registry));
+    let (_, store, _) = engine_testing::pair_bed_started(MODEL, &[prefill.url()], &[decode.url()]);
+    let policy_engine = PolicyEngine::at_keys(Arc::clone(&store), Arc::clone(&registry));
     let deps = PipelineDeps::pair(
         Arc::clone(&registry),
         Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
@@ -2960,7 +2960,7 @@ async fn a_pair_gateway_serves_a_pair_under_the_policy_controller() {
         None,
         Duration::from_secs(60),
     )
-    .with_host(Some(Arc::new(host)));
+    .with_policy_engine(Some(Arc::new(policy_engine)));
     let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::PrefillDecode, &deps)
         .expect("completion pipeline");
     let components = components(registry).await;
@@ -2997,8 +2997,8 @@ async fn a_pair_gateway_serves_a_pair_under_the_policy_controller() {
 
 /// The router the factory builds for a pair gateway under the policy
 /// controller serves a pair. The factory mounts the pair router over the
-/// context's host, the router's selection stage asks it, and each side ends
-/// whole on its own worker.
+/// context's policy engine, the router's selection stage asks it, and each side
+/// ends whole on its own worker.
 ///
 /// The router also tells that stage what the pair's settings keep. Here the
 /// role policies keep an explicit target and the main policy does not, so a
@@ -3030,11 +3030,11 @@ async fn the_factory_builds_a_pair_router_that_serves_under_the_policy_controlle
     let mut ctx = grpc_ctx_from(&config, mcp_orchestrator().await);
     let prefill = register_worker(&ctx.worker_registry, prefill_port, WorkerType::Prefill);
     let decode = register_worker(&ctx.worker_registry, decode_port, WorkerType::Decode);
-    let (_, store, _) = host_testing::pair_bed_started(MODEL, &[prefill.url()], &[decode.url()]);
-    let host = Host::at_keys(Arc::clone(&store), Arc::clone(&ctx.worker_registry));
+    let (_, store, _) = engine_testing::pair_bed_started(MODEL, &[prefill.url()], &[decode.url()]);
+    let policy_engine = PolicyEngine::at_keys(Arc::clone(&store), Arc::clone(&ctx.worker_registry));
     let context = Arc::get_mut(&mut ctx).expect("the context's one hold");
     context.policy_store = Some(Arc::clone(&store));
-    context.policy_host = Some(Arc::new(host));
+    context.policy_engine = Some(Arc::new(policy_engine));
     let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
     ctx.tokenizer_registry
         .load(
@@ -3108,14 +3108,14 @@ async fn placed_harmony_responses_context() -> (ResponsesContext, Arc<MemoryStor
 }
 
 /// A published store with one ready row for each of `workers`, each
-/// serving [`MODEL`], and the pipeline's deps under a host that places over
-/// those rows.
+/// serving [`MODEL`], and the pipeline's deps under a policy engine that places
+/// over those rows.
 fn placed_deps(
     registry: &Arc<WorkerRegistry>,
     workers: &[Arc<dyn Worker>],
 ) -> (PipelineDeps, Arc<MemoryStore>) {
     let urls: Vec<&str> = workers.iter().map(|worker| worker.url()).collect();
-    let (_, store, _) = host_testing::bed(&urls);
+    let (_, store, _) = engine_testing::bed(&urls);
     for url in urls {
         let mut facts = store.by_key(url).expect("the worker's row").facts;
         facts.models = vec![MODEL.to_string()];
@@ -3129,7 +3129,7 @@ fn placed_deps(
         None,
         Duration::from_secs(60),
     )
-    .with_host(Some(Arc::new(Host::at_keys(
+    .with_policy_engine(Some(Arc::new(PolicyEngine::at_keys(
         Arc::clone(&store),
         Arc::clone(registry),
     ))));
@@ -3216,7 +3216,7 @@ async fn a_placed_retry_is_not_shed_by_the_workers_overload_flag() {
 }
 
 /// A placed request's definitive failure still moves to the other worker
-/// where that worker's object reads overloaded. Under a host the retry
+/// where that worker's object reads overloaded. Under a policy engine the retry
 /// window reads a worker's status and breaker, and the retry's placement
 /// answers for the veto. Each engine sees the request once, and the second
 /// answer stands.

@@ -1,13 +1,13 @@
-//! The gateway as the policy controller's host in process: one decision an
-//! attempt, from the ask to the request's end.
+//! The gateway's policy engine, the policy controller in process: one decision
+//! an attempt, from the ask to the request's end.
 //!
-//! An attempt has two halves. The ask ([`Host::ask`]) states what the
+//! An attempt has two halves. The ask ([`PolicyEngine::ask`]) states what the
 //! attempt knows of its request and gets a decision through the
 //! controller's handle. The commit takes the first target the gateway
-//! can send to. [`Host::place`] does this for a regular attempt. [`Host::place_pair`]
-//! resolves both workers of each target in the ask so the commit can run
-//! under the prefill admission lock. The store builds the candidates: the
-//! gateway sends none and keeps no view of the rows.
+//! can send to. [`PolicyEngine::place`] does this for a regular attempt.
+//! [`PolicyEngine::place_pair`] resolves both workers of each target in the ask
+//! so the commit can run under the prefill admission lock. The store builds the
+//! candidates: the gateway sends none and keeps no view of the rows.
 //!
 //! The door in this process decides on the calling thread. A pair can
 //! wait for prefill admission and asks again when the queue wakes it.
@@ -118,9 +118,9 @@ pub(crate) fn mark() -> [u8; 8] {
 /// What an attempt states of its request.
 ///
 /// A stage builds its ask over [`Ask::of`] and names the facts it holds:
-/// `Ask { streaming, tried, ..Ask::of(id, model) }`. A fact the host learns
-/// to read later is then stated by the stages that hold it, and breaks no
-/// other.
+/// `Ask { streaming, tried, ..Ask::of(id, model) }`. A fact the policy engine
+/// learns to read later is then stated by the stages that hold it, and breaks
+/// no other.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Ask<'a> {
     /// The request's id.
@@ -282,7 +282,7 @@ struct Made<'r, 'a> {
     missed: &'r [WorkerId],
     /// Where the key of the last making came from, under the label the
     /// gateway counts it by. The door may make the request a second time,
-    /// behind a lease the store refused: the host counts after the
+    /// behind a lease the store refused: the policy engine counts after the
     /// decision, once.
     source: Cell<Option<&'static str>>,
 }
@@ -489,14 +489,14 @@ pub(crate) struct Asked {
     handle: Handle<Arc<Door>>,
 }
 
-/// The policy controller's host in this process: the door over the
+/// The policy engine in this process: the door over the
 /// controller's store, and the holder of the gateway's worker objects.
-pub(crate) struct Host {
+pub(crate) struct PolicyEngine {
     door: Arc<Door>,
     workers: Workers,
 }
 
-/// Where the host finds the worker of a target's row.
+/// Where the policy engine finds the worker of a target's row.
 enum Workers {
     /// The object the feed's holder laid for the row.
     Held(Arc<Objects<ModelWorkerSnapshot>>),
@@ -506,9 +506,9 @@ enum Workers {
     AtKey(Arc<WorkerRegistry>),
 }
 
-impl Host {
-    /// The host over the controller's `store` and the holder of its worker
-    /// `objects`.
+impl PolicyEngine {
+    /// The policy engine over the controller's `store` and the holder of its
+    /// worker `objects`.
     pub(crate) fn new(store: Arc<MemoryStore>, objects: Arc<Objects<ModelWorkerSnapshot>>) -> Self {
         Self {
             door: Arc::new(Door::new(store)),
@@ -516,8 +516,8 @@ impl Host {
         }
     }
 
-    /// One pass of the door's clock at `now`: the call of the host's timer
-    /// ([`upkeep`](super::upkeep)), about once a second.
+    /// One pass of the door's clock at `now`: the call of the policy engine's
+    /// timer ([`upkeep`](super::upkeep)), about once a second.
     pub(crate) fn sweep(&self, now: Instant) -> Swept {
         self.door.sweep(now)
     }
@@ -542,7 +542,8 @@ impl Host {
         Hashes::of(self.door.store(), model, prompt)
     }
 
-    /// The host of a bed that registers its workers by hand in `registry`.
+    /// The policy engine of a bed that registers its workers by hand in
+    /// `registry`.
     #[cfg(test)]
     pub(crate) fn at_keys(store: Arc<MemoryStore>, registry: Arc<WorkerRegistry>) -> Self {
         Self {
@@ -784,9 +785,9 @@ impl Host {
         self.commit_where(asked, |_| true, missed, now)
     }
 
-    /// The commit of a route with a rule of its own: as [`Host::commit`],
-    /// and a target whose worker `holds` refuses is passed over like one
-    /// the gateway cannot send to.
+    /// The commit of a route with a rule of its own: as
+    /// [`PolicyEngine::commit`], and a target whose worker `holds` refuses is
+    /// passed over like one the gateway cannot send to.
     ///
     /// The rule is the route's and the controller does not read it. Where
     /// few workers pass it, an attempt's asks may end with no worker while
@@ -839,9 +840,10 @@ impl Host {
     }
 
     /// The pair's commit on a route with a rule of its own: as
-    /// [`Host::commit_pair`], and a target either of whose workers `holds`
-    /// refuses is passed over like one the gateway cannot send to. The
-    /// rule is the route's, as [`Host::commit_where`] says of a regular one.
+    /// [`PolicyEngine::commit_pair`], and a target either of whose workers
+    /// `holds` refuses is passed over like one the gateway cannot send to. The
+    /// rule is the route's, as [`PolicyEngine::commit_where`] says of a regular
+    /// one.
     #[expect(clippy::unused_self, reason = "the commit uses workers from the ask")]
     pub(crate) fn commit_pair_where(
         &self,
@@ -918,8 +920,8 @@ impl Host {
     }
 
     /// Places a pair on a route with a rule of its own: as
-    /// [`Host::place_pair`], over [`Host::commit_pair_where`]. The pass
-    /// that reads which prefills are full and the probe of a request
+    /// [`PolicyEngine::place_pair`], over [`PolicyEngine::commit_pair_where`].
+    /// The pass that reads which prefills are full and the probe of a request
     /// behind a waiter count a worker the rule refuses as one the gateway
     /// cannot send to.
     pub(crate) async fn place_pair_where(
@@ -1036,7 +1038,7 @@ impl Host {
     }
 
     /// A regular attempt's worker at `now` on a route with a rule of its
-    /// own: as [`Host::place`], over [`Host::commit_where`].
+    /// own: as [`PolicyEngine::place`], over [`PolicyEngine::commit_where`].
     pub(crate) async fn place_where(
         &self,
         ask: &Ask<'_>,
@@ -1141,10 +1143,10 @@ type DecodeRule = dyn Fn(&dyn Worker) -> bool + Send + Sync;
 
 /// What a route keeps of a pair's first ask for the second ask of its
 /// decode ([`Placed::keep_ask`]), where the two are stages apart and the
-/// first ask's borrows end between them: the host that decides, the ask's
-/// facts, owned, and the route's own rule at the second commit.
+/// first ask's borrows end between them: the policy engine that decides, the
+/// ask's facts, owned, and the route's own rule at the second commit.
 pub(crate) struct KeptAsk {
-    host: Arc<Host>,
+    policy_engine: Arc<PolicyEngine>,
     id: Box<[u8]>,
     model: Box<str>,
     streaming: bool,
@@ -1160,17 +1162,17 @@ pub(crate) struct KeptAsk {
 }
 
 impl KeptAsk {
-    /// The facts of `ask`, owned, for a second ask by `host`, with no
+    /// The facts of `ask`, owned, for a second ask by `policy_engine`, with no
     /// hashes: the ask borrows the attempt's, and they move in behind its
     /// last use ([`Self::with_hashes`]). `holds` is the route's rule for a
     /// decode the second commit may take.
     pub(crate) fn of(
-        host: &Arc<Host>,
+        policy_engine: &Arc<PolicyEngine>,
         ask: &Ask<'_>,
         holds: impl Fn(&dyn Worker) -> bool + Send + Sync + 'static,
     ) -> Self {
         Self {
-            host: Arc::clone(host),
+            policy_engine: Arc::clone(policy_engine),
             id: ask.id.into(),
             model: ask.model.into(),
             streaming: ask.streaming,
@@ -1306,7 +1308,7 @@ impl Placed {
     /// After the prefill is sent, take the next sendable decode of that
     /// prefill. Returns `false` when the pick holds none or the decode has
     /// already been sent or released.
-    pub(crate) fn next_decode(&mut self, host: &Host) -> bool {
+    pub(crate) fn next_decode(&mut self, policy_engine: &PolicyEngine) -> bool {
         let Some(placed) = self.pair.as_deref_mut() else {
             return false;
         };
@@ -1317,7 +1319,7 @@ impl Placed {
             let Some(pair) = target.pair else {
                 continue;
             };
-            let Some(worker) = host
+            let Some(worker) = policy_engine
                 .worker(pair.decode_id)
                 .filter(|worker| routable_but_for_veto(worker.as_ref()))
             else {
@@ -1377,7 +1379,7 @@ impl Placed {
         let kept = self.pair.as_deref_mut()?.kept.take()?;
         let ask = kept.ask();
         let rule = |worker: &Arc<dyn Worker>| (kept.holds)(worker.as_ref()) && holds(worker);
-        self.decode_again(&kept.host, &ask, rule, now)
+        self.decode_again(&kept.policy_engine, &ask, rule, now)
     }
 
     /// Asks the pair's decode again at `now`, on the rows of that instant:
@@ -1400,7 +1402,7 @@ impl Placed {
     /// lease is given up: the first pick's decode is then sent unbooked.
     pub(crate) fn decode_again(
         &mut self,
-        host: &Host,
+        policy_engine: &PolicyEngine,
         ask: &Ask<'_>,
         holds: impl Fn(&Arc<dyn Worker>) -> bool,
         now: Instant,
@@ -1428,7 +1430,7 @@ impl Placed {
             Ok(_) if handle.decode_chosen() => ("shed", None),
             Ok(decision) => (outcome(&decision), Some(decision)),
         };
-        host.count_decode_call(ask.model, picked.as_ref(), outcome, seconds);
+        policy_engine.count_decode_call(ask.model, picked.as_ref(), outcome, seconds);
         let Some(Decision::Pick(pick)) = picked else {
             return None;
         };
@@ -1438,7 +1440,7 @@ impl Placed {
             };
             let sendable =
                 |worker: &Arc<dyn Worker>| routable_but_for_veto(worker.as_ref()) && holds(worker);
-            let Some(worker) = host.worker(pair.decode_id).filter(sendable) else {
+            let Some(worker) = policy_engine.worker(pair.decode_id).filter(sendable) else {
                 continue;
             };
             // The call took its first target. A later one is taken by name.
@@ -1485,8 +1487,8 @@ impl Held {
     /// workers, and neither is dropped ahead of its turn.
     ///
     /// A pair's prefill holds its load by the admission guard
-    /// [`Host::place_pair`] hands back apart. Its router gives that one up
-    /// when the prefill phase ends, ahead of the response.
+    /// [`PolicyEngine::place_pair`] hands back apart. Its router gives that one
+    /// up when the prefill phase ends, ahead of the response.
     pub(crate) fn new(
         placed: Placed,
         guard: impl FnOnce(&Arc<dyn Worker>) -> WorkerLoadGuard,

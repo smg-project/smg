@@ -1,5 +1,5 @@
-//! The upkeep of the host's door: the timer that runs its clock and shows
-//! its counts.
+//! The upkeep of the policy engine's door: the timer that runs its clock and
+//! shows its counts.
 //!
 //! The door ends nothing between two decisions by itself. A lease whose
 //! dispatch the gateway never named stays on file, counted on its worker,
@@ -25,7 +25,7 @@ use tokio::{
     time::{interval, MissedTickBehavior},
 };
 
-use super::host::Host;
+use super::engine::PolicyEngine;
 use crate::observability::metrics::Metrics;
 
 /// The time between two turns. A lease has seconds to name its dispatch,
@@ -65,10 +65,10 @@ impl Series {
     }
 
     /// Set each series to the door's count of it.
-    fn show(&mut self, host: &Host) {
-        self.faults.absolute(host.faults());
+    fn show(&mut self, policy_engine: &PolicyEngine) {
+        self.faults.absolute(policy_engine.faults());
         for (binding, row) in (0..).zip(&mut self.singles) {
-            let counts = ShadowKind::ALL.map(|kind| host.shadowed(binding, kind));
+            let counts = ShadowKind::ALL.map(|kind| policy_engine.shadowed(binding, kind));
             if row.is_none() && counts.iter().all(|&count| count == 0) {
                 continue;
             }
@@ -85,24 +85,24 @@ impl Series {
 
 /// One turn of the timer at `now`: a pass of the door's clock, then the
 /// door's counts shown.
-fn turn(host: &Host, series: &mut Series, now: Instant) {
-    host.sweep(now);
-    series.show(host);
+fn turn(policy_engine: &PolicyEngine, series: &mut Series, now: Instant) {
+    policy_engine.sweep(now);
+    series.show(policy_engine);
 }
 
-/// Start the timer of `host`: one turn every [`EVERY`], on no request's
-/// path.
+/// Start the timer of `policy_engine`: one turn every [`EVERY`], on no
+/// request's path.
 ///
-/// The task holds the host weakly. It ends at the first tick behind the
-/// host's last holder: nothing stops it by hand, and it keeps no context
-/// alive. A turn writes this process's store and series alone, so a
+/// The task holds the policy engine weakly. It ends at the first tick behind
+/// the policy engine's last holder: nothing stops it by hand, and it keeps no
+/// context alive. A turn writes this process's store and series alone, so a
 /// shutdown waits for none.
 #[expect(
     clippy::disallowed_methods,
-    reason = "a turn writes this process's store and series alone and the task ends behind its host: a shutdown waits for neither"
+    reason = "a turn writes this process's store and series alone and the task ends behind its policy engine: a shutdown waits for neither"
 )]
-pub(crate) fn start(host: &Arc<Host>) -> JoinHandle<()> {
-    let host = Arc::downgrade(host);
+pub(crate) fn start(policy_engine: &Arc<PolicyEngine>) -> JoinHandle<()> {
+    let policy_engine = Arc::downgrade(policy_engine);
     tokio::spawn(async move {
         let mut tick = interval(EVERY);
         // A late turn is one turn, never a burst of the turns missed.
@@ -110,10 +110,10 @@ pub(crate) fn start(host: &Arc<Host>) -> JoinHandle<()> {
         let mut series = Series::new();
         loop {
             tick.tick().await;
-            let Some(host) = host.upgrade() else {
+            let Some(policy_engine) = policy_engine.upgrade() else {
                 break;
             };
-            turn(&host, &mut series, Instant::now());
+            turn(&policy_engine, &mut series, Instant::now());
         }
     })
 }
@@ -136,9 +136,9 @@ mod tests {
     use super::{start, turn, Series, EVERY};
     use crate::{
         observability::metrics::test_support::render_with_recorder,
-        policy_controller::host::{
+        policy_controller::engine::{
             testing::{bed, bed_with, MODEL},
-            Ask, Host,
+            Ask, PolicyEngine,
         },
         routers::common::snapshot::WorkerRegistry,
     };
@@ -148,16 +148,16 @@ mod tests {
     /// pass of the clock it stays live, counted on its worker.
     #[tokio::test(start_paused = true)]
     async fn the_timer_ends_a_lease_whose_dispatch_was_never_named() {
-        let (host, store, _workers) = bed(&["http://w0:8000"]);
-        let host = Arc::new(host);
-        let _timer = start(&host);
+        let (policy_engine, store, _workers) = bed(&["http://w0:8000"]);
+        let policy_engine = Arc::new(policy_engine);
+        let _timer = start(&policy_engine);
         // The timer's task takes its first turn and waits for its tick.
         tokio::task::yield_now().await;
 
         let issued = Instant::now()
             .checked_sub(Duration::from_secs(60))
             .expect("a clock a minute old");
-        let placed = host.place(&Ask::of(b"r1", MODEL), issued).await;
+        let placed = policy_engine.place(&Ask::of(b"r1", MODEL), issued).await;
         assert!(placed.is_ok(), "the bed's one worker takes the request");
         assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
 
@@ -167,26 +167,27 @@ mod tests {
         assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
     }
 
-    /// The timer holds its host weakly: it runs while the host stands,
-    /// and ends at the first tick behind the host's last holder.
+    /// The timer holds its policy engine weakly: it runs while the policy
+    /// engine stands, and ends at the first tick behind the policy engine's
+    /// last holder.
     #[tokio::test(start_paused = true)]
-    async fn the_timer_ends_behind_its_hosts_last_holder() {
-        let (host, _store, _workers) = bed(&["http://w0:8000"]);
-        let host = Arc::new(host);
-        let timer = start(&host);
+    async fn the_timer_ends_behind_its_policy_engines_last_holder() {
+        let (policy_engine, _store, _workers) = bed(&["http://w0:8000"]);
+        let policy_engine = Arc::new(policy_engine);
+        let timer = start(&policy_engine);
         tokio::time::advance(EVERY).await;
         tokio::task::yield_now().await;
         assert!(!timer.is_finished());
 
-        drop(host);
+        drop(policy_engine);
         let ended = tokio::time::timeout(2 * EVERY, timer).await;
         assert!(matches!(ended, Ok(Ok(()))), "the task ended: {ended:?}");
     }
 
-    /// The host of a bed of one worker whose one binding shadows a copy
-    /// of its own profile: each decision has a shadow beside it. A shadow
+    /// The policy engine of a bed of one worker whose one binding shadows a
+    /// copy of its own profile: each decision has a shadow beside it. A shadow
     /// names a profile that no binding decides by.
-    fn shadowing_host() -> Host {
+    fn shadowing_policy_engine() -> PolicyEngine {
         let mut document = PolicySpec::preset("round_robin").expect("the preset");
         let live = document.profiles.get("round_robin").cloned();
         document
@@ -201,8 +202,8 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         store.apply(applied).expect("the store takes the document");
         let rows = [("http://w0:8000", Some(MODEL))];
-        let (host, ..) = bed_with(store, Arc::new(WorkerRegistry::new()), rows, None);
-        host
+        let (policy_engine, ..) = bed_with(store, Arc::new(WorkerRegistry::new()), rows, None);
+        policy_engine
     }
 
     /// A turn sets the series to the door's counts: the one shadow beside
@@ -211,17 +212,17 @@ mod tests {
     /// A binding that shadowed nothing shows no row.
     #[test]
     fn a_turn_shows_the_doors_shadows_and_faults_as_series() {
-        let host = shadowing_host();
+        let policy_engine = shadowing_policy_engine();
         let rendered = render_with_recorder(|| {
             let mut series = Series::new();
-            let placed = host
+            let placed = policy_engine
                 .place(&Ask::of(b"r1", MODEL), Instant::now())
                 .now_or_never()
                 .expect("a decision at once");
             assert!(placed.is_ok(), "the bed's one worker takes the request");
-            turn(&host, &mut series, Instant::now());
+            turn(&policy_engine, &mut series, Instant::now());
         });
-        let counts = ShadowKind::ALL.map(|kind| host.shadowed(0, kind));
+        let counts = ShadowKind::ALL.map(|kind| policy_engine.shadowed(0, kind));
         assert_eq!(
             counts.iter().sum::<u64>(),
             1,

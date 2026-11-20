@@ -1,6 +1,6 @@
-//! Test support of the host: the store a start makes with one ready row a
-//! URL, a registry with one worker a URL, and the host over both. A router's
-//! cases build their rows this way, so one fixture stands.
+//! Test support of the policy engine: the store a start makes with one ready
+//! row a URL, a registry with one worker a URL, and the policy engine over
+//! both. A router's cases build their rows this way, so one fixture stands.
 
 use std::{sync::Arc, time::Instant};
 
@@ -17,7 +17,7 @@ use smg_policy_controller::{
 };
 use smg_worker::identity::basic::{Worker, WorkerType};
 
-use super::{Host, Placed, GATEWAY};
+use super::{Placed, PolicyEngine, GATEWAY};
 use crate::{
     config::{PolicyConfig, RouterConfig, RoutingMode},
     policy_controller::start,
@@ -27,8 +27,8 @@ use crate::{
 /// The model every row and worker of [`bed`] serves.
 pub(crate) const MODEL: &str = "model-a";
 
-/// A host, its store, and the registry's workers in the URLs' order.
-type Bed = (Host, Arc<MemoryStore>, Vec<Arc<dyn Worker>>);
+/// A policy engine, its store, and the registry's workers in the URLs' order.
+type Bed = (PolicyEngine, Arc<MemoryStore>, Vec<Arc<dyn Worker>>);
 
 /// The id of the lease `placed` holds: a router's case reads the lease's
 /// sides in the store by it.
@@ -37,7 +37,7 @@ pub(crate) fn lease_of(placed: &Placed) -> LeaseId {
 }
 
 /// The store a start makes under the controller with one ready row a URL,
-/// a registry with one worker a URL, and the host over the two.
+/// a registry with one worker a URL, and the policy engine over the two.
 pub(crate) fn bed(urls: &[&str]) -> Bed {
     bed_under(RouterConfig::default().policy, urls)
 }
@@ -48,7 +48,7 @@ pub(crate) fn bed_under(policy: PolicyConfig, urls: &[&str]) -> Bed {
     started(policy, Arc::new(WorkerRegistry::new()), rows, None)
 }
 
-/// The same store and host over workers registered in `registry`.
+/// The same store and policy engine over workers registered in `registry`.
 pub(crate) fn bed_over(registry: Arc<WorkerRegistry>, urls: &[&str]) -> Bed {
     bed_over_models(registry, urls.iter().map(|&url| (url, Some(MODEL))), None)
 }
@@ -103,15 +103,15 @@ fn preset_bed(registry: Arc<WorkerRegistry>, urls: &[&str], events: bool) -> Bed
 
 /// [`preset_bed`] of three rows that publish cache events, with the second
 /// row's id.
-pub(crate) fn cache_bed() -> (Host, Arc<MemoryStore>, WorkerId) {
-    let (host, store, _) = preset_bed(Arc::new(WorkerRegistry::new()), &URLS, true);
+pub(crate) fn cache_bed() -> (PolicyEngine, Arc<MemoryStore>, WorkerId) {
+    let (policy_engine, store, _) = preset_bed(Arc::new(WorkerRegistry::new()), &URLS, true);
     let holder = store.by_key(URLS[1]).expect("the second worker's row").id;
-    (host, store, holder)
+    (policy_engine, store, holder)
 }
 
 /// [`preset_bed`] of three rows that publish none: the preset's prefix
 /// stage reads the record of sent prefixes for them.
-pub(crate) fn record_bed() -> (Host, Arc<MemoryStore>) {
+pub(crate) fn record_bed() -> (PolicyEngine, Arc<MemoryStore>) {
     record_bed_over(Arc::new(WorkerRegistry::new()), &URLS)
 }
 
@@ -119,9 +119,9 @@ pub(crate) fn record_bed() -> (Host, Arc<MemoryStore>) {
 pub(crate) fn record_bed_over(
     registry: Arc<WorkerRegistry>,
     urls: &[&str],
-) -> (Host, Arc<MemoryStore>) {
-    let (host, store, _) = preset_bed(registry, urls, false);
-    (host, store)
+) -> (PolicyEngine, Arc<MemoryStore>) {
+    let (policy_engine, store, _) = preset_bed(registry, urls, false);
+    (policy_engine, store)
 }
 
 /// [`bed`] over `store` and `registry`: a row publishes cache events where
@@ -188,12 +188,16 @@ fn bed_publishing<'a>(
         workers.push(worker);
     }
     store.publish_now();
-    (Host::at_keys(Arc::clone(&store), registry), store, workers)
+    (
+        PolicyEngine::at_keys(Arc::clone(&store), registry),
+        store,
+        workers,
+    )
 }
 
 /// A store under the stock pair presets with one ready row a URL, the
 /// prefills' then the decodes', a registry with one worker a row, and the
-/// host over the two. The workers come back in the rows' order.
+/// policy engine over the two. The workers come back in the rows' order.
 pub(crate) fn pair_bed(prefills: &[&str], decodes: &[&str]) -> Bed {
     let store = Arc::new(MemoryStore::new());
     let document = PolicySpec::pair_presets("least_load", "least_load").expect("the pair presets");
@@ -305,8 +309,8 @@ fn wire_of(url: &str) -> WireModes {
 }
 
 /// One ready row a URL in `store`, the prefills' then the decodes', each
-/// serving `model`, a registry with one worker a row, and the host over the
-/// two.
+/// serving `model`, a registry with one worker a row, and the policy engine
+/// over the two.
 fn pair_rows(store: Arc<MemoryStore>, model: &str, prefills: &[&str], decodes: &[&str]) -> Bed {
     pair_rows_shaped(store, model, |_, worker| worker, prefills, decodes)
 }
@@ -359,7 +363,11 @@ fn pair_rows_shaped(
         }
     }
     store.publish_now();
-    (Host::at_keys(Arc::clone(&store), registry), store, workers)
+    (
+        PolicyEngine::at_keys(Arc::clone(&store), registry),
+        store,
+        workers,
+    )
 }
 
 /// Stores a chain of content hashes in one batch on `id`, through the

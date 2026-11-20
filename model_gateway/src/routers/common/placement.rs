@@ -774,7 +774,7 @@ pub(crate) fn policy_declined(model: &str, declined_at: &str) -> Response {
 /// prefill of them pairs with a decode: `mismatches` are the components the
 /// pools disagree on, `prefill` and `decode` each pool's pairing keys. The
 /// verdict reads membership alone, so the classic selection and the policy
-/// controller's host give one answer for one fleet.
+/// engine give one answer for one fleet.
 pub(crate) fn no_compatible_pair(
     model: &str,
     mismatches: &[String],

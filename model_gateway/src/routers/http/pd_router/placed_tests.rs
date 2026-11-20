@@ -25,7 +25,7 @@ use super::{
 use crate::{
     config::{RouterConfig, RoutingMode},
     policy_controller::{
-        host::testing::{pair_in_flight, MODEL},
+        engine::testing::{pair_in_flight, MODEL},
         start,
     },
     routers::grpc::backend_client::BasicWorkerBuilder,
@@ -34,13 +34,13 @@ use crate::{
 
 type Case<T = ()> = Result<T, Box<dyn Error>>;
 
-/// A host, its store, and the registry's workers of each side in its URLs'
-/// order: the prefill workers, then the decode workers.
-type PairBed = (Host, Arc<MemoryStore>, [Vec<Arc<dyn Worker>>; 2]);
+/// A policy engine, its store, and the registry's workers of each side in its
+/// URLs' order: the prefill workers, then the decode workers.
+type PairBed = (PolicyEngine, Arc<MemoryStore>, [Vec<Arc<dyn Worker>>; 2]);
 
-/// A host over the store a prefill and decode gateway starts, with one ready
-/// row and one registry worker a URL of each side: the prefill workers, then
-/// the decode workers, each in its URLs' order.
+/// A policy engine over the store a prefill and decode gateway starts, with one
+/// ready row and one registry worker a URL of each side: the prefill workers,
+/// then the decode workers, each in its URLs' order.
 fn pair_bed_over(
     registry: Arc<WorkerRegistry>,
     prefill_urls: &[&str],
@@ -154,7 +154,11 @@ fn pair_bed_in(
         side.collect()
     });
     store.publish_now();
-    (Host::at_keys(Arc::clone(&store), registry), store, sides)
+    (
+        PolicyEngine::at_keys(Arc::clone(&store), registry),
+        store,
+        sides,
+    )
 }
 
 const GATEWAY: GatewayId = GatewayId::LOCAL;
@@ -175,10 +179,10 @@ const UNARY: PDRequestContext<'static> = PDRequestContext {
     rid: None,
 };
 
-fn router(worker_registry: Arc<WorkerRegistry>, host: Host) -> PDRouter {
+fn router(worker_registry: Arc<WorkerRegistry>, policy_engine: PolicyEngine) -> PDRouter {
     PDRouter {
         worker_registry,
-        host: Some(Arc::new(host)),
+        policy_engine: Some(Arc::new(policy_engine)),
         ..create_test_pd_router()
     }
 }
@@ -201,13 +205,13 @@ async fn chat(router: &PDRouter) -> Case<Response> {
 }
 
 /// A pair as the router's attempt asks for it, with no admission.
-async fn sent_pair(host: &Host) -> Case<Sent> {
-    let id = host::mark();
+async fn sent_pair(policy_engine: &PolicyEngine) -> Case<Sent> {
+    let id = engine::mark();
     let ask = Ask {
         phase: Phase::Prefill,
         ..Ask::of(&id, MODEL)
     };
-    let placed = host.place_pair(&ask, None, None).await;
+    let placed = policy_engine.place_pair(&ask, None, None).await;
     let (placed, _guard) = placed.map_err(|unplaced| format!("{unplaced:?}"))?;
     Ok(Sent::from(placed))
 }
@@ -229,8 +233,8 @@ async fn a_hosted_pair_is_sent_to_the_prefill_and_the_decode_the_controller_plac
     let (prefill, prefill_seen) = spawn_recording_stub("{}").await;
     let (decode, decode_seen) = spawn_recording_stub(r#"{"text":"done"}"#).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
-    let router = router(registry, host);
+    let (policy_engine, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+    let router = router(registry, policy_engine);
 
     let response = generate(&router).await?;
 
@@ -261,10 +265,11 @@ async fn a_pair_that_names_its_worker_is_refused_where_its_settings_keep_it() ->
         let (prefill, prefill_seen) = spawn_recording_stub("{}").await;
         let (decode, decode_seen) = spawn_recording_stub(r#"{"text":"done"}"#).await;
         let registry = Arc::new(WorkerRegistry::new());
-        let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+        let (policy_engine, store, _) =
+            pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
         let router = PDRouter {
             keeps_target,
-            ..router(registry, host)
+            ..router(registry, policy_engine)
         };
         let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
         let request = serde_json::from_value(json!({"text": "hi"}))?;
@@ -299,7 +304,7 @@ async fn a_pair_the_store_cannot_make_is_refused_though_the_registry_holds_one()
     let (prefill, prefill_seen) = spawn_recording_stub("{}").await;
     let (decode, decode_seen) = spawn_recording_stub(r#"{"text":"done"}"#).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+    let (policy_engine, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
     let row = store
         .by_key(&decode)
         .ok_or("the decode worker had no row")?;
@@ -307,7 +312,7 @@ async fn a_pair_the_store_cannot_make_is_refused_though_the_registry_holds_one()
         .remove(row.id, row.revision)
         .ok_or("the decode worker's row stood")?;
     store.publish_now();
-    let router = router(registry, host);
+    let router = router(registry, policy_engine);
 
     let response = generate(&router).await?;
 
@@ -326,8 +331,8 @@ async fn a_retryable_answer_that_names_no_side_names_both_rows_as_tried() -> Cas
     let (prefill, _) = spawn_recording_stub("{}").await;
     let (decode, _) = spawn_recording_stub("{}").await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
-    let sent = sent_pair(&host).await?;
+    let (policy_engine, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+    let sent = sent_pair(&policy_engine).await?;
     let rows = [Some(sent.id()), sent.decode_id()];
     let tried = parking_lot::Mutex::new(Vec::new());
     let refusal = error::service_unavailable("worker_unavailable", "a worker is down");
@@ -349,8 +354,9 @@ async fn an_answer_that_names_a_failed_side_names_that_row_alone_as_tried() -> C
         let (prefill, _) = spawn_recording_stub("{}").await;
         let (decode, _) = spawn_recording_stub("{}").await;
         let registry = Arc::new(WorkerRegistry::new());
-        let (host, store, sides) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
-        let sent = sent_pair(&host).await?;
+        let (policy_engine, store, sides) =
+            pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+        let sent = sent_pair(&policy_engine).await?;
         let rows = [Some(sent.id()), sent.decode_id()];
         let tried = parking_lot::Mutex::new(Vec::new());
         let mut refusal = error::internal_error("worker_failed", "the worker failed the request");
@@ -376,11 +382,11 @@ async fn the_tried_row_is_the_side_the_ledger_closed() -> Case {
     let (decode, _) = spawn_recording_stub("{}").await;
     let registry = Arc::new(WorkerRegistry::new());
     let bed = pair_bed_over(Arc::clone(&registry), &[&first, &second], &[&decode]);
-    let (host, store, [_, decodes]) = bed;
-    let sent = sent_pair(&host).await?;
+    let (policy_engine, store, [_, decodes]) = bed;
+    let sent = sent_pair(&policy_engine).await?;
     let prefill_row = sent.id();
     let pair = [Arc::clone(sent.worker()), Arc::clone(&decodes[0])];
-    let router = router(registry, host);
+    let router = router(registry, policy_engine);
     let ledger = AttemptLedger::default();
     let mut answer = error::internal_error("worker_failed", "the decode failed the request");
     mark_upstream_answer(&mut answer);
@@ -412,8 +418,8 @@ async fn a_decode_that_waits_on_its_prefill_outlives_the_dispatch_deadline() -> 
         &[&prefill],
         &[&decode],
     );
-    let (host, store, _) = bed;
-    let router = router(registry, host);
+    let (policy_engine, store, _) = bed;
+    let router = router(registry, policy_engine);
 
     let sweep = async {
         // The prefill holds its answer: its request is in, the decode's is not.
@@ -491,14 +497,14 @@ async fn decode_arrivals_over(
         &[&prefill],
         &[&first, &second],
     );
-    let (host, store, _) = bed;
+    let (policy_engine, store, _) = bed;
     let mut document = PolicySpec::pair_presets("least_load", "least_load")?;
     document.plans.pd_pair.decode = picked;
     document.generation = store.with_world(|world| world.spec().generation()) + 1;
     store
         .apply(AppliedSpec::validate(&document)?)
         .map_err(|stale| format!("{stale:?}"))?;
-    let router = router(registry, host);
+    let router = router(registry, policy_engine);
 
     report(&store, &second, &first)?;
     let turn = async {
@@ -560,14 +566,14 @@ async fn a_decode_its_prefill_was_told_is_booked_at_the_prefills_send() -> Case 
         (worker, WireModes::HTTP)
     };
     let bed = pair_bed_of(read, Arc::clone(&registry), &[&prefill], &[&decode]);
-    let (host, store, _) = bed;
+    let (policy_engine, store, _) = bed;
     let mut document = PolicySpec::pair_presets("least_load", "least_load")?;
     document.plans.pd_pair.decode = DecodePick::AfterPrefill;
     document.generation = store.with_world(|world| world.spec().generation()) + 1;
     store
         .apply(AppliedSpec::validate(&document)?)
         .map_err(|stale| format!("{stale:?}"))?;
-    let router = router(registry, host);
+    let router = router(registry, policy_engine);
     let row = store.by_key(&decode).ok_or("the decode's row")?.id;
 
     let booked = async {
@@ -614,7 +620,7 @@ async fn a_retry_is_not_placed_on_a_worker_the_ledger_closed() -> Case {
         let (second, _) = spawn_recording_stub("{}").await;
         let registry = Arc::new(WorkerRegistry::new());
         let bed = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&first, &second]);
-        let (host, store, [prefills, decodes]) = bed;
+        let (policy_engine, store, [prefills, decodes]) = bed;
         let ledger = AttemptLedger::default();
         let mut failed = error::internal_error("worker_failed", "the worker failed the request");
         mark_failed_side(&mut failed, decodes[closed].as_ref());
@@ -623,12 +629,15 @@ async fn a_retry_is_not_placed_on_a_worker_the_ledger_closed() -> Case {
             [&prefills[0], &decodes[closed]],
             decodes.iter(),
         );
-        let router = router(registry, host);
-        let host = router.host.as_deref().ok_or("the router holds the host")?;
+        let router = router(registry, policy_engine);
+        let policy_engine = router
+            .policy_engine
+            .as_deref()
+            .ok_or("the router holds the policy engine")?;
         let tried = parking_lot::Mutex::new(Vec::new());
         for _ in 0..4 {
             let placed = router
-                .place_pair_attempt(host, &UNARY, 0, unhashed, None, &tried, &ledger)
+                .place_pair_attempt(policy_engine, &UNARY, 0, unhashed, None, &tried, &ledger)
                 .await;
             let (sent, (_, decode), _guards, _asked) =
                 placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
@@ -650,11 +659,12 @@ async fn a_streamed_answer_its_decode_cuts_is_told_as_no_success() -> Case {
     for (decode, served) in [(whole, true), (spawn_cut_body_stub().await, false)] {
         let (prefill, _) = spawn_recording_stub("{}").await;
         let registry = Arc::new(WorkerRegistry::new());
-        let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+        let (policy_engine, store, _) =
+            pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
         let row = store
             .by_key(&decode)
             .ok_or("the decode worker had no row")?;
-        let router = router(registry, host);
+        let router = router(registry, policy_engine);
         let start = Instant::now();
         let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
         let request = serde_json::from_value(json!({"text": "hi", "stream": true}))?;
@@ -681,11 +691,12 @@ async fn a_drained_prefill_that_breaks_off_is_told_as_no_success() -> Case {
         let reply = json!({"text": "done"});
         let (decode, _) = spawn_delayed_stub(StatusCode::OK, reply, hold).await;
         let registry = Arc::new(WorkerRegistry::new());
-        let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+        let (policy_engine, store, _) =
+            pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
         let row = store
             .by_key(&prefill)
             .ok_or("the prefill worker had no row")?;
-        let router = router(registry, host);
+        let router = router(registry, policy_engine);
         let start = Instant::now();
         let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
         let request = serde_json::from_value(json!({"text": "hi", "stream": true}))?;
@@ -747,11 +758,12 @@ async fn a_drain_that_outlives_its_answer_tells_the_prefills_end() -> Case {
         let prefill = spawn_held_body_stub(DRAIN_HOLD, whole).await;
         let (decode, _) = spawn_recording_stub(r#"{"text":"done"}"#).await;
         let registry = Arc::new(WorkerRegistry::new());
-        let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+        let (policy_engine, store, _) =
+            pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
         let row = store
             .by_key(&prefill)
             .ok_or("the prefill worker had no row")?;
-        let router = router(registry, host);
+        let router = router(registry, policy_engine);
         let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
         let request = serde_json::from_value(json!({"text": "hi", "stream": true}))?;
         let start = Instant::now();
@@ -778,11 +790,12 @@ async fn a_client_that_leaves_mid_stream_leaves_the_prefill_to_its_drain() -> Ca
         let prefill = spawn_held_body_stub(DRAIN_HOLD, whole).await;
         let decode = spawn_held_body_stub(DRAIN_HOLD * 20, true).await;
         let registry = Arc::new(WorkerRegistry::new());
-        let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+        let (policy_engine, store, _) =
+            pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
         let row = store
             .by_key(&prefill)
             .ok_or("the prefill worker had no row")?;
-        let router = router(registry, host);
+        let router = router(registry, policy_engine);
         let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
         let request = serde_json::from_value(json!({"text": "hi", "stream": true}))?;
         let start = Instant::now();
@@ -872,11 +885,11 @@ async fn a_drained_prefill_ends_at_the_answers_next_frame() -> Case {
     let release = Release::default();
     let decode = spawn_released_body_stub(Arc::clone(&release)).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+    let (policy_engine, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
     let row = store
         .by_key(&prefill)
         .ok_or("the prefill worker had no row")?;
-    let router = router(registry, host);
+    let router = router(registry, policy_engine);
     let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
     let request = serde_json::from_value(json!({"text": "hi", "stream": true}))?;
     let start = Instant::now();
@@ -911,11 +924,11 @@ async fn a_prefill_read_whole_ends_ahead_of_its_decodes_answer() -> Case {
         let (decode, reached) = spawn_released_stub(reply, Arc::clone(&release)).await;
         let registry = Arc::new(WorkerRegistry::new());
         let bed = pair_bed_running(runtime, Arc::clone(&registry), &[&prefill], &[&decode]);
-        let (host, store, _) = bed;
+        let (policy_engine, store, _) = bed;
         let row = store
             .by_key(&prefill)
             .ok_or("the prefill worker had no row")?;
-        let router = router(registry, host);
+        let router = router(registry, policy_engine);
         let start = Instant::now();
 
         let early = async {
@@ -963,14 +976,17 @@ async fn a_row_whose_worker_dials_another_wire_is_passed_over_at_its_commit() ->
         };
         let registry = Arc::new(WorkerRegistry::new());
         let bed = pair_bed_of(grpc, Arc::clone(&registry), &[&prefill], &urls);
-        let (host, store, [_, decodes]) = bed;
-        let router = router(registry, host);
-        let host = router.host.as_deref().ok_or("the router holds the host")?;
+        let (policy_engine, store, [_, decodes]) = bed;
+        let router = router(registry, policy_engine);
+        let policy_engine = router
+            .policy_engine
+            .as_deref()
+            .ok_or("the router holds the policy engine")?;
         let tried = parking_lot::Mutex::new(Vec::new());
         let ledger = AttemptLedger::default();
         for _ in 0..4 {
             let placed = router
-                .place_pair_attempt(host, &UNARY, 0, unhashed, None, &tried, &ledger)
+                .place_pair_attempt(policy_engine, &UNARY, 0, unhashed, None, &tried, &ledger)
                 .await;
             let (sent, (_, decode), _guards, _asked) =
                 placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
@@ -988,8 +1004,8 @@ async fn a_row_whose_worker_dials_another_wire_is_passed_over_at_its_commit() ->
 
 /// Under a pair document whose sides rank by the ring, a prompt keeps its
 /// prefill and its decode over plain HTTP. The route states the request's
-/// text, the host hashes its windows, and the ring keys a request that has
-/// no routing key by them. Prompts that differ spread over each pool.
+/// text, the policy engine hashes its windows, and the ring keys a request that
+/// has no routing key by them. Prompts that differ spread over each pool.
 #[tokio::test]
 async fn a_prompt_keeps_its_pair_under_the_ring_over_http() -> Case {
     const PROMPTS: usize = 12;
@@ -1003,8 +1019,9 @@ async fn a_prompt_keeps_its_pair_under_the_ring_over_http() -> Case {
     let prefill_urls: Vec<&str> = prefills.iter().map(|(url, _)| url.as_str()).collect();
     let decode_urls: Vec<&str> = decodes.iter().map(|(url, _)| url.as_str()).collect();
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = ring_pair_bed(Arc::clone(&registry), &prefill_urls, &decode_urls);
-    let router = router(registry, host);
+    let (policy_engine, store, _) =
+        ring_pair_bed(Arc::clone(&registry), &prefill_urls, &decode_urls);
+    let router = router(registry, policy_engine);
     let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
     // Each prompt fills six windows at the document's block size, and the
     // prompts differ inside the first.
@@ -1049,9 +1066,12 @@ async fn a_prompt_keeps_its_pair_under_the_ring_over_http() -> Case {
 async fn a_text_request_states_its_size_from_its_hashing() -> Case {
     let registry = Arc::new(WorkerRegistry::new());
     let urls = (["http://prefill:8000"], ["http://decode:8000"]);
-    let (host, store, _) = ring_pair_bed(Arc::clone(&registry), &urls.0, &urls.1);
-    let router = router(registry, host);
-    let host = router.host.as_deref().ok_or("the router holds the host")?;
+    let (policy_engine, store, _) = ring_pair_bed(Arc::clone(&registry), &urls.0, &urls.1);
+    let router = router(registry, policy_engine);
+    let policy_engine = router
+        .policy_engine
+        .as_deref()
+        .ok_or("the router holds the policy engine")?;
     let tried = parking_lot::Mutex::new(Vec::new());
     let ledger = AttemptLedger::default();
     let text = "x".repeat(100 * TEXT_BYTES_PER_TOKEN as usize);
@@ -1062,9 +1082,9 @@ async fn a_text_request_states_its_size_from_its_hashing() -> Case {
     };
     let as_ids = Prompt::of(Some(ids.as_slice()), None);
     for (prompt, size) in [(as_text, 100), (as_ids, 37)] {
-        let hashed = |model: &str| host.hashes(model, &prompt);
+        let hashed = |model: &str| policy_engine.hashes(model, &prompt);
         let placed = router
-            .place_pair_attempt(host, &UNARY, 0, hashed, None, &tried, &ledger)
+            .place_pair_attempt(policy_engine, &UNARY, 0, hashed, None, &tried, &ledger)
             .await;
         let (sent, _, _guards, _asked) =
             placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
@@ -1111,14 +1131,17 @@ async fn a_pair_is_placed_past_more_pairs_of_another_wire_than_an_attempt_asks()
         };
         let registry = Arc::new(WorkerRegistry::new());
         let bed = pair_bed_of(other_wire, Arc::clone(&registry), &prefills, &decodes);
-        let (host, store, _) = bed;
-        let router = router(registry, host);
-        let host = router.host.as_deref().ok_or("the router holds the host")?;
+        let (policy_engine, store, _) = bed;
+        let router = router(registry, policy_engine);
+        let policy_engine = router
+            .policy_engine
+            .as_deref()
+            .ok_or("the router holds the policy engine")?;
         let tried = parking_lot::Mutex::new(Vec::new());
         let ledger = AttemptLedger::default();
         for _ in 0..4 {
             let placed = router
-                .place_pair_attempt(host, &UNARY, 0, unhashed, None, &tried, &ledger)
+                .place_pair_attempt(policy_engine, &UNARY, 0, unhashed, None, &tried, &ledger)
                 .await;
             let (sent, (prefill, decode), _guards, _asked) =
                 placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;

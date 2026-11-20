@@ -192,7 +192,7 @@ impl GrpcRouter {
         )
         .with_request_timeout(request_timeout)
         .with_grouped_dp_sticky(grouped_dp_sticky)
-        .with_host(ctx.policy_host.clone())
+        .with_policy_engine(ctx.policy_engine.clone())
         .with_pair_keeps_target(pair_keeps_target);
         // Deps for the parser-free endpoints (completion/embeddings/classify/
         // decisions/transcription).
@@ -205,7 +205,7 @@ impl GrpcRouter {
         )
         .with_request_timeout(request_timeout)
         .with_grouped_dp_sticky(grouped_dp_sticky)
-        .with_host(ctx.policy_host.clone())
+        .with_policy_engine(ctx.policy_engine.clone())
         .with_pair_keeps_target(pair_keeps_target);
 
         // Present in every mode: chat/generate, messages, completion.

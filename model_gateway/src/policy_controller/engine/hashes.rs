@@ -164,7 +164,7 @@ mod tests {
     use super::{prompt_token_count, Hashes};
     use crate::{
         policies::CacheNamespace,
-        policy_controller::host::{
+        policy_controller::engine::{
             testing::{cache_bed, record_bed, store_blocks, MODEL},
             tests::first,
             Ask, Prompt, GATEWAY,
@@ -246,7 +246,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_block_is_hashed_past_the_generations_depth() {
-        let (host, store, _) = cache_bed();
+        let (policy_engine, store, _) = cache_bed();
         store.set_block_size(MODEL, BLOCK_SIZE);
         let depth =
             store.deciding(|world| world.spec().block_hashes_read(HashKind::Token, BLOCK_SIZE));
@@ -260,11 +260,11 @@ mod tests {
             hashes: Some(&hashes),
             ..first(b"long")
         };
-        let _asked = host
+        let _asked = policy_engine
             .ask(&ask, &[], Instant::now())
             .await
             .expect("a decision");
-        assert_eq!(host.door.hashes_cut(), 0);
+        assert_eq!(policy_engine.door.hashes_cut(), 0);
 
         let mut document = PolicySpec::preset("random").expect("the preset");
         document.generation += 1;
@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn a_text_prompt_is_hashed_by_windows_of_bytes() {
         // A generation whose prefix stage reads the record of sent
-        // prefixes: it declares text hashes, so the host hashes them.
+        // prefixes: it declares text hashes, so the policy engine hashes them.
         let (_, store) = record_bed();
         store.set_block_size(MODEL, 32);
         let window = 32 * TEXT_BYTES_PER_TOKEN;

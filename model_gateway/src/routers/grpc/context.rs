@@ -64,7 +64,7 @@ use crate::{
     middleware::TenantRequestMeta,
     observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
-    policy_controller::host::{End, Held, Placed},
+    policy_controller::engine::{End, Held, Placed},
     routers::{
         common::{
             attempt_ledger::AttemptLedger,
@@ -2352,7 +2352,7 @@ pub(super) mod test_support {
 
     use super::*;
     use crate::{
-        policy_controller::host::{testing, Ask, KeptAsk},
+        policy_controller::engine::{testing, Ask, KeptAsk},
         routers::grpc::backend_client::BasicWorkerBuilder,
     };
 
@@ -2364,20 +2364,20 @@ pub(super) mod test_support {
     /// kept for its second ask as the selection stage keeps it. The
     /// prefill's admission guard and the store come with it.
     pub(super) async fn place_pair_waiting() -> (Placed, PrefillLoadGuard, Arc<MemoryStore>) {
-        let (host, store, _) =
+        let (policy_engine, store, _) =
             testing::pair_bed_picking(DecodePick::AfterPrefill, &["http://prefill:8000"], &DECODES);
-        let host = Arc::new(host);
+        let policy_engine = Arc::new(policy_engine);
         testing::report_loads(&store, DECODES[1], DECODES[0]);
         let ask = Ask {
             phase: Phase::Prefill,
             decode_again: true,
             ..Ask::of(b"placed", testing::MODEL)
         };
-        let (mut placed, guard) = host
+        let (mut placed, guard) = policy_engine
             .place_pair(&ask, None, None)
             .await
             .expect("a placed pair");
-        placed.keep_ask(KeptAsk::of(&host, &ask, |_| true));
+        placed.keep_ask(KeptAsk::of(&policy_engine, &ask, |_| true));
         (placed, guard, store)
     }
 
@@ -2394,19 +2394,19 @@ pub(super) mod test_support {
     ) -> (LoadGuards, WorkerSelection, [Arc<dyn Worker>; 2]) {
         let prefills = ["http://prefill:8000"];
         let bed = testing::pair_bed_shaped(DecodePick::AfterPrefill, shaped, &prefills, &DECODES);
-        let (host, store, workers) = bed;
-        let host = Arc::new(host);
+        let (policy_engine, store, workers) = bed;
+        let policy_engine = Arc::new(policy_engine);
         testing::report_loads(&store, DECODES[1], DECODES[0]);
         let ask = Ask {
             phase: Phase::Prefill,
             decode_again: true,
             ..Ask::of(b"placed", testing::MODEL)
         };
-        let (mut placed, room) = host
+        let (mut placed, room) = policy_engine
             .place_pair(&ask, None, None)
             .await
             .expect("a placed pair");
-        placed.keep_ask(KeptAsk::of(&host, &ask, |_| true));
+        placed.keep_ask(KeptAsk::of(&policy_engine, &ask, |_| true));
         let WorkerSelection::Disaggregated {
             encode_assignments,
             prefill,
@@ -2439,12 +2439,13 @@ pub(super) mod test_support {
     /// A pair the controller placed over one prefill and one decode, with
     /// the prefill's admission guard and the store.
     pub(super) async fn place_pair() -> (Placed, PrefillLoadGuard, Arc<MemoryStore>) {
-        let (host, store, _) = testing::pair_bed(&["http://prefill:8000"], &["http://decode:8000"]);
+        let (policy_engine, store, _) =
+            testing::pair_bed(&["http://prefill:8000"], &["http://decode:8000"]);
         let ask = Ask {
             phase: Phase::Prefill,
             ..Ask::of(b"placed", testing::MODEL)
         };
-        let (placed, guard) = host
+        let (placed, guard) = policy_engine
             .place_pair(&ask, None, None)
             .await
             .expect("a placed pair");
@@ -2462,8 +2463,8 @@ pub(super) mod test_support {
     }
 
     pub(in crate::routers::grpc) async fn place_worker() -> (Placed, Arc<MemoryStore>) {
-        let (host, store, _) = testing::bed(&["http://placed:8000"]);
-        let placed = host
+        let (policy_engine, store, _) = testing::bed(&["http://placed:8000"]);
+        let placed = policy_engine
             .place(&Ask::of(b"placed", testing::MODEL), Instant::now())
             .await
             .expect("a placement");
@@ -2567,7 +2568,7 @@ mod tests {
         *,
     };
     use crate::{
-        policy_controller::host::{testing, testing::report_loads},
+        policy_controller::engine::{testing, testing::report_loads},
         routers::{
             common::{pd_admission::admit_decode, prefill_admission::test_support::select_worker},
             grpc::{

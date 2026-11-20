@@ -41,7 +41,7 @@ use super::{feed, Feed, FeedDoor};
 use crate::{
     config::RouterConfig,
     policy_controller::{
-        host::{Ask, Host, Unplaced},
+        engine::{Ask, PolicyEngine, Unplaced},
         start,
     },
     routers::{
@@ -139,9 +139,9 @@ fn a_write_at_the_door_puts_the_workers_object_in_the_registry() {
 async fn a_written_row_is_in_force_for_the_next_decision() {
     let store = start_store().expect("the store starts");
     let (_, feed) = bed(&store);
-    let host = Host::new(store, Arc::clone(&feed.objects));
+    let policy_engine = PolicyEngine::new(store, Arc::clone(&feed.objects));
     let row = register(&*feed.door).expect("the worker registers");
-    let placed = host
+    let placed = policy_engine
         .place(&ask(b"first"), Instant::now())
         .await
         .expect("the next decision picks the worker");
@@ -152,7 +152,7 @@ async fn a_written_row_is_in_force_for_the_next_decision() {
 async fn a_failed_probe_is_written_on_the_row_and_the_object_mirrors_it() {
     let store = start_store().expect("the store starts");
     let (registry, feed) = bed(&store);
-    let host = Host::new(Arc::clone(&store), Arc::clone(&feed.objects));
+    let policy_engine = PolicyEngine::new(Arc::clone(&store), Arc::clone(&feed.objects));
     let row = register_with(&*feed.door, probed).expect("the worker registers");
     let object = feed.objects.object(row).expect("the row has an object");
     let worker = registry.get(&object).expect("the worker stands");
@@ -169,7 +169,7 @@ async fn a_failed_probe_is_written_on_the_row_and_the_object_mirrors_it() {
         Some((WorkerStatus::Pending, WorkerStatus::Ready))
     );
     assert_statuses(RowStatus::Ready, WorkerStatus::Ready);
-    let placed = host
+    let placed = policy_engine
         .place(&ask(b"first"), Instant::now())
         .await
         .expect("the ready row takes a decision");
@@ -191,7 +191,7 @@ async fn a_failed_probe_is_written_on_the_row_and_the_object_mirrors_it() {
     );
     assert_statuses(RowStatus::NotReady, WorkerStatus::NotReady);
     assert!(matches!(
-        host.ask(&ask(b"down"), &[], Instant::now()).await,
+        policy_engine.ask(&ask(b"down"), &[], Instant::now()).await,
         Err(Unplaced::Shed { .. })
     ));
 
@@ -208,7 +208,7 @@ async fn a_failed_probe_is_written_on_the_row_and_the_object_mirrors_it() {
         }
     );
     assert_statuses(RowStatus::Ready, WorkerStatus::Ready);
-    let placed = host
+    let placed = policy_engine
         .place(&ask(b"back"), Instant::now())
         .await
         .expect("the recovered row takes a decision");
@@ -419,7 +419,7 @@ fn a_replacement_at_the_door_moves_the_gauge_of_both_groups() {
 async fn a_replacement_takes_no_request_until_its_object_is_laid() {
     let store = start_store().expect("the store starts");
     let (registry, feed) = bed(&store);
-    let host = Host::new(Arc::clone(&store), Arc::clone(&feed.objects));
+    let policy_engine = PolicyEngine::new(Arc::clone(&store), Arc::clone(&feed.objects));
     register(&*feed.door).expect("the worker registers");
     let old = registry.get_by_url(URL).expect("the first object stands");
 
@@ -437,14 +437,14 @@ async fn a_replacement_takes_no_request_until_its_object_is_laid() {
     let stale = registry.get_by_url(URL).expect("the old object stands");
     assert!(Arc::ptr_eq(&stale, &old));
 
-    let gap = host
+    let gap = policy_engine
         .place(&ask(b"gap"), Instant::now())
         .await
         .expect_err("a row with no object takes no request");
     assert!(matches!(gap, Unplaced::NoTargetHolds), "{gap:?}");
 
     feed.settle();
-    let placed = host
+    let placed = policy_engine
         .place(&ask(b"laid"), Instant::now())
         .await
         .expect("the replacement's object takes the request");
@@ -740,9 +740,9 @@ fn a_worker_that_states_a_width_and_no_rank_is_one_row_with_its_object() {
 async fn a_drained_row_takes_no_decision_and_a_gone_row_leaves_the_registry() {
     let store = start_store().expect("the store starts");
     let (registry, feed) = bed(&store);
-    let host = Host::new(store, Arc::clone(&feed.objects));
+    let policy_engine = PolicyEngine::new(store, Arc::clone(&feed.objects));
     let row = register(&*feed.door).expect("the worker registers");
-    let before = host
+    let before = policy_engine
         .place(&ask(b"first"), Instant::now())
         .await
         .expect("the worker is picked before draining");
@@ -753,7 +753,7 @@ async fn a_drained_row_takes_no_decision_and_a_gone_row_leaves_the_registry() {
     let seen = feed.objects.standing(&object).expect("the object's row");
     let by = Remover::Maker(&Maker::Control);
     assert_eq!(feed.door.drained(by, URL, seen), Ok(Wrote::Draining(row)));
-    let drained = host
+    let drained = policy_engine
         .place(&ask(b"next"), Instant::now())
         .await
         .expect_err("a draining worker takes no decision");
