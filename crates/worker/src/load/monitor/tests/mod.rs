@@ -486,7 +486,7 @@ async fn removed_event_evicts_cached_loads() {
     let id = registry.register(Arc::clone(&worker)).unwrap();
     monitor.start_event_loop();
 
-    monitor.load_state.publish_group(
+    let _ = monitor.load_state.publish_group(
         &[],
         vec![(Arc::clone(&worker), Arc::new(WorkerLoadResponse::default()))],
     );
@@ -572,7 +572,7 @@ async fn status_changed_away_from_ready_evicts_worker() {
     monitor.start_event_loop();
 
     // Seed the load snapshot + DP cache as if a poll had succeeded.
-    monitor.load_state.publish_group(
+    let _ = monitor.load_state.publish_group(
         &[],
         vec![(Arc::clone(&worker), Arc::new(WorkerLoadResponse::default()))],
     );
@@ -3068,9 +3068,105 @@ async fn the_batchs_sentinel_covers_every_rank_of_the_row() {
 fn polled(monitor: &WorkerMonitor, worker: &Arc<dyn Worker>, answer: WorkerLoadResponse) {
     let _ = monitor.apply_polled_load("http://w:1", &answer, Instant::now());
     Metrics::record_engine_load("http://w:1", worker.model_id(), &answer);
-    monitor.load_state.publish_group(
+    let reports = monitor.pushed_reports.lock();
+    monitor.publish_rows(
+        &reports,
         &["http://w:1".to_string()],
         vec![(Arc::clone(worker), Arc::new(answer))],
+    );
+}
+
+/// A polled row can go under its successor's ahead of its own worker's
+/// eviction: the successor's tick published first. The row ends there,
+/// with the ranks it held past its worker's width, which the eviction can
+/// no longer name. The series the successor writes stay.
+#[tokio::test]
+async fn a_row_that_went_under_its_successors_ends_with_its_far_ranks() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        let mut answer = answer_of(0, 7);
+        answer.loads.push(SchedulerLoadSnapshot {
+            dp_rank: 5,
+            num_running_reqs: 8,
+            ..Default::default()
+        });
+        polled(&monitor, &first, answer);
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        monitor.publish_polled(
+            "m",
+            &["http://w:1".to_string()],
+            vec![(Arc::clone(&next), answer_of(0, 9), false)],
+        );
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+
+        assert_eq!(published_rows(&monitor), vec![(0, 9)], "its row");
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+    assert!(
+        running_series_of(&rendered, 5).ends_with(" -1"),
+        "{rendered}"
+    );
+}
+
+/// A tick can prune a row behind its worker's leave and ahead of the
+/// eviction's batch: the worker's answer came late and the fence refused
+/// it. The batch then finds no row at the URL. The row ends at that
+/// publish, and its series with it.
+#[tokio::test]
+async fn a_row_a_tick_prunes_behind_its_workers_leave_ends_its_series() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        polled(&monitor, &worker, answer_of(0, 7));
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        monitor.evict_worker_loads(&worker);
+        monitor.publish_polled("m", &["http://w:1".to_string()], Vec::new());
+
+        monitor.flush_pending_evictions();
+
+        assert!(monitor.load_state.snapshot().get("http://w:1").is_none());
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+}
+
+/// A pushed successor's flush takes a polled predecessor's row the same
+/// way. The predecessor holds no file, so the successor's first record
+/// clears nothing of it, and its eviction finds the successor's row. The
+/// row ends at the flush with its far rank, and the rank the successor's
+/// file holds stays.
+#[tokio::test]
+async fn a_row_a_pushed_successor_takes_ends_with_its_far_ranks() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        let mut answer = answer_of(0, 7);
+        answer.loads.push(SchedulerLoadSnapshot {
+            dp_rank: 5,
+            num_running_reqs: 8,
+            ..Default::default()
+        });
+        polled(&monitor, &first, answer);
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+        monitor.flush_pushed();
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+
+        assert_eq!(published_rows(&monitor), vec![(0, 9)], "its row");
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+    assert!(
+        running_series_of(&rendered, 5).ends_with(" -1"),
+        "{rendered}"
     );
 }
 

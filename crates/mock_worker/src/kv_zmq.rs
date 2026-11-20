@@ -48,7 +48,7 @@ use zeromq::{
     PubSocket, RouterSocket, ZmqError, ZmqMessage,
 };
 
-use crate::engine::{unix_seconds, Engine};
+use crate::engine::{unix_seconds, Engine, Place, Published};
 
 /// The engines' end-of-replay marker: `(-1).to_bytes(8, "big", signed=True)`.
 const END_SEQ: [u8; 8] = [0xff; 8];
@@ -158,12 +158,12 @@ async fn run(
                     generation = item.generation;
                     state.restart();
                 }
-                let message = state.publish(&item.batch, &item.spans);
-                if item.dropped {
-                    continue; // lost on the wire; replay still has it
-                }
-                if let Err(e) = publisher.send(message).await {
-                    tracing::warn!("kv-events publish failed: {e}");
+                // A batch lost on the wire is not among them; replay still
+                // has it.
+                for message in state.released(&item) {
+                    if let Err(e) = publisher.send(message).await {
+                        tracing::warn!("kv-events publish failed: {e}");
+                    }
                 }
             }
             request = recv_replay(&mut replay) => {
@@ -192,6 +192,10 @@ async fn recv_replay(replay: &mut Option<RouterSocket>) -> Result<ZmqMessage, Zm
 struct Publisher {
     topic: Vec<u8>,
     seq: u64,
+    /// The second of a swapped pair, handed over first, and whether a drop
+    /// hook lost it. It takes no sequence and no place in the buffer until
+    /// the first follows, so no replay holds the second without the first.
+    ahead: Option<(Vec<u8>, bool)>,
     buffer: VecDeque<(u64, Vec<u8>)>,
     buffer_steps: usize,
     dp_rank: i32,
@@ -203,6 +207,7 @@ impl Publisher {
         Self {
             topic,
             seq: 0,
+            ahead: None,
             buffer: VecDeque::new(),
             buffer_steps: buffer_steps.max(1),
             dp_rank,
@@ -220,6 +225,12 @@ impl Publisher {
     /// return the PUB message.
     fn publish(&mut self, batch: &common::KvEventBatch, spans: &[(usize, Vec<u32>)]) -> ZmqMessage {
         let payload = encode_batch(batch, self.dp_rank, self.wire, spans);
+        self.keep(payload)
+    }
+
+    /// Give `payload` the next sequence and keep it for replay: its PUB
+    /// message.
+    fn keep(&mut self, payload: Vec<u8>) -> ZmqMessage {
         let seq = self.seq;
         self.seq += 1;
         self.buffer.push_back((seq, payload.clone()));
@@ -229,9 +240,56 @@ impl Publisher {
         frame(&self.topic, seq, payload)
     }
 
+    /// [`Self::keep`], the message going to `live` unless a drop hook lost
+    /// the batch.
+    fn keep_into(&mut self, payload: Vec<u8>, lost: bool, live: &mut Vec<ZmqMessage>) {
+        let message = self.keep(payload);
+        if !lost {
+            live.push(message);
+        }
+    }
+
+    /// The PUB messages to send for a batch as the engine released it, in
+    /// the order they go out. This publisher numbers what it is handed, so a
+    /// batch a sequence hook released out of its turn takes the sequence of
+    /// its turn in the engine's order, and the wire shows the fault the hook
+    /// names. A copy repeats the last sequence, and the buffer keeps one.
+    /// The second of a swapped pair, handed over first, waits here: when the
+    /// first follows, both are numbered and kept in the engine's order, and
+    /// then the second goes out first. A batch a drop hook lost is numbered
+    /// and kept, not sent.
+    fn released(&mut self, item: &Published) -> Vec<ZmqMessage> {
+        let payload = encode_batch(&item.batch, self.dp_rank, self.wire, &item.spans);
+        let mut live = Vec::with_capacity(2);
+        match (item.place, self.ahead.take()) {
+            (Place::Behind, Some((second, second_lost))) => {
+                let first = self.keep(payload);
+                self.keep_into(second, second_lost, &mut live);
+                if !item.dropped {
+                    live.push(first);
+                }
+            }
+            (place, stray) => {
+                // A second whose first never came goes out in its turn.
+                if let Some((second, second_lost)) = stray {
+                    self.keep_into(second, second_lost, &mut live);
+                }
+                match place {
+                    Place::Ahead => self.ahead = Some((payload, item.dropped)),
+                    Place::Again if self.seq > 0 => {
+                        live.push(frame(&self.topic, self.seq - 1, payload));
+                    }
+                    _ => self.keep_into(payload, item.dropped, &mut live),
+                }
+            }
+        }
+        live
+    }
+
     /// A publisher restart: the sequence starts over and the buffer is gone.
     fn restart(&mut self) {
         self.seq = 0;
+        self.ahead = None;
         self.buffer.clear();
     }
 
@@ -924,6 +982,94 @@ mod tests {
             publisher.replay(&request).len(),
             1,
             "the buffer is gone after a restart"
+        );
+    }
+
+    /// A sequence hook's batches keep the sequence of their turn in the
+    /// engine's order. A copy repeats its sequence and replays once. The
+    /// second of a swapped pair waits for the first, so no replay between
+    /// the two holds it alone; then the second goes out first and both
+    /// replay in order. A second a drop hook lost is kept and not sent.
+    #[test]
+    fn a_copy_repeats_its_sequence_and_a_swapped_pair_keeps_its_turns() {
+        fn seq_of(message: &ZmqMessage, frame: usize) -> u64 {
+            let seq = message.get(frame).expect("seq");
+            u64::from_be_bytes(seq.as_ref().try_into().expect("8 bytes"))
+        }
+        /// The sequences of the messages that went out, in their order.
+        fn sent(messages: &[ZmqMessage]) -> Vec<u64> {
+            messages.iter().map(|m| seq_of(m, 1)).collect()
+        }
+        /// What a replay from the start answers: each sequence and payload.
+        fn replayed(publisher: &Publisher) -> Vec<(u64, Vec<u8>)> {
+            let mut request = ZmqMessage::from(b"peer".to_vec());
+            request.push_back(Vec::new().into());
+            request.push_back(0u64.to_be_bytes().to_vec().into());
+            let replies = publisher.replay(&request);
+            replies[..replies.len() - 1]
+                .iter()
+                .map(|m| (seq_of(m, 3), m.get(4).expect("payload").to_vec()))
+                .collect()
+        }
+        /// A batch of the time `at`: the payload carries the time, which
+        /// tells the batches apart.
+        fn batch(at: f64) -> common::KvEventBatch {
+            common::KvEventBatch {
+                timestamp: at,
+                ..sample_batch()
+            }
+        }
+        fn item(at: f64, place: Place, dropped: bool) -> Published {
+            Published {
+                batch: batch(at),
+                spans: Vec::new(),
+                dropped,
+                generation: 0,
+                place,
+            }
+        }
+        /// The buffer that holds the batches of `times`, in that order.
+        fn kept(times: &[f64]) -> Vec<(u64, Vec<u8>)> {
+            times
+                .iter()
+                .zip(0..)
+                .map(|(at, seq)| (seq, encode_batch(&batch(*at), 0, Wire::Vllm, &[])))
+                .collect()
+        }
+
+        let mut publisher = Publisher::new(b"kv".to_vec(), 8, 0, Wire::Vllm);
+        let once = publisher.released(&item(1.0, Place::InTurn, false));
+        let again = publisher.released(&item(1.0, Place::Again, false));
+        assert_eq!((sent(&once), sent(&again)), (vec![0], vec![0]));
+        assert_eq!(replayed(&publisher), kept(&[1.0]), "the copy is kept once");
+
+        // The engine's second and third batches as a pair. The third is
+        // handed over first and waits: a replay between the two holds
+        // neither.
+        let ahead = publisher.released(&item(3.0, Place::Ahead, false));
+        assert!(ahead.is_empty());
+        assert_eq!(replayed(&publisher), kept(&[1.0]));
+        let pair = publisher.released(&item(2.0, Place::Behind, false));
+        assert_eq!(sent(&pair), [2, 1], "the second goes out first");
+        assert_eq!(replayed(&publisher), kept(&[1.0, 2.0, 3.0]));
+
+        // A pair whose second a drop hook lost: both kept, the first sent.
+        assert!(publisher
+            .released(&item(5.0, Place::Ahead, true))
+            .is_empty());
+        let first_alone = publisher.released(&item(4.0, Place::Behind, false));
+        assert_eq!(sent(&first_alone), [3]);
+        // A second whose first never comes goes out in its turn.
+        assert!(publisher
+            .released(&item(6.0, Place::Ahead, false))
+            .is_empty());
+        let in_turn = publisher.released(&item(7.0, Place::InTurn, false));
+        assert_eq!(sent(&in_turn), [5, 6]);
+        assert_eq!(publisher.next_seq(), 7);
+        assert_eq!(
+            replayed(&publisher),
+            kept(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+            "one entry a sequence, in the engine's order"
         );
     }
 

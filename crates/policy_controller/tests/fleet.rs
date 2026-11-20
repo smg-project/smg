@@ -1,17 +1,20 @@
 //! The end-to-end case, the harness first: a controller on ephemeral ports,
 //! a fleet of mock engines and the generated client, in one process. The
 //! fleet registers, an engine of one rank through the control scope's call;
-//! the controller's own load driver polls it; a probe turn of the case asks
-//! each engine its health and writes what it heard; and the pool is read
-//! back as a decision's view reads it: every rank a row, healthy by its
-//! probe, its load from a poll, an engine that holds requests reading them.
+//! the controller's own load driver polls it; each engine is asked its
+//! health and what it answered is written, by the controller's own prober
+//! where its build has one and by a probe turn of the case elsewhere; and
+//! the pool is read back as a decision's view reads it: every rank a row,
+//! healthy by its probe, its load from a poll, an engine that holds
+//! requests reading them.
 //! That engine's KV events follow: a subscriber of the case hands each batch
 //! of its stream to the sink, and its row's index holds every block the
 //! events left the engine holding, where the cache-aware preset then asks a
-//! prompt that states them. Then one engine is killed: the first dial
+//! prompt that states them. Then one engine is killed: the first probe
 //! that hears it dead writes it, and the pool reads its rows unhealthy and
 //! every other row healthy. Next, an engine stops answering with its sockets
-//! open: a probe turn waits out its dial bound, writes it and goes on. Last,
+//! open: its probe waits out its bound and writes it, and a dial turn of
+//! the case waits out its own and goes on to every other engine. Last,
 //! the gateway sends requests of its own and reports each on its session:
 //! the store holds the completion of the engine that answered, none of class
 //! ok for the dead and the hung one, and nothing of it for another gateway;
@@ -127,7 +130,7 @@ use std::{
 use engines::cpu_seconds;
 use fleet::{
     within, DialEnd, Harness, Replica, Shape, DIAL_TIMEOUT, GATEWAY, POLL_INTERVAL, PROBE_INTERVAL,
-    ROOM,
+    PRODUCT_PROBES, ROOM,
 };
 use net::vm_rss_kib;
 use openai_protocol::worker::RuntimeType;
@@ -684,8 +687,10 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .sum();
         let pool = harness.view(MODEL, Role::Single).expect("the view");
         assert_eq!(pool.len(), ranks, "every rank is a row: {pool:?}");
+        // A controller that probes by itself asks an engine as its row
+        // arrives: nothing is asked yet only where the stand-in probes.
         assert!(
-            pool.iter().all(|row| !row.healthy && row.load.is_none()),
+            PRODUCT_PROBES || pool.iter().all(|row| !row.healthy && row.load.is_none()),
             "nothing is known of an engine nobody asked: {pool:?}"
         );
 
@@ -1869,7 +1874,33 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         })
         .await
         .expect("a live engine reads healthy");
+        let killed = harness.mark();
         let death = harness.kill(dead).await.expect("the kill");
+        // The death's verdicts are the statuses the store moved from the
+        // kill on, one a rank, whoever probes. The liveness rule moves a
+        // not-ready row on to failed three failures later: that step
+        // follows the death, it is not its verdict.
+        let verdicts = |harness: &Harness| {
+            let mut moved = harness.moved(killed).expect("the store's tail");
+            moved.retain(|moved| moved.engine == dead && moved.to != WorkerStatus::Failed);
+            moved
+        };
+        within(
+            "the death is written, one verdict a rank",
+            PROBE_INTERVAL + DIAL_TIMEOUT + ROOM,
+            || verdicts(&harness).len() >= 2,
+        )
+        .await
+        .expect("the death is written");
+        let written = death.at.elapsed();
+        assert_eq!(
+            verdicts(&harness)
+                .iter()
+                .map(|moved| (moved.from, moved.to))
+                .collect::<Vec<_>>(),
+            [(WorkerStatus::Ready, WorkerStatus::NotReady); 2],
+            "one verdict a rank from the kill on"
+        );
         within(
             "a dead engine's rows read unhealthy and every other row healthy",
             PROBE_INTERVAL + DIAL_TIMEOUT + ROOM,
@@ -1888,48 +1919,39 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             ranks,
             "a dead engine's rows stay rows: {pool:?}"
         );
-        // The death's verdicts are the ones written from the kill on, one a
-        // rank, by the first dial that heard the engine dead: a turn in
-        // flight at the kill, or the first one begun after the death. The
-        // liveness rule moves a not-ready row on to failed three failures
-        // later: that step follows the death, it is not its verdict.
-        let moved: Vec<_> = harness
-            .verdicts()
-            .into_iter()
-            .filter(|verdict| {
-                verdict.engine == dead
-                    && verdict.at >= death.at
-                    && verdict.to != WorkerStatus::Failed
-            })
-            .collect();
-        assert_eq!(
-            moved.len(),
-            2,
-            "one verdict a rank from the kill on: {moved:?}"
-        );
-        let first = harness
-            .first_unhealthy(dead, death.asked)
-            .expect("a dial heard the engine dead");
-        assert!(
-            first <= death.turn + 1,
-            "the first turn after the death dialed it: turn {first} after {death:?}"
-        );
-        for verdict in &moved {
-            assert_eq!(
-                (verdict.from, verdict.to),
-                (WorkerStatus::Ready, WorkerStatus::NotReady),
-                "{verdict:?}"
+        // Where the stand-in probes, its turns tell which dial wrote: the
+        // first that heard the engine dead, a turn in flight at the kill
+        // or the first one begun after the death.
+        if !PRODUCT_PROBES {
+            let first = harness
+                .first_unhealthy(dead, death.asked)
+                .expect("a dial heard the engine dead");
+            assert!(
+                first <= death.turn + 1,
+                "the first turn after the death dialed it: turn {first} after {death:?}"
             );
-            assert_eq!(
-                verdict.turn, first,
-                "the first dial that heard the engine dead wrote it: {verdict:?} after {death:?}"
-            );
+            let wrote: Vec<_> = harness
+                .verdicts()
+                .into_iter()
+                .filter(|verdict| {
+                    verdict.engine == dead
+                        && verdict.at >= death.at
+                        && verdict.to != WorkerStatus::Failed
+                })
+                .collect();
+            assert_eq!(wrote.len(), 2, "one verdict a rank: {wrote:?}");
+            for verdict in &wrote {
+                assert_eq!(
+                    (verdict.from, verdict.to),
+                    (WorkerStatus::Ready, WorkerStatus::NotReady),
+                    "{verdict:?}"
+                );
+                assert_eq!(
+                    verdict.turn, first,
+                    "the first dial that heard the engine dead wrote it: {verdict:?} after {death:?}"
+                );
+            }
         }
-        let written = moved
-            .iter()
-            .map(|verdict| verdict.at.duration_since(death.at))
-            .max()
-            .unwrap_or_default();
         // No decision names the dead engine: from the probe that heard it
         // dead its rows are no candidates.
         harness
@@ -1963,6 +1985,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         // costs a probe turn its dial bound and no more: that turn writes
         // the engine's row not ready, and no live row moves.
         let hung = engines[2];
+        let hanged = harness.mark();
         let hang = Instant::now();
         harness.hang(hung).expect("the hang");
         within(
@@ -1978,24 +2001,29 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         .await
         .expect("the hang is seen");
         let hung_seen = hang.elapsed();
-        let moved: Vec<_> = harness
-            .verdicts()
-            .into_iter()
-            .filter(|verdict| {
-                verdict.engine == hung && verdict.at >= hang && verdict.to != WorkerStatus::Failed
-            })
-            .collect();
+        let moved = harness.moved(hanged).expect("the store's tail");
         assert_eq!(
             moved
                 .iter()
-                .map(|verdict| (verdict.from, verdict.to))
+                .filter(|moved| moved.engine == hung && moved.to != WorkerStatus::Failed)
+                .map(|moved| (moved.from, moved.to))
                 .collect::<Vec<_>>(),
             [(WorkerStatus::Ready, WorkerStatus::NotReady)],
             "one verdict for the hung engine's one rank: {moved:?}"
         );
-        // That turn went on to every engine after the hung one, and from
-        // the hang on no live row moved.
-        let turn = moved[0].turn;
+        // The dialer's turn that waited out the bound went on to every
+        // engine after the hung one, and from the hang on no live row
+        // moved.
+        within(
+            "a dial waits out the hung engine",
+            PROBE_INTERVAL + DIAL_TIMEOUT + ROOM,
+            || harness.first_unhealthy(hung, 0).is_some(),
+        )
+        .await
+        .expect("a dial of the hung engine ends");
+        let turn = harness
+            .first_unhealthy(hung, 0)
+            .expect("the turn that waited out the bound");
         within("the turn that waited out the bound ends", ROOM, || {
             harness.dialed(turn).len() == FLEET.len()
         })
@@ -2017,13 +2045,8 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             ],
             "the turn that waited out the bound went on to every engine"
         );
-        let others: Vec<_> = harness
-            .verdicts()
-            .into_iter()
-            .filter(|verdict| {
-                verdict.at >= hang && verdict.engine != hung && verdict.engine != dead
-            })
-            .collect();
+        let mut others = harness.moved(hanged).expect("the store's tail");
+        others.retain(|moved| moved.engine != hung && moved.engine != dead);
         assert!(
             others.is_empty(),
             "no live row moves at the hang: {others:?}"
@@ -2868,8 +2891,9 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
             status_of(watcher, id).is_some_and(|status| status != WorkerStatus::Ready)
         };
 
-        // The snapshot tells the fleet as it registered: pending, with no
-        // prober started yet.
+        // The snapshot tells the fleet as it registered. Where the stand-in
+        // probes, no prober has started yet and every row is pending. A
+        // controller that probes by itself may have readied a row already.
         let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
         let opened = watcher.open(harness.client()).await;
         let mut stream = opened.expect("the watch opens");
@@ -2877,7 +2901,11 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
         told.expect("a snapshot is told");
         for id in &ids {
             let status = status_of(stream.watcher(), *id);
-            assert_eq!(status, Some(WorkerStatus::Pending));
+            assert!(
+                status == Some(WorkerStatus::Pending)
+                    || (PRODUCT_PROBES && status == Some(WorkerStatus::Ready)),
+                "a row of the snapshot reads {status:?}"
+            );
         }
 
         // The prober starts: the tail tells each engine it heard.

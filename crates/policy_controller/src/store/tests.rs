@@ -9,14 +9,14 @@ use std::{
 
 use super::{
     identity, identity_of,
-    leases::{Counts, Slot},
-    Ask, AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeSide, Dispatch,
-    GatewayId, Hand, HealthSink, HealthWrite, Journal, Kinds, KvEvent, KvEventSink, LeaseRecord,
-    LeaseRefused, LeaseState, LeasesStore, LoadSample, LoadSink, LoadSource, MembershipChange,
-    MembershipTail, MemoryStore, Picked, Pin, PollMode, Position, Reachability, ReservationKind,
-    ReservationStore, ResyncReason, Said, SequenceHash, SessionsStore, Sides, Signals,
-    SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, Watch, WorkerFacts, WorkerPatch, WorkerRow,
-    WorkerStatus, WorkersStore, World,
+    leases::{Counts, Slot, DISPATCH_TTL},
+    Ask, AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeRefused, DecodeSide,
+    Dispatch, GatewayId, Hand, HealthSink, HealthWrite, Journal, Kinds, KvEvent, KvEventSink,
+    LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSample, LoadSink, LoadSource,
+    MembershipChange, MembershipTail, MemoryStore, Picked, Pin, PollMode, Position, Reachability,
+    ReservationKind, ReservationStore, ResyncReason, Said, SequenceHash, SessionsStore, Sides,
+    Signals, SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, Watch, WorkerFacts, WorkerPatch,
+    WorkerRow, WorkerStatus, WorkersStore, World,
 };
 use crate::{
     decider::Decider,
@@ -241,9 +241,12 @@ fn probe_outcomes_follow_the_rows_thresholds_and_a_stale_outcome_is_dropped() {
     let health: &dyn HealthSink = &store;
     let id = store.upsert(facts("http://w:8000", 1)).id();
     let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-    assert_eq!(health.probe_outcome(id, true, revision()).moved(), None);
     assert_eq!(
-        health.probe_outcome(id, true, revision()).moved(),
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
+        None
+    );
+    assert_eq!(
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Ready)),
         "two passes promote a pending worker"
     );
@@ -252,40 +255,62 @@ fn probe_outcomes_follow_the_rows_thresholds_and_a_stale_outcome_is_dropped() {
     let stale = revision();
     WorkersStore::patch(&store, id, WorkerPatch::default(), stale).expect("the patch");
     assert_eq!(
-        health.probe_outcome(id, false, stale).moved(),
+        health.probe_outcome(id, false, stale, &|| true).moved(),
         None,
         "a stale outcome is dropped"
     );
-    assert_eq!(health.probe_outcome(id, false, revision()).moved(), None);
-    assert_eq!(health.probe_outcome(id, false, revision()).moved(), None);
     assert_eq!(
-        health.probe_outcome(id, false, revision()).moved(),
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
+        None
+    );
+    assert_eq!(
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
+        None
+    );
+    assert_eq!(
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
         Some((WorkerStatus::Ready, WorkerStatus::NotReady)),
         "three failures demote"
     );
     for _ in 0..8 {
-        assert_eq!(health.probe_outcome(id, false, revision()).moved(), None);
+        assert_eq!(
+            health
+                .probe_outcome(id, false, revision(), &|| true)
+                .moved(),
+            None
+        );
     }
     assert_eq!(
-        health.probe_outcome(id, false, revision()).moved(),
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
         Some((WorkerStatus::NotReady, WorkerStatus::Failed)),
         "nine more fail it"
     );
-    assert_eq!(health.probe_outcome(id, true, revision()).moved(), None);
     assert_eq!(
-        health.probe_outcome(id, true, revision()).moved(),
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
+        None
+    );
+    assert_eq!(
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
         Some((WorkerStatus::Failed, WorkerStatus::Ready)),
         "two passes bring a failed worker back"
     );
     let fresh = store.upsert(facts("http://f:8000", 1)).id();
     let fresh_revision = WorkersStore::get(&store, fresh).expect("the row").revision;
     assert_eq!(
-        health.connected(fresh, fresh_revision).moved(),
+        health.connected(fresh, fresh_revision, &|| true).moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Ready)),
         "the connect signal promotes at once"
     );
     assert_eq!(
-        health.connected(fresh, fresh_revision).moved(),
+        health.connected(fresh, fresh_revision, &|| true).moved(),
         None,
         "a ready row takes no second promotion"
     );
@@ -305,20 +330,27 @@ fn a_threshold_past_the_counters_range_is_never_met_early() {
         // far under it.
         for _ in 0..5 {
             assert_eq!(
-                health.probe_outcome(id, false, revision()).moved(),
+                health
+                    .probe_outcome(id, false, revision(), &|| true)
+                    .moved(),
                 None,
                 "pending under {threshold}"
             );
         }
-        assert_eq!(health.probe_outcome(id, true, revision()).moved(), None);
         assert_eq!(
-            health.probe_outcome(id, true, revision()).moved(),
+            health.probe_outcome(id, true, revision(), &|| true).moved(),
+            None
+        );
+        assert_eq!(
+            health.probe_outcome(id, true, revision(), &|| true).moved(),
             Some((WorkerStatus::Pending, WorkerStatus::Ready))
         );
         // And a ready one stays ready through failures under the threshold.
         for _ in 0..5 {
             assert_eq!(
-                health.probe_outcome(id, false, revision()).moved(),
+                health
+                    .probe_outcome(id, false, revision(), &|| true)
+                    .moved(),
                 None,
                 "ready under {threshold}"
             );
@@ -337,17 +369,29 @@ fn a_counter_at_its_ranges_end_stays_there() {
     // A pending worker's cap is held at the counter's end: met there, and
     // one probe short of it not yet.
     store.probed(id, 0, 0, u32::MAX - 2);
-    assert_eq!(health.probe_outcome(id, false, revision()).moved(), None);
     assert_eq!(
-        health.probe_outcome(id, false, revision()).moved(),
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
+        None
+    );
+    assert_eq!(
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Failed))
     );
     // Each counter at its end takes one probe more and stays there.
     store.probed(id, u32::MAX, u32::MAX, u32::MAX);
-    assert_eq!(health.probe_outcome(id, false, revision()).moved(), None);
+    assert_eq!(
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
+        None
+    );
     store.probed(id, 0, u32::MAX, u32::MAX);
     assert_eq!(
-        health.probe_outcome(id, true, revision()).moved(),
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
         Some((WorkerStatus::Failed, WorkerStatus::Ready))
     );
 }
@@ -363,23 +407,30 @@ fn a_threshold_whose_triple_passes_the_counters_range_fails_no_row_early() {
     stated.health.failure_threshold = threshold;
     let id = store.upsert(stated).id();
     let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-    assert_eq!(health.probe_outcome(id, true, revision()).moved(), None);
     assert_eq!(
-        health.probe_outcome(id, true, revision()).moved(),
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
+        None
+    );
+    assert_eq!(
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Ready))
     );
     // Ready, the row is not ready at the threshold's own count of failed
     // probes: the count is set one short of it.
     store.probed(id, threshold - 1, 0, 0);
     assert_eq!(
-        health.probe_outcome(id, false, revision()).moved(),
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
         Some((WorkerStatus::Ready, WorkerStatus::NotReady))
     );
     // Not ready, it fails at three thresholds of failed probes: five are
     // far under them.
     for _ in 0..5 {
         assert_eq!(
-            health.probe_outcome(id, false, revision()).moved(),
+            health
+                .probe_outcome(id, false, revision(), &|| true)
+                .moved(),
             None,
             "not ready under the triple"
         );
@@ -394,7 +445,7 @@ fn a_connect_signal_read_under_a_revision_the_row_left_is_dropped() {
     let read = WorkersStore::get(&store, id).expect("the row").revision;
     WorkersStore::patch(&store, id, WorkerPatch::default(), read).expect("the patch");
     assert_eq!(
-        health.connected(id, read).moved(),
+        health.connected(id, read, &|| true).moved(),
         None,
         "a stale signal is dropped"
     );
@@ -404,7 +455,7 @@ fn a_connect_signal_read_under_a_revision_the_row_left_is_dropped() {
         "and the row stays as it stood"
     );
     assert_eq!(
-        health.connected(id, read + 1).moved(),
+        health.connected(id, read + 1, &|| true).moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Ready)),
         "the signal read under the row's revision promotes"
     );
@@ -420,11 +471,11 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     let revision = || WorkersStore::get(&store, id).expect("the row").revision;
     // A write that moves nothing is judged, and says the status that stands.
     assert_eq!(
-        health.probe_outcome(id, true, revision()),
+        health.probe_outcome(id, true, revision(), &|| true),
         Stood(WorkerStatus::Pending)
     );
     assert_eq!(
-        health.probe_outcome(id, true, revision()),
+        health.probe_outcome(id, true, revision(), &|| true),
         Moved {
             from: WorkerStatus::Pending,
             to: WorkerStatus::Ready
@@ -434,13 +485,16 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     // failures ahead of it and one behind it are the threshold's three.
     for _ in 0..2 {
         assert_eq!(
-            health.probe_outcome(id, false, revision()),
+            health.probe_outcome(id, false, revision(), &|| true),
             Stood(WorkerStatus::Ready)
         );
     }
-    assert_eq!(health.connected(id, revision()), Stood(WorkerStatus::Ready));
     assert_eq!(
-        health.probe_outcome(id, false, revision()),
+        health.connected(id, revision(), &|| true),
+        Stood(WorkerStatus::Ready)
+    );
+    assert_eq!(
+        health.probe_outcome(id, false, revision(), &|| true),
         Moved {
             from: WorkerStatus::Ready,
             to: WorkerStatus::NotReady
@@ -452,15 +506,15 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     // threshold's two.
     let left = revision();
     WorkersStore::patch(&store, id, WorkerPatch::default(), left).expect("the patch");
-    assert_eq!(health.probe_outcome(id, true, left), Stale);
-    assert_eq!(health.connected(id, left), Stale);
+    assert_eq!(health.probe_outcome(id, true, left, &|| true), Stale);
+    assert_eq!(health.connected(id, left, &|| true), Stale);
     assert_eq!(
-        health.probe_outcome(id, true, revision()),
+        health.probe_outcome(id, true, revision(), &|| true),
         Stood(WorkerStatus::NotReady),
         "the stale pass was not counted"
     );
     assert_eq!(
-        health.probe_outcome(id, true, revision()),
+        health.probe_outcome(id, true, revision(), &|| true),
         Moved {
             from: WorkerStatus::NotReady,
             to: WorkerStatus::Ready
@@ -469,14 +523,14 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     // A draining row stands at the signal too.
     WorkersStore::set_status(&store, id, WorkerStatus::Draining, revision()).expect("drained");
     assert_eq!(
-        health.connected(id, revision()),
+        health.connected(id, revision(), &|| true),
         Stood(WorkerStatus::Draining)
     );
     // A write for a worker whose row is gone says no row.
     let last = revision();
     store.remove(id, last).expect("removed");
-    assert_eq!(health.probe_outcome(id, true, last), NoRow);
-    assert_eq!(health.connected(id, last), NoRow);
+    assert_eq!(health.probe_outcome(id, true, last, &|| true), NoRow);
+    assert_eq!(health.connected(id, last, &|| true), NoRow);
 }
 
 #[test]
@@ -1683,9 +1737,9 @@ fn a_lease_above_the_stores_term_is_refused_and_one_below_is_kept() {
         1,
         "the undispatched lease passed its deadline"
     );
-    assert_eq!(expired[0].lease.id, LeaseId(2));
+    assert_eq!(expired[0].record.lease.id, LeaseId(2));
     assert_eq!(
-        expired[0].state,
+        expired[0].record.state,
         LeaseState::Released(ReleaseReason::Abandoned)
     );
     assert_eq!(leases.live(gateway), 1);
@@ -1809,6 +1863,408 @@ fn done(side: Side) -> Outcome {
 fn sides(store: &MemoryStore, id: u64) -> Option<(LeaseState, LeaseState)> {
     let found = LeasesStore::sides(store, GatewayId(1), LeaseId(id))?;
     Some((found.record.state, found.decode?.state))
+}
+
+/// A pair filed with its decode targets chosen.
+fn chosen_pair(
+    id: u64,
+    prefill: WorkerId,
+    decodes: &[WorkerId],
+    now: Instant,
+) -> (LeaseRecord, DecodeSide) {
+    let (mut record, mut decode) = pair(id, prefill, decodes, now);
+    record.dispatch_deadline = now + DISPATCH_TTL;
+    decode.state = LeaseState::Chosen;
+    (record, decode)
+}
+
+#[test]
+fn a_chosen_decode_side_books_nothing_and_waits_under_no_deadline() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+    let (record, mut decode) = chosen_pair(1, p, &[d], now);
+    decode.session = Session::from_raw(41);
+    issue_pair(leases, (record, decode)).expect("the key is free");
+    assert_eq!(booked(&store, &[p, d]), [1, 0]);
+    assert!(carried(&store, decode.session).is_empty());
+    assert!(decode.state.is_chosen());
+    assert!(!decode.state.is_live());
+    assert!(!decode.state.is_issued());
+    assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    assert!(leases.expire(now + Duration::from_secs(9)).is_empty());
+    assert_eq!(store.queued(), 0);
+    assert_eq!(
+        sides(&store, 1),
+        Some((LeaseState::Dispatched { at: now }, LeaseState::Chosen))
+    );
+}
+
+#[test]
+fn a_call_issues_the_chosen_side_afresh_and_books_it_once() {
+    let store = MemoryStore::new().with_deciders(2);
+    let [p, d0, d1] = ["http://p:1", "http://d0:1", "http://d1:1"].map(|key| ready(&store, key));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let (_, mut decode) = pair(0, p, &[d1, d0], now);
+    decode.session = Session::from_raw(42);
+    decode.tokens = 24;
+    decode.state = LeaseState::issued(Some(9_000_000));
+    decode.target_index = 1;
+
+    let id = LeaseId(1);
+    issue_pair(leases, chosen_pair(id.0, p, &[d0], now)).expect("the key is free");
+    assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    let prefill = leases.get(gateway, id);
+    assert_eq!(leases.issue_decode(gateway, id, decode, now), Ok(()));
+    let filed = leases.sides(gateway, id).expect("on file");
+    assert_eq!(Some(filed.record), prefill);
+    assert_eq!(
+        filed.decode,
+        Some(DecodeSide {
+            target_index: 0,
+            ..decode
+        })
+    );
+    assert_eq!(filed.target_of(Side::Decode, 0), Some((d1, 0)));
+    assert_eq!(filed.target_of(Side::Decode, 1), Some((d0, 0)));
+    assert_eq!(booked(&store, &[p, d0, d1]), [1, 0, 1]);
+    assert_eq!(carried(&store, decode.session), [(d1, 1)]);
+    assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
+    assert!(carried(&store, decode.session).is_empty());
+
+    // A lease of an older term in block one names the second file.
+    let id = LeaseId(1 << 20 | 2);
+    assert_eq!(store.file_of(id), 1);
+    issue_pair(leases, chosen_pair(id.0, p, &[d0], now)).expect("the key is free");
+    assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    let mut heard = None;
+    assert!(store.unlocked());
+    let issued = store
+        .issue_decided_decode(gateway, id, decode, None, now, |lease| {
+            assert!(!store.unlocked(), "the issue is told under the turn");
+            heard = Some(*lease);
+        })
+        .expect("the prefill holds the chosen side");
+    assert_eq!(heard, Some(issued));
+    assert_eq!(
+        (
+            issued.id,
+            issued.side,
+            issued.booked,
+            issued.target_index,
+            issued.session,
+            issued.tokens
+        ),
+        (id, Side::Decode, d1, 0, decode.session, decode.tokens)
+    );
+    assert_eq!(
+        booked(&store, &[p, d0, d1]),
+        [1, 0, 0],
+        "no slot was supplied"
+    );
+}
+
+#[test]
+fn the_call_starts_the_dispatch_deadline_again() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, id, t0) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+    issue_pair(leases, chosen_pair(1, p, &[d], t0)).expect("the key is free");
+    assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), t0));
+    let pending = DecodeSide {
+        state: LeaseState::Chosen,
+        ..decode_side(d)
+    };
+    let now = t0 + Duration::from_secs(8);
+    assert_eq!(leases.issue_decode(gateway, id, pending, now), Ok(()));
+    assert_eq!(
+        sides(&store, 1),
+        Some((LeaseState::Dispatched { at: t0 }, LeaseState::ISSUED))
+    );
+    assert!(leases.expire(t0 + Duration::from_secs(9)).is_empty());
+    assert_eq!(store.queued(), 1);
+    assert_eq!(booked(&store, &[p, d]), [1, 1]);
+    let swept = leases.expire(t0 + Duration::from_secs(14));
+    let filed = leases.sides(gateway, id).expect("the prefill still stands");
+    assert_eq!(swept, [filed]);
+    assert_eq!(filed.record.state, LeaseState::Dispatched { at: t0 });
+    assert_eq!(
+        filed.decode.map(|side| side.state),
+        Some(LeaseState::Released(ReleaseReason::Abandoned))
+    );
+    assert_eq!(booked(&store, &[p, d]), [1, 0]);
+}
+
+#[test]
+fn the_call_is_refused_by_name() {
+    use DecodeRefused::{DecodeStands, NoLease, NotChosen, PrefillNotHeld};
+
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let (mut ended, decode) = chosen_pair(4, p, &[d], now);
+    ended.state = LeaseState::Completed;
+    issue_pair(leases, (ended, decode)).expect("the key is free");
+    leases
+        .issue(booking(gateway, 1, p, now))
+        .expect("the key is free");
+    issue_pair(leases, pair(2, p, &[d], now)).expect("the key is free");
+    for id in [3, 5, 6] {
+        issue_pair(leases, chosen_pair(id, p, &[d], now)).expect("the key is free");
+    }
+    for id in [2, 5, 6] {
+        assert!(leases.dispatched(gateway, LeaseId(id), on(Side::Prefill, 0), now));
+    }
+    let decode = decode_side(d);
+    assert_eq!(
+        leases.issue_decode(gateway, LeaseId(5), decode, now),
+        Ok(())
+    );
+    assert!(leases.dispatched(gateway, LeaseId(6), on(Side::Decode, 0), now));
+    let refused = |owner, id, reason| {
+        let before = (
+            leases.sides(gateway, id),
+            booked(&store, &[p, d]),
+            store.queued(),
+        );
+        let later = now + Duration::from_secs(8);
+        assert_eq!(
+            leases.issue_decode(owner, id, decode, later),
+            Err(reason),
+            "{owner:?} {id:?}"
+        );
+        assert_eq!(
+            (
+                leases.sides(gateway, id),
+                booked(&store, &[p, d]),
+                store.queued()
+            ),
+            before
+        );
+    };
+    refused(GatewayId(2), LeaseId(5), NoLease);
+    refused(gateway, LeaseId(1), NotChosen);
+    refused(gateway, LeaseId(2), NotChosen);
+    refused(gateway, LeaseId(3), PrefillNotHeld);
+    refused(gateway, LeaseId(4), PrefillNotHeld);
+    refused(gateway, LeaseId(5), DecodeStands);
+    refused(gateway, LeaseId(6), DecodeStands);
+    for id in [2, 5, 6] {
+        assert!(leases.completed(gateway, LeaseId(id), &done(Side::Decode)));
+    }
+    refused(gateway, LeaseId(2), NotChosen);
+    refused(gateway, LeaseId(5), DecodeStands);
+    refused(gateway, LeaseId(6), DecodeStands);
+    assert!(leases.completed(gateway, LeaseId(3), &done(Side::Prefill)));
+    refused(gateway, LeaseId(3), NoLease);
+}
+
+#[test]
+fn a_dispatch_on_a_chosen_side_books_it_once_as_it_lands() {
+    let store = MemoryStore::new();
+    let [p, d0, d1] = ["http://p:1", "http://d0:1", "http://d1:1"].map(|key| ready(&store, key));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    for (index, target, booked_index, counts) in
+        [(1, d1, 1, [1, 0, 1]), (u8::MAX, d0, 0, [1, 1, 0])]
+    {
+        let id = LeaseId(u64::from(index));
+        let (record, mut decode) = chosen_pair(id.0, p, &[d0, d1], now);
+        decode.session = Session::from_raw(41);
+        issue_pair(leases, (record, decode)).expect("the key is free");
+        assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
+        assert!(leases.expire(now + DISPATCH_TTL).is_empty());
+        assert_eq!(store.queued(), 0);
+        let at = now + Duration::from_secs(8);
+        assert!(leases.dispatched(gateway, id, on(Side::Decode, index), at));
+        let filed = leases.sides(gateway, id).expect("on file");
+        assert_eq!(
+            filed.decode,
+            Some(DecodeSide {
+                target,
+                target_index: booked_index,
+                state: LeaseState::Dispatched { at },
+                ..decode
+            })
+        );
+        assert_eq!(booked(&store, &[p, d0, d1]), counts);
+        assert_eq!(carried(&store, decode.session), [(target, 1)]);
+        assert_eq!(store.queued(), 0);
+        assert!(leases.dispatched(gateway, id, on(Side::Decode, 0), now));
+        assert_eq!(leases.sides(gateway, id), Some(filed));
+        assert_eq!(booked(&store, &[p, d0, d1]), counts);
+        assert_eq!(carried(&store, decode.session), [(target, 1)]);
+        assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
+        assert_eq!(booked(&store, &[p, d0, d1]), [0, 0, 0]);
+        assert!(carried(&store, decode.session).is_empty());
+    }
+}
+
+#[test]
+fn a_chosen_side_ends_with_its_prefill() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+    issue_pair(leases, chosen_pair(1, p, &[d], now)).expect("the key is free");
+    assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    // The gateway gives the chosen side up: its end stands and no call
+    // issues it.
+    assert!(leases.released(gateway, id, Some(Side::Decode), ReleaseReason::ClientGone));
+    let gone = LeaseState::Released(ReleaseReason::ClientGone);
+    assert_eq!(
+        sides(&store, 1),
+        Some((LeaseState::Dispatched { at: now }, gone))
+    );
+    let decode = chosen_pair(1, p, &[d], now).1;
+    assert_eq!(
+        leases.issue_decode(gateway, id, decode, now),
+        Err(DecodeRefused::DecodeStands)
+    );
+    assert_eq!(booked(&store, &[p, d]), [1, 0]);
+    assert!(leases.completed(gateway, id, &done(Side::Prefill)));
+    assert_eq!(leases.sides(gateway, id), None);
+    assert_eq!(store.paired(), [vec![], vec![]]);
+    assert_eq!(booked(&store, &[p, d]), [0, 0]);
+}
+
+#[test]
+fn a_chosen_side_dispatched_by_a_handed_frame_is_told_once() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (id, now) = (LeaseId(1), Instant::now());
+    leases.set_term(1);
+    store.tell_through(heard);
+    issue_pair(leases, chosen_pair(1, p, &[d], now)).expect("the key is free");
+    drop(told_sides());
+    let hand = Hand::new(GatewayId(1));
+    let sent = |side| Said::Dispatched(on(side, 0), now);
+    store.hand(&hand, id, sent(Side::Prefill));
+    store.hand(&hand, id, sent(Side::Decode));
+    store.hand(&hand, id, sent(Side::Decode));
+    // Each side's dispatch is told once, with the lease as its frame found
+    // it: the decode side stood chosen.
+    let told: Vec<_> = told_sides()
+        .into_iter()
+        .map(|(found, said)| (found.decode.map(|side| side.state), said))
+        .collect();
+    let chosen = Some(LeaseState::Chosen);
+    assert_eq!(
+        told,
+        [(chosen, sent(Side::Prefill)), (chosen, sent(Side::Decode))]
+    );
+    assert_eq!(booked(&store, &[p, d]), [1, 1]);
+}
+
+#[test]
+fn a_release_of_every_side_frees_a_chosen_side_s_place() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+    issue_pair(leases, chosen_pair(1, p, &[d], now)).expect("the key is free");
+    assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
+    assert_eq!(leases.sides(gateway, id), None);
+    assert_eq!(store.paired(), [vec![], vec![]]);
+    assert_eq!(booked(&store, &[p, d]), [0, 0]);
+}
+
+#[test]
+fn the_sweep_s_answer_tells_a_decode_side_that_completed_from_one_it_abandoned() {
+    let store = MemoryStore::new();
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let (p, d) = (WorkerId(7), WorkerId(8));
+    leases.set_term(1);
+    store.tell_through(heard);
+    drop(told_sides());
+    for id in [1, 2] {
+        issue_pair(leases, pair(id, p, &[d], now)).expect("the key is free");
+    }
+    assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Decode, 0), now));
+    assert!(leases.completed(gateway, LeaseId(1), &done(Side::Decode)));
+    let expired = leases.expire(now + Duration::from_secs(2));
+    let states = expired.iter().map(|sides| {
+        (
+            sides.record.lease.id,
+            sides.record.state,
+            sides.decode.map(|side| side.state),
+        )
+    });
+    let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
+    assert_eq!(
+        states.collect::<Vec<_>>(),
+        [
+            (LeaseId(1), abandoned, Some(LeaseState::Completed)),
+            (LeaseId(2), abandoned, Some(abandoned)),
+        ]
+    );
+    assert_eq!(leases.live(gateway), 0);
+    let told = |id, side| {
+        (
+            LeaseId(id),
+            Said::Released(Some(side), ReleaseReason::Abandoned),
+        )
+    };
+    let ends = told_sides()
+        .into_iter()
+        .map(|(sides, said)| (sides.record.lease.id, said));
+    assert_eq!(
+        ends.collect::<Vec<_>>(),
+        [
+            told(1, Side::Prefill),
+            told(2, Side::Prefill),
+            told(2, Side::Decode)
+        ]
+    );
+}
+
+#[test]
+fn a_pair_s_decode_side_is_told_issued_on_the_decode_worker() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    store.set_term(1);
+    let (mut record, mut decode) = pair(0, p, &[d], Instant::now());
+    record.lease.booked = p;
+    decode.session = Session::from_raw(41);
+    decode.tokens = 24;
+    let world = store.world();
+    let slots = [world.booked_of(p), world.booked_of(d)];
+    let heard = RefCell::new(Vec::new());
+    let prefill = store
+        .issue_decided_pair(record, decode, slots, |lease| {
+            heard.borrow_mut().push(*lease);
+        })
+        .expect("minted under the store's term");
+    let decode = Lease {
+        side: Side::Decode,
+        booked: d,
+        session: decode.session,
+        tokens: decode.tokens,
+        ..prefill
+    };
+    assert_eq!(heard.into_inner(), [prefill, decode]);
+}
+
+#[test]
+fn a_pair_with_both_sides_waiting_takes_one_place_of_the_queue() {
+    let store = MemoryStore::new();
+    store.set_term(1);
+    let (p, d) = (WorkerId(7), WorkerId(8));
+    issue_pair(&store, pair(1, p, &[d], Instant::now())).expect("the key is free");
+    assert_eq!(store.queued(), 1);
 }
 
 /// A pair filed with a side that ended books the side that lives, and
@@ -2054,12 +2510,12 @@ fn the_dispatch_deadline_ends_each_side_that_waits_and_a_dispatched_side_stands(
     assert!(leases.completed(gateway, LeaseId(1), &done(Side::Prefill)));
     assert_eq!(leases.get(gateway, LeaseId(1)), None);
     assert_eq!(booked(&store, &[p, d]), [1, 0]);
-    // The store's own sweep hands a pair's record back as it left its
-    // prefill part.
+    // The store's own sweep returns both sides as it left them.
     issue_pair(leases, pair(3, p, &[d], later)).expect("the key is free");
     assert!(leases.dispatched(gateway, LeaseId(3), on(Side::Decode, 0), later));
     let swept = leases.expire(later + Duration::from_secs(9));
-    let third = |record: &LeaseRecord| (record.lease.id, record.state) == (LeaseId(3), abandoned);
+    let third =
+        |found: &Sides| (found.record.lease.id, found.record.state) == (LeaseId(3), abandoned);
     assert!(swept.iter().any(third));
     let at = LeaseState::Dispatched { at: later };
     assert_eq!(sides(&store, 3), Some((abandoned, at)));
@@ -2108,14 +2564,16 @@ fn a_pair_issued_under_a_rule_with_a_ttl_stands_and_ends_as_any_pair() {
     let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
     assert_eq!(sides(&store, 1), Some((dispatched, dispatched)));
     assert_eq!(sides(&store, 2), Some((dispatched, abandoned)));
-    // The store's own sweep hands such a pair's record back as its
-    // prefill part stood, and the decode side's end is read from the
-    // store.
+    // The store's own sweep returns the prefill as it stood and the
+    // decode side as the sweep left it.
     issue_pair(leases, keyed(3, later)).expect("the key is free");
     assert!(leases.dispatched(gateway, LeaseId(3), on(Side::Prefill, 0), later));
     let swept = leases.expire(later + Duration::from_secs(9));
     let at = LeaseState::Dispatched { at: later };
-    let third = |record: &LeaseRecord| (record.lease.id, record.state) == (LeaseId(3), at);
+    let third = |found: &Sides| {
+        (found.record.lease.id, found.record.state) == (LeaseId(3), at)
+            && found.decode.is_some_and(|decode| decode.state == abandoned)
+    };
     assert!(swept.iter().any(third));
     assert_eq!(sides(&store, 3), Some((at, abandoned)));
 }
@@ -2569,7 +3027,7 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     assert_eq!(store.kv().held_blocks("m"), 1);
     assert_eq!(WorkersStore::get(&store, id), Some(expected));
     assert_eq!(
-        store.probe_outcome(id, false, revision),
+        store.probe_outcome(id, false, revision, &|| true),
         HealthWrite::Moved {
             from: WorkerStatus::Ready,
             to: WorkerStatus::NotReady
@@ -4322,7 +4780,7 @@ fn the_dispatch_deadlines_fall_due_in_their_own_order_whatever_order_they_were_f
     }
     let due = |secs: u64| {
         let ended = leases.expire(now + Duration::from_secs(secs));
-        let ids = ended.iter().map(|record| record.lease.id.0);
+        let ids = ended.iter().map(|found| found.record.lease.id.0);
         ids.collect::<Vec<u64>>()
     };
     assert_eq!(due(0), NONE);
@@ -4676,12 +5134,41 @@ fn the_sweep_applies_at_a_watched_file_whose_thread_waits() {
     assert_eq!(told_ids(), []);
     // Past both leases' dispatch deadline.
     let ended = LeasesStore::expire(&*store, now + Duration::from_secs(6));
-    let ended: Vec<_> = ended.iter().map(|record| record.lease.id).collect();
+    let ended: Vec<_> = ended.iter().map(|found| found.record.lease.id).collect();
     assert_eq!(ended, [ids[1]]);
     let abandoned = Said::Released(None, ReleaseReason::Abandoned);
     assert_eq!(told_ids(), [(1, dispatch), (2, abandoned)]);
     assert_eq!(in_flight(&store), [(a, 1)]);
     assert_eq!(place.look(), Watch::Quiet, "the dispatched lease stands");
+}
+
+/// The sweep applies a release left by a thread that unwound even where
+/// the dispatched lease has no place left in the deadline queue.
+#[test]
+fn the_sweep_applies_a_release_left_before_an_unwind() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(1, now);
+    let hand = Hand::new(GatewayId(1));
+    let dispatch = Said::Dispatched(Dispatch::default(), now);
+    store.hand(&hand, ids[0], dispatch);
+    assert_eq!(told_ids(), [(1, dispatch)]);
+    assert!(LeasesStore::expire(&*store, now + Duration::from_secs(6)).is_empty());
+    assert_eq!(store.queued(), 0, "the dispatched lease's place is popped");
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut place = store.at_work();
+        assert_eq!(place.look(), Watch::Quiet);
+        store.hand(&hand, ids[0], GONE);
+        assert_eq!(told_ids(), []);
+        panic!("leave the release for the sweep");
+    }));
+    assert!(unwound.is_err());
+
+    assert!(LeasesStore::expire(&*store, now + Duration::from_secs(6)).is_empty());
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(1, GONE)], vec![(a, 0)])
+    );
 }
 
 /// A full ring under a watch: the hand that finds it applies where the
@@ -5871,7 +6358,7 @@ fn the_sweep_ends_a_resting_files_due_leases_under_its_deciders_name() {
         let ended = LeasesStore::expire(store, late);
         ended
             .iter()
-            .map(|record| record.lease.id)
+            .map(|found| found.record.lease.id)
             .collect::<Vec<_>>()
     };
     let (began, working) = mpsc::sync_channel(1);

@@ -364,11 +364,15 @@ impl Checked {
                 // The frame carries no signal cells: they stand beside
                 // the rows of the host that decides.
                 signal_cells: None,
+                // The wire carries no client key yet: a request with no
+                // session key is placed as one with no key.
+                client_key: 0,
             },
             &Constraints {
                 excluded: &lists.excluded,
                 wire_modes: self.wires().unwrap_or_default(),
                 overload_lifted: constraints.overload_lifted,
+                decode_later: self.decode_later(),
                 subset_hint: constraints.subset_hint,
                 demands: Demands::default(),
                 // The asking gateway's standing vetoes beside lent rows,
@@ -412,6 +416,10 @@ impl Asked for Checked {
         Demands::default()
     }
 
+    fn decode_later(&self) -> bool {
+        false
+    }
+
     fn hashes(&self) -> usize {
         Self::hashes(self)
     }
@@ -422,6 +430,10 @@ impl Asked for Checked {
 
     fn block_hashes(&self) -> &[u64] {
         Self::block_hashes(self)
+    }
+
+    fn cache_namespace(&self) -> (u64, HashKind) {
+        (self.facts.namespace_seed, self.hash_kind)
     }
 
     fn seed(&self) -> u64 {
@@ -1270,6 +1282,7 @@ mod tests {
                 WireModes::GRPC.union(WireModes::ZMQ)
             );
             assert!(constraints.overload_lifted);
+            assert!(!constraints.decode_later);
             assert_eq!(constraints.subset_hint, Some(0));
         });
     }

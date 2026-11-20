@@ -830,6 +830,13 @@ profiles:
 bindings:
   - match: { model: "*" }
     profile: consistent_hashing
+    routing_key:
+      sources:
+        - header: x-smg-routing-key
+        - header: x-forwarded-for
+          client: true
+        - header: cookie
+          client: true
 ```
 
 ### `prefix_hash`
@@ -852,6 +859,9 @@ profiles:
 bindings:
   - match: { model: "*" }
     profile: prefix_hash
+    routing_key:
+      sources:
+        - header: x-smg-routing-key
 ```
 
 ### `manual`

@@ -4250,6 +4250,9 @@ pub(crate) mod tests {
         document.generation = 1;
         document.view.headers = manual.view.headers.clone();
         let binding = document.bindings.first_mut().expect("the preset's binding");
+        // The rule names the key's header, so the ring's own sources go: a
+        // binding names them once.
+        binding.routing_key = None;
         binding.sessions = Some(rule);
         binding.overload = Some(crate::spec::OverloadSpec {
             waiting_requests: Some(1),
@@ -4946,6 +4949,7 @@ pub(crate) mod tests {
                 let naming = Naming {
                     gateway: GATEWAY,
                     block_hashes: &[1, 2],
+                    namespace_seed: 0,
                     seed,
                     cap: 16,
                     wires: Some(WireModes::GRPC),
@@ -5463,6 +5467,51 @@ pub(crate) mod tests {
         };
         let side = |lease: &proto::Lease| (lease.id, lease.side(), lease.target_index);
         decision.leases.iter().map(side).collect()
+    }
+
+    #[tokio::test]
+    async fn a_pair_s_reply_names_the_decode_side_s_own_session() {
+        use crate::view::{Identity, Phase};
+
+        let document: PolicySpec = serde_json::from_str(
+            r#"{
+              "apiVersion": "smg.policy/v1",
+              "generation": 1,
+              "profiles": { "p": { "pick": "random" } },
+              "bindings": [
+                { "plan": "pd-pair", "profiles": { "prefill": "p", "decode": "p" } }
+              ]
+            }"#,
+        )
+        .expect("a document of this build");
+        let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
+        let key = 17;
+        let session = |phase| {
+            RequestFacts {
+                model: MODEL,
+                phase,
+                session_key: Identity::hashed(key),
+                ..RequestFacts::default()
+            }
+            .session()
+            .get()
+        };
+        let frame = keyed(session(Phase::Prefill), 77);
+        let answer = bed.ask(phased(frame, proto::Phase::Prefill)).await;
+        let Some(Answer::Decision(decision)) = answer.answer else {
+            panic!("a decision: {answer:?}");
+        };
+        let leases = decision
+            .leases
+            .iter()
+            .map(|lease| (lease.side(), lease.session_key));
+        assert_eq!(
+            leases.collect::<Vec<_>>(),
+            [
+                (proto::Side::Prefill, session(Phase::Prefill)),
+                (proto::Side::Decode, session(Phase::Decode)),
+            ]
+        );
     }
 
     /// A pair's ask reads what both sides' profiles read. The prefill

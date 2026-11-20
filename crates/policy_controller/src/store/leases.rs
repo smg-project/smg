@@ -18,8 +18,7 @@ use crate::{
 /// A lease still issued past it is released as abandoned.
 pub(crate) const DISPATCH_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Where a lease stands, or one side of a pair's lease: each side moves by
-/// its own frames.
+/// The state of a single's lease or of one side of a pair's lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeaseState {
     /// Decided, not yet dispatched; the dispatch deadline bounds this. It
@@ -39,9 +38,18 @@ pub enum LeaseState {
     },
     Completed,
     Released(ReleaseReason),
+    /// A pair's decode targets before issue. The side books no count and
+    /// has no dispatch deadline. A lease record's own state is never chosen.
+    Chosen,
 }
 
 impl LeaseState {
+    /// Whether the decode side holds a choice that has yet to be issued or
+    /// dispatched.
+    pub const fn is_chosen(self) -> bool {
+        matches!(self, Self::Chosen)
+    }
+
     /// Whether a frame still moves a lease that stands so: issued or
     /// dispatched.
     pub const fn is_live(self) -> bool {
@@ -141,13 +149,12 @@ impl Picked {
 }
 
 /// The decode side of a pair's lease, as the store keeps it beside the
-/// lease's record ([`Sides`]). The two sides share the lease's id, its
-/// generation and its issue; each has its worker, its booking and its
-/// state, and lives by its own frames.
+/// lease's record ([`Sides`]). The sides share the lease's id and generation.
+/// Each has its own target, state, and, when live, booking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodeSide {
-    /// The worker the side books: the chosen pair's decode, until the
-    /// side's `Dispatched` names another target of the pick.
+    /// The first decode target of the pick, or the worker the side moved
+    /// to at dispatch.
     pub target: WorkerId,
     /// The decodes of the pick's other targets and every target's decode
     /// rank, for that `Dispatched`.
@@ -156,27 +163,25 @@ pub struct DecodeSide {
     pub session: Session,
     /// Where the side stands.
     pub state: LeaseState,
-    /// The token-work the side books on its worker.
+    /// The token-work the side carries when issued.
     pub tokens: u32,
-    /// Which target of the pick the side books.
+    /// The index of the side's target in the pick.
     pub target_index: u8,
 }
 
 impl DecodeSide {
     /// The worker and the rank a `Dispatched` on the side names by its
-    /// target `index`: the decode the side books at the side's own index,
+    /// target `index`: the side's target at its own index,
     /// else the decode of the pick's target at that index
     /// ([`LeaseRecord::target_at`], for this side).
     pub fn target_at(&self, index: u8) -> Option<(WorkerId, u16)> {
         self.picked.at(self.target, self.target_index, index)
     }
 
-    /// The side's lease: `prefill`, the record's own, with what is the
-    /// decode side's. The worker it books ([`Lease::booked`]) is the
-    /// side's own, never the prefill's: a stage that books at the issue
-    /// reads it at the side's dispatch, which is told of the side as its
-    /// issue left it. Behind a dispatch that moved the side, the lease
-    /// names the worker the side moved to.
+    /// Builds the side's lease from the shared fields on `prefill` and
+    /// the decode side's own fields. [`Lease::booked`] names the decode
+    /// target at the read, including any move at dispatch. A dispatch
+    /// hook for an issued side reads the lease as it stood at issue.
     pub fn lease(&self, prefill: &Lease) -> Lease {
         Lease {
             side: Side::Decode,
@@ -222,8 +227,9 @@ pub struct LeaseRecord {
     /// The term of the leader that issued the lease.
     pub term: u64,
     pub issued_at: Instant,
-    /// Past it, an undispatched lease is released as abandoned.
+    /// Past it, an issued side is released as abandoned.
     pub dispatch_deadline: Instant,
+    /// The state of a single's lease or a pair's prefill side.
     pub state: LeaseState,
 }
 
@@ -276,8 +282,8 @@ impl Sides {
     /// The lease `side` names and where that side stands. A pair holds a
     /// prefill side, the record's own lease and state, and a decode side;
     /// `None` for another side. A single's lease reads no side: it is its
-    /// one lease under any. Each side's lease names the worker that side
-    /// books.
+    /// one lease under any. Each side's lease names its own target. The
+    /// state says whether the side is live.
     pub fn side(&self, side: Side) -> Option<(Lease, LeaseState)> {
         let record = &self.record;
         let Some(decode) = self.decode else {
@@ -364,6 +370,20 @@ pub enum LeaseRefused {
     Unclaimed,
 }
 
+/// Why a call could not issue the decode side of a pair's lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeRefused {
+    /// No lease of the gateway under that id.
+    NoLease,
+    /// The lease was filed without a chosen decode side.
+    NotChosen,
+    /// The prefill side is waiting for dispatch or has ended.
+    PrefillNotHeld,
+    /// The chosen side was already issued or dispatched, even if it has
+    /// ended, or its host gave it up.
+    DecodeStands,
+}
+
 /// Where leases are recorded.
 ///
 /// A lease carries the term of the leader that issued it; a record whose term
@@ -386,9 +406,25 @@ pub trait LeasesStore: Send + Sync {
 
     /// Files a pair's lease: `record`, its prefill part, with `decode`,
     /// its decode side, under one hold. The record takes the mark of a
-    /// pair's lease. A pair that is handed to another store travels by
-    /// this door, with its decode side.
+    /// pair's lease. A chosen decode side is filed without a booking or
+    /// a dispatch deadline of its own. A pair that is handed to another
+    /// store travels by this door, with its decode side.
     fn issue_pair(&self, record: LeaseRecord, decode: DecodeSide) -> Result<(), LeaseRefused>;
+
+    /// Issues the pair's chosen decode side once, while its prefill is
+    /// dispatched and still held. The side takes `decode`'s targets,
+    /// session, and tokens, books its first target, and has a new dispatch
+    /// deadline starting at `now`.
+    ///
+    /// If `decode` carries an issued state's session TTL, the new side
+    /// keeps it.
+    fn issue_decode(
+        &self,
+        gateway: GatewayId,
+        lease: LeaseId,
+        decode: DecodeSide,
+        now: Instant,
+    ) -> Result<(), DecodeRefused>;
 
     /// The gateway dispatched the lease as `dispatch` says, at `at`;
     /// `false` when the lease is unknown. A first dispatch that names
@@ -397,7 +433,8 @@ pub trait LeasesStore: Send + Sync {
     /// and the count the lease books. On a pair's lease the dispatch moves
     /// the side it names and no other: a decode's on another target moves
     /// the decode's booking alone, and a side the lease does not hold
-    /// changes nothing.
+    /// changes nothing. A dispatch on a chosen decode side books the
+    /// named target, or the first target if the index names none.
     fn dispatched(
         &self,
         gateway: GatewayId,
@@ -406,9 +443,9 @@ pub trait LeasesStore: Send + Sync {
         at: Instant,
     ) -> bool;
 
-    /// A side completed; `false` when the lease is unknown. A pair's side
-    /// ends alone and gives its count back, and the lease leaves the file
-    /// at its last side's end.
+    /// A side completed. Returns `false` when the lease is unknown. A
+    /// pair's live side ends alone and gives its count back. The lease
+    /// and any chosen side leave the file at the last live side's end.
     fn completed(&self, gateway: GatewayId, lease: LeaseId, outcome: &Outcome) -> bool;
 
     /// The gateway gave the lease up, on `side` or, with `None`, on every
@@ -430,15 +467,12 @@ pub trait LeasesStore: Send + Sync {
     /// a pair's, its decode side.
     fn sides(&self, gateway: GatewayId, lease: LeaseId) -> Option<Sides>;
 
-    /// Release the issued leases whose dispatch deadline passed at `now` as
-    /// abandoned; returns them. A pair's side that waits ends alone, and
-    /// its record is returned as the call left its prefill part. A store
-    /// that keeps a file of leases a decider ends them where its caller
-    /// may act: it passes a file whose decider is at work, which ends its
-    /// own at its issues, so what is returned can be a part of the leases
-    /// that are due. Such a store tells its engine of each end itself: a
-    /// caller tells none again.
-    fn expire(&self, now: Instant) -> Vec<LeaseRecord>;
+    /// Releases issued sides past their dispatch deadline at `now` as
+    /// abandoned and returns both parts of each lease as the call left
+    /// them. A file whose decider is at work is left to its decider, who
+    /// ends due leases at its issues. The store tells the lifecycle of
+    /// each end itself.
+    fn expire(&self, now: Instant) -> Vec<Sides>;
 
     /// Restore what a gateway's `Hello` pages list, releasing what they
     /// omit; a record above the store's term is skipped, and so is one

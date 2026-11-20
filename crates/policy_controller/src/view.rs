@@ -983,6 +983,12 @@ pub struct RequestFacts<'a> {
     /// second signal adds none. In-process only: the contract's facts gain
     /// nothing.
     pub signal_cells: Option<&'a crate::signals::SignalCells>,
+    /// The fingerprint of the request's client key, `0` where it has none
+    /// ([`KeySources::derive_client`](crate::KeySources::derive_client)):
+    /// what a ring places by where the request carries no session key. It
+    /// lifts no overload veto, pins no session and is counted under no key.
+    /// In-process only: the wire carries no client key yet.
+    pub client_key: u64,
 }
 
 /// The multiplier that spreads a session's model and phase over its key.
@@ -1105,6 +1111,17 @@ impl<'a> RequestFacts<'a> {
         }
     }
 
+    /// The key a ring places the request by: its session key's fingerprint,
+    /// else its client's ([`RequestFacts::client_key`]), `0` where it has
+    /// neither.
+    #[must_use]
+    pub fn ring_key(&self) -> u64 {
+        match self.session_key.hash {
+            0 => self.client_key,
+            session => session,
+        }
+    }
+
     /// The session the request belongs to: its key within its model and
     /// phase, as one value; [`Session::NONE`] when it carries no key. One key names one
     /// session per model, and each side of a pair keeps its own. The value
@@ -1170,6 +1187,8 @@ pub struct Constraints<'a> {
     /// ([`RequestFacts::session_counted`]). An engine built by hand does
     /// not: its host says so here.
     pub overload_lifted: bool,
+    /// This pair's decode is sent after its prefill has run. Default: false.
+    pub decode_later: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
     /// What the request demands of the worker that takes it
@@ -1405,12 +1424,13 @@ mod tests {
 
     /// A request's facts are copied where a decision narrows or resumes
     /// them, so their size is a cost of those decisions: the pin is exact.
-    /// The signal cells are the last word, one for every signal: a field
-    /// the facts gain moves this number and carries the decision bench's
-    /// cells that copy the facts (`benches/decision.rs`).
+    /// The signal cells are one word, for every signal, and the client's
+    /// key is one word more: a field the facts gain moves this number and
+    /// carries the decision bench's cells that copy the facts
+    /// (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 288);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 296);
     }
 
     #[test]

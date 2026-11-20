@@ -258,18 +258,107 @@
       ]
     },
     "FilterSpec": {
-      "description": "A filter: its bare name, or the name of a filter the host adds mapped to its parameters.",
+      "description": "A filter: its bare name, a built-in mapped to its parameters, or the name of a filter the host adds mapped to its parameters.",
       "anyOf": [
         {
           "type": "string"
         },
         {
+          "$ref": "#/$defs/FilterStage"
+        },
+        {
           "type": "object",
           "minProperties": 1,
           "maxProperties": 1,
+          "propertyNames": {
+            "not": {
+              "const": "has-room"
+            }
+          },
           "additionalProperties": {
             "type": "object"
           }
+        }
+      ]
+    },
+    "FilterStage": {
+      "description": "A built-in filter with its parameters, keyed by the filter's name:\n`{ has-room: { used, capacity } }`. One key per entry.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "has-room": {
+              "$ref": "#/$defs/HasRoomParams"
+            }
+          },
+          "required": [
+            "has-room"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "HasRoomParams": {
+      "description": "`has-room` by a rule: a worker has room where what it holds is at most\nits capacity less the headroom, `used <= (1 - headroom) * capacity`.\nThe filter stays soft: where no worker has room, every worker stands.\nWritten bare, `has-room` reads the bit its host sets.",
+      "type": "object",
+      "properties": {
+        "used": {
+          "description": "What a worker holds: field names and their coefficients, summed. At\nleast one field is required. A worker that lacks a named value has\nno room.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "format": "double",
+            "minimum": -1000000000000000.0,
+            "maximum": 1000000000000000.0,
+            "not": {
+              "const": 0
+            }
+          },
+          "minProperties": 1,
+          "propertyNames": {
+            "enum": [
+              "candidate.in_flight",
+              "load.active_kv_permille",
+              "load.kv_usage_permille",
+              "load.queued",
+              "load.resident_tokens",
+              "load.running",
+              "load.waiting_uncached_tokens",
+              "request.prompt_tokens",
+              "sent.requests",
+              "sent.tokens"
+            ]
+          }
+        },
+        "capacity": {
+          "description": "What a worker can hold, in the units of `used`.",
+          "$ref": "#/$defs/Capacity"
+        },
+        "headroom": {
+          "description": "The share of the capacity kept free: from 0 to under 1.",
+          "type": "number",
+          "format": "double",
+          "default": 0.0,
+          "minimum": 0,
+          "exclusiveMaximum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "used",
+        "capacity"
+      ]
+    },
+    "Capacity": {
+      "description": "What a worker can hold: a number above zero in the units of `used`, or the name of a field that holds one. No field of this build holds a capacity.",
+      "anyOf": [
+        {
+          "type": "number",
+          "format": "double",
+          "exclusiveMinimum": 0
+        },
+        {
+          "type": "string"
         }
       ]
     },
@@ -1377,7 +1466,7 @@
           "minimum": 1
         },
         "token_usage": {
-          "description": "Mean KV usage over an engine's ranks at or above which a worker is\nvetoed; above 0 and at most 1 (default 0.8).",
+          "description": "Mean active KV usage over an engine's ranks at or above which a\nworker is vetoed; above 0 and at most 1 (default 0.8). A rank that\nreports no active share counts its whole usage.",
           "type": [
             "number",
             "null"
@@ -1399,13 +1488,13 @@
       "type": "object",
       "properties": {
         "sources": {
-          "description": "The sources, read in order: one to eight, each named once.",
+          "description": "The sources, read in order: one to eight, each named once, and up\nto four client sources beside them.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/KeySourceSpec"
           },
           "minItems": 1,
-          "maxItems": 8
+          "maxItems": 12
         },
         "strip_lineage": {
           "description": "Take the turn and retry suffixes off a key, so every turn of a\nconversation shares one (`conv_t2_r1` keys as `conv`); default\nfalse.",
@@ -1433,7 +1522,7 @@
           "type": "boolean"
         },
         "max_bytes": {
-          "description": "The most bytes of a value this source hands, 8192 at most (default\n128). A longer value is passed over and the next source is read.",
+          "description": "The most bytes of a value this source hands, 8192 at most (default\n128). A longer value is passed over and the next source is read. A\nheader is measured as sent, and the request's own id after the\nblock's `strip_lineage` took its suffixes off.",
           "type": [
             "integer",
             "null"
@@ -1441,6 +1530,10 @@
           "format": "uint32",
           "minimum": 1,
           "maximum": 8192
+        },
+        "client": {
+          "description": "A source that tells one client from another, not one session: a\nheader a proxy or a browser sets. Its key places a request that\ncarries no session key on a ring. It lifts no overload veto, pins\nno session and is counted under no key. Of a binding's client\nsources, the first whose header a request carries is the one read,\nand a value it cannot hand ends the read. The value is read whole\nand leaves as its fingerprint alone, so `rid` and `max_bytes` are\nrefused beside it. A header may be named both ways: capped as a\nsession's source, and whole as a client's where that read handed no\nkey. Default false.",
+          "type": "boolean"
         }
       },
       "additionalProperties": false

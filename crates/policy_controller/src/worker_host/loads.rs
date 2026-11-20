@@ -61,6 +61,8 @@ struct KeptMember {
 /// and its engine judged again, unless a later object was heard or asked
 /// under the row first: the loads are that object's then. Behind a reset
 /// no entry says whose they are, and a replaced object's forget keeps them.
+/// A reset drops the loads of every row that is not `Ready`, by the row's
+/// own status.
 /// The host publishes the store's pending writes.
 pub struct LoadAdapter<G, S: ?Sized> {
     objects: Arc<Objects<G>>,
@@ -303,11 +305,17 @@ impl<G: Generation, S: StoreLoadSink + ?Sized + 'static> LoadSink for LoadAdapte
     }
 
     fn reset(&self) {
-        // The store's rows stay. Each ends with the write that removes its
-        // worker, so no row of a worker the collector lost stands there,
-        // and a reset at a term's start would wipe the loads a standby
-        // followed.
+        // The loads of a row that is `Ready` stay. They end with the write
+        // that removes their worker, and a reset at a term's start would
+        // wipe the loads a standby followed.
         self.members.write().clear();
+        // The collector resets behind events it lost. A worker that left
+        // `Ready` among them was never forgotten, so the store drops the
+        // loads of every row that is not `Ready`. The status read is the
+        // row's: a standby followed it, and its objects may not have.
+        if self.leads() {
+            self.store.evict_unready();
+        }
     }
 }
 
@@ -399,6 +407,10 @@ mod tests {
         fn evict(&self, id: WorkerId) {
             self.calls.lock().evicts += 1;
             self.memory.evict(id);
+        }
+
+        fn evict_unready(&self) {
+            self.memory.evict_unready();
         }
     }
 
@@ -1002,6 +1014,29 @@ mod tests {
             adapter.poll_mode(&worker, now, PERIOD),
             PollMode::Suppressed
         );
+    }
+
+    /// The collector lost the event of a rank that left `Ready`, so it said
+    /// no forget. Its reset drops the loads of the row that is not `Ready`,
+    /// and the rank that stays is judged alone.
+    #[test]
+    fn a_reset_drops_the_loads_of_a_row_that_is_not_ready() {
+        let replica = Replica::new();
+        let adapter = replica.lead();
+        let now = Instant::now();
+        let [(zero, _first), (one, _second)] = busy_pair(&replica, &adapter, now);
+        let row = WorkersStore::get(&replica.store.memory, zero).expect("a row");
+        replica
+            .store
+            .memory
+            .set_status(zero, WorkerStatus::NotReady, row.revision);
+        replica.publish();
+        assert!(replica.overloaded(one, now));
+        adapter.reset();
+        assert_eq!(replica.store.ranks(zero), 0);
+        assert_eq!(replica.store.ranks(one), 1);
+        replica.publish();
+        assert!(!replica.overloaded(one, now));
     }
 
     #[test]

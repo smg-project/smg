@@ -518,9 +518,9 @@ message WorkerEvent {
   // kinds a watcher can ask for when the rows were read (a standby's
   // snapshot stands at the log's head, at or after it; the rows are the
   // same at both); the tail starts after it. A registration call's answer
-  // carries the position of the call's write, and where the call wrote
-  // nothing the last position of those kinds: a watcher that has passed it
-  // holds the row as answered or a later one.
+  // carries a position at or after the call's write, and where the call
+  // wrote nothing the last position of those kinds: a watcher that has
+  // passed it holds the row as answered or a later one.
   uint64 seq = 1;
   uint64 membership_epoch = 2;
   oneof event {

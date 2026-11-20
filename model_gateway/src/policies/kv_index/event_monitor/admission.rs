@@ -109,19 +109,18 @@ impl WorkerStreamState {
         }
     }
 
-    /// The stream ended with a snapshot still arriving: what was applied is
-    /// a partial live set, so the next subscription asks from zero (and gets
-    /// a whole snapshot) instead of resuming after the last chunk's stamp.
-    /// Returns whether a snapshot was abandoned.
+    /// A stream's snapshot was abandoned: start every cursor over so the next
+    /// subscription asks from zero, whether or not this sink still considers
+    /// the snapshot open. Returns whether a snapshot was open.
     pub(super) fn abandon_snapshot(&mut self) -> bool {
-        let Some(progress) = self.snapshot.take() else {
-            return false;
-        };
         for cursor in self.ranks.values_mut() {
             cursor.reset();
         }
-        debug_assert!(progress.applied < progress.count);
-        true
+        let progress = self.snapshot.take();
+        if let Some(progress) = progress {
+            debug_assert!(progress.applied < progress.count);
+        }
+        progress.is_some()
     }
 }
 

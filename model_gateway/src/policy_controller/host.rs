@@ -3,22 +3,22 @@
 //!
 //! An attempt has two halves. The ask ([`Host::ask`]) states what the
 //! attempt knows of its request and gets a decision through the
-//! controller's handle. The commit ([`Host::commit`]) looks up the decision's
-//! targets and takes the first it can send to. [`Host::place`] is their loop
-//! for the regular shapes. The store builds the candidates: the gateway
-//! sends none and keeps no view of the rows.
+//! controller's handle. The commit takes the first target the gateway
+//! can send to. [`Host::place`] does this for a regular attempt. [`Host::place_pair`]
+//! resolves both workers of each target in the ask so the commit can run
+//! under the prefill admission lock. The store builds the candidates: the
+//! gateway sends none and keeps no view of the rows.
 //!
-//! The ask is the one function that may wait. In process the door decides
-//! on the calling thread and the ask is ready at once. A controller at an
-//! address is asked over its session, behind the same call.
+//! The door in this process decides on the calling thread. A pair can
+//! wait for prefill admission and asks again when the queue wakes it.
 //!
 //! A router speaks to [`Placed`] and [`Held`], never to the controller's
-//! handle. [`Placed`] is the attempt's worker with its decision's lease:
-//! the router says the dispatch at the send, then the request's end, or a
-//! release before any send. One dropped with a report owed says it, as the
-//! handle does. [`Held`] carries the worker crate's load guard beside it,
-//! so one value travels with a response to its end. The regular HTTP router
-//! holds its placement over the body that carries the guard.
+//! handle. [`Placed`] holds the workers and the decision's lease. Each
+//! side reports its dispatch, then its end or a release. The handle says
+//! any reports still owed at the drop. [`Held`] carries a regular
+//! worker's load guard with the placement to the response's end. The
+//! regular HTTP router holds its placement over the body that carries the
+//! guard.
 //!
 //! The gateway's own check of a target is what it alone knows: the worker's
 //! status as its probes read it, and its circuit breaker. The overload and
@@ -28,7 +28,7 @@ use std::{
     cell::Cell,
     fmt,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Instant,
@@ -38,9 +38,10 @@ use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue, StatusCode},
     response::Response,
 };
+use parking_lot::Mutex;
 use rand::RngExt;
 use smg_policy_controller::{
-    decision::{Decision, Lifted, ShedReason, Target, Targets, Trace},
+    decision::{Decision, Lifted, Pair, ShedReason, Targets, Trace, MAX_TARGETS},
     door::{Door, Maker, Refused, Request},
     handle::Handle,
     lease::{Outcome, ReleaseReason, Side, TransportClass},
@@ -49,10 +50,8 @@ use smg_policy_controller::{
     worker_host::Objects,
     AppliedSpec, DerivedKey, KeySource,
 };
-use smg_worker::identity::basic::{Worker, WorkerLoadGuard};
+use smg_worker::identity::basic::{Worker, WorkerLoadGuard, WorkerType};
 
-#[cfg(test)]
-use crate::routers::common::snapshot::WorkerRegistry;
 use crate::{
     middleware::{
         ADMISSION_QUEUE_FULL_CODE, ADMISSION_QUEUE_FULL_STATUS, ADMISSION_QUEUE_TIMEOUT_CODE,
@@ -64,12 +63,16 @@ use crate::{
     },
     routers::{
         common::{
-            overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
+            overload::{routable_but_for_veto, WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE},
             placement::{self, no_available_workers_because},
+            prefill_admission::{
+                acquire_decided, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
+                PrefillCandidateError, PrefillLoadGuard, PrefillSelectionContext,
+            },
             retry::mark_non_retryable,
-            snapshot::ModelWorkerSnapshot,
+            snapshot::{ModelWorkerSnapshot, WorkerRegistry},
         },
-        error,
+        error, prefill_queue_full, prefill_queue_timeout,
     },
 };
 
@@ -131,6 +134,10 @@ pub(crate) struct Ask<'a> {
     /// The request's own id, the `rid` of its body: a source of its routing
     /// key, where its binding names it.
     pub rid: Option<&'a str>,
+    /// A regular attempt is single. A pair is asked at its prefill.
+    pub phase: Phase,
+    /// The size of the prompt in tokens. Zero uses the count from hashing if available.
+    pub prompt_tokens: u32,
     /// The rows of the workers the request's failed attempts were sent to.
     pub tried: &'a [WorkerId],
     /// The attempt's prompt hashes, where it has them. The stage that holds
@@ -140,8 +147,8 @@ pub(crate) struct Ask<'a> {
 
 impl<'a> Ask<'a> {
     /// An ask for `model` under the request's `id` that states no other
-    /// fact: not streamed, no input of a routing key, nothing tried, no
-    /// hashes.
+    /// fact: a single request of no stated prompt size, not streamed, no
+    /// input of a routing key, nothing tried, no hashes.
     pub(crate) const fn of(id: &'a [u8], model: &'a str) -> Self {
         Self {
             id,
@@ -149,39 +156,54 @@ impl<'a> Ask<'a> {
             streaming: false,
             headers: None,
             rid: None,
+            phase: Phase::Single,
+            prompt_tokens: 0,
             tried: &[],
             hashes: None,
         }
     }
 
-    /// The request's routing key by the sources its binding names in `spec`:
-    /// the first that holds a value, with the source it came from
-    /// ([`KeySources::derive`](smg_policy_controller::KeySources::derive)).
+    /// The request's two keys by the sources its binding names in `spec`.
+    /// Its routing key is the first session source that holds a value, with
+    /// the source it came from
+    /// ([`KeySources::derive`](smg_policy_controller::KeySources::derive)):
     /// `None` where the binding names no source, or none of them holds a
-    /// value.
+    /// value. Its client's key is read where it has no routing key
+    /// ([`KeySources::derive_client`](smg_policy_controller::KeySources::derive_client)),
+    /// and is `0` where it carries none.
     ///
-    /// The key borrows the document. The door hands the ask the world it
-    /// decides under, and the key is derived there
+    /// The routing key borrows the document. The door hands the ask the
+    /// world it decides under, and the keys are derived there
     /// ([`Handle::decide_under`]).
-    fn key<'s>(&self, spec: &'s AppliedSpec) -> Option<DerivedKey<'s>>
+    fn keys<'s>(&self, spec: &'s AppliedSpec) -> (Option<DerivedKey<'s>>, u64)
     where
         'a: 's,
     {
-        let sources = spec.key_sources_for(self.model, Phase::Single)?;
+        let Some(sources) = spec.key_sources_for(self.model, self.phase) else {
+            return (None, 0);
+        };
         let headers = self.headers;
         let header = |name: &str| headers?.get(name).map(HeaderValue::as_bytes);
-        sources.derive(header, self.rid)
+        let derived = sources.derive(header, self.rid);
+        // A client's key places where no session's does: it is read for
+        // such a request alone.
+        let client_key = match derived {
+            Some(_) => 0,
+            None => sources.derive_client(header),
+        };
+        (derived, client_key)
     }
 
-    /// The request as the controller reads it, with its routing `key` and
-    /// the targets the gateway `missed` at this attempt's earlier commits.
-    /// The one place a fact of a request is stated: a later step adds its
-    /// fact here. Each ask borrows the attempt's hashes.
+    /// The request as the controller reads it, with its routing `key`, its
+    /// client's key and the targets the gateway `missed` at this attempt's
+    /// earlier asks or commits. The one place a fact of a request is
+    /// stated: a later step adds its fact here. Each ask borrows the
+    /// attempt's hashes.
     ///
     /// Each call draws the decision's seed anew. The seed is the one
     /// randomness a stage gets: under a constant seed a policy that draws
     /// picks the same worker of an unchanged pool every time.
-    fn request<'s>(&self, key: Identity<'s>, missed: &'s [WorkerId]) -> Request<'s>
+    fn request<'s>(&self, key: Identity<'s>, client_key: u64, missed: &'s [WorkerId]) -> Request<'s>
     where
         'a: 's,
     {
@@ -189,6 +211,9 @@ impl<'a> Ask<'a> {
             model: self.model,
             streaming: self.streaming,
             session_key: key,
+            phase: self.phase,
+            prompt_tokens: self.prompt_tokens,
+            client_key,
             attempt: u8::try_from(self.tried.len()).unwrap_or(u8::MAX),
             tried: self.tried,
             seed: rand::rng().random(),
@@ -199,7 +224,9 @@ impl<'a> Ask<'a> {
             facts.hash_kind = HashKind::Token;
             facts.block_size = hashes.block_size;
             facts.namespace_seed = hashes.namespace_seed;
-            facts.prompt_tokens = hashes.prompt_tokens;
+            if facts.prompt_tokens == 0 {
+                facts.prompt_tokens = hashes.prompt_tokens;
+            }
         }
         Request {
             id: self.id,
@@ -213,7 +240,7 @@ impl<'a> Ask<'a> {
 }
 
 /// One ask of an attempt, as the door takes it up: its request is made from
-/// the world the decision is made under, so its key is derived by the
+/// the world the decision is made under, so its keys are derived by the
 /// sources of the document that decides.
 struct Made<'r, 'a> {
     ask: &'r Ask<'a>,
@@ -231,13 +258,13 @@ impl Maker for Made<'_, '_> {
     }
 
     fn make<'w>(&'w self, world: &'w World) -> Request<'w> {
-        let derived = self.ask.key(world.spec());
+        let (derived, client_key) = self.ask.keys(world.spec());
         self.source.set(derived.map(|derived| match derived.source {
             KeySource::Header(_) => "header",
             KeySource::Rid => "rid",
         }));
         let key = derived.map_or(Identity::NONE, |derived| derived.key);
-        self.ask.request(key, self.missed)
+        self.ask.request(key, client_key, self.missed)
     }
 }
 
@@ -254,13 +281,28 @@ pub(crate) enum Unplaced {
         /// The seconds after which a retry may find room.
         retry_after_secs: u16,
     },
-    /// The controller queued the request. No stage of this build issues a
-    /// ticket, and a host that meets one refuses the request.
+    /// The controller queued the request.
     Queued,
     /// The door made no decision.
     Refused(Refused),
     /// The gateway could send to no target of its three asks.
     NoTargetHolds,
+    /// A pair can be sent, but its prefill has no admission room.
+    NoRoom,
+    /// The prefill admission queue refused the request.
+    Admission(PrefillAdmissionRejection),
+}
+
+impl PrefillCandidateError for Unplaced {
+    fn is_at_capacity(&self) -> bool {
+        matches!(self, Self::NoRoom)
+    }
+
+    /// A decision with no target the gateway can send to is decided again
+    /// with those targets named, three passes at most at one wake.
+    fn decides_again(&self, again: usize) -> bool {
+        matches!(self, Self::NoTargetHolds) && again + 1 < ASKS
+    }
 }
 
 impl Unplaced {
@@ -269,19 +311,18 @@ impl Unplaced {
     ///
     /// | Why | The answer |
     /// |---|---|
-    /// | The pool is saturated, or the controller queued the request | 503 `worker_overload_protection_shed`, with a retry hint |
+    /// | The pool is saturated, admission found no room, or the controller queued the request | 503 `worker_overload_protection_shed`, with a retry hint |
     /// | No endpoint is left, or the gateway can send to no target | 503 `no_available_workers`, with a retry hint |
-    /// | A queue is at its limit | 429 `admission_queue_full`, with the admission queue's retry hint |
+    /// | A controller queue is at its limit | 429 `admission_queue_full`, with a retry hint |
     /// | The decision's budget passed | 503 `admission_queue_timeout`, with the same hint |
+    /// | The prefill admission queue is full or timed out | 429 `pd_prefill_queue_full` or `pd_prefill_queue_timeout` |
     /// | The policy declined the request | 503 `policy_declined` |
     /// | The door made no decision | 503 `policy_controller_unavailable`, with a retry hint |
     ///
     /// A declined request reads the same message for every cause. Its
     /// refusal line names where the policy declined.
     ///
-    /// No answer is retried in process: a second ask a moment later reads
-    /// the same rows. A route that asks for a side of a pair refuses by name
-    /// before it asks, so that refusal of the door has no row of its own.
+    /// These answers end the routing attempt.
     pub(crate) fn answer(&self, model: &str) -> Response {
         let mut response = match *self {
             Self::Shed {
@@ -302,6 +343,13 @@ impl Unplaced {
                 ),
                 0,
             ),
+            Self::NoRoom => hinted(
+                error::service_unavailable(
+                    WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
+                    format!("No prefill worker for model '{model}' has admission room"),
+                ),
+                SHED_RETRY_AFTER_SECS,
+            ),
             Self::Shed {
                 reason: ShedReason::NoEndpoints,
                 emptied_by,
@@ -310,10 +358,14 @@ impl Unplaced {
                 format!("No available workers for model '{model}'"),
                 left_no_worker(emptied_by),
             ),
-            Self::NoTargetHolds => no_available_workers_because(
-                format!("No available workers for model '{model}'"),
-                "the gateway could send to no target the policy controller picked",
-            ),
+            Self::NoTargetHolds | Self::Admission(PrefillAdmissionRejection::Unavailable) => {
+                no_available_workers_because(
+                    format!("No available workers for model '{model}'"),
+                    "the gateway could send to no target the policy controller picked",
+                )
+            }
+            Self::Admission(PrefillAdmissionRejection::QueueFull) => prefill_queue_full(),
+            Self::Admission(PrefillAdmissionRejection::QueueTimeout) => prefill_queue_timeout(),
             Self::Shed {
                 reason: ShedReason::FlowLimit,
                 ..
@@ -373,10 +425,11 @@ fn hinted(mut response: Response, secs: u32) -> Response {
     response
 }
 
-/// A decision that picked: its targets, best first, and its lease, not yet
-/// committed.
+/// A pick awaiting commit, with its targets and lease.
 pub(crate) struct Asked {
     targets: Targets,
+    /// The prefill and decode resolved for each pair target.
+    pairs: [[Option<Arc<dyn Worker>>; 2]; MAX_TARGETS],
     handle: Handle<Arc<Door>>,
 }
 
@@ -440,6 +493,16 @@ impl Host {
         }
     }
 
+    /// The registry the gateway's workers stand in: the holder's, or a
+    /// bed's own.
+    fn registry(&self) -> &WorkerRegistry {
+        match &self.workers {
+            Workers::Held(objects) => objects.registry(),
+            #[cfg(test)]
+            Workers::AtKey(registry) => registry,
+        }
+    }
+
     fn profile_name(&self, trace: &Trace) -> Option<Arc<str>> {
         self.door.store().with_world(|world| {
             let spec = world.spec();
@@ -494,17 +557,33 @@ impl Host {
     /// handle, naming the targets the gateway `missed` at this attempt's
     /// earlier commits.
     ///
-    /// The one function of the host that may await. The door of this
-    /// process decides on the calling thread, under the store's own locks,
-    /// and awaits nothing.
-    #[expect(
-        clippy::unused_async,
-        reason = "a controller at an address is asked behind this call, over its session"
-    )]
+    /// Resolves both workers of each pair before admission can lock the
+    /// queue. The door in this process decides on the calling thread.
+    ///
+    /// An attempt that keeps one list across its asks asks first with the
+    /// list empty: this ask counts as its first then.
     pub(crate) async fn ask(
         &self,
         ask: &Ask<'_>,
         missed: &[WorkerId],
+        now: Instant,
+    ) -> Result<Asked, Unplaced> {
+        self.ask_as(ask, missed, missed.is_empty(), now).await
+    }
+
+    /// [`Self::ask`] for an attempt that says itself whether this is its
+    /// `first` ask, the one that counts its key's source. A pair's attempt
+    /// decides again at each wake of the admission queue, from a list a
+    /// wait on room leaves empty: its list does not tell its first ask.
+    #[expect(
+        clippy::unused_async,
+        reason = "a controller at an address is asked behind this call, over its session"
+    )]
+    async fn ask_as(
+        &self,
+        ask: &Ask<'_>,
+        missed: &[WorkerId],
+        first: bool,
         now: Instant,
     ) -> Result<Asked, Unplaced> {
         let made = Made {
@@ -517,8 +596,9 @@ impl Host {
         let seconds = started.elapsed().as_secs_f64();
         // A key's source counts once an attempt, at its first ask, as a
         // keyed selection of the gateway's own policies counts it: an ask
-        // again behind a missed commit is the same attempt's.
-        if let Some(source) = made.source.get().filter(|_| missed.is_empty()) {
+        // again, behind a missed commit or at a pair's later wake, is the
+        // same attempt's.
+        if let Some(source) = made.source.get().filter(|_| first) {
             Metrics::record_routing_key_source(source);
         }
         let decision = decided.as_ref().ok().map(Handle::decision);
@@ -539,10 +619,19 @@ impl Host {
         let handle = decided.map_err(Unplaced::Refused)?;
         let decision = *handle.decision();
         match decision {
-            Decision::Pick(pick) => Ok(Asked {
-                targets: pick.targets,
-                handle,
-            }),
+            Decision::Pick(pick) => {
+                let mut pairs: [_; MAX_TARGETS] = Default::default();
+                for (target, workers) in pick.targets.iter().zip(&mut pairs) {
+                    if let Some(pair) = target.pair {
+                        *workers = [self.worker(target.id), self.worker(pair.decode_id)];
+                    }
+                }
+                Ok(Asked {
+                    targets: pick.targets,
+                    pairs,
+                    handle,
+                })
+            }
             Decision::Shed(shed) => {
                 self.trace_decision(&decision, None);
                 Err(Unplaced::Shed {
@@ -588,19 +677,20 @@ impl Host {
         let Asked {
             targets,
             mut handle,
+            ..
         } = asked;
         for (index, target) in targets.iter().enumerate() {
-            let sendable = self.worker(target.id).filter(|worker| {
-                worker.is_healthy()
-                    && worker.circuit_breaker_can_execute()
-                    && holds(worker.as_ref())
-            });
+            let sendable = self
+                .worker(target.id)
+                .filter(|worker| routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref()));
             if let Some(worker) = sendable {
                 handle.take(index);
                 self.trace_decision(handle.decision(), Some(&worker));
                 return Some(Placed {
                     worker,
-                    target: *target,
+                    id: target.id,
+                    rank: target.dp_rank,
+                    pair: None,
                     handle,
                 });
             }
@@ -609,6 +699,167 @@ impl Host {
         missed.extend(targets.iter().map(|target| target.id));
         self.trace_decision(handle.decision(), None);
         None
+    }
+
+    /// Takes the first sendable pair whose prefill has room. The admission
+    /// lock can be held here, so every lookup happens in the ask.
+    #[expect(clippy::unused_self, reason = "the commit uses workers from the ask")]
+    pub(crate) fn commit_pair(
+        &self,
+        asked: Asked,
+        room: Option<&PrefillSelectionContext<'_>>,
+        missed: &mut Vec<WorkerId>,
+        now: Instant,
+    ) -> Result<Placed, Unplaced> {
+        let Asked {
+            targets,
+            pairs,
+            mut handle,
+        } = asked;
+        let mut failed = [[None; 2]; MAX_TARGETS];
+        let mut no_room = false;
+        for (index, (target, [prefill, decode])) in targets.iter().zip(pairs).enumerate() {
+            let Some(pair) = target.pair else {
+                continue;
+            };
+            let prefill = prefill.filter(|worker| routable_but_for_veto(worker.as_ref()));
+            let decode = decode.filter(|worker| routable_but_for_veto(worker.as_ref()));
+            let (Some(worker), Some(decode)) = (&prefill, decode.as_ref()) else {
+                failed[index] = [
+                    prefill.is_none().then_some(target.id),
+                    decode.is_none().then_some(pair.decode_id),
+                ];
+                continue;
+            };
+            if room.is_some_and(|room| !room.has_capacity(worker)) {
+                no_room = true;
+                continue;
+            }
+            handle.take(index);
+            return Ok(Placed {
+                worker: Arc::clone(worker),
+                id: target.id,
+                rank: target.dp_rank,
+                pair: Some(Box::new(PlacedPair {
+                    decode: Arc::clone(decode),
+                    side: pair,
+                    targets,
+                    index,
+                })),
+                handle,
+            });
+        }
+        handle.released(ReleaseReason::CommitFailed, now);
+        if no_room {
+            return Err(Unplaced::NoRoom);
+        }
+        missed.extend(failed.into_iter().flatten().flatten());
+        Err(Unplaced::NoTargetHolds)
+    }
+
+    /// Places a pair and takes its prefill load guard. A commit that can
+    /// send to no target decides again in place, three passes at most at
+    /// one wake: a queued request keeps its place and its deadline. A pass
+    /// asks up to three times while every prefill it names reads full
+    /// ([`Self::decide_pair`]), so one wake asks nine times at most.
+    /// Admission can decide again at each wake.
+    pub(crate) async fn place_pair(
+        &self,
+        ask: &Ask<'_>,
+        admission: Option<&PrefillAdmission>,
+        routing_key: Option<&str>,
+    ) -> Result<(Placed, PrefillLoadGuard), Unplaced> {
+        let missed = Mutex::new(Vec::new());
+        // The attempt's first ask, whichever half makes it: each wake's
+        // decision starts from the attempt's list, which stays empty
+        // across a wait on room.
+        let first = AtomicBool::new(true);
+        acquire_decided(
+            admission,
+            routing_key,
+            Placed::worker,
+            || self.probe_pair(ask, &missed, &first),
+            || self.decide_pair(ask, admission, missed.lock().clone(), &first),
+            |asked, room| self.commit_pair(asked, room, &mut missed.lock(), Instant::now()),
+        )
+        .await
+        .map_err(|error| match error {
+            PrefillAcquireError::Candidate(verdict) => verdict,
+            PrefillAcquireError::Rejected(rejection) => Unplaced::Admission(rejection),
+        })
+    }
+
+    /// One pass of a pair's decision: full prefills are excluded for up to
+    /// two more asks of the pass. The next wake can use them again if load
+    /// has fallen.
+    async fn decide_pair(
+        &self,
+        ask: &Ask<'_>,
+        admission: Option<&PrefillAdmission>,
+        mut missed: Vec<WorkerId>,
+        first: &AtomicBool,
+    ) -> Result<Asked, Unplaced> {
+        for _ in 0..ASKS {
+            let first = first.swap(false, Ordering::Relaxed);
+            let mut asked = self.ask_as(ask, &missed, first, Instant::now()).await?;
+            let Some(admission) = admission else {
+                return Ok(asked);
+            };
+            let before = missed.len();
+            for (target, [prefill, decode]) in asked.targets.iter().zip(&asked.pairs) {
+                let (Some(prefill), Some(decode)) = (prefill, decode) else {
+                    continue;
+                };
+                if routable_but_for_veto(prefill.as_ref()) && routable_but_for_veto(decode.as_ref())
+                {
+                    if !admission.reads_full(prefill) {
+                        return Ok(asked);
+                    }
+                    missed.push(target.id);
+                }
+            }
+            if missed.len() == before {
+                return Ok(asked);
+            }
+            asked
+                .handle
+                .released(ReleaseReason::CommitFailed, Instant::now());
+        }
+        Err(Unplaced::NoRoom)
+    }
+
+    /// A request behind a waiter asks only if a role has no sendable worker.
+    /// A pick is released before the request joins the queue.
+    async fn probe_pair(
+        &self,
+        ask: &Ask<'_>,
+        missed: &Mutex<Vec<WorkerId>>,
+        first: &AtomicBool,
+    ) -> Option<Unplaced> {
+        let workers = self.registry().generation(ask.model);
+        let (mut prefill, mut decode) = (false, false);
+        for worker in workers.iter() {
+            let found = match worker.worker_type() {
+                WorkerType::Prefill => &mut prefill,
+                WorkerType::Decode => &mut decode,
+                WorkerType::Regular | WorkerType::Encode => continue,
+            };
+            *found = *found || routable_but_for_veto(worker.as_ref());
+            if prefill && decode {
+                return None;
+            }
+        }
+        let missed = missed.lock().clone();
+        let first = first.swap(false, Ordering::Relaxed);
+        match self.ask_as(ask, &missed, first, Instant::now()).await {
+            Ok(mut asked) => {
+                asked
+                    .handle
+                    .released(ReleaseReason::CommitFailed, Instant::now());
+                None
+            }
+            Err(verdict) => Some(verdict),
+        }
     }
 
     /// A regular attempt's worker at `now`: the ask and the commit, three
@@ -683,6 +934,19 @@ impl End {
             duration_micros: elapsed_micros(now, sent),
         }
     }
+
+    fn outcome(self, side: Side, served: WorkerId) -> Outcome {
+        Outcome {
+            side,
+            served,
+            status: self.status,
+            class: self.class,
+            ttft_micros: self.ttft_micros,
+            tokens_in: self.tokens_in,
+            tokens_out: self.tokens_out,
+            duration_micros: self.duration_micros,
+        }
+    }
 }
 
 /// The time since `sent` in whole microseconds, saturating at `u32::MAX`.
@@ -690,12 +954,28 @@ fn elapsed_micros(now: Instant, sent: Instant) -> u32 {
     u32::try_from(now.saturating_duration_since(sent).as_micros()).unwrap_or(u32::MAX)
 }
 
-/// An attempt's worker, with its decision's lease held to the request's
+/// An attempt's workers, with its decision's lease held to the request's
 /// end.
 pub(crate) struct Placed {
     worker: Arc<dyn Worker>,
-    target: Target,
+    /// The store's row of the worker, from the target taken.
+    id: WorkerId,
+    /// The rank that target names for the worker.
+    rank: u16,
+    /// A pair's own part, behind one pointer: a regular placement rides in
+    /// its router's request context, whose size a case pins.
+    pair: Option<Box<PlacedPair>>,
     handle: Handle<Arc<Door>>,
+}
+
+/// What a placed pair holds beside its prefill: the decode worker with the
+/// decode side of the target taken, and the pick's targets with that
+/// target's index, for the next decode of the same prefill.
+struct PlacedPair {
+    decode: Arc<dyn Worker>,
+    side: Pair,
+    targets: Targets,
+    index: usize,
 }
 
 impl Placed {
@@ -706,13 +986,13 @@ impl Placed {
 
     /// The store's row of that worker: what a retry names as tried.
     pub(crate) fn id(&self) -> WorkerId {
-        self.target.id
+        self.id
     }
 
     /// The data-parallel rank the decision named for the worker: what a
     /// dispatch that pins a rank sends.
     pub(crate) fn rank(&self) -> u16 {
-        self.target.dp_rank
+        self.rank
     }
 
     /// The request was sent to the worker at `now`. Said once.
@@ -723,16 +1003,11 @@ impl Placed {
     /// The request ended with `end`, as the router read it at `now`. Said
     /// once.
     pub(crate) fn completed(&mut self, end: End, now: Instant) {
-        let outcome = Outcome {
-            side: Side::Single,
-            served: self.target.id,
-            status: end.status,
-            class: end.class,
-            ttft_micros: end.ttft_micros,
-            tokens_in: end.tokens_in,
-            tokens_out: end.tokens_out,
-            duration_micros: end.duration_micros,
-        };
+        let side = self
+            .handle
+            .lease()
+            .map_or(Side::Single, |leased| leased.lease.side);
+        let outcome = end.outcome(side, self.id());
         self.handle.completed(&outcome, now);
     }
 
@@ -741,13 +1016,77 @@ impl Placed {
     pub(crate) fn released(&mut self, reason: ReleaseReason, now: Instant) {
         self.handle.released(reason, now);
     }
+
+    /// The decode worker of a pair. A regular attempt has none.
+    pub(crate) fn decode(&self) -> Option<&Arc<dyn Worker>> {
+        self.pair.as_ref().map(|pair| &pair.decode)
+    }
+
+    /// The store's row of the decode worker.
+    pub(crate) fn decode_id(&self) -> Option<WorkerId> {
+        self.pair.as_ref().map(|pair| pair.side.decode_id)
+    }
+
+    /// The rank the decision named for the decode worker.
+    pub(crate) fn decode_rank(&self) -> Option<u16> {
+        self.pair.as_ref().map(|pair| pair.side.decode_dp_rank)
+    }
+
+    /// The decode request was sent at `now`. Said once.
+    pub(crate) fn decode_dispatched(&mut self, now: Instant) {
+        self.handle.dispatched_decode(now);
+    }
+
+    /// The decode request ended with `end`. Said once.
+    pub(crate) fn decode_completed(&mut self, end: End, now: Instant) {
+        if let Some(worker) = self.decode_id() {
+            self.handle
+                .completed(&end.outcome(Side::Decode, worker), now);
+        }
+    }
+
+    /// The decode side is given up under `reason`.
+    pub(crate) fn decode_released(&mut self, reason: ReleaseReason, now: Instant) {
+        self.handle.released_decode(reason, now);
+    }
+
+    /// After the prefill is sent, take the next sendable decode of that
+    /// prefill. Returns `false` when the pick holds none or the decode has
+    /// already been sent or released.
+    pub(crate) fn next_decode(&mut self, host: &Host) -> bool {
+        let Some(placed) = self.pair.as_deref_mut() else {
+            return false;
+        };
+        for (index, target) in placed.targets.iter().enumerate().skip(placed.index + 1) {
+            if target.id != self.id {
+                continue;
+            }
+            let Some(pair) = target.pair else {
+                continue;
+            };
+            let Some(worker) = host
+                .worker(pair.decode_id)
+                .filter(|worker| routable_but_for_veto(worker.as_ref()))
+            else {
+                continue;
+            };
+            if self.handle.take_decode(index).is_some() {
+                placed.decode = worker;
+                placed.side = pair;
+                placed.index = index;
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl fmt::Debug for Placed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Placed")
             .field("worker", &self.worker.url())
-            .field("target", &self.target)
+            .field("id", &self.id)
+            .field("rank", &self.rank)
             .field("handle", &self.handle)
             .finish()
     }
@@ -783,7 +1122,7 @@ impl Held {
 }
 
 mod ride;
-pub(crate) use ride::Sent;
+pub(crate) use ride::{BehindAnswer, Sent};
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]

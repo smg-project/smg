@@ -9,19 +9,25 @@
 //! The setting starts the store with the policy document for the routing
 //! configuration. The context holds the membership feed over that store and
 //! a host over the feed's holder. A regular HTTP router with that host asks
-//! it to place typed requests for a named model. The gateway's workflows
-//! leave the feed's door unused, so without a controller's address nothing
-//! feeds the store yet. The server answers with a refusing router in the
-//! gateway object's place ([`router`]), so its requests never reach the
-//! host. With the setting off, the context holds neither the store, its
-//! feed nor its host.
+//! it to place typed requests: for the model a request names, or for the one
+//! primary model the router's workers serve where it names none. A regular
+//! gRPC router asks it in its selection stage. A pair router mounts a
+//! refusing router under its usual id ([`undecided()`]) whenever the store
+//! started, with or without a controller's address. The routes that pick a
+//! worker by no routing policy serve as under the classic policies: a
+//! provider's router, a realtime session and a proxied GET. The gateway's
+//! workflows leave the feed's door unused, so without an address nothing
+//! feeds the store yet. With the setting off, the context holds neither the
+//! store, its feed nor its host.
 //!
 //! One site reads the setting, [`start_with`]. Every other site asks what
 //! the start left in the context.
 //!
 //! Under a controller's address a follower keeps the store's worker rows
 //! as that controller's watch tells them ([`follower`]). The gateway then
-//! discovers, registers and probes no worker of its own.
+//! discovers, registers and probes no worker of its own. Each row has its
+//! worker object in the registry before the gateway reports a fleet, and
+//! the object's status is the row's ([`feeds`]).
 
 use std::sync::Arc;
 
@@ -29,12 +35,13 @@ use smg_policy_controller::{
     store::{MemoryStore, StaleGeneration},
     Catalog, SpecError,
 };
+use smg_worker::connection::engine::EngineConnector;
 use tracing::info;
 
 use crate::{
     app_context::AppContext,
     config::{PolicyDocumentError, RouterConfig},
-    routers::RouterTrait,
+    routers::{common::snapshot::WorkerRegistry, RouterTrait},
 };
 
 // The follower dials through the controller crate's client, which two
@@ -61,6 +68,8 @@ pub(crate) mod feed;
 pub(crate) mod host;
 mod undecided;
 
+use feed::Feed;
+use follower::{Follower, Settings};
 pub(crate) use undecided::refused;
 use undecided::Undecided;
 
@@ -111,21 +120,43 @@ pub(crate) fn start_with(
     let generation = config.hosted_policy_in(&document, stages.as_ref())?;
     let store = MemoryStore::new();
     store.apply(generation)?;
-    info!("The policy controller is picked for this gateway: no classic router is built");
+    info!("The policy controller is picked for this gateway");
     Ok(Some(Arc::new(store)))
 }
 
-/// The controller's router for this process: the one router its server
-/// answers with. `None` where the classic policies decide.
+/// The store's membership feed and, under a controller's address, the
+/// follower that writes the store in the door's place.
 ///
-/// It asks what the start left in the context and never reads the setting
-/// again, so a router stands where a store started and nowhere else. It
-/// refuses each request by name.
-pub(crate) fn router(context: &AppContext) -> Option<Arc<dyn RouterTrait>> {
+/// The two are made together because they are one rule. A gateway that
+/// follows a controller probes no worker, so its holder copies each row's
+/// status onto the row's object ([`feed::following`]), and its follower
+/// settles the feed after each event. Elsewhere the door is the store's
+/// writer, and it settles the feed itself.
+pub(crate) fn feeds(
+    store: &Arc<MemoryStore>,
+    registry: &Arc<WorkerRegistry>,
+    connector: Arc<dyn EngineConnector>,
+    controller: Option<Settings>,
+) -> (Feed, Option<Follower>) {
+    match controller {
+        Some(settings) => {
+            let feed = feed::following(store, registry, connector);
+            let follower = Follower::start(settings, feed.clone());
+            (feed, Some(follower))
+        }
+        None => (feed::feed(store, registry, connector), None),
+    }
+}
+
+/// The refusing router for a family the controller does not decide yet:
+/// the pair routers, which need pair placement. It mounts under the
+/// family's usual id so the gateway can select it. Returns `None` under the
+/// classic policies.
+pub(crate) fn undecided(context: &AppContext) -> Option<Box<dyn RouterTrait>> {
     context
-        .policy_store
+        .policy_host
         .is_some()
-        .then(|| Arc::new(Undecided) as Arc<dyn RouterTrait>)
+        .then(|| Box::new(Undecided) as Box<dyn RouterTrait>)
 }
 
 #[cfg(test)]

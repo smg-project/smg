@@ -102,7 +102,7 @@ use crate::{
         logging::LoggingConfig, metrics, metrics::PrometheusConfig, metrics_server, otel_trace,
         runtime_metrics,
     },
-    policy_controller::{self, follower::Follower},
+    policy_controller::follower::Follower,
     routers::{
         common::realtime::ws::RealtimeQueryParams,
         error as route_error,
@@ -2275,25 +2275,6 @@ fn serve_listeners(
     Ok((data_serving, admin_serving))
 }
 
-/// The one router this server answers with, and the gateway object behind it
-/// where one is built.
-///
-/// A process the policy controller was picked for answers with the
-/// controller's router ([`policy_controller::router`]) and builds no gateway
-/// object. So no classic router is built, and no selection of the gateway
-/// object runs ahead of the controller's answer.
-pub(crate) async fn serving_router(
-    config: &ServerConfig,
-    context: &Arc<AppContext>,
-) -> Result<(Arc<dyn RouterTrait>, Option<Arc<Gateway>>), String> {
-    if let Some(router) = policy_controller::router(context) {
-        return Ok((router, None));
-    }
-    let gateway = Gateway::from_config(config, context).await?;
-    let router: Arc<dyn RouterTrait> = gateway.clone();
-    Ok((router, Some(gateway)))
-}
-
 /// Start the local health loop and keep its handle until the server stops.
 fn start_worker_health_checks(app_context: &AppContext) -> Option<WorkerManager> {
     if app_context.follows_controller() {
@@ -2334,7 +2315,8 @@ impl FollowerOnExit<'_> {
 
 impl Drop for FollowerOnExit<'_> {
     fn drop(&mut self) {
-        drop(self.take());
+        // The follower leaves the context here, and its task ends with it.
+        let _follower = self.take();
     }
 }
 
@@ -2610,7 +2592,7 @@ pub async fn startup_with(
         worker_stats.total_workers, worker_stats.healthy_workers
     );
 
-    let (router, gateway) = serving_router(&config, &app_context).await?;
+    let gateway = Gateway::from_config(&config, &app_context).await?;
 
     let _worker_manager = start_worker_health_checks(&app_context);
 
@@ -2623,6 +2605,13 @@ pub async fn startup_with(
         worker_monitor.start_event_loop();
         debug!("Started WorkerMonitor event loop");
     }
+    // Under the feed the collector writes the store from its own tasks. The
+    // feed's loop shows those writes when the store's instant comes.
+    let _publications = app_context
+        .policy_feed
+        .as_ref()
+        .filter(|_| app_context.worker_monitor.is_some())
+        .map(|feed| feed.publications());
 
     let admission_queue =
         if app_context.rate_limiter.is_some() && config.router_config.queue_size > 0 {
@@ -2712,10 +2701,10 @@ pub async fn startup_with(
     };
 
     let app_state = Arc::new(AppState {
-        router,
+        router: gateway.clone(),
         context: app_context.clone(),
         admission_queue,
-        gateway,
+        gateway: Some(gateway),
         mesh_handler,
         mesh_adapters,
         probe_state,

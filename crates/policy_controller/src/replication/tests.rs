@@ -158,9 +158,9 @@ fn every_journaled_entry_tells_one_event_in_the_stores_order() {
     // Three failed probes take a ready worker out; the first two move no
     // status and tell nothing.
     for _ in 0..3 {
-        store.probe_outcome(b, false, revision(&store, b));
+        store.probe_outcome(b, false, revision(&store, b), &|| true);
     }
-    store.connected(b, revision(&store, b));
+    store.connected(b, revision(&store, b), &|| true);
     let found = WorkersStore::get(&store, b).expect("the row");
     store.remove(b, found.revision);
 
@@ -368,10 +368,10 @@ fn a_watched_write_is_told_once_the_store_let_its_locks_go() {
     // Three failed probes take a ready worker out: the first two move no
     // status.
     for _ in 0..3 {
-        store.probe_outcome(b, false, revision(&store, b));
+        store.probe_outcome(b, false, revision(&store, b), &|| true);
     }
     tells("a probe's outcome", 1);
-    store.connected(b, revision(&store, b));
+    store.connected(b, revision(&store, b), &|| true);
     tells("a connection", 1);
     let stale = revision(&store, b) + 1;
     assert_eq!(store.remove(b, stale), None);

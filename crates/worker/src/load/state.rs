@@ -30,7 +30,7 @@
 //!   release the ones a report already reflects when it reads the report.
 
 use std::{
-    collections::HashMap,
+    collections::{hash_map::Entry, HashMap},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Weak,
@@ -39,6 +39,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use rustc_hash::FxHashSet;
 use tokio::sync::{watch, Notify};
 
 #[cfg(any(test, feature = "test-util"))]
@@ -57,6 +58,10 @@ pub type LoadReceiver = watch::Receiver<Arc<LoadSnapshot>>;
 /// A worker of an eviction batch's sentinel set, with the load of its own
 /// entry where the batch removed it.
 pub(crate) type Evicted = (Arc<dyn Worker>, Option<Arc<WorkerLoadResponse>>);
+
+/// A row a publish took away where no fresh row of the same worker stands
+/// at the URL behind it, with that worker.
+pub(crate) type Replaced = (Arc<dyn Worker>, Arc<WorkerLoadResponse>);
 
 /// One worker's published load and the incarnation that produced it.
 #[derive(Clone)]
@@ -240,11 +245,18 @@ impl<G: Generation> LoadState<G> {
     /// published stay the eviction path's responsibility, which always runs
     /// after the registry mutation and therefore after this fence would have
     /// started failing.
+    ///
+    /// Returns each row the publish took away where no fresh row of the
+    /// same worker stands at the URL behind it, with that worker while it
+    /// lives: a row that went under its successor's, and a row pruned with
+    /// no fresh one. Whether such a row's worker has left is the caller's
+    /// to ask the registry: the read here is by pointer alone.
+    #[must_use = "a returned row's series end only where the caller ends them"]
     pub(crate) fn publish_group(
         &self,
         group_urls: &[String],
         fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)>,
-    ) {
+    ) -> Vec<Replaced> {
         let published_at = Instant::now();
         let admitted: Vec<(Arc<str>, LoadEntry)> = fresh
             .into_iter()
@@ -259,17 +271,57 @@ impl<G: Generation> LoadState<G> {
             })
             .collect();
 
+        let mut replaced = Vec::new();
+        let ended = &mut replaced;
         self.rebuild(move |entries| {
             let mut changed = false;
-            for url in group_urls {
-                changed |= entries.remove(url.as_str()).is_some();
+            {
+                // A URL with a fresh row keeps its entry for the insert
+                // below, which reads whose row it replaces. The fresh rows
+                // come in the URLs' order, less the ones that failed, so
+                // one cursor finds a URL's. Where the cursor misses, the
+                // set of the fresh URLs says whether the rows are out of
+                // that order (an engine's ranks are gathered) or the URL
+                // has none.
+                let mut next = 0;
+                let mut out_of_order: Option<FxHashSet<&str>> = None;
+                for url in group_urls {
+                    if admitted
+                        .get(next)
+                        .is_some_and(|(fresh, _)| **fresh == **url)
+                    {
+                        next += 1;
+                        continue;
+                    }
+                    let fresh_urls = out_of_order.get_or_insert_with(|| {
+                        admitted.iter().map(|(fresh, _)| &**fresh).collect()
+                    });
+                    if fresh_urls.contains(url.as_str()) {
+                        continue;
+                    }
+                    if let Some(old) = entries.remove(url.as_str()) {
+                        changed = true;
+                        ended.extend(old.source.upgrade().map(|worker| (worker, old.load)));
+                    }
+                }
             }
             for (url, entry) in admitted {
-                entries.insert(url, entry);
+                match entries.entry(url) {
+                    Entry::Occupied(mut slot) => {
+                        let old = slot.insert(entry);
+                        if !Weak::ptr_eq(&old.source, &slot.get().source) {
+                            ended.extend(old.source.upgrade().map(|worker| (worker, old.load)));
+                        }
+                    }
+                    Entry::Vacant(slot) => {
+                        slot.insert(entry);
+                    }
+                }
                 changed = true;
             }
             changed
         });
+        replaced
     }
 
     /// Whether `worker` is the `Ready` worker the registry holds at its URL
@@ -448,10 +500,10 @@ mod tests {
         let worker = ready_worker("http://w1:8080", "m");
         registry.register(Arc::clone(&worker)).unwrap();
 
-        state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
         let held = state.snapshot();
 
-        state.publish_group(&[], vec![(Arc::clone(&worker), load(2))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&worker), load(2))]);
 
         // The held snapshot is immutable and stays scannable as-is...
         assert_eq!(waiting_of(&held, "http://w1:8080"), Some(1));
@@ -478,7 +530,8 @@ mod tests {
                     let group_urls = vec![worker.url().to_string()];
                     barrier.wait();
                     for round in 0..100 {
-                        state.publish_group(&group_urls, vec![(Arc::clone(&worker), load(round))]);
+                        let _ = state
+                            .publish_group(&group_urls, vec![(Arc::clone(&worker), load(round))]);
                     }
                 })
             })
@@ -498,7 +551,7 @@ mod tests {
         let (registry, state) = setup();
         let worker = ready_worker("http://w1:8080", "m");
         registry.register(Arc::clone(&worker)).unwrap();
-        state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
 
         worker.set_status(WorkerStatus::NotReady);
         state.enqueue_eviction(Arc::clone(&worker));
@@ -515,7 +568,7 @@ mod tests {
         let (registry, state) = setup();
         let worker = ready_worker("http://w1:8080", "m");
         let id = registry.register(Arc::clone(&worker)).unwrap();
-        state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
 
         registry.remove(&id);
         state.enqueue_eviction(Arc::clone(&worker));
@@ -526,7 +579,7 @@ mod tests {
         // incarnation fence drops it instead of re-inserting the dead worker
         // (which the pre-snapshot code did, permanently — the group's next
         // tick no longer listed the URL to prune).
-        state.publish_group(&[], vec![(Arc::clone(&worker), load(2))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&worker), load(2))]);
         assert!(state.snapshot().is_empty());
     }
 
@@ -537,7 +590,7 @@ mod tests {
         registry.register(Arc::clone(&worker)).unwrap();
 
         worker.set_status(WorkerStatus::NotReady);
-        state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
 
         assert!(state.snapshot().is_empty());
     }
@@ -547,7 +600,7 @@ mod tests {
         let (registry, state) = setup();
         let old = ready_worker("http://w1:8080", "m");
         let old_id = registry.register(Arc::clone(&old)).unwrap();
-        state.publish_group(&[], vec![(Arc::clone(&old), load(1))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&old), load(1))]);
 
         // Replace: same URL, new incarnation.
         registry.remove(&old_id);
@@ -562,7 +615,7 @@ mod tests {
 
         // ...and once the replacement has republished, a LATE flush of the
         // old incarnation's eviction must not tear down the fresh entry.
-        state.publish_group(&[], vec![(Arc::clone(&new), load(2))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&new), load(2))]);
         state.enqueue_eviction(Arc::clone(&old));
         let ended = state.apply_pending_evictions();
         assert!(
@@ -584,11 +637,90 @@ mod tests {
         let new = ready_worker("http://w1:8080", "m");
         registry.register(Arc::clone(&new)).unwrap();
 
-        state.publish_group(&[], vec![(Arc::clone(&old), load(1))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&old), load(1))]);
         assert!(state.snapshot().is_empty(), "the old worker's poll is late");
 
-        state.publish_group(&[], vec![(Arc::clone(&new), load(2))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&new), load(2))]);
         assert_eq!(waiting_of(&state.snapshot(), "http://w1:8080"), Some(2));
+    }
+
+    /// A publish hands back the row it took from a worker whose fresh row
+    /// does not stand at the URL behind it: one a successor's row replaced,
+    /// by a publish that prunes or by one that prunes nothing, and one
+    /// pruned with no fresh row. A worker's own row, refreshed, is not
+    /// handed back.
+    #[test]
+    fn a_publish_hands_back_the_rows_it_took_from_other_workers() {
+        let (registry, state) = setup();
+        let urls = ["http://w1:8080".to_string()];
+        let old = ready_worker("http://w1:8080", "m");
+        let old_id = registry.register(Arc::clone(&old)).unwrap();
+        assert!(state
+            .publish_group(&urls, vec![(Arc::clone(&old), load(1))])
+            .is_empty());
+        assert!(
+            state
+                .publish_group(&urls, vec![(Arc::clone(&old), load(2))])
+                .is_empty(),
+            "its own row, refreshed"
+        );
+
+        registry.remove(&old_id);
+        let new = ready_worker("http://w1:8080", "m");
+        let new_id = registry.register(Arc::clone(&new)).unwrap();
+        let replaced = state.publish_group(&urls, vec![(Arc::clone(&new), load(3))]);
+        assert!(replaced.len() == 1 && Arc::ptr_eq(&replaced[0].0, &old));
+        assert_eq!(replaced[0].1.total_waiting_uncached_tokens(), 2);
+
+        registry.remove(&new_id);
+        let third = ready_worker("http://w1:8080", "m");
+        registry.register(Arc::clone(&third)).unwrap();
+        let replaced = state.publish_group(&[], vec![(Arc::clone(&third), load(4))]);
+        assert!(
+            replaced.len() == 1 && Arc::ptr_eq(&replaced[0].0, &new),
+            "a publish that prunes nothing overwrote it"
+        );
+
+        let pruned = state.publish_group(&urls, Vec::new());
+        assert!(
+            pruned.len() == 1 && Arc::ptr_eq(&pruned[0].0, &third),
+            "pruned with no fresh row"
+        );
+        assert!(state.snapshot().is_empty());
+    }
+
+    /// The fresh rows can come out of the order of the group's URLs: the
+    /// ranks of one engine are gathered. Each worker's own row is still its
+    /// own, and a URL with no fresh row is still pruned.
+    #[test]
+    fn fresh_rows_out_of_the_urls_order_hand_back_no_row_of_their_own() {
+        let (registry, state) = setup();
+        let workers: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| {
+                let worker = ready_worker(&format!("http://w{i}:8080"), "m");
+                registry.register(Arc::clone(&worker)).unwrap();
+                worker
+            })
+            .collect();
+        let urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
+        let rows = |order: &[usize]| -> Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)> {
+            order
+                .iter()
+                .map(|&i| (Arc::clone(&workers[i]), load(1)))
+                .collect()
+        };
+        assert!(state.publish_group(&urls, rows(&[0, 1, 2, 3])).is_empty());
+        assert!(state.publish_group(&urls, rows(&[2, 0, 3, 1])).is_empty());
+
+        let pruned = state.publish_group(&urls, rows(&[3, 0, 1]));
+        assert!(
+            pruned.len() == 1 && Arc::ptr_eq(&pruned[0].0, &workers[2]),
+            "the one URL with no fresh row"
+        );
+        for (i, url) in urls.iter().enumerate() {
+            let waiting = waiting_of(&state.snapshot(), url);
+            assert_eq!(waiting, (i != 2).then_some(1), "{url}");
+        }
     }
 
     #[test]
@@ -605,7 +737,7 @@ mod tests {
             .iter()
             .map(|w| (Arc::clone(w), load(1)))
             .collect::<Vec<_>>();
-        state.publish_group(&[], fresh);
+        let _ = state.publish_group(&[], fresh);
         assert_eq!(state.snapshot().len(), 50);
 
         for worker in &workers {
@@ -629,7 +761,7 @@ mod tests {
         let (registry, state) = setup();
         let worker = ready_worker("http://w1:8080", "m");
         registry.register(Arc::clone(&worker)).unwrap();
-        state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
         state.enqueue_eviction(Arc::clone(&worker));
 
         state.clear();
@@ -646,7 +778,7 @@ mod tests {
         let (registry, state) = setup();
         let worker = ready_worker("http://w1:8080", "m");
         registry.register(Arc::clone(&worker)).unwrap();
-        state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
         worker.set_status(WorkerStatus::NotReady);
         state.enqueue_eviction(Arc::clone(&worker));
         worker.set_status(WorkerStatus::Ready);

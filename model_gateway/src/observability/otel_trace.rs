@@ -1,6 +1,7 @@
 //! OpenTelemetry tracing integration.
 
 use std::{
+    borrow::Cow,
     sync::{
         atomic::{AtomicBool, Ordering},
         OnceLock,
@@ -326,6 +327,20 @@ pub fn inject_trace_context_http(headers: &mut HeaderMap) {
     });
 }
 
+/// The caller's headers as a worker is sent them: lent as they are while
+/// tracing is off, copied to carry the W3C trace context of the current span
+/// while it is on.
+pub(crate) fn with_trace_context_http(headers: Option<&HeaderMap>) -> Cow<'_, HeaderMap> {
+    match headers {
+        Some(headers) if !is_otel_enabled() => Cow::Borrowed(headers),
+        _ => {
+            let mut traced = headers.cloned().unwrap_or_default();
+            inject_trace_context_http(&mut traced);
+            Cow::Owned(traced)
+        }
+    }
+}
+
 /// Inject W3C trace context into gRPC metadata.
 #[inline]
 pub fn inject_trace_context_grpc(metadata: &mut MetadataMap) {
@@ -372,12 +387,30 @@ impl smg_grpc_client::TraceInjector for OtelTraceInjector {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        borrow::Cow,
+        sync::{Arc, Mutex},
+    };
 
+    use axum::http::{HeaderMap, HeaderValue};
     use tracing::{Level, Subscriber};
     use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, Layer};
 
-    use super::CustomOtelFilter;
+    use super::{is_otel_enabled, with_trace_context_http, CustomOtelFilter};
+
+    /// While tracing is off (no test of this binary turns it on) nothing is
+    /// written into the headers, so the caller's map is lent, not copied.
+    #[test]
+    fn the_callers_headers_are_lent_while_tracing_is_off() {
+        assert!(!is_otel_enabled());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("r-1"));
+
+        let lent = with_trace_context_http(Some(&headers));
+        assert!(matches!(lent, Cow::Borrowed(_)));
+        assert_eq!(*lent, headers);
+        assert!(with_trace_context_http(None).is_empty());
+    }
 
     /// The trace layer's level is the more verbose of INFO and the log level: the spans export
     /// at `--log-level warn` and `error`, and a finer log level reaches the trace targets' events.

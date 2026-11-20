@@ -867,16 +867,25 @@ def test_every_example_renders_arguments_the_launcher_parses(example, tmp_path):
     launcher_args(with_readable_files(router_container(documents)["args"], tmp_path))
 
 
+def launcher_policies() -> list[str]:
+    """The launcher's ``--policy`` choices, read from its own parser."""
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    RouterArgs.add_cli_args(parser)
+    choices = parser._option_string_actions["--policy"].choices
+    assert choices is not None
+    return list(choices)
+
+
 @needs_chart
 def test_the_schema_admits_the_policies_the_launcher_takes():
     """The schema accepts an empty value and every launcher policy."""
     schema = json.loads(SCHEMA.read_text())
     policy = schema["properties"]["router"]["properties"]["policy"]
-    assert policy["enum"] == ["", *router_args.COMMON_POLICY_CHOICES]
+    assert policy["enum"] == ["", *launcher_policies()]
 
 
 @needs_helm
-@pytest.mark.parametrize("policy", router_args.COMMON_POLICY_CHOICES)
+@pytest.mark.parametrize("policy", launcher_policies())
 def test_every_launcher_policy_renders_and_reaches_the_launcher(policy):
     _, documents = render(f"router.policy={policy}")
     args = router_container(documents)["args"]
@@ -885,10 +894,9 @@ def test_every_launcher_policy_renders_and_reaches_the_launcher(policy):
 
 
 @needs_helm
-def test_a_prefill_only_policy_is_refused_by_the_schema():
-    """``bucket`` is a ``--prefill-policy`` choice, not a ``--policy`` one; the
-    schema refuses it where the launcher would, at render time."""
-    assert "router.policy must be one of the following" in render_error("router.policy=bucket")
+def test_a_policy_the_launcher_does_not_take_is_refused_by_the_schema():
+    """The schema refuses a name at render time, where the launcher would."""
+    assert "router.policy must be one of the following" in render_error("router.policy=fastest")
 
 
 POLICY_CONTROLLER_ON = "router.policyController=on"

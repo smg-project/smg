@@ -39,11 +39,11 @@ use crate::{
     affinity::{blocks_within, Gates, KvPressure, PrefixAffinity, WarmupSlice},
     bucket::Bucket,
     builtins::{
-        with_report_age, FewestSessions, LeastCost, LeastCostSent, LeastLoad, LeastRequests,
-        ResidentWork, SampledBest, SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT,
-        DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
+        has_room_rule, with_report_age, FewestSessions, HasRoomRule, LeastCost, LeastCostSent,
+        LeastLoad, LeastRequests, ResidentWork, SampledBest, SessionAffinity,
+        DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
     },
-    catalog::{profile_sent, Catalog, Found, StageBuild},
+    catalog::{profile_sent, Catalog, FilterFactory, Found, StageBuild},
     framework::{
         Binding, Engine, Filter, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted,
     },
@@ -96,8 +96,12 @@ pub const KEY_BYTES: u32 = 128;
 /// The most bytes an entry's `max_bytes` may ask for.
 pub const MAX_KEY_BYTES: u32 = 8192;
 
-/// The most sources one `routing_key` block lists.
+/// The most sources one `routing_key` block lists, its client sources not
+/// counted.
 pub const MAX_KEY_SOURCES: usize = 8;
+
+/// The most client sources one `routing_key` block lists.
+pub const MAX_CLIENT_SOURCES: usize = 4;
 
 /// The highest `view.max_block_hashes`: the hashes a `DecideRequest` at
 /// the contract's bound of 64 KiB carries beside an id of one byte, at
@@ -196,6 +200,9 @@ pub struct Needs {
     pub loads: bool,
     /// KV events into an index.
     pub events: bool,
+    /// The stage reads the prefixes sent to each worker.
+    #[serde(default)]
+    pub sent_prefixes: bool,
     /// A consistent-hash ring per model.
     pub ring: bool,
     /// Allow-listed headers in the view.
@@ -264,6 +271,7 @@ impl Needs {
             text_hashes: self.text_hashes || other.text_hashes,
             loads: self.loads || other.loads,
             events: self.events || other.events,
+            sent_prefixes: self.sent_prefixes || other.sent_prefixes,
             ring: self.ring || other.ring,
             headers: self.headers || other.headers,
             media: self.media || other.media,
@@ -964,15 +972,19 @@ impl ScoreStage {
     }
 }
 
-/// A filter reference: a bare name, or a name the catalog adds mapped to
-/// the parameters its factory reads.
+/// A filter reference: a bare name, a built-in mapped to its parameters
+/// ([`FilterStage`]), or a name the catalog adds mapped to the parameters
+/// its factory reads. A name YAML reads as no string (`true`, `7`, `~`) is
+/// written in quotes.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum FilterSpec {
     Name(String),
-    /// A name mapped to what the document wrote under it. The map is kept
-    /// as read so the validator can ask the catalog for the name first.
-    /// Parsing refuses a repeated key.
+    Params(FilterStage),
+    /// A name that is no built-in's with parameters, mapped to what the
+    /// document wrote under it. The map is kept as read so the validator
+    /// can ask the catalog for the name first. Parsing refuses a repeated
+    /// key.
     Added {
         name: String,
         written: serde_json::Value,
@@ -984,7 +996,138 @@ impl FilterSpec {
     pub fn name(&self) -> &str {
         match self {
             Self::Name(name) | Self::Added { name, .. } => name,
+            Self::Params(stage) => stage.name(),
         }
+    }
+}
+
+impl From<FilterStage> for FilterSpec {
+    fn from(stage: FilterStage) -> Self {
+        Self::Params(stage)
+    }
+}
+
+/// A built-in filter with its parameters, keyed by the filter's name:
+/// `{ has-room: { used, capacity } }`. One key per entry.
+#[derive(Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum FilterStage {
+    HasRoom(HasRoomParams),
+}
+
+impl FilterStage {
+    /// The filter's name, as the document spells it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::HasRoom(_) => HasRoomRule::NAME,
+        }
+    }
+}
+
+/// `has-room` by a rule: a worker has room where what it holds is at most
+/// its capacity less the headroom, `used <= (1 - headroom) * capacity`.
+/// The filter stays soft: where no worker has room, every worker stands.
+/// Written bare, `has-room` reads the bit its host sets.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HasRoomParams {
+    /// What a worker holds: field names and their coefficients, summed. At
+    /// least one field is required. A worker that lacks a named value has
+    /// no room.
+    #[serde(deserialize_with = "keyed_once")]
+    #[schemars(extend(
+        "minProperties" = 1,
+        "propertyNames" = { "enum": room_fields() },
+        "additionalProperties" = {
+            "type": "number",
+            "format": "double",
+            "minimum": -COST_PARAMETER_LIMIT,
+            "maximum": COST_PARAMETER_LIMIT,
+            "not": { "const": 0 }
+        }
+    ))]
+    pub used: BTreeMap<String, f64>,
+    /// What a worker can hold, in the units of `used`.
+    pub capacity: Capacity,
+    /// The share of the capacity kept free: from 0 to under 1.
+    #[serde(default)]
+    #[schemars(extend("minimum" = 0, "exclusiveMaximum" = 1))]
+    pub headroom: f64,
+}
+
+/// The names `has-room` may sum: every term's, and the request's size.
+fn room_fields() -> Vec<&'static str> {
+    let mut names: Vec<_> = Term::NAMES.iter().map(|&(name, _)| name).collect();
+    names.push(HasRoomRule::REQUEST_TOKENS);
+    names.sort_unstable();
+    names
+}
+
+/// What a worker can hold: a number above zero in the units of `used`, or
+/// the name of a field that holds one. No field of this build holds a
+/// capacity, so a name is read and refused.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum Capacity {
+    Fixed(f64),
+    Field(String),
+}
+
+impl Serialize for Capacity {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Fixed(capacity) => serializer.serialize_f64(*capacity),
+            Self::Field(name) => serializer.serialize_str(name),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Capacity {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CapacityVisitor;
+
+        impl Visitor<'_> for CapacityVisitor {
+            type Value = Capacity;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a number, or the name of a field that holds one")
+            }
+
+            fn visit_f64<E: de::Error>(self, capacity: f64) -> Result<Capacity, E> {
+                Ok(Capacity::Fixed(capacity))
+            }
+
+            fn visit_i64<E: de::Error>(self, capacity: i64) -> Result<Capacity, E> {
+                Ok(Capacity::Fixed(capacity as f64))
+            }
+
+            fn visit_u64<E: de::Error>(self, capacity: u64) -> Result<Capacity, E> {
+                Ok(Capacity::Fixed(capacity as f64))
+            }
+
+            fn visit_str<E: de::Error>(self, name: &str) -> Result<Capacity, E> {
+                Ok(Capacity::Field(name.to_string()))
+            }
+        }
+
+        deserializer.deserialize_any(CapacityVisitor)
+    }
+}
+
+impl JsonSchema for Capacity {
+    fn schema_name() -> Cow<'static, str> {
+        "Capacity".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "description": "What a worker can hold: a number above zero in the units of `used`, or the name of a field that holds one. No field of this build holds a capacity.",
+            "anyOf": [
+                { "type": "number", "format": "double", "exclusiveMinimum": 0 },
+                { "type": "string" }
+            ]
+        })
     }
 }
 
@@ -1066,6 +1209,15 @@ impl Serialize for FilterSpec {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Name(name) => serializer.serialize_str(name),
+            // One key, the stage's name, to its parameters, as a score
+            // entry is written.
+            Self::Params(stage) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                match stage {
+                    FilterStage::HasRoom(p) => map.serialize_entry(stage.name(), p)?,
+                }
+                map.end()
+            }
             Self::Added { name, written } => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry(name, &Ordered(written))?;
@@ -1267,19 +1419,26 @@ impl<'de> Deserialize<'de> for FilterSpec {
                 Ok(FilterSpec::Name(name.to_string()))
             }
 
-            // What stands under the name is kept as read: only the
+            // A built-in's key chooses its parameter struct, so the
+            // struct's own message names an unknown or mistyped parameter.
+            // What stands under any other name is kept as read: only the
             // validator knows the names a catalog adds.
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<FilterSpec, A::Error> {
                 let Some(name) = map.next_key::<String>()? else {
                     return Err(de::Error::custom("a filter entry names one filter"));
                 };
-                let Written(written) = map.next_value()?;
+                let entry = if name == HasRoomRule::NAME {
+                    FilterSpec::Params(FilterStage::HasRoom(map.next_value()?))
+                } else {
+                    let Written(written) = map.next_value()?;
+                    FilterSpec::Added { name, written }
+                };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::custom(
                         "a filter entry maps a single key to its parameters; write one entry per filter",
                     ));
                 }
-                Ok(FilterSpec::Added { name, written })
+                Ok(entry)
             }
         }
 
@@ -1292,15 +1451,17 @@ impl JsonSchema for FilterSpec {
         "FilterSpec".into()
     }
 
-    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         json_schema!({
-            "description": "A filter: its bare name, or the name of a filter the host adds mapped to its parameters.",
+            "description": "A filter: its bare name, a built-in mapped to its parameters, or the name of a filter the host adds mapped to its parameters.",
             "anyOf": [
                 { "type": "string" },
+                generator.subschema_for::<FilterStage>(),
                 {
                     "type": "object",
                     "minProperties": 1,
                     "maxProperties": 1,
+                    "propertyNames": { "not": { "const": HasRoomRule::NAME } },
                     "additionalProperties": { "type": "object" }
                 }
             ]
@@ -1585,8 +1746,8 @@ impl Default for Match {
 /// its rows are vetoed where a binding's overload block names no count.
 pub const OVERLOAD_WAITING_REQUESTS: u32 = 8;
 
-/// The mean KV usage over an engine's ranks at or above which its rows are
-/// vetoed where a binding's overload block names no usage.
+/// The mean active KV usage over an engine's ranks at or above which its
+/// rows are vetoed where a binding's overload block names no usage.
 pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 
 /// The overload veto's defaults for the workers of the pools decided under
@@ -1604,8 +1765,9 @@ pub struct OverloadSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub waiting_requests: Option<u32>,
-    /// Mean KV usage over an engine's ranks at or above which a worker is
-    /// vetoed; above 0 and at most 1 (default 0.8).
+    /// Mean active KV usage over an engine's ranks at or above which a
+    /// worker is vetoed; above 0 and at most 1 (default 0.8). A rank that
+    /// reports no active share counts its whole usage.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(extend("exclusiveMinimum" = 0), range(max = 1.0))]
     pub token_usage: Option<f32>,
@@ -1734,8 +1896,9 @@ fn default_inflight_cap() -> u16 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingKeySpec {
-    /// The sources, read in order: one to eight, each named once.
-    #[schemars(length(min = 1, max = 8))]
+    /// The sources, read in order: one to eight, each named once, and up
+    /// to four client sources beside them.
+    #[schemars(length(min = 1, max = 12))]
     pub sources: Vec<KeySourceSpec>,
     /// Take the turn and retry suffixes off a key, so every turn of a
     /// conversation shares one (`conv_t2_r1` keys as `conv`); default
@@ -1757,10 +1920,24 @@ pub struct KeySourceSpec {
     #[serde(skip_serializing_if = "is_default")]
     pub rid: bool,
     /// The most bytes of a value this source hands, 8192 at most (default
-    /// 128). A longer value is passed over and the next source is read.
+    /// 128). A longer value is passed over and the next source is read. A
+    /// header is measured as sent, and the request's own id after the
+    /// block's `strip_lineage` took its suffixes off.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 8192))]
     pub max_bytes: Option<u32>,
+    /// A source that tells one client from another, not one session: a
+    /// header a proxy or a browser sets. Its key places a request that
+    /// carries no session key on a ring. It lifts no overload veto, pins
+    /// no session and is counted under no key. Of a binding's client
+    /// sources, the first whose header a request carries is the one read,
+    /// and a value it cannot hand ends the read. The value is read whole
+    /// and leaves as its fingerprint alone, so `rid` and `max_bytes` are
+    /// refused beside it. A header may be named both ways: capped as a
+    /// session's source, and whole as a client's where that read handed no
+    /// key. Default false.
+    #[serde(skip_serializing_if = "is_default")]
+    pub client: bool,
 }
 
 /// A second profile deciding a share of the binding's requests, the
@@ -2850,10 +3027,11 @@ fn scorer_of(
     let max_age = view.max_report_age_ms;
     Ok(match stage {
         ScoreStage::LeastLoad(p) => Resolved::Built(with_report_age(
-            LeastLoad::new(
+            LeastLoad::of_profile(
                 p.kv_pressure_weight.unwrap_or(DEFAULT_KV_PRESSURE_WEIGHT),
                 p.mean_prefill_tokens.unwrap_or(DEFAULT_MEAN_PREFILL_TOKENS),
                 p.default_throughput.unwrap_or(DEFAULT_THROUGHPUT),
+                sent(),
             ),
             max_age,
         )),
@@ -2953,75 +3131,158 @@ struct StageInputs<'a> {
     signals: &'a [SignalColumn],
 }
 
-/// The filter the entry at `index` of a profile's list stands for. The
-/// catalog is asked for the name first: a name it does not hold is refused
-/// as unknown whatever is written under it. `at` is the profile's path:
-/// the entry's own is written where a refusal names it, so an entry that
+/// What a filter entry stands for.
+enum Filtered<'a> {
+    /// A built-in, by the parameters the document wrote.
+    Typed(&'a FilterStage),
+    /// A filter the catalog built.
+    Built(Box<dyn Filter>),
+}
+
+/// What the entry at `index` of a profile's list stands for. The catalog
+/// is asked for the name first: a name it does not hold is refused as
+/// unknown whatever is written under it. `at` is the profile's path: the
+/// entry's own is written where a refusal names it, so an entry that
 /// validates builds none.
-fn filtered(
-    entry: &FilterSpec,
+fn filtered<'a>(
+    entry: &'a FilterSpec,
     profile: &str,
     at: &At,
     index: usize,
     from: StageInputs<'_>,
     sent_ttl_ms: Option<u32>,
     sent: &mut Option<Arc<SentCredit>>,
-) -> Result<Box<dyn Filter>, SpecError> {
+) -> Result<Filtered<'a>, SpecError> {
     let name = entry.name();
     let path = || format!("{}.filter[{index}].{name}", at.0);
+    // The catalog's factory builds its filter from the document's map.
+    // A filter has no weight: the map is the factory's whole.
+    let made = |build: &FilterFactory,
+                mut params: serde_json::Map<String, serde_json::Value>,
+                sent: &mut Option<Arc<SentCredit>>| {
+        in_key_order(&mut params);
+        let filter = StageBuild::built(
+            &params,
+            profile,
+            sent_ttl_ms,
+            sent,
+            from.reports,
+            from.signals,
+            build,
+            Filter::needs,
+        )
+        .map_err(|error| error.at(&path()))?;
+        let answers = filter.name();
+        if answers != name {
+            return Err(SpecError::BadStage {
+                path: path(),
+                reason: format!("filter registered as {name:?} answers the name {answers:?}"),
+            });
+        }
+        Ok(Filtered::Built(filter))
+    };
     match (from.catalog.find_filter(name), entry) {
-        (Some(Found::Built(filter)), FilterSpec::Name(_)) => Ok(filter),
+        // A built-in's parameters are the validator's to check, under a
+        // name the catalog holds.
+        (Some(Found::Built(_) | Found::With(_)), FilterSpec::Params(stage)) => {
+            Ok(Filtered::Typed(stage))
+        }
+        (Some(Found::Built(filter)), FilterSpec::Name(_)) => Ok(Filtered::Built(filter)),
         // A filter registered with no parameter is written by its name
         // alone: whatever stands under it is refused.
         (Some(Found::Built(_)), FilterSpec::Added { written, .. }) => Err(SpecError::BadField {
             path: path(),
             value: written.to_string(),
-            reason: "left out under a filter that takes no parameter",
+            reason: "left out: this filter takes no parameter, write its bare name",
         }),
-        (Some(Found::With(build)), entry) => {
-            let mut params = match entry {
-                FilterSpec::Name(_) => serde_json::Map::new(),
-                FilterSpec::Added { written, .. } => written
-                    .as_object()
-                    .ok_or_else(|| SpecError::BadField {
-                        path: path(),
-                        value: written.to_string(),
-                        reason: "a map of the filter's parameters",
-                    })?
-                    .clone(),
-            };
-            // A filter has no weight: the map is the factory's whole, in
-            // the one order a scorer's parameters take.
-            params.sort_keys();
-            params
-                .values_mut()
-                .for_each(serde_json::Value::sort_all_objects);
-            let filter = StageBuild::built(
-                &params,
-                profile,
-                sent_ttl_ms,
-                sent,
-                from.reports,
-                from.signals,
-                build,
-                Filter::needs,
-            )
-            .map_err(|error| error.at(&path()))?;
-            let answers = filter.name();
-            if answers != name {
-                return Err(SpecError::BadStage {
-                    path: path(),
-                    reason: format!("filter registered as {name:?} answers the name {answers:?}"),
-                });
-            }
-            Ok(filter)
+        (Some(Found::With(build)), FilterSpec::Name(_)) => {
+            made(build, serde_json::Map::new(), sent)
         }
-        // No filter is the validator's to build from typed parameters.
+        (Some(Found::With(build)), FilterSpec::Added { written, .. }) => {
+            let params = written.as_object().ok_or_else(|| SpecError::BadField {
+                path: path(),
+                value: written.to_string(),
+                reason: "a map of the filter's parameters",
+            })?;
+            made(build, params.clone(), sent)
+        }
+        // The catalog holds no filter by its type alone.
         (None | Some(Found::Typed), _) => Err(SpecError::UnknownFilter {
             profile: profile.to_string(),
             name: name.to_string(),
         }),
     }
+}
+
+/// The stage's filter, with the view's settings. `sent` hands out the
+/// profile's count of sends.
+fn filter_of(
+    stage: &FilterStage,
+    view: &ViewSpec,
+    sent: impl FnOnce() -> Arc<SentCredit>,
+    at: &At,
+) -> Result<Box<dyn Filter>, SpecError> {
+    match stage {
+        FilterStage::HasRoom(p) => has_room_of(p, sent, view.max_report_age_ms, at),
+    }
+}
+
+/// Check the rule's parameters while resolving the field names into
+/// readers. Only a term that reads sends makes the profile's count.
+fn has_room_of(
+    p: &HasRoomParams,
+    sent: impl FnOnce() -> Arc<SentCredit>,
+    max_age_ms: Option<u64>,
+    at: &At,
+) -> Result<Box<dyn Filter>, SpecError> {
+    if p.used.is_empty() {
+        return Err(at.bad("used", "{}", "at least one field with its coefficient"));
+    }
+    let mut terms = Vec::new();
+    let mut request_tokens = 0.0;
+    for (name, &coefficient) in &p.used {
+        let term = if name == HasRoomRule::REQUEST_TOKENS {
+            None
+        } else {
+            let named = Term::named(name);
+            Some(named.ok_or_else(|| at.bad("used", name, "a field this build reads"))?)
+        };
+        if coefficient == 0.0
+            || !(-COST_PARAMETER_LIMIT..=COST_PARAMETER_LIMIT).contains(&coefficient)
+        {
+            return Err(at.sub("used").bad(
+                name,
+                coefficient,
+                "a finite number other than zero, of magnitude at most 1e15",
+            ));
+        }
+        match term {
+            Some(term) => terms.push((term, coefficient)),
+            None => request_tokens = coefficient,
+        }
+    }
+    let capacity = match &p.capacity {
+        Capacity::Fixed(capacity) if capacity.is_finite() && *capacity > 0.0 => *capacity,
+        Capacity::Fixed(capacity) => {
+            return Err(at.bad("capacity", capacity, "a finite number above zero"));
+        }
+        // No field of this build holds a capacity.
+        Capacity::Field(name) => {
+            return Err(at.bad("capacity", name, "a field this build reads"));
+        }
+    };
+    if !(0.0..1.0).contains(&p.headroom) {
+        return Err(at.bad("headroom", p.headroom, "a number from 0 to under 1"));
+    }
+    let reads_sent = terms.iter().any(|&(term, _)| term.reads_sent());
+    let rule = HasRoomRule::new(
+        &terms,
+        request_tokens,
+        capacity,
+        p.headroom,
+        reads_sent.then(sent),
+    );
+    Ok(has_room_rule(rule, max_age_ms))
 }
 
 /// What a score entry stands for.
@@ -3086,13 +3347,7 @@ fn scored(
                 Some(value) => check_added_weight(&value, &at)?,
                 None => 1.0,
             };
-            // One order for the factory, the canonical bytes and the
-            // digest: the keys of every map in order, whatever order the
-            // document wrote them in.
-            params.sort_keys();
-            params
-                .values_mut()
-                .for_each(serde_json::Value::sort_all_objects);
+            in_key_order(&mut params);
             let scorer = StageBuild::built(
                 &params,
                 profile,
@@ -3121,6 +3376,16 @@ fn scored(
             reason: "a scorer added in code: a built-in's parameters are typed",
         }),
     }
+}
+
+/// One order of a stage's parameters for its factory, the canonical bytes
+/// and the digest: the keys of every map in order, whatever order the
+/// document wrote them in.
+fn in_key_order(params: &mut serde_json::Map<String, serde_json::Value>) {
+    params.sort_keys();
+    params
+        .values_mut()
+        .for_each(serde_json::Value::sort_all_objects);
 }
 
 fn added_parameters<'a>(
@@ -3230,7 +3495,14 @@ fn check_profile(
     let mut sent = None;
     let mut filters = Vec::with_capacity(p.filter.len());
     for (index, entry) in p.filter.iter().enumerate() {
-        let filter = filtered(entry, name, &at, index, from, p.sent_ttl_ms, &mut sent)?;
+        let filter = match filtered(entry, name, &at, index, from, p.sent_ttl_ms, &mut sent)? {
+            Filtered::Built(filter) => filter,
+            Filtered::Typed(stage) => {
+                let stage_at = At::new(format!("{}.filter[{index}].{}", at.0, stage.name()));
+                let count = || profile_sent(&mut sent, name, p.sent_ttl_ms);
+                filter_of(stage, view, count, &stage_at)?
+            }
+        };
         filters.push(filter);
     }
     let mut scorers = Vec::with_capacity(p.score.len());
@@ -3561,20 +3833,30 @@ fn check_session_headers(
     Ok(())
 }
 
-/// A binding's routing key sources: one to eight entries, each a header
-/// outside the credential names or the request's own id, each named once,
-/// with a byte cap inside the schema's.
+/// A binding's routing key sources: one to eight entries and up to four
+/// client entries beside them, never client entries alone, each a header
+/// outside the credential names or the request's own id, each named once
+/// as a session's source and once as a client's, with a byte cap inside the
+/// schema's.
 fn check_routing_key(
     block: &RoutingKeySpec,
     cx: &BindingContext<'_>,
     at: &At,
 ) -> Result<(), SpecError> {
-    let listed = block.sources.len();
-    if listed == 0 || listed > MAX_KEY_SOURCES {
+    let clients = block.sources.iter().filter(|source| source.client).count();
+    let listed = block.sources.len() - clients;
+    if block.sources.is_empty() || listed > MAX_KEY_SOURCES {
         return Err(at.bad(
             "sources",
             format_args!("{listed} entries"),
             "a list of one to eight sources",
+        ));
+    }
+    if clients > MAX_CLIENT_SOURCES {
+        return Err(at.bad(
+            "sources",
+            format_args!("{clients} client entries"),
+            "a list of four client sources at most",
         ));
     }
     let mut seen = BTreeSet::new();
@@ -3594,7 +3876,14 @@ fn check_routing_key(
                 });
             }
         };
-        if !seen.insert((source.rid, name)) {
+        if source.client && (source.rid || source.max_bytes.is_some()) {
+            return Err(SpecError::BadField {
+                path: at.field("client"),
+                value: "true".to_string(),
+                reason: "a header read whole, with no rid and no max_bytes beside it",
+            });
+        }
+        if !seen.insert((source.rid, source.client, name)) {
             return Err(SpecError::Duplicate {
                 path: at.0,
                 name: name.to_string(),
@@ -3606,6 +3895,13 @@ fn check_routing_key(
             |bytes| (1..=MAX_KEY_BYTES).contains(&bytes),
             "between 1 and 8192",
         )?;
+    }
+    if listed == 0 {
+        return Err(at.bad(
+            "sources",
+            "client entries alone",
+            "a list of one to eight sources",
+        ));
     }
     Ok(())
 }
@@ -3934,6 +4230,33 @@ pub const PRESETS: [&str; 10] = [
 /// routing-key header; the host feeds the key it resolved under it.
 pub const MANUAL_SESSION_HEADER: &str = "x-smg-routing-key";
 
+/// The routing key sources of a preset whose ring places by the key, as
+/// the gateway's policy of that name reads them at its defaults: the
+/// routing key header, and for the hash ring, behind it, the two headers
+/// that tell one client from another, as client sources. `None` for every
+/// other preset: `manual` names its one header in its sessions rule, and no
+/// other preset's stage reads a key.
+fn preset_routing_key(name: &str) -> Option<RoutingKeySpec> {
+    let header = |name: &str, client| KeySourceSpec {
+        header: Some(name.to_string()),
+        client,
+        ..KeySourceSpec::default()
+    };
+    let sources = match name {
+        "prefix_hash" => vec![header(MANUAL_SESSION_HEADER, false)],
+        "consistent_hashing" => vec![
+            header(MANUAL_SESSION_HEADER, false),
+            header("x-forwarded-for", true),
+            header("cookie", true),
+        ],
+        _ => return None,
+    };
+    Some(RoutingKeySpec {
+        sources,
+        strip_lineage: false,
+    })
+}
+
 fn standard_filters() -> Vec<FilterSpec> {
     vec![
         "healthy".into(),
@@ -4020,7 +4343,8 @@ impl PolicySpec {
             },
             // The ring owner of the decision's key (an encode item's content
             // hash, a request's routing key), the ring's next members as the
-            // alternates; a keyless decision is the picker's draw.
+            // alternates; a request with no session key is placed by its
+            // client's key, and one with neither is the picker's draw.
             "consistent_hashing" => ProfileSpec {
                 filter: standard_filters(),
                 score: vec!["consistent-hash".into()],
@@ -4135,6 +4459,7 @@ impl PolicySpec {
             plans: PlansSpec::default(),
             bindings: vec![BindingSpec {
                 profile: Some(name.to_string()),
+                routing_key: preset_routing_key(name),
                 sessions,
                 ..BindingSpec::default()
             }],
@@ -4164,6 +4489,12 @@ impl PolicySpec {
         spec.bindings = vec![BindingSpec {
             plan: Some(PlanName::PdPair),
             profiles,
+            // One request, one key: the sides' session sources are the one
+            // header, and the hash ring's side adds its client sources.
+            routing_key: [prefill, decode]
+                .into_iter()
+                .filter_map(preset_routing_key)
+                .max_by_key(|key| key.sources.len()),
             ..BindingSpec::default()
         }];
         Ok(spec)
@@ -4355,6 +4686,14 @@ impl PolicySpec {
             self.profiles.len(),
             "every profile is built once the deferred check has passed"
         );
+        // A binding's routing key sources are kept by its place in the
+        // document and found by its place in the engine
+        // ([`AppliedSpec::key_sources_for`]): the two are one place.
+        debug_assert_eq!(
+            bindings.len(),
+            self.bindings.len(),
+            "every binding is built once the deferred check has passed"
+        );
         if self.bindings.is_empty() {
             // One profile, refused above when there are more.
             bindings.push(Binding {
@@ -4410,11 +4749,7 @@ impl PolicySpec {
     /// any (an exact id, then the longer `prefix*` or `*suffix`, then `*`).
     #[must_use]
     pub fn index_for(&self, model: &str) -> Option<(&str, &IndexSpec)> {
-        self.index
-            .iter()
-            .filter(|(pattern, _)| glob_matches(pattern, model))
-            .max_by_key(|(pattern, _)| specificity(pattern))
-            .map(|(pattern, spec)| (pattern.as_str(), spec))
+        index_matching(&self.index, model)
     }
 
     /// The JSON schema of the document, generated from these types: the
@@ -4536,6 +4871,17 @@ impl io::Write for HashWriter<'_> {
     }
 }
 
+fn index_matching<'a>(
+    index: &'a BTreeMap<String, IndexSpec>,
+    model: &str,
+) -> Option<(&'a str, &'a IndexSpec)> {
+    index
+        .iter()
+        .filter(|(pattern, _)| glob_matches(pattern, model))
+        .max_by_key(|(pattern, _)| specificity(pattern))
+        .map(|(pattern, spec)| (pattern.as_str(), spec))
+}
+
 /// One generation as a store applies it: the engine validated from a
 /// document, with the generation's number, its needs and its view's cap on
 /// a request's block hashes.
@@ -4573,6 +4919,8 @@ pub struct AppliedSpec {
     max_block_hashes: u32,
     /// The view's block size: a request that names none is counted by it.
     block_size: u32,
+    /// The index settings a model takes at a membership write or apply.
+    index: BTreeMap<String, IndexSpec>,
     pairing: Pairing,
     lists: ViewLists,
     /// Each binding's routing key sources, by the binding's place in the
@@ -4648,6 +4996,7 @@ impl AppliedSpec {
             signal_columns,
             max_block_hashes: document.view.max_block_hashes,
             block_size: Gates::of(None, None, document.view.block_size).block_size,
+            index: document.index.clone(),
             pairing: document.plans.pd_pair.pairing,
             lists: ViewLists::of(&document.view),
             key_sources: document
@@ -4673,6 +5022,7 @@ impl AppliedSpec {
             signal_columns: Arc::default(),
             max_block_hashes: ViewSpec::default().max_block_hashes,
             block_size: Gates::default().block_size,
+            index: BTreeMap::new(),
             pairing: Pairing::default(),
             lists: ViewLists::default(),
             key_sources: Box::default(),
@@ -4727,6 +5077,19 @@ impl AppliedSpec {
     #[must_use]
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// The document's block size, in tokens: the size a request's blocks
+    /// are counted by where neither the request nor a record says one.
+    pub(crate) fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    /// The most specific matching index settings, or the default.
+    pub(crate) fn index_for(&self, model: &str) -> IndexSpec {
+        index_matching(&self.index, model)
+            .map(|(_, spec)| spec.clone())
+            .unwrap_or_default()
     }
 
     /// The most prefix block hashes of one request a decision under this
@@ -5239,11 +5602,11 @@ mod tests {
             ),
             (
                 "consistent_hashing",
-                "sha256:9efb2b93ae8ceb8ba7468c8a611facf8c6f532e7f60f912f944cd4ca2c66bde6",
+                "sha256:f7f4be1857e6241e4e910252f2cdfc8b8c36a2516e822ec9607f683f5db7fb63",
             ),
             (
                 "prefix_hash",
-                "sha256:f27dcbcd0d1adafc34c00bba709cad16f979a4d02c92da34e388fb1fe917e469",
+                "sha256:f5bc21e35bb782d5ee2a559ece6b18c0905cebcd20c354b294ecf1c1e1c5d871",
             ),
             (
                 "manual",
@@ -7408,6 +7771,16 @@ mod tests {
         let refused = |text: &str| block(text).expect_err(text).to_string();
         let nine: Vec<String> = (0..9).map(|i| format!(r#"{{"header":"x-{i}"}}"#)).collect();
         let nine = format!(r#"{{"sources":[{}]}}"#, nine.join(","));
+        // Client sources are counted apart: four stand beside eight.
+        let beside_eight = |clients: usize| {
+            let listed: Vec<String> = (0..8)
+                .map(|i| format!(r#"{{"header":"x-{i}"}}"#))
+                .chain((0..clients).map(|i| format!(r#"{{"header":"x-c{i}","client":true}}"#)))
+                .collect();
+            format!(r#"{{"sources":[{}]}}"#, listed.join(","))
+        };
+        assert!(block(&beside_eight(4)).is_ok());
+        let five = beside_eight(5);
         for (text, message) in [
             (
                 r#"{"sources":[]}"#,
@@ -7416,6 +7789,10 @@ mod tests {
             (
                 nine.as_str(),
                 "bindings[0].routing_key.sources = 9 entries is not a list of one to eight sources",
+            ),
+            (
+                five.as_str(),
+                "bindings[0].routing_key.sources = 5 client entries is not a list of four client sources at most",
             ),
             (
                 r#"{"sources":[{}]}"#,
@@ -7451,6 +7828,61 @@ mod tests {
             ),
         ] {
             assert_eq!(refused(text), message);
+        }
+        // A host's own denied name, its tenant header, is refused as a
+        // credential is.
+        let tenant = spec_with_binding(
+            r#"{"profile":"p","routing_key":{"sources":[{"header":"x-tenant-id"}]}}"#,
+        );
+        assert!(tenant.validate().is_ok());
+        assert_eq!(
+            tenant.validate_with(&["x-tenant-id"]).err(),
+            Some(SpecError::DeniedHeader {
+                path: "bindings[0].routing_key.sources[0].header".to_string(),
+                name: "x-tenant-id".to_string(),
+            })
+        );
+        // A client source is a header read whole.
+        let client = |source: &str| {
+            spec_with_binding(&format!(
+                r#"{{"profile":"p","routing_key":{{"sources":[{source}]}}}}"#
+            ))
+            .validate()
+            .err()
+        };
+        assert_eq!(
+            client(r#"{"header":"x-a"},{"header":"cookie","client":true}"#),
+            None
+        );
+        // Client sources alone are no block: a sessions rule beside the
+        // block would have no source of a session's key.
+        assert_eq!(
+            client(r#"{"header":"cookie","client":true}"#).map(|refused| refused.to_string()),
+            Some(
+                "bindings[0].routing_key.sources = client entries alone is not a list of one to eight sources"
+                    .to_string()
+            )
+        );
+        // A header is named once each way.
+        assert_eq!(
+            client(r#"{"header":"x-forwarded-for"},{"header":"x-forwarded-for","client":true}"#),
+            None
+        );
+        assert!(matches!(
+            client(r#"{"header":"cookie","client":true},{"header":"cookie","client":true}"#),
+            Some(SpecError::Duplicate { .. })
+        ));
+        for refused in [
+            r#"{"rid":true,"client":true}"#,
+            r#"{"header":"cookie","max_bytes":64,"client":true}"#,
+        ] {
+            assert!(
+                matches!(
+                    client(refused),
+                    Some(SpecError::BadField { path, .. }) if path.ends_with("sources[0].client")
+                ),
+                "{refused}"
+            );
         }
         // One spelling or the other beside a sessions rule.
         let beside = |sessions: &str| {
@@ -7711,6 +8143,31 @@ mod tests {
             ));
             assert!(err.contains(message), "{entry}: {err}");
         }
+    }
+
+    /// YAML reads a bare `true`, a number or `~` as no string. A filter of
+    /// such a name is written in quotes, as a scorer of such a name is.
+    #[test]
+    fn a_filter_name_yaml_reads_as_no_string_is_written_in_quotes() {
+        let document = |entry: &str| {
+            format!(
+                "apiVersion: smg.policy/v1\nprofiles: {{p: {{filter: [{entry}], pick: random}}}}\n"
+            )
+        };
+        for bare in ["true", "7", "~"] {
+            let refused = serde_yaml::from_str::<PolicySpec>(&document(bare))
+                .expect_err("no string")
+                .to_string();
+            assert!(
+                refused.contains("a filter name, or one filter name mapped to its parameters"),
+                "{bare}: {refused}"
+            );
+        }
+        let quoted: PolicySpec = serde_yaml::from_str(&document(r#""true""#)).expect("a name");
+        assert_eq!(
+            quoted.profiles["p"].filter,
+            [FilterSpec::Name("true".into())]
+        );
     }
 
     #[test]

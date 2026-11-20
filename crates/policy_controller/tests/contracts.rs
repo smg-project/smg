@@ -172,6 +172,7 @@ fn request_record() -> &'static [&'static str] {
             named,
             model_fingerprint,
             signal_cells,
+            client_key,
         }
     )
 }
@@ -202,6 +203,7 @@ fn constraints_record() -> &'static [&'static str] {
             excluded,
             wire_modes,
             overload_lifted,
+            decode_later,
             subset_hint,
             demands,
             stalled,
@@ -653,6 +655,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "named",
                 "model_fingerprint",
                 "signal_cells",
+                "client_key",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -682,7 +685,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Constraints",
             record: constraints_record(),
-            host_only: &["demands", "stalled", "held", "pins"],
+            host_only: &["decode_later", "demands", "stalled", "held", "pins"],
             wire_only: &[],
             wire: &[
                 ("excluded", Type::Fixed64),
@@ -896,6 +899,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "named",
                 "model_fingerprint",
                 "signal_cells",
+                "client_key",
             ],
             before: &[],
             beside: &[],
