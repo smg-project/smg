@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "PolicySpec",
-  "description": "The policy specification, version `smg.policy/v1`: what the host builds\ninto the view, the per-model index settings, the profiles with their\nstages, the plans' rules and the ordered bindings. An unknown field at\nany level is refused by name.",
+  "description": "The policy specification, version `smg.policy/v1`: what the host builds\ninto the view, the per-model index settings, the signals its stages\nread, the profiles with their stages, the plans' rules and the ordered\nbindings. An unknown field at any level is refused by name.",
   "type": "object",
   "properties": {
     "apiVersion": {
@@ -25,6 +25,14 @@
       "additionalProperties": {
         "$ref": "#/$defs/IndexSpec"
       }
+    },
+    "signals": {
+      "description": "The signals the document's stages read, by name: a lower-case\nletter, then lower-case letters, digits and underscores, at most 63\nbytes. At most 64. A signal's column is its place among the names,\nin name order.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/SignalSpec"
+      },
+      "maxProperties": 64
     },
     "profiles": {
       "description": "The profiles by name.",
@@ -178,6 +186,31 @@
           "type": "string",
           "const": "hash"
         }
+      ]
+    },
+    "SignalSpec": {
+      "description": "One declared signal: a named value of a worker's report that the\ndocument's stages read beside the rows.",
+      "type": "object",
+      "properties": {
+        "unit": {
+          "description": "The unit a source states for its value to be taken: 1 to 31 bytes.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 31
+        },
+        "max_age_ms": {
+          "description": "A value older than this reads as no value. Absent: a value does\nnot end by its age.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "unit"
       ]
     },
     "ProfileSpec": {

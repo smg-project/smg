@@ -288,6 +288,9 @@ impl PairBuffers {
             decodes: &self.decode.candidates,
             prefill_affinity: &self.prefill.affinity,
             decode_affinity: &self.decode.affinity,
+            // The store keeps no signal cells yet: its views hand none.
+            prefill_signal_cells: None,
+            decode_signal_cells: None,
             table: PairTable::new(&self.ends, &self.listed),
         }
     }
@@ -373,6 +376,8 @@ impl EncodePairBuffers {
             facts: &self.facts,
             prefill_classes: &self.prefill_classes,
             affinity: &self.encode.affinity,
+            // The store keeps no signal cells yet: its views hand none.
+            signal_cells: None,
         };
         (self.pair.pools(), encode)
     }

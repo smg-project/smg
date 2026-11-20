@@ -171,6 +171,7 @@ fn request_record() -> &'static [&'static str] {
             affinity,
             named,
             model_fingerprint,
+            signal_cells,
         }
     )
 }
@@ -650,6 +651,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "affinity",
                 "named",
                 "model_fingerprint",
+                "signal_cells",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -892,6 +894,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "affinity",
                 "named",
                 "model_fingerprint",
+                "signal_cells",
             ],
             before: &[],
             beside: &[],

@@ -150,6 +150,7 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
         "generation",
         "view",
         "index",
+        "signals",
         "profiles",
         "plans",
         "bindings",

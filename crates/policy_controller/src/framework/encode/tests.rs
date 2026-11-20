@@ -12,6 +12,7 @@ use super::*;
 use crate::{
     counts::tests::Lent,
     framework::PairTable,
+    signals::{SignalCell, SignalCells, SignalColumn},
     spec::PolicySpec,
     view::{Health, MediaCounts, Role, WorkerId},
     Pick,
@@ -87,6 +88,11 @@ struct Bed {
     prefill_classes: Vec<u32>,
     prefill_affinity: Vec<AffinityFacts>,
     encode_affinity: Vec<AffinityFacts>,
+    /// Each pool's signal cells, one a row under one signal; empty for a
+    /// pool that is handed none.
+    prefill_cells: Vec<SignalCell>,
+    decode_cells: Vec<SignalCell>,
+    encode_cells: Vec<SignalCell>,
     keys: Vec<Identity<'static>>,
     one: Option<Identity<'static>>,
     references: bool,
@@ -106,6 +112,9 @@ impl Bed {
             prefill_classes: vec![1],
             prefill_affinity: Vec::new(),
             encode_affinity: Vec::new(),
+            prefill_cells: Vec::new(),
+            decode_cells: Vec::new(),
+            encode_cells: Vec::new(),
             keys: vec![Identity::hashed(11)],
             one: None,
             references: false,
@@ -161,12 +170,23 @@ impl Bed {
         facts: &RequestFacts<'_>,
         pool: &PoolFacts<'_>,
     ) -> (Decision, EncodePlaced) {
-        let pools = self.pools();
+        fn cells(of: &[SignalCell]) -> Option<SignalCells> {
+            (!of.is_empty()).then(|| SignalCells::new(of.to_vec(), 1))
+        }
+        let prefill = cells(&self.prefill_cells);
+        let decode = cells(&self.decode_cells);
+        let encoders = cells(&self.encode_cells);
+        let pools = PairPools {
+            prefill_signal_cells: prefill.as_ref(),
+            decode_signal_cells: decode.as_ref(),
+            ..self.pools()
+        };
         let encode = EncodePool {
             encoders: &self.encoders,
             facts: &self.facts,
             prefill_classes: &self.prefill_classes,
             affinity: &self.encode_affinity,
+            signal_cells: encoders.as_ref(),
         };
         let items = EncodeItems {
             keys: &self.keys,
@@ -694,6 +714,7 @@ fn decide_into(bed: &Bed, engine: &Engine, placed: &mut EncodePlaced) -> Decisio
         facts: &bed.facts,
         prefill_classes: &bed.prefill_classes,
         affinity: &bed.encode_affinity,
+        ..EncodePool::default()
     };
     let items = EncodeItems {
         keys: &bed.keys,
@@ -796,6 +817,112 @@ fn the_encode_side_is_asked_under_the_encode_phase() {
     assert_eq!(placed.encoders().len(), 1);
 }
 
+/// What [`ReadsHeld`] records: each row's worker id with the value it read.
+type HeldReads = Arc<parking_lot::Mutex<Vec<(u64, Option<f64>)>>>;
+
+/// A filter that keeps every row and records what the row reads of a
+/// signal: its worker's id with the value.
+#[derive(Debug)]
+struct ReadsHeld(SignalColumn, HeldReads);
+
+impl crate::framework::Filter for ReadsHeld {
+    fn name(&self) -> &'static str {
+        "reads-held"
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, row: &Candidate, _: &Constraints<'_>) -> bool {
+        self.1.lock().push((row.id.0, self.0.read(facts, row)));
+        true
+    }
+}
+
+/// Every pool a decision reads has its cells, and a side the admission
+/// narrows carries its admitted rows' cells. Here the admission leaves out
+/// the first prefill and the first decode, so each side's admitted row
+/// stands at position 0, where the host's cells hold its neighbour's
+/// value. The request's own cells name no pool. Each row that is asked
+/// reads its own value: a prefill 10 and its place, a decode 20 and its
+/// place, an encoder 30 and its place.
+#[test]
+fn each_admitted_row_and_each_encoder_reads_its_own_cells() {
+    let read = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let mut engine = engine();
+    for profile in &mut engine.profiles {
+        let held = SignalColumn::new("held", "tokens", 0, None);
+        let reads = ReadsHeld(held, Arc::clone(&read));
+        profile.filters.push(Box::new(reads));
+    }
+    let cell = |value| SignalCell {
+        value,
+        sampled_at_micros: 0,
+    };
+    let mut bed = Bed::new();
+    // The idle prefill's class has no open encoder; the idle decode takes
+    // no image and the request asks one of its decode.
+    bed.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 9)];
+    bed.prefill_classes = vec![1, 2];
+    bed.decodes = vec![
+        Candidate {
+            vision: false,
+            ..row(0, Role::Decode, 1, 0)
+        },
+        row(1, Role::Decode, 1, 9),
+    ];
+    bed.encoders = vec![
+        unready(row(0, Role::Encode, 0, 0)),
+        row(1, Role::Encode, 0, 3),
+    ];
+    bed.facts = vec![pushing(1), pushing(2)];
+    bed.decode_images = true;
+    bed.prefill_cells = vec![cell(10.0), cell(11.0)];
+    bed.decode_cells = vec![cell(20.0), cell(21.0)];
+    bed.encode_cells = vec![cell(30.0), cell(31.0)];
+    let request = SignalCells::new(vec![cell(1.0); 8], 1);
+    let (facts, pool) = bed.asked();
+    let facts = RequestFacts {
+        signal_cells: Some(&request),
+        ..facts
+    };
+    let (decision, _) = bed.decide_asked(&engine, &facts, &pool);
+    assert!(decision.pick().is_some(), "a pick, not {decision:?}");
+    let read = read.lock();
+    let own = |id: u64| Some(((id / 1_000) * 10 + id % 1_000) as f64);
+    assert!(read.iter().all(|&(id, value)| value == own(id)), "{read:?}");
+    // The admitted prefill, the admitted decode and the open encoder.
+    for id in [1_001, 2_001, 3_001] {
+        assert!(read.iter().any(|&(asked, _)| asked == id), "{id}: {read:?}");
+    }
+}
+
+/// A release build asserts no shape, so the host's cells may end before an
+/// admitted row. The scratch is one a side for every pass: a pass's cells
+/// are its own rows' alone.
+#[test]
+fn an_admitted_row_outside_the_hosts_cells_takes_cells_of_no_value() {
+    let cell = |value| SignalCell {
+        value,
+        sampled_at_micros: 0,
+    };
+    let values = |admitted: &Admitted| -> Vec<Option<f64>> {
+        (0..admitted.from.len() as u32)
+            .map(|at| admitted.cells.row(at).map(|row| row[0].value))
+            .collect()
+    };
+    let mut admitted = Admitted {
+        from: vec![1, 2],
+        ..Admitted::default()
+    };
+    admitted.copy_cells(&SignalCells::new(vec![cell(10.0), cell(11.0)], 1));
+    let read = values(&admitted);
+    assert_eq!(read[0], Some(11.0));
+    assert!(read[1].is_some_and(f64::is_nan), "no value, not {read:?}");
+    // The next pass admits one row: the cells of the pass before are gone.
+    admitted.from = vec![0];
+    admitted.copy_cells(&SignalCells::new(vec![cell(20.0), cell(21.0)], 1));
+    assert_eq!(values(&admitted), [Some(20.0)]);
+    assert!(admitted.cells.fits(1));
+}
+
 /// The decision of `bed` over a fresh scratch under `table`, and the words
 /// each of the encode side's four sets of bits holds after it: the open and
 /// the member encode classes, the decodes' classes and those that take
@@ -811,6 +938,7 @@ fn decided_widths(bed: &Bed, table: PairTable<'_>) -> (Decision, [usize; 4]) {
         facts: &bed.facts,
         prefill_classes: &bed.prefill_classes,
         affinity: &bed.encode_affinity,
+        ..EncodePool::default()
     };
     let items = EncodeItems {
         keys: &bed.keys,
@@ -982,6 +1110,7 @@ fn decide_under(
         facts: &bed.facts,
         prefill_classes: &bed.prefill_classes,
         affinity: &bed.encode_affinity,
+        ..EncodePool::default()
     };
     let items = EncodeItems {
         keys: &bed.keys,
@@ -1308,6 +1437,7 @@ fn a_mask_numbered_anew_is_forgotten_by_the_next_decision() {
         facts: &bed.facts,
         prefill_classes: &bed.prefill_classes,
         affinity: &bed.encode_affinity,
+        ..EncodePool::default()
     };
     let items = EncodeItems {
         keys: &bed.keys,
@@ -1468,6 +1598,7 @@ fn the_held_rows_of_a_mask_are_numbered_with_it() {
         facts: &cut.facts,
         prefill_classes: &cut.prefill_classes,
         affinity: &cut.encode_affinity,
+        ..EncodePool::default()
     };
     let items = EncodeItems {
         keys: &cut.keys,

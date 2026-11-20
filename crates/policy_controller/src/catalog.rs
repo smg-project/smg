@@ -28,6 +28,7 @@ use crate::{
     framework::{Filter, Picker, Scorer},
     reports::Reports,
     sent::SentCredit,
+    signals::SignalColumn,
     spec::{SpecError, SCORERS},
 };
 
@@ -72,6 +73,9 @@ pub struct StageBuild<'a> {
     sent_ttl_ms: Option<u32>,
     sent: &'a mut Option<Arc<SentCredit>>,
     reports: Reports,
+    /// The document's signals, resolved, in name order.
+    signals: &'a [SignalColumn],
+    resolved_signal: bool,
 }
 
 impl<'a> StageBuild<'a> {
@@ -81,6 +85,7 @@ impl<'a> StageBuild<'a> {
         sent_ttl_ms: Option<u32>,
         sent: &'a mut Option<Arc<SentCredit>>,
         reports: Reports,
+        signals: &'a [SignalColumn],
     ) -> Self {
         Self {
             written,
@@ -88,7 +93,14 @@ impl<'a> StageBuild<'a> {
             sent_ttl_ms,
             sent,
             reports,
+            signals,
+            resolved_signal: false,
         }
+    }
+
+    /// Whether the factory resolved a signal ([`Self::signal_column`]).
+    pub(crate) fn resolved_signal(&self) -> bool {
+        self.resolved_signal
     }
 }
 
@@ -123,6 +135,24 @@ impl StageBuild<'_> {
     /// `Copy`, and asking for it makes nothing.
     pub fn reports(&self) -> Reports {
         self.reports
+    }
+
+    /// The column of a signal the document declares, by its name. A name
+    /// the document does not declare is refused at the stage's entry. A
+    /// stage that keeps a column says so in its needs
+    /// ([`Needs::signal_cells`](crate::Needs::signal_cells)), and a stage
+    /// that keeps none does not: the validator refuses either mismatch, so
+    /// a host hands the cells to the profiles that read them and to no
+    /// other.
+    pub fn signal_column(&mut self, name: &str) -> Result<SignalColumn, StageError> {
+        let found = self
+            .signals
+            .binary_search_by(|column| column.name().cmp(name));
+        let column = found.map_err(|_| {
+            StageError::other(format!("{name} is not a signal the document declares"))
+        })?;
+        self.resolved_signal = true;
+        Ok(self.signals[column].clone())
     }
 }
 
