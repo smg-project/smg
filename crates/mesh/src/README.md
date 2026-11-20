@@ -76,8 +76,9 @@ round. A peer that cannot be reached is retried with exponential backoff:
 
 ## Configuration
 
-The gateway configures the mesh from its flags (`model_gateway/src/main.rs`,
-"Mesh Server"); the mesh has no configuration file of its own.
+The gateway configures the mesh from its flags
+(`model_gateway/src/cli/mod.rs`, "Mesh Server"); the mesh has no configuration
+file of its own.
 
 | Flag | Meaning |
 |---|---|

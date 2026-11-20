@@ -334,6 +334,24 @@ score:
 
 The stock schema lists the stock catalog. Validate an extended document against the host's catalog. Stateful scorers and pickers can observe issue, dispatch, completion, release, membership and signals when the host supplies them. A stage that keeps a number of each worker's load report says so through `Lifecycle::keeps_loads`. The controller then tells it every report before a decision can read that report, through `Lifecycle::on_signal`. A stage that does not say so is told no report. In process the load signal names two more things: the worker's slot in the host's counts and the report's sample instant. A host that builds the signal itself fills both. A scorer of your own can state a pick's overlap too: implement `Scorer::states_overlap` and `Scorer::said`. Both have a default that says nothing. `said` is asked once a decision, of the first target alone. The standalone validator refuses stages that declare a need for the full lifecycle. [Runnable Rust example](../../examples/policy-controller) · [Catalog API](src/catalog.rs)
 
+A gateway binary of your own can take the same catalog. Build it as the `stages` function of [`examples/policy-controller`](../../examples/policy-controller) does, set it on `server::Extensions` and start through the gateway library's `main_with`.
+
+```rust
+smg::stock_allocator!();
+
+fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
+    register_jemalloc_as_global_allocator();
+    let extensions = Extensions::new().stages(stages()?);
+    main_with(extensions)
+}
+```
+
+The library sets no allocator. Write `smg::stock_allocator!();` once at the root of your `main.rs` to run on jemalloc with the stock executable's server options, and call `register_jemalloc_as_global_allocator` first in `main` for the allocator's metrics. On MSVC and musl the macro expands to nothing. A build without the macro must leave out the `register_jemalloc_as_global_allocator` call: it runs on the system allocator, or on an allocator of its own. The gateway then says once on stderr that jemalloc was not registered and that the allocator's statistics are off.
+
+The gateway validates its policy document over that catalog at startup, where the policy controller is selected. A refusal stops the start and names what was refused. The gateway keeps its tenant header out of the document's view.
+
+The document the routing flags mean names stock stages alone. To run a stage of yours, name it in a document of your own and start the gateway with `--policy-controller on` and `--policy-spec FILE`. The document replaces the routing flags: a routing flag typed beside it is refused by name.
+
 ### Load a WebAssembly component
 
 Compile a component for the `smg:policy` package, at the version the WIT file names. The `policy` world takes records. `policy-packed` takes byte blocks with the layout given in the WIT. The host refuses imports from WASI. It provides log, clock, counter and seeded random calls. A component implements `init`, a decision resource with filter, score and pick, and `observe`. A score answer can carry `tie-band` on the scores' 0 to 1 scale: rows within that band of the best score tie, and the host uses its default band where the guest sends none. The host keeps instances per decider and meters their calls.
@@ -519,7 +537,7 @@ The host resolves a key and supplies it as `RequestFacts::session_key`, or as `f
 
 The stock controller counts a key's requests by the leases it holds. A request counts on the worker its lease books, from its decision to its end, over every gateway the controller serves. Decisions made at the same moment for one key each read the count before the others' leases are on file, so a burst of them can pass the cap. A request decided while its rule had no cap is not counted, so after a change that sets a cap a key can pass it until those requests end.
 
-**Where the key comes from.** A binding names the sources of its requests' key under `routing_key`. The host reads them in order, and the first that holds a value is the key. A ring places by that key, and a sessions rule pins it.
+**Where the key comes from.** A binding names the sources of its requests' key under `routing_key`. The host reads them in order, and the first that holds a value is the key. A ring places by that key, and a sessions rule pins it. An entry marked `client` is read apart, for a request the other entries give no key.
 
 ```yaml
 apiVersion: smg.policy/v1
@@ -536,22 +554,24 @@ bindings:
         - header: x-smg-routing-key
         - rid: true
         - header: x-forwarded-for
+          client: true
         - header: cookie
-          max_bytes: 8192
+          client: true
       strip_lineage: true
 ```
 
 | Field | Default | Meaning |
 |---|---|---|
-| `sources` | required | One to eight entries, read in order. An entry is `header: <name>`, or `rid: true` for the request's own id. |
+| `sources` | required | One to eight entries, read in order, and up to four client entries beside them. A block of client entries alone is refused. An entry is `header: <name>`, or `rid: true` for the request's own id. |
 | `max_bytes`, on an entry | 128 | The most bytes of a value the source hands, 8192 at most. A longer value is passed over. So is an empty one, and one that is not UTF-8. |
-| `strip_lineage` | `false` | Take the turn and retry suffixes off a key: `conv_t2_r1` keys as `conv`. |
+| `client`, on an entry | `false` | The header tells one client from another, not one session. Its value places a request that has no session key on a plain ring, and does nothing else: it lifts no overload veto, pins no session and is counted under no key. The first client entry whose header the request carries is read whole. A value that is empty or not visible ASCII gives no key. Refused beside `rid` and `max_bytes`. A header may be named both ways, once without `client` and once with it. |
+| `strip_lineage` | `false` | Take the turn and retry suffixes off a key: `conv_t2_r1` keys as `conv`. A header is measured against `max_bytes` as sent, and the request's own id without its suffixes. A suffix's counter has any number of digits. |
 
 A source need not be in `view.headers`: its value enters no view. A credential header is refused. A key from a header that `view.headers` does not list, `cookie` for one, leaves the host as its fingerprint alone, so no stage, plugin or record sees its text.
 
 A binding names its sources once. With `routing_key`, a sessions rule leaves out `sticky_header` and `headers`. Without it, the rule's own headers are the sources. A binding with neither gives its requests no key.
 
-A host reads a binding's sources with `AppliedSpec::key_sources_for` and derives a request's key with `KeySources::derive`. A host in process does both inside the door: it implements `door::Maker` and calls `Door::decide_under` or `Handle::decide_under`. The door hands `Maker::make` the world the decision is made under, and with it the applied document. The key's sources and the rule that pins the key are then of one generation, whatever is applied meanwhile. The maker is asked once for each run of the decision: a second time only where the store refused the first run's lease.
+A host reads a binding's sources with `AppliedSpec::key_sources_for` and derives a request's key with `KeySources::derive`. A host in process does both inside the door: it implements `door::Maker` and calls `Door::decide_under` or `Handle::decide_under`. The door hands `Maker::make` the world the decision is made under, and with it the applied document. The key's sources and the rule that pins the key are then of one generation, whatever is applied meanwhile. The maker is asked once for each run of the decision: a second time only where the store refused the first run's lease. A host derives the client's key with `KeySources::derive_client` and states it as `RequestFacts::client_key`. The standalone controller's wire carries no client key yet, so a controller at an address places such a request with no key.
 
 A plain ring under `single` can keep a key on an otherwise usable worker across the overload veto. This requires the sole scorer to be `consistent-hash` without prefix or load bound, bare `best`, and a steering binding. Any session rule must delegate and either have its cap disabled or have the key's counts held. The door and the standalone controller hold them from their leases. A host that decides over its own rows sets `session_counted`. With shedding enabled, a vetoed owner passes the request to a usable pin or ring successor if one exists. With a bounded prefix ring, an owner strictly above both load bounds is passed over. The mean includes the incoming request. Where boundaries supply a shallower key it is tried before the profile's keyless scoring path.
 
@@ -600,7 +620,7 @@ After a stream's end most repeats read `none`: the stream gave the lease up, or 
 
 **File.** Use a path that leads to a regular file of at most 128 KiB. The reader follows symlinks. A `.json` suffix selects JSON. The controller checks the file at startup. The watch polls after one second and reads a changed identity after two matching looks. A rejected update leaves the running generation in place and is logged and counted once per settled file state while leading. Unchanged documents count as neither apply nor rejection. A fast same-size edit can escape detection if the file identity does not move. An update that stays unstable can be rejected.
 
-**Store.** `--spec-store` uses an existing directory with a lock and support for hard links. It runs with a process-local lease. Startup loads the newest file or starts with no document in an empty store. An empty store can report ready and shed requests until the first apply. Enforce persists before publishing and retains the newest eight files normally. A competing start waits up to the shutdown grace for the lock.
+**Store.** `--spec-store` uses an existing directory with a lock and support for hard links. It runs with a process-local lease. Startup loads the newest file or starts with no document in an empty store. An empty store can report ready and shed requests until the first apply. Enforce persists before publishing and retains the newest eight files normally. A competing start waits up to the shutdown grace for the lock. Startup runs the newest file under the number in its name, also where the host's store already runs that document under a lower number. If the store refuses a generation after its file is written and the file cannot be removed, the apply fails as `not persisted` and says both. The store removes that file before its next write. A process that starts before that write reads it as a generation on file, and runs it if it is the newest.
 
 **Generation.** A zero or omitted number starts at 1 and increments on change. A file can claim a higher number. Enforce through the store takes the next number. Changed content under the standing number, a stale number, or an out-of-order store number is refused. An identical document with the standing or automatic number is a no-op. The digest is a canonical `sha256:` digest of parsed content without the generation line.
 
@@ -643,7 +663,7 @@ profiles.default.pick: the best-with-temperature picker is not in this build
 
 ### Explain and metrics
 
-Set `explain: { sample: N }` to keep every Nth pick or shed per decider. Zero turns it off and one keeps every pick or shed. Each decider allocates its 1024-slot ring on its first sampled write and overwrites its oldest records. At R eligible decisions a second on that decider, a full ring covers about `1024 × N / R` seconds. A new generation restarts counting. Older samples can still be read under the same term. The remote lookup uses `gateway_id` and `request_id`. Use the subject the gateway authenticates as on the gateway listener for `gateway_id`, because `Explain` hashes it the same way as the decide stream. Use `Door::explain` in process with the store gateway ID. `Door::explained` returns that record with its names: the plan, the profile, and that profile's picker, filters and scorers in their declared order. The names are `None` once another generation stands, or when the request matched no binding. A shed made ahead of every profile names the plan alone, unless the binding's profile is the document's first. A term change makes old samples unavailable on the service.
+Set `explain: { sample: N }` to keep every Nth pick or shed per decider. Zero turns it off and one keeps every pick or shed. Each decider allocates its 1024-slot ring on its first sampled write and overwrites its oldest records. With sampling on, a decision takes its decider's ring lock only when it keeps a record. That write can wait for an `Explain` read of the ring. At R eligible decisions a second on that decider, a full ring covers about `1024 × N / R` seconds. A new generation restarts counting. Older samples can still be read under the same term. The remote lookup uses `gateway_id` and `request_id`. Use the subject the gateway authenticates as on the gateway listener for `gateway_id`, because `Explain` hashes it the same way as the decide stream. Use `Door::explain` in process with the store gateway ID. `Door::explained` returns that record with its names: the plan, the profile, and that profile's picker, filters and scorers in their declared order. The names are `None` once another generation stands, or when the request matched no binding. A shed made ahead of every profile names the plan alone, unless the binding's profile is the document's first. A term change makes old samples unavailable on the service.
 
 A record echoes the lookup key and gives the decision and its trace without a lease. It keeps up to three top scores. The control call keeps the record's original binding position and trace. `binding` is 0 when no binding matched or when the first binding matched. The name fields are empty for unmatched decisions and records from older generations. It leaves the decision ID, full candidate list, view digest, plugin projections and lifecycle outcome unset. It omits request facts, headers and session keys.
 
@@ -819,7 +839,7 @@ bindings:
 
 ### `consistent_hashing`
 
-Favors the routing key's ring owner while it is usable. With no key the scores tie.
+Favors the routing key's ring owner while it is usable. With no session key the request is placed by its client's key, read from `x-forwarded-for`, else `cookie`. With neither, the scores tie. The binding names the routing key header as the key's source, and the two client headers behind it. A sessions rule added to the binding reads the same key and names no header of its own.
 
 <!-- preset: consistent_hashing -->
 ```yaml
@@ -843,7 +863,7 @@ bindings:
 
 ### `prefix_hash`
 
-Uses the routing key first, then the last whole block at the deepest reached boundary or the configured 256-token depth when no boundary is reached. When no key can be used, the in-flight-count scorer places the request.
+Uses the routing key first, then the last whole block at the deepest reached boundary or the configured 256-token depth when no boundary is reached. When no key can be used, the in-flight-count scorer places the request. The binding names the routing key header as the key's source. A sessions rule added to the binding names no header of its own.
 
 <!-- preset: prefix_hash -->
 ```yaml
