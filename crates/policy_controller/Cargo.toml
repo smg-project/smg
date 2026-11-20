@@ -489,5 +489,11 @@ harness = false
 name = "has_room"
 harness = false
 
+# A registered scorer's read of a row's report through the view's
+# reading, beside the same scorer reading the row's field.
+[[bench]]
+name = "reports"
+harness = false
+
 [lints]
 workspace = true
