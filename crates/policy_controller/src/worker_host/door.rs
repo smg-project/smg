@@ -74,8 +74,9 @@ pub enum Expect {
     /// whoever made the row.
     Nothing,
     /// The row its asker saw, at the revision it saw: a replacement by id.
-    /// No row refuses it ([`Refused::Absent`]), and so does another row or
-    /// revision ([`Refused::Moved`]).
+    /// No row refuses it ([`Refused::Absent`]), as does a draining row,
+    /// whose removal wins. Another row or revision refuses it too
+    /// ([`Refused::Moved`]).
     Seen(Standing),
     /// Anything: an upsert.
     Anything,
@@ -141,7 +142,16 @@ pub(crate) fn lay(
 ) -> Result<Wrote, Refused> {
     let store = turn.store();
     let standing = match expect {
-        Expect::Seen(seen) => Some(seen_row(store, url, seen)?),
+        Expect::Seen(seen) => {
+            let row = seen_row(store, url, seen)?;
+            // A draining row is leaving. Laid over, it would take the URL's
+            // next life and its removal would leave the worker: the removal
+            // wins, and the replacement reads the row as gone.
+            if row.status == WorkerStatus::Draining {
+                return Err(Refused::Absent);
+            }
+            Some(row)
+        }
         Expect::Nothing | Expect::Anything => store.by_key(url),
     };
     // An add changes no standing row, so it asks no maker and states no
@@ -475,8 +485,22 @@ pub(super) mod tests {
             })
         );
 
-        // The row its asker saw left.
+        // A draining row is leaving: its removal wins over a replacement.
         let seen = standing(&next);
+        assert_eq!(
+            door.drained(Remover::Maker(&control), URL, seen),
+            Ok(Wrote::Draining(next.id))
+        );
+        assert_eq!(
+            door.found(&control, Expect::Seen(seen), URL, &unstated),
+            Err(Refused::Absent)
+        );
+        assert_eq!(
+            store.by_key(URL).map(|row| (row.id, row.status)),
+            Some((next.id, WorkerStatus::Draining))
+        );
+
+        // The row its asker saw left.
         assert_eq!(
             door.gone(Remover::Maker(&control), URL, seen),
             Ok(Wrote::Removed(next.id))
