@@ -33,8 +33,8 @@ mod sent_prefixes {
         predictor::Predictor,
         spec::AffinitySource,
         store::{
-            index::Predicted, Ask, GatewayId, Kinds, Named, Naming, Position, Reachability,
-            ViewBuffers,
+            index::{seam, Predicted},
+            Ask, GatewayId, Kinds, Named, Naming, Position, Reachability, ViewBuffers,
         },
         view::{Candidate, Role, WireModes},
     };
@@ -65,6 +65,12 @@ mod sent_prefixes {
             store.admit(id, 0, batch(1), &stored(None, &chain(&HASHES))),
             BatchOutcome::Applied
         );
+    }
+
+    /// A batch with one stored block no request of these cases holds: the
+    /// store has heard the lane's cache events.
+    fn hear(store: &MemoryStore, id: WorkerId) -> BatchOutcome {
+        store.admit(id, 0, batch(1), &stored(None, &chain(&[999])))
     }
 
     fn record(store: &MemoryStore) -> Option<Arc<Predicted>> {
@@ -293,25 +299,75 @@ mod sent_prefixes {
     }
 
     #[test]
-    fn a_pool_where_every_row_has_events_reads_no_record() -> Case {
+    fn a_pool_whose_lanes_are_all_heard_reads_no_record() -> Case {
         let store = MemoryStore::new();
-        admitted(&store, "a");
-        admitted(&store, "b");
+        let a = admitted(&store, "a");
+        let b = admitted(&store, "b");
         store.apply(applied(&merged(1)?)?)?;
-        assert!(record(&store).is_none());
-        let (named, rows) = named(&store, None, 16, 7);
-        assert!(named.holders.is_empty());
-        assert!(named.keys.is_empty());
-        assert!(named.sent_pool().is_none());
-        store.deciding(|world| world.sent(&named, rows[0]));
-        assert!(store
-            .deciding(|world| world.sent_slices(MODEL, Role::Single))
-            .is_none());
+        // The pool holds its model's record whatever its lanes heard: no
+        // publication follows a lane's first batch.
+        assert!(record(&store).is_some());
+        for id in [a, b] {
+            assert_eq!(hear(&store, id), BatchOutcome::Applied);
+        }
+        let (read, rows) = named(&store, None, 16, 7);
+        assert!(read.holders.is_empty());
+        // The heard bits answered: no key was folded and no record read.
+        assert!(read.keys.is_empty());
+        assert!(read.sent_pool().is_none());
+        store.deciding(|world| world.sent(&read, rows[0]));
+        let slices = store.deciding(|world| world.sent_slices(MODEL, Role::Single));
+        assert_eq!(slices, Some(0));
+        // One lane unheard again, and the record is read again.
+        KvEventSink::removed(&store, a);
+        let (again, _) = named(&store, None, 16, 7);
+        assert!(!again.keys.is_empty());
+        assert!(again.sent_pool().is_some());
         Ok(())
     }
 
     #[test]
-    fn a_stale_prediction_cannot_name_a_worker_with_a_lane() -> Case {
+    fn a_batch_with_no_event_leaves_the_record_its_row() -> Case {
+        let store = MemoryStore::new();
+        let a = admitted(&store, "a");
+        store.apply(applied(&merged(1)?)?)?;
+        predicted(&store, a).ok_or("a record with a placement")?;
+        // A batch ran through the lane and carried no event: the index holds
+        // nothing of the row, so the record still speaks for it.
+        assert_eq!(store.admit(a, 0, batch(1), &[]), BatchOutcome::Applied);
+        let (read, rows) = named(&store, None, 16, 7);
+        assert_eq!(read.holders.len(), 1);
+        assert_eq!(rows[read.holders[0].row as usize], a);
+        // Its first event ends the cover.
+        let event = stored(None, &chain(&[999]));
+        assert_eq!(store.admit(a, 0, batch(2), &event), BatchOutcome::Applied);
+        let (read, _) = named(&store, None, 16, 7);
+        assert!(read.holders.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_row_that_takes_a_heard_rows_id_is_not_heard() -> Case {
+        let store = MemoryStore::new();
+        let a = admitted(&store, "a");
+        let c = admitted(&store, "c");
+        store.apply(applied(&merged(1)?)?)?;
+        for id in [a, c] {
+            assert_eq!(hear(&store, id), BatchOutcome::Applied);
+        }
+        let (read, _) = named(&store, None, 16, 7);
+        assert!(read.sent_pool().is_none(), "both lanes are heard");
+        // A row leaves, and the next row takes its id in the index.
+        let revision = store.get(a).ok_or("the row")?.revision;
+        store.remove(a, revision).ok_or("the removal")?;
+        admitted(&store, "b");
+        let (read, _) = named(&store, None, 16, 7);
+        assert!(read.sent_pool().is_some(), "a lane made anew is not heard");
+        Ok(())
+    }
+
+    #[test]
+    fn a_stale_prediction_cannot_name_a_worker_whose_lane_is_heard() -> Case {
         let store = MemoryStore::new();
         let event = admitted(&store, "event");
         admitted(&store, "other-event");
@@ -325,6 +381,100 @@ mod sent_prefixes {
         let holder = named.holders[0];
         assert_eq!(rows[holder.row as usize], event);
         assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (4, 0));
+        Ok(())
+    }
+
+    /// The naming reads the pool's heard bits once. A lane reset between
+    /// its lookup and its read of the record leaves the worker to the
+    /// index, which read it: the record, which still holds a placement of
+    /// it, does not name it a second time.
+    #[test]
+    fn a_lane_reset_behind_the_lookup_names_its_worker_once() -> Case {
+        let store = Arc::new(MemoryStore::new());
+        let event = admitted(&store, "event");
+        admitted(&store, "other-event");
+        plain(&store, "plain", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        publish(&store, event);
+        predicted(&store, event).ok_or("a record with a placement")?;
+        let reset = Arc::clone(&store);
+        seam::set(seam::Point::Looked, move || {
+            KvEventSink::removed(&*reset, event);
+        });
+        let (raced, rows) = named(&store, None, 16, 7);
+        assert!(!seam::pending(), "the reset ran behind the lookup");
+        assert_eq!(raced.holders.len(), 1, "the worker is named once");
+        let holder = raced.holders[0];
+        assert_eq!(rows[holder.row as usize], event);
+        assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (4, 0));
+        // The next naming reads the lane as it stands: the record speaks.
+        let (next, rows) = named(&store, None, 16, 7);
+        assert_eq!(next.holders.len(), 1);
+        let holder = next.holders[0];
+        assert_eq!(rows[holder.row as usize], event);
+        assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (0, 4));
+        Ok(())
+    }
+
+    /// The other order: a profile whose record is named ahead. A lane
+    /// first heard between the record's holders and the lookup stays the
+    /// record's for that naming, and its new blocks are left unread.
+    #[test]
+    fn a_lane_first_heard_behind_the_record_names_its_worker_once() -> Case {
+        let store = Arc::new(MemoryStore::new());
+        let event = admitted(&store, "event");
+        admitted(&store, "other-event");
+        let mut document = merged(1)?;
+        use_sent_prefixes(&mut document, AffinitySource::Predictor);
+        store.apply(applied(&document)?)?;
+        predicted(&store, event).ok_or("a record with a placement")?;
+        let heard = Arc::clone(&store);
+        seam::set(seam::Point::Recorded, move || publish(&heard, event));
+        let (raced, rows) = named(&store, None, 16, 7);
+        assert!(
+            !seam::pending(),
+            "the batch ran behind the record's holders"
+        );
+        assert_eq!(raced.holders.len(), 1, "the worker is named once");
+        let holder = raced.holders[0];
+        assert_eq!(rows[holder.row as usize], event);
+        assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (0, 4));
+        // The next naming reads the lane as heard: the index speaks.
+        let (next, rows) = named(&store, None, 16, 7);
+        assert_eq!(next.holders.len(), 1);
+        let holder = next.holders[0];
+        assert_eq!(rows[holder.row as usize], event);
+        assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (4, 0));
+        Ok(())
+    }
+
+    /// A pool past one word of lanes: the naming's one read holds every
+    /// unheard lane, the words behind the first unheard one among them.
+    #[test]
+    fn a_pool_past_one_word_of_lanes_is_read_whole() -> Case {
+        let store = MemoryStore::new();
+        let ids: Vec<WorkerId> = (0..70)
+            .map(|at| admitted(&store, &format!("event-{at:02}")))
+            .collect();
+        store.apply(applied(&merged(1)?)?)?;
+        for &id in &ids {
+            predicted(&store, id).ok_or("a record with a placement")?;
+        }
+        let blocks = |named: &Named| -> Vec<(u32, u32)> {
+            let holders = named.holders.iter();
+            holders
+                .map(|holder| (holder.overlap_blocks, holder.predicted_blocks))
+                .collect()
+        };
+        // Under no cap the record names every row it speaks for.
+        let (unheard, _) = named(&store, None, 0, 7);
+        assert_eq!(blocks(&unheard), vec![(0, 4); 70]);
+        // Heard, each lane is the index's, whichever word holds its bit.
+        for &id in &ids {
+            publish(&store, id);
+        }
+        let (heard, _) = named(&store, None, 0, 7);
+        assert_eq!(blocks(&heard), vec![(4, 0); 70]);
         Ok(())
     }
 
@@ -666,16 +816,34 @@ mod sent_prefixes {
     }
 
     #[test]
-    fn a_worker_that_takes_a_lane_forgets_its_placements() -> Case {
+    fn a_worker_that_takes_a_lane_is_read_from_the_record_until_its_lane_is_heard() -> Case {
         let store = MemoryStore::new();
         let id = plain(&store, "a", WireModes::GRPC, Reachability::Any);
         plain(&store, "b", WireModes::GRPC, Reachability::Any);
         store.apply(applied(&merged(1)?)?)?;
         predicted(&store, id).ok_or("the old placement")?;
         let record = record(&store).ok_or("the model's record")?;
-        assert_eq!(admitted(&store, "a"), id);
-        assert_eq!(record.record.read().deepest(&keys(&HASHES)).blocks(), 0);
-        assert!(record.sweeping.load(Ordering::Relaxed));
+        // The row asks for events now: it holds a lane no batch ran through.
+        let asks = WorkerFacts {
+            wire_modes: WireModes::GRPC,
+            reachable_from: Reachability::Any,
+            ..publisher("a", &[MODEL])
+        };
+        assert_eq!(store.upsert(asks).id(), id);
+        store.publish_now();
+        assert!(store.lane_counts(id, 0).is_some(), "the row holds a lane");
+        let (read, rows) = named(&store, None, 16, 7);
+        assert_eq!(read.holders.len(), 1);
+        let holder = read.holders[0];
+        assert_eq!(rows[holder.row as usize], id);
+        assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (0, 4));
+        // Its first batch: the index speaks for the row. The record's
+        // placement stays to age out under the bound, read by nobody.
+        assert_eq!(hear(&store, id), BatchOutcome::Applied);
+        let (read, _) = named(&store, None, 16, 7);
+        assert!(read.holders.is_empty());
+        assert_eq!(record.record.read().deepest(&keys(&HASHES)).blocks(), 4);
+        assert!(!record.sweeping.load(Ordering::Relaxed));
         Ok(())
     }
 
@@ -691,6 +859,104 @@ mod sent_prefixes {
         cut.rows.retain(|row| row.id == b);
         assert!(store.restore_from(cut));
         assert_eq!(predicted.record.read().deepest(&keys(&HASHES)).blocks(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_restore_that_keeps_a_worker_at_another_rank_forgets_its_placements() -> Case {
+        let store = MemoryStore::new();
+        let id = store
+            .upsert(WorkerFacts {
+                signals: Signals::default(),
+                dp_size: 2,
+                ..publisher("a", &[MODEL])
+            })
+            .id();
+        store.publish_now();
+        store.apply(applied(&merged(1)?)?)?;
+        let (cold, _) = named(&store, None, 16, 7);
+        store.deciding(|world| world.sent(&cold, id));
+        let (warm, _) = named(&store, None, 16, 7);
+        assert_eq!(warm.holders.len(), 1);
+        // A replica that recorded while it led restores a cut that holds
+        // the worker at another rank: a cache of its own.
+        let mut cut = store.cut(Kinds::All);
+        let rows = &mut cut.rows;
+        let row = rows.iter_mut().find(|row| row.id == id);
+        let row = row.ok_or("the cut's row")?;
+        row.facts.dp_rank = 1;
+        row.revision += 1;
+        cut.epoch += 1;
+        assert!(store.restore_from(cut));
+        assert_eq!(store.get(id).ok_or("the restored row")?.facts.dp_rank, 1);
+        let (read, _) = named(&store, None, 16, 7);
+        assert!(read.holders.is_empty(), "rank 1 was never sent this prefix");
+        Ok(())
+    }
+
+    #[test]
+    fn a_stage_that_reads_cache_events_keeps_the_index_holders_first() -> Case {
+        use crate::spec::{BestParams, PickStage, PolicySpec, PrefixAffinityParams, ScoreStage};
+
+        let store = MemoryStore::new();
+        let sent = plain(&store, "sent", WireModes::GRPC, Reachability::Any);
+        let indexed = admitted(&store, "indexed");
+        // The stock document's prefix stage reads cache events. A second
+        // one of little weight reads the record alone, under a sample of 1.
+        let mut document = PolicySpec::preset("cache_aware")?;
+        document.generation = 1;
+        for profile in document.profiles.values_mut() {
+            profile.pick = PickStage::Best(BestParams { sample: 1 }).into();
+            let second = ScoreStage::PrefixAffinity(PrefixAffinityParams {
+                weight: 0.01,
+                source: Some(AffinitySource::Predictor),
+                ..Default::default()
+            });
+            profile.score.push(second.into());
+        }
+        let spec = applied(&document)?;
+        let cap = spec.engine().named_for(MODEL, crate::view::Phase::Single);
+        assert_eq!(cap, 1);
+        store.apply(spec)?;
+        publish(&store, indexed);
+        let (cold, rows) = named(&store, None, 1, 0);
+        assert_eq!(rows[cold.holders[0].row as usize], indexed);
+        store.deciding(|world| world.sent(&cold, sent));
+        let (warm, rows) = named(&store, None, 1, 0);
+        let held = rows[warm.holders[0].row as usize];
+        assert_eq!(held, indexed, "the stage of weight 4 keeps its one holder");
+        Ok(())
+    }
+
+    #[test]
+    fn a_write_reads_its_permission_under_the_guard() -> Case {
+        let store = Arc::new(MemoryStore::new());
+        let id = plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        plain(&store, "b", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        let (cold, rows) = named(&store, None, 16, 7);
+        let row = rows.iter().position(|&row| row == id).ok_or("the row")?;
+        let record = record(&store).ok_or("the model's record")?;
+        let standing = store.deciding(|world| world.standing(MODEL, Role::Single));
+        let allowed = Arc::clone(&standing.ok_or("the pool's standing")?.tables.allowed[row]);
+        // This case holds the guard a write waits for. A removal's first
+        // step lands meanwhile: the worker's word is cleared.
+        let held = record.record.write();
+        let (started, on) = mpsc::channel();
+        let writer = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || {
+                let _ = started.send(());
+                store.deciding(|world| world.sent(&cold, id));
+            })
+        };
+        on.recv()?;
+        thread::sleep(Duration::from_millis(50));
+        allowed.store(false, Ordering::Relaxed);
+        drop(held);
+        writer.join().map_err(|_| "the writer's thread")?;
+        let blocks = record.record.read().deepest(&keys(&HASHES)).blocks();
+        assert_eq!(blocks, 0, "a worker that left is not written back");
         Ok(())
     }
 
@@ -765,6 +1031,26 @@ mod sent_prefixes {
         Ok(())
     }
 
+    /// A model's block size of record moves its record's bound at the next
+    /// membership write, though that write moves no member and no offer.
+    #[test]
+    fn a_block_size_of_record_moves_the_records_bound() -> Case {
+        let store = MemoryStore::new();
+        let join = || plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        join();
+        store.apply(applied(&merged(1)?)?)?;
+        let record = record(&store).ok_or("the model's record")?;
+        let bound = record.bound();
+        let size = store.deciding(|world| world.spec().block_size());
+        KvEventSink::set_block_size(&store, MODEL, 2 * size);
+        join();
+        assert_eq!(record.bound(), bound / 2);
+        KvEventSink::forget_block_size(&store, MODEL);
+        join();
+        assert_eq!(record.bound(), bound);
+        Ok(())
+    }
+
     #[test]
     fn a_lower_bound_keeps_its_sweep_past_a_decider_that_holds_the_record() -> Case {
         let store = MemoryStore::new();
@@ -792,7 +1078,13 @@ mod sent_prefixes {
         let lowered = thread::scope(|scope| {
             let store = &store;
             let lowering = scope.spawn(move || store.apply(smaller).is_ok());
-            while predicted.bound.load(Ordering::Relaxed) == was {
+            // A build that never moves the bound fails the case below: it
+            // does not hang here.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while predicted.bound.load(Ordering::Relaxed) == was
+                && !lowering.is_finished()
+                && Instant::now() < deadline
+            {
                 thread::yield_now();
             }
             // Time for a step the build must not take ahead of the guard.

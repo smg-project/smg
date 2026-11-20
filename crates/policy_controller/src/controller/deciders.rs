@@ -937,8 +937,9 @@ impl Deciding {
             let (decision, filed) = match entry(world, &taken) {
                 Entry::Single => {
                     let (decision, booking) = decide_in(world, &taken, buffers, own);
+                    let named = &buffers.named;
                     let filed = booking
-                        .map(|booking| issue(store, world, &taken, term, &decision, booking))
+                        .map(|booking| issue(store, world, &taken, term, &decision, booking, named))
                         .transpose();
                     (decision, filed)
                 }
@@ -1719,6 +1720,28 @@ pub(crate) mod tests {
             let booked = first_on_file(&beside, lease);
             assert_eq!(first_on_file(&bed.store, lease), booked, "request {id}");
             assert_eq!(booked, made.first().copied(), "request {id}");
+        }
+    }
+
+    /// A served decision writes the record of sent prefixes at its lease's
+    /// issue, as the door does in process: on workers that publish no cache
+    /// events a request lands where its prefix was sent.
+    #[tokio::test]
+    async fn a_served_request_lands_where_its_prefix_was_sent() {
+        let mut bed = bed(Some(preset("cache_aware", 1)), true, (1, 8), []);
+        let asked = |id: u8, seed: u64| {
+            let mut frame = frame(id, seed);
+            let facts = frame.facts.as_mut().expect("the case's frame has facts");
+            facts.block_hashes = (1..=8).collect();
+            facts.prompt_tokens = 8 * 16;
+            frame
+        };
+        let sent = picked(&bed.ask(asked(1, 100)).await);
+        // Each lease on file books its worker: load alone would send the
+        // next request to another.
+        for (id, seed) in (2..=4).zip(101..) {
+            let returned = picked(&bed.ask(asked(id, seed)).await);
+            assert_eq!(returned, sent, "request {id}");
         }
     }
 

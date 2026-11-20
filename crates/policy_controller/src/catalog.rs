@@ -320,10 +320,6 @@ pub struct Catalog {
     /// Whether the host makes the lifecycle's calls: a stage that needs
     /// them ([`crate::Lifecycle::needs_lifecycle`]) is in no other build.
     lifecycle: bool,
-    /// Whether the host records the prefixes it sent each worker: a
-    /// prefix-affinity source that reads them, alone or merged with the
-    /// index, is in no other build.
-    sent_prefixes: bool,
 }
 
 /// A built-in that takes no parameter: its factory builds it.
@@ -362,7 +358,6 @@ impl Catalog {
                 ("best-with-temperature", Build::Typed),
             ],
             lifecycle: true,
-            sent_prefixes: true,
         }
     }
 
@@ -378,20 +373,6 @@ impl Catalog {
     /// Whether the host makes the lifecycle's calls.
     pub(crate) fn makes_lifecycle_calls(&self) -> bool {
         self.lifecycle
-    }
-
-    /// The catalog of a host that records no prefix it sent: the validator
-    /// refuses a prefix-affinity source that reads them, by its field, as
-    /// not in this build.
-    #[cfg(any(test, feature = "controller"))]
-    pub(crate) fn without_sent_prefixes(mut self) -> Self {
-        self.sent_prefixes = false;
-        self
-    }
-
-    /// Whether the host records the prefixes it sent each worker.
-    pub(crate) fn records_sent_prefixes(&self) -> bool {
-        self.sent_prefixes
     }
 
     /// Adds a filter under `name`: a document names it as it names a
@@ -571,7 +552,6 @@ impl fmt::Debug for Catalog {
             .field("scorers", &self.scorers().collect::<Vec<_>>())
             .field("pickers", &self.pickers().collect::<Vec<_>>())
             .field("lifecycle", &self.lifecycle)
-            .field("sent_prefixes", &self.sent_prefixes)
             .finish()
     }
 }

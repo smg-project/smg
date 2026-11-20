@@ -68,8 +68,9 @@ pub trait Filter: Any + Send + Sync + Debug {
     /// [`Needs::text_hashes`], and one that declares neither may be handed
     /// none.
     ///
-    /// Asked once, where the stage's generation is built. The answer
-    /// stands for that generation: no decision asks again.
+    /// Asked only while the stage's generation is built, perhaps more than
+    /// once there. The answer stands for that generation: no decision and
+    /// no membership write asks.
     fn needs(&self) -> Needs {
         Needs::default()
     }
@@ -354,8 +355,9 @@ pub trait Scorer: Lifecycle + Debug {
     /// [`Needs::text_hashes`], and one that declares neither may be handed
     /// none.
     ///
-    /// Asked once, where the stage's generation is built. The answer
-    /// stands for that generation: no decision asks again.
+    /// Asked only while the stage's generation is built, perhaps more than
+    /// once there. The answer stands for that generation: no decision and
+    /// no membership write asks.
     fn needs(&self) -> Needs {
         Needs::default()
     }
@@ -594,8 +596,9 @@ pub trait Picker: Lifecycle + Debug {
     /// [`Needs::text_hashes`], and one that declares neither may be handed
     /// none.
     ///
-    /// Asked once, where the stage's generation is built. The answer
-    /// stands for that generation: no decision asks again.
+    /// Asked only while the stage's generation is built, perhaps more than
+    /// once there. The answer stands for that generation: no decision and
+    /// no membership write asks.
     fn needs(&self) -> Needs {
         Needs::default()
     }
@@ -723,9 +726,16 @@ impl Profile {
     /// Whether a scorer of this profile reads sent prefixes and no cache
     /// events ([`Engine::reads_sent_alone_for`]): asked of its scorers at
     /// the engine's build.
+    ///
+    /// The cache events meant are a request's holders, which a scorer
+    /// reads from the index where it declares token hashes beside the
+    /// events. One scorer that reads them there keeps the index's holders
+    /// first, whatever another reads. A scorer that reads the events for a
+    /// row's warm-up reads no holder and turns nothing here.
     fn reads_sent_alone(&self) -> bool {
-        let mut scorers = self.scorers.iter().map(|stage| stage.scorer.needs());
-        scorers.any(|needs| needs.sent_prefixes && !needs.events)
+        let needs = || self.scorers.iter().map(|stage| stage.scorer.needs());
+        needs().any(|needs| needs.sent_prefixes)
+            && !needs().any(|needs| needs.events && needs.token_hashes)
     }
 
     /// Whether any stage holds a [`DecisionScope`].
@@ -2355,14 +2365,14 @@ fn run_drawn(
         Some(tests) => draw_by(&mut |c| tests.keeps(facts, c, cx)),
         None => draw_by(&mut |c| profile.filters.iter().all(|f| f.keep(facts, c, cx))),
     };
-    // The host caps both lists at the picker's sample: past it a decision
+    // The host caps both lists at the profile's sample: past it a decision
     // reads dearer, never wrong, so a debug build alone asserts it.
     debug_assert!(
         facts.named.is_none_or(|named| {
             let cap = engine.profile_needs[at].sample as usize;
             cap == 0 || named.holders.len().max(named.warming.len()) <= cap
         }),
-        "each list of rows named stands at or under the sample of the picker that draws"
+        "each list of rows named stands at or under the profile's sample"
     );
     // A picker that read no value of the stream left the seed as it was.
     let resumed;
@@ -2576,9 +2586,10 @@ pub struct Engine {
     /// Per profile, the cap of the rows a host names for its decisions
     /// ([`Self::named_for`]), said once at the build.
     named: Vec<u32>,
-    /// Per profile, whether a scorer of it reads sent prefixes and no cache
-    /// events ([`Self::reads_sent_alone_for`]), asked of its scorers at the
-    /// build.
+    /// Per profile, whether it reads a request's holders from the record
+    /// of sent prefixes alone ([`Self::reads_sent_alone_for`]): a scorer
+    /// of it reads the record and none reads the holders from the index.
+    /// Asked of its scorers at the build.
     sent_alone: Vec<bool>,
     /// Per profile, its filters as one test of a row, where the engine
     /// holds every one itself ([`RowTests::of`]). A decision that draws
@@ -4102,9 +4113,14 @@ impl Engine {
             })
     }
 
-    /// Whether a scorer of that profile reads sent prefixes and no cache
-    /// events: the prefix stage under the source that reads the record
-    /// alone. A host names the record's holders ahead of the index's then.
+    /// Whether that profile reads a request's holders from the record of
+    /// sent prefixes alone: a scorer of it reads the record, as the prefix
+    /// stage does under the source that reads the record alone, and no
+    /// prefix stage reads the index. A host names the record's holders
+    /// ahead of the index's then. One prefix stage that reads cache events
+    /// keeps the index's holders first, whatever another reads: under a
+    /// cap it would lose them. A stage that reads cache events for a row's
+    /// warm-up reads no holder and turns nothing here.
     /// Kept at the build, as [`Self::reads_sent_for`] is.
     pub(crate) fn reads_sent_alone_for(&self, model: &str, phase: Phase) -> bool {
         self.resolve(model, phase)
@@ -14761,7 +14777,7 @@ mod tests {
     /// alone stops, by the assertion's own words.
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "at or under the sample of the picker that draws")]
+    #[should_panic(expected = "at or under the profile's sample")]
     fn rows_named_past_the_sample_stop_a_debug_build_where_the_picker_draws() {
         let engine = preset("cache_aware");
         let holders: Vec<crate::NamedHolder> = (0..17).map(|row| holding(row, 12)).collect();
@@ -14976,7 +14992,7 @@ mod tests {
     /// stops, by the assertion's own words.
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "at or under the sample of the picker that draws")]
+    #[should_panic(expected = "at or under the profile's sample")]
     fn rows_capped_by_the_engines_summary_stop_a_debug_build_under_a_narrower_profile() {
         let engine = two_samples();
         let holders: Vec<crate::NamedHolder> = (0..engine.needs().sample)

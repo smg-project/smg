@@ -9,7 +9,7 @@
 //! embeds the engine runs it on the caller's thread ([`Door`]): no frame
 //! is built and no thread is hopped. A single's issued lease records the
 //! prefix for its first target when the naming read a record of
-//! sent prefixes and the target has no cache-event lane.
+//! sent prefixes and the store has heard no cache event of the target.
 //!
 //! A request reaches the order in the form it was asked in (the trait
 //! `Asked`): a frame as the served controller checked it, or the facts a
@@ -856,7 +856,9 @@ pub(crate) struct PairBooking {
 /// first read, at that read's instant, from which [`DISPATCH_TTL`] runs
 /// for its gateway to name a dispatch. The lease books the count the
 /// decision's own world lays beside its target's row, and the engine that
-/// decided is told of it.
+/// decided is told of it. A lease on file is a request on its way to that
+/// target: the record of sent prefixes takes the prefix `named` holds,
+/// where the target's pool keeps one ([`World::sent`]).
 ///
 /// # Errors
 ///
@@ -869,6 +871,7 @@ pub(crate) fn issue<A: Asked>(
     term: u64,
     decision: &Decision,
     booking: Booking,
+    named: &Named,
 ) -> Result<Lease, LeaseRefused> {
     let record = record_of(taken, term, &booking, Side::Single);
     let booked = booked_in(world, &booking);
@@ -881,11 +884,13 @@ pub(crate) fn issue<A: Asked>(
     };
     // A decision that read its key's count files a lease that books the
     // key, whatever it did with the pin: the next read holds this request.
-    if booking.counted {
+    let lease = if booking.counted {
         store.issue_keyed(record, booked, told)
     } else {
         store.issue_decided(record, booked, told)
-    }
+    }?;
+    world.sent(named, booking.target);
+    Ok(lease)
 }
 
 /// Issues the two leases of a pair's pick, [`issue`] for a pair: a lease a
@@ -2814,11 +2819,10 @@ impl Door {
         match entry {
             Entry::Single => {
                 let (decision, booking) = decide_in(world, taken, buffers, &self.parts[at]);
+                let named = &buffers.named;
                 let lease = booking
-                    .map(|booking| -> Result<_, LeaseRefused> {
-                        let lease = issue(&self.store, world, taken, term, &decision, booking)?;
-                        world.sent(&buffers.named, booking.target);
-                        Ok(lease)
+                    .map(|booking| {
+                        issue(&self.store, world, taken, term, &decision, booking, named)
                     })
                     .transpose()
                     .map_err(|_| Refused::Unleased)?;

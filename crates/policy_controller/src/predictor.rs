@@ -1,6 +1,6 @@
 //! The sent-prefix predictor (design 4.4): which workers each prefix of a
-//! model's requests was sent to. A worker that publishes no cache events is
-//! remembered by what it was sent, and a decision reads that as it reads
+//! model's requests was sent to. A worker the store hears no cache events
+//! from is remembered by what it was sent, and a decision reads that as it reads
 //! the holders of the event-fed index ([`crate::store::index`]): the
 //! deepest block of its request that a worker was sent, and the workers
 //! sent it.
@@ -160,7 +160,7 @@ enum Ask<'a> {
 }
 
 /// The prefixes sent to a model's workers: what a decision reads for the
-/// workers that publish no cache events, and what its issue writes.
+/// workers the store hears no cache events from, and what its issue writes.
 #[derive(Debug)]
 pub struct Predictor {
     /// The blocks, in pieces that never move.
