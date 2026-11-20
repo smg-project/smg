@@ -215,6 +215,30 @@ fn a_shadow_of_another_outcome_changes_nothing_of_the_live_answer() {
     assert_eq!(kinds(&door), [0, 0, 1, 0]);
 }
 
+/// A request whose demand leaves none of a pool that has rows is shed by
+/// the door under the demand's own stage, as it is where no shadow is
+/// bound. No profile decided it: the shadow's picker is not asked, and no
+/// shadow is counted.
+#[test]
+fn a_pool_a_demand_emptied_is_shed_under_the_demand_and_is_not_shadowed() {
+    use crate::{decision::ShedReason, Demands, Unmet};
+
+    let (door, asked) = bed(Rule::Place(0), Rule::Place(1));
+    let mut order = request(b"r-1", 7);
+    order.constraints.demands = Demands {
+        vision: true,
+        ..Demands::default()
+    };
+    let decided = door.decide(GATEWAY, &order, Instant::now());
+    let shed = match decided.expect("a decision").decision {
+        Decision::Shed(shed) => Ok((shed.reason, shed.emptied_by)),
+        decision => Err(decision.pick().is_some()),
+    };
+    assert_eq!(shed, Ok((ShedReason::NoEndpoints, Unmet::Vision.stage())));
+    assert_eq!(asked.load(Ordering::Relaxed), 0);
+    assert_eq!(kinds(&door), [0, 0, 0, 0]);
+}
+
 /// A request with less than the floor of its budget left keeps it for its
 /// answer: its shadow is not asked, and is counted as skipped. At the
 /// floor, and with no budget stated, the shadow is asked.
