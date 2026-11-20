@@ -12,7 +12,7 @@ use smg_policy_controller::{
         WorkersStore,
     },
     view::{fingerprint, LoadRow, WorkerId},
-    AppliedSpec, PolicySpec,
+    worker_host, AppliedSpec, PolicySpec,
 };
 
 use super::*;
@@ -67,6 +67,7 @@ fn stage_on_rows(
             .runtime_type(*runtime)
             .model(ModelCard::new(MODEL).with_context_length(WINDOW))
             .build();
+        state_wire(store, &worker);
         assert!(registry.register(Arc::new(worker)).is_some());
     }
     let host = Host::at_keys(Arc::clone(store), Arc::clone(&registry));
@@ -188,6 +189,28 @@ fn assert_no_target_holds(refused: &Response, store: &MemoryStore) {
     assert_eq!(
         error::extract_error_code_from_response(refused),
         error::extract_error_code_from_response(&answer),
+    );
+    assert!(!is_retryable_response(refused));
+    assert_eq!(LeasesStore::live(store, GatewayId::LOCAL), 0);
+}
+
+/// The row of `worker` states the wire of its connection, by the rule a
+/// store's writer states it.
+fn state_wire(store: &MemoryStore, worker: &dyn Worker) {
+    let mut facts = store.by_key(worker.url()).expect("the worker's row").facts;
+    facts.wire_modes = worker_host::facts(worker, None).wire_modes;
+    let _row = store.upsert(facts);
+    store.publish_now();
+}
+
+/// `refused` is the host's answer for an ask no row serves on its wires:
+/// the controller shed it at its wires, the answer is final, and no lease
+/// was issued.
+fn assert_shed_by_wires(refused: &Response, store: &MemoryStore) {
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        placement::refusal_reason(refused),
+        Some("the policy controller's wires stage left no worker")
     );
     assert!(!is_retryable_response(refused));
     assert_eq!(LeasesStore::live(store, GatewayId::LOCAL), 0);
@@ -453,8 +476,9 @@ async fn a_worker_outside_the_regular_pool_is_passed_over() {
             RuntimeType::Vllm,
         ),
     ]);
-    // No wire is pinned: the regular pool's own match is the rule. One
-    // worker is on another connection, one is of another type.
+    // No wire is pinned. The ask states the pipeline's wires, so the worker
+    // on another connection is never named. The one of another type is
+    // named, and the regular pool's own match passes it over.
     for _ in 0..8 {
         let mut ctx = ingress(&stage.worker_registry);
         stage
@@ -479,7 +503,9 @@ async fn an_attempt_with_no_worker_on_its_wire_reads_the_hosts_answer() {
         .reselect(&mut ctx, &retained_plan(&[1]))
         .await
         .expect_err("no worker is on the wire");
-    assert_no_target_holds(&refused, &store);
+    // The retry states its plan's one wire, and no row serves it: the
+    // controller sheds the ask, and the route passes over nothing.
+    assert_shed_by_wires(&refused, &store);
 
     // A first attempt pins a wire for an adapter.
     let mut ctx = ingress(&stage.worker_registry);
@@ -492,6 +518,77 @@ async fn an_attempt_with_no_worker_on_its_wire_reads_the_hosts_answer() {
         .await
         .expect_err("no worker is on the adapter's wire");
     assert_no_target_holds(&refused, &store);
+}
+
+/// The stage's ask states the wires its pipeline dials, so the controller
+/// places among the rows that serve one. A fleet on another wire holds no
+/// such row: the ask is shed at its wires and no lease is issued. With no
+/// wire stated the controller named a target the route then passed over.
+#[tokio::test]
+async fn an_ask_states_the_wires_its_pipeline_dials() {
+    let (stage, store) = stage_with_workers(&[(
+        URLS[0],
+        WorkerType::Regular,
+        ConnectionMode::Http,
+        RuntimeType::Vllm,
+    )]);
+    let mut ctx = ingress(&stage.worker_registry);
+    let refused = stage
+        .execute(&mut ctx)
+        .await
+        .expect_err("no row serves the pipeline's wires");
+    assert_shed_by_wires(&refused, &store);
+}
+
+/// ZMQ is a wire of the pipeline too. With no pin the ask states it beside
+/// gRPC, so a worker on ZMQ is placed and the one on HTTP is never named.
+#[tokio::test]
+async fn an_unpinned_ask_places_a_worker_on_zmq() {
+    const ON_ZMQ: &str = "http://w2:8000";
+    let (stage, store) = stage_with_workers(&[
+        (
+            URLS[0],
+            WorkerType::Regular,
+            ConnectionMode::Http,
+            RuntimeType::Vllm,
+        ),
+        (
+            ON_ZMQ,
+            WorkerType::Regular,
+            ConnectionMode::Zmq,
+            RuntimeType::TokenSpeed,
+        ),
+    ]);
+    for _ in 0..8 {
+        let mut ctx = ingress(&stage.worker_registry);
+        stage.execute(&mut ctx).await.expect("the worker on ZMQ");
+        let placed = ctx.state.placed.as_ref().expect("a placement");
+        assert_eq!(placed.worker().url(), ON_ZMQ);
+    }
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+}
+
+/// With no pin the ask states the wire of every connection that uses the
+/// gRPC pipeline, and of no other. A pinned ask states its connection's
+/// wire by a match over every connection, so one that joins is visited.
+#[test]
+fn an_unpinned_ask_states_the_wires_of_the_pipelines_connections() {
+    let unpinned = route_wires(None);
+    for connection in [
+        ConnectionMode::Http,
+        ConnectionMode::Grpc,
+        ConnectionMode::Zmq,
+    ] {
+        let pinned = route_wires(Some(WireConstraint {
+            connection,
+            ..grpc_wire(RuntimeType::Vllm)
+        }));
+        assert_eq!(
+            unpinned.intersects(pinned),
+            connection.uses_grpc_pipeline(),
+            "{connection:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -780,26 +877,43 @@ async fn an_attempt_the_controller_does_not_place_reads_the_hosts_answer() {
 const PREFILL: &str = "http://p0:8000";
 const DECODE: &str = "http://d0:8000";
 
-fn urls_of<'a>(side: &[(&'a str, RuntimeType)]) -> Vec<&'a str> {
-    side.iter().map(|(url, _)| *url).collect()
+fn urls_of<'a>(side: &[(&'a str, ConnectionMode, RuntimeType)]) -> Vec<&'a str> {
+    side.iter().map(|(url, ..)| *url).collect()
 }
 
-/// The stage in `mode` over a host whose rows are a prefill pool and a
-/// decode pool under a pair document: one gRPC worker a URL, of the runtime
-/// beside it.
+/// `side` with every worker on gRPC.
+fn on_grpc<'a>(side: &[(&'a str, RuntimeType)]) -> Vec<(&'a str, ConnectionMode, RuntimeType)> {
+    side.iter()
+        .map(|(url, runtime)| (*url, ConnectionMode::Grpc, *runtime))
+        .collect()
+}
+
+/// [`pair_stage_on`] with every worker on gRPC.
 fn pair_stage(
     mode: WorkerSelectionMode,
     prefills: &[(&str, RuntimeType)],
     decodes: &[(&str, RuntimeType)],
 ) -> (WorkerSelectionStage, Arc<MemoryStore>) {
+    pair_stage_on(mode, &on_grpc(prefills), &on_grpc(decodes))
+}
+
+/// The stage in `mode` over a host whose rows are a prefill pool and a
+/// decode pool under a pair document: one worker a URL, on the connection
+/// and of the runtime beside it. Each row states its worker's wire.
+fn pair_stage_on(
+    mode: WorkerSelectionMode,
+    prefills: &[(&str, ConnectionMode, RuntimeType)],
+    decodes: &[(&str, ConnectionMode, RuntimeType)],
+) -> (WorkerSelectionStage, Arc<MemoryStore>) {
     let (_, store, rows) = host::testing::pair_bed(&urls_of(prefills), &urls_of(decodes));
     let registry = Arc::new(WorkerRegistry::new());
-    for (row, (_, runtime)) in rows.iter().zip(prefills.iter().chain(decodes)) {
+    for (row, (_, connection, runtime)) in rows.iter().zip(prefills.iter().chain(decodes)) {
         let worker = BasicWorkerBuilder::carrying(row)
-            .connection_mode(ConnectionMode::Grpc)
+            .connection_mode(*connection)
             .runtime_type(*runtime)
             .model(ModelCard::new(MODEL).with_context_length(WINDOW))
             .build();
+        state_wire(&store, &worker);
         assert!(registry.register(Arc::new(worker)).is_some());
     }
     let host = Host::at_keys(Arc::clone(&store), Arc::clone(&registry));
@@ -894,6 +1008,44 @@ async fn a_pair_shape_the_controller_does_not_place_is_refused_by_name() -> anyh
         .await
         .expect_err("the retry carries a decoding rule");
     assert_named_refusal(refused, "a retry under a decoding rule", &store).await
+}
+
+/// A fleet of mixed wires holds four pairs, and one of them is on the
+/// pipeline's wires: on gRPC, then on ZMQ. The pair's ask states those
+/// wires, so every attempt is placed on that pair. With no wire stated the
+/// controller named the other three as well, and each of them was released
+/// and refused.
+#[tokio::test]
+async fn a_pair_ask_states_the_wires_its_pipeline_dials() {
+    const HTTP_PREFILL: &str = "http://p1:8000";
+    const HTTP_DECODE: &str = "http://d1:8000";
+    for (connection, runtime) in [
+        (ConnectionMode::Grpc, RuntimeType::Vllm),
+        (ConnectionMode::Zmq, RuntimeType::TokenSpeed),
+    ] {
+        let (stage, store) = pair_stage_on(
+            WorkerSelectionMode::PrefillDecode,
+            &[
+                (HTTP_PREFILL, ConnectionMode::Http, RuntimeType::Vllm),
+                (PREFILL, connection, runtime),
+            ],
+            &[
+                (HTTP_DECODE, ConnectionMode::Http, RuntimeType::Vllm),
+                (DECODE, connection, runtime),
+            ],
+        );
+        for _ in 0..16 {
+            let mut ctx = ingress(&stage.worker_registry);
+            stage
+                .execute(&mut ctx)
+                .await
+                .expect("the pair on the pipeline's wires");
+            let placed = ctx.state.placed.as_ref().expect("a placement");
+            assert_eq!(placed.worker().url(), PREFILL);
+            assert_eq!(placed.decode().map(|decode| decode.url()), Some(DECODE));
+        }
+        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+    }
 }
 
 #[tokio::test]
