@@ -17,7 +17,7 @@ use smg_policy_controller::{
 
 use super::*;
 use crate::{
-    config::{PolicyConfig, RouterConfig, RoutingKeyOverrideConfig},
+    config::{PolicyConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode},
     middleware::request_id::RequestId,
     policy_controller::host::testing::MODEL,
     routers::grpc::context::LoadGuards,
@@ -383,16 +383,162 @@ async fn media_under_the_host_is_refused_by_name() -> anyhow::Result<()> {
     assert_named_refusal(refused, "media input", &store).await
 }
 
+/// A worker of `worker_type` on gRPC in `registry` that states no window,
+/// so no prompt is past it. No row stands for it: the stage reads a window
+/// off the registry.
+fn register_unbound(registry: &WorkerRegistry, url: &str, worker_type: WorkerType) {
+    let worker = BasicWorkerBuilder::new(url)
+        .worker_type(worker_type)
+        .connection_mode(ConnectionMode::Grpc)
+        .runtime_type(RuntimeType::Vllm)
+        .model(ModelCard::new(MODEL))
+        .build();
+    assert!(registry.register(Arc::new(worker)).is_some());
+}
+
+/// A request whose prompt is one token past [`WINDOW`].
+fn past_the_window(registry: &Arc<WorkerRegistry>) -> RequestContext {
+    ingress_with_tokens(registry, &[1; WINDOW as usize + 1])
+}
+
+/// The status and the body of an answer.
+async fn answer_of(response: Response) -> anyhow::Result<(StatusCode, Value)> {
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 4096).await?;
+    Ok((status, serde_json::from_slice(&body)?))
+}
+
 #[tokio::test]
 async fn a_bound_context_window_under_the_host_is_refused_by_name() -> anyhow::Result<()> {
     let (stage, store) = stage_with_host(&URLS[..1]);
-    let mut ctx = ingress(&stage.worker_registry);
-    ctx.state.preparation = Some(PreparationOutput::Generate {
-        original_text: None,
-        token_ids: vec![1; WINDOW as usize + 1],
-    });
+    // A second worker states no window, so it may hold the prompt. The
+    // demand binds one window of two, and the controller cannot place by it
+    // yet.
+    register_unbound(
+        &stage.worker_registry,
+        "http://unbound:8000",
+        WorkerType::Regular,
+    );
+    let mut ctx = past_the_window(&stage.worker_registry);
     let refused = stage.execute(&mut ctx).await.expect_err("the window binds");
     assert_named_refusal(refused, "a context demand a worker's window binds", &store).await
+}
+
+/// `stage`'s workers and host under consistent hashing, the classic policy
+/// that reads an explicit target.
+fn under_consistent_hashing(stage: &WorkerSelectionStage) -> WorkerSelectionStage {
+    WorkerSelectionStage::new(
+        Arc::clone(&stage.worker_registry),
+        Arc::new(PolicyRegistry::new(PolicyConfig::ConsistentHashing)),
+        stage.mode,
+        None,
+    )
+    .with_host(stage.host.clone())
+}
+
+/// A request that names the first candidate as its target.
+fn naming_its_worker(registry: &Arc<WorkerRegistry>) -> RequestContext {
+    let mut ctx = ingress(registry);
+    let mut headers = HeaderMap::new();
+    headers.insert("x-smg-target-worker", HeaderValue::from_static("0"));
+    ctx.input.headers = Some(headers);
+    ctx
+}
+
+/// A pair's settings keep an explicit target where the prefill or the
+/// decode policy, each the main one where unset, is consistent hashing.
+#[test]
+fn a_pairs_settings_keep_a_target_under_consistent_hashing_on_a_role() {
+    let pair = |prefill_policy: Option<PolicyConfig>, decode_policy: Option<PolicyConfig>| {
+        RoutingMode::PrefillDecode {
+            prefill_urls: Vec::new(),
+            decode_urls: Vec::new(),
+            prefill_policy,
+            decode_policy,
+        }
+    };
+    let hashing = || Some(PolicyConfig::ConsistentHashing);
+    let other = || Some(PolicyConfig::Random);
+    // A role alone, under another main policy.
+    let main = PolicyConfig::RoundRobin;
+    assert!(placement::pair_keeps_target(&pair(hashing(), None), &main));
+    assert!(placement::pair_keeps_target(&pair(None, hashing()), &main));
+    assert!(!placement::pair_keeps_target(&pair(None, None), &main));
+    // The main policy stands for a role with no setting of its own, and
+    // for no role that has one.
+    let main = PolicyConfig::ConsistentHashing;
+    assert!(placement::pair_keeps_target(&pair(None, other()), &main));
+    assert!(!placement::pair_keeps_target(
+        &pair(other(), other()),
+        &main
+    ));
+}
+
+/// Under consistent hashing the classic holds a request to the worker its
+/// header names. The controller reads no target yet and would place the
+/// request on another worker in silence, so both lines refuse it by name.
+/// Under a policy that reads no target the request is placed as before.
+#[tokio::test]
+async fn an_explicit_target_the_classic_keeps_is_refused_by_name() -> anyhow::Result<()> {
+    let (plain, store) = stage_with_host(&URLS);
+    let hashing = under_consistent_hashing(&plain);
+    let mut ctx = naming_its_worker(&hashing.worker_registry);
+    let refused = hashing
+        .execute(&mut ctx)
+        .await
+        .expect_err("the request names its worker");
+    assert_named_refusal(refused, "an explicit target worker", &store).await?;
+    // A retry of it has no next attempt.
+    let mut retry = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
+    retry.headers.clone_from(&ctx.input.headers);
+    assert!(!hashing.places_retry(&retry));
+    assert!(plain.places_retry(&retry));
+
+    // A pair asks its settings. No role policy is built under the host, so
+    // the registry's main policy says nothing of a pair.
+    let (pair, pair_store) = one_pair_stage(WorkerSelectionMode::PrefillDecode);
+    let unkept = under_consistent_hashing(&pair);
+    let mut ctx = naming_its_worker(&unkept.worker_registry);
+    assert!(unkept.execute(&mut ctx).await.is_ok());
+    drop(ctx);
+    let kept = pair.with_pair_keeps_target(true);
+    let mut ctx = naming_its_worker(&kept.worker_registry);
+    let refused = kept
+        .execute(&mut ctx)
+        .await
+        .expect_err("the request names its worker");
+    assert_named_refusal(refused, "an explicit target worker", &pair_store).await?;
+
+    let mut ctx = naming_its_worker(&plain.worker_registry);
+    assert!(plain.execute(&mut ctx).await.is_ok());
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
+    Ok(())
+}
+
+/// A prompt no worker's window holds is the client's to fix. Under the host
+/// it reads the classic's 400, the answer of the classic stage over the
+/// same workers, and no ask is made.
+#[tokio::test]
+async fn a_prompt_no_window_holds_reads_the_classic_400_under_the_host() -> anyhow::Result<()> {
+    let (stage, store) = stage_with_host(&URLS[..1]);
+    let mut ctx = past_the_window(&stage.worker_registry);
+    let refused = stage
+        .execute(&mut ctx)
+        .await
+        .expect_err("no window holds the prompt");
+    let hosted = answer_of(refused).await?;
+    assert_eq!(hosted.0, StatusCode::BAD_REQUEST);
+    assert_eq!(hosted.1["error"]["code"], "context_length_exceeded");
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+
+    let classic = regular_stage(Arc::clone(&stage.worker_registry));
+    let mut ctx = past_the_window(&classic.worker_registry);
+    let refused = classic
+        .execute(&mut ctx)
+        .await
+        .expect_err("no window holds the prompt");
+    assert_eq!(answer_of(refused).await?, hosted);
+    Ok(())
 }
 
 #[tokio::test]
@@ -989,11 +1135,12 @@ async fn a_pair_shape_the_controller_does_not_place_is_refused_by_name() -> anyh
     let refused = stage.execute(&mut ctx).await.expect_err("pixel input");
     assert_named_refusal(refused, "media input", &store).await?;
 
-    let mut ctx = ingress(&stage.worker_registry);
-    ctx.state.preparation = Some(PreparationOutput::Generate {
-        original_text: None,
-        token_ids: vec![1; WINDOW as usize + 1],
-    });
+    // A second pair states no window, so it may hold the prompt. The demand
+    // binds one pair of two, and the controller cannot place by it yet.
+    let registry = &stage.worker_registry;
+    register_unbound(registry, "http://unbound-p:8000", WorkerType::Prefill);
+    register_unbound(registry, "http://unbound-d:8000", WorkerType::Decode);
+    let mut ctx = past_the_window(registry);
     let refused = stage.execute(&mut ctx).await.expect_err("the window binds");
     assert_named_refusal(refused, "a context demand a worker's window binds", &store).await?;
 
@@ -1046,6 +1193,33 @@ async fn a_pair_ask_states_the_wires_its_pipeline_dials() {
         }
         assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
     }
+}
+
+/// A prompt no pair's windows hold reads the classic's 400 under the host,
+/// the answer of the classic pair stage over the same workers, and no ask
+/// is made.
+#[tokio::test]
+async fn a_pair_prompt_no_window_holds_reads_the_classic_400_under_the_host() -> anyhow::Result<()>
+{
+    let (stage, store) = one_pair_stage(WorkerSelectionMode::PrefillDecode);
+    let mut ctx = past_the_window(&stage.worker_registry);
+    let refused = stage
+        .execute(&mut ctx)
+        .await
+        .expect_err("no pair holds the prompt");
+    let hosted = answer_of(refused).await?;
+    assert_eq!(hosted.0, StatusCode::BAD_REQUEST);
+    assert_eq!(hosted.1["error"]["code"], "context_length_exceeded");
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+
+    let classic = round_robin_pd_stage(Arc::clone(&stage.worker_registry));
+    let mut ctx = past_the_window(&classic.worker_registry);
+    let refused = classic
+        .execute(&mut ctx)
+        .await
+        .expect_err("no pair holds the prompt");
+    assert_eq!(answer_of(refused).await?, hosted);
+    Ok(())
 }
 
 #[tokio::test]
