@@ -241,7 +241,7 @@ pub struct Needs {
     /// The signal cells beside the rows
     /// ([`RequestFacts::signal_cells`](crate::RequestFacts::signal_cells)).
     /// A stage that keeps a signal's column declares this, and no other
-    /// stage does: the validator holds every scorer it builds under a
+    /// stage does: the validator holds every stage it builds under a
     /// build context to both
     /// ([`StageBuild::signal_column`](crate::StageBuild::signal_column)).
     /// A host hands the cells where this is declared and none elsewhere.
@@ -2994,15 +2994,17 @@ fn filtered(
             params
                 .values_mut()
                 .for_each(serde_json::Value::sort_all_objects);
-            let mut context = StageBuild::new(
+            let filter = StageBuild::built(
                 &params,
                 profile,
                 sent_ttl_ms,
                 sent,
                 from.reports,
                 from.signals,
-            );
-            let filter = build(&mut context).map_err(|error| error.at(&path()))?;
+                build,
+                Filter::needs,
+            )
+            .map_err(|error| error.at(&path()))?;
             let answers = filter.name();
             if answers != name {
                 return Err(SpecError::BadStage {
@@ -3089,37 +3091,22 @@ fn scored(
             params
                 .values_mut()
                 .for_each(serde_json::Value::sort_all_objects);
-            let mut context = StageBuild::new(
+            let scorer = StageBuild::built(
                 &params,
                 profile,
                 sent_ttl_ms,
                 sent,
                 from.reports,
                 from.signals,
-            );
-            let scorer = build(&mut context).map_err(|error| error.at(&at.0))?;
-            let resolved = context.resolved_signal();
+                build,
+                Scorer::needs,
+            )
+            .map_err(|error| error.at(&at.0))?;
             let answers = scorer.name();
             if answers != name {
                 return Err(SpecError::BadStage {
                     path: at.0,
                     reason: format!("scorer registered as {name:?} answers the name {answers:?}"),
-                });
-            }
-            // A profile declares the signal cells exactly where one of its
-            // stages keeps a column: a stage that kept one and does not
-            // say so would be handed no cells, and one that says so and
-            // kept none would have a host hand cells nothing reads.
-            if scorer.needs().signal_cells != resolved {
-                return Err(SpecError::BadStage {
-                    path: at.0,
-                    reason: if resolved {
-                        "the scorer keeps a signal's column: its needs must set signal_cells"
-                    } else {
-                        "the scorer's needs set signal_cells and its build resolved no signal: \
-                         resolve one or leave the need unset"
-                    }
-                    .to_owned(),
                 });
             }
             Ok(Scored::Built(Weighted { scorer, weight }))

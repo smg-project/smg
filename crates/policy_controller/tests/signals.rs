@@ -6,9 +6,9 @@
 use std::sync::{Arc, Mutex};
 
 use smg_policy_controller::{
-    spec::MAX_SIGNALS, AppliedSpec, Candidate, Catalog, Constraints, Decision, Engine, Lifecycle,
-    Needs, PairPools, Phase, PolicySpec, PoolFacts, RequestFacts, Scorer, Scratch, SignalCell,
-    SignalCells, SignalColumn, StageBuild, TieBand, WorkerId,
+    spec::MAX_SIGNALS, AppliedSpec, Candidate, Catalog, Constraints, Decision, Engine, Filter,
+    Lifecycle, Needs, PairPools, Phase, PolicySpec, PoolFacts, RequestFacts, Scorer, Scratch,
+    SignalCell, SignalCells, SignalColumn, StageBuild, TieBand, WorkerId,
 };
 
 /// The decisions' instant on the host's clock.
@@ -504,7 +504,7 @@ fn a_stage_whose_needs_and_build_disagree_on_the_signal_cells_is_refused() {
     assert_eq!(
         refusal(false, true),
         Err(
-            "profiles.default.score[0].mismatched: the scorer keeps a signal's column: its needs \
+            "profiles.default.score[0].mismatched: the stage keeps a signal's column: its needs \
              must set signal_cells"
                 .to_owned()
         )
@@ -512,10 +512,101 @@ fn a_stage_whose_needs_and_build_disagree_on_the_signal_cells_is_refused() {
     assert_eq!(
         refusal(true, false),
         Err(
-            "profiles.default.score[0].mismatched: the scorer's needs set signal_cells and its \
+            "profiles.default.score[0].mismatched: the stage's needs set signal_cells and its \
              build resolved no signal: resolve one or leave the need unset"
                 .to_owned()
         )
+    );
+}
+
+/// Keeps the rows whose pending tokens stand at or under its limit, and a
+/// row of no value.
+#[derive(Debug)]
+struct AtMost {
+    pending: SignalColumn,
+    limit: f64,
+    declares: bool,
+}
+
+impl Filter for AtMost {
+    fn name(&self) -> &'static str {
+        "at-most"
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, row: &Candidate, _: &Constraints<'_>) -> bool {
+        let pending = self.pending.read(facts, row);
+        pending.is_none_or(|tokens| tokens <= self.limit)
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            signal_cells: self.declares,
+            ..Needs::default()
+        }
+    }
+}
+
+#[test]
+fn a_registered_filter_resolves_a_signal_and_is_held_to_its_need() {
+    let validated = |declares: bool| {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter_with("at-most", move |build: &mut StageBuild<'_>| {
+                Ok(Box::new(AtMost {
+                    pending: build.signal_column("pending")?,
+                    limit: 5.0,
+                    declares,
+                }))
+            })
+            .expect("a free name");
+        let text = "apiVersion: smg.policy/v1
+signals:
+  pending: { unit: tokens }
+profiles:
+  default:
+    filter:
+      - at-most
+    pick: random
+";
+        document(text).validate_in(&catalog, &[])
+    };
+    // A filter that keeps a column and says nothing would be handed no
+    // cells: it is refused where its context is made, as a scorer is.
+    assert_eq!(
+        validated(false)
+            .map(|_| ())
+            .map_err(|refused| refused.to_string()),
+        Err(
+            "profiles.default.filter[0].at-most: the stage keeps a signal's column: its needs \
+             must set signal_cells"
+                .to_owned()
+        )
+    );
+    let engine = validated(true).expect("validates");
+    assert!(engine.profiles()[0].needs().signal_cells);
+    // Rows 31 and 32 hold 9 and 3 pending tokens: the second alone stays.
+    let rows = rows(&[31, 32]);
+    let cells = SignalCells::new(vec![cell(9.0, 0), cell(3.0, 0)], 1);
+    let facts = RequestFacts {
+        now_micros: NOW,
+        signal_cells: Some(&cells),
+        ..RequestFacts::default()
+    };
+    let pool = PoolFacts {
+        pool_size: rows.len() as u32,
+        ..PoolFacts::default()
+    };
+    let decision = engine.decide(
+        &facts,
+        &pool,
+        &rows,
+        &Constraints::default(),
+        &mut Scratch::new(),
+    );
+    let pick = decision.pick().expect("a pick");
+    assert_eq!(
+        pick.targets.first().map(|target| target.id),
+        Some(WorkerId(32))
     );
 }
 

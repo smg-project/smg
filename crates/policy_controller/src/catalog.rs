@@ -29,7 +29,7 @@ use crate::{
     reports::Reports,
     sent::SentCredit,
     signals::SignalColumn,
-    spec::{SpecError, SCORERS},
+    spec::{Needs, SpecError, SCORERS},
 };
 
 /// Builds one stage: once at its registration, then once for each place a
@@ -79,15 +79,28 @@ pub struct StageBuild<'a> {
 }
 
 impl<'a> StageBuild<'a> {
-    pub(crate) fn new(
+    /// The stage `build` makes under a context of its own, held to its own
+    /// word on the signal cells: its needs (`needs`) set them exactly where
+    /// its factory resolved a signal ([`Self::signal_column`]). A stage
+    /// that kept a column and does not say so would be handed no cells and
+    /// read no value, in silence. One that says so and kept none would
+    /// have a host hand cells nothing reads. The one maker of a context: a
+    /// stage of any kind a factory builds comes through here.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the context's parts, the factory and the stage's own word on its needs"
+    )]
+    pub(crate) fn built<S: ?Sized>(
         written: &'a Map<String, Value>,
         profile: &'a str,
         sent_ttl_ms: Option<u32>,
         sent: &'a mut Option<Arc<SentCredit>>,
         reports: Reports,
         signals: &'a [SignalColumn],
-    ) -> Self {
-        Self {
+        build: impl FnOnce(&mut Self) -> Result<Box<S>, StageError>,
+        needs: impl FnOnce(&S) -> Needs,
+    ) -> Result<Box<S>, StageError> {
+        let mut context = Self {
             written,
             profile,
             sent_ttl_ms,
@@ -95,12 +108,18 @@ impl<'a> StageBuild<'a> {
             reports,
             signals,
             resolved_signal: false,
+        };
+        let stage = build(&mut context)?;
+        match (context.resolved_signal, needs(&stage).signal_cells) {
+            (true, false) => Err(StageError::other(
+                "the stage keeps a signal's column: its needs must set signal_cells",
+            )),
+            (false, true) => Err(StageError::other(
+                "the stage's needs set signal_cells and its build resolved no signal: \
+                 resolve one or leave the need unset",
+            )),
+            _ => Ok(stage),
         }
-    }
-
-    /// Whether the factory resolved a signal ([`Self::signal_column`]).
-    pub(crate) fn resolved_signal(&self) -> bool {
-        self.resolved_signal
     }
 }
 
