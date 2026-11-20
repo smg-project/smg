@@ -130,16 +130,7 @@ impl ModelProcessorSpec for LlavaSpec {
     }
 
     fn matches(&self, metadata: &ModelMetadata) -> bool {
-        // Match plain "llava" but not "llava_next" (handled by LlavaNextSpec).
-        let model_type = metadata.config_model_type();
-        if model_type.is_some_and(|mt| mt == "llava_next") {
-            return false;
-        }
-        let model_id_lower = metadata.model_id.to_ascii_lowercase();
-        if model_id_lower.contains("llava-next") || model_id_lower.contains("llava_next") {
-            return false;
-        }
-        model_id_lower.contains("llava") || model_type.is_some_and(|mt| mt == "llava")
+        metadata.config_model_type() == Some("llava")
     }
 
     /// The placeholder (`<image>`, or `[IMG]` under the Pixtral tower; the
@@ -384,6 +375,22 @@ mod tests {
         let registry = ModelRegistry::new();
         let spec = registry.lookup(&metadata).expect("llava alias");
         assert_eq!(spec.name(), "llava");
+    }
+
+    /// The config's `model_type` names the family, whatever the served id
+    /// says: a LLaVA-OneVision checkpoint does not take the LLaVA spec.
+    #[test]
+    fn a_llava_onevision_checkpoint_does_not_take_the_llava_spec() {
+        use crate::registry::ModelProcessorSpec;
+
+        let tokenizer = TestTokenizer::new(&[]);
+        let config = json!({"model_type": "llava_onevision"});
+        let metadata = ModelMetadata {
+            model_id: "llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        assert!(!super::LlavaSpec.matches(&metadata));
     }
 
     #[test]
