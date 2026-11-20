@@ -1745,6 +1745,43 @@ pub(crate) mod tests {
         }
     }
 
+    /// An entry of the record of sent prefixes is a prediction made at the
+    /// decision. A served decision whose last read of the clock finds its
+    /// budget gone leaves as `Busy` and gives its lease up. Its entry
+    /// stays, and the next request with that prefix follows it.
+    #[tokio::test]
+    async fn a_decision_that_leaves_as_busy_keeps_its_prefix_for_the_next_request() {
+        let asked = |id: u8, seed: u64| {
+            let mut frame = frame(id, seed);
+            let facts = frame.facts.as_mut().expect("the case's frame has facts");
+            facts.block_hashes = (1..=8).collect();
+            facts.prompt_tokens = 8 * 16;
+            frame
+        };
+        let fresh = |steps: Vec<Step>| bed(Some(preset("cache_aware", 1)), true, (1, 8), steps);
+        // Where the late request lands, and a second request that lands
+        // elsewhere as the first of its prefix, each on a bed of its own.
+        let late = picked(&fresh(Vec::new()).ask(asked(1, 100)).await);
+        let mut elsewhere = None;
+        for seed in 101..=132 {
+            if picked(&fresh(Vec::new()).ask(asked(2, seed)).await) != late {
+                elsewhere = Some(seed);
+                break;
+            }
+        }
+        let seed = elsewhere.expect("a seed that lands on another worker");
+        // The same two requests on one bed. The first decision's last read
+        // of the clock shows its budget gone, and the second is taken at
+        // the first's instant again.
+        let steps = [Duration::ZERO, BUDGET, Duration::ZERO].map(Step::At);
+        let mut bed = fresh(steps.into());
+        let answer = bed.ask(asked(1, 100)).await;
+        assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
+        assert_eq!(bed.store.live(GATEWAY), 0);
+        let next = picked(&bed.ask(asked(2, seed)).await);
+        assert_eq!(next, late, "the late decision's entry is followed");
+    }
+
     /// A decision waits in its stream's queue as it was made, with the
     /// lease issued for its pick and what is left of that lease's span: its
     /// frame is its stream's to build. A `Busy` is handed over as its

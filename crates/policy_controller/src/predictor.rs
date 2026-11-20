@@ -5,6 +5,15 @@
 //! deepest block of its request that a worker was sent, and the workers
 //! sent it.
 //!
+//! An entry is a prediction made at the decision. The door and the stock
+//! controller write it where a single's lease is issued, so it says where
+//! a prefix was decided to go, whether or not the request then left. A
+//! decision turned back behind its issue keeps its entry, and the next
+//! request of the prefix follows it: a false entry costs one miss on its
+//! worker, where no entry costs one miss on some worker, and it is true
+//! once followed. An entry stops speaking for a worker whose cache events
+//! are heard, and leaves with its worker or by the bound.
+//!
 //! This is the `tree` kind of the document's index settings
 //! ([`IndexKind`](crate::spec::IndexKind)). The `hash` kind is not built.
 //!
