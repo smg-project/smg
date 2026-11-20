@@ -2299,6 +2299,36 @@ async fn a_fleet_that_pairs_nothing_is_refused_by_the_pair_classes() {
             "{shed:?}"
         );
     }
+
+    // The same fleet on the other side: each row serves gRPC alone. An ask
+    // on that wire reads the refusal. An ask that states no wire keeps the
+    // shed, though an empty set of wires would read that side's entry.
+    for (id, _) in bed.prefills.iter().chain(&bed.decodes) {
+        let row = WorkersStore::get(&*bed.store, *id).expect("the bed's row");
+        let again = bed.store.upsert(WorkerFacts {
+            wire_modes: WireModes::GRPC,
+            ..row.facts
+        });
+        let row = WorkersStore::get(&*bed.store, again.id()).expect("the row on gRPC");
+        // Ready, where the new life did not start so.
+        let _ = bed.store.set_status(row.id, RowStatus::Ready, row.revision);
+    }
+    bed.store.publish_now();
+    let on_grpc = Ask {
+        wires: WireModes::GRPC,
+        ..pair_ask()
+    };
+    let refused = bed.host.place_pair(&on_grpc, None, None).await.err();
+    assert!(
+        matches!(&refused, Some(Unplaced::NoCompatiblePair { mismatches, .. })
+            if *mismatches == ["pairing_protocol"]),
+        "{refused:?}"
+    );
+    let shed = bed.host.place_pair(&pair_ask(), None, None).await.err();
+    assert!(
+        matches!(shed, Some(Unplaced::Shed { reason, .. }) if reason == no_endpoint),
+        "{shed:?}"
+    );
     assert_eq!(live(&bed.store, 0), 0);
 }
 

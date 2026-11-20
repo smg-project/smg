@@ -696,6 +696,9 @@ pub(crate) const NO_MEDIA_REF_CAPABLE_WORKER_CODE: &str = "no_media_ref_capable_
 /// The client-visible code of [`policy_declined`].
 pub(crate) const POLICY_DECLINED_CODE: &str = "policy_declined";
 
+/// The client-visible code of [`no_compatible_pair`].
+pub(crate) const NO_COMPATIBLE_PD_PAIR_CODE: &str = "no_compatible_pd_pair";
+
 const POLICY_DECLINED_MESSAGE: &str = "The policy declined the request for model";
 
 /// The 503 for a pool whose every worker is unavailable (unhealthy or its
@@ -774,20 +777,23 @@ pub(crate) fn policy_declined(model: &str, declined_at: &str) -> Response {
 /// prefill of them pairs with a decode: `mismatches` are the components the
 /// pools disagree on, `prefill` and `decode` each pool's pairing keys. The
 /// verdict reads membership alone, so the classic selection and the policy
-/// controller's host give one answer for one fleet.
+/// controller's host give one answer for one fleet. The line's reason is
+/// what the answer names: the mismatch and each pool's keys.
 pub(crate) fn no_compatible_pair(
     model: &str,
     mismatches: &[String],
     prefill: &[String],
     decode: &[String],
 ) -> Response {
-    error::service_unavailable(
-        "no_compatible_pd_pair",
+    let found = format!("mismatch on {mismatches:?}; prefill: {prefill:?}, decode: {decode:?}");
+    let mut response = error::service_unavailable(
+        NO_COMPATIBLE_PD_PAIR_CODE,
         format!(
-            "No prefill/decode pair for model '{model}' shares a KV transfer protocol (mismatch \
-             on {mismatches:?}; prefill: {prefill:?}, decode: {decode:?})"
+            "No prefill/decode pair for model '{model}' shares a KV transfer protocol ({found})"
         ),
-    )
+    );
+    response.extensions_mut().insert(RefusalReason(found));
+    response
 }
 
 /// The workers of `pool` a placement may use: those on `wire` when a retry
@@ -837,8 +843,9 @@ struct RefusalReason(String);
 /// own: a model whose workers are all unavailable (`no_available_workers`),
 /// a model nobody serves (`model_not_found`), a model none of whose
 /// workers processes the media references forwarded to it
-/// (`no_media_ref_capable_worker`), or a request the policy declined
-/// (`policy_declined`). One line per refusal, with
+/// (`no_media_ref_capable_worker`), a request the policy declined
+/// (`policy_declined`), or a fleet none of whose prefills pairs with a
+/// decode (`no_compatible_pd_pair`). One line per refusal, with
 /// the request id, the model and the pool's state, shows the condition and
 /// whom it hits; past this rate the lines are counted and the next one
 /// carries the count, while `smg_router_request_errors_total` keeps the
@@ -875,6 +882,12 @@ static POLICY_DECLINED_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
     REFUSAL_LOG_MODELS,
 );
 
+static NO_COMPATIBLE_PAIR_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+    REFUSAL_LINES_PER_SECOND,
+    Duration::from_secs(1),
+    REFUSAL_LOG_MODELS,
+);
+
 /// The router answering a refusal, as its line names it.
 #[derive(Clone, Copy)]
 pub(crate) struct RefusalSite<'a> {
@@ -898,6 +911,11 @@ enum Refusal {
     /// and capped like the pool's 503.
     NoMediaRefCapableWorker,
     PolicyDeclined,
+    /// The model's prefill and decode pools hold workers and no prefill
+    /// pairs with a decode ([`no_compatible_pair`]): a verdict over the
+    /// fleet's membership that holds until a worker changes, so it is keyed
+    /// and capped like the pool's 503.
+    NoCompatiblePair,
 }
 
 impl Refusal {
@@ -907,6 +925,7 @@ impl Refusal {
             MODEL_NOT_FOUND_CODE => Some(Self::ModelNotFound),
             NO_MEDIA_REF_CAPABLE_WORKER_CODE => Some(Self::NoMediaRefCapableWorker),
             POLICY_DECLINED_CODE => Some(Self::PolicyDeclined),
+            NO_COMPATIBLE_PD_PAIR_CODE => Some(Self::NoCompatiblePair),
             _ => None,
         }
     }
@@ -917,6 +936,7 @@ impl Refusal {
             Self::ModelNotFound => &MODEL_NOT_FOUND_LOG,
             Self::NoMediaRefCapableWorker => &NO_MEDIA_REF_CAPABLE_WORKER_LOG,
             Self::PolicyDeclined => &POLICY_DECLINED_LOG,
+            Self::NoCompatiblePair => &NO_COMPATIBLE_PAIR_LOG,
         }
     }
 
@@ -926,6 +946,7 @@ impl Refusal {
             Self::ModelNotFound => "No worker serves model",
             Self::NoMediaRefCapableWorker => "No worker processes media references for model",
             Self::PolicyDeclined => POLICY_DECLINED_MESSAGE,
+            Self::NoCompatiblePair => "No compatible prefill/decode pair for model",
         }
     }
 
@@ -941,7 +962,10 @@ impl Refusal {
     /// shares one allowance with every other such name, for the same reason.
     fn key(self, model_id: &str, registered: bool) -> &str {
         match self {
-            Self::NoAvailableWorkers | Self::NoMediaRefCapableWorker | Self::PolicyDeclined
+            Self::NoAvailableWorkers
+            | Self::NoMediaRefCapableWorker
+            | Self::PolicyDeclined
+            | Self::NoCompatiblePair
                 if registered =>
             {
                 model_id
@@ -949,6 +973,7 @@ impl Refusal {
             Self::NoAvailableWorkers
             | Self::NoMediaRefCapableWorker
             | Self::PolicyDeclined
+            | Self::NoCompatiblePair
             | Self::ModelNotFound => "",
         }
     }
@@ -956,8 +981,9 @@ impl Refusal {
 
 /// The log line of a refusal the gateway answers on its own, and its marker.
 ///
-/// A `no_available_workers`, `no_media_ref_capable_worker` or
-/// `policy_declined` 503, or a `model_not_found` 404, gets one WARN with
+/// A `no_available_workers`, `no_media_ref_capable_worker`,
+/// `policy_declined` or `no_compatible_pd_pair` 503, or a
+/// `model_not_found` 404, gets one WARN with
 /// the request id, the model, the state of the pools `site` draws from,
 /// and the reason the refusal names when it has one, capped at
 /// [`REFUSAL_LINES_PER_SECOND`] per model with workers for the 503s and for
@@ -1013,7 +1039,10 @@ pub(crate) fn report_refusal_under(
     // pool lookup per role, no walk over the workers; the 404 needs none.
     let registered = matches!(
         kind,
-        Refusal::NoAvailableWorkers | Refusal::NoMediaRefCapableWorker | Refusal::PolicyDeclined
+        Refusal::NoAvailableWorkers
+            | Refusal::NoMediaRefCapableWorker
+            | Refusal::PolicyDeclined
+            | Refusal::NoCompatiblePair
     ) && site
         .pools
         .iter()
@@ -4093,6 +4122,60 @@ mod tests {
         let lines = lines.lock().expect("the refusal's lines");
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert!(lines[2].contains(&format!("model_id=\"{MODEL}\"")));
+    }
+
+    /// A fleet that pairs nothing is reported once, under an allowance of
+    /// its own. Its line names what the answer names: the mismatch and each
+    /// pool's keys. The client's message is the sentence it always was.
+    #[tokio::test]
+    async fn a_fleet_that_pairs_nothing_is_reported_once_with_its_mismatch() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = test_subscriber(EventLines(tracing::Level::WARN, Arc::clone(&lines)));
+        let registry = http_registry(&["http://worker:8080"]);
+        let site = RefusalSite {
+            function: "WorkerSelectionStage::execute",
+            mode: "PrefillDecode",
+            pools: &[
+                ("prefill", RoutingPool::HttpPrefill),
+                ("decode", RoutingPool::HttpDecode),
+            ],
+        };
+        let list = |name: &str| vec![name.to_owned()];
+        let refuse = || no_compatible_pair(MODEL, &list("transport"), &list("a"), &list("b"));
+        let found = r#"mismatch on ["transport"]; prefill: ["a"], decode: ["b"]"#;
+        let refusal = refuse();
+        assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&refusal),
+            NO_COMPATIBLE_PD_PAIR_CODE
+        );
+        assert_eq!(refusal_reason(&refusal), Some(found));
+        let reported = report_refusal(&registry, site, None, MODEL, refusal);
+        assert!(reported.extensions().get::<ReportedRefusal>().is_some());
+        let reported = report_refusal(&registry, site, None, MODEL, reported);
+        {
+            let lines = lines.lock().expect("the refusal's lines");
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].contains("message=No compatible prefill/decode pair for model"));
+            assert!(lines[0].contains("mismatch on"), "{lines:?}");
+        }
+        let kind = Refusal::of(&reported).expect("the reported refusal's kind");
+        for other in [
+            Refusal::NoAvailableWorkers,
+            Refusal::ModelNotFound,
+            Refusal::NoMediaRefCapableWorker,
+            Refusal::PolicyDeclined,
+        ] {
+            assert!(!std::ptr::eq(kind.throttle(), other.throttle()));
+        }
+        let body = axum::body::to_bytes(reported.into_body(), 4096)
+            .await
+            .expect("the answer's body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON answer");
+        let message = format!(
+            "No prefill/decode pair for model '{MODEL}' shares a KV transfer protocol ({found})"
+        );
+        assert_eq!(body["error"]["message"], message.as_str());
     }
 
     /// The model in the line is the caller's own text, so it is written as a

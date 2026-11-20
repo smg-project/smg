@@ -245,8 +245,13 @@ enum PdSelectionFailure {
     /// circuit-broken, or the policy declined.
     Unavailable(String),
     /// Both roles are up, but no prefill shares a KV transfer protocol with
-    /// any decode (#2483).
-    Incompatible(String),
+    /// any decode (#2483): each pool's pairing keys, and the components the
+    /// pools disagree on.
+    Incompatible {
+        prefill: Vec<String>,
+        decode: Vec<String>,
+        mismatches: Vec<String>,
+    },
     /// The Prefill admission queue had no room for the request.
     QueueFull,
     /// The request waited out its Prefill admission timeout.
@@ -610,16 +615,19 @@ impl PDRouter {
             )
     }
 
-    fn handle_server_selection_error(failure: PdSelectionFailure) -> Response {
+    fn handle_server_selection_error(model_id: &str, failure: PdSelectionFailure) -> Response {
         match failure {
             // Already a decision-logged 503 with the overload error code and
             // counter; re-describing it as a circuit-breaker/health failure is
             // exactly the misdiagnosis this path used to hand operators.
             PdSelectionFailure::Shed(shed) => shed,
-            PdSelectionFailure::Incompatible(error) => {
-                error!("Failed to select PD pair error={}", error);
-                error::service_unavailable("no_compatible_pd_pair", error)
-            }
+            // The gRPC pair stage's sentence, from its one home. The
+            // refusal's line names the mismatch and each pool's keys.
+            PdSelectionFailure::Incompatible {
+                prefill,
+                decode,
+                mismatches,
+            } => placement::no_compatible_pair(model_id, &mismatches, &prefill, &decode),
             PdSelectionFailure::QueueFull => prefill_queue_full(),
             PdSelectionFailure::QueueTimeout => prefill_queue_timeout(),
             PdSelectionFailure::Unavailable(error) => {
@@ -1021,7 +1029,7 @@ impl PDRouter {
                     Err(e) => {
                         return self.report_refusal(
                             context.model_id,
-                            Self::handle_server_selection_error(*e),
+                            Self::handle_server_selection_error(context.model_id, *e),
                         );
                     }
                 };
@@ -2919,10 +2927,11 @@ impl PDRouter {
                 prefill,
                 decode,
                 mismatches,
-            } => PdSelectionFailure::Incompatible(format!(
-                "No prefill/decode pair shares a KV transfer protocol (mismatch on \
-                 {mismatches:?}; prefill: {prefill:?}, decode: {decode:?})"
-            )),
+            } => PdSelectionFailure::Incompatible {
+                prefill,
+                decode,
+                mismatches,
+            },
         }
     }
 
@@ -3395,8 +3404,8 @@ impl RouterTrait for PDRouter {
                 // broken one already did.
                 Err(failure) => match Self::pair_failure(*failure) {
                     PdSelectionFailure::Shed(shed) => return shed,
-                    PdSelectionFailure::Incompatible(e) => {
-                        return error::service_unavailable("no_compatible_pd_pair", e);
+                    incompatible @ PdSelectionFailure::Incompatible { .. } => {
+                        return Self::handle_server_selection_error(UNKNOWN_MODEL_ID, incompatible);
                     }
                     PdSelectionFailure::Unavailable(e) => {
                         return error::service_unavailable(
@@ -3407,7 +3416,7 @@ impl RouterTrait for PDRouter {
                     // The probe does not go through admission.
                     rejection @ (PdSelectionFailure::QueueFull
                     | PdSelectionFailure::QueueTimeout) => {
-                        return Self::handle_server_selection_error(rejection);
+                        return Self::handle_server_selection_error(UNKNOWN_MODEL_ID, rejection);
                     }
                 },
             };
@@ -3972,14 +3981,41 @@ mod tests {
         }
     }
 
+    /// A fleet that pairs nothing reads the gRPC pair stage's sentence here
+    /// too: the answer names the model, and the refusal's line carries the
+    /// mismatch and each pool's keys.
+    #[test]
+    fn a_fleet_that_pairs_nothing_answers_the_one_sentence() {
+        let list = |name: &str| vec![name.to_owned()];
+        let failure = PDRouter::pair_failure(PairFailure {
+            role: WorkerRole::Decode,
+            verdict: PlacementFailure::NoCompatiblePair {
+                prefill: list("a"),
+                decode: list("b"),
+                mismatches: list("transport"),
+            },
+        });
+        let response = PDRouter::handle_server_selection_error("m", failure);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            placement::NO_COMPATIBLE_PD_PAIR_CODE
+        );
+        assert_eq!(
+            placement::refusal_reason(&response),
+            Some(r#"mismatch on ["transport"]; prefill: ["a"], decode: ["b"]"#)
+        );
+    }
+
     /// A role that is merely down answers the same 503 as the other routers,
     /// Retry-After included, so a client keys its back-off on one answer
     /// whatever the transport.
     #[test]
     fn an_unavailable_role_answers_503_with_retry_after() {
-        let response = PDRouter::handle_server_selection_error(PdSelectionFailure::Unavailable(
-            "No prefill workers available".to_string(),
-        ));
+        let response = PDRouter::handle_server_selection_error(
+            UNKNOWN_MODEL_ID,
+            PdSelectionFailure::Unavailable("No prefill workers available".to_string()),
+        );
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -4686,7 +4722,7 @@ mod tests {
                 assert!(error.contains("No prefill workers available"));
             }
             PdSelectionFailure::Shed(_) => panic!("an empty fleet is not an overload shed"),
-            PdSelectionFailure::Incompatible(_) => {
+            PdSelectionFailure::Incompatible { .. } => {
                 panic!("an empty fleet has no pairing to be incompatible about")
             }
             PdSelectionFailure::QueueFull | PdSelectionFailure::QueueTimeout => {

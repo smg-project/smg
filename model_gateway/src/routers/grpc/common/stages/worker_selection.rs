@@ -1881,22 +1881,13 @@ impl WorkerSelectionStage {
                 model_id,
                 format!("No {role} workers below their Prefill admission limit"),
             ),
+            // The refusal's line names the mismatch and each pool's keys,
+            // once a refusal and under the model's allowance.
             PlacementFailure::NoCompatiblePair {
                 prefill,
                 decode,
                 mismatches,
-            } => {
-                error!(
-                    function = "WorkerSelectionStage::execute",
-                    mode = ?self.mode,
-                    model_id = %model_id,
-                    ?mismatches,
-                    ?prefill,
-                    ?decode,
-                    "No prefill/decode pair shares a KV transfer protocol"
-                );
-                placement::no_compatible_pair(model_id, &mismatches, &prefill, &decode)
-            }
+            } => placement::no_compatible_pair(model_id, &mismatches, &prefill, &decode),
             // A role nobody serves beside a partner role with workers: the
             // pair is incomplete (a role restarting, or not yet discovered),
             // which the refusal says; with no worker on either role the model

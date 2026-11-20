@@ -517,6 +517,8 @@ async fn an_explicit_target_the_classic_keeps_is_refused_by_name() -> anyhow::Re
         .await
         .expect_err("the request names its worker");
     assert_named_refusal(refused, "an explicit target worker", &pair_store).await?;
+    // A pair's retry of it has no next attempt either.
+    assert!(!kept.places_retry(&retry));
 
     let mut ctx = naming_its_worker(&plain.worker_registry);
     assert!(plain.execute(&mut ctx).await.is_ok());
@@ -1388,6 +1390,15 @@ async fn a_fleet_that_pairs_nothing_reads_the_classic_refusal_under_the_host() -
         .await
         .expect_err("the fleet pairs nothing");
     assert_eq!(hosted.status(), refused.status());
+    // Each stage reported its refusal, and the line's reason is one: the
+    // mismatch and each pool's keys.
+    let reason = placement::refusal_reason(&hosted).map(str::to_owned);
+    let named = reason.as_deref().unwrap_or_default();
+    assert!(named.starts_with("mismatch on ["), "{reason:?}");
+    assert_eq!(placement::refusal_reason(&refused), reason.as_deref());
+    for answer in [&hosted, &refused] {
+        assert!(answer.extensions().get::<ReportedRefusal>().is_some());
+    }
     let hosted: Value = serde_json::from_slice(&to_bytes(hosted.into_body(), 4096).await?)?;
     let refused: Value = serde_json::from_slice(&to_bytes(refused.into_body(), 4096).await?)?;
     assert_eq!(hosted["error"]["code"], "no_compatible_pd_pair");

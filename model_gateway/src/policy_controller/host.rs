@@ -326,9 +326,10 @@ pub(crate) enum Unplaced {
     Refused(Refused),
     /// The gateway could send to no target of its three asks.
     NoTargetHolds,
-    /// A pair's ask found no endpoint, and by membership no prefill pairs
-    /// with a decode: each pool's pairing keys and the components the two
-    /// pools disagree on, as the store's pair classes hold them.
+    /// A pair's ask that states its wires found no endpoint, and by
+    /// membership no prefill pairs with a decode on their side: each pool's
+    /// pairing keys and the components the two pools disagree on, as the
+    /// store's pair classes hold them.
     NoCompatiblePair {
         /// The prefill pool's pairing keys.
         prefill: Vec<String>,
@@ -363,7 +364,7 @@ impl Unplaced {
     /// |---|---|
     /// | The pool is saturated, admission found no room, or the controller queued the request | 503 `worker_overload_protection_shed`, with a retry hint |
     /// | No endpoint is left, or the gateway can send to no target | 503 `no_available_workers`, with a retry hint |
-    /// | A pair's pools hold workers and no prefill pairs with a decode | 503 `no_compatible_pd_pair`, naming what the pools disagree on |
+    /// | A pair's ask states its wires, and on their side the pools hold workers and no prefill pairs with a decode | 503 `no_compatible_pd_pair`, naming what the pools disagree on |
     /// | A controller queue is at its limit | 429 `admission_queue_full`, with a retry hint |
     /// | The decision's budget passed | 503 `admission_queue_timeout`, with the same hint |
     /// | The prefill admission queue is full or timed out | 429 `pd_prefill_queue_full` or `pd_prefill_queue_timeout` |
@@ -622,6 +623,10 @@ impl Host {
     ///
     /// An ask that states no wire does not say which side it draws from. It
     /// keeps the controller's shed.
+    ///
+    /// The lookup reads the world of its own minute, which can be later
+    /// than the one the decision read. The answer is a diagnosis and places
+    /// nothing, so a fleet that changed in between reads its newer state.
     fn unpaired(&self, ask: &Ask<'_>) -> Option<Unplaced> {
         if ask.phase == Phase::Single || ask.wires.is_empty() {
             return None;
