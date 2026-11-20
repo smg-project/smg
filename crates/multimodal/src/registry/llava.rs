@@ -130,7 +130,12 @@ impl ModelProcessorSpec for LlavaSpec {
     }
 
     fn matches(&self, metadata: &ModelMetadata) -> bool {
+        // The original LLaVA-NeXT releases declare `llava` too; this spec
+        // preprocesses one crop, not their anyres grid.
+        let id = metadata.model_id.to_ascii_lowercase();
         metadata.config_model_type() == Some("llava")
+            && !id.contains("llava-next")
+            && !id.contains("llava_next")
     }
 
     /// The placeholder (`<image>`, or `[IMG]` under the Pixtral tower; the
