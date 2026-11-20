@@ -201,7 +201,11 @@ pub struct Needs {
     pub text_hashes: bool,
     /// Load reports per worker.
     pub loads: bool,
-    /// KV events into an index.
+    /// KV events into an index. A stage that declares this beside
+    /// `token_hashes` reads the request's holders from the index, and a
+    /// host names the index's holders ahead of the record's for its
+    /// profile. A stage that reads the events for another fact of a row,
+    /// as a warm-up does, declares no hashes beside it.
     pub events: bool,
     /// The stage reads the prefixes sent to each worker.
     #[serde(default)]
@@ -398,8 +402,10 @@ pub struct IndexSpec {
     pub ttl_s: u32,
     /// The size bound of a tree index: characters on a text host, tokens
     /// otherwise. The crate's own store reads it for a pool whose profile
-    /// reads sent prefixes: the model's record holds `max_size` over the
-    /// block size placements at most, one a block a worker was sent.
+    /// reads sent prefixes: the model's record is bound to `max_size` over
+    /// the block size placements, never under one, one a block a worker
+    /// was sent. A lowered bound is met by sweeps at the record's next
+    /// writes, and a pool whose lanes are all heard writes none.
     #[schemars(range(min = 1))]
     pub max_size: u64,
     /// The index's sweep cadence, in seconds.
@@ -740,9 +746,9 @@ pub struct ConsistentHashParams {
     /// request carries. Under the view's `boundaries` a request that reaches
     /// one is keyed there instead, at the deepest it reaches. The depth is
     /// checked in the view's token blocks and read in the blocks a request
-    /// was hashed by. A text request's windows are `block_size` characters,
-    /// a quarter of a token block, so it carries a quarter of the checked
-    /// depth and a deeper depth keys at its last window. Under a block size
+    /// was hashed by. A host that hashes a text request by windows of the
+    /// block size times four bytes gives it the checked depth in windows,
+    /// as a token request has it in blocks. Under a block size
     /// an engine published above the depth a request has no key. Absent, a
     /// request with no routing key has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]

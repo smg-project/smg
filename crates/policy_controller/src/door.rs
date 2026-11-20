@@ -9,7 +9,7 @@
 //! embeds the engine runs it on the caller's thread ([`Door`]): no frame
 //! is built and no thread is hopped. A single's issued lease records the
 //! prefix for its first target when the naming read a record of
-//! sent prefixes and the target has no cache-event lane.
+//! sent prefixes and the store has heard no cache event of the target.
 //!
 //! A request reaches the order in the form it was asked in (the trait
 //! `Asked`): a frame as the served controller checked it, or the facts a

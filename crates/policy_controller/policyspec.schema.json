@@ -160,7 +160,7 @@
           "default": 180
         },
         "max_size": {
-          "description": "The size bound of a tree index: characters on a text host, tokens\notherwise. The crate's own store reads it for a pool whose profile\nreads sent prefixes: the model's record holds `max_size` over the\nblock size placements at most, one a block a worker was sent.",
+          "description": "The size bound of a tree index: characters on a text host, tokens\notherwise. The crate's own store reads it for a pool whose profile\nreads sent prefixes: the model's record is bound to `max_size` over\nthe block size placements, never under one, one a block a worker\nwas sent. A lowered bound is met by sweeps at the record's next\nwrites, and a pool whose lanes are all heard writes none.",
           "type": "integer",
           "format": "uint64",
           "minimum": 1,
@@ -857,7 +857,7 @@
           "exclusiveMinimum": 0
         },
         "prefix_tokens": {
-          "description": "The depth in tokens at which a request with no routing key is keyed\nby its prefix through the last whole block at or under the depth, so at\nleast one block of the view's block size and at most the blocks a\nrequest carries. Under the view's `boundaries` a request that reaches\none is keyed there instead, at the deepest it reaches. The depth is\nchecked in the view's token blocks and read in the blocks a request\nwas hashed by. A text request's windows are `block_size` characters,\na quarter of a token block, so it carries a quarter of the checked\ndepth and a deeper depth keys at its last window. Under a block size\nan engine published above the depth a request has no key. Absent, a\nrequest with no routing key has none.",
+          "description": "The depth in tokens at which a request with no routing key is keyed\nby its prefix through the last whole block at or under the depth, so at\nleast one block of the view's block size and at most the blocks a\nrequest carries. Under the view's `boundaries` a request that reaches\none is keyed there instead, at the deepest it reaches. The depth is\nchecked in the view's token blocks and read in the blocks a request\nwas hashed by. A host that hashes a text request by windows of the\nblock size times four bytes gives it the checked depth in windows,\nas a token request has it in blocks. Under a block size\nan engine published above the depth a request has no key. Absent, a\nrequest with no routing key has none.",
           "type": [
             "integer",
             "null"

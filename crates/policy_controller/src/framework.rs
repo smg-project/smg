@@ -2586,9 +2586,10 @@ pub struct Engine {
     /// Per profile, the cap of the rows a host names for its decisions
     /// ([`Self::named_for`]), said once at the build.
     named: Vec<u32>,
-    /// Per profile, whether a scorer of it reads sent prefixes and no cache
-    /// events ([`Self::reads_sent_alone_for`]), asked of its scorers at the
-    /// build.
+    /// Per profile, whether it reads a request's holders from the record
+    /// of sent prefixes alone ([`Self::reads_sent_alone_for`]): a scorer
+    /// of it reads the record and none reads the holders from the index.
+    /// Asked of its scorers at the build.
     sent_alone: Vec<bool>,
     /// Per profile, its filters as one test of a row, where the engine
     /// holds every one itself ([`RowTests::of`]). A decision that draws
