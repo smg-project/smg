@@ -534,11 +534,14 @@ impl<G: Generation> Objects<G> {
         // A row one gateway alone reaches is built unchecked where the
         // host asked for it: nothing here can dial its worker.
         let reached = !self.host_local_unchecked || row.facts.reachable_from == Reachability::Any;
-        let mut worker = if reached {
+        let worker = if reached {
             builder(row)
         } else {
             unchecked(row)
         };
+        // The registry's signal sender: the object says its connect signal
+        // and each move of its liveness veto to the collector's loop.
+        let mut worker = worker.connect_signal_tx(self.registry.connect_signal_sender());
         if let Some(connector) = &self.connector {
             worker = worker.engine_connector(Arc::clone(connector));
         }
@@ -949,10 +952,9 @@ mod tests {
         replica.remove(A);
         replica.follow();
         assert!(token.accepted(row));
+        // The read `lay_again` makes finds nothing, and forgets the row
+        // all the same.
         assert_eq!(replica.lay_again(&facts(A, 1)), 0);
-
-        // A read that finds nothing forgets the row all the same.
-        replica.follow();
         assert!(replica.credentials.is_empty());
         replica.store.upsert(facts(A, 2));
         replica.follow();

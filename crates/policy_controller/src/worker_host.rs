@@ -59,8 +59,10 @@
 //! supplies the [`Lead`] and the term the adapter writes under. Its
 //! projection ([`HealthAdapter::project`]) writes what the object knows of
 //! its worker onto the row: the object's liveness veto is the row's stalled
-//! bit, for every gateway. The host calls it at each change of that veto,
-//! and for an object it lays over another.
+//! bit, for every gateway. The worker crate's collector drives it through
+//! the adapter: at each move of that veto, for an object laid over another,
+//! and for every object where a collector starts. A host that runs the
+//! collector calls no projection of its own.
 //!
 //! [`LoadAdapter`] writes load records and poll answers to the store. The
 //! store decides when the collector polls and keeps the overload verdict.

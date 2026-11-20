@@ -59,7 +59,7 @@ use crate::{
     metrics::writers::Metrics,
     metrics_labels,
     registry::{
-        event::{WorkerConnected, WorkerEvent},
+        event::{WorkerConnected, WorkerEvent, WorkerSignal},
         Generation, WorkerId, WorkerOrigin, WorkerRegistry,
     },
     runtime::WorkerRuntime,
@@ -525,6 +525,11 @@ async fn run_health_loop<G: Generation>(
     let mut probes: ProbeFutures = FuturesUnordered::new();
     let mut in_flight: HashSet<WorkerId> = HashSet::new();
 
+    // The sink is told every worker's liveness once at the start. A host
+    // that starts a loop for each term of its lead writes what its objects
+    // know at the term's start this way, with no call of its own.
+    tell_liveness_of_all(&registry, sink.as_ref());
+
     loop {
         let now = tokio::time::Instant::now();
         let removals = queue_due_probes(
@@ -641,7 +646,10 @@ async fn run_health_loop<G: Generation>(
             () = tokio::time::sleep_until(sleep_until) => {}
             signal = signals.recv() => {
                 match signal {
-                    Some(connected) => {
+                    Some(WorkerSignal::LivenessMoved { url }) => {
+                        apply_liveness_signal(&registry, sink.as_ref(), &url);
+                    }
+                    Some(WorkerSignal::Connected(connected)) => {
                         apply_connect_signal_and_refresh(
                             &registry,
                             sink.as_ref(),
@@ -660,6 +668,7 @@ async fn run_health_loop<G: Generation>(
                 }
             }
             event = events_rx.recv() => {
+                tell_liveness_at_event(&event, &registry, sink.as_ref());
                 if apply_registry_event(event, &registry, &mut next_check, &config).is_break() {
                     return;
                 }
@@ -921,7 +930,7 @@ async fn apply_probe_completion<G: Generation>(
 /// lead) is signalled in each of them, not in the first alone.
 struct HeldSignals<G: Generation> {
     registry: Arc<WorkerRegistry<G>>,
-    receiver: Option<mpsc::UnboundedReceiver<WorkerConnected>>,
+    receiver: Option<mpsc::UnboundedReceiver<WorkerSignal>>,
 }
 
 impl<G: Generation> HeldSignals<G> {
@@ -938,7 +947,7 @@ impl<G: Generation> HeldSignals<G> {
     /// loop that does to end, then takes it: the `select!` branch lies
     /// dormant meanwhile and never spins. Cancel safe: a signal leaves the
     /// channel only in the `recv` that returns it.
-    async fn recv(&mut self) -> Option<WorkerConnected> {
+    async fn recv(&mut self) -> Option<WorkerSignal> {
         loop {
             match &mut self.receiver {
                 Some(receiver) => return receiver.recv().await,
@@ -956,6 +965,73 @@ impl<G: Generation> Drop for HeldSignals<G> {
         if let Some(receiver) = self.receiver.take() {
             self.registry.return_connect_signal_receiver(receiver);
         }
+    }
+}
+
+/// Say to `sink` that the liveness veto of `worker` may have moved
+/// ([`HealthSink::liveness_moved`]). The mark of a waiting signal is taken
+/// first and the sink reads the veto after: a move behind that read signals
+/// again, so the sink's last read is never older than the last move.
+fn tell_liveness(sink: &dyn HealthSink, worker_id: &WorkerId, worker: &dyn Worker) {
+    if let Some(runtime) = worker.runtime_state() {
+        runtime.liveness_signal_taken();
+    }
+    sink.liveness_moved(worker_id, worker.revision());
+}
+
+/// A liveness signal ([`WorkerSignal::LivenessMoved`]): the sink is told of
+/// the worker that stands at the URL now, at its revision. A replacement
+/// shares the running state of the worker it replaced, the veto with the
+/// rest, so a signal raised through the earlier object is the
+/// replacement's too. The signal of a worker that left is nobody's.
+fn apply_liveness_signal<G: Generation>(
+    registry: &Arc<WorkerRegistry<G>>,
+    sink: &dyn HealthSink,
+    url: &str,
+) {
+    let Some(worker_id) = registry.get_id_by_url(url) else {
+        return;
+    };
+    let Some(worker) = registry.get(&worker_id) else {
+        return;
+    };
+    tell_liveness(sink, &worker_id, worker.as_ref());
+}
+
+/// The liveness of every worker the registry holds: at the loop's start,
+/// and at its rebuild behind a lagged subscription, which may have lost a
+/// replacement's event.
+fn tell_liveness_of_all<G: Generation>(registry: &Arc<WorkerRegistry<G>>, sink: &dyn HealthSink) {
+    for descriptor in registry.reconcile_snapshot() {
+        if let Some(worker) = registry.get(&descriptor.worker_id) {
+            tell_liveness(sink, &descriptor.worker_id, worker.as_ref());
+        }
+    }
+}
+
+/// The liveness tells a registry event carries. A worker laid in another's
+/// place took its running state, the veto with it: the sink is told at the
+/// replacement's revision, where a tell of the earlier object may have met
+/// a sink already past it. A registered worker starts with no veto and is
+/// told of at its first move. A lagged subscription tells every worker.
+fn tell_liveness_at_event<G: Generation>(
+    event: &Result<WorkerEvent, broadcast::error::RecvError>,
+    registry: &Arc<WorkerRegistry<G>>,
+    sink: &dyn HealthSink,
+) {
+    match event {
+        Ok(WorkerEvent::Replaced {
+            worker_id,
+            new: worker,
+            ..
+        }) => tell_liveness(sink, worker_id, worker.as_ref()),
+        Err(broadcast::error::RecvError::Lagged(_)) => tell_liveness_of_all(registry, sink),
+        Ok(
+            WorkerEvent::Registered { .. }
+            | WorkerEvent::Removed { .. }
+            | WorkerEvent::StatusChanged { .. },
+        )
+        | Err(broadcast::error::RecvError::Closed) => {}
     }
 }
 
