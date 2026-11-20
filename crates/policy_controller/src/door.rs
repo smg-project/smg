@@ -206,8 +206,9 @@ pub(crate) struct Buffers<L> {
     pub(crate) lists: L,
     pub(crate) named: Named,
     /// The rows named again for a decision's shadow, where its profile
-    /// is named rows of its own ([`ShadowRows::Own`]): they grow at the
-    /// thread's first such shadow.
+    /// is named rows of its own ([`ShadowRows::Own`]). They are lent to
+    /// that shadow's asking for the one decision ([`decide_own_in`]),
+    /// and grow at the thread's first such shadow.
     pub(crate) shadow_named: Named,
     /// What a keyed decision reads of its key in the store, where its
     /// rule has an in-flight cap.
@@ -614,7 +615,11 @@ pub(crate) enum Shadow {
 ///
 /// A shadow that panics is held here, inside the catch its host keeps
 /// round the decision: the live decision stands as decided.
-struct Shadowing<'a, L> {
+///
+/// A decider is built for one way of asking its shadow ([`ShadowAsk`]):
+/// one whose shadow reads the live decision's rows carries nothing of a
+/// naming.
+struct Shadowing<'a, L, R> {
     engine: &'a Engine,
     /// The request's binding and how its shadow reads the live
     /// decision's rows, as the seat read them ahead of the order
@@ -623,20 +628,117 @@ struct Shadowing<'a, L> {
     /// What the request's budget still holds at the end of the live
     /// decision: asked there, and only where a shadow is due.
     left: L,
-    /// What a naming of the shadow's own rows reads beside the request.
-    naming: OwnRows<'a>,
+    /// How the shadow is asked.
+    ask: R,
 }
 
-/// What the door names a shadow's own rows by ([`ShadowRows::Own`]),
-/// beside the request: the world of the decision's one load, the gateway
-/// and the wires its view was built and narrowed for, whether a demand
-/// may have taken a row of it, and the buffer the rows are written on.
+/// How a [`Shadowing`] decider asks its shadow, by the rows the shadow
+/// profile reads: those of its live decision ([`LiveRows`]), or none of
+/// them ([`OwnRows`]).
+trait ShadowAsk {
+    /// Whether the live decision reads the affinity column its needs
+    /// declare ([`Decides::reads_column`]).
+    fn reads_column(&self) -> bool;
+
+    /// The shadow's decision over the live decision's view, by `rows`.
+    fn shadow(
+        self,
+        engine: &Engine,
+        rows: ShadowRows,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Option<Decision>;
+}
+
+/// The asking of a shadow that reads the rows its live decision was
+/// handed ([`ShadowRows::Same`]), or the view without the rows named for
+/// the live profile ([`ShadowRows::Unnamed`]).
+struct LiveRows;
+
+impl ShadowAsk for LiveRows {
+    fn reads_column(&self) -> bool {
+        true
+    }
+
+    // Forced into the decider's one call: the asking stands in line
+    // there, as it did where the decider held no other.
+    #[inline(always)]
+    fn shadow(
+        self,
+        engine: &Engine,
+        rows: ShadowRows,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Option<Decision> {
+        match rows {
+            // A profile that reads no column is named no row, live or
+            // as a shadow: the names would turn its pick to a draw.
+            ShadowRows::Unnamed => {
+                let unnamed = RequestFacts {
+                    named: None,
+                    ..*facts
+                };
+                engine.shadow(&unnamed, pool, candidates, constraints, scratch)
+            }
+            _ => engine.shadow(facts, pool, candidates, constraints, scratch),
+        }
+    }
+}
+
+/// The asking of a shadow that reads none of its live decision's rows:
+/// one that is named rows of its own ([`ShadowRows::Own`]), and one that
+/// is skipped ([`ShadowRows::Apart`]). It holds what the door names such
+/// rows by, beside the request: the world of the decision's one load,
+/// the gateway and the wires its view was built and narrowed for,
+/// whether a demand may have taken a row of it, and the buffer the rows
+/// are written on.
 struct OwnRows<'a> {
     world: &'a World,
     gateway: GatewayId,
     wires: Option<WireModes>,
     cut: bool,
     named: &'a mut Named,
+    /// Whether the live profile reads the affinity column by its own
+    /// stages: no column is filled for such a shadow's sake.
+    column: bool,
+}
+
+impl ShadowAsk for OwnRows<'_> {
+    fn reads_column(&self) -> bool {
+        self.column
+    }
+
+    fn shadow(
+        self,
+        engine: &Engine,
+        rows: ShadowRows,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Option<Decision> {
+        // A shadow that is skipped is asked nothing: its decider stops
+        // ahead of the asking.
+        let ShadowRows::Own(cap) = rows else {
+            return None;
+        };
+        // A profile that is named rows of its own reads them in the
+        // column's place, as it does live.
+        let named = self.name(cap, facts, candidates);
+        let own = RequestFacts {
+            named: Some(named.affinity()),
+            affinity: &[],
+            ..*facts
+        };
+        engine.shadow(&own, pool, candidates, constraints, scratch)
+    }
 }
 
 impl<'a> OwnRows<'a> {
@@ -651,13 +753,9 @@ impl<'a> OwnRows<'a> {
             wires,
             cut,
             named,
+            ..
         } = self;
-        let role = match facts.phase {
-            Phase::Single => Role::Single,
-            Phase::Prefill => Role::Prefill,
-            Phase::Decode => Role::Decode,
-            Phase::Encode => Role::Encode,
-        };
+        let role = role_of(facts.phase);
         let naming = Naming {
             gateway,
             block_hashes: facts.block_hashes,
@@ -677,7 +775,7 @@ impl<'a> OwnRows<'a> {
     }
 }
 
-impl<L: FnOnce() -> Duration> Shadowing<'_, L> {
+impl<L: FnOnce() -> Duration, R: ShadowAsk> Shadowing<'_, L, R> {
     // Forced into each form's one call, as the plain decider's is.
     #[inline(always)]
     fn decided<const STATED: bool>(
@@ -712,29 +810,9 @@ impl<L: FnOnce() -> Duration> Shadowing<'_, L> {
         if let Some(asking) = ON_SHADOW.take() {
             asking();
         }
-        let naming = self.naming;
-        let asked = catch_unwind(AssertUnwindSafe(|| match rows {
-            // A profile that reads no column is named no row, live or
-            // as a shadow: the names would turn its pick to a draw.
-            ShadowRows::Unnamed => {
-                let unnamed = RequestFacts {
-                    named: None,
-                    ..*facts
-                };
-                engine.shadow(&unnamed, pool, candidates, constraints, scratch)
-            }
-            // A profile that is named rows of its own reads them in the
-            // column's place, as it does live.
-            ShadowRows::Own(cap) => {
-                let named = naming.name(cap, facts, candidates);
-                let own = RequestFacts {
-                    named: Some(named.affinity()),
-                    affinity: &[],
-                    ..*facts
-                };
-                engine.shadow(&own, pool, candidates, constraints, scratch)
-            }
-            _ => engine.shadow(facts, pool, candidates, constraints, scratch),
+        let ask = self.ask;
+        let asked = catch_unwind(AssertUnwindSafe(|| {
+            ask.shadow(engine, rows, facts, pool, candidates, constraints, scratch)
         }));
         let shadow = match asked {
             Ok(Some(shadow)) => {
@@ -756,7 +834,9 @@ impl<L: FnOnce() -> Duration> Shadowing<'_, L> {
     }
 }
 
-impl<L: FnOnce() -> Duration> Decides<((Decision, Option<Booking>), Shadow)> for Shadowing<'_, L> {
+impl<L: FnOnce() -> Duration, R: ShadowAsk> Decides<((Decision, Option<Booking>), Shadow)>
+    for Shadowing<'_, L, R>
+{
     fn over(
         self,
         facts: &RequestFacts<'_>,
@@ -778,6 +858,10 @@ impl<L: FnOnce() -> Duration> Decides<((Decision, Option<Booking>), Shadow)> for
     ) -> ((Decision, Option<Booking>), Shadow) {
         self.decided::<true>(facts, pool, candidates, constraints, scratch)
     }
+
+    fn reads_column(&self) -> bool {
+        self.ask.reads_column()
+    }
 }
 
 /// [`decide_in`] for a request whose binding names a shadow: the live
@@ -785,7 +869,9 @@ impl<L: FnOnce() -> Duration> Decides<((Decision, Option<Booking>), Shadow)> for
 /// ([`Shadowing`]). `due` is the engine's word of the binding
 /// ([`Engine::shadow_for`]), read once ahead of the decision. `left` says
 /// what the request's budget still holds at the end of the live decision,
-/// by its host's own clock.
+/// by its host's own clock. The shadow is asked over the rows its live
+/// decision was handed ([`LiveRows`]): one that reads none of them is
+/// decided by [`decide_own_in`].
 pub(crate) fn decide_shadowed_in<A: Asked>(
     world: &World,
     taken: &Taken<'_, A>,
@@ -794,29 +880,65 @@ pub(crate) fn decide_shadowed_in<A: Asked>(
     due: (u32, ShadowRows),
     left: impl FnOnce() -> Duration,
 ) -> ((Decision, Option<Booking>), Shadow) {
+    shadowed_by(world, taken, buffers, own, due, left, LiveRows)
+}
+
+/// [`decide_shadowed_in`] for a shadow that reads none of its live
+/// decision's rows: one that is named rows of its own, or one that is
+/// skipped ([`OwnRows`]). No column is filled for such a shadow's sake:
+/// the live decision's is filled where its own profile reads it.
+///
+/// The buffer the shadow's rows are named on is lent out of `buffers`
+/// for the decision, since the hand holds the rest.
+pub(crate) fn decide_own_in<A: Asked>(
+    world: &World,
+    taken: &Taken<'_, A>,
+    buffers: &mut Buffers<A::Lists>,
+    own: &Part,
+    due: (u32, ShadowRows),
+    left: impl FnOnce() -> Duration,
+) -> ((Decision, Option<Booking>), Shadow) {
+    let engine = world.spec().engine();
+    let mut named = mem::take(&mut buffers.shadow_named);
+    let ask = OwnRows {
+        world,
+        gateway: taken.gateway,
+        wires: taken.request.wires(),
+        cut: !taken.request.demands().is_none(),
+        named: &mut named,
+        column: engine.live_column_at(due.0, taken.request.phase()),
+    };
+    let decided = shadowed_by(world, taken, buffers, own, due, left, ask);
+    buffers.shadow_named = named;
+    decided
+}
+
+/// The hand of a shadowed decision by one way of asking its shadow
+/// ([`ShadowAsk`]): the live decision with its booking, and what became
+/// of that shadow.
+#[inline(always)]
+fn shadowed_by<A: Asked, R: ShadowAsk>(
+    world: &World,
+    taken: &Taken<'_, A>,
+    buffers: &mut Buffers<A::Lists>,
+    own: &Part,
+    due: (u32, ShadowRows),
+    left: impl FnOnce() -> Duration,
+    ask: R,
+) -> ((Decision, Option<Booking>), Shadow) {
     let spec = world.spec();
     let engine = spec.engine();
     if taken.request.hashes() > taken.request.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
     }
-    // The buffer of the shadow's own rows is lent for the decision: the
-    // hand holds the thread's other buffers while the shadow is named.
-    let mut named = std::mem::take(&mut buffers.shadow_named);
     let shadowing = Shadowing {
         engine,
         due,
         left,
-        naming: OwnRows {
-            world,
-            gateway: taken.gateway,
-            wires: taken.request.wires(),
-            cut: !taken.request.demands().is_none(),
-            named: &mut named,
-        },
+        ask,
     };
     let (((decision, booking), shadow), built) =
         hand(world, taken, buffers, &own.undialed, shadowing);
-    buffers.shadow_named = named;
     let booking = booking.map(|booking| Booking { built, ..booking });
     ((decision, booking), shadow)
 }
@@ -1333,6 +1455,16 @@ pub(crate) trait Decides<R> {
     {
         self.over(facts, pool, candidates, constraints, scratch)
     }
+
+    /// Whether the affinity column the decision's needs declare has a
+    /// reader over the rows this decider is handed. The needs join a
+    /// shadow profile's to the live one's
+    /// ([`Engine::reads_for`](crate::framework::Engine::reads_for)). A
+    /// decider says no where the shadow alone declared the column and
+    /// reads none of the live decision's rows: [`hand`] then fills none.
+    fn reads_column(&self) -> bool {
+        true
+    }
 }
 
 impl<R, F> Decides<R> for F
@@ -1438,8 +1570,11 @@ pub(crate) fn hand<A: Asked, R>(
     // is named no row and keeps its column. The deciding profile answers
     // for itself: the needs are merged over a pair's two phases and a
     // sessions rule, so they say only where to ask, and no other decision
-    // pays the second walk.
-    let cap = if needs.affinity {
+    // pays the second walk. They join a shadow profile's too: a column
+    // that the shadow alone declared, and reads none of, is not filled
+    // ([`Decides::reads_column`]).
+    let column = needs.affinity && decide.reads_column();
+    let cap = if column {
         engine.named_for(model, phase)
     } else {
         0
@@ -1449,15 +1584,10 @@ pub(crate) fn hand<A: Asked, R>(
         gateway,
         now,
         pinned: None,
-        affinity: needs.affinity && !names,
+        affinity: column && !names,
         signal_cells: needs.signal_cells,
     };
-    let role = match phase {
-        Phase::Single => Role::Single,
-        Phase::Prefill => Role::Prefill,
-        Phase::Decode => Role::Decode,
-        Phase::Encode => Role::Encode,
-    };
+    let role = role_of(phase);
     let Buffers {
         view,
         held: holds,
@@ -1647,6 +1777,17 @@ pub(crate) fn hand<A: Asked, R>(
         }
     });
     (answer, built)
+}
+
+/// The role whose pool decides a request of `phase`: the pool [`hand`]
+/// reads its rows of, and the one a shadow's own rows are named in.
+const fn role_of(phase: Phase) -> Role {
+    match phase {
+        Phase::Single => Role::Single,
+        Phase::Prefill => Role::Prefill,
+        Phase::Decode => Role::Decode,
+        Phase::Encode => Role::Encode,
+    }
 }
 
 /// Whether the request's own narrowing can leave a row: a subset of none
@@ -2985,26 +3126,23 @@ impl Door {
                     };
                     // Each order's answer is built in its own place:
                     // two that met in one would cost a copy of it.
-                    if let Some((binding, rows)) = due {
-                        let mut due = Due {
-                            binding,
-                            rows,
-                            said: None,
-                        };
-                        let decided = order.shadowed(&world, at, term, &taken, buffers, &mut due);
+                    let Some((binding, rows)) = due else {
+                        let decided = order.plain(&world, at, term, &taken, buffers);
                         if flags & SAMPLES_DECISIONS != 0 {
-                            self.sampled(at, engine, &taken, &decided, due.said, sample_count);
+                            self.sampled(at, engine, &taken, &decided, None, sample_count);
                         }
                         return decided;
-                    }
+                    };
+                    let mut due = Due {
+                        binding,
+                        rows,
+                        said: None,
+                    };
+                    let decided = order.shadowed(&world, at, term, &taken, buffers, &mut due);
                     if flags & SAMPLES_DECISIONS != 0 {
-                        let decided = order.plain(&world, at, term, &taken, buffers);
-                        self.sampled(at, engine, &taken, &decided, None, sample_count);
-                        return decided;
+                        self.sampled(at, engine, &taken, &decided, due.said, sample_count);
                     }
-                    // No shadow is due and nothing is sampled: the request
-                    // is ordered below, by the line a generation that
-                    // shadows nowhere runs.
+                    return decided;
                 }
                 order.plain(&world, at, term, &taken, buffers)
             };
@@ -3192,7 +3330,7 @@ impl Door {
             Entry::Single => {
                 let (decision, booking) = decide_in(world, taken, buffers, &self.parts[at]);
                 let lease =
-                    self.file::<false>(world, term, taken, &buffers.named, &decision, booking)?;
+                    self.file::<PLAIN>(world, term, taken, &buffers.named, &decision, booking)?;
                 Ok(Decided { decision, lease })
             }
             Entry::Pair => self.pair(world, at, term, taken, buffers),
@@ -3200,18 +3338,18 @@ impl Door {
         }
     }
 
-    /// What stands behind a single's decision, in both its orders
-    /// ([`Self::order`], [`Self::order_shadowed`]): a pick's lease is
-    /// issued, the engine that decided is told of it, and the record of
-    /// sent prefixes takes the prefix of `named`, the live decision's
-    /// naming ([`issue`]). A step that joins a single's commit is
-    /// written here, once, and stands in both orders.
+    /// What stands behind a single's decision, in each of its orders
+    /// ([`Self::order`], [`Self::order_shadowed`], [`Self::order_own`]):
+    /// a pick's lease is issued, the engine that decided is told of it,
+    /// and the record of sent prefixes takes the prefix of `named`, the
+    /// live decision's naming ([`issue`]). A step that joins a
+    /// single's commit is written here, once, and stands in every order.
     ///
-    /// Each order builds a copy of its own (`SHADOWED`), with a telling
-    /// of its own: the store builds its issue for each telling, so
-    /// neither order's issue moves where the other's is built.
+    /// Each order builds a copy of its own (`ORDER`), with a telling of
+    /// its own: the store builds its issue for each telling, so no
+    /// order's issue moves where another's is built.
     #[inline(always)]
-    fn file<const SHADOWED: bool>(
+    fn file<const ORDER: u8>(
         &self,
         world: &World,
         term: u64,
@@ -3246,6 +3384,10 @@ impl Door {
     /// behind the commit: the live decision is issued as decided. The
     /// budget is the one its host stated at the decision's instant: in
     /// process the door reads no clock.
+    ///
+    /// A shadow that reads none of its live decision's rows takes an
+    /// order of its own ([`Self::order_own`]): this one pays one test
+    /// for it and runs no part of a naming.
     fn order_shadowed(
         &self,
         world: &World,
@@ -3255,12 +3397,50 @@ impl Door {
         buffers: &mut Buffers<()>,
         due: &mut Due,
     ) -> Result<Decided, Refused> {
+        if matches!(due.rows, ShadowRows::Own(_) | ShadowRows::Apart) {
+            return self.order_own(world, at, term, taken, buffers, due);
+        }
+        self.shadowed_order::<SHADOWED>(world, at, term, taken, buffers, due)
+    }
+
+    /// [`Self::order_shadowed`] for a shadow that reads none of its live
+    /// decision's rows: one that is named rows of its own, or one that
+    /// is skipped ([`decide_own_in`]). Out of line, with a copy of the
+    /// commit of its own: no other order runs a part of it.
+    #[inline(never)]
+    fn order_own(
+        &self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        due: &mut Due,
+    ) -> Result<Decided, Refused> {
+        self.shadowed_order::<OWN_ROWS>(world, at, term, taken, buffers, due)
+    }
+
+    /// The body of the two shadowed orders, built once for each
+    /// ([`Self::order_shadowed`], [`Self::order_own`]): the decision
+    /// with its shadow, the commit ([`Self::file`]), then what the
+    /// shadow said or its fault.
+    #[inline(always)]
+    fn shadowed_order<const ORDER: u8>(
+        &self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        due: &mut Due,
+    ) -> Result<Decided, Refused> {
         let own = &self.parts[at];
-        let ((decision, booking), shadow) =
-            decide_shadowed_in(world, taken, buffers, own, (due.binding, due.rows), || {
-                taken.left
-            });
-        let filed = self.file::<true>(world, term, taken, &buffers.named, &decision, booking);
+        let word = (due.binding, due.rows);
+        let ((decision, booking), shadow) = match ORDER {
+            OWN_ROWS => decide_own_in(world, taken, buffers, own, word, || taken.left),
+            _ => decide_shadowed_in(world, taken, buffers, own, word, || taken.left),
+        };
+        let filed = self.file::<ORDER>(world, term, taken, &buffers.named, &decision, booking);
         if shadow == Shadow::Faulted {
             // The next decision reads nothing the shadow left.
             buffers.scratch = Scratch::default();
@@ -3418,6 +3598,13 @@ impl Door {
         })
     }
 }
+
+/// The plain order's copy of a single's commit ([`Door::file`]).
+const PLAIN: u8 = 0;
+/// The copy of the order whose shadow reads its live decision's rows.
+const SHADOWED: u8 = 1;
+/// The copy of the order whose shadow reads none of them.
+const OWN_ROWS: u8 = 2;
 
 /// A decision's shadow at its seat: what the seat read of the request's
 /// binding ahead of the order ([`Engine::shadow_for`]), and what the

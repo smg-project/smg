@@ -2598,9 +2598,11 @@ pub(crate) struct NamedBy {
 }
 
 /// How a binding's shadow reads the rows its live decision was handed
-/// ([`Engine::shadow_for`]). A host names rows for the live profile alone,
-/// by what that profile says it is named by ([`NamedBy`]), so they are a
-/// shadow profile's own rows only where the two say one value.
+/// ([`Engine::shadow_for`]). A host names rows for the live profile by
+/// what that profile says it is named by ([`NamedBy`]). They are the
+/// shadow profile's own rows where the two say one value. Where the two
+/// differ by the cap alone, or the live profile is named no row, a host
+/// names the shadow's rows again ([`Self::Own`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShadowRows {
     /// As the live decision read them: the shadow profile would be handed
@@ -4183,6 +4185,19 @@ impl Engine {
         self.bindings.get(at as usize).map(|entry| &entry.binding)
     }
 
+    /// Whether the live profile of the binding at `at` reads the affinity
+    /// column for `phase` by its own stages. [`Self::reads_for`] joins
+    /// the shadow profile's needs to the live one's: a host that skips a
+    /// shadow, or names it rows of its own ([`ShadowRows`]), fills the
+    /// live decision's column by this word.
+    pub(crate) fn live_column_at(&self, at: u32, phase: Phase) -> bool {
+        self.bindings
+            .get(at as usize)
+            .and_then(|entry| profile_index(&entry.binding, phase))
+            .and_then(|index| self.profile_needs.get(usize::from(index)))
+            .is_some_and(|needs| needs.affinity)
+    }
+
     /// The binding a request of `phase` for `model` resolves to, where
     /// its shadow is asked ([`Self::shadow`]): its position in this
     /// generation, and how that shadow reads the rows a host handed the
@@ -4224,10 +4239,9 @@ impl Engine {
     /// The ruling a host reads a pool's warming rows by, for the decisions
     /// of `phase` for `model`: the live profile's
     /// ([`Self::warm_rule_for`]) and, where that profile rules by none and
-    /// its binding's shadow is named rows of its own
-    /// ([`ShadowRows::Own`]), the shadow profile's. A live profile that
-    /// rules by none reads no warming row, so the rows it is handed do
-    /// not move.
+    /// its binding's shadow is named rows of its own, the shadow
+    /// profile's. A live profile that rules by none reads no warming row,
+    /// so the rows it is handed do not move.
     pub fn pool_rule_for(&self, model: &str, phase: Phase) -> Option<WarmRule> {
         self.warm_rule_for(model, phase).or_else(|| {
             let (at, rows) = self.shadow_for(model, phase)?;
@@ -7596,11 +7610,13 @@ mod tests {
         assert!(run(&reused, "second").is_none());
     }
 
-    /// A host names rows for the live profile alone, by its cap, its
-    /// warm-up ruling and the record of sent prefixes. A shadow reads them
-    /// where its own profile would be named the same, reads the view
-    /// without them where that profile reads no column, and is not asked
-    /// anywhere else.
+    /// A host names rows for the live profile, by its cap, its warm-up
+    /// ruling and the record of sent prefixes. A shadow reads them where
+    /// its own profile would be named the same, and reads the view
+    /// without them where that profile reads no column. It is named rows
+    /// of its own where it differs by its cap, or the live profile is
+    /// named none, and the pool's ruling and record are its own. It is
+    /// not asked anywhere else.
     #[test]
     fn a_shadow_reads_its_live_rows_only_where_it_would_be_handed_them() {
         use crate::spec::{

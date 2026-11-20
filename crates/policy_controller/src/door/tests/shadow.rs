@@ -627,6 +627,51 @@ fn a_budget_under_the_floor_names_no_rows_for_the_shadow() {
     assert_eq!((kinds(&door)[3], named(&door)), (1, 1));
 }
 
+/// A shadow's need of the affinity column fills none for a live decision
+/// whose rows it does not read. Behind least load, a shadow that is named
+/// rows of its own and one that is skipped leave the live decision no
+/// column. A live profile that reads the column itself is filled it.
+#[test]
+fn a_column_is_filled_for_the_live_profile_and_for_no_shadow_alone() {
+    let filled = |document: &PolicySpec| {
+        let (store, _) = cached(document, 1, 2);
+        let door = Door::new(store);
+        let hashes = [1_u64];
+        let mut asked = request(b"col", 7);
+        asked.facts.block_hashes = &hashes;
+        placed(&door, &asked);
+        let skipped = kinds(&door)[3];
+        let slot = door.seats[0].slot.lock();
+        (slot.buffers.view.affinity.len(), skipped)
+    };
+    assert_eq!(filled(&own_rows(true)), (0, 0), "rows of its own");
+    let mut apart = own_rows(true);
+    let twin = apart.profiles.get_mut("twin").expect("the shadow profile");
+    let prefix = PrefixAffinityParams {
+        weight: 4.0,
+        source: Some(AffinitySource::Predictor),
+        ..PrefixAffinityParams::default()
+    };
+    twin.score[1] = ScoreStage::PrefixAffinity(prefix).into();
+    assert_eq!(filled(&apart), (0, 1), "a shadow that is skipped");
+    // A live profile of two warm-up rulings is named no row and reads
+    // the column whole, with the cache-aware preset's profile behind it.
+    let mut whole = PolicySpec::preset("cache_aware").expect("a preset of this build");
+    whole.explain.sample = 1;
+    let live = whole.profiles.values_mut().next();
+    let live = live.expect("the preset's profile");
+    let twin = live.clone();
+    let slice = WarmupSliceParams {
+        weight: 8.0,
+        secs: Some(120),
+        ..WarmupSliceParams::default()
+    };
+    live.score.push(ScoreStage::WarmupSlice(slice).into());
+    whole.profiles.insert("twin".into(), twin);
+    whole.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+    assert_eq!(filled(&whole), (3, 0), "the live profile's own column");
+}
+
 /// A profile that reads no column is named no row when it decides live.
 /// As a shadow behind a live profile that is named rows it is asked
 /// without them: the names would turn a sampling picker's pick to a draw.
