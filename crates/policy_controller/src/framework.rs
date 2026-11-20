@@ -9,7 +9,7 @@ use crate::{
     affinity::{forget_judged, WarmRule},
     builtins::{target_of, Best, FewestSessions, LeastRequests, Random, RowTests},
     decision::{
-        Decision, Lifted, Overlap, Pair, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace,
+        Decision, Lifted, Overlap, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace,
         MAX_TARGETS, TRACE_TOP,
     },
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
@@ -5442,9 +5442,17 @@ impl Engine {
                 // targets name the prefill, its trace is the prefill's, and
                 // that decision is the one returned.
                 Decision::Pick(paired) => {
-                    paired.targets.pair_under(prefill_target);
-                    paired.trace = prefill_pick.trace;
-                    paired.session_verdict = SessionVerdict::None;
+                    // Every field of a pick is named here, with no rest:
+                    // a field added later fails this build until the pair
+                    // says whose value it keeps.
+                    let Pick {
+                        targets,
+                        trace,
+                        session_verdict,
+                    } = paired;
+                    targets.pair_under(prefill_target);
+                    *trace = prefill_pick.trace;
+                    *session_verdict = SessionVerdict::None;
                     return decision;
                 }
                 Decision::Shed(shed) => last_shed = Some(*shed),
@@ -5505,7 +5513,7 @@ impl Engine {
         // This call has one draw sequence, seeded by its own request.
         decode_facts.seed = facts.seed;
         let _opened = shown.then(|| profile.open(&decode_facts, decodes, pool));
-        let decision = run_profile(
+        let mut decision = run_profile(
             profile,
             index,
             &decode_facts,
@@ -5514,24 +5522,14 @@ impl Engine {
             decode_cx,
             &mut scratch.decode,
         );
-        let Decision::Pick(pick) = decision else {
-            return decision;
-        };
         // Each target names the held prefill with one decode, as the
-        // targets of a pair's first decision do.
-        let held = target_of(prefill);
-        let mut targets = Targets::new();
-        for decode in pick.targets.iter() {
-            targets.push(Target {
-                pair: Some(Pair {
-                    decode_position: decode.position,
-                    decode_id: decode.id,
-                    decode_dp_rank: decode.dp_rank,
-                }),
-                ..held
-            });
+        // targets of a pair's first decision do. They are turned where the
+        // decision stands, and its trace and its verdict stay the decode's:
+        // taken out and built beside it, the pick was copied twice.
+        if let Decision::Pick(pick) = &mut decision {
+            pick.targets.pair_under(&target_of(prefill));
         }
-        Decision::Pick(Pick { targets, ..pick })
+        decision
     }
 }
 
@@ -5741,6 +5739,7 @@ mod tests {
             PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
         },
         counts::tests::Lent,
+        decision::Pair,
         sessions::Recovery,
         spec::{PolicySpec, PowerOfTwoMetric, PrefixAffinityParams, SpillParams},
         view::{Health, Identity, MediaCounts, Role, Session, WorkerId},
