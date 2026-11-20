@@ -121,6 +121,40 @@ fn settle_brings_a_row_written_past_the_door_into_the_registry() {
     assert_eq!(registry.get_id_by_url(URL), Some(object));
 }
 
+struct TurnAtRegistration {
+    feed: Feed,
+    held: OnceLock<bool>,
+}
+
+impl Wake for TurnAtRegistration {
+    fn wake(self: Arc<Self>) {
+        self.held
+            .get_or_init(|| self.feed.turn.try_lock().is_none());
+    }
+}
+
+#[test]
+fn a_settle_holds_the_feeds_turn() {
+    let store = Arc::new(MemoryStore::default());
+    let (registry, feed) = bed(&store);
+    let at_registration = Arc::new(TurnAtRegistration {
+        feed: feed.clone(),
+        held: OnceLock::new(),
+    });
+    let waker = Waker::from(Arc::clone(&at_registration));
+    let mut events = registry.subscribe_events();
+    let mut event = pin!(events.recv());
+    // Read the turn on the thread that lays the row's object.
+    assert!(event
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+
+    store.upsert(stated());
+    feed.settle();
+    assert_eq!(at_registration.held.get(), Some(&true));
+}
+
 #[test]
 fn a_second_write_of_the_same_facts_moves_nothing() {
     let (registry, feed) = bed(&Arc::new(MemoryStore::default()));
@@ -230,7 +264,7 @@ fn a_membership_write_holds_the_feed_turn_through_its_listener() {
                 assert!(door.turn.try_lock().is_none());
                 calls.fetch_add(1, Ordering::Relaxed);
             }),
-            turn: Mutex::new(()),
+            turn: Arc::new(Mutex::new(())),
         }
     });
     let row = register(&*door).expect("the worker registers");

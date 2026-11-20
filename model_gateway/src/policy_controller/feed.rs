@@ -28,13 +28,19 @@ pub(crate) struct Feed {
     pub objects: Arc<Objects<ModelWorkerSnapshot>>,
     /// The store the door writes and the holder follows.
     store: Arc<MemoryStore>,
+    /// The feed's turn: one write with its listener, or one settle, at a
+    /// time.
+    turn: Arc<Mutex<()>>,
 }
 
 impl Feed {
     /// Bring the registry to the store's rows, then publish them: the two
     /// calls the door's listener makes after each write. A follower that
     /// applies a served controller's events calls this after each event.
+    /// It takes the feed's turn, so it never runs between a write at the
+    /// door and that write's listener.
     pub(crate) fn settle(&self) {
+        let _turn = self.turn.lock();
         settle(&self.objects, &self.store);
     }
 }
@@ -55,22 +61,24 @@ pub(crate) fn feed(store: &Arc<MemoryStore>, registry: &Arc<WorkerRegistry>) -> 
         let store = Arc::clone(store);
         move || settle(&objects, &store)
     });
+    let turn = Arc::new(Mutex::new(()));
     Feed {
         door: Arc::new(FeedDoor {
             door,
-            turn: Mutex::new(()),
+            turn: Arc::clone(&turn),
         }),
         objects,
         store: Arc::clone(store),
+        turn,
     }
 }
 
 /// The store door releases its turn before calling the listener. Hold the
-/// feed's turn through that call so the listener cannot publish a later
-/// write whose row the holder has yet to read.
+/// feed's turn through that call, so neither a later write nor a settle
+/// can publish a row the holder has yet to read.
 struct FeedDoor {
     door: StoreDoor,
-    turn: Mutex<()>,
+    turn: Arc<Mutex<()>>,
 }
 
 impl FeedDoor {
