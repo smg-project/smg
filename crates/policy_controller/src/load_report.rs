@@ -308,7 +308,8 @@ pub struct RankValues {
     /// The slots of one reduction, kept for their room.
     made: Vec<Option<Made>>,
     /// Whether a record read the other ranks' entries since the keeper's
-    /// start and since its columns last moved: they are read once.
+    /// start, since its columns last moved and since it last dropped a
+    /// rank: they are read once.
     settled: bool,
 }
 
@@ -467,12 +468,14 @@ impl RankValues {
     /// of every rank, at `sampled_at`. A pushed record is its own rank's,
     /// at `sampled_at`, and every other entry is what its rank's last
     /// record left. Such an entry is read once, at the first record behind
-    /// the keeper's start and behind each new list of columns, for the
-    /// names the keeper holds no statement of: a worker's first records
-    /// list one rank, and a keeper can be younger than its report. The
-    /// entry is dated by its own rank's last record, as the source holds
-    /// it, and is not read where the source holds none. It moves at its
-    /// own rank's record alone, so no later record reads it.
+    /// the keeper's start, behind each new list of columns and behind a
+    /// report that dropped a rank, for the names the keeper holds no
+    /// statement of. A worker's first records list one rank, a keeper can
+    /// be younger than its report, and an answer can leave out a rank the
+    /// pushed report still lists. The entry is dated by its own rank's
+    /// last record, as the source holds it, and is not read where the
+    /// source holds none. It moves at its own rank's record alone, so no
+    /// later record reads it.
     ///
     /// A rank's statement takes the place of its last one of that name,
     /// unless that one was sampled later: a later report of an older
@@ -490,6 +493,7 @@ impl RankValues {
             return false;
         };
         self.read_under(columns);
+        let kept = self.ranks.len();
         if in_order {
             // Both lists stand in rank order: one walk drops the ranks the
             // report lists no more.
@@ -503,8 +507,13 @@ impl RankValues {
                 |kept: &RankStated| report.loads.iter().any(|rank| rank.dp_rank == kept.rank);
             self.ranks.retain(listed);
         }
+        // An answer can leave out a rank the pushed report still lists:
+        // the next record reads that rank's entry again.
+        if self.ranks.len() < kept {
+            self.settled = false;
+        }
         // Another rank's entry moves at that rank's own record alone, so
-        // one read of the others tells all they can.
+        // one read of the others tells all they can of the ranks kept.
         let others = !self.settled;
         self.settled |= matches!(of, ReportOf::OneRank { .. });
         for rank in &report.loads {

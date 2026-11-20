@@ -1723,6 +1723,40 @@ mod tests {
         assert_eq!(depth(&replica, id), Some((100.0, first)));
     }
 
+    /// An answer can leave out a rank the pushed report still lists. The
+    /// rank's statements go with the answer, and the next record reads the
+    /// rank's entry again, under its own record: the row's value keeps
+    /// moving with the other ranks.
+    #[test]
+    fn a_rank_an_answer_leaves_out_counts_again_from_its_entry() {
+        let replica = Replica::new();
+        let (id, worker) = replica.add(facts(URL));
+        declare(&replica);
+        let adapter = replica.lead();
+        let start = Instant::now() + Duration::from_secs(1);
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let micros = |at: Instant| replica.store.memory.micros(at);
+        let all = file(&[(0, Some(1.0)), (1, Some(2.0)), (2, Some(4.0))]);
+        adapter.record(&worker, 2, &all, at(0), at(0));
+        adapter.record(&worker, 1, &all, at(10), at(10));
+        adapter.record(&worker, 0, &all, at(20), at(20));
+        assert_eq!(depth(&replica, id), Some((7.0, micros(at(0)))));
+        // Rank 0 pushes while a poll is out, and the answer lists ranks 0
+        // and 1 alone: the store passes its row over.
+        let asked = at(1_000);
+        let pushed = file(&[(0, Some(3.0)), (1, Some(2.0)), (2, Some(4.0))]);
+        adapter.record(&worker, 0, &pushed, at(1_001), at(1_001));
+        assert_eq!(depth(&replica, id), Some((9.0, micros(at(0)))));
+        let answer = file(&[(0, Some(3.0)), (1, Some(2.0))]);
+        let ranks = adapter.report(&[polled(&worker, Some(&answer))], asked);
+        assert_eq!(ranks.newer, [0]);
+        // Rank 0's next record counts rank 2 from its entry, as old as
+        // rank 2's own record.
+        let next = file(&[(0, Some(5.0)), (1, Some(2.0)), (2, Some(4.0))]);
+        adapter.record(&worker, 0, &next, at(1_500), at(1_500));
+        assert_eq!(depth(&replica, id), Some((11.0, micros(at(0)))));
+    }
+
     /// A rank worker's report is one rank's, by a record and by a poll:
     /// its last value is the store's cell, and its entry makes no keeper.
     #[test]
