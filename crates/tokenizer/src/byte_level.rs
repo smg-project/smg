@@ -13,11 +13,9 @@
 //! That is the rule `tokenizers`' `DecodeStream` applies to its window, and
 //! the window's already-emitted prefix always consists of complete
 //! sequences, so the lossy decode of the pending bytes alone is the text the
-//! reference would emit: the same pieces at the same tokens, and over a
-//! whole stream exactly `decode(all_ids)`: the pending buffer holds at most
-//! the bytes since the last emission, normally one partial character, and
-//! the stream's end releases it as `decode` renders the same bytes, a
-//! character the end cut short as one replacement character.
+//! reference would emit at each step. The pending buffer holds at most the
+//! bytes since the last emission, normally one partial character; the
+//! stream's end emits its complete prefix and drops an incomplete suffix.
 
 use std::{
     borrow::Cow,
@@ -490,9 +488,9 @@ fn settled(text: &str) -> bool {
 /// before it render as `String::from_utf8_lossy` renders them, a complete
 /// character as it is and an invalid sequence (a stray byte the model wrote)
 /// as the replacement character; the bytes from it on are the start of a
-/// character the model never finished, which a byte-level stream's end
-/// renders as one replacement character, as `decode` does, and which a
-/// ByteFallback vocabulary's window counts to keep off its end.
+/// character the model never finished, which a byte-level stream drops at
+/// its end and which a ByteFallback vocabulary's window counts to keep off
+/// its end.
 pub(crate) fn cut_start(bytes: &[u8]) -> usize {
     let mut index = 0;
     while index < bytes.len() {
@@ -572,14 +570,12 @@ impl IncrementalDecoder for ByteLevelIncremental {
         if self.pending.is_empty() {
             return Ok(false);
         }
-        // The emitted text ends at a character boundary, so the pending
-        // bytes alone are the tail `decode` renders for the whole stream:
-        // the complete characters among them as they are, an invalid
-        // sequence and a sequence the end cut short (the start of a
-        // character the model never finished) as the replacement character.
-        out.push_str(&String::from_utf8_lossy(&self.pending));
+        // Keep complete text and invalid bytes, but not the start of a
+        // character for which the stream supplied no remaining bytes.
+        let end = cut_start(&self.pending);
+        out.push_str(&String::from_utf8_lossy(&self.pending[..end]));
         self.pending.clear();
-        Ok(true)
+        Ok(end != 0)
     }
 
     fn reset(&mut self) {
@@ -1051,19 +1047,17 @@ pub(crate) mod tests {
     }
 
     /// A character the end of the stream cut short, two, three and four
-    /// bytes long, and a lone continuation byte: the end renders each as
-    /// `decode` renders the same ids, one replacement character after the
-    /// text before it, and holds the bytes until then.
+    /// bytes long, is dropped; a lone invalid continuation byte is rendered.
     #[test]
-    fn the_end_renders_a_cut_character_as_decode_does() {
+    fn the_end_drops_cut_characters_and_renders_invalid_bytes() {
         let tokenizer = byte_level_tokenizer();
         let table = ByteLevelTable::build(&tokenizer).expect("table");
         let id = |token: &str| tokenizer.token_to_id(token).expect("token");
         let h = id("h");
         let cases: [(Vec<u32>, &str); 4] = [
-            (vec![h, id("Ã")], "h\u{FFFD}"),
-            (vec![h, id("Ġà"), id("¤")], "h \u{FFFD}"),
-            (vec![h, id("ðŁ"), id(&byte_token(0x98))], "h\u{FFFD}"),
+            (vec![h, id("Ã")], "h"),
+            (vec![h, id("Ġà"), id("¤")], "h "),
+            (vec![h, id("ðŁ"), id(&byte_token(0x98))], "h"),
             (vec![h, id("©")], "h\u{FFFD}"),
         ];
         for (ids, text) in cases {
@@ -1073,17 +1067,28 @@ pub(crate) mod tests {
                 dec.step_into(id, &mut out).expect("step");
             }
             assert_eq!(out, "h", "{ids:?}: the cut bytes are held");
-            assert!(dec.finish_into(&mut out).expect("finish"));
+            assert_eq!(dec.finish_into(&mut out).expect("finish"), text.len() > 1);
             assert_eq!(out, text, "{ids:?}");
-            assert_eq!(
-                out,
-                tokenizer.decode(&ids, false).expect("decode"),
-                "{ids:?}: as decode renders the ids"
-            );
             assert!(dec.pending().is_empty());
             assert!(!dec.finish_into(&mut out).expect("a second finish"));
             assert_eq!(out, text);
         }
+    }
+
+    #[test]
+    fn the_end_drops_a_cut_character_and_keeps_complete_text() {
+        let tokenizer = byte_level_tokenizer();
+        let table = ByteLevelTable::build(&tokenizer).expect("table");
+        let id = |token: &str| tokenizer.token_to_id(token).expect("token");
+        let mut dec = ByteLevelIncremental::new(table, false, UnknownId::Drop);
+        let mut out = String::new();
+
+        assert!(dec.step_into(id("h"), &mut out).expect("step"));
+        assert!(!dec.step_into(id("Ġà"), &mut out).expect("step"));
+        assert_eq!(out, "h");
+        assert!(dec.finish_into(&mut out).expect("finish"));
+        assert_eq!(out, "h ");
+        assert!(!out.contains(char::REPLACEMENT_CHARACTER));
     }
 
     /// The three piece-timing shapes the reference fixtures exercise, each
