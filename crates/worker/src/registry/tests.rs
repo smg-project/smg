@@ -3310,12 +3310,15 @@ fn a_removed_worker_leaves_every_model_the_index_holds_it_under() {
     let id = registry.register(Arc::clone(&endpoint)).unwrap();
     assert!(registry.refresh_models(&endpoint, vec![ModelCard::new("llama")]));
     assert_eq!(registry.get_by_model("qwen").len(), 1);
+    registry.set_model_retry_config("qwen", RetryConfig::default(), true);
 
     assert!(registry.remove(&id).is_some());
     assert!(registry.get_by_model("llama").is_empty());
     assert!(registry.get_by_model("qwen").is_empty());
-    // The registry holds no worker now, so it lists no model.
+    // The registry holds no worker now, so it lists no model, and the
+    // left-out model's retry settings went with its last worker.
     assert!(registry.get_models().is_empty());
+    assert!(registry.get_retry_config("qwen").is_none());
 }
 
 /// The same for a worker registered without model cards: it is indexed
@@ -3381,4 +3384,58 @@ fn a_removed_workers_alias_goes_with_a_model_its_refresh_left_out() {
     assert!(registry.remove(&id).is_some());
     assert!(registry.resolve_model_alias("qwen-latest").is_none());
     assert!(registry.get_by_model("qwen-latest").is_empty());
+}
+
+/// A replacement reads the aliases from the alias index too: the alias of
+/// a model the old worker's refresh left out goes with the old handle.
+#[test]
+fn a_replaced_workers_alias_goes_with_a_model_its_refresh_left_out() {
+    let registry = WorkerRegistry::new();
+    let endpoint: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![
+                ModelCard::new("qwen").with_alias("qwen-latest"),
+                ModelCard::new("llama"),
+            ])
+            .build(),
+    );
+    let id = registry.register(Arc::clone(&endpoint)).unwrap();
+    assert!(registry.refresh_models(&endpoint, vec![ModelCard::new("llama")]));
+    let next: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![ModelCard::new("llama")])
+            .build(),
+    );
+
+    assert!(registry.replace(&id, next));
+    assert!(registry.resolve_model_alias("qwen-latest").is_none());
+    assert!(registry.get_by_model("qwen-latest").is_empty());
+}
+
+/// A removal frees its URL ahead of its walk of the index, so a
+/// registration of the same URL can stand in a model's slice already.
+/// The eviction takes the handle it is given, and the newcomer keeps its
+/// place.
+#[test]
+fn an_eviction_from_the_index_takes_the_handle_and_not_its_address() {
+    let registry = WorkerRegistry::new();
+    let built = || -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new("http://endpoint:8080")
+                .model(ModelCard::new("llama"))
+                .build(),
+        )
+    };
+    let (leaving, newcomer) = (built(), built());
+    // What the slice holds once the newcomer registered at the freed URL:
+    // its handle, in the place of the one that leaves.
+    registry.add_worker_to_model_index("llama", Arc::clone(&newcomer));
+
+    registry.remove_worker_from_model_index("llama", &leaving);
+    let llama = registry.get_by_model("llama");
+    assert_eq!(llama.len(), 1);
+    assert!(Arc::ptr_eq(&llama[0], &newcomer));
+
+    registry.remove_worker_from_model_index("llama", &newcomer);
+    assert!(registry.get_by_model("llama").is_empty());
 }

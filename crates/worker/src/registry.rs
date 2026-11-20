@@ -1418,7 +1418,7 @@ impl<G: Generation> WorkerRegistry<G> {
 
         // Diff model indexes: remove stale, add new.
         for removed_model in old_models.difference(&new_models) {
-            self.remove_worker_from_model_index(removed_model, old_worker.url());
+            self.remove_worker_from_model_index(removed_model, &old_worker);
             // Mirror `remove()`: drop any per-model retry override when
             // the replacement leaves the model with no workers. Without
             // this, `get_retry_config()` would keep returning a stale
@@ -1900,7 +1900,7 @@ impl<G: Generation> WorkerRegistry<G> {
 
             let left = self.models_left_by(&worker);
             for model_id in &left {
-                self.remove_worker_from_model_index(model_id, worker.url());
+                self.remove_worker_from_model_index(model_id, &worker);
                 // Drop the per-model retry config when the last worker leaves.
                 let model_empty = self
                     .model_index
@@ -2280,9 +2280,13 @@ impl<G: Generation> WorkerRegistry<G> {
         fresh
     }
 
-    /// Drop `worker_url` from the copy-on-write model index slice for
-    /// `model_id`. Evicts the whole model entry when empty.
-    fn remove_worker_from_model_index(&self, model_id: &str, worker_url: &str) {
+    /// Drop `worker` from the copy-on-write model index slice for
+    /// `model_id`, by its handle. Evicts the whole model entry when empty.
+    ///
+    /// By handle and not by URL: a removal frees its URL ahead of its walk
+    /// of the index, so a registration of the same URL can stand in the
+    /// slice already, and it keeps its place.
+    fn remove_worker_from_model_index(&self, model_id: &str, worker: &Arc<dyn Worker>) {
         let mut should_remove_entry = false;
         // As in add_worker_to_model_index: the replaced snapshot drops after
         // the shard guard, not under it.
@@ -2292,7 +2296,7 @@ impl<G: Generation> WorkerRegistry<G> {
             let new_workers: Vec<Arc<dyn Worker>> = entry
                 .members()
                 .iter()
-                .filter(|w| w.url() != worker_url)
+                .filter(|w| !Arc::ptr_eq(w, worker))
                 .cloned()
                 .collect();
 
