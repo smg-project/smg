@@ -13,7 +13,7 @@ use smg_policy_controller::{
         WorkerStatus as RowStatus, WorkersStore,
     },
     view::{Role, WorkerId},
-    AppliedSpec, LeaseId, PolicySpec,
+    AppliedSpec, LeaseId, PolicySpec, WireModes,
 };
 use smg_worker::identity::basic::{Worker, WorkerType};
 
@@ -170,6 +170,7 @@ fn bed_publishing<'a>(
             models: vec![model.unwrap_or(UNKNOWN_MODEL_ID).to_string()],
             dp_size,
             max_running: Some(64),
+            wire_modes: wire_of(url),
             signals: Signals {
                 events,
                 ..Signals::default()
@@ -225,6 +226,17 @@ pub(crate) fn pair_bed_started(model: &str, prefills: &[&str], decodes: &[&str])
     pair_rows(store, model, prefills, decodes)
 }
 
+/// The wire a bed's row at `url` states, as a store's writer states it for
+/// a worker: gRPC under its scheme, else HTTP. A case that types its worker
+/// otherwise writes the row's wire itself.
+fn wire_of(url: &str) -> WireModes {
+    if url.starts_with("grpc://") {
+        WireModes::GRPC
+    } else {
+        WireModes::HTTP
+    }
+}
+
 /// One ready row a URL in `store`, the prefills' then the decodes', each
 /// serving `model`, a registry with one worker a row, and the host over the
 /// two.
@@ -245,6 +257,7 @@ fn pair_rows(store: Arc<MemoryStore>, model: &str, prefills: &[&str], decodes: &
                 models: vec![model.to_string()],
                 dp_size: 1,
                 max_running: Some(64),
+                wire_modes: wire_of(url),
                 ..WorkerFacts::default()
             };
             let id = store.upsert(facts).id();

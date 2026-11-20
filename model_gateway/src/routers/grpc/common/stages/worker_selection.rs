@@ -12,7 +12,7 @@ use axum::{
 };
 use futures::{future::Either, FutureExt};
 use openai_protocol::common::CachePartition;
-use smg_policy_controller::{lease::ReleaseReason, view::Phase};
+use smg_policy_controller::{lease::ReleaseReason, view::Phase, WireModes};
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 use tracing::{debug, error, warn};
 
@@ -1203,6 +1203,20 @@ fn retry_media(ctx: &DispatchContext) -> MediaDemands {
     }
 }
 
+/// The wires a route of the gRPC pipeline dials, as its ask states them:
+/// the one connection `wire` pins, else both wires the pipeline speaks. The
+/// controller then places among the rows that serve one of them. A row on
+/// another wire is never named, where the route's rule could only pass it
+/// over.
+fn route_wires(wire: Option<WireConstraint>) -> WireModes {
+    match wire.map(|wire| wire.connection) {
+        Some(ConnectionMode::Http) => WireModes::HTTP,
+        Some(ConnectionMode::Grpc) => WireModes::GRPC,
+        Some(ConnectionMode::Zmq) => WireModes::ZMQ,
+        None => WireModes::GRPC.union(WireModes::ZMQ),
+    }
+}
+
 /// The route's rule for a worker of `pool`, built from the classic
 /// selection's own rules: the pool's match, the request's wire, and on a
 /// retry the ledger's admit. The controller reads none of them. At a
@@ -1918,7 +1932,10 @@ impl WorkerSelectionStage {
         let hashes = host.hashes(model_id, &prompt);
         let id = host::mark();
         let rule = on_route(RoutingPool::GrpcPipelineRegular, wire, attempt.ledger());
-        let ask = attempt.ask(model_id, &id, &hashes);
+        let ask = Ask {
+            wires: route_wires(wire),
+            ..attempt.ask(model_id, &id, &hashes)
+        };
         let placed = host
             .place_where(&ask, rule, Instant::now())
             .await
@@ -1966,9 +1983,12 @@ impl WorkerSelectionStage {
     /// phase, and the prompt's size is its hashes' count. The pair's
     /// runtime is its prefill worker's.
     ///
-    /// The host's pair commit takes no rule of the route. So a pair the
-    /// route cannot send to is given up as a failed commit and refused, as
-    /// the regular helper refuses an attempt no target holds.
+    /// The ask states the wires the route dials, so the controller names no
+    /// pair on another wire. The host's pair commit takes no other rule of
+    /// the route. So a pair the route still cannot send to, one of two
+    /// runtimes or one a retry's pin refuses, is given up as a failed commit
+    /// and refused, as the regular helper refuses an attempt no target
+    /// holds.
     #[expect(
         clippy::too_many_arguments,
         reason = "the pair's selection threads every input the classic placement consumes"
@@ -2012,6 +2032,7 @@ impl WorkerSelectionStage {
         let ask = Ask {
             phase: Phase::Prefill,
             attempt: Some(attempt.number()),
+            wires: route_wires(wire),
             ..attempt.ask(model_id, &id, &hashes)
         };
         let (mut placed, guard) = host
