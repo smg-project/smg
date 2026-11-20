@@ -3001,6 +3001,25 @@ pub(crate) mod tests {
         Ok(Arc::new(store))
     }
 
+    /// The stock pair document filters its prefills by a bit the host
+    /// supplies. A row the store builds reads that bit open, so the document
+    /// as written places a pair over the store's rows. With the bit unset it
+    /// kept no prefill and shed every pair.
+    #[test]
+    fn a_pair_is_placed_over_the_stores_rows_under_the_stock_pair_document() {
+        let store = MemoryStore::new();
+        member(&store, "p0", Role::Prefill);
+        member(&store, "d0", Role::Decode);
+        let document = PolicySpec::pair_presets("least_load", "least_load");
+        let applied = AppliedSpec::validate(&document.expect("the stock presets"));
+        let applied = store.apply(applied.expect("the stock document"));
+        applied.expect("a first generation");
+        let door = Door::new(Arc::new(store));
+        let answer = door.decide(GATEWAY, &pair_request(b"pair"), Instant::now());
+        let decided = answer.expect("no refusal");
+        assert!(decided.lease.is_some(), "the stock document shed the pair");
+    }
+
     fn apply_epd(store: &MemoryStore) -> Result<(), Box<dyn Error>> {
         member(store, "e0", Role::Encode);
         let mut document = PolicySpec::epd_presets("least_load", "least_load", "least_load")?;

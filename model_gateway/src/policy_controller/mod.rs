@@ -11,9 +11,12 @@
 //! a host over the feed's holder. A regular HTTP router with that host asks
 //! it to place typed requests: for the model a request names, or for the one
 //! primary model the router's workers serve where it names none. A regular
-//! gRPC router asks it in its selection stage. A pair router mounts a
-//! refusing router under its usual id ([`undecided()`]) whenever the store
-//! started, with or without a controller's address. The routes that pick a
+//! gRPC router and a gRPC pair router ask it in their selection stage. The
+//! pair router does where the document in force plans pairs, and mounts a
+//! refusing router elsewhere ([`undecided_without()`]). An HTTP pair router
+//! and a gRPC encode pair router mount a refusing router under their usual
+//! id ([`undecided()`]) whenever the store started, with or without a
+//! controller's address. The routes that pick a
 //! worker by no routing policy serve as under the classic policies: a
 //! provider's router, a realtime session and a proxied GET. The gateway's
 //! workflows leave the feed's door unused, so without an address nothing
@@ -38,6 +41,7 @@
 
 use std::sync::Arc;
 
+pub(crate) use smg_policy_controller::spec::PlanName;
 use smg_policy_controller::{
     operator::{Format, SpecDoor, SpecRejected},
     store::MemoryStore,
@@ -213,14 +217,46 @@ pub(crate) fn feeds(
 }
 
 /// The refusing router for a family the controller does not decide yet:
-/// the pair routers, which need pair placement. It mounts under the
-/// family's usual id so the gateway can select it. Returns `None` under the
-/// classic policies.
+/// the HTTP pair router and the gRPC encode pair router. It mounts under
+/// the family's usual id so the gateway can select it. Returns `None` under
+/// the classic policies.
 pub(crate) fn undecided(context: &AppContext) -> Option<Box<dyn RouterTrait>> {
     context
         .policy_host
         .is_some()
         .then(|| Box::new(Undecided) as Box<dyn RouterTrait>)
+}
+
+/// The refusing router for a family this gateway does not decide in its
+/// own process. `None` under the classic policies, and where the gateway
+/// decides the family.
+///
+/// A family is not decided where no binding of the document in force names
+/// its `plan`. A request of it is then decided under another plan, and none
+/// of its targets commits as the family's: a pair asked under a single's
+/// plan answers that no target holds. A gateway of many routers mounts
+/// every family over its one document, so a family reaches this where the
+/// gateway's own mode is another's.
+///
+/// Nor is it decided where the gateway follows a controller. Such a request
+/// is the controller's to decide, and no ask reaches it for these families
+/// yet, so the family refuses by name there as it did.
+pub(crate) fn undecided_without(
+    context: &AppContext,
+    plan: PlanName,
+) -> Option<Box<dyn RouterTrait>> {
+    let planned = || {
+        context
+            .router_config
+            .policy_document_in_force()
+            .is_ok_and(|document| {
+                document
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.plan.as_ref() == Some(&plan))
+            })
+    };
+    undecided(context).filter(|_| context.follows_controller() || !planned())
 }
 
 #[cfg(test)]

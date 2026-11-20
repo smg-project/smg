@@ -855,6 +855,89 @@ async fn the_regular_grpc_router_is_built_under_the_setting() -> Case {
     Ok(())
 }
 
+/// The pair router's selection stage asks the host; the stage's cases and
+/// the pipeline's serving cases hold that. No classic pair policy is built
+/// beside it.
+#[tokio::test]
+async fn the_grpc_pair_router_is_built_under_the_setting() -> Case {
+    let mut config = picked(quiet());
+    config.connection_mode = ConnectionMode::Grpc;
+    config.mode = RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    let (context, gateway) = build(config).await?;
+    let router = gateway
+        .select_router_for_request(None)
+        .ok_or("the gRPC pair router is missing")?;
+    assert_eq!(router.router_type(), "grpc_pd");
+    let policies = &context.policy_registry;
+    let unset = policies.get_default_policy();
+    assert!(Arc::ptr_eq(&policies.get_prefill_policy(), &unset));
+    assert!(Arc::ptr_eq(&policies.get_decode_policy(), &unset));
+    Ok(())
+}
+
+/// A gateway of many routers mounts every family over its one document.
+/// Under a document that plans no pair the gRPC pair family refuses by
+/// name: a pair asked there would be decided as a single. Under a pair
+/// gateway's document it serves.
+#[tokio::test]
+async fn many_routers_mount_the_grpc_pair_router_where_the_document_plans_pairs() -> Case {
+    use crate::routers::{factory::router_ids, RouterFactory};
+
+    let mut regular = picked(quiet());
+    regular.enable_igw = true;
+    let mut pair = regular.clone();
+    pair.mode = RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    for (config, serves) in [(regular, false), (pair, true)] {
+        let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);
+        let routers = RouterFactory::create_igw_routers(&config.policy, &context).await;
+        let (_, _, built) = routers
+            .into_iter()
+            .find(|(id, ..)| *id == router_ids::GRPC_PD)
+            .ok_or("the gRPC pair family has no entry")?;
+        let router = built?;
+        if serves {
+            assert_eq!(router.router_type(), "grpc_pd");
+        } else {
+            assert_refusing_router(router.as_ref(), "gRPC pair, many routers").await?;
+        }
+    }
+    Ok(())
+}
+
+/// Under a controller's address a pair is the controller's to decide, and
+/// no ask reaches it for a pair yet. The gRPC pair family refuses by name
+/// there, as it did, though the gateway's document plans pairs.
+#[tokio::test]
+async fn a_grpc_pair_gateway_that_follows_a_controller_refuses_by_name() -> Case {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let mut config = picked(quiet());
+    config.connection_mode = ConnectionMode::Grpc;
+    config.mode = RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    config.policy_controller_address = Some(socket.local_addr()?.to_string());
+    let (context, gateway) = build(config).await?;
+    assert!(context.follows_controller());
+    let router = gateway
+        .select_router_for_request(None)
+        .ok_or("the router is missing")?;
+    assert_refusing_router(router.as_ref(), "gRPC pair under an address").await
+}
+
 async fn assert_refusing_router(router: &dyn RouterTrait, family: &str) -> Case {
     assert_eq!(router.router_type(), ROUTER_TYPE, "{family}");
     let answer = router.health_generate(Request::new(Body::empty())).await;
@@ -890,11 +973,7 @@ async fn the_pair_routers_refuse_by_name() -> Case {
         prefill_policy: None,
         decode_policy: None,
     };
-    for (family, config) in [
-        ("HTTP pair", pair),
-        ("gRPC pair", grpc_pair),
-        ("gRPC encode pair", encode_pair),
-    ] {
+    for (family, config) in [("HTTP pair", pair), ("gRPC encode pair", encode_pair)] {
         let (context, gateway) = build(config).await?;
         let router = gateway
             .select_router_for_request(None)

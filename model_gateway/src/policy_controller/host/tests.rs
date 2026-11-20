@@ -1782,6 +1782,23 @@ fn an_asks_own_token_count_wins_over_its_hashes_count() {
     assert_eq!(ask.request(Identity::NONE, 0, &[]).facts.prompt_tokens, 37);
 }
 
+#[test]
+fn an_asks_stated_attempt_wins_over_the_count_of_its_rows() {
+    // A failed pair names its prefill and its decode: two rows, one attempt.
+    let rows = [WorkerId(3), WorkerId(4)];
+    let counted = Ask {
+        tried: &rows,
+        ..pair_ask()
+    };
+    assert_eq!(counted.request(Identity::NONE, 0, &[]).facts.attempt, 2);
+    let stated = Ask {
+        attempt: Some(1),
+        ..counted
+    };
+    let request = stated.request(Identity::NONE, 0, &[]);
+    assert_eq!((request.facts.attempt, request.facts.tried), (1, &rows[..]));
+}
+
 #[tokio::test]
 async fn a_prefill_without_room_is_passed_over_for_the_next_pair_target() {
     let bed = PairBed::new(Pairing::Lenient, 2, 2, 2).expect("a pair fleet");

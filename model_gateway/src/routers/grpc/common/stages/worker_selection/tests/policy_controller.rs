@@ -209,7 +209,7 @@ async fn a_first_attempt_under_the_host_lands_on_the_placed_worker() {
     ctx.input.headers = Some(headers);
     let id = host::mark();
     let hashes = host::Hashes::default();
-    let ask = RegularAttempt::First(&ctx).ask(MODEL, &id, &hashes);
+    let ask = Attempt::First(&ctx).ask(MODEL, &id, &hashes);
     assert_eq!(ask.id, id);
     assert!(ask.streaming);
     assert!(ask.tried.is_empty());
@@ -493,7 +493,7 @@ async fn a_retry_names_the_rows_of_its_failed_attempts() {
     ctx.headers = Some(HeaderMap::new());
     let id = host::mark();
     let hashes = host::Hashes::default();
-    let ask = RegularAttempt::Retry(&ctx).ask(MODEL, &id, &hashes);
+    let ask = Attempt::Retry(&ctx).ask(MODEL, &id, &hashes);
     assert!(ask.streaming);
     // A retry states the headers it retained and no `rid`.
     assert_eq!(ask.headers, ctx.headers.as_ref());
@@ -518,7 +518,7 @@ async fn a_retry_names_the_rows_of_its_failed_attempts() {
     ctx.release_attempt(&failure, Instant::now());
     assert_eq!(*ctx.tried_rows, [first_row]);
     // The retry's ask states that row as tried.
-    let ask = RegularAttempt::Retry(&ctx).ask(MODEL, &id, &hashes);
+    let ask = Attempt::Retry(&ctx).ask(MODEL, &id, &hashes);
     assert_eq!(ask.tried, [first_row]);
 
     stage
@@ -637,5 +637,249 @@ async fn an_attempt_the_controller_does_not_place_reads_the_hosts_answer() {
     );
     assert!(!is_retryable_response(&unplaced));
     assert!(ctx.state.placed.is_none());
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+}
+
+const PREFILL: &str = "http://p0:8000";
+const DECODE: &str = "http://d0:8000";
+
+fn urls_of<'a>(side: &[(&'a str, RuntimeType)]) -> Vec<&'a str> {
+    side.iter().map(|(url, _)| *url).collect()
+}
+
+/// The stage in `mode` over a host whose rows are a prefill pool and a
+/// decode pool under a pair document: one gRPC worker a URL, of the runtime
+/// beside it.
+fn pair_stage(
+    mode: WorkerSelectionMode,
+    prefills: &[(&str, RuntimeType)],
+    decodes: &[(&str, RuntimeType)],
+) -> (WorkerSelectionStage, Arc<MemoryStore>) {
+    let (_, store, rows) = host::testing::pair_bed(&urls_of(prefills), &urls_of(decodes));
+    let registry = Arc::new(WorkerRegistry::new());
+    for (row, (_, runtime)) in rows.iter().zip(prefills.iter().chain(decodes)) {
+        let worker = BasicWorkerBuilder::carrying(row)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(*runtime)
+            .model(ModelCard::new(MODEL).with_context_length(WINDOW))
+            .build();
+        assert!(registry.register(Arc::new(worker)).is_some());
+    }
+    let host = Host::at_keys(Arc::clone(&store), Arc::clone(&registry));
+    let stage = WorkerSelectionStage::new(
+        registry,
+        Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+        mode,
+        None,
+    )
+    .with_host(Some(Arc::new(host)));
+    (stage, store)
+}
+
+/// [`pair_stage`] over one prefill and one decode of one runtime.
+fn one_pair_stage(mode: WorkerSelectionMode) -> (WorkerSelectionStage, Arc<MemoryStore>) {
+    pair_stage(
+        mode,
+        &[(PREFILL, RuntimeType::Vllm)],
+        &[(DECODE, RuntimeType::Vllm)],
+    )
+}
+
+#[tokio::test]
+async fn a_hosted_pair_selection_is_the_controllers_prefill_and_decode() {
+    let (stage, store) = one_pair_stage(WorkerSelectionMode::PrefillDecode);
+    let mut ctx = ingress(&stage.worker_registry);
+    stage.execute(&mut ctx).await.expect("a placed pair");
+    // The classic placement leaves no placement and asks for no lease.
+    let placed = ctx
+        .state
+        .placed
+        .as_ref()
+        .expect("the placement followed the pair");
+    assert!(ctx.state.pd_prefill_guard.is_some());
+    let Some(WorkerSelection::Disaggregated {
+        encode_assignments,
+        prefill,
+        decode,
+        runtime_type,
+    }) = ctx.state.workers.as_ref()
+    else {
+        panic!("a pair");
+    };
+    assert!(encode_assignments.is_none());
+    assert!(Arc::ptr_eq(prefill, placed.worker()));
+    assert!(Arc::ptr_eq(
+        decode,
+        placed.decode().expect("the pair's decode")
+    ));
+    assert_eq!((prefill.url(), decode.url()), (PREFILL, DECODE));
+    assert_eq!(*runtime_type, RuntimeType::Vllm);
+    let key = |id: WorkerId| {
+        WorkersStore::get(&*store, id)
+            .expect("a row")
+            .facts
+            .key
+            .clone()
+    };
+    assert_eq!(key(placed.id()), PREFILL);
+    assert_eq!(placed.decode_id().map(key).as_deref(), Some(DECODE));
+    // One lease for the pair, asked at its prefill with the prompt's size.
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
+    let leases = store.expire(Instant::now() + Duration::from_secs(60));
+    assert!(!leases.is_empty());
+    assert!(leases.iter().all(|sides| sides.record.lease.tokens == 3));
+}
+
+#[tokio::test]
+async fn a_pair_shape_the_controller_does_not_place_is_refused_by_name() -> anyhow::Result<()> {
+    let (stage, store) = one_pair_stage(WorkerSelectionMode::PrefillDecode);
+    let mut ctx = ingress(&stage.worker_registry);
+    ctx.state.multimodal_intermediate = Some(image_intermediate(None));
+    let refused = stage.execute(&mut ctx).await.expect_err("pixel input");
+    assert_named_refusal(refused, "media input", &store).await?;
+
+    let mut ctx = ingress(&stage.worker_registry);
+    ctx.state.preparation = Some(PreparationOutput::Generate {
+        original_text: None,
+        token_ids: vec![1; WINDOW as usize + 1],
+    });
+    let refused = stage.execute(&mut ctx).await.expect_err("the window binds");
+    assert_named_refusal(refused, "a context demand a worker's window binds", &store).await?;
+
+    // A retry under a decoding rule has no next attempt, and is refused by
+    // name when asked all the same. A plain retry is placed.
+    let mut under_rule = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
+    under_rule.constraint_decided_on = Some(utils::WorkerDecoding::of(None));
+    assert!(!stage.places_retry(&under_rule));
+    assert!(stage.places_retry(&dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm))));
+    let refused = stage
+        .reselect(&mut under_rule, &retained_plan(&[1]))
+        .await
+        .expect_err("the retry carries a decoding rule");
+    assert_named_refusal(refused, "a retry under a decoding rule", &store).await
+}
+
+#[tokio::test]
+async fn a_pair_on_another_wire_than_the_pinned_one_is_released_and_refused() {
+    let (stage, store) = one_pair_stage(WorkerSelectionMode::PrefillDecode);
+    let prefill = stage
+        .worker_registry
+        .get_by_url(PREFILL)
+        .expect("the prefill");
+    let plan = retained_plan(&[1]);
+    // A retry pinned to the wire of another runtime: the pair the
+    // controller names is not on it. Its lease and its slot are given up.
+    let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Sglang));
+    let refused = stage
+        .reselect(&mut ctx, &plan)
+        .await
+        .expect_err("no pair is on the wire");
+    assert_no_target_holds(&refused, &store);
+    assert!(ctx.placed.is_none() && ctx.pd_prefill_guard.is_none());
+    assert_eq!(prefill.load(), 0);
+
+    // On the pair's own wire the same retry is placed.
+    let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
+    stage
+        .reselect(&mut ctx, &plan)
+        .await
+        .expect("a pair on the wire");
+    assert!(ctx.placed.is_some() && ctx.pd_prefill_guard.is_some());
+    assert_eq!(prefill.load(), 1);
+    drop(ctx);
+
+    // A pair of two runtimes cannot go out as one request: refused the
+    // same way, with no wire pinned.
+    let (stage, store) = pair_stage(
+        WorkerSelectionMode::PrefillDecode,
+        &[(PREFILL, RuntimeType::Vllm)],
+        &[(DECODE, RuntimeType::Sglang)],
+    );
+    let mut ctx = ingress(&stage.worker_registry);
+    let refused = stage
+        .execute(&mut ctx)
+        .await
+        .expect_err("the pair spans two runtimes");
+    assert_no_target_holds(&refused, &store);
+}
+
+#[tokio::test]
+async fn a_request_with_encode_items_is_refused_by_name_under_a_host() -> anyhow::Result<()> {
+    let (stage, store) = one_pair_stage(WorkerSelectionMode::EncodePrefillDecode);
+    let mut ctx = ingress(&stage.worker_registry);
+    ctx.state.multimodal_intermediate = Some(image_intermediate(None));
+    let refused = stage.execute(&mut ctx).await.expect_err("processed items");
+    assert_named_refusal(refused, "encode items", &store).await?;
+
+    let mut ctx = ingress(&stage.worker_registry);
+    ctx.state.multimodal_refs = Some(multimodal::MediaPlan::new([MediaContentPart::AudioUrl {
+        url: "https://example.test/audio.wav".to_owned().into(),
+        uuid: None,
+    }]));
+    let refused = stage.execute(&mut ctx).await.expect_err("item references");
+    assert_named_refusal(refused, "encode items", &store).await?;
+
+    // A request with none is a pair, placed in the same mode, and so is
+    // its retry.
+    let mut ctx = ingress(&stage.worker_registry);
+    stage.execute(&mut ctx).await.expect("a placed pair");
+    assert!(ctx
+        .state
+        .placed
+        .as_ref()
+        .is_some_and(|placed| placed.decode().is_some()));
+    assert!(matches!(
+        ctx.state.workers,
+        Some(WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            ..
+        })
+    ));
+    drop(ctx);
+    let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
+    assert!(stage.places_retry(&ctx));
+    stage
+        .reselect(&mut ctx, &retained_plan(&[1]))
+        .await
+        .expect("the pair again");
+    assert!(ctx.placed.is_some());
+    Ok(())
+}
+
+#[test]
+fn a_pair_attempt_states_the_retry_loops_number() {
+    let first = ingress(&Arc::new(WorkerRegistry::new()));
+    assert_eq!(Attempt::First(&first).number(), 0);
+    // Two failed pairs named four rows, and the retry is the second.
+    let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
+    ctx.tried_rows = Box::from([WorkerId(1), WorkerId(2), WorkerId(3), WorkerId(4)]);
+    ctx.attempt = 2;
+    assert_eq!(Attempt::Retry(&ctx).number(), 2);
+    ctx.attempt = 300;
+    assert_eq!(Attempt::Retry(&ctx).number(), u8::MAX);
+}
+
+#[tokio::test]
+async fn the_classic_pair_stage_is_unmoved_without_a_host() {
+    let (hosted, store) = one_pair_stage(WorkerSelectionMode::PrefillDecode);
+    let classic = round_robin_pd_stage(Arc::clone(&hosted.worker_registry));
+    let mut ctx = ingress(&classic.worker_registry);
+    classic.execute(&mut ctx).await.expect("the classic pair");
+    assert!(ctx.state.placed.is_none());
+    assert!(ctx.state.pd_prefill_guard.is_some());
+    assert!(matches!(
+        &ctx.state.workers,
+        Some(WorkerSelection::Disaggregated { prefill, decode, .. })
+            if prefill.url() == PREFILL && decode.url() == DECODE
+    ));
+
+    let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
+    classic
+        .reselect(&mut ctx, &retained_plan(&[1]))
+        .await
+        .expect("the classic pair again");
+    assert!(ctx.placed.is_none() && ctx.pd_prefill_guard.is_some());
+    assert!(classic.places_retry(&ctx));
+    // No decision was asked of the controller.
     assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
 }

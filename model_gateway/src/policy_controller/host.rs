@@ -140,6 +140,10 @@ pub(crate) struct Ask<'a> {
     pub prompt_tokens: u32,
     /// The rows of the workers the request's failed attempts were sent to.
     pub tried: &'a [WorkerId],
+    /// The retry number, `0` for the first attempt. `None` counts the rows
+    /// of `tried`, one a failed attempt. A stage whose failed attempt names
+    /// more rows than one states the number: a pair names two.
+    pub attempt: Option<u8>,
     /// The attempt's prompt hashes, where it has them. The stage that holds
     /// the tokens fills this once per attempt, before its first ask.
     pub hashes: Option<&'a Hashes>,
@@ -159,6 +163,7 @@ impl<'a> Ask<'a> {
             phase: Phase::Single,
             prompt_tokens: 0,
             tried: &[],
+            attempt: None,
             hashes: None,
         }
     }
@@ -214,7 +219,9 @@ impl<'a> Ask<'a> {
             phase: self.phase,
             prompt_tokens: self.prompt_tokens,
             client_key,
-            attempt: u8::try_from(self.tried.len()).unwrap_or(u8::MAX),
+            attempt: self
+                .attempt
+                .unwrap_or_else(|| u8::try_from(self.tried.len()).unwrap_or(u8::MAX)),
             tried: self.tried,
             seed: rand::rng().random(),
             ..RequestFacts::default()
@@ -1098,20 +1105,26 @@ impl fmt::Debug for Placed {
 pub(crate) struct Held {
     /// Dropped first: a report still owed is said while the load stands.
     placed: Placed,
-    /// The load of the placement's worker, given back at the drop.
+    /// The load of the worker the response is read from, given back at the
+    /// drop.
     #[expect(dead_code, reason = "held for its drop alone")]
     guard: WorkerLoadGuard,
 }
 
 impl Held {
-    /// The placement beside the load guard `guard` makes of its worker. The
-    /// guard is asked of the placement's own worker, so the two do not name
-    /// two workers, and neither is dropped ahead of its turn.
+    /// The placement beside the load guard `guard` makes of the worker its
+    /// response is read from: a single's worker, a pair's decode. The guard
+    /// is asked of the placement's own worker, so the two do not name two
+    /// workers, and neither is dropped ahead of its turn.
+    ///
+    /// A pair's prefill holds its load by the admission guard
+    /// [`Host::place_pair`] hands back apart. Its router gives that one up
+    /// when the prefill phase ends, ahead of the response.
     pub(crate) fn new(
         placed: Placed,
         guard: impl FnOnce(&Arc<dyn Worker>) -> WorkerLoadGuard,
     ) -> Self {
-        let guard = guard(placed.worker());
+        let guard = guard(placed.decode().unwrap_or_else(|| placed.worker()));
         Self { placed, guard }
     }
 

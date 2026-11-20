@@ -2939,6 +2939,126 @@ async fn a_streaming_harmony_responses_iteration_releases_its_share_once_its_str
     );
 }
 
+/// A pair gateway serves a request under the policy controller. The store
+/// is the one such a gateway starts: the document its configuration makes,
+/// over rows as the store builds them. Both sides go out to engines, the
+/// answer is whole, the decode worker is the routed one, and the pair's
+/// lease ends with the answer.
+#[tokio::test]
+async fn a_pair_gateway_serves_a_pair_under_the_policy_controller() {
+    let prefill_port = spawn_stub(GatedScheduler::default()).await;
+    let decode_port = spawn_stub(GatedScheduler::default()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let prefill = register_worker(&registry, prefill_port, WorkerType::Prefill);
+    let decode = register_worker(&registry, decode_port, WorkerType::Decode);
+    let (_, store, _) = host_testing::pair_bed_started(MODEL, &[prefill.url()], &[decode.url()]);
+    let host = Host::at_keys(Arc::clone(&store), Arc::clone(&registry));
+    let deps = PipelineDeps::pair(
+        Arc::clone(&registry),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    )
+    .with_host(Some(Arc::new(host)));
+    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::PrefillDecode, &deps)
+        .expect("completion pipeline");
+    let components = components(registry).await;
+    let started = Instant::now();
+
+    let response = pipeline
+        .execute_completion(
+            completion_request(false),
+            None,
+            MODEL.to_string(),
+            components,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-smg-routed-worker-id"],
+        format!("grpc://127.0.0.1:{decode_port}")
+    );
+    drop(response);
+    // Each side ended whole on its own worker, and no lease is left.
+    for url in [prefill.url(), decode.url()] {
+        let row = store.by_key(url).expect("the side's row").id;
+        assert!(
+            store.completed_ok_since(GatewayId::LOCAL, row, started),
+            "{url}"
+        );
+    }
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+}
+
+/// The router the factory builds for a pair gateway under the policy
+/// controller serves a pair. The factory mounts the pair router over the
+/// context's host, the router's selection stage asks it, and each side ends
+/// whole on its own worker.
+#[tokio::test]
+async fn the_factory_builds_a_pair_router_that_serves_under_the_policy_controller() {
+    use crate::{
+        config::test_support::pd_routing_mode,
+        routers::{
+            grpc::testing::{grpc_config, grpc_ctx_from, mcp_orchestrator},
+            RouterFactory,
+        },
+    };
+
+    let prefill_port = spawn_stub(GatedScheduler::default()).await;
+    let decode_port = spawn_stub(GatedScheduler::default()).await;
+    let mut config = grpc_config(pd_routing_mode()).build_unchecked();
+    config.policy_controller = true;
+    let mut ctx = grpc_ctx_from(&config, mcp_orchestrator().await);
+    let prefill = register_worker(&ctx.worker_registry, prefill_port, WorkerType::Prefill);
+    let decode = register_worker(&ctx.worker_registry, decode_port, WorkerType::Decode);
+    let (_, store, _) = host_testing::pair_bed_started(MODEL, &[prefill.url()], &[decode.url()]);
+    let host = Host::at_keys(Arc::clone(&store), Arc::clone(&ctx.worker_registry));
+    let context = Arc::get_mut(&mut ctx).expect("the context's one hold");
+    context.policy_store = Some(Arc::clone(&store));
+    context.policy_host = Some(Arc::new(host));
+    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
+    ctx.tokenizer_registry
+        .load(
+            "tokenizer-id",
+            MODEL,
+            "test",
+            || async move { Ok(tokenizer) },
+        )
+        .await
+        .expect("load mock tokenizer");
+
+    let router = RouterFactory::create_router(&ctx)
+        .await
+        .expect("the pair router");
+    assert_eq!(router.router_type(), "grpc_pd");
+    let body: CompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": MODEL,
+        "prompt": "Hello world",
+        "stream": false,
+    }))
+    .expect("completion request");
+    let started = Instant::now();
+    let response = router
+        .route_completion(None, &anonymous(), body, MODEL)
+        .await;
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    drop(response);
+    for url in [prefill.url(), decode.url()] {
+        let row = store.by_key(url).expect("the side's row").id;
+        assert!(
+            store.completed_ok_since(GatewayId::LOCAL, row, started),
+            "{url}"
+        );
+    }
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+}
+
 async fn placed_harmony_responses_context() -> (ResponsesContext, Arc<MemoryStore>, WorkerId) {
     let port = spawn_stub(GatedScheduler::default()).await;
     let registry = Arc::new(WorkerRegistry::new());
