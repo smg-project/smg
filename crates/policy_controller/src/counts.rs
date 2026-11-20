@@ -285,7 +285,9 @@ impl<'a> LentCounts<'a> {
 /// request's facts are asked which once a walk, so no read tests it and
 /// the lent table's parts are found once. A walk reads what the one reader
 /// reads ([`RequestFacts::in_flight`](crate::RequestFacts::in_flight)),
-/// and a stage that reads a row or two asks that.
+/// and a stage that reads a row or two asks that. The form
+/// `|counts, written|` also binds `written`: true over rows that carry
+/// their counts, false beside a lent table.
 macro_rules! with_counts {
     ($facts:expr, |$counts:ident| $walk:expr) => {
         $crate::counts::with_counts!($facts, |$counts, _written| $walk)

@@ -1,6 +1,8 @@
 //! The cost of scoring with a profile's send tally over a whole pool. Each
 //! cell reads rows with no sends, a send held per row, or a send per row
-//! that reaches its time limit at the decision.
+//! that reaches its time limit at the decision. The `policy_sent` cells read
+//! the tally from a registered scorer, the `policy_engine/least_cost_sent`
+//! cells through `least-cost` terms.
 
 #![expect(
     clippy::expect_used,
@@ -59,6 +61,23 @@ fn engine() -> Engine {
     document.validate_in(&catalog, &[]).expect("validates")
 }
 
+fn least_cost() -> Engine {
+    let document: PolicySpec = serde_json::from_value(serde_json::json!({
+        "apiVersion": API_VERSION,
+        "profiles": {
+            "work": {
+                "sent_ttl_ms": TTL_MS,
+                "score": [{ "least-cost": { "terms": {
+                    "candidate.in_flight": 177, "sent.requests": 1000, "sent.tokens": 1
+                } } }],
+                "pick": "best"
+            }
+        }
+    }))
+    .expect("a document");
+    document.validate().expect("validates")
+}
+
 fn fill(engine: &Engine, rows: &[Candidate]) {
     let lease = Lease {
         issued_micros: SENT_AT,
@@ -75,13 +94,16 @@ fn fill(engine: &Engine, rows: &[Candidate]) {
     }
 }
 
-fn sent(c: &mut Criterion) {
-    let mut group = c.benchmark_group("policy_sent");
+/// The three cells of one group. The rows' counts in flight repeat every
+/// `in_flight_cycle` rows: a cycle of one leaves every row at zero.
+fn cells(c: &mut Criterion, group: &str, engine: fn() -> Engine, in_flight_cycle: u32) {
+    let mut group = c.benchmark_group(group);
     for n in [8, 64, 512] {
         let rows: Vec<_> = (0..n)
             .map(|position| Candidate {
                 position,
                 id: WorkerId(1003 + u64::from(position)),
+                in_flight: position % in_flight_cycle,
                 ..Candidate::default()
             })
             .collect();
@@ -120,6 +142,11 @@ fn sent(c: &mut Criterion) {
         });
     }
     group.finish();
+}
+
+fn sent(c: &mut Criterion) {
+    cells(c, "policy_sent", engine, 1);
+    cells(c, "policy_engine/least_cost_sent", least_cost, 17);
 }
 
 criterion_group!(benches, sent);

@@ -26,6 +26,7 @@ use crate::{
         TieBand, Unit, DRAW_BOUND,
     },
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
+    sent::SentCredit,
     spec::{CostMargin, Needs, Unreported},
     terms::{Coefficients, Term},
     view::{
@@ -2241,6 +2242,8 @@ pub struct LeastCost {
     margin: CostMargin,
     request_cost: Option<f64>,
     loads: bool,
+    /// The profile's count of sends, where a term reads it.
+    sent: Option<Arc<SentCredit>>,
 }
 
 impl LeastCost {
@@ -2250,6 +2253,7 @@ impl LeastCost {
         terms: Box<[(Term, f64)]>,
         margin: CostMargin,
         unreported: Option<Unreported>,
+        sent: Option<Arc<SentCredit>>,
     ) -> Self {
         let loads = terms.iter().any(|&(term, _)| term.reads_load());
         let request_cost = match unreported {
@@ -2261,6 +2265,7 @@ impl LeastCost {
             margin,
             request_cost,
             loads,
+            sent,
         }
     }
 
@@ -2408,7 +2413,9 @@ impl Scorer for LeastCost {
 
     fn needs(&self) -> Needs {
         Needs {
-            loads: self.loads,
+            // A report ends the sends before it, so a sent term needs the
+            // reports though it reads none.
+            loads: self.loads || self.sent.is_some(),
             ..Needs::default()
         }
     }
@@ -2435,6 +2442,22 @@ impl ReadsLoad for LeastCost {
     ) -> TieBand {
         with_costs(|costs| {
             let (mut bounds, pending) = self.collect_costs(facts, candidates, kept, costs, load);
+            if let Some(credit) = &self.sent {
+                // The sends close the sum: their names sort behind every
+                // field the walk adds. A row priced over the least kept no
+                // sum and takes none. The sends move the ends of the sums,
+                // so the ends are taken again.
+                let sends = credit.reads(facts);
+                bounds = CostBounds::EMPTY;
+                for (&row, cost) in kept.iter().zip(costs.iter_mut()) {
+                    if let RowCost::Sum(sum) = cost {
+                        let sent = sends.of(&candidates[row as usize]);
+                        *sum += f64::from(sent.requests) * self.terms.sent_requests;
+                        *sum += sent.tokens as f64 * self.terms.sent_tokens;
+                        bounds.include(*sum);
+                    }
+                }
+            }
             if pending {
                 let baseline = if bounds.least.is_finite() {
                     bounds.least
@@ -4316,7 +4339,7 @@ mod tests {
                 let rule = price.map_or(Unreported::MissingAsZero, |request_cost| {
                     Unreported::OverLeast { request_cost }
                 });
-                let stage = LeastCost::new(terms.clone(), CostMargin::default(), Some(rule));
+                let stage = LeastCost::new(terms.clone(), CostMargin::default(), Some(rule), None);
                 costs.clear();
                 stage.collect_costs(&facts, &rows, &kept, &mut costs, |row| row.load.as_ref());
                 assert_eq!(costs.len(), rows.len());
@@ -4364,7 +4387,7 @@ mod tests {
                 .iter()
                 .map(|(name, &coefficient)| (Term::named(name).unwrap(), coefficient))
                 .collect();
-            let stage = LeastCost::new(terms, params.margin, params.unreported);
+            let stage = LeastCost::new(terms, params.margin, params.unreported, None);
             let want = f64::from(value) * -2.5;
             costs.clear();
             stage.collect_costs(
@@ -4390,6 +4413,7 @@ mod tests {
             Box::new(terms),
             CostMargin::default(),
             Some(Unreported::OverLeast { request_cost: 2.5 }),
+            None,
         );
         let mut rows = [candidate(0, 2), candidate(1, 3), candidate(2, 4)];
         for index in [0, 2] {
@@ -4418,6 +4442,7 @@ mod tests {
             ]),
             CostMargin::default(),
             Some(Unreported::OverLeast { request_cost: 4.0 }),
+            None,
         );
         let count = Cell::new(13);
         let missing = stage.cost_of::<false, false, false>(None, true, || count.replace(29));
