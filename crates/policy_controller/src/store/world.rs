@@ -1123,6 +1123,9 @@ pub struct World {
     /// a publication shows, so a decision reads one number. One list for
     /// every world until a count moves.
     unreported: Arc<[u32]>,
+    /// The epoch of the overload verdicts these rows carry
+    /// ([`Self::overload_epoch`]).
+    overload_epoch: u64,
     /// The generation this publication was made under: its engine and its
     /// number, read with the rows in one load.
     spec: Arc<AppliedSpec>,
@@ -1218,6 +1221,40 @@ impl World {
     /// `at` in the rows' clock: microseconds since the store's origin.
     pub fn micros(&self, at: Instant) -> u64 {
         micros(self.origin, at)
+    }
+
+    /// The epoch of this world's overload verdicts: the one thing to
+    /// compare between two worlds' verdicts. It moves with a judgment that
+    /// moved a row's bit, whatever started it, and with every membership
+    /// build, whose rows are judged from no bit. Two worlds of one epoch
+    /// carry the same verdict on every row, so a host that mirrors the
+    /// verdicts ([`Self::overloaded`]) reads them again only where the
+    /// epoch moved.
+    pub fn overload_epoch(&self) -> u64 {
+        self.overload_epoch
+    }
+
+    /// Every row this world publishes under an overload verdict, pool by
+    /// pool. A worker has a row in each pool it serves, and each row is
+    /// judged under its own pool's thresholds. A host that mirrors the
+    /// verdict onto its own worker object reads the worker overloaded
+    /// where any of its rows is handed, and clear where none is.
+    pub fn overloaded(&self) -> impl Iterator<Item = &Candidate> + '_ {
+        self.rows
+            .iter()
+            .flat_map(|pool| pool.iter())
+            .filter(|row| row.health.overloaded)
+    }
+
+    /// The row of worker `id` in the first pool that lists it, by one
+    /// binary search a pool; `None` for a worker no pool lists. A member
+    /// holds one rank in every pool that lists it, and each of its rows
+    /// carries that rank's load record: the first pool found answers for
+    /// its figures. Its overload verdict is each pool's own
+    /// ([`Self::overloaded`]).
+    pub fn first_row_of(&self, id: WorkerId) -> Option<&Candidate> {
+        let (pool, row) = self.pooled_row(id)?;
+        self.rows.get(pool)?.get(row)
     }
 
     /// How many members serve `model` in `role`, every status and every
@@ -2838,6 +2875,11 @@ pub(super) struct Writer {
     unnamed: Vec<(WorkerId, u16)>,
     /// How many writes to the load table moved an overload verdict.
     flips: u64,
+    /// The epoch of the working rows' overload verdicts. It moves with a
+    /// judgment that moved a row's bit ([`Self::judge`]) and with every
+    /// membership build, whose rows start with no bit. A world carries the
+    /// epoch of its publication ([`World::overload_epoch`]).
+    overload_epoch: u64,
     /// The standing members outside the standing generation's lists.
     outside: OutsideLists,
     /// Each member's fields under the standing generation's lists, in id
@@ -2903,6 +2945,7 @@ impl Writer {
             silenced: 0,
             unnamed: Vec::new(),
             flips: 0,
+            overload_epoch: 0,
             outside: OutsideLists::default(),
             listed: Vec::new(),
             listed_spare: Vec::new(),
@@ -2935,6 +2978,7 @@ impl Writer {
             derived: Arc::clone(&self.derived),
             rows: self.published.clone().into_boxed_slice(),
             unreported: Arc::clone(&self.unreported),
+            overload_epoch: self.overload_epoch,
             vetoes: Arc::clone(&self.pool_vetoes),
             spec: Arc::clone(&self.spec),
             #[cfg(feature = "controller")]
@@ -3194,6 +3238,7 @@ impl Writer {
             heard,
             sample_bound,
             unnamed,
+            overload_epoch,
             ..
         } = self;
         let Some(engine) = engines.get(engine as usize).filter(|engine| engine.judged) else {
@@ -3290,6 +3335,7 @@ impl Writer {
                 moved = true;
             }
         }
+        *overload_epoch += u64::from(moved);
         moved
     }
 
@@ -3686,6 +3732,9 @@ impl Writer {
         // A build takes in every membership write: none stays owed.
         self.owed = None;
         self.builds += 1;
+        // A build's rows start with no bit: a verdict the last world showed
+        // can go with no judgment to move it.
+        self.overload_epoch += 1;
         let origin = self.origin;
         // The last write's classes: carried, or what the written worker's
         // derive starts from.
