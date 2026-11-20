@@ -129,6 +129,20 @@ fn a_held_send_costs_a_row_the_request_coefficient() {
 }
 
 #[test]
+fn a_new_documents_engine_keeps_the_sends_of_the_standing_one() {
+    let params = "terms: {candidate.in_flight: 250, sent.requests: 1000}";
+    let standing = engine(params);
+    let rows = [row(0, 0, None), row(1, 0, None), row(2, 8, None)];
+    send(&standing, &rows[1], 317);
+    let next = engine(params);
+    next.succeed(&standing);
+    assert_eq!(
+        scores_at(&next, &rows, SENT_AT + 1),
+        [(1, 1.0), (2, 0.5), (3, 0.0)]
+    );
+}
+
+#[test]
 fn sent_terms_alone_need_the_reports_and_no_rule_for_a_row_without_one() {
     let engine = engine("terms: {sent.requests: 3, sent.tokens: 1}");
     assert!(engine.needs().loads);
