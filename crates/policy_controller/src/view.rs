@@ -276,6 +276,18 @@ impl<'a> Identity<'a> {
     }
 }
 
+/// The key of a prefix one block longer: the key of the prefix before it
+/// folded with the block's hash. A host hashes each block by its own
+/// content ([`RequestFacts::block_hashes`]), so one hash names one block
+/// wherever it stands. A prefix is named by this fold over its blocks'
+/// hashes in order from the first, started at the request's cache
+/// namespace ([`RequestFacts::namespace_seed`]): the ring's key of a prefix
+/// and the sent-prefix predictor's are that one number. The key's top bits
+/// take every bit of both.
+pub(crate) const fn fold_block(prefix: u64, hash: u64) -> u64 {
+    (prefix.rotate_left(23) ^ hash).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
 /// The fingerprint of a key: FNV-1a over its bytes, never `0` for a present
 /// key, so `0` reads as absent everywhere a fingerprint travels (the lease,
 /// the trace, a session table).
@@ -853,7 +865,10 @@ pub struct RequestFacts<'a> {
     pub max_output_tokens: u32,
     /// The host's token count or estimate.
     pub prompt_tokens: u32,
-    /// Prefix block hashes, capped by the host.
+    /// One hash a whole block of the prompt, in order from the first,
+    /// capped by the host. A hash is of its own block's content and of
+    /// nothing ahead of it: what names a prefix is the fold of its
+    /// blocks' hashes, which the stages that key by a prefix make.
     pub block_hashes: &'a [u64],
     pub hash_kind: HashKind,
     /// The routing key as the host derives it, lineage-stripped: the key

@@ -710,7 +710,7 @@ pub struct ConsistentHashParams {
     #[schemars(extend("exclusiveMinimum" = 0))]
     pub weight: f32,
     /// The depth in tokens at which a request with no routing key is keyed
-    /// by its prefix: the last whole block at or under the depth, so at
+    /// by its prefix through the last whole block at or under the depth, so at
     /// least one block of the view's block size and at most the blocks a
     /// request carries. Under the view's `boundaries` a request that reaches
     /// one is keyed there instead, at the deepest it reaches. The depth is
@@ -2655,10 +2655,10 @@ fn depth_edge(
     }
 }
 
-/// A consistent-hash stage's prefix depths against the view. A key is the
-/// last whole block at or under its depth, so `prefix_tokens` and each of
-/// the view's boundaries hold at least one block and no more blocks than a
-/// request carries.
+/// A consistent-hash stage's prefix depths against the view. A key ends
+/// with the last whole block at or under its depth, so `prefix_tokens` and
+/// each of the view's boundaries hold at least one block and no more blocks
+/// than a request carries.
 fn check_prefix_depth(
     stage: &ScoreStage,
     gates: Gates,
