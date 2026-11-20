@@ -1415,10 +1415,13 @@ pub(crate) struct Viewed<'a> {
 /// lease's own engine. A dispatch also feeds the counts of sends of the
 /// generation `world` holds, whichever generation issued the lease: a
 /// send is the host's, whatever document decided it
-/// ([`Engine::dispatched_sent`]). It feeds them where `world` lists the
-/// worker at the rank the report names ([`World::lists_rank`]): a row
-/// that left takes no send, so a late report enters no rank behind a
-/// removal. A dispatch is told on the target its report names by index,
+/// ([`Engine::dispatched_sent`]). A count that does not know the rank
+/// the report names enters it only where `world` lists the worker at
+/// that rank ([`World::lists_rank`]), so a late report enters no rank
+/// behind a removal. A rank a count knows takes the send unasked: a
+/// removal forgets the worker's ranks, and a stale rank of a listed
+/// worker may take a late send that no row reads.
+/// A dispatch is told on the target its report names by index,
 /// as the record holds the pick, and the lease told names that index:
 /// the record was read before the door wrote it. A report that names no
 /// target of the pick tells nothing.
