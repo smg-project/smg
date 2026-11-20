@@ -208,18 +208,20 @@ fn the_signals_section_refuses_each_bad_entry_by_its_path() {
         .map(|n| format!("  s{n}: {{ unit: tokens }}\n"))
         .collect();
     assert_eq!(refusal(&many), "signals lists 65 entries; at most 64");
-    // Printable ASCII alone, so a unit's bytes are its characters: the
-    // third is two characters and three bytes, the last holds a tab.
+    // Visible ASCII alone, so a unit's bytes are its characters and no
+    // space hides at an end: the third is two characters and three bytes,
+    // the fourth holds a tab, the last a space.
     for unit in [
         String::new(),
         "u".repeat(32),
         "\u{b5}s".into(),
         "a\\tb".into(),
+        "tokens / s".into(),
     ] {
         assert_eq!(
             refusal(&format!("  held: {{ unit: \"{unit}\" }}\n")),
             format!(
-                "signals.held.unit = \"{unit}\" is not a unit of 1 to 31 printable ASCII characters"
+                "signals.held.unit = \"{unit}\" is not a unit of 1 to 31 ASCII characters with no space"
             )
         );
     }
@@ -234,9 +236,10 @@ fn the_signals_section_refuses_each_bad_entry_by_its_path() {
     );
     // The longest name, the longest unit, the longest age and the most
     // signals are taken.
-    // The unit holds both ends of its alphabet: a space and a tilde.
+    // The unit holds both ends of its alphabet: an exclamation mark and a
+    // tilde.
     let longest = format!(
-        "  {}: {{ unit: \"{} ~\", max_age_ms: 3599999 }}\n",
+        "  {}: {{ unit: \"!{}~\", max_age_ms: 3599999 }}\n",
         "a".repeat(63),
         "u".repeat(29)
     );

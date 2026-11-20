@@ -278,7 +278,7 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
     // A unit's length and its alphabet, as the validator takes them.
     assert_eq!(field("SignalSpec", "unit")["minLength"], 1);
     assert_eq!(field("SignalSpec", "unit")["maxLength"], 31);
-    assert_eq!(field("SignalSpec", "unit")["pattern"], "^[ -~]*$");
+    assert_eq!(field("SignalSpec", "unit")["pattern"], "^[!-~]*$");
     // A signal's name and the count of signals, as the validator takes them.
     let signals = &root["properties"]["signals"];
     assert_eq!(signals["maxProperties"], MAX_SIGNALS);

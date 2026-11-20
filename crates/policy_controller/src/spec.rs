@@ -1955,8 +1955,9 @@ pub struct ExplainSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SignalSpec {
-    /// The unit a source states for its value to be taken: 1 to 31
-    /// printable ASCII characters.
+    /// The unit a source states for its value to be taken: 1 to 31 ASCII
+    /// characters with no space. It is compared byte for byte with the
+    /// unit a report states.
     #[schemars(length(min = 1, max = 31))]
     #[schemars(extend("pattern" = SIGNAL_UNIT_PATTERN))]
     pub unit: String,
@@ -1982,10 +1983,11 @@ const SIGNAL_NAME_PATTERN: &str = "^[a-z][a-z0-9_]{0,62}$";
 /// The most bytes a signal's unit takes.
 const MAX_SIGNAL_UNIT: usize = 31;
 
-/// A unit's characters as the schema states them: printable ASCII, a space
-/// among them. A unit's bytes are then its characters, so the schema's
-/// length is the one [`check_signals`] takes.
-const SIGNAL_UNIT_PATTERN: &str = "^[ -~]*$";
+/// A unit's characters as the schema states them: visible ASCII, so no
+/// space. One at either end of a unit would not be seen in a document and
+/// would match no report. A unit's bytes are then its characters, so the
+/// schema's length is the one [`check_signals`] takes.
+const SIGNAL_UNIT_PATTERN: &str = "^[!-~]*$";
 
 /// The policy specification, version `smg.policy/v1`: what the host builds
 /// into the view, the per-model index settings, the signals its stages
@@ -2460,8 +2462,8 @@ fn check_index(index: &BTreeMap<String, IndexSpec>, view: &ViewSpec) -> Result<(
 
 /// The `signals` section's checks, each refused by its path: at most
 /// [`MAX_SIGNALS`] names, each a lower-case identifier of at most 63
-/// bytes, a unit of 1 to 31 printable ASCII characters, and a maximum age
-/// of 1 to 3,599,999 where one is written. A signal no stage reads is allowed: a host's own
+/// bytes, a unit of 1 to 31 ASCII characters with no space, and a maximum
+/// age of 1 to 3,599,999 where one is written. A signal no stage reads is allowed: a host's own
 /// stage may read it.
 fn check_signals(signals: &BTreeMap<String, SignalSpec>) -> Result<(), SpecError> {
     if signals.len() > MAX_SIGNALS {
@@ -2485,12 +2487,12 @@ fn check_signals(signals: &BTreeMap<String, SignalSpec>) -> Result<(), SpecError
         }
         // The key's path is built at a refusal alone.
         let at = || At::new(format!("signals.{name}"));
-        let printable = spec.unit.bytes().all(|b| b == b' ' || b.is_ascii_graphic());
-        if spec.unit.is_empty() || spec.unit.len() > MAX_SIGNAL_UNIT || !printable {
+        let visible = spec.unit.bytes().all(|b| b.is_ascii_graphic());
+        if spec.unit.is_empty() || spec.unit.len() > MAX_SIGNAL_UNIT || !visible {
             return Err(at().bad(
                 "unit",
                 format!("{:?}", spec.unit),
-                "a unit of 1 to 31 printable ASCII characters",
+                "a unit of 1 to 31 ASCII characters with no space",
             ));
         }
         match spec.max_age_ms {
