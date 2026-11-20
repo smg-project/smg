@@ -21,8 +21,10 @@
 //! store, its feed nor its host.
 //!
 //! The HTTP pair router asks the host for each attempt's pair, through
-//! prefill admission. The refusing router is for the pair routers that do
-//! not ask it yet.
+//! prefill admission. It is built where this gateway decides pairs in its
+//! own process, and the refusing router is mounted elsewhere
+//! ([`undecided_without()`]). The refusing router is also for the pair
+//! routers that do not ask the host yet.
 //!
 //! One site reads the setting, [`start_with`]. Every other site asks what
 //! the start left in the context.
@@ -35,6 +37,7 @@
 
 use std::sync::Arc;
 
+pub(crate) use smg_policy_controller::spec::PlanName;
 use smg_policy_controller::{
     store::{MemoryStore, StaleGeneration},
     Catalog, SpecError,
@@ -161,6 +164,38 @@ pub(crate) fn undecided(context: &AppContext) -> Option<Box<dyn RouterTrait>> {
         .policy_host
         .is_some()
         .then(|| Box::new(Undecided) as Box<dyn RouterTrait>)
+}
+
+/// The refusing router for a family this gateway does not decide in its
+/// own process. `None` under the classic policies, and where the gateway
+/// decides the family.
+///
+/// A family is not decided where no binding of the document in force names
+/// its `plan`. A request of it is then decided under another plan, and none
+/// of its targets commits as the family's: a pair asked under a single's
+/// plan answers that no target holds. A gateway of many routers mounts
+/// every family over its one document, so a family reaches this where the
+/// gateway's own mode is another's.
+///
+/// Nor is it decided where the gateway follows a controller. Such a request
+/// is the controller's to decide, and no ask reaches it for these families
+/// yet, so the family refuses by name there as it did.
+pub(crate) fn undecided_without(
+    context: &AppContext,
+    plan: PlanName,
+) -> Option<Box<dyn RouterTrait>> {
+    let planned = || {
+        context
+            .router_config
+            .policy_document_in_force()
+            .is_ok_and(|document| {
+                document
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.plan.as_ref() == Some(&plan))
+            })
+    };
+    undecided(context).filter(|_| context.follows_controller() || !planned())
 }
 
 #[cfg(test)]

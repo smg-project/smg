@@ -146,6 +146,14 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
+        // The pair router asks the controller's host where this gateway
+        // decides pairs in its own process. Its family refuses by name
+        // elsewhere.
+        if let Some(router) =
+            policy_controller::undecided_without(ctx, policy_controller::PlanName::PdPair)
+        {
+            return Ok(router);
+        }
         Self::set_pd_policies(
             prefill_policy_config,
             decode_policy_config,
