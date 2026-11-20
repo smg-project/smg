@@ -28,6 +28,7 @@ use smg_policy_controller::{
     AppliedSpec, Catalog, CatalogError, PolicySpec, SpecError,
 };
 use smg_worker::{connection::engine::EngineConnector, identity::basic::ConnectionMode};
+use tracing_test::traced_test;
 
 use super::{
     operators::document_bytes, refused, start, start_with, undecided::ROUTER_TYPE, StartError,
@@ -143,6 +144,24 @@ fn a_setting_no_document_says_stops_the_start_by_its_name() -> Case {
             "dp_minimum_tokens_scheduler = true: the document has no rank policy: under the controller a rank is a candidate of the profile"
         );
     }
+    Ok(())
+}
+
+/// A gateway of many routers whose settings' document plans one family
+/// says so at its start: the family left out, and the setting by its name.
+#[traced_test]
+#[test]
+fn the_start_names_a_family_the_settings_document_leaves_out() -> Case {
+    let mut config = picked(RouterConfig::default());
+    config.enable_igw = true;
+    start(&config)?.ok_or("the controller was not picked")?;
+    assert!(!logs_contain("The policy document plans no"));
+
+    config.routing_key_override.enabled = true;
+    start(&config)?.ok_or("the controller was not picked")?;
+    assert!(logs_contain(
+        "The policy document plans no prefill and decode pairs, so the policy controller places none of their requests: routing_key_override.enabled = true: "
+    ));
     Ok(())
 }
 

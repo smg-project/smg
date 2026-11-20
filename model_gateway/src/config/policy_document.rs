@@ -247,6 +247,54 @@ impl RouterConfig {
         })
     }
 
+    /// The family a gateway of many routers leaves without a plan, and the
+    /// setting that leaves it so. `None` in a gateway of one router, in the
+    /// encode mode, and where the routing settings' document plans both
+    /// families.
+    ///
+    /// The settings' document then plans this configuration's own family
+    /// alone ([`Self::policy_document`]), and the controller places no
+    /// request of the other one. No later refusal names the setting, so the
+    /// start says this answer once. It is meaningful where the settings have
+    /// a document.
+    pub(crate) fn family_left_out(&self) -> Option<(&'static str, PolicyDocumentError)> {
+        if !self.enable_igw {
+            return None;
+        }
+        let family = match &self.mode {
+            RoutingMode::Regular { worker_urls: _ }
+            | RoutingMode::OpenAI { worker_urls: _ }
+            | RoutingMode::Anthropic { worker_urls: _ }
+            | RoutingMode::Gemini { worker_urls: _ } => "prefill and decode pairs",
+            RoutingMode::PrefillDecode {
+                prefill_urls: _,
+                decode_urls: _,
+                prefill_policy: _,
+                decode_policy: _,
+            } => "single workers",
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: _,
+                prefill_urls: _,
+                decode_urls: _,
+                encode_policy: _,
+                prefill_policy: _,
+                decode_policy: _,
+            } => return None,
+        };
+        let why = match both_families(self) {
+            Ok(Some(both)) => written(self, both).err()?,
+            // A regular configuration whose main policy runs on no side of
+            // a pair: its document plans single workers alone.
+            Ok(None) => unsaid(
+                "policy",
+                self.policy.name(),
+                "this policy runs on no side of a pair",
+            ),
+            Err(_) => return None,
+        };
+        matches!(why, PolicyDocumentError::Unsaid { .. }).then_some((family, why))
+    }
+
     /// Validates the document over the stock stages, with the gateway's
     /// own headers denied to the view: the typed half of the check a hosted
     /// document passes. The start and `--print-policy-spec` hand the
@@ -2589,6 +2637,75 @@ mod tests {
         assert_eq!(
             refusal(&many_routers(keyed)),
             ("routing_key_override.enabled", "true".to_string())
+        );
+    }
+
+    #[test]
+    fn many_routers_name_the_family_left_out_and_the_setting_that_leaves_it() {
+        // The families the settings' document plans: pairs, then singles.
+        fn planned(config: &RouterConfig) -> (bool, bool) {
+            let document = config.policy_document().expect("the settings' document");
+            (
+                document
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.plan.is_some()),
+                document
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.plan.is_none()),
+            )
+        }
+        fn left_out(config: &RouterConfig) -> Option<(&'static str, &'static str, String)> {
+            config.family_left_out().map(|(family, why)| match why {
+                PolicyDocumentError::Unsaid { setting, value, .. } => (family, setting, value),
+                other => panic!("expected a setting by its name, got {other:?}"),
+            })
+        }
+        let pairs = "prefill and decode pairs";
+
+        // Both families are planned: nothing is left out.
+        let plain = many_routers(RouterConfig::default());
+        assert_eq!((planned(&plain), left_out(&plain)), ((true, true), None));
+
+        // The override, and the manual policy, leave the pairs of a regular
+        // configuration out. A gateway of one router mounts one family.
+        let mut overridden = config(PolicyConfig::RoundRobin);
+        overridden.routing_key_override.enabled = true;
+        assert_eq!(left_out(&overridden), None);
+        let overridden = many_routers(overridden);
+        assert_eq!(planned(&overridden), (false, true));
+        assert_eq!(
+            left_out(&overridden),
+            Some((pairs, "routing_key_override.enabled", "true".to_string()))
+        );
+        let manual = many_routers(config(at_flag_defaults("manual")));
+        assert_eq!(planned(&manual), (false, true));
+        assert_eq!(
+            left_out(&manual),
+            Some((pairs, "policy", "manual".to_string()))
+        );
+
+        // A pair configuration leaves its single workers out: under the
+        // override the prefix ring's keyed requests have no document.
+        let mut keyed = RouterConfig {
+            mode: pair_mode(
+                Some(PolicyConfig::ConsistentHashing),
+                Some(PolicyConfig::ConsistentHashing),
+            ),
+            ..config(at_flag_defaults("prefix_hash"))
+        };
+        keyed.routing_key_override.enabled = true;
+        keyed.routing_key_override.headers = vec![MANUAL_SESSION_HEADER.to_string()];
+        let keyed = many_routers(keyed);
+        assert_eq!(planned(&keyed), (true, false));
+        assert_eq!(
+            left_out(&keyed),
+            Some((
+                "single workers",
+                "routing_key_override.enabled",
+                "true".to_string()
+            ))
         );
     }
 
