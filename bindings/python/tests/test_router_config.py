@@ -716,6 +716,10 @@ class TestKeywordOnlyParametersOfTheCliFlags:
             "grouped_dp_sticky",
             "pd_pairing_mode",
             "policy_controller",
+            "policy_controller_address",
+            "policy_controller_tls_ca_cert",
+            "policy_controller_tls_cert",
+            "policy_controller_tls_key",
             "policy_spec",
             "runtime_worker_threads",
             "webrtc_bind_addr",
@@ -739,6 +743,33 @@ class TestKeywordOnlyParametersOfTheCliFlags:
     def test_an_unknown_policy_controller_value_is_refused(self):
         with pytest.raises(ValueError, match=r"policy_controller.*other.*expected 'on' or 'off'"):
             _Router(worker_urls=["http://w:8000"], policy_controller="other").start()
+
+    @pytest.mark.parametrize(
+        ("options", "refusal"),
+        [
+            ({}, "requires the policy_controller setting"),
+            (
+                {"policy_controller": "on", "worker_urls": ["http://w:8000"]},
+                "supplies the workers",
+            ),
+            (
+                {"policy_controller": "on", "policy_controller_tls_cert": "cert.pem"},
+                "must be given together",
+            ),
+            (
+                {
+                    "policy_controller": "on",
+                    "policy_controller_tls_cert": "cert.pem",
+                    "policy_controller_tls_key": "key.pem",
+                },
+                "requires --policy-controller-tls-ca-cert",
+            ),
+        ],
+    )
+    def test_a_controller_address_is_checked_as_on_the_command_line(self, options, refusal):
+        options = {"worker_urls": [], "policy_controller_address": "controller:30100", **options}
+        with pytest.raises(ValueError, match=refusal):
+            _Router(**options).start()
 
     def test_a_document_path_reaches_the_configuration(self, tmp_path):
         path = tmp_path / "routing.yaml"
