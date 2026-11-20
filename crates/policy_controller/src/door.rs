@@ -2694,17 +2694,19 @@ impl Door {
         match entry {
             Entry::Single => {
                 let (decision, booking) = decide_in(world, taken, buffers, &self.parts[at]);
-                let lease = booking
-                    .map(|booking| -> Result<_, LeaseRefused> {
-                        let lease = issue(&self.store, world, taken, term, &decision, booking)?;
-                        world.sent(&buffers.named, booking.target);
-                        Ok(lease)
-                    })
-                    .transpose()
-                    .map_err(|_| Refused::Unleased)?;
+                let Some(booking) = booking else {
+                    return Ok(Decided {
+                        decision,
+                        lease: None,
+                    });
+                };
+                let Ok(lease) = issue(&self.store, world, taken, term, &decision, booking) else {
+                    return Err(Refused::Unleased);
+                };
+                world.sent(&buffers.named, booking.target);
                 Ok(Decided {
                     decision,
-                    lease: lease.map(|lease| Leased {
+                    lease: Some(Leased {
                         lease,
                         due: taken.due(),
                     }),
