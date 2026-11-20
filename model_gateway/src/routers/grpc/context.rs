@@ -383,8 +383,11 @@ pub(crate) struct RoutingSnapshot {
     /// Captured when the prompt has no token ids, or when a configured policy
     /// reads request text next to them.
     pub routing_text: Option<String>,
-    /// rid-derived sticky key, derived once at first selection.
-    pub rid_key: Option<String>,
+    /// The body's `rid`, kept at first selection where a retry reads it: the
+    /// classic sticky key derives from it again, and an ask of the policy
+    /// controller states it. It stands in the derived key's place, so the
+    /// dispatch context keeps its size class.
+    pub rid: Option<String>,
     /// The request's cache namespace, derived once at first selection.
     pub cache_namespace: Option<CacheNamespace>,
     /// The request carries pixel media (an image or a video), noted at first
@@ -2125,7 +2128,7 @@ pub(super) mod test_support {
             routing: RoutingSnapshot {
                 context_requirements: Default::default(),
                 routing_text: None,
-                rid_key: None,
+                rid: None,
                 cache_namespace: None,
                 needs_vision: false,
                 decode_needs_vision: false,

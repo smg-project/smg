@@ -363,6 +363,10 @@ struct SelectionInputs<'a> {
     ids: &'a [u32],
     headers: Option<&'a HeaderMap>,
     rid_key: Option<String>,
+    /// The body's `rid`, where the routing snapshot keeps it for the
+    /// retries: the classic sticky key derives from it, or a host stands,
+    /// whose asks state it. Elsewhere no retry reads it and none is copied.
+    rid: Option<&'a str>,
     /// Whether the routing snapshot keeps a copy of the text: always without
     /// token ids, and with them only for a policy that reads text next to
     /// the ids (cache_aware routes on the ids and would copy the whole
@@ -407,10 +411,12 @@ impl<'a> SelectionInputs<'a> {
         let ids = prep.token_ids();
 
         let headers = input.headers.as_ref();
+        let rid = input.request_type.rid();
         let rid_key = stage
             .policy_registry
-            .derive_rid_key(input.request_type.rid())
+            .derive_rid_key(rid)
             .map(str::to_string);
+        let rid = rid.filter(|_| rid_key.is_some() || stage.host.is_some());
 
         // Text is copied only when a configured policy would actually read it
         // (see the `keep_text` field).
@@ -460,6 +466,7 @@ impl<'a> SelectionInputs<'a> {
             ids,
             headers,
             rid_key,
+            rid,
             keep_text,
             cache_namespace,
             media,
@@ -487,7 +494,7 @@ impl<'a> SelectionInputs<'a> {
                 .keep_text
                 .then(|| self.text.map(str::to_string))
                 .flatten(),
-            rid_key: self.rid_key.clone(),
+            rid: self.rid.map(str::to_string),
             cache_namespace: self.cache_namespace,
             needs_vision: self.needs_vision,
             decode_needs_vision: self.demand.decode,
@@ -756,7 +763,10 @@ impl WorkerSelectionStage {
         }
         let text = ctx.routing.routing_text.as_deref();
         let tokens = Some(plan.routing_token_ids()).filter(|ids| !ids.is_empty());
-        let rid_key = ctx.routing.rid_key.as_deref();
+        // The first selection's key, derived again from the `rid` it kept.
+        let rid_key = self
+            .policy_registry
+            .derive_rid_key(ctx.routing.rid.as_deref());
         let cache_namespace = ctx.routing.cache_namespace;
         let headers = ctx.headers.as_ref();
         let model_id = ctx.model_id.as_str();
@@ -1118,7 +1128,7 @@ impl<'a> RegularAttempt<'a> {
     /// gateway's own `id` for it and with the prompt's `hashes`. Nothing a
     /// client sent names an ask. The request's headers and its own `rid`
     /// are the sources of its routing key: a first attempt states both, and
-    /// a retry states the headers it retained and no `rid`.
+    /// a retry states the two as the request left them behind.
     fn ask(self, model: &'a str, id: &'a [u8], hashes: &'a host::Hashes) -> Ask<'a> {
         let (streaming, headers, rid, tried) = match self {
             Self::First(ctx) => (
@@ -1130,7 +1140,7 @@ impl<'a> RegularAttempt<'a> {
             Self::Retry(ctx) => (
                 ctx.streaming,
                 ctx.headers.as_ref(),
-                None,
+                ctx.routing.rid.as_deref(),
                 &ctx.tried_rows[..],
             ),
         };
@@ -3835,7 +3845,7 @@ mod tests {
             routing: RoutingSnapshot {
                 context_requirements: ContextRequirements::default(),
                 routing_text: None,
-                rid_key: None,
+                rid: None,
                 cache_namespace: None,
                 needs_vision: false,
                 decode_needs_vision: false,
