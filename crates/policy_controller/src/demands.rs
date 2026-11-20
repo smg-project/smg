@@ -88,6 +88,16 @@ pub struct Demands {
 }
 
 impl Demands {
+    /// No demand: what a request states that needs nothing of its worker.
+    pub const NONE: Self = Self {
+        runtime: 0,
+        vision: false,
+        references: References::None,
+        input_window: 0,
+        output_window: 0,
+        target: None,
+    };
+
     /// Whether the request demands nothing: its door reads no fact then.
     #[must_use]
     pub const fn is_none(self) -> bool {

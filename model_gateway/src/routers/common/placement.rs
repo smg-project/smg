@@ -445,17 +445,24 @@ fn select_among(
             Err(Miss::NobodyAvailable) if !asked_again => {}
             Err(Miss::NobodyAvailable | Miss::Declined) => return None,
         }
-        let came_free = candidates.iter().any(|worker| {
-            worker.is_available()
-                && inputs
-                    .candidate_filter
-                    .is_none_or(|accepts| accepts(worker.as_ref()))
-        });
-        if !came_free {
+        if !any_available(candidates, inputs.candidate_filter) {
             return None;
         }
         asked_again = true;
     }
+}
+
+/// Whether a candidate the request may use is available. The single
+/// selection then hands its policy a list that holds someone, and an
+/// explicit target is read against that list. Where none is, no policy is
+/// asked: the pool's veto fallback answers.
+pub(crate) fn any_available(
+    candidates: &[Arc<dyn Worker>],
+    candidate_filter: Option<CandidateFilter<'_>>,
+) -> bool {
+    candidates.iter().any(|worker| {
+        worker.is_available() && candidate_filter.is_none_or(|accepts| accepts(worker.as_ref()))
+    })
 }
 
 /// One pass of the single-worker selection. `whole` is the

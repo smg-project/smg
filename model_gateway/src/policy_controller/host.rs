@@ -49,7 +49,7 @@ use smg_policy_controller::{
     store::{GatewayId, MemoryStore, World},
     view::{Constraints, Identity, Phase, RequestFacts, WorkerId},
     worker_host::Objects,
-    AppliedSpec, DerivedKey, KeySource, MediaCounts, WireModes,
+    AppliedSpec, Demands, DerivedKey, KeySource, MediaCounts, WireModes,
 };
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard, WorkerType};
 
@@ -153,6 +153,10 @@ pub(crate) struct Ask<'a> {
     /// the controller places among the rows that serve it. None stated
     /// leaves every row in.
     pub wires: WireModes,
+    /// What the request demands of the worker that takes it. The controller
+    /// keeps the demands ahead of its stages, among the rows whose
+    /// registrations meet them. None stated leaves every row in.
+    pub demands: Demands,
     /// The rows of the workers the request's failed attempts were sent to.
     pub tried: &'a [WorkerId],
     /// The retry number, `0` for the first attempt. `None` counts the rows
@@ -167,8 +171,8 @@ pub(crate) struct Ask<'a> {
 impl<'a> Ask<'a> {
     /// An ask for `model` under the request's `id` that states no other
     /// fact: a single request of no stated prompt size, not streamed, no
-    /// input of a routing key, no media, no stated wire, nothing tried, no
-    /// stated attempt, no hashes, no second ask of a decode.
+    /// input of a routing key, no media, no stated wire, no demand, nothing
+    /// tried, no stated attempt, no hashes, no second ask of a decode.
     pub(crate) const fn of(id: &'a [u8], model: &'a str) -> Self {
         Self {
             id,
@@ -181,6 +185,7 @@ impl<'a> Ask<'a> {
             prompt_tokens: 0,
             media: MediaCounts::NONE,
             wires: WireModes::NONE,
+            demands: Demands::NONE,
             tried: &[],
             attempt: None,
             hashes: None,
@@ -261,6 +266,7 @@ impl<'a> Ask<'a> {
             constraints: Constraints {
                 excluded: missed,
                 wire_modes: self.wires,
+                demands: self.demands,
                 ..Constraints::default()
             },
         }
@@ -564,6 +570,23 @@ impl Host {
                 use smg_policy_controller::store::WorkersStore;
                 let row = WorkersStore::get(&**self.door.store(), id)?;
                 registry.get_by_url(&row.facts.key)
+            }
+        }
+    }
+
+    /// The store's row of `worker`: the row its object stands for. `None`
+    /// where the holder keeps no row for it, or has laid another object in
+    /// its place.
+    pub(crate) fn row_of(&self, worker: &Arc<dyn Worker>) -> Option<WorkerId> {
+        match &self.workers {
+            Workers::Held(objects) => {
+                let id = objects.registry().get_id_by_url(worker.url())?;
+                Some(objects.standing_of(&id, worker)?.row)
+            }
+            #[cfg(test)]
+            Workers::AtKey(_) => {
+                use smg_policy_controller::store::WorkersStore;
+                Some(WorkersStore::by_key(&**self.door.store(), worker.url())?.id)
             }
         }
     }

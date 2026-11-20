@@ -40,7 +40,7 @@ use openai_protocol::{
     UNKNOWN_MODEL_ID,
 };
 use reqwest::multipart::{Form, Part};
-use smg_policy_controller::view::WorkerId;
+use smg_policy_controller::{view::WorkerId, Demands};
 use smg_worker::{
     identity::{
         basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
@@ -813,20 +813,42 @@ impl Router {
         models.all(|other| other == model).then(|| model.to_owned())
     }
 
-    /// The refusal of a request that names its worker, where the model's
+    /// The store's row of the worker a request names, where the model's
     /// classic policy holds it to that worker ([`placement::strict_target`]).
-    /// The host reads no explicit target yet and would place the request on
-    /// another worker, so the shape is refused by name.
-    fn explicit_target_refusal(
+    /// The classic's own selection resolves the name (`select`), so the
+    /// header's index means what it means on the classic line: it counts
+    /// the workers that are available.
+    ///
+    /// `Ok(None)` for a request that names no worker, and where no worker
+    /// the request may use is available (`available`): the classic reads no
+    /// header there, and the binding's rule for a pool the veto empties
+    /// answers. `Err` is the classic's refusal of a header that names
+    /// nobody, and the same answer for a worker the store holds no row for.
+    fn named_row(
         &self,
+        host: &Host,
+        site: &'static str,
         model_id: &str,
         headers: Option<&HeaderMap>,
-    ) -> Option<Response> {
+        available: impl FnOnce() -> bool,
+        select: impl FnOnce() -> Result<Arc<dyn Worker>, Response>,
+    ) -> Result<Option<WorkerId>, Response> {
         // A request that names no worker pays the header's probe alone.
-        header_utils::extract_target_worker(headers)?;
+        if header_utils::extract_target_worker(headers).is_none() {
+            return Ok(None);
+        }
         let policy = self.policy_registry.get_policy_or_default(model_id);
-        placement::strict_target(policy.as_ref(), headers)
-            .then(|| crate::policy_controller::refused("an explicit target worker"))
+        if !placement::strict_target(policy.as_ref(), headers) || !available() {
+            return Ok(None);
+        }
+        let worker = select()?;
+        host.row_of(&worker).map(Some).ok_or_else(|| {
+            let refusal = placement::no_available_workers_because(
+                "All workers are unavailable (circuit breaker open or unhealthy)",
+                "the policy controller holds no row for the worker the request names",
+            );
+            self.report_refusal(site, model_id, refusal)
+        })
     }
 
     /// The attempt's placement by the policy controller, or the answer of a
@@ -865,9 +887,22 @@ impl Router {
                 error::model_not_found(&model),
             ));
         }
-        if let Some(refusal) = self.explicit_target_refusal(&model, attempt.headers) {
-            return Err(refusal);
-        }
+        // The classic selects by the request's own model id, and so does
+        // the resolution of a name.
+        let target = self.named_row(
+            host,
+            "Router::route_typed_request",
+            attempt.model_id,
+            attempt.headers,
+            || {
+                let pool = self
+                    .worker_registry
+                    .get_routing_pool(attempt.model_id, RoutingPool::HttpRegular);
+                let ledger = attempt.ledger;
+                ledger.with_candidate_filter(|filter| placement::any_available(&pool, filter))
+            },
+            || self.select_worker_for_attempt(attempt),
+        )?;
         let id = host::mark();
         let tried = attempt.tried_rows.lock().clone();
         // The prompt the classic arm routes by: the request's token ids
@@ -883,6 +918,10 @@ impl Router {
             streaming: attempt.is_stream,
             headers: attempt.headers,
             rid: attempt.rid,
+            demands: Demands {
+                target,
+                ..Demands::NONE
+            },
             tried: &tried,
             hashes: Some(&hashes),
             ..Ask::of(&id, &model)
@@ -1346,7 +1385,7 @@ impl Router {
                 (worker, None)
             }
             Some(host) => match self
-                .place_transcription(host, headers, body.rid(), model_id, is_stream)
+                .place_transcription(host, headers, body.rid(), model_id, &routing, is_stream)
                 .await
             {
                 Ok(placed) => (Arc::clone(placed.worker()), Some(Sent::from(placed))),
@@ -1425,6 +1464,7 @@ impl Router {
         headers: Option<&HeaderMap>,
         rid: Option<&str>,
         model_id: &str,
+        routing: &RoutingDerivatives,
         streaming: bool,
     ) -> Result<Placed, Response> {
         let pool = self
@@ -1440,15 +1480,24 @@ impl Router {
         if pool.iter().all(|worker| worker.is_dp_aware()) {
             return Err(Self::transcription_dp_not_supported());
         }
-        if let Some(refusal) = self.explicit_target_refusal(model_id, headers) {
-            return Err(refusal);
-        }
+        let target = self.named_row(
+            host,
+            TRANSCRIPTION_REFUSAL_SITE,
+            model_id,
+            headers,
+            || placement::any_available(&pool, Some(&|worker: &dyn Worker| !worker.is_dp_aware())),
+            || self.select_transcription_worker(headers, model_id, routing),
+        )?;
 
         let id = host::mark();
         let ask = Ask {
             streaming,
             headers,
             rid,
+            demands: Demands {
+                target,
+                ..Demands::NONE
+            },
             ..Ask::of(&id, model_id)
         };
         host.place_where(

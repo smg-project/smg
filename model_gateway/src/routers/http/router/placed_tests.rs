@@ -622,22 +622,54 @@ async fn an_attempt_the_controller_does_not_place_reads_the_hosts_answer() -> Ca
     Ok(())
 }
 
-/// Under the host a request that names its worker is refused by name where
-/// the model's classic policy holds it to that worker, on the typed line
-/// and on the transcription line, and no worker is asked. Under a policy
-/// that reads no target the header changes nothing.
+/// Under the host a request that names its worker goes to that worker
+/// where the model's classic policy holds it there, on the typed line and
+/// on the transcription line. The header's index counts the available
+/// workers in the pool's order, as on the classic line: a worker that is
+/// not ready takes no place in the count. An index that names nobody is
+/// the classic's refusal, and no worker is asked. Where no worker is
+/// available the header is not read. Under a policy that reads no target
+/// the header changes nothing.
 #[tokio::test]
-async fn a_request_that_names_its_worker_is_refused_by_name_under_the_host() -> Case {
+async fn a_request_that_names_its_worker_goes_to_it_under_the_host() -> Case {
+    use PolicyConfig::{ConsistentHashing, RoundRobin};
+
     let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
-    let mut headers = HeaderMap::new();
-    headers.insert("x-smg-target-worker", HeaderValue::from_static("0"));
-    for (policy, refused) in [
-        (PolicyConfig::ConsistentHashing, true),
-        (PolicyConfig::RoundRobin, false),
+    // The places the gateway reads as not ready, and whether every worker
+    // is over its thresholds. Then where a row's two requests land: on the
+    // worker at a place, or on no worker; `None` leaves the place to the
+    // policy.
+    let none: &[usize] = &[];
+    for (policy, target, down, over, lands) in [
+        (ConsistentHashing, "0", none, false, Some(Some(0))),
+        (ConsistentHashing, "2", none, false, Some(Some(2))),
+        (ConsistentHashing, "3", none, false, Some(None)),
+        (ConsistentHashing, "x", none, false, Some(None)),
+        // The index passes over the worker that is not ready.
+        (ConsistentHashing, "0", &[0], false, Some(Some(1))),
+        (ConsistentHashing, "2", &[0], false, Some(None)),
+        // No worker is available: an index that names nobody is not read.
+        (ConsistentHashing, "7", none, true, None),
+        (RoundRobin, "2", none, false, None),
     ] {
-        let (url, hits) = fixed_status_upstream(&[GENERATE, TRANSCRIBE], StatusCode::OK).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-target-worker", HeaderValue::from_static(target));
+        let mut urls = Vec::new();
+        let mut hits = Vec::new();
+        for _ in 0..3 {
+            let (url, hit) = fixed_status_upstream(&[GENERATE, TRANSCRIBE], StatusCode::OK).await;
+            urls.push(url);
+            hits.push(hit);
+        }
+        let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
         let registry = Arc::new(WorkerRegistry::new());
-        let (host, ..) = bed_over(Arc::clone(&registry), &[&url]);
+        let (host, _, workers) = bed_over(Arc::clone(&registry), &urls);
+        for place in down {
+            workers[*place].set_status(WorkerStatus::NotReady);
+        }
+        for worker in &workers {
+            registry.set_worker_overloaded(worker, over);
+        }
         let mut router = router(registry, Some(host));
         router.policy_registry = Arc::new(PolicyRegistry::new(policy));
         let request = serde_json::from_value(json!({"text": "hi"}))?;
@@ -656,18 +688,27 @@ async fn a_request_that_names_its_worker_is_refused_by_name_under_the_host() -> 
         let transcribed = router
             .route_audio_transcriptions(Some(&headers), &meta, &request, audio, MODEL)
             .await;
+        let hits: Vec<usize> = hits.iter().map(|hit| hit.load(Ordering::SeqCst)).collect();
         for response in [generated, transcribed] {
-            if refused {
-                assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+            if lands == Some(None) {
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
                 assert_eq!(
                     extract_error_code_from_response(&response),
-                    "not_decided_by_policy_controller"
+                    "no_available_workers"
                 );
             } else {
-                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.status(), StatusCode::OK, "{target} {down:?}");
             }
         }
-        assert_eq!(hits.load(Ordering::SeqCst), if refused { 0 } else { 2 });
+        match lands {
+            Some(Some(place)) => {
+                let mut named = [0; 3];
+                named[place] = 2;
+                assert_eq!(hits, named, "{target} {down:?}");
+            }
+            Some(None) => assert_eq!(hits, [0; 3], "{target} {down:?}"),
+            None => assert_eq!(hits.iter().sum::<usize>(), 2),
+        }
     }
     Ok(())
 }
