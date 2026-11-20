@@ -1812,7 +1812,9 @@ fn a_row_carries_its_registrations_fixed_facts_and_reads_its_own_rank() {
         (row.in_flight, row.session_in_flight, row.active_sessions),
         (0, 0, 0)
     );
-    assert!(!row.has_capacity && !row.has_room && !row.health.overloaded);
+    assert!(!row.health.overloaded);
+    // No admission window is the store's to know: both bits read open.
+    assert!(row.has_capacity && row.has_room);
     assert_eq!(row.connector, 0);
     // Under a generation that declares no list the listed fields read 0.
     assert_eq!((row.zone, row.labels, row.engine_kind), (0, 0, 0));
