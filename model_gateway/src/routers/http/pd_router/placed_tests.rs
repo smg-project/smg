@@ -1,16 +1,16 @@
 //! The HTTP pair router over a store and a registry of loopback workers.
 
-use std::{error::Error, time::Duration};
+use std::{collections::HashSet, error::Error, time::Duration};
 
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
-use serde_json::json;
+use serde_json::{json, Value};
 use smg_policy_controller::{
     spec::DecodePick,
     store::{
         GatewayId, HealthSink, LeasesStore, LoadSink, LoadSource, MemoryStore, PairingDescriptor,
         WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
     },
-    view::{LoadRow, Role, WireModes},
+    view::{LoadRow, Role, WireModes, TEXT_BYTES_PER_TOKEN},
     AppliedSpec, PolicySpec,
 };
 use smg_worker::identity::basic::{ConnectionMode, MORIIO_CONNECTOR};
@@ -84,6 +84,33 @@ fn pair_bed_of(
     let store = start(&config)
         .expect("the start takes the routing")
         .expect("the controller was picked");
+    pair_bed_in(store, shaped, registry, prefill_urls, decode_urls)
+}
+
+/// [`pair_bed_over`] under the prefix-hash pair presets: each side ranks by
+/// the ring, which keys a request that has no routing key by its prompt's
+/// hashes.
+fn ring_pair_bed(
+    registry: Arc<WorkerRegistry>,
+    prefill_urls: &[&str],
+    decode_urls: &[&str],
+) -> PairBed {
+    let store = Arc::new(MemoryStore::new());
+    let document = PolicySpec::pair_presets("prefix_hash", "prefix_hash").expect("the presets");
+    let applied = AppliedSpec::validate(&document).expect("the presets validate");
+    store.apply(applied).expect("the store takes the presets");
+    let plain = |_: &str, worker: BasicWorkerBuilder| (worker, WireModes::HTTP);
+    pair_bed_in(store, plain, registry, prefill_urls, decode_urls)
+}
+
+/// [`pair_bed_of`] over `store`, under the document it holds.
+fn pair_bed_in(
+    store: Arc<MemoryStore>,
+    shaped: impl Fn(&str, BasicWorkerBuilder) -> (BasicWorkerBuilder, WireModes),
+    registry: Arc<WorkerRegistry>,
+    prefill_urls: &[&str],
+    decode_urls: &[&str],
+) -> PairBed {
     let pairing = Arc::new(PairingDescriptor {
         protocol: Some("pair-wire".to_owned()),
         ..PairingDescriptor::default()
@@ -131,6 +158,11 @@ fn pair_bed_of(
 }
 
 const GATEWAY: GatewayId = GatewayId::LOCAL;
+
+/// An attempt's prompt that states nothing: no hashes and no size.
+fn unhashed(_: &str) -> Hashes {
+    Hashes::default()
+}
 
 /// A unary generate request of the bed's model, as an attempt reads it.
 const UNARY: PDRequestContext<'static> = PDRequestContext {
@@ -596,7 +628,7 @@ async fn a_retry_is_not_placed_on_a_worker_the_ledger_closed() -> Case {
         let tried = parking_lot::Mutex::new(Vec::new());
         for _ in 0..4 {
             let placed = router
-                .place_pair_attempt(host, &UNARY, 0, 0, None, &tried, &ledger)
+                .place_pair_attempt(host, &UNARY, 0, unhashed, None, &tried, &ledger)
                 .await;
             let (sent, (_, decode), _guards, _asked) =
                 placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
@@ -938,7 +970,7 @@ async fn a_row_whose_worker_dials_another_wire_is_passed_over_at_its_commit() ->
         let ledger = AttemptLedger::default();
         for _ in 0..4 {
             let placed = router
-                .place_pair_attempt(host, &UNARY, 0, 0, None, &tried, &ledger)
+                .place_pair_attempt(host, &UNARY, 0, unhashed, None, &tried, &ledger)
                 .await;
             let (sent, (_, decode), _guards, _asked) =
                 placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
@@ -951,6 +983,95 @@ async fn a_row_whose_worker_dials_another_wire_is_passed_over_at_its_commit() ->
         }
         assert_eq!(live(&store, 0).await, 0);
     }
+    Ok(())
+}
+
+/// Under a pair document whose sides rank by the ring, a prompt keeps its
+/// prefill and its decode over plain HTTP. The route states the request's
+/// text, the host hashes its windows, and the ring keys a request that has
+/// no routing key by them. Prompts that differ spread over each pool.
+#[tokio::test]
+async fn a_prompt_keeps_its_pair_under_the_ring_over_http() -> Case {
+    const PROMPTS: usize = 12;
+    const REPEATS: usize = 4;
+    let mut prefills = Vec::new();
+    let mut decodes = Vec::new();
+    for _ in 0..3 {
+        prefills.push(spawn_recording_stub("{}").await);
+        decodes.push(spawn_recording_stub(r#"{"text":"done"}"#).await);
+    }
+    let prefill_urls: Vec<&str> = prefills.iter().map(|(url, _)| url.as_str()).collect();
+    let decode_urls: Vec<&str> = decodes.iter().map(|(url, _)| url.as_str()).collect();
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = ring_pair_bed(Arc::clone(&registry), &prefill_urls, &decode_urls);
+    let router = router(registry, host);
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    // Each prompt fills six windows at the document's block size, and the
+    // prompts differ inside the first.
+    let prompts: Vec<String> = (0..PROMPTS)
+        .map(|n| format!("prompt {n:02} of the case, ").repeat(16))
+        .collect();
+    for _ in 0..REPEATS {
+        for prompt in &prompts {
+            let request = serde_json::from_value(json!({"text": prompt}))?;
+            let answer = router.route_generate(None, &meta, request, MODEL).await;
+            assert_eq!(answer.status(), StatusCode::OK);
+            axum::body::to_bytes(answer.into_body(), usize::MAX).await?;
+        }
+    }
+    for side in [&prefills, &decodes] {
+        let mut used = HashSet::new();
+        for prompt in &prompts {
+            // The side's workers that saw the prompt, each with its count.
+            let mut holders = Vec::new();
+            for (at, (_, seen)) in side.iter().enumerate() {
+                let seen = seen.lock().map_err(|e| e.to_string())?;
+                let sent = |(_, body): &&(String, Value)| body["text"] == prompt.as_str();
+                match seen.iter().filter(sent).count() {
+                    0 => {}
+                    hits => holders.push((at, hits)),
+                }
+            }
+            assert_eq!(holders.len(), 1, "one worker holds the prompt: {holders:?}");
+            assert_eq!(holders[0].1, REPEATS);
+            used.insert(holders[0].0);
+        }
+        assert!(used.len() > 1, "the prompts spread over the pool: {used:?}");
+    }
+    assert_eq!(live(&store, 0).await, 0);
+    Ok(())
+}
+
+/// A request's size comes from its hashing, by one rule for both kinds: the
+/// ask states no count beside its hashes. A text request books its bytes at
+/// the text's rate, and a request of token ids books their count.
+#[tokio::test]
+async fn a_text_request_states_its_size_from_its_hashing() -> Case {
+    let registry = Arc::new(WorkerRegistry::new());
+    let urls = (["http://prefill:8000"], ["http://decode:8000"]);
+    let (host, store, _) = ring_pair_bed(Arc::clone(&registry), &urls.0, &urls.1);
+    let router = router(registry, host);
+    let host = router.host.as_deref().ok_or("the router holds the host")?;
+    let tried = parking_lot::Mutex::new(Vec::new());
+    let ledger = AttemptLedger::default();
+    let text = "x".repeat(100 * TEXT_BYTES_PER_TOKEN as usize);
+    let ids: Vec<u32> = (1..=37).collect();
+    let as_text = Prompt {
+        text: Some(&text),
+        ..Prompt::default()
+    };
+    let as_ids = Prompt::of(Some(ids.as_slice()), None);
+    for (prompt, size) in [(as_text, 100), (as_ids, 37)] {
+        let hashed = |model: &str| host.hashes(model, &prompt);
+        let placed = router
+            .place_pair_attempt(host, &UNARY, 0, hashed, None, &tried, &ledger)
+            .await;
+        let (sent, _, _guards, _asked) =
+            placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
+        assert_eq!(sent.lease_tokens(), Some(size));
+        drop(sent);
+    }
+    assert_eq!(live(&store, 0).await, 0);
     Ok(())
 }
 
@@ -997,7 +1118,7 @@ async fn a_pair_is_placed_past_more_pairs_of_another_wire_than_an_attempt_asks()
         let ledger = AttemptLedger::default();
         for _ in 0..4 {
             let placed = router
-                .place_pair_attempt(host, &UNARY, 0, 0, None, &tried, &ledger)
+                .place_pair_attempt(host, &UNARY, 0, unhashed, None, &tried, &ledger)
                 .await;
             let (sent, (prefill, decode), _guards, _asked) =
                 placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
