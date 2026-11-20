@@ -991,7 +991,7 @@ mod sent_prefixes {
 
     #[test]
     fn a_write_reads_its_permission_under_the_guard() -> Case {
-        let store = Arc::new(MemoryStore::new());
+        let store = MemoryStore::new();
         let id = plain(&store, "a", WireModes::GRPC, Reachability::Any);
         plain(&store, "b", WireModes::GRPC, Reachability::Any);
         store.apply(applied(&merged(1)?)?)?;
@@ -1000,24 +1000,43 @@ mod sent_prefixes {
         let record = record(&store).ok_or("the model's record")?;
         let standing = store.deciding(|world| world.standing(MODEL, Role::Single));
         let allowed = Arc::clone(&standing.ok_or("the pool's standing")?.tables.allowed[row]);
-        // This case holds the guard a write waits for. A removal's first
-        // step lands meanwhile: the worker's word is cleared.
-        let held = record.record.write();
-        let (started, on) = mpsc::channel();
-        let writer = {
-            let store = Arc::clone(&store);
-            thread::spawn(move || {
-                let _ = started.send(());
-                store.deciding(|world| world.sent(&cold, id));
-            })
-        };
-        on.recv()?;
-        thread::sleep(Duration::from_millis(50));
-        allowed.store(false, Ordering::Relaxed);
-        drop(held);
-        writer.join().map_err(|_| "the writer's thread")?;
+        // A removal's first step lands as the write takes the guard: the
+        // worker's word is cleared.
+        seam::set(seam::Point::Guarded, move || {
+            allowed.store(false, Ordering::Relaxed);
+        });
+        store.deciding(|world| world.sent(&cold, id));
+        assert!(!seam::pending(), "the step ran under the write's guard");
         let blocks = record.record.read().deepest(&keys(&HASHES)).blocks();
         assert_eq!(blocks, 0, "a worker that left is not written back");
+        Ok(())
+    }
+
+    #[test]
+    fn a_write_waits_for_no_thread_that_holds_the_record() -> Case {
+        let store = MemoryStore::new();
+        let id = plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        let (cold, _) = named(&store, None, 16, 7);
+        let record = record(&store).ok_or("the model's record")?;
+        let slices = || store.deciding(|world| world.sent_slices(MODEL, Role::Single));
+        // Another decider writes the record. A lease issued meanwhile
+        // leaves its naming out and takes no guard.
+        let held = record.record.write();
+        thread::scope(|scope| {
+            let (finished, done) = mpsc::channel();
+            let (store, cold) = (&store, &cold);
+            scope.spawn(move || {
+                store.deciding(|world| world.sent(cold, id));
+                let _ = finished.send(());
+            });
+            let finished = done.recv_timeout(Duration::from_secs(5));
+            drop(held);
+            finished
+        })?;
+        assert_eq!(slices(), Some(0), "a held record is not written");
+        store.deciding(|world| world.sent(&cold, id));
+        assert_eq!(slices(), Some(1), "a free record is");
         Ok(())
     }
 

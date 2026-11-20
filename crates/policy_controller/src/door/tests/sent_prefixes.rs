@@ -939,11 +939,18 @@ fn readers_and_a_writer_share_one_record() -> Case {
         }
     });
     let mut buffers = Buffers::default();
+    let mut written = 0;
     for n in 0..128 {
         let hashes = [1000 + n, 2, 3, 4, 5, 6, 7, 8];
         decide_only(&door, &token_request(&hashes), now, &mut buffers);
-        assert_eq!(depths(&buffers), vec![(0, 8)]);
+        // A write that met another thread at the record left its prefix
+        // out whole.
+        match depths(&buffers).as_slice() {
+            [] => {}
+            [(0, 8)] => written += 1,
+            part => return Err(format!("a prefix written in part: {part:?}").into()),
+        }
     }
-    assert_eq!(slices(&store, Role::Single), Some(128));
+    assert_eq!(slices(&store, Role::Single), Some(written));
     Ok(())
 }
