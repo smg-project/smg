@@ -1358,7 +1358,10 @@ mod tests {
             f.sink.resync(f.row, Some(0), reason);
             assert_eq!(f.blocks(), 1);
             f.sink.resync(f.row, Some(RANK), reason);
-            assert_eq!(f.blocks(), 0);
+            // An abandoned snapshot keeps the block it showed until the
+            // next reason empties the rank. Every other reason empties it.
+            let kept = usize::from(reason == ResyncReason::SnapshotAbandoned);
+            assert_eq!(f.blocks(), kept, "{reason:?}");
         }
 
         f.applied(7, &store);

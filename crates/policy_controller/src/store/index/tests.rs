@@ -1625,6 +1625,51 @@ fn a_second_snapshot_leaves_nothing_of_the_first_and_a_chunk_alone_only_adds() {
     assert_eq!(store.cursor(a, 0).expect("heard").applied, 41);
 }
 
+/// A snapshot its stream did not finish cannot be trusted past what it
+/// showed. The cursor starts over, so the next subscription asks from zero,
+/// and the blocks of its chunks stay until the next snapshot's start. Every
+/// other reason empties the rank, and a rank that is not the row's resets
+/// nothing.
+#[test]
+fn an_abandoned_snapshot_keeps_its_blocks_and_starts_its_cursor_over() {
+    let store = MemoryStore::new();
+    let a = admitted(&store, "a");
+    let chunk = |sequence| BatchFacts {
+        sequence,
+        clears: false,
+        snapshot: Some(SnapshotChunk {
+            unknown_before: false,
+        }),
+    };
+    let (first, second) = (chain(&[1, 2, 3]), chain(&[7, 8]));
+    store.resync(a, None, ResyncReason::Snapshot);
+    assert_eq!(
+        store.admit(a, 0, chunk(9), &stored(None, &first)),
+        BatchOutcome::Applied
+    );
+    store.resync(a, Some(1), ResyncReason::DataLoss);
+    assert_eq!(store.cursor(a, 0).expect("heard").applied, 9, "rank 1");
+    assert_eq!(store.indexed_blocks(a, 0), 3);
+
+    store.resync(a, Some(0), ResyncReason::SnapshotAbandoned);
+    assert_eq!(store.cursor(a, 0), Some(Default::default()), "from zero");
+    assert_eq!(held(&store, MODEL, &[1, 2, 3]), BTreeMap::from([(a, 3)]));
+    assert_eq!(store.resyncs(ResyncReason::SnapshotAbandoned), 1);
+    // The stream that follows is taken from wherever it starts, and its
+    // snapshot's start replaces what the abandoned one showed.
+    store.resync(a, None, ResyncReason::Snapshot);
+    assert_eq!(store.indexed_blocks(a, 0), 0);
+    assert_eq!(
+        store.admit(a, 0, chunk(4), &stored(None, &second)),
+        BatchOutcome::Applied
+    );
+    assert_eq!(held(&store, MODEL, &[7, 8]), BTreeMap::from([(a, 2)]));
+
+    store.resync(a, Some(0), ResyncReason::DataLoss);
+    assert_eq!(store.cursor(a, 0), Some(Default::default()), "from zero");
+    assert_eq!(store.indexed_blocks(a, 0), 0);
+}
+
 /// What a batch that clears leaves owes nothing to what came before it,
 /// wherever the clear stands among its events: below the cursor such a batch
 /// is a restarted publisher's, applied whole, and the stream goes on from
