@@ -4,11 +4,15 @@
 use std::{
     collections::{BTreeSet, HashSet},
     convert::Infallible,
+    error::Error,
+    future::ready,
     io,
+    ops::Range,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Barrier,
+        mpsc, Arc, Barrier,
     },
+    task::Poll,
     thread,
     time::{Duration, Instant},
 };
@@ -19,29 +23,37 @@ use axum::{
     response::Response,
 };
 use bytes::Bytes;
-use futures::FutureExt;
+use futures::{poll, FutureExt};
 use futures_util::{stream, StreamExt};
 use kv_index::compute_request_content_hashes;
-use openai_protocol::worker::WorkerStatus;
+use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use smg_policy_controller::{
     decision::{Decision, Shed, ShedReason, Trace},
     door::Refused,
-    lease::{ReleaseReason, TransportClass},
-    spec::{KeySourceSpec, RoutingKeySpec},
+    spec::{KeySourceSpec, Pairing, RoutingKeySpec},
     store::{
-        BatchOutcome, HealthSink, KvEventSink, LeasesStore, LoadSink, LoadSource, MemoryStore,
-        SessionsStore, WorkerFacts, WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
+        Ask as StoreAsk, BatchOutcome, HealthSink, KvEventSink, LeaseState, LeasesStore, LoadSink,
+        LoadSource, MemoryStore, PairBuffers, PairingDescriptor, SessionsStore, WorkerFacts,
+        WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    view::{fingerprint, Identity, LoadRow},
-    AppliedSpec, DerivedKey, KeySource, PolicySpec,
+    view::{
+        fingerprint, Candidate, Identity, LoadRow, Phase, RequestFacts, Role, WireModes, WorkerId,
+    },
+    AppliedSpec, Catalog, DerivedKey, KeySource, Lease, LeaseId, Lifecycle, Membership, Outcome,
+    Picker, PolicySpec, ReleaseReason, Side, Target, Targets, TieBand, TransportClass,
 };
-use smg_worker::{health::circuit_breaker::CircuitBreakerConfig, identity::basic::WorkerLoadGuard};
+use smg_worker::{
+    health::circuit_breaker::CircuitBreakerConfig,
+    identity::basic::{Worker, WorkerLoadGuard, WorkerType},
+};
 
 use super::{
     elapsed_micros, left_no_worker, mark, profile_of,
     testing::{bed, bed_under, cache_bed, store_blocks, MODEL},
-    transport_class, Ask, End, Hashes, Held, Prompt, Sent, Unplaced, GATEWAY, NO_STAGE,
+    transport_class, Ask, End, Hashes, Held, Host, Placed, Prompt, Sent, Unplaced, GATEWAY,
+    NO_STAGE,
 };
 use crate::{
     config::{ManualAssignmentMode, PolicyConfig, RouterConfig},
@@ -50,8 +62,18 @@ use crate::{
         ADMISSION_QUEUE_TIMEOUT_STATUS,
     },
     observability::{cache_trace, metrics::test_support::render_with_recorder},
-    routers::common::{
-        placement::refusal_reason, retry::is_retryable_response, stream::GuardedStream,
+    routers::{
+        common::{
+            placement::refusal_reason,
+            prefill_admission::{
+                acquire_decided, test_support::select_worker, PrefillAdmission,
+                PrefillAdmissionAttempt, PrefillAdmissionRejection, PrefillCandidateError,
+            },
+            retry::is_retryable_response,
+            snapshot::WorkerRegistry,
+            stream::GuardedStream,
+        },
+        grpc::backend_client::BasicWorkerBuilder,
     },
 };
 
@@ -366,6 +388,8 @@ async fn a_pick_lands_on_the_gateways_worker_of_its_row() {
         .expect("a worker");
     let row = WorkersStore::get(&*store, placed.id()).expect("the target's row");
     assert_eq!(placed.worker().url(), row.facts.key);
+    assert!(placed.decode().is_none());
+    assert_eq!((placed.decode_id(), placed.decode_rank()), (None, None));
 }
 
 fn assert_decisions(rendered: &str, profile: &str, outcome: &str, count: u32) {
@@ -850,6 +874,25 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
             Some("1"),
             None,
         ),
+        (Unplaced::NoRoom, unavailable, shed_code, Some("2")),
+        (
+            Unplaced::Admission(PrefillAdmissionRejection::QueueFull),
+            StatusCode::TOO_MANY_REQUESTS,
+            "pd_prefill_queue_full",
+            None,
+        ),
+        (
+            Unplaced::Admission(PrefillAdmissionRejection::QueueTimeout),
+            StatusCode::TOO_MANY_REQUESTS,
+            "pd_prefill_queue_timeout",
+            None,
+        ),
+        (
+            Unplaced::Admission(PrefillAdmissionRejection::Unavailable),
+            unavailable,
+            "no_available_workers",
+            Some("1"),
+        ),
         (
             shed(ShedReason::FlowLimit),
             ADMISSION_QUEUE_FULL_STATUS,
@@ -880,6 +923,7 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
         ),
     ];
     for (unplaced, status, code, retry_after, message) in rows {
+        assert_eq!(unplaced.is_at_capacity(), unplaced == Unplaced::NoRoom);
         let answer = unplaced.answer(MODEL);
         let hint = answer
             .headers()
@@ -1213,4 +1257,909 @@ async fn a_key_whose_client_left_before_the_send_keeps_no_pin() {
     sent.dispatched(now);
     assert_eq!(SessionsStore::len(&*store), 1);
     sent.completed(ok(), now);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PairCall {
+    Issued(Lease),
+    Dispatched(Side, WorkerId, u32),
+    Completed(Outcome),
+    Released(LeaseId, Side, ReleaseReason),
+}
+
+type PairCalls = Arc<Mutex<Vec<PairCall>>>;
+
+#[derive(Debug)]
+struct Publication {
+    entered: mpsc::Sender<()>,
+    resume: Mutex<mpsc::Receiver<()>>,
+}
+
+#[derive(Clone, Debug)]
+struct PairPicker {
+    name: &'static str,
+    limit: usize,
+    calls: Option<PairCalls>,
+    publication: Option<Arc<Publication>>,
+}
+
+impl PairPicker {
+    fn record(&self, call: PairCall) {
+        if let Some(calls) = &self.calls {
+            calls.lock().push(call);
+        }
+    }
+}
+
+impl Picker for PairPicker {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn pick(
+        &self,
+        _: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        _: &[f32],
+        _: TieBand,
+        out: &mut Targets,
+    ) {
+        let mut kept = kept.to_vec();
+        kept.sort_unstable_by_key(|&i| candidates[i as usize].dp_rank);
+        for i in kept.into_iter().take(self.limit) {
+            let row = &candidates[i as usize];
+            out.push(Target {
+                position: row.position,
+                id: row.id,
+                dp_rank: row.dp_rank,
+                pair: None,
+            });
+        }
+    }
+}
+
+impl Lifecycle for PairPicker {
+    fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
+        self.record(PairCall::Issued(*lease));
+    }
+
+    fn on_dispatched(&self, _: &Lease, target: &Target, side: Side, since: u32) {
+        self.record(PairCall::Dispatched(side, target.id, since));
+    }
+
+    fn on_completed(&self, _: &Lease, outcome: &Outcome) {
+        self.record(PairCall::Completed(*outcome));
+    }
+
+    fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+        self.record(PairCall::Released(lease.id, lease.side, reason));
+    }
+
+    fn on_membership(&self, change: &Membership<'_>) {
+        if let (Membership::Snapshot(_), Some(publication)) = (change, &self.publication) {
+            let _ = publication.entered.send(());
+            let _ = publication.resume.lock().recv();
+        }
+    }
+}
+
+fn pair_spec(
+    mode: Pairing,
+    decode_targets: usize,
+    generation: u64,
+    calls: &PairCalls,
+    publication: Option<Arc<Publication>>,
+) -> Result<AppliedSpec, Box<dyn Error>> {
+    let mut document = PolicySpec::pair_presets("least_load", "least_load")?;
+    document.plans.pd_pair.pairing = mode;
+    document.generation = generation;
+    let mut catalog = Catalog::builtin();
+    let prefill = PairPicker {
+        name: "ordered-prefill",
+        limit: 4,
+        calls: Some(Arc::clone(calls)),
+        publication,
+    };
+    let decode = PairPicker {
+        name: "ordered-decode",
+        limit: decode_targets,
+        calls: None,
+        publication: None,
+    };
+    for (profile, picker) in [("prefill", prefill), ("decode", decode)] {
+        let profile = document
+            .profiles
+            .get_mut(profile)
+            .ok_or("the side's profile is missing")?;
+        profile.filter = vec!["healthy".into(), "not-tried".into()];
+        profile.score.clear();
+        profile.pick = picker.name.into();
+        catalog.picker(picker.name, move || Box::new(picker.clone()))?;
+    }
+    AppliedSpec::validate_in(&document, &catalog, &[]).map_err(Into::into)
+}
+
+struct PairBed {
+    host: Host,
+    store: Arc<MemoryStore>,
+    prefills: Vec<(WorkerId, Arc<dyn Worker>)>,
+    decodes: Vec<(WorkerId, Arc<dyn Worker>)>,
+    calls: PairCalls,
+}
+
+impl PairBed {
+    fn new(
+        mode: Pairing,
+        prefills: u16,
+        decodes: u16,
+        decode_targets: usize,
+    ) -> Result<Self, Box<dyn Error>> {
+        let store = Arc::new(MemoryStore::new());
+        let registry = Arc::new(WorkerRegistry::new());
+        let add = |name,
+                   role,
+                   worker_type,
+                   ranks: Range<u16>,
+                   protocol: Option<&str>|
+         -> Result<Vec<_>, Box<dyn Error>> {
+            ranks
+                .map(|rank| {
+                    let url = format!("http://{name}-{rank}:8000");
+                    let id = store
+                        .upsert(WorkerFacts {
+                            key: url.clone(),
+                            engine: url.clone(),
+                            engine_kind: "runtime".to_owned(),
+                            incarnation: 1,
+                            role,
+                            wire_modes: WireModes::HTTP,
+                            models: vec![MODEL.to_owned()],
+                            dp_rank: rank,
+                            dp_size: rank + 1,
+                            pairing: protocol.map(|protocol: &str| {
+                                Arc::new(PairingDescriptor {
+                                    protocol: Some(protocol.to_owned()),
+                                    ..PairingDescriptor::default()
+                                })
+                            }),
+                            ..WorkerFacts::default()
+                        })
+                        .id();
+                    let row = WorkersStore::get(&*store, id).ok_or("the row is missing")?;
+                    store
+                        .set_status(id, RowStatus::Ready, row.revision)
+                        .ok_or("the row did not become ready")?;
+                    let worker: Arc<dyn Worker> = Arc::new(
+                        BasicWorkerBuilder::new(&url)
+                            .model(ModelCard::new(MODEL))
+                            .worker_type(worker_type)
+                            .status(WorkerStatus::Ready)
+                            .circuit_breaker_config(CircuitBreakerConfig {
+                                failure_threshold: 1,
+                                ..CircuitBreakerConfig::default()
+                            })
+                            .build(),
+                    );
+                    registry
+                        .register(Arc::clone(&worker))
+                        .ok_or("the worker did not register")?;
+                    Ok((id, worker))
+                })
+                .collect()
+        };
+        let protocol = match mode {
+            Pairing::Strict | Pairing::Off => Some("prefill-wire"),
+            Pairing::Lenient => None,
+        };
+        let decode_protocol = match mode {
+            Pairing::Off => Some("decode-wire"),
+            Pairing::Strict | Pairing::Lenient => Some("prefill-wire"),
+        };
+        let prefills = add(
+            "p",
+            Role::Prefill,
+            WorkerType::Prefill,
+            1..1 + prefills,
+            protocol,
+        )?;
+        let decodes = add(
+            "d",
+            Role::Decode,
+            WorkerType::Decode,
+            4..4 + decodes,
+            decode_protocol,
+        )?;
+        let calls = PairCalls::default();
+        store.apply(pair_spec(mode, decode_targets, 1, &calls, None)?)?;
+        store.publish_now();
+        Ok(Self {
+            host: Host::new(Arc::clone(&store), registry),
+            store,
+            prefills,
+            decodes,
+            calls,
+        })
+    }
+
+    async fn commit(&self) -> Result<Placed, Unplaced> {
+        let now = Instant::now();
+        let asked = self.host.ask(&pair_ask(), &[], now).await?;
+        self.host.commit_pair(asked, None, &mut Vec::new(), now)
+    }
+
+    fn issued(&self, side: Side) -> Vec<Lease> {
+        self.calls
+            .lock()
+            .iter()
+            .filter_map(|call| match *call {
+                PairCall::Issued(lease) if lease.side == side => Some(lease),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn counts(&self, ids: &[WorkerId]) -> Option<Vec<u32>> {
+        self.store.with_world(|world| {
+            let ask = StoreAsk {
+                gateway: GATEWAY,
+                now: Instant::now(),
+                pinned: None,
+                affinity: false,
+            };
+            let mut rows = PairBuffers::default();
+            let built = world.build_pair(MODEL, &ask, &mut rows)?;
+            world.count_pair_in_flight(&built, &ask, &mut rows);
+            let pools = rows.pools();
+            ids.iter()
+                .map(|id| {
+                    pools
+                        .prefills
+                        .iter()
+                        .chain(pools.decodes)
+                        .find(|row| row.id == *id)
+                        .map(|row| row.in_flight)
+                })
+                .collect()
+        })
+    }
+}
+
+fn pair_ask() -> Ask<'static> {
+    Ask {
+        phase: Phase::Prefill,
+        prompt_tokens: 37,
+        ..first(b"pair")
+    }
+}
+
+#[tokio::test]
+async fn a_pair_lands_on_a_prefill_and_its_decode_with_the_ranks_its_targets_name() {
+    for mode in [Pairing::Strict, Pairing::Lenient, Pairing::Off] {
+        let bed = PairBed::new(mode, 1, 1, 1).expect("a pair fleet");
+        let (prefill, worker) = &bed.prefills[0];
+        let (decode, decoder) = &bed.decodes[0];
+        let now = Instant::now();
+        let asked = bed.host.ask(&pair_ask(), &[], now).await.expect("a pair");
+        let target = *asked.targets.first().expect("a target");
+        let partner = target.pair.expect("a decode target");
+        let placed = bed
+            .host
+            .commit_pair(asked, None, &mut Vec::new(), now)
+            .expect("a placement");
+        assert_eq!((placed.id(), placed.rank()), (*prefill, target.dp_rank));
+        assert!(Arc::ptr_eq(placed.worker(), worker));
+        assert_eq!(placed.decode_id(), Some(*decode));
+        assert_eq!(placed.decode_rank(), Some(partner.decode_dp_rank));
+        assert_eq!((placed.rank(), placed.decode_rank()), (1, Some(4)));
+        assert!(Arc::ptr_eq(placed.decode().expect("a decode"), decoder));
+        for side in [Side::Prefill, Side::Decode] {
+            assert_eq!(bed.issued(side)[0].tokens, 37);
+        }
+    }
+}
+
+#[test]
+fn an_asks_own_token_count_wins_over_its_hashes_count() {
+    let tokens = Hashes {
+        prompt_tokens: 88,
+        ..Hashes::default()
+    };
+    let ask = Ask {
+        hashes: Some(&tokens),
+        ..pair_ask()
+    };
+    assert_eq!(ask.request(Identity::NONE, &[]).facts.prompt_tokens, 37);
+}
+
+#[tokio::test]
+async fn a_prefill_without_room_is_passed_over_for_the_next_pair_target() {
+    let bed = PairBed::new(Pairing::Lenient, 2, 2, 2).expect("a pair fleet");
+    let (full, prefill) = &bed.prefills[0];
+    bed.decodes[1].1.record_circuit_breaker_outcome(false);
+    let admission = PrefillAdmission::new(1, 0, Duration::ZERO);
+    let _occupied = admission
+        .admit(None, select_worker(prefill))
+        .await
+        .expect("held load");
+    let now = Instant::now();
+    let asked = bed
+        .host
+        .ask(&pair_ask(), &[], now)
+        .await
+        .expect("the first pair");
+    assert_eq!(asked.targets.first().expect("a target").id, *full);
+    let mut missed = vec![WorkerId(0)];
+    let mut asked = Some(asked);
+    let result = admission
+        .admit(None, |room| {
+            let result = bed.host.commit_pair(
+                asked.take().expect("one commit"),
+                Some(room),
+                &mut missed,
+                now,
+            );
+            assert_eq!(result.expect_err("the prefill is full"), Unplaced::NoRoom);
+            PrefillAdmissionAttempt::<()>::AtCapacity
+        })
+        .await;
+    assert!(matches!(result, Err(PrefillAdmissionRejection::QueueFull)));
+    assert_eq!(missed, [WorkerId(0)]);
+    assert_eq!(live(&bed.store, 0), 0);
+    let other = bed
+        .host
+        .ask(&pair_ask(), &[*full], now)
+        .await
+        .expect("the other pair");
+    let mut other = Some(other);
+    let admitted = admission
+        .admit(None, |room| {
+            let placed = bed
+                .host
+                .commit_pair(
+                    other.take().expect("one commit"),
+                    Some(room),
+                    &mut missed,
+                    now,
+                )
+                .expect("the second prefill has room");
+            room.select(Arc::clone(placed.worker()), placed)
+        })
+        .await
+        .expect("the other pair is admitted");
+    let placed = &admitted.selected;
+    assert_eq!(placed.id(), bed.prefills[1].0);
+    assert_eq!(placed.decode_id(), Some(bed.decodes[0].0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pair_that_finds_no_room_queues_and_is_decided_again_at_its_admission() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
+    let admission = PrefillAdmission::new(1, 1, Duration::from_secs(5));
+    let occupied = admission
+        .admit(None, select_worker(&bed.prefills[0].1))
+        .await
+        .expect("held load");
+    let ask = pair_ask();
+    let decided_at = Instant::now();
+    let mut clock = [decided_at, decided_at + Duration::from_millis(1)].into_iter();
+    let attempt = acquire_decided(
+        Some(&admission),
+        None,
+        Placed::worker,
+        || ready(None),
+        || {
+            bed.host
+                .ask(&ask, &[], clock.next().expect("one decision per wake"))
+        },
+        |asked, room| {
+            bed.host
+                .commit_pair(asked, room, &mut Vec::new(), Instant::now())
+        },
+    );
+    tokio::pin!(attempt);
+    assert!(poll!(attempt.as_mut()).is_pending());
+    assert_eq!(admission.queued_requests(), 1);
+    let first = bed.issued(Side::Prefill)[0].id;
+    {
+        let calls = bed.calls.lock();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            calls[2],
+            PairCall::Released(first, Side::Prefill, ReleaseReason::CommitFailed)
+        );
+        assert_eq!(
+            calls[3],
+            PairCall::Released(first, Side::Decode, ReleaseReason::CommitFailed)
+        );
+    }
+    assert_eq!(live(&bed.store, 0), 0);
+    drop(occupied);
+    let Ok((placed, _guard)) = attempt.await else {
+        panic!("a new decision is admitted");
+    };
+    let second = placed.handle.lease().expect("a lease").lease.id;
+    assert_eq!(
+        bed.issued(Side::Prefill)
+            .iter()
+            .map(|lease| lease.id)
+            .collect::<Vec<_>>(),
+        [first, second]
+    );
+    assert_ne!(first, second);
+    assert!(LeasesStore::get(&*bed.store, GATEWAY, first).is_none());
+    let record =
+        LeasesStore::get(&*bed.store, GATEWAY, second).expect("the second decision's lease");
+    assert_eq!(record.issued_at, decided_at + Duration::from_millis(1));
+    assert_eq!(live(&bed.store, 1), 1);
+}
+
+#[tokio::test]
+async fn a_decode_the_gateway_cannot_send_to_is_passed_over_and_named_in_the_next_ask() {
+    for targets in [1, 2] {
+        let bed = PairBed::new(Pairing::Lenient, 1, 2, targets).expect("a pair fleet");
+        if targets == 1 {
+            bed.decodes[0].1.set_status(WorkerStatus::NotReady);
+        } else {
+            bed.decodes[0].1.record_circuit_breaker_outcome(false);
+        }
+        let (placed, _) = bed
+            .host
+            .place_pair(&pair_ask(), None, None)
+            .await
+            .expect("the other decode");
+        assert_eq!(placed.decode_id(), Some(bed.decodes[1].0));
+        let issued: Vec<_> = bed
+            .issued(Side::Decode)
+            .iter()
+            .map(|lease| lease.booked)
+            .collect();
+        if targets == 1 {
+            assert_eq!(issued, [bed.decodes[0].0, bed.decodes[1].0]);
+        } else {
+            assert_eq!(issued, [bed.decodes[0].0]);
+        }
+        assert_eq!(live(&bed.store, 1), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_missing_prefill_and_an_open_decode_breaker_are_both_misses() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 2, 2).expect("a pair fleet");
+    let (prefill, worker) = &bed.prefills[0];
+    let (decode, decoder) = &bed.decodes[0];
+    bed.host
+        .registry
+        .remove_by_url(worker.url())
+        .expect("the prefill leaves the registry");
+    decoder.record_circuit_breaker_outcome(false);
+    let now = Instant::now();
+    let asked = bed
+        .host
+        .ask(&pair_ask(), &[], now)
+        .await
+        .expect("the store still sees the pair");
+    let mut missed = Vec::new();
+    let result = bed.host.commit_pair(asked, None, &mut missed, now);
+    assert_eq!(
+        result.expect_err("no target holds"),
+        Unplaced::NoTargetHolds
+    );
+    assert_eq!(
+        missed.into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([*prefill, *decode])
+    );
+    assert_eq!(live(&bed.store, 0), 0);
+}
+
+#[tokio::test]
+async fn three_passes_with_no_target_end_the_attempt() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 4, 1).expect("a pair fleet");
+    for (_, worker) in &bed.decodes {
+        worker.set_status(WorkerStatus::NotReady);
+    }
+    let result = bed.host.place_pair(&pair_ask(), None, None).await;
+    assert!(matches!(result, Err(Unplaced::NoTargetHolds)));
+    let issued: Vec<_> = bed
+        .issued(Side::Decode)
+        .iter()
+        .map(|lease| lease.booked)
+        .collect();
+    assert_eq!(
+        issued,
+        bed.decodes[..3]
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(live(&bed.store, 0), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_queued_head_whose_decode_cannot_be_sent_to_asks_again_in_its_place() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 2, 1).expect("a pair fleet");
+    let admission = PrefillAdmission::new(1, 2, Duration::from_secs(5));
+    let occupied = admission
+        .admit(None, select_worker(&bed.prefills[0].1))
+        .await
+        .expect("held load");
+    let ask = pair_ask();
+    let head = bed.host.place_pair(&ask, Some(&admission), None);
+    tokio::pin!(head);
+    assert!(poll!(head.as_mut()).is_pending());
+    let behind = bed.host.place_pair(&ask, Some(&admission), None);
+    tokio::pin!(behind);
+    assert!(poll!(behind.as_mut()).is_pending());
+    assert_eq!(admission.queued_requests(), 2);
+
+    // The controller still picks the first decode: its breaker is the
+    // gateway's to know.
+    bed.decodes[0].1.record_circuit_breaker_outcome(false);
+    drop(occupied);
+    assert!(poll!(behind.as_mut()).is_pending());
+    let Poll::Ready(Ok((placed, _guard))) = poll!(head.as_mut()) else {
+        panic!("the head asks again in its place and is admitted");
+    };
+    assert_eq!(placed.decode_id(), Some(bed.decodes[1].0));
+    assert_eq!(admission.queued_requests(), 1);
+    assert!(poll!(behind.as_mut()).is_pending());
+    assert_eq!(live(&bed.store, 1), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_queues_refusals_leave_no_lease_on_file() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
+    let timeout = Duration::from_secs(5);
+    let admission = PrefillAdmission::new(1, 1, timeout);
+    let _occupied = admission
+        .admit(None, select_worker(&bed.prefills[0].1))
+        .await
+        .expect("held load");
+    let ask = pair_ask();
+    let waiting = bed.host.place_pair(&ask, Some(&admission), None);
+    tokio::pin!(waiting);
+    assert!(poll!(waiting.as_mut()).is_pending());
+    assert_eq!(live(&bed.store, 0), 0);
+    let decided = bed.issued(Side::Prefill).len();
+    assert!(matches!(
+        bed.host
+            .place_pair(&pair_ask(), Some(&admission), None)
+            .await,
+        Err(Unplaced::Admission(PrefillAdmissionRejection::QueueFull))
+    ));
+    assert_eq!(admission.queued_requests(), 1);
+    assert_eq!(
+        bed.issued(Side::Prefill).len(),
+        decided,
+        "a live fleet joins without deciding"
+    );
+    assert_eq!(live(&bed.store, 0), 0);
+    tokio::time::advance(timeout).await;
+    assert!(matches!(
+        waiting.await,
+        Err(Unplaced::Admission(PrefillAdmissionRejection::QueueTimeout))
+    ));
+    assert_eq!(admission.queued_requests(), 0);
+    assert_eq!(live(&bed.store, 0), 0);
+}
+
+#[tokio::test]
+async fn each_side_of_a_placed_pair_reports_its_own_dispatch_and_end() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
+    let now = Instant::now();
+    let asked = bed.host.ask(&pair_ask(), &[], now).await.expect("a pair");
+    let mut placed = bed
+        .host
+        .commit_pair(asked, None, &mut Vec::new(), now)
+        .expect("a placement");
+    let (prefill, decode) = (bed.prefills[0].0, bed.decodes[0].0);
+    let lease = placed.handle.lease().expect("a lease").lease.id;
+    bed.calls.lock().clear();
+    placed.dispatched(now + Duration::from_micros(5));
+    placed.decode_dispatched(now + Duration::from_micros(8));
+    let end = End {
+        ttft_micros: 13,
+        tokens_in: 37,
+        tokens_out: 5,
+        duration_micros: 233,
+        ..ok()
+    };
+    placed.completed(end, now);
+    let sides = bed
+        .store
+        .sides(GATEWAY, lease)
+        .expect("decode still holds the lease");
+    assert_eq!(sides.record.state, LeaseState::Completed);
+    assert_eq!(
+        sides.decode.expect("decode still stands").state,
+        LeaseState::Dispatched {
+            at: now + Duration::from_micros(8)
+        }
+    );
+    placed.decode_completed(end, now);
+    placed.completed(end, now);
+    placed.decode_completed(end, now);
+    assert_eq!(live(&bed.store, 0), 0);
+    assert_eq!(
+        *bed.calls.lock(),
+        [
+            PairCall::Dispatched(Side::Prefill, prefill, 5),
+            PairCall::Dispatched(Side::Decode, decode, 8),
+            PairCall::Completed(Outcome {
+                side: Side::Prefill,
+                served: prefill,
+                status: 200,
+                class: TransportClass::Ok,
+                ttft_micros: 13,
+                tokens_in: 37,
+                tokens_out: 5,
+                duration_micros: 233
+            }),
+            PairCall::Completed(Outcome {
+                side: Side::Decode,
+                served: decode,
+                status: 200,
+                class: TransportClass::Ok,
+                ttft_micros: 13,
+                tokens_in: 37,
+                tokens_out: 5,
+                duration_micros: 233
+            }),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn releasing_the_decode_leaves_the_prefill_on_file() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
+    let mut placed = bed.commit().await.expect("a placement");
+    let lease = placed.handle.lease().expect("a lease").lease.id;
+    placed.decode_released(ReleaseReason::ClientGone, Instant::now());
+    let sides = bed.store.sides(GATEWAY, lease).expect("the prefill stands");
+    assert_eq!(sides.record.state, LeaseState::ISSUED);
+    assert_eq!(
+        sides.decode.expect("decode state").state,
+        LeaseState::Released(ReleaseReason::ClientGone)
+    );
+    placed.released(ReleaseReason::ClientGone, Instant::now());
+    assert_eq!(live(&bed.store, 0), 0);
+}
+
+#[tokio::test]
+async fn the_next_decode_of_the_same_prefill_is_taken_before_the_decode_is_sent() {
+    let bed = PairBed::new(Pairing::Lenient, 2, 3, 3).expect("a pair fleet");
+    let mut placed = bed.commit().await.expect("a placement");
+    let prefill = placed.id();
+    let rank = placed.rank();
+    let decodes = [bed.decodes[0].0, bed.decodes[1].0, bed.decodes[2].0];
+    assert_eq!(placed.decode_id(), Some(decodes[0]));
+    let ids = [prefill, decodes[0], decodes[1], decodes[2]];
+    assert_eq!(bed.counts(&ids), Some(vec![1, 1, 0, 0]));
+    assert!(!placed.next_decode(&bed.host), "the prefill must go first");
+    placed.dispatched(Instant::now());
+    bed.decodes[1].1.set_status(WorkerStatus::NotReady);
+    assert!(placed.next_decode(&bed.host));
+    assert_eq!((placed.id(), placed.rank()), (prefill, rank));
+    assert_eq!(
+        (placed.decode_id(), placed.decode_rank()),
+        (Some(decodes[2]), Some(6))
+    );
+    assert!(Arc::ptr_eq(
+        placed.decode().expect("the alternate"),
+        &bed.decodes[2].1
+    ));
+    assert!(
+        !placed.next_decode(&bed.host),
+        "the earlier decodes stay behind"
+    );
+    assert_eq!(bed.counts(&ids), Some(vec![1, 1, 0, 0]));
+    placed.decode_dispatched(Instant::now());
+    assert_eq!(bed.counts(&ids), Some(vec![1, 0, 0, 1]));
+    assert_eq!(live(&bed.store, 1), 1);
+}
+
+#[tokio::test]
+async fn a_pair_without_admission_is_one_ask_and_one_commit() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
+    let prefill = &bed.prefills[0].1;
+    let _occupied = WorkerLoadGuard::with_key(Arc::clone(prefill), None);
+    let (placed, guard) = bed
+        .host
+        .place_pair(&pair_ask(), None, Some("request"))
+        .await
+        .expect("a placement");
+    assert_eq!(bed.issued(Side::Prefill).len(), 1);
+    assert_eq!(live(&bed.store, 1), 1);
+    assert_eq!(
+        (
+            prefill.load(),
+            prefill.routing_key_load(),
+            bed.decodes[0].1.load()
+        ),
+        (2, 1, 0)
+    );
+    assert_eq!(placed.id(), bed.prefills[0].0);
+    drop(guard);
+    assert_eq!((prefill.load(), prefill.routing_key_load()), (1, 0));
+}
+
+#[tokio::test]
+async fn a_commit_under_a_held_publication_returns() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
+    let now = Instant::now();
+    let asked = bed
+        .host
+        .ask(&pair_ask(), &[], now)
+        .await
+        .expect("a decision before publication");
+    thread::scope(|scope| {
+        let (entered, publishing) = mpsc::channel();
+        let (resume, held) = mpsc::channel();
+        let publication = Arc::new(Publication {
+            entered,
+            resume: Mutex::new(held),
+        });
+        let spec = pair_spec(Pairing::Lenient, 1, 2, &bed.calls, Some(publication))
+            .expect("a new generation");
+        let store = &bed.store;
+        let writer = scope.spawn(move || store.apply(spec));
+        let deadline = Duration::from_secs(3);
+        publishing
+            .recv_timeout(deadline)
+            .expect("the writer holds membership");
+        let (returned, result) = mpsc::channel();
+        let host = &bed.host;
+        scope.spawn(move || {
+            let placement = host.commit_pair(asked, None, &mut Vec::new(), now);
+            let _ = returned.send(placement);
+        });
+        let committed = result.recv_timeout(deadline);
+        drop(resume);
+        writer
+            .join()
+            .expect("the publication thread")
+            .expect("the publication finished");
+        assert_eq!(
+            committed
+                .expect("the commit returned while membership was locked")
+                .expect("a placement")
+                .id(),
+            bed.prefills[0].0
+        );
+    });
+}
+
+#[tokio::test]
+async fn a_decision_whose_targets_read_full_asks_again_and_names_them() {
+    let bed = PairBed::new(Pairing::Lenient, 2, 1, 1).expect("a pair fleet");
+    let (first, prefill) = &bed.prefills[0];
+    let admission = PrefillAdmission::new(1, 0, Duration::ZERO);
+    let _occupied = admission
+        .admit(None, select_worker(prefill))
+        .await
+        .expect("held load");
+    let (placed, _guard) = bed
+        .host
+        .place_pair(&pair_ask(), Some(&admission), None)
+        .await
+        .expect("the next decision finds room");
+    let issued: Vec<_> = bed
+        .issued(Side::Prefill)
+        .iter()
+        .map(|lease| lease.booked)
+        .collect();
+    assert_eq!(issued, [*first, bed.prefills[1].0]);
+    assert_eq!(placed.id(), bed.prefills[1].0);
+    assert_eq!(live(&bed.store, 1), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_behind_a_waiter_whose_fleet_is_gone_is_answered_at_once() {
+    for role in [Role::Prefill, Role::Decode] {
+        let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
+        let admission = PrefillAdmission::new(1, 1, Duration::from_secs(5));
+        let prefill = &bed.prefills[0].1;
+        let _occupied = admission
+            .admit(None, select_worker(prefill))
+            .await
+            .expect("held load");
+        let older = admission.admit(None, select_worker(prefill));
+        tokio::pin!(older);
+        assert!(poll!(older.as_mut()).is_pending());
+        let (id, worker) = if role == Role::Prefill {
+            &bed.prefills[0]
+        } else {
+            &bed.decodes[0]
+        };
+        bed.host
+            .registry
+            .remove_by_url(worker.url())
+            .expect("the worker leaves the registry");
+        let row = WorkersStore::get(&*bed.store, *id).expect("the row");
+        bed.store
+            .remove(*id, row.revision)
+            .expect("the row leaves the store");
+        let ask = pair_ask();
+        let request = bed.host.place_pair(&ask, Some(&admission), None);
+        tokio::pin!(request);
+        assert!(matches!(
+            poll!(request.as_mut()),
+            Poll::Ready(Err(Unplaced::Shed {
+                reason: ShedReason::NoEndpoints,
+                ..
+            }))
+        ));
+        assert_eq!(admission.queued_requests(), 1);
+        assert_eq!(live(&bed.store, 0), 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_probe_refuses_a_decode_ask_and_releases_a_pick_before_queuing() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
+    let admission = PrefillAdmission::new(1, 2, Duration::from_secs(5));
+    let prefill = &bed.prefills[0].1;
+    let _occupied = admission
+        .admit(None, select_worker(prefill))
+        .await
+        .expect("held load");
+    let older = admission.admit(None, select_worker(prefill));
+    tokio::pin!(older);
+    assert!(poll!(older.as_mut()).is_pending());
+    bed.decodes[0].1.set_status(WorkerStatus::NotReady);
+
+    let side = Ask {
+        phase: Phase::Decode,
+        ..pair_ask()
+    };
+    let refused = bed.host.place_pair(&side, Some(&admission), None);
+    tokio::pin!(refused);
+    assert!(matches!(
+        poll!(refused.as_mut()),
+        Poll::Ready(Err(Unplaced::Refused(Refused::PairSide)))
+    ));
+    assert_eq!(admission.queued_requests(), 1);
+
+    let ask = pair_ask();
+    let picked = bed.host.place_pair(&ask, Some(&admission), None);
+    tokio::pin!(picked);
+    assert!(poll!(picked.as_mut()).is_pending());
+    assert_eq!(admission.queued_requests(), 2);
+    assert_eq!(live(&bed.store, 0), 0);
+    let first = bed.issued(Side::Prefill)[0].id;
+    assert_eq!(
+        &bed.calls.lock()[2..],
+        [
+            PairCall::Released(first, Side::Prefill, ReleaseReason::CommitFailed),
+            PairCall::Released(first, Side::Decode, ReleaseReason::CommitFailed),
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_decision_that_reads_every_target_full_waits_and_is_admitted_at_a_release() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
+    let prefill = &bed.prefills[0].1;
+    let admission = PrefillAdmission::new(1, 1, Duration::from_secs(5));
+    let occupied = admission
+        .admit(None, select_worker(prefill))
+        .await
+        .expect("held load");
+    assert!(admission.reads_full(prefill));
+    let ask = pair_ask();
+    let request = bed.host.place_pair(&ask, Some(&admission), None);
+    tokio::pin!(request);
+    assert!(poll!(request.as_mut()).is_pending());
+    assert_eq!(admission.queued_requests(), 1);
+    assert_eq!(bed.issued(Side::Prefill).len(), 3);
+    assert_eq!(live(&bed.store, 0), 0);
+    drop(occupied);
+    assert!(!admission.reads_full(prefill));
+    let (placed, _guard) = request
+        .await
+        .expect("the released slot admits the new decision");
+    assert_eq!(placed.id(), bed.prefills[0].0);
+    assert_eq!(bed.issued(Side::Prefill).len(), 4);
+    assert_eq!(admission.queued_requests(), 0);
+    assert_eq!(live(&bed.store, 1), 1);
 }
