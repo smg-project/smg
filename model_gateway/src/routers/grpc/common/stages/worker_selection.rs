@@ -2350,9 +2350,14 @@ impl WorkerSelectionStage {
             return Err(shape.refusal(|| None));
         }
 
+        // Named a fact at a time over the default, as the pair's is.
         let prompt = host::Prompt {
             tokens: inputs.tokens,
+            ..host::Prompt::default()
+        };
+        let prompt = host::Prompt {
             namespace: inputs.cache_namespace,
+            ..prompt
         };
         let hashes = host.hashes(model_id, &prompt);
         let id = host::mark();
