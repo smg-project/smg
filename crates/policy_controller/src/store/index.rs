@@ -610,7 +610,17 @@ impl Predicted {
             .step_by(Self::SLICE)
             .chain(std::iter::once(keys.len()));
         for end in ends {
-            let mut record = self.record.write();
+            // An entry is a prediction: a naming that meets a held record
+            // is left out whole, so its first slice waits for no thread.
+            let mut record = if end > Self::SLICE {
+                self.record.write()
+            } else if let Some(record) = self.record.try_write() {
+                record
+            } else {
+                return;
+            };
+            #[cfg(test)]
+            seam::at(seam::Point::Guarded);
             // A worker may leave between slices. Its removal clears this
             // word before forgetting under the same guard.
             if !allowed.load(Ordering::Relaxed) {
@@ -955,6 +965,9 @@ mod seam {
         Looked,
         /// Ahead of a lookup made again, behind the ids it is kept within.
         Again,
+        /// In a lease's write, not a naming: under the record's guard,
+        /// ahead of the read of the worker's word.
+        Guarded,
     }
 
     type Hook = Box<dyn FnOnce()>;
