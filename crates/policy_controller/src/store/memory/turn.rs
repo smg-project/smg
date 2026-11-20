@@ -247,6 +247,11 @@ mod ring {
         pub(super) fn write(&self, frame: Handed) -> Result<(), Handed> {
             self.0.push(frame)
         }
+
+        /// Whether a frame waits for the next take.
+        pub(super) fn waits(&self) -> bool {
+            !self.0.is_empty()
+        }
     }
 
     /// The ring's reading end. It stands behind the file's turn, so the
@@ -310,6 +315,8 @@ pub(super) struct Behind {
 pub(super) struct File {
     /// The turn: its holder writes the file.
     turn: Mutex<Behind>,
+    /// The next deadline written with the queue under `turn`.
+    next_due: Arc<super::NextDue>,
     /// What a hand reads at each frame.
     shown: Shown,
     /// Who is at work at the file: what a hand reads where no watch
@@ -321,13 +328,18 @@ pub(super) struct File {
     /// The thread that holds the turn; 0 for none.
     #[cfg(debug_assertions)]
     holder: AtomicUsize,
+    /// Takes of this file's turn, for cases that assert a path avoided it.
+    #[cfg(test)]
+    takes: AtomicUsize,
 }
 
 impl File {
     fn new(leases: Leases, name: Option<Decider>) -> Self {
         let (hands, ring) = ring::ends();
+        let next_due = Arc::clone(&leases.next_due);
         Self {
             turn: Mutex::new(Behind { leases, ring }),
+            next_due,
             shown: Shown {
                 hands,
                 watched: AtomicBool::new(false),
@@ -338,12 +350,21 @@ impl File {
             name,
             #[cfg(debug_assertions)]
             holder: AtomicUsize::new(0),
+            #[cfg(test)]
+            takes: AtomicUsize::new(0),
         }
+    }
+
+    /// Whether this file may hold work for a sweep.
+    pub(super) fn sweep_needed(&self, now: std::time::Instant) -> bool {
+        self.next_due.reached(now) || self.shown.hands.waits()
     }
 
     /// Takes the turn and applies nothing: for the term's read, which no
     /// handed frame changes.
     pub(super) fn take(&self) -> Turn<'_> {
+        #[cfg(test)]
+        self.takes.fetch_add(1, SeqCst);
         #[cfg(debug_assertions)]
         assert_ne!(
             self.holder.load(SeqCst),
@@ -364,6 +385,18 @@ impl File {
     #[cfg(test)]
     pub(super) fn free(&self) -> bool {
         self.turn.try_lock().is_some()
+    }
+
+    /// Takes of this file's turn since the test last cleared them.
+    #[cfg(test)]
+    pub(super) fn takes(&self) -> usize {
+        self.takes.load(SeqCst)
+    }
+
+    /// Starts this test's count of turn takes again.
+    #[cfg(test)]
+    pub(super) fn clear_takes(&self) {
+        self.takes.store(0, SeqCst);
     }
 
     /// The turn where it is free, with nothing applied. `None` where a
