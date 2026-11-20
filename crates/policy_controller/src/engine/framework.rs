@@ -432,6 +432,63 @@ pub const DRAW_BOUND: u32 = 8;
 /// and where it ends.
 pub const DRAW_FROM: usize = 16;
 
+/// The smallest pool at which a decision draws first where its host lends a
+/// reader of live rows ([`RequestFacts::live`]), set by run. There a row
+/// asked about is a read of the host's worker, a call and the worker's own
+/// words, where a row that carries its facts is a read of the row beside
+/// the last: the whole pass pays that read a row at any size, and the draw
+/// pays it for the rows it draws alone. The run counts one decision's
+/// instructions under each floor, every row ready: the draw reads fewer
+/// than the whole pass from one row on under `round_robin` (3,147 against
+/// 3,355 at one row, 3,172 against 5,227 at eight) and under `random`, and
+/// from two rows on under a picker that draws two (4,212 against 4,318),
+/// which leaves a pool of one row to the whole pass before it draws. So
+/// every pool that holds a row is drawn from.
+pub const LIVE_DRAW_FROM: usize = 1;
+
+/// [`LIVE_DRAW_FROM`] as the run that sets it turns it: a bench asks the
+/// same decision under each floor in one build.
+#[cfg(feature = "test-util")]
+mod turned {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static LIVE_DRAW_FROM: AtomicUsize = AtomicUsize::new(super::LIVE_DRAW_FROM);
+
+    pub(super) fn live_draw_from() -> usize {
+        LIVE_DRAW_FROM.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn turn(rows: usize) {
+        LIVE_DRAW_FROM.store(rows, Ordering::Relaxed);
+    }
+}
+
+/// Turns the floor a decision over a reader of live rows draws first from,
+/// for every engine of the process: the knob of the run that sets
+/// [`LIVE_DRAW_FROM`], and no test's.
+#[cfg(feature = "test-util")]
+pub fn turn_live_draw_from(rows: usize) {
+    turned::turn(rows);
+}
+
+/// The smallest pool at which this decision draws first: [`DRAW_FROM`] over
+/// rows that carry their facts, and [`LIVE_DRAW_FROM`] where the host lends
+/// a reader of live rows.
+#[inline]
+fn draws_from(facts: &RequestFacts<'_>) -> usize {
+    if facts.live.is_none() {
+        return DRAW_FROM;
+    }
+    #[cfg(feature = "test-util")]
+    {
+        turned::live_draw_from()
+    }
+    #[cfg(not(feature = "test-util"))]
+    {
+        LIVE_DRAW_FROM
+    }
+}
+
 /// The pool size from which a profile whose leading stages are ranks is
 /// decided by rank ([`Scorer::spread`]); a smaller pool is asked whole. Rows
 /// stand in front where four fill the targets and are at most half, so in a
@@ -4750,6 +4807,22 @@ impl Engine {
         })
     }
 
+    /// Whether a decision for `model` in `phase` reads no clock: its profile
+    /// asks its host for nothing ([`Engine::reads_for`]), shows no row to a
+    /// plugin, refuses by no report, and its binding holds no sessions rule.
+    /// Such a decision reads its rows' bits and counts, its pool's rotation
+    /// and its seed, and a host may hand it no instant
+    /// ([`RequestFacts::now_micros`] of `0`). A host that keeps its own
+    /// clock asks once a membership, not once a request.
+    #[must_use]
+    pub fn clock_free(&self, model: &str, phase: Phase) -> bool {
+        let Some((entry, _, _)) = self.resolve(model, phase) else {
+            return true;
+        };
+        let (needs, shown, by_reports) = self.reads_for(model, phase);
+        needs == Needs::default() && !shown && !by_reports && entry.binding.sessions.is_none()
+    }
+
     /// The binding a request resolves to, with its profile for the phase: one
     /// walk of the bindings per decision; `None` when no binding matches or
     /// the binding's plan has no side for the phase.
@@ -4960,7 +5033,7 @@ impl Engine {
             // A draw or the ranks, only over a pool of `DRAW_FROM` rows or
             // more: the ranks' floor is the draw's.
             let ahead = marks.ahead();
-            if ahead != 0 && candidates.len() >= DRAW_FROM {
+            if ahead != 0 && candidates.len() >= draws_from(facts) {
                 // A profile that draws for every request is the draw's at one
                 // compare, the one it paid before the ranks: it holds no rank
                 // mark, so its marks read `DRAWS_FIRST` alone ([`Marks::of`]).
@@ -5157,7 +5230,7 @@ impl Engine {
             }
         }
         let ahead = marks.ahead();
-        if ahead != 0 && candidates.len() >= DRAW_FROM {
+        if ahead != 0 && candidates.len() >= draws_from(facts) {
             if ahead == Marks::DRAWS_FIRST || (facts.named.is_some() && ahead & Marks::JOINED != 0)
             {
                 return Some(run_drawn(self, index, facts, pool, set, cx, buf));

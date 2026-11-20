@@ -28,6 +28,9 @@
 //! - `placement` — policy-driven worker placement over the routing
 //!   pools (single worker and prefill/decode pairs), the one sequence the
 //!   HTTP and gRPC families used to each carry a copy of
+//! - `policy_placement` — that placement decided by the policy engine,
+//!   where the gateway hosts it: the same pools of the same registry, read
+//!   in place
 //! - [`worker_selection`] — per-request worker-selection helpers used
 //!   by every routing path (regular, PD, fallback, external provider)
 //! - `test_support` (test builds only) — the fast retry policy the HTTP
@@ -68,6 +71,7 @@ pub mod pd_admission;
 pub(crate) mod pd_failure;
 pub use smg_external_router::persistence_utils;
 pub(crate) mod placement;
+pub(crate) mod policy_placement;
 pub mod prefill_admission;
 pub(crate) mod rate_limit_cell;
 pub use smg_external_router::realtime;
@@ -225,13 +229,22 @@ pub(crate) fn attach_sized_body(
 pub mod bench_support {
     use std::sync::Arc;
 
-    use smg_worker::identity::basic::Worker;
+    use smg_policy_controller::{
+        document::AppliedSpec, engine::policy_engine::PolicyEngine, stages::Catalog,
+    };
+    use smg_worker::{
+        identity::basic::{Worker, WorkerLoadGuard},
+        load::state::LoadReceiver,
+    };
 
     use super::{
         attempt_ledger::AttemptLedger,
+        overload,
         placement::{select_pair, select_single, PlacementInputs},
     };
+    pub use crate::policy_controller::bench_support::{ControllerPath, Route};
     use crate::{
+        config::RouterConfig,
         observability::cache_trace,
         policies::PolicyRegistry,
         routers::common::{
@@ -239,6 +252,73 @@ pub mod bench_support {
             snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
         },
     };
+
+    /// Hands the classic policies the load feed the monitor would publish.
+    pub fn attach_loads(policies: &PolicyRegistry, loads: Option<LoadReceiver>) {
+        policies.set_load_receiver(loads);
+    }
+
+    /// Sets `policies` the policy engine of the document in force under
+    /// `config`, validated as the gateway's start validates it: from then on
+    /// [`route_classic`] is placed by the engine, over the same registry,
+    /// the same policies and the same workers.
+    ///
+    /// # Errors
+    ///
+    /// A configuration no policy document says, and a document the engine
+    /// refuses, each in its own words.
+    pub fn host_policy_engine(
+        policies: &PolicyRegistry,
+        config: &RouterConfig,
+    ) -> Result<(), String> {
+        let document = config
+            .policy_document_in_force()
+            .map_err(|refused| refused.to_string())?;
+        let spec = AppliedSpec::validate_in(
+            &document,
+            &Catalog::builtin(),
+            &config.denied_view_headers(),
+        )
+        .map_err(|refused| refused.to_string())?;
+        policies.set_policy_engine(Arc::new(PolicyEngine::new(spec)));
+        Ok(())
+    }
+
+    /// One request's routing under the classic policies on `route`: the
+    /// placement over the route's own pool, the dispatch-time read of the
+    /// chosen worker's overload veto, and the worker's load guard from the
+    /// send to the request's end, whose drop tells the model's policy.
+    /// `false` where the request had no worker.
+    pub fn route_classic(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model: &str,
+        route: Route,
+        tokens: Option<&[u32]>,
+    ) -> bool {
+        let pool = match route {
+            Route::Http => RoutingPool::HttpRegular,
+            Route::Grpc => RoutingPool::GrpcPipelineRegular,
+        };
+        let inputs = PlacementInputs {
+            tokens,
+            ..Default::default()
+        };
+        let Some(worker) = select_single(registry, policies, model, pool, None, inputs) else {
+            return false;
+        };
+        let shed = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            model,
+            registry.overload_shed_enabled(),
+        );
+        if shed.is_some() {
+            return false;
+        }
+        let guard = WorkerLoadGuard::with_key(worker, policies.sticky_key(None, None));
+        drop(guard);
+        true
+    }
 
     /// Whether a process switch captures every request's cache trace
     /// (`SMG_CACHE_TRACE=1` or `SMG_CACHE_TRACE_HEADER=1`). A benchmark cell

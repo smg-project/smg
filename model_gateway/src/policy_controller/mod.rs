@@ -69,6 +69,8 @@ pub(crate) mod follower;
 #[path = "follower_absent.rs"]
 pub(crate) mod follower;
 
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) mod bench_support;
 #[cfg_attr(
     not(test),
     expect(

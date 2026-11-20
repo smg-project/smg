@@ -1532,6 +1532,7 @@ mod tests {
             named: None,
             signal_cells: None,
             client_key: 0,
+            live: None,
         };
         let exposure = Exposure {
             tenant: Reveal::Plain,

@@ -37,8 +37,13 @@ provider-gemini = ["smg-external-router/gemini"]
 providers = ["provider-openai", "provider-anthropic", "provider-gemini"]
 # Client-injection seam for this crate's own K8s discovery integration tests
 # (auto-enabled by the self dev-dependency below, never in production builds).
-# It turns on the worker crate's test support, which the gateway's re-exports.
-test-util = ["smg-worker/test-util", "smg-service-discovery/test-util"]
+# It turns on the worker crate's test support, which the gateway's re-exports,
+# and the policy crate's, for the knob the decision-path bench turns.
+test-util = [
+    "smg-worker/test-util",
+    "smg-service-discovery/test-util",
+    "smg-policy-controller/test-util",
+]
 
 vendored-openssl = ["openssl/vendored"]
 
@@ -113,7 +118,7 @@ smg-rl.workspace = true
 # supplies the membership door and the holder of worker objects, and the
 # operator feature the operators' door over the document. The crate's
 # client is two targets': see the end of this file.
-smg-policy-controller = { workspace = true, features = ["operator", "worker-host"] }
+smg-policy-controller = { workspace = true, features = ["in-process", "operator", "worker-host"] }
 smg-grpc-client.workspace = true
 engine-zmq-client.workspace = true
 engine-zmq-adapter.workspace = true
@@ -324,6 +329,14 @@ path = "benches/forced_call_stream.rs"
 name = "symphony_messages_stream"
 harness = false
 path = "benches/symphony_messages_stream.rs"
+
+# One request's routing, the classic policies against the policy controller
+# in this process: a fixed count of decisions a cell, so the same binary
+# counts instructions.
+[[bench]]
+name = "decision_paths"
+harness = false
+path = "benches/decision_paths.rs"
 
 [lints]
 workspace = true

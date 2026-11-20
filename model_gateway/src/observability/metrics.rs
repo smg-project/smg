@@ -41,6 +41,7 @@ mod handles {
         cell::{OnceCell, RefCell},
         collections::HashMap,
         hash::Hash,
+        sync::Arc,
         thread::LocalKey,
     };
 
@@ -165,6 +166,10 @@ mod handles {
         /// Decision counters for the newest generation seen on this thread,
         /// by static labels, then by the bounded set of interned models.
         pub(super) static POLICY_DECISIONS: RefCell<(u64, ByLabels<DecisionLabels, Counter>)> = RefCell::new((0, FxHashMap::default()));
+        /// The decision counter the last counted decision went through, with
+        /// its labels and its model, where `POLICY_DECISIONS` keeps it: a run
+        /// of decisions for one model under one profile hashes no label.
+        pub(super) static LAST_POLICY_DECISION: RefCell<Option<(DecisionLabels, Arc<str>, Counter)>> = const { RefCell::new(None) };
         /// Decision times by mode and outcome.
         pub(super) static POLICY_DECISION_SECONDS: RefCell<FxHashMap<(&'static str, &'static str), Histogram>> = RefCell::new(FxHashMap::default());
         /// `smg_cache_aware_policy_branch_total` by branch.
@@ -205,6 +210,7 @@ mod handles {
         STREAMS.with_borrow_mut(HashMap::clear);
         WORKER_SELECTIONS.with_borrow_mut(HashMap::clear);
         POLICY_DECISIONS.set((0, FxHashMap::default()));
+        LAST_POLICY_DECISION.set(None);
         POLICY_DECISION_SECONDS.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_BRANCHES.with_borrow_mut(HashMap::clear);
         MANUAL_BRANCHES.with_borrow_mut(HashMap::clear);
@@ -338,6 +344,9 @@ pub(crate) const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
 
 const POLICY_DECISIONS_TOTAL: &str = "smg_policy_decisions_total";
 const POLICY_DECISION_SECONDS: &str = "smg_policy_decision_seconds";
+/// The engine in the gateway's own process times one decision in this many
+/// (`smg_policy_decision_seconds`), and counts every one.
+pub const POLICY_DECISIONS_PER_TIMED: u32 = 64;
 const POLICY_SHADOW_DECISIONS_TOTAL: &str = "smg_policy_shadow_decisions_total";
 const POLICY_DECISION_FAULTS_TOTAL: &str = "smg_policy_decision_faults_total";
 
@@ -812,7 +821,10 @@ pub(crate) fn init_metrics() {
     );
     describe_histogram!(
         POLICY_DECISION_SECONDS,
-        "Seconds spent asking the policy controller for one decision, by mode and outcome"
+        "Seconds spent asking the policy controller for one decision, by mode and outcome. \
+         Sampled where the gateway decides over its own worker registry: one decision in 64 is \
+         timed there, so this histogram's count is not the count of decisions \
+         (smg_policy_decisions_total is)"
     );
     describe_counter!(
         POLICY_SHADOW_DECISIONS_TOTAL,
@@ -2326,16 +2338,30 @@ impl Metrics {
         });
     }
 
-    /// Count and time one policy decision for `model_id`. The counter asks
-    /// `profile_name` only when it needs a handle for a profile. A decision
-    /// no profile made counts under an empty `profile` label and keeps its
-    /// handle under no generation. Where a profile's generation is gone, the
-    /// empty label is used and that handle is discarded after counting.
+    /// Count and time one policy decision for `model_id`
+    /// ([`Self::count_policy_decision`], [`Self::time_policy_decision`]).
     pub fn record_policy_decision(
         model_id: &str,
         decision: PolicyDecision,
         profile_name: impl FnOnce() -> Option<Arc<str>>,
         seconds: f64,
+    ) {
+        Self::count_policy_decision(model_id, decision, profile_name);
+        Self::time_policy_decision(decision.mode, decision.outcome, seconds);
+    }
+
+    /// Count one policy decision for `model_id`: every decision, through a
+    /// handle the calling thread keeps. A decision that shares its model and
+    /// labels with the one this thread counted before it uses that
+    /// decision's handle and hashes nothing. The counter asks `profile_name`
+    /// only when it needs a handle for a profile. A decision no profile
+    /// made counts under an empty `profile` label and keeps its handle
+    /// under no generation. Where a profile's generation is gone, the empty
+    /// label is used and that handle is discarded after counting.
+    pub fn count_policy_decision(
+        model_id: &str,
+        decision: PolicyDecision,
+        profile_name: impl FnOnce() -> Option<Arc<str>>,
     ) {
         let PolicyDecision {
             generation,
@@ -2362,15 +2388,36 @@ impl Metrics {
                 outcome,
                 mode,
             };
+            // A run of decisions for one model under one profile counts
+            // through the handle the last of them used: two compares, and
+            // no label hashed.
+            let counted = handles::LAST_POLICY_DECISION.with_borrow(|last| {
+                last.as_ref()
+                    .filter(|(kept, model, _)| *kept == labels && **model == *model_id)
+                    .map(|(_, _, count)| count.increment(1))
+                    .is_some()
+            });
+            if counted {
+                return;
+            }
             handles::POLICY_DECISIONS.with_borrow_mut(|(newest, by_labels)| {
                 if profile.is_some() && generation > *newest {
                     by_labels.clear();
+                    handles::LAST_POLICY_DECISION.set(None);
                     *newest = generation;
                 }
                 let models = (profile.is_none() || generation == *newest)
                     .then(|| by_labels.entry(labels).or_default());
-                if let Some(count) = models.as_ref().and_then(|models| models.get(model_id)) {
+                let kept = models
+                    .as_ref()
+                    .and_then(|models| models.get_key_value(model_id));
+                if let Some((model, count)) = kept {
                     count.increment(1);
+                    handles::LAST_POLICY_DECISION.set(Some((
+                        labels,
+                        Arc::clone(model),
+                        count.clone(),
+                    )));
                     return;
                 }
                 let model = intern_model_label(model_id);
@@ -2383,6 +2430,11 @@ impl Metrics {
                 let count = build(Arc::clone(&model), name);
                 count.increment(1);
                 if let Some(models) = models {
+                    handles::LAST_POLICY_DECISION.set(Some((
+                        labels,
+                        Arc::clone(&model),
+                        count.clone(),
+                    )));
                     models.insert(model, count);
                 }
             });
@@ -2390,6 +2442,13 @@ impl Metrics {
             let name = profile.and_then(|_| profile_name());
             build(intern_model_label(model_id), name).increment(1);
         }
+    }
+
+    /// Record the `seconds` one policy decision took. A caller that times
+    /// every decision records each; the engine in the gateway's own process
+    /// times one decision in [`POLICY_DECISIONS_PER_TIMED`], so there the
+    /// histogram's count is a sample's and the counter's is the decisions'.
+    pub fn time_policy_decision(mode: &'static str, outcome: &'static str, seconds: f64) {
         handles::with_static(
             &handles::POLICY_DECISION_SECONDS,
             (mode, outcome),

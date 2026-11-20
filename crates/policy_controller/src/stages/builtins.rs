@@ -64,8 +64,8 @@ impl Filter for Healthy {
         true
     }
 
-    fn keep(&self, _: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
-        c.health.routable_ignoring_overload() && !cx.masks(c.position)
+    fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
+        OwnBits::keeps(facts.health(c)) && !cx.masks(c.position)
     }
 
     /// The host's mask is asked about once: a pass under no standing veto
@@ -78,7 +78,7 @@ impl Filter for Healthy {
         kept: &mut Vec<u32>,
     ) {
         if !cx.stalled.is_empty() {
-            return retain_masked(candidates, cx, kept);
+            return retain_masked(facts, candidates, cx, kept);
         }
         OwnBits.retain(facts, candidates, cx, kept);
     }
@@ -101,8 +101,18 @@ impl Filter for OwnBits {
         false
     }
 
-    fn keep(&self, _: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
-        c.health.routable_ignoring_overload()
+    fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
+        Self::keeps(facts.health(c))
+    }
+}
+
+impl OwnBits {
+    /// The test of a row's own bits, of bits read already: the filter's
+    /// `keep` and the folded test ([`RowTests::keeps`]) both ask here, so
+    /// the two cannot part.
+    #[inline(always)]
+    const fn keeps(health: crate::engine::Health) -> bool {
+        health.routable_ignoring_overload()
     }
 }
 
@@ -110,8 +120,13 @@ impl Filter for OwnBits {
 /// the host's mask. Out of line, so the pass under no veto stays the short
 /// one.
 #[inline(never)]
-fn retain_masked(candidates: &[Candidate], cx: &Constraints<'_>, kept: &mut Vec<u32>) {
-    kept.retain(|&i| candidates[i as usize].health.routable_ignoring_overload() && !cx.masks(i));
+fn retain_masked(
+    facts: &RequestFacts<'_>,
+    candidates: &[Candidate],
+    cx: &Constraints<'_>,
+    kept: &mut Vec<u32>,
+) {
+    kept.retain(|&i| OwnBits::keeps(facts.health(&candidates[i as usize])) && !cx.masks(i));
 }
 
 /// Not over the overload thresholds, unless the host lifted the veto.
@@ -132,8 +147,17 @@ impl Filter for NotOverloaded {
         true
     }
 
-    fn keep(&self, _: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
-        cx.overload_lifted || !c.health.overloaded
+    fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
+        Self::keeps(facts.health(c), cx)
+    }
+}
+
+impl NotOverloaded {
+    /// The filter's test of bits read already, shared with the folded
+    /// test ([`RowTests::keeps`]).
+    #[inline(always)]
+    const fn keeps(health: crate::engine::Health, cx: &Constraints<'_>) -> bool {
+        cx.overload_lifted || !health.overloaded
     }
 }
 
@@ -848,8 +872,15 @@ impl RowTests {
         cx: &Constraints<'_>,
     ) -> bool {
         let holds = |test: u8| self.0 & test != 0;
-        (!holds(Self::HEALTHY) || OwnBits.keep(facts, c, cx))
-            && (!holds(Self::NOT_OVERLOADED) || NotOverloaded.keep(facts, c, cx))
+        // One read of the row's bits answers both tests of them: beside a
+        // host's reader of live rows a read is a read of its worker.
+        let health = if holds(Self::HEALTHY | Self::NOT_OVERLOADED) {
+            facts.health(c)
+        } else {
+            c.health
+        };
+        (!holds(Self::HEALTHY) || OwnBits::keeps(health))
+            && (!holds(Self::NOT_OVERLOADED) || NotOverloaded::keeps(health, cx))
             && (!holds(Self::HAS_CAPACITY) || HasCapacity.keep(facts, c, cx))
             && (!holds(Self::HAS_ROOM) || HasRoom.keep(facts, c, cx))
             && (!holds(Self::NOT_TRIED) || NotTried.keep(facts, c, cx))

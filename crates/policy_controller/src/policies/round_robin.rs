@@ -250,7 +250,7 @@ impl Picker for RoundRobin {
         kept.push(pick as u32);
         let mut refused = 0;
         for step in 1..rows {
-            if kept.len() == MAX_TARGETS || refused == DRAW_BOUND {
+            if kept.len() == facts.most_targets() || refused == DRAW_BOUND {
                 break;
             }
             let row = (pick + step) % rows;

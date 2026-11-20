@@ -868,6 +868,30 @@ pub struct KeyedRow {
     pub in_flight: u16,
 }
 
+/// One row's live facts, as its host reads them at a decision
+/// ([`LiveRows`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LiveRow {
+    /// The row's health bits now.
+    pub health: Health,
+    /// The row's requests in flight now.
+    pub in_flight: u32,
+}
+
+/// A host's reader of the live facts it keeps beside the rows it lends
+/// ([`RequestFacts::live`]): the health bits and the requests in flight of
+/// the row at a position, read where the host keeps them.
+///
+/// A decision reads one value a row: the reader keeps its first read of a
+/// position for the decision, and every later read returns it. A stage
+/// that reads a row twice, or orders rows by what it read, then reads one
+/// number, as it does of rows that carry their own.
+pub trait LiveRows: std::fmt::Debug + Sync {
+    /// The live facts of the row at `position` in the rows the decision
+    /// is made over.
+    fn read(&self, position: u32) -> LiveRow;
+}
+
 /// One request as a decision sees it. Borrowed from the host for the
 /// duration of the decision.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1012,6 +1036,17 @@ pub struct RequestFacts<'a> {
     /// The wire's request facts carry it to a controller, and a plugin's
     /// frame keeps `0` under every exposure.
     pub client_key: u64,
+    /// The host's reader of the rows' live facts, where the rows carry
+    /// none ([`LiveRows`]): a host that keeps a worker's health and its
+    /// requests in flight on the worker itself writes its rows once a
+    /// membership and lends the reader here, asked by a row's position. A
+    /// reader of a row's health bits or of its count asks
+    /// [`RequestFacts::health`] and [`RequestFacts::in_flight`], and none
+    /// learns which rows it was given. `None` where the rows carry their
+    /// own: the rows a store publishes, and rows a host writes for the
+    /// decision. A profile that shows its rows to a plugin is handed
+    /// written rows and no reader. In-process only.
+    pub live: Option<&'a dyn LiveRows>,
 }
 
 /// The multiplier that spreads a session's model and phase over its key.
@@ -1091,9 +1126,37 @@ impl<'a> RequestFacts<'a> {
     /// later read returns it.
     #[inline]
     pub fn in_flight(&self, row: &Candidate) -> u32 {
+        if let Some(live) = self.live {
+            return live.read(row.position).in_flight;
+        }
         match self.lent_in_flight {
             Some(lent) => lent.at(row.position),
             None => row.in_flight,
+        }
+    }
+
+    /// The health bits of `row`: what the host's reader says of the row's
+    /// position where it lent one ([`RequestFacts::live`]), the row's own
+    /// bits otherwise. Every reader of a row's health asks here.
+    #[inline]
+    pub fn health(&self, row: &Candidate) -> Health {
+        match self.live {
+            Some(live) => live.read(row.position).health,
+            None => row.health,
+        }
+    }
+
+    /// The most targets the decision names. A host that lends a reader of
+    /// live rows takes one worker a decision and asks again for a retry,
+    /// with the workers it tried named ([`RequestFacts::tried`]): no
+    /// alternate is read for it. Every other host takes
+    /// [`MAX_TARGETS`](crate::engine::MAX_TARGETS).
+    #[inline]
+    pub fn most_targets(&self) -> usize {
+        if self.live.is_some() {
+            1
+        } else {
+            crate::engine::MAX_TARGETS
         }
     }
 
@@ -1451,13 +1514,14 @@ mod tests {
 
     /// A request's facts are copied where a decision narrows or resumes
     /// them, so their size is a cost of those decisions: the pin is exact.
-    /// The signal cells are one word, for every signal, and the client's
-    /// key is one word more: a field the facts gain moves this number and
-    /// carries the decision bench's cells that copy the facts
+    /// The signal cells are one word, for every signal, the client's key
+    /// is one word more, and the host's reader of live rows two (a
+    /// reference to a trait object): a field the facts gain moves this
+    /// number and carries the decision bench's cells that copy the facts
     /// (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 296);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 312);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::{
 };
 
 use openai_protocol::{worker::TagVocabulary, UNKNOWN_MODEL_ID};
+use smg_policy_controller::engine::policy_engine::{PolicyEngine, PoolMembers};
 use smg_worker::{
     identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
     load,
@@ -180,6 +181,9 @@ pub struct ModelWorkerSnapshot {
     /// The consistent-hash ring over the URLs of this generation's members
     /// (see [`Self::hash_ring`]).
     hash_ring: OnceLock<Arc<HashRing>>,
+    /// What the policy engine reads of each pool's members (see
+    /// [`Self::pool_members`]).
+    pool_members: [OnceLock<PoolMembers>; RoutingPool::COUNT],
 }
 
 impl ModelWorkerSnapshot {
@@ -192,6 +196,7 @@ impl ModelWorkerSnapshot {
             window_floors: std::array::from_fn(|_| OnceLock::new()),
             labels: OnceLock::new(),
             hash_ring: OnceLock::new(),
+            pool_members: std::array::from_fn(|_| OnceLock::new()),
         }
     }
 
@@ -344,6 +349,31 @@ impl ModelWorkerSnapshot {
                 ))
             })
             .clone()
+    }
+
+    /// What the policy engine reads of `pool`'s members: `engine` reads the
+    /// pool's workers on the first request after the membership change,
+    /// every request after it borrows the kept value, so a decision builds
+    /// nothing of the fleet, whatever its size. The value holds the pool's
+    /// own list ([`Self::pool`]), the one a classic policy is handed, and
+    /// nothing that changes while the membership stands: a worker's health
+    /// and its requests in flight stay on the worker, where a decision
+    /// reads them.
+    ///
+    /// `model_id` is the id the first request spelled. The engine keeps
+    /// what it reads of an id with that spelling and reads a request under
+    /// another by its own, so the first spelling to arrive decides nothing
+    /// for the others (an alias and its canonical id share one snapshot).
+    /// The gateway holds one engine, set once at its start: no other is
+    /// handed the value.
+    pub(crate) fn pool_members(
+        &self,
+        pool: RoutingPool,
+        model_id: &str,
+        engine: &PolicyEngine,
+    ) -> &PoolMembers {
+        self.pool_members[pool.index()]
+            .get_or_init(|| engine.pool_members(model_id, self.pool(pool)))
     }
 
     /// The workers of `pool`, projected once per snapshot and borrowed from

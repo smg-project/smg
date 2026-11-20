@@ -91,6 +91,10 @@ wit! {
     // Host-only: the signal cells stand beside the rows of the host that
     // decides, and no contract carries them yet.
     Option<&crate::load::SignalCells> => "host-only",
+    // Host-only: a guest reads a candidate's health and its requests in
+    // flight as the candidate's own fields, and a host that lends a reader
+    // of live rows hands a guest rows it wrote for the decision.
+    Option<&dyn crate::engine::LiveRows> => "host-only",
     // Host-only: the engines a host lists beside its rows name the rows by
     // position, and a guest is shown rows.
     Engines<'_> => "host-only",
@@ -217,10 +221,10 @@ pub(crate) fn all() -> Vec<Probe> {
             prompt_tokens, block_hashes, hash_kind, session_key, phase, attempt, tried,
             budget_micros, headers, media, seed, block_size, now_micros, pinned_at,
             lent_in_flight, lent_session_in_flight, session_counted, affinity, named,
-            model_fingerprint, signal_cells, client_key,
+            model_fingerprint, signal_cells, client_key, live,
         } host [
             now_micros, pinned_at, lent_in_flight, lent_session_in_flight, session_counted,
-            affinity, named, model_fingerprint, signal_cells, client_key
+            affinity, named, model_fingerprint, signal_cells, client_key, live
         ],
         &request),
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),

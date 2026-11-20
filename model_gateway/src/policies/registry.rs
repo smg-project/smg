@@ -184,6 +184,13 @@ pub struct PolicyRegistry {
     // DP-rank policy: Supports the selection of dp-rank outside the engine.
     dp_rank_policy: Arc<OnceLock<Arc<dyn DPRankLoadPolicy>>>,
 
+    /// The policy engine that places requests in the policies' stead, over
+    /// the same registry and the same workers (set once at startup,
+    /// lock-free reads via OnceLock). Empty unless the `policy_controller`
+    /// setting is on with no controller address: the placement asks it
+    /// where it stands, and the policies above where it does not.
+    policy_engine: Arc<OnceLock<Arc<smg_policy_controller::engine::policy_engine::PolicyEngine>>>,
+
     /// Shared sticky selector for the routing-key override. `Some` when the
     /// override is enabled; consulted (instead of the configured policy) for keyed
     /// requests via [`PolicyRegistry::select_worker_for_model`].
@@ -274,6 +281,7 @@ impl PolicyRegistry {
             load_rx: Arc::new(RwLock::new(None)),
             mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
+            policy_engine: Arc::new(OnceLock::new()),
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
@@ -941,6 +949,26 @@ impl PolicyRegistry {
 
     pub fn get_dp_rank_policy(&self) -> Option<Arc<dyn DPRankLoadPolicy>> {
         self.dp_rank_policy.get().map(Arc::clone)
+    }
+
+    /// Hand the placement `engine`, the policy engine that decides in this
+    /// registry's stead from then on (set once at startup). Nothing else
+    /// of the registry changes: its policies stay built, and the workers'
+    /// completions still reach them.
+    pub fn set_policy_engine(
+        &self,
+        engine: Arc<smg_policy_controller::engine::policy_engine::PolicyEngine>,
+    ) {
+        debug!("set policy engine");
+        let _ = self.policy_engine.set(engine);
+    }
+
+    /// The policy engine that places requests, where one was set
+    /// ([`Self::set_policy_engine`]): one read, no count taken.
+    pub(crate) fn policy_engine(
+        &self,
+    ) -> Option<&smg_policy_controller::engine::policy_engine::PolicyEngine> {
+        self.policy_engine.get().map(|engine| &**engine)
     }
 
     /// Set the decode policy for PD mode (set once at startup).

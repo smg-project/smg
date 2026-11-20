@@ -1626,6 +1626,41 @@ fn policy_decisions_read_the_profile_again_after_a_miss() {
     }
 }
 
+/// A run of decisions for one model under one profile counts through the
+/// handle the last of them used, every one counted. That handle is one the
+/// thread keeps for the newest generation: it falls with its generation, and
+/// a late decision of an older generation does not take its place.
+#[test]
+fn a_run_of_policy_decisions_counts_through_the_last_handle() {
+    let rendered = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(true));
+        let last = || {
+            handles::LAST_POLICY_DECISION.with_borrow(|last| {
+                last.as_ref()
+                    .map(|(labels, model, _)| (labels.generation, model.to_string()))
+            })
+        };
+        assert_eq!(last(), None);
+        for model in ["m1", "m1", "m1", "m2", "m1"] {
+            Metrics::count_policy_decision(model, decision(1, "pick"), || Some("old".into()));
+        }
+        assert_eq!(last(), Some((1, "m1".to_owned())));
+        Metrics::count_policy_decision("m1", decision(2, "pick"), || Some("new".into()));
+        Metrics::count_policy_decision("m1", decision(1, "pick"), || Some("old".into()));
+        assert_eq!(last(), Some((2, "m1".to_owned())));
+        Metrics::count_policy_decision("m1", decision(2, "pick"), || Some("new".into()));
+        handles::reset();
+        assert_eq!(last(), None);
+    });
+    for line in [
+        "smg_policy_decisions_total{model=\"m1\",profile=\"old\",outcome=\"pick\",mode=\"embedded\"} 5",
+        "smg_policy_decisions_total{model=\"m2\",profile=\"old\",outcome=\"pick\",mode=\"embedded\"} 1",
+        "smg_policy_decisions_total{model=\"m1\",profile=\"new\",outcome=\"pick\",mode=\"embedded\"} 2",
+    ] {
+        assert!(rendered.lines().any(|sample| sample == line), "{line}\n{rendered}");
+    }
+}
+
 /// The cost of the chat path's per-request records with and without the
 /// kept handles, for the Numbers table; run with `--ignored --nocapture`.
 #[test]

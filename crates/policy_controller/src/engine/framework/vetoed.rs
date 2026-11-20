@@ -370,9 +370,9 @@ pub(super) fn emptied(
     // harder veto refuses too gains nobody when it is lifted. Nor does a
     // row a hold of the host stands on, whichever doubt it carries: it
     // stays masked, and both tests pass it by.
-    let own = candidates
-        .iter()
-        .any(|row| doubted_alone(row.health) && cx.held.binary_search(&row.position).is_err());
+    let own = candidates.iter().any(|row| {
+        doubted_alone(facts.health(row)) && cx.held.binary_search(&row.position).is_err()
+    });
     // The two lengths answer for the rows only where every held row is a
     // row of the mask, named once: the store's view keeps that, and a host
     // that fills the constraints by hand owes it.
@@ -380,7 +380,7 @@ pub(super) fn emptied(
         cx.held.iter().all(|held| cx.stalled.contains(held)),
         "a held row is no row of the mask"
     );
-    let masked = cx.stalled.len() > cx.held.len() && mask_doubts(candidates, cx);
+    let masked = cx.stalled.len() > cx.held.len() && mask_doubts(facts, candidates, cx);
     if (own || masked) && veto_ran(profile, Healthy.name(), ended) {
         return doubted(emptied_by, own, profile, facts, cx, buf, set);
     }
@@ -455,12 +455,18 @@ fn doubted(
     };
     let stage = if own {
         let mut rows = std::mem::take(&mut buf.undoubted);
-        undoubted(set.candidates, &mut rows);
+        undoubted(facts, set.candidates, &mut rows);
         let lifted = Set {
             candidates: &rows,
             ..set.shedding()
         };
-        let stage = filter(profile, &whole, &pass, buf, lifted);
+        // The rows written for this pass carry their own bits and counts:
+        // a host's reader of live rows is not asked about them.
+        let written = RequestFacts {
+            live: None,
+            ..whole
+        };
+        let stage = filter(profile, &written, &pass, buf, lifted);
         buf.undoubted = rows;
         stage
     } else {
@@ -486,14 +492,24 @@ fn doubted(
 /// rows a hold stands on. A stage that answers from its own scope answers
 /// as it did: the scope was opened over the decision's rows. One pool of
 /// rows a scratch, sized at the first pass that needs it.
-fn undoubted(candidates: &[Candidate], rows: &mut Vec<Candidate>) {
+fn undoubted(facts: &RequestFacts<'_>, candidates: &[Candidate], rows: &mut Vec<Candidate>) {
     rows.clear();
-    rows.extend(candidates.iter().map(|row| Candidate {
-        health: Health {
-            stalled: row.health.stalled && row.health.breaker_open,
-            ..row.health
-        },
-        ..*row
+    rows.extend(candidates.iter().map(|row| {
+        let health = facts.health(row);
+        Candidate {
+            health: Health {
+                stalled: health.stalled && health.breaker_open,
+                ..health
+            },
+            // Beside a host's reader of live rows the row written here
+            // carries the count the reader said, as it carries the bits.
+            in_flight: if facts.live.is_some() {
+                facts.in_flight(row)
+            } else {
+                row.in_flight
+            },
+            ..*row
+        }
     }));
 }
 
@@ -514,12 +530,12 @@ const fn doubted_alone(health: Health) -> bool {
 /// stands on whose own bits refuse nothing. Both lists are in order, so a
 /// held row is found by a search. Asked only of a pool the rule was put
 /// to, and only where the mask is longer than the held list.
-fn mask_doubts(candidates: &[Candidate], cx: &Constraints<'_>) -> bool {
+fn mask_doubts(facts: &RequestFacts<'_>, candidates: &[Candidate], cx: &Constraints<'_>) -> bool {
     cx.stalled.iter().any(|&at| {
         cx.held.binary_search(&at).is_err()
             && candidates
                 .get(at as usize)
-                .is_some_and(|row| row.health.routable_ignoring_overload())
+                .is_some_and(|row| facts.health(row).routable_ignoring_overload())
     })
 }
 

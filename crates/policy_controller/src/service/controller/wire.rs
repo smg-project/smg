@@ -432,6 +432,8 @@ impl Checked {
                 // the rows of the host that decides, whose view hands them.
                 signal_cells: view.signal_cells,
                 client_key: facts.client_key,
+                // The controller's rows carry their own health and counts.
+                live: None,
             },
             Constraints {
                 excluded: &lists.excluded,

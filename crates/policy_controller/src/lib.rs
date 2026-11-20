@@ -123,6 +123,10 @@
 //!   follows its own store, on a leader and on a standby alike, and hands
 //!   each object a gRPC connector: an object connects to its engine at its
 //!   first use.
+//! - Behind the `in-process` feature, the engine in a gateway's own process
+//!   (`engine::policy_engine`): `PolicyEngine` decides over the gateway's
+//!   own worker objects, read in place. It keeps no worker list, no health
+//!   and no count of requests in flight, and names nothing of the store.
 //! - Behind the `discovery` feature, worker discovery under the controller:
 //!   the binary takes the discovery flags, and the replica that leads runs
 //!   the selected provider over the replica's worker objects. A pass asks

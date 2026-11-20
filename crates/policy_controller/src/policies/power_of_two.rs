@@ -73,7 +73,10 @@ impl PolicySpec {
 /// uniform draws over the rows the whole pass keeps, each drawn again while
 /// its row is refused. `false` once [`DRAW_BOUND`] rows were refused before
 /// both were held, a pool with one row kept among them: the whole pass
-/// decides.
+/// decides. A pool of one row holds no second: it is left to the whole pass
+/// before a value is drawn or a row asked about. Only a host that lends a
+/// reader of live rows draws over a pool that small
+/// ([`LIVE_DRAW_FROM`](crate::engine::LIVE_DRAW_FROM)).
 ///
 /// [`DRAW_BOUND`]: crate::engine::framework::DRAW_BOUND
 fn draw_two_kept(
@@ -82,6 +85,9 @@ fn draw_two_kept(
     keep: &mut dyn FnMut(&Candidate) -> bool,
     kept: &mut Vec<u32>,
 ) -> bool {
+    if candidates.len() < 2 {
+        return false;
+    }
     let mut refused = 0;
     let Some(first) = draw_kept(draw, candidates, None, keep, &mut refused) else {
         return false;

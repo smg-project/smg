@@ -219,13 +219,21 @@ worker-host = [
 # objects. Off by default.
 discovery = ["controller", "worker-host", "dep:smg-service-discovery"]
 
+# The engine in a gateway's own process: one front over the gateway's worker
+# objects, which reads a worker's health and its requests in flight where the
+# worker crate keeps them. It names nothing of the store. Off by default: it
+# brings the worker crate's runtime.
+in-process = ["dep:smg-worker", "smg-worker/runtime"]
+
 default = ["wasm"]
 # The WebAssembly plugin host over the committed `smg:policy` worlds.
 wasm = ["dep:wasmtime", "dep:thread_local", "dep:tracing", "dep:rustix"]
 # A case's hold of the gRPC plugin runtime's I/O thread, the stand-in for a
-# host that takes the thread's core. The package's own tests and benches
-# turn it on through the dev-dependency on the package itself; no build of
-# a product has it.
+# host that takes the thread's core, and the knob of the run that sets the
+# pool size a decision over live rows draws first from. The package's own
+# tests and benches turn it on through the dev-dependency on the package
+# itself, and the gateway's benches through its own `test-util`; no build
+# of a product has it.
 test-util = ["smg-worker?/test-util"]
 
 [dev-dependencies]
@@ -239,6 +247,8 @@ test-util = ["smg-worker?/test-util"]
 smg-policy-controller-test-util = { package = "smg-policy-controller", path = ".", default-features = false, features = ["test-util"] }
 # The discovery cases record the jobs a provider submits.
 smg-service-discovery = { workspace = true, features = ["test-util"] }
+# The in-process engine's cases set a worker's status.
+openai-protocol = { workspace = true }
 criterion = "0.8"
 # The Kubernetes elector's tests run its client against a service in the
 # test's process that plays one Lease, and its three-process cell against
