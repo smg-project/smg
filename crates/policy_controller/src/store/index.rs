@@ -39,6 +39,15 @@
 //! known whole. Two cases alone make the lookup again: a row it kept had
 //! its id taken since, or its cap is full of holders the pass refuses.
 //!
+//! A model's index keeps each row's view of its cache groups other than
+//! main attention beside the chain, where a row's host wrote one through
+//! its lent lane. The chain holds the main group's blocks alone, so a row
+//! with a view is named at what its groups can serve of the depth the
+//! chain scored, by the index crate's one rule for every host
+//! (`Index::served_into`). A group's window is counted in the model's
+//! block size of record, and in the generation's where it has none. A
+//! model none of whose rows holds a view pays one load for all of it.
+//!
 //! A pool whose profile reads sent prefixes holds its model's record of
 //! sends. The record speaks for a row until the row's lane is heard: a row
 //! with no lane, and a row whose lane applied no event yet, since a
@@ -70,10 +79,10 @@ use std::{
     },
 };
 
+use kv_index::{request_prefix_hashes_of, ChainIndex, GroupViews};
 pub use kv_index::{
     ApplyError, ChainBlockMap, ContentHash, SequenceHash, StoredBlock, WorkerGroups,
 };
-use kv_index::{ChainIndex, GroupViews};
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use rustc_hash::FxHashMap;
 
@@ -485,6 +494,35 @@ fn below(draw: &mut Draw, under: u32) -> u32 {
     ((u128::from(draw.next_u64()) * u128::from(under)) >> 64) as u32
 }
 
+/// Keeps the deepest `cap` of `kept`, a list of holders in any order, as
+/// the index's bounded lookup keeps them: every holder of a depth that
+/// fits whole, from the deepest down, and of the depth the cap cuts as
+/// many as fit, each as likely as another by `draw`. For holders whose
+/// depths moved behind their lookup ([`Index::served_into`]): the bounded
+/// lookup cuts as it walks, by the depths the chain holds.
+fn deepest_of(kept: &mut Vec<(u32, u32)>, cap: usize, draw: &mut Draw) {
+    if kept.len() <= cap {
+        return;
+    }
+    kept.sort_unstable_by_key(|&(_, blocks)| std::cmp::Reverse(blocks));
+    let Some(&(_, cut)) = cap.checked_sub(1).and_then(|last| kept.get(last)) else {
+        kept.clear();
+        return;
+    };
+    // The holders at the depth the cap cuts stand in one run. Where the
+    // run ends past the cap, each place of the cap inside it takes one of
+    // the run's holders not yet placed, by the draw. A run that fits whole
+    // reads no value of it.
+    let first = kept.partition_point(|&(_, blocks)| blocks > cut);
+    let end = kept.partition_point(|&(_, blocks)| blocks >= cut);
+    if end > cap {
+        for at in first..cap {
+            kept.swap(at, at + below(draw, (end - at) as u32) as usize);
+        }
+    }
+    kept.truncate(cap);
+}
+
 /// The rows a naming wrote in the affinity column's place
 /// ([`World::name`](crate::store::World::name)), with the naming's own
 /// buffers: a host keeps it across decisions beside its view.
@@ -820,7 +858,7 @@ impl Tables {
     #[inline(never)]
     fn look_again(
         &self,
-        naming: &Naming<'_>,
+        (naming, block_size): (&Naming<'_>, u32),
         within: &[u64],
         cap: usize,
         whole_at: u64,
@@ -830,7 +868,7 @@ impl Tables {
             return;
         };
         if kept.iter().any(|&(id, _)| index.taken_since(id, whole_at)) {
-            Self::again(index, naming, within, cap, whole_at, kept);
+            Self::again(index, (naming, block_size), within, cap, whole_at, kept);
         }
     }
 
@@ -844,7 +882,7 @@ impl Tables {
     #[inline(never)]
     fn again(
         index: &Index,
-        naming: &Naming<'_>,
+        (naming, block_size): (&Naming<'_>, u32),
         within: &[u64],
         cap: usize,
         whole_at: u64,
@@ -859,7 +897,7 @@ impl Tables {
             let own = index.own(&within[..words], whole_at);
             #[cfg(test)]
             seam::at(seam::Point::Again);
-            index.deepest_again(naming, &own[..words], cap, seed, kept);
+            index.deepest_again((naming, block_size), &own[..words], cap, seed, kept);
             // As in the naming: the read before the fence, the asks after.
             fence(Ordering::Acquire);
             if !kept.iter().any(|&(id, _)| index.taken_since(id, whole_at)) {
@@ -891,7 +929,7 @@ impl Tables {
     #[inline(never)]
     fn passing(
         &self,
-        naming: &Naming<'_>,
+        (naming, block_size): (&Naming<'_>, u32),
         within: &[u64],
         room: usize,
         passes: &dyn Fn(u32) -> bool,
@@ -921,10 +959,10 @@ impl Tables {
             // As in the naming: the count the tables are whole at before
             // the lookup, the lookup before the fence, the asks after.
             let whole_at = self.taken.load(Ordering::Acquire);
-            index.deepest_again(naming, &mask[..words], room, seed, kept);
+            index.deepest_again((naming, block_size), &mask[..words], room, seed, kept);
             fence(Ordering::Acquire);
             if index.taken() != whole_at {
-                self.look_again(naming, &mask[..words], room, whole_at, kept);
+                self.look_again((naming, block_size), &mask[..words], room, whole_at, kept);
             }
             if kept.is_empty() || kept.iter().any(|&(id, _)| passes(id)) {
                 break;
@@ -1183,10 +1221,10 @@ impl PoolIndex {
         pool: (u32, &[Candidate]),
         locals: &[(u32, GatewayId)],
         view: &[Candidate],
-        hash_kind: HashKind,
+        counted: (HashKind, u32),
         named: &mut Named,
     ) {
-        self.name_in::<false>(naming, pool, locals, view, hash_kind, named);
+        self.name_in::<false>(naming, pool, locals, view, counted, named);
     }
 
     /// [`Self::name`] for a view its caller cut by more than its gateway's
@@ -1200,22 +1238,25 @@ impl PoolIndex {
         pool: (u32, &[Candidate]),
         locals: &[(u32, GatewayId)],
         view: &[Candidate],
-        hash_kind: HashKind,
+        counted: (HashKind, u32),
         named: &mut Named,
     ) {
-        self.name_in::<true>(naming, pool, locals, view, hash_kind, named);
+        self.name_in::<true>(naming, pool, locals, view, counted, named);
     }
 
     /// The one naming, built once for each of its two callers. `CUT` says
     /// which rows the holders' lookup is kept within, and a build a
-    /// caller keeps each caller's lookup in a frame of its own.
+    /// caller keeps each caller's lookup in a frame of its own. The pair
+    /// after the view says how the request's blocks are counted: their
+    /// kind, and the block size of the world's generation
+    /// ([`Index::served_into`]).
     fn name_in<const CUT: bool>(
         &self,
         naming: &Naming<'_>,
         (pool_at, pool): (u32, &[Candidate]),
         locals: &[(u32, GatewayId)],
         view: &[Candidate],
-        hash_kind: HashKind,
+        (hash_kind, block_size): (HashKind, u32),
         named: &mut Named,
     ) {
         named.thin = self.ruled.thin;
@@ -1310,22 +1351,29 @@ impl PoolIndex {
             };
             // The naming's own lookup, in its own frame: one instantiation
             // with a second caller goes out of line for every decision
-            // ([`Index::deepest_again`]).
-            index.chain.deepest_into(
-                naming.block_hashes,
-                |hash| *hash,
-                within,
-                room,
-                |under| below(&mut draw, under),
-                &mut named.kept,
-            );
+            // ([`Index::deepest_again`]). A model one of whose rows holds a
+            // view of its cache groups is read at what the groups serve.
+            if index.groups.is_empty() {
+                index.chain.deepest_into(
+                    naming.block_hashes,
+                    |hash| *hash,
+                    within,
+                    room,
+                    |under| below(&mut draw, under),
+                    &mut named.kept,
+                );
+            } else {
+                let hashes = (naming.block_hashes, block_size);
+                index.served_into(hashes, within, room, &mut draw, &mut named.kept);
+            }
             #[cfg(test)]
             seam::at(seam::Point::Looked);
             // Every read of the lookup stands before this fence, and the
             // question of what was taken since after it ([`Index`]).
             fence(Ordering::Acquire);
             if index.taken() != whole_at {
-                tables.look_again(naming, within, room, whole_at, &mut named.kept);
+                let asked = (naming, block_size);
+                tables.look_again(asked, within, room, whole_at, &mut named.kept);
             }
             for &(id, blocks) in &named.kept {
                 let row = tables.row_of.get(id as usize).copied().unwrap_or(NONE);
@@ -1408,7 +1456,7 @@ impl PoolIndex {
     #[inline(never)]
     pub(super) fn name_again(
         &self,
-        naming: &Naming<'_>,
+        (naming, block_size): (&Naming<'_>, u32),
         pool: &[Candidate],
         view: &[Candidate],
         keeps: &dyn Fn(&Candidate) -> bool,
@@ -1457,7 +1505,7 @@ impl PoolIndex {
         } else {
             tables.within_view(pool, view, &mut mask)
         };
-        if !tables.passing(naming, within, room, &passes, named) {
+        if !tables.passing((naming, block_size), within, room, &passes, named) {
             return;
         }
         named.holders.retain(recorded);
@@ -1619,7 +1667,17 @@ struct Index {
     chain: ChainIndex,
     /// Each row's view of its cache groups other than main attention,
     /// under the row's id: written by a lent body ([`LaneWriter::groups`]).
+    /// A naming reads a holder at what its groups can serve
+    /// ([`Self::served_into`]).
     groups: GroupViews,
+    /// The model's block size of record: the store's one cell of it
+    /// (`Table::block_sizes`, read by [`of_record`]), which the two
+    /// routines of the record write under the table's lock
+    /// ([`KvTables::set_block_size`], [`KvTables::forget_block_size`]). A
+    /// naming reads it here with no lock, for the size a group's window is
+    /// counted in: a size of the instant it was read at, which orders
+    /// nothing against the views.
+    block_size: Arc<AtomicU64>,
     /// Index id -> the count its last take made; 0 for an id never taken.
     took: [AtomicU64; INDEX_WORKERS],
     /// How many times a row took an id ([`Self::take`]).
@@ -1643,10 +1701,11 @@ struct Index {
 }
 
 impl Index {
-    fn new() -> Self {
+    fn new(block_size: Arc<AtomicU64>) -> Self {
         Self {
             chain: ChainIndex::with_max_workers(INDEX_WORKERS),
             groups: GroupViews::new(),
+            block_size,
             took: std::array::from_fn(|_| AtomicU64::new(0)),
             taken: AtomicU64::new(0),
             heard: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -1728,21 +1787,84 @@ impl Index {
     /// decision would pay a call for the lookup it makes once.
     fn deepest_again(
         &self,
-        naming: &Naming<'_>,
+        (naming, block_size): (&Naming<'_>, u32),
         within: &[u64],
         cap: usize,
         seed: u64,
         kept: &mut Vec<(u32, u32)>,
     ) {
         let mut draw = Draw::new(seed);
-        self.chain.deepest_into(
-            naming.block_hashes,
+        if self.groups.is_empty() {
+            self.chain.deepest_into(
+                naming.block_hashes,
+                |hash| *hash,
+                within,
+                cap,
+                |under| below(&mut draw, under),
+                kept,
+            );
+        } else {
+            let hashes = (naming.block_hashes, block_size);
+            self.served_into(hashes, within, cap, &mut draw, kept);
+        }
+    }
+
+    /// The lookup of a model one of whose rows holds a view of its cache
+    /// groups: the request's deepest holders within `within` under `cap`,
+    /// into `kept` by index id, each at what its groups can serve.
+    ///
+    /// The chain holds the main group's blocks alone, so the depth it
+    /// scores is the most a row can reuse. A row with a view reuses what
+    /// its other groups can serve of that depth, by the engine's own rule,
+    /// which the index crate keeps for every host
+    /// ([`GroupViews::cap_holders`]). The rule can leave a row the chain
+    /// scored deepest behind one it scored shallower, so no depth is cut
+    /// before it: every holder within `within` is scored, the rule shrinks
+    /// each row that has a view and drops one it leaves nothing, and the
+    /// cap then keeps the deepest of what stands ([`deepest_of`]). A
+    /// group's window is counted in the model's block size of record, and
+    /// in `block_size` where the model has none: the block size of the
+    /// decision's generation, as the world that names hands it, which is
+    /// the size such a request was hashed by.
+    ///
+    /// Out of line, and behind one load of the views' count: a model none
+    /// of whose rows holds a view keeps the bounded lookup, and pays that
+    /// load. The reads here stand before the caller's fence, as the bounded
+    /// lookup's do, and the question of an id taken since runs behind it
+    /// unchanged.
+    #[inline(never)]
+    fn served_into(
+        &self,
+        (hashes, block_size): (&[u64], u32),
+        within: &[u64],
+        cap: usize,
+        draw: &mut Draw,
+        kept: &mut Vec<(u32, u32)>,
+    ) {
+        kept.clear();
+        if cap == 0 {
+            return;
+        }
+        self.chain.score_into(
+            hashes,
             |hash| *hash,
-            within,
-            cap,
-            |under| below(&mut draw, under),
-            kept,
+            false,
+            |id, blocks| {
+                let (word, bit) = ((id / 64) as usize, 1u64 << (id % 64));
+                if within.get(word).is_some_and(|ids| ids & bit != 0) {
+                    kept.push((id, blocks));
+                }
+            },
         );
+        let stands = of_record(self.block_size.load(Ordering::Relaxed));
+        let block_size = stands.unwrap_or(block_size);
+        self.groups.cap_holders(
+            || request_prefix_hashes_of(hashes, |hash| *hash),
+            block_size as usize,
+            kept,
+            |_| {},
+        );
+        deepest_of(kept, cap, draw);
     }
 
     /// Whether `id` was taken since the count `whole_at`. A reader asks
@@ -1774,6 +1896,14 @@ impl Index {
     }
 }
 
+/// A model's block size of record, in tokens, as its cell holds it: none
+/// for a cell of 0, else one less than the cell. A size of zero is of
+/// record too, and a request of such a model states no hash.
+fn of_record(cell: u64) -> Option<u32> {
+    let size = cell.checked_sub(1)?;
+    u32::try_from(size).ok()
+}
+
 /// One model's index, and how many lanes write it.
 struct ModelIndex {
     index: Arc<Index>,
@@ -1788,7 +1918,10 @@ struct Table {
     predicted: FxHashMap<Box<str>, Weak<Predicted>>,
     /// The same word in every pool that can record for this worker.
     allowed: FxHashMap<WorkerId, Weak<AtomicBool>>,
-    block_sizes: HashMap<String, u32>,
+    /// Each model's block size of record, one cell a model
+    /// ([`of_record`]), which the model's index reads too ([`Index`]). A
+    /// model that forgets its size keeps its cell.
+    block_sizes: HashMap<String, Arc<AtomicU64>>,
     /// How many times a lane was made or retired, a model's block size of
     /// record moved, or a worker's word to record was cleared: a pool's
     /// place in an index moves with one of the first two, its record's
@@ -1905,11 +2038,12 @@ impl KvTables {
         let model = model?;
         let mut table = self.table.lock();
         table.moves += 1;
+        let size = Arc::clone(table.block_sizes.entry(model.clone()).or_default());
         let held = table
             .indexes
             .entry(model.as_str().into())
             .or_insert_with(|| ModelIndex {
-                index: Arc::new(Index::new()),
+                index: Arc::new(Index::new(size)),
                 lanes: 0,
             });
         // An index at its ceiling: the row holds no lane, and stands in the
@@ -2252,14 +2386,18 @@ impl KvTables {
     }
 
     pub(super) fn block_size(&self, model: &str) -> Option<u32> {
-        self.table.lock().block_sizes.get(model).copied()
+        let table = self.table.lock();
+        of_record(table.block_sizes.get(model)?.load(Ordering::Relaxed))
     }
 
+    /// Take `size` as `model`'s block size of record where it is the
+    /// first or the widest stated.
     pub(super) fn set_block_size(&self, model: &str, size: u32) {
         let mut table = self.table.lock();
-        let of_record = table.block_sizes.get(model).copied();
-        if of_record.is_none_or(|of_record| size > of_record) {
-            table.block_sizes.insert(model.to_string(), size);
+        let cell = table.block_sizes.entry(model.to_string()).or_default();
+        let stands = of_record(cell.load(Ordering::Relaxed));
+        if stands.is_none_or(|stands| size > stands) {
+            cell.store(u64::from(size) + 1, Ordering::Relaxed);
             table.moves += 1;
         }
     }
@@ -2267,7 +2405,8 @@ impl KvTables {
     /// Drop the size of record so a returning model can set it anew.
     pub(super) fn forget_block_size(&self, model: &str) {
         let mut table = self.table.lock();
-        if table.block_sizes.remove(model).is_some() {
+        let cell = table.block_sizes.get(model);
+        if cell.is_some_and(|cell| cell.swap(0, Ordering::Relaxed) != 0) {
             table.moves += 1;
         }
     }

@@ -94,12 +94,21 @@ pub struct ReferenceIndexer {
 /// The chain of prefix hashes of a request: position 0 is the bare content hash, every later
 /// position chains the previous prefix with its content hash.
 pub fn request_prefix_hashes(content_hashes: &[ContentHash]) -> Vec<SequenceHash> {
-    let mut chain = Vec::with_capacity(content_hashes.len());
-    for (position, &content) in content_hashes.iter().enumerate() {
-        let prefix = if position == 0 {
-            SequenceHash(content.0)
-        } else {
-            chain_prefix_hash(chain[position - 1], content)
+    request_prefix_hashes_of(content_hashes, |content| content.0)
+}
+
+/// [`request_prefix_hashes`] for a caller that keeps its own hash type, as the index's lookups
+/// take one: `hash_of` reads a block's content hash.
+pub fn request_prefix_hashes_of<T>(
+    content_hashes: &[T],
+    hash_of: impl Fn(&T) -> u64,
+) -> Vec<SequenceHash> {
+    let mut chain: Vec<SequenceHash> = Vec::with_capacity(content_hashes.len());
+    for content in content_hashes {
+        let content = hash_of(content);
+        let prefix = match chain.last() {
+            Some(&parent) => chain_prefix_hash(parent, ContentHash(content)),
+            None => SequenceHash(content),
         };
         chain.push(prefix);
     }

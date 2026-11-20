@@ -283,44 +283,23 @@ impl KvIndex {
     }
 
     /// The engine's reuse rule over a hybrid worker's cache groups, applied
-    /// to the overlap the index scored: every holder with a group view has
-    /// its depth shrunk to what its sliding-window and state groups can serve
-    /// ([`kv_index::WorkerGroups::cap`]), and a holder shrunk to nothing
-    /// leaves the scores. Returns the holders it shrank, for the decision
-    /// trace. One atomic load on a fleet without such workers, one read of
-    /// the views table for every holder on a fleet with them.
+    /// to the overlap the index scored, by the index crate's one routine
+    /// ([`GroupViews::cap_holders`]): a holder with a group view is shrunk
+    /// to what its groups can serve, and one shrunk to nothing leaves the
+    /// scores. Returns the holders it shrank, for the decision trace.
     pub fn cap_by_groups(
         &self,
         content_hashes: &[ContentHash],
         block_size: usize,
         overlap: &mut OverlapScores,
     ) -> Vec<GroupCap> {
-        let views = self.groups();
-        if views.is_empty() {
-            return Vec::new();
-        }
-        let table = views.read();
-        let mut prefixes = Vec::new();
         let mut caps = Vec::new();
-        overlap.scores.retain(|&worker, depth| {
-            let Some(view) = table.view(worker) else {
-                return true;
-            };
-            if prefixes.is_empty() {
-                prefixes = request_prefix_hashes(content_hashes);
-            }
-            let cap = view.cap(&prefixes, *depth, block_size);
-            if cap.depth < *depth {
-                caps.push(GroupCap {
-                    worker,
-                    uncapped: *depth,
-                    capped: cap.depth,
-                    group: cap.by.unwrap_or(0),
-                });
-                *depth = cap.depth;
-            }
-            cap.depth > 0
-        });
+        self.groups().cap_holders(
+            || request_prefix_hashes(content_hashes),
+            block_size,
+            overlap,
+            |cap| caps.push(cap),
+        );
         caps
     }
 

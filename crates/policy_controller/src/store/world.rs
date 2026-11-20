@@ -1898,10 +1898,14 @@ impl World {
             return;
         };
         let pool: (u32, &[Candidate]) = (index as u32, rows);
+        // The request's blocks as they are counted: their kind, and the
+        // block size of this world's generation, which a row's cache groups
+        // are read by where its model has no size of record.
+        let counted = (hash_kind, self.spec.block_size());
         if CUT {
-            held.name_cut(naming, pool, &shape.locals, view, hash_kind, named);
+            held.name_cut(naming, pool, &shape.locals, view, counted, named);
         } else {
-            held.name(naming, pool, &shape.locals, view, hash_kind, named);
+            held.name(naming, pool, &shape.locals, view, counted, named);
         }
     }
 
@@ -1997,7 +2001,8 @@ impl World {
             return;
         };
         if let (Some(rows), Some(Some(held))) = (self.rows.get(index), self.indexes.get(index)) {
-            held.name_again(naming, rows, view, keeps, named);
+            let asked = (naming, self.spec.block_size());
+            held.name_again(asked, rows, view, keeps, named);
         }
     }
 

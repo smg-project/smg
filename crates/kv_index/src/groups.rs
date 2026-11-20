@@ -23,15 +23,18 @@
 //! when the main store comes. A worker of a plain full-attention model has no view and pays
 //! nothing; a model's registry answers "none" with one atomic load.
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    cell::LazyCell,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use parking_lot::{RwLock, RwLockReadGuard};
 use rustc_hash::FxHashMap;
 
-use crate::block::{chain_prefix_hash, ContentHash, SequenceHash};
+use crate::block::{chain_prefix_hash, ContentHash, OverlapScores, SequenceHash};
 
 /// Groups a view can hold memberships for: one bit each in a block's mask. An engine's group
 /// indices are small (a handful per model); a group past the last bit is left out of the rule.
@@ -656,6 +659,48 @@ impl GroupViews {
         }))
     }
 
+    /// The engine's reuse rule over the holders one lookup scored: every holder with a view has
+    /// its depth shrunk to what its sliding-window and state groups can serve
+    /// ([`WorkerGroups::cap`]), and a holder shrunk to nothing leaves `holders`. Each holder the
+    /// rule shrank goes to `shrank`, for a decision's trace.
+    ///
+    /// `prefixes` makes the request's prefix hashes
+    /// ([`request_prefix_hashes`](crate::request_prefix_hashes)) and is asked at the first
+    /// holder that has a view. `block_size` is the model's, in tokens. One atomic load on a
+    /// fleet without a view, and with one, one read of the views table for every holder. Every
+    /// host's routing decision calls this, so a hybrid worker's overlap is bounded alike
+    /// wherever it is scored.
+    pub fn cap_holders<P: AsRef<[SequenceHash]>>(
+        &self,
+        prefixes: impl FnOnce() -> P,
+        block_size: usize,
+        holders: &mut impl Scored,
+        mut shrank: impl FnMut(GroupCap),
+    ) {
+        if self.is_empty() {
+            return;
+        }
+        let table = self.read();
+        let prefixes = LazyCell::new(prefixes);
+        holders.retain_scored(|worker, depth| {
+            let Some(view) = table.view(worker) else {
+                return true;
+            };
+            let prefixes: &[SequenceHash] = (*prefixes).as_ref();
+            let cap = view.cap(prefixes, *depth, block_size);
+            if cap.depth < *depth {
+                shrank(GroupCap {
+                    worker,
+                    uncapped: *depth,
+                    capped: cap.depth,
+                    group: cap.by.unwrap_or(0),
+                });
+                *depth = cap.depth;
+            }
+            cap.depth > 0
+        });
+    }
+
     /// The worker left: its view goes.
     pub fn remove(&self, worker: u32) {
         let taken = self
@@ -679,6 +724,28 @@ impl GroupViews {
     }
 }
 
+/// The holders one lookup scored, each with its depth in blocks, in either shape the index hands
+/// them out: the scores of [`ChainIndex::find_matches`](crate::ChainIndex::find_matches) and the
+/// list [`ChainIndex::deepest_into`](crate::ChainIndex::deepest_into) keeps. What
+/// [`GroupViews::cap_holders`] shrinks.
+pub trait Scored {
+    /// Offers each holder once, its worker and its depth: `keep` may lower the depth, and a
+    /// holder it answers `false` for leaves.
+    fn retain_scored(&mut self, keep: impl FnMut(u32, &mut u32) -> bool);
+}
+
+impl Scored for OverlapScores {
+    fn retain_scored(&mut self, mut keep: impl FnMut(u32, &mut u32) -> bool) {
+        self.scores.retain(|&worker, depth| keep(worker, depth));
+    }
+}
+
+impl Scored for Vec<(u32, u32)> {
+    fn retain_scored(&mut self, mut keep: impl FnMut(u32, &mut u32) -> bool) {
+        self.retain_mut(|(worker, depth)| keep(*worker, depth));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,6 +765,12 @@ mod tests {
     /// retains the blocks at `retained`.
     fn view(index: u32, kind: GroupKind, blocks: usize, retained: &[usize]) -> WorkerGroups {
         let view = WorkerGroups::new();
+        fill(&view, index, kind, blocks, retained);
+        view
+    }
+
+    /// Fills `view` as [`view`] makes one.
+    fn fill(view: &WorkerGroups, index: u32, kind: GroupKind, blocks: usize, retained: &[usize]) {
         let main: Vec<(SequenceHash, ContentHash)> = contents(blocks)
             .into_iter()
             .enumerate()
@@ -707,7 +780,6 @@ mod tests {
         view.learn(index, Some(kind), 0);
         let hashes: Vec<SequenceHash> = retained.iter().map(|&at| engine(at)).collect();
         view.group_stored(index, &hashes);
-        view
     }
 
     fn prefixes(blocks: usize) -> Vec<SequenceHash> {
@@ -844,6 +916,56 @@ mod tests {
     /// Two groups: each shrinks the candidate in turn until nothing moves. A state block at 5
     /// takes the window's tail at 6..9 out of reach, and the window group then finds no tail
     /// at or below 6 and no leading run: the engine recomputes the whole prompt.
+    /// One lookup's holders pass through a model's views alike in either shape the index
+    /// hands them out. A holder with a view is shrunk to what its groups serve and handed on,
+    /// one shrunk to nothing leaves, and a holder with no view stands. A fleet with no view
+    /// asks for no prefix hash.
+    #[test]
+    fn a_lookups_holders_are_capped_alike_in_either_shape() {
+        let views = GroupViews::new();
+        // Worker 1's state group retains the fourth block alone: eight blocks serve four.
+        fill(&views.get_or_create(1), 1, GroupKind::State, 8, &[3]);
+        // Worker 2's group placed a block and retains none on the path: it serves nothing.
+        let gone = views.get_or_create(2);
+        fill(&gone, 1, GroupKind::State, 8, &[7]);
+        gone.group_removed(1, &[engine(7)]);
+        // Worker 3 holds every block its overlap reads, and worker 4 has no view.
+        fill(&views.get_or_create(3), 1, GroupKind::State, 8, &[5]);
+        let scored = [(1, 8), (2, 8), (3, 6), (4, 7)];
+        let capped = [(1, 4), (3, 6), (4, 7)];
+        let shrunk = |worker, group| GroupCap {
+            worker,
+            uncapped: 8,
+            capped: if worker == 1 { 4 } else { 0 },
+            group,
+        };
+
+        let mut kept: Vec<(u32, u32)> = scored.to_vec();
+        let mut caps = Vec::new();
+        views.cap_holders(|| prefixes(8), 16, &mut kept, |cap| caps.push(cap));
+        assert_eq!(kept, capped);
+        assert_eq!(caps, [shrunk(1, 1), shrunk(2, 1)]);
+
+        let mut overlap = OverlapScores::default();
+        overlap.scores.extend(scored);
+        let mut caps = Vec::new();
+        views.cap_holders(|| prefixes(8), 16, &mut overlap, |cap| caps.push(cap));
+        let mut scores: Vec<(u32, u32)> = overlap.scores.into_iter().collect();
+        scores.sort_unstable();
+        caps.sort_unstable_by_key(|cap| cap.worker);
+        assert_eq!(scores, capped);
+        assert_eq!(caps, [shrunk(1, 1), shrunk(2, 1)]);
+
+        let mut kept: Vec<(u32, u32)> = scored.to_vec();
+        GroupViews::new().cap_holders(
+            || -> Vec<SequenceHash> { panic!("a fleet with no view reads no prefix") },
+            16,
+            &mut kept,
+            |_| panic!("and shrinks no holder"),
+        );
+        assert_eq!(kept, scored);
+    }
+
     #[test]
     fn the_rule_is_the_fixed_point_over_the_groups() {
         let path = prefixes(10);

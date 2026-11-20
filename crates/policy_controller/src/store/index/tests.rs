@@ -2513,7 +2513,7 @@ mod named {
         time::{Duration, Instant},
     };
 
-    use super::{admitted, batch, chain, publisher, stored, MODEL};
+    use super::{admitted, batch, chain, publisher, stored, GroupKind, MODEL};
     use crate::{
         store::{
             index::{seam, PoolIndex},
@@ -2652,6 +2652,184 @@ mod named {
     fn holds(store: &MemoryStore, id: WorkerId, contents: &[u64]) {
         let outcome = store.admit(id, 0, batch(1), &stored(None, &chain(contents)));
         assert_eq!(outcome, BatchOutcome::Applied);
+    }
+
+    /// The index of the one group a case's views hold beside main
+    /// attention.
+    const GROUP: u32 = 1;
+
+    /// `id` holds the blocks of `contents`, and its view of its cache
+    /// groups names them: the main blocks by one typed batch, then the
+    /// row's view through its lent lane, with a state group that retains
+    /// the blocks at `retained`. The view, for a case that writes it on.
+    fn serves(
+        store: &MemoryStore,
+        id: WorkerId,
+        contents: &[u64],
+        retained: &[usize],
+    ) -> Arc<kv_index::WorkerGroups> {
+        serves_by(store, id, contents, GroupKind::State, retained)
+    }
+
+    /// [`serves`] with a group of `kind`.
+    fn serves_by(
+        store: &MemoryStore,
+        id: WorkerId,
+        contents: &[u64],
+        kind: GroupKind,
+        retained: &[usize],
+    ) -> Arc<kv_index::WorkerGroups> {
+        holds(store, id, contents);
+        let mut view = None;
+        let outcome = store.admit_through(id, 0, batch(2), &mut |lane| {
+            view = Some(lane.groups());
+        });
+        assert_eq!(outcome, BatchOutcome::Applied);
+        let view = view.expect("the body ran");
+        let blocks = chain(contents);
+        let main: Vec<_> = blocks
+            .iter()
+            .map(|block| (block.seq_hash, block.content_hash))
+            .collect();
+        view.main_stored(None, &main);
+        view.learn(GROUP, Some(kind), 0);
+        let kept: Vec<_> = retained.iter().map(|&at| blocks[at].seq_hash).collect();
+        view.group_stored(GROUP, &kept);
+        view
+    }
+
+    /// The holders a decision of the local gateway is handed for `request`
+    /// under `cut`, in the order of their workers.
+    fn served(store: &MemoryStore, request: &[u64], cut: (u32, u64)) -> Vec<(WorkerId, u32)> {
+        let mut holders = handed(store, GatewayId::LOCAL, None, request, cut).holders;
+        holders.sort_unstable();
+        holders
+    }
+
+    /// A row that holds a view of its cache groups is named at what the
+    /// groups can serve of the depth the chain scored, by the engine's own
+    /// rule. A row the rule leaves nothing is named by nobody. Under a cap
+    /// the deepest are the deepest served: a row the chain scored shallower
+    /// is named ahead of a row its groups cut below it. A view the rule
+    /// cannot read leaves the chain's depth standing. The model has no
+    /// block size of record here: the rule runs all the same.
+    #[test]
+    fn a_row_with_a_view_of_its_cache_groups_is_named_at_what_they_serve() {
+        let store = MemoryStore::new();
+        store.apply(sampled(1)).expect("above the unbound start");
+        let request = [1, 2, 3, 4, 5, 6, 7, 8];
+        let [cut, plain, empty, unread] =
+            ["cut", "plain", "empty", "unread"].map(|key| admitted(&store, key));
+        // Its state group retains the fourth block alone: four of eight.
+        serves(&store, cut, &request, &[3]);
+        // No view: six blocks, as the chain holds them.
+        holds(&store, plain, &request[..6]);
+        // Its group placed a block and retains none on the path: nothing.
+        let gone = serves(&store, empty, &request, &[7]);
+        gone.group_removed(GROUP, &[chain(&request)[7].seq_hash]);
+        // Its view came after its blocks and names none of them: the rule
+        // leaves such a view out.
+        let late = serves(&store, unread, &request, &[0]);
+        late.clear();
+        late.created_over(request.len());
+
+        let mut by_groups = vec![(cut, 4), (plain, 6), (unread, 8)];
+        by_groups.sort_unstable();
+        assert_eq!(served(&store, &request, (16, 7)), by_groups);
+        assert_eq!(served(&store, &request, (0, 7)), by_groups);
+        // Under a cap the deepest served stand, whatever the seed: the row
+        // the chain scored at six ahead of two it scored at eight.
+        let mut two = vec![(plain, 6), (unread, 8)];
+        two.sort_unstable();
+        for seed in 0..8 {
+            assert_eq!(served(&store, &request, (2, seed)), two, "seed {seed}");
+            assert_eq!(served(&store, &request, (1, seed)), [(unread, 8)]);
+        }
+    }
+
+    /// A group's window is counted in the model's block size of record,
+    /// and in the block size of the decision's generation where the model
+    /// has none. The record reaches a model's index whether it was told
+    /// before the index was made or after, and a size the model forgot is
+    /// met by no later decision: a narrower one told after it stands.
+    #[test]
+    fn a_groups_window_is_counted_in_the_models_block_size_of_record() {
+        let store = MemoryStore::new();
+        store.apply(sampled(1)).expect("above the unbound start");
+        let size = store.deciding(|world| world.spec().block_size());
+        assert!(
+            size >= 2 && size.is_multiple_of(2),
+            "a size the case can halve"
+        );
+        // A window of two blocks of the generation's size and one token:
+        // it needs two blocks retained at the hit by that size, one by
+        // twice it, and four by half of it.
+        let window = GroupKind::SlidingWindow {
+            window: 2 * size + 1,
+        };
+        // Told before the model's index is made.
+        store.set_block_size(MODEL, 2 * size);
+        let request = [1, 2, 3, 4, 5, 6, 7, 8];
+        let (one, two) = (admitted(&store, "one"), admitted(&store, "two"));
+        // One retains the last block of the request, the other the last two.
+        serves_by(&store, one, &request, window, &[7]);
+        serves_by(&store, two, &request, window, &[6, 7]);
+        let mut both = vec![(one, 8), (two, 8)];
+        both.sort_unstable();
+        assert_eq!(served(&store, &request, (16, 7)), both);
+        // Forgotten: the generation's size, by which one block is no tail.
+        store.forget_block_size(MODEL);
+        assert_eq!(served(&store, &request, (16, 7)), [(two, 8)]);
+        // A narrower size than the one forgotten stands, in the index that
+        // was there all along: two blocks are no tail by it.
+        store.set_block_size(MODEL, size / 2);
+        assert!(served(&store, &request, (16, 7)).is_empty());
+        // The widest stated stands, as before.
+        store.set_block_size(MODEL, size);
+        assert_eq!(served(&store, &request, (16, 7)), [(two, 8)]);
+        // A size of zero is of record too, apart from none, and a wider
+        // one stands over it.
+        store.forget_block_size(MODEL);
+        assert_eq!(store.block_size(MODEL), None);
+        store.set_block_size(MODEL, 0);
+        assert_eq!(store.block_size(MODEL), Some(0));
+        store.set_block_size(MODEL, size);
+        assert_eq!(store.block_size(MODEL), Some(size));
+    }
+
+    /// The depth the cap cuts is drawn evenly among the rows that serve it:
+    /// of three rows whose groups serve four blocks beside one that serves
+    /// six, a cap of two names the deeper and one of the three, each by
+    /// some seed.
+    #[test]
+    fn the_depth_the_cap_cuts_is_drawn_among_the_rows_that_serve_it() {
+        let store = MemoryStore::new();
+        store.apply(sampled(1)).expect("above the unbound start");
+        store.set_block_size(MODEL, 16);
+        let request = [1, 2, 3, 4, 5, 6, 7, 8];
+        let deep = admitted(&store, "deep");
+        holds(&store, deep, &request[..6]);
+        let level: std::collections::BTreeSet<WorkerId> = (0..3)
+            .map(|n| {
+                let id = admitted(&store, &format!("level{n}"));
+                serves(&store, id, &request, &[3]);
+                id
+            })
+            .collect();
+        let mut drawn = std::collections::BTreeSet::new();
+        for seed in 0..40 {
+            let cut = served(&store, &request, (2, seed));
+            assert_eq!(cut.len(), 2, "seed {seed}");
+            assert!(cut.contains(&(deep, 6)), "seed {seed}: {cut:?}");
+            drawn.extend(
+                cut.iter()
+                    .filter(|holder| holder.1 == 4)
+                    .map(|holder| holder.0),
+            );
+        }
+        assert_eq!(drawn, level, "each of the three is drawn by some seed");
+        // A cap the level fits whole under draws nothing and names all four.
+        assert_eq!(served(&store, &request, (4, 7)).len(), 4);
     }
 
     /// A decision is handed its request's deepest holders by their place in
@@ -2910,6 +3088,36 @@ mod named {
         let now = handed(&store, GatewayId::LOCAL, None, &request, (16, 7));
         assert_eq!(now.holders.len(), 2);
         assert!(now.holders.contains(&(stays, 2)) && now.holders.contains(&(taker, 3)));
+    }
+
+    /// The same on a pool one of whose rows holds a view of its cache
+    /// groups, where every holder is scored and the groups' rule is read:
+    /// the row that left is named no holder by the taker's blocks, and its
+    /// own view is gone with it. The row that stands is named at what its
+    /// groups serve.
+    #[test]
+    fn an_index_id_taken_again_names_no_holder_where_a_row_holds_a_view() {
+        let store = MemoryStore::new();
+        store.apply(sampled(1)).expect("above the unbound start");
+        store.set_block_size(MODEL, 16);
+        let (left, stays) = (admitted(&store, "left"), admitted(&store, "stays"));
+        let request = [1, 2, 3, 4];
+        // The row that leaves holds a view that serves the request whole.
+        serves(&store, left, &request, &[3]);
+        // The taker holds the request whole. The row that stands comes to
+        // hold it too, and its state group retains the second block alone.
+        let (holders, taker) =
+            named_past_an_id_taken_again(&store, left, &request, (16, 7), |taker| {
+                holds(&store, taker, &request);
+                serves(&store, stays, &request, &[1]);
+            });
+        assert_eq!(holders, [(stays, 2)]);
+        // The world of now names both: the taker has no view of its own.
+        assert_eq!(served(&store, &request, (16, 7)), {
+            let mut both = vec![(stays, 2), (taker, 4)];
+            both.sort_unstable();
+            both
+        });
     }
 
     /// The naming goes on past an id taken again: a row that stands is named

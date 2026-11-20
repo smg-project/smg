@@ -35,13 +35,15 @@ pub use block::{
 };
 pub use chain_index::{BlockRef, ChainIndex, ChainIndexStats};
 pub use common::{MatchResult, TenantId};
-pub use groups::{Cap, Group, GroupCap, GroupKind, GroupViews, GroupViewsRead, WorkerGroups};
+pub use groups::{
+    Cap, Group, GroupCap, GroupKind, GroupViews, GroupViewsRead, Scored, WorkerGroups,
+};
 pub use lane_map::ChainBlockMap;
 pub use lane_pool::{
     Claimed, Control, LaneHooks, LanePool, LanePoolConfig, PoolMetrics, QueueFull,
 };
 pub use path_hash::{hash_node_path, hash_token_path, GLOBAL_EVICTION_HASH};
-pub use reference::{request_prefix_hashes, ReferenceIndexer};
+pub use reference::{request_prefix_hashes, request_prefix_hashes_of, ReferenceIndexer};
 pub use sharded::{ShardedChainIndex, SHARD_SHIFT};
 // Re-export under names matching old tree.rs API for easier migration
 pub use string_tree::Tree;
