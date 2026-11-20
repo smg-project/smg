@@ -3818,13 +3818,26 @@ impl Decodes {
         }
     }
 
-    /// Takes what the last issue replaced of the side in the place `at`,
-    /// where that record is the lease's under `key`.
+    /// Returns the issued, originally chosen decode at `at` and takes its saved side
+    /// and deadline only if both belong to `key` and any named issue is still current.
     #[cfg(feature = "controller")]
-    fn kept(&mut self, at: u32, key: &Key) -> Option<Replaced> {
+    fn kept(
+        &mut self,
+        at: u32,
+        key: &Key,
+        issue: Option<DecodeIssue>,
+    ) -> Option<(&mut HeldDecode, Replaced)> {
+        let (owner, decode) = self.places.get_mut(at as usize)?.as_mut()?;
+        if owner != key
+            || !decode.filed_chosen
+            || !decode.side.state.is_issued()
+            || issue.is_some_and(|issue| issue.0 != decode.issues)
+        {
+            return None;
+        }
         let place = self.replaced.get_mut(at as usize)?;
         let (_, replaced) = place.take_if(|(owner, _)| *owner == *key)?;
-        Some(replaced)
+        Some((decode, replaced))
     }
 }
 
@@ -4018,31 +4031,20 @@ impl Leases {
         Ok((held, found))
     }
 
-    /// How many calls issued the decode side under `key`, where a call
-    /// issued it and no dispatch named it: `None` for any other side.
+    /// Undoes the current decode issue if `issue` is `None` or matches, returning both prior sides.
+    /// Returns `None` without changes if there is no matching issue with saved state.
     #[cfg(feature = "controller")]
-    fn issued_decode(&self, key: &Key) -> Option<u8> {
-        let held = self.records.get(key)?;
-        let decode = self.decodes.get(held.decode, key)?;
-        (decode.filed_chosen && decode.side.state.is_issued()).then_some(decode.issues)
-    }
+    fn taken_back(&mut self, key: &Key, issue: Option<DecodeIssue>) -> Option<Sides> {
+        use std::collections::hash_map::Entry;
 
-    /// Puts the decode side under `key` back as its last issue found it:
-    /// the side and the lease's dispatch deadline stand as they stood, and
-    /// the booking and the key's are freed. A lease whose prefill ended
-    /// since leaves the file here: no later event ends a side that is not
-    /// live. `false` where no issue's record stands for the side, and
-    /// nothing moves.
-    #[cfg(feature = "controller")]
-    fn put_back(&mut self, key: &Key) -> bool {
-        let Some(held) = self.records.get_mut(key) else {
-            return false;
+        let Entry::Occupied(mut entry) = self.records.entry(*key) else {
+            return None;
         };
-        let Some((before, deadline)) = self.decodes.kept(held.decode, key) else {
-            return false;
-        };
-        let Some(decode) = self.decodes.get_mut(held.decode, key) else {
-            return false;
+        let held = entry.get_mut();
+        let (decode, (before, deadline)) = self.decodes.kept(held.decode, key, issue)?;
+        let found = Sides {
+            record: held.record,
+            decode: Some(decode.side),
         };
         let side_key = keyed_decode(held.keyed, &decode.side);
         decode.side = before;
@@ -4055,34 +4057,10 @@ impl Leases {
             self.sessions.free(session, worker);
         }
         if ended {
-            self.end(key);
+            let held = entry.remove();
+            self.gone(held, key, |_, _| ());
         }
-        true
-    }
-
-    /// Returns the decode side under `key` to chosen where a call issued
-    /// it and no dispatch named it ([`Self::put_back`]): under `issue`
-    /// where one is named, under any issue else. The side holds the first
-    /// pick's targets again: that pick's dispatch books it, and a later
-    /// call issues it anew. The lease comes back as the issue left it,
-    /// both its parts; `None` where no such side stands, and nothing moves.
-    #[cfg(feature = "controller")]
-    fn taken_back(&mut self, key: &Key, issue: Option<DecodeIssue>) -> Option<Sides> {
-        let count = self.issued_decode(key)?;
-        if issue.is_some_and(|issue| issue.0 != count) {
-            return None;
-        }
-        let found = self.found(key);
-        self.put_back(key).then_some(found).flatten()
-    }
-
-    /// Undoes `issue`, one issue of the decode side under `key`, where the
-    /// side still waits under it ([`Self::put_back`]). `false` where the
-    /// side moved since, by a dispatch, a repeat's ending or a later issue:
-    /// nothing moves then.
-    #[cfg(feature = "controller")]
-    fn unissue_decode(&mut self, key: &Key, issue: DecodeIssue) -> bool {
-        self.issued_decode(key) == Some(issue.0) && self.put_back(key)
+        Some(found)
     }
 
     /// Replaces a chosen decode side in its place while the prefill is
@@ -4201,13 +4179,6 @@ impl Leases {
         Some(decode.side)
     }
 
-    /// Whether the lease under `key` is a pair's: a release that names a
-    /// side ends that side of it alone.
-    fn pairs(&self, key: &Key) -> bool {
-        let pair = |held: &Held| held.record.decode.is_some();
-        self.records.get(key).is_some_and(pair)
-    }
-
     /// Both parts of the lease `held` under `key`: its record and, where
     /// the record carries the mark of a pair's lease, its decode side.
     fn sides(&self, key: &Key, held: &Held) -> Sides {
@@ -4218,13 +4189,6 @@ impl Leases {
             None
         };
         Sides { record, decode }
-    }
-
-    /// Both parts of the lease under `key` as the file holds them.
-    #[cfg(feature = "controller")]
-    fn found(&self, key: &Key) -> Option<Sides> {
-        let held = self.records.get(key)?;
-        Some(self.sides(key, held))
     }
 
     /// Whether a side of the lease `held` under `key` waits for its
@@ -4251,7 +4215,7 @@ impl Leases {
     #[inline(always)]
     fn dispatched(
         &mut self,
-        store: &MemoryStore,
+        slots: Slots<'_>,
         key: &Key,
         dispatch: Dispatch,
         at: Instant,
@@ -4264,7 +4228,15 @@ impl Leases {
         if held.record.decode.is_some() {
             if let Some(decode) = self.decodes.get_mut(held.decode, key) {
                 found.decode = Some(decode.side);
-                Self::dispatched_side(store, held, decode, dispatch, at);
+                Self::dispatched_side(
+                    slots,
+                    &self.counts,
+                    &self.sessions,
+                    held,
+                    decode,
+                    dispatch,
+                    at,
+                );
             }
             return Some(found);
         }
@@ -4282,7 +4254,7 @@ impl Leases {
         };
         if target != held.record.target {
             let first = held.booked;
-            held.booked = store.slots().of(target);
+            held.booked = slots.of(target);
             self.counts.moved(first, held.booked);
             if held.keyed {
                 let session = held.record.lease.session;
@@ -4298,7 +4270,9 @@ impl Leases {
     /// of a pair's pick names the same prefill, so only the decode's
     /// booking can move. A chosen decode books its target at dispatch.
     fn dispatched_side(
-        store: &MemoryStore,
+        slots: Slots<'_>,
+        counts: &Counts,
+        sessions: &SessionTables,
         held: &mut Held,
         decode: &mut HeldDecode,
         dispatch: Dispatch,
@@ -4314,10 +4288,10 @@ impl Leases {
                 side.state = LeaseState::Dispatched { at };
                 if let Some((target, _)) = named {
                     if target != side.target {
-                        let to = store.slots().of(target);
-                        rebook(&store.counts, &mut decode.booked, to);
+                        let to = slots.of(target);
+                        rebook(counts, &mut decode.booked, to);
                         if held.keyed {
-                            store.sessions.moved(side.session, side.target, target);
+                            sessions.moved(side.session, side.target, target);
                         }
                         side.target = target;
                     }
@@ -4331,12 +4305,12 @@ impl Leases {
                     side.target_index = dispatch.target_index;
                 }
                 side.state = LeaseState::Dispatched { at };
-                decode.booked = store.slots().of(side.target);
+                decode.booked = slots.of(side.target);
                 if let Some(booked) = decode.booked {
-                    store.counts.book(booked);
+                    counts.book(booked);
                 }
                 if let Some((session, worker)) = keyed_decode(held.keyed, side) {
-                    store.sessions.book(session, worker);
+                    sessions.book(session, worker);
                 }
             }
             _ => {}
@@ -4352,13 +4326,13 @@ impl Leases {
     #[inline(always)]
     fn released(&mut self, key: &Key, side: Option<Side>, reason: ReleaseReason) -> Option<Sides> {
         match side {
-            Some(side) if self.pairs(key) => self.end_side(key, side, LeaseState::Released(reason)),
-            _ => self.taken(key),
+            Some(side) => self.end_side(key, side, LeaseState::Released(reason)),
+            None => self.taken(key),
         }
     }
 
-    /// A single ends whole. A pair leaves with its last live side.
-    /// Both return the sides as they stood before the report.
+    /// Returns the prior sides. Any side ends a single. A pair ignores absent or ended sides.
+    /// Each side frees its bookings (none for a chosen decode). The last live side removes the pair.
     #[inline(always)]
     fn end_side(&mut self, key: &Key, side: Side, ended: LeaseState) -> Option<Sides> {
         use std::collections::hash_map::Entry;
@@ -4741,7 +4715,8 @@ impl MemoryStore {
         issue: DecodeIssue,
     ) -> bool {
         self.turn_of(self.file_of(lease))
-            .unissue_decode(&(gateway, lease), issue)
+            .taken_back(&(gateway, lease), Some(issue))
+            .is_some()
     }
 
     /// The prefill worker of the lease a decode call names, where the
@@ -5215,7 +5190,8 @@ impl LeasesStore for MemoryStore {
         at: Instant,
     ) -> bool {
         self.turn_of(self.file_of(lease))
-            .dispatched(self, &(gateway, lease), dispatch, at)
+            .dispatched(self.slots(), &(gateway, lease), dispatch, at)
+            // A pair needs its decode place even to dispatch its prefill.
             .is_some_and(|found| found.record.decode.is_none() || found.decode.is_some())
     }
 

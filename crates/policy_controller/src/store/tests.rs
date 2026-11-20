@@ -5283,6 +5283,22 @@ fn dispatch_and_completion_each_look_up_the_lease_once() {
     assert_eq!((hashes(dispatch), hashes(complete)), (1, 1));
 }
 
+#[cfg(feature = "controller")]
+#[test]
+fn a_decode_take_back_looks_up_the_lease_once() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    store.set_term(1);
+    issue_pair(&store, chosen_pair(id.0, p, &[d], now)).expect("the key is free");
+    assert!(store.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    assert_eq!(store.issue_decode(gateway, id, decode_side(d), now), Ok(()));
+
+    LEASE_HASHES.set(0);
+    assert!(store.take_back_decode(gateway, id, ReleaseReason::Abandoned));
+    assert_eq!(LEASE_HASHES.get(), 1);
+}
+
 #[test]
 fn a_frame_handed_where_nobody_is_at_work_is_applied_by_its_hand() {
     let now = Instant::now();

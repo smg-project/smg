@@ -1162,7 +1162,7 @@ impl MemoryStore {
     fn apply_frame(&self, at: usize, leases: &mut Leases, key: Key, said: Said, one: &mut OneLoad) {
         let found = match said {
             Said::Dispatched(dispatch, when) => leases
-                .dispatched(self, &key, dispatch, when)
+                .dispatched(self.slots(), &key, dispatch, when)
                 .filter(|found| takes_dispatch(found, dispatch.side)),
             Said::Completed(outcome) => leases.end_side(&key, outcome.side, LeaseState::Completed),
             Said::Released(side, reason) => leases.released(&key, side, reason),
