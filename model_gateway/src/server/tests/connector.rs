@@ -417,10 +417,10 @@ async fn the_host_can_delegate_a_stock_engine_to_the_stock_connector() {
 
 /// A host's own connection that holds the gateway's client: it answers the
 /// load call itself and hands every other call to that client.
-struct OwnLoads(Arc<dyn EngineConnection>);
+struct HostLoads(Arc<dyn EngineConnection>);
 
 #[async_trait]
-impl EngineConnection for OwnLoads {
+impl EngineConnection for HostLoads {
     fn carries_admin_calls(&self) -> bool {
         self.0.carries_admin_calls()
     }
@@ -474,10 +474,10 @@ impl EngineConnection for OwnLoads {
 /// A host whose connector returns its own connection for each gRPC engine
 /// and knows nothing of a front.
 #[derive(Debug)]
-struct OwnLoadsConnector;
+struct HostLoadsConnector;
 
 #[async_trait]
-impl EngineConnector for OwnLoadsConnector {
+impl EngineConnector for HostLoadsConnector {
     async fn connect_grpc(
         &self,
         url: &str,
@@ -486,7 +486,7 @@ impl EngineConnector for OwnLoadsConnector {
         let stock = BackendConnector::shared()
             .connect_grpc(url, runtime)
             .await?;
-        Ok(Arc::new(OwnLoads(stock)))
+        Ok(Arc::new(HostLoads(stock)))
     }
 
     async fn connect_zmq(&self, link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
@@ -507,7 +507,7 @@ impl EngineConnector for OwnLoadsConnector {
 async fn a_worker_on_a_hosts_connection_is_polled_through_it_and_sent_to_through_the_gateways_client(
 ) {
     let (url, _) = mock_grpc_engine().await;
-    let app = gateway(Extensions::new().connector(Arc::new(OwnLoadsConnector))).await;
+    let app = gateway(Extensions::new().connector(Arc::new(HostLoadsConnector))).await;
     // The engine listens and the registration's probes dial it: they get
     // time enough on a loaded host.
     let mut registering = registration(&app, &url);
@@ -516,7 +516,7 @@ async fn a_worker_on_a_hosts_connection_is_polled_through_it_and_sent_to_through
     let connection = worker.engine_connection().await.unwrap().unwrap();
     let fronted = connection.downcast_arc::<Fronted>().unwrap();
     let front = Arc::clone(fronted.front());
-    assert!(front.downcast_arc::<OwnLoads>().is_some());
+    assert!(front.downcast_arc::<HostLoads>().is_some());
 
     let client = get_backend_client(worker.as_ref()).await.unwrap().unwrap();
     assert!(EngineConnection::health_check(client.as_ref())
