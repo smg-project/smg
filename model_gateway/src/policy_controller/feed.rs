@@ -2,10 +2,10 @@
 //! registry up to date and publishes membership for decisions in that order.
 //! Each membership write asks for publication before it returns.
 //!
-//! A registration of this process hands the door the worker it built, and
-//! the holder keeps that object as the row's ([`FeedDoor`]). It holds what
-//! no row states: the worker's credential, its connection settings and its
-//! model cards.
+//! A registration of this process hands the door the workers it built, and
+//! the holder keeps each as its row's object ([`FeedDoor`]). An object
+//! holds what no row states: the worker's credential, its connection
+//! settings and its model cards.
 //!
 //! Under a controller's address the follower writes the store in the door's
 //! place, and settles the feed after each event it takes ([`following`]).
@@ -392,9 +392,10 @@ fn over(store: &Arc<MemoryStore>, objects: Objects<ModelWorkerSnapshot>) -> Feed
 /// feed's turn through that call, so neither a later write nor a settle
 /// can publish a row the holder has yet to read.
 ///
-/// A built worker is on offer at the holder through its write, inside the
-/// same turn: the listener's read lays the row with it, and a write that
-/// moved no fact has the holder lay it too. The offer ends with the turn.
+/// A registration's built workers are on offer at the holder through its
+/// write, inside the same turn: the listener's read lays each row with its
+/// own, and a row the write left unmoved has the holder lay it too. The
+/// offer ends whole with the turn.
 /// A guarded write names the object it replaces, and the holder refuses it
 /// in that turn where another object stands.
 struct FeedDoor {
@@ -405,10 +406,7 @@ struct FeedDoor {
 }
 
 impl FeedDoor {
-    fn write(
-        &self,
-        write: impl FnOnce(&StoreDoor) -> Result<Wrote, Refused>,
-    ) -> Result<Wrote, Refused> {
+    fn write<T>(&self, write: impl FnOnce(&StoreDoor) -> Result<T, Refused>) -> Result<T, Refused> {
         let _turn = self.turn.lock();
         write(&self.door)
     }
@@ -425,17 +423,17 @@ impl Membership for FeedDoor {
         self.write(|door| door.found(maker, expect, url, state))
     }
 
-    fn found_built(
+    fn found_rows(
         &self,
         maker: &Maker,
         expect: Expect,
-        built: &Arc<dyn Worker>,
+        built: &[Arc<dyn Worker>],
         over: Option<Over<'_>>,
-    ) -> Result<Wrote, Refused> {
+    ) -> Result<Vec<Wrote>, Refused> {
         self.write(|door| {
             let seen = over.map(Over::object);
             self.objects.handing(self.store.as_ref(), built, seen, || {
-                door.found_built(maker, expect, built, over)
+                door.found_rows(maker, expect, built, over)
             })
         })
     }
@@ -456,7 +454,7 @@ impl Membership for FeedDoor {
     ) -> Result<Wrote, Refused> {
         self.write(|door| {
             self.objects
-                .handing(self.store.as_ref(), built, Some(over), || {
+                .handing_one(self.store.as_ref(), built, Some(over), || {
                     door.refreshed(seen, built, over)
                 })
         })

@@ -527,6 +527,122 @@ fn a_refreshed_worker_is_the_rows_object_when_its_write_returns() {
     let wrote = feed.door.refreshed(seen(), &moved, &equal);
     assert!(matches!(wrote, Ok(Wrote::InPlace(_))), "{wrote:?}");
     assert!(held(&moved));
+}
+
+/// A worker's ranks, each built with its own key and, where one is
+/// named, a tier's label.
+fn ranks(width: usize, gold: Option<usize>) -> Vec<Arc<dyn Worker>> {
+    (0..width)
+        .map(|rank| -> Arc<dyn Worker> {
+            let worker = BasicWorkerBuilder::new(URL)
+                .model(ModelCard::new(MODEL))
+                .dp_config(rank, width)
+                .api_key(format!("key-{rank}"));
+            let worker = if gold == Some(rank) {
+                worker.label("tier", "gold")
+            } else {
+                worker
+            };
+            Arc::new(worker.build())
+        })
+        .collect()
+}
+
+/// Whether each of `built` is the object the registry holds under its URL.
+fn stand(registry: &WorkerRegistry, built: &[Arc<dyn Worker>]) -> Vec<bool> {
+    built
+        .iter()
+        .map(|built| {
+            let held = registry.get_by_url(built.url());
+            held.is_some_and(|held| Arc::ptr_eq(&held, built))
+        })
+        .collect()
+}
+
+/// A worker of three ranks registered in one turn of the feed's door
+/// leaves the three objects its registration built, each with its key.
+#[test]
+fn three_ranks_registered_in_one_turn_leave_three_handed_objects() {
+    let store = Arc::new(MemoryStore::default());
+    let (registry, feed) = bed(&store);
+    let built = ranks(3, None);
+    let wrote = feed
+        .door
+        .found_rows(&Maker::Control, Expect::Nothing, &built, None);
+    assert!(
+        matches!(
+            wrote.as_deref(),
+            Ok([
+                Wrote::Registered(_),
+                Wrote::Registered(_),
+                Wrote::Registered(_)
+            ])
+        ),
+        "{wrote:?}"
+    );
+    assert_eq!(stand(&registry, &built), [true; 3]);
+    assert_eq!(built[2].api_key().map(String::as_str), Some("key-2"));
+    assert_eq!(feed.objects.unhanded(), 0);
+
+    // One rank alone is not the engine's width: the write is refused
+    // whole, and the object on offer for it is taken back.
+    let alone = ranks(3, None);
+    let refused = feed
+        .door
+        .found_rows(&Maker::Control, Expect::Anything, &alone[1..2], None);
+    assert!(matches!(refused, Err(Refused::Past(_))), "{refused:?}");
+    assert_eq!(stand(&registry, &built), [true; 3]);
+    assert_eq!(stand(&registry, &alone), [false; 3]);
+    assert_eq!(feed.objects.unhanded(), 0);
+}
+
+/// The same three ranks registered again with one rank's label changed
+/// lay each row with its own object, the unmoved rows too.
+#[test]
+fn ranks_registered_again_lay_each_row_with_its_own_object() {
+    let store = Arc::new(MemoryStore::default());
+    let (registry, feed) = bed(&store);
+    let first = ranks(3, None);
+    feed.door
+        .found_rows(&Maker::Control, Expect::Nothing, &first, None)
+        .expect("three ranks registered");
+    let again = ranks(3, Some(1));
+    let wrote = feed
+        .door
+        .found_rows(&Maker::Control, Expect::Anything, &again, None);
+    assert!(
+        matches!(
+            wrote.as_deref(),
+            Ok([Wrote::Unmoved(_), Wrote::InPlace(_), Wrote::Unmoved(_)])
+        ),
+        "{wrote:?}"
+    );
+    assert_eq!(stand(&registry, &again), [true; 3]);
+    assert_eq!(stand(&registry, &first), [false; 3]);
+    assert_eq!(feed.objects.unhanded(), 0);
+}
+
+/// A width that shrinks to two ends the third rank's object, and the two
+/// ranks that stay are laid with the objects of the narrower registration.
+#[test]
+fn a_width_that_shrinks_ends_the_object_of_the_rank_that_left() {
+    let store = Arc::new(MemoryStore::default());
+    let (registry, feed) = bed(&store);
+    let wide = ranks(3, None);
+    feed.door
+        .found_rows(&Maker::Control, Expect::Nothing, &wide, None)
+        .expect("three ranks registered");
+    let narrow = ranks(2, None);
+    let wrote = feed
+        .door
+        .found_rows(&Maker::Control, Expect::Anything, &narrow, None);
+    assert!(
+        matches!(wrote.as_deref(), Ok([_, _, Wrote::Removed(_)])),
+        "{wrote:?}"
+    );
+    assert_eq!(stand(&registry, &narrow), [true; 2]);
+    assert!(registry.get_by_url(wide[2].url()).is_none());
+    assert_eq!(store.snapshot().1.len(), 2);
     assert_eq!(feed.objects.unhanded(), 0);
 }
 

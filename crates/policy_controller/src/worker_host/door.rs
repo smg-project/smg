@@ -1,9 +1,12 @@
 //! Writes through a host's membership door.
 
-use std::sync::Arc;
+use std::{mem, slice, sync::Arc};
 
 use parking_lot::Mutex;
-use smg_worker::{identity::basic::Worker, settings::UnhealthyRemovalScope};
+use smg_worker::{
+    identity::{basic::Worker, builder::rank_url},
+    settings::UnhealthyRemovalScope,
+};
 
 use super::{
     found::{facts, stated},
@@ -30,8 +33,15 @@ pub enum Wrote {
     Removed(WorkerId),
 }
 
+impl Wrote {
+    fn changed(&self) -> bool {
+        !matches!(self, Self::Unmoved(_))
+    }
+}
+
 /// A write the door refused. Nothing was written.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Refused {
     /// Another maker's row, named by its maker.
     NotMaker(String),
@@ -46,7 +56,8 @@ pub enum Refused {
     NotLeading(String),
     /// Another writer moved the row under the call.
     Moved,
-    /// A row stands under the URL of a registration that expects none.
+    /// A row stands where a registration expects none: under a URL it
+    /// states, or one it would retire.
     Stands,
     /// The row a replacement or a refresh names is draining: its removal
     /// takes the worker.
@@ -76,19 +87,20 @@ pub enum Remover<'a> {
     Health(UnhealthyRemovalScope),
 }
 
-/// What a registration expects to stand under its URL. Once that holds, its
-/// facts are laid by one rule whatever it expects: an absent URL is
-/// registered, and a standing row is left, changed in place or replaced as
-/// its facts say.
+/// What a registration expects to stand under the URLs it states. Once that
+/// holds, its facts are laid by one rule whatever it expects: an absent URL
+/// is registered, and a standing row is left, changed in place or replaced
+/// as its facts say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Expect {
-    /// Nothing: an add. A standing row refuses it ([`Refused::Stands`]),
+    /// Nothing: an add. A row standing under a URL it states, or one the
+    /// registration would retire, refuses it whole ([`Refused::Stands`]),
     /// whoever made the row.
     Nothing,
-    /// The row its asker saw, at the revision it saw: a replacement by id.
-    /// No row refuses it ([`Refused::Absent`]), and so does another row or
-    /// revision ([`Refused::Moved`]). A draining row refuses it too
-    /// ([`Refused::Draining`]): its removal wins.
+    /// The row its asker saw, at the revision it saw: a replacement by id,
+    /// which states that one row. No row refuses it ([`Refused::Absent`]),
+    /// and so does another row or revision ([`Refused::Moved`]). A draining
+    /// row refuses it too ([`Refused::Draining`]): its removal wins.
     Seen(Standing),
     /// Anything: an upsert.
     Anything,
@@ -120,6 +132,15 @@ impl<'a> Over<'a> {
     }
 }
 
+/// One row a registration states.
+#[derive(Clone, Copy)]
+pub(crate) struct Stated<'a> {
+    /// The row's URL: its key.
+    pub(crate) url: &'a str,
+    /// The facts the registration states, over what stands under the URL.
+    pub(crate) state: &'a dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
+}
+
 /// The membership door a host hands its registration and removal steps.
 pub trait Membership: Send + Sync + 'static {
     /// Lay a registration's facts under `url`, over what it expects to
@@ -128,6 +149,10 @@ pub trait Membership: Send + Sync + 'static {
     /// are refused: the maker was asked of the row under `url`, and the
     /// store writes by the facts' key. The door states the row's event
     /// signal itself, by the generation in force, whatever the facts state.
+    ///
+    /// This is the write of one row by the row's own rule. It holds no rule
+    /// of the engine's other rows and no row leaves with it: a worker's
+    /// rows are registered through [`found_rows`](Self::found_rows).
     fn found(
         &self,
         maker: &Maker,
@@ -136,28 +161,54 @@ pub trait Membership: Send + Sync + 'static {
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
     ) -> Result<Wrote, Refused>;
 
-    /// Lay the registration of a worker its asker built, under the
-    /// worker's URL. The facts are the ones `built` states over the
-    /// standing row ([`facts`](super::facts)).
+    /// Lays the rows one registration states of one engine, each with the
+    /// worker its registration built, over what it expects to stand. A
+    /// row's URL is its worker's, and its facts are the ones the worker
+    /// states over the standing row ([`facts`](super::facts)), by the
+    /// write's verb. The engine is the one the rows' own facts state, so no
+    /// caller names it another way.
     ///
-    /// Each door says what it does with the object. A door whose host
-    /// keeps built objects hands `built` to the holder in the write's turn
+    /// A registration is held whole: each row to the rule of
+    /// [`found`](Self::found), the rows together to the engine's full
+    /// width, and the engine's rows it does not state leave with it. Every
+    /// check holds before the first write, so a refusal of a row or of the
+    /// group writes nothing. At a door whose lead can move, a lead lost
+    /// between two rows refuses at that row ([`Refused::NotLeading`]), and
+    /// the rows written before it stand. A guarded write ([`Expect::Seen`])
+    /// states the one row its asker saw and changes it where it stands, by
+    /// that row's own rule.
+    ///
+    /// Each door says what it does with the objects. A door whose host
+    /// keeps built objects hands them to the holder for the write's turn
     /// ([`Objects::handing`](super::Objects::handing)). A door over a door
     /// passes the call on. Any other door writes the facts alone, and its
-    /// host's holder builds the object from the row.
+    /// host's holder builds each object from its row.
     ///
     /// `over` names the object a guarded write replaces, by the write's
-    /// verb ([`Over`]). A door that hands `built` in holds the write
+    /// verb ([`Over`]). A door that hands the objects in holds the write
     /// against that object. Every door reads the verb: a replacement by id
     /// states its thresholds whole, and any other write keeps the standing
-    /// row's where `built` states none.
+    /// row's where a built worker states none.
+    fn found_rows(
+        &self,
+        maker: &Maker,
+        expect: Expect,
+        built: &[Arc<dyn Worker>],
+        over: Option<Over<'_>>,
+    ) -> Result<Vec<Wrote>, Refused>;
+
+    /// Lay the registration of one built worker:
+    /// [`found_rows`](Self::found_rows) with one row.
     fn found_built(
         &self,
         maker: &Maker,
         expect: Expect,
         built: &Arc<dyn Worker>,
         over: Option<Over<'_>>,
-    ) -> Result<Wrote, Refused>;
+    ) -> Result<Wrote, Refused> {
+        let wrote = self.found_rows(maker, expect, slice::from_ref(built), over)?;
+        wrote.first().copied().ok_or(Refused::Moved)
+    }
 
     /// Mark the row the asker saw as draining. Its revision stays the same.
     fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused>;
@@ -202,12 +253,21 @@ pub trait Membership: Send + Sync + 'static {
 pub(crate) trait Turn {
     fn store(&self) -> &MemoryStore;
 
-    /// The number of the life a registration makes now.
+    /// Check the term before the registration starts writing.
+    fn check_term(&self) -> Result<(), Refused> {
+        Ok(())
+    }
+
+    /// The number of the life a registration makes now, or a refusal where
+    /// the turn may make none: under a term its log no longer leads.
     fn life(&self) -> Result<u64, Refused>;
 
     /// The door's own rules of the facts it is about to write, behind the
     /// store's measure.
     fn room(&self, facts: &WorkerFacts, maker: &Maker) -> Result<(), Refused>;
+
+    /// Hear a row's write at its place in the turn.
+    fn told(&self, _: Wrote) {}
 }
 
 fn made_by(row: &WorkerRow, maker: &Maker) -> Result<(), Refused> {
@@ -225,16 +285,46 @@ fn seen_row(store: &MemoryStore, url: &str, seen: Standing) -> Result<WorkerRow,
     Ok(row)
 }
 
-/// Lay a registration over what it expects to stand while the door holds
-/// its turn. The row's event signal is stated here, over the facts the
-/// callback states ([`asks_events`]).
-pub(crate) fn lay(
+const RANKS: Refused = Refused::Past(Past {
+    fact: "dp_rank",
+    why: "a registration states every rank of one engine under its own URL",
+});
+
+/// The rows `built` states, handed to `write`: each worker's URL, and its
+/// facts over the row that stands there, by the write's verb ([`stated`]).
+pub(crate) fn stating<T>(
+    built: &[Arc<dyn Worker>],
+    over: Option<Over<'_>>,
+    write: impl FnOnce(&[Stated<'_>]) -> T,
+) -> T {
+    let states: Vec<_> = built
+        .iter()
+        .map(|worker| move |standing: Option<&WorkerFacts>| stated(worker.as_ref(), standing, over))
+        .collect();
+    let rows: Vec<_> = built
+        .iter()
+        .zip(&states)
+        .map(|(worker, state)| Stated {
+            url: worker.url(),
+            state,
+        })
+        .collect();
+    write(&rows)
+}
+
+/// What a stated row leaves to write: its facts, and what laying them makes
+/// of the row that stands under its URL.
+type Ready = (WorkerFacts, Option<(WorkerId, Laid)>);
+
+/// Check one stated row by its own rule, over what its write expects to
+/// stand under its URL. Nothing is written. The row's event signal is
+/// stated here, over the facts its callback states ([`asks_events`]).
+fn ready_row(
     turn: &impl Turn,
     maker: &Maker,
     expect: Expect,
-    url: &str,
-    state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-) -> Result<Wrote, Refused> {
+    Stated { url, state }: &Stated<'_>,
+) -> Result<Ready, Refused> {
     let store = turn.store();
     let standing = match expect {
         Expect::Seen(seen) => Some(seen_row(store, url, seen)?),
@@ -247,16 +337,15 @@ pub(crate) fn lay(
     }
     if let Some(row) = &standing {
         made_by(row, maker)?;
-        // A draining row is leaving. Laid over, it would take the URL's
-        // next life and its removal would leave the worker: the removal
-        // wins over a replacement.
+        // A draining row is leaving. Laid over, it would take the
+        // URL's next life and its removal would leave the worker: the
+        // removal wins over a replacement.
         if matches!(expect, Expect::Seen(_)) && row.status == WorkerStatus::Draining {
             return Err(Refused::Draining);
         }
     }
-
     let mut facts = state(standing.as_ref().map(|row| &row.facts));
-    if facts.key != url {
+    if facts.key != *url {
         return Err(Refused::Past(Past {
             fact: "key",
             why: "the facts name the URL of the call",
@@ -271,15 +360,133 @@ pub(crate) fn lay(
     }
     facts.bounded(maker).map_err(Refused::Past)?;
     turn.room(&facts, maker)?;
+    let laid = standing.map(|row| (row.id, row.laid(&facts)));
+    Ok((facts, laid))
+}
 
-    match &standing {
-        None => facts.incarnation = turn.life()?,
-        Some(row) => match row.laid(&facts) {
-            Laid::Unmoved => return Ok(Wrote::Unmoved(row.id)),
-            Laid::InPlace => {}
-            Laid::Another => facts.incarnation = turn.life()?,
-        },
+/// Lay one row by its own rule alone: the write of [`Membership::found`].
+/// No rule of the engine's other rows is held and no row leaves.
+pub(crate) fn lay_one(
+    turn: &impl Turn,
+    maker: &Maker,
+    expect: Expect,
+    url: &str,
+    state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
+) -> Result<Wrote, Refused> {
+    let (facts, laid) = ready_row(turn, maker, expect, &Stated { url, state })?;
+    turn.check_term()?;
+    write_row(turn, maker, facts, laid)
+}
+
+/// Check each row and the group, over what the registration expects to
+/// stand, before writing either the rows that stay or the rows that leave.
+/// One turn covers the whole registration.
+pub(crate) fn lay(
+    turn: &impl Turn,
+    maker: &Maker,
+    expect: Expect,
+    rows: &[Stated<'_>],
+) -> Result<Vec<Wrote>, Refused> {
+    if rows.is_empty() {
+        return Err(Refused::Past(Past {
+            fact: "rows",
+            why: "a registration states at least one row",
+        }));
     }
+    // A guarded write states the one row its asker saw and changes it where
+    // it stands, by that row's own rule: the group's rule is a
+    // registration's.
+    if matches!(expect, Expect::Seen(_)) {
+        let [row] = rows else {
+            return Err(Refused::Past(Past {
+                fact: "rows",
+                why: "a replacement states the one row its asker saw",
+            }));
+        };
+        return lay_one(turn, maker, expect, row.url, row.state).map(|wrote| vec![wrote]);
+    }
+    let store = turn.store();
+    let mut ready = Vec::with_capacity(rows.len());
+    for row in rows {
+        ready.push(ready_row(turn, maker, expect, row)?);
+    }
+
+    // The engine is the one the first row states. The others are held to
+    // it below, and the store is asked by it.
+    let engine = ready[0].0.engine.as_str();
+    let width = usize::from(ready[0].0.dp_size);
+    if width != rows.len() {
+        return Err(RANKS);
+    }
+    let ranked = width > 1;
+    let mut seen = vec![false; width];
+    for (facts, _) in &ready {
+        let rank = usize::from(facts.dp_rank);
+        let Some(seen) = seen.get_mut(rank) else {
+            return Err(RANKS);
+        };
+        let right_key = if ranked {
+            facts.key == rank_url(engine, rank)
+        } else {
+            facts.key == engine
+        };
+        if facts.engine != engine
+            || usize::from(facts.dp_size) != width
+            || !right_key
+            || mem::replace(seen, true)
+        {
+            return Err(RANKS);
+        }
+    }
+
+    // Every standing row of the engine that the registration does not
+    // state leaves with it: the ranks a narrower worker no longer has, the
+    // plain row of one that comes back ranked, the ranks of one that comes
+    // back plain, and a rank left above ranks that were removed. The rows
+    // are the engine's by their own fact, whatever their keys read as.
+    let mut left: Vec<_> = store
+        .of_engine(engine)
+        .into_iter()
+        .filter(|row| rows.iter().all(|stated| stated.url != row.facts.key))
+        .collect();
+    left.sort_by_key(|row| row.facts.dp_rank);
+    for row in &left {
+        // An add retires no row: the engine stands in another form.
+        if expect == Expect::Nothing {
+            return Err(Refused::Stands);
+        }
+        made_by(row, maker)?;
+    }
+
+    turn.check_term()?;
+    let mut answer = Vec::with_capacity(width + left.len());
+    for (facts, laid) in ready {
+        answer.push(write_row(turn, maker, facts, laid)?);
+    }
+    for row in left {
+        let wrote = changed(store.remove(row.id, row.revision), Wrote::Removed)?;
+        turn.told(wrote);
+        answer.push(wrote);
+    }
+    Ok(answer)
+}
+
+fn write_row(
+    turn: &impl Turn,
+    maker: &Maker,
+    mut facts: WorkerFacts,
+    laid: Option<(WorkerId, Laid)>,
+) -> Result<Wrote, Refused> {
+    match laid {
+        None | Some((_, Laid::Another)) => facts.incarnation = turn.life()?,
+        Some((id, Laid::Unmoved)) => {
+            let wrote = Wrote::Unmoved(id);
+            turn.told(wrote);
+            return Ok(wrote);
+        }
+        Some((_, Laid::InPlace)) => {}
+    }
+    let store = turn.store();
     let probes = facts.health.probes;
     let change = store.upsert_by(facts, maker.clone());
     let wrote = match change {
@@ -297,6 +504,7 @@ pub(crate) fn lay(
             store.connected(row.id, row.revision, &|| true);
         }
     }
+    turn.told(wrote);
     Ok(wrote)
 }
 
@@ -389,7 +597,7 @@ pub(crate) fn refresh(
         return Err(Refused::Draining);
     }
     let mut stated = facts(built, Some(&row.facts));
-    let labels = std::mem::replace(&mut stated.labels, row.facts.labels.clone());
+    let labels = mem::replace(&mut stated.labels, row.facts.labels.clone());
     if stated != row.facts {
         return Err(Refused::NotLabelsAlone);
     }
@@ -429,24 +637,41 @@ impl StoreDoor {
         }
     }
 
-    /// Call `told` once per write, after the turn is released. A refusal
-    /// or an unmoved row leaves the listener alone.
+    /// Call `told` once after a turn that changed any rows is released.
     #[must_use]
     pub fn telling(mut self, told: impl Fn() + Send + Sync + 'static) -> Self {
         self.told = Some(Box::new(told));
         self
     }
 
-    fn call(&self, write: impl FnOnce() -> Result<Wrote, Refused>) -> Result<Wrote, Refused> {
+    fn call<T>(
+        &self,
+        write: impl FnOnce() -> Result<T, Refused>,
+        changed: impl FnOnce(&T) -> bool,
+    ) -> Result<T, Refused> {
         let turn = self.turn.lock();
         let answer = write();
         drop(turn);
-        if !matches!(answer, Err(_) | Ok(Wrote::Unmoved(_))) {
+        if answer.as_ref().is_ok_and(changed) {
             if let Some(told) = &self.told {
                 told();
             }
         }
         answer
+    }
+
+    /// The registration's write over rows of stated facts, in the door's
+    /// turn.
+    fn rows(
+        &self,
+        maker: &Maker,
+        expect: Expect,
+        rows: &[Stated<'_>],
+    ) -> Result<Vec<Wrote>, Refused> {
+        self.call(
+            || lay(self, maker, expect, rows),
+            |answer| answer.iter().any(Wrote::changed),
+        )
     }
 }
 
@@ -472,29 +697,27 @@ impl Membership for StoreDoor {
         url: &str,
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
     ) -> Result<Wrote, Refused> {
-        self.call(|| lay(self, maker, expect, url, state))
+        self.call(|| lay_one(self, maker, expect, url, state), Wrote::changed)
     }
 
-    // This door has no holder. The row takes the facts alone, by the
+    // This door has no holder. The rows take the facts alone, by the
     // write's verb.
-    fn found_built(
+    fn found_rows(
         &self,
         maker: &Maker,
         expect: Expect,
-        built: &Arc<dyn Worker>,
+        built: &[Arc<dyn Worker>],
         over: Option<Over<'_>>,
-    ) -> Result<Wrote, Refused> {
-        self.found(maker, expect, built.url(), &|standing| {
-            stated(built.as_ref(), standing, over)
-        })
+    ) -> Result<Vec<Wrote>, Refused> {
+        stating(built, over, |rows| self.rows(maker, expect, rows))
     }
 
     fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
-        self.call(|| drain(&self.store, by, url, seen))
+        self.call(|| drain(&self.store, by, url, seen), Wrote::changed)
     }
 
     fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
-        self.call(|| take(&self.store, by, url, seen))
+        self.call(|| take(&self.store, by, url, seen), Wrote::changed)
     }
 
     // This door has no holder. The row takes the labels alone.
@@ -504,7 +727,7 @@ impl Membership for StoreDoor {
         built: &Arc<dyn Worker>,
         _: &Arc<dyn Worker>,
     ) -> Result<Wrote, Refused> {
-        self.call(|| refresh(self, seen, built.as_ref()))
+        self.call(|| refresh(self, seen, built.as_ref()), Wrote::changed)
     }
 }
 
@@ -527,7 +750,8 @@ pub(super) mod tests {
     };
 
     use super::{
-        changed, lay, Expect, Membership, Refused, Remover, Standing, StoreDoor, Turn, Wrote,
+        changed, lay, Expect, Membership, Refused, Remover, Standing, Stated, StoreDoor, Turn,
+        Wrote,
     };
     use crate::{
         demands::{DemandFacts, Demands},
@@ -539,7 +763,8 @@ pub(super) mod tests {
         store::{
             index::indexed_under,
             membership::{self, Past},
-            Maker, MemoryStore, Signals, WorkerFacts, WorkerRow, WorkerStatus, WorkersStore,
+            Maker, MembershipChange, MembershipTail, MemoryStore, Signals, WorkerFacts, WorkerRow,
+            WorkerStatus, WorkersStore,
         },
         view::{Role, WireModes, WorkerId},
     };
@@ -563,6 +788,56 @@ pub(super) mod tests {
         }
     }
 
+    /// A door as the cases reach it: the trait, and the registration's
+    /// write over rows of stated facts, where a case states facts no built
+    /// worker would.
+    pub(crate) trait Rows: Membership {
+        fn rows(
+            &self,
+            maker: &Maker,
+            expect: Expect,
+            rows: &[Stated<'_>],
+        ) -> Result<Vec<Wrote>, Refused>;
+    }
+
+    impl Rows for StoreDoor {
+        fn rows(
+            &self,
+            maker: &Maker,
+            expect: Expect,
+            rows: &[Stated<'_>],
+        ) -> Result<Vec<Wrote>, Refused> {
+            StoreDoor::rows(self, maker, expect, rows)
+        }
+    }
+
+    pub(crate) trait FindOne: Rows {
+        /// One row, upserted.
+        fn found_one(
+            &self,
+            maker: &Maker,
+            url: &str,
+            state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
+        ) -> Result<Wrote, Refused> {
+            self.found_one_over(maker, Expect::Anything, url, state)
+        }
+
+        /// One row, laid over what its registration expects.
+        fn found_one_over(
+            &self,
+            maker: &Maker,
+            expect: Expect,
+            url: &str,
+            state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
+        ) -> Result<Wrote, Refused> {
+            let answer = self.rows(maker, expect, &[Stated { url, state }])?;
+            assert_eq!(answer.len(), 1);
+            Ok(answer[0])
+        }
+    }
+
+    impl<T: Rows + ?Sized> FindOne for T {}
+
     fn standing(row: &WorkerRow) -> Standing {
         Standing {
             row: row.id,
@@ -575,9 +850,431 @@ pub(super) mod tests {
         revision: 0,
     };
 
-    fn local_door() -> (Arc<MemoryStore>, Box<dyn Membership>) {
+    fn local_door() -> (Arc<MemoryStore>, Box<dyn Rows>) {
         let (store, door) = door();
         (store, Box::new(door))
+    }
+
+    fn ranked(width: u16) -> Vec<WorkerFacts> {
+        (0..width)
+            .map(|rank| WorkerFacts {
+                key: format!("{URL}@{rank}"),
+                dp_rank: rank,
+                dp_size: width,
+                ..stated()
+            })
+            .collect()
+    }
+
+    fn find_rows(
+        door: &dyn Rows,
+        maker: &Maker,
+        facts: &[WorkerFacts],
+    ) -> Result<Vec<Wrote>, Refused> {
+        find_rows_over(door, maker, Expect::Anything, facts)
+    }
+
+    fn find_rows_over(
+        door: &dyn Rows,
+        maker: &Maker,
+        expect: Expect,
+        facts: &[WorkerFacts],
+    ) -> Result<Vec<Wrote>, Refused> {
+        let states: Vec<_> = facts
+            .iter()
+            .map(|facts| move |_: Option<&WorkerFacts>| facts.clone())
+            .collect();
+        let rows: Vec<_> = facts
+            .iter()
+            .zip(&states)
+            .map(|(facts, state)| Stated {
+                url: &facts.key,
+                state,
+            })
+            .collect();
+        door.rows(maker, expect, &rows)
+    }
+
+    type Open = fn() -> (Arc<MemoryStore>, Box<dyn Rows>);
+
+    #[test]
+    fn a_width_of_four_makes_four_rows_in_one_write() {
+        check_four_rows(local_door).expect("four ranks registered");
+    }
+
+    fn check_four_rows(open: Open) -> Result<(), &'static str> {
+        let (store, door) = open();
+        let mut facts = ranked(4);
+        facts.rotate_left(2);
+        for row in &mut facts[..2] {
+            row.health.probes = false;
+        }
+        let answer = find_rows(&*door, &Maker::Control, &facts).map_err(|_| "registered")?;
+        assert_eq!(answer.len(), 4);
+        let mut lives = Vec::new();
+        for (index, stated) in facts.iter().enumerate() {
+            let row = store.by_key(&stated.key).ok_or("the registered rank")?;
+            assert_eq!(answer[index], Wrote::Registered(row.id));
+            assert_eq!(row.facts.key, stated.key);
+            assert_eq!(row.facts.engine, URL);
+            assert_eq!((row.facts.dp_rank, row.facts.dp_size), (stated.dp_rank, 4));
+            let status = if index < 2 {
+                WorkerStatus::Ready
+            } else {
+                WorkerStatus::Pending
+            };
+            assert_eq!(row.status, status);
+            lives.push(row.facts.incarnation);
+        }
+        let steps: Vec<_> = lives
+            .windows(2)
+            .map(|pair| pair[1].checked_sub(pair[0]))
+            .collect();
+        assert_eq!(steps, [Some(2), Some(2), Some(1)], "{lives:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_registration_refused_at_one_rank_writes_no_rank() {
+        check_bad_label(local_door);
+    }
+
+    fn check_bad_label(open: Open) {
+        let (store, door) = open();
+        let mut ranks = ranked(4);
+        ranks[2].labels.insert("tier".to_owned(), "x".repeat(4097));
+        let epoch = store.epoch();
+        assert_eq!(
+            find_rows(&*door, &Maker::Control, &ranks),
+            Err(Refused::Past(Past {
+                fact: "labels",
+                why: "a label's value is at most 4096 bytes",
+            }))
+        );
+        assert_eq!(store.epoch(), epoch);
+        assert!(store.snapshot().1.is_empty());
+    }
+
+    #[test]
+    fn a_worker_that_comes_back_narrower_loses_the_ranks_it_no_longer_states() {
+        check_narrower(local_door).expect("four ranks, then two");
+    }
+
+    fn check_narrower(open: Open) -> Result<(), &'static str> {
+        let (store, door) = open();
+        let maker = Maker::Control;
+        let four = ranked(4);
+        find_rows(&*door, &maker, &four).map_err(|_| "registered four ranks")?;
+        let old: Vec<_> = four
+            .iter()
+            .map(|facts| store.by_key(&facts.key).ok_or("the old rank"))
+            .collect::<Result<_, _>>()?;
+        let alias = WorkerFacts {
+            key: format!("{URL}@03"),
+            engine: format!("{URL}@03"),
+            ..stated()
+        };
+        store.upsert(alias.clone());
+        let epoch = store.epoch();
+        let two = ranked(2);
+        assert_eq!(
+            find_rows(&*door, &maker, &two),
+            Ok(vec![
+                Wrote::InPlace(old[0].id),
+                Wrote::InPlace(old[1].id),
+                Wrote::Removed(old[2].id),
+                Wrote::Removed(old[3].id),
+            ])
+        );
+        let MembershipTail::Changes(changes) = store.changes_since(epoch) else {
+            return Err("four changes after this epoch");
+        };
+        assert_eq!(
+            changes
+                .into_iter()
+                .map(|(_, change)| change)
+                .collect::<Vec<_>>(),
+            [
+                MembershipChange::Resized { id: old[0].id },
+                MembershipChange::Resized { id: old[1].id },
+                MembershipChange::Removed { id: old[2].id },
+                MembershipChange::Removed { id: old[3].id },
+            ]
+        );
+        for row in &old[..2] {
+            let resized = store.get(row.id).ok_or("the resized rank")?;
+            assert_eq!(resized.facts.dp_size, 2);
+            assert_eq!(resized.facts.incarnation, row.facts.incarnation);
+        }
+        assert!(four[2..]
+            .iter()
+            .all(|facts| store.by_key(&facts.key).is_none()));
+        assert_eq!(store.by_key(&alias.key).map(|row| row.facts), Some(alias));
+        Ok(())
+    }
+
+    #[test]
+    fn ranks_left_above_removed_ranks_are_the_engines_still() {
+        check_partial_removal(local_door).expect("two ranks of four removed");
+    }
+
+    /// Ranks zero and one of four are removed one row at a time. The two
+    /// left refuse an add, and leave with the next registration.
+    fn check_partial_removal(open: Open) -> Result<(), &'static str> {
+        let (store, door) = open();
+        let maker = Maker::Control;
+        let four = ranked(4);
+        find_rows(&*door, &maker, &four).map_err(|_| "registered four ranks")?;
+        let old: Vec<_> = four
+            .iter()
+            .map(|facts| store.by_key(&facts.key).ok_or("the old rank"))
+            .collect::<Result<_, _>>()?;
+        for row in &old[..2] {
+            door.gone(Remover::Maker(&maker), &row.facts.key, standing(row))
+                .map_err(|_| "a low rank removed")?;
+        }
+        let epoch = store.epoch();
+        let two = ranked(2);
+        assert_eq!(
+            find_rows_over(&*door, &maker, Expect::Nothing, &two),
+            Err(Refused::Stands)
+        );
+        assert_eq!(store.epoch(), epoch);
+
+        let answer = find_rows(&*door, &maker, &two).map_err(|_| "two ranks registered")?;
+        assert!(matches!(
+            answer[..2],
+            [Wrote::Registered(_), Wrote::Registered(_)]
+        ));
+        assert_eq!(
+            answer[2..],
+            [Wrote::Removed(old[2].id), Wrote::Removed(old[3].id)]
+        );
+        assert!(four[2..]
+            .iter()
+            .all(|facts| store.by_key(&facts.key).is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_worker_that_comes_back_ranked_loses_its_plain_row() {
+        check_ranked_then_plain(local_door).expect("plain, ranked and plain again");
+    }
+
+    fn check_ranked_then_plain(open: Open) -> Result<(), &'static str> {
+        let (store, door) = open();
+        let maker = Maker::Control;
+        find_rows(&*door, &maker, &[stated()]).map_err(|_| "registered the plain row")?;
+        let plain = store.by_key(URL).ok_or("the plain row")?;
+        let four = ranked(4);
+        let answer = find_rows(&*door, &maker, &four).map_err(|_| "registered four ranks")?;
+        assert_eq!(answer.len(), 5);
+        assert_eq!(answer[4], Wrote::Removed(plain.id));
+        assert_eq!(store.by_key(URL), None);
+        let ids: Vec<_> = four
+            .iter()
+            .map(|facts| store.by_key(&facts.key).map(|row| row.id).ok_or("the rank"))
+            .collect::<Result<_, _>>()?;
+        let answer = find_rows(&*door, &maker, &[stated()]).map_err(|_| "plain again")?;
+        let fresh = store.by_key(URL).ok_or("the new plain row")?;
+        let expected: Vec<_> = std::iter::once(Wrote::Registered(fresh.id))
+            .chain(ids.into_iter().map(Wrote::Removed))
+            .collect();
+        assert_eq!(answer, expected);
+        assert!(four.iter().all(|facts| store.by_key(&facts.key).is_none()));
+        assert_ne!(plain.id, fresh.id);
+        Ok(())
+    }
+
+    #[test]
+    fn another_makers_row_of_the_engine_refuses_the_registration_whole() {
+        check_other_maker(local_door).expect("the control row stands alone");
+    }
+
+    fn check_other_maker(open: Open) -> Result<(), &'static str> {
+        let (store, door) = open();
+        let provider = Maker::provider("pool", "private/key").map_err(|_| "the provider")?;
+        find_rows(&*door, &Maker::Control, &[stated()]).map_err(|_| "the control registration")?;
+        let before = store.snapshot();
+        assert_eq!(
+            find_rows(&*door, &provider, &ranked(4)),
+            Err(Refused::NotMaker(
+                "the row was made by a control call: its maker alone changes it".to_owned()
+            ))
+        );
+        assert_eq!(store.snapshot(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn ranks_that_are_not_zero_to_the_width_each_once_are_refused() {
+        check_invalid_ranks(local_door);
+    }
+
+    fn check_invalid_ranks(open: Open) {
+        let (store, door) = open();
+        let four = ranked(4);
+        let mut duplicate = four.clone();
+        duplicate[1] = four[0].clone();
+        let mut past_width = four.clone();
+        past_width[3].dp_rank = 4;
+        past_width[3].key = format!("{URL}@4");
+        let mut another_engine = four.clone();
+        another_engine[1].engine = "http://other:8000".to_owned();
+        // The door reads the engine from the first row: a first row that
+        // states another, or every row stating another, is held to its key.
+        let mut another_first = four.clone();
+        another_first[0].engine = "http://other:8000".to_owned();
+        let mut another_all = four.clone();
+        for facts in &mut another_all {
+            facts.engine = "http://other:8000".to_owned();
+        }
+        let mut wrong_key = four.clone();
+        wrong_key[1].key = format!("{URL}@01");
+        let mut wrong_width = four.clone();
+        wrong_width[1].dp_size = 2;
+        let mut wrong_plain = stated();
+        wrong_plain.dp_rank = 1;
+        let missing_rank = four[..3].to_vec();
+        for ranks in [
+            duplicate,
+            past_width,
+            another_engine,
+            another_first,
+            another_all,
+            wrong_key,
+            wrong_width,
+            vec![wrong_plain],
+            missing_rank,
+        ] {
+            assert!(
+                matches!(
+                    find_rows(&*door, &Maker::Control, &ranks),
+                    Err(Refused::Past(Past {
+                        fact: "dp_rank",
+                        ..
+                    }))
+                ),
+                "{ranks:?}"
+            );
+            assert_eq!(store.snapshot(), (0, Vec::new()));
+        }
+        // Facts under another key than their row's URL are refused by the
+        // key's name, ahead of the group's shape.
+        let row = Stated {
+            url: "http://other:8000",
+            state: &|_| stated(),
+        };
+        assert!(matches!(
+            door.rows(&Maker::Control, Expect::Anything, &[row]),
+            Err(Refused::Past(Past { fact: "key", .. }))
+        ));
+        assert_eq!(store.snapshot(), (0, Vec::new()));
+    }
+
+    #[test]
+    fn the_same_ranks_stated_again_write_nothing() {
+        let heard = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&heard);
+        let store = Arc::new(MemoryStore::default());
+        let door = StoreDoor::new(Arc::clone(&store)).telling(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        });
+        check_unchanged(&store, &door).expect("the same four ranks stand");
+        assert_eq!(heard.load(Ordering::Relaxed), 1);
+    }
+
+    fn check_unchanged(store: &MemoryStore, door: &dyn Rows) -> Result<(), &'static str> {
+        let maker = Maker::Control;
+        let four = ranked(4);
+        let first = find_rows(door, &maker, &four).map_err(|_| "registered four ranks")?;
+        let epoch = store.epoch();
+        let expected = first
+            .into_iter()
+            .map(|wrote| match wrote {
+                Wrote::Registered(id) => Ok(Wrote::Unmoved(id)),
+                _ => Err("a new rank must be registered"),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(find_rows(door, &maker, &four), Ok(expected));
+        assert_eq!(store.epoch(), epoch);
+        Ok(())
+    }
+
+    #[test]
+    fn the_write_of_one_row_holds_no_group_rule_and_takes_no_row() {
+        check_one_row(local_door);
+    }
+
+    /// The first form of the write, as its callers hand it: a rank laid
+    /// alone, and one rank's row changed beside the other.
+    pub(crate) fn check_one_row(open: Open) {
+        let (store, door) = open();
+        let ranks = ranked(2);
+        let one = |facts: &WorkerFacts, expect| {
+            door.found(&Maker::Control, expect, &facts.key, &|_| facts.clone())
+        };
+        let low = one(&ranks[0], Expect::Nothing);
+        assert!(matches!(low, Ok(Wrote::Registered(_))), "{low:?}");
+        // The rows write holds the engine to its width where one rank stands.
+        let epoch = store.epoch();
+        assert!(matches!(
+            find_rows(&*door, &Maker::Control, &ranks[1..]),
+            Err(Refused::Past(Past {
+                fact: "dp_rank",
+                ..
+            }))
+        ));
+        assert_eq!(store.epoch(), epoch);
+        let high = one(&ranks[1], Expect::Nothing);
+        assert!(matches!(high, Ok(Wrote::Registered(_))), "{high:?}");
+
+        // One rank's row is changed where it stands, and the other stays.
+        let other = store.by_key(&ranks[0].key).expect("the low rank");
+        let seen = standing(&store.by_key(&ranks[1].key).expect("the high rank"));
+        let resized = WorkerFacts {
+            max_running: Some(8),
+            ..ranks[1].clone()
+        };
+        let wrote = one(&resized, Expect::Seen(seen));
+        assert!(
+            matches!(wrote, Ok(Wrote::InPlace(_) | Wrote::Another { .. })),
+            "{wrote:?}"
+        );
+        assert_eq!(store.by_key(&ranks[0].key), Some(other));
+        assert_eq!(
+            store.by_key(&ranks[1].key).map(|row| row.facts.max_running),
+            Some(Some(8))
+        );
+    }
+
+    #[test]
+    fn no_row_stated_is_refused() {
+        check_empty(local_door);
+    }
+
+    fn check_empty(open: Open) {
+        let (store, door) = open();
+        assert!(matches!(
+            door.rows(&Maker::Control, Expect::Anything, &[]),
+            Err(Refused::Past(Past { fact: "rows", .. }))
+        ));
+        assert_eq!(store.snapshot(), (0, Vec::new()));
+    }
+
+    #[cfg(feature = "controller")]
+    pub(crate) fn check_rank_rows(open: Open) -> Result<(), &'static str> {
+        check_four_rows(open)?;
+        check_bad_label(open);
+        check_narrower(open)?;
+        check_partial_removal(open)?;
+        check_ranked_then_plain(open)?;
+        check_other_maker(open)?;
+        check_invalid_ranks(open);
+        let (store, door) = open();
+        check_unchanged(&store, &*door)?;
+        check_empty(open);
+        Ok(())
     }
 
     #[test]
@@ -614,7 +1311,7 @@ pub(super) mod tests {
     /// facts state: what the generation in force reads for the row's first
     /// model in the phase of its role, and only for a gRPC worker. A write
     /// under a later generation states it again.
-    pub(crate) fn check_event_signal(open: impl Fn() -> (Arc<MemoryStore>, Box<dyn Membership>)) {
+    pub(crate) fn check_event_signal(open: impl Fn() -> (Arc<MemoryStore>, Box<dyn Rows>)) {
         const PAIRED: &str = "pd/x";
         // The row's model, role and wire, what its facts state, and what the
         // door states.
@@ -640,7 +1337,7 @@ pub(super) mod tests {
                 },
                 ..stated()
             };
-            door.found(&Maker::Control, Expect::Nothing, URL, &|_| found.clone())
+            door.found_one_over(&Maker::Control, Expect::Nothing, URL, &|_| found.clone())
                 .expect("registered");
             let row = store.by_key(URL).expect("the found row");
             assert_eq!(
@@ -655,7 +1352,7 @@ pub(super) mod tests {
             store
                 .apply(AppliedSpec::validate(&later).expect("the preset validates"))
                 .expect("the second generation");
-            door.found(&Maker::Control, Expect::Anything, URL, &|_| found.clone())
+            door.found_one(&Maker::Control, URL, &|_| found.clone())
                 .expect("laid again");
             let row = store.by_key(URL).expect("the row laid again");
             assert_eq!(
@@ -669,33 +1366,32 @@ pub(super) mod tests {
     /// An add registers an absent URL, and a standing row refuses it before
     /// a fact is stated, whoever made the row. A replacement is laid over
     /// the row its asker saw by the rule every registration takes, and is
-    /// refused where that row moved or left.
-    pub(crate) fn check_expectations(
-        open: impl FnOnce() -> (Arc<MemoryStore>, Box<dyn Membership>),
-    ) {
+    /// refused where that row moved or left. An add of ranks is whole or
+    /// not at all.
+    pub(crate) fn check_expectations(open: Open) {
         let (store, door) = open();
         let control = Maker::Control;
         let pool = Maker::provider("pool", "private/key").expect("a maker");
         let unstated = |_: Option<&WorkerFacts>| -> WorkerFacts { panic!("no fact is stated") };
 
-        let added = door.found(&control, Expect::Nothing, URL, &|_| stated());
+        let added = door.found_one_over(&control, Expect::Nothing, URL, &|_| stated());
         let row = store.by_key(URL).expect("the added row");
         assert_eq!(added, Ok(Wrote::Registered(row.id)));
         let epoch = store.epoch();
         for maker in [&control, &pool] {
             assert_eq!(
-                door.found(maker, Expect::Nothing, URL, &unstated),
+                door.found_one_over(maker, Expect::Nothing, URL, &unstated),
                 Err(Refused::Stands)
             );
         }
 
         let seen = Expect::Seen(standing(&row));
         assert_eq!(
-            door.found(&control, seen, URL, &|_| stated()),
+            door.found_one_over(&control, seen, URL, &|_| stated()),
             Ok(Wrote::Unmoved(row.id))
         );
         assert_eq!(
-            door.found(&pool, seen, URL, &unstated),
+            door.found_one_over(&pool, seen, URL, &unstated),
             Err(Refused::NotMaker(
                 "the row was made by a control call: its maker alone changes it".to_owned()
             ))
@@ -708,11 +1404,11 @@ pub(super) mod tests {
             ..stated()
         };
         assert_eq!(
-            door.found(&control, seen, URL, &relabelled),
+            door.found_one_over(&control, seen, URL, &relabelled),
             Ok(Wrote::InPlace(row.id))
         );
         assert_eq!(
-            door.found(&control, seen, URL, &unstated),
+            door.found_one_over(&control, seen, URL, &unstated),
             Err(Refused::Moved)
         );
 
@@ -722,7 +1418,7 @@ pub(super) mod tests {
             models: vec!["other".to_owned()],
             ..stated()
         };
-        let wrote = door.found(&control, Expect::Seen(standing(&moved)), URL, &other);
+        let wrote = door.found_one_over(&control, Expect::Seen(standing(&moved)), URL, &other);
         let next = store.by_key(URL).expect("the next life");
         assert_eq!(
             wrote,
@@ -740,11 +1436,11 @@ pub(super) mod tests {
             Ok(Wrote::Draining(next.id))
         );
         assert_eq!(
-            door.found(&control, Expect::Seen(seen), URL, &unstated),
+            door.found_one_over(&control, Expect::Seen(seen), URL, &unstated),
             Err(Refused::Draining)
         );
         assert!(matches!(
-            door.found(&pool, Expect::Seen(seen), URL, &unstated),
+            door.found_one_over(&pool, Expect::Seen(seen), URL, &unstated),
             Err(Refused::NotMaker(_))
         ));
         assert_eq!(
@@ -758,10 +1454,43 @@ pub(super) mod tests {
             Ok(Wrote::Removed(next.id))
         );
         assert_eq!(
-            door.found(&control, Expect::Seen(seen), URL, &unstated),
+            door.found_one_over(&control, Expect::Seen(seen), URL, &unstated),
             Err(Refused::Absent)
         );
         assert_eq!(store.by_key(URL), None);
+
+        // The second of two ranks stands: the add writes neither.
+        let (store, door) = open();
+        let two = ranked(2);
+        store.upsert(two[1].clone());
+        let epoch = store.epoch();
+        assert_eq!(
+            find_rows_over(&*door, &control, Expect::Nothing, &two),
+            Err(Refused::Stands)
+        );
+        assert_eq!(store.epoch(), epoch);
+
+        // Two ranks are added in one write. The engine's row in its other
+        // form refuses an add, and a replacement states one row.
+        let (store, door) = open();
+        let add = |facts: &[WorkerFacts]| find_rows_over(&*door, &control, Expect::Nothing, facts);
+        let ranks = add(&two).expect("two ranks added");
+        assert!(matches!(
+            ranks[..],
+            [Wrote::Registered(_), Wrote::Registered(_)]
+        ));
+        let epoch = store.epoch();
+        assert_eq!(add(&[stated()]), Err(Refused::Stands));
+        let rank = store.by_key(&two[0].key).expect("rank zero");
+        assert!(matches!(
+            find_rows_over(&*door, &control, Expect::Seen(standing(&rank)), &two),
+            Err(Refused::Past(Past { fact: "rows", .. }))
+        ));
+        assert_eq!(store.epoch(), epoch);
+        find_rows(&*door, &control, &[stated()]).expect("plain again");
+        let epoch = store.epoch();
+        assert_eq!(add(&two), Err(Refused::Stands));
+        assert_eq!(store.epoch(), epoch);
     }
 
     #[test]
@@ -770,17 +1499,15 @@ pub(super) mod tests {
     }
 
     pub(crate) fn check_guard(
-        open: impl FnOnce() -> (Arc<MemoryStore>, Box<dyn Membership>),
+        open: impl FnOnce() -> (Arc<MemoryStore>, Box<dyn Rows>),
     ) -> Result<(), &'static str> {
         let (store, door) = open();
         let maker = Maker::Control;
         let by = Remover::Maker(&maker);
-        assert!(door
-            .found(&maker, Expect::Anything, URL, &|_| stated())
-            .is_ok());
+        assert!(door.found_one(&maker, URL, &|_| stated()).is_ok());
         let first = store.by_key(URL).ok_or("the first row")?;
         assert!(door
-            .found(&maker, Expect::Anything, URL, &|_| WorkerFacts {
+            .found_one(&maker, URL, &|_| WorkerFacts {
                 role: Role::Decode,
                 ..stated()
             })
@@ -812,7 +1539,7 @@ pub(super) mod tests {
     }
 
     pub(crate) fn check_provider(
-        open: impl Fn() -> (Arc<MemoryStore>, Box<dyn Membership>),
+        open: impl Fn() -> (Arc<MemoryStore>, Box<dyn Rows>),
     ) -> Result<(), &'static str> {
         let own = Maker::provider("pool", "private/key").map_err(|_| "the source's maker")?;
         let another =
@@ -829,9 +1556,7 @@ pub(super) mod tests {
             ),
         ] {
             let (store, door) = open();
-            assert!(door
-                .found(&maker, Expect::Anything, URL, &|_| stated())
-                .is_ok());
+            assert!(door.found_one(&maker, URL, &|_| stated()).is_ok());
             let row = store.by_key(URL).ok_or("the registered row")?;
             let by = Remover::Provider("pool");
             let seen = standing(&row);
@@ -855,7 +1580,7 @@ pub(super) mod tests {
     }
 
     pub(crate) fn check_health_scope(
-        open: impl Fn() -> (Arc<MemoryStore>, Box<dyn Membership>),
+        open: impl Fn() -> (Arc<MemoryStore>, Box<dyn Rows>),
     ) -> Result<(), &'static str> {
         let provider = Maker::provider("pool", "private/key").map_err(|_| "the source's maker")?;
         for (scope, control, discovered) in [
@@ -865,9 +1590,7 @@ pub(super) mod tests {
         ] {
             for (maker, allowed) in [(&Maker::Control, control), (&provider, discovered)] {
                 let (store, door) = open();
-                assert!(door
-                    .found(maker, Expect::Anything, URL, &|_| stated())
-                    .is_ok());
+                assert!(door.found_one(maker, URL, &|_| stated()).is_ok());
                 let row = store.by_key(URL).ok_or("the registered row")?;
                 let by = Remover::Health(scope);
                 let seen = standing(&row);
@@ -891,13 +1614,11 @@ pub(super) mod tests {
     }
 
     pub(crate) fn check_maker(
-        open: impl FnOnce() -> (Arc<MemoryStore>, Box<dyn Membership>),
+        open: impl FnOnce() -> (Arc<MemoryStore>, Box<dyn Rows>),
     ) -> Result<(), &'static str> {
         let (store, door) = open();
         let maker = Maker::provider("pool", "private/key").map_err(|_| "the source's maker")?;
-        assert!(door
-            .found(&maker, Expect::Anything, URL, &|_| stated())
-            .is_ok());
+        assert!(door.found_one(&maker, URL, &|_| stated()).is_ok());
         let row = store.by_key(URL).ok_or("the registered row")?;
         assert_eq!(
             door.drained(Remover::Provider("pool"), URL, standing(&row)),
@@ -933,7 +1654,7 @@ pub(super) mod tests {
     /// past its bound is refused, and a row that moved, drains or left
     /// takes no refresh. A refused refresh writes nothing.
     pub(crate) fn check_refresh(
-        open: impl Fn() -> (Arc<MemoryStore>, Box<dyn Membership>),
+        open: impl Fn() -> (Arc<MemoryStore>, Box<dyn Rows>),
     ) -> Result<(), &'static str> {
         let provider = Maker::provider("pool", "private/key").map_err(|_| "the source's maker")?;
         let worker = |built: BasicWorkerBuilder| -> Arc<dyn Worker> { Arc::new(built.build()) };
@@ -1003,7 +1724,7 @@ pub(super) mod tests {
     fn a_found_worker_is_registered_under_its_maker() {
         let (store, door) = door();
         let maker = Maker::provider("pool", "first").expect("a maker");
-        let wrote = door.found(&maker, Expect::Anything, URL, &|standing| {
+        let wrote = door.found_one(&maker, URL, &|standing| {
             assert!(standing.is_none());
             stated()
         });
@@ -1032,11 +1753,11 @@ pub(super) mod tests {
             heard.fetch_add(1, Ordering::Relaxed);
         });
         let maker = Maker::provider("pool", "first").expect("a maker");
-        door.found(&maker, Expect::Anything, URL, &|_| stated())
+        door.found_one(&maker, URL, &|_| stated())
             .expect("registered");
         let row = store.by_key(URL).expect("the registered row");
         assert_eq!(
-            door.found(&maker, Expect::Anything, URL, &|_| stated()),
+            door.found_one(&maker, URL, &|_| stated()),
             Ok(Wrote::Unmoved(row.id))
         );
         let seen = standing(&row);
@@ -1055,7 +1776,7 @@ pub(super) mod tests {
     fn a_changed_label_is_written_in_place_and_a_changed_role_is_another_life() {
         let (store, door) = door();
         let maker = Maker::provider("pool", "first").expect("a maker");
-        door.found(&maker, Expect::Anything, URL, &|_| stated())
+        door.found_one(&maker, URL, &|_| stated())
             .expect("registered");
         let old = store.by_key(URL).expect("the registered row");
         let labelled = WorkerFacts {
@@ -1063,7 +1784,7 @@ pub(super) mod tests {
             ..stated()
         };
         assert_eq!(
-            door.found(&maker, Expect::Anything, URL, &|_| labelled.clone()),
+            door.found_one(&maker, URL, &|_| labelled.clone()),
             Ok(Wrote::InPlace(old.id))
         );
         let standing = store.by_key(URL).expect("the refreshed row");
@@ -1073,7 +1794,7 @@ pub(super) mod tests {
         assert_eq!(standing.revision, 2);
 
         let before = store.epoch();
-        let wrote = door.found(&maker, Expect::Anything, URL, &|_| WorkerFacts {
+        let wrote = door.found_one(&maker, URL, &|_| WorkerFacts {
             role: Role::Decode,
             ..labelled.clone()
         });
@@ -1110,7 +1831,7 @@ pub(super) mod tests {
             demand_facts: DemandFacts { runtime },
             ..stated()
         };
-        door.found(&maker, Expect::Anything, URL, &|_| stating(7))
+        door.found_one(&maker, URL, &|_| stating(7))
             .expect("registered");
         // Its checks are on: a check's word makes the first life ready.
         let pending = store.by_key(URL).expect("the registered row");
@@ -1135,7 +1856,7 @@ pub(super) mod tests {
         let target = placed.decision.pick().expect("the worker states runtime 7");
         assert_eq!(target.targets.first().map(|target| target.id), Some(old.id));
 
-        let wrote = door.found(&maker, Expect::Anything, URL, &|_| stating(9));
+        let wrote = door.found_one(&maker, URL, &|_| stating(9));
         let row = store.by_key(URL).expect("the replaced row");
         assert_eq!(
             wrote,
@@ -1172,14 +1893,12 @@ pub(super) mod tests {
             ),
         ] {
             let (store, door) = door();
-            door.found(&maker, Expect::Anything, URL, &|_| stated())
+            door.found_one(&maker, URL, &|_| stated())
                 .expect("registered");
             let row = store.by_key(URL).expect("the registered row");
             let expected = Err(Refused::NotMaker(why.to_owned()));
             assert_eq!(
-                door.found(&caller, Expect::Anything, URL, &|_| panic!(
-                    "only the maker states facts"
-                )),
+                door.found_one(&caller, URL, &|_| panic!("only the maker states facts")),
                 expected
             );
             assert_eq!(
@@ -1195,6 +1914,52 @@ pub(super) mod tests {
         }
     }
 
+    /// A life is asked a row at a time: a turn that may make no second life
+    /// refuses there, and the row written before it stands.
+    #[test]
+    fn a_life_refused_between_two_rows_leaves_the_row_before() {
+        struct OneLife<'a>(&'a MemoryStore, std::cell::Cell<bool>);
+
+        impl Turn for OneLife<'_> {
+            fn store(&self) -> &MemoryStore {
+                self.0
+            }
+
+            fn life(&self) -> Result<u64, Refused> {
+                if self.1.replace(true) {
+                    return Err(Refused::NotLeading("the term moved".to_owned()));
+                }
+                Ok(7)
+            }
+
+            fn room(&self, _: &WorkerFacts, _: &Maker) -> Result<(), Refused> {
+                Ok(())
+            }
+        }
+
+        let (store, _) = door();
+        let two = ranked(2);
+        let states: Vec<_> = two
+            .iter()
+            .map(|facts| move |_: Option<&WorkerFacts>| facts.clone())
+            .collect();
+        let rows: Vec<_> = two
+            .iter()
+            .zip(&states)
+            .map(|(facts, state)| Stated {
+                url: &facts.key,
+                state,
+            })
+            .collect();
+        let turn = OneLife(&store, std::cell::Cell::new(false));
+        assert_eq!(
+            lay(&turn, &Maker::Control, Expect::Anything, &rows),
+            Err(Refused::NotLeading("the term moved".to_owned()))
+        );
+        assert!(store.by_key(&two[0].key).is_some());
+        assert!(store.by_key(&two[1].key).is_none());
+    }
+
     #[test]
     fn a_fact_past_its_bound_writes_nothing() {
         struct Shut<'a>(&'a MemoryStore);
@@ -1205,7 +1970,7 @@ pub(super) mod tests {
             }
 
             fn life(&self) -> Result<u64, Refused> {
-                Err(Refused::NotLeading("no life".to_owned()))
+                Ok(0)
             }
 
             fn room(&self, _: &WorkerFacts, _: &Maker) -> Result<(), Refused> {
@@ -1222,21 +1987,36 @@ pub(super) mod tests {
             models: vec!["m".repeat(257)],
             ..stated()
         };
-        let no = Err(Refused::Past(Past {
+        let no = Refused::Past(Past {
             fact: "models",
             why: "a model id is at most 256 bytes",
-        }));
+        });
         assert_eq!(
-            door.found(&maker, Expect::Anything, URL, &|_| invalid.clone()),
-            no
+            door.found_one(&maker, URL, &|_| invalid.clone()),
+            Err(no.clone())
         );
         assert_eq!(
-            lay(&Shut(&store), &maker, Expect::Anything, URL, &|_| invalid
-                .clone()),
-            no
+            lay(
+                &Shut(&store),
+                &maker,
+                Expect::Anything,
+                &[Stated {
+                    url: URL,
+                    state: &|_| invalid.clone()
+                }]
+            ),
+            Err(no.clone())
         );
         assert_eq!(
-            lay(&Shut(&store), &maker, Expect::Anything, URL, &|_| stated()),
+            lay(
+                &Shut(&store),
+                &maker,
+                Expect::Anything,
+                &[Stated {
+                    url: URL,
+                    state: &|_| stated()
+                }]
+            ),
             Err(Refused::Past(Past {
                 fact: "row",
                 why: "no room"
@@ -1247,10 +2027,7 @@ pub(super) mod tests {
 
         store.upsert_by(invalid.clone(), maker.clone());
         let standing = store.by_key(URL);
-        assert_eq!(
-            door.found(&maker, Expect::Anything, URL, &|_| invalid.clone()),
-            no
-        );
+        assert_eq!(door.found_one(&maker, URL, &|_| invalid.clone()), Err(no));
         assert_eq!(store.by_key(URL), standing);
         assert_eq!(store.epoch(), 1);
     }
@@ -1259,7 +2036,7 @@ pub(super) mod tests {
     fn a_drain_marks_the_makers_row_once_and_a_removal_takes_it() {
         let (store, door) = door();
         let maker = Maker::provider("pool", "first").expect("a maker");
-        door.found(&maker, Expect::Anything, URL, &|_| stated())
+        door.found_one(&maker, URL, &|_| stated())
             .expect("registered");
         let row = store.by_key(URL).expect("the registered row");
         let stale = row.revision - 1;
@@ -1333,7 +2110,7 @@ pub(super) mod tests {
         });
         let (done, finished) = mpsc::channel();
         let writer = thread::spawn(move || {
-            let found = door.found(&maker, Expect::Anything, URL, &|_| stated());
+            let found = door.found_one(&maker, URL, &|_| stated());
             let seen = standing(&store.by_key(URL).expect("the registered row"));
             let by = Remover::Maker(&maker);
             let drained = door.drained(by, URL, seen);
@@ -1356,13 +2133,13 @@ pub(super) mod tests {
     fn a_worker_whose_checks_are_off_is_ready_at_once() {
         let (store, door) = door();
         let maker = Maker::provider("pool", "first").expect("a maker");
-        door.found(&maker, Expect::Anything, URL, &|_| stated())
+        door.found_one(&maker, URL, &|_| stated())
             .expect("registered");
         assert_eq!(
             store.by_key(URL).map(|row| row.status),
             Some(WorkerStatus::Pending)
         );
-        let wrote = door.found(&maker, Expect::Anything, URL, &|_| {
+        let wrote = door.found_one(&maker, URL, &|_| {
             let mut facts = stated();
             facts.health.probes = false;
             facts
@@ -1373,7 +2150,7 @@ pub(super) mod tests {
 
         door.gone(Remover::Maker(&maker), URL, standing(&row))
             .expect("removed");
-        let wrote = door.found(&maker, Expect::Anything, URL, &|_| row.facts.clone());
+        let wrote = door.found_one(&maker, URL, &|_| row.facts.clone());
         let fresh = store.by_key(URL).expect("the newly registered row");
         assert_eq!(wrote, Ok(Wrote::Registered(fresh.id)));
         assert_eq!((fresh.status, fresh.revision), (WorkerStatus::Ready, 1));
@@ -1389,7 +2166,7 @@ pub(super) mod tests {
                 .map(|_| {
                     scope.spawn(|| {
                         ready.wait();
-                        door.found(&maker, Expect::Anything, URL, &|_| {
+                        door.found_one(&maker, URL, &|_| {
                             assert!(
                                 door.turn.is_locked(),
                                 "the facts are stated in the door's turn"
@@ -1426,13 +2203,13 @@ pub(super) mod tests {
     fn the_facts_are_stated_over_the_row_that_stands() {
         let (store, door) = door();
         let maker = Maker::provider("pool", "first").expect("a maker");
-        door.found(&maker, Expect::Anything, URL, &|_| WorkerFacts {
+        door.found_one(&maker, URL, &|_| WorkerFacts {
             zone: Some("east".to_owned()),
             ..stated()
         })
         .expect("registered");
         let old = store.by_key(URL).expect("the registered row");
-        let wrote = door.found(&maker, Expect::Anything, URL, &|standing| {
+        let wrote = door.found_one(&maker, URL, &|standing| {
             assert_eq!(standing, Some(&old.facts));
             WorkerFacts {
                 zone: standing.and_then(|facts| facts.zone.clone()),
@@ -1447,7 +2224,7 @@ pub(super) mod tests {
 
         // Facts under another key are refused in every build: the store
         // writes by the facts' key, and no maker was asked of that row.
-        let mismatch = door.found(&maker, Expect::Anything, URL, &|_| WorkerFacts {
+        let mismatch = door.found_one(&maker, URL, &|_| WorkerFacts {
             key: "http://another".to_owned(),
             ..stated()
         });

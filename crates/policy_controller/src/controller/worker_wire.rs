@@ -363,9 +363,9 @@ fn maker_weight(maker: &Maker) -> usize {
 /// the fact, and a promoted one would decide by other facts than its leader
 /// did. The row on the wire carries a pairing's port alone and no encode
 /// offer, vision bit, priority or drain window, and it reads an empty zone
-/// and a zero window, block size or port as none. The facts are written as the log
-/// writes them and read back as a standby reads them, so a fact the wire
-/// gains is taken here with no second list.
+/// and a zero admission window, block size or port as none. The facts are
+/// written as the log writes them and read back as a standby reads them, so
+/// a fact the wire gains is taken here with no second list.
 #[cfg(feature = "worker-host")]
 #[cfg_attr(
     not(test),

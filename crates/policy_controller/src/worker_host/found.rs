@@ -11,6 +11,14 @@ use crate::{
     view::{threshold_permille, WireModes},
 };
 
+/// The engine a worker's rows stand under: the address its ranks share, or
+/// its own, as it was registered. A join base is not that key: it drops an
+/// HTTP address's trailing slash.
+pub(super) fn engine_of(worker: &dyn Worker) -> &str {
+    let spec = &worker.metadata().spec;
+    spec.dp_base_url.as_deref().unwrap_or(&spec.url)
+}
+
 /// The facts a provider states of a worker it found, from the object to the
 /// row as the module's table describes. Facts the object does not carry
 /// come from the standing row, or from the store's defaults. The models are
@@ -27,7 +35,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
     let checks = &metadata.health_config;
     WorkerFacts {
         key: spec.url.clone(),
-        engine: spec.dp_base_url.as_ref().unwrap_or(&spec.url).clone(),
+        engine: engine_of(worker).to_owned(),
         incarnation: standing.incarnation,
         role: role(spec.worker_type),
         wire_modes: match spec.connection_mode {

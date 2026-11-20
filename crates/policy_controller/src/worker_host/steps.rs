@@ -22,8 +22,8 @@ use wfaas::{
 };
 
 use super::{
-    facts, Credentials, Expect, KeptCredential, Membership, Objects, Over, Refused, Remover,
-    Standing, Wrote,
+    facts, found::engine_of, Credentials, Expect, KeptCredential, Membership, Objects, Over,
+    Refused, Remover, Standing, Wrote,
 };
 use crate::{
     store::{Maker, Unmade, WorkersStore},
@@ -69,7 +69,7 @@ pub const DRAIN_WORKERS_AT_DOOR_STEP: &str = "drain_workers_at_door";
 /// The step that removes the drained workers' rows after they settle.
 pub const REMOVE_WORKERS_AT_DOOR_STEP: &str = "remove_workers_at_door";
 
-/// Write the workers the preceding registration steps created.
+/// Write the workers the preceding steps created in one registration.
 pub struct WriteWorkersAtDoor<G> {
     door: Arc<dyn Membership>,
     objects: Arc<Objects<G>>,
@@ -120,10 +120,12 @@ pub struct RemoveWorkersAtDoor<G> {
 /// The write is a step of the local kind, as the creation is: it skips a
 /// registration of another kind, whose workers the host's own steps write.
 ///
-/// A job's mode is what the write expects under each URL. An upsert
-/// expects anything and a create-only job expects nothing. A replacement
-/// by id expects the row behind the registry's worker of that id, read
-/// through `objects` at the revision the job names.
+/// The write lays a job's workers, the ranks of one engine, in one door
+/// turn, and the job's mode is what it expects to stand. An upsert expects
+/// anything. A create-only job expects nothing of the engine, and its ranks
+/// are added whole or not at all. A replacement by id expects the row
+/// behind the registry's worker of that id, read through `objects` at the
+/// revision the job names.
 ///
 /// The write keeps no credential: the object the holder builds from a row
 /// carries none. [`registration_at_door_keeping`] is the line of a host
@@ -268,17 +270,17 @@ fn failed(step: &str, message: impl Into<String>) -> WorkflowError {
     }
 }
 
-fn registration_refusal(url: &str, refusal: Refused) -> WorkflowError {
+fn registration_refusal(engine: &str, refusal: Refused) -> WorkflowError {
     let message = match refusal {
         Refused::NotMaker(why) => why,
         Refused::Past(past) => format!("{}: {}", past.fact, past.why),
         Refused::Absent => ABSENT.to_owned(),
         Refused::NotLeading(_) => NOT_LEADING.to_owned(),
         Refused::Moved => MOVED.to_owned(),
-        Refused::Stands => format!("Worker {} already exists", Endpoint::redacted_str(url)),
+        Refused::Stands => format!("Worker {} already exists", Endpoint::redacted_str(engine)),
         Refused::Draining => format!(
             "Worker {} is draining, so the replacement was dropped",
-            Endpoint::redacted_str(url)
+            Endpoint::redacted_str(engine)
         ),
         Refused::OutOfScope => Refused::OUT_OF_SCOPE.to_owned(),
         Refused::NotLabelsAlone => Refused::NOT_LABELS_ALONE.to_owned(),
@@ -344,20 +346,6 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
         // A replacement by id names the worker it replaces beside the row.
         let (expect, over) = match &data.registration_mode {
             WorkerRegistrationMode::Upsert => (Expect::Anything, None),
-            // The door takes one row a call. An add refused at a later rank
-            // would leave the earlier ones, and its retry would be refused at
-            // the rank it wrote: no rank is written until the door lays a
-            // worker's ranks in one turn.
-            WorkerRegistrationMode::CreateOnly if workers.len() > 1 => {
-                return Err(failed(
-                    WRITE_WORKERS_AT_DOOR_STEP,
-                    format!(
-                        "Adding a worker of {} ranks needs them written in one turn, \
-                         which this door does not take yet",
-                        workers.len()
-                    ),
-                ));
-            }
             WorkerRegistrationMode::CreateOnly => (Expect::Nothing, None),
             WorkerRegistrationMode::ReplaceById {
                 worker_id,
@@ -374,9 +362,7 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
                 (Expect::Seen(standing), Some(held))
             }
         };
-        for worker in workers {
-            self.write_at_door(&maker, expect, worker, over.as_ref().map(Over::Replaced))?;
-        }
+        self.write_at_door(&maker, expect, workers, over.as_ref().map(Over::Replaced))?;
         data.workers = Some(WorkerList::from_workers(workers));
         Ok(StepResult::Success)
     }
@@ -393,38 +379,52 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
 }
 
 impl<G: Generation> WriteWorkersAtDoor<G> {
-    /// Write one worker at the door. A line that keeps runs the whole of
-    /// it in its holder's turn ([`Objects::keeping`]): the keep, the door's
-    /// write, the keeper's answer and the lay-again that answer asks for.
-    /// A guarded write is refused there as moved, ahead of its keep, where
-    /// another object stands under the URL by then. The plain line takes
-    /// no turn here: where its holder keeps built objects, its door hands
-    /// in under that turn.
+    /// Write a registration's workers at the door, in one call. A line
+    /// that keeps runs the whole of it in its holder's turn
+    /// ([`Objects::keeping`]): the keep, the door's write, the keeper's
+    /// answer and the lay-again that answer asks for. A guarded write is
+    /// refused there as moved, ahead of its keep, where another object
+    /// stands under the URL by then. The plain line takes no turn here:
+    /// where its holder keeps built objects, its door hands in under that
+    /// turn.
+    ///
+    /// The workers are the ranks of one engine and dial one address, where
+    /// one registration is in flight. So the keep is the registration's:
+    /// it holds the credential the first worker states, and its acceptance
+    /// binds every row the door answered.
     fn write_at_door(
         &self,
         maker: &Maker,
         expect: Expect,
-        worker: &Arc<dyn Worker>,
+        workers: &[Arc<dyn Worker>],
         over: Option<Over<'_>>,
-    ) -> WorkflowResult<Wrote> {
-        let url = worker.url();
-        let write = || -> WorkflowResult<Wrote> {
-            // Kept ahead of the write: the holder may build the row's
-            // object inside the door's turn.
-            let kept = self.keep(worker.as_ref())?;
-            let answer = self.door.found_built(maker, expect, worker, over);
-            self.answer_kept(worker.as_ref(), kept, answer.as_ref().ok());
-            answer.map_err(|refusal| registration_refusal(url, refusal))
+    ) -> WorkflowResult<Vec<Wrote>> {
+        let first = workers.first();
+        // The refusal names the engine as the rows' facts state it.
+        let engine = first.map_or("", |worker| engine_of(worker.as_ref()));
+        let write = || -> WorkflowResult<Vec<Wrote>> {
+            // Kept ahead of the write: the holder may build a row's object
+            // inside the door's turn.
+            let kept = match first {
+                Some(worker) => self.keep(worker.as_ref())?,
+                None => None,
+            };
+            let answer = self.door.found_rows(maker, expect, workers, over);
+            if let Some(worker) = first {
+                self.answer_kept(worker.as_ref(), kept, answer.as_deref().ok());
+            }
+            answer.map_err(|refusal| registration_refusal(engine, refusal))
         };
         if self.keeping.is_none() {
             return write();
         }
+        let url = first.map_or("", |worker| worker.url());
         self.objects
             .keeping(url, over.map(Over::object), write)
-            .map_err(|refusal| registration_refusal(url, refusal))?
+            .map_err(|refusal| registration_refusal(engine, refusal))?
     }
 
-    /// Keep what `worker` states for its engine, ahead of its row's write.
+    /// Keep what `worker` states for its engine, ahead of the rows' write.
     /// One registration is in flight at an address: a second fails here,
     /// before the door, and is tried again.
     fn keep(&self, worker: &dyn Worker) -> WorkflowResult<Option<KeptCredential>> {
@@ -439,21 +439,27 @@ impl<G: Generation> WriteWorkersAtDoor<G> {
     }
 
     /// Answer the keeper at the door's answer, with no await between the
-    /// two: the row the door wrote is accepted, and a refusal puts back
+    /// two: the rows the door wrote are accepted, and a refusal puts back
     /// what stood. Where the keeper says an object may hold another
     /// credential than its row takes, the holder lays the address again.
     fn answer_kept(
         &self,
         worker: &dyn Worker,
         kept: Option<KeptCredential>,
-        wrote: Option<&Wrote>,
+        wrote: Option<&[Wrote]>,
     ) {
         let (Some(keeping), Some(kept)) = (&self.keeping, kept) else {
             return;
         };
-        let again = match wrote.and_then(written_row) {
-            Some(row) => kept.accepted(row),
-            None => kept.put_back(),
+        let rows: Vec<WorkerId> = wrote
+            .into_iter()
+            .flatten()
+            .filter_map(written_row)
+            .collect();
+        let again = if rows.is_empty() {
+            kept.put_back()
+        } else {
+            kept.accepted_rows(&rows)
         };
         if again {
             self.objects
@@ -728,15 +734,18 @@ mod tests {
             engine::{EngineConnection, EngineConnector, ZmqLink},
             http_client::{WorkerHttpClientCache, WorkerHttpClientSettings},
         },
-        identity::{basic::Worker, builder::BasicWorkerBuilder},
+        identity::{
+            basic::Worker,
+            builder::{rank_url, BasicWorkerBuilder},
+        },
         jobs::{WorkerJobAsker, WorkerRegistrationMode},
         model_card::ModelCard,
         registry::WorkerRegistry,
         settings::{RegistrationSettings, UnhealthyRemovalScope},
-        worker::{HealthCheckConfig, RuntimeType, WorkerSpec},
+        worker::{HealthCheckConfig, RuntimeType, WorkerSpec, WorkerType},
         workflow::{
-            RegistrationGates, WorkerRegistrationWorkflowData, WorkerRemovalRequest,
-            WorkerRemovalWorkflowData, WorkflowHost,
+            find_workers_by_url, RegistrationGates, WorkerRegistrationWorkflowData,
+            WorkerRemovalRequest, WorkerRemovalWorkflowData, WorkflowHost,
         },
     };
     use tokio::time::{self, Instant};
@@ -981,6 +990,79 @@ mod tests {
         object.api_key().cloned()
     }
 
+    fn ranked_workers(width: usize) -> Vec<Arc<dyn Worker>> {
+        ranked_at(URL, width)
+    }
+
+    fn ranked_at(url: &str, width: usize) -> Vec<Arc<dyn Worker>> {
+        (0..width)
+            .map(|rank| {
+                let spec = WorkerSpec {
+                    worker_type: WorkerType::Prefill,
+                    models: vec![ModelCard::new("model")].into(),
+                    ..WorkerSpec::new(url.to_owned())
+                };
+                Arc::new(
+                    <BasicWorkerBuilder>::from_spec(spec)
+                        .dp_config(rank, width)
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn four_rank_rows_stand_as_four_objects_under_their_ranks() {
+        let f = Fixture::new();
+        let mut workers = ranked_workers(4);
+        workers.rotate_left(1);
+        let mut cx = f.registration(WorkerJobAsker::Discovery, workers);
+        // The engine is the built workers' base address, in any order of
+        // the ranks, whatever address the job's configuration names.
+        cx.data.config.url = "worker:8000".to_owned();
+        f.write().execute(&mut cx).await.expect("written");
+        f.objects.follow(&*f.store);
+
+        let mut held = find_workers_by_url(&f.host.registry, URL);
+        held.sort_by_key(|worker| worker.dp_rank());
+        assert_eq!(held.len(), 4);
+        for (rank, worker) in held.iter().enumerate() {
+            assert_eq!(worker.url(), format!("{URL}@{rank}"));
+            assert_eq!(worker.base_url(), URL);
+            assert_eq!((worker.dp_rank(), worker.dp_size()), (Some(rank), Some(4)));
+            assert_eq!(worker.worker_type(), &WorkerType::Prefill);
+            let by_key = f
+                .host
+                .registry
+                .get_by_url(worker.url())
+                .expect("the rank's object");
+            assert!(Arc::ptr_eq(worker, &by_key));
+        }
+    }
+
+    /// A join base drops an HTTP address's trailing slash and a row's facts
+    /// keep the address as written. The door reads the engine from the
+    /// facts, for a plain worker and for a ranked one.
+    #[tokio::test]
+    async fn a_worker_registered_with_a_trailing_slash_is_laid_under_its_address_as_written() {
+        const SLASHED: &str = "http://worker:8000/";
+        let f = Fixture::new();
+        let plain = worker(SLASHED, "model");
+        assert_eq!(plain.base_url(), URL);
+        let mut cx = f.registration(WorkerJobAsker::Discovery, vec![plain]);
+        f.write().execute(&mut cx).await.expect("a plain worker");
+        let row = f.store.by_key(SLASHED).expect("the plain row");
+        assert_eq!(row.facts.engine, SLASHED);
+
+        let f = Fixture::new();
+        let mut cx = f.registration(WorkerJobAsker::Discovery, ranked_at(SLASHED, 2));
+        f.write().execute(&mut cx).await.expect("a ranked worker");
+        for rank in 0..2 {
+            let row = f.store.by_key(&rank_url(SLASHED, rank));
+            assert_eq!(row.expect("the rank's row").facts.engine, SLASHED);
+        }
+    }
+
     #[test]
     fn an_asker_registers_as_its_maker() {
         use WorkerJobAsker::{Api, Discovery, Health, Startup};
@@ -1023,8 +1105,8 @@ mod tests {
     async fn a_registration_writes_one_row_a_worker_under_its_askers_maker() {
         let f = Fixture::new();
         let urls = ["http://worker:8000@0", "http://worker:8000@1"];
-        let workers = urls.map(|url| worker(url, "model"));
-        let mut cx = f.registration(WorkerJobAsker::Discovery, workers.to_vec());
+        let workers = ranked_workers(2);
+        let mut cx = f.registration(WorkerJobAsker::Discovery, workers.clone());
         assert_eq!(
             f.write().execute(&mut cx).await.expect("written"),
             StepResult::Success
@@ -1179,15 +1261,12 @@ mod tests {
     #[tokio::test]
     async fn another_makers_row_fails_a_registration_with_the_stores_sentence() {
         let f = Fixture::new();
-        let occupied = worker(URL, "model");
-        f.seed(&Maker::Control, occupied.as_ref())
-            .expect("registered");
-        let before = f.store.by_key(URL);
-        let available = "http://available:8000";
-        let mut cx = f.registration(
-            WorkerJobAsker::Discovery,
-            vec![worker(available, "model"), occupied],
-        );
+        let workers = ranked_workers(2);
+        let available = workers[0].url().to_owned();
+        let occupied = workers[1].url().to_owned();
+        f.store.upsert(facts(workers[1].as_ref(), None));
+        let before = f.store.by_key(&occupied);
+        let mut cx = f.registration(WorkerJobAsker::Discovery, workers);
         let write = f.write();
         let error = write.execute(&mut cx).await.expect_err("another maker");
         assert_eq!(
@@ -1195,8 +1274,8 @@ mod tests {
             "Step failed: write_workers_at_door - the row was made by a control call: its maker alone changes it"
         );
         assert!(!StepExecutor::<Registration>::is_retryable(&write, &error));
-        assert_eq!(f.store.by_key(URL), before);
-        assert!(f.store.by_key(available).is_some());
+        assert_eq!(f.store.by_key(&occupied), before);
+        assert!(f.store.by_key(&available).is_none());
         assert!(cx.data.workers.is_none());
     }
 
@@ -1230,13 +1309,13 @@ mod tests {
             Err(self.0.clone())
         }
 
-        fn found_built(
+        fn found_rows(
             &self,
             _: &Maker,
             _: Expect,
-            _: &Arc<dyn Worker>,
+            _: &[Arc<dyn Worker>],
             _: Option<Over<'_>>,
-        ) -> Result<Wrote, Refused> {
+        ) -> Result<Vec<Wrote>, Refused> {
             Err(self.0.clone())
         }
 
@@ -1313,15 +1392,44 @@ mod tests {
     async fn a_keeping_write_builds_each_rows_object_with_what_its_worker_states() {
         let (f, credentials) = Fixture::keeping();
         let plain = "http://plain:8000";
-        let workers = vec![keyed(URL, "key-a"), worker(plain, "model")];
-        let mut cx = f.registration(WorkerJobAsker::Startup, workers);
         let write = f.write_keeping(&credentials);
-        assert_eq!(
-            write.execute(&mut cx).await.expect("written"),
-            StepResult::Success
-        );
+        // A job's workers are one engine's, so each engine is its own job.
+        for workers in [vec![keyed(URL, "key-a")], vec![worker(plain, "model")]] {
+            let mut cx = f.registration(WorkerJobAsker::Startup, workers);
+            assert_eq!(
+                write.execute(&mut cx).await.expect("written"),
+                StepResult::Success
+            );
+        }
         assert_eq!(held_key(&f, URL).as_deref(), Some("key-a"));
         assert_eq!(held_key(&f, plain), None);
+    }
+
+    /// The ranks of one engine dial one address. A keeping write of three
+    /// ranks keeps once for the registration, and the keeper binds every
+    /// rank's row: each rank's object holds what the registration stated.
+    #[tokio::test]
+    async fn a_keeping_write_of_several_ranks_binds_every_ranks_row() {
+        let (f, credentials) = Fixture::keeping();
+        let ranks: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|rank| {
+                let spec = WorkerSpec {
+                    models: vec![ModelCard::new("model")].into(),
+                    api_key: Some("key-a".to_owned()),
+                    ..WorkerSpec::new(URL.to_owned())
+                };
+                let ranked = <BasicWorkerBuilder>::from_spec(spec).dp_config(rank, 3);
+                Arc::new(ranked.build()) as Arc<dyn Worker>
+            })
+            .collect();
+        let mut cx = f.registration(WorkerJobAsker::Startup, ranks);
+        let write = f.write_keeping(&credentials);
+        write.execute(&mut cx).await.expect("written");
+        assert_eq!(credentials.len(), 1);
+        for rank in 0..3 {
+            let key = held_key(&f, &rank_url(URL, rank));
+            assert_eq!(key.as_deref(), Some("key-a"), "rank {rank}");
+        }
     }
 
     /// A worker registered again with another credential moves no row, so
@@ -1435,19 +1543,21 @@ mod tests {
             Err(Refused::Moved)
         }
 
-        fn found_built(
+        fn found_rows(
             &self,
             maker: &Maker,
             _: Expect,
-            built: &Arc<dyn Worker>,
+            built: &[Arc<dyn Worker>],
             _: Option<Over<'_>>,
-        ) -> Result<Wrote, Refused> {
-            self.door
-                .found(maker, Expect::Anything, built.url(), &|standing| {
-                    let mut moved = standing.cloned().expect("the row stands");
-                    moved.labels.insert("moved".to_owned(), "under".to_owned());
-                    moved
-                })?;
+        ) -> Result<Vec<Wrote>, Refused> {
+            for built in built {
+                self.door
+                    .found(maker, Expect::Anything, built.url(), &|standing| {
+                        let mut moved = standing.cloned().expect("the row stands");
+                        moved.labels.insert("moved".to_owned(), "under".to_owned());
+                        moved
+                    })?;
+            }
             self.objects.follow(&*self.store);
             Err(Refused::Moved)
         }
@@ -1571,7 +1681,7 @@ mod tests {
             .write_at_door(
                 &Maker::Control,
                 Expect::Seen(seen),
-                &stale[0],
+                &stale[..1],
                 Some(Over::Replaced(&over)),
             )
             .expect_err("another object stands under the URL");
@@ -1648,17 +1758,27 @@ mod tests {
         assert!(!StepExecutor::<Registration>::is_retryable(&write, &error));
         assert_eq!(f.store.epoch(), epoch);
 
-        // Two ranks, the second standing: one door call a rank would write
-        // the first, and the add's retry would be refused there. None is.
-        let ranks =
-            ["http://worker:8000@0", "http://worker:8000@1"].map(|url| worker(url, "model"));
-        cx.data.actual_workers = Some(vec![Arc::clone(&ranks[1])]);
-        write.execute(&mut cx).await.expect("the second rank");
+        // Two ranks, the second standing: the door checks every rank in its
+        // one turn ahead of a write, so the first is not written.
+        let f = Fixture::new();
+        let ranks = ranked_workers(2);
+        f.store.upsert(facts(ranks[1].as_ref(), None));
         let epoch = f.store.epoch();
-        cx.data.actual_workers = Some(ranks.to_vec());
-        let error = write.execute(&mut cx).await.expect_err("two ranks");
-        assert!(error.to_string().contains("2 ranks"), "{error}");
+        let mut cx = f.registration(WorkerJobAsker::Api, ranks);
+        cx.data.registration_mode = WorkerRegistrationMode::CreateOnly;
+        let error = f.write().execute(&mut cx).await.expect_err("a rank stands");
+        assert_eq!(
+            error.to_string(),
+            "Step failed: write_workers_at_door - Worker http://worker:8000 already exists"
+        );
         assert_eq!(f.store.epoch(), epoch);
+
+        // Two free ranks are added whole.
+        let f = Fixture::new();
+        let mut cx = f.registration(WorkerJobAsker::Api, ranked_workers(2));
+        cx.data.registration_mode = WorkerRegistrationMode::CreateOnly;
+        f.write().execute(&mut cx).await.expect("two ranks added");
+        assert_eq!(f.store.snapshot().1.len(), 2);
     }
 
     #[tokio::test]
