@@ -328,7 +328,7 @@
       ]
     },
     "HasRoomParams": {
-      "description": "`has-room` by a rule: a worker has room where what it holds is at most\nits capacity less the headroom, `used <= (1 - headroom) * capacity`.\nThe filter stays soft: where no worker has room, every worker stands.\nWritten bare, `has-room` reads the bit its host sets. A null under the\nname, the slip of a bare name written with a colon, is refused with\nboth forms named. A reader that takes a null for an empty map refuses\nit by the part it lacks.",
+      "description": "`has-room` by a rule: a worker has room where what it holds is at most\nits capacity less the headroom, `used <= (1 - headroom) * capacity`.\nThe filter stays soft: where no worker has room, every worker stands.\nWritten bare, `has-room` reads the bit its host sets. A null under the\nname, the slip of a bare name written with a colon, is refused with\nboth forms named, whichever reader takes the document.",
       "type": "object",
       "properties": {
         "used": {
