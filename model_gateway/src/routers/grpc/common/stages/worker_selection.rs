@@ -1859,10 +1859,7 @@ impl WorkerSelectionStage {
             return Err(policy_controller::refused(shape));
         }
 
-        let prompt = host::Prompt {
-            tokens: inputs.tokens,
-            namespace: inputs.cache_namespace,
-        };
+        let prompt = host::Prompt::of(inputs.tokens, inputs.cache_namespace);
         let hashes = host.hashes(model_id, &prompt);
         let id = host::mark();
         let rule = on_route(wire, attempt.ledger());

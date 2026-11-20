@@ -29,7 +29,7 @@ use super::{
 use crate::{
     config::{PolicyConfig, RouterConfig},
     middleware::ReportedRefusal,
-    policy_controller::host::testing::{bed_over, bed_over_models, MODEL},
+    policy_controller::host::testing::{bed_over, bed_over_models, record_bed_over, MODEL},
     routers::{
         common::{
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
@@ -141,6 +141,42 @@ async fn the_same_bed_with_no_host_is_placed_by_the_classic_policy() -> Case {
     let (a, b) = six_chats(false).await?;
     assert!(a > 0);
     assert_eq!(a + b, 6);
+    Ok(())
+}
+
+/// A repeated prompt keeps its worker over plain HTTP. The route states the
+/// request's text, the host hashes its windows, and the record of sent
+/// prefixes places by them: the workers publish no cache events and state no
+/// block size.
+#[tokio::test]
+async fn a_repeated_prompt_keeps_its_worker_over_http() -> Case {
+    let mut workers = Vec::new();
+    for _ in 0..3 {
+        workers.push(fixed_status_upstream(&[CHAT], StatusCode::OK).await);
+    }
+    let urls: Vec<&str> = workers.iter().map(|(url, _)| url.as_str()).collect();
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, _store) = record_bed_over(Arc::clone(&registry), &urls);
+    let router = router(registry, Some(host));
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    // Five windows of text at the document's block size.
+    let prompt = "the same long prompt, ".repeat(16);
+    let request = Arc::new(serde_json::from_value(json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": prompt}]
+    }))?);
+    for _ in 0..40 {
+        let answer = router
+            .route_chat(None, &meta, Arc::clone(&request), MODEL)
+            .await;
+        assert_eq!(answer.status(), StatusCode::OK);
+    }
+    let mut hits: Vec<usize> = workers
+        .iter()
+        .map(|(_, hits)| hits.load(Ordering::SeqCst))
+        .collect();
+    hits.sort_unstable();
+    assert_eq!(hits, [0, 0, 40]);
     Ok(())
 }
 

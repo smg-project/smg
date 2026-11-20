@@ -29,7 +29,7 @@
 //! is what names the prefix: requests that share that much of a prompt
 //! share an owner, and two that differ anywhere in it do not. It is the key
 //! the sent-prefix predictor keeps that prefix under. The depth counts in
-//! the blocks the request was hashed by, text windows at four characters a
+//! the blocks the request was hashed by, text windows at four bytes a
 //! token under the text kind. A request that carries no whole block has no
 //! key, and the tokens past a request's last whole block are not in its key.
 //!
@@ -1094,7 +1094,6 @@ impl Scorer for ConsistentHash {
         Needs {
             ring: true,
             token_hashes: hashes,
-            text: hashes,
             text_hashes: hashes,
             ..Needs::default()
         }
@@ -1805,8 +1804,8 @@ mod tests {
             ..hashed(&hashes)
         };
         assert_eq!(prefix_key(64, gates, &learned), through(&hashes[..2]));
-        // Under the text kind the depth is in windows at four characters a
-        // token: 64 tokens are 256 characters, sixteen windows of sixteen.
+        // Under the text kind the depth is in windows at four bytes a
+        // token: 64 tokens are 256 bytes, sixteen windows of sixteen.
         let windows: Vec<u64> = (1..=20).collect();
         let text = RequestFacts {
             hash_kind: crate::view::HashKind::Text,
@@ -2089,7 +2088,7 @@ mod tests {
     #[test]
     fn the_prefix_form_declares_the_request_s_hashes() {
         let needs = prefixed(256).needs();
-        assert!(needs.ring && needs.token_hashes && needs.text && needs.text_hashes);
+        assert!(needs.ring && needs.token_hashes && needs.text_hashes && !needs.text);
         let plain = ConsistentHash::new(None).needs();
         assert!(plain.ring && !plain.token_hashes && !plain.text && !plain.text_hashes);
     }

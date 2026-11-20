@@ -4820,7 +4820,7 @@ pub(crate) mod tests {
             let mut frame = frame(1, 7);
             let facts = frame.facts.as_mut().expect("the case's frame has facts");
             facts.block_hashes = vec![1];
-            facts.hash_kind = proto::HashKind::Text.into();
+            facts.hash_kind = proto::HashKind::Token.into();
             let request = checked(frame);
             let now = Instant::now() + Duration::from_secs(3);
             let taken = Taken::at(&request, gateway, now, now).expect("budget is left");
@@ -4912,7 +4912,7 @@ pub(crate) mod tests {
             let mut frame = frame(1, seed);
             let facts = frame.facts.as_mut().expect("the case's frame has facts");
             facts.block_hashes = vec![1, 2, 3];
-            facts.hash_kind = proto::HashKind::Text.into();
+            facts.hash_kind = proto::HashKind::Token.into();
             let frame = constrained(frame, u32::from(WireModes::GRPC.bits()), None);
             let request = checked(frame);
             let taken = Taken::at(&request, GATEWAY, at, at).expect("budget is left");
@@ -5035,7 +5035,7 @@ pub(crate) mod tests {
             let mut frame = phased(frame(1, 7), proto::Phase::Decode);
             let facts = frame.facts.as_mut().expect("the case's frame has facts");
             facts.block_hashes = vec![1];
-            facts.hash_kind = proto::HashKind::Text.into();
+            facts.hash_kind = proto::HashKind::Token.into();
             let request = checked(frame);
             let now = Instant::now() + Duration::from_secs(3);
             let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
@@ -5119,7 +5119,7 @@ pub(crate) mod tests {
             let mut frame = frame(1, seed);
             let facts = frame.facts.as_mut().expect("the case's frame has facts");
             facts.block_hashes = vec![block];
-            facts.hash_kind = proto::HashKind::Text.into();
+            facts.hash_kind = proto::HashKind::Token.into();
             decided(&store, frame, now, &[]).1
         };
         let held = (1..=32).filter(|&seed| asked(1, seed) == Some(members[5]));
@@ -5176,7 +5176,7 @@ pub(crate) mod tests {
             let mut frame = frame(1, 7);
             let facts = frame.facts.as_mut().expect("the case's frame has facts");
             facts.block_hashes = vec![block];
-            facts.hash_kind = proto::HashKind::Text.into();
+            facts.hash_kind = proto::HashKind::Token.into();
             let request = checked(frame);
             let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
             let mut buffers = Buffers::default();
@@ -5268,7 +5268,7 @@ pub(crate) mod tests {
             let mut frame = frame(1, seed);
             let facts = frame.facts.as_mut().expect("the case's frame has facts");
             facts.block_hashes = vec![1, 2];
-            facts.hash_kind = proto::HashKind::Text.into();
+            facts.hash_kind = proto::HashKind::Token.into();
             let request = checked(frame);
             let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
             let mut buffers = Buffers::default();

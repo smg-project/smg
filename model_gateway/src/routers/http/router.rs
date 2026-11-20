@@ -70,7 +70,7 @@ use crate::{
         otel_trace::{inject_trace_context_http, with_trace_context_http},
     },
     policies::{CacheNamespace, PolicyRegistry},
-    policy_controller::host::{self, Ask, BehindAnswer, Host, Placed, Sent},
+    policy_controller::host::{self, Ask, BehindAnswer, Host, Placed, Prompt, Sent},
     rate_limit::RateLimitManager,
     routers::{
         common::{
@@ -851,11 +851,21 @@ impl Router {
         }
         let id = host::mark();
         let tried = attempt.tried_rows.lock().clone();
+        // The prompt the classic arm routes by: the request's token ids
+        // where it has them, else its text.
+        let hashes = attempt.lease.with_view(|view| {
+            let prompt = Prompt {
+                text: view.text,
+                ..Prompt::of(view.tokens, view.cache_namespace)
+            };
+            host.hashes(&model, &prompt)
+        });
         let ask = Ask {
             streaming: attempt.is_stream,
             headers: attempt.headers,
             rid: attempt.rid,
             tried: &tried,
+            hashes: Some(&hashes),
             ..Ask::of(&id, &model)
         };
         let ledger = attempt.ledger;
