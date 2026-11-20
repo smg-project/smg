@@ -16,8 +16,8 @@
 //! picked for. With the setting off nothing here is constructed, and no
 //! request reads this module.
 //!
-//! One site reads the setting, [`start`]. Every other site asks what the
-//! start left in the context.
+//! One site reads the setting, [`start_with`]. Every other site asks what
+//! the start left in the context.
 //!
 //! Under a controller's address a follower keeps the store's worker rows
 //! as that controller's watch tells them ([`follower`]). The gateway then
@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use smg_policy_controller::{
     store::{MemoryStore, StaleGeneration},
-    SpecError,
+    Catalog, PolicySpec, SpecError,
 };
 use tracing::info;
 
@@ -75,20 +75,36 @@ pub(crate) enum StartError {
     Stale(#[from] StaleGeneration),
 }
 
+/// [`start_with`] as the stock gateway starts: no stages of a host, and the
+/// document the routing configuration means. The cases start their stores
+/// through it.
+#[cfg(test)]
+pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, StartError> {
+    start_with(config, None, RouterConfig::policy_document)
+}
+
 /// The controller's store for this process, holding the policy document the
 /// routing configuration means as its one generation. `None` where the
-/// classic policies decide: nothing is constructed then.
+/// classic policies decide: nothing is constructed then, and `document` is
+/// not called.
+///
+/// `stages` is the catalog of a host's own stages. The stock gateway hands
+/// none, and the document is then checked over the stock stages alone.
 ///
 /// A configuration the document cannot say, and a document the gateway's
 /// check of a hosted document refuses ([`RouterConfig::hosted_policy`]),
 /// stop the start by name. Neither is served by the classic policies in
 /// silence.
-pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, StartError> {
+pub(crate) fn start_with(
+    config: &RouterConfig,
+    stages: Option<Catalog>,
+    document: impl FnOnce(&RouterConfig) -> Result<PolicySpec, PolicyDocumentError>,
+) -> Result<Option<Arc<MemoryStore>>, StartError> {
     if !config.policy_controller {
         return Ok(None);
     }
-    let document = config.policy_document()?;
-    let generation = config.hosted_policy(&document)?;
+    let document = document(config)?;
+    let generation = config.hosted_policy_in(&document, stages.as_ref())?;
     let store = MemoryStore::new();
     store.apply(generation)?;
     info!("The policy controller is picked for this gateway: no classic router is built");

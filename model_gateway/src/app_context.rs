@@ -15,7 +15,7 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
-use smg_policy_controller::store::MemoryStore;
+use smg_policy_controller::{store::MemoryStore, Catalog};
 use smg_worker::{
     connection::{
         engine::EngineConnector,
@@ -289,12 +289,29 @@ impl AppContext {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
+        Self::from_config_with_stages(
+            router_config,
+            request_timeout_secs,
+            webrtc_bind_addr,
+            webrtc_stun_server,
+            None,
+        )
+    }
+
+    pub(crate) fn from_config_with_stages(
+        router_config: RouterConfig,
+        request_timeout_secs: u64,
+        webrtc_bind_addr: Option<std::net::IpAddr>,
+        webrtc_stun_server: Option<String>,
+        stages: Option<Catalog>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
         Box::pin(async move {
-            Box::pin(AppContextBuilder::from_config(
+            Box::pin(AppContextBuilder::from_config_with_stages(
                 router_config,
                 request_timeout_secs,
                 webrtc_bind_addr,
                 webrtc_stun_server,
+                stages,
             ))
             .await?
             .build()
@@ -696,6 +713,23 @@ impl AppContextBuilder {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> Result<Self, String> {
+        Box::pin(Self::from_config_with_stages(
+            router_config,
+            request_timeout_secs,
+            webrtc_bind_addr,
+            webrtc_stun_server,
+            None,
+        ))
+        .await
+    }
+
+    async fn from_config_with_stages(
+        router_config: RouterConfig,
+        request_timeout_secs: u64,
+        webrtc_bind_addr: Option<std::net::IpAddr>,
+        webrtc_stun_server: Option<String>,
+        stages: Option<Catalog>,
+    ) -> Result<Self, String> {
         // A served model aliased under a vendor name keeps that vendor's
         // contract profile after the alias is resolved into the served name.
         ProviderProfile::register_model_aliases(
@@ -717,7 +751,7 @@ impl AppContextBuilder {
             .with_tool_parser_factory()
             .with_worker_registry()
             .with_policy_registry(&router_config)
-            .with_policy_controller(&router_config)?
+            .with_policy_controller(&router_config, stages)?
             .with_storage(&router_config)
             .await?
             .with_worker_monitor(&router_config)?
@@ -894,10 +928,16 @@ impl AppContextBuilder {
         self
     }
 
-    /// Start the policy store and, when configured, its worker watch.
-    fn with_policy_controller(mut self, config: &RouterConfig) -> Result<Self, String> {
+    /// Start the policy store and, when configured, its worker watch. A start
+    /// the store refuses stops this one, by name.
+    fn with_policy_controller(
+        mut self,
+        config: &RouterConfig,
+        stages: Option<Catalog>,
+    ) -> Result<Self, String> {
         self.policy_store =
-            policy_controller::start(config).map_err(|refusal| refusal.to_string())?;
+            policy_controller::start_with(config, stages, RouterConfig::policy_document)
+                .map_err(|refusal| refusal.to_string())?;
         if let (Some(address), Some(store)) =
             (&config.policy_controller_address, &self.policy_store)
         {
