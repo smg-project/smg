@@ -94,6 +94,10 @@ impl Coefficients {
                     LoadField::WaitingUncachedTokens => &mut coefficients.waiting_uncached_tokens,
                 },
             };
+            debug_assert!(
+                coefficient != 0.0,
+                "a named term has a coefficient other than zero"
+            );
             *field = coefficient;
         }
         coefficients
