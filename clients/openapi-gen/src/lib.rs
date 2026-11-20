@@ -412,6 +412,8 @@ pub const CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
     ("POST", "/secrets/reload"),
     ("GET", "/rate-limits/tenants"),
     ("PUT", "/rate-limits/tenants"),
+    ("GET", "/policy/spec"),
+    ("POST", "/policy/spec:validate"),
     ("POST", "/flush_cache"),
     ("POST", "/start_profile"),
     ("POST", "/stop_profile"),
@@ -1551,6 +1553,166 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
     paths.insert(
         "/v1/models".to_string(),
         get_endpoint("listModels", "List available models", &resp_name),
+    );
+
+    // ---- The policy document, where the policy controller decides ----
+    let generation_of = |description: &str| {
+        serde_json::json!({
+            "type": "object",
+            "description": description,
+            "properties": {
+                "generation": {"type": "integer"},
+                "digest": {"type": ["string", "null"], "description": "`sha256:` and 64 hex digits; null where no document stands"}
+            },
+            "required": ["generation", "digest"]
+        })
+    };
+    let policy_off = || {
+        refused("The classic policies decide for this gateway, which holds no policy document (POLICY_CONTROLLER_OFF)")
+    };
+    paths.insert(
+        "/policy/spec".to_string(),
+        PathItem {
+            get: Some(operation(
+                "getPolicySpec",
+                "The policy document in force as its source wrote it: the admin role alone, mounted only with control-plane authentication",
+                None,
+                None,
+                {
+                    let mut responses = inline_response(
+                        "The document with its generation, digest, form and application time; the digest, quoted, in ETag",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "generation": {"type": "integer"},
+                                "digest": {"type": "string", "description": "`sha256:` and 64 hex digits"},
+                                "format": {"type": "string", "enum": ["yaml", "json"], "description": "The form `document` is in"},
+                                "applied_at": {"type": "string", "format": "date-time"},
+                                "document": {"type": "string", "description": "The document as its source wrote it"}
+                            },
+                            "required": ["generation", "digest", "format", "applied_at", "document"]
+                        }),
+                    );
+                    responses.insert("409".to_string(), policy_off());
+                    responses
+                },
+            )),
+            ..PathItem::default()
+        },
+    );
+    let needs_rows = serde_json::json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "model": {"type": "string"},
+                "phase": {"type": "string", "enum": ["single", "prefill", "decode", "encode"]},
+                "needs": {
+                    "type": "object",
+                    "description": "The facts a host feeds for the model and phase, each by name",
+                    "additionalProperties": {"type": "boolean"}
+                }
+            },
+            "required": ["model", "phase", "needs"]
+        }
+    });
+    let refused_dry_run = |description: &str| Response {
+        description: description.to_string(),
+        content: Some(inline_content(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "error": {"type": "string"},
+                "code": {"type": "string"},
+                "field_path": {"type": "string", "description": "The path of the field a refused document's refusal is about; empty where it is about the whole document"},
+                "standing": generation_of("The generation that stands")
+            },
+            "required": ["error", "code", "standing"]
+        }))),
+    };
+    paths.insert(
+        "/policy/spec:validate".to_string(),
+        PathItem {
+            post: Some(operation(
+                "validatePolicySpec",
+                "What an apply of a policy document would do against the one in force, with nothing applied: the admin role alone, mounted only with control-plane authentication",
+                Some(vec![
+                    // The guard: the digest the caller read as standing, as
+                    // `GET /policy/spec` writes it in ETag. Absent or `*`
+                    // guards nothing.
+                    Parameter {
+                        name: "If-Match".to_string(),
+                        location: "header".to_string(),
+                        required: false,
+                        schema: ParameterSchema::of("string"),
+                    },
+                ]),
+                Some(RequestBody {
+                    required: true,
+                    content: BTreeMap::from([
+                        (
+                            "application/yaml".to_string(),
+                            MediaType {
+                                schema: serde_json::json!({"type": "string"}),
+                            },
+                        ),
+                        (
+                            "application/json".to_string(),
+                            MediaType {
+                                schema: serde_json::json!({"type": "object"}),
+                            },
+                        ),
+                    ]),
+                }),
+                {
+                    let mut responses = inline_response(
+                        "The document would run: the generation it was checked against, the number it would run under with its digest, and what a host must feed before and after",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "standing": generation_of("The generation the document was checked against"),
+                                "would_run": generation_of("The number an apply would run the document under, with the document's digest"),
+                                "needs": {
+                                    "type": "object",
+                                    "properties": {"before": needs_rows.clone(), "after": needs_rows},
+                                    "required": ["before", "after"]
+                                }
+                            },
+                            "required": ["standing", "would_run", "needs"]
+                        }),
+                    );
+                    responses.insert(
+                        "400".to_string(),
+                        refused("If-Match is a list, a weak tag or no text; it carries one ETag"),
+                    );
+                    responses.insert("409".to_string(), policy_off());
+                    responses.insert(
+                        "412".to_string(),
+                        refused_dry_run("If-Match names another digest than the standing one's (PRECONDITION_FAILED)"),
+                    );
+                    responses.insert(
+                        "413".to_string(),
+                        Response {
+                            description: "The body is over 128 KiB, a document's bound; it is not read past the bound".to_string(),
+                            content: None,
+                        },
+                    );
+                    responses.insert(
+                        "415".to_string(),
+                        refused("Content-Type names no form of a policy document"),
+                    );
+                    responses.insert(
+                        "422".to_string(),
+                        refused_dry_run("The document would not run (INVALID_DOCUMENT); the body names the field"),
+                    );
+                    responses.insert(
+                        "429".to_string(),
+                        refused("As many dry runs wait as may (TOO_MANY_DRY_RUNS)"),
+                    );
+                    responses
+                },
+            )),
+            ..PathItem::default()
+        },
     );
 
     // ---- The control-plane routes take the bearer ----

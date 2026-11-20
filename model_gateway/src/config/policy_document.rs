@@ -56,7 +56,7 @@ use smg_policy_controller::{
         ScoreStage, SpillParams, WarmupSliceParams, MANUAL_SESSION_HEADER, MAX_KEY_SOURCES,
         OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS,
     },
-    AppliedSpec, Assignment, Catalog, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError,
+    AppliedSpec, Assignment, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError,
 };
 
 use super::{
@@ -222,21 +222,18 @@ impl RouterConfig {
     }
 
     /// Validates the document over the stock stages, with the gateway's
-    /// tenant header denied to the view.
+    /// own headers denied to the view: the check of `--print-policy-spec`.
+    /// The host's start hands its document to the operators' door, which
+    /// denies the same headers and checks over the stock stages or a
+    /// host's own.
     pub fn hosted_policy(&self, document: &PolicySpec) -> Result<AppliedSpec, SpecError> {
-        self.hosted_policy_in(document, None)
+        AppliedSpec::validate_with(document, &self.denied_view_headers())
     }
 
-    pub(crate) fn hosted_policy_in(
-        &self,
-        document: &PolicySpec,
-        stages: Option<&Catalog>,
-    ) -> Result<AppliedSpec, SpecError> {
-        let denied_headers = [self.tenant_resolution.tenant_header_name.as_str()];
-        match stages {
-            Some(stages) => AppliedSpec::validate_in(document, stages, &denied_headers),
-            None => AppliedSpec::validate_with(document, &denied_headers),
-        }
+    /// The header names this gateway denies the view of a document it
+    /// hosts: its tenant header, which it keeps to itself.
+    pub(crate) fn denied_view_headers(&self) -> [&str; 1] {
+        [self.tenant_resolution.tenant_header_name.as_str()]
     }
 }
 

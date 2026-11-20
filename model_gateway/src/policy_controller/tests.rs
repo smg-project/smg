@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use smg_policy_controller::{
     framework::{Scorer, TieBand},
     lease::Lifecycle,
+    operator::SpecRejected,
     store::{WorkerFacts, WorkerStatus as RowStatus, WorkersStore},
     view::{Candidate, RequestFacts, Role, WireModes},
     AppliedSpec, Catalog, CatalogError, PolicySpec, SpecError,
@@ -538,9 +539,9 @@ fn the_store_starts_with_a_registered_scorer() -> Case {
     let digest = document.digest()?;
     let generation = document.generation;
     let config = running(RouterConfig::default(), document);
-    let store = start_with(&config, Some(host_stages()?))?
+    let started = start_with(&config, Some(host_stages()?))?
         .ok_or("the controller was picked and no store started")?;
-    let world = store.world();
+    let world = started.store.world();
     assert_eq!(world.spec().generation(), generation);
     assert_eq!(world.spec().digest(), Some(digest));
     Ok(())
@@ -554,7 +555,7 @@ fn the_stock_store_names_the_unknown_scorer() -> Case {
         .ok_or("the stock start took a scorer it does not hold")?;
     assert!(matches!(
         refusal,
-        StartError::Spec(SpecError::UnknownScorer { .. })
+        StartError::Spec(SpecRejected::Invalid(SpecError::UnknownScorer { .. }))
     ));
     assert_eq!(
         refusal.to_string(),
@@ -571,7 +572,9 @@ fn the_classic_policies_skip_a_document_the_catalog_would_refuse() -> Case {
     );
     assert!(matches!(
         start_with(&config, Some(host_stages()?)),
-        Err(StartError::Spec(SpecError::UnknownScorer { .. }))
+        Err(StartError::Spec(SpecRejected::Invalid(
+            SpecError::UnknownScorer { .. }
+        )))
     ));
 
     config.policy_controller = false;
@@ -594,7 +597,7 @@ fn the_gateways_tenant_header_is_denied_with_a_host_catalog() -> Case {
         .ok_or("the start took a view that reads the tenant header")?;
     assert!(matches!(
         refusal,
-        StartError::Spec(SpecError::DeniedHeader { .. })
+        StartError::Spec(SpecRejected::Invalid(SpecError::DeniedHeader { .. }))
     ));
     assert_eq!(
         refusal.to_string(),
