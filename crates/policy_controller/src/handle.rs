@@ -214,6 +214,25 @@ impl<D: Deref<Target = Door>> Handle<D> {
         Ok(Self::hold(Arm::Door { door, gateway }, decided, later, now))
     }
 
+    /// [`Handle::decide_encode_pair`] for a request its host makes from the
+    /// world the door decides under ([`Door::decide_encode_pair_under`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Refused`]: the door made no decision for the request.
+    pub fn decide_encode_pair_under(
+        door: D,
+        gateway: GatewayId,
+        maker: &impl Maker,
+        items: EncodeItems<'_>,
+        placed: &mut EncodePlaced,
+        now: Instant,
+    ) -> Result<Self, Refused> {
+        let (decided, later) =
+            door.decide_encode_pair_under_stated(gateway, maker, items, placed, now)?;
+        Ok(Self::hold(Arm::Door { door, gateway }, decided, later, now))
+    }
+
     fn hold(arm: Arm<D>, decided: Decided, later: bool, now: Instant) -> Self {
         let first = decided
             .decision
@@ -704,7 +723,8 @@ mod tests {
         door::{
             tests::{
                 counted, fleet, held as deciding, later_request, load_decodes, pair_counts,
-                pair_fleet, pair_request, picking, push_fleet, request, Ends, GATEWAY, PATIENCE,
+                pair_fleet, pair_request, picking, push_fleet, push_store, request, Ends, GATEWAY,
+                PATIENCE,
             },
             Door, Maker, Refused, Request,
         },
@@ -1567,6 +1587,54 @@ mod tests {
                 ReleaseReason::Abandoned
             )]
         );
+    }
+
+    #[test]
+    fn a_handle_of_an_encode_pair_made_under_a_maker_holds_the_decode_as_the_made_request_said(
+    ) -> Result<(), Box<dyn Error>> {
+        struct Later;
+        impl Maker for Later {
+            fn model(&self) -> &str {
+                later_request(b"pair").facts.model
+            }
+
+            fn make<'w>(&'w self, _: &'w World) -> Request<'w> {
+                later_request(b"pair")
+            }
+        }
+        let (store, encoder) = push_store()?;
+        store.tell_through(|_, _, _, said, _| WORDS.with_borrow_mut(|words| words.push(said)));
+        let door = Door::new(Arc::clone(&store));
+        let now = Instant::now();
+        let items = EncodeItems {
+            keys: &[Identity::hashed(11)],
+            ..EncodeItems::default()
+        };
+        let mut placed = EncodePlaced::new();
+        let handle =
+            Handle::decide_encode_pair_under(&door, GATEWAY, &Later, items, &mut placed, now)
+                .expect("a pair's handle");
+        let lease = handle.lease().expect("the prefill's lease").lease.id;
+        assert_eq!(
+            placed.encoders().first().map(|target| target.id),
+            Some(encoder)
+        );
+        assert_eq!(
+            states(&store, lease),
+            Some([LeaseState::ISSUED, LeaseState::Chosen])
+        );
+        let _ = words();
+        drop(handle);
+        // A chosen decode is owed no word: the prefill's release alone.
+        assert_eq!(
+            words(),
+            [Said::Released(
+                Some(Side::Prefill),
+                ReleaseReason::Abandoned
+            )]
+        );
+        assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+        Ok(())
     }
 
     /// The decode a call issued is dated by its own dispatch. The side's

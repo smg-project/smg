@@ -3368,6 +3368,53 @@ impl Door {
         decided
     }
 
+    /// [`Door::decide_encode_pair`] for a request its host makes from the
+    /// world the door decides under ([`Door::decide_under`]). The document
+    /// that states the request's key is then the one that places its items.
+    ///
+    /// # Errors
+    ///
+    /// [`Refused`]: no decision is made for the request. `placed` is cleared.
+    pub fn decide_encode_pair_under(
+        &self,
+        gateway: GatewayId,
+        maker: &impl Maker,
+        items: EncodeItems<'_>,
+        placed: &mut EncodePlaced,
+        now: Instant,
+    ) -> Result<Decided, Refused> {
+        let (decided, _) =
+            self.decide_encode_pair_under_stated(gateway, maker, items, placed, now)?;
+        Ok(decided)
+    }
+
+    /// [`Door::decide_encode_pair_under`], with what the made request said
+    /// of its decode, as [`Door::decide_under_stated`] says it.
+    pub(crate) fn decide_encode_pair_under_stated(
+        &self,
+        gateway: GatewayId,
+        maker: &impl Maker,
+        items: EncodeItems<'_>,
+        placed: &mut EncodePlaced,
+        now: Instant,
+    ) -> Result<(Decided, bool), Refused> {
+        let made = Made(maker);
+        let mut later = false;
+        let order = WithEncodeStated {
+            order: WithEncode {
+                door: self,
+                items,
+                placed: &mut *placed,
+            },
+            later: &mut later,
+        };
+        let decided = self.deciding(gateway, &made, now, order);
+        if decided.is_err() {
+            placed.clear();
+        }
+        decided.map(|decided| (decided, later))
+    }
+
     /// Decides the decode side of the pair's lease `lease`, for the gateway
     /// it was issued to, while its prefill is dispatched and held and its
     /// decode side is chosen. The decode profile runs over the decodes that
@@ -4488,6 +4535,42 @@ impl Orders for WithEncode<'_, '_, '_> {
     }
 }
 
+/// [`WithEncode`] for [`Door::decide_encode_pair_under_stated`]: each run
+/// of the order notes what the made request said of its decode
+/// ([`Asked::decode_later`]).
+struct WithEncodeStated<'d, 'i, 'p, 'l> {
+    order: WithEncode<'d, 'i, 'p>,
+    later: &'l mut bool,
+}
+
+impl Orders for WithEncodeStated<'_, '_, '_, '_> {
+    #[inline(always)]
+    fn plain(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+    ) -> Result<Decided, Refused> {
+        *self.later = taken.request.decode_later();
+        self.order.plain(world, at, term, taken, buffers)
+    }
+
+    fn shadowed(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        due: &mut Due,
+    ) -> Result<Decided, Refused> {
+        *self.later = taken.request.decode_later();
+        self.order.shadowed(world, at, term, taken, buffers, due)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     pub(crate) mod sent_prefixes;
@@ -4689,19 +4772,29 @@ pub(crate) mod tests {
         Ok(document)
     }
 
-    fn encode_door() -> Result<Door, Box<dyn Error>> {
+    fn encode_store() -> Result<Arc<MemoryStore>, Box<dyn Error>> {
         let store = Arc::new(MemoryStore::new());
         encode_member(&store, "grpc://d0:8000", Role::Decode, "c0");
         store.apply(AppliedSpec::validate(&encode_document()?)?)?;
-        Ok(Door::new(store))
+        Ok(store)
+    }
+
+    fn encode_door() -> Result<Door, Box<dyn Error>> {
+        Ok(Door::new(encode_store()?))
+    }
+
+    /// The store of [`push_fleet`] and its encoder, with no door over it
+    /// yet: a case hands the store its own teller first.
+    pub(crate) fn push_store() -> Result<(Arc<MemoryStore>, WorkerId), Box<dyn Error>> {
+        let store = encode_store()?;
+        encode_member(&store, "grpc://p0:8000", Role::Prefill, "c0");
+        let encoder = encode_member(&store, "grpc://e0:8000", Role::Encode, "c0");
+        Ok((store, encoder))
     }
 
     pub(crate) fn push_fleet() -> Result<(Door, WorkerId), Box<dyn Error>> {
-        let door = encode_door()?;
-        let store = door.store();
-        encode_member(store, "grpc://p0:8000", Role::Prefill, "c0");
-        let encoder = encode_member(store, "grpc://e0:8000", Role::Encode, "c0");
-        Ok((door, encoder))
+        let (store, encoder) = push_store()?;
+        Ok((Door::new(store), encoder))
     }
 
     pub(crate) fn pair_request(id: &[u8]) -> Request<'_> {
@@ -5193,6 +5286,61 @@ pub(crate) mod tests {
             (next.handed.get(), decided.decision.trace().generation),
             (2, 2)
         );
+    }
+
+    /// [`Reads`] for a pair's prefill.
+    struct ReadsPair<'t>(Reads<'t>);
+
+    impl Maker for ReadsPair<'_> {
+        fn model(&self) -> &str {
+            MODEL
+        }
+
+        fn make<'w>(&'w self, world: &'w World) -> Request<'w> {
+            let mut asked = self.0.make(world);
+            asked.facts.phase = Phase::Prefill;
+            asked
+        }
+    }
+
+    /// An encode pair's request is made from the world its items are placed
+    /// under, as a single request is. An apply that lands while the host
+    /// makes it is the next decision's.
+    #[test]
+    fn an_encode_pairs_request_is_made_from_the_world_its_items_are_placed_under(
+    ) -> Result<(), Box<dyn Error>> {
+        let (door, encoder) = push_fleet()?;
+        let store = door.store();
+        let standing = || store.with_world(|world| world.spec().generation());
+        let reads = |applies, id| {
+            ReadsPair(Reads {
+                store,
+                handed: Cell::new(0),
+                applies,
+                id,
+            })
+        };
+        let first = standing();
+        let now = Instant::now();
+        let mut placed = EncodePlaced::new();
+        let raced = reads(Some(first + 1), b"made");
+        let decided = door
+            .decide_encode_pair_under(GATEWAY, &raced, items(), &mut placed, now)
+            .expect("a decision");
+        assert!(decided.pair(), "{:?}", decided.decision);
+        assert_eq!(decided.decision.trace().generation, first);
+        assert_eq!((raced.0.handed.get(), standing()), (first, first + 1));
+        let encoders: Vec<_> = placed.encoders().iter().map(|placed| placed.id).collect();
+        assert_eq!(encoders, [encoder, encoder]);
+        release(&door, &decided);
+
+        // The next request is made under the applied document. Its plan
+        // places no item.
+        let next = reads(None, b"next");
+        let decided = door.decide_encode_pair_under(GATEWAY, &next, items(), &mut placed, now);
+        assert_eq!(next.0.handed.get(), first + 1);
+        assert!(placed.encoders().is_empty(), "{decided:?}");
+        Ok(())
     }
 
     #[test]
