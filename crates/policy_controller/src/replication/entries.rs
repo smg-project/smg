@@ -25,6 +25,7 @@ const DISPATCHED: &str = "a new leader reads dispatched leases from the engines'
                           snapshots and rebuilds credits from its own tally";
 const PINS: &str = "pins, reservations and lease ends are journaled once pins have one table";
 const PUBLISHED: &str = "every replica publishes its own world";
+const REPORTED: &str = "each engine's next load report states its values again";
 
 /// The list: `(trait or type, entry, fate)`, each in its file's own order.
 pub const ENTRIES: &[(&str, &str, Fate)] = &[
@@ -92,6 +93,8 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("LoadSink", "publish_due", Fate::Read),
     ("LoadSink", "publish", Fate::Rebuilt(PUBLISHED)),
     ("LoadSink", "wake_with", Fate::Read),
+    ("SignalSink", "signal_columns", Fate::Read),
+    ("SignalSink", "signal_value", Fate::Rebuilt(REPORTED)),
     ("KvEventSink", "admit", Fate::Rebuilt(SUBSCRIPTION)),
     ("KvEventSink", "reconnected", Fate::Rebuilt(SUBSCRIPTION)),
     ("KvEventSink", "resync", Fate::Rebuilt(SUBSCRIPTION)),
@@ -186,10 +189,11 @@ mod tests {
     use super::*;
 
     /// The store's ingress traits, each with its file's text.
-    const TRAITS: [(&str, &str); 7] = [
+    const TRAITS: [(&str, &str); 8] = [
         ("WorkersStore", include_str!("../store/workers.rs")),
         ("HealthSink", include_str!("../store/health.rs")),
         ("LoadSink", include_str!("../store/loads.rs")),
+        ("SignalSink", include_str!("../store/signals.rs")),
         ("KvEventSink", include_str!("../store/kv_events.rs")),
         ("ReservationStore", include_str!("../store/reservations.rs")),
         ("SessionsStore", include_str!("../store/sessions.rs")),

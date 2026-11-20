@@ -172,14 +172,16 @@ pub fn signal_values(
                 }
                 // Every rank before this one stated the name, and this is
                 // the rank's first statement of it. Under another unit the
-                // row has no value: no later statement of the rank is read.
-                Some(made) if made.ranks == nth => {
-                    if made.unit == stated.unit {
-                        made.ranks += 1;
-                        made.value = joined(columns[at].across_ranks(), made.value, stated.value);
-                        made.oldest = made.oldest.min(sampled);
+                // row has no value: its slot is emptied, and a slot is
+                // filled at the first rank alone, so no later statement
+                // is read.
+                Some(row) if row.ranks == nth => {
+                    if row.unit == stated.unit {
+                        row.ranks += 1;
+                        row.value = joined(columns[at].across_ranks(), row.value, stated.value);
+                        row.oldest = row.oldest.min(sampled);
                     } else {
-                        made.ranks = u32::MAX;
+                        made[at] = None;
                     }
                 }
                 // A rank before this one left the name out or stated

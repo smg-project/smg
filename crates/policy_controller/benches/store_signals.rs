@@ -20,6 +20,8 @@
 
 #[path = "common/filled.rs"]
 mod filled;
+#[path = "common/reads_two.rs"]
+mod reads_two;
 
 use std::{
     hint::black_box,
@@ -32,10 +34,11 @@ use smg_policy_controller::{
         Ask, GatewayId, LoadSink, LoadSource, MemoryStore, SignalSink, Taken, ViewBuffers,
         WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    AppliedSpec, Candidate, Catalog, Constraints, Lifecycle, LoadRow, Needs, PolicySpec,
-    RequestFacts, Role, Scorer, Scratch, SignalColumn, SignalSource, TieBand, WorkerId,
-    API_VERSION,
+    AppliedSpec, Catalog, Constraints, LoadRow, PolicySpec, RequestFacts, Role, Scratch,
+    SignalSource, WorkerId, API_VERSION,
 };
+
+use crate::reads_two::ReadsTwo;
 
 const SIZES: [usize; 3] = [8, 64, 512];
 const MODEL: &str = "m";
@@ -43,41 +46,6 @@ const ASKER: GatewayId = GatewayId(1);
 /// The declared signals, in name order: a row's cells stand in it.
 const NAMES: [&str; 4] = ["pending", "spare_one", "spare_two", "used"];
 const UNIT: &str = "tokens";
-
-/// Scores a row by the two values it reads: the less of both, the better.
-#[derive(Debug)]
-struct ReadsTwo(SignalColumn, SignalColumn);
-
-impl Lifecycle for ReadsTwo {}
-
-impl Scorer for ReadsTwo {
-    fn name(&self) -> &'static str {
-        "reads-two"
-    }
-
-    fn score(
-        &self,
-        facts: &RequestFacts<'_>,
-        candidates: &[Candidate],
-        kept: &[u32],
-        out: &mut [f32],
-    ) -> TieBand {
-        for (&index, score) in kept.iter().zip(out) {
-            let row = &candidates[index as usize];
-            let used = self.0.read(facts, row).unwrap_or(0.0);
-            let pending = self.1.read(facts, row).unwrap_or(0.0);
-            *score = 1.0 / (1.0 + (used + pending) as f32);
-        }
-        TieBand::NORMALIZED
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            signal_cells: true,
-            ..Needs::default()
-        }
-    }
-}
 
 /// The document every cell runs under: four signals, two of them read.
 fn applied() -> AppliedSpec {

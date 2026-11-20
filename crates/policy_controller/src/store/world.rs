@@ -236,7 +236,9 @@ pub struct ViewBuffers {
 impl ViewBuffers {
     /// The signal cells of the rows a build wrote here ([`World::build`]):
     /// `None` where its ask took none and under a generation that declares
-    /// no signal.
+    /// no signal. A view ([`World::view`]) names its own cells
+    /// ([`PoolView::signal_cells`]): one that lends its rows writes none
+    /// here, and these stay those of the build before.
     pub fn cells(&self) -> Option<&SignalCells> {
         (self.signal_cells.signals() != 0).then_some(&self.signal_cells)
     }

@@ -24,6 +24,10 @@ use crate::{
 };
 
 /// One value and when it was sampled, in microseconds on the host's clock.
+///
+/// A value is finite and of magnitude at most 1e15. The store's sink takes
+/// no other. A host that hands cells it built passes no sink, and holds
+/// its values to the same bound itself.
 #[derive(Clone, Copy, Debug)]
 pub struct SignalCell {
     pub value: f64,
