@@ -1006,6 +1006,10 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
     };
     let unavailable = StatusCode::SERVICE_UNAVAILABLE;
     let shed_code = "worker_overload_protection_shed";
+    let no_pair = format!(
+        "No prefill/decode pair for model '{MODEL}' shares a KV transfer protocol (mismatch on \
+         [\"runtime\"]; prefill: [\"a/?/?\"], decode: [\"b/?/?\"])"
+    );
     let rows = [
         (
             shed(ShedReason::Saturated),
@@ -1078,6 +1082,17 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
             "policy_controller_unavailable",
             Some("1"),
             None,
+        ),
+        (
+            Unplaced::NoCompatiblePair {
+                prefill: vec!["a/?/?".to_owned()],
+                decode: vec!["b/?/?".to_owned()],
+                mismatches: vec!["runtime".to_owned()],
+            },
+            unavailable,
+            "no_compatible_pd_pair",
+            None,
+            Some(no_pair.as_str()),
         ),
     ];
     for (unplaced, status, code, retry_after, message) in rows {
@@ -2242,6 +2257,48 @@ async fn each_side_of_a_placed_pair_reports_its_own_dispatch_and_end() {
             }),
         ]
     );
+}
+
+/// A fleet whose pools hold workers and no prefill pairs with a decode. The
+/// store's pair classes judge it from membership alone, as the classic pair
+/// index does, and the host answers by them: each pool's keys and what the
+/// pools disagree on. An ask that states the wire of another side reads the
+/// controller's own shed.
+#[tokio::test]
+async fn a_fleet_that_pairs_nothing_is_refused_by_the_pair_classes() {
+    // The bed's two protocols pair under off. Under the lenient rule two
+    // protocols that differ pair nothing.
+    let bed = PairBed::new(Pairing::Off, 1, 1, 1).expect("a pair fleet");
+    assert!(bed.commit().await.is_ok());
+    let lenient =
+        pair_spec(Pairing::Lenient, 1, 2, &bed.calls, None, None).expect("the lenient document");
+    bed.store.apply(lenient).expect("a later generation");
+    bed.store.publish_now();
+    let unpaired = Unplaced::NoCompatiblePair {
+        prefill: vec!["prefill-wire".to_owned()],
+        decode: vec!["decode-wire".to_owned()],
+        mismatches: vec!["pairing_protocol".to_owned()],
+    };
+    let on_http = Ask {
+        wires: WireModes::HTTP,
+        ..pair_ask()
+    };
+    for ask in [pair_ask(), on_http] {
+        let refused = bed.host.place_pair(&ask, None, None).await.err();
+        assert_eq!(refused.as_ref(), Some(&unpaired));
+    }
+    // No row serves gRPC, so that side holds no refusal.
+    let on_grpc = Ask {
+        wires: WireModes::GRPC,
+        ..pair_ask()
+    };
+    let shed = bed.host.place_pair(&on_grpc, None, None).await.err();
+    let no_endpoint = ShedReason::NoEndpoints;
+    assert!(
+        matches!(shed, Some(Unplaced::Shed { reason, .. }) if reason == no_endpoint),
+        "{shed:?}"
+    );
+    assert_eq!(live(&bed.store, 0), 0);
 }
 
 /// A route's rule at the pair's commit: a target whose decode the rule

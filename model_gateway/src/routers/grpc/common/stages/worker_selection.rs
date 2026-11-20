@@ -1895,14 +1895,7 @@ impl WorkerSelectionStage {
                     ?decode,
                     "No prefill/decode pair shares a KV transfer protocol"
                 );
-                error::service_unavailable(
-                    "no_compatible_pd_pair",
-                    format!(
-                        "No prefill/decode pair for model '{model_id}' shares a KV transfer \
-                         protocol (mismatch on {mismatches:?}; prefill: {prefill:?}, decode: \
-                         {decode:?})"
-                    ),
-                )
+                placement::no_compatible_pair(model_id, &mismatches, &prefill, &decode)
             }
             // A role nobody serves beside a partner role with workers: the
             // pair is incomplete (a role restarting, or not yet discovered),

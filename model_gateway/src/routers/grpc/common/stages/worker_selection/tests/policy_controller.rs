@@ -203,6 +203,15 @@ fn state_wire(store: &MemoryStore, worker: &dyn Worker) {
     store.publish_now();
 }
 
+/// The row of `worker` states its runtime, by the rule a store's writer
+/// states it.
+fn state_runtime(store: &MemoryStore, worker: &dyn Worker) {
+    let mut facts = store.by_key(worker.url()).expect("the worker's row").facts;
+    facts.engine_kind = worker_host::facts(worker, None).engine_kind;
+    let _row = store.upsert(facts);
+    store.publish_now();
+}
+
 /// `refused` is the host's answer for an ask no row serves on its wires:
 /// the controller shed it at its wires, the answer is final, and no lease
 /// was issued.
@@ -1342,6 +1351,47 @@ async fn a_request_with_encode_items_is_refused_by_name_under_a_host() -> anyhow
         .await
         .expect("the pair again");
     assert!(ctx.placed.is_some());
+    Ok(())
+}
+
+/// A prefill and a decode of two runtimes pair nothing on this wire: the
+/// store keeps known runtimes apart, as the classic pair index does. Both
+/// judge the fleet from membership alone, and under the host the answer is
+/// the classic stage's own, its code and its message whole.
+#[tokio::test]
+async fn a_fleet_that_pairs_nothing_reads_the_classic_refusal_under_the_host() -> anyhow::Result<()>
+{
+    let (stage, store) = pair_stage(
+        WorkerSelectionMode::PrefillDecode,
+        &[(PREFILL, RuntimeType::Vllm)],
+        &[(DECODE, RuntimeType::Sglang)],
+    );
+    for url in [PREFILL, DECODE] {
+        let worker = stage
+            .worker_registry
+            .get_by_url(url)
+            .context("the worker")?;
+        state_runtime(&store, worker.as_ref());
+    }
+    let mut ctx = ingress(&stage.worker_registry);
+    let hosted = stage
+        .execute(&mut ctx)
+        .await
+        .expect_err("the fleet pairs nothing");
+    assert!(!is_retryable_response(&hosted));
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+
+    let classic = round_robin_pd_stage(Arc::clone(&stage.worker_registry));
+    let mut ctx = ingress(&classic.worker_registry);
+    let refused = classic
+        .execute(&mut ctx)
+        .await
+        .expect_err("the fleet pairs nothing");
+    assert_eq!(hosted.status(), refused.status());
+    let hosted: Value = serde_json::from_slice(&to_bytes(hosted.into_body(), 4096).await?)?;
+    let refused: Value = serde_json::from_slice(&to_bytes(refused.into_body(), 4096).await?)?;
+    assert_eq!(hosted["error"]["code"], "no_compatible_pd_pair");
+    assert_eq!(hosted, refused);
     Ok(())
 }
 
