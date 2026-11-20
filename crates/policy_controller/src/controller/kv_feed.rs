@@ -130,6 +130,8 @@ mod tests {
         /// nothing, its task ends by itself, and no removal waits for it.
         async fn streaming(&self, url: &str) -> u64 {
             let id = self.new_slot(url, None).await;
+            // On the case's current-thread runtime, the stream's task is
+            // queued before its slot shows, and this turn runs it.
             tokio::task::yield_now().await;
             id
         }
