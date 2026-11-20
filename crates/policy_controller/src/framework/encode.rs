@@ -594,16 +594,20 @@ impl Engine {
             let mut any_open = false;
             let mut any_member = false;
             side.opened.clear();
+            // The pass adds to its two sets once an encoder. Their words
+            // are bound here, so no row loads their places or their counts
+            // again.
+            let (open_words, member_words) = (side.open.words_mut(), side.member.words_mut());
             for (at, (row, of)) in (0u32..).zip(encode.encoders.iter().zip(encode.facts)) {
                 if of.class != 0 && takes(row, of) {
                     any_member = true;
-                    if !side.member.insert(of.class) {
+                    if !ClassBits::insert_in(member_words, of.class) {
                         side.far_member.push(of.class);
                     }
                     if open(row) {
                         any_open = true;
                         side.opened.push(at);
-                        if !side.open.insert(of.class) {
+                        if !ClassBits::insert_in(open_words, of.class) {
                             side.far_open.push(of.class);
                         }
                     }
@@ -645,10 +649,13 @@ impl Engine {
         side.vision_of.reset(width);
         side.far.clear();
         side.far_vision.clear();
+        // The same of the decodes' two sets: bound once, written once a
+        // decode.
+        let (decodes_of, vision_of) = (side.decodes_of.words_mut(), side.vision_of.words_mut());
         for row in pools.decodes.iter().filter(|row| row.pair_class != 0) {
-            if side.decodes_of.insert(row.pair_class) {
+            if ClassBits::insert_in(decodes_of, row.pair_class) {
                 if row.vision {
-                    side.vision_of.insert(row.pair_class);
+                    ClassBits::insert_in(vision_of, row.pair_class);
                 }
             } else if !tabled {
                 side.far.push(row.pair_class);

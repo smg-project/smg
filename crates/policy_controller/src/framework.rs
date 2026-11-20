@@ -1033,7 +1033,19 @@ impl ClassBits {
     /// Adds `class` and says whether the set holds it. A number the set was
     /// not sized for is left out: what it means is each caller's to say.
     fn insert(&mut self, class: u32) -> bool {
-        let Some(word) = self.words.get_mut(class as usize / 64) else {
+        Self::insert_in(&mut self.words, class)
+    }
+
+    /// The set's words to add to, for a pass that adds to the set once a
+    /// row: bound ahead of the pass, as [`Self::words`] is for a read.
+    fn words_mut(&mut self) -> &mut [u64] {
+        &mut self.words
+    }
+
+    /// [`Self::insert`] over the words a pass bound by
+    /// [`Self::words_mut`].
+    fn insert_in(words: &mut [u64], class: u32) -> bool {
+        let Some(word) = words.get_mut(class as usize / 64) else {
             return false;
         };
         *word |= 1 << (class % 64);
@@ -10281,6 +10293,43 @@ mod tests {
             let row = &decodes[pair.decode_position as usize];
             assert_eq!((pair.decode_id, pair.decode_dp_rank), (row.id, row.dp_rank));
         }
+    }
+
+    /// A decode decided later is the decode profile's decision: its trace
+    /// names that profile and counts the decodes it chose among, whatever
+    /// profile placed the held prefill.
+    #[test]
+    fn a_decode_decided_alone_names_the_decode_profile_in_its_trace() {
+        let engine = Engine::new(
+            vec![least_requests_profile(), least_requests_profile()],
+            vec![Binding {
+                decode_profile: Some(1),
+                ..pair_binding()
+            }],
+            1,
+            Needs::default(),
+        );
+        let prefills = classed_rows(&[1]);
+        let decodes = classed_rows(&[1, 2, 1]);
+        let decision = engine.decide_decode(
+            &request(7),
+            &PoolFacts::default(),
+            PairPools {
+                prefills: &prefills,
+                decodes: &decodes,
+                ..PairPools::default()
+            },
+            prefills[0].id,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        let pick = decision.pick().expect("decodes of the held prefill");
+        assert_eq!(pick.trace.made_under(), Some(1), "the decode profile");
+        assert_eq!(
+            pick.trace.survivors.get(),
+            Some(2),
+            "the decodes of class 1"
+        );
     }
 
     #[test]

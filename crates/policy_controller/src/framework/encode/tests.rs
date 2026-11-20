@@ -1101,6 +1101,22 @@ fn an_encode_class_above_the_rows_handed_is_a_class_still() {
         panic!("a pick, not {decision:?}");
     };
     assert_eq!(targets.first().map(|target| target.position), Some(1));
+    // A far class whose one encoder is registered and closed admits no
+    // prefill: the open far classes are a list of their own. The prefill
+    // of the open far class is picked, though it holds more requests.
+    let mut bed = Bed::new();
+    bed.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 10)];
+    bed.encoders = vec![
+        unready(row(0, Role::Encode, 0, 0)),
+        row(1, Role::Encode, 0, 0),
+    ];
+    bed.facts = vec![pushing(64), pushing(65)];
+    bed.prefill_classes = vec![64, 65];
+    let (decision, _) = decided_widths(&bed, none);
+    let Decision::Pick(Pick { targets, .. }) = decision else {
+        panic!("a pick, not {decision:?}");
+    };
+    assert_eq!(targets.first().map(|target| target.position), Some(1));
 }
 
 #[test]
