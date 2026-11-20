@@ -945,6 +945,8 @@ fn audit_refusal(call: &'static str, by: &Principal, code: Code, why: &str, aske
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(feature = "worker-host")]
+    use std::sync::atomic::AtomicUsize;
     use std::{
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -1749,12 +1751,14 @@ pub(crate) mod tests {
         assert_eq!(store.epoch(), 2);
     }
 
-    /// The door's log as its store's journal, which leaves its term as the
-    /// first membership write lands: a lead lost inside one call.
+    /// The door's log as its store's journal, which leaves its term as a
+    /// membership write lands: a lead lost inside one call.
     #[cfg(feature = "worker-host")]
     struct LosesTheLead {
         log: Arc<crate::replication::Log>,
-        lost: AtomicBool,
+        /// The membership writes the lead still holds for. The write that
+        /// finds none left loses it, once.
+        holds: AtomicUsize,
     }
 
     #[cfg(feature = "worker-host")]
@@ -1768,12 +1772,16 @@ pub(crate) mod tests {
             left: Option<&WorkerRow>,
         ) {
             self.log.member(at, epoch, change, row, left);
-            if !self.lost.swap(true, Ordering::Relaxed) {
-                let next = Position {
-                    seq: 40,
-                    term: TERM + 1,
-                };
-                assert!(self.log.restart(next).is_ok(), "a place the log takes");
+            match self.holds.load(Ordering::Relaxed) {
+                0 => {
+                    let next = Position {
+                        seq: 40,
+                        term: TERM + 1,
+                    };
+                    assert!(self.log.restart(next).is_ok(), "a place the log takes");
+                    self.holds.store(usize::MAX, Ordering::Relaxed);
+                }
+                more => self.holds.store(more - 1, Ordering::Relaxed),
             }
         }
 
@@ -1832,7 +1840,7 @@ pub(crate) mod tests {
         let (_, feed) = journaled_from(&LeasePlace::Process, 0);
         let journal = Arc::new(LosesTheLead {
             log: Arc::clone(&feed.log),
-            lost: AtomicBool::new(false),
+            holds: AtomicUsize::new(0),
         });
         let store = Arc::new(MemoryStore::journaled(journal).with_deciders(1));
         store::LeasesStore::set_term(store.as_ref(), TERM);
@@ -1859,6 +1867,72 @@ pub(crate) mod tests {
         );
         assert!(refusal.contains("membership call refused"), "{refusal}");
         assert!(!logged.contains(URL), "{logged}");
+    }
+
+    /// A door whose journal loses the lead when told, with `width` ranks of
+    /// [`URL`] registered under a lead that holds.
+    #[cfg(feature = "worker-host")]
+    fn losing(width: u32) -> (Arc<MemoryStore>, Door, Arc<LosesTheLead>) {
+        let (_, feed) = journaled_from(&LeasePlace::Process, 0);
+        let journal = Arc::new(LosesTheLead {
+            log: Arc::clone(&feed.log),
+            holds: AtomicUsize::new(usize::MAX),
+        });
+        let handed = Arc::clone(&journal);
+        let store = Arc::new(MemoryStore::journaled(handed).with_deciders(1));
+        store::LeasesStore::set_term(store.as_ref(), TERM);
+        let door = Door::based(Arc::clone(&store), Arc::clone(&feed.log), 0);
+        door.register(&operator(), under(TERM), &ask(wide(URL, width), Mode::Add))
+            .expect("the ranks registered under a held lead");
+        (store, door, journal)
+    }
+
+    /// A lead lost behind a rank's write in place refuses the next rank's.
+    /// The term is asked ahead of every write, whatever it makes of its
+    /// row.
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_term_lost_behind_a_write_in_place_stops_the_next_ranks_write() {
+        let (store, door, journal) = losing(2);
+        journal.holds.store(0, Ordering::Relaxed);
+        let relabelled = proto::WorkerSpec {
+            labels: [("tier".to_owned(), "gold".to_owned())].into(),
+            ..wide(URL, 2)
+        };
+        let refused = door
+            .register(&operator(), under(TERM), &ask(relabelled, Mode::Upsert))
+            .expect_err("the lead was lost at the second rank");
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (Code::Unavailable, super::LEADS_NO_TERM)
+        );
+        let labels = |rank: u32| {
+            let row = store.by_key(&format!("{URL}@{rank}")).expect("the rank");
+            row.facts.labels.len()
+        };
+        assert_eq!((labels(0), labels(1)), (1, 0));
+    }
+
+    /// A lead lost behind the last rank that stays refuses the removal of
+    /// the rank a narrower registration no longer states.
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_term_lost_ahead_of_a_removal_leaves_the_rank_that_would_leave() {
+        let (store, door, journal) = losing(3);
+        journal.holds.store(1, Ordering::Relaxed);
+        let refused = door
+            .register(&operator(), under(TERM), &ask(wide(URL, 2), Mode::Upsert))
+            .expect_err("the lead was lost ahead of the removal");
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (Code::Unavailable, super::LEADS_NO_TERM)
+        );
+        let width = |rank: u32| {
+            store
+                .by_key(&format!("{URL}@{rank}"))
+                .map(|row| row.facts.dp_size)
+        };
+        assert_eq!((width(0), width(1), width(2)), (Some(2), Some(2), Some(3)));
     }
 
     /// A registration states at most 64 ranks. At the bound, with every rank
