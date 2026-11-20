@@ -88,6 +88,8 @@ pub(crate) struct HarmonyStreamingProcessor;
 /// [`next_response`]): its callers end the stream on their error path, the
 /// one they take today when the client's leaving is met at a send.
 const CLIENT_LEFT: &str = "Client disconnected";
+const RETAIN_OUTPUT_ITEM: bool = true;
+const OMIT_OUTPUT_ITEM: bool = false;
 
 /// One read of the engine stream for the client of a Responses iteration
 /// (see [`next_response`]).
@@ -758,8 +760,8 @@ struct ResponsesDecode {
     /// The message item the first final-channel delta opened: its output index and id.
     message: Option<(usize, String)>,
     content_part_added: bool,
-    /// Each call's output index, item id and response format, by the parser's call index.
-    calls: HashMap<usize, (usize, String, Option<ResponseFormat>)>,
+    /// Each call's streamed item, by the parser's call index.
+    calls: HashMap<usize, OpenCall>,
     /// The server calls the turn may open items for, its first ones (`None` where no session
     /// serves the turn, so no call is a server's): a server call past them opens no item.
     server_call_allowance: Option<usize>,
@@ -792,6 +794,15 @@ struct ResponsesDecode {
     /// the verdict that it is not polled again.
     tail_tokens: u64,
     engine_outlived: bool,
+}
+
+struct OpenCall {
+    output_index: usize,
+    item_id: String,
+    response_format: Option<ResponseFormat>,
+    /// The item as `output_item.added` announced it, retained so a partial
+    /// call rejected by the completed parse can still be closed.
+    item: serde_json::Value,
 }
 
 impl ResponsesDecode {
@@ -1019,10 +1030,10 @@ impl ResponsesDecode {
                 .await;
             return;
         }
-        let Some((output_index, item_id, response_format)) = self.calls.get(&call.index) else {
+        let Some(open) = self.calls.get(&call.index) else {
             return;
         };
-        if !streams_arguments(response_format.as_ref()) {
+        if !streams_arguments(open.response_format.as_ref()) {
             return;
         }
         let Some(args) = call
@@ -1033,12 +1044,12 @@ impl ResponsesDecode {
         else {
             return;
         };
-        let kind = match response_format {
+        let kind = match open.response_format {
             Some(_) => McpEvent::CALL_ARGUMENTS_DELTA,
             None => FunctionCallEvent::ARGUMENTS_DELTA,
         };
         emitter
-            .send_arguments_delta_best_effort(kind, args, *output_index, item_id, tx)
+            .send_arguments_delta_best_effort(kind, args, open.output_index, &open.item_id, tx)
             .await;
     }
 
@@ -1086,9 +1097,6 @@ impl ResponsesDecode {
         });
         let type_str = ResponseStreamEventEmitter::type_str_for_format(response_format.as_ref());
         let (output_index, item_id) = emitter.allocate_output_index_for_format(response_format);
-        self.calls
-            .insert(call.index, (output_index, item_id.clone(), response_format));
-
         let mut item = json!({
             "id": item_id,
             "type": type_str,
@@ -1105,6 +1113,15 @@ impl ResponsesDecode {
             emitter
                 .send_output_item_added(output_index, &item, tx)
                 .await,
+        );
+        self.calls.insert(
+            call.index,
+            OpenCall {
+                output_index,
+                item_id: item_id.clone(),
+                response_format,
+                item,
+            },
         );
 
         // Emit in_progress event for MCP tools
@@ -1184,6 +1201,11 @@ impl ResponsesDecode {
             }
         }
         self.close_calls(emitter, tx, session).await;
+        // A terminal frame that read no call leaves the turn's calls to
+        // `recover_calls`, which reads a trailing cut call and closes it once.
+        if self.tool_calls.is_some() {
+            self.close_unread_calls(emitter, tx).await;
+        }
         self.close_message(emitter, tx).await;
     }
 
@@ -1200,43 +1222,47 @@ impl ResponsesDecode {
             return;
         };
         for (call_index, tool_call) in tool_calls.iter().enumerate() {
-            let Some((output_index, item_id, response_format)) = self.calls.get(&call_index) else {
+            let Some(open) = self.calls.get(&call_index) else {
                 continue;
             };
             let tool_name = &tool_call.function.name;
             let args_str = tool_call.function.arguments.as_deref().unwrap_or("");
 
-            if streams_arguments(response_format.as_ref()) {
-                let event = match response_format {
-                    Some(_) => {
-                        emitter.emit_mcp_call_arguments_done(*output_index, item_id, args_str)
-                    }
-                    None => {
-                        emitter.emit_function_call_arguments_done(*output_index, item_id, args_str)
-                    }
+            if streams_arguments(open.response_format.as_ref()) {
+                let event = match open.response_format {
+                    Some(_) => emitter.emit_mcp_call_arguments_done(
+                        open.output_index,
+                        &open.item_id,
+                        args_str,
+                    ),
+                    None => emitter.emit_function_call_arguments_done(
+                        open.output_index,
+                        &open.item_id,
+                        args_str,
+                    ),
                 };
                 emitter.send_event_best_effort(&event, tx).await;
             }
 
             // Emit completed event for MCP tools
-            if let Some(fmt) = *response_format {
-                let event = emitter.emit_tool_call_completed(*output_index, item_id, fmt);
+            if let Some(fmt) = open.response_format {
+                let event = emitter.emit_tool_call_completed(open.output_index, &open.item_id, fmt);
                 emitter.send_event_best_effort(&event, tx).await;
             }
 
             let type_str =
-                ResponseStreamEventEmitter::type_str_for_format(response_format.as_ref());
+                ResponseStreamEventEmitter::type_str_for_format(open.response_format.as_ref());
             // A function call's status is read through the emitter under this iteration's
             // finish (none when the stream ended before its terminal frame): a recovered call
             // the finish cut is `incomplete`, and the response reads it as cut on its terminal
             // event and stored object. A hosted or MCP call's item keeps `completed`; its
             // result replaces the item.
-            let status = match response_format {
+            let status = match open.response_format {
                 Some(_) => "completed",
                 None => emitter.function_call_status(args_str),
             };
             let mut item = json!({
-                "id": item_id,
+                "id": open.item_id,
                 "type": type_str,
                 "name": tool_name,
                 "call_id": &tool_call.id,
@@ -1246,12 +1272,61 @@ impl ResponsesDecode {
             let label = session
                 .map(|s| s.resolve_tool_server_label(tool_name))
                 .unwrap_or_else(|| DEFAULT_SERVER_LABEL.to_string());
-            attach_mcp_server_label(&mut item, Some(label.as_str()), response_format.as_ref());
+            attach_mcp_server_label(
+                &mut item,
+                Some(label.as_str()),
+                open.response_format.as_ref(),
+            );
 
             ResponseStreamEventEmitter::sent(
-                emitter.send_output_item_done(*output_index, item, tx).await,
+                emitter
+                    .send_output_item_done(open.output_index, item, RETAIN_OUTPUT_ITEM, tx)
+                    .await,
             );
-            emitter.complete_output_item(*output_index);
+            emitter.complete_output_item(open.output_index);
+        }
+    }
+
+    /// Every item opened past the calls the turn read closes with what the
+    /// parser holds of its arguments. The tool loop does not run these calls.
+    async fn close_unread_calls(&self, emitter: &mut ResponseStreamEventEmitter, tx: &SseSender) {
+        let read = self.tool_calls.as_ref().map_or(0, Vec::len);
+        let arguments = self
+            .parser
+            .extract_incomplete_commentary()
+            .and_then(|calls| calls.into_iter().next())
+            .and_then(|call| call.function.arguments)
+            .unwrap_or_default();
+        let Some(last) = self.calls.keys().copied().max() else {
+            return;
+        };
+        for index in read..=last {
+            let Some(open) = self.calls.get(&index) else {
+                continue;
+            };
+            if streams_arguments(open.response_format.as_ref()) {
+                let event = match open.response_format {
+                    Some(_) => emitter.emit_mcp_call_arguments_done(
+                        open.output_index,
+                        &open.item_id,
+                        &arguments,
+                    ),
+                    None => emitter.emit_function_call_arguments_done(
+                        open.output_index,
+                        &open.item_id,
+                        &arguments,
+                    ),
+                };
+                emitter.send_event_best_effort(&event, tx).await;
+            }
+            let mut item = open.item.clone();
+            item["arguments"] = json!(&arguments);
+            item["status"] = json!("incomplete");
+            ResponseStreamEventEmitter::sent(
+                emitter
+                    .send_output_item_done(open.output_index, item, OMIT_OUTPUT_ITEM, tx)
+                    .await,
+            );
         }
     }
 
@@ -1287,7 +1362,9 @@ impl ResponsesDecode {
         // The sender keeps the item before the frame goes out: the item is in the final output
         // whether or not the frame reached the client.
         ResponseStreamEventEmitter::sent(
-            emitter.send_output_item_done(*output_index, item, tx).await,
+            emitter
+                .send_output_item_done(*output_index, item, RETAIN_OUTPUT_ITEM, tx)
+                .await,
         );
         emitter.complete_output_item(*output_index);
     }
@@ -1329,6 +1406,7 @@ impl ResponsesDecode {
             final_text_extracted.len()
         );
         self.close_calls(emitter, tx, session).await;
+        self.close_unread_calls(emitter, tx).await;
     }
 
     /// The engine's counts the stream brought (the terminal frame's counters).
