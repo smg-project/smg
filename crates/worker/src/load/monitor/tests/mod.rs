@@ -186,7 +186,10 @@ impl LoadRecord for PushedRecord {
     }
 
     fn snapshot(&self) -> SchedulerLoadSnapshot {
-        self.snapshot.clone()
+        // Marked as the wire's record marks its own.
+        let mut snapshot = self.snapshot.clone();
+        snapshot.mark_stated(self.telemetry);
+        snapshot
     }
 
     fn values_sent(&self) -> usize {
@@ -1065,6 +1068,57 @@ async fn a_record_offers_the_count_it_states_at_zero_and_none_it_leaves_out() {
         (rank0.num_used_tokens, rank0.max_total_num_tokens),
         (0, 8_192)
     );
+}
+
+/// A rank with no token capacity states neither fixed count, pushed as
+/// polled. An engine that keeps no such size fills both counts with zero on
+/// every heartbeat: under load its record offers neither, where a zero of
+/// tokens held would read the engine idle. The entry stores what the record
+/// said.
+#[tokio::test]
+async fn a_pushed_heartbeat_with_no_capacity_offers_neither_fixed_count() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let offered = |monitor: &WorkerMonitor| -> Vec<(String, f64)> {
+        published_rank0(monitor, "grpc://w1:9000")
+            .named_values()
+            .map(|value| (value.name.to_string(), value.value))
+            .collect()
+    };
+    let figures = |monitor: &WorkerMonitor| {
+        let rank0 = published_rank0(monitor, "grpc://w1:9000");
+        (rank0.num_used_tokens, rank0.max_total_num_tokens)
+    };
+    // The rank's first record, then the one that replaces it: both arms.
+    for running in [6, 7] {
+        let loaded = pushed(running).used_tokens(0).total_tokens(0);
+        monitor.apply_pushed_load(&worker, 0, &loaded, Instant::now());
+        assert!(offered(&monitor).is_empty(), "{running} running");
+    }
+    // A held count beside a capacity of zero is no statement either.
+    let held = pushed(8).used_tokens(211).total_tokens(0);
+    monitor.apply_pushed_load(&worker, 0, &held, Instant::now());
+    assert!(offered(&monitor).is_empty());
+    assert_eq!(figures(&monitor), (211, 0));
+
+    // A capacity states both counts, the zero held too.
+    let idle = pushed(9).used_tokens(0).total_tokens(8_192);
+    monitor.apply_pushed_load(&worker, 0, &idle, Instant::now());
+    assert_eq!(
+        offered(&monitor),
+        [
+            ("kv_tokens_used".to_owned(), 0.0),
+            ("kv_tokens_capacity".to_owned(), 8_192.0)
+        ]
+    );
+
+    // A record that carries a held count and leaves its capacity out
+    // states neither: the entry keeps the capacity of the record before,
+    // and the rule reads the record's own.
+    monitor.apply_pushed_load(&worker, 0, &pushed(10).used_tokens(211), Instant::now());
+    assert!(offered(&monitor).is_empty());
+    assert_eq!(figures(&monitor), (211, 8_192));
 }
 
 /// The poll decision reads the receipt of the worker's pushed records
