@@ -759,6 +759,11 @@ impl<G: Generation> WorkerMonitor<G> {
                 at
             }
             Err(at) => {
+                // A rank's first record keeps nothing, and the parts it
+                // left out are marked all the same: a count it did not
+                // state is not offered as a zero.
+                let mut fresh = fresh;
+                fresh.kept = LoadTelemetry::all().difference(record.telemetry());
                 report.loads.insert(at, fresh);
                 report.dp_rank_count = i32::try_from(report.loads.len()).unwrap_or(i32::MAX);
                 at

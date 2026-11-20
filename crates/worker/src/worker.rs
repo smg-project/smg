@@ -1818,10 +1818,13 @@ pub struct SchedulerLoadSnapshot {
                        states."
     )]
     pub values: Vec<NamedValue>,
-    /// The parts of this entry that its own record did not carry: the load
-    /// monitor kept them from an older record of the rank. Empty for a
-    /// polled answer and for a rank's first record. Never serialized: an
-    /// answer on the wire states its figures and no mark.
+    /// The parts of this entry that its own record did not state. A pushed
+    /// record's are the parts it left out: the load monitor kept them from
+    /// an older record of the rank, or the rank has none of them yet. A
+    /// polled rank that reports no token capacity states neither fixed
+    /// token count ([`Self::bound_values`]). Empty where the record stated
+    /// every part. Never serialized: an answer on the wire states its
+    /// figures and no mark.
     #[serde(skip)]
     #[schemars(skip)]
     pub kept: LoadTelemetry,
@@ -1836,20 +1839,31 @@ impl SchedulerLoadSnapshot {
     /// states: the first of a name stands. The kept entries keep their
     /// order.
     ///
+    /// A polled rank that reports no token capacity is marked as stating
+    /// neither fixed token count ([`Self::kept`]). An engine that reports
+    /// its counts reports its capacity
+    /// ([`WorkerLoadResponse::has_absolute_token_data`]), so such a rank's
+    /// zero is no statement: the answer has no key that says so.
+    ///
     /// The load monitor passes every polled answer through this and counts
     /// what it answers. A pushed record's snapshot is built under the same
-    /// bounds. A host that takes an answer by a way of its own calls this
-    /// before it reads the list.
+    /// bounds, and marked by what the record carried. A host that takes an
+    /// answer by a way of its own calls this before it reads the list.
     pub fn bound_values(&mut self) -> usize {
+        if self.max_total_num_tokens <= 0 {
+            self.kept |= LoadTelemetry::USED_TOKENS | LoadTelemetry::TOTAL_TOKENS;
+        }
         value_bounds::bound(&mut self.values)
     }
 
     /// Values the engine reports by name, followed by the two fixed token
-    /// counts, each where it is nonzero, its name is absent from the list
-    /// and this snapshot's own record carried it. A count the entry kept
-    /// from an older record ([`Self::kept`]) is not offered: what a
-    /// snapshot offers by name is its own record's. Missing fixed counts
-    /// are stored as zero.
+    /// counts, each where this snapshot's own record stated it and its
+    /// name is absent from the list. A stated count is offered at zero
+    /// too: an engine that goes idle states zero tokens held, and a reader
+    /// that keeps the last value it read must hear it. A count the record
+    /// did not state ([`Self::kept`]) is not offered: what a snapshot
+    /// offers by name is its own record's. Such a count is stored as zero,
+    /// or as the last record's.
     pub fn named_values(&self) -> impl Iterator<Item = NamedValue> + '_ {
         let [used, capacity, tokens] = &*FIXED_COUNT_NAMES;
         let fixed = [
@@ -1861,10 +1875,8 @@ impl SchedulerLoadSnapshot {
             ),
         ]
         .into_iter()
-        .filter(|&(name, count, part)| {
-            count != 0
-                && !self.kept.contains(part)
-                && !self.values.iter().any(|value| value.name == *name)
+        .filter(|&(name, _, part)| {
+            !self.kept.contains(part) && !self.values.iter().any(|value| value.name == *name)
         })
         .map(move |(name, count, _)| NamedValue {
             name: Arc::clone(name),
@@ -2470,10 +2482,15 @@ mod load_snapshot_tests {
 
     #[test]
     fn named_values_offer_the_fixed_token_counts_independently() {
-        let mut snapshot = SchedulerLoadSnapshot::default();
+        // A record that stated neither count.
+        let mut snapshot = SchedulerLoadSnapshot {
+            kept: LoadTelemetry::USED_TOKENS | LoadTelemetry::TOTAL_TOKENS,
+            ..Default::default()
+        };
         assert!(snapshot.named_values().next().is_none());
 
         snapshot.num_used_tokens = 211;
+        snapshot.kept = LoadTelemetry::TOTAL_TOKENS;
         let used = NamedValue {
             name: "kv_tokens_used".into(),
             unit: "tokens".into(),
@@ -2486,6 +2503,7 @@ mod load_snapshot_tests {
         );
 
         snapshot.max_total_num_tokens = 1_373;
+        snapshot.kept = LoadTelemetry::empty();
         let capacity = NamedValue {
             name: "kv_tokens_capacity".into(),
             unit: "tokens".into(),
@@ -2502,8 +2520,49 @@ mod load_snapshot_tests {
         }));
         assert!(Arc::ptr_eq(&values[0].unit, &values[1].unit));
 
+        // A stated count is offered at zero: an idle engine holds none.
         snapshot.num_used_tokens = 0;
-        assert_eq!(snapshot.named_values().collect::<Vec<_>>(), [capacity]);
+        let idle = NamedValue {
+            value: 0.0,
+            ..values[0].clone()
+        };
+        assert_eq!(
+            snapshot.named_values().collect::<Vec<_>>(),
+            [idle, capacity]
+        );
+    }
+
+    #[test]
+    fn a_polled_rank_with_no_token_capacity_states_neither_fixed_count() {
+        let names = |snapshot: &SchedulerLoadSnapshot| -> Vec<(String, f64)> {
+            snapshot
+                .named_values()
+                .map(|value| (value.name.to_string(), value.value))
+                .collect()
+        };
+        // No capacity: the answer's zero, or a count beside it, is no
+        // statement.
+        for used in [0, 211] {
+            let mut polled = SchedulerLoadSnapshot {
+                num_used_tokens: used,
+                ..Default::default()
+            };
+            assert_eq!(polled.bound_values(), 0);
+            assert!(names(&polled).is_empty(), "{used} used");
+        }
+        // A capacity: both counts are the engine's, the zero too.
+        let mut polled = SchedulerLoadSnapshot {
+            max_total_num_tokens: 1_373,
+            ..Default::default()
+        };
+        assert_eq!(polled.bound_values(), 0);
+        assert_eq!(
+            names(&polled),
+            [
+                (KV_TOKENS_USED.to_owned(), 0.0),
+                (KV_TOKENS_CAPACITY.to_owned(), 1_373.0)
+            ]
+        );
     }
 
     #[test]
