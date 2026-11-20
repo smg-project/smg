@@ -448,7 +448,7 @@ mod handles {
 pub fn describe_series() {
     describe_gauge!(
         "smg_worker_pool_size",
-        "Current worker pool size by worker_type, connection_mode, model"
+        "Current worker pool size by worker_type, connection_mode and the worker's primary model"
     );
     describe_counter!(
         "smg_pd_rendezvous_failures_total",

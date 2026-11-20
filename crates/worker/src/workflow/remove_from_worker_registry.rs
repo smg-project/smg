@@ -9,7 +9,6 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 use super::{
     data::WorkerRemovalWorkflowData,
     host::{require_host, WorkflowHost},
-    pool::{pool_group, refresh_worker_pool_sizes, PoolGroups},
 };
 use crate::{
     identity::{basic::Worker, endpoint::Endpoint},
@@ -45,20 +44,6 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>> for RemoveFromW
             "Removing {} worker(s) from worker registry",
             worker_urls.len()
         );
-
-        // Snapshot the unique `(worker_type, connection_mode, model_id)`
-        // groups for the workers we are about to remove. We capture this
-        // before the removal so the pool-size metric update below can
-        // recompute the per-group count after the workers have been
-        // pulled from the registry. The cache eviction the old
-        // `LoadMonitor` path used to do here is now handled by
-        // `WorkerMonitor` reacting to `WorkerEvent::Removed`.
-        let mut unique_configs = PoolGroups::new();
-        for url in &worker_urls {
-            if let Some(w) = registry.get_by_url(url) {
-                unique_configs.insert(pool_group(w.as_ref()));
-            }
-        }
 
         // The worker removed can differ from the worker found (a rebuild
         // under its id during the drain); the policy step asks after the
@@ -148,12 +133,6 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>> for RemoveFromW
             );
         }
 
-        // Update Layer 3 worker pool size metrics for unique
-        // configurations. WorkerMonitor subscribes to registry events
-        // directly and reconciles per-group polling state on its own,
-        // so this step no longer needs to push group-removed
-        // notifications.
-        refresh_worker_pool_sizes(registry, &unique_configs);
         if !standing.is_empty() {
             let kept: Vec<Arc<dyn Worker>> = context
                 .data
