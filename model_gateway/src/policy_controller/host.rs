@@ -326,6 +326,17 @@ pub(crate) enum Unplaced {
     Refused(Refused),
     /// The gateway could send to no target of its three asks.
     NoTargetHolds,
+    /// A pair's ask found no endpoint, and by membership no prefill pairs
+    /// with a decode: each pool's pairing keys and the components the two
+    /// pools disagree on, as the store's pair classes hold them.
+    NoCompatiblePair {
+        /// The prefill pool's pairing keys.
+        prefill: Vec<String>,
+        /// The decode pool's pairing keys.
+        decode: Vec<String>,
+        /// The components the pools disagree on.
+        mismatches: Vec<String>,
+    },
     /// A pair can be sent, but its prefill has no admission room.
     NoRoom,
     /// The prefill admission queue refused the request.
@@ -352,6 +363,7 @@ impl Unplaced {
     /// |---|---|
     /// | The pool is saturated, admission found no room, or the controller queued the request | 503 `worker_overload_protection_shed`, with a retry hint |
     /// | No endpoint is left, or the gateway can send to no target | 503 `no_available_workers`, with a retry hint |
+    /// | A pair's pools hold workers and no prefill pairs with a decode | 503 `no_compatible_pd_pair`, naming what the pools disagree on |
     /// | A controller queue is at its limit | 429 `admission_queue_full`, with a retry hint |
     /// | The decision's budget passed | 503 `admission_queue_timeout`, with the same hint |
     /// | The prefill admission queue is full or timed out | 429 `pd_prefill_queue_full` or `pd_prefill_queue_timeout` |
@@ -403,6 +415,11 @@ impl Unplaced {
                     "the gateway could send to no target the policy controller picked",
                 )
             }
+            Self::NoCompatiblePair {
+                ref prefill,
+                ref decode,
+                ref mismatches,
+            } => placement::no_compatible_pair(model, mismatches, prefill, decode),
             Self::Admission(PrefillAdmissionRejection::QueueFull) => prefill_queue_full(),
             Self::Admission(PrefillAdmissionRejection::QueueTimeout) => prefill_queue_timeout(),
             Self::Shed {
@@ -597,6 +614,28 @@ impl Host {
         );
     }
 
+    /// Why no pair can be made for `ask`, where it asks for one on the wires
+    /// it states and the store's pair classes refuse that side of its
+    /// fleet. The classes judge from membership alone, as the classic pair
+    /// index does, so a fleet that pairs nothing reads the classic's answer
+    /// and not a missing endpoint.
+    ///
+    /// An ask that states no wire does not say which side it draws from. It
+    /// keeps the controller's shed.
+    fn unpaired(&self, ask: &Ask<'_>) -> Option<Unplaced> {
+        if ask.phase == Phase::Single || ask.wires.is_empty() {
+            return None;
+        }
+        self.door.store().with_world(|world| {
+            let refusal = world.pairs(ask.model)?.refusal(ask.wires)?;
+            Some(Unplaced::NoCompatiblePair {
+                prefill: refusal.prefill.clone(),
+                decode: refusal.decode.clone(),
+                mismatches: refusal.mismatches.clone(),
+            })
+        })
+    }
+
     fn trace_decision(&self, decision: &Decision, worker: Option<&Arc<dyn Worker>>) {
         cache_trace::decided(|| {
             let trace = decision.trace();
@@ -717,11 +756,14 @@ impl Host {
             }
             Decision::Shed(shed) => {
                 self.trace_decision(&decision, None);
-                Err(Unplaced::Shed {
+                let unpaired = (shed.reason == ShedReason::NoEndpoints)
+                    .then(|| self.unpaired(ask))
+                    .flatten();
+                Err(unpaired.unwrap_or(Unplaced::Shed {
                     reason: shed.reason,
                     emptied_by: shed.emptied_by,
                     retry_after_secs: shed.retry_after_secs,
-                })
+                }))
             }
             Decision::Queue(_) => Err(Unplaced::Queued),
         }
