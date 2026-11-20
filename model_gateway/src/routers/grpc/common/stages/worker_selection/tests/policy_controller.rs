@@ -846,6 +846,19 @@ async fn a_request_with_encode_items_is_refused_by_name_under_a_host() -> anyhow
     Ok(())
 }
 
+#[test]
+fn a_pair_attempt_states_the_retry_loops_number() {
+    let first = ingress(&Arc::new(WorkerRegistry::new()));
+    assert_eq!(Attempt::First(&first).number(), 0);
+    // Two failed pairs named four rows, and the retry is the second.
+    let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
+    ctx.tried_rows = Box::from([WorkerId(1), WorkerId(2), WorkerId(3), WorkerId(4)]);
+    ctx.attempt = 2;
+    assert_eq!(Attempt::Retry(&ctx).number(), 2);
+    ctx.attempt = 300;
+    assert_eq!(Attempt::Retry(&ctx).number(), u8::MAX);
+}
+
 #[tokio::test]
 async fn the_classic_pair_stage_is_unmoved_without_a_host() {
     let (hosted, store) = one_pair_stage(WorkerSelectionMode::PrefillDecode);

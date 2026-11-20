@@ -140,6 +140,10 @@ pub(crate) struct Ask<'a> {
     pub prompt_tokens: u32,
     /// The rows of the workers the request's failed attempts were sent to.
     pub tried: &'a [WorkerId],
+    /// The retry number, `0` for the first attempt. `None` counts the rows
+    /// of `tried`, one a failed attempt. A stage whose failed attempt names
+    /// more rows than one states the number: a pair names two.
+    pub attempt: Option<u8>,
     /// The attempt's prompt hashes, where it has them. The stage that holds
     /// the tokens fills this once per attempt, before its first ask.
     pub hashes: Option<&'a Hashes>,
@@ -159,6 +163,7 @@ impl<'a> Ask<'a> {
             phase: Phase::Single,
             prompt_tokens: 0,
             tried: &[],
+            attempt: None,
             hashes: None,
         }
     }
@@ -214,7 +219,9 @@ impl<'a> Ask<'a> {
             phase: self.phase,
             prompt_tokens: self.prompt_tokens,
             client_key,
-            attempt: u8::try_from(self.tried.len()).unwrap_or(u8::MAX),
+            attempt: self
+                .attempt
+                .unwrap_or_else(|| u8::try_from(self.tried.len()).unwrap_or(u8::MAX)),
             tried: self.tried,
             seed: rand::rng().random(),
             ..RequestFacts::default()

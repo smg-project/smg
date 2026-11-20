@@ -644,7 +644,6 @@ pub(crate) async fn execute_sequential_pd(
         decode_request,
         decode_client.clone(),
         handed_off,
-        placement,
     )
     .await?;
     // Decode established: record the success-only PD metrics here.
@@ -723,9 +722,12 @@ async fn sequential_prefill_side(
     // above was read before the booking.
     let prefill_ticket =
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
-    // A pair the policy controller placed says its prefill's dispatch here.
+    // A pair the policy controller placed is committed here, at the
+    // prefill's send: both sides say their dispatch. The decode goes out
+    // once the prefill has run, and a side that waited that long would end
+    // at its dispatch deadline.
     if let Some(placement) = placement {
-        placement.sent(PdSide::Prefill, prefill_start);
+        placement.committed(prefill_start);
     }
     let prefill_stream = dispatch_prefill_within(
         PrefillWait {
@@ -824,6 +826,12 @@ async fn sequential_prefill_side(
     // The prefill phase ends at the drain; recorded by the executor only once
     // decode is established.
     let done = Instant::now();
+    // A placed pair's prefill ends here for the controller too: it reads
+    // the prefill worker free while the decode runs.
+    if let Some(placement) = placement {
+        let prompt_tokens = u32::try_from(sides.prompt_tokens).unwrap_or(u32::MAX);
+        placement.prefill_ended(prompt_tokens, done);
+    }
     Ok(PrefillHarvest {
         stream: prefill_stream,
         kv_params,
@@ -952,7 +960,6 @@ async fn sequential_decode_side(
     decode_request: ProtoGenerateRequest,
     mut decode_client: BackendClient,
     handed_off: bool,
-    placement: Option<&Placement>,
 ) -> Result<(ProtoStream, Instant), Response> {
     let workers = sides.workers;
     // Send request to decode
@@ -983,10 +990,6 @@ async fn sequential_decode_side(
     } else {
         None
     };
-    // A pair the policy controller placed says its decode's dispatch here.
-    if let Some(placement) = placement {
-        placement.sent(PdSide::Decode, decode_sent);
-    }
     let decode_worker = workers.decode_worker().cloned();
     let decode_stream = dispatch_decode_within(
         decode_bound,

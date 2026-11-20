@@ -1170,6 +1170,16 @@ impl<'a> Attempt<'a> {
             Self::Retry(ctx) => Some(&ctx.ledger),
         }
     }
+
+    /// The retry number, `0` for the first attempt, as the retry loop
+    /// counts it. A pair's ask states it: a failed pair names two rows, so
+    /// the count of the tried rows is not its number.
+    fn number(&self) -> u8 {
+        match self {
+            Self::First(_) => 0,
+            Self::Retry(ctx) => u8::try_from(ctx.attempt).unwrap_or(u8::MAX),
+        }
+    }
 }
 
 /// What a retry's media demands of a candidate. The retained wire carries
@@ -1988,6 +1998,7 @@ impl WorkerSelectionStage {
         let ledger = attempt.ledger();
         let ask = Ask {
             phase: Phase::Prefill,
+            attempt: Some(attempt.number()),
             ..attempt.ask(model_id, &id, &hashes)
         };
         let (mut placed, guard) = host

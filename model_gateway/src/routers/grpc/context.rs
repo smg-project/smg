@@ -1138,14 +1138,55 @@ impl Placement {
         }
     }
 
+    /// A placed pair whose decode follows its prefill goes out at `now`:
+    /// both sides say their dispatch. The decode worker is committed from
+    /// the prefill's send. A decode side left waiting through the prefill
+    /// would end at its dispatch deadline, and the decode would then run
+    /// with no booking.
+    pub(crate) fn committed(&self, now: Instant) {
+        let mut held = self.cell.lock();
+        let placed = held.placed();
+        placed.dispatched(now);
+        placed.decode_dispatched(now);
+    }
+
+    /// A placed pair's prefill phase ended whole at `now`, having read
+    /// `tokens_in` of the prompt: the prefill's side ends where its
+    /// admission guard is dropped, and the controller reads its worker free
+    /// while the decode runs. The decode's side stands to the response's
+    /// end. A single has no phase that ends here.
+    pub(crate) fn prefill_ended(&self, tokens_in: u32, now: Instant) {
+        let end = End {
+            status: 200,
+            class: TransportClass::Ok,
+            ttft_micros: 0,
+            tokens_in,
+            tokens_out: 0,
+            duration_micros: self.micros_to(now),
+        };
+        let mut held = self.cell.lock();
+        let placed = held.placed();
+        if placed.decode().is_some() {
+            placed.completed(end, now);
+        }
+    }
+
+    /// The time from the dispatch to `now` in whole microseconds.
+    fn micros_to(&self, now: Instant) -> u32 {
+        let micros = now.saturating_duration_since(self.sent).as_micros();
+        u32::try_from(micros).unwrap_or(u32::MAX)
+    }
+
     /// Report the dispatch's status, transport class and token counts at
     /// `now`. The lease takes its first end. The router has no time to the
     /// first token for this report and sends zero.
     ///
     /// A pair's whole answer ends both of its sides, and the prefill wrote
-    /// no token of it. Any other end of a pair names no side, so the pair
-    /// is given up: a side that was sent ends as cancelled, one that was
-    /// not is released, and neither worker is charged.
+    /// no token of it. A prefill that said its end at its phase boundary
+    /// ([`Self::prefill_ended`]) says none again, and the answer ends the
+    /// decode alone. Any other end of a pair names no side, so the pair is
+    /// given up: a side that was sent ends as cancelled, one that was not
+    /// is released, and neither worker is charged.
     pub(crate) fn ended(
         &self,
         status: u16,
@@ -1154,14 +1195,13 @@ impl Placement {
         tokens_out: u32,
         now: Instant,
     ) {
-        let micros = now.saturating_duration_since(self.sent).as_micros();
         let end = End {
             status,
             class,
             ttft_micros: 0,
             tokens_in,
             tokens_out,
-            duration_micros: u32::try_from(micros).unwrap_or(u32::MAX),
+            duration_micros: self.micros_to(now),
         };
         let mut held = self.cell.lock();
         let placed = held.placed();
@@ -2271,15 +2311,23 @@ pub(super) mod test_support {
 #[cfg(test)]
 mod tests {
     use smg_grpc_client::VllmEngineClient;
-    use smg_policy_controller::store::{GatewayId, LeasesStore};
+    use smg_policy_controller::{
+        store::{GatewayId, LeasesStore, MemoryStore},
+        LeaseId, Side,
+    };
 
     use super::{
         test_support::{dispatch_context, dispatched, pair_selection, place_pair, place_worker},
         *,
     };
-    use crate::routers::{
-        common::{pd_admission::admit_decode, prefill_admission::test_support::select_worker},
-        grpc::{backend_client::BasicWorkerBuilder, client::GrpcClient, test_engine::mock_engine},
+    use crate::{
+        policy_controller::host::testing,
+        routers::{
+            common::{pd_admission::admit_decode, prefill_admission::test_support::select_worker},
+            grpc::{
+                backend_client::BasicWorkerBuilder, client::GrpcClient, test_engine::mock_engine,
+            },
+        },
     };
 
     #[tokio::test]
@@ -2467,6 +2515,64 @@ mod tests {
         // With both said, no side waits.
         let both = [PdSide::Prefill, PdSide::Decode];
         assert_eq!(after_the_sends_of(&both).await, (false, 1));
+    }
+
+    /// Whether each side of a pair's lease still stands live in the store,
+    /// issued or dispatched: the prefill's, then the decode's.
+    fn live_sides(store: &MemoryStore, lease: LeaseId) -> (bool, bool) {
+        let sides = store.sides(GatewayId::LOCAL, lease);
+        let live = |side| {
+            sides
+                .and_then(|sides| sides.side(side))
+                .is_some_and(|(_, state)| state.is_live())
+        };
+        (live(Side::Prefill), live(Side::Decode))
+    }
+
+    #[tokio::test]
+    async fn a_committed_pair_keeps_its_decode_booked_through_a_slow_prefill() {
+        let (placed, _admission, store) = place_pair().await;
+        let lease = testing::lease_of(&placed);
+        let selection = pair_selection(&placed);
+        let now = Instant::now();
+        let guards = LoadGuards::at_dispatch(&selection, None, 1, Some(placed), now);
+        let placement = guards.placement().expect("the pair's placement");
+        // A sequential dispatch sends the prefill alone and commits the pair
+        // there. The prefill then runs past the dispatch deadline, and no
+        // decode has gone out.
+        placement.committed(now);
+        let late = now + std::time::Duration::from_secs(60);
+        assert!(store.expire(late).is_empty(), "no side waited");
+        assert_eq!(live_sides(&store, lease), (true, true));
+        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
+    }
+
+    #[tokio::test]
+    async fn a_placed_pairs_prefill_ends_at_its_phase_boundary() {
+        let (placed, admission, store) = place_pair().await;
+        let lease = testing::lease_of(&placed);
+        let selection = pair_selection(&placed);
+        let sent = Instant::now();
+        let guards = LoadGuards::at_dispatch(&selection, None, 1, Some(placed), sent);
+        let placement = guards.placement().expect("the pair's placement");
+        placement.committed(sent);
+        assert_eq!(live_sides(&store, lease), (true, true));
+        // The prefill is drained: its admission guard goes, and its side
+        // ends with it. The decode's side stands for the response.
+        drop(admission);
+        placement.prefill_ended(17, sent);
+        assert_eq!(live_sides(&store, lease), (false, true));
+        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
+        // The whole answer has the decode's end alone left to say.
+        placement.completed(17, 5);
+        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+
+        // A single has no prefill phase: the word says nothing of its lease.
+        let (placed, store) = place_worker().await;
+        let guards = dispatched(placed, sent);
+        let placement = guards.placement().expect("the dispatch's placement");
+        placement.prefill_ended(17, sent);
+        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
     }
 
     #[tokio::test]

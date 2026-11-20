@@ -12,11 +12,11 @@ use smg_policy_controller::{
         WorkerStatus as RowStatus, WorkersStore,
     },
     view::{Role, WorkerId},
-    AppliedSpec, PolicySpec,
+    AppliedSpec, LeaseId, PolicySpec,
 };
 use smg_worker::identity::basic::{Worker, WorkerType};
 
-use super::Host;
+use super::{Host, Placed};
 use crate::{
     config::{PolicyConfig, RouterConfig},
     policy_controller::start,
@@ -28,6 +28,12 @@ pub(crate) const MODEL: &str = "model-a";
 
 /// A host, its store, and the registry's workers in the URLs' order.
 type Bed = (Host, Arc<MemoryStore>, Vec<Arc<dyn Worker>>);
+
+/// The id of the lease `placed` holds: a router's case reads the lease's
+/// sides in the store by it.
+pub(crate) fn lease_of(placed: &Placed) -> LeaseId {
+    placed.handle.lease().expect("a lease").lease.id
+}
 
 /// The store a start makes under the controller with one ready row a URL,
 /// a registry with one worker a URL, and the host over the two.
