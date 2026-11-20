@@ -41,7 +41,7 @@ use crate::{
     counts::Slot,
     decider::Decider,
     decision::{Decision, Pair, Pick, ShadowKind, Shed, ShedReason, Target, Targets, Trace},
-    demands::{DemandFacts, Demands, Unmet},
+    demands::{DemandFacts, Demands},
     framework::{
         release, EncodeItems, EncodePlaced, Engine, Plan, Scratch, ShadowRows, KEEPS_DECIDERS,
         SAMPLES_DECISIONS, SHADOWS,
@@ -179,7 +179,7 @@ pub(crate) fn summed(parts: &[Part], count: impl Fn(&Part) -> &AtomicU64) -> u64
 
 /// The stage a decision is shed under when its pool has rows and its
 /// gateway shares a wire with none of them, or its request's runtime is
-/// none of theirs ([`Unmet::Runtime`]).
+/// none of theirs ([`Unmet::Runtime`](crate::demands::Unmet::Runtime)).
 pub(crate) const WIRES: &str = "wires";
 
 /// The stage a decision is shed under when its gateway hints a subset of 0
@@ -1576,7 +1576,8 @@ type Read<'a> = (
 /// A pool that has rows of which the request's own narrowing left none is
 /// answered in the decider's form for it ([`Decides::emptied`]), under
 /// the stage that took the last row: the request's hint of 0, the last
-/// demand its rows failed first ([`Unmet`]), or its gateway's wires.
+/// demand its rows failed first ([`Unmet`](crate::demands::Unmet)), or its
+/// gateway's wires.
 ///
 /// A request whose profile holds a stage that may refuse by a report of
 /// leases ([`Filter::refuses_by_reports`](crate::framework::Filter::refuses_by_reports))
@@ -1661,7 +1662,7 @@ pub(crate) fn hand<A: Asked, R>(
     let by_door = wires.is_none() && request.subset() != Some(0) && request.demands().is_none();
     // The last demand the rows a demand took failed first, where one took
     // a row of the build: the rows left are named within themselves then.
-    let mut unmet: Option<Unmet> = None;
+    let mut unmet: Option<crate::demands::Unmet> = None;
     let (pool, now_micros, candidates, masks, affinity, cells, counts, built): Read<'_> = if by_door
     {
         match world.view(model, role, &ask, shown, view) {
@@ -1854,12 +1855,12 @@ fn emptied<R>(
     constraints: &Constraints<'_>,
     scratch: &mut Scratch,
     subset: Option<u32>,
-    unmet: Option<Unmet>,
+    unmet: Option<crate::demands::Unmet>,
 ) -> R {
     let stage = if subset == Some(0) {
         SUBSET_HINT
     } else {
-        unmet.map_or(WIRES, Unmet::stage)
+        unmet.map_or(WIRES, crate::demands::Unmet::stage)
     };
     decide.emptied(facts, pool, constraints, scratch, stage)
 }
@@ -1891,9 +1892,10 @@ pub(crate) struct Took {
     /// list: `0` where no demand took a row.
     pub(crate) demanded: u64,
     /// The last of the demands those rows failed first, in the order a
-    /// host answers for them ([`Unmet`]): the stage a pool the demands
-    /// left nobody is shed under. `None` where no demand took a row.
-    pub(crate) unmet: Option<Unmet>,
+    /// host answers for them ([`Unmet`](crate::demands::Unmet)): the stage
+    /// a pool the demands left nobody is shed under. `None` where no demand
+    /// took a row.
+    pub(crate) unmet: Option<crate::demands::Unmet>,
 }
 
 /// [`narrow`] for a request that states hard demands ([`Demands`]): one
