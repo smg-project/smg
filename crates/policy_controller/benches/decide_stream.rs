@@ -2137,6 +2137,7 @@ fn in_process(store: &MemoryStore, decisions: u64, commit: bool) -> u64 {
             now: Instant::now(),
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         let decision = store.deciding(|world| {
             // The door a decider reads a plain request's pool by: the

@@ -368,8 +368,8 @@ impl Checked {
                 lent_session_in_flight: None,
                 session_counted: false,
                 // The frame carries no signal cells: they stand beside
-                // the rows of the host that decides.
-                signal_cells: None,
+                // the rows of the host that decides, whose view hands them.
+                signal_cells: view.signal_cells,
                 client_key: facts.client_key,
             },
             Constraints {
@@ -1220,6 +1220,7 @@ mod tests {
             in_flight: None,
             max_block_hashes: 256,
             pins: None,
+            signal_cells: None,
         };
         checked.read(lists, view, unnamed, check)
     }
@@ -1566,6 +1567,7 @@ mod tests {
                 in_flight: None,
                 max_block_hashes,
                 pins: None,
+                signal_cells: None,
             };
             checked.read(&mut Lists::default(), view, unnamed, |facts, _| {
                 facts.block_hashes.to_vec()

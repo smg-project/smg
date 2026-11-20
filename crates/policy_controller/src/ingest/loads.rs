@@ -50,7 +50,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use openai_protocol::worker::{RuntimeType, WorkerLoadResponse};
+use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse};
 use parking_lot::Mutex;
 use tokio::{
     sync::{watch, Notify},
@@ -62,8 +62,11 @@ use tracing::{debug, warn};
 use super::scrape;
 use crate::{
     address::{split, UNPARSABLE},
-    load_report::load_row,
-    store::{LoadSink, LoadSource, PollMode, Reachability, WorkerRow, WorkerStatus, WorkersStore},
+    load_report::{load_row, signal_values},
+    store::{
+        LoadSink, LoadSource, PollMode, Reachability, SignalSink, WorkerRow, WorkerStatus,
+        WorkersStore,
+    },
     view::{Role, SignalSource, WireModes, WorkerId},
 };
 
@@ -213,6 +216,11 @@ pub struct Stats {
     /// record arrived while the read was out keeps that record, so the rows
     /// on file can be fewer.
     pub rows: AtomicU64,
+    /// Named values the bounds took out of polled answers. This poll
+    /// passes no load monitor, so the driver puts each rank's list under
+    /// the worker crate's bounds itself, where the document declares a
+    /// signal and the list is read.
+    pub values_dropped: AtomicU64,
 }
 
 /// Failed reads by [`ReadError::label`].
@@ -428,7 +436,7 @@ fn peer(engine: &str) -> &str {
 
 impl<S, P> LoadDriver<S, P>
 where
-    S: WorkersStore + LoadSink + 'static,
+    S: WorkersStore + LoadSink + SignalSink + 'static,
     P: LoadProbe,
 {
     /// A driver over `store`. The store is told the report period
@@ -721,6 +729,14 @@ where
     /// left out a rank its own records serve says nothing of the engine,
     /// which is heard. The store drops a row for a worker that left while
     /// the call was out.
+    ///
+    /// Behind each polled row the store took go the values its rank's
+    /// answer states of the signals the document declares
+    /// ([`signal_values`]), dated as the row is. A row the store passed
+    /// over takes its values with it. Each rank's list is first put under
+    /// the worker crate's bounds, and what left is counted
+    /// ([`Stats::values_dropped`]). A scrape's sample states nothing by
+    /// name. A document that declares no signal costs a poll one test.
     fn apply(&self, engine: &Engine, polled_at: Instant, read: Read) {
         match read {
             Read::Poll {
@@ -728,7 +744,7 @@ where
                 served,
                 answer,
             } => {
-                let report = match answer {
+                let mut report = match answer {
                     Ok(report) => report,
                     Err(error) => {
                         debug!(engine = peer(&engine.key), %error, "the load poll produced no report");
@@ -748,21 +764,37 @@ where
                 // unavailable: nothing is written for it, never another
                 // rank's figures.
                 let parallel = engine.dp_size > 1;
+                // Each rank's scoped answer, kept past its row where the
+                // document declares a signal.
+                let columns = self.store.signal_columns();
+                let mut scoped_answers = Vec::new();
+                if !columns.is_empty() {
+                    // No load monitor stands ahead of this poll: the list
+                    // is bound here, before anything reads it.
+                    let ranks = report.loads.iter_mut();
+                    let dropped: usize = ranks.map(SchedulerLoadSnapshot::bound_values).sum();
+                    self.stats
+                        .values_dropped
+                        .fetch_add(dropped as u64, Ordering::Relaxed);
+                }
                 let answer: Vec<_> = ranks
                     .into_iter()
                     .map(|(rank, id)| {
-                        let row = report
+                        let scoped = report
                             .clone()
-                            .for_dp_rank(parallel.then_some(usize::from(rank)))
-                            .map(|scoped| {
-                                load_row(
-                                    &scoped,
-                                    engine.role,
-                                    received,
-                                    sampled_at.unwrap_or(received),
-                                    SignalSource::Poll,
-                                )
-                            });
+                            .for_dp_rank(parallel.then_some(usize::from(rank)));
+                        let row = scoped.as_ref().map(|scoped| {
+                            load_row(
+                                scoped,
+                                engine.role,
+                                received,
+                                sampled_at.unwrap_or(received),
+                                SignalSource::Poll,
+                            )
+                        });
+                        if !columns.is_empty() {
+                            scoped_answers.push(scoped);
+                        }
                         (id, rank, row)
                     })
                     .collect();
@@ -772,11 +804,33 @@ where
                 // none and is the word that no report came, which a poll
                 // that left out a served rank does not say.
                 if rows > 0 || !served {
-                    if let Some(sampled_at) = sampled_at {
+                    let passed = if let Some(sampled_at) = sampled_at {
                         self.store
-                            .report_sampled(&answer, polled_at, sampled_at, LoadSource::Poll);
+                            .report_sampled(&answer, polled_at, sampled_at, LoadSource::Poll)
                     } else {
-                        self.store.report(&answer, polled_at, LoadSource::Poll);
+                        self.store.report(&answer, polled_at, LoadSource::Poll)
+                    };
+                    // The rows first, then their values. The positions the
+                    // store passed over stand in the answer's order.
+                    let mut passed = passed.into_iter().peekable();
+                    let stated = answer.iter().zip(&scoped_answers);
+                    for (position, (&(id, rank, _), scoped)) in stated.enumerate() {
+                        if passed.next_if_eq(&position).is_some() {
+                            continue;
+                        }
+                        let Some(scoped) = scoped else {
+                            continue;
+                        };
+                        // A value is dated from its row's sample: the
+                        // answer's stamp, else the poll's start.
+                        signal_values(
+                            scoped,
+                            &columns,
+                            sampled_at.unwrap_or(polled_at),
+                            |name, unit, value, at| {
+                                self.store.signal_value(id, rank, name, unit, value, at);
+                            },
+                        );
                     }
                 }
                 self.stats.rows.fetch_add(rows as u64, Ordering::Relaxed);

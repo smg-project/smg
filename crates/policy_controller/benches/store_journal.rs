@@ -302,6 +302,7 @@ fn view_build(c: &mut Criterion) {
                 now: pool.opened + Duration::from_secs(1),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let mut out = ViewBuffers::default();
             group.bench_with_input(BenchmarkId::new(kind, n), &n, |b, _| {

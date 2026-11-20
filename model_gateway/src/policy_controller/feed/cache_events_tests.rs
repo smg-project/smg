@@ -190,6 +190,7 @@ fn holders(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
             now: Instant::now(),
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         let mut view = ViewBuffers::default();
         let Some(built) = world.build(MODEL, Role::Single, &ask, &mut view) else {

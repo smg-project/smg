@@ -481,6 +481,7 @@ mod tests {
                 in_flight: None,
                 max_block_hashes: want.block_hashes.len(),
                 pins: None,
+                signal_cells: None,
             };
             checked.read(
                 &mut Lists::default(),
@@ -567,6 +568,7 @@ mod tests {
             in_flight: None,
             max_block_hashes: 0,
             pins: None,
+            signal_cells: None,
         };
         checked.read(&mut Lists::default(), view, door::unnamed, |facts, _| {
             assert_eq!(facts.tenant.hash, want.tenant.hash);

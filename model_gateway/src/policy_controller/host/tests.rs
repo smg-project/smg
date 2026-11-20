@@ -1736,6 +1736,7 @@ impl PairBed {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let mut rows = PairBuffers::default();
             let built = world.build_pair(MODEL, &ask, &mut rows)?;

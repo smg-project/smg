@@ -293,6 +293,7 @@ mod tests {
             now,
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         let mut view = ViewBuffers::default();
         store

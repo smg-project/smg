@@ -4119,6 +4119,7 @@ mod tests {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             feed.store().deciding(|world| {
                 let mut view = ViewBuffers::default();

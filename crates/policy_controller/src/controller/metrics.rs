@@ -28,7 +28,7 @@ use super::{
 };
 use crate::{
     ingest::loads::{Failures, Stats},
-    store::StoreCounts,
+    store::{StoreCounts, Taken},
 };
 
 /// `1` for the controller's state (`starting`, `leader`, `syncing`,
@@ -63,6 +63,8 @@ pub const LOAD_SCRAPES_TOTAL: &str = "smg_policy_controller_load_scrapes_total";
 pub const LOAD_SCRAPE_FAILURES_TOTAL: &str = "smg_policy_controller_load_scrape_failures_total";
 /// Rank rows the load driver wrote.
 pub const LOAD_ROWS_TOTAL: &str = "smg_policy_controller_load_rows_total";
+/// Named values the bounds took out of the load driver's polled answers.
+pub const LOAD_VALUES_DROPPED_TOTAL: &str = "smg_policy_controller_load_values_dropped_total";
 /// The generation of the policy spec the controller runs. Rendered by a
 /// controller with a spec source, from its first document on.
 pub const SPEC_GENERATION: &str = "smg_policy_spec_generation";
@@ -118,6 +120,11 @@ pub const OVERLOAD_FLIPS_TOTAL: &str = "smg_policy_controller_overload_flips_tot
 /// decision gives up) counts with the requests that got no decision.
 pub const LIFECYCLE_FAULTS_TOTAL: &str = "smg_policy_controller_lifecycle_faults_total";
 
+/// Writes to the store's signal sink, by `outcome`: what became of each
+/// ([`Taken`]). A value under a name the document does not declare counts
+/// `undeclared`, and one that states another unit `wrong_unit`.
+pub const SIGNAL_WRITES_TOTAL: &str = "smg_policy_controller_signal_writes_total";
+
 /// The controller's series and the handle that renders them.
 pub(crate) struct Metrics {
     handle: PrometheusHandle,
@@ -134,6 +141,8 @@ pub(crate) struct Metrics {
     outside: [Gauge; 2],
     overload_flips: Counter,
     lifecycle_faults: Counter,
+    /// The signal sink's writes, in the order of [`Taken::EACH`].
+    signal_writes: [Counter; Taken::EACH.len()],
     /// Held from a scrape's sample of the state to the end of its render:
     /// the gauges are written from one sample and read back whole.
     scrape: Mutex<()>,
@@ -163,6 +172,7 @@ struct LoadCounters {
     /// In the order of [`Failures::LABELS`].
     scrape_failures: Vec<Counter>,
     rows: Counter,
+    values_dropped: Counter,
 }
 
 /// The decide call's counts as the recorder's counters, set absolute from
@@ -243,6 +253,11 @@ impl Metrics {
             "Rank rows the load driver wrote".into(),
         );
         recorder.describe_counter(
+            KeyName::from_const_str(LOAD_VALUES_DROPPED_TOTAL),
+            None,
+            "Named values the bounds took out of the load driver's polled answers".into(),
+        );
+        recorder.describe_counter(
             KeyName::from_const_str(DECIDE_BUSY_TOTAL),
             None,
             "Decide requests answered Busy, by the reason the answer carries".into(),
@@ -293,6 +308,11 @@ impl Metrics {
             None,
             "Writes to the load table that moved an overload verdict".into(),
         );
+        recorder.describe_counter(
+            KeyName::from_const_str(SIGNAL_WRITES_TOTAL),
+            None,
+            "Named values written to the store, by what became of each".into(),
+        );
         let state = State::ALL.map(|state| {
             let key = Key::from_parts(STATE, vec![Label::new("state", state.as_str())]);
             recorder.register_gauge(&key, &metadata)
@@ -321,6 +341,8 @@ impl Metrics {
                 .map(|reason| counter(LOAD_SCRAPE_FAILURES_TOTAL, "reason", reason))
                 .collect(),
             rows: recorder.register_counter(&Key::from_name(LOAD_ROWS_TOTAL), &metadata),
+            values_dropped: recorder
+                .register_counter(&Key::from_name(LOAD_VALUES_DROPPED_TOTAL), &metadata),
         };
         let decides = DecideCounters {
             busy: Counts::BUSY.map(|reason| counter(DECIDE_BUSY_TOTAL, "reason", reason)),
@@ -352,6 +374,11 @@ impl Metrics {
             recorder.register_counter(&Key::from_name(OVERLOAD_FLIPS_TOTAL), &metadata);
         let lifecycle_faults =
             recorder.register_counter(&Key::from_name(LIFECYCLE_FAULTS_TOTAL), &metadata);
+        let signal_writes = Taken::EACH.map(|taken| {
+            let outcome = Label::new("outcome", taken.label());
+            let key = Key::from_parts(SIGNAL_WRITES_TOTAL, vec![outcome]);
+            recorder.register_counter(&key, &metadata)
+        });
         start.set(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -369,6 +396,7 @@ impl Metrics {
             outside,
             overload_flips,
             lifecycle_faults,
+            signal_writes,
             scrape: Mutex::new(()),
             recorder,
             spec: OnceLock::new(),
@@ -483,6 +511,9 @@ impl Metrics {
         zones.set(f64::from(counts.outside.zones));
         self.overload_flips.absolute(counts.overload_flips);
         self.lifecycle_faults.absolute(counts.lifecycle_faults);
+        for (counter, count) in self.signal_writes.iter().zip(counts.signal_writes) {
+            counter.absolute(count);
+        }
     }
 
     /// Sets the load counters from the driver's atomics.
@@ -511,6 +542,8 @@ impl Metrics {
             counter.absolute(count);
         }
         self.loads.rows.absolute(stats.rows.load(Ordering::Relaxed));
+        let dropped = stats.values_dropped.load(Ordering::Relaxed);
+        self.loads.values_dropped.absolute(dropped);
     }
 
     /// Moves the state gauge: `1` on `now`, `0` on the others.
@@ -527,8 +560,8 @@ mod tests {
 
     use super::{
         Generations, Metrics, StoreCounts, MEMBERS_OUTSIDE_LIST, REPLICATION_LAG_SECONDS,
-        REPLICATION_RESTORES_ASKED_TOTAL, REPLICATION_SYNCED, SPEC_APPLY_TOTAL, SPEC_GENERATION,
-        START_TIME_SECONDS, STATE,
+        REPLICATION_RESTORES_ASKED_TOTAL, REPLICATION_SYNCED, SIGNAL_WRITES_TOTAL,
+        SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
     };
     use crate::{
         controller::{
@@ -695,6 +728,7 @@ mod tests {
         stats.polls.fetch_add(3, Ordering::Relaxed);
         stats.suppressed.fetch_add(2, Ordering::Relaxed);
         stats.rows.fetch_add(7, Ordering::Relaxed);
+        stats.values_dropped.fetch_add(4, Ordering::Relaxed);
         stats.scrapes.fetch_add(1, Ordering::Relaxed);
         stats.poll_failures.deadline.fetch_add(1, Ordering::Relaxed);
         let rendered = metrics.render(
@@ -711,6 +745,7 @@ mod tests {
         assert!(rendered
             .contains("smg_policy_controller_load_scrape_failures_total{reason=\"no_load\"} 0"));
         assert!(rendered.contains("smg_policy_controller_load_rows_total 7"));
+        assert!(rendered.contains("smg_policy_controller_load_values_dropped_total 4"));
         assert_eq!(
             ReadError::Deadline(Duration::from_secs(3)).label(),
             "deadline"
@@ -844,6 +879,7 @@ mod tests {
             },
             overload_flips: 9,
             lifecycle_faults: 4,
+            signal_writes: [7, 1, 2, 3, 4, 5],
         };
         let rendered = metrics.render(
             || State::Leader,
@@ -861,6 +897,19 @@ mod tests {
         );
         assert!(rendered.contains("smg_policy_controller_overload_flips_total 9"));
         assert!(rendered.contains("smg_policy_controller_lifecycle_faults_total 4"));
+        // The signal sink's writes, one series an outcome.
+        let outcomes = [
+            ("written", 7),
+            ("undeclared", 1),
+            ("wrong_unit", 2),
+            ("not_finite", 3),
+            ("not_a_member", 4),
+            ("older", 5),
+        ];
+        for (outcome, count) in outcomes {
+            let series = format!("{SIGNAL_WRITES_TOTAL}{{outcome=\"{outcome}\"}} {count}");
+            assert!(rendered.contains(&series), "{series}");
+        }
 
         // The count outside a list falls once a generation names the member.
         let rendered = metrics.render(

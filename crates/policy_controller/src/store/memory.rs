@@ -22,6 +22,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     lease::{LeaseId, Lifecycle, Membership, Outcome, ReleaseReason, Side, TransportClass},
+    signals::{SignalCell, SignalColumn},
     spec::AppliedSpec,
     store::{
         health::{HealthSink, HealthWrite, LeaderBits, VetoWrite},
@@ -35,13 +36,15 @@ use crate::{
         loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
         reservations::{ReservationKind, ReservationStore},
         sessions::{Pin, SessionTables, SessionsStore},
+        signals::{SignalSink, Taken, Writes},
         workers::{
             identity, Maker, MembershipChange, MembershipTail, WorkerFacts, WorkerPatch, WorkerRow,
             WorkerStatus, WorkersStore,
         },
         world::{
             left_models, micros, same_cache, same_offer, Ask, Built, Classes, EncodePairBuffers,
-            OutsideLists, PairBuffers, StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW,
+            OnFile, OutsideLists, PairBuffers, StaleGeneration, ViewBuffers, World, Writer,
+            PUBLISH_WINDOW,
         },
         GatewayId,
     },
@@ -70,6 +73,9 @@ pub struct StoreCounts {
     /// ([`MemoryStore::lifecycle_faults`]): a count of its own, read
     /// beside the two.
     pub lifecycle_faults: u64,
+    /// The writes to the signal sink by what became of each, in the order
+    /// of [`Taken::EACH`]: counts of their own, as the faults are.
+    pub signal_writes: [u64; Taken::EACH.len()],
 }
 
 /// The store. `Default` is empty with term `0`.
@@ -143,6 +149,10 @@ pub struct MemoryStore {
     /// the one instant the host's loop cannot have read. A lock of its own,
     /// the last taken and held for the call alone.
     wake: Mutex<Option<Wake>>,
+    /// The writes to the signal sink by what became of each. Counted with
+    /// no lock: a write under a name the document does not declare takes
+    /// none.
+    signal_writes: Writes,
 }
 
 /// The store's replicated tables at one place of its history
@@ -239,6 +249,7 @@ impl MemoryStore {
             journal: None,
             load_journal: None,
             wake: Mutex::new(None),
+            signal_writes: Writes::default(),
         }
     }
 
@@ -864,12 +875,18 @@ impl MemoryStore {
                 return Ok(false);
             }
             let Loads { ranks, writer } = &mut *loads;
-            let ranks = &*ranks;
+            // The cells on file go under the generation's own columns
+            // before the writer reads them. A generation the writer refuses
+            // moves none.
+            let standing = writer.spec();
+            if generation > standing.generation() {
+                carry_cells(ranks, standing.signal_columns(), spec.signal_columns());
+            }
             let (world, before) = writer.apply(
                 Arc::clone(&spec),
                 workers.epoch,
                 workers.members(),
-                |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
+                OnTable(ranks),
             )?;
             world.tell_kept_loads();
             spec.engine().succeed(self.world.load().spec().engine());
@@ -1011,12 +1028,11 @@ impl MemoryStore {
     fn swap_world(&self, workers: &Workers) {
         let mut loads = self.loads.lock();
         let Loads { ranks, writer } = &mut *loads;
-        let ranks = &*ranks;
         writer.clear_listed();
         let world = writer.rebuild(
             workers.epoch,
             workers.members(),
-            |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
+            OnTable(ranks),
             Classes::Derive,
         );
         world.tell_kept_loads();
@@ -1145,13 +1161,10 @@ impl MemoryStore {
     fn pay(&self, workers: &Workers, at: Option<Instant>) {
         let mut loads = self.loads.lock();
         let Loads { ranks, writer } = &mut *loads;
-        let ranks = &*ranks;
         let (world, built) = match at {
             Some(now) if !writer.build_due(now) => (writer.publish_if_due(now), false),
             _ => {
-                let world = writer.build_owed(at, workers.epoch, workers.members(), |id, rank| {
-                    ranks.get(&id)?.samples.get(&rank).copied()
-                });
+                let world = writer.build_owed(at, workers.epoch, workers.members(), OnTable(ranks));
                 let built = world.is_some();
                 (world, built)
             }
@@ -1260,6 +1273,7 @@ impl MemoryStore {
             outside: loads.writer.outside(),
             overload_flips: loads.writer.flips(),
             lifecycle_faults: self.lifecycle_faults(),
+            signal_writes: self.signal_writes.read(),
         }
     }
 
@@ -1277,6 +1291,14 @@ impl MemoryStore {
     /// a generation that declares no list counts none.
     pub fn outside_lists(&self) -> OutsideLists {
         self.counts().outside
+    }
+
+    /// `held`, run with the load lock held: a write that answers meanwhile
+    /// took no such lock.
+    #[cfg(test)]
+    pub(super) fn with_loads_held<R>(&self, held: impl FnOnce() -> R) -> R {
+        let _loads = self.loads.lock();
+        held()
     }
 
     /// How many workers the load table holds an entry for.
@@ -1435,14 +1457,16 @@ impl MemoryStore {
         Duration::from_micros(self.world.load().spec().engine().pins_absence_micros())
     }
 
-    /// How many times a publication allocated a pool's rows since the store
-    /// was made. A publication writes a pool's rows over rows no world
-    /// lists any more: the ones the pool published before its last, else
-    /// any of its length that left a pool. It allocates when it finds
-    /// none: at a pool's first publication after a membership build,
-    /// unless rows that build retired fit it, and past that only while a
-    /// reader holds a world from before the pool's last publication. A
-    /// membership build's own rows are not counted.
+    /// How many times a publication allocated a pool's rows or its signal
+    /// cells since the store was made. A publication writes a pool's rows
+    /// over rows no world lists any more: the ones the pool published
+    /// before its last, else any of its length that left a pool. It
+    /// allocates when it finds none: at a pool's first publication after a
+    /// membership build, unless rows that build retired fit it, and past
+    /// that only while a reader holds a world from before the pool's last
+    /// publication. A pool's cells are written over the block it published
+    /// before its last, by the same rule. A membership build's own rows
+    /// and cells are not counted.
     pub fn publication_allocations(&self) -> u64 {
         self.loads.lock().writer.allocations()
     }
@@ -2384,6 +2408,71 @@ impl LoadSource {
 struct Ranks {
     samples: BTreeMap<u16, LoadSample>,
     pushed_at: BTreeMap<u16, Instant>,
+    /// Each rank's signal cells: one a signal the standing generation
+    /// declares, in its columns' order. No entry for a rank no value was
+    /// written for. They leave with the samples: an entry is replaced
+    /// whole.
+    cells: BTreeMap<u16, Box<[SignalCell]>>,
+}
+
+/// The load table as the world's writer reads it ([`OnFile`]).
+struct OnTable<'a>(&'a FxHashMap<WorkerId, Ranks>);
+
+impl OnFile for OnTable<'_> {
+    fn sample(&self, id: WorkerId, rank: u16) -> Option<LoadSample> {
+        self.0.get(&id)?.samples.get(&rank).copied()
+    }
+
+    fn cells(&self, id: WorkerId, rank: u16) -> Option<&[SignalCell]> {
+        self.0.get(&id)?.cells.get(&rank).map(|cells| &**cells)
+    }
+}
+
+/// The column `name` stands at among `columns`, which are in name order,
+/// where `unit` is its declared one; else what a write under them comes
+/// to.
+fn column_of(columns: &[SignalColumn], name: &str, unit: &str) -> Result<usize, Taken> {
+    let at = columns
+        .binary_search_by(|column| column.name().cmp(name))
+        .map_err(|_| Taken::Undeclared)?;
+    if columns[at].unit() == unit {
+        Ok(at)
+    } else {
+        Err(Taken::WrongUnit)
+    }
+}
+
+/// Carry every rank's cells from the columns of the generation that stood
+/// to the next one's: a name both declare under the same unit keeps its
+/// cell, at its new column, and every other column starts with no value.
+/// Two generations that declare the same signals move nothing.
+fn carry_cells(table: &mut FxHashMap<WorkerId, Ranks>, old: &[SignalColumn], new: &[SignalColumn]) {
+    if old.is_empty() {
+        return;
+    }
+    // Each new column's place among the old ones.
+    let from: Vec<Option<usize>> = new
+        .iter()
+        .map(|column| column_of(old, column.name(), column.unit()).ok())
+        .collect();
+    let stands =
+        old.len() == new.len() && from.iter().enumerate().all(|(at, from)| *from == Some(at));
+    if stands {
+        return;
+    }
+    for ranks in table.values_mut() {
+        if new.is_empty() {
+            ranks.cells.clear();
+            continue;
+        }
+        for cells in ranks.cells.values_mut() {
+            let carried = |from: &Option<usize>| {
+                from.and_then(|at| cells.get(at).copied())
+                    .unwrap_or(SignalCell::NONE)
+            };
+            *cells = from.iter().map(carried).collect();
+        }
+    }
 }
 
 impl Ranks {
@@ -2775,6 +2864,8 @@ impl LoadSink for MemoryStore {
             for &rank in ranks.samples.keys() {
                 folded = writer.fold_load(id, rank, None).or(folded);
             }
+            // The member's values go with its samples.
+            let unsaid = !ranks.cells.is_empty() && writer.forget_signals(id);
             *ranks = Ranks::default();
             // The member's marks go with its rows: a rank with nothing on
             // file is a rank again, and its engine is judged for it.
@@ -2784,7 +2875,7 @@ impl LoadSink for MemoryStore {
                 None if forgot => writer.engine_of(id),
                 None => None,
             };
-            if folded.is_some() || forgot {
+            if folded.is_some() || forgot || unsaid {
                 if let Some(engine) = engine {
                     writer.judged(engine, false);
                 }
@@ -2832,6 +2923,101 @@ impl LoadSink for MemoryStore {
 
     fn wake_with(&self, wake: Wake) {
         *self.wake.lock() = Some(wake);
+    }
+}
+
+// ---------------------------------------------------------------- signals
+
+impl SignalSink for MemoryStore {
+    fn signal_columns(&self) -> Arc<[SignalColumn]> {
+        self.world.load().spec().shared_signal_columns()
+    }
+
+    /// A value that is taken is shown as a load write with no instant of
+    /// its own is: with the window's next publication, or at once in a
+    /// store that publishes no window.
+    fn signal_value(
+        &self,
+        id: WorkerId,
+        rank: u16,
+        name: &str,
+        unit: &str,
+        value: f64,
+        sampled_at: Instant,
+    ) -> Taken {
+        let taken = self.write_signal(id, rank, name, unit, value, sampled_at);
+        self.signal_writes.count(taken);
+        taken
+    }
+}
+
+impl MemoryStore {
+    /// [`SignalSink::signal_value`] ahead of its count.
+    fn write_signal(
+        &self,
+        id: WorkerId,
+        rank: u16,
+        name: &str,
+        unit: &str,
+        value: f64,
+        sampled_at: Instant,
+    ) -> Taken {
+        // The name and its unit are read with no lock held, under the
+        // generation of the last publication.
+        let (generation, found) = {
+            let world = self.world.load();
+            let spec = world.spec();
+            let found = column_of(spec.signal_columns(), name, unit);
+            (spec.generation(), found)
+        };
+        let column = match found {
+            Ok(column) => column,
+            Err(taken) => return taken,
+        };
+        if !value.is_finite() {
+            return Taken::NotFinite;
+        }
+        let mut loads = self.loads.lock();
+        let Loads {
+            ranks: table,
+            writer,
+        } = &mut *loads;
+        // A generation applied since that read has columns of its own: the
+        // name is read again under them.
+        let spec = writer.spec();
+        let column = if spec.generation() == generation {
+            column
+        } else {
+            match column_of(spec.signal_columns(), name, unit) {
+                Ok(column) => column,
+                Err(taken) => return taken,
+            }
+        };
+        let signals = spec.signal_columns().len();
+        // No entry, no member: as a load record for it is dropped.
+        let Some(ranks) = table.get_mut(&id) else {
+            return Taken::NotAMember;
+        };
+        let cells = ranks
+            .cells
+            .entry(rank)
+            .or_insert_with(|| vec![SignalCell::NONE; signals].into());
+        let Some(held) = cells.get_mut(column) else {
+            return Taken::Undeclared;
+        };
+        let cell = SignalCell {
+            value,
+            sampled_at_micros: micros(self.origin, sampled_at),
+        };
+        if !held.is_none() && held.sampled_at_micros > cell.sampled_at_micros {
+            return Taken::Older;
+        }
+        *held = cell;
+        if writer.fold_signal(id, rank, column, cell) {
+            let world = writer.folded();
+            self.show(writer, world);
+        }
+        Taken::Written
     }
 }
 

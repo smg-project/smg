@@ -214,6 +214,7 @@ mod tests {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let built = world
                 .build(MODEL, Role::Single, &ask, &mut view)

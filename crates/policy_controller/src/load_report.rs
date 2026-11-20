@@ -1,11 +1,18 @@
 //! A worker's load row from its report, shared by the load driver and the
 //! worker host's load adapter.
 
-use std::time::Instant;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use smg_worker::worker::WorkerLoadResponse;
+use smg_worker::worker::{NamedValue, WorkerLoadResponse};
 
-use crate::view::{permille, LoadRow, Role, SignalSource};
+use crate::{
+    signals::SignalColumn,
+    spec::AcrossRanks,
+    view::{permille, LoadRow, Role, SignalSource},
+};
 
 /// One worker's load row from its report, in one pass over the ranks: the
 /// request and token counts summed, the KV ratios averaged, the drain rate
@@ -83,6 +90,133 @@ pub fn load_row(
 /// A summed engine count as the row's field: negative reads as none.
 fn narrow(count: i64) -> u32 {
     u32::try_from(count.max(0)).unwrap_or(u32::MAX)
+}
+
+/// One row's values of the declared signals from its report, each handed
+/// to `each` by its name, with the unit the report states, the value and
+/// its sample instant: what every source of a report writes to the signal
+/// sink behind the report's row ([`load_row`]), so each makes the same
+/// values of the same report.
+///
+/// `columns` are the declared signals in name order
+/// ([`SignalSink::signal_columns`](crate::store::SignalSink::signal_columns)):
+/// a name the document does not declare is not offered. A row has a value
+/// only where every rank of the report states the name, under one unit: a
+/// sum over some of the ranks would understate the row, as the resident
+/// tokens are counted. The ranks' values are made one as the signal
+/// declares ([`AcrossRanks`]), under the oldest sample among them. A rank
+/// that states a name twice is read at its first statement. A report of
+/// one rank, as a rank's own record and a scoped answer are, hands that
+/// rank's values as they are and allocates nothing.
+///
+/// `sampled_at` is the sample instant of the report's row: a record's
+/// own, a polled answer's stamp, else the poll's start. A value is
+/// sampled then, less its own age where the report states one: the age
+/// is the engine's, as of the report it made. A polled value is so never
+/// dated after its poll began, as its row is not.
+pub fn signal_values(
+    report: &WorkerLoadResponse,
+    columns: &[SignalColumn],
+    sampled_at: Instant,
+    mut each: impl FnMut(&str, &str, f64, Instant),
+) {
+    if columns.is_empty() {
+        return;
+    }
+    let column_of = |name: &str| {
+        let found = columns.binary_search_by(|column| column.name().cmp(name));
+        found.ok()
+    };
+    let sampled = |stated: &NamedValue| {
+        stated.age_ms.map_or(sampled_at, |age| {
+            let age = Duration::from_millis(u64::from(age));
+            sampled_at.checked_sub(age).unwrap_or(sampled_at)
+        })
+    };
+    let ranks = match report.loads.as_slice() {
+        [] => return,
+        // One rank: nothing is kept. Each declared name has a bit, set at
+        // the name's first statement.
+        [rank] if columns.len() <= u64::BITS as usize => {
+            let mut read = 0u64;
+            for stated in rank.named_values() {
+                let Some(at) = column_of(&stated.name) else {
+                    continue;
+                };
+                let bit = 1u64 << at;
+                if read & bit == 0 {
+                    read |= bit;
+                    each(&stated.name, &stated.unit, stated.value, sampled(&stated));
+                }
+            }
+            return;
+        }
+        ranks => ranks,
+    };
+    let mut made: Vec<Option<Made>> = vec![None; columns.len()];
+    for (nth, rank) in (0u32..).zip(ranks) {
+        for stated in rank.named_values() {
+            let Some(at) = column_of(&stated.name) else {
+                continue;
+            };
+            let sampled = sampled(&stated);
+            match &mut made[at] {
+                slot @ None if nth == 0 => {
+                    *slot = Some(Made {
+                        ranks: 1,
+                        unit: stated.unit,
+                        value: stated.value,
+                        oldest: sampled,
+                    });
+                }
+                // Every rank before this one stated the name, and this is
+                // the rank's first statement of it, under the same unit.
+                Some(made) if made.ranks == nth && made.unit == stated.unit => {
+                    made.ranks += 1;
+                    made.value = joined(columns[at].across_ranks(), made.value, stated.value);
+                    made.oldest = made.oldest.min(sampled);
+                }
+                // A rank before this one left the name out or stated
+                // another unit, or this rank states the name once more.
+                _ => {}
+            }
+        }
+    }
+    let count = ranks.len() as u32;
+    for (column, made) in columns.iter().zip(made) {
+        let Some(made) = made.filter(|made| made.ranks == count) else {
+            continue;
+        };
+        let value = match column.across_ranks() {
+            AcrossRanks::Mean => made.value / f64::from(count),
+            AcrossRanks::Sum | AcrossRanks::Max | AcrossRanks::Min => made.value,
+        };
+        each(column.name(), &made.unit, value, made.oldest);
+    }
+}
+
+/// One declared signal's value over the ranks read so far.
+#[derive(Clone)]
+struct Made {
+    /// How many ranks stated the name, each rank from the first.
+    ranks: u32,
+    unit: Arc<str>,
+    value: f64,
+    oldest: Instant,
+}
+
+/// The value over one more rank. A rank's value that is no finite number
+/// makes the row's none, under every reduction: the sink then counts it,
+/// where a maximum would pass it over.
+fn joined(across: AcrossRanks, so_far: f64, next: f64) -> f64 {
+    match across {
+        AcrossRanks::Sum | AcrossRanks::Mean => so_far + next,
+        AcrossRanks::Max | AcrossRanks::Min if !(so_far.is_finite() && next.is_finite()) => {
+            f64::NAN
+        }
+        AcrossRanks::Max => so_far.max(next),
+        AcrossRanks::Min => so_far.min(next),
+    }
 }
 
 #[cfg(test)]
@@ -224,5 +358,202 @@ mod tests {
         assert_eq!((row.running, row.queued), (0, 0));
         assert_eq!(row.kv_usage_permille, 1_000);
         assert_eq!(row.live_rate, 0);
+    }
+
+    /// The declared signals `names`, each under `unit` and its reduction,
+    /// in name order as the applied document lists them.
+    fn columns(names: &[(&str, &str, AcrossRanks)]) -> Vec<SignalColumn> {
+        let mut names = names.to_vec();
+        names.sort_by_key(|&(name, ..)| name);
+        let column = |((name, unit, across), at): ((&str, &str, AcrossRanks), u16)| {
+            SignalColumn::new(name, unit, at, None).across(across)
+        };
+        names.into_iter().zip(0..).map(column).collect()
+    }
+
+    fn stated(name: &str, unit: &str, value: f64, age_ms: Option<u32>) -> NamedValue {
+        NamedValue {
+            name: name.into(),
+            unit: unit.into(),
+            value,
+            age_ms,
+        }
+    }
+
+    /// One rank that states `values` by name and no fixed count.
+    fn stating(values: Vec<NamedValue>) -> SchedulerLoadSnapshot {
+        SchedulerLoadSnapshot {
+            values,
+            ..Default::default()
+        }
+    }
+
+    /// What the conversion hands of `report` under `columns`, received at
+    /// `received` from a record sampled 50 ms before: each value by its
+    /// name and unit, with its age at the receipt in milliseconds. A
+    /// stated age counts back from the record's sample.
+    fn made(
+        report: &WorkerLoadResponse,
+        columns: &[SignalColumn],
+        received: Instant,
+    ) -> Vec<(String, String, f64, u128)> {
+        let sampled_at = received - Duration::from_millis(50);
+        let mut made = Vec::new();
+        signal_values(report, columns, sampled_at, |name, unit, value, at| {
+            let age = received.duration_since(at).as_millis();
+            made.push((name.to_owned(), unit.to_owned(), value, age));
+        });
+        made
+    }
+
+    fn value(name: &str, unit: &str, value: f64, age: u128) -> (String, String, f64, u128) {
+        (name.to_owned(), unit.to_owned(), value, age)
+    }
+
+    #[test]
+    fn several_ranks_make_one_rows_value_as_the_signal_declares_under_the_oldest_sample() {
+        let received = Instant::now() + Duration::from_secs(5);
+        let columns = columns(&[
+            ("largest", "ms", AcrossRanks::Max),
+            ("middle", "ms", AcrossRanks::Mean),
+            ("smallest", "ms", AcrossRanks::Min),
+            ("total", "ms", AcrossRanks::Sum),
+        ]);
+        let names = ["largest", "middle", "smallest", "total"];
+        // Three ranks state 2, 5 and 11 of each name. The first states no
+        // age, so its value is as old as its record: 50 ms. The second's
+        // is 300 ms older than the record.
+        let rank = |value, age| stating(names.map(|name| stated(name, "ms", value, age)).into());
+        let whole = report(vec![
+            rank(2.0, None),
+            rank(5.0, Some(300)),
+            rank(11.0, Some(120)),
+        ]);
+        assert_eq!(
+            made(&whole, &columns, received),
+            [
+                value("largest", "ms", 11.0, 350),
+                value("middle", "ms", 6.0, 350),
+                value("smallest", "ms", 2.0, 350),
+                value("total", "ms", 18.0, 350),
+            ]
+        );
+        // Scoped to one rank, a report hands that rank's values as they are.
+        let scoped = whole.for_dp_rank(None).map(|mut all| {
+            all.loads.truncate(1);
+            all
+        });
+        let scoped = scoped.expect("a report with ranks");
+        let alone = made(&scoped, &columns, received);
+        assert_eq!(alone, names.map(|name| value(name, "ms", 2.0, 50)));
+    }
+
+    #[test]
+    fn a_row_has_a_value_only_where_every_rank_states_the_name_under_one_unit() {
+        let received = Instant::now() + Duration::from_secs(5);
+        let columns = columns(&[
+            ("mixed", "ms", AcrossRanks::Sum),
+            ("partial", "ms", AcrossRanks::Sum),
+            ("twice", "ms", AcrossRanks::Sum),
+            ("whole", "ms", AcrossRanks::Sum),
+        ]);
+        let first = stating(vec![
+            stated("mixed", "ms", 1.0, None),
+            stated("partial", "ms", 1.0, None),
+            stated("twice", "ms", 1.0, None),
+            // A second statement by one rank: its first one is read.
+            stated("twice", "ms", 64.0, None),
+            stated("whole", "ms", 1.0, None),
+            // A name the document does not declare is not offered.
+            stated("other", "ms", 1.0, None),
+        ]);
+        let second = stating(vec![
+            stated("mixed", "seconds", 2.0, None),
+            stated("twice", "ms", 2.0, None),
+            stated("whole", "ms", 2.0, None),
+        ]);
+        assert_eq!(
+            made(&report(vec![first.clone(), second]), &columns, received),
+            [value("twice", "ms", 3.0, 50), value("whole", "ms", 3.0, 50)]
+        );
+        // The ranks in the other order: the names the first one leaves out
+        // are none of the row's, and the one both state is.
+        let late = stating(vec![stated("partial", "ms", 2.0, None)]);
+        assert_eq!(
+            made(&report(vec![late, first]), &columns, received),
+            [value("partial", "ms", 3.0, 50)]
+        );
+        // No declared signal and no rank hand nothing.
+        let one = report(vec![stating(vec![stated("whole", "ms", 1.0, None)])]);
+        assert_eq!(made(&one, &[], received), []);
+        assert_eq!(made(&report(vec![]), &columns, received), []);
+    }
+
+    #[test]
+    fn a_report_of_one_rank_hands_each_declared_name_at_its_first_statement() {
+        let received = Instant::now() + Duration::from_secs(5);
+        let columns = columns(&[
+            ("depth", "items", AcrossRanks::Mean),
+            ("wait", "ms", AcrossRanks::Max),
+        ]);
+        let alone = report(vec![stating(vec![
+            stated("wait", "ms", 7.0, Some(20)),
+            stated("other", "ms", 1.0, None),
+            stated("depth", "items", 3.0, None),
+            stated("wait", "ms", 64.0, None),
+        ])]);
+        // In the report's order: the one rank's values are handed as they
+        // are read, each under its own age or its record's.
+        assert_eq!(
+            made(&alone, &columns, received),
+            [
+                value("wait", "ms", 7.0, 70),
+                value("depth", "items", 3.0, 50)
+            ]
+        );
+        // A value that is no number is handed on: the sink counts it.
+        let odd = report(vec![stating(vec![stated("wait", "ms", f64::NAN, None)])]);
+        let made = made(&odd, &columns, received);
+        assert!(matches!(made.as_slice(), [(_, _, value, _)] if value.is_nan()));
+    }
+
+    #[test]
+    fn a_ranks_value_that_is_no_number_makes_the_rows_none_under_every_reduction() {
+        let received = Instant::now() + Duration::from_secs(5);
+        for across in [
+            AcrossRanks::Sum,
+            AcrossRanks::Max,
+            AcrossRanks::Min,
+            AcrossRanks::Mean,
+        ] {
+            let columns = columns(&[("depth", "items", across)]);
+            for odd in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let rank = |value| stating(vec![stated("depth", "items", value, None)]);
+                let made = made(
+                    &report(vec![rank(4.0), rank(odd), rank(9.0)]),
+                    &columns,
+                    received,
+                );
+                let [(_, _, value, _)] = made.as_slice() else {
+                    panic!("one value, {made:?}");
+                };
+                assert!(!value.is_finite(), "{across:?} of {odd}: {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_fixed_token_counts_are_offered_under_their_names() {
+        let received = Instant::now() + Duration::from_secs(5);
+        let columns = columns(&[("kv_tokens_used", "tokens", AcrossRanks::Sum)]);
+        let rank = |used| SchedulerLoadSnapshot {
+            num_used_tokens: used,
+            max_total_num_tokens: 8_192,
+            ..Default::default()
+        };
+        assert_eq!(
+            made(&report(vec![rank(1_000), rank(24)]), &columns, received),
+            [value("kv_tokens_used", "tokens", 1_024.0, 50)]
+        );
     }
 }

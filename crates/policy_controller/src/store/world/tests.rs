@@ -193,6 +193,7 @@ fn ask(now: Instant) -> Ask {
         now,
         pinned: None,
         affinity: false,
+        signal_cells: false,
     }
 }
 

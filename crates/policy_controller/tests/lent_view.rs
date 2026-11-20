@@ -209,6 +209,7 @@ fn lent_agrees(
         now: opened + Duration::from_secs(1),
         pinned: pin.then(|| ids[n / 2]),
         affinity: written.needs().affinity,
+        signal_cells: false,
     };
     let (mut copy, mut out) = (ViewBuffers::default(), ViewBuffers::default());
     let (mut one, mut two) = (Scratch::new(), Scratch::new());
@@ -332,6 +333,7 @@ fn a_decision_that_straddles_a_write_frees_nothing() {
         now: opened + Duration::from_secs(1),
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let until = Some(opened + Duration::from_secs(7_200));
     let write = |kind: usize, turn: u32| match kind {
@@ -473,6 +475,7 @@ fn a_period_told_before_any_window_shows_its_judgment_and_frees_nothing() {
         now: late,
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let (mut out, mut after) = (ViewBuffers::default(), ViewBuffers::default());
     let freed = store.with_world(|world| {

@@ -815,6 +815,7 @@ The admin `/metrics` endpoint exports the following series. A spec source adds t
 | `smg_policy_controller_load_scrapes_total` | Successful HTTP load scrapes. |
 | `smg_policy_controller_load_scrape_failures_total` | Scrape failures by `reason`. The poll and scrape label values are `transport`, `answer`, `deadline`, `no_load`, `unsupported`, and `client`. |
 | `smg_policy_controller_load_rows_total` | Rank load rows written by the load driver. |
+| `smg_policy_controller_load_values_dropped_total` | Named values that the list bounds removed from the load driver's polled answers. |
 | `smg_policy_spec_generation` | Standing spec generation. |
 | `smg_policy_spec_apply_total` | Applies by `result` (`applied` or `rejected`). |
 | `smg_policy_controller_decide_busy_total` | Busy answers by wire `reason`. |
@@ -827,6 +828,7 @@ The admin `/metrics` endpoint exports the following series. A spec source adds t
 | `smg_policy_controller_members_outside_list` | Members not classified by a configured list, by `list` (`engines` or `zones`). |
 | `smg_policy_controller_overload_flips_total` | Load writes that changed an overload verdict. |
 | `smg_policy_controller_lifecycle_faults_total` | Panics contained while applying dispatch, completion, release or dispatch expiry. |
+| `smg_policy_controller_signal_writes_total` | Named values written to the store, by `outcome` (`written`, `undeclared`, `wrong_unit`, `not_finite`, `not_a_member` or `older`). |
 
 Plugin stats are available through the host APIs. Both kinds count answers, declines, exhausted decision budgets, breaker bypass and openings, stalls and observed events. WebAssembly also reports traps, fuel use and exhaustion, invalid replies, overlong calls, instantiations, lost events and unread timing. gRPC reports plugin Busy, invalid replies, overlarge pools, cold or refused frames, misses and their attribution, connections, stream failures, late answers and dropped observe events. Declared counters are separate from these host stats. [WebAssembly stats](src/wasm/plugin.rs) · [gRPC stats](src/grpc/plugin.rs)
 

@@ -592,7 +592,9 @@ pub(crate) fn encode_pair_in<A: Asked>(
         |rows, engine, model, mut ask, wires, subset| {
             if !items.keys.is_empty() {
                 // The prefill binding names the encode profile for the pair.
-                ask.affinity |= engine.pair_encode_needs(model).affinity;
+                let needs = engine.pair_encode_needs(model);
+                ask.affinity |= needs.affinity;
+                ask.signal_cells |= needs.signal_cells;
             }
             let built = world.build_encode_pair(model, &ask, rows)?;
             // Counts follow the build's row order until narrowing moves it.
@@ -686,6 +688,7 @@ fn pair_with<const DECODE: bool, A: Asked, R, B>(
         now,
         pinned: None,
         affinity: prefill.affinity || decode.affinity,
+        signal_cells: prefill.signal_cells || decode.signal_cells,
     };
     // One side alone is no pair: the engine answers over no candidate, as
     // it answers any host that hands it none.
@@ -722,13 +725,15 @@ fn pair_with<const DECODE: bool, A: Asked, R, B>(
     let viewed = Viewed {
         now_micros: built.map_or_else(|| world.micros(now), |(prefill, _)| prefill.now_micros),
         budget_micros: u32::try_from(left.as_micros()).unwrap_or(u32::MAX),
-        // A pair's columns ride its two pools, and a pair names no rows.
+        // A pair's columns and cells ride its two pools, and a pair names
+        // no rows.
         affinity: &[],
         stalled: &[],
         held: &[],
         in_flight: None,
         max_block_hashes: request.hashes_read(spec),
         pins: pins.map(|pins| pins as &dyn PinSource),
+        signal_cells: None,
     };
     request.read(lists, viewed, unnamed, |facts, constraints| {
         if emptied {
@@ -1046,6 +1051,7 @@ type Read<'a> = (
     &'a [Candidate],
     (&'a [u32], &'a [u32]),
     &'a [AffinityFacts],
+    Option<&'a crate::SignalCells>,
     Option<crate::LentCounts<'a>>,
     Option<Built>,
 );
@@ -1133,6 +1139,7 @@ pub(crate) fn hand<A: Asked, R>(
         now,
         pinned: None,
         affinity: needs.affinity && !names,
+        signal_cells: needs.signal_cells,
     };
     let role = match phase {
         Phase::Single => Role::Single,
@@ -1166,7 +1173,8 @@ pub(crate) fn hand<A: Asked, R>(
     // Whether a demand took a row of the build: the rows left are named
     // within themselves then.
     let mut cut = false;
-    let (pool, now_micros, candidates, masks, affinity, counts, built): Read<'_> = if by_door {
+    let (pool, now_micros, candidates, masks, affinity, cells, counts, built): Read<'_> = if by_door
+    {
         match world.view(model, role, &ask, shown, view) {
             Some(read) => (
                 read.pool_facts(),
@@ -1174,10 +1182,20 @@ pub(crate) fn hand<A: Asked, R>(
                 read.candidates,
                 (read.stalled, world.held(&read, &ask, holds)),
                 read.affinity,
+                read.signal_cells,
                 read.in_flight,
                 Some(read.built),
             ),
-            None => (none(), world.micros(now), &[], (&[], &[]), &[], None, None),
+            None => (
+                none(),
+                world.micros(now),
+                &[],
+                (&[], &[]),
+                &[],
+                None,
+                None,
+                None,
+            ),
         }
     } else {
         let built = world.build(model, role, &ask, view);
@@ -1226,6 +1244,8 @@ pub(crate) fn hand<A: Asked, R>(
             &view.candidates,
             (&[], &[]),
             &view.affinity,
+            // The cells the build wrote, each kept row's at its new place.
+            view.cells(),
             None,
             built,
         )
@@ -1240,6 +1260,7 @@ pub(crate) fn hand<A: Asked, R>(
         in_flight: counts,
         max_block_hashes: request.hashes_read(spec),
         pins: pins.map(|pins| pins as &dyn PinSource),
+        signal_cells: cells,
     };
     // The store's sessions, where the decision's rule has an in-flight
     // cap: a keyed request reads its key's count there. Under any other
@@ -1339,8 +1360,8 @@ pub(crate) struct Took {
 /// demand, each by its entry of `facts`, the build's column
 /// ([`World::demand_facts`]). A row with no entry meets none. The kept rows
 /// keep their order and take their positions, and every column beside them
-/// follows in the same step: the affinity column and the facts. A hint of
-/// 0 keeps none.
+/// follows in the same step: the affinity column, the signal cells and the
+/// facts. A hint of 0 keeps none.
 ///
 /// The rows a demand took are named by their places in the build's list
 /// ([`Took::demanded`]), never by what the demand states: two requests
@@ -1356,11 +1377,15 @@ pub(crate) fn narrow_demanded(
     if subset == Some(0) {
         view.candidates.clear();
         view.affinity.clear();
+        view.signal_cells.refill(0);
         facts.clear();
         return Took::default();
     }
     // The column is by row, where the profile declared one.
     let column = !view.affinity.is_empty();
+    // The signal cells are by row too, where the build wrote any.
+    let mut cells =
+        crate::store::world::KeptCells::of(&mut view.signal_cells, view.candidates.len());
     let mut took = Took::default();
     let (mut kept, mut position) = (0, 0_u32);
     for at in 0..view.candidates.len() {
@@ -1388,12 +1413,18 @@ pub(crate) fn narrow_demanded(
         if column {
             view.affinity[kept] = view.affinity[at];
         }
+        if let Some(cells) = &mut cells {
+            cells.keep(at);
+        }
         facts[kept] = stated;
         kept += 1;
     }
     view.candidates.truncate(kept);
     if column {
         view.affinity.truncate(kept);
+    }
+    if let Some(cells) = cells {
+        cells.end();
     }
     facts.truncate(kept);
     took
@@ -1460,6 +1491,10 @@ pub(crate) struct Viewed<'a> {
     /// The pins of record the host lends the decision ([`PinSource`]);
     /// `None` where it keeps none.
     pub(crate) pins: Option<&'a dyn PinSource>,
+    /// The candidates' signal cells, as the view handed them: `None` for
+    /// a profile that reads no signal, and for a pair, whose cells ride
+    /// its pools.
+    pub(crate) signal_cells: Option<&'a crate::SignalCells>,
 }
 
 /// Tells the engine what was said of a lease: one function of the record
@@ -1907,9 +1942,8 @@ impl Asked for Request<'_> {
             session_counted: false,
             // Cells a caller handed are by its own list's positions too:
             // read by the store's, an in-range read would answer another
-            // row's value. The door reads its own view's cells, and its
-            // view hands none yet.
-            signal_cells: None,
+            // row's value. The door reads its own view's cells.
+            signal_cells: viewed.signal_cells,
             ..self.facts
         };
         let constraints = Constraints {
@@ -3310,6 +3344,7 @@ pub(crate) mod tests {
             now: Instant::now(),
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         let mut out = ViewBuffers::default();
         store.deciding(|world| {
@@ -6600,10 +6635,10 @@ pub(crate) mod tests {
     }
 
     /// The door reads its own view's cells, never the request's: cells a
-    /// caller hands on the request's facts are by its own list's positions,
-    /// and the store's view hands none yet. Here the caller's cells hold a
-    /// value at every position the store's pool has, and every read
-    /// through the door is no value.
+    /// caller hands on the request's facts are by its own list's positions.
+    /// Here the caller's cells hold a value at every position the store's
+    /// pool has and the store holds none, and every read through the door
+    /// is no value.
     #[test]
     fn the_door_reads_none_of_the_cells_a_caller_hands_on_the_request() {
         let store = fleet(1);
@@ -6816,6 +6851,7 @@ pub(crate) mod tests {
                     now: Instant::now(),
                     pinned: None,
                     affinity: false,
+                    signal_cells: false,
                 };
                 let read = world.view(MODEL, Role::Single, &ask, false, &mut view);
                 let read = read.expect("the pool");
@@ -7656,6 +7692,145 @@ pub(crate) mod tests {
             assert!(decided.is_ok(), "{:?}", decided.err());
         }
         assert_eq!(door.faults(), 0);
+        Ok(())
+    }
+
+    /// A request that states a hard demand is decided over the rows the
+    /// demand leaves, and each of them reads its own signal value at its
+    /// new place: the cells follow the rows through that narrowing as the
+    /// affinity column does.
+    #[test]
+    fn rows_a_demand_leaves_read_their_own_signal_values() {
+        use crate::store::{SignalSink, Taken};
+
+        /// What the stage read: each row's worker with its value.
+        type Read = Vec<(WorkerId, Option<f64>)>;
+
+        /// Reads one signal of every row it scores and keeps each row's
+        /// worker with what it read.
+        #[derive(Debug)]
+        struct ReadsEach {
+            held: crate::SignalColumn,
+            read: Arc<Mutex<Read>>,
+        }
+
+        impl Lifecycle for ReadsEach {}
+
+        impl crate::Scorer for ReadsEach {
+            fn name(&self) -> &'static str {
+                "reads-each"
+            }
+
+            fn score(
+                &self,
+                facts: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                kept: &[u32],
+                out: &mut [f32],
+            ) -> TieBand {
+                let rows = kept.iter().map(|&row| &candidates[row as usize]);
+                let read = rows.map(|row| (row.id, self.held.read(facts, row)));
+                self.read.lock().extend(read);
+                out.fill(0.0);
+                TieBand::NORMALIZED
+            }
+
+            fn needs(&self) -> Needs {
+                Needs {
+                    signal_cells: true,
+                    ..Needs::default()
+                }
+            }
+        }
+
+        let (store, ids) = stating(&[9, 7, 9, 7]);
+        let read = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&read);
+        let mut catalog = Catalog::builtin();
+        let added = catalog.scorer_with("reads-each", move |build| {
+            Ok(Box::new(ReadsEach {
+                held: build.signal_column("held")?,
+                read: Arc::clone(&kept),
+            }))
+        });
+        added.expect("a free name");
+        let document: PolicySpec = serde_json::from_str(
+            r#"{"apiVersion":"smg.policy/v1","generation":2,
+                "signals":{"held":{"unit":"tokens"}},
+                "profiles":{"p":{"score":["reads-each"],"pick":"best"}}}"#,
+        )
+        .expect("a well-formed document");
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+        let applied = store.apply(spec.expect("the catalog holds the stage"));
+        applied.expect("a later generation");
+        let now = Instant::now();
+        for (id, value) in ids.iter().zip([10.0, 11.0, 12.0, 13.0]) {
+            let taken = store.signal_value(*id, 0, "held", "tokens", value, now);
+            assert_eq!(taken, Taken::Written);
+        }
+        store.publish_now();
+        let door = Door::new(Arc::clone(&store));
+        let mut asked = request(b"stays", 7);
+        asked.constraints.demands = Demands { runtime: 7 };
+        let decided = door.decide(GATEWAY, &asked, now).expect("a decision");
+        assert!(decided.decision.pick().is_some(), "{decided:?}");
+        // The demand left the second and the fourth member: each read the
+        // value written for it, and no other row was read.
+        let mut read = read.lock().clone();
+        read.sort_by_key(|&(id, _)| id);
+        let mut left = [(ids[1], Some(11.0)), (ids[3], Some(13.0))];
+        left.sort_by_key(|&(id, _)| id);
+        assert_eq!(read, left);
+    }
+
+    /// A stage of the encode profile alone reads a signal: the door asks
+    /// the view for the cells on that profile's need, and the stage reads
+    /// its encoder's value.
+    #[test]
+    fn an_encode_profiles_stage_reads_its_encoders_signal_value() -> Result<(), Box<dyn Error>> {
+        use crate::{
+            spec::{AcrossRanks, SignalSpec},
+            store::{SignalSink, Taken},
+        };
+
+        let (door, encoder) = push_fleet()?;
+        let read = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&read);
+        let mut catalog = Catalog::builtin();
+        catalog.scorer_with("reads-held", move |build| {
+            Ok(Box::new(ReadsHeld {
+                held: build.signal_column("held")?,
+                read: Arc::clone(&kept),
+            }))
+        })?;
+        let mut document = encode_document()?;
+        document.generation = 2;
+        let held = SignalSpec {
+            unit: "tokens".into(),
+            max_age_ms: None,
+            across_ranks: AcrossRanks::default(),
+        };
+        document.signals.insert("held".into(), held);
+        let encode = document.profiles.get_mut("encode");
+        let encode = encode.ok_or("missing encode profile")?;
+        encode.score.push("reads-held".into());
+        let digest = document.digest()?;
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])?;
+        door.store().apply(spec)?;
+        let now = Instant::now();
+        let taken = door
+            .store()
+            .signal_value(encoder, 0, "held", "tokens", 7.0, now);
+        assert_eq!(taken, Taken::Written);
+        door.store().publish_now();
+        let mut placed = EncodePlaced::new();
+        let asked = pair_request(b"r-1");
+        let decided = door.decide_encode_pair(GATEWAY, &asked, items(), &mut placed, now);
+        assert!(decided.is_ok(), "{:?}", decided.err());
+        let read = read.lock();
+        assert!(!read.is_empty(), "the encode profile's stage was asked");
+        assert!(read.iter().all(|value| *value == Some(7.0)), "{read:?}");
         Ok(())
     }
 

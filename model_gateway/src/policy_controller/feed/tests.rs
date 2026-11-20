@@ -301,6 +301,7 @@ fn stalled(store: &MemoryStore) -> bool {
         now: Instant::now(),
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     store.deciding(|world| {
         let mut view = ViewBuffers::default();
@@ -608,6 +609,7 @@ impl Loads {
             now: Instant::now(),
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         self.store
             .build_view(MODEL, Role::Single, &ask, &mut view)?;
