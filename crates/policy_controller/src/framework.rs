@@ -4459,6 +4459,26 @@ impl Engine {
         decision
     }
 
+    /// [`Self::decide_stated`] for a request whose shadow will be asked
+    /// ([`Self::shadow`]): the decision of [`Self::decide_keeping`], with
+    /// the same word stated in the pick.
+    pub fn decide_stated_keeping(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Decision {
+        forget_judged();
+        let mut decision = self.decide_keeping(facts, pool, candidates, cx, scratch);
+        if let Decision::Pick(pick) = &mut decision {
+            let overlap = self.overlap_of(facts, candidates, pick);
+            pick.targets.state(overlap);
+        }
+        decision
+    }
+
     /// What `pick`'s first target holds of the request, by the first
     /// scorer of the profile that decided that states it.
     fn overlap_of(
@@ -6427,6 +6447,63 @@ mod tests {
         }
         let engine = with_shadow(by_sessions(), Some(SESSIONS));
         let _ = engine.decide_keeping(&facts, &pool, &rows, &cx, &mut scratch);
+        assert!(scratch.sessions_found.is_of(key, &facts));
+    }
+
+    /// The stated keeping entry makes the stated entry's decision, word
+    /// and all, and keeps what it read of the key as the keeping entry
+    /// does.
+    #[test]
+    fn shadow_reading_is_kept_by_the_stated_keeping_entry_with_its_word() {
+        let params = PrefixAffinityParams::default();
+        let cache = || Profile {
+            name: "cache".into(),
+            filters: vec![Box::new(Healthy)],
+            scorers: vec![Weighted {
+                scorer: Box::new(PrefixAffinity::new(
+                    &params,
+                    Gates::of(Some(&params), None, Some(16)),
+                )),
+                weight: 1.0,
+            }],
+            picker: Box::new(Best),
+        };
+        // A decision claims its key in its engine's table: each entry
+        // decides on an engine of its own.
+        let engine = || {
+            Engine::new(
+                vec![cache(), by_sessions()],
+                vec![Binding {
+                    shadow: Some(1),
+                    sessions: Some(SESSIONS),
+                    ..single_binding()
+                }],
+                23,
+                Needs::default(),
+            )
+        };
+        // Every row holds eight of the request's sixteen blocks.
+        let column = [AffinityFacts {
+            overlap_blocks: 8,
+            admitted_age_ms: u32::MAX,
+            ..AffinityFacts::default()
+        }; 2];
+        let hashes = [0u64; 16];
+        let facts = RequestFacts {
+            block_hashes: &hashes,
+            prompt_tokens: 256,
+            affinity: &column,
+            ..keyed_at(61, 71)
+        };
+        let key = facts.session().get();
+        let rows = [candidate(0, 13), candidate(1, 3)];
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let stated = engine().decide_stated(&facts, &pool, &rows, &cx, &mut scratch);
+        assert_eq!(stated.pick().map(|pick| pick.overlap().blocks), Some(8));
+        assert!(!scratch.sessions_found.is_of(key, &facts));
+        let keeping = engine().decide_stated_keeping(&facts, &pool, &rows, &cx, &mut scratch);
+        assert_eq!(keeping, stated);
         assert!(scratch.sessions_found.is_of(key, &facts));
     }
 
