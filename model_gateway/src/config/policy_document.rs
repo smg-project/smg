@@ -222,10 +222,10 @@ impl RouterConfig {
     }
 
     /// Validates the document over the stock stages, with the gateway's
-    /// own headers denied to the view: the check of `--print-policy-spec`.
-    /// The host's start hands its document to the operators' door, which
-    /// denies the same headers and checks over the stock stages or a
-    /// host's own.
+    /// own headers denied to the view: the typed half of the check a hosted
+    /// document passes. The start and `--print-policy-spec` hand the
+    /// document's YAML to the operators' door, which bounds its size and
+    /// reads it back before it validates it this way.
     pub fn hosted_policy(&self, document: &PolicySpec) -> Result<AppliedSpec, SpecError> {
         AppliedSpec::validate_with(document, &self.denied_view_headers())
     }

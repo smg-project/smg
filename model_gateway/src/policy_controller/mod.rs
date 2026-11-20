@@ -121,13 +121,12 @@ pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, S
 /// `stages` is the catalog of a host's own stages. The stock gateway hands
 /// none, and the door then checks over the stock stages alone.
 ///
-/// The door is handed the document as YAML and checks it as
-/// `--print-policy-spec` does ([`RouterConfig::hosted_policy`]), with the
-/// gateway's own headers denied to the view, and it checks a later dry run
-/// over the same stages. A configuration the document cannot say, a routing
-/// setting that disagrees with a given document, and a document that check
-/// refuses, stop the start by name. None of them is served by the classic
-/// policies in silence.
+/// The door is handed the document as YAML by the one function
+/// `--print-policy-spec` checks its own through ([`hosted`]), and it checks
+/// a later dry run over the same stages. A configuration the document
+/// cannot say, a routing setting that disagrees with a given document, and
+/// a document that check refuses, stop the start by name. None of them is
+/// served by the classic policies in silence.
 pub(crate) fn start_with(
     config: &RouterConfig,
     stages: Option<Catalog>,
@@ -137,16 +136,32 @@ pub(crate) fn start_with(
     }
     let document = config.policy_document_in_force()?;
     let written = serde_yaml::to_string(&document)?;
+    let started = hosted(config, stages, &written)?;
+    info!("The policy controller is picked for this gateway");
+    Ok(Some(started))
+}
+
+/// A new store and the operators' door over it, holding `written` as the
+/// store's one generation: the one check and apply of a document this
+/// gateway hosts. The door bounds the YAML's size, reads it back and
+/// validates it over `stages`, the stock ones where a host hands none, with
+/// the gateway's own headers denied to the view. The start keeps what this
+/// returns. `--print-policy-spec` calls it for its refusal alone, so the
+/// print and the start never part.
+pub(crate) fn hosted(
+    config: &RouterConfig,
+    stages: Option<Catalog>,
+    written: &str,
+) -> Result<Started, SpecRejected> {
     let store = Arc::new(MemoryStore::new());
     let denied = config.denied_view_headers().map(str::to_owned);
     let stages = stages.unwrap_or_else(Catalog::builtin);
     let door = SpecDoor::new(Arc::clone(&store), Arc::new(stages), denied.into());
-    door.apply(written.into_bytes(), Format::Yaml)?;
-    info!("The policy controller is picked for this gateway");
-    Ok(Some(Started {
+    door.apply(written.as_bytes().to_vec(), Format::Yaml)?;
+    Ok(Started {
         store,
         door: Arc::new(door),
-    }))
+    })
 }
 
 /// The store's membership feed and, under a controller's address, the

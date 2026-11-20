@@ -169,6 +169,35 @@ async fn a_dry_run_tells_the_next_number_and_applies_nothing() -> Case {
     Ok(())
 }
 
+/// The OpenAPI document gives each fact of a dry run's needs the type the
+/// answer writes it in: the picker's sample is a number among flags.
+#[tokio::test]
+async fn a_dry_runs_needs_are_of_the_types_the_openapi_document_gives() -> Case {
+    let app = app_under(picked()).await?;
+    let (_, _, would_run) = answered(&app, dry_run().body(Body::from(OTHER))?).await?;
+    let fed = would_run["needs"]["after"][0]["needs"]
+        .as_object()
+        .ok_or("no needs")?;
+    assert!(fed.contains_key("sample") && fed.contains_key("loads"));
+    let document = serde_json::to_value(openapi_gen::document()?)?;
+    let answer = &document["paths"][VALIDATE]["post"]["responses"]["200"]["content"]
+        ["application/json"]["schema"];
+    let schema =
+        &answer["properties"]["needs"]["properties"]["after"]["items"]["properties"]["needs"];
+    for (name, value) in fed {
+        let declared = schema["properties"]
+            .get(name)
+            .unwrap_or_else(|| &schema["additionalProperties"]);
+        let written = match value {
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "integer",
+            _ => "another type",
+        };
+        assert_eq!(declared["type"], written, "{name}");
+    }
+    Ok(())
+}
+
 /// A document that would not run is refused with the path of its field and
 /// the generation that stands. The gateway's own header is denied to a dry
 /// run's view as the start denies it.

@@ -1609,7 +1609,11 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                 "phase": {"type": "string", "enum": ["single", "prefill", "decode", "encode"]},
                 "needs": {
                     "type": "object",
-                    "description": "The facts a host feeds for the model and phase, each by name",
+                    "description": "The facts a host feeds for the model and phase, each a flag by its name, and the sample a picker draws",
+                    "properties": {
+                        "sample": {"type": "integer", "minimum": 0, "description": "The rows a sampling picker draws of a large pool; 0 for none"}
+                    },
+                    "required": ["sample"],
                     "additionalProperties": {"type": "boolean"}
                 }
             },

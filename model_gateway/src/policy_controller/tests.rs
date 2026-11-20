@@ -29,7 +29,9 @@ use smg_policy_controller::{
 };
 use smg_worker::{connection::engine::EngineConnector, identity::basic::ConnectionMode};
 
-use super::{refused, start, start_with, undecided::ROUTER_TYPE, StartError};
+use super::{
+    operators::document_bytes, refused, start, start_with, undecided::ROUTER_TYPE, StartError,
+};
 use crate::{
     app_context::AppContext,
     config::{ManualAssignmentMode, PolicyConfig, PolicyDocumentError, RouterConfig, RoutingMode},
@@ -544,6 +546,33 @@ fn the_store_starts_with_a_registered_scorer() -> Case {
     let world = started.store.world();
     assert_eq!(world.spec().generation(), generation);
     assert_eq!(world.spec().digest(), Some(digest));
+    Ok(())
+}
+
+/// A hosted document passes the door's bound at the start: one whose YAML
+/// is past it stops the start by its size. The print option answers by the
+/// same function.
+#[test]
+fn a_document_past_the_doors_bound_stops_the_start_by_its_size() -> Case {
+    let config = picked(RouterConfig::default());
+    let mut document = config.policy_document()?;
+    let stock = document.bindings[0].clone();
+    let many = (0..4096).map(|n| {
+        let mut binding = stock.clone();
+        binding.matcher.model = format!("tenant-{n:04}/model");
+        binding
+    });
+    document.bindings.splice(0..0, many);
+    let written = serde_yaml::to_string(&document)?.len();
+    let bound = document_bytes();
+    assert!(written > bound, "{written}");
+    let refusal = start_with(&config, None, |_| Ok(document))
+        .err()
+        .ok_or("the start took a document past the door's bound")?;
+    assert_eq!(
+        refusal.to_string(),
+        format!("the document is {written} bytes; at most {bound}")
+    );
     Ok(())
 }
 
