@@ -2624,6 +2624,15 @@ pub async fn startup_with(
         .as_ref()
         .filter(|_| app_context.worker_monitor.is_some())
         .map(|feed| feed.publications());
+    // Under the feed the workers' cache events reach the store's index, and
+    // their pushed load records the worker monitor, by the feed's follow,
+    // for the server's life. Under a controller's address the controller
+    // reads them, and this gateway reads none.
+    let _cache_events = app_context
+        .policy_feed
+        .as_ref()
+        .filter(|_| app_context.policy_follower.is_none())
+        .map(|feed| feed.cache_events(app_context.worker_monitor.as_ref()));
 
     let admission_queue =
         if app_context.rate_limiter.is_some() && config.router_config.queue_size > 0 {

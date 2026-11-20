@@ -12,6 +12,13 @@
 //! when the store's instant comes. The loop is the gateway's one hand on
 //! the store's wake. It keeps the listener's order: the registry is brought
 //! up to date, then the store publishes.
+//!
+//! The store's index is fed by the workers' cache events. The feed runs
+//! the crate's follow of them for as long as its answer is kept. It is the
+//! gateway's one collector of cache events: the classic one is not built
+//! beside it. So the follow also carries what the classic one carried
+//! beside the events: each worker's pushed load records, to the worker
+//! monitor, which says them to the feed's load sink.
 
 use std::{
     sync::Arc,
@@ -22,8 +29,8 @@ use parking_lot::Mutex;
 use smg_policy_controller::{
     store::{LoadSink as StoreLoadSink, Maker, MemoryStore, WorkerFacts},
     worker_host::{
-        Expect, HealthAdapter, LoadAdapter, Membership, Objects, Refused, Remover, SoleLead,
-        Standing, StoreDoor, Wrote,
+        Expect, HealthAdapter, KvFeed, LoadAdapter, Membership, Objects, Refused, Remover,
+        SoleLead, Standing, StoreDoor, Wrote,
     },
 };
 use smg_worker::{
@@ -34,11 +41,14 @@ use smg_worker::{
     registry::WorkerId,
     worker::{WorkerLoadResponse, WorkerStatus},
 };
-use tokio::{sync::Notify, time::sleep_until};
+use tokio::{
+    sync::{watch, Notify},
+    time::sleep_until,
+};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::warn;
 
-use crate::routers::common::snapshot::{ModelWorkerSnapshot, WorkerRegistry};
+use crate::routers::common::snapshot::{ModelWorkerSnapshot, WorkerMonitor, WorkerRegistry};
 
 /// The feed of a gateway that decides in its own process: the door its
 /// worker workflows write at, and the holder that keeps the registry as
@@ -153,6 +163,36 @@ impl Feed {
         // The store shows nothing before its instant, so the loop never
         // hands it an earlier one.
         settle(&self.objects, &self.store, Some(Instant::now().max(due)));
+    }
+
+    /// Read the cache events of the store's workers into its index, and
+    /// their pushed load records into `loads`, for as long as the answer is
+    /// kept. The follow is the crate's own: as the registry changes it asks
+    /// a stream of each gRPC worker, for its cache events where its row asks
+    /// for them and for its load records alone where `loads` wants them.
+    pub(crate) fn cache_events(&self, loads: Option<&Arc<WorkerMonitor>>) -> CacheEvents {
+        let follow = KvFeed::new(Arc::clone(&self.store), Arc::clone(&self.objects));
+        if let Some(monitor) = loads {
+            follow.set_load_sink(monitor);
+        }
+        let (stop, stopped) = watch::channel(false);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the follow holds no request; its answer's drop stops it, and a shutdown need not wait for it"
+        )]
+        tokio::spawn(async move { follow.run(stopped).await });
+        CacheEvents(stop)
+    }
+}
+
+/// The feed's cache events, for as long as this is kept. Its drop tells the
+/// follow to stop. The follow then ends every stream itself, so its task is
+/// not aborted.
+pub(crate) struct CacheEvents(watch::Sender<bool>);
+
+impl Drop for CacheEvents {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
     }
 }
 
@@ -361,5 +401,7 @@ impl Membership for FeedDoor {
     }
 }
 
+#[cfg(test)]
+mod cache_events_tests;
 #[cfg(test)]
 mod tests;

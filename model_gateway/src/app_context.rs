@@ -1138,7 +1138,7 @@ impl AppContextBuilder {
 
     /// Create the KV event monitor: the streams of the gRPC workers.
     ///
-    /// Every gateway has one, whatever its policies: a worker under a
+    /// A gateway has one whatever its classic policies: a worker under a
     /// cache-aware policy streams its KV events into the model's index, every
     /// other gRPC worker streams its load records alone, so load-aware
     /// routing prices a worker by a record at the engine's cadence rather
@@ -1148,7 +1148,16 @@ impl AppContextBuilder {
     /// is cheap (empty maps) and stays dormant until workers are added; a
     /// model without an events subscription has no index and no index
     /// gauges.
+    ///
+    /// Under the policy controller's feed none is built: the feed's own
+    /// follow reads the workers' cache events into the store's index and
+    /// their load records into the worker monitor, and each reader of this
+    /// monitor takes `None`.
     fn with_kv_event_monitor(mut self) -> Self {
+        // One collector a gateway: under the feed the store's follow is it.
+        if self.policy_feed.is_some() {
+            return self;
+        }
         let monitor = Arc::new(KvEventMonitor::new());
         debug!("Created KV event monitor for the workers' KV-event and load streams");
         // The load records on the streams are polls of the worker.
@@ -1581,6 +1590,35 @@ mod tests {
         let cache_aware =
             as_cache_aware(policy.as_ref()).expect("the label's policy is cache-aware");
         assert!(cache_aware.kv_event_monitor_is_set_for_test());
+    }
+
+    /// Under the policy controller's feed the classic monitor is not built:
+    /// the context holds none, and a cache-aware policy is handed none.
+    #[tokio::test]
+    async fn under_the_feed_the_classic_cache_event_monitor_is_not_built() {
+        use crate::policies::as_cache_aware;
+
+        let config = RouterConfig {
+            policy_controller: true,
+            ..config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000))
+        };
+        let builder = AppContextBuilder::new()
+            .with_client(&config, 5)
+            .expect("client builds")
+            .with_worker_registry()
+            .with_policy_registry(&config)
+            .with_policy_controller(&config, None)
+            .expect("the policy controller starts")
+            .with_kv_event_monitor();
+        assert!(builder.policy_feed.is_some());
+        assert!(builder.kv_event_monitor.is_none());
+        let policy = builder
+            .policy_registry
+            .as_ref()
+            .expect("policy registry set")
+            .get_default_policy();
+        let cache_aware = as_cache_aware(policy.as_ref()).expect("default policy is cache-aware");
+        assert!(!cache_aware.kv_event_monitor_is_set_for_test());
     }
 
     /// A dropped context lets its worker monitor go: the monitor holds the

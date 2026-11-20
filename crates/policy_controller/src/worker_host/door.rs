@@ -173,7 +173,8 @@ pub(crate) fn lay(
         }));
     }
     // The host states the row's stream in the write that makes the row: the
-    // follow is told of a worker once, and reads the row then.
+    // follow is told of a worker once for each object laid, and reads the
+    // row then.
     facts.signals.events = store.deciding(|world| asks_events(&facts, world.spec().engine()));
     if let Some(row) = &standing {
         facts.incarnation = row.facts.incarnation;
