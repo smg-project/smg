@@ -3118,6 +3118,34 @@ mod tests {
         WATCHED.set(None);
     }
 
+    /// A rank's row whose next life keeps its object leaves its engine's
+    /// ranks with the rest of its entry: the rank is answered by its new
+    /// row alone.
+    #[test]
+    fn a_new_life_that_keeps_its_object_takes_its_rows_rank() {
+        let (replica, door) = handing();
+        let ranked = |rank: usize, model: &str| -> Arc<dyn Worker> {
+            let worker = <BasicWorkerBuilder>::new(A).model(ModelCard::new(model));
+            Arc::new(worker.dp_config(rank, 2).build())
+        };
+        let (lower, first) = (ranked(0, "m"), ranked(1, "m"));
+        for built in [&lower, &first] {
+            let wrote = registered(&replica, &door, built, Expect::Nothing);
+            assert!(matches!(wrote, Ok(Wrote::Registered(_))), "{wrote:?}");
+        }
+        let engine = replica.row(lower.url()).id;
+        let old = replica.row(first.url()).id;
+        assert_eq!(replica.objects.rank_row(engine, 1), Some(old));
+
+        let second = ranked(1, "n");
+        let wrote = registered(&replica, &door, &second, Expect::Anything);
+        assert!(matches!(wrote, Ok(Wrote::Another { .. })), "{wrote:?}");
+        let new = replica.row(second.url()).id;
+        assert_ne!(new, old);
+        assert!(Arc::ptr_eq(&replica.at(second.url()), &second));
+        assert_eq!(replica.objects.rank_row(engine, 1), Some(new));
+    }
+
     /// An engine's ranks are answered by their rows, asked of its rank 0
     /// row. A rank no row holds is answered by none, a row above rank 0 is
     /// answered none, and a row that is its own engine has its one rank.
