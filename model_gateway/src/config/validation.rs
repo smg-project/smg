@@ -1985,7 +1985,12 @@ impl ConfigValidator {
         Ok(())
     }
 
-    fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+    /// The two refusals of a policy document that would not run as it was
+    /// given: one beside the switch off, and a path whose document was
+    /// never loaded. The validator holds a configuration to them. The
+    /// controller's start holds the configuration it is handed to them as
+    /// well: a host may build its context from one it never validated.
+    pub(crate) fn validate_policy_document(config: &RouterConfig) -> ConfigResult<()> {
         // A launcher gives the document's path, and a host may hand the
         // document itself. Either one, with the switch off, would be dropped
         // and the classic policies would serve.
@@ -2011,6 +2016,11 @@ impl ConfigValidator {
                 "the policy document of this path is not loaded: the builder reads it, or set policy_spec",
             ));
         }
+        Ok(())
+    }
+
+    fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        Self::validate_policy_document(config)?;
 
         let has_service_discovery = config.discovery.is_some();
         let invalid_decode_policy = match &config.mode {

@@ -58,7 +58,7 @@ use tracing::info;
 
 use crate::{
     app_context::AppContext,
-    config::{PolicyDocumentError, RouterConfig},
+    config::{validation::ConfigValidator, ConfigError, PolicyDocumentError, RouterConfig},
     routers::{common::snapshot::WorkerRegistry, RouterTrait},
 };
 
@@ -95,6 +95,11 @@ use undecided::Undecided;
 /// Why the controller's store did not start.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StartError {
+    /// A policy document that would not run as it was given: one beside
+    /// the setting off, or a path whose document was never loaded. The
+    /// validator's two refusals, in its words.
+    #[error(transparent)]
+    Unrun(#[from] ConfigError),
     /// The routing configuration holds a setting no policy document says, or
     /// one that disagrees with the document a user gave.
     #[error(transparent)]
@@ -130,6 +135,12 @@ pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, S
 /// a provider's and neither a document nor a controller's address is given:
 /// the setting moves nothing there, and one log line says so.
 ///
+/// A host may build its context from a configuration it never validated,
+/// so the validator's two refusals of a document that would not run stand
+/// here as well ([`ConfigValidator::validate_policy_document`]): a document
+/// given beside the setting off, and a path whose document was never
+/// loaded, stop the start in the validator's words.
+///
 /// `stages` is the catalog of a host's own stages. The stock gateway hands
 /// none, and the door then checks over the stock stages alone.
 ///
@@ -144,6 +155,7 @@ pub(crate) fn start_with(
     config: &RouterConfig,
     stages: Option<Catalog>,
 ) -> Result<Option<Started>, StartError> {
+    ConfigValidator::validate_policy_document(config)?;
     if !config.policy_controller {
         return Ok(None);
     }

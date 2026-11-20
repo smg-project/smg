@@ -751,8 +751,12 @@ fn the_stock_store_names_the_unknown_scorer() -> Case {
     Ok(())
 }
 
+/// A host may build its context from a configuration it never validated.
+/// A document handed beside the setting off stops the start in the
+/// validator's words, and no catalog reads it: the classic policies do not
+/// serve in its place in silence.
 #[test]
-fn the_classic_policies_skip_a_document_the_catalog_would_refuse() -> Case {
+fn a_document_beside_the_setting_off_stops_the_start() -> Case {
     let mut config = running(
         RouterConfig::default(),
         scorer_document(&RouterConfig::default(), "unknown-score")?,
@@ -765,7 +769,32 @@ fn the_classic_policies_skip_a_document_the_catalog_would_refuse() -> Case {
     ));
 
     config.policy_controller = false;
-    assert!(start_with(&config, Some(host_stages()?))?.is_none());
+    let refusal = start_with(&config, Some(host_stages()?))
+        .err()
+        .ok_or("the start dropped a given document")?;
+    assert_eq!(
+        refusal.to_string(),
+        "Invalid value for field 'policy_spec': the given document - a policy document is run by the policy controller: set --policy-controller on"
+    );
+    Ok(())
+}
+
+/// The path is written with a configuration and the document is not. A
+/// configuration that holds the path alone would run the routing settings'
+/// document: the start refuses it in the validator's words.
+#[test]
+fn a_path_with_no_loaded_document_stops_the_start() -> Case {
+    let config = picked(RouterConfig {
+        policy_spec_path: Some("routing.yaml".to_owned()),
+        ..RouterConfig::default()
+    });
+    let refusal = start(&config)
+        .err()
+        .ok_or("the start ran the routing settings' document")?;
+    assert_eq!(
+        refusal.to_string(),
+        "Invalid value for field 'policy_spec': routing.yaml - the policy document of this path is not loaded: the builder reads it, or set policy_spec"
+    );
     Ok(())
 }
 
