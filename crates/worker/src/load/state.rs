@@ -280,6 +280,28 @@ impl<G: Generation> LoadState<G> {
             })
     }
 
+    /// The row at `worker`'s URL, where it came from another worker that
+    /// is the registry's `Ready` worker now: that worker and the ranks in
+    /// its row. Such a worker is a live writer of those ranks' engine
+    /// series under its own models: a poll writes them with the row it
+    /// publishes, and a pushed record ahead of its row.
+    pub(crate) fn another_live_workers_row(
+        &self,
+        worker: &Arc<dyn Worker>,
+    ) -> Option<(Arc<dyn Worker>, Vec<i32>)> {
+        let (source, load) = self
+            .tx
+            .borrow()
+            .entries
+            .get(worker.url())
+            .and_then(|entry| {
+                let source = entry.source.upgrade()?;
+                Some((source, Arc::clone(&entry.load)))
+            })?;
+        (!Arc::ptr_eq(&source, worker) && self.is_current_incarnation(&source))
+            .then(|| (source, load.loads.iter().map(|rank| rank.dp_rank).collect()))
+    }
+
     /// Queue a worker's eviction and wake the flusher. The snapshot changes
     /// on the next [`Self::apply_pending_evictions`] batch.
     pub(crate) fn enqueue_eviction(&self, worker: Arc<dyn Worker>) {

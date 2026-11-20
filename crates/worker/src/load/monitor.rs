@@ -352,6 +352,11 @@ pub trait LoadConsumer: Send + Sync {
 struct PushedFile {
     report: WorkerLoadResponse,
     pusher: Arc<dyn Worker>,
+    /// A record came while the pusher was not `Ready`: its rank is on file
+    /// and its engine series is held. The file stays in the flush's queue
+    /// until a flush finds the pusher `Ready`: that one writes every
+    /// rank's series, publishes the report and clears the mark.
+    series_held: bool,
 }
 
 impl PushedFile {
@@ -360,6 +365,61 @@ impl PushedFile {
         Self {
             report: WorkerLoadResponse::default(),
             pusher: Arc::clone(pusher),
+            series_held: false,
+        }
+    }
+
+    /// One rank of the report goes to its engine series. A file is reached
+    /// through the lock of the reports alone, so every live write of a
+    /// pusher's series is made under that lock, where the sentinel is
+    /// written too ([`WorkerMonitor::clear_series`]).
+    fn write_rank_series(&self, at: usize, url: &str, model_id: &str) {
+        Metrics::record_engine_rank_load(url, model_id, &self.report.loads[at]);
+    }
+
+    /// The ranks the report holds at or past `width`, its worker's own
+    /// width. The sentinel of the worker's series covers the width and
+    /// each of these, and no rank between: a far rank costs one sentinel.
+    fn ranks_past(&self, width: usize) -> impl Iterator<Item = i32> + '_ {
+        self.report
+            .loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .filter(move |rank| usize::try_from(*rank).is_ok_and(|rank| rank >= width))
+    }
+}
+
+/// Set `worker`'s `smg_engine_*` series to the sentinel, one by one, for
+/// its own width and each rank `file` holds past it: a rank's load series
+/// under each of the worker's models, and its pair series, which carry no
+/// model. A series a live writer has written is left. `live` answers for
+/// a rank under a model, and under any model where it is given none. Its
+/// callers hold the lock of the reports, under which every series is
+/// written.
+#[cold]
+fn write_sentinel(
+    worker: &Arc<dyn Worker>,
+    file: Option<&PushedFile>,
+    live: impl Fn(Option<&str>, i32) -> bool,
+) {
+    let url = worker.url();
+    let width = worker.dp_size().unwrap_or(1).max(1);
+    let ranks = (0..width)
+        .filter_map(|rank| i32::try_from(rank).ok())
+        .chain(file.into_iter().flat_map(|file| file.ranks_past(width)));
+    // A worker can serve multiple models (one load group per model),
+    // so sentinel every model's series — not just the primary.
+    let models = worker_model_ids(worker);
+    for rank in ranks {
+        for model_id in &models {
+            if !live(Some(model_id.as_str()), rank) {
+                Metrics::remove_engine_rank_load_metrics(url, model_id, rank);
+            }
+        }
+        // The pair series carry the engine's role and no model: a rank's
+        // are left where a live writer holds the rank under any model.
+        if !live(None, rank) {
+            Metrics::remove_engine_rank_pd_metrics(url, rank);
         }
     }
 }
@@ -587,9 +647,10 @@ impl<G: Generation> WorkerMonitor<G> {
     /// finds no report, or the report of another worker, starts one for the
     /// registry's worker at the URL alone, whatever its status: the sink
     /// and the wedged rule hear a registered worker that is not `Ready`,
-    /// and its rows and its series are held back. Any other is dropped
-    /// ahead of the report, the sink, the series and the publish. Its
-    /// worker is still marked as one whose stream pushes, as for any record.
+    /// and its rows and its series are held back for the flush that finds
+    /// it `Ready`. Any other is dropped ahead of the report, the sink, the
+    /// series and the publish. Its worker is still marked as one whose
+    /// stream pushes, as for any record.
     pub fn apply_pushed_load<R: LoadRecord>(
         self: &Arc<Self>,
         worker: &Arc<dyn Worker>,
@@ -622,9 +683,10 @@ impl<G: Generation> WorkerMonitor<G> {
         // finds it copies no key.
         let mut reports = self.pushed_reports.lock();
         // The status is read under this hold, for the series below. A
-        // leave's eviction takes the hold behind the status's change: a
-        // record behind that eviction reads the change, and one ahead of
-        // it has its series under the sentinel the eviction writes.
+        // leave's eviction takes the hold behind the status's change, and
+        // writes the sentinel there with the report it removes: a record
+        // behind that eviction reads the change, and one ahead of it has
+        // its series under that sentinel.
         let ready =
             runtime.map_or_else(|| worker.status(), |state| state.status()) == WorkerStatus::Ready;
         if !reports
@@ -647,14 +709,20 @@ impl<G: Generation> WorkerMonitor<G> {
             if let Some(left) = reports.insert(url.to_string(), started) {
                 // The report replaced was a worker's whose eviction is still
                 // to come. The sink forgets it here, under this hold, so the
-                // receipts are this worker's alone.
+                // receipts are this worker's alone. Its series go with it,
+                // every rank it held: this record writes its own rank
+                // below, and the others read the sentinel until this
+                // worker reports them. A series that a poll of this worker
+                // wrote, with the row it published, is not cleared.
                 self.sink.forget(&left.pusher);
+                self.clear_series(&reports, &left.pusher, Some(&left));
             }
         }
         // On file: made just above when it was not.
-        let Some(report) = reports.get_mut(url).map(|file| &mut file.report) else {
+        let Some(file) = reports.get_mut(url) else {
             return;
         };
+        let report = &mut file.report;
         // What a poll would have put in the rank's entry, with the telemetry
         // the record left out (an event batch's record is the core only)
         // kept from the last record that carried it.
@@ -701,9 +769,12 @@ impl<G: Generation> WorkerMonitor<G> {
         // handles kept for it; a poll's report feeds every rank's. The
         // series is held back with the rows: a worker that is not `Ready`
         // keeps the sentinel its eviction wrote, so a stream that ends
-        // there leaves no load that reads as live.
+        // there leaves no load that reads as live. Its file is marked, and
+        // the flush that finds the worker `Ready` writes the held series.
         if ready {
-            Metrics::record_engine_rank_load(url, worker.model_id(), &report.loads[at]);
+            file.write_rank_series(at, url, worker.model_id());
+        } else {
+            file.series_held = true;
         }
         // A record feeds the DP-rank token cache nothing. The cache's one
         // reader is the HTTP pair router's rank pick, and a stream is opened
@@ -861,6 +932,45 @@ impl<G: Generation> WorkerMonitor<G> {
         });
     }
 
+    /// The end of a tick that polled: each answer's `smg_engine_*` series
+    /// and the group's rows, under one hold of the lock of the reports. A
+    /// record writes its series under that lock and the sentinel is
+    /// written there, so no record and no eviction runs between a poll's
+    /// series and its row, which the sentinel's guard reads. The series
+    /// are written behind the publish's own fence, read under the hold:
+    /// an answer for a worker that left during the fetch writes none, and
+    /// the sentinel of its eviction stands.
+    fn publish_polled(
+        &self,
+        model_id: &str,
+        polled_urls: &[String],
+        group_loads: Vec<(Arc<dyn Worker>, WorkerLoadResponse, bool)>,
+    ) {
+        let _reports = self.pushed_reports.lock();
+        // Every successful load poll is also the canonical observability
+        // sample. Load-aware policies already require this poll; the
+        // explicit engine-metrics option only forces polling when routing
+        // does not. Reusing the response avoids a second Engine RPC. (A
+        // pushed record feeds the same gauges from `apply_pushed_load`.)
+        for (worker, load, _) in &group_loads {
+            if self.load_state.is_current_incarnation(worker) {
+                Metrics::record_engine_load(worker.url(), model_id, load);
+            }
+        }
+        // Merge into the shared snapshot in one rebuild: clear stale entries
+        // for the polled URLs first, then insert the fresh loads — each
+        // paired with the worker that produced it so the incarnation fence
+        // can drop reports that raced a removal or replacement. Workers that
+        // failed this tick get their stale entries pruned along with the
+        // rest. The responses move (no deep clones): the metrics pass above
+        // took its references.
+        let fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)> = group_loads
+            .into_iter()
+            .map(|(worker, load, _)| (worker, Arc::new(load)))
+            .collect();
+        self.load_state.publish_group(polled_urls, fresh);
+    }
+
     /// One engine's answer of a tick, reconciled with what its members'
     /// streams pushed. The sink is told the answer whole, under the lock of
     /// the reports, and names the ranks whose stream is the newer and the
@@ -1014,23 +1124,39 @@ impl<G: Generation> WorkerMonitor<G> {
     /// report its records updated in place. A report a poll's empty answer
     /// emptied has nothing to publish (that poll's publish pruned the entry).
     /// A report the fence refuses publishes nothing and prunes nothing: the
-    /// row its worker published before is the eviction's to remove.
+    /// row its worker published before is the eviction's to remove. A file
+    /// marked while its worker was not `Ready` stays queued through the
+    /// flushes that find it so. The first that finds the worker `Ready`
+    /// writes its held series and publishes its row, with no record since.
     pub(crate) fn flush_pushed(&self) {
-        let reports = self.pushed_reports.lock();
+        let mut reports = self.pushed_reports.lock();
         let changed: Vec<(String, Arc<dyn Worker>)> = self.pending_pushed.lock().drain().collect();
         if changed.is_empty() {
             return;
         }
         let timestamp = chrono::Utc::now().to_rfc3339();
         let mut fresh: Vec<PushedReport> = Vec::with_capacity(changed.len());
+        let mut held: Vec<(String, Arc<dyn Worker>)> = Vec::new();
         for (url, worker) in changed {
-            let Some(report) = reports
-                .get(url.as_str())
-                .map(|file| &file.report)
-                .filter(|report| !report.loads.is_empty())
+            let Some(file) = reports
+                .get_mut(url.as_str())
+                .filter(|file| !file.report.loads.is_empty())
             else {
                 continue;
             };
+            if file.series_held {
+                if !self.load_state.is_current_incarnation(&worker) {
+                    // Held still, and the fence would refuse it: it stays
+                    // queued for the flush that finds its worker `Ready`.
+                    held.push((url, worker));
+                    continue;
+                }
+                for at in 0..file.report.loads.len() {
+                    file.write_rank_series(at, url.as_str(), worker.model_id());
+                }
+                file.series_held = false;
+            }
+            let report = &file.report;
             fresh.push((
                 worker,
                 Arc::new(WorkerLoadResponse {
@@ -1048,6 +1174,11 @@ impl<G: Generation> WorkerMonitor<G> {
             // worker's row. A refused one leaves the row to the eviction,
             // which writes the sentinel of the series with it.
             self.load_state.publish_group(&[], fresh);
+        }
+        if !held.is_empty() {
+            // Under the hold of the reports still: no record has queued
+            // one of these workers since the drain above.
+            self.pending_pushed.lock().extend(held);
         }
     }
 
@@ -1317,9 +1448,11 @@ impl<G: Generation> WorkerMonitor<G> {
     /// cleared synchronously; the shared snapshot removal is queued so a
     /// removal wave costs one batched rebuild instead of one per worker (see
     /// [`Self::flush_pending_evictions`]). The report and the sink's part
-    /// go when the report at the URL is the worker's own, or none is there.
-    /// A report another worker started ahead of this eviction stays, with
-    /// what the sink holds at the URL: both are that worker's.
+    /// go when the report at the URL is the worker's own, or none is there,
+    /// and the series the report fed are set to the sentinel with it
+    /// ([`Self::clear_series`]). A report another worker started ahead of
+    /// this eviction stays, with what the sink holds at the URL: both are
+    /// that worker's.
     fn evict_worker_loads(&self, worker: &Arc<dyn Worker>) {
         let url = worker.url();
         self.native_loads_memo.remove(url);
@@ -1333,8 +1466,23 @@ impl<G: Generation> WorkerMonitor<G> {
                 // replacement is polled until its own stream pushes. The
                 // sink forgets under this hold, so a record of the next
                 // worker at the URL lands behind it and keeps its receipt.
-                reports.remove(url);
+                let report = reports.remove(url);
                 self.sink.forget(worker);
+                // The series go with the report, under this hold and with
+                // or without a published row: a record ahead of the first
+                // publish wrote them too.
+                if let Some(file) = &report {
+                    self.clear_series(&reports, worker, Some(file));
+                }
+                // Its place in the flush's queue goes too, where a held
+                // report waits: the queue keeps no worker that is gone.
+                let mut pending = self.pending_pushed.lock();
+                if pending
+                    .get(url)
+                    .is_some_and(|source| Arc::ptr_eq(source, worker))
+                {
+                    pending.remove(url);
+                }
             }
         }
         self.load_state.enqueue_eviction(Arc::clone(worker));
@@ -1349,16 +1497,60 @@ impl<G: Generation> WorkerMonitor<G> {
     /// registration. A same-URL replacement that already republished keeps
     /// its entry, and its series continues uninterrupted. So does a worker
     /// that left `Ready` and came back ahead of the flush: the batch does
-    /// not evict it, and no sentinel lands over what it wrote since.
+    /// not evict it, and no sentinel lands over what it wrote since. The
+    /// sentinel is written under the lock of the reports, and not where the
+    /// series has a live owner ([`Self::clear_series`]).
     pub(crate) fn flush_pending_evictions(&self) {
         for worker in self.load_state.apply_pending_evictions() {
-            // A worker can serve multiple models (one load group per model),
-            // so sentinel every model's series — not just the primary.
-            let dp_size = worker.dp_size().unwrap_or(1);
-            for model_id in worker_model_ids(&worker) {
-                Metrics::remove_engine_load_metrics(worker.url(), &model_id, dp_size);
-            }
+            // One hold a worker: a removal wave does not keep the records
+            // waiting behind every sentinel of the batch at once.
+            let reports = self.pushed_reports.lock();
+            self.clear_series(&reports, &worker, None);
         }
+    }
+
+    /// Set a worker's `smg_engine_*` series to the sentinel, one by one,
+    /// unless a live writer has written the series. The worker itself is
+    /// one, where it is the registry's `Ready` worker again: none is set.
+    /// Another `Ready` worker whose row stands at the URL is one for the
+    /// ranks in the row, under each of its models: a poll writes a
+    /// worker's series with the row it publishes. Another worker whose
+    /// report stands at the URL with no record held is one for the ranks
+    /// on that report, under its own model. The pair series carry the
+    /// engine's role and no model: a rank's are left where a live writer
+    /// holds the rank under any model. A report with a held record
+    /// is no live writer: its worker was not `Ready` at that record, and
+    /// the flush that finds it `Ready` writes its series. `reports` is
+    /// the locked map of the pushed reports, and every series is written
+    /// under that lock, so a sentinel and a live write do not cross.
+    /// `file` is the report an eviction or a successor's first record
+    /// took off the file, where there was one: the sentinel covers the
+    /// worker's own width and each rank that report held past it.
+    fn clear_series(
+        &self,
+        reports: &FxHashMap<String, PushedFile>,
+        worker: &Arc<dyn Worker>,
+        file: Option<&PushedFile>,
+    ) {
+        if self.load_state.is_current_incarnation(worker) {
+            return;
+        }
+        let row = self
+            .load_state
+            .another_live_workers_row(worker)
+            .map(|(source, ranks)| (worker_model_ids(&source), ranks));
+        let other = reports
+            .get(worker.url())
+            .filter(|other| !Arc::ptr_eq(&other.pusher, worker) && !other.series_held);
+        write_sentinel(worker, file, |model_id, rank| {
+            row.as_ref().is_some_and(|(models, ranks)| {
+                ranks.contains(&rank)
+                    && model_id.is_none_or(|id| models.iter().any(|model| model == id))
+            }) || other.is_some_and(|other| {
+                model_id.is_none_or(|id| other.pusher.model_id() == id)
+                    && other.report.loads.iter().any(|load| load.dp_rank == rank)
+            })
+        });
     }
 
     /// Spawn the polling loop for a single group.
@@ -1850,14 +2042,15 @@ async fn run_event_loop<G: Generation>(
                 // The event can be handled behind the worker's return. A
                 // worker that is the registry's `Ready` worker again keeps
                 // its loads: its feed has carried on since.
-                if new_status != WorkerStatus::Ready
-                    && !monitor.load_state.is_current_incarnation(&worker)
-                {
+                if new_status == WorkerStatus::Ready {
+                    // The group's polling loop reads the registry on every
+                    // tick and picks the worker up by itself. A report
+                    // held while the worker was not `Ready` waits in the
+                    // flush's queue: the flusher is woken to publish it.
+                    monitor.pushed_notify.notify_one();
+                } else if !monitor.load_state.is_current_incarnation(&worker) {
                     monitor.evict_worker_loads(&worker);
                 }
-                // No action needed when transitioning *into* Ready: the
-                // group's polling loop reads from the registry on every
-                // tick and will pick the worker up automatically.
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!(
@@ -2051,27 +2244,7 @@ async fn poll_group_once<G: Generation>(
         polled.len()
     );
 
-    // Every successful load poll is also the canonical observability
-    // sample. Load-aware policies already require this poll; the explicit
-    // engine-metrics option only forces polling when routing does not.
-    // Reusing the response avoids a second Engine RPC. (A pushed record
-    // feeds the same gauges from `apply_pushed_load`.)
-    for (worker, load, _) in &group_loads {
-        Metrics::record_engine_load(worker.url(), &group_key.model_id, load);
-    }
-
-    // Merge into the shared snapshot in one rebuild: clear stale entries
-    // for the polled URLs first, then insert the fresh loads — each
-    // paired with the worker that produced it so the incarnation fence
-    // can drop reports that raced a removal or replacement. Workers that
-    // failed this tick get their stale entries pruned along with the
-    // rest. The responses move (no deep clones): the metrics pass above
-    // took its references.
-    let fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)> = group_loads
-        .into_iter()
-        .map(|(worker, load, _)| (worker, Arc::new(load)))
-        .collect();
-    monitor.load_state.publish_group(&polled_urls, fresh);
+    monitor.publish_polled(&group_key.model_id, &polled_urls, group_loads);
 }
 
 /// `poll_group_once` for a host's tests: one tick over engines the host's own
