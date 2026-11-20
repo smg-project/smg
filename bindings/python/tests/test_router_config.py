@@ -672,21 +672,40 @@ class TestPolicyDocument:
         path = policy_document("round_robin", kind="PolicySpec")
         self.assert_start_refusal(path, 'the document carries kind "PolicySpec"', *mode)
 
-    @pytest.mark.parametrize("policy", ["round_robin", "cache_aware"])
-    def test_a_set_flag_that_disagrees_is_refused_by_name(self, policy_document, policy):
-        path = policy_document("random")
-        self.assert_start_refusal(
-            path,
-            f"the routing flags and the policy document disagree at profiles.{policy}:",
-            "--policy",
-            policy,
+    @pytest.mark.parametrize(
+        ("flags", "named"),
+        [
+            (["--policy", "round_robin"], "--policy"),
+            (["--cache-threshold", "0.7"], "--cache-threshold"),
+            (["--pd-disaggregation", "--prefill-policy", "random"], "--prefill-policy"),
+            (["--disable-worker-overload-protection"], "--worker-overload-protection"),
+        ],
+    )
+    def test_a_routing_option_set_beside_a_document_is_refused_by_name(
+        self, policy_document, flags, named
+    ):
+        path = policy_document("round_robin")
+        args = parse_router_args(["--policy-controller", "on", "--policy-spec", str(path), *flags])
+        with pytest.raises(ValueError) as refusal:
+            Router.from_args(args)
+        assert str(refusal.value) == (
+            f"A policy document replaces the routing options, and these are set beside it: {named}"
         )
 
-    def test_a_set_flag_that_agrees_takes_the_document(self, policy_document):
+    def test_the_routing_options_at_their_defaults_stand_beside_a_document(self, policy_document):
+        # The chart's line carries these six at their defaults on every render.
+        line = [
+            "--cache-threshold=0.3",
+            "--balance-abs-threshold=64",
+            "--balance-rel-threshold=1.5",
+            "--eviction-interval-secs=120",
+            "--max-tree-size=67108864",
+            "--block-size=16",
+        ]
         path = policy_document("round_robin")
-        self.assert_start_refusal(
-            path, "failed to read WASM storage hook", "--policy", "round_robin"
-        )
+        args = parse_router_args(["--policy-controller", "on", "--policy-spec", str(path), *line])
+        assert args.options_a_document_replaces() == []
+        Router.from_args(args)
 
     def test_a_line_with_no_document_builds_cache_aware_as_before(self, tmp_path):
         args = parse_router_args(["--cache-threshold", "2"])

@@ -1165,6 +1165,22 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_path_with_no_loaded_document_is_refused() {
+        let config = RouterConfig {
+            enable_igw: true,
+            policy_controller: true,
+            policy_spec_path: Some("routing.yaml".to_owned()),
+            ..RouterConfig::default()
+        };
+        assert!(matches!(
+            config.validate().expect_err("the document was never read"),
+            ConfigError::InvalidValue { field, value, reason }
+                if field == "policy_spec" && value == "routing.yaml"
+                    && reason.starts_with("the policy document of this path is not loaded")
+        ));
+    }
+
     /// Test complex routing mode helper method
     #[test]
     fn test_builder_prefill_decode_mode() {

@@ -82,17 +82,20 @@ fn the_store_starts_with_the_document_the_routing_configuration_means() -> Case 
 
 #[test]
 fn the_store_starts_on_the_given_document() -> Case {
-    let mut document = PolicySpec::preset("round_robin")?;
-    document.generation = 2;
-    let digest = document.digest()?;
-    let config = picked(RouterConfig {
-        policy_spec: Some(document),
-        ..RouterConfig::default()
-    });
-    let store = start(&config)?.ok_or("the controller was picked and no store started")?;
-    let world = store.world();
-    assert_eq!(world.spec().generation(), 2);
-    assert_eq!(world.spec().digest(), Some(digest));
+    // A document that names no generation is the store's first.
+    for (written, runs) in [(2, 2), (0, 1)] {
+        let mut document = PolicySpec::preset("round_robin")?;
+        document.generation = written;
+        let digest = document.digest()?;
+        let config = picked(RouterConfig {
+            policy_spec: Some(document),
+            ..RouterConfig::default()
+        });
+        let store = start(&config)?.ok_or("the controller was picked and no store started")?;
+        let world = store.world();
+        assert_eq!(world.spec().generation(), runs);
+        assert_eq!(world.spec().digest(), Some(digest));
+    }
     Ok(())
 }
 

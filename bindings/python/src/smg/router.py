@@ -488,6 +488,13 @@ class Router:
     def from_args(args: RouterArgs) -> Router:
         """Create a router from a RouterArgs instance."""
 
+        replaced = args.options_a_document_replaces()
+        if replaced:
+            flags = ", ".join(f"--{name.replace('_', '-')}" for name in replaced)
+            raise ValueError(
+                "A policy document replaces the routing options, and these are set"
+                f" beside it: {flags}"
+            )
         args_dict = vars(args).copy()
         provider = args.selected_discovery_provider()
         for field in _DISCOVERY_FIELDS:

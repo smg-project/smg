@@ -403,8 +403,9 @@ impl CliArgs {
         }))
     }
 
-    /// Select the main routing policy. A supplied document compares against
-    /// the configuration default when the line leaves the policy unset.
+    /// Select the main routing policy. A policy document replaces the
+    /// routing flags, so the line names no policy beside one: the
+    /// configuration's default stands in, and the document decides.
     fn routing_policy(&self) -> PolicyConfig {
         match self.routing.policy.as_deref() {
             Some(policy) => self.parse_policy(policy),
@@ -1496,9 +1497,18 @@ impl CliArgs {
         if self.routing.enable_igw {
             return;
         }
-        println!("Policy: {}", self.routing_policy().name());
+        println!("{}", self.policy_line());
         for line in self.node_lines(prefill_urls, encode_urls) {
             println!("{line}");
+        }
+    }
+
+    /// The banner's policy line: the document where one decides, else the
+    /// policy the line means.
+    fn policy_line(&self) -> String {
+        match &self.routing.policy_spec {
+            Some(path) => format!("Policy: document {path}"),
+            None => format!("Policy: {}", self.routing_policy().name()),
         }
     }
 

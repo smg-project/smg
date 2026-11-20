@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from smg.router_args import RouterArgs
+from smg.router_args import DOCUMENT_REPLACES, RouterArgs
 
 ROOT = Path(__file__).resolve().parents[3]
 GATEWAY_SRC = ROOT / "model_gateway" / "src"
@@ -604,10 +604,25 @@ def test_the_launchers_leave_policy_unset_and_describe_the_same_default(rust, la
     assert sorted(option.choices) == sorted(re.findall(r'"([a-z_]+)"', choices[1]))
     cli_help = " ".join(line.split("/// ", 1)[1] for line in declaration["help"].splitlines())
     default_help = (
-        "Defaults to cache_aware. With a policy document and no --policy, the document decides."
+        "Defaults to cache_aware."
+        " A policy document replaces the routing flags, and --policy is refused beside one."
     )
     assert cli_help.endswith(default_help)
     assert option.help.endswith(default_help)
+
+
+def test_the_launchers_list_the_same_options_a_document_replaces():
+    block = re.search(
+        r"const DOCUMENT_REPLACES: \[&str; (\d+)\] = \[(.*?)\];", CLI_MODULE.read_text(), re.S
+    )
+    assert block, "the CLI's list of the flags a document replaces moved"
+    cli = re.findall(r'"([a-z_0-9]+)"', block[2])
+    assert len(cli) == int(block[1])
+    # The launcher spells the interval with its unit and folds the disable
+    # flag into worker_overload_protection.
+    cli.remove("disable_worker_overload_protection")
+    cli[cli.index("eviction_interval")] = "eviction_interval_secs"
+    assert list(DOCUMENT_REPLACES) == cli
 
 
 @pytest.mark.parametrize("use_router_prefix", [False, True])

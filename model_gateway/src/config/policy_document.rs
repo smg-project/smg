@@ -161,18 +161,33 @@ impl RouterConfig {
     /// if the settings describe the same document or the default
     /// configuration's document for this mode. A conflict names the first
     /// difference and the two values.
+    ///
+    /// Both launchers refuse a routing setting beside a document before
+    /// this runs, so the comparison judges a configuration built by hand.
+    /// The generation is no part of it: it numbers the document, and no
+    /// routing setting says it. A document that names none is this
+    /// gateway's first and takes number 1, since a store applies only a
+    /// number above the one it holds.
     pub fn policy_document_in_force(&self) -> Result<PolicySpec, PolicyDocumentError> {
-        let said = self.policy_document()?;
+        let mut said = self.policy_document()?;
         let Some(given) = &self.policy_spec else {
             return Ok(said);
         };
+        let mut given = given.clone();
+        if given.generation == 0 {
+            given.generation = 1;
+        }
         let plain = RouterConfig {
             mode: self.mode.with_defaults(),
             ..RouterConfig::default()
         }
         .policy_document()?;
-        if said == plain || said == *given {
-            return Ok(given.clone());
+        if said == plain {
+            return Ok(given);
+        }
+        said.generation = given.generation;
+        if said == given {
+            return Ok(given);
         }
 
         let written = |spec| {
@@ -180,7 +195,7 @@ impl RouterConfig {
                 .map_err(|error| SpecError::NoCanonicalForm(error.to_string()))
         };
         let flags = written(&said)?;
-        let document = written(given)?;
+        let document = written(&given)?;
         if let Some(difference) = first_difference(Some(&flags), Some(&document), String::new()) {
             return Err(difference);
         }
@@ -952,6 +967,27 @@ mod tests {
             ..config(PolicyConfig::RoundRobin)
         };
         assert_eq!(config.policy_document_in_force(), Ok(document));
+    }
+
+    #[test]
+    fn the_generation_numbers_the_document_and_is_no_part_of_the_comparison() {
+        for (written, runs) in [(0, 1), (1, 1), (7, 7)] {
+            let mut document = preset("round_robin");
+            document.generation = written;
+            let mut in_force = document.clone();
+            in_force.generation = runs;
+            for settings in [RouterConfig::default(), config(PolicyConfig::RoundRobin)] {
+                let config = RouterConfig {
+                    policy_spec: Some(document.clone()),
+                    ..settings
+                };
+                assert_eq!(
+                    config.policy_document_in_force().as_ref(),
+                    Ok(&in_force),
+                    "generation {written}"
+                );
+            }
+        }
     }
 
     #[test]
