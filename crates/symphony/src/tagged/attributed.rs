@@ -335,8 +335,9 @@ pub struct Assembler {
     /// Whether the syntax refused bytes inside the started call (a word between tags, a tag out
     /// of its place, cut short or with a tail, a value held for its close that the end cut): the
     /// model's call had something in it the client will not get, so it is no whole call, and
-    /// nothing is made up for its close ([`Self::close`]). The table's configured stuttered
-    /// marker is the exception: it is still reported and dropped, but does not set this flag.
+    /// nothing is made up for its close ([`Self::close`]). The table's stuttered marker written
+    /// right before a parameter opener is the exception: it is reported and dropped without
+    /// refusing the call.
     refused: bool,
     /// The static prefix of the table's stuttered marker held between tags. What follows decides
     /// whether it is the opening tag's stutter or ordinary refused text.
@@ -465,8 +466,8 @@ impl Assembler {
     /// value, which is how a client that reads them as JSON is told, as a cut call tells it. (The
     /// engine's own parser hands such a call out whole with the members its reader matched, `{}`
     /// when none; a client read a well-formed call with no word that the model's call had failed.)
-    /// The table's configured stuttered marker is the exception: it is reported and dropped
-    /// without refusing the call.
+    /// The table's stuttered marker written right before a parameter opener is the exception: it
+    /// is reported and dropped without refusing the call.
     pub fn close(mut self, terminal: &str, out: &mut Events) {
         if self.done {
             return;
@@ -1688,6 +1689,10 @@ mod tests {
             (r#"{"a": 7"#.to_string(), String::new())
         );
         assert_eq!(refused(&events), ["｜DSM"]);
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::TextBetweenTags)]
+        );
     }
 
     /// An object-typed value nested past the bound the crate's JSON reader puts on a call's
