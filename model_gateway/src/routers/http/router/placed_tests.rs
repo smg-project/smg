@@ -593,6 +593,56 @@ async fn an_attempt_the_controller_does_not_place_reads_the_hosts_answer() -> Ca
     Ok(())
 }
 
+/// Under the host a request that names its worker is refused by name where
+/// the model's classic policy holds it to that worker, on the typed line
+/// and on the transcription line, and no worker is asked. Under a policy
+/// that reads no target the header changes nothing.
+#[tokio::test]
+async fn a_request_that_names_its_worker_is_refused_by_name_under_the_host() -> Case {
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    let mut headers = HeaderMap::new();
+    headers.insert("x-smg-target-worker", HeaderValue::from_static("0"));
+    for (policy, refused) in [
+        (PolicyConfig::ConsistentHashing, true),
+        (PolicyConfig::RoundRobin, false),
+    ] {
+        let (url, hits) = fixed_status_upstream(&[GENERATE, TRANSCRIBE], StatusCode::OK).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let (host, ..) = bed_over(Arc::clone(&registry), &[&url]);
+        let mut router = router(registry, Some(host));
+        router.policy_registry = Arc::new(PolicyRegistry::new(policy));
+        let request = serde_json::from_value(json!({"text": "hi"}))?;
+        let generated = router
+            .route_generate(Some(&headers), &meta, request, MODEL)
+            .await;
+        let request = TranscriptionRequest {
+            model: MODEL.into(),
+            ..TranscriptionRequest::default()
+        };
+        let audio = AudioFile {
+            bytes: Bytes::from_static(b"audio"),
+            file_name: "speech.wav".into(),
+            content_type: Some(AUDIO_TYPE.into()),
+        };
+        let transcribed = router
+            .route_audio_transcriptions(Some(&headers), &meta, &request, audio, MODEL)
+            .await;
+        for response in [generated, transcribed] {
+            if refused {
+                assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+                assert_eq!(
+                    extract_error_code_from_response(&response),
+                    "not_decided_by_policy_controller"
+                );
+            } else {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), if refused { 0 } else { 2 });
+    }
+    Ok(())
+}
+
 async fn no_model(router: &Router) -> Case<Response> {
     let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
     let request = serde_json::from_value(json!({"text": "hi"}))?;
