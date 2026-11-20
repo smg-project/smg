@@ -5,6 +5,8 @@
 //! built from the world the store publishes ([`MemoryStore::world`]), not
 //! through these locks.
 
+#[cfg(test)]
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     mem,
@@ -84,6 +86,8 @@ pub struct MemoryStore {
     /// holds it as a [`Writing`], which tells the journal when the write's
     /// locks are let go.
     workers: Mutex<Workers>,
+    #[cfg(test)]
+    snapshot_pause: Mutex<Option<(SyncSender<()>, Receiver<()>)>>,
     health: Mutex<HealthTables>,
     /// The load rows, one entry per member: an entry is created with its
     /// worker's row and deleted with it, both under the workers lock (taken
@@ -231,6 +235,8 @@ impl MemoryStore {
         let leases = Leases::empty(0, Arc::clone(&counts), Arc::clone(&sessions), origin);
         Self {
             workers: Mutex::default(),
+            #[cfg(test)]
+            snapshot_pause: Mutex::default(),
             health: Mutex::default(),
             loads: Mutex::new(Loads {
                 ranks: FxHashMap::default(),
@@ -1953,6 +1959,23 @@ impl Writing<'_> {
 }
 
 impl MemoryStore {
+    #[cfg(test)]
+    pub(super) fn pause_snapshot_after_clone(&self) -> (Receiver<()>, SyncSender<()>) {
+        let (cloned_tx, cloned_rx) = mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+        *self.snapshot_pause.lock() = Some((cloned_tx, resume_rx));
+        (cloned_rx, resume_tx)
+    }
+
+    #[cfg(test)]
+    fn pause_snapshot(&self) {
+        let pause = self.snapshot_pause.lock().take();
+        if let Some((cloned, resume)) = pause {
+            cloned.send(()).expect("snapshot test receives clone point");
+            resume.recv().expect("snapshot test resumes sorting");
+        }
+    }
+
     /// The word to the journal, at its drop, that a write's locks are let
     /// go.
     fn released(&self) -> Released<'_> {
@@ -2274,10 +2297,17 @@ impl WorkersStore for MemoryStore {
     }
 
     fn snapshot(&self) -> (u64, Vec<WorkerRow>) {
-        let workers = self.workers.lock();
-        let mut rows: Vec<WorkerRow> = workers.rows.values().map(|row| row.row.clone()).collect();
+        // Copied under the lock, sorted after it: a writer waits for the
+        // copy alone.
+        let (epoch, mut rows) = {
+            let workers = self.workers.lock();
+            let rows: Vec<WorkerRow> = workers.rows.values().map(|row| row.row.clone()).collect();
+            (workers.epoch, rows)
+        };
+        #[cfg(test)]
+        self.pause_snapshot();
         rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
-        (workers.epoch, rows)
+        (epoch, rows)
     }
 
     fn changes_since(&self, epoch: u64) -> MembershipTail {
