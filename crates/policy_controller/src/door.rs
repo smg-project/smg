@@ -755,7 +755,9 @@ impl<'a> OwnRows<'a> {
     /// The rows of `candidates` named for the shadow of `facts`' request
     /// under `cap`, as [`hand`] names a live profile's: by the request's
     /// block hashes as the engine reads them, on the decision's seed, at
-    /// the instant its view was built.
+    /// the instant its view was built. A cap full of holders the shadow
+    /// profile's pass refuses is not read past: that lookup
+    /// ([`World::name_kept`]) takes the live profile's test of a row.
     fn name(self, cap: u32, facts: &RequestFacts<'_>, candidates: &[Candidate]) -> &'a Named {
         let Self {
             world,
