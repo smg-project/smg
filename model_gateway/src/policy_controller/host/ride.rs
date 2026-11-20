@@ -1,5 +1,5 @@
-//! A placement as the regular HTTP router holds it, to the end of its
-//! response's body.
+//! A placement as an HTTP router holds it, to the end of its response's
+//! body.
 
 use std::{
     ops::Deref,
@@ -33,7 +33,7 @@ fn answered(response: &Response) -> bool {
     marks.get::<UpstreamAnswer>().is_some() || marks.get::<BehindAnswer>().is_some()
 }
 
-/// A placement with what the regular HTTP router alone knows of its send:
+/// A placement with what an HTTP router alone knows of its send:
 /// the instant, and the mark its streamed answer's relay writes at a cut.
 /// The host's [`Placed`] keeps neither, so a route that needs none carries
 /// none.
@@ -68,6 +68,25 @@ impl Sent {
         self.placed.dispatched(now);
     }
 
+    /// A pair's decode request was sent at `now`. Said once. Where the
+    /// prefill was not sent, the placement's time counts from here.
+    pub(crate) fn decode_dispatched(&mut self, now: Instant) {
+        if self.at.is_none() {
+            self.at = Some(now);
+        }
+        self.placed.decode_dispatched(now);
+    }
+
+    /// A pair's prefill answered `status` at `now`, ahead of the end of the
+    /// answer its decode writes. Said once.
+    pub(crate) fn prefill_ended(&mut self, status: StatusCode, now: Instant) {
+        if let Some(at) = self.at {
+            let class = transport_class(status, true);
+            self.placed
+                .completed(End::http(status, class, at, None, now), now);
+        }
+    }
+
     /// The mark for the relay of this placement's streamed answer: the relay
     /// writes the status of a cut's class on it, and the body's end reads it.
     pub(crate) fn cut_mark(&mut self) -> Arc<AtomicU16> {
@@ -93,7 +112,9 @@ impl Sent {
         self.ended(response.status(), answered(response), now);
     }
 
-    /// Say the placement's end where it was sent.
+    /// Say the placement's end where it was sent. A pair's answer is its
+    /// decode's: the decode ends with it, and so does a prefill whose router
+    /// said no end ahead of it ([`Self::prefill_ended`]).
     fn end(
         mut self,
         status: StatusCode,
@@ -102,8 +123,9 @@ impl Sent {
         now: Instant,
     ) {
         if let Some(at) = self.at {
-            self.placed
-                .completed(End::http(status, class, at, first, now), now);
+            let end = End::http(status, class, at, first, now);
+            self.placed.completed(end, now);
+            self.placed.decode_completed(end, now);
         }
     }
 
