@@ -2465,7 +2465,13 @@ impl Router {
             policy_needs_text: self
                 .policy_registry
                 .any_policy_needs_request_text(Some(headers)),
-            model_ambiguous: self.worker_registry.model_count() > 1,
+            // A worker knows a model's canonical id alone, and only a body
+            // read here has an alias in it rewritten to that id.
+            model_ambiguous: self.worker_registry.model_count() > 1
+                || candidates.iter().any(|w| {
+                    let models = &w.metadata().spec.models;
+                    models.iter().any(|card| !card.aliases.is_empty())
+                }),
             worker_mutates_body: candidates.iter().any(|w| w.mutates_request()),
             wasm_request_hooks,
             content_length: header_utils::content_length(Some(headers)).map(|len| len as u64),
@@ -2536,7 +2542,9 @@ impl Router {
         // Guard the registration races the decision left open: a mutating
         // worker that joined after the fleet check must not receive an
         // unmutated stream, and a second model appearing re-opens
-        // wrong-model selection.
+        // wrong-model selection. An alias registered after the decision is
+        // not re-checked: the request named a name that did not exist when
+        // its path was decided.
         if worker.mutates_request() {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_WORKER_MUTATES_BODY);
             return Err(req);
@@ -4493,6 +4501,15 @@ mod tests {
             .build()
     }
 
+    /// A worker of one model that declares a second name for it.
+    fn aliased_worker(url: &str) -> BasicWorker {
+        BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .models(vec![ModelCard::new("model-a").with_alias("model-a-latest")])
+            .build()
+    }
+
     type CapturedUpstreamRequest = Arc<tokio::sync::Mutex<Option<(HeaderMap, Bytes)>>>;
 
     /// Loopback engine stub: captures the forwarded `/generate` request and
@@ -4670,6 +4687,22 @@ mod tests {
         assert_eq!(
             router.request_body_path(&headers_with_content_length(Some("64")), false),
             BodyPath::Stream(REASON_RETRY_FORFEITED)
+        );
+    }
+
+    /// A lone model under an alias buffers: a body may name the alias, and
+    /// the worker knows the canonical id alone.
+    #[test]
+    fn an_aliased_lone_model_decides_buffer() {
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![aliased_worker("http://worker1:8080")],
+        );
+        assert_eq!(
+            router.request_body_path(&headers_with_content_length(Some("64")), false),
+            BodyPath::Buffer(REASON_MODEL_AMBIGUOUS),
+            "a body that may name an alias is read first"
         );
     }
 
@@ -5061,6 +5094,30 @@ mod tests {
             vec![plain_worker("http://worker1:8080")],
         );
         assert_falls_back_with_body_intact(&router).await;
+    }
+
+    /// The streamed path forwards a body unread, the name it gives the model
+    /// included: a request to a lone model under an alias goes back to the
+    /// buffered path, which sends the worker the canonical id.
+    #[tokio::test]
+    async fn a_body_that_may_name_an_alias_is_not_streamed_to_the_worker() {
+        let (url, captured) = spawn_capture_stub("application/json", r#"{"text":"ok"}"#).await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![aliased_worker(&url)]);
+
+        let handed_back = router
+            .route_streaming_request(
+                streamed_request(&[b"{\"model\":\"model-a-latest\",\"text\":\"hello\"}"]),
+                "/generate",
+                false,
+            )
+            .await;
+
+        let sent = captured.lock().await.take().map(|(_, body)| body);
+        assert_eq!(
+            sent, None,
+            "the worker was sent the alias: a body that may name an alias is read first"
+        );
+        assert!(handed_back.is_err());
     }
 
     fn with_header(mut req: Request<Body>, name: &'static str, value: &str) -> Request<Body> {
