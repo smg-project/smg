@@ -152,7 +152,8 @@ operator = [
 ]
 # The standalone controller: the ingestion drivers, the listeners with their
 # scopes, the protocol's generated service and client, the election, the gRPC
-# health service, the admin endpoints and the binary of the package's name.
+# health service and the admin endpoints. The stock binary also needs
+# `worker-host` to read cache events.
 # Off by default: the engine alone has no server dependency. It builds on
 # Linux and macOS: the gRPC plugin kind dials a Unix socket and reads its
 # peer's user through `rustix`, which is declared for those two.
@@ -262,11 +263,11 @@ rustix = { version = "1", default-features = false, features = ["pty"] }
 [[bin]]
 name = "smg-policy-controller"
 path = "src/bin/smg-policy-controller.rs"
-required-features = ["controller"]
+required-features = ["controller", "worker-host"]
 
 [[test]]
 name = "binary"
-required-features = ["controller"]
+required-features = ["controller", "worker-host"]
 
 [[test]]
 name = "operator_door"
@@ -274,11 +275,11 @@ required-features = ["operator"]
 
 [[test]]
 name = "spec_file"
-required-features = ["controller"]
+required-features = ["controller", "worker-host"]
 
 [[test]]
 name = "spec_store"
-required-features = ["controller"]
+required-features = ["controller", "worker-host"]
 
 # Replays recorded rows through the row builder of `ingest`: a bare test run builds no part of it.
 [[test]]
@@ -295,7 +296,7 @@ required-features = ["kubernetes"]
 
 [[test]]
 name = "failover"
-required-features = ["client"]
+required-features = ["client", "worker-host"]
 
 [[test]]
 name = "fleet"
@@ -316,11 +317,11 @@ required-features = ["controller"]
 
 [[test]]
 name = "membership_door"
-required-features = ["controller"]
+required-features = ["controller", "worker-host"]
 
 [[test]]
 name = "replicas"
-required-features = ["controller"]
+required-features = ["controller", "worker-host"]
 
 [[test]]
 name = "replication"
@@ -328,7 +329,7 @@ required-features = ["controller"]
 
 [[test]]
 name = "watch_workers"
-required-features = ["controller"]
+required-features = ["controller", "worker-host"]
 
 [[bench]]
 name = "decision"
