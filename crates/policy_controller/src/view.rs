@@ -1006,7 +1006,8 @@ pub struct RequestFacts<'a> {
     /// ([`KeySources::derive_client`](crate::KeySources::derive_client)):
     /// what a ring places by where the request carries no session key. It
     /// lifts no overload veto, pins no session and is counted under no key.
-    /// In-process only: the wire carries no client key yet.
+    /// The wire's request facts carry it to a controller, and a plugin's
+    /// frame keeps `0` under every exposure.
     pub client_key: u64,
 }
 
