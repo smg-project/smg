@@ -41,7 +41,11 @@ use serde_json::{json, Map, Value};
 use smg_worker::{identity::basic::ConnectionMode, test_support::no_health_check};
 
 use super::*;
-use crate::{config::types::PolicyConfig, routers::grpc::backend_client::BasicWorkerBuilder};
+use crate::{
+    app_context::testing::app_context_for_tests,
+    config::{types::PolicyConfig, RouterConfig},
+    routers::grpc::backend_client::BasicWorkerBuilder,
+};
 
 const MODEL: &str = "m";
 /// A request is placed this many times the pool's size.
@@ -126,7 +130,7 @@ struct Bed {
 }
 
 impl Bed {
-    fn of(row: &Row) -> Self {
+    async fn of(row: &Row) -> Self {
         let worker_registry = Arc::new(WorkerRegistry::new());
         worker_registry.set_overload_shed(row.shed);
         let mut workers = Vec::new();
@@ -152,18 +156,17 @@ impl Bed {
             worker_registry.set_worker_overloaded(&worker, member.state == State::Over);
             workers.push(worker);
         }
-        let router = Router {
-            worker_registry,
-            policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
-            retry_config: RetryConfig::default(),
-            max_payload_size: 1 << 20,
-            stream_stall_timeout: None,
-            max_buffered_request_bytes: 0,
-            realtime_registry: Arc::new(RealtimeRegistry::new()),
-            webrtc_bind_addr: None,
-            webrtc_stun_server: None,
-            rate_limit_manager: None,
+        // The router is built as the gateway builds it, by its own
+        // constructor over a context: a field the router gains is filled
+        // there, and this file names none of them.
+        let config = RouterConfig {
+            policy: PolicyConfig::RoundRobin,
+            ..RouterConfig::default()
         };
+        let context = app_context_for_tests(config, worker_registry, None);
+        let router = Router::new(&context)
+            .await
+            .expect("the router builds over a test context");
         Self { router, workers }
     }
 
@@ -234,7 +237,7 @@ async fn refused(refusal: Response) -> Value {
 /// One recording of a row: its workers as the gateway reads them, and the
 /// answer to each request.
 async fn recorded(row: &Row) -> Value {
-    let bed = Bed::of(row);
+    let bed = Bed::of(row).await;
     let workers: Vec<Value> = row
         .workers
         .iter()
