@@ -7,10 +7,11 @@
 //! cool-down, during which every stage of the plugin takes its fallback
 //! without a call. A report stamped during the cool-down, by a call admitted
 //! before the open, is dropped whenever it arrives: one incident is one
-//! opening. One breaker
-//! per plugin, shared by its instances; the latency ring is per thread, or
-//! with a named decider's instance where a kind keeps one, kept across
-//! rebuilds (no shared write per call).
+//! opening. A delayed failure stamped more than one window before the latest
+//! counted failure is also dropped. One breaker per plugin, shared by its
+//! instances; the latency ring is per thread, or with a named decider's
+//! instance where a kind keeps one, kept across rebuilds (no shared write per
+//! call).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,12 +19,13 @@ use parking_lot::Mutex;
 
 use super::config::BreakerSpec;
 
-/// The failure window: when it started, on the runtime's clock, and the
-/// failures counted in it. With none counted there is no window: the next
-/// failure starts one at its own instant.
+/// The failure window: its earliest and latest instants on the runtime's
+/// clock, and the failures counted in it. With none counted there is no
+/// window: the next failure starts one at its own instant.
 #[derive(Debug, Default)]
 struct Window {
     start_micros: u64,
+    end_micros: u64,
     failures: u32,
 }
 
@@ -64,21 +66,31 @@ impl Breaker {
     /// and says whether this one opened it. A failure stamped while the
     /// breaker was open, by a call admitted before it opened, is dropped
     /// whenever it arrives: it counts in no window and opens nothing again.
+    /// A delayed failure stamped more than one window before the latest
+    /// counted failure is also dropped because it fits no window with them.
     pub(crate) fn failure(&self, now_micros: u64) -> bool {
         let mut window = self.window.lock();
         if now_micros < self.open_until.load(Ordering::Relaxed) {
             return false;
         }
         if window.failures == 0
-            || now_micros.saturating_sub(window.start_micros) > self.spec.window_micros
+            || (now_micros > window.end_micros
+                && now_micros - window.start_micros > self.spec.window_micros)
         {
             // A new window: the first failure in it, whether none was
-            // counted (the first ever, the first after an open) or the last
-            // window ran out. Two threads that race here both count their
-            // failure in the new window: the second to take the lock finds
-            // the window the first started.
+            // counted (the first ever, the first after an open) or this is
+            // newer than the last window. Two threads that race here both
+            // count their failure in the new window when their instants fit.
             window.start_micros = now_micros;
+            window.end_micros = now_micros;
             window.failures = 0;
+        } else if now_micros < window.start_micros {
+            if window.end_micros - now_micros > self.spec.window_micros {
+                return false;
+            }
+            window.start_micros = now_micros;
+        } else {
+            window.end_micros = window.end_micros.max(now_micros);
         }
         window.failures = window.failures.saturating_add(1);
         let opened = window.failures >= self.spec.failures;
@@ -236,6 +248,36 @@ mod tests {
         b.failure(2_100);
         b.failure(2_200);
         assert!(b.is_open(2_201));
+    }
+
+    #[test]
+    fn an_older_failure_outside_the_current_window_does_not_open() {
+        let b = Breaker::new(BreakerSpec {
+            failures: 2,
+            window_micros: 1_000,
+            cooldown_micros: 5_000,
+        });
+        assert!(!b.failure(2_000));
+        assert!(!b.failure(0));
+        assert_eq!(b.opens(), 0);
+        assert!(!b.is_open(2_001));
+    }
+
+    #[test]
+    fn an_older_failure_inside_the_window_counts_from_its_own_instant() {
+        let b = Breaker::new(spec());
+        assert!(!b.failure(1_000));
+        assert!(!b.failure(500), "the older failure fits the window");
+        assert!(b.failure(1_400), "three failures within 900 us open");
+
+        let b = Breaker::new(spec());
+        assert!(!b.failure(1_000));
+        assert!(!b.failure(500));
+        assert!(
+            !b.failure(1_900),
+            "a failure outside the window starts a new window"
+        );
+        assert_eq!(b.opens(), 0);
     }
 
     #[test]
