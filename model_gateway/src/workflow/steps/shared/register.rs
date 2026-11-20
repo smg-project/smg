@@ -11,7 +11,7 @@ use smg_worker::{
     health::bootstrap_probe,
     identity::basic::Worker,
     registry::{worker_model_ids, WorkerId},
-    workflow::{pool_group, refresh_worker_pool_sizes, PoolGroups, WorkerKind},
+    workflow::WorkerKind,
 };
 use tracing::debug;
 use wfaas::{
@@ -187,23 +187,6 @@ fn register_worker(
     }
 }
 
-/// The pool-size groups a registration of `workers` touches: each new
-/// worker's own group, and the group of the worker it replaces at the same
-/// URL, when there is one and it differs (a replacement that changes the
-/// model, worker type or connection mode empties the old group).
-pub(crate) fn pool_groups_touched(
-    registry: &WorkerRegistry,
-    workers: &[Arc<dyn Worker>],
-) -> PoolGroups {
-    let mut groups: PoolGroups = workers.iter().map(|w| pool_group(w.as_ref())).collect();
-    for worker in workers {
-        if let Some(replaced) = registry.get_by_url(worker.url()) {
-            groups.insert(pool_group(replaced.as_ref()));
-        }
-    }
-    groups
-}
-
 /// The models a registration of `workers` may move workers off: every model
 /// whose policy a worker it replaces at the same URL keeps
 /// ([`WorkerRegistry::policy_model_ids`]). Whether a worker of this node, the
@@ -228,11 +211,6 @@ fn write_batch(
     let registry = &app_context.worker_registry;
     check_batch(registry, workers, registration_mode)?;
 
-    // Taken before the registry is written: a replacement that changes a
-    // worker's group must refresh the group it leaves as well as the one
-    // it joins, and only the registry as it is now knows the former.
-    let touched_groups = pool_groups_touched(registry, workers);
-
     let mut worker_ids = Vec::with_capacity(workers.len());
     for worker in workers {
         let worker_id = register_worker(registry, Arc::clone(worker), registration_mode)?;
@@ -249,7 +227,7 @@ fn write_batch(
         worker_ids.push(worker_id);
     }
 
-    after_write(app_context, workers, &touched_groups, symphony_table);
+    after_write(app_context, workers, symphony_table);
 
     // WorkerMonitor subscribes to registry events directly (see
     // `smg_worker::load::monitor::WorkerMonitor::start_event_loop`), so this
@@ -269,12 +247,11 @@ fn write_batch(
 
 /// What a registration does beside the registry's write, once every worker
 /// of the batch stands in the registry: the parser series of
-/// `symphony_table`, the port probe, the retry settings of each model and
-/// the pool sizes of `groups`.
+/// `symphony_table`, the port probe and the retry settings of each model.
+/// The registry's own write moved the pool sizes.
 fn after_write(
     app_context: &AppContext,
     workers: &[Arc<dyn Worker>],
-    groups: &PoolGroups,
     symphony_table: Option<&'static str>,
 ) {
     // Under Symphony the failure classes of the table that reads these
@@ -319,10 +296,6 @@ fn after_write(
             }
         }
     }
-
-    // Update Layer 3 worker pool size metrics per unique
-    // `(worker_type, connection_mode, model_id)` the registration touched.
-    refresh_worker_pool_sizes(&app_context.worker_registry, groups);
 }
 
 /// A test's hold on the registry step, between the engine's cancel read for
@@ -437,15 +410,7 @@ impl StepExecutor<WorkerWorkflowData> for RegisterBesideRowsStep {
                 for worker in workers {
                     pd_admission::announce_decode_window(worker.as_ref());
                 }
-                // The door replaced the registry's object ahead of this
-                // step, so the group a replaced worker left is the
-                // check's to name: it read the registry ahead of the write.
-                let mut groups: PoolGroups = workers
-                    .iter()
-                    .map(|worker| pool_group(worker.as_ref()))
-                    .collect();
-                groups.extend(context.data.host_notes.pool_groups.iter().cloned());
-                after_write(&app_context, workers, &groups, symphony_table);
+                after_write(&app_context, workers, symphony_table);
             }
             WorkerKind::External => {
                 let registry = &app_context.worker_registry;
@@ -570,49 +535,6 @@ mod tests {
             .get(&id)
             .is_some_and(|entry| Arc::ptr_eq(&entry, &provider)));
         assert!(feed.objects.standing(&id).is_none());
-    }
-
-    /// Beside the rows the step refreshes the pool size of each group its
-    /// registration touched, as the check noted them ahead of the door's
-    /// write. The door replaces the registry's object first, so the step
-    /// no longer finds the worker a replacement moved out of its group.
-    /// The only worker of a model, moved to another model, leaves the old
-    /// model's gauge at zero.
-    #[tokio::test]
-    async fn beside_rows_a_replacement_refreshes_the_group_its_worker_left() {
-        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let _guard = metrics::set_default_local_recorder(&recorder);
-        let (registry, feed, host) = beside_rows();
-        let step = RegisterBesideRowsStep::new(Arc::clone(&feed.objects));
-        let size = |model: &str| {
-            let model = format!("model=\"{model}\"");
-            handle
-                .render()
-                .lines()
-                .find(|line| line.starts_with("smg_worker_pool_size{") && line.contains(&model))
-                .and_then(|line| line.rsplit(' ').next().map(str::to_owned))
-        };
-
-        // A registration, then its replacement by a worker of another
-        // model: the check's read, the door's write, the step.
-        for (model, left) in [("m1", None), ("m2", Some("m1"))] {
-            let new = worker(model);
-            let mut context = built(&host, WorkerKind::Local, &new);
-            context.data.host_notes.pool_groups =
-                pool_groups_touched(&registry, std::slice::from_ref(&new));
-            feed.door
-                .found_built(&Maker::Control, Expect::Anything, &new, None)
-                .unwrap();
-            assert_eq!(
-                step.execute(&mut context).await.unwrap(),
-                StepResult::Success
-            );
-            assert_eq!(size(model).as_deref(), Some("1"), "{model}");
-            if let Some(left) = left {
-                assert_eq!(size(left).as_deref(), Some("0"), "{left}");
-            }
-        }
     }
 
     #[tokio::test]
@@ -752,26 +674,6 @@ mod tests {
             worker_id: worker_id.as_str().to_string(),
             expected_revision,
         }
-    }
-
-    #[test]
-    fn a_replacement_that_changes_the_model_touches_the_group_it_leaves_too() {
-        let registry = WorkerRegistry::new();
-        registry.register(worker("original-model")).unwrap();
-
-        // The same URL comes back under another model: both groups' pool
-        // sizes move, the old one to zero.
-        let touched = pool_groups_touched(&registry, &[worker("replacement-model")]);
-        let models: HashSet<&str> = touched.iter().map(|(_, _, m)| m.as_str()).collect();
-        assert_eq!(
-            models,
-            HashSet::from(["original-model", "replacement-model"])
-        );
-
-        // A URL the registry has not seen touches its own group only.
-        let fresh = pool_groups_touched(&registry, &[worker_at("http://fresh:8080", "new-model")]);
-        assert_eq!(fresh.len(), 1);
-        assert!(fresh.iter().all(|(_, _, m)| m == "new-model"));
     }
 
     #[test]

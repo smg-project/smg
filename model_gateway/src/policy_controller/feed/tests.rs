@@ -348,6 +348,70 @@ fn settle_brings_a_row_written_past_the_door_into_the_registry() {
     assert_eq!(registry.get_id_by_url(URL), Some(object));
 }
 
+/// The pool-size gauge's sample for the group of `model`, or none where
+/// the group never had a worker.
+fn pool_size(
+    handle: &metrics_exporter_prometheus::PrometheusHandle,
+    model: &str,
+) -> Option<String> {
+    let model = format!("model=\"{model}\"");
+    handle
+        .render()
+        .lines()
+        .find(|line| line.starts_with("smg_worker_pool_size{") && line.contains(&model))
+        .and_then(|line| line.rsplit(' ').next().map(str::to_owned))
+}
+
+/// A row this gateway follows moves the pool-size gauge with no workflow
+/// step beside it. The settle that lays its object counts it, and the
+/// settle that takes the object out leaves the group at zero.
+#[test]
+fn a_followed_row_moves_the_pool_size_gauge_as_it_joins_and_as_it_leaves() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        let store = Arc::new(MemoryStore::default());
+        let (registry, feed) = bed(&store);
+        // A follower of a served controller writes the store itself.
+        let row = store.upsert(stated()).id();
+        feed.settle();
+        assert!(feed.objects.object(row).is_some());
+        assert_eq!(pool_size(&handle, MODEL).as_deref(), Some("1"));
+
+        let stands = store.by_key(URL).expect("the row");
+        assert!(store.remove(stands.id, stands.revision).is_some());
+        feed.settle();
+        assert!(registry.get_by_url(URL).is_none());
+        assert_eq!(pool_size(&handle, MODEL).as_deref(), Some("0"));
+    });
+}
+
+/// A replacement the door hands the holder moves both pool groups in one
+/// step. The only worker of a model, moved to another model, leaves the
+/// old model's gauge at zero.
+#[test]
+fn a_replacement_at_the_door_moves_the_gauge_of_both_groups() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        let (_, feed) = bed(&Arc::new(MemoryStore::default()));
+        for (model, left) in [("m1", None), ("m2", Some("m1"))] {
+            let new: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(URL)
+                    .model(ModelCard::new(model))
+                    .build(),
+            );
+            feed.door
+                .found_built(&Maker::Control, Expect::Anything, &new, None)
+                .expect("the door takes the registration");
+            assert_eq!(pool_size(&handle, model).as_deref(), Some("1"), "{model}");
+            if let Some(left) = left {
+                assert_eq!(pool_size(&handle, left).as_deref(), Some("0"), "{left}");
+            }
+        }
+    });
+}
+
 /// The store shows a replacement inside its own write, and with probes
 /// off the door readies it there, ahead of the listener. A door with no
 /// listener leaves that state standing: the registry holds the old object.

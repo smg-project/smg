@@ -5,7 +5,6 @@ mod find_worker_to_update;
 mod forget_cache_events;
 mod provider_workers;
 mod rediscover_labels;
-mod refresh_pool_sizes;
 mod release_tokenizer;
 mod remove_from_policy_registry;
 mod submit_tokenizer_job;
@@ -29,7 +28,6 @@ use provider_workers::{
     ForProviderWorkers, DRAIN_PROVIDER_WORKERS_STEP, REMOVE_PROVIDER_WORKERS_STEP,
 };
 pub use rediscover_labels::RediscoverLabelsStep;
-use refresh_pool_sizes::{RefreshPoolSizesStep, REFRESH_POOL_SIZES_STEP};
 pub use release_tokenizer::ReleaseTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
 use smg_policy_controller::worker_host::{removal_at_door, REMOVE_WORKERS_AT_DOOR_STEP};
@@ -103,7 +101,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
 /// controller's store, and the line is the store crate's removal at the
 /// feed's door, under `scope` for a health check's removal. The door marks
 /// a drained row's worker `Draining` in the registry ([`DrainingDoor`]),
-/// and the holder takes a removed row's object out of it. Five gateway
+/// and the holder takes a removed row's object out of it. Four gateway
 /// steps follow:
 /// ```text
 ///     find_workers_to_remove
@@ -118,15 +116,15 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
 ///              |
 ///     remove_provider_workers
 ///              |
-///       +------+---------------+------------------+
-///       |                      |                  |
-///  forget_cache_events  refresh_pool_sizes  release_tokenizer
+///           +--+----------------+
+///           |                   |
+///  forget_cache_events  release_tokenizer
 /// ```
 /// The door's steps leave a worker with no row alone. A provider's worker
 /// has none, and the two steps behind them are the registry's own: they
 /// drain it and take it out, as the classic line does. A removal that
 /// names workers of both kinds has each taken where it stands
-/// ([`ForProviderWorkers`]). The last three write nothing to the run's
+/// ([`ForProviderWorkers`]). The last two write nothing to the run's
 /// data, so they stand side by side, and a cleanup that fails or times out
 /// holds no other back. No step writes the classic policies: they decide
 /// nothing there.
@@ -171,16 +169,6 @@ pub(crate) fn worker_removal_line(
                 "Forget the cache events of the removed workers",
                 Arc::new(ForgetCacheEventsStep),
             )
-            .with_retry(single_attempt())
-            .depends_on(&[REMOVE_PROVIDER_WORKERS_STEP]),
-        )
-        .add_step(
-            StepDefinition::new(
-                REFRESH_POOL_SIZES_STEP,
-                "Refresh the pool sizes the removed workers left",
-                Arc::new(RefreshPoolSizesStep),
-            )
-            .with_timeout(Duration::from_secs(10))
             .with_retry(single_attempt())
             .depends_on(&[REMOVE_PROVIDER_WORKERS_STEP]),
         )
@@ -667,7 +655,7 @@ mod tests {
     }
 
     /// With no feed the line is the one it was. Under a feed it is the
-    /// store crate's removal at the door and five gateway steps, each
+    /// store crate's removal at the door and four gateway steps, each
     /// behind one step alone. No step writes the classic policies, and none
     /// takes a row's worker out of the registry by hand.
     #[test]
@@ -682,7 +670,7 @@ mod tests {
             ),
             ("release_tokenizer", &["remove_from_worker_registry"]),
         ];
-        let at_the_door: [(&str, &[&str]); 9] = [
+        let at_the_door: [(&str, &[&str]); 8] = [
             ("find_workers_to_remove", &[]),
             ("settle_drained_workers", &["drain_workers_at_door"]),
             ("drain_workers_at_door", &["find_workers_to_remove"]),
@@ -690,7 +678,6 @@ mod tests {
             ("drain_provider_workers", &["remove_workers_at_door"]),
             ("remove_provider_workers", &["drain_provider_workers"]),
             ("forget_cache_events", &["remove_provider_workers"]),
-            ("refresh_pool_sizes", &["remove_provider_workers"]),
             ("release_tokenizer", &["remove_provider_workers"]),
         ];
         let registry = Arc::new(WorkerRegistry::new());
@@ -802,7 +789,6 @@ mod tests {
             for step in ["drain_provider_workers", "remove_provider_workers"] {
                 assert_eq!(ended(step), provider_steps, "{url} {step}");
             }
-            assert_eq!(ended("refresh_pool_sizes"), StepStatus::Succeeded, "{url}");
             // The registry's drain waits the provider's own window.
             assert_eq!(asked.elapsed() >= window, url == provider, "{url}");
             assert!(!stands(url, &stood), "{url}");
@@ -971,7 +957,6 @@ mod tests {
             "remove_workers_at_door",
             "drain_provider_workers",
             "remove_provider_workers",
-            "refresh_pool_sizes",
         ] {
             let ended = state.step_states[&StepId::new(step)].status;
             assert_eq!(ended, StepStatus::Succeeded, "{step}");

@@ -31,7 +31,7 @@ use crate::{
             zmq_client::zmq_handshake_address,
         },
     },
-    workflow::{data::WorkerWorkflowData, steps::shared::pool_groups_touched},
+    workflow::data::WorkerWorkflowData,
 };
 
 /// The id of the gateway's check on the local line.
@@ -116,11 +116,6 @@ impl StepExecutor<WorkerWorkflowData> for CheckLocalWorkerStep {
             *connection_mode,
             &flags,
         );
-        // The registration step refreshes the pool sizes. Where the door
-        // writes the registry ahead of it, this read alone still finds the
-        // worker a replacement moves out of its group.
-        context.data.host_notes.pool_groups =
-            pool_groups_touched(&app_context.worker_registry, workers);
 
         if mm_settings().processing.value == MmProcessingMode::Worker {
             warn_about_media_processing(workers, &app_context.worker_registry);
@@ -595,49 +590,6 @@ mod tests {
                     && line.ends_with(" 0")
             }),
             "{scrape}"
-        );
-    }
-
-    /// The check notes the pool-size groups its registration touches ahead
-    /// of the write: the new worker's group, and the group of the worker
-    /// that stands under its URL.
-    #[tokio::test]
-    async fn the_check_notes_the_group_of_the_worker_its_registration_replaces() {
-        use smg_worker::workflow::pool_group;
-
-        let host = app_context_with(
-            RouterConfig::builder()
-                .worker_startup_timeout_secs(1)
-                .parser(ParserChoice::Symphony)
-                .build_unchecked(),
-        );
-        let standing: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://127.0.0.1:18001")
-                .model(ModelCard::new("another-model"))
-                .connection_mode(ConnectionMode::Grpc)
-                .build(),
-        );
-        host.worker_registry
-            .register(Arc::clone(&standing))
-            .expect("the standing worker registers");
-
-        let mode = WorkerRegistrationMode::Upsert;
-        let mut ctx = grpc_worker_context("Qwen/Qwen3-8B", mode, Arc::clone(&host));
-        assert_eq!(
-            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
-            StepResult::Success
-        );
-        assert_eq!(
-            CheckLocalWorkerStep.execute(&mut ctx).await.unwrap(),
-            StepResult::Success
-        );
-        let created = ctx.data.actual_workers.as_deref().expect("the new worker");
-        let noted = &ctx.data.host_notes.pool_groups;
-        assert_eq!(noted.len(), 2, "{noted:?}");
-        assert!(noted.contains(&pool_group(standing.as_ref())), "{noted:?}");
-        assert!(
-            noted.contains(&pool_group(created[0].as_ref())),
-            "{noted:?}"
         );
     }
 

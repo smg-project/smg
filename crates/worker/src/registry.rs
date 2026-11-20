@@ -40,6 +40,7 @@ use crate::{
 };
 
 pub mod event;
+mod pool;
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -238,6 +239,11 @@ pub struct WorkerRegistry<G> {
     /// reading it costs one map probe and no worker walk.
     model_overloaded: Arc<DashMap<String, AtomicUsize, FxBuildHasher>>,
 
+    /// Count of workers in each pool group, which the pool-size gauge reads.
+    /// Moved by a delta where a worker enters, is replaced or leaves, with
+    /// the gauge's write in the same hold.
+    pool_sizes: pool::PoolSizes,
+
     /// `--worker-overload-shed`: refuse a request with a 503 when every
     /// candidate is overloaded instead of steering it to the least-loaded
     /// one. Read by every router at its overload decision points.
@@ -335,6 +341,7 @@ impl<G: Generation> WorkerRegistry<G> {
             url_to_id: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             worker_mutation_locks: Arc::new(DashMap::new()),
             model_overloaded: Arc::new(DashMap::with_hasher(FxBuildHasher)),
+            pool_sizes: pool::PoolSizes::default(),
             overload_shed: Arc::new(AtomicBool::new(false)),
             overload_transitions: Arc::new(parking_lot::Mutex::new(())),
             model_retry_configs: Arc::new(DashMap::with_hasher_and_shard_amount(
@@ -1404,6 +1411,10 @@ impl<G: Generation> WorkerRegistry<G> {
         // they go: the series store keeps its witness, so a later removal of
         // the URL drops those writes until the old instance is gone too.
         Metrics::worker_replaced(old_worker.url(), Arc::downgrade(&old_worker));
+        // A replacement of another type, mode or primary model leaves one
+        // pool group and joins another, in this one step.
+        self.pool_sizes
+            .replaced(old_worker.as_ref(), new_worker.as_ref());
 
         // The replacement's series are its own from here: its HTTP/2 flag,
         // and the breaker it ends with, the adopted one or one of its own.
@@ -1855,6 +1866,8 @@ impl<G: Generation> WorkerRegistry<G> {
             // registration of the same URL cannot slip in between and have its
             // fresh series retired under it.
             Metrics::remove_worker_metrics(worker.url(), Arc::downgrade(&worker));
+            // Its pool group gives it up in the same step.
+            self.pool_sizes.left(worker.as_ref());
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
@@ -2098,6 +2111,8 @@ impl<G: Generation> WorkerRegistry<G> {
         Metrics::worker_registered(worker.url());
         worker.publish_series();
         worker.republish_state();
+        // Its pool group counts it from here.
+        self.pool_sizes.entered(worker.as_ref());
 
         // The worker's request counter starts at zero with its registration,
         // so a worker that gets no traffic shows as such.
