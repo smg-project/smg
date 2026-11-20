@@ -65,7 +65,10 @@ use std::{
     borrow::Cow,
     cell::{RefCell, RefMut},
     ops::Range,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex, OnceLock, PoisonError,
+    },
     time::Instant,
 };
 
@@ -312,14 +315,157 @@ const LONG_PIECE_BYTES_TOTAL: usize = 128 << 20;
 /// What an entry of the long tier takes beyond its piece and ids.
 const LONG_PIECE_ENTRY_BYTES: usize = size_of::<(Box<[u8]>, Box<[u32]>)>();
 
-/// Inputs at least this long are encoded unit by unit on the thread pool (a
-/// text between added tokens, or a chunk of one cut at a stable boundary)
-/// when the pool has more than one thread (see `worth_the_pool`); shorter
-/// inputs would spend more on the hand-offs than they save.
+/// Inputs at least this long are cut into units (a text between added
+/// tokens, or a chunk of one cut at a stable boundary) when the pool has
+/// threads to spare for the texts in flight (see `pool_helpers`). A text
+/// of three units or more, from about 96 KiB, is encoded by the calling
+/// thread and the threads of the pool that help it; one of two units (64
+/// to 96 KiB) is cut and encoded by its calling thread alone, since no job
+/// is handed out for one unit. Shorter inputs would spend more on the
+/// hand-offs than they save.
 const PARALLEL_MIN_BYTES: usize = 64 << 10;
 /// The size a long text unit is cut into for the pool, at the first stable
 /// boundary past each multiple of it.
 const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
+/// The shortest text counted among the encodes in flight
+/// ([`ENCODES_IN_FLIGHT`]): the two atomic steps of a counted call are
+/// nothing beside an encode of this size, and a shorter text is out again
+/// before it could stand in a long one's way.
+const COUNTED_MIN_BYTES: usize = 4 << 10;
+/// Texts of [`COUNTED_MIN_BYTES`] or more that are being encoded now, by
+/// every encoder of the process: the thread pool is one for the process, so
+/// two encoders have to see each other. A long text shares the threads of
+/// the pool with the texts counted as it came in (see `pool_helpers`).
+static ENCODES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// One text counted among the encodes in flight until it drops.
+struct InFlight<'a> {
+    count: &'a AtomicUsize,
+    /// The texts counted when this one came in, itself among them.
+    texts: usize,
+}
+
+impl<'a> InFlight<'a> {
+    /// Counts one text into `count`.
+    fn enter(count: &'a AtomicUsize) -> Self {
+        Self {
+            count,
+            texts: count.fetch_add(1, Ordering::Relaxed) + 1,
+        }
+    }
+
+    /// The threads of a pool of `threads` that help this text's calling
+    /// thread: the pool's threads divided among the texts in flight as it
+    /// came in, less the one that calls. A text alone in flight is helped
+    /// by every other thread of the pool, the second of two texts on
+    /// sixteen threads by seven, and a text that came in among more texts
+    /// than half the pool's threads by none.
+    fn helpers(&self, threads: usize) -> usize {
+        (threads / self.texts).saturating_sub(1)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The units of one long text while its calling thread and the threads of
+/// the pool that help it encode them, dealt in spans of consecutive units:
+/// the first span is the calling thread's and each helper has one. A
+/// thread takes the units of its own span from the front, then the units
+/// of a span whose thread has not begun, from the back, so no unit waits
+/// for a thread that sleeps. A span whose thread has begun is that
+/// thread's to the end. The calling thread begins its span at its first
+/// take, after unit 0: until then the others take from that span's back,
+/// which gives a unit to a helper whose own span came out empty, as it
+/// does when a text has about as many units as threads.
+///
+/// The deal keeps a thread on the units its piece cache holds when a text
+/// comes again. Taken by a race from the front, a thread's units were
+/// other ones at every call and each cache had to learn the whole text;
+/// and a thread that knows a unit takes it before the thread that has yet
+/// to learn it gets there, so that thread learned a unit or two a call.
+/// One caller that repeats a text of 500,000 tokens on a pool of two
+/// threads encoded a fifth fewer tokens a second than before the calling
+/// thread took units, over the ten calls after the third (measured); with
+/// the spans it is level from the fourth call.
+struct UnitClaims {
+    /// The ids of each unit or why its text leaves the direct path, set by
+    /// the thread that took the unit.
+    outputs: Vec<OnceLock<Result<Vec<u32>, Fallback>>>,
+    /// The spans; unit 0 is the calling thread's and in no span. A lock a
+    /// span: it is held for one step of a range, once a unit.
+    spans: Vec<Mutex<UnitSpan>>,
+    /// The model declined a piece of a unit: no further unit is taken.
+    declined: AtomicBool,
+}
+
+/// One span of [`UnitClaims`].
+struct UnitSpan {
+    /// The units of the span no thread has taken.
+    left: Range<usize>,
+    /// The span's own thread has taken a unit of it, or found none left.
+    begun: bool,
+}
+
+impl UnitClaims {
+    /// The claims of `units` dealt in `spans` spans, as many as threads
+    /// encode the text and no more than units, unit 0 taken for its calling
+    /// thread. The spans hold about the same bytes of text each, not the
+    /// same count of units: a span ends with the unit that fills its share
+    /// of the bytes. An added token counts nothing, so a prompt of short
+    /// texts between added tokens and long ones is dealt by what there is
+    /// to encode.
+    fn new(units: &[Segment<'_>], spans: usize) -> Self {
+        let bytes = |unit: &Segment<'_>| match unit {
+            Segment::Added(_) => 0,
+            Segment::Text(text) => text.len(),
+        };
+        let span = |left| Mutex::new(UnitSpan { left, begun: false });
+        let share = units.iter().map(bytes).sum::<usize>() / spans;
+        let mut dealt = Vec::with_capacity(spans);
+        let (mut start, mut seen) = (1, 0);
+        for (index, unit) in units.iter().enumerate() {
+            seen += bytes(unit);
+            while dealt.len() + 1 < spans && seen >= (dealt.len() + 1) * share {
+                dealt.push(span(start..index + 1));
+                start = index + 1;
+            }
+        }
+        dealt.push(span(start..units.len()));
+        Self {
+            outputs: units.iter().map(|_| OnceLock::new()).collect(),
+            spans: dealt,
+            declined: AtomicBool::new(false),
+        }
+    }
+
+    /// The next unit for a thread whose own span is `home`: the first unit
+    /// left of that span, then the last unit left of a span no thread has
+    /// begun, the spans after its own first, around to the one before it;
+    /// `None` when no such unit is left or a piece was declined.
+    fn take(&self, home: usize) -> Option<usize> {
+        if self.declined.load(Ordering::Relaxed) {
+            return None;
+        }
+        let spans = self.spans.len();
+        (0..spans).find_map(|step| {
+            let mut span = self.spans[(home + step) % spans]
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if step == 0 {
+                span.begun = true;
+                span.left.next()
+            } else if span.begun {
+                None
+            } else {
+                span.left.next_back()
+            }
+        })
+    }
+}
 /// Threads of the pool the vocabulary seed is read on at load. The pool is
 /// built for that read and joined before the load returns: on rayon's
 /// global pool the first load would build that pool at the machine's
@@ -2515,9 +2661,11 @@ impl NativeEncoder {
     /// `tokenizers` instead, for the caller to count: a piece the model
     /// declines, found after the pieces before it were tokenized, so that
     /// the error surfaces from the `tokenizers` encode. A long input is
-    /// encoded on the thread pool, unit by unit (see [`Self::units`]), with
-    /// the same code per unit, when the pool has more than one thread (see
-    /// [`Self::worth_the_pool`]). `model` is the model behind the vocabulary,
+    /// encoded unit by unit (see [`Self::units`]), with the same code per
+    /// unit, by the calling thread and the threads of the pool that help
+    /// it, when the pool has threads to spare for the texts in flight (see
+    /// [`Self::pool_helpers`]); otherwise by the calling thread alone.
+    /// `model` is the model behind the vocabulary,
     /// read for the whole-piece lookup of `ignore_merges` and for the
     /// pieces of a model whose merge table declined; `None` for a
     /// vocabulary read from ranks ([`Self::from_ranks`]), whose table is
@@ -2528,17 +2676,48 @@ impl NativeEncoder {
         text: &str,
         add_special_tokens: bool,
     ) -> Result<Vec<u32>, Fallback> {
-        self.encode_with(model, text, Self::worth_the_pool(text), add_special_tokens)
+        let in_flight = Self::in_flight(text);
+        let helpers = Self::pool_helpers(text, in_flight.as_ref());
+        self.encode_units(model, text, helpers, true, add_special_tokens, true)
     }
 
-    /// Whether `text` is encoded through the thread pool: long enough
-    /// (`PARALLEL_MIN_BYTES`) and a pool with more than one thread to cut
-    /// it for. A pool of one thread (a process pinned to one core, a
-    /// container with one CPU) encodes the units one after the other and
-    /// pays the cut, the Vec per unit and the join for nothing: 5 % of the
-    /// cycles and 140 allocations per encode of 2 MB on one core, measured.
-    fn worth_the_pool(text: &str) -> bool {
-        text.len() >= PARALLEL_MIN_BYTES && rayon::current_num_threads() > 1
+    /// `text` counted among the encodes in flight ([`ENCODES_IN_FLIGHT`])
+    /// until the value drops, when it is long enough to count
+    /// (`COUNTED_MIN_BYTES`).
+    fn in_flight(text: &str) -> Option<InFlight<'static>> {
+        (text.len() >= COUNTED_MIN_BYTES).then(|| InFlight::enter(&ENCODES_IN_FLIGHT))
+    }
+
+    /// The threads of the pool asked to help the calling thread encode
+    /// `text`: none for a text under `PARALLEL_MIN_BYTES`; for a longer
+    /// one the pool's threads divided among the texts in flight as it came
+    /// in (`in_flight`, itself among them), less one, the calling thread
+    /// (see [`InFlight::helpers`]). With no helper the calling thread
+    /// encodes the text alone and uncut, as it encodes a short one: a text
+    /// that came in among more texts than half the pool's threads, and
+    /// every text on a pool of one thread (a process pinned to one core, a
+    /// container with one CPU), where the cut, the Vec per unit and the
+    /// join bought nothing (5 % of the cycles and 140 allocations per
+    /// encode of 2 MB on one core, measured).
+    ///
+    /// The calling thread takes units of its text itself (see
+    /// [`Self::encode_claimed_units`]) and the helpers take the rest, so a
+    /// long text no longer waits for a thread of the pool to wake before
+    /// its first unit, and it spreads over as many threads as the pool can
+    /// spare it rather than over every thread of the pool. The pool buys a
+    /// long text's wall time with idle cores, and callers that already fill
+    /// the cores leave it none. The calling thread so takes a piece cache
+    /// at its first long text ([`Self::thread_piece_cache`]) and counts
+    /// among the threads the cache totals are shared by
+    /// ([`Self::piece_cache_share`]), where before a thread that sent only
+    /// long texts held none.
+    fn pool_helpers(text: &str, in_flight: Option<&InFlight<'_>>) -> usize {
+        match in_flight {
+            Some(counted) if text.len() >= PARALLEL_MIN_BYTES => {
+                counted.helpers(rayon::current_num_threads())
+            }
+            _ => 0,
+        }
     }
 
     /// The ids of `text` with no added token cut out of it and no frame:
@@ -2554,19 +2733,17 @@ impl NativeEncoder {
         text: &str,
         at_start: bool,
     ) -> Result<Vec<u32>, Fallback> {
-        self.encode_units(
-            model,
-            text,
-            Self::worth_the_pool(text),
-            false,
-            false,
-            at_start,
-        )
+        let in_flight = Self::in_flight(text);
+        let helpers = Self::pool_helpers(text, in_flight.as_ref());
+        self.encode_units(model, text, helpers, false, false, at_start)
     }
 
-    /// [`Self::encode`] with the thread pool used or not; the ids are the
-    /// same either way (the units are encoded by the same code in the same
-    /// order).
+    /// [`Self::encode`] with the thread pool used or not, whatever is in
+    /// flight: with it (`parallel`) the text is cut and every other thread
+    /// of the pool, one at the least, is asked to help, as for a text alone
+    /// in flight; the ids are the same either way (the units are encoded by
+    /// the same code in the same order).
+    #[cfg(test)]
     pub(crate) fn encode_with(
         &self,
         model: Option<&ModelWrapper>,
@@ -2574,23 +2751,31 @@ impl NativeEncoder {
         parallel: bool,
         add_special_tokens: bool,
     ) -> Result<Vec<u32>, Fallback> {
-        self.encode_units(model, text, parallel, true, add_special_tokens, true)
+        let helpers = if parallel {
+            rayon::current_num_threads().saturating_sub(1).max(1)
+        } else {
+            0
+        };
+        self.encode_units(model, text, helpers, true, add_special_tokens, true)
     }
 
-    /// The encode behind [`Self::encode_with`] and [`Self::encode_plain`]:
-    /// `added` says whether the added tokens are cut out of the text first,
-    /// `framed` whether the post-processor's frame goes around the ids,
-    /// `at_start` whether the text starts the input (see
+    /// The encode behind [`Self::encode`] and [`Self::encode_plain`]:
+    /// `helpers` is the count of pool threads asked to help the calling
+    /// thread (none: the text is not cut for the pool and its caller
+    /// encodes it alone), `added` says whether the added tokens are cut out
+    /// of the text first, `framed` whether the post-processor's frame goes
+    /// around the ids, `at_start` whether the text starts the input (see
     /// [`Self::marker_before`]).
     fn encode_units(
         &self,
         model: Option<&ModelWrapper>,
         text: &str,
-        parallel: bool,
+        helpers: usize,
         added: bool,
         framed: bool,
         at_start: bool,
     ) -> Result<Vec<u32>, Fallback> {
+        let parallel = helpers > 0;
         // The scanners' word scans, chosen once per call on the input's
         // length (`WORD_SCAN_MIN_BYTES`): every unit of a long input takes
         // them; a short input walks its runs byte by byte, the chain
@@ -2611,32 +2796,38 @@ impl NativeEncoder {
         } else {
             (&[], &[])
         };
-        if parallel && units.len() >= 2 {
-            // One Vec per unit, reserved for its text's estimate up front
-            // (see `ids_capacity`: a denser unit grows past it by doubling)
-            // and filled in place, then joined; the pool's collection makes
-            // no list of its own (measured by the crate's encode_cost bench:
-            // a 32k-token encode made 60-125 allocations this way before,
-            // 6-49 after; what remains is per unit, the mapping buffer below
-            // growing to its first piece and the ids growing past their
-            // estimate on denser text). The join copies each id once, as it
-            // did.
-            let mut parts: Vec<Vec<u32>> = units
-                .iter()
-                .map(|unit| Vec::with_capacity(Self::ids_capacity(unit)))
-                .collect();
-            units
-                .par_iter()
-                .zip(parts.par_iter_mut())
-                .enumerate()
-                .try_for_each(|(index, (unit, ids))| {
-                    let marker = self.marker_before(units, index, at_start);
-                    let mut mapped = String::new();
-                    let mut cache = self.piece_cache_for_call();
-                    self.encode_unit(model, unit, marker, words, &mut mapped, ids, &mut cache)?;
-                    self.answer_rest(ids, &mut cache);
-                    Ok(())
-                })?;
+        // A text of one or two units stays with its caller: no job is handed
+        // out for one unit.
+        if parallel && units.len() >= 3 {
+            // The calling thread starts on unit 0 at once and the helpers,
+            // one job each, take units as they wake (`UnitClaims`), no more
+            // of them than units are left for them. A helper's own span
+            // follows its place in the pool: the pool wakes the same
+            // threads for the same count of jobs, so a thread has the same
+            // span when the text comes again (two helpers that share a
+            // place share a span, and the span left without a thread is
+            // taken by the others). A helper that wakes after the last unit
+            // was taken returns without a cache or a buffer; the scope
+            // ends when every job it handed out has.
+            let jobs = helpers.min(units.len() - 1);
+            let claims = UnitClaims::new(units, jobs + 1);
+            rayon::in_place_scope(|scope| {
+                for _ in 0..jobs {
+                    scope.spawn(|_| {
+                        let home = 1 + rayon::current_thread_index().unwrap_or(0) % jobs;
+                        self.encode_claimed_units(model, units, &claims, home, words, at_start);
+                    });
+                }
+                self.encode_claimed_units(model, units, &claims, 0, words, at_start);
+            });
+            // Each unit's ids filled a Vec of their own; the join copies
+            // each id once. A unit no thread took is one a declined piece
+            // left behind: the text leaves before the join.
+            let parts = claims
+                .outputs
+                .into_iter()
+                .map(|output| output.into_inner().unwrap_or(Err(Fallback::PieceDeclined)))
+                .collect::<Result<Vec<_>, _>>()?;
             let body: usize = parts.iter().map(Vec::len).sum();
             let mut ids = Vec::with_capacity(before.len() + body + after.len());
             ids.extend_from_slice(before);
@@ -2665,6 +2856,69 @@ impl NativeEncoder {
         self.answer_rest(&mut ids, &mut cache);
         ids.extend_from_slice(after);
         Ok(ids)
+    }
+
+    /// Encodes units of one long text on the current thread, one after the
+    /// other until none is left for it to take (`claims`): the units of
+    /// the thread's own span (`home`) and after them the units of the
+    /// spans no thread has begun. The calling thread's span is the first
+    /// and it starts on unit 0, which no other thread takes, so it always
+    /// encodes a unit of its text. One
+    /// mapping buffer and one borrow of the thread's piece cache serve all
+    /// the units the thread takes, and a thread that finds none takes
+    /// neither. Each unit's ids go to a Vec of their own, reserved for the
+    /// unit's estimate up front (see `ids_capacity`: a denser unit grows
+    /// past it by doubling), into the unit's slot of `claims`; a declined
+    /// piece goes there instead and stops the taking, and the units taken
+    /// before it are encoded to their ends all the same.
+    fn encode_claimed_units(
+        &self,
+        model: Option<&ModelWrapper>,
+        units: &[Segment<'_>],
+        claims: &UnitClaims,
+        home: usize,
+        words: bool,
+        at_start: bool,
+    ) {
+        let first = if home == 0 {
+            Some(0)
+        } else {
+            claims.take(home)
+        };
+        let Some(mut index) = first else {
+            return;
+        };
+        let mut mapped = String::new();
+        let mut cache = self.piece_cache_for_call();
+        loop {
+            let unit = &units[index];
+            let marker = self.marker_before(units, index, at_start);
+            let mut ids = Vec::with_capacity(Self::ids_capacity(unit));
+            let output = match self.encode_unit(
+                model,
+                unit,
+                marker,
+                words,
+                &mut mapped,
+                &mut ids,
+                &mut cache,
+            ) {
+                Ok(()) => {
+                    self.answer_rest(&mut ids, &mut cache);
+                    Ok(ids)
+                }
+                Err(reason) => {
+                    claims.declined.store(true, Ordering::Relaxed);
+                    Err(reason)
+                }
+            };
+            // A unit is taken once, so its slot is empty until here.
+            let _ = claims.outputs[index].set(output);
+            let Some(next) = claims.take(home) else {
+                return;
+            };
+            index = next;
+        }
     }
 
     /// Room for the ids of one unit, from its bytes: about a token per three
