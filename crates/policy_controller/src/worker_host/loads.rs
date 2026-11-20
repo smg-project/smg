@@ -9,9 +9,10 @@
 //! holder, under the map's write lock. It releases the map before calling
 //! the store, which takes its own locks and may pay for a membership build
 //! on a poll answer. What a worker over several ranks stated has a lock of
-//! its own, taken behind the map's release and held across the store's
-//! writes of that worker's values. The store calls no adapter, so nothing
-//! takes the two the other way. The adapter calls no collector.
+//! its own, in the worker's entry. It is taken behind the map's release
+//! and held across the store's calls for that worker's values: the read
+//! of another rank's row, and the writes. The store calls no adapter, so
+//! nothing takes the two the other way. The adapter calls no collector.
 
 use std::{
     sync::{Arc, OnceLock},
@@ -29,7 +30,7 @@ use smg_worker::{
 
 use super::{object::role, Lead, Objects};
 use crate::{
-    load_report::{load_row, signal_values, RankValues},
+    load_report::{load_row, signal_values, RankValues, ReportOf},
     signals::SignalColumn,
     store::{LoadSink as StoreLoadSink, LoadSource, PollMode as StorePollMode, SignalSink},
     view::{Role, SignalSource, WorkerId},
@@ -83,9 +84,11 @@ struct KeptMember {
 /// that worker's values are made over what each rank last stated, each
 /// statement under its own sample instant ([`RankValues`]). The statements
 /// are kept in the worker's entry, and go with it at a forget, at a reset
-/// and when another object takes its address. A polled answer is one
-/// sample of every rank, and states them all, though its row is passed
-/// over. A worker of one rank keeps none.
+/// and when another object takes its address. What a rank stated before
+/// its entry kept it is read from the report again, under that rank's own
+/// record as the store holds its row: a worker's first records list one
+/// rank. A polled answer is one sample of every rank, and states them
+/// all, though its row is passed over. A worker of one rank keeps none.
 pub struct LoadAdapter<G, S: ?Sized> {
     objects: Arc<Objects<G>>,
     store: Arc<S>,
@@ -251,9 +254,9 @@ impl<G: Generation, S: StoreLoadSink + SignalSink + ?Sized> LoadAdapter<G, S> {
             };
             let mut keeper = keeper.lock();
             if passed_over {
-                keeper.keep(report, None, &columns, polled_at);
+                keeper.keep(report, ReportOf::EveryRank, &columns, polled_at);
             } else {
-                keeper.values(report, None, &columns, polled_at, write);
+                keeper.values(report, ReportOf::EveryRank, &columns, polled_at, write);
             }
         }
         passed
@@ -312,12 +315,21 @@ where
             return;
         }
         // A report of several ranks lists each at its latest record: this
-        // record states its own rank alone.
+        // record states its own rank. Another rank's entry is read where
+        // nothing of it is kept yet, under that rank's own last record as
+        // the store holds its row.
         if let Some(keeper) = self.keeper(worker) {
-            let own = Some(i32::from(rank));
+            let heard = |other: i32| {
+                let other = u16::try_from(other).ok()?;
+                Some(self.store.load(member.row, other)?.sampled_at)
+            };
+            let of = ReportOf::OneRank {
+                rank: i32::from(rank),
+                heard: &heard,
+            };
             keeper
                 .lock()
-                .values(report, own, &columns, sampled_at, write);
+                .values(report, of, &columns, sampled_at, write);
         }
     }
 
@@ -1303,8 +1315,13 @@ mod tests {
     /// The `random` preset as the next generation, declaring the depth in
     /// items and the fixed count of used tokens, applied to the store.
     fn declare(replica: &Replica) {
+        declare_as(replica, 2);
+    }
+
+    /// As [`declare`], as the generation `generation`.
+    fn declare_as(replica: &Replica, generation: u64) {
         let mut document = PolicySpec::preset("random").expect("a preset of this build");
-        document.generation = 2;
+        document.generation = generation;
         for (name, unit) in [("depth", "items"), ("kv_tokens_used", "tokens")] {
             let spec = SignalSpec {
                 unit: unit.to_owned(),
@@ -1562,6 +1579,10 @@ mod tests {
         assert_eq!(depth(&replica, id), Some((2.0, micros(later))));
     }
 
+    /// A worker's statements go with its entry. Behind a reset the store
+    /// still holds each rank's row: a rank's last statement is read from
+    /// its entry again, under its own record. Behind a forget the rows
+    /// went too, and the rank states again.
     #[test]
     fn a_workers_statements_go_with_its_entry() {
         let replica = Replica::new();
@@ -1570,21 +1591,68 @@ mod tests {
         let adapter = replica.lead();
         let start = Instant::now() + Duration::from_secs(1);
         let at = |ms: u64| start + Duration::from_millis(ms);
+        let micros = |at: Instant| replica.store.memory.micros(at);
         let both = file(&[(0, Some(1.0)), (1, Some(2.0))]);
         adapter.record(&worker, 1, &both, at(0), at(0));
-        // A reset drops the entry, and rank 1's statement with it: rank
-        // 0's record alone makes no value.
+        // A reset drops the entry, and rank 1's statement with it. The
+        // store holds rank 1's row still: rank 0's record reads rank 1's
+        // entry, under rank 1's own record.
         adapter.reset();
         adapter.record(&worker, 0, &both, at(10), at(10));
-        assert_eq!(depth(&replica, id), None);
-        adapter.record(&worker, 1, &both, at(20), at(20));
-        adapter.record(&worker, 0, &both, at(30), at(30));
-        let restated = replica.store.memory.micros(at(20));
-        assert_eq!(depth(&replica, id), Some((3.0, restated)));
-        // A forget drops it too, with the row's cells.
+        assert_eq!(depth(&replica, id), Some((3.0, micros(at(0)))));
+        // A forget takes the rows too: rank 1's entry has no instant, and
+        // counts when rank 1 states again.
         adapter.forget(&worker);
         adapter.record(&worker, 0, &both, at(40), at(40));
         assert_eq!(depth(&replica, id), None);
+        adapter.record(&worker, 1, &both, at(50), at(50));
+        adapter.record(&worker, 0, &both, at(60), at(60));
+        assert_eq!(depth(&replica, id), Some((3.0, micros(at(50)))));
+    }
+
+    /// A worker's first records list one rank, and are read as a worker
+    /// of one rank. The next rank's first record reads the first rank's
+    /// entry, under that rank's own record: a rank that stated once and
+    /// fell silent counts all the same, as old as it is.
+    #[test]
+    fn a_ranks_first_statement_counts_at_the_next_ranks_first_record() {
+        let replica = Replica::new();
+        let (id, worker) = replica.add(facts(URL));
+        declare(&replica);
+        let adapter = replica.lead();
+        let start = Instant::now() + Duration::from_secs(1);
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let alone = file(&[(1, Some(100.0))]);
+        adapter.record(&worker, 1, &alone, at(0), at(0));
+        assert_eq!(depth(&replica, id), None);
+        let both = file(&[(0, Some(1.0)), (1, Some(100.0))]);
+        adapter.record(&worker, 0, &both, at(9_000), at(9_000));
+        let first = replica.store.memory.micros(at(0));
+        assert_eq!(depth(&replica, id), Some((101.0, first)));
+    }
+
+    /// A document that declares the same signals keeps the statements, as
+    /// the store carries their cells. Rank 1's last record left the depth
+    /// out, so no report states it again: its statement still counts
+    /// behind the new document.
+    #[test]
+    fn a_new_document_of_the_same_signals_keeps_the_statements() {
+        let replica = Replica::new();
+        let (id, worker) = replica.add(facts(URL));
+        declare(&replica);
+        let adapter = replica.lead();
+        let start = Instant::now() + Duration::from_secs(1);
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let both = file(&[(0, Some(1.0)), (1, Some(2.0))]);
+        adapter.record(&worker, 1, &both, at(0), at(0));
+        adapter.record(&worker, 0, &both, at(10), at(10));
+        let bare = file(&[(0, Some(1.0)), (1, None)]);
+        adapter.record(&worker, 1, &bare, at(20), at(20));
+        assert_eq!(depth(&replica, id).map(|(value, _)| value), Some(3.0));
+        declare_as(&replica, 3);
+        let moved = file(&[(0, Some(4.0)), (1, None)]);
+        adapter.record(&worker, 0, &moved, at(30), at(30));
+        assert_eq!(depth(&replica, id).map(|(value, _)| value), Some(6.0));
     }
 
     /// A rank worker's report is one rank's, by a record and by a poll:
