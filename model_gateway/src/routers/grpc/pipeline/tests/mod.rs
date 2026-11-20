@@ -729,10 +729,10 @@ async fn image_to_a_worker_without_a_vision_verdict_is_not_refused() {
     )
     .await;
     let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
-    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
     assert_eq!(
-        body["error"]["code"], "invalid_multimodal_request",
+        body["error"]["code"], "multimodal_processing_failed",
         "{body}"
     );
 }
@@ -983,10 +983,10 @@ async fn image_to_a_pool_whose_engine_takes_images_goes_on_into_media_processing
     let (pipeline, components, _) =
         chat_pipeline_over(RuntimeType::Sglang, &[], model_dir.path()).await;
     let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
-    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
     assert_eq!(
-        body["error"]["code"], "invalid_multimodal_request",
+        body["error"]["code"], "multimodal_processing_failed",
         "{body}"
     );
 }
@@ -1057,15 +1057,22 @@ async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_
             .await
             .expect("drain body");
         let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
-        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
         if refused {
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
             assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
             assert_eq!(
                 body["error"]["message"], "backend mlx does not support image inputs",
                 "{body}"
             );
         } else {
-            assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
+            // Past the matrix the request goes on into media resolution, to
+            // the config lookup the test's model directory cannot satisfy:
+            // the deployment's fault, answered in the server's class.
+            assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+            assert_eq!(
+                body["error"]["code"], "multimodal_processing_failed",
+                "{body}"
+            );
         }
         assert!(
             seen_ids
