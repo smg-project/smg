@@ -271,22 +271,22 @@ impl Keyed {
     }
 
     /// Hands `decide` the request with its key's count beside the rows,
-    /// where `sessions` are lent and the request carries a key. One hold
-    /// of the key's shard reads the count and the pin of record: the
-    /// engine is handed the count by row, and asks that read for the pin.
-    /// Any other request is handed on as it stands.
-    // Forced into each of the hand's two calls: out of line a decision
-    // that reads no key would pay a call ahead of its engine's.
+    /// where the request carries a key. One hold of the key's shard in
+    /// `sessions` reads the count and the pin of record: the engine is
+    /// handed the count by row, and asks that read for the pin. A request
+    /// that carries no key is handed on as it stands.
+    // Forced into each of the hand's two calls: out of line a request
+    // with no key would pay a call ahead of its engine's.
     #[inline(always)]
     fn lend<'a, R>(
         &'a mut self,
-        sessions: Option<&'a StorePins<'a>>,
+        sessions: &'a StorePins<'a>,
         facts: &RequestFacts<'_>,
         constraints: &Constraints<'_>,
         candidates: &[Candidate],
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R {
-        let read = sessions.and_then(|pins| self.read(pins, facts.session(), candidates));
+        let read = self.read(sessions, facts.session(), candidates);
         let lent;
         let (facts, constraints) = match &read {
             Some((pin, rows)) => {
@@ -1162,7 +1162,8 @@ pub(crate) fn hand<A: Asked, R>(
         pins: pins.map(|pins| pins as &dyn PinSource),
     };
     // The store's sessions, where the decision's rule has an in-flight
-    // cap: a keyed request reads its key's count there.
+    // cap: a keyed request reads its key's count there. Under any other
+    // rule the engine is asked at once, past the key's read.
     let sessions = pins.filter(|_| needs.session_in_flight);
     if names {
         // A row is named by its place among the rows the decision is made
@@ -1186,8 +1187,9 @@ pub(crate) fn hand<A: Asked, R>(
             named: Some(named.affinity()),
             ..viewed
         };
-        let answer = request.read(lists, viewed, |facts, constraints| {
-            keyed.lend(
+        let answer = request.read(lists, viewed, |facts, constraints| match sessions {
+            None => decide.over_named(facts, &pool, candidates, constraints, scratch),
+            Some(sessions) => keyed.lend(
                 sessions,
                 facts,
                 constraints,
@@ -1195,18 +1197,19 @@ pub(crate) fn hand<A: Asked, R>(
                 |facts, constraints| {
                     decide.over_named(facts, &pool, candidates, constraints, scratch)
                 },
-            )
+            ),
         });
         return (answer, built);
     }
-    let answer = request.read(lists, viewed, |facts, constraints| {
-        keyed.lend(
+    let answer = request.read(lists, viewed, |facts, constraints| match sessions {
+        None => decide.over(facts, &pool, candidates, constraints, scratch),
+        Some(sessions) => keyed.lend(
             sessions,
             facts,
             constraints,
             candidates,
             |facts, constraints| decide.over(facts, &pool, candidates, constraints, scratch),
-        )
+        ),
     });
     (answer, built)
 }
@@ -1600,9 +1603,12 @@ impl Asked for Request<'_> {
 /// engine and the rows.
 pub trait Maker {
     /// The model of the request. The door takes its seat by it, ahead of
-    /// the load.
+    /// the load: the request [`Maker::make`] makes names this model.
     fn model(&self) -> &str;
-    /// The request, made from the world its decision is made under.
+    /// The request, made from the world its decision is made under. It is
+    /// made inside the door's hold of its seat: a maker that waits holds
+    /// up the seat's other requests, and one that asks the door again can
+    /// wait on the seat it holds.
     fn make<'w>(&'w self, world: &'w World) -> Request<'w>;
 }
 
@@ -4431,24 +4437,17 @@ pub(crate) mod tests {
         asked
     }
 
-    /// The door hands a keyed decision its key's count beside the rows, by
-    /// row, and writes none into a row: over the publication's own rows,
-    /// and over the rows written for a gateway that states its wires. A
-    /// worker that is no candidate of the decision is dropped from the
-    /// count, and a request with no key is handed none.
-    #[test]
-    fn the_door_hands_a_keys_count_beside_the_rows_and_writes_none_into_a_row() {
-        let store = fleet(1);
+    /// Applies `document` to `store` with the counting picker as the pick
+    /// of its `manual` profile, under a rule whose keys the profile's own
+    /// stages place: the picker is handed each key no pin takes and each
+    /// key placed again at its cap. Returns the reader of what the last
+    /// decision handed the picker.
+    fn counting(store: &MemoryStore, mut document: PolicySpec) -> impl Fn() -> Handed {
         let handed = Arc::new(Mutex::new(Vec::new()));
         let kept = Arc::clone(&handed);
         let mut catalog = Catalog::builtin();
         let added = catalog.picker("counted", move || Box::new(Counted(Arc::clone(&kept))));
         added.expect("a free name");
-        // A cap of one, under a rule whose keys the profile's own stages
-        // place: the picker is handed each key no pin takes and each key
-        // placed again at its cap. Its draw may land on the key's worker
-        // again, which is the pin taken.
-        let mut document = capped(2, 1);
         let profile = document.profiles.get_mut("manual");
         profile.expect("the preset's profile").pick = "counted".into();
         let rule = document.bindings[0].sessions.as_mut();
@@ -4457,12 +4456,25 @@ pub(crate) mod tests {
         let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
         let applied = store.apply(spec.expect("the catalog holds the stage"));
         applied.expect("a later generation");
-        let door = Door::new(Arc::clone(&store));
-        let last = || {
+        move || {
             let handed = handed.lock();
             let last: Option<&Handed> = handed.last();
             last.cloned().expect("a decision reached the picker")
-        };
+        }
+    }
+
+    /// The door hands a keyed decision its key's count beside the rows, by
+    /// row, and writes none into a row: over the publication's own rows,
+    /// and over the rows written for a gateway that states its wires. A
+    /// worker that is no candidate of the decision is dropped from the
+    /// count, and a request with no key is handed none.
+    #[test]
+    fn the_door_hands_a_keys_count_beside_the_rows_and_writes_none_into_a_row() {
+        let store = fleet(1);
+        // A cap of one. The picker's draw may land on the key's worker
+        // again, which is the pin taken.
+        let last = counting(&store, capped(2, 1));
+        let door = Door::new(Arc::clone(&store));
         // A key's first request: none of its requests is in flight.
         let (first, owner, _) = placed(&door, &keyed(b"r-1", 7, 1));
         assert_eq!((last().lent(), last().counted), (Some(vec![]), true));
@@ -4505,6 +4517,39 @@ pub(crate) mod tests {
         assert_eq!(verdict == SessionVerdict::Respill, next != held);
         assert_eq!(last().lent(), Some(vec![(held, 1)]));
         assert_eq!(last().rows.len(), 2);
+    }
+
+    /// A profile whose own stages read the affinity column is asked over
+    /// the rows the store names for it ([`Decides::over_named`]). A keyed
+    /// decision reads its key's count at that call as at the other: the
+    /// picker is handed the count beside the rows, and each lease books the
+    /// key.
+    #[test]
+    fn a_decision_over_named_rows_reads_its_keys_count() {
+        let store = fleet(1);
+        let mut document = capped(2, 1);
+        let profile = document.profiles.get_mut("manual");
+        let profile = profile.expect("the preset's profile");
+        profile.score.push("prefix-affinity".into());
+        let last = counting(&store, document);
+        let named = store.with_world(|world| {
+            let engine = world.spec().engine();
+            engine.named_for(MODEL, Phase::Single)
+        });
+        assert_ne!(named, 0, "the profile is named its rows");
+        let door = Door::new(Arc::clone(&store));
+        let (first, owner, _) = placed(&door, &keyed(b"r-1", 7, 1));
+        assert_eq!((last().lent(), last().counted), (Some(vec![]), true));
+        report(&door, first, dispatched());
+        // The second finds the cap met: the picker reads the first on the
+        // key's worker.
+        placed(&door, &keyed(b"r-2", 7, 2));
+        assert_eq!(last().lent(), Some(vec![(owner, 1)]));
+        // Each of the two leases books the key.
+        let mut carried = Vec::new();
+        store.keyed(keyed(b"r-0", 7, 0).facts.session(), &mut carried);
+        let booked: u32 = carried.iter().map(|&(_, count)| count).sum();
+        assert_eq!(booked, 2, "{carried:?}");
     }
 
     /// One read of a key's shard names the rows that carry the key's
