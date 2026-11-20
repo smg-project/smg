@@ -135,6 +135,11 @@ pub(crate) fn mark() -> [u8; 8] {
 }
 
 /// What an attempt states of its request.
+///
+/// A stage builds its ask over [`Ask::of`] and names the facts it holds:
+/// `Ask { streaming, tried, ..Ask::of(id, model) }`. A fact the host learns
+/// to read later is then stated by the stages that hold it, and breaks no
+/// other.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Ask<'a> {
     /// The request's id.
@@ -157,6 +162,21 @@ pub(crate) struct Ask<'a> {
 }
 
 impl<'a> Ask<'a> {
+    /// An ask for `model` under the request's `id` that states no other
+    /// fact: not streamed, no input of a routing key, nothing tried, no
+    /// hashes.
+    pub(crate) const fn of(id: &'a [u8], model: &'a str) -> Self {
+        Self {
+            id,
+            model,
+            streaming: false,
+            headers: None,
+            rid: None,
+            tried: &[],
+            hashes: None,
+        }
+    }
+
     /// The request's routing key by the sources its binding names in `spec`:
     /// the first that holds a value
     /// ([`KeySources::derive`](smg_policy_controller::KeySources::derive)).

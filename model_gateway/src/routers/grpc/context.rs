@@ -2037,18 +2037,7 @@ mod tests {
     async fn place_worker() -> Result<(Placed, Arc<MemoryStore>), Unplaced> {
         let (host, store, _) = testing::bed(&["http://placed:8000"]);
         let placed = host
-            .place(
-                &Ask {
-                    id: b"placed",
-                    model: "model-a",
-                    streaming: false,
-                    headers: None,
-                    rid: None,
-                    tried: &[],
-                    hashes: None,
-                },
-                Instant::now(),
-            )
+            .place(&Ask::of(b"placed", "model-a"), Instant::now())
             .await?;
         Ok((placed, store))
     }

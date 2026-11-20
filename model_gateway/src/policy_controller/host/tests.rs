@@ -101,15 +101,7 @@ fn manual() -> PolicyConfig {
 
 /// A first attempt's ask of the request `id`.
 pub(super) fn first(id: &[u8]) -> Ask<'_> {
-    Ask {
-        id,
-        model: MODEL,
-        streaming: false,
-        headers: None,
-        rid: None,
-        tried: &[],
-        hashes: None,
-    }
+    Ask::of(id, MODEL)
 }
 
 /// A plain end with status 200.

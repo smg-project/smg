@@ -1126,13 +1126,9 @@ impl<'a> RegularAttempt<'a> {
             Self::Retry(ctx) => (ctx.streaming, &ctx.tried_rows[..]),
         };
         Ask {
-            id,
-            model,
             streaming,
-            headers: None,
-            rid: None,
             tried,
-            hashes: None,
+            ..Ask::of(id, model)
         }
     }
 
