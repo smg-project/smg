@@ -643,9 +643,12 @@ impl Elector {
     }
 
     /// One step of the election at `now`: a holder renews, a candidate takes
-    /// a free lease or keeps following. Call it every renew period. An error
-    /// changes nothing: a holder keeps its record and its fence closes by
-    /// itself at the deadline; the next successful step settles it.
+    /// a free lease or keeps following. Call it every renew period. A backend
+    /// or write error leaves a holder its record and its fence closes by
+    /// itself at the deadline; the next successful step settles it. A record
+    /// read with the maximum renewal timestamp settles held ownership before
+    /// returning its error. A take or renewal that would write the maximum is
+    /// refused and leaves a holder its record, as a write error does.
     pub fn tick(&mut self, now: Instant) -> Result<Tick, ElectError> {
         self.step_at(now);
         let current = self.backend.read()?;
@@ -656,8 +659,19 @@ impl Elector {
         // read and write, which is the conservative stamp for the fence.
         let seen = Instant::now().max(now);
         self.observe(current.as_ref(), seen);
-        // `held` stays as it is until a write or a read settles it: an error
-        // on the way leaves the holder its record.
+        if let Some(record) = current
+            .as_ref()
+            .filter(|record| record.renewed_at_micros == u64::MAX)
+        {
+            let err = self.timestamp_error(record.renewed_at_micros);
+            if let Some(term) = self.held.as_ref().map(|mine| mine.term) {
+                self.lose(term, current);
+            }
+            return Err(err);
+        }
+        // Once the read is usable, `held` stays as it is until a write or a
+        // later read settles it: an error on the way leaves the holder its
+        // record.
         match self.held.clone() {
             // Told to leave and no release landed yet: the release again,
             // never a renewal.
@@ -702,7 +716,8 @@ impl Elector {
             holder: String::new(),
             term: self.highest_term.max(mine.term),
             duration_ms: whole_millis_up(self.owed()),
-            renewed_at_micros: next_wall_micros(mine.renewed_at_micros),
+            renewed_at_micros: next_wall_micros(mine.renewed_at_micros)
+                .unwrap_or(mine.renewed_at_micros),
             ..mine.clone()
         };
         let written = match self.backend.write(Some(&mine), &released) {
@@ -838,7 +853,8 @@ impl Elector {
         }
         let raised = LeaseRecord {
             term,
-            renewed_at_micros: next_wall_micros(seen.renewed_at_micros),
+            renewed_at_micros: next_wall_micros(seen.renewed_at_micros)
+                .unwrap_or(seen.renewed_at_micros),
             ..seen.clone()
         };
         if self.backend.write(Some(seen), &raised)? == Written::Done {
@@ -960,7 +976,7 @@ impl Elector {
             }
         }
         let renewed = LeaseRecord {
-            renewed_at_micros: next_wall_micros(mine.renewed_at_micros),
+            renewed_at_micros: self.advancing_wall_micros(mine.renewed_at_micros)?,
             ..mine.clone()
         };
         let written = match self.backend.write(Some(&mine), &renewed) {
@@ -1039,6 +1055,19 @@ impl Elector {
         Tick::Lost {
             term,
             holder: current.map(|record| record.holder).unwrap_or_default(),
+        }
+    }
+
+    fn advancing_wall_micros(&self, previous: u64) -> Result<u64, ElectError> {
+        next_wall_micros(previous).ok_or_else(|| self.timestamp_error(previous))
+    }
+
+    fn timestamp_error(&self, value: u64) -> ElectError {
+        ElectError::Malformed {
+            place: self.backend.place(),
+            detail: format!(
+                "renewed_at_micros is {value}, so the renewal timestamp cannot advance"
+            ),
         }
     }
 
@@ -1162,7 +1191,8 @@ impl Elector {
         if term >= TERM_CEILING {
             return Err(ElectError::Term(term));
         }
-        let wall = next_wall_micros(current.as_ref().map_or(0, |r| r.renewed_at_micros));
+        let wall =
+            self.advancing_wall_micros(current.as_ref().map_or(0, |r| r.renewed_at_micros))?;
         let record = LeaseRecord {
             holder: self.identity.clone(),
             term,
@@ -1258,13 +1288,15 @@ fn whole_millis_up(duration: Duration) -> u64 {
 }
 
 /// The wall clock in microseconds since the Unix epoch, and at least one
-/// past `previous`: every write moves the record.
-fn next_wall_micros(previous: u64) -> u64 {
+/// past `previous`. `None` when the value would reach the maximum, leaving
+/// no later value for the write after it.
+fn next_wall_micros(previous: u64) -> Option<u64> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| u64::try_from(since.as_micros()).unwrap_or(u64::MAX))
         .unwrap_or(0);
-    now.max(previous.saturating_add(1))
+    let next = now.max(previous.saturating_add(1));
+    (next < u64::MAX).then_some(next)
 }
 
 /// The one-replica backend: a record in this process, shared by every clone
@@ -3120,6 +3152,201 @@ mod tests {
         assert!(!b.is_holder());
         let stored = lease.clone().read().expect("read").expect("the record");
         assert!(stored.is_released(), "nothing was written");
+    }
+
+    #[test]
+    fn a_maximum_wall_timestamp_cannot_make_invisible_renewals() {
+        let released = LeaseRecord {
+            holder: String::new(),
+            term: 1,
+            acquired_at_micros: 1,
+            renewed_at_micros: u64::MAX,
+            duration_ms: 0,
+        };
+        let mut lease = MemoryLease::new();
+        assert_eq!(lease.write(None, &released).expect("seed"), Written::Done);
+        let mut a = candidate(&lease, "a@host:1");
+        let mut b = candidate(&lease, "b@host:2");
+        let t0 = Instant::now() + AHEAD;
+
+        match a.tick(t0) {
+            Err(ElectError::Malformed { place, detail }) => {
+                assert_eq!(place, "memory");
+                assert_eq!(
+                    detail,
+                    format!(
+                        "renewed_at_micros is {}, so the renewal timestamp cannot advance",
+                        u64::MAX
+                    )
+                );
+                assert_eq!(lease.clone().read().expect("read"), Some(released));
+                assert_eq!(a.fence().leader_term(t0), None);
+                assert_eq!(b.fence().leader_term(t0), None);
+                return;
+            }
+            Err(err) => panic!("the maximum timestamp was not refused: {err}"),
+            Ok(take) => assert_eq!(take, Tick::Acquired { term: 2 }),
+        }
+        assert_eq!(a.fence().leader_term(t0), Some(2));
+        assert_eq!(
+            b.tick(t0).expect("first sight"),
+            Tick::Following {
+                holder: "a@host:1".to_owned(),
+                term: 2,
+            }
+        );
+
+        for step in 1..=3 {
+            let now = t0 + step * S;
+            assert_eq!(a.tick(now).expect("renew"), Tick::Renewed { term: 2 });
+            let following = b.tick(now).expect("follow");
+            assert!(
+                a.fence().leader_term(now).is_none() || b.fence().leader_term(now).is_none(),
+                "both fences opened after {following:?}"
+            );
+            assert_ne!(
+                following,
+                Tick::Acquired { term: 3 },
+                "an invisible renewal let the follower take the live lease"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_maximum_timestamp_still_counts_its_held_term() {
+        let held = LeaseRecord {
+            holder: "a@host:1".to_owned(),
+            term: 5,
+            acquired_at_micros: 1,
+            renewed_at_micros: u64::MAX,
+            duration_ms: 3_000,
+        };
+        let mut lease = MemoryLease::new();
+        assert_eq!(lease.write(None, &held).expect("seed"), Written::Done);
+        let mut b = candidate(&lease, "b@host:2");
+        let t0 = Instant::now() + AHEAD;
+        assert!(matches!(
+            b.tick(t0),
+            Err(ElectError::Malformed { detail, .. })
+                if detail == format!(
+                    "renewed_at_micros is {}, so the renewal timestamp cannot advance",
+                    u64::MAX
+                )
+        ));
+
+        let restored = LeaseRecord {
+            holder: String::new(),
+            term: 3,
+            acquired_at_micros: 1,
+            renewed_at_micros: 2,
+            duration_ms: 0,
+        };
+        assert_eq!(
+            lease.write(Some(&held), &restored).expect("restore"),
+            Written::Done
+        );
+        assert_eq!(
+            b.tick(t0 + S).expect("lower release"),
+            Tick::Gone { term: 5 }
+        );
+        assert_eq!(b.highest_term(), 5);
+        assert_eq!(lease.clone().read().expect("read"), Some(restored));
+    }
+
+    #[test]
+    fn a_refused_maximum_timestamp_settles_a_holders_loss() {
+        let lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + AHEAD;
+        a.lead_at(t0);
+        let mine = lease.clone().read().expect("read").expect("the record");
+        let malformed = LeaseRecord {
+            holder: "b@host:2".to_owned(),
+            term: 5,
+            renewed_at_micros: u64::MAX,
+            ..mine.clone()
+        };
+        assert_eq!(
+            lease
+                .clone()
+                .write(Some(&mine), &malformed)
+                .expect("replace"),
+            Written::Done
+        );
+
+        let refused = a.tick(t0 + S).expect_err("the record is malformed");
+        assert!(matches!(refused, ElectError::Malformed { .. }));
+        assert_eq!(a.highest_term(), 5);
+        assert!(!a.is_holder(), "the malformed record ended ownership");
+        assert_eq!(a.fence().leader_term(t0 + S), None);
+
+        assert_eq!(
+            lease
+                .clone()
+                .write(Some(&malformed), &mine)
+                .expect("restore"),
+            Written::Done
+        );
+        assert_eq!(
+            a.tick(t0 + 2 * S).expect("look"),
+            Tick::Following {
+                holder: "a@host:1".to_owned(),
+                term: 1,
+            }
+        );
+        assert_eq!(a.highest_term(), 5);
+    }
+
+    #[test]
+    fn a_take_that_would_write_the_maximum_timestamp_is_refused() {
+        let released = LeaseRecord {
+            holder: String::new(),
+            term: 1,
+            acquired_at_micros: 1,
+            renewed_at_micros: u64::MAX - 1,
+            duration_ms: 0,
+        };
+        let mut lease = MemoryLease::new();
+        assert_eq!(lease.write(None, &released).expect("seed"), Written::Done);
+        let mut a = candidate(&lease, "a@host:1");
+
+        let refused = a
+            .tick(Instant::now() + AHEAD)
+            .expect_err("the timestamp cannot advance twice");
+        assert!(matches!(
+            refused,
+            ElectError::Malformed { detail, .. }
+                if detail == format!(
+                    "renewed_at_micros is {}, so the renewal timestamp cannot advance",
+                    u64::MAX - 1
+                )
+        ));
+        assert_eq!(lease.clone().read().expect("read"), Some(released));
+        assert!(!a.is_holder());
+    }
+
+    #[test]
+    fn a_renewal_that_would_write_the_maximum_timestamp_is_refused() {
+        let released = LeaseRecord {
+            holder: String::new(),
+            term: 1,
+            acquired_at_micros: 1,
+            renewed_at_micros: u64::MAX - 2,
+            duration_ms: 0,
+        };
+        let mut lease = MemoryLease::new();
+        assert_eq!(lease.write(None, &released).expect("seed"), Written::Done);
+        let mut a = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + AHEAD;
+        assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 2 });
+        let taken = lease.clone().read().expect("read").expect("the record");
+        assert_eq!(taken.renewed_at_micros, u64::MAX - 1);
+
+        let refused = a
+            .tick(t0 + S)
+            .expect_err("the renewal timestamp cannot advance twice");
+        assert!(matches!(refused, ElectError::Malformed { .. }));
+        assert_eq!(lease.clone().read().expect("read"), Some(taken));
     }
 
     #[test]

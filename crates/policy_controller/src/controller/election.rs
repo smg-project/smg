@@ -576,6 +576,7 @@ fn run_loop(
         // own time, after the period or after a step that took longer than
         // the period, fits in the deadline.
         let began = Instant::now();
+        let held = elector.is_holder();
         let ticked = elector.tick(began);
         // The standing's term is the highest this replica saw or was told,
         // read before anybody is named: the loop's one reader of a term. The
@@ -667,8 +668,18 @@ fn run_loop(
                 );
             }
             Err(error) => {
-                // One line a streak: the step repeats every renew period.
-                if !failing {
+                let ownership_ended = held && !elector.is_holder();
+                // One line a streak, and one for the error that ends
+                // ownership, first in its streak or not: that fence is
+                // closed now, not at the deadline.
+                if ownership_ended {
+                    leading = false;
+                    warn!(
+                        identity = elector.identity(),
+                        %error,
+                        "an election step failed after ownership ended; the fence is closed"
+                    );
+                } else if !failing {
                     warn!(
                         identity = elector.identity(),
                         %error,
@@ -2443,6 +2454,63 @@ mod tests {
         fn place(&self) -> String {
             "a store that can lose its record".to_owned()
         }
+    }
+
+    #[test]
+    fn a_timestamp_error_during_a_failure_streak_reports_closed_fence_and_next_lead() {
+        let store = Losable::default();
+        store.put(&LeaseRecord {
+            term: 1,
+            ..LeaseRecord::default()
+        });
+        let holder = Elector::new(
+            Box::new(store.clone()),
+            "a@127.0.0.1:1",
+            ElectionSettings {
+                duration: Duration::from_secs(60),
+                renew_period: Duration::from_millis(20),
+                renew_deadline: Duration::from_secs(40),
+            },
+        )
+        .expect("the settings are in order");
+        let fence = holder.fence();
+        let (standing, _stood) = watch::channel(Standing::default());
+        let looping = looping(holder, standing);
+        until("the first lead", || {
+            fence.leader_term(Instant::now()) == Some(2)
+        });
+        until("the first line of leading", || looping.said(": leading"));
+
+        store.fail_writes(true);
+        until("a failing renewal", || {
+            looping.said("the fence closes at the renew deadline")
+        });
+        store.put(&LeaseRecord {
+            holder: "x@127.0.0.1:8".to_owned(),
+            term: 5,
+            acquired_at_micros: 1,
+            renewed_at_micros: u64::MAX,
+            duration_ms: 60_000,
+        });
+        until("the malformed record to close the fence", || {
+            fence.leader_term(Instant::now()).is_none()
+        });
+        store.put(&LeaseRecord {
+            term: 5,
+            renewed_at_micros: 1,
+            ..LeaseRecord::default()
+        });
+        store.fail_writes(false);
+        until("the repaired lease to be taken", || {
+            fence.leader_term(Instant::now()) == Some(6)
+        });
+
+        let (leading, text) = looping.stopped_with(": leading");
+        assert_eq!(leading, 2, "{text}");
+        assert!(
+            text.contains("an election step failed after ownership ended; the fence is closed"),
+            "{text}"
+        );
     }
 
     #[test]
