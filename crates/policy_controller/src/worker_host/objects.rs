@@ -422,9 +422,9 @@ impl<G: Generation> Objects<G> {
     /// stands under the URL by then.
     ///
     /// A write that makes the row another life keeps the worker's id:
-    /// the read lays `built` in the place of the old life's object. With
-    /// no object on offer, it drops that object and lays the new life's
-    /// under another id.
+    /// the read lays `built` in the place of the old life's object, by the
+    /// store's tail or by its snapshot. With no object on offer, it drops
+    /// that object and lays the new life's under another id.
     ///
     /// A holder built without [`Self::with_built_kept`] runs `write` alone.
     pub fn handing<S: WorkersStore + ?Sized>(
@@ -661,10 +661,10 @@ impl<G: Generation> Objects<G> {
             // The old incarnation first: its object leaves the URL the new
             // one's is built under. It leaves whatever stands under its id
             // now: an incarnation a key takes again is another life. An
-            // object on offer for the new one takes the old one's place
-            // instead, and the worker keeps its id.
+            // object on offer for the row under its URL now takes the old
+            // one's place instead, and the worker keeps its id.
             MembershipChange::Replaced { old, new } => {
-                if !self.succeed(store, old, new) {
+                if !self.succeed(store, old, |url| store.by_key(url)) {
                     self.end(old);
                 }
                 self.settle(store, old);
@@ -688,6 +688,10 @@ impl<G: Generation> Objects<G> {
     /// revision held is trusted alone here: behind a gap of the tail, as in
     /// another history, a row under a held id and revision may be another
     /// life with other facts. The facts are compared beside it.
+    ///
+    /// A row that went leaves its object's place to the life that took its
+    /// URL, where a registration has that life's object on offer: the
+    /// worker keeps its id, as on the tail's read.
     fn reconcile<S: WorkersStore + ?Sized>(&self, store: &S, rows: &[WorkerRow]) {
         let stand: HashSet<WorkerId> = rows.iter().map(|row| row.id).collect();
         let gone: Vec<WorkerId> = self
@@ -699,7 +703,10 @@ impl<G: Generation> Objects<G> {
             .copied()
             .collect();
         for id in gone {
-            self.end(id);
+            let under = |url: &str| rows.iter().find(|row| row.facts.key == url).cloned();
+            if !self.succeed(store, id, under) {
+                self.end(id);
+            }
         }
         for row in rows {
             if self.stands(row) {
@@ -708,6 +715,18 @@ impl<G: Generation> Objects<G> {
                 self.lay(store, row);
             }
         }
+    }
+
+    /// The URL of the object on offer, where one is on offer.
+    fn offered_url(&self) -> Option<String> {
+        let offered = self.offered.lock();
+        offered.as_ref().map(|built| built.url().to_owned())
+    }
+
+    /// Whether the object of the row `id` was laid under `url`.
+    fn stood_at(&self, id: WorkerId, url: &str) -> bool {
+        let held = self.held.read();
+        held.facts.get(&id).is_some_and(|facts| facts.key == url)
     }
 
     /// Whether `row`'s object was built from the row as it stands now: the
@@ -883,16 +902,25 @@ impl<G: Generation> Objects<G> {
         self.put(store, row, built, true, succeeds);
     }
 
-    /// Lay `new`, the life a write made of the row `old`, with the object
-    /// on offer for it, in the place of the old life's object: under its
-    /// id in the registry and with its running state. The old row leaves
-    /// every table of the entry. Return whether an object was laid: with
-    /// none on offer that states the new row as it stands, the read drops
-    /// the old life's object and lays the new life under a new id.
-    fn succeed<S: WorkersStore + ?Sized>(&self, store: &S, old: WorkerId, new: WorkerId) -> bool {
-        let offered = store
-            .get(new)
-            .and_then(|row| Some((self.take_offered(&row)?, row)));
+    /// Lay the life that stands under the URL of the row `old`, with the
+    /// object on offer for it, in the place of the old row's object: under
+    /// its id in the registry and with its running state. `standing`
+    /// answers the row under a URL as the read holds it, by the store or
+    /// by its snapshot. The old row leaves every table of the entry.
+    ///
+    /// Return whether an object was laid. With none on offer under the old
+    /// row's URL that states the row there, the read drops the old row's
+    /// object, and a new life is laid under a new id.
+    fn succeed<S: WorkersStore + ?Sized>(
+        &self,
+        store: &S,
+        old: WorkerId,
+        standing: impl FnOnce(&str) -> Option<WorkerRow>,
+    ) -> bool {
+        let Some(url) = self.offered_url().filter(|url| self.stood_at(old, url)) else {
+            return false;
+        };
+        let offered = standing(&url).and_then(|row| Some((self.take_offered(&row)?, row)));
         let Some((built, row)) = offered else {
             return false;
         };
@@ -1588,6 +1616,115 @@ mod tests {
         assert_eq!(replica.objects.len(), 1);
         assert_eq!(replica.objects.unhanded(), 0);
         assert_eq!(replica.told(), [("registered", anew)]);
+    }
+
+    /// The same replacement where the URL took two lives inside one read:
+    /// the row under the URL at the read takes the old object's place, and
+    /// the life between the two is laid nowhere.
+    #[test]
+    fn a_new_life_keeps_its_workers_id_through_two_lives_in_one_read() {
+        let (mut replica, door) = handing();
+        let first = built(A, KEY_A);
+        registered(&replica, &door, &first, Expect::Anything).expect("the first write");
+        let id = replica.id(A);
+        let old = replica.row(A);
+        replica.told();
+
+        // A life between, written with no read behind it.
+        let between = WorkerFacts {
+            models: vec!["x".to_string()],
+            incarnation: old.facts.incarnation + 1_000,
+            ..old.facts.clone()
+        };
+        let between = replica.store.upsert(between).id();
+        assert_ne!(between, old.id);
+
+        let renamed = <BasicWorkerBuilder>::new(A).model(ModelCard::new("n"));
+        let second: Arc<dyn Worker> = Arc::new(renamed.api_key(KEY_B).build());
+        let wrote = replica
+            .objects
+            .handing(replica.store.as_ref(), &second, Some(&first), || {
+                door.found_built(
+                    &Maker::Control,
+                    Expect::Anything,
+                    &second,
+                    Some(Over::Replaced(&first)),
+                )
+            });
+        let new = replica.row(A);
+        let another = Wrote::Another {
+            old: between,
+            new: new.id,
+        };
+        assert_eq!(wrote, Ok(another));
+        assert_eq!(replica.id(A), id);
+        assert!(Arc::ptr_eq(&replica.at(A), &second));
+        assert!(entry_stands(&replica, A));
+        assert_eq!(replica.objects.object(old.id), None);
+        assert_eq!(replica.objects.object(between), None);
+        assert_eq!(replica.objects.len(), 1);
+        assert_eq!(replica.objects.unhanded(), 0);
+        assert_eq!(replica.told(), [("replaced", id.clone())]);
+    }
+
+    /// The same replacement through a read that takes the store's
+    /// snapshot. The tail no longer reaches, the row that went leaves its
+    /// object's place to the life on offer under its URL, and the worker
+    /// keeps its id. A row beside it keeps its object.
+    #[test]
+    fn a_new_life_keeps_its_workers_id_through_a_snapshot_read() {
+        let (mut replica, door) = handing();
+        let first = built(A, KEY_A);
+        registered(&replica, &door, &first, Expect::Anything).expect("the first write");
+        let beside = built(B, KEY_B);
+        registered(&replica, &door, &beside, Expect::Anything).expect("the second write");
+        let (id, other) = (replica.id(A), replica.id(B));
+        let old = replica.row(A);
+        let read_to = replica.store.epoch();
+        replica.told();
+
+        // More status writes than the tail keeps, and no read between.
+        let flipped = replica.row(B);
+        for turn in 0..1_100 {
+            let status = [WorkerStatus::Ready, WorkerStatus::NotReady][turn % 2];
+            assert!(replica
+                .store
+                .set_status(flipped.id, status, flipped.revision)
+                .is_some());
+        }
+        assert_eq!(
+            replica.store.changes_since(read_to),
+            MembershipTail::SnapshotRequired
+        );
+
+        let renamed = <BasicWorkerBuilder>::new(A).model(ModelCard::new("n"));
+        let second: Arc<dyn Worker> = Arc::new(renamed.api_key(KEY_C).build());
+        let wrote = replica
+            .objects
+            .handing(replica.store.as_ref(), &second, Some(&first), || {
+                door.found_built(
+                    &Maker::Control,
+                    Expect::Anything,
+                    &second,
+                    Some(Over::Replaced(&first)),
+                )
+            });
+        assert!(matches!(wrote, Ok(Wrote::Another { .. })), "{wrote:?}");
+        assert_eq!(replica.id(A), id);
+        assert!(Arc::ptr_eq(&replica.at(A), &second));
+        assert!(entry_stands(&replica, A));
+        assert_eq!(replica.objects.object(old.id), None);
+        assert_eq!(replica.id(B), other);
+        assert!(Arc::ptr_eq(&replica.at(B), &beside));
+        assert_eq!(replica.objects.len(), 2);
+        assert_eq!(replica.objects.unhanded(), 0);
+        let told = replica.told();
+        assert!(told.contains(&("replaced", id.clone())), "{told:?}");
+        assert!(
+            told.iter()
+                .all(|(what, _)| *what != "removed" && *what != "registered"),
+            "{told:?}"
+        );
     }
 
     /// A replacement takes the standing object's status, so a handed
