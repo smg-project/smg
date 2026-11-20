@@ -716,7 +716,10 @@ impl MemoryStore {
     /// The generation's engine is then told every member once, by id
     /// ([`Membership::Snapshot`]), under the workers lock and with the load
     /// lock let go: its stages start empty, and each membership write after
-    /// it is told behind the same lock, in its order.
+    /// it is told behind the same lock, in its order. One thing does not
+    /// start empty: a profile's count of sends, which the engine takes
+    /// over from the standing generation's profile of the same name
+    /// before the publication ([`Engine::succeed`](crate::Engine::succeed)).
     ///
     /// The journal is told the generation's number there too, behind the
     /// publication ([`Journal::generation`]).
@@ -807,6 +810,7 @@ impl MemoryStore {
                 |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
             )?;
             world.tell_kept_loads();
+            spec.engine().succeed(self.world.load().spec().engine());
             writer.replaced(self.world.swap(world));
             // A generation of another pairing mode builds the membership
             // and lists every member. One of the standing mode publishes

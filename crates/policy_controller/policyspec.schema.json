@@ -205,7 +205,7 @@
           "$ref": "#/$defs/PickSpec"
         },
         "sent_ttl_ms": {
-          "description": "The number of milliseconds a send counts for. An unset limit keeps\nsends from expiring by age. A stage must ask for the profile's tally\nfor the limit to be used.",
+          "description": "The number of milliseconds a send counts for. An unset limit keeps\nsends from expiring by age. A profile whose stages do not read its\ncount of sends is refused if it sets a limit.",
           "type": [
             "integer",
             "null"

@@ -2493,7 +2493,9 @@ pub struct Engine {
     /// overlap stated ([`Engine::decide_stated`]), and no other does. The
     /// place is kept whole: a profile is as long as its document makes it.
     stating: Vec<Option<usize>>,
-    /// One tally per profile that reads sends.
+    /// One tally per profile that reads sends, in the order of the
+    /// profiles' names: a later engine finds a profile's by its name
+    /// ([`Engine::succeed`]).
     pub(crate) sent_credits: Vec<Arc<SentCredit>>,
 }
 
@@ -3490,6 +3492,31 @@ impl Engine {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Takes over what the standing engine's counts of sends hold: each
+    /// profile's count takes the rows' entries of the standing profile of
+    /// the same name, where both have a stage that reads sends. A profile
+    /// under a new name starts empty. The two engines share those entries
+    /// from here on: a decision still running under the standing engine
+    /// reads the sends a later one counts, and each count reads them under
+    /// its own time limit.
+    ///
+    /// [`MemoryStore::apply`](crate::store::MemoryStore::apply) calls it
+    /// before it shows the new engine. A host with a store of its own
+    /// calls it where it swaps engines, before this engine takes a
+    /// decision or a dispatch: what this engine's counts held until then
+    /// is let go. A rank the standing count first hears of behind this
+    /// call is entered in the standing count alone.
+    pub fn succeed(&self, standing: &Engine) {
+        for credit in &self.sent_credits {
+            if let Ok(at) = standing
+                .sent_credits
+                .binary_search_by(|prior| prior.profile.cmp(&credit.profile))
+            {
+                credit.succeed(&standing.sent_credits[at]);
+            }
+        }
     }
 
     /// The session table: the pins of every key a sessions rule placed.

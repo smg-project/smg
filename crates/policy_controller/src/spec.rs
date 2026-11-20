@@ -1379,8 +1379,8 @@ pub struct ProfileSpec {
     /// The picker.
     pub pick: PickSpec,
     /// The number of milliseconds a send counts for. An unset limit keeps
-    /// sends from expiring by age. A stage must ask for the profile's tally
-    /// for the limit to be used.
+    /// sends from expiring by age. A profile whose stages do not read its
+    /// count of sends is refused if it sets a limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub sent_ttl_ms: Option<u32>,
@@ -3994,6 +3994,11 @@ impl PolicySpec {
         }
         needs.headers |= !self.view.headers.is_empty();
         let mut engine = Engine::new(profiles, bindings, self.generation, needs);
+        // In the order of the profiles' names, as the map walks them: a
+        // later engine finds a profile's count by its name.
+        debug_assert!(sent_credits
+            .windows(2)
+            .all(|pair| pair[0].profile < pair[1].profile));
         engine.sent_credits = sent_credits;
         engine.set_explain_sample(self.explain.sample);
         engine.limit_report_age(self.view.max_report_age_ms);
