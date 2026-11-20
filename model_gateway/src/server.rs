@@ -69,7 +69,10 @@ pub use smg_worker::connection::client_factory::{
 };
 use smg_worker::{
     connection::engine::EngineConnector,
-    health::manager::{WorkerManager, WorkerManagerConfig},
+    health::{
+        manager::{WorkerManager, WorkerManagerConfig},
+        port::HealthSink,
+    },
     identity::{basic::ConnectionMode, endpoint::Endpoint},
     jobs::WorkerJobs,
 };
@@ -2298,8 +2301,15 @@ fn start_worker_health_checks(app_context: &AppContext) -> Option<WorkerManager>
         return None;
     }
     let config = &app_context.router_config;
-    WorkerManager::maybe_start(
+    // With a feed the loop writes through the feed's sink, so each worker's
+    // health keeps one writer.
+    let health_sink: Arc<dyn HealthSink> = match &app_context.policy_feed {
+        Some(feed) => feed.health_sink(),
+        None => app_context.worker_registry.clone(),
+    };
+    WorkerManager::maybe_start_with_sink(
         app_context.worker_registry.clone(),
+        health_sink,
         WorkerManagerConfig {
             default_check_interval_secs: config.health_check.check_interval_secs,
             remove_unhealthy: config.unhealthy_removal_scope(),

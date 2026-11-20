@@ -3245,6 +3245,32 @@ async fn an_eviction_clears_the_series_of_a_model_its_successor_does_not_serve()
     );
 }
 
+/// Past the cap of model labels two models share the label `other`, and
+/// so one series a worker and rank. A successor of one such model keeps
+/// the series it writes at the eviction of a predecessor of another: the
+/// guard matches a live writer's model by the series' label.
+#[tokio::test]
+async fn an_eviction_leaves_the_series_its_successor_shares_past_the_label_cap() {
+    use crate::metrics::labels_full;
+
+    let rendered = render_with_recorder(|| {
+        let _full = labels_full::hold_on_this_thread();
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "a-model-past-the-cap");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        monitor.apply_pushed_load(&first, 0, &pushed(7), Instant::now());
+        let next = ready_worker("http://w:1", "another-model-past-the-cap");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        polled(&monitor, &next, answer_of(0, 9));
+
+        monitor.evict_worker_loads(&first);
+    });
+    assert!(
+        running_series_under(&rendered, "other").ends_with(" 9"),
+        "{rendered}"
+    );
+}
+
 /// The pair series are a family apart from the load series. An eviction
 /// with no live writer at the URL sets both to the sentinel.
 #[tokio::test]

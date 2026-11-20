@@ -475,7 +475,8 @@ pub(crate) struct DispatchContext {
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub workers: Option<WorkerSelection>,
     /// The attempt's placement, taken when the dispatch creates its load guards.
-    pub placed: Option<Placed>,
+    // Pending placement stays out of the inline dispatch allocation.
+    pub placed: Option<Box<Placed>>,
     pub sticky_key: Option<String>,
     pub clients: Option<ClientSelection>,
     /// Consumed by the first dispatch; a rendezvous retry re-dispatches only the
@@ -499,6 +500,15 @@ pub(crate) struct DispatchContext {
     pub pd_prefill_guard: Option<PrefillLoadGuard>,
     pub response: ResponseState,
 }
+
+// Enforce the same allocator class in a production build, where test trace
+// fields are absent. The original unit test also checks its test-build shape.
+#[cfg(all(not(test), target_pointer_width = "64"))]
+const _: () = {
+    use std::mem::size_of;
+
+    assert!(size_of::<DispatchContext>() <= 2560);
+};
 
 impl DispatchContext {
     /// Cached tokenizer (cheap Arc clone).
@@ -531,7 +541,7 @@ impl DispatchContext {
                 );
                 placement.id()
             })
-            .or_else(|| self.placed.as_ref().map(Placed::id));
+            .or_else(|| self.placed.as_deref().map(Placed::id));
         self.load_guards = None;
         self.placed = None;
         if let Some(row) = row {
@@ -1493,7 +1503,7 @@ impl RequestContext {
             constraint_decided_on: self.state.constraint_decided_on,
             tokenizer: self.state.tokenizer,
             workers: self.state.workers,
-            placed: self.state.placed,
+            placed: self.state.placed.map(Box::new),
             sticky_key: self.state.sticky_key,
             clients: self.state.clients,
             encode_outputs: self.state.encode_outputs,
@@ -2141,7 +2151,7 @@ pub(super) mod test_support {
             workers: Some(WorkerSelection::Single {
                 worker: Arc::clone(placed.worker()),
             }),
-            placed: Some(placed),
+            placed: Some(Box::new(placed)),
             sticky_key: None,
             clients: None,
             encode_outputs: None,

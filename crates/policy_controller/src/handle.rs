@@ -74,9 +74,11 @@ use crate::{
 enum Arm<D> {
     /// The door of this process, and the gateway the decision was made for.
     Door { door: D, gateway: GatewayId },
-    /// A controller, over the host's link.
+    /// A controller, over the host's link. The link rides behind a
+    /// pointer: a host embeds the handle in each request's context, and a
+    /// handle of its door is the size it has in a build with no link.
     #[cfg(feature = "client")]
-    Link(Link),
+    Link(Box<Link>),
 }
 
 /// What a handle still owes its lease.
@@ -474,6 +476,12 @@ impl<D: Deref<Target = Door>> Handle<D> {
     /// budget says the request's time is spent, and the controller would
     /// answer busy at its receipt. A request built for the door in process
     /// carries that budget unless its host states one.
+    ///
+    /// A request that states a hard demand is answered
+    /// [`Unanswered::Unsent`] with [`Error::OutOfRange`] before anything is
+    /// sent. This protocol version states no demand, and a controller that
+    /// reads none would pick among workers the demand rules out. Its host
+    /// decides such a request itself.
     pub async fn asked(
         link: &Link,
         request: &Request<'_>,
@@ -483,10 +491,13 @@ impl<D: Deref<Target = Door>> Handle<D> {
         if request.facts.budget_micros == 0 {
             return Err(Unanswered::Late);
         }
+        if !request.constraints.demands.is_none() {
+            return Err(Unanswered::Unsent(Error::OutOfRange("constraints.demands")));
+        }
         let (asked, left_out) = wire::request(request);
         let told = link.ask_cut(asked, left_out, budget).await?;
         match wire::decided(&told, now) {
-            Ok(decided) => Ok(Self::hold(Arm::Link(link.clone()), decided, now)),
+            Ok(decided) => Ok(Self::hold(Arm::Link(Box::new(link.clone())), decided, now)),
             Err(unread) => {
                 link.release_late(told);
                 Err(Unanswered::Unsent(Error::NoDecision(unread.to_string())))
@@ -652,6 +663,19 @@ mod tests {
             said => said,
         });
         calls.collect()
+    }
+
+    /// A host embeds the handle in the context it allocates once a request,
+    /// and fits that context to its allocator's class. A handle is the size
+    /// it has in a build with no link: the link's arm rides behind a
+    /// pointer, and the door's own pointer tells the arms apart. A field
+    /// that grows the handle grows each such context, so its hosts are
+    /// read before this number moves.
+    #[test]
+    fn a_handle_is_the_size_it_has_in_a_build_with_no_link() {
+        const HELD: usize = 480;
+        assert_eq!(size_of::<Handle<Arc<Door>>>(), HELD);
+        assert_eq!(size_of::<Handle<&Door>>(), HELD);
     }
 
     /// A request that is served: its lease is booked at the issue, moves
@@ -1474,7 +1498,7 @@ mod tests {
                 gateway_frame::Frame,
                 released::{Reason, What},
             },
-            ReleaseReason,
+            Demands, ReleaseReason,
         };
 
         fn picked() -> proto::Decision {
@@ -1961,6 +1985,42 @@ mod tests {
             .await
             .expect("the ask returns");
             assert!(matches!(answer, Err(Unanswered::Late)), "{answer:?}");
+            assert_eq!(tokio::time::Instant::now(), before);
+            assert!(
+                poll(pin!(peer.requests.next())).is_pending(),
+                "nothing went out"
+            );
+        }
+
+        /// This protocol version states no hard demand, and a controller
+        /// that reads none picks among workers the demand rules out. The
+        /// handle refuses a request that states one before anything is
+        /// sent: no credit goes, and no time passes.
+        #[tokio::test(start_paused = true)]
+        async fn a_request_that_states_a_demand_is_refused_before_anything_is_sent() {
+            let mut peer = Peer::new(1);
+            let mut ask = request(&[1], 7);
+            ask.facts.budget_micros = 200_000;
+            ask.constraints.demands = Demands { runtime: 7 };
+            let before = tokio::time::Instant::now();
+            let answer = timeout(
+                PATIENCE,
+                pin!(Handle::<&Door>::asked(
+                    &peer.link,
+                    &ask,
+                    Instant::now(),
+                    PATIENCE
+                )),
+            )
+            .await
+            .expect("the ask returns");
+            assert!(
+                matches!(
+                    answer,
+                    Err(Unanswered::Unsent(Error::OutOfRange("constraints.demands")))
+                ),
+                "{answer:?}"
+            );
             assert_eq!(tokio::time::Instant::now(), before);
             assert!(
                 poll(pin!(peer.requests.next())).is_pending(),

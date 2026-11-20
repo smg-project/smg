@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "PolicySpec",
-  "description": "The policy specification, version `smg.policy/v1`: what the host builds\ninto the view, the per-model index settings, the profiles with their\nstages, the plans' rules and the ordered bindings. An unknown field at\nany level is refused by name.",
+  "description": "The policy specification, version `smg.policy/v1`: what the host builds\ninto the view, the per-model index settings, the signals its stages\nread, the profiles with their stages, the plans' rules and the ordered\nbindings. An unknown field at any level is refused by name.",
   "type": "object",
   "properties": {
     "apiVersion": {
@@ -24,6 +24,17 @@
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/IndexSpec"
+      }
+    },
+    "signals": {
+      "description": "The signals the document's stages read, by name: a lower-case\nletter, then lower-case letters, digits and underscores, at most 63\nbytes. At most 64. A signal's column is its place among the names,\nin name order.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/SignalSpec"
+      },
+      "maxProperties": 64,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]{0,62}$"
       }
     },
     "profiles": {
@@ -97,7 +108,7 @@
           "default": 256
         },
         "max_report_age_ms": {
-          "description": "With this limit in milliseconds set, `least-load`, `resident-work`,\n`least-cost` and the KV-pressure gates of `prefix-affinity` and\n`warmup-slice` treat older reports as missing. A report exactly at\nthe limit still counts. Overload verdicts can still reflect older\nreports, plugins interpret report age themselves, and host-registered\nstages keep their own rules. Omit it to use reports of any age.",
+          "description": "With this limit in milliseconds set, `least-load`, `resident-work`,\n`least-cost` and the KV-pressure gates of `prefix-affinity` and\n`warmup-slice` treat older reports as missing. A report exactly at\nthe limit still counts. A host-registered stage reads a report\nunder the limit through its build context's `reports()`, and one\nthat reads the row's report itself sees it at any age. Overload\nverdicts can still reflect older reports, and plugins interpret\nreport age themselves. Omit it to use reports of any age.",
           "type": [
             "integer",
             "null"
@@ -178,6 +189,33 @@
           "type": "string",
           "const": "hash"
         }
+      ]
+    },
+    "SignalSpec": {
+      "description": "One declared signal: a named value of a worker's report that the\ndocument's stages read beside the rows.",
+      "type": "object",
+      "properties": {
+        "unit": {
+          "description": "The unit a source states for its value to be taken: 1 to 31 ASCII\ncharacters with no space. It is compared byte for byte with the\nunit a report states.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 31,
+          "pattern": "^[!-~]*$"
+        },
+        "max_age_ms": {
+          "description": "A value older than this reads as no value: 1 to 3,599,999, the\nbound of the view's `max_report_age_ms`. A store's clock keeps one\nhour, and a sample older than that stands at the clock's origin:\nunder a longer limit it would read as fresh. Absent: a value does\nnot end by its age.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1,
+          "maximum": 3599999
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "unit"
       ]
     },
     "ProfileSpec": {
@@ -730,7 +768,7 @@
           "exclusiveMinimum": 0
         },
         "prefix_tokens": {
-          "description": "The depth in tokens at which a request with no routing key is keyed\nby its prefix: the last whole block at or under the depth, so at\nleast one block of the view's block size and at most the blocks a\nrequest carries. Under the view's `boundaries` a request that reaches\none is keyed there instead, at the deepest it reaches. The depth is\nchecked in the view's token blocks and read in the blocks a request\nwas hashed by. A text request's windows are `block_size` characters,\na quarter of a token block, so it carries a quarter of the checked\ndepth and a deeper depth keys at its last window. Under a block size\nan engine published above the depth a request has no key. Absent, a\nrequest with no routing key has none.",
+          "description": "The depth in tokens at which a request with no routing key is keyed\nby its prefix through the last whole block at or under the depth, so at\nleast one block of the view's block size and at most the blocks a\nrequest carries. Under the view's `boundaries` a request that reaches\none is keyed there instead, at the deepest it reaches. The depth is\nchecked in the view's token blocks and read in the blocks a request\nwas hashed by. A text request's windows are `block_size` characters,\na quarter of a token block, so it carries a quarter of the checked\ndepth and a deeper depth keys at its last window. Under a block size\nan engine published above the depth a request has no key. Absent, a\nrequest with no routing key has none.",
           "type": [
             "integer",
             "null"

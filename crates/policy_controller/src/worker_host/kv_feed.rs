@@ -3,7 +3,12 @@
 //!
 //! # Limits
 //!
-//! Eligible workers keep streaming when the active generation reads no index.
+//! A row written over the controller's wire states its own signal, so such
+//! a worker keeps streaming when the active generation reads no index. A
+//! row found at a host's door is stated by the generation in force at that
+//! write ([`asks_events`]). The follow is told of a worker once, so a later
+//! generation moves a standing worker's stream only when its row is laid
+//! again as another life.
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -16,7 +21,11 @@ use smg_worker::{
 use tokio::sync::{broadcast::error::RecvError, watch};
 
 use super::{KvHost, Objects};
-use crate::store::{index::indexed_under, MemoryStore, WorkersStore};
+use crate::{
+    store::{index::indexed_under, MemoryStore, WorkerFacts, WorkersStore},
+    view::{Phase, Role, WireModes},
+    Engine,
+};
 
 /// A host's cache-event collector and the worker objects it follows.
 pub struct KvFeed<G: Generation> {
@@ -122,4 +131,22 @@ impl<G: Generation> KvFeed<G> {
         }
         self.collector.on_worker_removed(url).await;
     }
+}
+
+/// Whether a found row asks for its engine's cache events under `engine`:
+/// whether a decision reads the index for the row's first model, the one
+/// the store indexes the row under, in the phase of the row's role. Only a
+/// gRPC worker streams.
+pub(super) fn asks_events(facts: &WorkerFacts, engine: &Engine) -> bool {
+    let phase = match facts.role {
+        Role::Single => Phase::Single,
+        Role::Prefill => Phase::Prefill,
+        Role::Decode => Phase::Decode,
+        Role::Encode => Phase::Encode,
+    };
+    facts.wire_modes.contains(WireModes::GRPC)
+        && facts
+            .models
+            .first()
+            .is_some_and(|model| engine.needs_for(model, phase).events)
 }

@@ -276,6 +276,18 @@ impl<'a> Identity<'a> {
     }
 }
 
+/// The key of a prefix one block longer: the key of the prefix before it
+/// folded with the block's hash. A host hashes each block by its own
+/// content ([`RequestFacts::block_hashes`]), so one hash names one block
+/// wherever it stands. A prefix is named by this fold over its blocks'
+/// hashes in order from the first, started at the request's cache
+/// namespace ([`RequestFacts::namespace_seed`]): the ring's key of a prefix
+/// and the sent-prefix predictor's are that one number. The key's top bits
+/// take every bit of both.
+pub(crate) const fn fold_block(prefix: u64, hash: u64) -> u64 {
+    (prefix.rotate_left(23) ^ hash).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
 /// The fingerprint of a key: FNV-1a over its bytes, never `0` for a present
 /// key, so `0` reads as absent everywhere a fingerprint travels (the lease,
 /// the trace, a session table).
@@ -742,10 +754,14 @@ pub(crate) const REPORT_CLOCK_HISTORY_MS: u32 = 3_600_000;
 pub(crate) const MAX_REPORT_AGE_MS: u32 = REPORT_CLOCK_HISTORY_MS - 1;
 
 /// The oldest sample a decision can use under a report age limit.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct ReportCutoff(u64);
 
 impl ReportCutoff {
+    /// The cutoff of a view that sets no limit: no sample is older than
+    /// the clock's origin, so every report is read.
+    pub(crate) const ANY_AGE: Self = Self(0);
+
     pub(crate) fn new(now_micros: u64, max_age_ms: u64) -> Self {
         Self(now_micros.saturating_sub(max_age_ms * 1_000))
     }
@@ -849,7 +865,10 @@ pub struct RequestFacts<'a> {
     pub max_output_tokens: u32,
     /// The host's token count or estimate.
     pub prompt_tokens: u32,
-    /// Prefix block hashes, capped by the host.
+    /// One hash a whole block of the prompt, in order from the first,
+    /// capped by the host. A hash is of its own block's content and of
+    /// nothing ahead of it: what names a prefix is the fold of its
+    /// blocks' hashes, which the stages that key by a prefix make.
     pub block_hashes: &'a [u64],
     pub hash_kind: HashKind,
     /// The routing key as the host derives it, lineage-stripped: the key
@@ -954,6 +973,16 @@ pub struct RequestFacts<'a> {
     /// that hands a decision its facts from the host's own store makes
     /// them so. In-process only: the wire carries the name.
     pub model_fingerprint: ModelFingerprint,
+    /// The signal cells beside the rows of this decision, by the row's
+    /// position: handed by a host for a profile whose stages read a signal
+    /// ([`Needs::signal_cells`](crate::Needs::signal_cells)), and for no
+    /// other. `None` reads as no value for every row. A pair decision takes
+    /// each side's cells from its pool ([`PairPools`](crate::PairPools)),
+    /// and an encode pair its encoders' from theirs: cells here are not
+    /// read there. One word for every signal the document declares: a
+    /// second signal adds none. In-process only: the contract's facts gain
+    /// nothing.
+    pub signal_cells: Option<&'a crate::signals::SignalCells>,
 }
 
 /// The multiplier that spreads a session's model and phase over its key.
@@ -1143,6 +1172,16 @@ pub struct Constraints<'a> {
     pub overload_lifted: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
+    /// What the request demands of the worker that takes it
+    /// ([`Demands`](crate::Demands)). A door keeps the demands before any
+    /// stage runs, where it keeps its gateway's wires, and no stage reads
+    /// them: an engine handed rows by a host of its own is handed rows
+    /// that meet them. A pair's sides keep none yet: a door sheds a
+    /// pair's request that states a demand, under the stage `wires`,
+    /// whatever its sides state. In-process only: this protocol version
+    /// states no demand, and a handle refuses a request that states one
+    /// before it sends it over a link (`Handle::asked`).
+    pub demands: crate::Demands,
     /// The rows a standing veto of this host masks, by position, in order,
     /// where the host did not write them into the rows: a view of a
     /// publication's own rows hands them here, and a reader of a row's
@@ -1362,6 +1401,16 @@ mod tests {
         println!("Candidate size {size} bytes, alignment {alignment} bytes");
         assert_eq!((size, alignment), (128, 64));
         assert_eq!(size_of::<AffinityFacts>(), 20);
+    }
+
+    /// A request's facts are copied where a decision narrows or resumes
+    /// them, so their size is a cost of those decisions: the pin is exact.
+    /// The signal cells are the last word, one for every signal: a field
+    /// the facts gain moves this number and carries the decision bench's
+    /// cells that copy the facts (`benches/decision.rs`).
+    #[test]
+    fn a_requests_facts_take_the_pinned_bytes() {
+        assert_eq!(size_of::<RequestFacts<'_>>(), 288);
     }
 
     #[test]

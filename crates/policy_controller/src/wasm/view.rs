@@ -1524,6 +1524,7 @@ mod tests {
             // no rows named in its place.
             affinity: &[],
             named: None,
+            signal_cells: None,
         };
         let exposure = Exposure {
             tenant: Reveal::Plain,

@@ -1,6 +1,6 @@
 //! Cases of the store's start and of the router a server answers with.
 
-use std::{cell::Cell, error::Error, sync::Arc};
+use std::{error::Error, sync::Arc};
 
 use axum::{
     body::{to_bytes, Body},
@@ -81,17 +81,58 @@ fn the_store_starts_with_the_document_the_routing_configuration_means() -> Case 
 }
 
 #[test]
+fn the_store_starts_on_the_given_document() -> Case {
+    // A document that names no generation is the store's first.
+    for (written, runs) in [(2, 2), (0, 1)] {
+        let mut document = PolicySpec::preset("round_robin")?;
+        document.generation = written;
+        let digest = document.digest()?;
+        let config = picked(RouterConfig {
+            policy_spec: Some(document),
+            ..RouterConfig::default()
+        });
+        let store = start(&config)?.ok_or("the controller was picked and no store started")?;
+        let world = store.world();
+        assert_eq!(world.spec().generation(), runs);
+        assert_eq!(world.spec().digest(), Some(digest));
+    }
+    Ok(())
+}
+
+#[test]
+fn a_start_whose_flags_and_document_disagree_is_refused_by_name() -> Case {
+    let config = picked(RouterConfig {
+        policy: PolicyConfig::RoundRobin,
+        policy_spec: Some(PolicySpec::preset("random")?),
+        ..RouterConfig::default()
+    });
+    let refusal = start(&config)
+        .err()
+        .ok_or("the start took a document that disagrees with the flags")?;
+    assert!(matches!(refusal, StartError::Document(_)), "{refusal:?}");
+    let message = refusal.to_string();
+    assert!(
+        message.contains("disagree at profiles.round_robin:"),
+        "{message}"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_setting_no_document_says_stops_the_start_by_its_name() -> Case {
     let mut config = picked(RouterConfig::default());
     config.routing_key_override.enabled = true;
-    let refusal = start(&config)
-        .err()
-        .ok_or("the start took a setting no document says")?;
-    assert!(matches!(refusal, StartError::Document(_)), "{refusal:?}");
-    assert_eq!(
-        refusal.to_string(),
-        "routing_key_override.enabled = true: the controller holds no recorded form of the sticky sessions' rule yet"
-    );
+    for supplied in [None, Some(PolicySpec::preset("round_robin")?)] {
+        config.policy_spec = supplied;
+        let refusal = start(&config)
+            .err()
+            .ok_or("the start took a setting no document says")?;
+        assert!(matches!(refusal, StartError::Document(_)), "{refusal:?}");
+        assert_eq!(
+            refusal.to_string(),
+            "routing_key_override.enabled = true: the controller holds no recorded form of the sticky sessions' rule yet"
+        );
+    }
     Ok(())
 }
 
@@ -453,13 +494,20 @@ fn scorer_document(config: &RouterConfig, name: &str) -> Result<PolicySpec, Poli
     Ok(document)
 }
 
+/// `config` with the policy controller picked and `document` given, as a
+/// host gives one.
+fn running(mut config: RouterConfig, document: PolicySpec) -> RouterConfig {
+    config.policy_spec = Some(document);
+    picked(config)
+}
+
 #[test]
 fn the_store_starts_with_a_registered_scorer() -> Case {
-    let config = picked(RouterConfig::default());
-    let document = scorer_document(&config, SCORER)?;
+    let document = scorer_document(&RouterConfig::default(), SCORER)?;
     let digest = document.digest()?;
     let generation = document.generation;
-    let store = start_with(&config, Some(host_stages()?), |_| Ok(document))?
+    let config = running(RouterConfig::default(), document);
+    let store = start_with(&config, Some(host_stages()?))?
         .ok_or("the controller was picked and no store started")?;
     let world = store.world();
     assert_eq!(world.spec().generation(), generation);
@@ -469,8 +517,8 @@ fn the_store_starts_with_a_registered_scorer() -> Case {
 
 #[test]
 fn the_stock_store_names_the_unknown_scorer() -> Case {
-    let config = picked(RouterConfig::default());
-    let refusal = start_with(&config, None, |config| scorer_document(config, SCORER))
+    let document = scorer_document(&RouterConfig::default(), SCORER)?;
+    let refusal = start_with(&running(RouterConfig::default(), document), None)
         .err()
         .ok_or("the stock start took a scorer it does not hold")?;
     assert!(matches!(
@@ -486,26 +534,23 @@ fn the_stock_store_names_the_unknown_scorer() -> Case {
 
 #[test]
 fn the_classic_policies_skip_a_document_the_catalog_would_refuse() -> Case {
-    let document = |config: &RouterConfig| scorer_document(config, "unknown-score");
-    let config = RouterConfig::default();
+    let mut config = running(
+        RouterConfig::default(),
+        scorer_document(&RouterConfig::default(), "unknown-score")?,
+    );
     assert!(matches!(
-        start_with(&picked(config.clone()), Some(host_stages()?), document),
+        start_with(&config, Some(host_stages()?)),
         Err(StartError::Spec(SpecError::UnknownScorer { .. }))
     ));
 
-    let read = Cell::new(false);
-    let store = start_with(&config, Some(host_stages()?), |config| {
-        read.set(true);
-        document(config)
-    })?;
-    assert!(store.is_none());
-    assert!(!read.get());
+    config.policy_controller = false;
+    assert!(start_with(&config, Some(host_stages()?))?.is_none());
     Ok(())
 }
 
 #[test]
 fn the_gateways_tenant_header_is_denied_with_a_host_catalog() -> Case {
-    let mut config = picked(RouterConfig::default());
+    let mut config = RouterConfig::default();
     let tenant_header = "x-account-scope";
     config.tenant_resolution.tenant_header_name = tenant_header.into();
     let mut document = scorer_document(&config, SCORER)?;
@@ -513,7 +558,7 @@ fn the_gateways_tenant_header_is_denied_with_a_host_catalog() -> Case {
     let stages = host_stages()?;
     AppliedSpec::validate_in(&document, &stages, &[])?;
 
-    let refusal = start_with(&config, Some(stages), |_| Ok(document))
+    let refusal = start_with(&running(config, document), Some(stages))
         .err()
         .ok_or("the start took a view that reads the tenant header")?;
     assert!(matches!(
@@ -523,6 +568,31 @@ fn the_gateways_tenant_header_is_denied_with_a_host_catalog() -> Case {
     assert_eq!(
         refusal.to_string(),
         format!("view.headers[0]: header {tenant_header:?} is on the deny-list")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_hosts_catalog_and_document_reach_the_store_through_the_context() -> Case {
+    let document = scorer_document(&quiet(), SCORER)?;
+    let digest = document.digest()?;
+    let config = running(quiet(), document);
+
+    let stages = Some(host_stages()?);
+    let hosted =
+        AppContext::from_config_with_extensions(config.clone(), 30, None, None, stages, None)
+            .await?;
+    let store = hosted
+        .policy_store
+        .as_ref()
+        .ok_or("the controller was picked and no store started")?;
+    assert_eq!(store.world().spec().digest(), Some(digest));
+
+    // The stock start holds no stage of a host, and says so by name.
+    let refusal = AppContext::from_config(config, 30, None, None).await.err();
+    assert_eq!(
+        refusal,
+        Some(format!("profile \"random\": unknown scorer {SCORER:?}"))
     );
     Ok(())
 }

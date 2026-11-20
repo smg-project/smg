@@ -36,7 +36,7 @@ use smg_policy_controller::{
     view::{fingerprint, Identity, LoadRow},
     AppliedSpec, DerivedKey, KeySource, PolicySpec,
 };
-use smg_worker::identity::basic::WorkerLoadGuard;
+use smg_worker::{health::circuit_breaker::CircuitBreakerConfig, identity::basic::WorkerLoadGuard};
 
 use super::{
     elapsed_micros, left_no_worker, mark, profile_of,
@@ -508,32 +508,25 @@ bindings:
 
 #[test]
 fn only_a_shed_ahead_of_every_profile_names_no_profile() {
-    let shed = |reason, emptied_by| {
+    let shed = |profile, emptied_by| {
         Decision::Shed(Shed {
-            reason,
+            reason: ShedReason::PolicyDeclined,
             emptied_by,
             retry_after_secs: 1,
             wait_allowed: false,
             trace: Trace {
-                profile: 3,
+                profile,
                 ..Trace::default()
             },
         })
     };
-    for (reason, stage) in [
-        (ShedReason::PolicyDeclined, "binding"),
-        (ShedReason::PolicyDeclined, "affinity-column"),
-        (ShedReason::PolicyDeclined, "written-rows"),
-        (ShedReason::NoEndpoints, "wires"),
-        (ShedReason::NoEndpoints, "subset-hint"),
-    ] {
-        assert_eq!(profile_of(&shed(reason, stage)), None, "{stage}");
+    // The trace's mark decides, and a stage's word decides nothing: rows
+    // not written decline under their profile, and so does a plugin stage
+    // that carries the word of a shed the engine makes ahead of a profile.
+    for stage in ["written-rows", "binding", "random"] {
+        assert_eq!(profile_of(&shed(3, stage)), Some(3), "{stage}");
+        assert_eq!(profile_of(&shed(Trace::NO_PROFILE, stage)), None, "{stage}");
     }
-    // A profile's own stage that declines, and a pool a filter emptied.
-    let by_a_picker = shed(ShedReason::PolicyDeclined, "random");
-    assert_eq!(profile_of(&by_a_picker), Some(3));
-    let emptied = shed(ShedReason::NoEndpoints, "healthy");
-    assert_eq!(profile_of(&emptied), Some(3));
 }
 
 #[test]
@@ -702,14 +695,25 @@ async fn a_returning_prefix_lands_on_the_worker_that_holds_it() {
 
 #[tokio::test]
 async fn a_worker_the_gateway_cannot_send_to_is_passed_over() {
-    let (host, _store, workers) = bed(&["http://w0:8000", "http://w1:8000"]);
-    workers[0].set_status(WorkerStatus::NotReady);
-    for turn in 0..8u8 {
-        let placed = host
-            .place(&first(&[turn]), Instant::now())
-            .await
-            .expect("the other worker");
-        assert_eq!(placed.worker().url(), "http://w1:8000");
+    // The filter's two halves: a worker that is not ready, and a ready
+    // worker whose breaker is open.
+    for open_breaker in [false, true] {
+        let (host, _store, workers) = bed(&["http://w0:8000", "http://w1:8000"]);
+        if open_breaker {
+            for _ in 0..CircuitBreakerConfig::default().failure_threshold {
+                workers[0].record_outcome(503);
+            }
+            assert!(!workers[0].circuit_breaker_can_execute());
+        } else {
+            workers[0].set_status(WorkerStatus::NotReady);
+        }
+        for turn in 0..8u8 {
+            let placed = host
+                .place(&first(&[turn]), Instant::now())
+                .await
+                .expect("the other worker");
+            assert_eq!(placed.worker().url(), "http://w1:8000");
+        }
     }
 }
 

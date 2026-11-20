@@ -56,6 +56,7 @@ use std::{
 pub(crate) use crate::door::Viewed;
 use crate::{
     decision::{Decision, ShedReason, Target},
+    demands::Demands,
     door::Asked,
     lease::{Lease, Side},
     operator::{Document, NeedsRow, Status},
@@ -360,12 +361,16 @@ impl Checked {
                 // whose rule has an in-flight cap.
                 lent_session_in_flight: None,
                 session_counted: false,
+                // The frame carries no signal cells: they stand beside
+                // the rows of the host that decides.
+                signal_cells: None,
             },
             &Constraints {
                 excluded: &lists.excluded,
                 wire_modes: self.wires().unwrap_or_default(),
                 overload_lifted: constraints.overload_lifted,
                 subset_hint: constraints.subset_hint,
+                demands: Demands::default(),
                 // The asking gateway's standing vetoes beside lent rows,
                 // and nothing where each row carries its own bit.
                 stalled: view.stalled,
@@ -399,6 +404,12 @@ impl Asked for Checked {
 
     fn subset(&self) -> Option<u32> {
         Self::subset(self)
+    }
+
+    /// A frame states no demand: the contract's constraints carry none
+    /// yet.
+    fn demands(&self) -> Demands {
+        Demands::default()
     }
 
     fn hashes(&self) -> usize {
@@ -755,8 +766,8 @@ pub(super) fn unix_micros(at: SystemTime) -> i64 {
 /// for each of the engine's rows that has a flag to set
 /// ([`crate::Engine::needs_rows`]), in their order. A need the contract's row has
 /// no flag for is not told here: a worker's requests in flight, the
-/// sessions in flight, a key's in-flight count and the affinity column are
-/// the controller's own to hold.
+/// sessions in flight, a key's in-flight count, the affinity column and
+/// the signal cells are the controller's own to hold.
 pub(super) fn needs_summary(rows: Vec<NeedsRow>) -> proto::NeedsSummary {
     let models = rows
         .into_iter()

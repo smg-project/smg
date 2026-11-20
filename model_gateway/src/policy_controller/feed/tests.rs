@@ -14,11 +14,19 @@ use std::{
 
 use parking_lot::Mutex;
 use smg_policy_controller::{
-    store::{HealthPolicy, Maker, MemoryStore, WorkerFacts, WorkersStore},
+    store::{
+        HealthPolicy, Maker, MemoryStore, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
+    },
     view::{Role, WireModes, WorkerId},
     worker_host::{Expect, Membership, Refused, Remover, Standing, StoreDoor, Wrote},
 };
-use smg_worker::{connection::engine::EngineConnector, registry::event::WorkerEvent};
+use smg_worker::{
+    connection::engine::EngineConnector,
+    health::port::{HealthSink, ProbeAnswer},
+    identity::basic::Worker,
+    registry::event::WorkerEvent,
+    worker::WorkerStatus,
+};
 
 use super::{feed, Feed, FeedDoor};
 use crate::{
@@ -27,7 +35,10 @@ use crate::{
         host::{Ask, Host, Unplaced},
         start,
     },
-    routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BackendConnector},
+    routers::{
+        common::snapshot::WorkerRegistry,
+        grpc::backend_client::{BackendConnector, BasicWorkerBuilder},
+    },
 };
 
 const URL: &str = "http://worker:8000";
@@ -57,9 +68,25 @@ fn stated() -> WorkerFacts {
 }
 
 fn register(door: &dyn Membership) -> Result<WorkerId, String> {
-    match door.found(&Maker::Control, Expect::Nothing, URL, &|_| stated()) {
+    register_with(door, stated)
+}
+
+fn register_with(door: &dyn Membership, facts: fn() -> WorkerFacts) -> Result<WorkerId, String> {
+    match door.found(&Maker::Control, Expect::Nothing, URL, &|_| facts()) {
         Ok(Wrote::Registered(id)) => Ok(id),
         other => Err(format!("expected a registration, got {other:?}")),
+    }
+}
+
+fn probed() -> WorkerFacts {
+    WorkerFacts {
+        health: HealthPolicy {
+            failure_threshold: 2,
+            success_threshold: 2,
+            probes: true,
+            ..HealthPolicy::default()
+        },
+        ..stated()
     }
 }
 
@@ -107,6 +134,157 @@ async fn a_written_row_is_in_force_for_the_next_decision() {
         .await
         .expect("the next decision picks the worker");
     assert_eq!(placed.id(), row);
+}
+
+#[tokio::test]
+async fn a_failed_probe_is_written_on_the_row_and_the_object_mirrors_it() {
+    let store = start_store().expect("the store starts");
+    let (registry, feed) = bed(&store);
+    let host = Host::new(Arc::clone(&store), Arc::clone(&feed.objects));
+    let row = register_with(&*feed.door, probed).expect("the worker registers");
+    let object = feed.objects.object(row).expect("the row has an object");
+    let worker = registry.get(&object).expect("the worker stands");
+    let revision = worker.revision();
+    let sink = feed.health_sink();
+
+    let assert_statuses = |row_status, object_status| {
+        assert_eq!(store.by_key(URL).map(|row| row.status), Some(row_status));
+        assert_eq!(worker.status(), object_status);
+    };
+    assert_statuses(RowStatus::Pending, WorkerStatus::Pending);
+    assert_eq!(
+        sink.connected(&object, revision),
+        Some((WorkerStatus::Pending, WorkerStatus::Ready))
+    );
+    assert_statuses(RowStatus::Ready, WorkerStatus::Ready);
+    let placed = host
+        .place(&ask(b"first"), Instant::now())
+        .await
+        .expect("the ready row takes a decision");
+    assert_eq!(placed.id(), row);
+    drop(placed);
+
+    let probe = |passed, launched| sink.probe_outcome(&object, passed, revision, launched);
+    assert_eq!(
+        probe(false, WorkerStatus::Ready),
+        ProbeAnswer::Stood(WorkerStatus::Ready)
+    );
+    assert_statuses(RowStatus::Ready, WorkerStatus::Ready);
+    assert_eq!(
+        probe(false, WorkerStatus::Ready),
+        ProbeAnswer::Moved {
+            old: WorkerStatus::Ready,
+            new: WorkerStatus::NotReady
+        }
+    );
+    assert_statuses(RowStatus::NotReady, WorkerStatus::NotReady);
+    assert!(matches!(
+        host.ask(&ask(b"down"), &[], Instant::now()).await,
+        Err(Unplaced::Shed { .. })
+    ));
+
+    assert_eq!(
+        probe(true, WorkerStatus::NotReady),
+        ProbeAnswer::Stood(WorkerStatus::NotReady)
+    );
+    assert_statuses(RowStatus::NotReady, WorkerStatus::NotReady);
+    assert_eq!(
+        probe(true, WorkerStatus::NotReady),
+        ProbeAnswer::Moved {
+            old: WorkerStatus::NotReady,
+            new: WorkerStatus::Ready
+        }
+    );
+    assert_statuses(RowStatus::Ready, WorkerStatus::Ready);
+    let placed = host
+        .place(&ask(b"back"), Instant::now())
+        .await
+        .expect("the recovered row takes a decision");
+    assert_eq!(placed.id(), row);
+}
+
+#[test]
+fn a_worker_with_no_row_keeps_the_registrys_health() {
+    let store = Arc::new(MemoryStore::default());
+    let (registry, feed) = bed(&store);
+    let classic = WorkerRegistry::new();
+    let pending = || -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(URL)
+                .status(WorkerStatus::Pending)
+                .build(),
+        )
+    };
+    let (worker, reference) = (pending(), pending());
+    let id = registry
+        .register(Arc::clone(&worker))
+        .expect("a worker without a row");
+    let reference_id = classic
+        .register(Arc::clone(&reference))
+        .expect("a classic worker");
+    let epoch = store.epoch();
+    let sink = feed.health_sink();
+
+    assert_eq!(
+        sink.connected(&id, worker.revision()),
+        classic.connected(&reference_id, reference.revision())
+    );
+    assert_eq!(worker.status(), WorkerStatus::Ready);
+    for _ in 0..2 {
+        assert_eq!(
+            sink.probe_outcome(&id, true, worker.revision(), WorkerStatus::Ready),
+            classic.probe_outcome(
+                &reference_id,
+                true,
+                reference.revision(),
+                WorkerStatus::Ready
+            )
+        );
+        assert_eq!(worker.status(), reference.status());
+    }
+    assert!(store.snapshot().1.is_empty());
+    assert_eq!(store.epoch(), epoch);
+}
+
+#[test]
+fn a_rows_object_takes_no_step_of_the_registrys_own() {
+    let store = Arc::new(MemoryStore::default());
+    let (registry, feed) = bed(&store);
+    let row = register_with(&*feed.door, probed).expect("the worker registers");
+    let object = feed.objects.object(row).expect("the row has an object");
+    let worker = registry.get(&object).expect("the worker stands");
+    let pass = |sink: &dyn HealthSink| {
+        sink.probe_outcome(&object, true, worker.revision(), WorkerStatus::Pending)
+    };
+
+    // Leave the object one pass short of ready while the row has counted none.
+    assert_eq!(
+        pass(registry.as_ref()),
+        ProbeAnswer::Stood(WorkerStatus::Pending)
+    );
+    assert_eq!(
+        pass(feed.health_sink().as_ref()),
+        ProbeAnswer::Stood(WorkerStatus::Pending)
+    );
+    assert_eq!(
+        store.by_key(URL).map(|row| row.status),
+        Some(RowStatus::Pending)
+    );
+    assert_eq!(worker.status(), WorkerStatus::Pending);
+    assert_eq!(
+        worker
+            .runtime_state()
+            .expect("the worker's state")
+            .total_pending_probes(),
+        1
+    );
+    assert_eq!(
+        pass(registry.as_ref()),
+        ProbeAnswer::Moved {
+            old: WorkerStatus::Pending,
+            new: WorkerStatus::Ready
+        }
+    );
 }
 
 #[test]

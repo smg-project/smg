@@ -1696,7 +1696,9 @@ impl WorkersStore for MemoryStore {
             // matches (role, models and wires), as the registry inherits a
             // replaced worker's runtime state today. A drain is of the
             // registration it named and ends with it: a draining
-            // incarnation hands no status on.
+            // incarnation hands no status on. What a registration states
+            // for a request's hard demands is not asked, though a change of
+            // it starts another life: it is the same reachable worker.
             let old = workers.rows.remove(&old_id);
             let new_id = identity(&facts.key, facts.incarnation);
             let status = old

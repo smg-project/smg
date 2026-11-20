@@ -46,6 +46,11 @@ crates/policy_controller/tests/classic/sheets/
   sticky_rank.json
   cache_aware.json
   sticky_override.json
+  retry_wire.json
+  media_refs.json
+  context_window.json
+  constraint_decider.json
+  rank_pin.json
 model_gateway/src/         the gateway's recorders, each a test module beside the code it runs
   policies/classic_rows.rs                                                  power_of_two.json
   policies/classic_manual_rows.rs                                           manual.json
@@ -58,10 +63,19 @@ model_gateway/src/         the gateway's recorders, each a test module beside th
   routers/grpc/common/stages/request_execution/classic_sticky_rank_rows.rs  sticky_rank.json
   policies/classic_cache_aware_rows.rs                                      cache_aware.json
   policies/classic_sticky_override_rows.rs                                  sticky_override.json
+  routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs     retry_wire.json
+  routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs     media_refs.json
+  routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs     context_window.json
+  routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs     constraint_decider.json
+  routers/http/router/classic_rank_rows.rs                                    rank_pin.json
 crates/worker/src/         the worker crate's recorders, test modules beside the load monitor
   load/monitor/classic_overload_rows.rs                                     overload.json
   load/monitor/classic_minimum_tokens_rows.rs                               minimum_tokens.json
 ```
+
+Five sheets record which workers a hard placement rule leaves: `retry_wire.json`, `media_refs.json`,
+`context_window.json` and `constraint_decider.json` run the gRPC worker-selection demands; `rank_pin.json`
+runs the HTTP transcription route's rule for workers that registered a data-parallel rank.
 
 ## A sheet
 
@@ -253,6 +267,14 @@ and the rows at one request and at two hold it. No pick moves a count: the count
 Under `delegate` a sequence row runs power of two over two workers with no load report, so the policy compares
 both by their requests in flight and draws nothing.
 
+These five sheets use **placement rows**, not sequence, drawn, pair or verdict rows. Each row records a
+pool's worker facts and an ordered list of `answers`: each answer is either `placed` (the set of workers
+the request can reach, indexed in that pool) or `refused` (status, code, retry-after presence and message).
+The four gRPC sheets carry the ordered `requests` answered. The HTTP rank-pin sheet omits that list:
+every row issues one transcription request and records its one answer. The original recorders repeat
+each row twenty times and require identical answers. Their rows and original recorded commits remain
+unchanged; the README registers the existing recordings.
+
 ## The sheets
 
 Each sheet is recorded on its own, so the commit is a column of the sheet's row and never one commit for the
@@ -273,6 +295,11 @@ directory. The sha256 is of the file as committed.
 | `sticky_rank.json` | the rank of a sticky key on one grouped worker under hash placement: a key's rank, a request with no key, a worker of one engine or of no count, the ranks a connection places a pin on, how the keys keep and spread | `615542c4c69bb28fb3cb3e9e4ee29a8e2be0a7bc` | 8: 6 sequence, 2 drawn | `d8663087d143cb6d8f46777b2abf6b38e16153fb738c33240c8c7473c86805af` | `classic_sticky_rank_rows.rs` |
 | `cache_aware.json` | cache aware in single placement, under each of its three matchers: a holder kept, the count gate and its spill, its factor under the command line's defaults, a margin under its floor, a miss, a match at the threshold, a holder tried or not usable, the two KV gates, a request that ends, the blocks a worker stores and removes | `bfe189b332349c44cf7e3b6e1102a9b5a2699d9d` | 28: 26 sequence, 2 drawn | `f13a642dc9252e0328f8092b3ff322a03f270d918311c3b5c5dd29979ab8f085` | `classic_cache_aware_rows.rs` |
 | `sticky_override.json` | the routing-key override over a policy that reads no key: a pin under the cap and under its model, a key seen first under the map's modes and under `delegate`, each pin order after a failover, and at the cap a pin that follows, a pick on the pinned worker again, a pick on a worker at the cap, every worker at the cap, no other worker routable | `26f90083091e4dd791420febd88beda3bef3faac` | 18: 14 sequence, 4 drawn | `d74b5e3c8a31b4f1c8cd55cef5629acad0659658c830d937f94b056e9580562b` | `classic_sticky_override_rows.rs` |
+| `retry_wire.json` | a retry's retained runtime and transport | `a4935a5acd15151641b1988e234016a95fd172da` | 8 placement rows | `5ab9e99211e10b2fd8e0d3fd8400fe207cfc9adc8e7b1603dd13c70177d7128c` | `classic_hard_demand_rows.rs` |
+| `media_refs.json` | media-reference processing, pipeline and vision demands | `a4935a5acd15151641b1988e234016a95fd172da` | 10 placement rows | `5c624c90b8b3195fa18b73390fb07e822b94876134c088aaccf359da6bdc7990` | `classic_hard_demand_rows.rs` |
+| `context_window.json` | input and completion budgets against each worker window separately | `a4935a5acd15151641b1988e234016a95fd172da` | 8 placement rows | `bf49bf479afab2621fa118ea07c35ff21cbbd0b06dcb499fa1d1318bd60e0f62` | `classic_hard_demand_rows.rs` |
+| `constraint_decider.json` | retries restricted to workers deciding the constraint alike | `a4935a5acd15151641b1988e234016a95fd172da` | 5 placement rows | `5008922d28db1276f4a202de44b24935b8f10fe8d3581a0e9483d597358493c0` | `classic_hard_demand_rows.rs` |
+| `rank_pin.json` | HTTP transcription only on workers without a registered rank | `a4935a5acd15151641b1988e234016a95fd172da` | 11 placement rows | `774c494485af59153ef9579acde444459bc37f001741b7da95903679151c59f7` | `classic_rank_rows.rs` |
 
 ## Recording
 
@@ -303,6 +330,11 @@ The overload and minimum-tokens sheets' recorders are tests of the worker crate:
 | `sticky_rank.json` | `request_execution::classic_sticky_rank_rows` |
 | `cache_aware.json` | `policies::classic_cache_aware_rows` |
 | `sticky_override.json` | `policies::classic_sticky_override_rows` |
+| `retry_wire.json` | `worker_selection::classic_hard_demand_rows` |
+| `media_refs.json` | `worker_selection::classic_hard_demand_rows` |
+| `context_window.json` | `worker_selection::classic_hard_demand_rows` |
+| `constraint_decider.json` | `worker_selection::classic_hard_demand_rows` |
+| `rank_pin.json` | `router::classic_rank_rows` |
 
 The pair sheet's recorder is a child of the pair index and reads a pairing descriptor by its readers, so it records the
 descriptor the gateway derived and never a second reading of the registration. The encode sheet's recorder is a

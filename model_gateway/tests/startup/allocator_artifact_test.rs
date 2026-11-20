@@ -51,6 +51,10 @@ fn smg_binary_uses_global_jemalloc() {
     let stats = jemalloc_stats("stats_print:true,stats_print_opts:J")
         .expect("jemalloc statistics from the SMG executable");
     assert!(
+        !stats.contains("warning: jemalloc was not registered"),
+        "SMG executable did not register its allocator: {stats}"
+    );
+    assert!(
         stats.contains("\"jemalloc\""),
         "SMG executable did not emit jemalloc statistics: {stats}"
     );

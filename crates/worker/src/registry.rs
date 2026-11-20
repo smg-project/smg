@@ -19,7 +19,7 @@ use std::{
 use arc_swap::ArcSwap;
 use dashmap::{mapref::entry::Entry, DashMap};
 use rustc_hash::FxBuildHasher;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Notify};
 use uuid::Uuid;
 
 use crate::{
@@ -271,10 +271,17 @@ pub struct WorkerRegistry<G> {
     /// and dynamically-registered workers need it long after.
     connect_signal_tx: mpsc::UnboundedSender<WorkerConnected>,
 
-    /// Receiver drained by the manager's health loop. Taken once via
-    /// [`Self::take_connect_signal_receiver`]; `None` thereafter (and when
-    /// no manager runs, e.g. health checks globally disabled).
+    /// Receiver drained by the manager's health loop. One loop holds it at
+    /// a time: [`Self::take_connect_signal_receiver`] hands it out, and the
+    /// loop hands it back at its end
+    /// ([`Self::return_connect_signal_receiver`]). It waits here while no
+    /// loop runs: health checks globally disabled, or between two loops of
+    /// a host that starts one for each term of its lead.
     connect_signal_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<WorkerConnected>>>,
+
+    /// Wakes a loop that started while another held the receiver: told each
+    /// time the receiver comes back.
+    connect_signal_home: Notify,
 
     /// What makes the engine connection of a worker this registry builds
     /// from a peer's published state (see [`Self::with_engine_connector`]).
@@ -327,6 +334,7 @@ impl<G: Generation> WorkerRegistry<G> {
             event_tx: broadcast::Sender::new(1024),
             connect_signal_tx,
             connect_signal_rx: parking_lot::Mutex::new(Some(connect_signal_rx)),
+            connect_signal_home: Notify::new(),
             engine_connector: None,
         }
     }
@@ -396,11 +404,32 @@ impl<G: Generation> WorkerRegistry<G> {
         self.connect_signal_tx.clone()
     }
 
-    /// Take the connect-signal receiver. Returns `Some` exactly once (the
-    /// manager takes it at startup); `None` on any later call. Holds the
+    /// Take the connect-signal receiver: `Some` for the one loop that holds
+    /// it, `None` while another does. A loop hands it back at its end, and
+    /// the next take gets it with every signal sent meanwhile. Holds the
     /// receiver lock briefly.
     pub fn take_connect_signal_receiver(&self) -> Option<mpsc::UnboundedReceiver<WorkerConnected>> {
         self.connect_signal_rx.lock().take()
+    }
+
+    /// Hand the connect-signal receiver back, at the end of the loop that
+    /// took it, and wake a loop that waits for it
+    /// ([`Self::connect_signal_receiver_returned`]). Holds the receiver lock
+    /// briefly.
+    pub(crate) fn return_connect_signal_receiver(
+        &self,
+        receiver: mpsc::UnboundedReceiver<WorkerConnected>,
+    ) {
+        *self.connect_signal_rx.lock() = Some(receiver);
+        self.connect_signal_home.notify_one();
+    }
+
+    /// Resolves once the receiver was handed back. A loop that started
+    /// without it awaits this, then takes. A hand-back nobody awaited is
+    /// kept for the next await, so a loop that takes nothing on waking
+    /// awaits again.
+    pub(crate) async fn connect_signal_receiver_returned(&self) {
+        self.connect_signal_home.notified().await;
     }
 
     /// True if any registered worker is Pending and depends on the connect

@@ -1,5 +1,7 @@
 {{- include "smg.validateDiscovery" . -}}
 {{- include "smg.validateAdmission" . -}}
+{{- include "smg.validatePolicy" . -}}
+{{- $policyConfigMap := include "smg.routerPolicyConfigMapName" . -}}
 apiVersion: apps/v1
 {{- if .Values.router.mesh.enabled }}
 kind: StatefulSet
@@ -54,7 +56,13 @@ spec:
         {{- if include "smg.oracleSecretManaged" . }}
         checksum/oracle-secret: {{ include (print $.Template.BasePath "/secret-oracle.yaml") . | sha256sum }}
         {{- end }}
-        {{- with .Values.router.podAnnotations }}
+        {{- $podAnnotations := .Values.router.podAnnotations }}
+        {{- /* Roll the pods on an inline edit so the gateway reads the new file at start-up. */}}
+        {{- if .Values.router.policySpec }}
+        {{- $checksum := include "smg.routerPolicySpec" . | sha256sum }}
+        {{- $podAnnotations = merge (dict "checksum/policy-spec" $checksum) ($podAnnotations | default dict) }}
+        {{- end }}
+        {{- with $podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       labels:
@@ -204,6 +212,11 @@ spec:
               mountPath: /etc/smg/consul-tls
               readOnly: true
             {{- end }}
+            {{- if $policyConfigMap }}
+            - name: policy-spec
+              mountPath: {{ include "smg.routerPolicySpecPath" . | dir }}
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
@@ -258,6 +271,11 @@ spec:
               - key: {{ .key }}
                 path: {{ .path }}
               {{- end }}
+        {{- end }}
+        {{- if $policyConfigMap }}
+        - name: policy-spec
+          configMap:
+            name: {{ $policyConfigMap | quote }}
         {{- end }}
       {{- with .Values.router.nodeSelector }}
       nodeSelector:

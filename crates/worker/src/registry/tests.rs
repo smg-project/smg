@@ -193,7 +193,7 @@ fn assert_sampling_defaults_group_values(
 }
 
 #[test]
-fn connect_signal_receiver_is_taken_exactly_once() {
+fn connect_signal_receiver_is_held_by_one_taker_at_a_time() {
     let registry = WorkerRegistry::new();
     assert!(
         registry.take_connect_signal_receiver().is_some(),
@@ -203,6 +203,32 @@ fn connect_signal_receiver_is_taken_exactly_once() {
         registry.take_connect_signal_receiver().is_none(),
         "a second take must return None so a second manager runs poll-only"
     );
+}
+
+/// The receiver handed back is taken again, with what was sent while
+/// nobody read: a signal waits in the channel for the next loop. The
+/// hand-back wakes a waiter that asks after it too.
+#[tokio::test]
+async fn a_returned_connect_signal_receiver_is_taken_again_with_what_was_sent_meanwhile() {
+    let registry = WorkerRegistry::new();
+    let held = registry
+        .take_connect_signal_receiver()
+        .expect("the first take");
+    registry
+        .connect_signal_sender()
+        .send(WorkerConnected {
+            url: "ipc:///tmp/w.ipc".to_string(),
+            revision: 3,
+        })
+        .expect("send on a live channel");
+    registry.return_connect_signal_receiver(held);
+    registry.connect_signal_receiver_returned().await;
+
+    let mut again = registry
+        .take_connect_signal_receiver()
+        .expect("the receiver is back");
+    let got = again.recv().await.expect("the signal sent meanwhile");
+    assert_eq!(got.revision, 3);
 }
 
 #[tokio::test]

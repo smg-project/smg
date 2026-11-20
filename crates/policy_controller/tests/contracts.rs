@@ -171,6 +171,7 @@ fn request_record() -> &'static [&'static str] {
             affinity,
             named,
             model_fingerprint,
+            signal_cells,
         }
     )
 }
@@ -202,6 +203,7 @@ fn constraints_record() -> &'static [&'static str] {
             wire_modes,
             overload_lifted,
             subset_hint,
+            demands,
             stalled,
             held,
             pins
@@ -650,6 +652,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "affinity",
                 "named",
                 "model_fingerprint",
+                "signal_cells",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -679,7 +682,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Constraints",
             record: constraints_record(),
-            host_only: &["stalled", "held", "pins"],
+            host_only: &["demands", "stalled", "held", "pins"],
             wire_only: &[],
             wire: &[
                 ("excluded", Type::Fixed64),
@@ -892,6 +895,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "affinity",
                 "named",
                 "model_fingerprint",
+                "signal_cells",
             ],
             before: &[],
             beside: &[],

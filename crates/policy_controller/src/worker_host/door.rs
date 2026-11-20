@@ -5,7 +5,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use smg_worker::settings::UnhealthyRemovalScope;
 
-use super::Standing;
+use super::{kv_feed::asks_events, Standing};
 use crate::{
     store::{
         membership::{self, NotMaker, Past},
@@ -44,6 +44,9 @@ pub enum Refused {
     Moved,
     /// A row stands under the URL of a registration that expects none.
     Stands,
+    /// The row a replacement names is draining: its removal takes the
+    /// worker.
+    Draining,
     /// The row's maker is outside the health removal scope.
     OutOfScope,
 }
@@ -75,7 +78,8 @@ pub enum Expect {
     Nothing,
     /// The row its asker saw, at the revision it saw: a replacement by id.
     /// No row refuses it ([`Refused::Absent`]), and so does another row or
-    /// revision ([`Refused::Moved`]).
+    /// revision ([`Refused::Moved`]). A draining row refuses it too
+    /// ([`Refused::Draining`]): its removal wins.
     Seen(Standing),
     /// Anything: an upsert.
     Anything,
@@ -87,7 +91,8 @@ pub trait Membership: Send + Sync + 'static {
     /// stand there. The callback states facts for `url` during the door's
     /// turn and must leave writes to the door. Facts whose key is not `url`
     /// are refused: the maker was asked of the row under `url`, and the
-    /// store writes by the facts' key.
+    /// store writes by the facts' key. The door states the row's event
+    /// signal itself, by the generation in force, whatever the facts state.
     fn found(
         &self,
         maker: &Maker,
@@ -131,7 +136,8 @@ fn seen_row(store: &MemoryStore, url: &str, seen: Standing) -> Result<WorkerRow,
 }
 
 /// Lay a registration over what it expects to stand while the door holds
-/// its turn.
+/// its turn. The row's event signal is stated here, over the facts the
+/// callback states ([`asks_events`]).
 pub(crate) fn lay(
     turn: &impl Turn,
     maker: &Maker,
@@ -151,6 +157,12 @@ pub(crate) fn lay(
     }
     if let Some(row) = &standing {
         made_by(row, maker)?;
+        // A draining row is leaving. Laid over, it would take the URL's
+        // next life and its removal would leave the worker: the removal
+        // wins over a replacement.
+        if matches!(expect, Expect::Seen(_)) && row.status == WorkerStatus::Draining {
+            return Err(Refused::Draining);
+        }
     }
 
     let mut facts = state(standing.as_ref().map(|row| &row.facts));
@@ -160,6 +172,9 @@ pub(crate) fn lay(
             why: "the facts name the URL of the call",
         }));
     }
+    // The host states the row's stream in the write that makes the row: the
+    // follow is told of a worker once, and reads the row then.
+    facts.signals.events = store.deciding(|world| asks_events(&facts, world.spec().engine()));
     if let Some(row) = &standing {
         facts.incarnation = row.facts.incarnation;
     }
@@ -352,7 +367,7 @@ pub(super) mod tests {
             mpsc, Arc, Barrier, Weak,
         },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use smg_worker::settings::UnhealthyRemovalScope;
@@ -361,9 +376,16 @@ pub(super) mod tests {
         changed, lay, Expect, Membership, Refused, Remover, Standing, StoreDoor, Turn, Wrote,
     };
     use crate::{
+        demands::{DemandFacts, Demands},
+        door::{
+            tests::{request, GATEWAY, MODEL},
+            Door,
+        },
+        spec::{AppliedSpec, PolicySpec},
         store::{
+            index::indexed_under,
             membership::{self, Past},
-            Maker, MemoryStore, WorkerFacts, WorkerRow, WorkerStatus, WorkersStore,
+            Maker, MemoryStore, Signals, WorkerFacts, WorkerRow, WorkerStatus, WorkersStore,
         },
         view::{Role, WireModes, WorkerId},
     };
@@ -407,6 +429,87 @@ pub(super) mod tests {
     #[test]
     fn a_registration_is_laid_over_what_it_expects() {
         check_expectations(local_door);
+    }
+
+    #[test]
+    fn a_found_row_states_its_event_signal() {
+        check_event_signal(local_door);
+    }
+
+    /// A generation whose prefill profile of `pd/*` reads the index, and no
+    /// other profile of it.
+    fn prefill_reads_the_index() -> AppliedSpec {
+        let text = r#"{
+          "apiVersion": "smg.policy/v1",
+          "profiles": {
+            "default": { "filter": ["healthy"], "pick": "round-robin" },
+            "prefill": { "filter": ["healthy"], "score": ["prefix-affinity"], "pick": "best" },
+            "decode": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" }
+          },
+          "bindings": [
+            { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "decode" } },
+            { "match": { "model": "*" }, "profile": "default" }
+          ]
+        }"#;
+        let mut spec: PolicySpec = serde_json::from_str(text).expect("a well-formed document");
+        spec.generation = 1;
+        AppliedSpec::validate(&spec).expect("the document validates")
+    }
+
+    /// The door states a found row's event signal itself, whatever the
+    /// facts state: what the generation in force reads for the row's first
+    /// model in the phase of its role, and only for a gRPC worker. A write
+    /// under a later generation states it again.
+    pub(crate) fn check_event_signal(open: impl Fn() -> (Arc<MemoryStore>, Box<dyn Membership>)) {
+        const PAIRED: &str = "pd/x";
+        // The row's model, role and wire, what its facts state, and what the
+        // door states.
+        let rows = [
+            (PAIRED, Role::Prefill, WireModes::GRPC, false, true),
+            (PAIRED, Role::Decode, WireModes::GRPC, true, false),
+            (PAIRED, Role::Single, WireModes::GRPC, true, false),
+            (PAIRED, Role::Prefill, WireModes::HTTP, true, false),
+            ("other", Role::Prefill, WireModes::GRPC, true, false),
+        ];
+        for (model, role, wire_modes, events, asked) in rows {
+            let (store, door) = open();
+            store
+                .apply(prefill_reads_the_index())
+                .expect("the first generation");
+            let found = WorkerFacts {
+                models: vec![model.to_owned()],
+                role,
+                wire_modes,
+                signals: Signals {
+                    events,
+                    ..Signals::default()
+                },
+                ..stated()
+            };
+            door.found(&Maker::Control, Expect::Nothing, URL, &|_| found.clone())
+                .expect("registered");
+            let row = store.by_key(URL).expect("the found row");
+            assert_eq!(
+                row.facts.signals.events, asked,
+                "{model} {role:?} {wire_modes:?}"
+            );
+            assert_eq!(indexed_under(&row).is_some(), asked);
+
+            // Every profile of the cache-aware preset reads the index.
+            let mut later = PolicySpec::preset("cache_aware").expect("the preset");
+            later.generation = 2;
+            store
+                .apply(AppliedSpec::validate(&later).expect("the preset validates"))
+                .expect("the second generation");
+            door.found(&Maker::Control, Expect::Anything, URL, &|_| found.clone())
+                .expect("laid again");
+            let row = store.by_key(URL).expect("the row laid again");
+            assert_eq!(
+                row.facts.signals.events,
+                wire_modes == WireModes::GRPC,
+                "{model} {role:?} {wire_modes:?} under the later generation"
+            );
+        }
     }
 
     /// An add registers an absent URL, and a standing row refuses it before
@@ -475,8 +578,27 @@ pub(super) mod tests {
             })
         );
 
-        // The row its asker saw left.
+        // A draining row is leaving: its removal wins over a replacement,
+        // which is told so. Another maker is told the row is not its own.
         let seen = standing(&next);
+        assert_eq!(
+            door.drained(Remover::Maker(&control), URL, seen),
+            Ok(Wrote::Draining(next.id))
+        );
+        assert_eq!(
+            door.found(&control, Expect::Seen(seen), URL, &unstated),
+            Err(Refused::Draining)
+        );
+        assert!(matches!(
+            door.found(&pool, Expect::Seen(seen), URL, &unstated),
+            Err(Refused::NotMaker(_))
+        ));
+        assert_eq!(
+            store.by_key(URL).map(|row| (row.id, row.status)),
+            Some((next.id, WorkerStatus::Draining))
+        );
+
+        // The row its asker saw left.
         assert_eq!(
             door.gone(Remover::Maker(&control), URL, seen),
             Ok(Wrote::Removed(next.id))
@@ -731,6 +853,69 @@ pub(super) mod tests {
             membership::life(0, door.base, before)
         );
         assert_eq!((row.facts.role, row.revision), (Role::Decode, 1));
+    }
+
+    /// A refresh that changes the runtime a worker states starts another
+    /// life. The row that stated the old number is gone when the write is
+    /// answered: with no publication awaited, a retry that demands the old
+    /// runtime is decided over nobody, and one that demands the new runtime
+    /// is placed on the new life. The new life is handed the old one's
+    /// status: the worker's checks are on, and none runs between the two.
+    #[test]
+    fn a_changed_demand_fact_is_another_life_and_the_old_one_takes_no_retry() {
+        let (store, door) = door();
+        let maker = Maker::provider("pool", "first").expect("a maker");
+        let stating = |runtime| WorkerFacts {
+            models: vec![MODEL.to_owned()],
+            demand_facts: DemandFacts { runtime },
+            ..stated()
+        };
+        door.found(&maker, Expect::Anything, URL, &|_| stating(7))
+            .expect("registered");
+        // Its checks are on: a check's word makes the first life ready.
+        let pending = store.by_key(URL).expect("the registered row");
+        store
+            .set_status(pending.id, WorkerStatus::Ready, pending.revision)
+            .expect("ready");
+        let old = store.by_key(URL).expect("the ready row");
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        document.generation = 1;
+        let applied = AppliedSpec::validate(&document).expect("the document validates");
+        store.apply(applied).expect("above the unbound start");
+        store.publish_now();
+        let policy = Door::new(Arc::clone(&store));
+        let decide = |id: &[u8], runtime: u32| {
+            let mut retry = request(id, 7);
+            retry.constraints.wire_modes = WireModes::HTTP;
+            retry.constraints.demands = Demands { runtime };
+            let decided = policy.decide(GATEWAY, &retry, Instant::now());
+            decided.expect("a decision")
+        };
+        let placed = decide(b"before", 7);
+        let target = placed.decision.pick().expect("the worker states runtime 7");
+        assert_eq!(target.targets.first().map(|target| target.id), Some(old.id));
+
+        let wrote = door.found(&maker, Expect::Anything, URL, &|_| stating(9));
+        let row = store.by_key(URL).expect("the replaced row");
+        assert_eq!(
+            wrote,
+            Ok(Wrote::Another {
+                old: old.id,
+                new: row.id
+            })
+        );
+        assert_eq!(store.get(old.id), None);
+        assert_eq!(row.facts.demand_facts, DemandFacts { runtime: 9 });
+        assert_eq!(row.status, WorkerStatus::Ready, "handed on by the store");
+
+        let refused = decide(b"after", 7);
+        assert!(
+            refused.decision.pick().is_none() && refused.lease.is_none(),
+            "the worker states runtime 9: {refused:?}"
+        );
+        let moved = decide(b"moved", 9);
+        let target = moved.decision.pick().expect("the worker states runtime 9");
+        assert_eq!(target.targets.first().map(|target| target.id), Some(row.id));
     }
 
     #[test]

@@ -89,11 +89,23 @@ impl WorkerFacts {
     /// laid over the row does: the one write that asks this copies it first.
     /// The facts are compared whole, so facts that state another number are
     /// never `Unmoved`.
+    ///
+    /// Another life starts where the facts change which requests the worker
+    /// can take at all: its role, its wires, its models, or what it states
+    /// for a request's hard demands. The store pays a publication at the
+    /// write of another life, so a decision that starts once the write is
+    /// answered reads none of the old life's facts. A decision that loaded
+    /// its publication before the write still decides over the old life.
+    ///
+    /// A life the demand facts alone start is handed the standing life's
+    /// status: the store hands a status on where role, models and wires
+    /// match, and it is the same reachable worker.
     pub fn laid_over(&self, standing: &Self) -> Laid {
         if self == standing {
             Laid::Unmoved
         } else if self.role != standing.role
             || self.wire_modes != standing.wire_modes
+            || self.demand_facts != standing.demand_facts
             || !self.same_models(standing)
         {
             Laid::Another
@@ -263,6 +275,7 @@ mod tests {
 
     use super::{base, Laid, NotMaker, HALF};
     use crate::{
+        demands::DemandFacts,
         store::{Maker, Unmade, WorkerFacts, WorkerRow, WorkerStatus},
         view::{Role, WireModes, WorkerId},
     };
@@ -375,6 +388,25 @@ mod tests {
         let mut reordered = standing.clone();
         reordered.models.reverse();
         assert_eq!(reordered.laid_over(&standing), Laid::InPlace);
+    }
+
+    /// What a worker states for a request's hard demands says which
+    /// requests it can take at all, as its wires do: a registration that
+    /// changes it starts another life, whichever way the number moves.
+    #[test]
+    fn a_changed_demand_fact_is_another_life() {
+        let stating = |runtime| WorkerFacts {
+            demand_facts: DemandFacts { runtime },
+            ..WorkerFacts::default()
+        };
+        for (standing, fresh) in [(7, 9), (7, 0), (0, 7)] {
+            assert_eq!(
+                stating(fresh).laid_over(&stating(standing)),
+                Laid::Another,
+                "{standing} to {fresh}"
+            );
+        }
+        assert_eq!(stating(7).laid_over(&stating(7)), Laid::Unmoved);
     }
 
     #[test]

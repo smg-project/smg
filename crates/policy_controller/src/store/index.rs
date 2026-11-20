@@ -375,6 +375,38 @@ impl Tables {
         mask
     }
 
+    /// The workers a read is kept within for a view its caller cut further
+    /// than [`Self::within`] reads it: the view's own rows, each found
+    /// among the pool's by one walk of the two lists, which stand in one
+    /// order. A row the index does not hold is no bit.
+    fn within_view<'a>(
+        &'a self,
+        pool: &[Candidate],
+        view: &[Candidate],
+        mask: &'a mut [u64; MASK_WORDS],
+    ) -> &'a [u64] {
+        let words = self.members.len().min(MASK_WORDS);
+        let mask = &mut mask[..words];
+        mask.fill(0);
+        let mut rows = pool.iter().zip(self.id_of.iter());
+        for kept in view {
+            let found = rows.find(|(row, _)| row.id == kept.id);
+            debug_assert!(
+                found.is_some(),
+                "a cut view's rows stand among its pool's, in their order"
+            );
+            let Some((_, &id)) = found else {
+                break;
+            };
+            if id != NONE {
+                if let Some(word) = mask.get_mut((id / 64) as usize) {
+                    *word |= 1u64 << (id % 64);
+                }
+            }
+        }
+        mask
+    }
+
     /// How many times a naming makes its lookup again before it names no
     /// holder: each round more needs a take under a row it kept.
     const ROUNDS: usize = 4;
@@ -651,7 +683,37 @@ impl PoolIndex {
     /// publication's that the view holds, less the rows whose naming ended
     /// by the decision's instant: whole within the cap, a draw of the cap
     /// past it, on another stream.
+    #[inline]
     pub(super) fn name(
+        &self,
+        naming: &Naming<'_>,
+        pool: &[Candidate],
+        locals: &[(u32, GatewayId)],
+        view: &[Candidate],
+        named: &mut Named,
+    ) {
+        self.name_in::<false>(naming, pool, locals, view, named);
+    }
+
+    /// [`Self::name`] for a view its caller cut by more than its gateway's
+    /// wires since the build, as a request's hard demands cut it: the
+    /// holders' lookup is kept within the view's own rows, so a row the
+    /// cut took is named by nobody and takes no place of the cap.
+    pub(super) fn name_cut(
+        &self,
+        naming: &Naming<'_>,
+        pool: &[Candidate],
+        locals: &[(u32, GatewayId)],
+        view: &[Candidate],
+        named: &mut Named,
+    ) {
+        self.name_in::<true>(naming, pool, locals, view, named);
+    }
+
+    /// The one naming, built once for each of its two callers. `CUT` says
+    /// which rows the holders' lookup is kept within, and a build a
+    /// caller keeps each caller's lookup in a frame of its own.
+    fn name_in<const CUT: bool>(
         &self,
         naming: &Naming<'_>,
         pool: &[Candidate],
@@ -681,7 +743,11 @@ impl PoolIndex {
         let index = tables.index.as_ref();
         if let Some(index) = index.filter(|_| !naming.block_hashes.is_empty()) {
             let mut mask = [0u64; MASK_WORDS];
-            let within = tables.within(naming, locals, &mut mask);
+            let within = if CUT {
+                tables.within_view(pool, view, &mut mask)
+            } else {
+                tables.within(naming, locals, &mut mask)
+            };
             // The count the tables are whole at, read before the lookup: a
             // membership write that keeps them tells a later count, and
             // that count covers only what is read after it.

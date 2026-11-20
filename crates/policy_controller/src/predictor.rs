@@ -69,7 +69,7 @@ use std::{mem, slice};
 
 use rustc_hash::FxHashMap;
 
-use crate::view::WorkerId;
+use crate::view::{fold_block, WorkerId};
 
 /// No block: the end of a list, and the block before a request's first.
 const NONE: u32 = u32::MAX;
@@ -87,12 +87,6 @@ const CHUNK: usize = 1 << 12;
 const MAPS: usize = 1 << 8;
 /// The places of room a list of workers keeps while no block uses it.
 const POOLED: usize = 8;
-
-/// The key of a prefix one block longer: the key before it folded with the
-/// block's hash. The key's top bits take every bit of both.
-const fn fold(key: u64, hash: u64) -> u64 {
-    (key.rotate_left(23) ^ hash).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-}
 
 /// The map a key is found through.
 const fn map_of(key: u64) -> usize {
@@ -335,7 +329,7 @@ impl Predictor {
         keys.clear();
         let mut key = seed;
         keys.extend(hashes.iter().map(|&hash| {
-            key = fold(key, hash);
+            key = fold_block(key, hash);
             key
         }));
     }

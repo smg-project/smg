@@ -183,7 +183,7 @@ use http::{header::AUTHORIZATION, HeaderMap};
 
 use super::*;
 use crate::{
-    connection::engine::{EngineConnection, EngineConnector, ZmqLink},
+    connection::engine::{EngineConnection, EngineConnector, HealthAnswer, ZmqLink},
     health::circuit_breaker::CircuitState,
     identity::{
         basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
@@ -192,7 +192,9 @@ use crate::{
     },
     jobs::WorkerRegistrationMode,
     model_card::ModelCard,
-    test_support::{BasicWorkerBuilder, CountingConnector, RefusedAddress, WorkerRegistry},
+    test_support::{
+        BasicWorkerBuilder, CountingConnector, RefusedAddress, ScriptedAnswers, WorkerRegistry,
+    },
     worker::{HealthCheckConfig, WorkerSpec, WorkerStatus},
 };
 
@@ -3181,6 +3183,128 @@ impl HealthSink for RecordingSink {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn maybe_start_with_sink_hands_every_fact_to_the_sink_it_was_given() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let probes = [("grpc://passing:1", true), ("grpc://failing:1", false)].map(|(url, passed)| {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .connection_mode(ConnectionMode::Grpc)
+                .engine_connection(ScriptedAnswers::answering_health(Ok(HealthAnswer {
+                    healthy: passed,
+                    message: String::new(),
+                })))
+                .health_config(HealthCheckConfig {
+                    success_threshold: 1,
+                    check_interval_secs: 3600,
+                    ..HealthCheckConfig::default()
+                })
+                .build(),
+        );
+        let id = registry.register(worker.clone()).expect("a probe worker");
+        let fact = (id, passed, worker.revision(), WorkerStatus::Pending);
+        (worker, fact)
+    });
+    let unprobed = unprobed_worker("http://unprobed:1");
+    unprobed.set_status(WorkerStatus::Pending);
+    let unprobed_id = registry
+        .register(unprobed.clone())
+        .expect("an unprobed worker");
+    let sink = Arc::new(RecordingSink::answering(ProbeAnswer::Stood(
+        WorkerStatus::Pending,
+    )));
+    let mut manager = WorkerManager::maybe_start_with_sink(
+        registry.clone(),
+        sink.clone(),
+        test_config(),
+        None,
+        true,
+        false,
+    )
+    .expect("health checks are on");
+    registry
+        .connect_signal_sender()
+        .send(WorkerConnected {
+            url: unprobed.url().to_string(),
+            revision: unprobed.revision(),
+        })
+        .expect("the manager takes the connect signal");
+
+    wait_until(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        "the sink did not receive both probe outcomes and the connect signal",
+        || sink.probes.lock().len() >= probes.len() && !sink.connects.lock().is_empty(),
+    )
+    .await;
+    manager.shutdown().await;
+
+    let seen = sink.probes.lock();
+    assert_eq!(seen.len(), probes.len());
+    for (worker, fact) in probes {
+        assert!(seen.contains(&fact), "missing probe outcome {fact:?}");
+        assert_eq!(worker.status(), WorkerStatus::Pending);
+        assert_eq!(
+            worker
+                .runtime_state()
+                .expect("the worker's state")
+                .total_pending_probes(),
+            0
+        );
+    }
+    assert_eq!(*sink.connects.lock(), [(unprobed_id, unprobed.revision())]);
+    assert_eq!(unprobed.status(), WorkerStatus::Pending);
+}
+
+/// The plain start hands its job queue and its removal rule on to the loop.
+/// A worker that fails its probe under a removal scope is failed by the
+/// registry, the sink of that start, and handed over for removal once: at
+/// its address, by its id and revision.
+#[tokio::test(start_paused = true)]
+async fn maybe_start_hands_its_job_queue_and_its_removal_rule_to_the_loop() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let url = "grpc://failing:1";
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .connection_mode(ConnectionMode::Grpc)
+            .engine_connection(ScriptedAnswers::answering_health(Ok(HealthAnswer {
+                healthy: false,
+                message: String::new(),
+            })))
+            .health_config(HealthCheckConfig {
+                failure_threshold: 1,
+                check_interval_secs: 1,
+                ..HealthCheckConfig::default()
+            })
+            .build(),
+    );
+    let id = registry.register(worker.clone()).expect("a probe worker");
+    let jobs = Arc::new(RecordedJobs::default());
+    let mut manager = WorkerManager::maybe_start(
+        registry,
+        config_removing(UnhealthyRemovalScope::AllLocal),
+        Some(jobs.clone()),
+        true,
+        false,
+    )
+    .expect("health checks are on");
+    wait_until(
+        tokio::time::Instant::now() + Duration::from_secs(20),
+        "the loop did not ask its queue to remove the failed worker",
+        || !jobs.0.lock().is_empty(),
+    )
+    .await;
+    manager.shutdown().await;
+
+    assert_eq!(worker.status(), WorkerStatus::Failed);
+    let removal = (
+        url.to_owned(),
+        id.as_str().to_owned(),
+        worker.revision(),
+        WorkerJobAsker::Health,
+    );
+    assert_eq!(*jobs.0.lock(), [removal]);
+}
+
 /// The collector says its two facts to the sink it was handed and writes no
 /// status itself. A probe's outcome crosses with the id, pass or fail, the
 /// revision and the status the probe was launched at, and the sink's answer
@@ -3374,5 +3498,60 @@ fn a_promoted_workers_next_check_follows_the_status_it_took() {
     assert!(
         *due >= before + Duration::from_secs(3600),
         "an interval out, not at once"
+    );
+}
+
+/// One loop holds the registry's connect-signal receiver, and hands it back
+/// at its end: a loop started behind it is signalled from then on. A host
+/// that runs a loop for each term of its lead starts the next as the last
+/// one ends, so the second loop here starts while the first still runs.
+#[tokio::test]
+async fn a_loop_started_behind_another_is_signalled_once_the_first_ends() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = unprobed_worker("http://unprobed:1");
+    let worker_id = registry.register(worker.clone()).unwrap();
+    let signal = || {
+        registry
+            .connect_signal_sender()
+            .send(WorkerConnected {
+                url: worker.url().to_string(),
+                revision: worker.revision(),
+            })
+            .expect("the channel has its receiver");
+    };
+    let first_sink = Arc::new(RecordingSink::answering(ProbeAnswer::Stale));
+    let second_sink = Arc::new(RecordingSink::answering(ProbeAnswer::Stale));
+    let first =
+        WorkerManager::start_with_sink(registry.clone(), first_sink.clone(), test_config(), None);
+    let _second =
+        WorkerManager::start_with_sink(registry.clone(), second_sink.clone(), test_config(), None);
+
+    // The first loop holds the receiver: its sink is told, the second's
+    // is not.
+    signal();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    wait_until(deadline, "the first loop reads the signal", || {
+        first_sink.connects.lock().len() == 1
+    })
+    .await;
+    assert!(second_sink.connects.lock().is_empty());
+
+    // The first loop ends, by the abort at its manager's drop. The second
+    // takes the receiver and reads the next signal.
+    drop(first);
+    signal();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    wait_until(deadline, "the second loop reads the signal", || {
+        second_sink.connects.lock().len() == 1
+    })
+    .await;
+    assert_eq!(
+        *second_sink.connects.lock(),
+        vec![(worker_id, worker.revision())]
+    );
+    assert_eq!(
+        first_sink.connects.lock().len(),
+        1,
+        "the first read no more"
     );
 }

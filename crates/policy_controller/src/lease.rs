@@ -164,7 +164,9 @@ pub enum Membership<'a> {
     },
 }
 
-/// A signal about one worker.
+/// A signal about one worker. The named values a document declares under
+/// `signals` are the other thing of that name: numbers read beside the
+/// rows ([`SignalCells`](crate::SignalCells)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signal {
     /// A load row for one rank of a worker, as the host shows it to its

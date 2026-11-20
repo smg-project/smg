@@ -149,10 +149,6 @@ pub struct AppContext {
     /// the policy store is present.
     pub(crate) policy_host: Option<Arc<Host>>,
     /// The membership feed over [`Self::policy_store`], present wherever the store is.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the context holds the feed for membership writes")
-    )]
     pub(crate) policy_feed: Option<Feed>,
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
     pub rl: Option<Arc<smg_rl::RlState>>,
@@ -959,8 +955,7 @@ impl AppContextBuilder {
         stages: Option<Catalog>,
     ) -> Result<Self, String> {
         self.policy_store =
-            policy_controller::start_with(config, stages, RouterConfig::policy_document)
-                .map_err(|refusal| refusal.to_string())?;
+            policy_controller::start_with(config, stages).map_err(|refusal| refusal.to_string())?;
         if let Some(store) = &self.policy_store {
             let registry = self.worker_registry.as_ref().ok_or_else(|| {
                 "worker_registry must be set before the policy controller".to_string()
