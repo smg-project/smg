@@ -66,6 +66,9 @@ pub trait Filter: Any + Send + Sync + Debug {
     /// hashes: a stage that reads them declares [`Needs::token_hashes`] or
     /// [`Needs::text_hashes`], and one that declares neither may be handed
     /// none.
+    ///
+    /// Asked once, where the stage's generation is built. The answer
+    /// stands for that generation: no decision asks again.
     fn needs(&self) -> Needs {
         Needs::default()
     }
@@ -349,6 +352,9 @@ pub trait Scorer: Lifecycle + Debug {
     /// hashes: a stage that reads them declares [`Needs::token_hashes`] or
     /// [`Needs::text_hashes`], and one that declares neither may be handed
     /// none.
+    ///
+    /// Asked once, where the stage's generation is built. The answer
+    /// stands for that generation: no decision asks again.
     fn needs(&self) -> Needs {
         Needs::default()
     }
@@ -586,6 +592,9 @@ pub trait Picker: Lifecycle + Debug {
     /// hashes: a stage that reads them declares [`Needs::token_hashes`] or
     /// [`Needs::text_hashes`], and one that declares neither may be handed
     /// none.
+    ///
+    /// Asked once, where the stage's generation is built. The answer
+    /// stands for that generation: no decision asks again.
     fn needs(&self) -> Needs {
         Needs::default()
     }
@@ -2255,7 +2264,7 @@ fn run_drawn(
     // reads dearer, never wrong, so a debug build alone asserts it.
     debug_assert!(
         facts.named.is_none_or(|named| {
-            let cap = profile.picker.needs().sample as usize;
+            let cap = engine.profile_needs[at].sample as usize;
             cap == 0 || named.holders.len().max(named.warming.len()) <= cap
         }),
         "each list of rows named stands at or under the sample of the picker that draws"
@@ -3665,6 +3674,16 @@ impl Engine {
     fn pair_decode_needs(&self, model: &str) -> Needs {
         self.pair_binding(model)
             .and_then(|b| profile_index(b, Phase::Decode))
+            .and_then(|i| self.profile_needs.get(usize::from(i)))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// The needs of the encode profile of `model`'s pair binding
+    /// ([`Self::pair_binding`]), nothing where the pair has none.
+    pub(crate) fn pair_encode_needs(&self, model: &str) -> Needs {
+        self.pair_binding(model)
+            .and_then(|b| profile_index(b, Phase::Encode))
             .and_then(|i| self.profile_needs.get(usize::from(i)))
             .copied()
             .unwrap_or_default()
