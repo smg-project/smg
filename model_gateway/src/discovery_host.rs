@@ -23,13 +23,7 @@ impl DiscoveryHost for AppContext {
     }
 
     fn stamp(&self, spec: &mut WorkerSpec) {
-        // A worker that becomes a row of the policy controller's store takes
-        // no key.
-        if self.registers_at_door(spec) {
-            spec.api_key = None;
-        } else {
-            spec.api_key.clone_from(&self.router_config.api_key);
-        }
+        spec.api_key.clone_from(&self.router_config.api_key);
         spec.max_connection_attempts = self
             .router_config
             .connection_attempt_budget(RouterConfig::DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS);

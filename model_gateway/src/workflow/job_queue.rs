@@ -33,9 +33,9 @@ use crate::{
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
         create_worker_removal_workflow_data, create_worker_update_workflow_data,
         create_worker_workflow_data, note_tokenizer_load_outcome, note_tokenizer_removed,
-        registered_entries, registered_in, steps::rows_written, McpServerConfigRequest,
-        TokenizerConfigRequest, TokenizerRemovalRequest, WasmModuleConfigRequest,
-        WasmModuleRemovalRequest, WorkerRegistrationMode, WorkflowEngines,
+        registered_entries, registered_in, McpServerConfigRequest, TokenizerConfigRequest,
+        TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
+        WorkerRegistrationMode, WorkflowEngines,
     },
 };
 
@@ -607,13 +607,9 @@ impl JobHost for AppContext {
                         // id and revision): a worker registered or replaced
                         // since is not this job's to remove, and the step
                         // record alone can be read before the step's end.
-                        let mut entries = registered_entries(&context.worker_registry, &state);
-                        // A row's object is the holder's, never the one the
-                        // job built: the door's write names this job's rows.
-                        if let Some(feed) = context.door_feed() {
-                            let rows = &feed.objects;
-                            entries.extend(rows_written(&context.worker_registry, rows, &state));
-                        }
+                        // A row's object is the one the job handed in at
+                        // the door, so the same read names a row's worker.
+                        let entries = registered_entries(&context.worker_registry, &state);
                         Err(if entries.is_empty() {
                             if registered_in(&state) {
                                 format!(
@@ -847,11 +843,7 @@ impl JobHost for AppContext {
                     spec.worker_type = proto_worker_type;
                     spec.bootstrap_port = bootstrap_port;
                     apply_startup_worker_config(&mut spec, router_config);
-                    // The runtime is stated by now. A worker that becomes a row
-                    // of the policy controller's store takes no key.
-                    if !context.registers_at_door(&spec) {
-                        spec.api_key.clone_from(&api_key);
-                    }
+                    spec.api_key.clone_from(&api_key);
                     let config = spec;
 
                     let job = Job::AddWorker {
@@ -1714,13 +1706,11 @@ mod tests {
     }
 
     /// A gateway that holds an API key and decides by the policy controller
-    /// still registers its start-up workers. Its start-up list states the
-    /// key on a provider's worker alone: a self-hosted worker becomes a row
-    /// of the store, and a row holds no credential yet. The start says so,
-    /// and the keyless registration ends with the worker's row ready. Under
-    /// the classic policies the list states the key on both.
+    /// states the key on its start-up workers as under the classic policies:
+    /// on a self-hosted worker, which becomes a row of the store, and on a
+    /// provider's. A row holds no credential, and the row's object in the
+    /// registry holds the key.
     #[tokio::test]
-    #[tracing_test::traced_test]
     async fn under_the_policy_controller_a_keyed_gateways_startup_worker_becomes_a_row() {
         use smg_policy_controller::store::{WorkerStatus as RowStatus, WorkersStore};
 
@@ -1753,21 +1743,19 @@ mod tests {
             .expect("the classic start-up list");
         assert_eq!(stated(&next_job()), Some((url.clone(), key.clone())));
         assert_eq!(stated(&next_job()), Some((provider.clone(), key.clone())));
-        assert!(!logs_contain("holds no worker credential yet"));
 
         config.policy_controller = true;
         let hosted = AppContext::from_config(config.clone(), 30, None, None)
             .await
             .expect("the context");
         let hosted = Arc::new(hosted);
-        assert!(logs_contain("holds no worker credential yet"));
         let (queue, mut next_job) = recording_for_tests(&hosted);
         hosted.worker_job_queue.set(queue).unwrap();
         execute_job(&startup(&config), &hosted, &marks, None)
             .await
             .expect("the start-up list");
         let registration = next_job();
-        assert_eq!(stated(&registration), Some((url.clone(), None)));
+        assert_eq!(stated(&registration), Some((url.clone(), key.clone())));
         assert_eq!(stated(&next_job()), Some((provider, key)));
 
         let engines = WorkflowEngines::with_feed(&config, hosted.door_feed());
@@ -1777,6 +1765,12 @@ mod tests {
         let store = hosted.policy_store.as_ref().expect("the store");
         let row = store.by_key(&url).expect("the worker's row");
         assert_eq!(row.status, RowStatus::Ready);
+        let object = hosted
+            .worker_registry
+            .get_by_url(&url)
+            .expect("the row's object");
+        let held = object.api_key();
+        assert_eq!(held.map(String::as_str), Some("gateway-key"));
     }
 
     /// A gateway that decides by the policy controller, its queue recording
@@ -1815,12 +1809,12 @@ mod tests {
 
     /// Under the policy controller a label refresh leaves a row's worker
     /// alone and ends well: the door takes the engine's labels from no
-    /// writer yet. An update job that states what no row holds fails by the
-    /// worker API's name for it, and writes nothing. The registry keeps the
-    /// object the holder laid, so the removal behind them still takes the
-    /// worker.
+    /// writer yet. An update job that states an API key, a priority or a
+    /// cost moves the object the holder keeps, though no fact of the row
+    /// moves: each job hands its rebuilt worker in. The removal behind
+    /// them still takes the worker.
     #[tokio::test]
-    async fn under_the_policy_controller_a_refresh_and_an_unheld_field_leave_a_rows_worker() {
+    async fn under_the_policy_controller_an_update_moves_a_rows_key_priority_and_cost() {
         let (hosted, url, _, _jobs) = a_hosted_gateway_with_a_row().await;
         let registry = &hosted.worker_registry;
         let laid = registry.get_by_url(&url).expect("the row's object");
@@ -1841,31 +1835,37 @@ mod tests {
             refreshed.as_ref().is_ok_and(|text| text.contains(left)),
             "{refreshed:?}"
         );
-        for (body, name) in [
-            (
-                serde_json::json!({"api_key": "secret-key", "labels": {"tier": "a"}}),
-                "POLICY_CONTROLLER_WORKER_KEY_UNSUPPORTED",
-            ),
-            (
-                serde_json::json!({"priority": 7, "labels": {"tier": "a"}}),
-                "POLICY_CONTROLLER_WORKER_FIELD_UNSUPPORTED",
-            ),
-            (
-                serde_json::json!({"cost": 2.5}),
-                "POLICY_CONTROLLER_WORKER_FIELD_UNSUPPORTED",
-            ),
-        ] {
-            let updated = execute_job(&update(body), &hosted, &marks, None).await;
-            assert!(
-                updated
-                    .as_ref()
-                    .is_err_and(|text| text.contains(name) && !text.contains("secret-key")),
-                "{updated:?}"
-            );
-        }
         let stands = registry.get_by_url(&url).expect("the worker");
         assert!(Arc::ptr_eq(&stands, &laid));
-        assert!(!stands.metadata().spec.labels.contains_key("tier"));
+
+        // One job a field. Each object is the job's rebuilt worker and
+        // keeps what the jobs before it set.
+        type Held = fn(&dyn Worker) -> bool;
+        type Field = (serde_json::Value, Held);
+        let fields: [Field; 3] = [
+            (serde_json::json!({"api_key": "secret-key"}), |worker| {
+                worker.api_key().map(String::as_str) == Some("secret-key")
+            }),
+            (serde_json::json!({"priority": 7}), |worker| {
+                worker.metadata().spec.priority == 7
+            }),
+            (serde_json::json!({"cost": 2.5}), |worker| {
+                (worker.metadata().spec.cost - 2.5).abs() < f32::EPSILON
+            }),
+        ];
+        let mut held: Vec<Held> = Vec::new();
+        for (body, holds) in fields {
+            let before = registry.get_by_url(&url).expect("the worker");
+            assert!(!holds(before.as_ref()), "{body}");
+            let updated = execute_job(&update(body.clone()), &hosted, &marks, None).await;
+            assert!(updated.is_ok(), "{body}: {updated:?}");
+            let stands = registry.get_by_url(&url).expect("the worker");
+            assert!(!Arc::ptr_eq(&stands, &before), "{body}");
+            held.push(holds);
+            assert!(held.iter().all(|holds| holds(stands.as_ref())), "{body}");
+        }
+        let feed = hosted.door_feed().expect("the feed");
+        assert_eq!(feed.objects.unhanded(), 0);
 
         let removal = Job::RemoveWorker {
             url: url.clone(),
@@ -1926,15 +1926,17 @@ mod tests {
     }
 
     /// Under the policy controller a POST that fails behind its row's write
-    /// leaves no row. The job reads its rows from the holder where the state
-    /// records the door's write, and sends them out through the removal job.
-    /// A POST the door refused wrote no row, and the row that stood under its
-    /// URL is not its to remove.
+    /// leaves no row. The row's object is the worker the job built and
+    /// handed in at the door, so the job names it as it names a classic
+    /// worker, and sends it out through the removal job. A POST the door
+    /// refused wrote no row, and the row that stood under its URL is not its
+    /// to remove. Nor is a worker that another registration laid under the
+    /// URL between the write and the failure.
     #[tokio::test]
     async fn under_the_policy_controller_a_post_that_fails_behind_its_row_takes_the_row_out() {
         use smg_policy_controller::{
             store::{Maker, WorkersStore},
-            worker_host::{facts, Expect, WRITE_WORKERS_AT_DOOR_STEP},
+            worker_host::{Expect, WRITE_WORKERS_AT_DOOR_STEP},
         };
         use smg_worker::workflow::single_attempt;
         use wfaas::{
@@ -1949,26 +1951,40 @@ mod tests {
         let store = hosted.policy_store.as_ref().expect("the store");
         let registry = &hosted.worker_registry;
         let door = Arc::clone(&hosted.door_feed().expect("the feed").door);
-        // The door's write under its step's name, then a step that fails.
-        let write = FunctionStep::new(move |run: &mut WorkflowContext<WorkerWorkflowData>| {
-            let url = run.data.config.url.clone();
-            let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(&url).build());
-            let wrote = door
-                .found(&Maker::Control, Expect::Nothing, &url, &|row| {
-                    facts(worker.as_ref(), row)
+        let built =
+            |url: &str| -> Arc<dyn Worker> { Arc::new(BasicWorkerBuilder::new(url).build()) };
+        // The door's write under its step's name, with the built worker
+        // handed in, then a step that fails.
+        let write = FunctionStep::new({
+            let door = Arc::clone(&door);
+            move |run: &mut WorkflowContext<WorkerWorkflowData>| {
+                let worker = built(&run.data.config.url);
+                let wrote = door
+                    .found_built(&Maker::Control, Expect::Nothing, &worker, None)
+                    .is_ok();
+                run.data.actual_workers = Some(vec![worker]);
+                Box::pin(async move {
+                    Ok(if wrote {
+                        StepResult::Success
+                    } else {
+                        StepResult::Failure
+                    })
                 })
-                .is_ok();
-            run.data.actual_workers = Some(vec![worker]);
-            Box::pin(async move {
-                Ok(if wrote {
-                    StepResult::Success
-                } else {
-                    StepResult::Failure
-                })
-            })
+            }
         });
-        let fail = FunctionStep::new(|_: &mut WorkflowContext<WorkerWorkflowData>| {
-            Box::pin(async { Ok(StepResult::Failure) })
+        // Ahead of the failure another registration lays its own worker
+        // under one of the URLs: the row stands unmoved, the object is new.
+        let relaid = "http://relaid:8000";
+        let newer = built(relaid);
+        let fail = FunctionStep::new({
+            let newer = Arc::clone(&newer);
+            move |run: &mut WorkflowContext<WorkerWorkflowData>| {
+                if run.data.config.url == relaid {
+                    door.found_built(&Maker::Control, Expect::Anything, &newer, None)
+                        .expect("the newer registration");
+                }
+                Box::pin(async { Ok(StepResult::Failure) })
+            }
         });
         hosted
             .workflow_engines
@@ -1992,7 +2008,12 @@ mod tests {
             )
             .unwrap();
 
-        for (url, written) in [("http://fresh:8000", true), (standing.as_str(), false)] {
+        let posts = [
+            ("http://fresh:8000", true),
+            (standing.as_str(), false),
+            (relaid, false),
+        ];
+        for (url, taken) in posts {
             let id = registry.reserve_id_for_url(url);
             let job = Job::AddWorker {
                 config: Box::new(WorkerSpec::new(url)),
@@ -2004,11 +2025,15 @@ mod tests {
                 .expect_err("the registration fails");
             assert_eq!(
                 failure.contains("leave through a queued removal"),
-                written,
+                taken,
                 "{url}: {failure}"
             );
             assert!(store.by_key(url).is_some(), "{url}");
-            if written {
+            if url == relaid {
+                let stands = registry.get_by_url(url).expect("the newer worker");
+                assert!(Arc::ptr_eq(&stands, &newer), "the newer worker left");
+            }
+            if taken {
                 let laid = registry.get(&id).expect("the row's object");
                 let rows = HashMap::from([(id.as_str().to_string(), Some(laid.revision()))]);
                 assert!(
@@ -2065,8 +2090,9 @@ mod tests {
 
     /// Under the policy controller a PATCH moves a row's labels and its
     /// health checks. The update job lays them over the row at the store's
-    /// door as the control maker, in place, and the holder lays the row's
-    /// object under the same id.
+    /// door as the control maker, in place, and hands its rebuilt worker
+    /// in: the holder lays that worker under the same id, and no lay
+    /// misses its object.
     #[tokio::test]
     async fn under_the_policy_controller_a_patch_moves_a_rows_labels_and_health_checks() {
         use smg_policy_controller::store::WorkersStore;
@@ -2106,6 +2132,9 @@ mod tests {
         );
         assert_eq!(metadata.health_config.failure_threshold, 7);
         assert_eq!(metadata.health_config.drain_settle_secs, 9);
+        let feed = hosted.door_feed().expect("the feed");
+        assert_eq!(feed.objects.standing(&id).map(|at| at.row), Some(row.id));
+        assert_eq!(feed.objects.unhanded(), 0);
     }
 
     /// Under the policy controller a PATCH that turns a row's health checks
@@ -2152,6 +2181,55 @@ mod tests {
         assert!(!row.facts.health.probes);
         assert_eq!(row.status, RowStatus::Ready);
         let laid = registry.get(&id).expect("the row's object");
+        assert_eq!(laid.status(), WorkerStatus::Ready);
+    }
+
+    /// Under the policy controller a PUT that turns a row's health checks
+    /// off leaves its worker in service. The door promotes the row. The
+    /// holder lays the job's object over one that was out of service, and
+    /// the activation step promotes it as far as its row.
+    #[tokio::test]
+    async fn under_the_policy_controller_a_put_that_turns_checks_off_promotes_a_rows_worker() {
+        use openai_protocol::worker::WorkerStatus;
+        use smg_policy_controller::store::{WorkerStatus as RowStatus, WorkersStore};
+
+        let (hosted, url, _, mut next_job) = a_hosted_gateway_with_a_row().await;
+        let store = hosted.policy_store.as_ref().expect("the store");
+        let registry = &hosted.worker_registry;
+        let service = &hosted.worker_service;
+        let id = registry.get_id_by_url(&url).expect("the worker's id");
+        let marks = DashSet::new();
+        let checks_off = |off: bool| {
+            let mut spec = WorkerSpec::new(&url);
+            spec.health.disable_health_check = Some(off);
+            spec
+        };
+
+        // Checks on, then the worker out of service, as behind failed probes.
+        service
+            .replace_worker(id.as_str(), checks_off(false))
+            .await
+            .expect("the 202");
+        let done = execute_job(&next_job(), &hosted, &marks, None).await;
+        assert!(done.is_ok(), "{done:?}");
+        let checked = store.by_key(&url).expect("the worker's row");
+        assert!(checked.facts.health.probes);
+        let _ = registry.transition_status(&id, WorkerStatus::NotReady);
+        let out = registry.get(&id).expect("the row's object");
+        assert_eq!(out.status(), WorkerStatus::NotReady);
+
+        service
+            .replace_worker(id.as_str(), checks_off(true))
+            .await
+            .expect("the 202");
+        let done = execute_job(&next_job(), &hosted, &marks, None).await;
+        assert!(done.is_ok(), "{done:?}");
+
+        let row = store.by_key(&url).expect("the worker's row");
+        assert!(!row.facts.health.probes);
+        assert_eq!(row.status, RowStatus::Ready);
+        let laid = registry.get(&id).expect("the row's object");
+        assert!(!Arc::ptr_eq(&laid, &out));
         assert_eq!(laid.status(), WorkerStatus::Ready);
     }
 

@@ -1942,20 +1942,6 @@ impl ConfigValidator {
             if let Some((option, _)) = tls.into_iter().find(|(_, path)| path.is_some()) {
                 return refuse(&format!("{option} requires --policy-controller-address"));
             }
-            // A worker of the controller's store is built from its row, and
-            // a row holds no health path yet: where the gateway probes, it
-            // probes that worker at the default path.
-            let probed = HealthCheckConfig::default().endpoint;
-            let checks = &config.health_check;
-            let probes = config.policy_controller && !checks.disable_health_check;
-            if probes && checks.endpoint != probed {
-                return refuse(&format!(
-                    "--health-check-endpoint {} conflicts with the policy_controller setting \
-                     (--policy-controller on): a worker of the controller's store is probed at \
-                     {probed} alone yet",
-                    checks.endpoint
-                ));
-            }
             return Ok(());
         };
         if !config.policy_controller {
@@ -2161,27 +2147,22 @@ mod tests {
         }
     }
 
-    /// A gateway that hosts the controller refuses a health path of its
-    /// own. A worker of the controller's store is built from its row, which
-    /// holds none, so it would be probed at the default path. The classic
-    /// policies keep the path. So does a gateway that probes no worker: one
-    /// with its checks off, and one that follows a controller.
+    /// A gateway keeps a health path of its own under every setting. Where
+    /// it hosts the controller, the worker a registration builds carries
+    /// the path, and the holder keeps that worker as the row's object.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn a_hosted_controller_refuses_a_health_path_of_its_own() {
+    fn a_health_path_of_its_own_is_kept_under_every_setting() {
         let health_check = HealthCheckConfig {
             endpoint: "/healthz".to_owned(),
             ..HealthCheckConfig::default()
         };
-        controller_refusal(
-            &RouterConfig {
+        for kept in [
+            RouterConfig {
                 policy_controller: true,
                 health_check: health_check.clone(),
                 ..Default::default()
             },
-            &["--health-check-endpoint /healthz", "policy_controller"],
-        );
-        for kept in [
             RouterConfig {
                 health_check: health_check.clone(),
                 ..Default::default()

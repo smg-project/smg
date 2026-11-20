@@ -5,7 +5,7 @@ use std::{
 
 use dashmap::DashSet;
 use llm_tokenizer::registry::TokenizerRegistry;
-use openai_protocol::{profile::ProviderProfile, worker::WorkerSpec};
+use openai_protocol::profile::ProviderProfile;
 use parking_lot::Mutex;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use reqwest::Client;
@@ -26,11 +26,11 @@ use smg_worker::{
     },
     health::liveness,
     settings::RegistrationSettings,
-    workflow::{find_workers_by_url, WorkerKind, WorkflowHost},
+    workflow::{find_workers_by_url, WorkflowHost},
 };
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::{
     admin::worker_service::WorkerService,
@@ -66,10 +66,7 @@ use crate::{
     },
     server::http_client_builder,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    workflow::{
-        data::RegistrationNotes, steps::stated_kind, JobQueue, TokenizerLoadFailures,
-        WorkflowEngines,
-    },
+    workflow::{data::RegistrationNotes, JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
 
 /// Error type for AppContext builder
@@ -315,15 +312,6 @@ impl AppContext {
     /// workers ([`workflows_feed`]).
     pub(crate) fn door_feed(&self) -> Option<&Feed> {
         workflows_feed(self.policy_feed.as_ref(), self.follows_controller())
-    }
-
-    /// Whether a registration of `spec` writes a row of the policy
-    /// controller's store: where the workflows write at the door, every
-    /// worker but a stated provider's. A row holds no credential yet, so
-    /// the gateway states its own API key on no such worker, at start-up or
-    /// from discovery.
-    pub(crate) fn registers_at_door(&self, spec: &WorkerSpec) -> bool {
-        self.door_feed().is_some() && stated_kind(spec) != Some(WorkerKind::External)
     }
 
     /// Whether a row of the policy controller's store stands for a worker
@@ -1029,13 +1017,6 @@ impl AppContextBuilder {
             self.policy_follower = follower.map(|follower| Arc::new(Mutex::new(Some(follower))));
             self.policy_operators = Some(Arc::new(Operators::new(door)));
             self.policy_store = Some(store);
-        }
-        if self.policy_store.is_some() && config.api_key.is_some() {
-            warn!(
-                "The policy controller's store holds no worker credential yet: the gateway \
-                 sends its API key to no self-hosted worker in its own calls, and a worker \
-                 that demands a key refuses them"
-            );
         }
         Ok(self)
     }

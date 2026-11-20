@@ -52,6 +52,12 @@
 //! stated takes none. Where a registration's answer says so, the host has
 //! the holder lay the address's objects again ([`Objects::lay_again`]).
 //!
+//! A host whose registrations run in its own process needs none of that.
+//! Its registration built a whole object, and the holder keeps it as the
+//! row's ([`Objects::with_built_kept`]): the door hands it in with the
+//! write ([`Membership::found_built`], [`Objects::handing`]). The object
+//! holds what the table does not carry, its credential first.
+//!
 //! # The adapters
 //!
 //! [`HealthAdapter`] writes probe outcomes and connect signals to the store
@@ -79,7 +85,8 @@
 //! The host hands out a [`Membership`] door. A host without election uses
 //! [`StoreDoor`]. A replica that may lead uses the controller's door.
 //!
-//! [`registration_at_door`] writes the created workers' rows.
+//! [`registration_at_door`] writes the created workers' rows, and hands
+//! each built worker to the door with its write.
 //! [`removal_at_door`] marks the selected rows draining, waits for the
 //! workers to settle and removes their rows. The steps write the store
 //! through the door. [`Objects`] remains the registry's one writer.

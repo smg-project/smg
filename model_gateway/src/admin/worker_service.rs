@@ -35,9 +35,7 @@ use crate::{
     config::{unused_credentials_warning, validate_worker_url, RouterConfig},
     routers::{common::snapshot::WorkerRegistry, provider_support},
     workflow::{
-        job_queue::cancel_registration,
-        steps::{stated_kind, WORKER_FIELD_UNSUPPORTED, WORKER_KEY_UNSUPPORTED},
-        Job, JobQueue, WorkerRegistrationMode,
+        job_queue::cancel_registration, steps::stated_kind, Job, JobQueue, WorkerRegistrationMode,
     },
 };
 
@@ -326,37 +324,6 @@ fn provider_among(workers: &[Arc<dyn Worker>]) -> Option<String> {
         .find_map(|worker| discovery_provider(worker.as_ref()).cloned())
 }
 
-/// What a call states that no row of the policy controller's store holds
-/// yet. A row's object is built from the row alone, so such a field would
-/// be accepted and dropped.
-struct Unheld {
-    key: bool,
-    priority: bool,
-    cost: bool,
-}
-
-impl Unheld {
-    /// The refusal of the call at `url`, by the first field it states: the
-    /// credential, then the priority, then the cost.
-    fn refuse(&self, url: &str) -> Result<(), WorkerServiceError> {
-        let field = if self.key {
-            return Err(WorkerServiceError::KeyUnsupported {
-                url: url.to_string(),
-            });
-        } else if self.priority {
-            "priority"
-        } else if self.cost {
-            "cost"
-        } else {
-            return Ok(());
-        };
-        Err(WorkerServiceError::FieldUnsupported {
-            url: url.to_string(),
-            field,
-        })
-    }
-}
-
 /// Error types for worker service operations
 #[derive(Debug)]
 pub enum WorkerServiceError {
@@ -400,14 +367,6 @@ pub enum WorkerServiceError {
         family: &'static str,
         feature: &'static str,
     },
-    /// The spec states an API key for a local worker, on a gateway whose
-    /// local workers are rows of the policy controller's store (a POST, a
-    /// PUT or a PATCH)
-    KeyUnsupported { url: String },
-    /// The call states a priority or a cost for a local worker, on a gateway
-    /// whose local workers are rows of the policy controller's store (a
-    /// POST, a PUT or a PATCH)
-    FieldUnsupported { url: String, field: &'static str },
     /// Job queue not initialized
     QueueNotInitialized,
     /// Failed to submit job to queue
@@ -429,8 +388,6 @@ impl WorkerServiceError {
             | Self::DiscoveryUpdates { .. }
             | Self::DiscoveryRemoves { .. } => "WORKER_DISCOVERY_OWNED",
             Self::ProviderNotCompiled { .. } => "PROVIDER_NOT_COMPILED",
-            Self::KeyUnsupported { .. } => WORKER_KEY_UNSUPPORTED,
-            Self::FieldUnsupported { .. } => WORKER_FIELD_UNSUPPORTED,
             Self::QueueNotInitialized => "INTERNAL_SERVER_ERROR",
             Self::QueueSubmitFailed { .. } => "INTERNAL_SERVER_ERROR",
         }
@@ -448,8 +405,6 @@ impl WorkerServiceError {
             Self::DiscoveryUpdates { .. } => StatusCode::CONFLICT,
             Self::DiscoveryRemoves { .. } => StatusCode::CONFLICT,
             Self::ProviderNotCompiled { .. } => StatusCode::BAD_REQUEST,
-            Self::KeyUnsupported { .. } => StatusCode::BAD_REQUEST,
-            Self::FieldUnsupported { .. } => StatusCode::BAD_REQUEST,
             Self::QueueNotInitialized => StatusCode::INTERNAL_SERVER_ERROR,
             Self::QueueSubmitFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -533,16 +488,6 @@ impl std::fmt::Display for WorkerServiceError {
                 f,
                 "Worker '{url}' targets the {family} provider, but this build carries no \
                  {family} router; rebuild with the `{feature}` Cargo feature to admit it."
-            ),
-            Self::KeyUnsupported { url } => write!(
-                f,
-                "Worker '{url}' states an API key, and a worker of the policy controller's \
-                 store holds none yet."
-            ),
-            Self::FieldUnsupported { url, field } => write!(
-                f,
-                "Worker '{url}' states a {field}, and the worker API sets none on a worker \
-                 of the policy controller's store yet. Leave the {field} out of the request."
             ),
             Self::QueueNotInitialized => write!(f, "Job queue not initialized"),
             Self::QueueSubmitFailed { message } => write!(f, "{message}"),
@@ -724,32 +669,12 @@ impl WorkerService {
     }
 
     /// The service of a gateway whose local workers are rows of the policy
-    /// controller's store: it refuses what no row holds yet, and a change
-    /// of a discovered worker, since it writes no provider's row.
+    /// controller's store: it refuses a change of a discovered worker,
+    /// since it writes no provider's row.
     #[must_use]
     pub(crate) fn with_local_workers_as_rows(mut self) -> Self {
         self.local_workers_are_rows = true;
         self
-    }
-
-    /// Where a local worker is a row, a POST's add and a PUT's replacement
-    /// are written at the store's door. A row holds no credential, no
-    /// priority and no cost yet, so a spec that states one is refused by
-    /// name here rather than after the 202. A spec states a priority or a
-    /// cost where it differs from a new spec's. A provider's worker stays
-    /// outside the store and registers as before.
-    fn refuse_what_no_row_holds(&self, config: &WorkerSpec) -> Result<(), WorkerServiceError> {
-        let local = stated_kind(config) != Some(WorkerKind::External);
-        if !(self.local_workers_are_rows && local) {
-            return Ok(());
-        }
-        let unstated = WorkerSpec::new(String::new());
-        Unheld {
-            key: config.api_key.is_some(),
-            priority: config.priority != unstated.priority,
-            cost: (config.cost - unstated.cost).abs() > f32::EPSILON,
-        }
-        .refuse(&config.url)
     }
 
     /// Whether `worker` is a row of the policy controller's store here.
@@ -793,7 +718,6 @@ impl WorkerService {
         validate_spec(&config)?;
         validate_worker_url_request(&config.url)?;
         Self::require_provider_router(&config)?;
-        self.refuse_what_no_row_holds(&config)?;
 
         if self.router_config.api_key.is_some() && config.api_key.is_none() {
             warn!(
@@ -936,7 +860,6 @@ impl WorkerService {
                 ),
             });
         }
-        self.refuse_what_no_row_holds(&config)?;
 
         // A data-parallel router expands one spec into one worker per rank,
         // each registered under a rank-suffixed URL. Re-running registration
@@ -1185,16 +1108,6 @@ impl WorkerService {
         if let (Some(labels), Some(worker)) = (&update.labels, &worker) {
             validate_merged_labels(&worker.metadata().spec.labels, labels)?;
         }
-        // A PATCH of a row's worker moves its labels and its health checks
-        // at the store's door. What no row holds yet is refused by name.
-        if !rows.is_empty() {
-            Unheld {
-                key: update.api_key.is_some(),
-                priority: update.priority.is_some(),
-                cost: update.cost.is_some(),
-            }
-            .refuse(&url)?;
-        }
         let job = Job::UpdateWorker {
             url: url.clone(),
             update: Box::new(update),
@@ -1385,13 +1298,13 @@ mod tests {
     }
 
     /// A gateway whose local workers are rows writes a POST's add and a
-    /// PUT's replacement at the store's door. It refuses by name what no
-    /// row holds yet: a worker that states an API key, a priority or a
-    /// cost, each with 400 before the 202. A PUT that would move a worker
-    /// between the rows and the providers is a bad request. Nothing is
-    /// reserved. A provider's worker registers as before.
+    /// PUT's replacement at the store's door. The holder keeps the object
+    /// the registration builds, so a worker that states an API key, a
+    /// priority or a cost passes as on the classic line. A PUT that would
+    /// move a worker between the rows and the providers is a bad request.
+    /// Nothing is reserved.
     #[tokio::test]
-    async fn where_a_local_worker_is_a_row_the_api_refuses_what_no_row_holds() {
+    async fn where_a_local_worker_is_a_row_the_api_takes_a_key_a_priority_and_a_cost() {
         let spec = |url: &str, runtime: &str, stated: serde_json::Value| -> WorkerSpec {
             let mut spec = json!({"url": url, "runtime": runtime});
             for (field, value) in stated.as_object().into_iter().flatten() {
@@ -1404,17 +1317,17 @@ mod tests {
         register_worker(&registry, replaced, Some("served"));
         let id = registry.get_id_by_url(replaced).unwrap();
         let service = make_service(Arc::clone(&registry)).with_local_workers_as_rows();
-        let key = "POLICY_CONTROLLER_WORKER_KEY_UNSUPPORTED";
-        let field = "POLICY_CONTROLLER_WORKER_FIELD_UNSUPPORTED";
 
+        // Each passes the row's checks and ends at the queue this service
+        // lacks, as a plain POST and a plain PUT do.
         let created = "http://create:8000";
-        let unheld = [
-            (json!({"api_key": "secret-key"}), key, "states an API key"),
-            (json!({"priority": 7}), field, "states a priority"),
-            (json!({"cost": 2.5}), field, "states a cost"),
-        ];
-        for (stated, name, said) in &unheld {
-            for refused in [
+        for stated in [
+            json!({}),
+            json!({"api_key": "secret-key"}),
+            json!({"priority": 7}),
+            json!({"cost": 2.5}),
+        ] {
+            for passed in [
                 service
                     .create_worker(spec(created, "sglang", stated.clone()))
                     .await
@@ -1424,12 +1337,10 @@ mod tests {
                     .await
                     .map(drop),
             ] {
-                let (answered, body, _) = answer(refused.unwrap_err()).await;
-                assert_eq!(answered, StatusCode::BAD_REQUEST);
-                assert_eq!(body["code"], *name);
-                let sentence = body["error"].as_str().unwrap();
-                assert!(sentence.contains(said), "{sentence}");
-                assert!(!sentence.contains("secret-key"), "{sentence}");
+                assert!(
+                    matches!(passed, Err(WorkerServiceError::QueueNotInitialized)),
+                    "{stated}"
+                );
             }
         }
         assert!(registry.get_id_by_url_or_reservation(created).is_none());
@@ -1459,43 +1370,6 @@ mod tests {
         assert_eq!(answered, StatusCode::BAD_REQUEST);
         let sentence = body["error"].as_str().unwrap();
         assert!(sentence.contains("Use DELETE + POST instead"), "{sentence}");
-
-        // A plain POST and a plain PUT pass the row's checks and end at the
-        // queue this service lacks.
-        for passed in [
-            service
-                .create_worker(spec(created, "sglang", json!({})))
-                .await
-                .map(drop),
-            service
-                .replace_worker(id.as_str(), spec(replaced, "sglang", json!({})))
-                .await
-                .map(drop),
-        ] {
-            assert!(matches!(
-                passed,
-                Err(WorkerServiceError::QueueNotInitialized)
-            ));
-        }
-
-        // A provider's worker, and a service with no rows behind it, pass
-        // the row's checks whatever they state: each ends at the next one.
-        for (stated, _, _) in &unheld {
-            for passed in [
-                service
-                    .create_worker(spec(created, "external", stated.clone()))
-                    .await,
-                make_service(Arc::clone(&registry))
-                    .create_worker(spec(created, "sglang", stated.clone()))
-                    .await,
-            ] {
-                let refusal = passed.err().map(|error| error.error_code());
-                assert!(
-                    !refusal.is_some_and(|code| [key, field].contains(&code)),
-                    "{refusal:?}"
-                );
-            }
-        }
     }
 
     /// Where a local worker is a row, its maker alone removes it at the
@@ -1551,13 +1425,13 @@ mod tests {
         }
     }
 
-    /// A PATCH of a row's worker moves its labels and its health checks at
-    /// the store's door. It refuses by name what no row holds yet: an API
-    /// key, a priority or a cost, each with 400, the key first. A
+    /// A PATCH of a row's worker passes whatever it states: its labels and
+    /// its health checks move the row at the store's door, and an API key,
+    /// a priority or a cost moves the object the holder keeps. A
     /// provider's worker takes each PATCH, and so does a worker of a
     /// service with no rows.
     #[tokio::test]
-    async fn a_patch_of_a_rows_worker_refuses_what_no_row_holds() {
+    async fn a_patch_of_a_rows_worker_takes_a_key_a_priority_and_a_cost() {
         let registry = Arc::new(WorkerRegistry::new());
         let row = "http://row:8000";
         register_worker(&registry, row, Some("served"));
@@ -1572,42 +1446,21 @@ mod tests {
             serde_json::from_value(body.clone()).expect("an update")
         };
         let service = make_service(Arc::clone(&registry)).with_local_workers_as_rows();
-        let key = "POLICY_CONTROLLER_WORKER_KEY_UNSUPPORTED";
-        let field = "POLICY_CONTROLLER_WORKER_FIELD_UNSUPPORTED";
 
-        let unheld = [
-            (json!({"api_key": "secret-key"}), key, "states an API key"),
-            (json!({"priority": 7}), field, "states a priority"),
-            (json!({"cost": 2.5}), field, "states a cost"),
-            (
-                json!({"api_key": "secret-key", "priority": 7, "labels": {"tier": "a"}}),
-                key,
-                "states an API key",
-            ),
-        ];
-        for (patch, name, said) in &unheld {
-            let refused = service.update_worker(id(row).as_str(), update(patch)).await;
-            let (answered, body, _) = answer(refused.map(drop).unwrap_err()).await;
-            assert_eq!(answered, StatusCode::BAD_REQUEST);
-            assert_eq!(body["code"], *name);
-            let sentence = body["error"].as_str().unwrap();
-            assert!(sentence.contains(said), "{sentence}");
-            assert!(!sentence.contains("secret-key"), "{sentence}");
-        }
-
-        // What a row holds passes the checks, and so does every PATCH of a
-        // provider's worker and of a worker of a service with no rows: each
-        // ends at the queue this service lacks.
-        let held = [
+        // Each PATCH passes the checks on each side and ends at the queue
+        // this service lacks.
+        let patches = [
             json!({"labels": {"tier": "a"}}),
             json!({"health": {"timeout_secs": 7}}),
+            json!({"api_key": "secret-key"}),
+            json!({"priority": 7}),
+            json!({"cost": 2.5}),
+            json!({"api_key": "secret-key", "priority": 7, "labels": {"tier": "a"}}),
         ];
         let classic = make_service(Arc::clone(&registry));
         let mut passed = Vec::new();
-        for patch in &held {
+        for patch in &patches {
             passed.push(service.update_worker(id(row).as_str(), update(patch)).await);
-        }
-        for (patch, _, _) in &unheld {
             passed.push(
                 service
                     .update_worker(id(provider).as_str(), update(patch))

@@ -6,7 +6,6 @@ mod forget_cache_events;
 mod provider_workers;
 mod rediscover_labels;
 mod refresh_pool_sizes;
-mod refuse_worker_key;
 mod release_tokenizer;
 mod remove_from_policy_registry;
 mod submit_tokenizer_job;
@@ -31,9 +30,6 @@ use provider_workers::{
 };
 pub use rediscover_labels::RediscoverLabelsStep;
 use refresh_pool_sizes::{RefreshPoolSizesStep, REFRESH_POOL_SIZES_STEP};
-pub(crate) use refuse_worker_key::{
-    RefuseWorkerKeyStep, REFUSE_WORKER_KEY_STEP, WORKER_KEY_UNSUPPORTED,
-};
 pub use release_tokenizer::ReleaseTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
 use smg_policy_controller::worker_host::{removal_at_door, REMOVE_WORKERS_AT_DOOR_STEP};
@@ -48,7 +44,6 @@ use smg_worker::{
 };
 pub use submit_tokenizer_job::SubmitTokenizerJobStep;
 use update_at_door::UpdateAtDoorStep;
-pub(crate) use update_at_door::WORKER_FIELD_UNSUPPORTED;
 pub use update_policies_for_worker::UpdatePoliciesForWorkerStep;
 pub use update_remaining_policies::UpdateRemainingPoliciesStep;
 pub use update_worker_properties::UpdateWorkerPropertiesStep;

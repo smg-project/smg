@@ -21,7 +21,7 @@ use wfaas::{
     WorkflowDefinition, WorkflowError, WorkflowResult,
 };
 
-use super::{facts, Expect, Membership, Objects, Refused, Remover, Standing, Wrote};
+use super::{Expect, Membership, Objects, Refused, Remover, Standing, Wrote};
 use crate::store::{Maker, Unmade};
 
 /// The provider name used by the host's own discovery source.
@@ -200,15 +200,15 @@ fn registration_refusal(url: &str, refusal: Refused) -> WorkflowError {
 
 /// The row behind the worker a replacement by id names: the registry's
 /// worker of that id, where it still stands at the job's revision under the
-/// one built worker's URL, as the holder built it. The door checks the row
-/// again in its turn.
+/// one built worker's URL, as the holder laid it, and that worker. The door
+/// checks the row again in its turn, and the holder the worker.
 fn replaced<G: Generation>(
     registry: &WorkerRegistry<G>,
     objects: &Objects<G>,
     workers: &[Arc<dyn Worker>],
     worker_id: &str,
     expected_revision: u64,
-) -> WorkflowResult<Standing> {
+) -> WorkflowResult<(Standing, Arc<dyn Worker>)> {
     let [worker] = workers else {
         return Err(failed(
             WRITE_WORKERS_AT_DOOR_STEP,
@@ -222,7 +222,7 @@ fn replaced<G: Generation>(
     registry
         .get(&id)
         .filter(|held| held.revision() == expected_revision && held.url() == worker.url())
-        .and_then(|held| objects.standing_of(&id, &held))
+        .and_then(|held| Some((objects.standing_of(&id, &held)?, held)))
         .ok_or_else(|| {
             failed(
                 WRITE_WORKERS_AT_DOOR_STEP,
@@ -253,8 +253,9 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_owned()))?;
         let maker = maker_of(&data.asker, &data.config.url)
             .map_err(|why| failed(WRITE_WORKERS_AT_DOOR_STEP, why.to_string()))?;
-        let expect = match &data.registration_mode {
-            WorkerRegistrationMode::Upsert => Expect::Anything,
+        // A replacement by id names the worker it replaces beside the row.
+        let (expect, over) = match &data.registration_mode {
+            WorkerRegistrationMode::Upsert => (Expect::Anything, None),
             // The door takes one row a call. An add refused at a later rank
             // would leave the earlier ones, and its retry would be refused at
             // the rank it wrote: no rank is written until the door lays a
@@ -269,27 +270,26 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
                     ),
                 ));
             }
-            WorkerRegistrationMode::CreateOnly => Expect::Nothing,
+            WorkerRegistrationMode::CreateOnly => (Expect::Nothing, None),
             WorkerRegistrationMode::ReplaceById {
                 worker_id,
                 expected_revision,
             } => {
                 let registry = require_host(data.host.as_ref())?.worker_registry();
-                Expect::Seen(replaced(
+                let (standing, held) = replaced(
                     registry,
                     &self.objects,
                     workers,
                     worker_id,
                     *expected_revision,
-                )?)
+                )?;
+                (Expect::Seen(standing), Some(held))
             }
         };
         for worker in workers {
             let url = worker.url();
             self.door
-                .found(&maker, expect, url, &|standing| {
-                    facts(worker.as_ref(), standing)
-                })
+                .found_built(&maker, expect, worker, over.as_ref())
                 .map_err(|refusal| registration_refusal(url, refusal))?;
         }
         data.workers = Some(WorkerList::from_workers(workers));
@@ -1013,6 +1013,16 @@ mod tests {
             _: Expect,
             _: &str,
             _: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
+        ) -> Result<Wrote, Refused> {
+            Err(self.0.clone())
+        }
+
+        fn found_built(
+            &self,
+            _: &Maker,
+            _: Expect,
+            _: &Arc<dyn Worker>,
+            _: Option<&Arc<dyn Worker>>,
         ) -> Result<Wrote, Refused> {
             Err(self.0.clone())
         }

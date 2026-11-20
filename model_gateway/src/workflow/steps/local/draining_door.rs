@@ -1,13 +1,13 @@
 //! The door a removal writes at, where the holder leaves a worker's status
 //! to the gateway.
 //!
-//! The feed's holder copies no row's status onto its object: the gateway's
-//! own health checks write an object's status. A drain is not a health
-//! check's word. The store turns the row `Draining`, and the object would
-//! read `Ready` in the registry through the whole window, where every
-//! reader of the registry still sends to it. The registry's own drain marks
-//! a `Ready` worker `Draining`. This door makes that mark where the store
-//! answered a drain.
+//! The feed's holder sets an object to its row's status where it lays
+//! one, and at no status change: the gateway's own health checks write an
+//! object's status. A drain is not a health check's word. The store turns
+//! the row `Draining`, and the object would read `Ready` in the registry
+//! through the whole window, where every reader of the registry still
+//! sends to it. The registry's own drain marks a `Ready` worker
+//! `Draining`. This door makes that mark where the store answered a drain.
 
 use std::sync::Arc;
 
@@ -17,6 +17,7 @@ use smg_policy_controller::{
     view::WorkerId,
     worker_host::{Expect, Membership, Objects, Refused, Remover, Standing, Wrote},
 };
+use smg_worker::identity::basic::Worker;
 
 use crate::routers::common::snapshot::ModelWorkerSnapshot;
 
@@ -61,6 +62,18 @@ impl Membership for DrainingDoor {
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
     ) -> Result<Wrote, Refused> {
         self.door.found(maker, expect, url, state)
+    }
+
+    // The feed's door hands a built worker to the holder: pass the call on,
+    // so the holder keeps the object the registration built.
+    fn found_built(
+        &self,
+        maker: &Maker,
+        expect: Expect,
+        built: &Arc<dyn Worker>,
+        over: Option<&Arc<dyn Worker>>,
+    ) -> Result<Wrote, Refused> {
+        self.door.found_built(maker, expect, built, over)
     }
 
     fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {

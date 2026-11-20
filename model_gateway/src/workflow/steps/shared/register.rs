@@ -6,7 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use smg_policy_controller::worker_host::{Objects, WRITE_WORKERS_AT_DOOR_STEP};
+use smg_policy_controller::worker_host::Objects;
 use smg_worker::{
     health::bootstrap_probe,
     identity::basic::Worker,
@@ -46,8 +46,9 @@ pub(crate) const REGISTER_WORKERS_STEP: &str = "register_workers";
 /// The register step of a line whose local workers are rows of the policy
 /// controller's store.
 ///
-/// The holder lays a row's object in the registry, so the step writes no
-/// local worker: it keeps what a registration does beside that write. A
+/// The holder lays a row's object in the registry, the one the job built,
+/// so the step writes no local worker: it keeps what a registration does
+/// beside that write. A
 /// provider's workers stay outside the store: the step writes them, and
 /// refuses one at a URL a row's object holds. It writes no classic policy,
 /// which decides nothing there.
@@ -81,6 +82,10 @@ pub fn registered_in<D: WorkflowData>(state: &WorkflowState<D>) -> bool {
 /// registration whose registry step the state does not record as succeeded
 /// (a cancellation written while the step ran) is still read from the
 /// registry itself.
+///
+/// A row's worker is read the same way: the holder lays the object the job
+/// built and handed in at the door, so the registry's entry is the job's
+/// own. A row laid with no object handed in holds another, and is left.
 pub fn registered_entries<D: WorkerRegistrationData>(
     registry: &WorkerRegistry,
     state: &WorkflowState<D>,
@@ -95,39 +100,6 @@ pub fn registered_entries<D: WorkerRegistrationData>(
             let id = registry.get_id_by_url(worker.url())?;
             let entry = registry.get(&id)?;
             Arc::ptr_eq(&entry, worker).then(|| (id.as_str().to_string(), entry.revision()))
-        })
-        .collect()
-}
-
-/// [`registered_entries`] for the rows of a line that writes at the store's
-/// door: the registration's workers whose rows stand now, by the id and
-/// revision of the objects the holder laid for them. The holder's object is
-/// never the one the job built, so the state says whether the door's write
-/// was this registration's: a row that stood before a refused add is not.
-/// A cancellation written while the write ran reads as no write.
-pub(crate) fn rows_written<D: WorkerRegistrationData>(
-    registry: &WorkerRegistry,
-    rows: &Objects<ModelWorkerSnapshot>,
-    state: &WorkflowState<D>,
-) -> HashMap<String, u64> {
-    let wrote = state
-        .step_states
-        .get(&StepId::new(WRITE_WORKERS_AT_DOOR_STEP))
-        .is_some_and(|step| step.status == StepStatus::Succeeded);
-    if !wrote {
-        return HashMap::new();
-    }
-    state
-        .context
-        .data
-        .get_actual_workers()
-        .into_iter()
-        .flatten()
-        .filter_map(|worker| {
-            let id = registry.get_id_by_url(worker.url())?;
-            let entry = registry.get(&id)?;
-            rows.standing_of(&id, &entry)?;
-            Some((id.as_str().to_string(), entry.revision()))
         })
         .collect()
 }
@@ -456,8 +428,8 @@ impl StepExecutor<WorkerWorkflowData> for RegisterBesideRowsStep {
         let symphony_table = context.data.symphony_table();
 
         match kind {
-            // The door wrote these workers' rows, and the holder laid their
-            // objects in the registry.
+            // The door wrote these workers' rows, and the holder laid these
+            // objects in the registry as the rows'.
             WorkerKind::Local => {
                 for worker in workers {
                     pd_admission::announce_decode_window(worker.as_ref());
