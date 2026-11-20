@@ -6,15 +6,13 @@
 //! ([`RouterConfig::policy_controller`]). The classic policies are the
 //! default.
 //!
-//! At this step the setting starts the store and hands it the policy
-//! document the routing configuration means. Without a controller's address
-//! nothing feeds the store yet, and no code of the controller decides. So
-//! the server answers with one refusing router in the gateway object's
-//! place ([`router`]). No gateway
-//! object and no classic router is built, and each request is refused by
-//! name: the classic policies never decide for a process the controller was
-//! picked for. With the setting off nothing here is constructed, and no
-//! request reads this module.
+//! The setting starts the store with the policy document for the routing
+//! configuration. The context holds a host over that store. A regular HTTP
+//! router with that host asks it to place typed requests for a named model.
+//! Without a controller's address nothing feeds the store yet. The server
+//! answers with a refusing router in the gateway object's place
+//! ([`router`]), so its requests never reach the host. With the setting off,
+//! the context holds neither the store nor its host.
 //!
 //! One site reads the setting, [`start_with`]. Every other site asks what
 //! the start left in the context.
@@ -50,7 +48,7 @@ pub(crate) mod follower;
     not(test),
     expect(
         dead_code,
-        reason = "the request's end and the pair's routers call the rest in later changes"
+        reason = "the rank accessor, explicit release and Held are exercised by tests"
     )
 )]
 pub(crate) mod host;
@@ -115,8 +113,8 @@ pub(crate) fn start_with(
 /// answers with. `None` where the classic policies decide.
 ///
 /// It asks what the start left in the context and never reads the setting
-/// again, so a router stands where a store started and nowhere else. At this
-/// step the router refuses each request by name.
+/// again, so a router stands where a store started and nowhere else. It
+/// refuses each request by name.
 pub(crate) fn router(context: &AppContext) -> Option<Arc<dyn RouterTrait>> {
     context
         .policy_store

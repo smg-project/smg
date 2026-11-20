@@ -29,7 +29,8 @@ use crate::{
     config::{ManualAssignmentMode, PolicyConfig, PolicyDocumentError, RouterConfig},
     middleware::{RouteRequestMeta, TenantKey},
     routers::{
-        common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder, RouterTrait,
+        common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder,
+        http::router::Router, RouterTrait,
     },
     server::{serving_router, ServerConfig},
 };
@@ -564,5 +565,39 @@ async fn a_starts_context_holds_the_store_where_the_controller_was_picked() -> C
         refusal.as_deref(),
         Some("routing_key_override.enabled = true: the controller holds no recorded form of the sticky sessions' rule yet")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_starts_context_holds_the_host_where_it_holds_the_store() -> Case {
+    let hosted = Arc::new(AppContext::from_config(picked(quiet()), 30, None, None).await?);
+    assert!(hosted.policy_store.is_some());
+    assert!(hosted.policy_host.is_some());
+    // A worker the registry holds and the store has no row for. The
+    // controller answers for it; the classic policy would have sent to it.
+    let worker = BasicWorkerBuilder::new("http://127.0.0.1:1")
+        .model(ModelCard::new("model-a"))
+        .status(WorkerStatus::Ready)
+        .build();
+    hosted
+        .worker_registry
+        .register(Arc::new(worker))
+        .ok_or("the worker did not register")?;
+    let router = Router::new(&hosted).await?;
+    let meta = RouteRequestMeta::new(TenantKey::from("test-tenant"));
+    let routed = router
+        .route_generate(None, &meta, body(json!({"text": "hi"})), "model-a")
+        .await;
+    assert_eq!(
+        refusal(routed).await,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_available_workers".to_owned()
+        )
+    );
+
+    let classic = AppContext::from_config(quiet(), 30, None, None).await?;
+    assert!(classic.policy_store.is_none());
+    assert!(classic.policy_host.is_none());
     Ok(())
 }

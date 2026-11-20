@@ -18,7 +18,8 @@
 //! the router says the dispatch at the send, then the request's end, or a
 //! release before any send. One dropped with a report owed says it, as the
 //! handle does. [`Held`] carries the worker crate's load guard beside it,
-//! so one value travels with a response to its end.
+//! so one value travels with a response to its end. The regular HTTP router
+//! holds its placement over the body that carries the guard.
 //!
 //! The gateway's own check of a target is what it alone knows: the worker's
 //! status as its probes read it, and its circuit breaker. The overload and
@@ -35,7 +36,7 @@ use std::{
 };
 
 use axum::{
-    http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
+    http::{header::RETRY_AFTER, HeaderMap, HeaderValue, StatusCode},
     response::Response,
 };
 use rand::RngExt;
@@ -51,7 +52,10 @@ use smg_policy_controller::{
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard};
 
 use crate::{
-    middleware::SHED_RETRY_AFTER_SECS,
+    middleware::{
+        ADMISSION_QUEUE_FULL_CODE, ADMISSION_QUEUE_FULL_STATUS, ADMISSION_QUEUE_TIMEOUT_CODE,
+        ADMISSION_QUEUE_TIMEOUT_STATUS, SHED_RETRY_AFTER_SECS,
+    },
     observability::{
         cache_trace,
         metrics::{Metrics, PolicyDecision},
@@ -59,7 +63,8 @@ use crate::{
     routers::{
         common::{
             overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
-            placement::no_available_workers_because, retry::mark_non_retryable,
+            placement::{self, no_available_workers_because},
+            retry::mark_non_retryable,
             snapshot::WorkerRegistry,
         },
         error,
@@ -272,7 +277,8 @@ pub(crate) enum Unplaced {
     Shed {
         /// Why.
         reason: ShedReason,
-        /// The stage that left no candidate.
+        /// The stage that left no candidate, or what of the policy
+        /// declined.
         emptied_by: &'static str,
         /// The seconds after which a retry may find room.
         retry_after_secs: u16,
@@ -296,8 +302,11 @@ impl Unplaced {
     /// | No endpoint is left, or the gateway can send to no target | 503 `no_available_workers`, with a retry hint |
     /// | A queue is at its limit | 429 `admission_queue_full`, with the admission queue's retry hint |
     /// | The decision's budget passed | 503 `admission_queue_timeout`, with the same hint |
-    /// | The picker declined every candidate | 503 `policy_declined` |
+    /// | The policy declined the request | 503 `policy_declined` |
     /// | The door made no decision | 503 `policy_controller_unavailable`, with a retry hint |
+    ///
+    /// A declined request reads the same message for every cause. Its
+    /// refusal line names where the policy declined.
     ///
     /// No answer is retried in process: a second ask a moment later reads
     /// the same rows. A route that asks for a side of a pair refuses by name
@@ -338,8 +347,9 @@ impl Unplaced {
                 reason: ShedReason::FlowLimit,
                 ..
             } => hinted(
-                error::too_many_requests(
-                    "admission_queue_full",
+                error::create_error(
+                    ADMISSION_QUEUE_FULL_STATUS,
+                    ADMISSION_QUEUE_FULL_CODE,
                     "a queue of the policy controller is at its limit",
                 ),
                 SHED_RETRY_AFTER_SECS,
@@ -348,8 +358,9 @@ impl Unplaced {
                 reason: ShedReason::Deadline,
                 ..
             } => hinted(
-                error::service_unavailable(
-                    "admission_queue_timeout",
+                error::create_error(
+                    ADMISSION_QUEUE_TIMEOUT_STATUS,
+                    ADMISSION_QUEUE_TIMEOUT_CODE,
                     "the decision's budget passed before a worker was picked",
                 ),
                 SHED_RETRY_AFTER_SECS,
@@ -358,12 +369,7 @@ impl Unplaced {
                 reason: ShedReason::PolicyDeclined,
                 emptied_by,
                 ..
-            } => error::service_unavailable(
-                "policy_declined",
-                format!(
-                    "The policy's {emptied_by} stage declined every worker for model '{model}'"
-                ),
-            ),
+            } => return placement::policy_declined(model, emptied_by),
             Self::Refused(_) => hinted(
                 error::service_unavailable(
                     "policy_controller_unavailable",
@@ -634,11 +640,11 @@ impl Host {
 /// A request's end, as its router read it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct End {
-    /// The status the worker answered with, 0 where none was read.
+    /// The response status, 0 where none was read.
     pub status: u16,
     /// What became of the transport.
     pub class: TransportClass,
-    /// The time to the first token, in microseconds.
+    /// The time to the first token or data frame, in microseconds.
     pub ttft_micros: u32,
     /// The tokens the worker read.
     pub tokens_in: u32,
@@ -646,6 +652,43 @@ pub(crate) struct End {
     pub tokens_out: u32,
     /// The time from the send to the end, in microseconds.
     pub duration_micros: u32,
+}
+
+/// What became of the transport, for the status a request ended with.
+/// `answered` says the worker gave that status itself.
+pub(crate) fn transport_class(status: StatusCode, answered: bool) -> TransportClass {
+    match status {
+        status if status < StatusCode::BAD_REQUEST => TransportClass::Ok,
+        StatusCode::GATEWAY_TIMEOUT => TransportClass::Timeout,
+        status if status.is_client_error() => TransportClass::ClientError,
+        _ if answered => TransportClass::ServerError,
+        _ => TransportClass::ConnectFailed,
+    }
+}
+
+impl End {
+    /// An HTTP answer with timing from the send and any first data frame.
+    fn http(
+        status: StatusCode,
+        class: TransportClass,
+        sent: Instant,
+        first: Option<Instant>,
+        now: Instant,
+    ) -> Self {
+        Self {
+            status: status.as_u16(),
+            class,
+            ttft_micros: first.map_or(0, |first| elapsed_micros(first, sent)),
+            tokens_in: 0,
+            tokens_out: 0,
+            duration_micros: elapsed_micros(now, sent),
+        }
+    }
+}
+
+/// The time since `sent` in whole microseconds, saturating at `u32::MAX`.
+fn elapsed_micros(now: Instant, sent: Instant) -> u32 {
+    u32::try_from(now.saturating_duration_since(sent).as_micros()).unwrap_or(u32::MAX)
 }
 
 /// An attempt's worker, with its decision's lease held to the request's
@@ -740,6 +783,8 @@ impl Held {
     }
 }
 
+mod ride;
+pub(crate) use ride::Sent;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]
