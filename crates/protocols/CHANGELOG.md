@@ -293,6 +293,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - A completion request with `"echo": null` is served, as the public API allows. The crate refused
   it as a 400 `invalid_type`. The engine flags `no_stop_trim`, `ignore_eos`, `skip_special_tokens`
   and `return_hidden_states` read a `null` as their default too, as the chat request's flags do.
+- Interactions content takes every MIME type the public API names: audio in `audio/mpeg`, `m4a`,
+  `l16`, `opus`, `alaw`, `mulaw` and `webm`; images in `gif`, `bmp` and `tiff`; documents in
+  `text/csv` and the Office and OpenDocument formats beside PDF. Each was an unknown variant that
+  refused the whole request, or failed the answer that held it. Breaking: `AudioMimeType`,
+  `ImageMimeType` and `DocumentMimeType` gain the variants.
 - A replayed `computer_call_output` input item with `acknowledged_safety_checks: null`, which the
   public API allows (`ComputerCallOutputItemParam`), parses as none acknowledged. The crate refused
   the request whole, as matching no variant of `ResponseInput`.
