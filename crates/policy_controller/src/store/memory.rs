@@ -3163,6 +3163,9 @@ struct Leases {
 /// place with one store, and the places its issues step over leave the
 /// word as it is. The word is then the first place's deadline or earlier,
 /// never later, and an early one costs the sweep one visit.
+///
+/// Relaxed: every store is made under the file's turn, and the sweep's
+/// read may lag by a pass.
 struct NextDue {
     origin: Instant,
     at: AtomicU64,
@@ -3185,7 +3188,8 @@ impl NextDue {
         self.at.store(1, Relaxed);
     }
 
-    /// The sweep read the first place's deadline, or found none.
+    /// The first place's deadline as the turn's holder reads it, or none
+    /// for an empty queue.
     fn set(&self, at: Option<Instant>) {
         self.at.store(at.map_or(0, |at| self.word(at)), Relaxed);
     }
@@ -3835,7 +3839,8 @@ impl Leases {
 
     /// Shows the sweep the deadline of the queue's first place, or that
     /// the queue is empty: the file is asked again once that instant is
-    /// reached. The sweep's, behind its ends, under the file's turn.
+    /// reached. The sweep's, at its take and behind its ends, under the
+    /// file's turn.
     fn show_due(&self) {
         self.next_due.set(self.due.front().map(|&(due, _)| due));
     }
@@ -4397,8 +4402,10 @@ impl MemoryStore {
     /// `settled` says no, asked under the file's turn behind everything
     /// handed to it: a host that keeps what was said of a file's leases
     /// beside its ring says no until it has handed that on, so no lease is
-    /// ended ahead of a dispatch said of it. Returns both parts of each
-    /// lease as the sweep left them.
+    /// ended ahead of a dispatch said of it. The file's deadline is shown
+    /// ahead of both questions ([`Leases::show_due`]): a file passed at one
+    /// is asked again at that instant. Returns both parts of each lease as
+    /// the sweep left them.
     pub(crate) fn expire_where(&self, now: Instant, settled: impl Fn(usize) -> bool) -> Vec<Sides> {
         let mut ended = Vec::new();
         for at in 0..self.files.len() {
@@ -4411,6 +4418,9 @@ impl MemoryStore {
                 continue;
             }
             let mut leases = self.files[at].take();
+            // Shown ahead of the questions: a file passed at one is asked
+            // again at its deadline, not at every pass.
+            leases.show_due();
             if !self.applied(at, &mut leases) || !settled(at) {
                 continue;
             }
@@ -4702,9 +4712,26 @@ mod tests {
         assert_eq!(takes(), 1, "only the due lease's file is taken");
     }
 
+    /// A lease issued at `now` that waits for its dispatch until `deadline`.
+    fn waiting(now: Instant, request: u64, deadline: Instant) -> LeaseRecord {
+        LeaseRecord {
+            lease: Lease::default(),
+            gateway: GatewayId(1),
+            request,
+            target: WorkerId(1),
+            picked: Picked::default(),
+            decode: None,
+            term: 1,
+            issued_at: now,
+            dispatch_deadline: deadline,
+            state: LeaseState::ISSUED,
+        }
+    }
+
     /// An issue reads no clock for the hint. A new first place asks the
     /// sweep once, the sweep reads its deadline, and no sweep takes the
-    /// file again before it. The file it emptied is passed.
+    /// file again before it. A place behind the first asks none. The file
+    /// the sweep emptied is passed.
     #[test]
     fn a_file_is_asked_once_and_then_at_the_deadline_the_sweep_read() {
         let store = MemoryStore::new().with_deciders(256);
@@ -4713,43 +4740,59 @@ mod tests {
         let now = Instant::now();
         let after = |millis: u64| now + Duration::from_millis(millis);
         LeasesStore::set_term(&store, 1);
-        let record = LeaseRecord {
-            lease: Lease::default(),
-            gateway: GatewayId(1),
-            request: 1,
-            target: WorkerId(1),
-            picked: Picked::default(),
-            decode: None,
-            term: 1,
-            issued_at: now,
-            dispatch_deadline: after(1_000),
-            state: LeaseState::ISSUED,
-        };
         let _acting = Decider::new(173).enter();
-        let filed = store.issue_decided(record, None, |_| {});
-        filed.expect("the lease is filed");
+        let file = |request: u64, millis: u64| {
+            let filed = store.issue_decided(waiting(now, request, after(millis)), None, |_| {});
+            filed.expect("the lease is filed")
+        };
+        file(1, 1_000);
         clear_takes();
         assert!(LeasesStore::expire(&store, now).is_empty());
         assert_eq!(takes(), 1, "a new first place asks the sweep once");
         assert!(LeasesStore::expire(&store, after(500)).is_empty());
         assert_eq!(takes(), 1, "the sweep waits for the deadline it read");
+        file(2, 1_500);
+        clear_takes();
+        assert!(LeasesStore::expire(&store, after(500)).is_empty());
+        assert_eq!(takes(), 0, "a place behind the first asks no sweep");
         // A lease filed with an earlier deadline of its own is a new
         // first place: the sweep is asked ahead of the instant it read.
-        let earlier = LeaseRecord {
-            request: 2,
-            dispatch_deadline: after(600),
-            ..record
-        };
-        let filed = store.issue_decided(earlier, None, |_| {});
-        let earlier = filed.expect("the lease is filed");
+        let earlier = file(3, 600);
         clear_takes();
         let ended = LeasesStore::expire(&store, after(700));
         assert_eq!((ended.len(), takes()), (1, 1));
         assert_eq!(ended[0].record.lease.id, earlier.id);
         let ended = LeasesStore::expire(&store, after(1_000));
         assert_eq!((ended.len(), takes()), (1, 2));
+        let ended = LeasesStore::expire(&store, after(1_500));
+        assert_eq!((ended.len(), takes()), (1, 3));
         assert!(LeasesStore::expire(&store, after(2_000)).is_empty());
-        assert_eq!(takes(), 2, "the emptied file needs no turn");
+        assert_eq!(takes(), 3, "the emptied file needs no turn");
+    }
+
+    /// The sweep shows a file's deadline ahead of its questions. A file
+    /// whose host has not settled is asked once before that instant, and
+    /// from it at every pass until the host settles.
+    #[test]
+    fn a_file_its_host_has_not_settled_is_asked_once_before_its_deadline() {
+        let store = MemoryStore::new();
+        let clear_takes = || store.files.iter().for_each(turn::File::clear_takes);
+        let takes = || store.files.iter().map(turn::File::takes).sum::<usize>();
+        let now = Instant::now();
+        let after = |millis: u64| now + Duration::from_millis(millis);
+        LeasesStore::set_term(&store, 1);
+        let filed = store.issue_decided(waiting(now, 1, after(1_000)), None, |_| {});
+        filed.expect("the lease is filed");
+        clear_takes();
+        for millis in [100, 200, 300] {
+            assert!(store.expire_where(after(millis), |_| false).is_empty());
+        }
+        assert_eq!(takes(), 1, "asked once before its deadline");
+        for millis in [1_000, 1_100] {
+            assert!(store.expire_where(after(millis), |_| false).is_empty());
+        }
+        assert_eq!(takes(), 3, "asked at every pass from its deadline");
+        assert_eq!(store.expire_where(after(1_200), |_| true).len(), 1);
     }
 }
 

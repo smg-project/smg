@@ -315,7 +315,8 @@ pub(super) struct Behind {
 pub(super) struct File {
     /// The turn: its holder writes the file.
     turn: Mutex<Behind>,
-    /// The next deadline written with the queue under `turn`.
+    /// When a sweep next asks the file, written under `turn`
+    /// ([`super::NextDue`]).
     next_due: Arc<super::NextDue>,
     /// What a hand reads at each frame.
     shown: Shown,
