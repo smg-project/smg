@@ -48,7 +48,7 @@ use smg_policy_controller::{
     store::{GatewayId, MemoryStore, World},
     view::{Constraints, HashKind, Identity, Phase, RequestFacts, WorkerId},
     worker_host::Objects,
-    AppliedSpec, DerivedKey, KeySource,
+    AppliedSpec, DerivedKey, KeySource, MediaCounts, WireModes,
 };
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard, WorkerType};
 
@@ -138,8 +138,19 @@ pub(crate) struct Ask<'a> {
     pub phase: Phase,
     /// The size of the prompt in tokens. Zero uses the count from hashing if available.
     pub prompt_tokens: u32,
+    /// The media the request carries, by count. Zero where it carries
+    /// none. A stage that places by media reads it.
+    pub media: MediaCounts,
+    /// The wires the route dials. A route that dials one states it, and
+    /// the controller places among the rows that serve it. None stated
+    /// leaves every row in.
+    pub wires: WireModes,
     /// The rows of the workers the request's failed attempts were sent to.
     pub tried: &'a [WorkerId],
+    /// The retry number, `0` for the first attempt. `None` counts the rows
+    /// of `tried`, one a failed attempt. A stage whose failed attempt names
+    /// more rows than one states the number: a pair names two.
+    pub attempt: Option<u8>,
     /// The attempt's prompt hashes, where it has them. The stage that holds
     /// the tokens fills this once per attempt, before its first ask.
     pub hashes: Option<&'a Hashes>,
@@ -148,7 +159,8 @@ pub(crate) struct Ask<'a> {
 impl<'a> Ask<'a> {
     /// An ask for `model` under the request's `id` that states no other
     /// fact: a single request of no stated prompt size, not streamed, no
-    /// input of a routing key, nothing tried, no hashes.
+    /// input of a routing key, no media, no stated wire, nothing tried, no
+    /// stated attempt, no hashes.
     pub(crate) const fn of(id: &'a [u8], model: &'a str) -> Self {
         Self {
             id,
@@ -158,7 +170,10 @@ impl<'a> Ask<'a> {
             rid: None,
             phase: Phase::Single,
             prompt_tokens: 0,
+            media: MediaCounts::NONE,
+            wires: WireModes::NONE,
             tried: &[],
+            attempt: None,
             hashes: None,
         }
     }
@@ -213,8 +228,11 @@ impl<'a> Ask<'a> {
             session_key: key,
             phase: self.phase,
             prompt_tokens: self.prompt_tokens,
+            media: self.media,
             client_key,
-            attempt: u8::try_from(self.tried.len()).unwrap_or(u8::MAX),
+            attempt: self
+                .attempt
+                .unwrap_or_else(|| u8::try_from(self.tried.len()).unwrap_or(u8::MAX)),
             tried: self.tried,
             seed: rand::rng().random(),
             ..RequestFacts::default()
@@ -233,6 +251,7 @@ impl<'a> Ask<'a> {
             facts,
             constraints: Constraints {
                 excluded: missed,
+                wire_modes: self.wires,
                 ..Constraints::default()
             },
         }

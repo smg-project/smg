@@ -43,7 +43,8 @@ use smg_policy_controller::{
         WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
     },
     view::{
-        fingerprint, Candidate, Identity, LoadRow, Phase, RequestFacts, Role, WireModes, WorkerId,
+        fingerprint, Candidate, Identity, LoadRow, MediaCounts, Phase, RequestFacts, Role,
+        WireModes, WorkerId,
     },
     AppliedSpec, Catalog, DerivedKey, KeySource, Lease, LeaseId, Lifecycle, Membership, Outcome,
     Picker, PolicySpec, ReleaseReason, Side, Target, Targets, TieBand, TransportClass,
@@ -1171,6 +1172,25 @@ async fn an_ask_with_no_routing_key_states_its_clients_key() {
     assert_eq!(keys_of(&HeaderMap::new()), (true, 0));
 }
 
+/// An ask states its request's media, and the request carries the counts
+/// as stated. An ask that states none carries zero.
+#[test]
+fn an_ask_states_its_requests_media() {
+    let media = MediaCounts {
+        images: 2,
+        audio: 1,
+        bytes: 4_096,
+        ..MediaCounts::NONE
+    };
+    let ask = Ask {
+        media,
+        ..first(b"media")
+    };
+    assert_eq!(ask.request(Identity::NONE, 0, &[]).facts.media, media);
+    let bare = first(b"bare").request(Identity::NONE, 0, &[]);
+    assert_eq!(bare.facts.media, MediaCounts::NONE);
+}
+
 #[tokio::test]
 async fn a_key_is_read_by_the_documents_sources_in_their_order() {
     let (_, store, _) = bed_under(PolicyConfig::ConsistentHashing, &URLS[..1]);
@@ -1730,6 +1750,23 @@ fn an_asks_own_token_count_wins_over_its_hashes_count() {
     assert_eq!(ask.request(Identity::NONE, 0, &[]).facts.prompt_tokens, 37);
 }
 
+#[test]
+fn an_asks_stated_attempt_wins_over_the_count_of_its_rows() {
+    // A failed pair names its prefill and its decode: two rows, one attempt.
+    let rows = [WorkerId(3), WorkerId(4)];
+    let counted = Ask {
+        tried: &rows,
+        ..pair_ask()
+    };
+    assert_eq!(counted.request(Identity::NONE, 0, &[]).facts.attempt, 2);
+    let stated = Ask {
+        attempt: Some(1),
+        ..counted
+    };
+    let request = stated.request(Identity::NONE, 0, &[]);
+    assert_eq!((request.facts.attempt, request.facts.tried), (1, &rows[..]));
+}
+
 #[tokio::test]
 async fn a_prefill_without_room_is_passed_over_for_the_next_pair_target() {
     let bed = PairBed::new(Pairing::Lenient, 2, 2, 2).expect("a pair fleet");
@@ -2226,6 +2263,39 @@ async fn a_pair_without_admission_is_one_ask_and_one_commit() {
     assert_eq!(placed.id(), bed.prefills[0].0);
     drop(guard);
     assert_eq!((prefill.load(), prefill.routing_key_load()), (1, 0));
+}
+
+/// A route states the wire it dials, and the controller places among the
+/// rows that serve it. No row of this fleet serves the other wire.
+#[tokio::test]
+async fn an_ask_that_states_its_wire_is_placed_among_the_rows_that_serve_it() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
+    let ask = |wires| Ask {
+        wires,
+        ..pair_ask()
+    };
+    let now = Instant::now();
+    let unplaced = bed.host.ask(&ask(WireModes::GRPC), &[], now).await.err();
+    assert!(
+        matches!(
+            unplaced,
+            Some(Unplaced::Shed {
+                reason: ShedReason::NoEndpoints,
+                emptied_by: "wires",
+                ..
+            })
+        ),
+        "{unplaced:?}"
+    );
+    assert_eq!(live(&bed.store, 0), 0);
+
+    let asked = bed.host.ask(&ask(WireModes::HTTP), &[], now).await;
+    let asked = asked.expect("the rows serve the wire");
+    let placed = bed
+        .host
+        .commit_pair(asked, None, &mut Vec::new(), now)
+        .expect("a placement");
+    assert_eq!(placed.id(), bed.prefills[0].0);
 }
 
 #[tokio::test]
