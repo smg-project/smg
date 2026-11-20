@@ -130,6 +130,11 @@ struct Entry {
     /// it stands unconfirmed, and no other dispatch elsewhere touches it; a
     /// claim whose commit never comes stands until the TTL sweeps the key.
     claim: WorkerId,
+    /// The id the claim's lease names: the claimed worker's id when the
+    /// claim was made, read while a claim stands. It differs from `claim`
+    /// once the worker is registered again under the claim
+    /// ([`SessionTable::rename_worker`]).
+    leased: WorkerId,
 }
 
 impl Entry {
@@ -203,6 +208,10 @@ pub struct SessionTable {
     /// The decision clock at the next sweep, of the idle keys or of a
     /// worker that left: `u64::MAX` while neither is owed.
     next_sweep_micros: AtomicU64,
+    /// The decision clock at the next pass over the idle keys, read by the
+    /// sweep alone: a sweep a leave asked for walks no shard for the keys
+    /// before their pass is due. `u64::MAX` where no rule sweeps.
+    next_pass_micros: AtomicU64,
     /// The sweep interval: the shortest among the rules of the engine's
     /// bindings, so no rule's interval defers another rule's expiry; `0`
     /// never sweeps (no rule has a TTL).
@@ -212,6 +221,13 @@ pub struct SessionTable {
     /// forgotten: `0` until a decision stamps it, the word of a leave
     /// carrying no clock. One id and one instant a worker, in the order
     /// they left, [`ABSENT_WORKERS`] at most.
+    ///
+    /// A host tells a leave and a join under its own membership lock, and
+    /// the sweep that ends an absence holds this lock across its walk:
+    /// the host's lock first, then this one, then a shard's. Nothing
+    /// takes this lock under a shard's. A membership write that lands in
+    /// that sweep waits for one walk of the table: the price of a worker
+    /// that joins again behind the end losing no pin it is given after.
     absent: Mutex<Vec<(WorkerId, u64)>>,
     /// How long a worker that left keeps its pins.
     absence_micros: u64,
@@ -227,6 +243,7 @@ impl SessionTable {
                 .map(|_| Mutex::new(FxHashMap::default()))
                 .collect(),
             next_sweep_micros: AtomicU64::new(if sweep_micros == 0 { u64::MAX } else { 0 }),
+            next_pass_micros: AtomicU64::new(if sweep_micros == 0 { u64::MAX } else { 0 }),
             sweep_micros,
             absent: Mutex::new(Vec::new()),
             absence_micros: ABSENCE_MICROS,
@@ -300,6 +317,7 @@ impl SessionTable {
                 Recovery::Original => entry.append(target),
             }
             entry.claim = target;
+            entry.leased = target;
             return Claim::Made(target);
         };
         Claim::Standing(owner, entry.pins)
@@ -353,13 +371,19 @@ impl SessionTable {
         // decision's commit elsewhere withdraws a claim still unconfirmed; an
         // older request's commit on the owner leaves a retry's claim standing
         // for the retries after it.
+        // A claim's lease names the id its worker had when it claimed: a
+        // dispatch on that id is one on the claimed worker, registered
+        // again since or not.
+        let claimed_here = entry.claim != WorkerId(0) && entry.leased == target;
+        let target = if claimed_here { entry.claim } else { target };
         if entry.claim != WorkerId(0) && entry.claim == target {
             entry.claim = WorkerId(0);
         }
         if let SessionVerdict::Claimed(claimed) = verdict {
-            if claimed != WorkerId(0) && entry.claim == claimed {
+            if claimed != WorkerId(0) && entry.claim != WorkerId(0) && entry.leased == claimed {
+                let pin = entry.claim;
                 entry.claim = WorkerId(0);
-                entry.withdraw(claimed);
+                entry.withdraw(pin);
             }
         }
         if entry.pins[0] == target {
@@ -379,7 +403,7 @@ impl SessionTable {
     /// while no row holds its id, as an unhealthy member's do. A request
     /// of one of its keys is placed by the rule meanwhile, and its commit
     /// moves the pins by the rule's recovery. The worker is forgotten
-    /// ([`Self::forget_worker`]) once the absence's time passes on the
+    /// ([`Self::forget_workers`]) once the absence's time passes on the
     /// decision clock, counted from the next decision of any key. One
     /// registered again before that takes its pins under its new id
     /// ([`Self::rename_worker`]), and one that joins under the id it had
@@ -439,7 +463,10 @@ impl SessionTable {
     /// again, and a registration makes a new id. One walk of the table on
     /// a rare event. The rule's recovery then rules as for two routable
     /// pins: under `original` a key goes back to the worker it was first
-    /// placed on, under `latest` it stays where it was served last.
+    /// placed on, under `latest` it stays where it was served last. A
+    /// claim no dispatch confirmed follows its worker and keeps the id its
+    /// lease names: the claiming decision's dispatch on the old id
+    /// confirms it, and its commit elsewhere withdraws it.
     pub(crate) fn rename_worker(&self, old: WorkerId, new: WorkerId) {
         if old == WorkerId(0) || new == WorkerId(0) {
             return;
@@ -459,6 +486,7 @@ impl SessionTable {
                 if entry.pins[0] == entry.pins[1] {
                     entry.pins[1] = WorkerId(0);
                 }
+                // The lease's id stays beside it ([`Entry::leased`]).
                 if entry.claim == old {
                     entry.claim = new;
                 }
@@ -466,32 +494,42 @@ impl SessionTable {
         }
     }
 
-    /// Drops a worker from every key's pins: one that left and did not
-    /// return inside the absence's time, or one a host knows returns as
-    /// another worker. One walk of the table on a rare event. A key whose
-    /// owner went keeps its failover as the owner; a key with no pin left
-    /// leaves the table and is placed afresh.
-    pub(crate) fn forget_worker(&self, worker: WorkerId) {
-        if worker == WorkerId(0) {
+    /// Drops `workers` from every key's pins: the ones that left and did
+    /// not return inside the absence's time, or that a host knows return
+    /// as other workers. One walk of the table for them all, on a rare
+    /// event. A key whose owner went keeps its failover as the owner; a
+    /// key with no pin left leaves the table and is placed afresh.
+    pub(crate) fn forget_workers(&self, workers: &[WorkerId]) {
+        // No pin names the empty id: a list of it alone walks nothing.
+        if workers.iter().all(|&worker| worker == WorkerId(0)) {
             return;
         }
-        self.absent.lock().retain(|(id, _)| *id != worker);
-        self.drop_pins(&[worker]);
+        self.absent.lock().retain(|(id, _)| !workers.contains(id));
+        self.drop_pins(workers);
     }
 
     /// The pins of `workers` leave every key, in one walk.
     fn drop_pins(&self, workers: &[WorkerId]) {
         for shard in &self.shards {
-            shard.lock().retain(|_, entry| {
-                if workers.contains(&entry.pins[1]) {
-                    entry.pins[1] = WorkerId(0);
-                }
-                if workers.contains(&entry.pins[0]) {
-                    entry.pins = [entry.pins[1], WorkerId(0)];
-                }
-                entry.pins[0] != WorkerId(0)
-            });
+            shard
+                .lock()
+                .retain(|_, entry| Self::unpinned(entry, workers));
         }
+    }
+
+    /// Takes the pins of `workers` off `entry`. False where that takes the
+    /// key's last pin: it leaves the table and is placed afresh. A key
+    /// that holds no pin stays: a decision read it and its claim follows
+    /// ([`Self::lookup`]), and the idle keys' pass alone reclaims it.
+    fn unpinned(entry: &mut Entry, workers: &[WorkerId]) -> bool {
+        let held = entry.pins[0] != WorkerId(0);
+        if workers.contains(&entry.pins[1]) {
+            entry.pins[1] = WorkerId(0);
+        }
+        if workers.contains(&entry.pins[0]) {
+            entry.pins = [entry.pins[1], WorkerId(0)];
+        }
+        !held || entry.pins[0] != WorkerId(0)
     }
 
     /// Whether a sweep is due: of the keys whose TTL passed, once per the
@@ -509,52 +547,63 @@ impl SessionTable {
 
     /// The sweep that is due at `due`, out of line. A leave not yet stamped
     /// takes its end, the absence's time from this decision. A worker whose
-    /// absence ended is forgotten, the ones of one pass in one walk. Every
-    /// key whose TTL passed is forgotten where a rule has one.
+    /// absence ended is forgotten, and every key whose TTL passed where the
+    /// pass over the idle keys is due: one walk of the table for both, and
+    /// none where neither is owed. The pass keeps its own instant, so a
+    /// sweep a leave asked for walks no shard for the keys ahead of it.
     #[cold]
     #[inline(never)]
     fn sweep(&self, due: u64, now_micros: u64) {
-        let idle = match self.sweep_micros {
-            0 => u64::MAX,
-            sweep => now_micros.saturating_add(sweep),
+        let pass = self.next_pass_micros.load(Ordering::Relaxed);
+        let idle = now_micros >= pass;
+        let next_pass = if idle {
+            now_micros.saturating_add(self.sweep_micros)
+        } else {
+            pass
         };
         let claimed = self.next_sweep_micros.compare_exchange(
             due,
-            idle,
+            next_pass,
             Ordering::Relaxed,
             Ordering::Relaxed,
         );
         if claimed.is_err() {
             return;
         }
+        if idle {
+            self.next_pass_micros.store(next_pass, Ordering::Relaxed);
+        }
         let mut ended: Vec<WorkerId> = Vec::new();
-        {
-            let mut absent = self.absent.lock();
-            let mut next = idle;
-            absent.retain_mut(|(worker, ends)| {
-                if *ends == 0 {
-                    *ends = now_micros.saturating_add(self.absence_micros).max(1);
-                }
-                if *ends <= now_micros {
-                    ended.push(*worker);
-                    return false;
-                }
-                next = next.min(*ends);
-                true
-            });
-            // Under the lock, as a leave's own store is.
-            self.next_sweep_micros.store(next, Ordering::Relaxed);
-        }
-        if !ended.is_empty() {
-            self.drop_pins(&ended);
-        }
-        if self.sweep_micros != 0 {
-            for shard in &self.shards {
-                shard
-                    .lock()
-                    .retain(|_, entry| entry.expires_at_micros > now_micros);
+        let mut absent = self.absent.lock();
+        let mut next = next_pass;
+        absent.retain_mut(|(worker, ends)| {
+            if *ends == 0 {
+                *ends = now_micros.saturating_add(self.absence_micros).max(1);
             }
+            if *ends <= now_micros {
+                ended.push(*worker);
+                return false;
+            }
+            next = next.min(*ends);
+            true
+        });
+        // Under the lock, as a leave's own store is.
+        self.next_sweep_micros.store(next, Ordering::Relaxed);
+        // Where an absence ended the walk runs under the list's lock: a
+        // worker that joins again behind its end waits for the walk, and
+        // loses no pin it is given after. A pass over the idle keys alone
+        // holds nothing.
+        let held = (!ended.is_empty()).then_some(absent);
+        if held.is_none() && !idle {
+            return;
         }
+        for shard in &self.shards {
+            shard.lock().retain(|_, entry| {
+                let stays = !idle || entry.expires_at_micros > now_micros;
+                stays && Self::unpinned(entry, &ended)
+            });
+        }
+        drop(held);
     }
 
     /// The pins of `key`, for tests and dumps.
@@ -1071,7 +1120,7 @@ mod tests {
             }
         }
         assert_eq!(table.pins(s(3)), Some([WorkerId(2), WorkerId(1)]));
-        table.forget_worker(WorkerId(2));
+        table.forget_workers(&[WorkerId(2)]);
         assert_eq!(
             table.pins(s(1)),
             Some([WorkerId(1), WorkerId(0)]),
@@ -1089,8 +1138,68 @@ mod tests {
             "untouched"
         );
         assert_eq!(table.len(), 3);
-        table.forget_worker(WorkerId(0));
+        table.forget_workers(&[WorkerId(0)]);
         assert_eq!(table.len(), 3, "the empty id is never a pin");
+    }
+
+    /// The pass over the idle keys reclaims what expired alone. A key a
+    /// decision read and has not claimed yet holds no pin, and stays.
+    #[test]
+    fn the_pass_keeps_a_key_read_and_not_yet_claimed() {
+        let rule = SessionRule {
+            ttl_micros: Some(100),
+            sweep_micros: 1_000,
+            ..ORIGINAL
+        };
+        let table = SessionTable::new(rule.sweep_micros);
+        // The first pass: the next is due at 1,010.
+        table.lookup(s(1), 10, &rule);
+        assert_eq!(table.lookup(s(1), 1_005, &rule), [WorkerId(0); 2]);
+        // Another key's decision runs the pass.
+        table.lookup(s(2), 1_010, &rule);
+        let claim = table.claim(s(1), [WorkerId(0); 2], WorkerId(3));
+        assert_eq!(claim, Claim::Made(WorkerId(3)));
+        table.dispatched(s(1), SessionVerdict::Claimed(WorkerId(3)), WorkerId(3));
+        assert_eq!(table.lookup(s(1), 1_020, &rule), [WorkerId(3), WorkerId(0)]);
+    }
+
+    /// A walk that forgets a worker takes a key with no pin left out of
+    /// the table, and leaves the key a decision read and has not claimed.
+    #[test]
+    fn a_forgotten_workers_walk_keeps_a_key_read_and_not_yet_claimed() {
+        let table = SessionTable::new(RULE.sweep_micros);
+        table.lookup(s(1), 10, &RULE);
+        table.dispatched(s(2), SessionVerdict::Pinned, WorkerId(4));
+        table.forget_workers(&[WorkerId(0)]);
+        table.forget_workers(&[WorkerId(4)]);
+        assert_eq!(table.pins(s(1)), Some([WorkerId(0); 2]));
+        assert_eq!(table.pins(s(2)), None);
+    }
+
+    /// A claim follows its worker to its new id and keeps the id its lease
+    /// names. The claiming decision's own dispatch, which names the old
+    /// id, confirms the renamed claim. Its commit elsewhere withdraws it,
+    /// and the worker that served the key is pinned alone.
+    #[test]
+    fn a_claim_renamed_with_its_worker_is_confirmed_or_withdrawn_by_its_lease() {
+        let table = SessionTable::new(ORIGINAL.sweep_micros);
+        for key in [7, 8] {
+            assert_eq!(table.lookup(s(key), 10, &ORIGINAL), [WorkerId(0); 2]);
+            let claim = table.claim(s(key), [WorkerId(0); 2], WorkerId(1));
+            assert_eq!(claim, Claim::Made(WorkerId(1)));
+        }
+        table.rename_worker(WorkerId(1), WorkerId(11));
+        let renamed = Some([WorkerId(11), WorkerId(0)]);
+        assert_eq!((table.pins(s(7)), table.pins(s(8))), (renamed, renamed));
+        // Its own dispatch names the id the worker had: confirmed.
+        table.dispatched(s(7), SessionVerdict::Claimed(WorkerId(1)), WorkerId(1));
+        assert_eq!(table.pins(s(7)), renamed);
+        // A pin a dispatch confirmed is withdrawn by no later commit.
+        table.dispatched(s(7), SessionVerdict::Claimed(WorkerId(1)), WorkerId(2));
+        assert_eq!(table.pins(s(7)), Some([WorkerId(11), WorkerId(2)]));
+        // The other key's commit lands elsewhere: withdrawn.
+        table.dispatched(s(8), SessionVerdict::Claimed(WorkerId(1)), WorkerId(2));
+        assert_eq!(table.pins(s(8)), Some([WorkerId(2), WorkerId(0)]));
     }
 
     /// A worker that left keeps its pins. Its key is served elsewhere
@@ -1207,6 +1316,31 @@ mod tests {
         table.lookup(s(2), 30_000, &rule);
         assert_eq!(table.pins(s(2)), Some([WorkerId(2), WorkerId(0)]));
         assert_eq!(table.pins(s(1)), None, "the worker that stayed away");
+    }
+
+    /// A leave asks for a sweep, and that sweep walks no idle key ahead of
+    /// the pass over them: the pass keeps its own instant. The key whose
+    /// TTL passed stays until the pass is due, as with no leave.
+    #[test]
+    fn a_leave_walks_no_idle_key_before_their_pass_is_due() {
+        let rule = SessionRule {
+            ttl_micros: Some(100),
+            sweep_micros: 1_000,
+            ..ORIGINAL
+        };
+        let table = SessionTable::new(rule.sweep_micros).with_absence(5_000);
+        // The first lookup runs the pass: the next is due at 1,010.
+        for (key, worker) in [(1, 1), (2, 2)] {
+            table.lookup(s(key), 10, &rule);
+            table.dispatched(s(key), SessionVerdict::Pinned, WorkerId(worker));
+        }
+        table.left(WorkerId(9));
+        // Key 1 is idle past its TTL at 300, and the leave's sweep runs.
+        table.lookup(s(2), 300, &rule);
+        assert_eq!(table.absent(), 1, "the leave is stamped");
+        assert!(table.pins(s(1)).is_some(), "no pass before 1,010");
+        table.lookup(s(2), 1_010, &rule);
+        assert_eq!(table.pins(s(1)), None, "the pass at its own instant");
     }
 
     /// A table that holds no key files no absence: no pin names the

@@ -3778,12 +3778,12 @@ impl Engine {
         self.sessions.rename_worker(old, new);
     }
 
-    /// A worker that left membership does not return as itself: its
-    /// session pins leave now, ahead of the absence's time. A key it owned
-    /// keeps its failover as its owner, and one with no pin left is placed
-    /// afresh.
-    pub fn pins_forget(&self, worker: WorkerId) {
-        self.sessions.forget_worker(worker);
+    /// Workers that left membership do not return as themselves: their
+    /// session pins leave now, ahead of the absence's time, in one walk of
+    /// the table for them all. A key one of them owned keeps its failover
+    /// as its owner, and one with no pin left is placed afresh.
+    pub fn pins_forget(&self, workers: &[WorkerId]) {
+        self.sessions.forget_workers(workers);
     }
 
     /// How long a worker that left membership keeps its session pins, in
@@ -12071,7 +12071,7 @@ mod tests {
             Some([WorkerId(100), WorkerId(0)]),
             "a replacement's pins stand until the host says which way"
         );
-        engine.pins_forget(WorkerId(100));
+        engine.pins_forget(&[WorkerId(100)]);
         pool.remove(0);
         renumber(&mut pool);
         assert_eq!(engine.sessions.pins(session(7)), None);
