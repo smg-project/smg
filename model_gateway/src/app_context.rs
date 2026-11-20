@@ -26,7 +26,7 @@ use smg_worker::{
     },
     health::liveness,
     settings::RegistrationSettings,
-    workflow::{find_workers_by_url, WorkflowHost},
+    workflow::WorkflowHost,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
@@ -312,18 +312,6 @@ impl AppContext {
     /// workers ([`workflows_feed`]).
     pub(crate) fn door_feed(&self) -> Option<&Feed> {
         workflows_feed(self.policy_feed.as_ref(), self.follows_controller())
-    }
-
-    /// Whether a row of the policy controller's store stands for a worker
-    /// `url` selects. The holder is then the one writer of that worker's
-    /// object in the registry.
-    pub(crate) fn holds_row_at(&self, url: &str) -> bool {
-        self.door_feed().is_some_and(|feed| {
-            find_workers_by_url(&self.worker_registry, url)
-                .iter()
-                .filter_map(|worker| self.worker_registry.get_id_by_url(worker.url()))
-                .any(|id| feed.objects.standing(&id).is_some())
-        })
     }
 
     /// Create AppContext from config with all components initialized

@@ -213,13 +213,6 @@ impl UpdateWorkerPropertiesStep {
             workers_to_update.iter().zip(merged).enumerate()
         {
             let row = at_door.zip(rows.get(index).copied().flatten());
-            if refresh && row.is_some() {
-                debug!(
-                    worker_url = %worker.redacted_url(),
-                    "The door takes the engine's labels from no writer yet; the row's worker is kept as it is"
-                );
-                continue;
-            }
             if refresh {
                 // The engine's id is the worker's live id from here, rebuilt
                 // or not (a rebuilt worker shares the cell): the id a handoff
@@ -351,10 +344,23 @@ impl UpdateWorkerPropertiesStep {
             // A row's worker is written at the store's door, and the holder
             // lays this worker over the one that stands, under its id.
             if let Some((door, standing)) = row {
-                // The door promotes a row whose checks the update turned
-                // off, and the holder sets the worker it lays to its row's
-                // status: no promotion follows here.
-                door.lay(&context.data.asker, standing, &new_worker, worker)?;
+                if refresh {
+                    // A refresh is the engine's word: the door asks no
+                    // maker and takes the labels alone. One it drops is
+                    // left to the next transition into service.
+                    if !door.refresh(standing, &new_worker, worker)? {
+                        debug!(
+                            worker_url = %worker.redacted_url(),
+                            "Worker changed, left or drains during the label refresh; not rebuilt"
+                        );
+                        continue;
+                    }
+                } else {
+                    // The door promotes a row whose checks the update
+                    // turned off, and the holder sets the worker it lays to
+                    // its row's status: no promotion follows here.
+                    door.lay(&context.data.asker, standing, &new_worker, worker)?;
+                }
                 let registry = &app_context.worker_registry;
                 updated_workers.extend(registry.get_by_url(worker.url()));
                 continue;

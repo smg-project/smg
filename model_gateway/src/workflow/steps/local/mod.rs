@@ -343,7 +343,7 @@ mod tests {
     };
     use smg_policy_controller::{
         store::{Maker, MemoryStore, WorkerStatus as RowStatus, WorkersStore},
-        worker_host::{facts, Expect, DISCOVERY, DRAIN_WORKERS_AT_DOOR_STEP},
+        worker_host::{facts, Expect, Remover, DISCOVERY, DRAIN_WORKERS_AT_DOOR_STEP},
     };
     use smg_worker::{
         identity::basic::{ConnectionMode, Worker},
@@ -664,6 +664,72 @@ mod tests {
             edges(&worker_update_line(Some(&feed))),
             written(&at_the_door)
         );
+    }
+
+    /// The update step's refresh at the door, by the door's answer. A
+    /// worker rebuilt from the row's object takes its place, and the row
+    /// takes its labels. One rebuilt from an object that stands no more is
+    /// dropped, and so is one whose row is draining: the step says so and
+    /// the standing object stays. One that states another fact than its
+    /// labels fails by name.
+    #[test]
+    fn under_the_feed_a_refresh_is_laid_or_dropped_by_the_doors_answer() {
+        let store = Arc::new(MemoryStore::default());
+        let registry = Arc::new(WorkerRegistry::new());
+        let feed = feed(&store, &registry, BackendConnector::shared());
+        let step = UpdateAtDoorStep::new(Arc::clone(&feed.door), Arc::clone(&feed.objects));
+        let url = "http://ours:8000";
+        let built = |model: &str, tier: &str| -> Arc<dyn Worker> {
+            let worker = BasicWorkerBuilder::new(url).model(ModelCard::new(model));
+            Arc::new(worker.label("tier", tier).build())
+        };
+        let seen = || {
+            let id = registry.get_id_by_url(url).expect("the object's id");
+            feed.objects.standing(&id).expect("the object's row")
+        };
+        let stands = |worker: &Arc<dyn Worker>| {
+            let held = registry.get_by_url(url);
+            held.is_some_and(|held| Arc::ptr_eq(&held, worker))
+        };
+        let tier = || {
+            let row = store.by_key(url).expect("the row");
+            row.facts.labels.get("tier").cloned()
+        };
+
+        let first = built("m", "a");
+        let wrote = feed
+            .door
+            .found_built(&Maker::Control, Expect::Anything, &first, None);
+        assert!(wrote.is_ok(), "{wrote:?}");
+
+        let second = built("m", "b");
+        let laid = step.refresh(seen(), &second, &first);
+        assert!(matches!(laid, Ok(true)), "{laid:?}");
+        assert!(stands(&second));
+        assert_eq!(tier().as_deref(), Some("b"));
+
+        // Rebuilt from the object the second replaced: an older refresh.
+        let late = step.refresh(seen(), &built("m", "c"), &first);
+        assert!(matches!(late, Ok(false)), "{late:?}");
+        assert!(stands(&second));
+        assert_eq!(tier().as_deref(), Some("b"));
+
+        let refused = step.refresh(seen(), &built("n", "b"), &second);
+        let why = refused.map_err(|error| error.to_string());
+        let named = "states another fact than its labels";
+        assert!(
+            why.as_ref().is_err_and(|why| why.contains(named)),
+            "{why:?}"
+        );
+        assert!(stands(&second));
+
+        let by = Remover::Maker(&Maker::Control);
+        let drained = feed.door.drained(by, url, seen());
+        assert!(drained.is_ok(), "{drained:?}");
+        let leaving = step.refresh(seen(), &built("m", "c"), &second);
+        assert!(matches!(leaving, Ok(false)), "{leaving:?}");
+        assert!(stands(&second));
+        assert_eq!(feed.objects.unhanded(), 0);
     }
 
     /// With no feed the line is the one it was. Under a feed it is the
