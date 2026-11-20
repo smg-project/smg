@@ -46,11 +46,14 @@ pub(crate) fn bound(values: &mut Vec<NamedValue>) -> usize {
     stated - kept
 }
 
-/// Reads a `values` key as any answer states it, and fails no answer over
-/// it. A list keeps its entries in their order: a named value as it
-/// stands, any other entry as one with no name, which the bounds drop and
-/// the load monitor counts. A key of any other shape is some other key of
-/// the answer's own, and reads as no list.
+/// Reads a well-formed `values` key as any answer states it, and fails no
+/// answer over it. A list keeps its entries in their order: a named value
+/// as it stands, any other entry as one with no name, which the bounds
+/// drop and the load monitor counts. A key of any other shape is some
+/// other key of the answer's own, and reads as no list. A token no JSON
+/// reader takes, a bare `NaN` among them, fails the whole body here as
+/// anywhere in it: the load monitor keeps a route that had answered over
+/// such a body.
 pub(crate) fn stated<'de, D>(source: D) -> Result<Vec<NamedValue>, D::Error>
 where
     D: Deserializer<'de>,
@@ -146,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn a_values_key_fails_no_answer_whatever_it_states() {
+    fn a_well_formed_values_key_fails_no_answer_whatever_it_states() {
         let read = |values: &str| -> SchedulerLoadSnapshot {
             let answer = format!(
                 r#"{{"dp_rank":2,"num_running_reqs":5,"values":{values},"num_waiting_reqs":7}}"#
