@@ -116,7 +116,9 @@ pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, S
 /// The controller's store for this process, holding the policy document in
 /// force ([`RouterConfig::policy_document_in_force`]) as its one generation.
 /// `None` where the classic policies decide: nothing is constructed then,
-/// and no document is read.
+/// and no document is read. `None` too where every router of the gateway is
+/// a provider's and neither a document nor a controller's address is given:
+/// the setting moves nothing there, and one log line says so.
 ///
 /// `stages` is the catalog of a host's own stages. The stock gateway hands
 /// none, and the door then checks over the stock stages alone.
@@ -133,6 +135,20 @@ pub(crate) fn start_with(
     stages: Option<Catalog>,
 ) -> Result<Option<Started>, StartError> {
     if !config.policy_controller {
+        return Ok(None);
+    }
+    // A gateway whose every router is a provider's places its requests by
+    // no routing policy, so no document says it and the classic line serves
+    // it. A document given beside it has nothing to run and a controller's
+    // address nothing to supply: the read below refuses each by name.
+    if let (Some(mode), None, None) = (
+        config.provider_alone(),
+        &config.policy_spec,
+        &config.policy_controller_address,
+    ) {
+        info!(
+            "The policy controller is picked and moves nothing here: the {mode} provider mode places its requests by no routing policy"
+        );
         return Ok(None);
     }
     let document = config.policy_document_in_force()?;
