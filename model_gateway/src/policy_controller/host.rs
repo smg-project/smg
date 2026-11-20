@@ -90,9 +90,10 @@ const GATEWAY: GatewayId = GatewayId::LOCAL;
 /// the gateway could not send to.
 const ASKS: usize = 3;
 
-/// The encode items one ask may state. A pair's commit walks the placed
+/// The encode items one ask may state. The bound is the controller's own:
+/// the classic selection has none. A pair's commit walks the placed
 /// encoders under the prefill admission lock, so one request bounds that
-/// walk. The bound stands above the largest image limit a model states.
+/// walk.
 const MAX_ENCODE_KEYS: usize = 256;
 
 /// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied:
@@ -206,6 +207,12 @@ impl<'a> Ask<'a> {
     /// images: such an ask is decided with its items, in one decision.
     fn states_items(&self) -> bool {
         !self.items.keys.is_empty() || self.items.one.is_some() || self.items.decode_images
+    }
+
+    /// Whether the ask states more items than one ask may
+    /// ([`MAX_ENCODE_KEYS`]): it is refused by name, and nothing is asked.
+    fn states_too_many_items(&self) -> bool {
+        self.items.keys.len() > MAX_ENCODE_KEYS
     }
 
     /// The request's two keys by the sources its binding names in `spec`.
@@ -745,7 +752,7 @@ impl Host {
         now: Instant,
     ) -> Result<Asked, Unplaced> {
         // Refused ahead of the decision: nothing is booked for it.
-        if ask.items.keys.len() > MAX_ENCODE_KEYS {
+        if ask.states_too_many_items() {
             return Err(Unplaced::TooManyItems);
         }
         let made = Made {
@@ -898,7 +905,9 @@ impl Host {
     /// a request too. They were placed for the first target's prefill, so
     /// a target of another prefill is passed over. The walk over them only
     /// reads, and an ask's items are bounded ([`MAX_ENCODE_KEYS`]). The
-    /// list that holds moves into the placement as the ask built it.
+    /// list that holds moves into the placement as the ask built it. A
+    /// miss is the rare path: there the ask's list drops and the misses
+    /// are named under the lock.
     pub(crate) fn commit_pair(
         &self,
         asked: Asked,
@@ -1023,6 +1032,11 @@ impl Host {
         admission: Option<&PrefillAdmission>,
         routing_key: Option<&str>,
     ) -> Result<(Placed, PrefillLoadGuard), Unplaced> {
+        // Ahead of admission: the answer is the same under any load, and
+        // the request takes no place in the queue.
+        if ask.states_too_many_items() {
+            return Err(Unplaced::TooManyItems);
+        }
         let holds = &holds;
         let missed = Mutex::new(Vec::new());
         // The attempt's first ask, whichever half makes it: each wake's

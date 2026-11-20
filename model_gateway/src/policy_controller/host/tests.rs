@@ -1012,6 +1012,10 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
         "No prefill/decode pair for model '{MODEL}' shares a KV transfer protocol (mismatch on \
          [\"runtime\"]; prefill: [\"a/?/?\"], decode: [\"b/?/?\"])"
     );
+    // The refusal's text names the bound itself.
+    let bound = format!(
+        "The policy controller is picked for this gateway and does not decide a request of more than {MAX_ENCODE_KEYS} encode items yet"
+    );
     let rows = [
         (
             shed(ShedReason::Saturated),
@@ -1101,9 +1105,7 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
             StatusCode::NOT_IMPLEMENTED,
             "not_decided_by_policy_controller",
             None,
-            Some(
-                "The policy controller is picked for this gateway and does not decide a request of more than 256 encode items yet",
-            ),
+            Some(bound.as_str()),
         ),
     ];
     for (unplaced, status, code, retry_after, message) in rows {
@@ -3051,6 +3053,39 @@ async fn an_ask_past_the_bound_of_its_items_is_refused_and_books_nothing() {
     let asked = bed.host.ask(&at, &[], now).await;
     let asked = asked.expect("an ask at the bound");
     assert_eq!(asked.encoders.len(), MAX_ENCODE_KEYS);
+}
+
+/// The bound is read ahead of admission: behind a waiter the request is
+/// refused at once, under the same name, and takes no place in the queue.
+#[tokio::test(start_paused = true)]
+async fn an_ask_past_the_bound_is_refused_ahead_of_admission() {
+    let bed = EncodeBed::new(1, 1).expect("an encode fleet");
+    let admission = PrefillAdmission::new(1, 2, Duration::from_secs(5));
+    let prefill = &bed.prefills[0].1;
+    let _occupied = admission
+        .admit(None, select_worker(prefill))
+        .await
+        .expect("held load");
+    let older = admission.admit(None, select_worker(prefill));
+    tokio::pin!(older);
+    assert!(poll!(older.as_mut()).is_pending());
+
+    let keys: Vec<_> = (0_u64..)
+        .take(MAX_ENCODE_KEYS + 1)
+        .map(Identity::hashed)
+        .collect();
+    let past = Ask {
+        items: items(&keys),
+        ..pair_ask()
+    };
+    let refused = bed.host.place_pair(&past, Some(&admission), None);
+    tokio::pin!(refused);
+    assert!(matches!(
+        poll!(refused.as_mut()),
+        Poll::Ready(Err(Unplaced::TooManyItems))
+    ));
+    assert_eq!(admission.queued_requests(), 1, "the waiter alone");
+    assert_eq!(live(&bed.store, 0), 0);
 }
 
 /// With items the commit walks a pick's alternates as a pair without
