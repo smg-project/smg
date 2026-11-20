@@ -2441,8 +2441,8 @@ pub(crate) mod tests {
     use parking_lot::Mutex;
 
     use super::{
-        decider_of, pinned, DecisionRecord, Door, Maker, Refused, Request, Swept, World,
-        DISPATCH_TTL, ON_SAMPLE_READ, SEAT, TERM_MARK,
+        decider_of, pinned, Door, Maker, Refused, Request, Swept, World, DISPATCH_TTL,
+        ON_SAMPLE_READ, SEAT, TERM_MARK,
     };
     use crate::{
         builtins::Random,
@@ -2462,6 +2462,7 @@ pub(crate) mod tests {
             Candidate, Constraints, Identity, KeyedRow, Phase, PoolFacts, RequestFacts, Role,
             Session, WireModes, WorkerId,
         },
+        DecisionRecord,
     };
 
     const MODEL: &str = "model-a";
@@ -2932,6 +2933,32 @@ pub(crate) mod tests {
                 names: None
             })
         );
+    }
+
+    #[test]
+    fn the_door_sheds_before_the_first_profile_and_names_the_plan_alone() {
+        let store = fleet(1);
+        sampling(&store, 2, 1);
+        let door = Door::new(store);
+
+        let id = b"narrowed";
+        let mut ask = request(id, 7);
+        ask.constraints.subset_hint = Some(0);
+        let answer = door.decide(GATEWAY, &ask, Instant::now()).expect("a shed");
+        let Decision::Shed(shed) = answer.decision else {
+            panic!("the subset left no candidate");
+        };
+        assert_eq!(shed.emptied_by, super::SUBSET_HINT);
+        let explained = door.explained(GATEWAY, id).expect("the sampled shed");
+        assert_eq!(explained.record.binding, Some(0));
+        assert_eq!(
+            explained.names,
+            Some(crate::Names {
+                plan: "single",
+                ..crate::Names::default()
+            }),
+        );
+        assert_eq!(shed.trace.made_under(), None);
     }
 
     #[test]
@@ -3659,7 +3686,11 @@ pub(crate) mod tests {
         asked.constraints.wire_modes = WireModes::ZMQ;
         let decided = door.decide(GATEWAY, &asked, Instant::now());
         let decided = decided.expect("a decision");
-        assert!(decided.decision.pick().is_none(), "no member it can dial");
+        let Decision::Shed(shed) = decided.decision else {
+            panic!("the gateway can dial no member");
+        };
+        assert_eq!(shed.emptied_by, super::WIRES);
+        assert_eq!(shed.trace.made_under(), None);
         assert!(decided.lease.is_none());
         assert_eq!((door.undialed(), door.hashes_cut()), (3, 0));
     }

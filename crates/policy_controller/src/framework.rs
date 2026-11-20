@@ -3258,15 +3258,16 @@ fn carries_a_column(facts: &RequestFacts<'_>) -> bool {
 /// plugin was handed rows that carry a mask or a pin beside them.
 const WRITTEN_ROWS: &str = "written-rows";
 
-/// The decline of a pair decision whose rows were not written for the
-/// plugin they are shown to. Cold and out of line: the pair entry's path
-/// past the refusal keeps its weight, and the passes it calls stay
-/// inlined. Built in place, the refusal cost a pair decision under no mask
-/// 26 instructions.
+/// The decline of a decision whose rows were not written for the plugin
+/// they are shown to, under the profile that declines. Cold and out of
+/// line: an entry's path past the refusal keeps its weight, and the passes
+/// it calls stay inlined. Built in place, the refusal cost a pair decision
+/// under no mask 26 instructions.
 #[cold]
 #[inline(never)]
-fn rows_not_written(bare: Trace) -> Decision {
-    shed(ShedReason::PolicyDeclined, WRITTEN_ROWS, bare)
+fn rows_not_written(bare: Trace, profile: u16) -> Decision {
+    let trace = Trace { profile, ..bare };
+    shed(ShedReason::PolicyDeclined, WRITTEN_ROWS, trace)
 }
 
 /// Whether an affinity column stands for `pool`: empty, or one entry a
@@ -3346,13 +3347,19 @@ impl Engine {
     /// Every profile's stages are folded in here, so the summary
     /// ([`Self::needs`]) holds a stage's needs however the engine was built.
     /// A binding built in code can shadow with a separate profile without
-    /// a decision scope under the single plan.
+    /// a decision scope under the single plan. An engine holds at most
+    /// 65,535 profiles: the position past them marks a decision made ahead
+    /// of every profile ([`Trace::NO_PROFILE`]).
     pub fn new(
         profiles: Vec<Profile>,
         bindings: Vec<Binding>,
         generation: u64,
         needs: Needs,
     ) -> Self {
+        debug_assert!(
+            profiles.len() <= usize::from(Trace::NO_PROFILE),
+            "the position past 65,535 profiles is the mark of no profile"
+        );
         // Each profile's needs, asked of its stages once: the summary and
         // the phase answers below fold them.
         let profile_needs: Vec<Needs> = profiles.iter().map(Profile::needs).collect();
@@ -3946,7 +3953,7 @@ impl Engine {
             None
         } else if marks.opens_first() {
             if unwritten() {
-                return shed(ShedReason::PolicyDeclined, WRITTEN_ROWS, bare);
+                return rows_not_written(bare, index);
             }
             let opened = profile.open(facts, candidates, pool);
             if placed() {
@@ -3962,7 +3969,7 @@ impl Engine {
             // The key's mark: a keyed request keeps its key's worker over
             // the overload veto, where the binding steers.
             if marks.keyed_scope() && unwritten() {
-                return shed(ShedReason::PolicyDeclined, WRITTEN_ROWS, bare);
+                return rows_not_written(bare, index);
             }
             let opened = marks
                 .keyed_scope()
@@ -4823,7 +4830,15 @@ impl Engine {
         if (prefill_shown && !cx.stalled.is_empty())
             || (decode_shown && !decode_cx.stalled.is_empty())
         {
-            return rows_not_written(bare);
+            // The side whose shown rows stand beside a mask is the one that
+            // declines: the prefill's first.
+            let prefill = prefill_shown && !cx.stalled.is_empty();
+            let declining = if prefill {
+                binding.profile
+            } else {
+                decode_index
+            };
+            return rows_not_written(bare, declining);
         }
         // One scope per side: the WIT view has one candidate list, so the
         // prefill stages read the prefill pool and the decode stages the
@@ -6066,6 +6081,7 @@ mod tests {
             Decision::Shed(shed) => {
                 assert_eq!(shed.reason, ShedReason::NoEndpoints);
                 assert_eq!(shed.emptied_by, "healthy");
+                assert_eq!(shed.trace.made_under(), Some(0));
             }
             other => panic!("an unhealthy pool answered {other:?}"),
         }
@@ -6340,6 +6356,7 @@ mod tests {
                 "a column of {} for three candidates answered {decision:?}",
                 column.len()
             );
+            assert_eq!(decision.trace().made_under(), None);
         }
         // A decision's inputs are checked before anything is resolved from
         // them: a model no binding covers is refused for its column when the
@@ -6855,6 +6872,7 @@ mod tests {
                 (ShedReason::PolicyDeclined, WRITTEN_ROWS),
                 "{beside}"
             );
+            assert_eq!(shed.trace.made_under(), Some(0), "{beside}");
         }
         // A profile that shows nothing reads both.
         assert!(lead(&plain.decide(
@@ -6975,6 +6993,7 @@ mod tests {
         // A mask beside the decode side's rows: declined, and no scope opens.
         let decision = decide(&engine, &decodes, [&written, &masked]);
         assert!(declined(&decision), "{decision:?}");
+        assert_eq!(decision.trace().made_under(), Some(1));
         assert_eq!(read(), (1, 0), "no scope opens for a declined decision");
         // A mask beside the prefill side, which shows nothing: its filters
         // read it, and the masked prefill is passed over.
@@ -7482,6 +7501,7 @@ mod tests {
                 assert_eq!(shed.reason, ShedReason::PolicyDeclined);
                 assert_eq!(shed.emptied_by, "binding");
                 assert_eq!(shed.trace.survivors.get(), Some(0), "no pool was read");
+                assert_eq!(shed.trace.made_under(), None);
             }
             other => panic!("a single binding answered a pair with {other:?}"),
         }
@@ -7638,6 +7658,7 @@ mod tests {
             "the tried worker is dropped while another remains"
         );
         assert_eq!(pick.trace.survivors.get(), Some(1));
+        assert_eq!(pick.trace.made_under(), Some(0));
     }
 
     #[test]
@@ -7674,6 +7695,7 @@ mod tests {
                 assert_eq!(shed.reason, ShedReason::PolicyDeclined);
                 assert_eq!(shed.emptied_by, "binding");
                 assert_eq!(shed.trace.survivors.get(), Some(0), "no pool was read");
+                assert_eq!(shed.trace.made_under(), None);
             }
             other => panic!("an unbound model answered {other:?}"),
         }

@@ -459,13 +459,11 @@ impl Engine {
         side: &mut EncodeScratch,
         placed: &mut EncodePlaced,
     ) -> Decision {
-        let bare = Trace {
+        let unbound = Trace {
             seed: facts.seed,
             generation: pool.generation,
             ..Trace::default()
         };
-        let declined = |stage| turned_away(ShedReason::PolicyDeclined, stage, bare);
-        let gap = |stage| turned_away(ShedReason::NoEndpoints, stage, bare);
         // The prefill's lookup names the plan: a binding of another plan
         // declines, as a pair decision under a single binding is declined.
         let epd = self
@@ -475,11 +473,21 @@ impl Engine {
                 Plan::Single | Plan::PdPair => None,
             });
         let Some(index) = epd else {
-            return declined("binding");
+            return turned_away(ShedReason::PolicyDeclined, "binding", unbound);
         };
         let Some(profile) = self.profiles.get(usize::from(index)) else {
-            return declined("binding");
+            return turned_away(ShedReason::PolicyDeclined, "binding", unbound);
         };
+        // The encode profile is resolved: a shed of the encode side below
+        // is made under it, and its trace says so. A column of the pair's
+        // or of the request's is refused as the other two entries refuse
+        // it, ahead of every profile.
+        let bare = Trace {
+            profile: index,
+            ..unbound
+        };
+        let declined = |stage| turned_away(ShedReason::PolicyDeclined, stage, bare);
+        let gap = |stage| turned_away(ShedReason::NoEndpoints, stage, bare);
         if encode.facts.len() != encode.encoders.len()
             || encode.prefill_classes.len() != pools.prefills.len()
             || !column_fits(encode.affinity, encode.encoders)
@@ -492,13 +500,13 @@ impl Engine {
         if !column_fits(pools.prefill_affinity, pools.prefills)
             || !column_fits(pools.decode_affinity, pools.decodes)
         {
-            return declined(AFFINITY_COLUMN);
+            return turned_away(ShedReason::PolicyDeclined, AFFINITY_COLUMN, unbound);
         }
         // A column on the request, or rows named on it, name neither pool.
         // The pair entry refuses them: here they are refused before a stage
         // of the encode side is asked.
         if carries_a_column(facts) {
-            return declined(AFFINITY_COLUMN);
+            return turned_away(ShedReason::PolicyDeclined, AFFINITY_COLUMN, unbound);
         }
         debug_assert_indexed(encode.encoders);
         let needs = !items.keys.is_empty();
