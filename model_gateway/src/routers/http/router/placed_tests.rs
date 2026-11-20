@@ -249,6 +249,35 @@ async fn a_placed_attempt_says_its_dispatch_and_its_lease_ends_with_it() -> Case
     Ok(())
 }
 
+/// A prompt under one window is pinned as the classic's prefix policy pins
+/// it: the host keys it by what it has, so its sends land on one worker.
+#[tokio::test]
+async fn a_prompt_under_one_window_lands_on_one_worker_under_the_prefix_ring() -> Case {
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    let mut upstreams = Vec::new();
+    for _ in 0..3 {
+        upstreams.push(fixed_status_upstream(&[GENERATE], StatusCode::OK).await);
+    }
+    let urls: Vec<&str> = upstreams.iter().map(|(url, _)| url.as_str()).collect();
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = bed_over(Arc::clone(&registry), &urls);
+    let mut doc = PolicySpec::preset("prefix_hash")?;
+    doc.generation += 1;
+    store.apply(AppliedSpec::validate(&doc)?)?;
+    let router = router(registry, Some(host));
+    for _ in 0..6 {
+        let request = serde_json::from_value(json!({"text": "a prompt of 26 bytes, once"}))?;
+        let response = router.route_generate(None, &meta, request, MODEL).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let mut hits: Vec<usize> = upstreams
+        .iter()
+        .map(|(_, hits)| hits.load(Ordering::SeqCst))
+        .collect();
+    hits.sort_unstable();
+    assert_eq!(hits, [0, 0, 6]);
+    Ok(())
+}
 #[tokio::test]
 async fn a_retry_names_the_row_of_its_failed_attempt() -> Case {
     let (a, hits_a) = fixed_status_upstream(&[CHAT], StatusCode::SERVICE_UNAVAILABLE).await;
