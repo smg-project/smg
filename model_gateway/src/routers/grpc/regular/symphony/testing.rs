@@ -273,7 +273,7 @@ pub(super) fn read_with(format: Format) -> Vec<Event<'static>> {
     let assignment = Assignment {
         format: Arc::new(format),
         prompt: "<|im_start|>assistant\n".to_string(),
-        forbids_calls: false,
+        forbids_calls: Forbids::Nothing,
         past_the_end: false,
         forcing: None,
         opener: None,
