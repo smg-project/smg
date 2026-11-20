@@ -5145,10 +5145,11 @@ impl Engine {
         }
     }
 
-    /// Records a dispatch in each profile tally that stages read, where
-    /// `present` says the row still stands. The store's door asks its
-    /// world there, and `present` is asked only where a profile reads
-    /// sends.
+    /// Records a dispatch in each profile tally that stages read. A tally
+    /// asks `present` only where the send would enter a rank it does not
+    /// know: the store's door asks its world there, so a late report
+    /// enters no rank behind a removal. An engine whose profiles read no
+    /// sends asks nothing.
     #[inline]
     pub(crate) fn dispatched_sent(
         &self,
@@ -5156,14 +5157,14 @@ impl Engine {
         target: &Target,
         side: Side,
         since_decision_micros: u32,
-        present: impl FnOnce() -> bool,
+        present: impl Fn() -> bool,
     ) {
-        if !self.sent_credits.is_empty() && present() {
-            self.credit_dispatch(lease, target, side, since_decision_micros);
+        if !self.sent_credits.is_empty() {
+            self.credit_dispatch(lease, target, side, since_decision_micros, present);
         }
     }
 
-    #[cold]
+    /// Out of line: an engine with no tally keeps its caller short.
     #[inline(never)]
     fn credit_dispatch(
         &self,
@@ -5171,9 +5172,10 @@ impl Engine {
         target: &Target,
         side: Side,
         since_decision_micros: u32,
+        present: impl Fn() -> bool,
     ) {
         for credit in &self.sent_credits {
-            credit.dispatched(lease, target, side, since_decision_micros);
+            credit.dispatched(lease, target, side, since_decision_micros, &present);
         }
     }
 

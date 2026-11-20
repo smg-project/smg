@@ -2728,10 +2728,11 @@ fn scorer_of(
     let max_age = view.max_report_age_ms;
     Ok(match stage {
         ScoreStage::LeastLoad(p) => Resolved::Built(with_report_age(
-            LeastLoad::new(
+            LeastLoad::of_profile(
                 p.kv_pressure_weight.unwrap_or(DEFAULT_KV_PRESSURE_WEIGHT),
                 p.mean_prefill_tokens.unwrap_or(DEFAULT_MEAN_PREFILL_TOKENS),
                 p.default_throughput.unwrap_or(DEFAULT_THROUGHPUT),
+                sent(),
             ),
             max_age,
         )),

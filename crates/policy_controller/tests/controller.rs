@@ -1668,6 +1668,7 @@ async fn a_served_dispatch_feeds_a_registered_scorer_without_lifecycle_hooks() {
                             Sent {
                                 requests: 1,
                                 tokens: u64::from(TOKENS),
+                                ..Sent::default()
                             }
                         )));
                         assert!(seen.contains(&(target, Sent::default())));

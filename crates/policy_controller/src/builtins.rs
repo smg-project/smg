@@ -8,7 +8,7 @@ use std::{
     collections::VecDeque,
     hash::Hasher,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -26,7 +26,7 @@ use crate::{
         TieBand, Unit, DRAW_BOUND,
     },
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
-    sent::SentCredit,
+    sent::{Sent, SentCredit},
     spec::{CostMargin, Needs, Unreported},
     terms::{Coefficients, Term},
     view::{
@@ -668,6 +668,11 @@ pub(crate) struct SinceReport {
     /// The held token-work in the high bits and the held requests in the low
     /// [`REQUEST_BITS`]: one word, so a reader never sees a torn pair.
     held: AtomicU64,
+    /// How many of the held dispatches were recorded at no tokens: those
+    /// of a lease that states no size, under a profile's count. A word of
+    /// its own, written behind the held word and released ahead of it: a
+    /// read that crosses a write may see one of the two without the other.
+    unsized_held: AtomicU32,
     /// The lowest of the lanes' front instants; `u64::MAX` when none. A
     /// dispatch lowers it under its lane's lock; a release recomputes it
     /// under every lane's lock, so it never reads above any lane's front.
@@ -813,6 +818,7 @@ impl Default for SinceReport {
     fn default() -> Self {
         Self {
             held: AtomicU64::new(0),
+            unsized_held: AtomicU32::new(0),
             oldest_micros: AtomicU64::new(u64::MAX),
             retiring: Mutex::new(()),
             lanes: Default::default(),
@@ -828,6 +834,8 @@ impl SinceReport {
         u64::from(tokens) << REQUEST_BITS | 1
     }
 
+    /// Holds one dispatch of `tokens` made at `at_micros`. A dispatch of no
+    /// tokens is counted as a send of no stated size.
     pub(crate) fn record(&self, at_micros: u64, tokens: u32) {
         // Past the bound the row's oldest batch retires before this dispatch
         // lands, by instant across the lanes: the newest credits stay,
@@ -854,6 +862,9 @@ impl SinceReport {
             newest.is_none()
         };
         self.held.fetch_add(Self::weight(tokens), Ordering::Relaxed);
+        if tokens == 0 {
+            self.unsized_held.fetch_add(1, Ordering::Relaxed);
+        }
         if front {
             lane.publish_oldest(&dispatches);
         }
@@ -867,6 +878,9 @@ impl SinceReport {
 
     fn pop_oldest(&self, dispatches: &mut Dispatches) {
         if let Some((_, tokens)) = dispatches.pop_front() {
+            if tokens == 0 {
+                self.unsized_held.fetch_sub(1, Ordering::Relaxed);
+            }
             self.held.fetch_sub(Self::weight(tokens), Ordering::Relaxed);
         }
     }
@@ -912,6 +926,7 @@ impl SinceReport {
             return;
         }
         let mut retired = 0;
+        let mut unsized_retired = 0;
         for _ in 0..RETIRE_BATCH {
             // The lane whose front is the oldest; none when every lane is
             // empty.
@@ -925,8 +940,11 @@ impl SinceReport {
             };
             if let Some((_, tokens)) = held_lanes[i].pop_front() {
                 retired += Self::weight(tokens);
+                unsized_retired += u32::from(tokens == 0);
             }
         }
+        self.unsized_held
+            .fetch_sub(unsized_retired, Ordering::Relaxed);
         self.held.fetch_sub(retired, Ordering::Relaxed);
         for (dispatches, lane) in held_lanes.iter().zip(&self.lanes) {
             lane.publish_oldest(dispatches);
@@ -941,16 +959,22 @@ impl SinceReport {
         sampled_at_micros > self.kept_of.load(Ordering::Acquire)
     }
 
-    /// The held token-work and requests once the dispatches made at or
-    /// before the report's sample are released. A sample that reaches none
-    /// of them reads the word alone. Inlined into each load scorer's row
-    /// loop: two loads and a compare a row, the release behind a call.
+    /// What the row holds once the dispatches made at or before
+    /// `through_micros` are released: a report sampled then reflects
+    /// them, or a time limit ends them. An instant that reaches none of
+    /// them reads the words alone. Inlined into a reader's row loop: three
+    /// loads and a compare a row, the release behind a call.
     #[inline(always)]
-    pub(crate) fn credit_through(&self, sampled_at_micros: u64) -> (u64, u64) {
-        if self.reaches(sampled_at_micros) {
-            self.release_through(sampled_at_micros);
+    pub(crate) fn sent_through(&self, through_micros: u64) -> Sent {
+        if self.reaches(through_micros) {
+            self.release_through(through_micros);
         }
-        self.held_credit()
+        let (tokens, requests) = self.held_credit();
+        Sent {
+            requests: requests as u32,
+            tokens,
+            unsized_requests: self.unsized_held.load(Ordering::Relaxed),
+        }
     }
 
     /// Whether the row holds a dispatch made at or before the sample: one
@@ -1092,20 +1116,27 @@ impl Credits {
         }
     }
 
-    /// Credits the rank a dispatch landed on. A lease that states no size
-    /// is credited at `mean_prefill`, the calling stage's own mean: a
-    /// credit of no tokens would read its worker as free until that
-    /// worker's next report. `credit` is handed the rank's entry with the
-    /// dispatch's instant and its size, and records it
-    /// ([`SinceReport::record`]): a stage that keeps the rank's number
-    /// records it under the report it was told.
+    /// Credits the rank a dispatch landed on. `credit` is handed the
+    /// rank's entry with the dispatch's instant and the tokens its lease
+    /// states, zero where it states none, and records it
+    /// ([`SinceReport::record`]). A profile's count records the zero: the
+    /// entry counts the send as one of no stated size, and each reader
+    /// prices it. A stage that keeps a tally of its own records its mean:
+    /// a credit of no tokens would read its worker as free until that
+    /// worker's next report. A stage that keeps the rank's number records
+    /// the dispatch under the report it was told.
+    ///
+    /// A rank the tally does not know is entered only where `present`
+    /// says its row still stands, so a late dispatch enters no rank
+    /// behind a removal. A rank the tally knows takes the dispatch
+    /// unasked: a removal forgets the worker's entries.
     pub(crate) fn dispatched(
         &self,
         lease: &Lease,
         target: &Target,
         side: Side,
         since_decision_micros: u32,
-        mean_prefill: u32,
+        present: impl FnOnce() -> bool,
         credit: impl FnOnce(&SinceReport, u64, u32),
     ) {
         // The decode side of a pair target is the pair's decode rank; the
@@ -1119,19 +1150,18 @@ impl Credits {
             Side::Single | Side::Prefill | Side::Encode => (target.id, target.dp_rank),
         };
         let dispatched_micros = lease.issued_micros + u64::from(since_decision_micros);
-        let tokens = match lease.tokens {
-            0 => mean_prefill,
-            stated => stated,
-        };
         // A rank the tally knows is credited on its own entry; the first
         // dispatch to a rank enters it (another dispatch may have entered it
         // meanwhile: the entry the map holds is the one credited).
         if let Some(since) = self.tally.load().get(&rank) {
-            credit(since, dispatched_micros, tokens);
+            credit(since, dispatched_micros, lease.tokens);
+            return;
+        }
+        if !present() {
             return;
         }
         if let Some(since) = self.entry(rank) {
-            credit(&since, dispatched_micros, tokens);
+            credit(&since, dispatched_micros, lease.tokens);
         }
     }
 
@@ -1184,11 +1214,37 @@ pub struct LeastLoad {
     pub kv_pressure_weight: f32,
     pub mean_prefill_tokens: u32,
     pub default_throughput: f32,
-    credits: Credits,
+    /// The count of sends the stage reads: its profile's where a document
+    /// built the stage, one of its own elsewhere.
+    sent: Arc<SentCredit>,
+    /// Whether the count is the stage's own. The stage's hooks feed its
+    /// own count. The engine feeds a profile's.
+    feeds: bool,
 }
 
 impl LeastLoad {
+    /// The stage over a count of its own, which its hooks feed.
     pub fn new(kv_pressure_weight: f32, mean_prefill_tokens: u32, default_throughput: f32) -> Self {
+        Self {
+            feeds: true,
+            ..Self::of_profile(
+                kv_pressure_weight,
+                mean_prefill_tokens,
+                default_throughput,
+                Arc::new(SentCredit::new("", None)),
+            )
+        }
+    }
+
+    /// The stage over its profile's count of sends, as a document builds
+    /// it: the profile's other readers read the same sends, and the
+    /// profile's time limit ends them here too.
+    pub(crate) fn of_profile(
+        kv_pressure_weight: f32,
+        mean_prefill_tokens: u32,
+        default_throughput: f32,
+        sent: Arc<SentCredit>,
+    ) -> Self {
         Self {
             kv_pressure_weight,
             mean_prefill_tokens: mean_prefill_tokens.max(1),
@@ -1197,31 +1253,38 @@ impl LeastLoad {
             } else {
                 1.0
             },
-            credits: Credits::default(),
+            sent,
+            feeds: false,
         }
     }
 
     /// Dispatches no report reflects yet on `worker`, over every rank of it,
     /// for tests and dumps.
     pub fn held(&self, worker: WorkerId) -> usize {
-        self.credits.held(worker)
+        self.sent.credits.held(worker)
     }
 
     /// Dispatches no report reflects yet on one rank of `worker`.
     pub fn held_at(&self, worker: WorkerId, dp_rank: u16) -> usize {
-        self.credits.held_at(worker, dp_rank)
+        self.sent.credits.held_at(worker, dp_rank)
     }
 
-    /// One rank's held word as a decision reads it: token-work and requests.
+    /// One rank's held work as a decision reads it: token-work, a send of
+    /// no stated size at the mean prefill, and requests.
     #[cfg(test)]
     fn held_word_at(&self, worker: WorkerId, dp_rank: u16) -> (u64, u64) {
-        self.credits
+        self.sent
+            .credits
             .tally
             .load()
             .get(&(worker, dp_rank))
             .map_or((0, 0), |since| {
-                let held = since.held.load(Ordering::Relaxed);
-                (held >> REQUEST_BITS, held & REQUEST_MASK)
+                let (tokens, requests) = since.held_credit();
+                let unsized_held = u64::from(since.unsized_held.load(Ordering::Relaxed));
+                (
+                    tokens + unsized_held * u64::from(self.mean_prefill_tokens),
+                    requests,
+                )
             })
     }
 
@@ -1229,7 +1292,7 @@ impl LeastLoad {
     /// runs it.
     #[cfg(test)]
     fn retire_oldest_batch_of(&self, worker: WorkerId, dp_rank: u16) {
-        if let Some(since) = self.credits.tally.load().get(&(worker, dp_rank)) {
+        if let Some(since) = self.sent.credits.tally.load().get(&(worker, dp_rank)) {
             since.retire_oldest_batch();
         }
     }
@@ -1237,7 +1300,8 @@ impl LeastLoad {
     /// The rank row, for a test that holds its retire lock.
     #[cfg(test)]
     fn row(&self, worker: WorkerId, dp_rank: u16) -> Arc<SinceReport> {
-        self.credits
+        self.sent
+            .credits
             .tally
             .load()
             .get(&(worker, dp_rank))
@@ -1381,24 +1445,25 @@ impl LeastLoad {
         load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> TieBand {
         // One load of the tally: each reporting row's held work is read
-        // (released first when its report's sample reaches a dispatch) and
-        // its credit work written; the divisions and the KV barrier run after
-        // the load is gone. A row without a report is marked and costed after
-        // the peer baseline is known. No allocation.
+        // (released first when its report's sample or the time limit
+        // reaches a dispatch) and its credit work written; the divisions
+        // and the KV barrier run after the load is gone. A send of no
+        // stated size is priced here, at the stage's mean. A row without a
+        // report is marked and costed after the peer baseline is known. No
+        // allocation.
         let mut reporting = 0usize;
         {
-            let tally = self.credits.tally.load();
+            let sends = self.sent.reads(facts);
+            let mean = u64::from(self.mean_prefill_tokens);
             with_counts!(facts, |counts| {
                 for (slot, &i) in out.iter_mut().zip(rows) {
                     let c = &candidates[i as usize];
                     *slot = match load(c) {
                         Some(report) => {
-                            let (tokens, requests) =
-                                tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
-                                    since.credit_through(c.load_sampled_at_micros)
-                                });
+                            let sent = sends.reported(c);
+                            let tokens = sent.tokens + u64::from(sent.unsized_requests) * mean;
                             reporting += 1;
-                            self.credit_work(report, counts(c), tokens, requests)
+                            self.credit_work(report, counts(c), tokens, u64::from(sent.requests))
                         }
                         None => PENDING,
                     };
@@ -1449,18 +1514,16 @@ impl Lifecycle for LeastLoad {
         side: Side,
         since_decision_micros: u32,
     ) {
-        self.credits.dispatched(
-            lease,
-            target,
-            side,
-            since_decision_micros,
-            self.mean_prefill_tokens,
-            |since, at_micros, tokens| since.record(at_micros, tokens),
-        );
+        if self.feeds {
+            self.sent
+                .dispatched(lease, target, side, since_decision_micros, || true);
+        }
     }
 
     fn on_membership(&self, change: &Membership<'_>) {
-        self.credits.membership(change, |_| {});
+        if self.feeds {
+            self.sent.membership(change);
+        }
     }
 }
 
@@ -2102,8 +2165,14 @@ impl Lifecycle for ResidentWork {
             target,
             side,
             since_decision_micros,
-            self.mean_prefill_tokens,
-            |since, at_micros, tokens| {
+            || true,
+            |since, at_micros, stated| {
+                // The stage's own tally holds a send of no stated size at
+                // the stage's mean.
+                let tokens = match stated {
+                    0 => self.mean_prefill_tokens,
+                    stated => stated,
+                };
                 let told = since.told.lock();
                 since.record(at_micros, tokens);
                 // A number is kept from its report's first decision on:
