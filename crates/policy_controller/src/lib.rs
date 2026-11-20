@@ -93,10 +93,9 @@
 //!   ends.
 //! - Behind the `controller` feature, the standalone controller
 //!   (`controller`): the listeners with their credentialed scopes, the
-//!   health service on each, the admin endpoints, readiness and the drain,
-//!   the load driver over the store, and the binary of the package's name
-//!   over them. The scopes' calls and the election arrive in the step's
-//!   later PRs.
+//!   health service on each, the admin endpoints, readiness, the drain and
+//!   the load driver over the store. The stock binary also requires the
+//!   `worker-host` feature so it can read cache events.
 //! - Behind the `client` feature, the gateway's side of the controller's
 //!   protocol (`client`). The reference client (`client::Client`) asks
 //!   one request at a time, reports its lifecycle and watches workers'

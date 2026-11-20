@@ -185,8 +185,8 @@ commands_of() {
             local selectors
             # The example controller rides the policy crate's invocation: it asks for the crate's
             # `controller` feature, which this line turns on already, so nothing is built twice.
-            # `worker-host` is on for the cases of the crate's worker objects: no test target requires it,
-            # so nothing else would turn it on.
+            # `worker-host` is on for the cases of the crate's worker objects and for the test targets that
+            # run the stock binary, which require it.
             echo "-p kv-index -p smg-mesh -p smg-mm-rdma -p smg-policy-controller -p policy-controller-example --features smg-policy-controller/client,smg-policy-controller/kubernetes,smg-policy-controller/worker-host"
             # The policy crate's library once more, under `discovery`: no package of the shard asks for
             # that feature, so nothing else would run the cases behind it. The line above stays as it
