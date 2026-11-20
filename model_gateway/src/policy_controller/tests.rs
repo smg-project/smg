@@ -652,6 +652,29 @@ async fn the_regular_router_is_built_under_the_setting() -> Case {
     Ok(())
 }
 
+/// The HTTP pair router asks the host for each attempt's pair; the router's
+/// own cases hold that. No classic pair policy is built beside it.
+#[tokio::test]
+async fn the_http_pair_router_is_built_under_the_setting() -> Case {
+    let mut config = picked(quiet());
+    config.mode = RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    let (context, gateway) = build(config).await?;
+    let router = gateway
+        .select_router_for_request(None)
+        .ok_or("the HTTP pair router is missing")?;
+    assert_eq!(router.router_type(), "pd");
+    let policies = &context.policy_registry;
+    let unset = policies.get_default_policy();
+    assert!(Arc::ptr_eq(&policies.get_prefill_policy(), &unset));
+    assert!(Arc::ptr_eq(&policies.get_decode_policy(), &unset));
+    Ok(())
+}
+
 /// The router's selection stage asks the host; the stage's cases hold that.
 #[tokio::test]
 async fn the_regular_grpc_router_is_built_under_the_setting() -> Case {
@@ -680,36 +703,16 @@ async fn assert_refusing_router(router: &dyn RouterTrait, family: &str) -> Case 
     Ok(())
 }
 
-/// The pair router asks the host for each attempt's pair; the router's own
-/// cases hold that. No classic pair policy is built beside it.
 #[tokio::test]
-async fn the_http_pair_router_is_built_under_the_setting() -> Case {
-    let (context, gateway) = build(pair_of(picked(quiet()))).await?;
-    let router = gateway
-        .select_router_for_request(None)
-        .ok_or("the pair router is missing")?;
-    assert_eq!(router.router_type(), "pd");
-    let policies = &context.policy_registry;
-    let unset = policies.get_default_policy();
-    assert!(Arc::ptr_eq(&policies.get_prefill_policy(), &unset));
-    assert!(Arc::ptr_eq(&policies.get_decode_policy(), &unset));
-    Ok(())
-}
-
-/// `config` as a pair gateway with no worker of either side.
-fn pair_of(mut config: RouterConfig) -> RouterConfig {
-    config.mode = RoutingMode::PrefillDecode {
+async fn the_pair_routers_refuse_by_name() -> Case {
+    let mut pair = picked(quiet());
+    pair.mode = RoutingMode::PrefillDecode {
         prefill_urls: vec![],
         decode_urls: vec![],
         prefill_policy: None,
         decode_policy: None,
     };
-    config
-}
-
-#[tokio::test]
-async fn the_grpc_pair_routers_refuse_by_name() -> Case {
-    let mut grpc_pair = pair_of(picked(quiet()));
+    let mut grpc_pair = pair.clone();
     grpc_pair.connection_mode = ConnectionMode::Grpc;
     let mut encode_pair = grpc_pair.clone();
     encode_pair.mode = RoutingMode::EncodePrefillDecode {
@@ -720,11 +723,21 @@ async fn the_grpc_pair_routers_refuse_by_name() -> Case {
         prefill_policy: None,
         decode_policy: None,
     };
-    for (family, config) in [("gRPC pair", grpc_pair), ("gRPC encode pair", encode_pair)] {
+    for (family, config) in [
+        ("HTTP pair", pair),
+        ("gRPC pair", grpc_pair),
+        ("gRPC encode pair", encode_pair),
+    ] {
         let (context, gateway) = build(config).await?;
         let router = gateway
             .select_router_for_request(None)
             .ok_or("the router is missing")?;
+        // The HTTP pair router asks the host and refuses nothing. Its own
+        // case holds what it is built as.
+        if family == "HTTP pair" {
+            assert_eq!(router.router_type(), "pd");
+            continue;
+        }
         assert_refusing_router(router.as_ref(), family).await?;
         // No classic pair policy was built for the refused family.
         let policies = &context.policy_registry;

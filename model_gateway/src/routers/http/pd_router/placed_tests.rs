@@ -2,19 +2,122 @@
 
 use std::{error::Error, time::Duration};
 
+use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::json;
-use smg_policy_controller::store::{GatewayId, HealthSink, LeasesStore, MemoryStore, WorkersStore};
+use smg_policy_controller::{
+    store::{
+        GatewayId, HealthSink, LeasesStore, MemoryStore, PairingDescriptor, WorkerFacts,
+        WorkerStatus as RowStatus, WorkersStore,
+    },
+    view::{Role, WireModes},
+};
+use smg_worker::identity::basic::ConnectionMode;
 
 use super::{
     tests::{create_test_pd_router, spawn_cut_body_stub, spawn_delayed_stub, spawn_recording_stub},
     *,
 };
 use crate::{
-    policy_controller::host::testing::{pair_bed_over, pair_bed_running, MODEL},
+    config::{RouterConfig, RoutingMode},
+    policy_controller::{host::testing::MODEL, start},
+    routers::grpc::backend_client::BasicWorkerBuilder,
     tenant::TenantKey,
 };
 
 type Case<T = ()> = Result<T, Box<dyn Error>>;
+
+/// A host, its store, and the registry's workers of each side in its URLs'
+/// order: the prefill workers, then the decode workers.
+type PairBed = (Host, Arc<MemoryStore>, [Vec<Arc<dyn Worker>>; 2]);
+
+/// A host over the store a prefill and decode gateway starts, with one ready
+/// row and one registry worker a URL of each side: the prefill workers, then
+/// the decode workers, each in its URLs' order.
+fn pair_bed_over(
+    registry: Arc<WorkerRegistry>,
+    prefill_urls: &[&str],
+    decode_urls: &[&str],
+) -> PairBed {
+    pair_bed_of(|_, worker| worker, registry, prefill_urls, decode_urls)
+}
+
+/// [`pair_bed_over`] with every worker of `runtime`: a pair router picks its
+/// dispatch by its prefill worker's runtime.
+fn pair_bed_running(
+    runtime: RuntimeType,
+    registry: Arc<WorkerRegistry>,
+    prefill_urls: &[&str],
+    decode_urls: &[&str],
+) -> PairBed {
+    let running = |_: &str, worker: BasicWorkerBuilder| worker.runtime_type(runtime);
+    pair_bed_of(running, registry, prefill_urls, decode_urls)
+}
+
+/// [`pair_bed_over`] with each registry worker as `shaped` leaves it, by
+/// its URL. The rows are written the same for every shape.
+fn pair_bed_of(
+    shaped: impl Fn(&str, BasicWorkerBuilder) -> BasicWorkerBuilder,
+    registry: Arc<WorkerRegistry>,
+    prefill_urls: &[&str],
+    decode_urls: &[&str],
+) -> PairBed {
+    let config = RouterConfig {
+        policy_controller: true,
+        mode: RoutingMode::PrefillDecode {
+            prefill_urls: Vec::new(),
+            decode_urls: Vec::new(),
+            prefill_policy: None,
+            decode_policy: None,
+        },
+        ..RouterConfig::default()
+    };
+    let store = start(&config)
+        .expect("the start takes the routing")
+        .expect("the controller was picked");
+    let pairing = Arc::new(PairingDescriptor {
+        protocol: Some("pair-wire".to_owned()),
+        ..PairingDescriptor::default()
+    });
+    let roles = [
+        (Role::Prefill, WorkerType::Prefill, prefill_urls),
+        (Role::Decode, WorkerType::Decode, decode_urls),
+    ];
+    let sides = roles.map(|(role, worker_type, urls)| {
+        let side = urls.iter().map(|&url| {
+            let builder = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(MODEL))
+                .worker_type(worker_type)
+                .status(WorkerStatus::Ready);
+            let worker: Arc<dyn Worker> = Arc::new(shaped(url, builder).build());
+            let facts = WorkerFacts {
+                key: worker.url().to_string(),
+                engine: url.to_string(),
+                incarnation: 1,
+                role,
+                wire_modes: WireModes::HTTP,
+                models: vec![MODEL.to_string()],
+                dp_size: 1,
+                max_running: Some(64),
+                pairing: Some(Arc::clone(&pairing)),
+                ..WorkerFacts::default()
+            };
+            let id = store.upsert(facts).id();
+            let row = WorkersStore::get(&*store, id).expect("the row");
+            if row.status != RowStatus::Ready {
+                store
+                    .set_status(id, RowStatus::Ready, row.revision)
+                    .expect("the row stands");
+            }
+            registry
+                .register(Arc::clone(&worker))
+                .expect("the worker registers");
+            worker
+        });
+        side.collect()
+    });
+    store.publish_now();
+    (Host::at_keys(Arc::clone(&store), registry), store, sides)
+}
 
 const GATEWAY: GatewayId = GatewayId::LOCAL;
 
@@ -137,27 +240,59 @@ async fn a_retryable_answer_that_names_no_side_names_both_rows_as_tried() -> Cas
     Ok(())
 }
 
-/// A definitive answer names its side, and that row alone is tried: the
-/// partner stays as selectable as it was.
+/// An answer whose failure the ledger gave to one side names that row alone
+/// as tried: the partner stays as selectable as it was.
 #[tokio::test]
-async fn a_definitive_answer_names_its_own_side_alone_as_tried() -> Case {
-    for (side, row) in [(PdSide::Prefill, 0), (PdSide::Decode, 1)] {
+async fn an_answer_that_names_a_failed_side_names_that_row_alone_as_tried() -> Case {
+    for failed in [0, 1] {
         let (prefill, _) = spawn_recording_stub("{}").await;
         let (decode, _) = spawn_recording_stub("{}").await;
         let registry = Arc::new(WorkerRegistry::new());
-        let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+        let (host, store, sides) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
         let sent = sent_pair(&host).await?;
         let rows = [Some(sent.id()), sent.decode_id()];
         let tried = parking_lot::Mutex::new(Vec::new());
         let mut refusal = error::internal_error("worker_failed", "the worker failed the request");
-        refusal.extensions_mut().insert(OwnFailure(side));
+        mark_failed_side(&mut refusal, sides[failed][0].as_ref());
 
         let _ = PDRouter::end_placed(Some(sent), &tried, refusal);
 
         let named: Vec<_> = tried.lock().iter().copied().map(Some).collect();
-        assert_eq!(named, [rows[row]], "{side:?}");
+        assert_eq!(named, [rows[failed]], "side {failed}");
         assert_eq!(live(&store, 0).await, 0);
     }
+    Ok(())
+}
+
+/// The tried row is the one the request's ledger closed, which is not
+/// always the one that answered. With two prefills and one decode, the
+/// decode's own failure leaves no pair without it: the ledger closes the
+/// prefill, and the retry takes the other prefill with the same decode.
+#[tokio::test]
+async fn the_tried_row_is_the_side_the_ledger_closed() -> Case {
+    let (first, _) = spawn_recording_stub("{}").await;
+    let (second, _) = spawn_recording_stub("{}").await;
+    let (decode, _) = spawn_recording_stub("{}").await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let bed = pair_bed_over(Arc::clone(&registry), &[&first, &second], &[&decode]);
+    let (host, store, [_, decodes]) = bed;
+    let sent = sent_pair(&host).await?;
+    let prefill_row = sent.id();
+    let pair = [Arc::clone(sent.worker()), Arc::clone(&decodes[0])];
+    let router = router(registry, host);
+    let ledger = AttemptLedger::default();
+    let mut answer = error::internal_error("worker_failed", "the decode failed the request");
+    mark_upstream_answer(&mut answer);
+    answer.extensions_mut().insert(OwnFailure(PdSide::Decode));
+
+    let answer = router.settle_attempt(&ledger, MODEL, [&pair[0], &pair[1]], answer);
+    let tried = parking_lot::Mutex::new(Vec::new());
+    let _ = PDRouter::end_placed(Some(sent), &tried, answer);
+
+    assert!(!ledger.admits(pair[0].as_ref()), "the prefill stayed open");
+    assert!(ledger.admits(pair[1].as_ref()), "the one decode was closed");
+    assert_eq!(*tried.lock(), [prefill_row]);
+    assert_eq!(live(&store, 0).await, 0);
     Ok(())
 }
 
@@ -274,6 +409,132 @@ async fn a_streamed_answer_its_decode_cuts_is_told_as_no_success() -> Case {
         assert_eq!(live(&store, 0).await, 0);
         let ok = HealthSink::completed_ok_since(&*store, GATEWAY, row.id, start);
         assert_eq!(ok, served, "served whole: {served}");
+    }
+    Ok(())
+}
+
+/// A streamed pair's prefill is drained beside the answer, and the drain
+/// tells the prefill's end. One that breaks off is told as no success,
+/// though the answer went out whole. A whole drain is the control.
+#[tokio::test]
+async fn a_drained_prefill_that_breaks_off_is_told_as_no_success() -> Case {
+    let hold = Duration::from_millis(300);
+    let whole = spawn_recording_stub("{}").await.0;
+    for (prefill, served) in [(whole, true), (spawn_cut_body_stub().await, false)] {
+        let reply = json!({"text": "done"});
+        let (decode, _) = spawn_delayed_stub(StatusCode::OK, reply, hold).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+        let row = store
+            .by_key(&prefill)
+            .ok_or("the prefill worker had no row")?;
+        let router = router(registry, host);
+        let start = Instant::now();
+        let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+        let request = serde_json::from_value(json!({"text": "hi", "stream": true}))?;
+
+        let response = router.route_generate(None, &meta, request, MODEL).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert_eq!(live(&store, 0).await, 0);
+        let ok = HealthSink::completed_ok_since(&*store, GATEWAY, row.id, start);
+        assert_eq!(ok, served, "drained whole: {served}");
+    }
+    Ok(())
+}
+
+/// A prefill that is read whole ends where its guard drops, ahead of the
+/// answer its decode writes. The decode here holds its answer, and the
+/// prefill's row hears its success well inside that hold. Both shapes: the
+/// two sides sent together, and the decode sent behind its prefill.
+#[tokio::test]
+async fn a_prefill_read_whole_ends_ahead_of_its_decodes_answer() -> Case {
+    let hold = Duration::from_millis(600);
+    for runtime in [RuntimeType::default(), RuntimeType::Vllm] {
+        let (prefill, _) = spawn_recording_stub("{}").await;
+        let reply = json!({"object": "chat.completion"});
+        let (decode, decode_seen) = spawn_delayed_stub(StatusCode::OK, reply, hold).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let bed = pair_bed_running(runtime, Arc::clone(&registry), &[&prefill], &[&decode]);
+        let (host, store, _) = bed;
+        let row = store
+            .by_key(&prefill)
+            .ok_or("the prefill worker had no row")?;
+        let router = router(registry, host);
+        let start = Instant::now();
+
+        let early = async {
+            // The patience ends inside the decode's hold: a prefill that
+            // ends with the answer is read as not ended here.
+            for _ in 0..100 {
+                let held = decode_seen.lock().is_ok_and(|seen| !seen.is_empty());
+                if held && HealthSink::completed_ok_since(&*store, GATEWAY, row.id, start) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            false
+        };
+        let (response, ended) = tokio::join!(chat(&router), early);
+
+        assert_eq!(response?.status(), StatusCode::OK, "{runtime:?}");
+        assert!(
+            ended,
+            "{runtime:?}: the prefill stayed booked behind its decode"
+        );
+        assert_eq!(live(&store, 0).await, 0);
+    }
+    Ok(())
+}
+
+/// A pair of another wire is not placed: the commit asks each side's HTTP
+/// pool of its worker, so a pick that names the gRPC decode is passed over
+/// for the HTTP one, whichever the pick lists first.
+#[tokio::test]
+async fn a_pair_of_another_wire_is_passed_over_at_its_commit() -> Case {
+    for other in [0, 1] {
+        let (prefill, _) = spawn_recording_stub("{}").await;
+        let (first, _) = spawn_recording_stub("{}").await;
+        let (second, _) = spawn_recording_stub("{}").await;
+        let urls = [first.as_str(), second.as_str()];
+        let grpc = |url: &str, worker: BasicWorkerBuilder| {
+            if url == urls[other] {
+                worker.connection_mode(ConnectionMode::Grpc)
+            } else {
+                worker
+            }
+        };
+        let registry = Arc::new(WorkerRegistry::new());
+        let bed = pair_bed_of(grpc, Arc::clone(&registry), &[&prefill], &urls);
+        let (host, store, [_, decodes]) = bed;
+        let router = router(registry, host);
+        let host = router.host.as_deref().ok_or("the router holds the host")?;
+        let context = PDRequestContext {
+            route: "/generate",
+            batch_size: None,
+            is_stream: false,
+            return_logprob: false,
+            model_id: MODEL,
+            headers: None,
+            rid: None,
+        };
+        let tried = parking_lot::Mutex::new(Vec::new());
+        let ledger = AttemptLedger::default();
+        for _ in 0..4 {
+            let placed = router
+                .place_pair_attempt(host, &context, 0, None, &tried, &ledger)
+                .await;
+            let (sent, (_, decode), _guards) =
+                placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
+            assert_eq!(
+                decode.url(),
+                decodes[1 - other].url(),
+                "the gRPC decode {other}"
+            );
+            drop(sent);
+        }
+        assert_eq!(live(&store, 0).await, 0);
     }
     Ok(())
 }

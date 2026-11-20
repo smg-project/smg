@@ -44,6 +44,8 @@ pub(crate) struct Sent {
     /// a pair's prefill's. A pair's prefill that was not sent is said no
     /// end, and the placement's drop releases its side.
     own_sent: bool,
+    /// The mark the drain of a pair's prefill writes its end's status on.
+    drained: Option<Arc<AtomicU16>>,
     cut: Option<Arc<AtomicU16>>,
 }
 
@@ -53,6 +55,7 @@ impl From<Placed> for Sent {
             placed,
             at: None,
             own_sent: false,
+            drained: None,
             cut: None,
         }
     }
@@ -93,6 +96,26 @@ impl Sent {
         }
     }
 
+    /// The mark for the drain of this pair's prefill, which outlives the
+    /// attempt that sent it: the drain writes its end's status on it, and
+    /// the answer's body tells the prefill's end from it at its next frame.
+    pub(crate) fn drain_mark(&mut self) -> Arc<AtomicU16> {
+        Arc::clone(self.drained.get_or_insert_with(Arc::default))
+    }
+
+    /// Say the prefill's end where its drain marked one. Said once: the
+    /// mark is given up with it. The clock is read only for a marked end.
+    fn tell_drained(&mut self) {
+        let marked = self
+            .drained
+            .as_ref()
+            .map(|mark| mark.load(Ordering::Relaxed));
+        if let Some(Ok(status)) = marked.map(StatusCode::from_u16) {
+            self.drained = None;
+            self.prefill_ended(status, Instant::now());
+        }
+    }
+
     /// The mark for the relay of this placement's streamed answer: the relay
     /// writes the status of a cut's class on it, and the body's end reads it.
     pub(crate) fn cut_mark(&mut self) -> Arc<AtomicU16> {
@@ -120,7 +143,8 @@ impl Sent {
 
     /// Say the placement's end where it was sent. A pair's answer is its
     /// decode's: the decode ends with it, and so does a prefill whose router
-    /// said no end ahead of it ([`Self::prefill_ended`]). A prefill that
+    /// said no end ahead of it ([`Self::prefill_ended`]). A drain that
+    /// marked its end ahead of the answer's tells its own. A prefill that
     /// was not sent hears no end: the drop releases its side.
     fn end(
         mut self,
@@ -129,6 +153,7 @@ impl Sent {
         first: Option<Instant>,
         now: Instant,
     ) {
+        self.tell_drained();
         if let Some(at) = self.at {
             let end = End::http(status, class, at, first, now);
             if self.own_sent {
@@ -219,6 +244,9 @@ impl http_body::Body for Ride {
                     this.first.get_or_insert_with(Instant::now);
                 }
                 if !this.progress.frame_out(frame, this.inner.is_end_stream()) {
+                    if let Some(sent) = &mut this.sent {
+                        sent.tell_drained();
+                    }
                     return next;
                 }
                 false

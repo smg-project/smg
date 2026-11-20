@@ -11,15 +11,18 @@
 //! a host over the feed's holder. A regular HTTP router with that host asks
 //! it to place typed requests: for the model a request names, or for the one
 //! primary model the router's workers serve where it names none. A regular
-//! gRPC router asks it in its selection stage, and the HTTP pair router asks
-//! it for each attempt's pair. A gRPC pair router mounts a refusing router
-//! under its usual id ([`undecided()`]) whenever the store started, with or
-//! without a controller's address. The routes that pick a
+//! gRPC router asks it in its selection stage. A pair router mounts a
+//! refusing router under its usual id ([`undecided()`]) whenever the store
+//! started, with or without a controller's address. The routes that pick a
 //! worker by no routing policy serve as under the classic policies: a
 //! provider's router, a realtime session and a proxied GET. The gateway's
 //! workflows leave the feed's door unused, so without an address nothing
 //! feeds the store yet. With the setting off, the context holds neither the
 //! store, its feed nor its host.
+//!
+//! The HTTP pair router asks the host for each attempt's pair, through
+//! prefill admission. The refusing router is for the pair routers that do
+//! not ask it yet.
 //!
 //! One site reads the setting, [`start_with`]. Every other site asks what
 //! the start left in the context.
@@ -150,7 +153,7 @@ pub(crate) fn feeds(
 }
 
 /// The refusing router for a family the controller does not decide yet:
-/// the gRPC pair routers, which need pair placement. It mounts under the
+/// the pair routers, which need pair placement. It mounts under the
 /// family's usual id so the gateway can select it. Returns `None` under the
 /// classic policies.
 pub(crate) fn undecided(context: &AppContext) -> Option<Box<dyn RouterTrait>> {

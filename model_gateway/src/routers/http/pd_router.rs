@@ -38,7 +38,7 @@ use serde_json::{
 use smg_policy_controller::view::{Phase, WorkerId};
 use smg_worker::{
     identity::{
-        basic::{RuntimeType, Worker, WorkerLoadGuard},
+        basic::{RuntimeType, Worker, WorkerLoadGuard, WorkerType},
         endpoint::Endpoint,
     },
     metrics::writers::Metrics as WorkerMetrics,
@@ -67,7 +67,8 @@ use crate::{
         common::{
             attach_sized_body,
             attempt_ledger::{
-                is_definitive_failure, mark_failed_side, mark_upstream_answer, AttemptLedger,
+                failed_side_type, is_definitive_failure, mark_failed_side, mark_upstream_answer,
+                AttemptLedger,
             },
             header_utils,
             kv_transfer::{
@@ -1328,8 +1329,9 @@ impl PDRouter {
     /// both sides hold, or the answer of a request it did not place. The
     /// prefill's guard is the admission's and the decode's is taken here, as
     /// on the classic path. The controller reads the tried rows softly. The
-    /// commit asks `ledger` of both workers, as the classic selection's
-    /// filter does: a worker that answered the request definitively takes no
+    /// commit asks the route's rule of both workers, made of the classic
+    /// selection's own: a worker of the HTTP pair pools, and one `ledger`
+    /// admits. A worker that answered the request definitively takes no
     /// further attempt of it, at any of its ranks.
     async fn place_pair_attempt(
         &self,
@@ -1360,9 +1362,20 @@ impl PDRouter {
             tried: &tried,
             ..Ask::of(&id, &model)
         };
-        let admits = |worker: &dyn Worker| ledger.admits(worker);
+        // The controller reads neither rule, so a target one of them
+        // refuses is passed over like one the gateway cannot send to.
+        let on_route = |worker: &dyn Worker| {
+            let pooled =
+                RoutingPool::HttpPrefill.matches(worker) || RoutingPool::HttpDecode.matches(worker);
+            pooled && ledger.admits(worker)
+        };
         let placed = host
-            .place_pair_where(&ask, admits, self.prefill_admission.as_deref(), sticky_key)
+            .place_pair_where(
+                &ask,
+                on_route,
+                self.prefill_admission.as_deref(),
+                sticky_key,
+            )
             .await;
         let (placed, prefill_guard) = match placed {
             Ok(placed) => placed,
@@ -1392,29 +1405,30 @@ impl PDRouter {
 
     /// The end of an attempt the policy controller placed. The rows of a
     /// pair whose answer a retry may replace join the request's tried rows:
-    /// the row of the side a definitive answer names, else both.
-    /// A success ends the decode at the end of the body it writes, and a
-    /// prefill whose dispatch body said no end ahead of it at the answer's
-    /// head. A failed attempt names no side here: the placement's drop
-    /// completes a side that was sent and not ended as cancelled, and
-    /// releases one that was not sent.
+    /// the row of the side the request's ledger closed, else both.
+    /// A success ends the decode at the end of the body it writes. Its
+    /// prefill ends ahead of that: where it was read whole, or where its
+    /// drain marks its end. A failed attempt names no side here: the
+    /// placement's drop completes a side that was sent and not ended as
+    /// cancelled, and releases one that was not sent.
     fn end_placed(
         placed: Option<Sent>,
         tried_rows: &parking_lot::Mutex<Vec<WorkerId>>,
         response: Response,
     ) -> Response {
-        let Some(mut placed) = placed else {
+        let Some(placed) = placed else {
             return response;
         };
         if is_retryable_response(&response) {
-            // A definitive answer names its side, and that row alone is
-            // tried: its partner stays as selectable as it was.
-            let named = response.extensions().get::<OwnFailure>().map(|own| own.0);
+            // The ledger gave the failure to one side, which is not always
+            // the side that answered. That row alone is tried: its partner
+            // stays as selectable as it was.
+            let named = failed_side_type(&response);
             let mut tried = tried_rows.lock();
-            if named != Some(PdSide::Decode) {
+            if named != Some(WorkerType::Decode) {
                 tried.push(placed.id());
             }
-            if named != Some(PdSide::Prefill) {
+            if named != Some(WorkerType::Prefill) {
                 tried.extend(placed.decode_id());
             }
         }
@@ -1422,12 +1436,10 @@ impl PDRouter {
         if !status.is_success() {
             return response;
         }
-        let now = Instant::now();
         if head_success_recorded(&response) {
-            placed.prefill_ended(status, now);
             placed.held_to_the_end_of(response)
         } else {
-            placed.ended_by(&response, now);
+            placed.ended_by(&response, Instant::now());
             response
         }
     }
@@ -1796,6 +1808,13 @@ impl PDRouter {
             placed.decode_dispatched(dispatch_start);
         }
         let cut = Self::cut_mark_of(placed.as_deref_mut(), context.is_stream);
+        // The drain of a streamed pair's prefill outlives this attempt. It
+        // writes its end on the placement's mark, and the answer's body
+        // tells the prefill's end from it.
+        let drain_mark = placed
+            .as_deref_mut()
+            .filter(|_| context.is_stream && !context.return_logprob)
+            .map(Sent::drain_mark);
         let prefill_fut = async {
             let resp = send_with_stale_conn_retry(prefill_request)
                 .await
@@ -1826,6 +1845,9 @@ impl PDRouter {
                         }
                     }
                     prefill.record_outcome(drained.as_u16());
+                    if let Some(mark) = drain_mark {
+                        mark.store(drained.as_u16(), Ordering::Relaxed);
+                    }
                     if drained.is_server_error() {
                         Metrics::record_worker_error(
                             metrics_labels::WORKER_PREFILL,
@@ -3574,7 +3596,6 @@ mod tests {
     use serde_json::json;
     use smg_worker::{
         health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        identity::basic::WorkerType,
         test_support::RefusedAddress,
     };
     use tokio::sync::{mpsc, oneshot};
