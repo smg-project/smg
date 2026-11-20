@@ -745,16 +745,12 @@ impl Host {
         };
         let started = Instant::now();
         let mut placed = EncodePlaced::new();
+        let door = Arc::clone(&self.door);
+        // Either way the request is made from the world that decides it.
         let decided = if ask.states_items() {
-            // The encode entry takes a request and no maker. The request is
-            // made from the world the host loads here, ahead of the
-            // decision's own load.
-            let world = self.door.store().world();
-            let request = made.make(&world);
-            let door = Arc::clone(&self.door);
-            Handle::decide_encode_pair(door, GATEWAY, &request, ask.items, &mut placed, now)
+            Handle::decide_encode_pair_under(door, GATEWAY, &made, ask.items, &mut placed, now)
         } else {
-            Handle::decide_under(Arc::clone(&self.door), GATEWAY, &made, now)
+            Handle::decide_under(door, GATEWAY, &made, now)
         };
         let seconds = started.elapsed().as_secs_f64();
         // A key's source counts once an attempt, at its first ask, as a
