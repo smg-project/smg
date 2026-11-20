@@ -191,7 +191,7 @@ mod tests {
     use smg_worker::{
         identity::{basic::Worker, builder::BasicWorkerBuilder},
         model_card::ModelCard,
-        pd::pairing::{PairingMismatch, PdPairingMode},
+        pd::pairing::{layout_labels, PairingMismatch, PdPairingMode},
         worker::{HealthCheckConfig, OverloadUpdate, RuntimeType, WorkerSpec},
     };
 
@@ -201,7 +201,7 @@ mod tests {
         spec::Pairing,
         store::{
             encoding::{EncodeHandoff, EncodeOffer},
-            pairing::{mismatch, Member, PairingDescriptor},
+            pairing::{mismatch, Member, PairingDescriptor, LAYOUT_FACTS},
             Ask, GatewayId, HealthPolicy, LoadSink as _, LoadSource, Maker, MemoryStore, Overload,
             Reachability, Signals, ViewBuffers, WorkerFacts, WorkerRow, WorkerStatus,
             WorkersStore as _,
@@ -404,6 +404,15 @@ mod tests {
         // The table states the standing row's descriptor, and none of its own.
         assert_eq!(facts(&worker, None).pairing, None);
         assert_eq!(facts(&silent, Some(&standing)).pairing, standing.pairing);
+    }
+
+    /// The store's layout facts are the worker crate's, name for name and in
+    /// its order. The map leaves out a fact the store keeps no slot for, so
+    /// a fact added there with no slot here fails this case.
+    #[test]
+    fn the_stores_layout_facts_are_the_workers_own() {
+        let slots = LAYOUT_FACTS.iter().map(|&(_, fact)| fact);
+        assert!(layout_labels().eq(slots));
     }
 
     /// The store's rule over the rows of two workers names the mismatch the

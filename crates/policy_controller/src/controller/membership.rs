@@ -3537,6 +3537,41 @@ pub(crate) mod tests {
         assert!(!logged.contains(HTTP), "{logged}");
     }
 
+    /// The controller's door reads a built worker's facts alone. Its log
+    /// carries no pairing descriptor and its room test refuses a row that
+    /// states one. So a worker that reports a transport and a version is
+    /// registered and refreshed here, and its row states no descriptor.
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_worker_that_reports_pairing_facts_is_laid_with_no_descriptor() {
+        const HTTP: &str = "http://10.0.0.6:8000";
+        let (store, door) = hosted_door();
+        let built = |version: &str| -> Arc<dyn Worker> {
+            let worker = <BasicWorkerBuilder>::new(HTTP)
+                .model(ModelCard::new("m"))
+                .runtime_type(smg_worker::worker::RuntimeType::Sglang)
+                .label("disaggregation_transfer_backend", "nixl");
+            Arc::new(worker.label("version", version).build())
+        };
+        let first = built("1");
+        let offered = first.pd_pairing();
+        assert_eq!(
+            (offered.transport(), offered.version()),
+            (Some("nixl"), Some("1"))
+        );
+        let wrote = door.found_built(&Maker::Control, Expect::Nothing, &first, None);
+        assert!(wrote.is_ok(), "{wrote:?}");
+        let row = store.by_key(HTTP).expect("the registered row");
+        assert_eq!(row.facts.pairing, None);
+
+        let wrote = door.refreshed(standing(&row), &built("2"), &first);
+        assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
+        let refreshed = store.by_key(HTTP).expect("the refreshed row");
+        assert_eq!(refreshed.facts.pairing, None);
+        let version = refreshed.facts.labels.get("version");
+        assert_eq!(version.map(String::as_str), Some("2"));
+    }
+
     #[cfg(feature = "worker-host")]
     #[test]
     fn every_write_of_a_provider_leaves_its_audit_line() {
