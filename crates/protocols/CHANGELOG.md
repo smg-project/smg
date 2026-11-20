@@ -390,6 +390,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   So does a key of the generation and agent configs (`maxOutputTokens`, `stopSequences`,
   `thinkingSummaries`, ...), which goes upstream in snake_case with its value.
   Breaking: `InteractionsRequest` gains `other: Map<String, Value>`.
+- A Messages image or document whose source is a file uploaded through the Files API
+  (`{"type": "file", "file_id": ...}`) is accepted and forwarded as written, as the public API
+  takes it. The source was an unknown variant, which refused the whole request. The gRPC router,
+  which has no Files API to read the file from, refuses such an image naming the block wherever it
+  appears, and such a document at a message's top level; a document inside a tool result is left
+  out of its prompt, as every document there is today. Breaking: `ImageSource` and
+  `DocumentSource` gain `File`.
 - `GenerateRequest` runs the rules of its `sampling_params`, with the chat route's lower bound on
   `n`, and refuses an empty `input_ids` as the chat route refuses an empty `messages`, so the
   gateway's `/generate` reads its body through the validated extractor and answers a negative
