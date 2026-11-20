@@ -23,7 +23,7 @@ use tokenizers::{
     },
     processors::template::TemplateProcessing,
     tokenizer::{SplitDelimiterBehavior, Tokenizer as HfTokenizer},
-    AddedToken, AddedVocabulary, Model,
+    AddedToken, AddedVocabulary, Decoder as _, Model,
 };
 use tracing::{debug, info, warn};
 
@@ -31,7 +31,9 @@ use tracing::{debug, info, warn};
 use crate::v1::V1Encoder;
 use crate::{
     byte_fallback::{byte_token, PieceTable},
-    byte_level::{cut_start, decoder_kind, ByteLevelIncremental, ByteLevelTable, UnknownId},
+    byte_level::{
+        cut_start, decoder_kind, push_token_bytes, ByteLevelIncremental, ByteLevelTable, UnknownId,
+    },
     chat_template::{
         load_chat_template_from_file, wrap_string_content_in_place, ChatTemplateContentFormat,
         ChatTemplateParams, ChatTemplateState, ConfigChatTemplates, ThinkingKeyName,
@@ -187,6 +189,39 @@ fn has_byte_fallback(decoder: &DecoderWrapper) -> bool {
         DecoderWrapper::ByteFallback(_) => true,
         DecoderWrapper::Sequence(sequence) => sequence.get_decoders().iter().any(has_byte_fallback),
         _ => false,
+    }
+}
+
+fn has_byte_level(decoder: &DecoderWrapper) -> bool {
+    match decoder {
+        DecoderWrapper::ByteLevel(_) => true,
+        DecoderWrapper::Sequence(sequence) => sequence.get_decoders().iter().any(has_byte_level),
+        _ => false,
+    }
+}
+
+/// Decode a chain at end of input, dropping bytes after its last complete
+/// character before the byte-level decoder turns them into U+FFFD.
+fn finish_byte_level_chain(
+    decoder: &DecoderWrapper,
+    mut tokens: Vec<String>,
+) -> tokenizers::Result<Vec<String>> {
+    match decoder {
+        DecoderWrapper::Sequence(sequence) => {
+            for decoder in sequence.get_decoders() {
+                tokens = finish_byte_level_chain(decoder, tokens)?;
+            }
+            Ok(tokens)
+        }
+        DecoderWrapper::ByteLevel(_) => {
+            let mut bytes = Vec::new();
+            for token in tokens {
+                push_token_bytes(&token, &mut bytes);
+            }
+            let end = cut_start(&bytes);
+            Ok(vec![String::from_utf8_lossy(&bytes[..end]).into_owned()])
+        }
+        _ => decoder.decode_chain(tokens),
     }
 }
 
@@ -1161,6 +1196,34 @@ impl HuggingFaceTokenizer {
             return Ok(table.render(ids, skip_special_tokens));
         }
         self.decode(ids, skip_special_tokens)
+    }
+
+    /// The window's end through a decoder chain that contains ByteLevel: the
+    /// same chain as `decode`, except that its incomplete final bytes are
+    /// removed before their lossy conversion. Other decoder kinds use the
+    /// regular window decode.
+    fn finish_window_decode(
+        &self,
+        ids: &[TokenIdType],
+        skip_special_tokens: bool,
+    ) -> Result<String> {
+        let Some(decoder) = self
+            .core
+            .tokenizer
+            .get_decoder()
+            .filter(|decoder| has_byte_level(decoder))
+        else {
+            return self.window_decode(ids, skip_special_tokens);
+        };
+        let added = self.core.tokenizer.get_added_vocabulary();
+        let tokens: Vec<String> = ids
+            .iter()
+            .filter_map(|&id| self.core.tokenizer.id_to_token(id))
+            .filter(|token| !skip_special_tokens || !added.is_special_token(token))
+            .collect();
+        finish_byte_level_chain(decoder, tokens)
+            .map(|tokens| tokens.concat())
+            .map_err(|error| Error::msg(format!("Decoding failed: {error}")))
     }
 
     /// The token-text table (see `token_text`); `None` for a decoder it does
@@ -2494,15 +2557,15 @@ impl Decoder for HuggingFaceTokenizer {
         if self.has_byte_fallback {
             // The byte tokens of a character the end cut short come off the
             // window: the end releases the text before them and nothing for
-            // the character, where the window's decode would render the
-            // whole byte run around them as replacement characters,
-            // rewriting text already sent (the one end that differs from
-            // `decode`, see `IncrementalDecoder::finish_into`).
+            // the character, as every stream end drops an incomplete
+            // trailing character (see `IncrementalDecoder::finish_into`);
+            // the window's decode would render the whole byte run around
+            // them as replacement characters, rewriting text already sent.
             let held = (*prefix_index).min(ids.len());
             let cut = self.cut_tail(&ids[held..], skip_special_tokens);
             ids.truncate(ids.len() - cut);
         }
-        let decoded = self.window_decode(ids, skip_special_tokens)?;
+        let decoded = self.finish_window_decode(ids, skip_special_tokens)?;
         let (pending, prefix_mismatch) = match decoded.strip_prefix(prefix.as_str()) {
             Some(pending) => (pending.to_string(), false),
             None => {
