@@ -1164,20 +1164,34 @@ fn admitted(store: &MemoryStore, key: &str) -> WorkerId {
 /// A membership write that moves no member, no lane, no block size of
 /// record and no row's word to record walks no pool: each stands in its
 /// model's index as it did. A registration refreshed with the offer it had
-/// is such a write. A worker more makes a lane, and the pools are walked.
+/// is such a write, and it stays one under the default source, where the
+/// pools hold a record of sent prefixes. A worker more makes a lane, and
+/// the pools are walked.
 #[test]
 fn a_write_that_moves_no_member_walks_no_pool() {
+    use crate::door::tests::sent_prefixes::{applied, merged};
+
     let store = MemoryStore::new();
     admitted(&store, "a");
     admitted(&store, "b");
-    let walks = store.pool_walks();
-    let refreshed = WorkerFacts {
-        priority: 7,
-        ..publisher("a", &[MODEL])
+    let refresh = |priority| {
+        store.upsert(WorkerFacts {
+            priority,
+            ..publisher("a", &[MODEL])
+        });
+        store.publish_now();
     };
-    store.upsert(refreshed);
-    store.publish_now();
+    let walks = store.pool_walks();
+    refresh(7);
     assert_eq!(store.pool_walks(), walks, "every pool stands as it did");
+    let preset = merged(1).and_then(|document| applied(&document));
+    store
+        .apply(preset.expect("the preset validates"))
+        .expect("the store takes the preset");
+    store.publish_now();
+    let walks = store.pool_walks();
+    refresh(8);
+    assert_eq!(store.pool_walks(), walks, "with a record to keep too");
     admitted(&store, "c");
     assert_eq!(store.pool_walks(), walks + 1, "a lane was made");
 }

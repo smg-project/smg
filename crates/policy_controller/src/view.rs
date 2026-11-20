@@ -913,7 +913,8 @@ pub struct RequestFacts<'a> {
     /// Under the token kind it is in tokens: an index's learned block size
     /// on an event-fed request, the configured one on a tree-fed request;
     /// `0` reads the view's. Under the text kind it is the window's size in
-    /// bytes, and a text request always states it. Last on the wire (the
+    /// bytes, and a text request always states it: the wire refuses one
+    /// that carries hashes and states none. Last on the wire (the
     /// numbering follows the record's order).
     pub block_size: u32,
     /// The host's clock at the decision, in microseconds since its origin.

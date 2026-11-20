@@ -41,10 +41,10 @@
 //!
 //! A pool whose profile reads sent prefixes holds its model's record of
 //! sends. The record speaks for a row until the row's lane is heard: a row
-//! with no lane, and a row whose lane heard no event yet, since a
+//! with no lane, and a row whose lane applied no event yet, since a
 //! worker that asks for cache events may never publish one. A lane says so
 //! by one bit of its model's index (`Index`), which a decision reads with
-//! no lock: no publication follows a lane's first event. Naming lists the
+//! no lock: no publication follows its first applied event. Naming lists the
 //! record's holders beside the index's under one cap: after them, in the
 //! room they leave, or ahead of them where no prefix stage of the profile
 //! reads cache events. Issuing a lease writes the blocks sent to its
@@ -487,8 +487,8 @@ struct Tables {
 
 impl Tables {
     /// Whether the record of sent prefixes speaks for the pool's row at
-    /// `row` now: the row holds no lane, or no batch with an event ran
-    /// through its lane. A decision's write asks here, at its own later
+    /// `row` now: the row holds no lane, or no batch with an event was
+    /// applied in its lane. A decision's write asks here, at its own later
     /// instant: that read orders nothing against the one its naming made
     /// for the whole pool ([`Self::unheard`]).
     fn covered(&self, row: usize) -> bool {
@@ -499,7 +499,7 @@ impl Tables {
     }
 
     /// The pool's lanes the record speaks for, a bit an id: those no batch
-    /// with an event ran through. `None` where it speaks for no row of the
+    /// with an event was applied in. `None` where it speaks for no row of the
     /// pool: every row holds a lane and every lane was heard. That is one
     /// read of the index's heard bits against the pool's members, a word
     /// for 64 rows, and all a pool whose events flow pays for the record
@@ -1094,7 +1094,8 @@ impl PoolIndex {
         }
         let room = cap.saturating_sub(named.holders.len());
         // An engine's events are token blocks. A request hashed by windows
-        // of its text asks the record alone.
+        // of its text asks the record alone, so a lane whose events are
+        // heard is cold for it.
         let tokens = hashed && hash_kind == HashKind::Token;
         let index = tables.index.as_ref();
         if let Some(index) = index.filter(|_| tokens && room > 0) {

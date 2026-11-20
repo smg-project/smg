@@ -12,7 +12,9 @@
 //! request of the prefix follows it: a false entry costs one miss on its
 //! worker, where no entry costs one miss on some worker, and it is true
 //! once followed. An entry stops speaking for a worker whose cache events
-//! are heard, and leaves with its worker or by the bound.
+//! are heard, and leaves with its worker or by the bound. The keys hold no
+//! hash kind: a host that makes its own hashes keeps a text request's
+//! apart from a token request's.
 //!
 //! This is the `tree` kind of the document's index settings
 //! ([`IndexKind`](crate::spec::IndexKind)). The `hash` kind is not built.

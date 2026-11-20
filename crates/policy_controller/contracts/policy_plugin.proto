@@ -316,7 +316,8 @@ message RequestFacts {
   // the token kind it is in tokens: an index's learned block size on an
   // event-fed request, the configured one on a tree-fed request; 0 reads the
   // view's. Under the text kind it is the window's size in bytes, and a text
-  // request always states it.
+  // request always states it. A text frame that carries hashes and states
+  // none is refused by this field.
   uint32 block_size = 19;
   // The fingerprint of the request's client, as the host derives it from the
   // client sources of its binding's routing key; 0 where the request names
