@@ -11,12 +11,14 @@
 //! a host over the feed's holder. A regular HTTP router with that host asks
 //! it to place typed requests: for the model a request names, or for the one
 //! primary model the router's workers serve where it names none. A regular
-//! gRPC router and a gRPC pair router ask it in their selection stage. The
-//! pair router does where the document in force plans pairs, and mounts a
-//! refusing router elsewhere ([`undecided_without()`]). An HTTP pair router
-//! and a gRPC encode pair router mount a refusing router under their usual
-//! id ([`undecided()`]) whenever the store started, with or without a
-//! controller's address. The routes that pick a
+//! gRPC router and a gRPC pair router ask it in their selection stage. An
+//! HTTP pair router asks it for each attempt's pair, through prefill
+//! admission. A pair router does where this gateway decides pairs in its
+//! own process: the document in force plans pairs and the gateway follows
+//! no controller. It mounts a refusing router elsewhere
+//! ([`undecided_without()`]). A gRPC encode pair router mounts a refusing
+//! router under its usual id ([`undecided()`]) whenever the store started,
+//! with or without a controller's address. The routes that pick a
 //! worker by no routing policy serve as under the classic policies: a
 //! provider's router, a realtime session and a proxied GET. A local worker's
 //! registration writes its row at the feed's door. With the setting off, the
@@ -28,12 +30,6 @@
 //! it was given. The door stays in the context beside the store. The
 //! control plane reads the document in force through it and checks another
 //! against it ([`operators`]). Nothing is applied after the start.
-//!
-//! The HTTP pair router asks the host for each attempt's pair, through
-//! prefill admission. It is built where this gateway decides pairs in its
-//! own process, and the refusing router is mounted elsewhere
-//! ([`undecided_without()`]). The refusing router is also for the pair
-//! routers that do not ask the host yet.
 //!
 //! One site reads the setting, [`start_with`]. Every other site asks what
 //! the start left in the context.
@@ -223,7 +219,7 @@ pub(crate) fn feeds(
 }
 
 /// The refusing router for a family the controller does not decide yet:
-/// the HTTP pair router and the gRPC encode pair router. It mounts under
+/// the gRPC encode pair router. It mounts under
 /// the family's usual id so the gateway can select it. Returns `None` under
 /// the classic policies.
 pub(crate) fn undecided(context: &AppContext) -> Option<Box<dyn RouterTrait>> {
