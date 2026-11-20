@@ -68,6 +68,7 @@ pub use smg_worker::connection::client_factory::{
     blocking_http_client, http_client, http_client_builder, install_crypto_provider,
 };
 use smg_worker::{
+    connection::engine::EngineConnector,
     health::manager::{WorkerManager, WorkerManagerConfig},
     identity::{basic::ConnectionMode, endpoint::Endpoint},
     jobs::WorkerJobs,
@@ -1140,12 +1141,16 @@ impl ServerConfig {
 #[non_exhaustive]
 pub struct Extensions {
     stages: Option<Catalog>,
+    connector: Option<Arc<dyn EngineConnector>>,
 }
 
 impl Extensions {
-    /// Use the stock stages.
+    /// Use the stock stages and connector.
     pub fn new() -> Self {
-        Self { stages: None }
+        Self {
+            stages: None,
+            connector: None,
+        }
     }
 
     /// Set the catalog of stages a policy document may name. Start with
@@ -1154,6 +1159,24 @@ impl Extensions {
     #[must_use]
     pub fn stages(mut self, stages: Catalog) -> Self {
         self.stages = Some(stages);
+        self
+    }
+
+    /// Set the connector workers of this gateway use to probe and connect
+    /// to their engines. Delegate to [`BackendConnector::shared`] for engines
+    /// you want the gateway to connect to as usual.
+    ///
+    /// For gRPC or ZMQ inference the gateway requires a [`BackendClient`].
+    /// It refuses other connections with
+    /// `its engine connection is not the gateway's backend client`.
+    /// If the connection supplies load reports, let the worker runtime be
+    /// the only poller of that engine's load.
+    ///
+    /// [`BackendConnector::shared`]: crate::routers::grpc::backend_client::BackendConnector::shared
+    /// [`BackendClient`]: crate::routers::grpc::backend_client::BackendClient
+    #[must_use]
+    pub fn connector(mut self, connector: Arc<dyn EngineConnector>) -> Self {
+        self.connector = Some(connector);
         self
     }
 }
@@ -2305,6 +2328,25 @@ impl Drop for FollowerOnExit<'_> {
     }
 }
 
+/// The context of this process, built over what the host added: its stages
+/// and its worker connector.
+async fn build_app_context(
+    config: &ServerConfig,
+    extensions: Extensions,
+) -> Result<Arc<AppContext>, String> {
+    Ok(Arc::new(
+        AppContext::from_config_with_extensions(
+            config.router_config.clone(),
+            config.router_config.request_timeout_secs,
+            config.webrtc_bind_addr,
+            config.webrtc_stun_server.clone(),
+            extensions.stages,
+            extensions.connector,
+        )
+        .await?,
+    ))
+}
+
 /// Start the gateway listeners and drain them within the configured shutdown budget.
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     Box::pin(startup_with(config, Extensions::default())).await
@@ -2519,16 +2561,7 @@ pub async fn startup_with(
         config.router_config.max_payload_size / (1024 * 1024)
     );
 
-    let app_context = Arc::new(
-        AppContext::from_config_with_stages(
-            config.router_config.clone(),
-            config.router_config.request_timeout_secs,
-            config.webrtc_bind_addr,
-            config.webrtc_stun_server.clone(),
-            extensions.stages,
-        )
-        .await?,
-    );
+    let app_context = build_app_context(&config, extensions).await?;
     let follower_on_exit = app_context
         .follows_controller()
         .then(|| FollowerOnExit(&app_context));
@@ -3736,6 +3769,8 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
 
 #[cfg(test)]
 mod tests {
+    mod connector;
+
     use std::convert::Infallible;
 
     use axum::response::sse::{Event, Sse};

@@ -5,6 +5,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use smg_worker::{
+    connection::engine::EngineConnector,
     health::{
         circuit_breaker::CircuitBreakerConfig,
         resilience::{resolve_resilience, ResolvedResilience},
@@ -13,7 +14,7 @@ use smg_worker::{
         basic::{BasicWorker, ConnectionMode, RuntimeType, Worker, WorkerType},
         endpoint::Endpoint,
     },
-    workflow::{WorkerKind, WorkerList},
+    workflow::{WorkerKind, WorkerList, WorkflowHost},
 };
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
@@ -37,6 +38,7 @@ fn normalize_external_url(url: &str) -> String {
 struct ExternalWorkerParts<'a> {
     /// The endpoint, normalized to `https://`.
     url: &'a str,
+    engine_connector: Arc<dyn EngineConnector>,
     /// The discovered models; none for a wildcard worker, which accepts any
     /// model and forwards the user's auth.
     model_cards: &'a [ModelCard],
@@ -58,6 +60,7 @@ struct ExternalWorkerParts<'a> {
 fn build_external_worker(parts: ExternalWorkerParts<'_>) -> BasicWorker {
     // No cards is the wildcard worker: the builder reads an empty list so.
     let mut builder = BasicWorkerBuilder::new(parts.url)
+        .engine_connector(parts.engine_connector)
         .models(parts.model_cards.to_vec())
         .worker_type(WorkerType::Regular)
         .connection_mode(ConnectionMode::Http)
@@ -166,6 +169,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
 
         let worker = Arc::new(build_external_worker(ExternalWorkerParts {
             url: &normalized_url,
+            engine_connector: app_context.engine_connector(),
             model_cards,
             api_key: config.api_key.as_deref(),
             labels: &labels,
@@ -209,7 +213,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::http_client;
+    use crate::{routers::grpc::backend_client::BackendConnector, server::http_client};
 
     fn parts<'a>(
         cards: &'a [ModelCard],
@@ -218,6 +222,7 @@ mod tests {
     ) -> ExternalWorkerParts<'a> {
         ExternalWorkerParts {
             url: "https://api.example.com",
+            engine_connector: BackendConnector::shared(),
             model_cards: cards,
             api_key: Some("key"),
             labels,

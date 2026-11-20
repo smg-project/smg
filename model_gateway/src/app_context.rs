@@ -116,6 +116,7 @@ pub struct AppContext {
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
+    engine_connector: Arc<dyn EngineConnector>,
     pub prefill_admission: Option<Arc<PrefillAdmission>>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub gateway: Option<Arc<Gateway>>,
@@ -225,6 +226,7 @@ pub struct AppContextBuilder {
     reasoning_parser_factory: Option<ReasoningParserFactory>,
     tool_parser_factory: Option<ToolParserFactory>,
     worker_registry: Option<Arc<WorkerRegistry>>,
+    engine_connector: Arc<dyn EngineConnector>,
     policy_registry: Option<Arc<PolicyRegistry>>,
     gateway: Option<Arc<Gateway>>,
     response_storage: Option<Arc<dyn ResponseStorage>>,
@@ -263,7 +265,7 @@ impl WorkflowHost for AppContext {
     }
 
     fn engine_connector(&self) -> Arc<dyn EngineConnector> {
-        BackendConnector::shared()
+        Arc::clone(&self.engine_connector)
     }
 }
 
@@ -289,29 +291,32 @@ impl AppContext {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
-        Self::from_config_with_stages(
+        Self::from_config_with_extensions(
             router_config,
             request_timeout_secs,
             webrtc_bind_addr,
             webrtc_stun_server,
             None,
+            None,
         )
     }
 
-    pub(crate) fn from_config_with_stages(
+    pub(crate) fn from_config_with_extensions(
         router_config: RouterConfig,
         request_timeout_secs: u64,
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
         stages: Option<Catalog>,
+        connector: Option<Arc<dyn EngineConnector>>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
         Box::pin(async move {
-            Box::pin(AppContextBuilder::from_config_with_stages(
+            Box::pin(AppContextBuilder::from_config_with_extensions(
                 router_config,
                 request_timeout_secs,
                 webrtc_bind_addr,
                 webrtc_stun_server,
                 stages,
+                connector,
             ))
             .await?
             .build()
@@ -356,6 +361,10 @@ fn has_https_worker(config: &RouterConfig) -> bool {
 
 impl AppContextBuilder {
     pub fn new() -> Self {
+        Self::new_with_connector(None)
+    }
+
+    fn new_with_connector(connector: Option<Arc<dyn EngineConnector>>) -> Self {
         Self {
             client: None,
             router_config: None,
@@ -365,6 +374,7 @@ impl AppContextBuilder {
             reasoning_parser_factory: None,
             tool_parser_factory: None,
             worker_registry: None,
+            engine_connector: connector.unwrap_or_else(BackendConnector::shared),
             policy_registry: None,
             gateway: None,
             response_storage: None,
@@ -666,6 +676,7 @@ impl AppContextBuilder {
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
+            engine_connector: self.engine_connector,
             prefill_admission,
             policy_registry,
             gateway: self.gateway,
@@ -713,22 +724,24 @@ impl AppContextBuilder {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> Result<Self, String> {
-        Box::pin(Self::from_config_with_stages(
+        Box::pin(Self::from_config_with_extensions(
             router_config,
             request_timeout_secs,
             webrtc_bind_addr,
             webrtc_stun_server,
             None,
+            None,
         ))
         .await
     }
 
-    async fn from_config_with_stages(
+    async fn from_config_with_extensions(
         router_config: RouterConfig,
         request_timeout_secs: u64,
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
         stages: Option<Catalog>,
+        connector: Option<Arc<dyn EngineConnector>>,
     ) -> Result<Self, String> {
         // A served model aliased under a vendor name keeps that vendor's
         // contract profile after the alias is resolved into the served name.
@@ -742,7 +755,7 @@ impl AppContextBuilder {
         // registry is built below (the first call wins; `build` keeps its
         // call for a context assembled without this constructor).
         liveness::configure_from(router_config.worker_liveness_budgets());
-        Ok(Self::new()
+        Ok(Self::new_with_connector(connector)
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
             .maybe_rate_limit_manager(&router_config)?
@@ -923,7 +936,7 @@ impl AppContextBuilder {
     /// Create worker registry
     fn with_worker_registry(mut self) -> Self {
         self.worker_registry = Some(Arc::new(
-            WorkerRegistry::new().with_engine_connector(BackendConnector::shared()),
+            WorkerRegistry::new().with_engine_connector(Arc::clone(&self.engine_connector)),
         ));
         self
     }
@@ -1790,7 +1803,7 @@ pub(crate) mod testing {
 
     use smg_worker::connection::http_client::WorkerHttpClientCache;
 
-    use super::{AppContext, ToolParserFactory};
+    use super::{AppContext, BackendConnector, ToolParserFactory};
     use crate::{
         admin::worker_service::WorkerService,
         config::RouterConfig,
@@ -1826,6 +1839,7 @@ pub(crate) mod testing {
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,
             worker_registry: Arc::clone(&worker_registry),
+            engine_connector: BackendConnector::shared(),
             prefill_admission: None,
             policy_registry: Arc::new(
                 PolicyRegistry::with_override(
