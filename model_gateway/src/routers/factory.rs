@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use smg_external_router::{builtin_routers, spec_for_backend};
+use smg_external_router::{builtin_routers, spec_for_backend, ExternalRouterSpec};
 use smg_worker::identity::basic::ConnectionMode;
 
 use super::{
@@ -18,6 +18,7 @@ use crate::{
     app_context::AppContext,
     config::{PolicyConfig, RoutingMode},
     policies::{DPRankLoadPolicy, MinimumTokensPolicy, PolicyFactory},
+    policy_controller,
 };
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -145,6 +146,9 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
+        if let Some(router) = policy_controller::undecided(ctx) {
+            return Ok(router);
+        }
         Self::set_pd_policies(
             prefill_policy_config,
             decode_policy_config,
@@ -175,6 +179,9 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
         mode: Mode,
     ) -> Result<Box<dyn RouterTrait>, String> {
+        if let Some(router) = policy_controller::undecided(ctx) {
+            return Ok(router);
+        }
         let router = GrpcRouter::new(ctx, mode)?;
 
         Ok(Box::new(router))
@@ -227,12 +234,22 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
         match spec_for_backend(backend) {
-            Some(spec) if spec.compiled => ExternalRouterAdapter::mount(spec, ctx).await,
+            Some(spec) if spec.compiled => Self::mount_external(spec, ctx).await,
             Some(spec) => Err(spec.not_compiled()),
             None => Err(format!(
                 "{backend} is not an external router this gateway knows"
             )),
         }
+    }
+
+    async fn mount_external(
+        spec: ExternalRouterSpec,
+        ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        if let Some(router) = policy_controller::undecided(ctx) {
+            return Ok(router);
+        }
+        ExternalRouterAdapter::mount(spec, ctx).await
     }
 
     /// Create all routers for IGW (multi-router) mode.
@@ -295,7 +312,7 @@ impl RouterFactory {
             routers.push((
                 RouterId::new(spec.router_id),
                 spec.label,
-                ExternalRouterAdapter::mount(spec, ctx).await,
+                Self::mount_external(spec, ctx).await,
             ));
         }
 

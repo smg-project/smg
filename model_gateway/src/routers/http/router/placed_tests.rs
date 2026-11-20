@@ -14,7 +14,9 @@ use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg_policy_controller::{
     spec::{KeySourceSpec, RoutingKeySpec},
-    store::{GatewayId, HealthSink, LeasesStore, WorkerStatus as RowStatus, WorkersStore},
+    store::{
+        GatewayId, HealthSink, LeasesStore, MemoryStore, WorkerStatus as RowStatus, WorkersStore,
+    },
     AppliedSpec, PolicySpec, PowerOfTwoMetric,
 };
 use smg_worker::test_support::RefusedAddress;
@@ -36,6 +38,7 @@ use crate::{
         grpc::backend_client::BasicWorkerBuilder,
         http::test_support::spawn_sized_sse_worker_cut_after,
     },
+    server::ServerConfig,
     tenant::TenantKey,
 };
 
@@ -63,11 +66,11 @@ fn router(worker_registry: Arc<WorkerRegistry>, host: Option<Host>) -> Router {
     }
 }
 
-async fn chat(router: &Router) -> Case<Response> {
+async fn chat(router: &dyn RouterTrait) -> Case<Response> {
     chat_with_stream(router, false).await
 }
 
-async fn chat_with_stream(router: &Router, streaming: bool) -> Case<Response> {
+async fn chat_with_stream(router: &dyn RouterTrait, streaming: bool) -> Case<Response> {
     let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
     let request = serde_json::from_value(json!({
         "model": MODEL,
@@ -79,12 +82,13 @@ async fn chat_with_stream(router: &Router, streaming: bool) -> Case<Response> {
         .await)
 }
 
-/// Six chats with two registry workers and one row in the store.
-async fn six_chats(hosted: bool) -> Case<(usize, usize)> {
+/// Two registry workers, with only the overloaded worker in the store.
+async fn one_store_row(
+    registry: &Arc<WorkerRegistry>,
+) -> Case<(Host, Arc<MemoryStore>, [Arc<AtomicUsize>; 2])> {
     let (a, hits_a) = fixed_status_upstream(&[CHAT], StatusCode::OK).await;
     let (b, hits_b) = fixed_status_upstream(&[CHAT], StatusCode::OK).await;
-    let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, workers) = bed_over(Arc::clone(&registry), &[&a, &b]);
+    let (host, store, workers) = bed_over(Arc::clone(registry), &[&a, &b]);
     let row = store.by_key(&a).ok_or("worker A had no row to remove")?;
     store
         .remove(row.id, row.revision)
@@ -92,6 +96,13 @@ async fn six_chats(hosted: bool) -> Case<(usize, usize)> {
     // Only the store decides overload for a hosted attempt.
     registry.set_overload_shed(true);
     assert!(registry.set_worker_overloaded(&workers[1], true));
+    Ok((host, store, [hits_a, hits_b]))
+}
+
+/// Six chats with two registry workers and one row in the store.
+async fn six_chats(hosted: bool) -> Case<(usize, usize)> {
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, _, [hits_a, hits_b]) = one_store_row(&registry).await?;
     let router = router(registry, hosted.then_some(host));
     for _ in 0..6 {
         assert_eq!(chat(&router).await?.status(), StatusCode::OK);
@@ -102,6 +113,25 @@ async fn six_chats(hosted: bool) -> Case<(usize, usize)> {
 #[tokio::test]
 async fn an_attempt_under_the_host_goes_to_the_worker_the_controller_placed() -> Case {
     assert_eq!(six_chats(true).await?, (0, 6));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_chat_request_through_the_gateway_object_reaches_the_placed_worker() -> Case {
+    let mut config = RouterConfig {
+        policy_controller: true,
+        ..RouterConfig::default()
+    };
+    config.health_check.disable_health_check = true;
+    let mut context = AppContext::from_config(config.clone(), 30, None, None).await?;
+    let (host, store, [hits_a, hits_b]) = one_store_row(&context.worker_registry).await?;
+    context.policy_host = Some(Arc::new(host));
+    context.policy_store = Some(store);
+    let gateway = Gateway::from_config(&ServerConfig::minimal(config), &Arc::new(context)).await?;
+
+    assert_eq!(chat(gateway.as_ref()).await?.status(), StatusCode::OK);
+    assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+    assert_eq!(hits_b.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
@@ -444,19 +474,6 @@ async fn a_worker_that_answered_definitively_takes_no_later_attempt() -> Case {
     Ok(())
 }
 
-#[tokio::test]
-async fn a_realtime_request_under_the_host_is_refused_by_name() -> Case {
-    let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
-    let router = router(registry, Some(host));
-    let Err(refusal) = router.select_realtime_worker(MODEL, None).await else {
-        return Err("a realtime worker was selected under the host".into());
-    };
-    assert_refused(refusal, "a realtime request").await?;
-    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
-    Ok(())
-}
-
 #[test]
 fn a_failed_placement_adds_its_row_each_time() -> Case {
     let url = "http://127.0.0.1:1";
@@ -563,6 +580,37 @@ async fn assert_refused(response: Response, shape: &str) -> Case {
         .as_str()
         .ok_or("the refusal has no message")?;
     assert!(message.contains(shape), "{message}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_proxied_get_and_a_realtime_session_are_refused_by_name_under_the_host() -> Case {
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, _, _) = bed_over(Arc::clone(&registry), &[]);
+    let hosted = router(Arc::clone(&registry), Some(host));
+    let classic = router(registry, None);
+    let session = serde_json::from_value(json!({"type": "realtime", "model": MODEL}))?;
+
+    assert_refused(
+        hosted.health_generate(Request::new(Body::empty())).await,
+        "a proxied GET",
+    )
+    .await?;
+    assert_refused(
+        hosted.route_realtime_session(None, &session).await,
+        "a realtime session",
+    )
+    .await?;
+
+    let get = classic.health_generate(Request::new(Body::empty())).await;
+    assert_eq!(get.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(extract_error_code_from_response(&get), "no_workers");
+    let realtime = classic.route_realtime_session(None, &session).await;
+    assert_eq!(realtime.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        extract_error_code_from_response(&realtime),
+        "model_not_found"
+    );
     Ok(())
 }
 

@@ -1,4 +1,4 @@
-//! Cases of the store's start and of the router a server answers with.
+//! Store startup and routing under the policy controller.
 
 use std::{
     error::Error,
@@ -26,23 +26,20 @@ use smg_policy_controller::{
     view::{Candidate, RequestFacts, Role, WireModes},
     AppliedSpec, Catalog, CatalogError, PolicySpec, SpecError,
 };
-use smg_worker::{
-    connection::engine::EngineConnector,
-    identity::basic::{ConnectionMode, RuntimeType},
-};
+use smg_worker::{connection::engine::EngineConnector, identity::basic::ConnectionMode};
 
 use super::{refused, start, start_with, undecided::ROUTER_TYPE, StartError};
 use crate::{
     app_context::AppContext,
-    config::{ManualAssignmentMode, PolicyConfig, PolicyDocumentError, RouterConfig},
+    config::{ManualAssignmentMode, PolicyConfig, PolicyDocumentError, RouterConfig, RoutingMode},
     middleware::{RouteRequestMeta, TenantKey},
     routers::{
-        common::snapshot::WorkerRegistry,
+        gateway::Gateway,
         grpc::backend_client::{BackendConnector, BasicWorkerBuilder},
         http::router::Router,
         RouterTrait,
     },
-    server::{serving_router, ServerConfig},
+    server::ServerConfig,
 };
 
 type Case = Result<(), Box<dyn Error>>;
@@ -207,36 +204,17 @@ async fn refusal(answer: Response) -> (StatusCode, String) {
 
 /// The asks of `answers` not refused by the controller's name, with what
 /// each read.
-async fn not_by_name(answers: Vec<(&'static str, Response)>) -> Vec<String> {
+async fn not_by_name(
+    answers: Vec<(&'static str, Response)>,
+) -> Vec<(&'static str, StatusCode, String)> {
     let mut other = Vec::new();
     for (ask, answer) in answers {
         let (status, code) = refusal(answer).await;
         if (status, code.as_str()) != (StatusCode::NOT_IMPLEMENTED, BY_NAME) {
-            other.push(format!("{ask}: {status} {code}"));
+            other.push((ask, status, code));
         }
     }
     other
-}
-
-/// Registers a ready regular worker of `model` at `url`, on `mode`, of
-/// `runtime` where one is named.
-fn register(
-    registry: &WorkerRegistry,
-    url: &str,
-    model: &str,
-    mode: ConnectionMode,
-    runtime: Option<RuntimeType>,
-) {
-    let mut worker = BasicWorkerBuilder::new(url)
-        .model(ModelCard::new(model))
-        .connection_mode(mode)
-        .status(WorkerStatus::Ready);
-    if let Some(runtime) = runtime {
-        worker = worker.runtime_type(runtime);
-    }
-    registry
-        .register(Arc::new(worker.build()))
-        .expect("the worker registers");
 }
 
 /// A chat request for `model`.
@@ -444,28 +422,74 @@ fn quiet() -> RouterConfig {
     config
 }
 
-/// Every route and every adapter shape, asked of the router a server answers
-/// with under `config`: each is refused by the controller's name. The
-/// registry holds the workers a gateway object would choose a router by, and
-/// no gateway object is built to choose.
-async fn refused_whole(config: RouterConfig) -> Case {
-    let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);
-    let registry = &context.worker_registry;
-    register(registry, "http://w1:8080", "m", ConnectionMode::Http, None);
-    let runtime = Some(RuntimeType::Sglang);
-    register(
-        registry,
-        "grpc://w2:8080",
-        "base",
-        ConnectionMode::Grpc,
-        runtime,
+async fn build_gateway(config: RouterConfig) -> Result<Arc<Gateway>, String> {
+    let context = Box::pin(AppContext::from_config(config.clone(), 30, None, None)).await?;
+    Box::pin(Gateway::from_config(
+        &ServerConfig::minimal(config),
+        &Arc::new(context),
+    ))
+    .await
+}
+
+/// With an empty registry, typed requests reach a model miss and routes
+/// outside placement keep their own answers.
+async fn decided_or_refused(config: RouterConfig) -> Case {
+    let enable_igw = config.enable_igw;
+    let gateway = build_gateway(config).await?;
+    assert_eq!(gateway.router_count() > 1, enable_igw);
+
+    let mut answers = every_route(gateway.as_ref(), "m").await;
+    answers.extend(adapter_asks(gateway.as_ref()).await);
+    let other = not_by_name(answers).await;
+    let (model_misses, other): (Vec<_>, Vec<_>) = other.iter().partition(|(_, status, code)| {
+        *status == StatusCode::NOT_FOUND && code == "model_not_found"
+    });
+    assert_eq!(
+        model_misses
+            .into_iter()
+            .map(|(ask, _, _)| *ask)
+            .collect::<Vec<_>>(),
+        [
+            "route_generate",
+            "route_chat",
+            "route_completion",
+            "route_responses",
+            "route_embeddings",
+            "route_classify",
+            "route_decisions",
+            "route_systemone",
+            "route_rerank",
+            "route_messages",
+            "route_messages_count_tokens",
+            "chat, the model names the adapter",
+            "chat, the request's field names the adapter",
+            "completion, the model names the adapter",
+            "generate, the request's field names the adapter",
+        ],
     );
-    let (router, gateway) = serving_router(&ServerConfig::minimal(config), &context).await?;
-    assert!(gateway.is_none(), "a gateway object is built");
-    assert_eq!(router.router_type(), ROUTER_TYPE);
-    let mut other = not_by_name(every_route(router.as_ref(), "m").await).await;
-    other.extend(not_by_name(adapter_asks(router.as_ref()).await).await);
-    assert!(other.is_empty(), "not refused by name: {other:?}");
+    assert_eq!(
+        other
+            .into_iter()
+            .map(|(ask, status, code)| (*ask, *status, code.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "cancel_response",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_workers"
+            ),
+            (
+                "route_messages, no token asked",
+                StatusCode::BAD_REQUEST,
+                "max_tokens_zero_not_relayed"
+            ),
+            (
+                "route_interactions",
+                StatusCode::NOT_IMPLEMENTED,
+                "interactions_not_implemented"
+            ),
+        ],
+    );
     Ok(())
 }
 
@@ -608,15 +632,96 @@ async fn a_hosts_catalog_and_document_reach_the_store_through_the_context() -> C
 }
 
 #[tokio::test]
-async fn every_request_is_refused_by_name_where_one_router_would_be_built() -> Case {
-    Box::pin(refused_whole(picked(quiet()))).await
+async fn under_the_setting_one_router_serves_typed_requests_and_refuses_the_rest() -> Case {
+    Box::pin(decided_or_refused(picked(quiet()))).await
 }
 
 #[tokio::test]
-async fn every_request_is_refused_by_name_where_many_routers_would_be_built() -> Case {
+async fn under_the_setting_many_routers_serve_typed_requests_and_refuse_the_rest() -> Case {
     let mut config = picked(quiet());
     config.enable_igw = true;
-    Box::pin(refused_whole(config)).await
+    Box::pin(decided_or_refused(config)).await
+}
+
+#[tokio::test]
+async fn the_regular_router_under_the_setting_holds_the_host() -> Case {
+    let gateway = build_gateway(picked(quiet())).await?;
+    let router = gateway
+        .select_router_for_request(None)
+        .ok_or("the regular router is missing")?;
+    assert_eq!(router.router_type(), "regular");
+    assert_eq!(
+        refusal(router.health_generate(Request::new(Body::empty())).await).await,
+        (StatusCode::NOT_IMPLEMENTED, BY_NAME.to_owned())
+    );
+    Ok(())
+}
+
+async fn assert_refusing_router(router: &dyn RouterTrait, family: &str) -> Case {
+    assert_eq!(router.router_type(), ROUTER_TYPE, "{family}");
+    let answer = router.health_generate(Request::new(Body::empty())).await;
+    assert_eq!(answer.status(), StatusCode::NOT_IMPLEMENTED, "{family}");
+    let bytes = to_bytes(answer.into_body(), 1024).await?;
+    let error: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(error["error"]["code"], BY_NAME, "{family}");
+    assert_eq!(
+        error["error"]["message"],
+        "The policy controller is picked for this gateway and does not decide requests for this router yet",
+        "{family}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_pair_the_grpc_and_the_provider_routers_refuse_by_name() -> Case {
+    let mut pair = picked(quiet());
+    pair.mode = RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    let mut grpc = picked(quiet());
+    grpc.connection_mode = ConnectionMode::Grpc;
+    for (family, config) in [("HTTP pair", pair), ("gRPC regular", grpc)] {
+        let gateway = build_gateway(config).await?;
+        let router = gateway
+            .select_router_for_request(None)
+            .ok_or("the router is missing")?;
+        assert_refusing_router(router.as_ref(), family).await?;
+    }
+
+    #[cfg(feature = "provider-openai")]
+    {
+        use smg_external_router::known::OPENAI;
+        use smg_worker::identity::basic::RuntimeType;
+
+        use crate::routers::RouterFactory;
+
+        // A provider-only mode has no policy document. In a multi-router
+        // gateway, an external worker selects the mounted provider router.
+        let mut config = picked(quiet());
+        config.enable_igw = true;
+        let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);
+        let model = "external-model";
+        let worker = BasicWorkerBuilder::new("http://127.0.0.1:1")
+            .model(ModelCard::new(model))
+            .runtime_type(RuntimeType::External)
+            .status(WorkerStatus::Ready)
+            .build();
+        context
+            .worker_registry
+            .register(Arc::new(worker))
+            .ok_or("the provider worker did not register")?;
+        let gateway = Gateway::from_config(&ServerConfig::minimal(config), &context).await?;
+        let router = gateway
+            .select_router_for_request(Some(model))
+            .ok_or("the provider router is missing")?;
+        assert_refusing_router(router.as_ref(), "multi-router provider").await?;
+        let router = RouterFactory::create_external_router(OPENAI.backend, &context).await?;
+        assert_refusing_router(router.as_ref(), "single-router provider").await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -624,9 +729,11 @@ async fn the_classic_policies_build_the_gateway_object() -> Case {
     let config = quiet();
     let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);
     assert!(context.policy_store.is_none());
-    let (router, gateway) = serving_router(&ServerConfig::minimal(config), &context).await?;
-    assert!(gateway.is_some(), "no gateway object is built");
-    assert_ne!(router.router_type(), ROUTER_TYPE);
+    let gateway = Gateway::from_config(&ServerConfig::minimal(config), &context).await?;
+    let router = gateway
+        .select_router_for_request(None)
+        .ok_or("the regular router is missing")?;
+    assert_eq!(router.router_type(), "regular");
     Ok(())
 }
 

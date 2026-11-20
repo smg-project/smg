@@ -9,12 +9,11 @@
 //! The setting starts the store with the policy document for the routing
 //! configuration. The context holds the membership feed over that store and
 //! a host over the feed's holder. A regular HTTP router with that host asks
-//! it to place typed requests for a named model. The gateway's workflows
-//! leave the feed's door unused, so without a controller's address nothing
-//! feeds the store yet. The server answers with a refusing router in the
-//! gateway object's place ([`router`]), so its requests never reach the
-//! host. With the setting off, the context holds neither the store, its
-//! feed nor its host.
+//! it to place typed requests for a model the registry serves. The gateway's
+//! workflows leave the feed's door unused, so without a controller's address
+//! nothing feeds the store yet. Other router families mount a refusing
+//! router under their usual ids ([`undecided()`]). With the setting off, the
+//! context holds neither the store, its feed nor its host.
 //!
 //! One site reads the setting, [`start_with`]. Every other site asks what
 //! the start left in the context.
@@ -116,7 +115,7 @@ pub(crate) fn start_with(
     let generation = config.hosted_policy_in(&document, stages.as_ref())?;
     let store = MemoryStore::new();
     store.apply(generation)?;
-    info!("The policy controller is picked for this gateway: no classic router is built");
+    info!("The policy controller is picked for this gateway");
     Ok(Some(Arc::new(store)))
 }
 
@@ -144,17 +143,18 @@ pub(crate) fn feeds(
     }
 }
 
-/// The controller's router for this process: the one router its server
-/// answers with. `None` where the classic policies decide.
+/// The refusing router for a family the controller does not decide yet.
+/// It mounts under the family's usual id so the gateway can select it.
+/// Returns `None` under the classic policies.
 ///
-/// It asks what the start left in the context and never reads the setting
-/// again, so a router stands where a store started and nowhere else. It
-/// refuses each request by name.
-pub(crate) fn router(context: &AppContext) -> Option<Arc<dyn RouterTrait>> {
+/// The pair routers need pair placement. The regular gRPC router needs
+/// host placement in its routing stage. Provider and external routers
+/// need the worker registry populated from the store.
+pub(crate) fn undecided(context: &AppContext) -> Option<Box<dyn RouterTrait>> {
     context
-        .policy_store
+        .policy_host
         .is_some()
-        .then(|| Arc::new(Undecided) as Arc<dyn RouterTrait>)
+        .then(|| Box::new(Undecided) as Box<dyn RouterTrait>)
 }
 
 #[cfg(test)]
