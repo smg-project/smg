@@ -119,7 +119,7 @@ An embedded host can implement or use the store's ingress traits for membership,
 
 ### In a host process
 
-Validate a `PolicySpec` to get an `Engine`. Call `Engine::decide` with request facts, rows, constraints and reusable `Scratch`. For a host that needs booking, apply an `AppliedSpec` to `MemoryStore` and call `Door` or `Handle`. The door runs on the caller's thread. It issues the lease for the first target. The host takes a target, reports dispatch and completion or release, and calls `Door::sweep` on its timer. The door decides a pair when asked at its prefill: that one request decides both sides. It returns `PairSide` for a decode or an encode sent on its own, and `Unleased` or `Faulted` if it cannot book or decide a pick. `Door::decide_encode_pair` also places an `epd` request's encode items. A pick can state what its first worker holds of the request's prefix (`Pick::overlap`): the leading blocks held, the request's blocks, where the match came from, and whether the prefix margin kept that worker in front. The profile's first `prefix-affinity` scorer says it. A host that calls the library asks through `Engine::decide_stated`. The controller's `Decide` answer does not carry it yet. [Engine example](src/framework.rs) · [Door API](src/door.rs) · [Handle API](src/handle.rs)
+Validate a `PolicySpec` to get an `Engine`. Call `Engine::decide` with request facts, rows, constraints and reusable `Scratch`. For a host that needs booking, apply an `AppliedSpec` to `MemoryStore` and call `Door` or `Handle`. The door runs on the caller's thread. It issues the lease for the first target. The host takes a target, reports dispatch and completion or release, and calls `Door::sweep` on its timer. The door decides a pair when asked at its prefill: that one request decides both sides. It returns `PairSide` for a decode or an encode sent on its own, and `Unleased` or `Faulted` if it cannot book or decide a pick. `Door::decide_encode_pair` and `Handle::decide_encode_pair` also place an `epd` request's encode items. A pick can state what its first worker holds of the request's prefix (`Pick::overlap`): the leading blocks held, the request's blocks, where the match came from, and whether the prefix margin kept that worker in front. The profile's first `prefix-affinity` scorer says it. A host that calls the library asks through `Engine::decide_stated`. The controller's `Decide` answer does not carry it yet. [Engine example](src/framework.rs) · [Door API](src/door.rs) · [Handle API](src/handle.rs)
 
 The crate defaults to `wasm`. Use `default-features = false` for the library without that runtime. `ingest` adds load polling and scrape helpers. `controller` adds the service, its protocol, command line and gRPC plugin host, and enables `ingest`. `client` enables the reference client and watcher and implies `controller`. `kubernetes` adds the namespaced Lease backend. `operator` adds the operators' door for a host's own process and builds no server. `worker-host` adds an optional registry of worker objects that follows membership. In the controller build those objects use a lazy gRPC connector. The feature also has the cache feed's two parts: `worker_host::KvAdapter` writes a worker's cache events to the index, and `worker_host::KvHost` gives each event subscription its row. A controller built with the feature fills its index itself: every replica opens a cache-event stream to each gRPC worker whose row asks for events. The stock controller is built without it. `test-util` supports the crate's tests and benches. [Cargo features](Cargo.toml)
 
@@ -230,6 +230,31 @@ struct PreferWorker {
     preferred: u64,
 }
 
+impl Lifecycle for PreferWorker {}
+
+impl Scorer for PreferWorker {
+    fn name(&self) -> &'static str {
+        "prefer-worker"
+    }
+
+    fn score(
+        &self,
+        _: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        for (&row, score) in kept.iter().zip(out) {
+            *score = if candidates[row as usize].id.0 == self.preferred {
+                1.0
+            } else {
+                0.0
+            };
+        }
+        TieBand::NORMALIZED
+    }
+}
+
 stages.scorer_with("prefer-worker", |build| {
     Ok(Box::new(build.params::<PreferWorker>()?))
 })?;
@@ -247,6 +272,7 @@ score:
 - The keys of a parameter map carry no order. The factory reads them in key order, and two files that differ in that order alone have one digest. A key written twice is refused.
 - A filter and a picker take no parameters yet.
 - The scorer's `name()` must return the name it is registered under. `scorer`, `filter` and `picker` run the factory once at registration and refuse another name there. `scorer_with` runs no factory then, so validation refuses the name.
+- A `scorer_with` factory can call `build.sent()` for the profile's `SentCredit`: what the host sent each row since that row's last load report. The scorer reads a row's `Sent { requests, tokens }` with `read`. A send is a dispatch the host reports. It stops counting at a report of the row sampled at or after it, at the profile's `sent_ttl_ms`, or at the row's removal. When a send arrives with 8,192 already held on a row, the tally retires the row's oldest batch, at any age.
 
 The stock schema lists the stock catalog. Validate an extended document against the host's catalog. Stateful scorers and pickers can observe issue, dispatch, completion, release, membership and signals when the host supplies them. A stage that keeps a number of each worker's load report says so through `Lifecycle::keeps_loads`. The controller then tells it every report before a decision can read that report, through `Lifecycle::on_signal`. A stage that does not say so is told no report. In process the load signal names two more things: the worker's slot in the host's counts and the report's sample instant. A host that builds the signal itself fills both. A scorer of your own can state a pick's overlap too: implement `Scorer::states_overlap` and `Scorer::said`. Both have a default that says nothing. `said` is asked once a decision, of the first target alone. The standalone validator refuses stages that declare a need for the full lifecycle. [Runnable Rust example](../../examples/policy-controller) · [Catalog API](src/catalog.rs)
 
@@ -320,7 +346,7 @@ Use `apiVersion: smg.policy/v1` and at least one profile. Both YAML and JSON use
 |---|---|
 | `apiVersion` | Required. Only `smg.policy/v1` is accepted. |
 | `generation` | Unsigned 64-bit number, default 0. Zero asks the service to number it. See [Updating a document](#updating-a-document). |
-| `profiles.<name>` | One to 65535 profiles. `filter` and `score` default to empty. `pick` is required. Stage mappings have one name. See [Built-in stages](#built-in-stages). |
+| `profiles.<name>` | One to 65535 profiles. `filter` and `score` default to empty. `pick` is required. Stage mappings have one name. `sent_ttl_ms` is optional and positive. It sets how many milliseconds a send counts for in the profile's tally of sends (`StageBuild::sent`). Left unset, a send ends at a report of the row sampled at or after it, or at the row's removal. The 8,192 sends a row holds bound the tally either way. A profile whose stages ask for no tally refuses it, and no built-in stage asks. See [Built-in stages](#built-in-stages). |
 | `view.headers` | Up to 256 unique lowercase HTTP header names, in wire position order. Default empty. Denied names are `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `api-key` and `x-goog-api-key`. Embedded validation can deny more, such as the gateway's tenant header. |
 | `view.block_size` | Positive fallback block size when the request gives none. The prefix stages fall back to 16 if omitted. |
 | `view.boundaries` | Positive, strictly ascending token positions, default empty. Used by prefix keying and required for a `hash` index entry. With a prefix-keyed scorer every boundary and `prefix_tokens` must cover at least one whole configured block and fit the hash cap. |
@@ -416,7 +442,7 @@ bindings:
     profiles: { encode: encode, prefill: prefill, decode: decode }
 ```
 
-Use this document with `Door::decide_encode_pair`, which places the request's encode items beside the pair. A host that decides over its own rows calls `Engine::decide_encode_pair` and supplies `EncodeItems`, the worker offers and the compatibility tables. The encode profile can key each item by content hash. A push handoff can place by one supplied key. Images require a vision-capable encoder, and a request can require a vision-capable decode worker. The engine writes encoder choices to `EncodePlaced`. All choices are made before dispatch. [Encode entry and refusal names](src/framework/encode.rs)
+Use this document with `Door::decide_encode_pair`, or `Handle::decide_encode_pair` to hold the decision. Pass the request's `EncodeItems` and an `EncodePlaced`. The door reads the worker offers and the compatibility tables from the store. A host that decides over its own rows calls `Engine::decide_encode_pair` and supplies those as well. The encode profile can key each item by content hash. A push handoff can place by one supplied key. Images require a vision-capable encoder, and a request can require a vision-capable decode worker. The decision writes encoder choices to `EncodePlaced`. All choices are made before dispatch. [Encode entry and refusal names](src/framework/encode.rs)
 
 ### Session keys
 
