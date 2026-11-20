@@ -179,7 +179,7 @@ struct CliArgs {
 /// with each of them, and the parser knows where a value came from: a flag
 /// typed beside a document is refused by both names, at its default value
 /// too. A flag the gateway still reads under a document is not listed.
-const DOCUMENT_REPLACES: [&str; 45] = [
+const DOCUMENT_REPLACES: [&str; 44] = [
     "policy",
     "cache_threshold",
     "balance_abs_threshold",
@@ -215,7 +215,6 @@ const DOCUMENT_REPLACES: [&str; 45] = [
     "power_of_two_load_metric",
     "routing_key_override",
     "pd_pairing_mode",
-    "grouped_dp_sticky",
     "dp_minimum_tokens_scheduler",
     "worker_warmup_secs",
     "worker_warmup_share",
@@ -2328,14 +2327,35 @@ mod tests {
         assert_eq!(config.policy_document_in_force(), Ok(document));
     }
 
+    #[test]
+    fn the_pin_to_an_engine_of_a_grouped_worker_stands_beside_a_document() {
+        // The dispatch applies the pin behind any document's decision, so
+        // the flag is typed beside a document and both reach the gateway.
+        let (file, document) = policy_file("round_robin").expect("a policy document file");
+        let path = file.path().to_str().expect("a UTF-8 path");
+        let config = cli_args_from(&[
+            "--policy-controller",
+            "on",
+            "--policy-spec",
+            path,
+            "--grouped-dp-sticky",
+            "hash",
+        ])
+        .to_router_config(vec![], vec![])
+        .expect("the routing configuration");
+        assert_eq!(config.grouped_dp_sticky, GroupedDpSticky::Hash);
+        assert_eq!(config.policy_document_in_force(), Ok(document));
+    }
+
     /// The flags under the routing policy heading a document does not
     /// replace: the controller's own, and what the gateway reads itself.
-    const BESIDE_A_DOCUMENT: [&str; 6] = [
+    const BESIDE_A_DOCUMENT: [&str; 7] = [
         "policy_controller",
         "policy_spec",
         "print_policy_spec",
         "dp_aware",
         "routing_key_headers",
+        "grouped_dp_sticky",
         "enable_igw",
     ];
 
