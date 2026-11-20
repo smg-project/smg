@@ -5,11 +5,16 @@
 //! wait for all dependencies to complete successfully.
 
 use std::{
+    any::Any,
     collections::{HashMap, HashSet, VecDeque},
+    future::Future,
+    panic::{catch_unwind, AssertUnwindSafe},
+    pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    task::{self, Poll},
     time::Duration,
 };
 
@@ -293,6 +298,34 @@ enum Outcome {
         error: String,
         retryable: bool,
     },
+}
+
+/// A step's future that ends with its panic, when it panics, where it would
+/// unwind its task. The attempt then settles as failed. Left to unwind, the
+/// step would read as running for ever and its run would never end, so every
+/// wait on that run would last its whole timeout.
+struct CatchPanic<F>(F);
+
+impl<F: Future + Unpin> Future for CatchPanic<F> {
+    type Output = Result<F::Output, Box<dyn Any + Send>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        let inner = Pin::new(&mut self.0);
+        match catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(panic) => Poll::Ready(Err(panic)),
+        }
+    }
+}
+
+/// The words a panic carried, when it carried words.
+fn panic_words(panic: &(dyn Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
 }
 
 /// Fixed backoff that returns the same delay every time
@@ -1168,19 +1201,28 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         let mut context = self.state_store.get_context(instance_id).await?;
 
         let step_start = std::time::Instant::now();
-        let result = timeout(step_timeout, step.executor.execute(&mut context)).await;
+        let result = timeout(
+            step_timeout,
+            CatchPanic(step.executor.execute(&mut context)),
+        )
+        .await;
         let duration = step_start.elapsed();
 
         let outcome = match result {
-            Ok(Ok(StepResult::Success)) => Outcome::Success,
-            Ok(Ok(StepResult::Skip)) => Outcome::Skip,
-            Ok(Ok(StepResult::Failure)) => Outcome::Failed {
+            Ok(Ok(Ok(StepResult::Success))) => Outcome::Success,
+            Ok(Ok(Ok(StepResult::Skip))) => Outcome::Skip,
+            Ok(Ok(Ok(StepResult::Failure))) => Outcome::Failed {
                 error: "Step failed".to_string(),
                 retryable: false,
             },
-            Ok(Err(e)) => Outcome::Failed {
+            Ok(Ok(Err(e))) => Outcome::Failed {
                 error: format!("{e}"),
                 retryable: step.executor.is_retryable(&e),
+            },
+            // A panic fails the attempt, and no further attempt is made.
+            Ok(Err(panic)) => Outcome::Failed {
+                error: format!("Step panicked: {}", panic_words(panic.as_ref())),
+                retryable: false,
             },
             Err(_) => Outcome::Failed {
                 error: format!("Step timeout after {step_timeout:?}"),

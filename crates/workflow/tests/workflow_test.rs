@@ -226,6 +226,58 @@ async fn test_workflow_failure_after_max_retries() {
     assert_eq!(counter.load(Ordering::SeqCst), 3);
 }
 
+/// A step that panics with words of its own.
+struct PanickingStep;
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for PanickingStep {
+    #[expect(clippy::panic, reason = "the case needs a step that panics")]
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        panic!("the step's own words");
+    }
+}
+
+/// A step that panics fails its attempt, and its run ends as failed after
+/// that one attempt. Left to unwind its task, the step read as running for
+/// ever, and a wait on its run lasted the whole timeout.
+#[tokio::test]
+async fn a_step_that_panics_ends_its_run_as_failed() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let workflow = WorkflowDefinition::new("panicking_workflow", "A step panics").add_step(
+        StepDefinition::new(
+            "panicking_step",
+            "Step that panics",
+            Arc::new(PanickingStep),
+        )
+        .with_retry(RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffStrategy::Fixed(Duration::from_millis(10)),
+        })
+        .with_failure_action(FailureAction::FailWorkflow),
+    );
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let state = engine
+        .wait_for_terminal_state(instance_id, "panicking", Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    let step_state = state
+        .step_states
+        .get(&StepId::new("panicking_step"))
+        .unwrap();
+    assert_eq!(step_state.status, StepStatus::Failed);
+    assert_eq!(step_state.attempt, 1);
+    assert_eq!(
+        step_state.last_error.as_deref(),
+        Some("Step panicked: the step's own words")
+    );
+}
+
 #[tokio::test]
 async fn test_workflow_continue_on_failure() {
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
