@@ -41,8 +41,10 @@
 //! standing object's running state, including its status. A host that gets
 //! health from the rows can use [`Objects::with_status_followed`] to copy
 //! their status on tail changes and snapshots, for objects kept or laid
-//! again. The holder checks the row's revision and writes under the
-//! object's mutation lock. The host's breaker and vetoes still apply.
+//! again. The holder checks the row's revision under the object's
+//! mutation lock and hands the registry the status, as the health
+//! adapter does: the registry's subscribers hear the change, and a
+//! promotion comes back as any promotion does. The host's vetoes stand.
 //! The id and the revision stand beside the object in the
 //! holder ([`Standing`]). No credential and no connector is a row's fact. A
 //! host hands the holder its connector ([`Objects::with_connector`]); a

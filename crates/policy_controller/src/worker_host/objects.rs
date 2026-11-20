@@ -86,8 +86,10 @@ struct Held {
 /// By default a status change reads no row and leaves the object alone.
 /// With [`Self::with_status_followed`], the holder copies the row's status
 /// on a status change, on a build or replacement, and on a snapshot read
-/// that keeps the object. The object's own breaker and vetoes still govern
-/// whether it can take requests.
+/// that keeps the object. The registry makes the write, as it makes a
+/// health driver's: its subscribers hear the change once, and a promoted
+/// worker comes back as any promotion brings it, an open breaker on
+/// trial. The host's own vetoes stand.
 ///
 /// A row that leaves ends its object, even where a row stands under its id
 /// again by the time the change is read: a row registered again under the
@@ -360,6 +362,7 @@ impl<G: Generation> Objects<G> {
 
     /// Read the row under the lock the health adapter writes under. The
     /// object's entry must still name that row and its current revision.
+    /// The registry writes the status it is handed and tells it.
     #[inline(never)]
     fn copy_status<S: WorkersStore + ?Sized>(&self, store: &S, row: WorkerId) {
         let Some(id) = self.object(row) else {
@@ -377,12 +380,10 @@ impl<G: Generation> Objects<G> {
                         .filter(|row| row.revision == standing.revision)
                 })
                 .map(|row| status(row.status));
-            if let Some(next) = next.filter(|&next| next != object.status()) {
-                // Set the status here. A registry health promotion can
-                // also change the host's breaker.
-                object.set_status(next);
-            }
-            ((), None)
+            // The registry writes it, as it writes the adapter's: one
+            // status event to its subscribers, and what goes with a
+            // promotion. A status that stands writes nothing.
+            ((), next)
         };
         self.registry
             .apply_if_revision(&id, object.revision(), write);
@@ -735,9 +736,10 @@ mod tests {
         replica.store.upsert(facts(A, 1));
         replica.follow();
         let row = replica.row(A);
-        let worker = replica.at(A);
+        let (id, worker) = (replica.id(A), replica.at(A));
         assert_eq!(worker.status(), ObjectStatus::Pending);
         assert!(!worker.is_available());
+        assert_eq!(replica.told(), [("registered", id.clone())]);
 
         for (row_status, object_status, available) in [
             (WorkerStatus::Ready, ObjectStatus::Ready, true),
@@ -751,6 +753,8 @@ mod tests {
             assert!(Arc::ptr_eq(&worker, &replica.at(A)));
             assert_eq!(worker.status(), object_status);
             assert_eq!(worker.is_available(), available);
+            // The registry's subscribers hear each change once.
+            assert_eq!(replica.told(), [("status", id.clone())]);
         }
 
         for _ in 0..CircuitBreakerConfig::default().failure_threshold {
@@ -766,9 +770,13 @@ mod tests {
             .store
             .set_status(row.id, WorkerStatus::Ready, row.revision)
             .is_some());
+        replica.told();
         replica.follow();
         assert_eq!(worker.status(), ObjectStatus::Ready);
-        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+        assert_eq!(replica.told(), [("status", id)]);
+        // A promotion comes back as any promotion does: the open breaker
+        // goes on trial. The host's own vetoes stand.
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
         assert!(worker.is_overloaded());
         assert_eq!(worker.stall_reason(), Some(StallReason::Unreachable));
         assert!(!worker.is_available());
@@ -829,7 +837,9 @@ mod tests {
         replica.store.upsert(facts(B, 1));
         replica.follow();
         let (a, b) = (replica.at(A), replica.at(B));
+        let (id_a, id_b) = (replica.id(A), replica.id(B));
         assert!(!a.is_available() && !b.is_available());
+        replica.told();
 
         let other = MemoryStore::new();
         other.upsert(facts(A, 1));
@@ -847,6 +857,11 @@ mod tests {
         assert!(a.is_available());
         assert!(!Arc::ptr_eq(&b, &replica.at(B)));
         assert!(replica.at(B).is_available());
+        // Each object's change is told, kept or laid again.
+        let told = replica.told();
+        for id in [&id_a, &id_b] {
+            assert!(told.contains(&("status", id.clone())), "{told:?}");
+        }
 
         let row = other.by_key(A).expect("a row in the snapshot");
         assert!(other
@@ -856,6 +871,7 @@ mod tests {
         replica.follow();
         assert!(Arc::ptr_eq(&a, &replica.at(A)));
         assert!(!a.is_available());
+        assert_eq!(replica.told(), [("status", id_a)]);
     }
 
     #[test]
