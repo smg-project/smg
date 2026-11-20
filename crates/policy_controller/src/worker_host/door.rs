@@ -58,8 +58,9 @@ pub enum Refused {
     NotLeading(String),
     /// Another writer moved the row under the call.
     Moved,
-    /// A row stands where a registration expects none: under a URL it
-    /// states, or one it would retire.
+    /// A row stands where an add expects none: under a URL it states, or
+    /// one it would retire. The rows of the same add, tried again, are not
+    /// such rows ([`Expect::Nothing`]).
     Stands,
     /// The row a replacement or a refresh names is draining: its removal
     /// takes the worker.
@@ -98,6 +99,14 @@ pub enum Expect {
     /// Nothing: an add. A row standing under a URL it states, or one the
     /// registration would retire, refuses it whole ([`Refused::Stands`]),
     /// whoever made the row.
+    ///
+    /// One standing is the add's own. A lead lost between two rows leaves
+    /// the rows written before it, and the same add tried again lays the
+    /// rest: every row that stands under a URL it states is its maker's
+    /// and states equal facts, and a row is left to write. The standing
+    /// rows answer unmoved and the others are registered. An engine that
+    /// stands whole refuses the add, and so does a standing row that
+    /// differs or is another maker's.
     Nothing,
     /// The row its asker saw, at the revision it saw: a replacement by id,
     /// which states that one row. No row refuses it ([`Refused::Absent`]),
@@ -181,8 +190,10 @@ pub trait Membership: Send + Sync + 'static {
     /// nothing. At a door whose lead can move, the term is asked ahead of
     /// each row's write and each removal: a lead lost between two of them
     /// refuses there ([`Refused::NotLeading`]), and what was written before
-    /// it stands. A guarded write ([`Expect::Seen`]) states the one row its
-    /// asker saw and changes it where it stands, by that row's own rule.
+    /// it stands. An upsert lays the rest, and so does the same add tried
+    /// again ([`Expect::Nothing`]). A guarded write ([`Expect::Seen`])
+    /// states the one row its asker saw and changes it where it stands, by
+    /// that row's own rule.
     ///
     /// Each door says what it does with the objects. A door whose host
     /// keeps built objects hands them to the holder for the write's turn
@@ -336,27 +347,38 @@ fn states_the_engine_whole(ready: &[Ready]) -> bool {
     matches!(ready, [(only, _)] if only.key == only.engine && only.dp_rank == 0)
 }
 
-/// Check one stated row by its own rule, over what its write expects to
-/// stand under its URL. Nothing is written. The row's event signal is
-/// stated here, over the facts its callback states ([`asks_events`]).
+/// The row a write expects to stand under `url`, read once for the row's
+/// rule.
+fn standing_under(
+    store: &MemoryStore,
+    expect: Expect,
+    url: &str,
+) -> Result<Option<WorkerRow>, Refused> {
+    Ok(match expect {
+        Expect::Seen(seen) => Some(seen_row(store, url, seen)?),
+        Expect::Nothing | Expect::Anything => store.by_key(url),
+    })
+}
+
+/// Check one stated row by its own rule, over the row its write expects to
+/// stand under its URL ([`standing_under`]). Nothing is written. The row's
+/// event signal is stated here, over the facts its callback states
+/// ([`asks_events`]).
 fn ready_row(
     turn: &impl Turn,
     maker: &Maker,
     expect: Expect,
     Stated { url, state }: &Stated<'_>,
+    standing: Option<WorkerRow>,
 ) -> Result<Ready, Refused> {
     let store = turn.store();
-    let standing = match expect {
-        Expect::Seen(seen) => Some(seen_row(store, url, seen)?),
-        Expect::Nothing | Expect::Anything => store.by_key(url),
-    };
-    // An add changes no standing row, so it asks no maker and states no
-    // fact: its refusal is the same whoever made the row.
-    if expect == Expect::Nothing && standing.is_some() {
-        return Err(Refused::Stands);
-    }
     if let Some(row) = &standing {
-        made_by(row, maker)?;
+        // An add of several rows asks no maker here. What it meets is
+        // judged over its rows together, and its refusal is the same
+        // whoever made the row ([`same_add`]).
+        if expect != Expect::Nothing {
+            made_by(row, maker)?;
+        }
         // A draining row is leaving. Laid over, it would take the
         // URL's next life and its removal would leave the worker: the
         // removal wins over a replacement.
@@ -384,8 +406,39 @@ fn ready_row(
     Ok((facts, laid))
 }
 
+/// What an add meets, over the rows it states. An add writes no row that
+/// stands, and one standing is its own: a lead lost between two rows leaves
+/// the rows written before it, and the same add tried again lays the rest.
+/// It is the same add where every standing row is its maker's and would
+/// answer unmoved, and a row is left to write. An engine that stands whole,
+/// another maker's row and a row whose facts differ refuse it, the same
+/// whoever made the row.
+///
+/// The rule reads what stands and nothing of a first attempt, so it holds
+/// at the next leader's door too.
+fn same_add(store: &MemoryStore, maker: &Maker, ready: &[Ready]) -> Result<(), Refused> {
+    let mut writes = false;
+    for (_, laid) in ready {
+        let Some((id, laid)) = laid else {
+            writes = true;
+            continue;
+        };
+        let own = store.get(*id).is_some_and(|row| row.made_by(maker).is_ok());
+        if !own || *laid != Laid::Unmoved {
+            return Err(Refused::Stands);
+        }
+    }
+    if writes {
+        Ok(())
+    } else {
+        Err(Refused::Stands)
+    }
+}
+
 /// Lay one row by its own rule alone: the write of [`Membership::found`].
-/// No rule of the engine's other rows is held and no row leaves.
+/// No rule of the engine's other rows is held and no row leaves. One row
+/// has no rest to lay, so an add of it is refused by any row that stands,
+/// before a fact is stated and whoever made the row.
 pub(crate) fn lay_one(
     turn: &impl Turn,
     maker: &Maker,
@@ -393,7 +446,11 @@ pub(crate) fn lay_one(
     url: &str,
     state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
 ) -> Result<Wrote, Refused> {
-    let (facts, laid) = ready_row(turn, maker, expect, &Stated { url, state })?;
+    let standing = standing_under(turn.store(), expect, url)?;
+    if expect == Expect::Nothing && standing.is_some() {
+        return Err(Refused::Stands);
+    }
+    let (facts, laid) = ready_row(turn, maker, expect, &Stated { url, state }, standing)?;
     turn.check_term()?;
     write_row(turn, maker, facts, laid)
 }
@@ -425,17 +482,29 @@ pub(crate) fn lay(
         };
         return lay_one(turn, maker, expect, row.url, row.state).map(|wrote| vec![wrote]);
     }
-    let mut ready = Vec::with_capacity(rows.len());
+    let store = turn.store();
+    let mut standing = Vec::with_capacity(rows.len());
     for row in rows {
-        ready.push(ready_row(turn, maker, expect, row)?);
+        standing.push(standing_under(store, expect, row.url)?);
+    }
+    // An add with no row left to write is refused before a fact is stated,
+    // whoever made the rows that stand.
+    if expect == Expect::Nothing && standing.iter().all(Option::is_some) {
+        return Err(Refused::Stands);
+    }
+    let mut ready = Vec::with_capacity(rows.len());
+    for (row, standing) in rows.iter().zip(standing) {
+        ready.push(ready_row(turn, maker, expect, row, standing)?);
     }
     lay_ready(turn, maker, expect == Expect::Nothing, ready)
 }
 
 /// The group's rule over the rows one registration states, then the rows
 /// that leave and the writes. A door that states its rows by a rule of its
-/// own enters here, behind that rule: `adds` says the registration expects
-/// no row of the engine to stand.
+/// own enters here, behind that rule: `adds` says the registration is an
+/// add, which meets the rows that stand by the add's rule ([`same_add`])
+/// and retires none. Such a door hands an add's standing row in with what
+/// laying it would make, and asks its maker of no row.
 pub(crate) fn lay_ready(
     turn: &impl Turn,
     maker: &Maker,
@@ -449,6 +518,9 @@ pub(crate) fn lay_ready(
             why: "a registration states at least one row",
         }));
     };
+    if adds {
+        same_add(store, maker, &ready)?;
+    }
     // The engine is the one the first row states. The others are held to
     // it below, and the store is asked by it.
     let engine = first.engine.as_str();
@@ -1301,6 +1373,16 @@ pub(super) mod tests {
         };
         let low = one(&ranks[0], Expect::Nothing);
         assert!(matches!(low, Ok(Wrote::Registered(_))), "{low:?}");
+        // An add of the row again is refused before a fact is stated,
+        // whoever made the row: one row has no rest to lay.
+        let unstated = |_: Option<&WorkerFacts>| -> WorkerFacts { panic!("no fact is stated") };
+        let pool = Maker::provider("pool", "private/key").expect("a maker");
+        for maker in [&Maker::Control, &pool] {
+            assert_eq!(
+                door.found(maker, Expect::Nothing, &ranks[0].key, &unstated),
+                Err(Refused::Stands)
+            );
+        }
         // The rows write holds the engine to its width where one rank stands.
         let epoch = store.epoch();
         assert!(matches!(
@@ -1334,6 +1416,73 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn an_add_tried_again_lays_the_ranks_its_first_attempt_left() {
+        check_same_add(local_door).expect("the same add");
+    }
+
+    /// The rows a lost lead leaves, then the same add: the rank that stands
+    /// answers unmoved under its id and the others are registered. With
+    /// every rank standing the engine is whole, and the add is refused.
+    fn check_same_add(open: Open) -> Result<(), &'static str> {
+        let (store, door) = open();
+        let three = ranked(3);
+        let first = door
+            .found(&Maker::Control, Expect::Nothing, &three[0].key, &|_| {
+                three[0].clone()
+            })
+            .map_err(|_| "the first rank alone")?;
+        let add = || find_rows_over(&*door, &Maker::Control, Expect::Nothing, &three);
+        let wrote = add().map_err(|_| "the same add")?;
+        let [Wrote::Unmoved(stood), Wrote::Registered(_), Wrote::Registered(_)] = wrote.as_slice()
+        else {
+            return Err("one rank unmoved and two registered");
+        };
+        assert_eq!(first, Wrote::Registered(*stood));
+        assert_eq!(store.snapshot().1.len(), 3);
+        let epoch = store.epoch();
+        assert_eq!(add(), Err(Refused::Stands));
+        assert_eq!(store.epoch(), epoch);
+        Ok(())
+    }
+
+    #[test]
+    fn an_add_over_a_standing_rank_that_is_not_its_own_writes_nothing() {
+        check_add_not_its_own(local_door).expect("each add refused");
+    }
+
+    /// An add lays the rest by what stands alone. A standing rank whose
+    /// facts differ, a rank another maker wrote and a rank past the stated
+    /// width each refuse it whole as a row that stands, and nothing is
+    /// written.
+    fn check_add_not_its_own(open: Open) -> Result<(), &'static str> {
+        let (store, door) = open();
+        let three = ranked(3);
+        door.found(&Maker::Control, Expect::Nothing, &three[2].key, &|_| {
+            three[2].clone()
+        })
+        .map_err(|_| "the last rank alone")?;
+        let before = store.snapshot();
+        let refused = |maker: &Maker, facts: &[WorkerFacts]| {
+            let add = find_rows_over(&*door, maker, Expect::Nothing, facts);
+            assert_eq!(add, Err(Refused::Stands));
+            assert_eq!(store.snapshot(), before);
+        };
+
+        // The add states a label the standing rank does not.
+        let mut labelled = three.clone();
+        for facts in &mut labelled {
+            facts.labels.insert("tier".to_owned(), "gold".to_owned());
+        }
+        refused(&Maker::Control, &labelled);
+        // Another maker states the same rows.
+        let provider = Maker::provider("pool", "private/key").map_err(|_| "the provider")?;
+        refused(&provider, &three);
+        // The standing rank is past the width the add states.
+        refused(&Maker::Control, &ranked(2));
+        Ok(())
+    }
+
+    #[test]
     fn no_row_stated_is_refused() {
         check_empty(local_door);
     }
@@ -1357,6 +1506,8 @@ pub(super) mod tests {
         check_whole_row(open)?;
         check_other_maker(open)?;
         check_invalid_ranks(open);
+        check_same_add(open)?;
+        check_add_not_its_own(open)?;
         let (store, door) = open();
         check_unchanged(&store, &*door)?;
         check_empty(open);
@@ -1449,11 +1600,11 @@ pub(super) mod tests {
         }
     }
 
-    /// An add registers an absent URL, and a standing row refuses it before
-    /// a fact is stated, whoever made the row. A replacement is laid over
-    /// the row its asker saw by the rule every registration takes, and is
-    /// refused where that row moved or left. An add of ranks is whole or
-    /// not at all.
+    /// An add registers an absent URL. Where every row it states stands it
+    /// is refused before a fact is stated, whoever made the rows. A
+    /// replacement is laid over the row its asker saw by the rule every
+    /// registration takes, and is refused where that row moved or left. An
+    /// add of ranks over a standing rank that differs writes no rank.
     pub(crate) fn check_expectations(open: Open) {
         let (store, door) = open();
         let control = Maker::Control;
@@ -1545,10 +1696,14 @@ pub(super) mod tests {
         );
         assert_eq!(store.by_key(URL), None);
 
-        // The second of two ranks stands: the add writes neither.
+        // The second of two ranks stands with another label: the add
+        // writes neither.
         let (store, door) = open();
         let two = ranked(2);
-        store.upsert(two[1].clone());
+        store.upsert(WorkerFacts {
+            labels: [("tier".to_owned(), "gold".to_owned())].into(),
+            ..two[1].clone()
+        });
         let epoch = store.epoch();
         assert_eq!(
             find_rows_over(&*door, &control, Expect::Nothing, &two),
@@ -2150,6 +2305,14 @@ pub(super) mod tests {
     }
 
     fn lay_under(turn: &TermFor<'_>, facts: &[WorkerFacts]) -> Result<Vec<Wrote>, Refused> {
+        lay_as(turn, Expect::Anything, facts)
+    }
+
+    fn lay_as(
+        turn: &TermFor<'_>,
+        expect: Expect,
+        facts: &[WorkerFacts],
+    ) -> Result<Vec<Wrote>, Refused> {
         let states: Vec<_> = facts
             .iter()
             .map(|facts| move |_: Option<&WorkerFacts>| facts.clone())
@@ -2162,7 +2325,7 @@ pub(super) mod tests {
                 state,
             })
             .collect();
-        lay(turn, &Maker::Control, Expect::Anything, &rows)
+        lay(turn, &Maker::Control, expect, &rows)
     }
 
     /// The term is asked ahead of every write, whatever the write makes of
@@ -2208,6 +2371,37 @@ pub(super) mod tests {
             Err(Refused::NotLeading("the term moved".to_owned()))
         );
         assert_eq!(store.snapshot(), (0, Vec::new()));
+    }
+
+    /// A lead lost behind an add's first row leaves that row. The same add
+    /// under a term that holds lays the rest, and the row that stands
+    /// answers unmoved.
+    #[test]
+    fn an_add_that_lost_its_lead_lays_the_rest_when_it_is_tried_again() {
+        let (store, _) = door();
+        let three = ranked(3);
+        let add = |checks| {
+            let turn = TermFor(&store, std::cell::Cell::new(checks));
+            lay_as(&turn, Expect::Nothing, &three)
+        };
+        assert_eq!(
+            add(1),
+            Err(Refused::NotLeading("the term moved".to_owned()))
+        );
+        assert_eq!(store.snapshot().1.len(), 1);
+        let wrote = add(3);
+        assert!(
+            matches!(
+                wrote.as_deref(),
+                Ok([
+                    Wrote::Unmoved(_),
+                    Wrote::Registered(_),
+                    Wrote::Registered(_)
+                ])
+            ),
+            "{wrote:?}"
+        );
+        assert_eq!(store.snapshot().1.len(), 3);
     }
 
     #[test]
