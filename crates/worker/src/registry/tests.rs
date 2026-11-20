@@ -1506,6 +1506,35 @@ fn test_model_index_fast_lookup() {
     assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
 }
 
+/// The model index is iterated on request paths and the map's iterator pays
+/// for every shard, so its shard count is fixed: not the library's default
+/// of four shards a CPU.
+#[test]
+fn the_model_index_keeps_a_fixed_shard_count() {
+    use dashmap::Map as _;
+
+    let registry = WorkerRegistry::new();
+    assert_eq!(
+        registry.model_index._shard_count(),
+        16,
+        "the model index's shard count follows the CPUs"
+    );
+}
+
+/// The per-model retry overrides are scanned on a request path, as the model
+/// index is counted on one, so their map keeps the same fixed shard count.
+#[test]
+fn the_retry_override_map_keeps_a_fixed_shard_count() {
+    use dashmap::Map as _;
+
+    let registry = WorkerRegistry::new();
+    assert_eq!(
+        registry.model_retry_configs._shard_count(),
+        16,
+        "the retry override map's shard count follows the CPUs"
+    );
+}
+
 // Health-checker integration tests moved to health/manager.rs along with
 // the loop itself. The registry is now a pure collection — see
 // `health::manager::WorkerManager` tests.

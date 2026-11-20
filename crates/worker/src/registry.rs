@@ -140,6 +140,15 @@ struct GlobalRoutingSnapshot<G> {
 /// and node maps the same way.
 type ModelIndex<G> = Arc<DashMap<String, Arc<G>, FxBuildHasher>>;
 
+/// Shards of the maps that hold one entry a model and are iterated on
+/// request paths, on any host: the model index
+/// ([`WorkerRegistry::model_count`]) and the per-model retry overrides
+/// ([`WorkerRegistry::any_model_retry_override_enables_retries`]). Iterating
+/// a map costs one lock and one allocation a shard, whether the shard holds
+/// an entry or not: the count must not follow the CPUs the process sees, as
+/// the library's default does (four shards a CPU).
+const MODEL_MAP_SHARDS: usize = 16;
+
 /// Model alias to canonical model ID.
 type ModelAliasIndex = Arc<DashMap<String, Arc<str>, FxBuildHasher>>;
 
@@ -298,7 +307,10 @@ impl<G: Generation> WorkerRegistry<G> {
         let empty_generation = Arc::new(G::of(Arc::from(Self::EMPTY_WORKERS)));
         Self {
             workers: Arc::new(DashMap::new()),
-            model_index: Arc::new(DashMap::with_hasher(FxBuildHasher)),
+            model_index: Arc::new(DashMap::with_hasher_and_shard_amount(
+                FxBuildHasher,
+                MODEL_MAP_SHARDS,
+            )),
             global_routing_snapshot: ArcSwap::from_pointee(GlobalRoutingSnapshot {
                 epoch: 0,
                 snapshot: Arc::clone(&empty_generation),
@@ -317,7 +329,10 @@ impl<G: Generation> WorkerRegistry<G> {
             model_overloaded: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             overload_shed: Arc::new(AtomicBool::new(false)),
             overload_transitions: Arc::new(parking_lot::Mutex::new(())),
-            model_retry_configs: Arc::new(DashMap::with_hasher(FxBuildHasher)),
+            model_retry_configs: Arc::new(DashMap::with_hasher_and_shard_amount(
+                FxBuildHasher,
+                MODEL_MAP_SHARDS,
+            )),
             worker_origins: Arc::new(DashMap::new()),
             import_records: Arc::new(DashMap::new()),
             // Sized for fleet-scale bursts (startup registration, probe
