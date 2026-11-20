@@ -1015,7 +1015,7 @@ impl AppContextBuilder {
             self.policy_feed = Some(feed);
             self.policy_host = Some(Arc::new(host));
             self.policy_follower = follower.map(|follower| Arc::new(Mutex::new(Some(follower))));
-            self.policy_operators = Some(Arc::new(Operators::new(door)));
+            self.policy_operators = Some(Arc::new(Operators::new(Arc::clone(&store), door)));
             self.policy_store = Some(store);
         }
         Ok(self)
