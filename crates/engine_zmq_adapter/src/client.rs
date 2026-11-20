@@ -1720,22 +1720,34 @@ impl ZmqEngineClient {
 
     /// Per-rank load from the piggybacked scheduler stats (SMG's DP routing
     /// signal), in the same shape as the gRPC `GetLoads` response. A rank that
-    /// has not reported yet has no entry. A TokenSpeed entry is numbered by
-    /// the rank a pin reaches ([`RankIndices`]), which is the engine's index
-    /// only when its ranks dialled in at indices 0..n in rank order.
+    /// has not reported yet has no entry. An entry is numbered by its
+    /// engine's index.
     pub fn get_loads(&self) -> WorkerLoadResponse {
-        let loads: Vec<SchedulerLoadSnapshot> = match &self.backend {
-            ZmqBackend::TokenSpeed(client) => {
-                loads_by_rank(&RankIndices::of(client.engines()), |index| {
-                    self.rank_load(index)
-                })
-            }
-            ZmqBackend::Vllm(_) | ZmqBackend::Sglang(_) | ZmqBackend::Trtllm(_) => self
-                .engines()
-                .iter()
-                .filter_map(|engine| self.rank_load(engine.engine_id.engine_index()?))
-                .collect(),
+        let loads: Vec<SchedulerLoadSnapshot> = self
+            .engines()
+            .iter()
+            .filter_map(|engine| self.rank_load(engine.engine_id.engine_index()?))
+            .collect();
+        WorkerLoadResponse {
+            timestamp: String::new(),
+            dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
+            loads,
+            ..Default::default()
+        }
+    }
+
+    /// [`get_loads`](Self::get_loads) with each entry numbered by the rank a
+    /// pin reaches, for a reader that scopes the answer to rank workers. A
+    /// TokenSpeed rank is its engine's index only when the ranks dialled in
+    /// at indices 0..n in rank order ([`RankIndices`]); the other dialects
+    /// place a pin by index.
+    pub fn get_loads_by_rank(&self) -> WorkerLoadResponse {
+        let ZmqBackend::TokenSpeed(client) = &self.backend else {
+            return self.get_loads();
         };
+        let loads = loads_by_rank(&RankIndices::of(client.engines()), |index| {
+            self.rank_load(index)
+        });
         WorkerLoadResponse {
             timestamp: String::new(),
             dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),

@@ -695,12 +695,6 @@ fn attention_dp_width(labels: &HashMap<String, String>, size: usize) -> Option<u
         .then_some(size as u64)
 }
 
-/// Ranks to register for a dp-aware worker. A width above one expands into
-/// one dp-annotated worker per rank. A width-1 advertisement (older
-/// servicers emit it as a capability signal) and a missing one both
-/// register a plain worker: there is no placement to choose, and pinning
-/// rank 0 anyway still alters engine-side scheduling. The DP read already
-/// logged the degradation for the missing-label case.
 /// The refusal of a create for an address that already has a worker.
 fn already_exists(url: &str) -> WorkflowError {
     WorkflowError::StepFailed {
@@ -709,6 +703,12 @@ fn already_exists(url: &str) -> WorkflowError {
     }
 }
 
+/// Ranks to register for a dp-aware worker. A width above one expands into
+/// one dp-annotated worker per rank. A width-1 advertisement (older
+/// servicers emit it as a capability signal) and a missing one both
+/// register a plain worker: there is no placement to choose, and pinning
+/// rank 0 anyway still alters engine-side scheduling. The DP read already
+/// logged the degradation for the missing-label case.
 fn dp_rank_expansion(dp_info: Option<&DpInfo>) -> Vec<Option<(usize, usize)>> {
     match dp_info {
         Some(dp_info) if dp_info.dp_size > 1 => (0..dp_info.dp_size)

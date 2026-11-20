@@ -420,7 +420,7 @@ impl EngineConnection for BackendClient {
     async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.get_loads().await,
-            Self::Zmq(client) => Ok(client.get_loads()),
+            Self::Zmq(client) => Ok(client.get_loads_by_rank()),
         }
     }
 
