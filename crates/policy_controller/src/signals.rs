@@ -188,18 +188,6 @@ impl SignalColumn {
         self.across_ranks
     }
 
-    /// Whether this column continues `earlier`, a column of another
-    /// document: the same name, under the same unit and the same
-    /// reduction. A value made under one then stands under the other: the
-    /// store carries its cells, and a source the statements it keeps. The
-    /// maximum age and the column's place are no part of it: a changed age
-    /// reads the same value under the new age.
-    pub(crate) fn continues(&self, earlier: &Self) -> bool {
-        self.name == earlier.name
-            && self.unit == earlier.unit
-            && self.across_ranks == earlier.across_ranks
-    }
-
     /// The row's value at this decision: `None` where the facts hand no
     /// cells, where the row has no value, and where the value is older
     /// than the signal's maximum age. A value at exactly that age is read.

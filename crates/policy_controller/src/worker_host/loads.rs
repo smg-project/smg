@@ -84,11 +84,13 @@ struct KeptMember {
 /// that worker's values are made over what each rank last stated, each
 /// statement under its own sample instant ([`RankValues`]). The statements
 /// are kept in the worker's entry, and go with it at a forget, at a reset
-/// and when another object takes its address. What a rank stated before
-/// its entry kept it is read from the report again, under that rank's own
-/// record as the store holds its row: a worker's first records list one
-/// rank. A polled answer is one sample of every rank, and states them
-/// all, though its row is passed over. A worker of one rank keeps none.
+/// and when another object takes its address. So do they at a new
+/// document. What a rank stated before the entry kept it is read from the
+/// report again, under that rank's own record as the store holds its row:
+/// a worker's first records list one rank. A poll's row in a rank's place
+/// dates no entry. A polled answer is one sample of every rank, and states
+/// them all, though its row is passed over. A worker of one rank keeps
+/// none.
 pub struct LoadAdapter<G, S: ?Sized> {
     objects: Arc<Objects<G>>,
     store: Arc<S>,
@@ -321,7 +323,10 @@ where
         if let Some(keeper) = self.keeper(worker) {
             let heard = |other: i32| {
                 let other = u16::try_from(other).ok()?;
-                Some(self.store.load(member.row, other)?.sampled_at)
+                let sample = self.store.load(member.row, other)?;
+                // A poll's row stands at the member's own rank, whatever
+                // ranks its answer listed: it is no record of that rank.
+                matches!(sample.source, LoadSource::Stream).then_some(sample.sampled_at)
             };
             let of = ReportOf::OneRank {
                 rank: i32::from(rank),
@@ -1312,17 +1317,22 @@ mod tests {
     /// its sample instant, or none.
     type Held = Vec<Option<(f64, u64)>>;
 
+    /// What [`declare`] declares: the depth in items and the fixed count
+    /// of used tokens.
+    const DECLARED: [(&str, &str); 2] = [("depth", "items"), ("kv_tokens_used", "tokens")];
+
     /// The `random` preset as the next generation, declaring the depth in
     /// items and the fixed count of used tokens, applied to the store.
     fn declare(replica: &Replica) {
-        declare_as(replica, 2);
+        declare_as(replica, 2, &DECLARED);
     }
 
-    /// As [`declare`], as the generation `generation`.
-    fn declare_as(replica: &Replica, generation: u64) {
+    /// As [`declare`], as the generation `generation` and declaring
+    /// `signals`, each by its name and unit.
+    fn declare_as(replica: &Replica, generation: u64, signals: &[(&str, &str)]) {
         let mut document = PolicySpec::preset("random").expect("a preset of this build");
         document.generation = generation;
-        for (name, unit) in [("depth", "items"), ("kv_tokens_used", "tokens")] {
+        for &(name, unit) in signals {
             let spec = SignalSpec {
                 unit: unit.to_owned(),
                 max_age_ms: None,
@@ -1631,12 +1641,34 @@ mod tests {
         assert_eq!(depth(&replica, id), Some((101.0, first)));
     }
 
-    /// A document that declares the same signals keeps the statements, as
-    /// the store carries their cells. Rank 1's last record left the depth
-    /// out, so no report states it again: its statement still counts
-    /// behind the new document.
+    /// A new document ends the statements, though it declares the same
+    /// signals. The next record reads each rank's latest record again,
+    /// under that rank's own instant, so the row's value moves at once.
     #[test]
-    fn a_new_document_of_the_same_signals_keeps_the_statements() {
+    fn a_new_document_reads_each_ranks_latest_record_again() {
+        let replica = Replica::new();
+        let (id, worker) = replica.add(facts(URL));
+        declare(&replica);
+        let adapter = replica.lead();
+        let start = Instant::now() + Duration::from_secs(1);
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let both = file(&[(0, Some(1.0)), (1, Some(2.0))]);
+        adapter.record(&worker, 1, &both, at(0), at(0));
+        adapter.record(&worker, 0, &both, at(10), at(10));
+        assert_eq!(depth(&replica, id).map(|(value, _)| value), Some(3.0));
+        declare_as(&replica, 3, &DECLARED);
+        let moved = file(&[(0, Some(4.0)), (1, Some(2.0))]);
+        adapter.record(&worker, 0, &moved, at(30), at(30));
+        let first = replica.store.memory.micros(at(0));
+        assert_eq!(depth(&replica, id), Some((6.0, first)));
+    }
+
+    /// A signal removed and declared again starts with no value, as the
+    /// store's cells do: nothing a rank stated passes the document that
+    /// stood between. A rank whose latest record leaves the name out
+    /// counts when it states the name again.
+    #[test]
+    fn a_signal_declared_again_starts_from_the_latest_records() {
         let replica = Replica::new();
         let (id, worker) = replica.add(facts(URL));
         declare(&replica);
@@ -1649,10 +1681,46 @@ mod tests {
         let bare = file(&[(0, Some(1.0)), (1, None)]);
         adapter.record(&worker, 1, &bare, at(20), at(20));
         assert_eq!(depth(&replica, id).map(|(value, _)| value), Some(3.0));
-        declare_as(&replica, 3);
+        // Two documents between two reports: the depth goes, and comes
+        // back as it was declared.
+        declare_as(&replica, 3, &DECLARED[1..]);
+        declare_as(&replica, 4, &DECLARED);
         let moved = file(&[(0, Some(4.0)), (1, None)]);
         adapter.record(&worker, 0, &moved, at(30), at(30));
-        assert_eq!(depth(&replica, id).map(|(value, _)| value), Some(6.0));
+        assert_eq!(depth(&replica, id), None);
+        let both = file(&[(0, Some(4.0)), (1, Some(2.0))]);
+        adapter.record(&worker, 1, &both, at(40), at(40));
+        adapter.record(&worker, 0, &both, at(50), at(50));
+        let restated = replica.store.memory.micros(at(40));
+        assert_eq!(depth(&replica, id), Some((6.0, restated)));
+    }
+
+    /// A poll's row stands in the place of a silent rank's sample at the
+    /// row's own rank, though its answer leaves that rank out and the
+    /// rank's pushed entry stays on file. Such a row is no record of the
+    /// rank: its entry is not dated by the poll, and no old value reads
+    /// fresh.
+    #[test]
+    fn a_polls_row_in_a_ranks_place_dates_no_entry() {
+        let replica = Replica::new();
+        let (id, worker) = replica.add(facts(URL));
+        declare(&replica);
+        let adapter = replica.lead();
+        let start = Instant::now() + Duration::from_secs(1);
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let alone = file(&[(0, Some(100.0))]);
+        adapter.record(&worker, 0, &alone, at(0), at(0));
+        // An answer that lists rank 1 alone, with no depth: its row takes
+        // the place of rank 0's sample.
+        let answer = file(&[(1, None)]);
+        adapter.report(&[polled(&worker, Some(&answer))], at(9_000));
+        let both = file(&[(0, Some(100.0)), (1, Some(1.0))]);
+        adapter.record(&worker, 1, &both, at(10_000), at(10_000));
+        let bare = file(&[(0, None), (1, Some(1.0))]);
+        adapter.record(&worker, 0, &bare, at(11_000), at(11_000));
+        // The row holds what rank 0 stated alone, as old as it is.
+        let first = replica.store.memory.micros(at(0));
+        assert_eq!(depth(&replica, id), Some((100.0, first)));
     }
 
     /// A rank worker's report is one rank's, by a record and by a poll:

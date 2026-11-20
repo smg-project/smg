@@ -294,9 +294,11 @@ fn joined(across: AcrossRanks, so_far: f64, next: f64) -> f64 {
 ///
 /// What is kept is bounded by the declared signals times the report's
 /// ranks. A rank that a report of several ranks lists no more takes its
-/// statements with it. Under another document a statement stands where a
-/// column continues its own, of the same name, unit and reduction, as the
-/// store carries its cell. It ends where none does.
+/// statements with it. A statement stands for the column it was read
+/// under: a list of columns handed anew ends them all, though it declares
+/// the same signals, and each rank's entry is read from the report again.
+/// A name a rank's latest record left out then counts when the rank states
+/// it again.
 #[derive(Debug, Default)]
 pub struct RankValues {
     /// The columns the statements were read under.
@@ -339,9 +341,9 @@ pub enum ReportOf<'a> {
         /// The rank the record came from.
         rank: i32,
         /// When another rank's last record was sampled, by its rank:
-        /// `None` where the source holds no record of it. A keeper asks
-        /// it where that rank's entry states a name it holds no statement
-        /// of.
+        /// `None` where the source holds no record of it. A poll's row in
+        /// a rank's place is no record of the rank. A keeper asks it where
+        /// that rank's entry states a name it holds no statement of.
         heard: &'a dyn Fn(i32) -> Option<Instant>,
     },
 }
@@ -539,34 +541,18 @@ impl RankValues {
     }
 
     /// The statements under `columns`, the list of the document in force.
-    /// Where the list is another than the one they were read under, each
-    /// statement moves to the column that continues its own
-    /// ([`SignalColumn::continues`]), and ends where none does.
+    /// A statement stands for the column it was read under: another list
+    /// ends them all, though it declares the same signals, and the next
+    /// record reads the other ranks' entries again. No statement so
+    /// passes a document that stood between two reports.
     fn read_under(&mut self, columns: &Arc<[SignalColumn]>) {
         let same = |stood: &Arc<[SignalColumn]>| Arc::ptr_eq(stood, columns);
         if self.columns.as_ref().is_some_and(same) {
             return;
         }
-        // Another list may declare a name the entries state and no record
-        // was read for.
+        self.ranks.clear();
         self.settled = false;
-        let Some(stood) = self.columns.replace(Arc::clone(columns)) else {
-            return;
-        };
-        let carried = |stated: &mut Stated| {
-            let Some(under) = stood.get(stated.column) else {
-                return false;
-            };
-            let next = column_of(columns, under.name());
-            let next = next.filter(|&at| columns.get(at).is_some_and(|next| next.continues(under)));
-            next.is_some_and(|at| {
-                stated.column = at;
-                true
-            })
-        };
-        for rank in &mut self.ranks {
-            rank.stated.retain_mut(carried);
-        }
+        self.columns = Some(Arc::clone(columns));
     }
 
     /// Whether a statement of `rank` under the name at `column` is kept.
@@ -1188,12 +1174,12 @@ mod tests {
         assert_eq!(whole, [value("depth", "items", 3.0, 980)]);
     }
 
-    /// Under another document a statement stands where a column continues
-    /// its own: the same name, unit and reduction, at whatever place the
-    /// new list gives it. Another reduction or another unit is another
-    /// signal, and the statement ends.
+    /// A statement stands for the column it was read under. Another list
+    /// of columns ends them all, though it declares the same signal, and
+    /// the next record reads each rank's entry again: a rank's latest
+    /// record under its own instant, where the source holds it.
     #[test]
-    fn under_another_document_a_statement_stands_where_its_column_continues() {
+    fn another_list_of_columns_ends_the_statements_and_the_entries_are_read_again() {
         let start = Instant::now();
         let at = |ms: u64| start + Duration::from_millis(ms);
         let now = at(1_000);
@@ -1202,29 +1188,30 @@ mod tests {
         let both = report(vec![ranked(0, depth(1.0)), ranked(1, depth(2.0))]);
         kept(&mut keeper, &both, Some(1), &first, (at(0), now));
         kept(&mut keeper, &both, Some(0), &first, (at(0), now));
-        // The same signal behind a name that sorts ahead of it. Rank 1's
-        // record left the depth out: its statement follows its column, and
-        // rank 0's next record counts it.
-        let wider: Arc<[SignalColumn]> = columns(&[
-            ("backlog", "items", AcrossRanks::Sum),
-            ("depth", "items", AcrossRanks::Sum),
-        ])
-        .into();
-        let moved = report(vec![ranked(0, depth(4.0)), ranked(1, Vec::new())]);
-        let carried = kept(&mut keeper, &moved, Some(0), &wider, (at(10), now));
-        assert_eq!(carried, [value("depth", "items", 6.0, 1_000)]);
-        // The depth under another reduction is another signal: what the
-        // ranks stated ends, and the row has no value until each states
-        // again.
-        let largest: Arc<[SignalColumn]> = columns(&[("depth", "items", AcrossRanks::Max)]).into();
-        let ended = kept(&mut keeper, &moved, Some(0), &largest, (at(20), now));
+        // The source holds no record of rank 1: rank 0's record alone
+        // makes no value under the new list.
+        let again = depth_alone();
+        let ended = kept(&mut keeper, &both, Some(0), &again, (at(40), now));
         assert!(ended.is_empty());
-        let restated = kept(&mut keeper, &both, Some(1), &largest, (at(30), now));
-        assert_eq!(restated, [value("depth", "items", 4.0, 980)]);
-        // Another unit ends them as well.
-        let timed: Arc<[SignalColumn]> = columns(&[("depth", "ms", AcrossRanks::Max)]).into();
-        let ended = kept(&mut keeper, &moved, Some(0), &timed, (at(40), now));
-        assert!(ended.is_empty());
+        let restated = kept(&mut keeper, &both, Some(1), &again, (at(50), now));
+        assert_eq!(restated, [value("depth", "items", 3.0, 960)]);
+        // The source heard rank 1 at the start: under another list its
+        // entry is read again, as old as its record.
+        let third = depth_alone();
+        let heard = |rank: i32| (rank == 1).then(|| at(0));
+        let record = ReportOf::OneRank {
+            rank: 0,
+            heard: &heard,
+        };
+        let moved = report(vec![ranked(0, depth(4.0)), ranked(1, depth(2.0))]);
+        let read = kept_of(&mut keeper, &moved, record, &third, (at(60), now));
+        assert_eq!(read, [value("depth", "items", 6.0, 1_000)]);
+        // A name the entry leaves out is not read: what rank 1 stated
+        // under the last list is gone with that list.
+        let fourth = depth_alone();
+        let bare = report(vec![ranked(0, depth(4.0)), ranked(1, Vec::new())]);
+        let gone = kept_of(&mut keeper, &bare, record, &fourth, (at(70), now));
+        assert!(gone.is_empty());
     }
 
     /// A worker's first records list one rank, and keep nothing. At the

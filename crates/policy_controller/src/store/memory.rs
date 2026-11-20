@@ -2639,7 +2639,8 @@ fn continued(columns: &[SignalColumn], made: &SignalColumn) -> Result<usize, Tak
     let at = columns
         .binary_search_by(|column| column.name().cmp(made.name()))
         .map_err(|_| Taken::Undeclared)?;
-    if columns[at].continues(made) {
+    let column = &columns[at];
+    if column.unit() == made.unit() && column.across_ranks() == made.across_ranks() {
         Ok(at)
     } else {
         Err(Taken::Undeclared)
