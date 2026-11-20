@@ -22,7 +22,12 @@
 # scripts/tests/test_ci_rust_tests.py checks those filters against the
 # manifests). The gateway crate's integration test binaries are dealt
 # round-robin, by name, over GATEWAY_SHARDS shards; its unit tests, binaries
-# and doc tests are a shard of their own. The radix tree's differential fuzz
+# and doc tests are a shard of their own. Each of those shards runs its
+# binaries twice: on the classic policies, then with every test gateway
+# deciding through the policy controller (POLICY_CONTROLLER_LEG, a switch the
+# test harness reads when a test runs, so the second leg builds nothing). The
+# cases the second leg does not pass yet are listed with their reasons in
+# model_gateway/tests/policy_controller_leg.skip. The radix tree's differential fuzz
 # is the heaviest test in the workspace by far and runs alone, under its own
 # timeout.
 #
@@ -36,6 +41,11 @@ set -euo pipefail
 shopt -s inherit_errexit
 
 GATEWAY_SHARDS=3
+
+# The second leg of a gateway shard: the environment its invocation sets, and
+# the cases it leaves out.
+POLICY_CONTROLLER_LEG='SMG_TEST_POLICY_CONTROLLER=1'
+POLICY_CONTROLLER_LEG_SKIPS="$(dirname "${BASH_SOURCE[0]}")/../model_gateway/tests/policy_controller_leg.skip"
 
 # shard | path filter | extra setup (comma-separated: golden, ffmpeg, turbojpeg, postgres, wasm-fixtures, policy-guest, policy-import) | test step timeout (minutes)
 SHARDS='
@@ -140,7 +150,20 @@ test_selectors_except() {
     done
 }
 
-# The shard's cargo test invocations: "<cargo test arguments> [:: <test binary arguments>]".
+# `--exact --skip <case> ...` for the cases POLICY_CONTROLLER_LEG_SKIPS lists: a case a
+# line by its full name, and `#` to the end of a line is a comment. Under --exact a
+# skip leaves out the one case of that name and no case whose name holds it.
+policy_controller_leg_skips() {
+    local cases
+    cases=$(sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$POLICY_CONTROLLER_LEG_SKIPS")
+    printf -- '--exact'
+    printf '%s\n' "$cases" | awk 'NF { printf " --skip %s", $1 }'
+}
+
+# The shard's cargo test invocations:
+# "[<NAME>=<value> ...] <cargo test arguments> [:: <test binary arguments>]".
+# Leading NAME=value words are the invocation's environment. Such an invocation
+# runs binaries a line above it builds, so the build mode passes it over.
 commands_of() {
     local shard=$1
     case "$shard" in
@@ -153,10 +176,13 @@ commands_of() {
             echo "-p smg -p smg-test-harness --lib"
             echo "-p smg --doc" ;;
         gateway-[0-9]*)
-            local index=${shard#gateway-} selectors
+            local index=${shard#gateway-} selectors skips
             [ "$index" -ge 1 ] && [ "$index" -le "$GATEWAY_SHARDS" ] || { echo "no gateway shard $index" >&2; exit 2; }
             selectors=$(test_selectors smg "$index" "$GATEWAY_SHARDS")
-            echo "-p smg$selectors" ;;
+            echo "-p smg$selectors"
+            # The same binaries once more under the policy controller, less the listed cases.
+            skips=$(policy_controller_leg_skips)
+            echo "$POLICY_CONTROLLER_LEG -p smg$selectors :: $skips" ;;
         bindings)
             echo "-p smg-python -p smg-golang" ;;
         tokenizer)
@@ -209,7 +235,7 @@ commands_of() {
 }
 
 run_commands() {
-    local shard=$1 mode=$2 line cargo_args test_args commands status=0
+    local shard=$1 mode=$2 line cargo_args test_args env_args commands status=0
     # Assigned first: a process substitution would hide a failure of commands_of.
     commands=$(commands_of "$shard")
     while IFS= read -r line; do
@@ -217,9 +243,16 @@ run_commands() {
         cargo_args=${line%% :: *}
         test_args=
         [ "$line" != "$cargo_args" ] && test_args=${line#* :: }
+        env_args=
+        while [[ "$cargo_args" =~ ^([A-Z_][A-Z0-9_]*=[^[:space:]]*)[[:space:]]+(.*)$ ]]; do
+            env_args="$env_args ${BASH_REMATCH[1]}"
+            cargo_args=${BASH_REMATCH[2]}
+        done
         if [ "$mode" = build ]; then
             # Doc tests compile when they run; cargo refuses --doc with --no-run.
             case " $cargo_args " in *" --doc "*) continue ;; esac
+            # An invocation with an environment of its own runs binaries built above.
+            [ -z "$env_args" ] || continue
             # shellcheck disable=SC2086
             (set -x; cargo test $cargo_args --no-run)
         # A shard names several binaries per invocation and may run several
@@ -231,10 +264,10 @@ run_commands() {
         # when any binary did.
         elif [ -n "$test_args" ]; then
             # shellcheck disable=SC2086
-            (set -x; cargo test --no-fail-fast $cargo_args -- $test_args) || status=$?
+            (set -x; env $env_args cargo test --no-fail-fast $cargo_args -- $test_args) || status=$?
         else
             # shellcheck disable=SC2086
-            (set -x; cargo test --no-fail-fast $cargo_args) || status=$?
+            (set -x; env $env_args cargo test --no-fail-fast $cargo_args) || status=$?
         fi
     done <<< "$commands"
     return "$status"
@@ -352,7 +385,11 @@ for shard, cmds in commands.items():
     used = {m for c in cmds for m in re.findall(r"-p (\S+)", c)}
     if used != set(packages[shard]): problems.append(f"{shard}: commands test {sorted(used)} but the shard lists {sorted(packages[shard])}")
 # The gateway integration shards deal every test binary once; the radix shards likewise.
-dealt = Counter(t for s, cmds in commands.items() if re.fullmatch(r"gateway-\d+", s) for c in cmds for t in re.findall(r"--test (\S+)", c))
+# An invocation with an environment of its own is a shard second leg: it runs again what the first deals.
+second = re.compile(r"[A-Z_][A-Z0-9_]*=\S* ")
+dealt = Counter(t for s, cmds in commands.items() if re.fullmatch(r"gateway-\d+", s) for c in cmds if not second.match(c) for t in re.findall(r"--test (\S+)", c))
+again = Counter(t for s, cmds in commands.items() if re.fullmatch(r"gateway-\d+", s) for c in cmds if second.match(c) for t in re.findall(r"--test (\S+)", c))
+if again != dealt: problems.append(f"the second leg runs {sorted(again.elements())}, the first deals {sorted(dealt.elements())}")
 if dealt != Counter(gateway): problems.append(f"gateway test binaries dealt {sorted(dealt.elements())} != {sorted(gateway)}")
 if any(n != 1 for n in dealt.values()): problems.append("a gateway test binary is dealt twice")
 rdealt = Counter(t for s in ("kv", "radix-fuzz") for c in commands.get(s, []) for t in re.findall(r"--test (\S+)", c) if "smg-radix-tree" in c)

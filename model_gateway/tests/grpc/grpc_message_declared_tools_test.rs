@@ -127,10 +127,7 @@ async fn serve() -> Gateway {
             ..Default::default()
         })
         .build();
-    context
-        .worker_registry
-        .register(Arc::new(worker_entry))
-        .unwrap();
+    context.register_built(Arc::new(worker_entry)).unwrap();
     let router = RouterFactory::create_router(&context).await.unwrap();
     Gateway {
         router,

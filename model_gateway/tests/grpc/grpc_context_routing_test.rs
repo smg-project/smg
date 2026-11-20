@@ -167,10 +167,7 @@ async fn router(dir: &std::path::Path, engines: &[&Engine], pd: bool) -> Box<dyn
     config.health_check.disable_health_check = true;
     let context = common::create_test_context_with_tokenizer_registry(config, tokenizers).await;
     for engine in engines {
-        context
-            .worker_registry
-            .register(Arc::clone(&engine.worker))
-            .unwrap();
+        context.register_built(Arc::clone(&engine.worker)).unwrap();
     }
     RouterFactory::create_router(&context).await.unwrap()
 }

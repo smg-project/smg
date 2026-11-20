@@ -93,18 +93,17 @@ async fn app_for(upstream: &Upstream, runtime: RuntimeType) -> Router {
 
 async fn app_for_dispatch(upstream: &Upstream, runtime: RuntimeType, use_gateway: bool) -> Router {
     let ctx = create_test_app_context().await;
-    ctx.worker_registry
-        .register(Arc::new(
-            BasicWorkerBuilder::new(&upstream.url)
-                .runtime_type(runtime)
-                .model(ModelCard::new(MODEL).with_alias(ALIAS))
-                .health_config(openai_protocol::worker::HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .build(),
-        ))
-        .unwrap();
+    ctx.register_built(Arc::new(
+        BasicWorkerBuilder::new(&upstream.url)
+            .runtime_type(runtime)
+            .model(ModelCard::new(MODEL).with_alias(ALIAS))
+            .health_config(openai_protocol::worker::HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build(),
+    ))
+    .unwrap();
     let router = Arc::new(HttpRouter::new(&ctx).await.unwrap());
     if !use_gateway {
         return create_test_app_with_context(router, ctx);

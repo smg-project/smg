@@ -50,6 +50,7 @@ use smg_mesh::{
 };
 use smg_policy_controller::Catalog;
 use tokio::{signal, spawn};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
@@ -99,7 +100,7 @@ use crate::{
         logging::LoggingConfig, metrics, metrics::PrometheusConfig, metrics_server, otel_trace,
         runtime_metrics,
     },
-    policy_controller::{follower::Follower, operators},
+    policy_controller::{feed::CacheEvents, follower::Follower, operators},
     routers::{
         common::realtime::ws::RealtimeQueryParams,
         error as route_error,
@@ -1941,7 +1942,7 @@ async fn start_workflow_engines(
 
     // Initialize typed workflow engines. Where the gateway decides in its
     // own process, the worker workflows write at its store's door.
-    let engines = WorkflowEngines::with_feed(&config.router_config, app_context.door_feed());
+    let engines = WorkflowEngines::for_context(app_context);
 
     // Subscribe logging to all workflow engines
     engines.subscribe_all(Arc::new(LoggingSubscriber)).await;
@@ -2310,6 +2311,58 @@ fn serve_listeners(
     Ok((data_serving, admin_serving))
 }
 
+/// The loops that keep a gateway's workers, for as long as this is kept:
+/// the health checks, and under the policy controller's feed the store's
+/// publications and the workers' cache events. The start keeps it until the
+/// server stops. The fields drop in the order the start's own handles
+/// dropped: the cache events, the publications, then the health loop.
+#[must_use = "dropping it ends the loops"]
+pub struct WorkerLoops {
+    _cache_events: Option<CacheEvents>,
+    _publications: Option<AbortOnDropHandle<()>>,
+    _health: Option<WorkerManager>,
+}
+
+/// Start the loops that keep the workers of `app_context`, in the start's
+/// order: the health checks, the load monitor's event loop, then under the
+/// feed its publications and its cache events. The start calls it behind
+/// its start-up workers and its workflow engines, and so does a host that
+/// assembles a gateway by hand.
+pub fn start_worker_loops(app_context: &AppContext) -> WorkerLoops {
+    let health = start_worker_health_checks(app_context);
+
+    // WorkerMonitor subscribes to registry events. Starting its event
+    // loop here (after the synchronous worker population in
+    // Gateway::from_config) means the bootstrap reconcile
+    // captures every worker that exists at this point and the event
+    // task picks up everything registered afterwards.
+    if let Some(ref worker_monitor) = app_context.worker_monitor {
+        worker_monitor.start_event_loop();
+        debug!("Started WorkerMonitor event loop");
+    }
+    // Under the feed the collector writes the store from its own tasks. The
+    // feed's loop shows those writes when the store's instant comes.
+    let publications = app_context
+        .policy_feed
+        .as_ref()
+        .filter(|_| app_context.worker_monitor.is_some())
+        .map(|feed| feed.publications());
+    // Under the feed the workers' cache events reach the store's index, and
+    // their pushed load records the worker monitor, by the feed's follow,
+    // for the server's life. Under a controller's address the controller
+    // reads them, and this gateway reads none.
+    let cache_events = app_context
+        .policy_feed
+        .as_ref()
+        .filter(|_| app_context.policy_follower.is_none())
+        .map(|feed| feed.cache_events(app_context.worker_monitor.as_ref()));
+    WorkerLoops {
+        _cache_events: cache_events,
+        _publications: publications,
+        _health: health,
+    }
+}
+
 /// Start the local health loop and keep its handle until the server stops.
 fn start_worker_health_checks(app_context: &AppContext) -> Option<WorkerManager> {
     if app_context.follows_controller() {
@@ -2637,33 +2690,10 @@ pub async fn startup_with(
 
     let gateway = Gateway::from_config(&config, &app_context).await?;
 
-    let _worker_manager = start_worker_health_checks(&app_context);
-
-    // WorkerMonitor subscribes to registry events. Starting its event
-    // loop here (after the synchronous worker population in
-    // Gateway::from_config above) means the bootstrap reconcile
-    // captures every worker that exists at this point and the event
-    // task picks up everything registered afterwards.
-    if let Some(ref worker_monitor) = app_context.worker_monitor {
-        worker_monitor.start_event_loop();
-        debug!("Started WorkerMonitor event loop");
-    }
-    // Under the feed the collector writes the store from its own tasks. The
-    // feed's loop shows those writes when the store's instant comes.
-    let _publications = app_context
-        .policy_feed
-        .as_ref()
-        .filter(|_| app_context.worker_monitor.is_some())
-        .map(|feed| feed.publications());
-    // Under the feed the workers' cache events reach the store's index, and
-    // their pushed load records the worker monitor, by the feed's follow,
-    // for the server's life. Under a controller's address the controller
-    // reads them, and this gateway reads none.
-    let _cache_events = app_context
-        .policy_feed
-        .as_ref()
-        .filter(|_| app_context.policy_follower.is_none())
-        .map(|feed| feed.cache_events(app_context.worker_monitor.as_ref()));
+    // The health checks, the load monitor's events and the feed's two
+    // loops, behind the synchronous worker population in
+    // Gateway::from_config above, for the server's life.
+    let _worker_loops = start_worker_loops(&app_context);
 
     let admission_queue =
         if app_context.rate_limiter.is_some() && config.router_config.queue_size > 0 {

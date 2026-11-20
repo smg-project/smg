@@ -384,8 +384,8 @@ async fn zombie_worker_removed_and_manual_worker_kept() {
     );
     // An operator-added worker without the label — never touched.
     let manual = Arc::new(BasicWorkerBuilder::new("http://127.0.0.1:21").build());
-    app_context.worker_registry.register(zombie).unwrap();
-    app_context.worker_registry.register(manual).unwrap();
+    app_context.register_built(zombie).unwrap();
+    app_context.register_built(manual).unwrap();
 
     let handle = start_service_discovery_with_client(
         fake.client(),

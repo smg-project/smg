@@ -292,8 +292,7 @@ async fn serve_engines(setup: Setup, engines: Vec<Engine>) -> Gateway {
             worker_entry = worker_entry.label(*key, *value);
         }
         context
-            .worker_registry
-            .register(Arc::new(worker_entry.build()))
+            .register_built(Arc::new(worker_entry.build()))
             .unwrap();
     }
     let router = RouterFactory::create_router(&context).await.unwrap();

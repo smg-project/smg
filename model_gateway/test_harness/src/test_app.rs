@@ -25,6 +25,8 @@ use smg_data_connector::{
 use smg_mcp::{McpConfig, McpOrchestrator};
 use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 
+use crate::{keep_worker_loops, policy_controller_leg};
+
 /// Create a test Axum application using the actual server's build_app function
 #[expect(
     clippy::unwrap_used,
@@ -308,26 +310,42 @@ pub async fn create_test_app_context_with_config(router_config: &RouterConfig) -
     let conversation_storage = Arc::new(MemoryConversationStorage::new());
     let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
 
-    Arc::new(
-        AppContext::builder()
-            .router_config(router_config.clone())
-            .client(client)
-            .rate_limiter(None)
-            .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
-            .reasoning_parser_factory(None)
-            .tool_parser_factory(None)
-            .worker_registry(worker_registry)
-            .policy_registry(policy_registry)
-            .response_storage(response_storage)
-            .conversation_storage(conversation_storage)
-            .conversation_item_storage(conversation_item_storage)
-            .worker_monitor(None)
-            .worker_job_queue(worker_job_queue)
-            .workflow_engines(workflow_engines)
-            .mcp_orchestrator(mcp_orchestrator_lock)
-            .build()
-            .unwrap(),
-    )
+    // The suite's second leg: the context decides in its own process, as a
+    // gateway started with the setting does. The copy is made behind the
+    // function's one await, so the future does not keep it.
+    let hosted = router_config.policy_controller || policy_controller_leg();
+    let config = RouterConfig {
+        policy_controller: hosted,
+        ..router_config.clone()
+    };
+    let builder = AppContext::builder()
+        .router_config(config.clone())
+        .client(client)
+        .rate_limiter(None)
+        .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
+        .reasoning_parser_factory(None)
+        .tool_parser_factory(None)
+        .worker_registry(worker_registry)
+        .policy_registry(policy_registry)
+        .response_storage(response_storage)
+        .conversation_storage(conversation_storage)
+        .conversation_item_storage(conversation_item_storage)
+        .worker_monitor(None)
+        .worker_job_queue(worker_job_queue)
+        .workflow_engines(workflow_engines)
+        .mcp_orchestrator(mcp_orchestrator_lock);
+    let builder = if hosted {
+        builder
+            .with_policy_controller(&config, None)
+            .expect("the policy controller starts")
+    } else {
+        builder
+    };
+    let app_context = Arc::new(builder.build().unwrap());
+    if hosted {
+        keep_worker_loops(&app_context);
+    }
+    app_context
 }
 
 /// Register an external worker (OpenAI-compatible API endpoint) in the test AppContext.
@@ -358,7 +376,7 @@ pub fn register_external_worker(ctx: &Arc<AppContext>, url: &str, models: Option
             .build(),
     );
 
-    ctx.worker_registry.register(worker);
+    ctx.register_built(worker);
 }
 
 /// Register an external worker with a custom model card that has aliases.
@@ -380,7 +398,7 @@ pub fn register_external_worker_with_card(ctx: &Arc<AppContext>, url: &str, mode
             .build(),
     );
 
-    ctx.worker_registry.register(worker);
+    ctx.register_built(worker);
 }
 
 /// The text of the metrics endpoint at `addr`.

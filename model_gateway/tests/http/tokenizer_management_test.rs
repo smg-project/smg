@@ -71,7 +71,7 @@ fn serve_the_loaded_model_under(context: &AppContext, alias: &str) {
             })
             .build(),
     );
-    context.worker_registry.register(worker);
+    context.register_built(worker);
 }
 
 #[expect(clippy::expect_used)]

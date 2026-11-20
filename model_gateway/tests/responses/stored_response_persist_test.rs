@@ -134,7 +134,7 @@ async fn app() -> (Router, tokio::task::AbortHandle) {
     // request.
     let _ = stand_in.await;
     let context = common::create_test_context_with_storages(config, tokenizers, storages).await;
-    context.worker_registry.register(worker).unwrap();
+    context.register_built(worker).unwrap();
     let router = RouterFactory::create_router(&context).await.unwrap();
     let app = common::test_app::create_test_app_with_context(Arc::from(router), context);
     (app, engine.abort_handle())

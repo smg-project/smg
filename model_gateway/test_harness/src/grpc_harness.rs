@@ -224,8 +224,7 @@ pub async fn grpc_router(
 ) -> Box<dyn RouterTrait> {
     for worker in workers {
         app_context
-            .worker_registry
-            .register(worker)
+            .register_built(worker)
             .expect("register the worker");
     }
     RouterFactory::create_router(app_context)

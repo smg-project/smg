@@ -114,8 +114,7 @@ impl Bed {
     fn add_prefill_worker(&mut self, port: u16) -> String {
         let newcomer = worker(port, WorkerType::Prefill);
         self.app_context
-            .worker_registry
-            .register(Arc::clone(&newcomer))
+            .register_built(Arc::clone(&newcomer))
             .unwrap();
         self.prefill_workers.push(newcomer);
         self.app_context
@@ -175,10 +174,7 @@ async fn build_bed(prefill_ports: &[u16], decode_port: u16) -> Bed {
         .chain([(decode_port, WorkerType::Decode)]);
     for (port, worker_type) in roles {
         let worker = worker(port, worker_type);
-        app_context
-            .worker_registry
-            .register(Arc::clone(&worker))
-            .unwrap();
+        app_context.register_built(Arc::clone(&worker)).unwrap();
         if matches!(worker.worker_type(), WorkerType::Prefill) {
             prefill_workers.push(worker);
         }

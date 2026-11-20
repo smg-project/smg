@@ -72,25 +72,23 @@ async fn pd_router_with_policy(
         disable_health_check: true,
         ..Default::default()
     };
-    ctx.worker_registry
-        .register(Arc::new(
-            BasicWorkerBuilder::new(&prefill.url)
-                .worker_type(WorkerType::Prefill)
-                .bootstrap_port(Some(port_of(&prefill.url)))
-                .model(ModelCard::new(MODEL))
-                .health_config(health.clone())
-                .build(),
-        ))
-        .unwrap();
-    ctx.worker_registry
-        .register(Arc::new(
-            BasicWorkerBuilder::new(&decode.url)
-                .worker_type(WorkerType::Decode)
-                .model(ModelCard::new(MODEL))
-                .health_config(health)
-                .build(),
-        ))
-        .unwrap();
+    ctx.register_built(Arc::new(
+        BasicWorkerBuilder::new(&prefill.url)
+            .worker_type(WorkerType::Prefill)
+            .bootstrap_port(Some(port_of(&prefill.url)))
+            .model(ModelCard::new(MODEL))
+            .health_config(health.clone())
+            .build(),
+    ))
+    .unwrap();
+    ctx.register_built(Arc::new(
+        BasicWorkerBuilder::new(&decode.url)
+            .worker_type(WorkerType::Decode)
+            .model(ModelCard::new(MODEL))
+            .health_config(health)
+            .build(),
+    ))
+    .unwrap();
     (PDRouter::new(&ctx).await.unwrap(), dir)
 }
 

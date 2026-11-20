@@ -58,10 +58,7 @@ mod dp_removal_tests {
             None => builder,
         };
         let worker: Arc<dyn Worker> = Arc::new(builder.build());
-        context
-            .worker_registry
-            .register(Arc::clone(&worker))
-            .unwrap();
+        context.register_built(Arc::clone(&worker)).unwrap();
         worker
     }
 
@@ -579,10 +576,7 @@ mod discovery_ownership_tests {
             for (key, value) in labels {
                 builder = builder.label(key, value);
             }
-            context
-                .worker_registry
-                .register(Arc::new(builder.build()))
-                .unwrap();
+            context.register_built(Arc::new(builder.build())).unwrap();
         }
         let router = Arc::new(HttpRouter::new(&context).await.unwrap());
         let app = create_test_app_with_context(router, Arc::clone(&context));

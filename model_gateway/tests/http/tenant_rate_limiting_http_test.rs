@@ -358,17 +358,16 @@ pub(super) async fn context(
     retries: bool,
 ) -> (Arc<AppContext>, Option<tempfile::TempDir>) {
     let (ctx, dir) = limited_context(limiter, retries).await;
-    ctx.worker_registry
-        .register(Arc::new(
-            BasicWorkerBuilder::new(&worker.url)
-                .model(ModelCard::new(MODEL))
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .build(),
-        ))
-        .unwrap();
+    ctx.register_built(Arc::new(
+        BasicWorkerBuilder::new(&worker.url)
+            .model(ModelCard::new(MODEL))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build(),
+    ))
+    .unwrap();
     (ctx, dir)
 }
 

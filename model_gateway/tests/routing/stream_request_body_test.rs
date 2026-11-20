@@ -123,7 +123,7 @@ async fn streaming_app_with_config(
             })
             .build(),
     );
-    ctx.app_context.worker_registry.register(worker);
+    ctx.app_context.register_built(worker);
 
     let app = ctx.create_app();
     (app, captured, ctx)
@@ -332,7 +332,7 @@ async fn routing_key_override_buffers_and_prefers_header_over_fresh_rids() {
                 })
                 .build(),
         );
-        ctx.app_context.worker_registry.register(worker);
+        ctx.app_context.register_built(worker);
     }
     let app = ctx.create_app();
 
@@ -434,7 +434,7 @@ async fn multi_model_registry_buffers_and_routes_to_the_right_model() {
                 })
                 .build(),
         );
-        ctx.app_context.worker_registry.register(worker);
+        ctx.app_context.register_built(worker);
     }
     let app = ctx.create_app();
 

@@ -79,17 +79,16 @@ async fn upstream(body: Value) -> Upstream {
 /// [`MODEL`], dispatched through the gateway as a served deployment is.
 async fn app_for(upstream: &Upstream) -> Router {
     let ctx = create_test_app_context().await;
-    ctx.worker_registry
-        .register(Arc::new(
-            BasicWorkerBuilder::new(&upstream.url)
-                .model(ModelCard::new(MODEL))
-                .health_config(openai_protocol::worker::HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .build(),
-        ))
-        .unwrap();
+    ctx.register_built(Arc::new(
+        BasicWorkerBuilder::new(&upstream.url)
+            .model(ModelCard::new(MODEL))
+            .health_config(openai_protocol::worker::HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build(),
+    ))
+    .unwrap();
     let router = Arc::new(HttpRouter::new(&ctx).await.unwrap());
     let gateway = Arc::new(Gateway::new(ctx.worker_registry.clone()));
     gateway.register_router(router_ids::HTTP_REGULAR, router);

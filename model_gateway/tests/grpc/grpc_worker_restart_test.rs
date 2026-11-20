@@ -211,8 +211,7 @@ async fn build_router_with(
             .build(),
     );
     app_context
-        .worker_registry
-        .register(worker.clone())
+        .register_built(worker.clone())
         .expect("register the worker");
     let manager = WorkerManager::start(
         app_context.worker_registry.clone(),

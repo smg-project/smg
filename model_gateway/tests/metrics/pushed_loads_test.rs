@@ -92,10 +92,7 @@ async fn eight_workers_loads_reach_the_gateway_through_the_event_streams() {
             .build(),
         );
         worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
-        app_context
-            .worker_registry
-            .register(Arc::clone(&worker))
-            .unwrap();
+        app_context.register_built(Arc::clone(&worker)).unwrap();
         kv_monitor
             .on_worker_added(&worker, SubscriptionKind::Events)
             .await;

@@ -15,7 +15,11 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
-use smg_policy_controller::{store::MemoryStore, Catalog};
+use smg_policy_controller::{
+    store::{Maker, MemoryStore},
+    worker_host::Expect,
+    Catalog,
+};
 use smg_worker::{
     connection::{
         engine::EngineConnector,
@@ -25,6 +29,8 @@ use smg_worker::{
         },
     },
     health::liveness,
+    identity::basic::Worker,
+    registry::WorkerId,
     settings::RegistrationSettings,
     workflow::WorkflowHost,
 };
@@ -312,6 +318,41 @@ impl AppContext {
     /// workers ([`workflows_feed`]).
     pub(crate) fn door_feed(&self) -> Option<&Feed> {
         workflows_feed(self.policy_feed.as_ref(), self.follows_controller())
+    }
+
+    /// Register a worker its caller built, with the one writer of this
+    /// gateway's workers: the registry, or the door of the policy
+    /// controller's store where the gateway decides in its own process.
+    /// The store then holds the worker's row and its holder lays this
+    /// object in the registry, as a registration's own write does. A host
+    /// that assembles a gateway by hand registers here where it would
+    /// write the registry. `None` where the address is taken or the door
+    /// refuses the worker.
+    pub fn register_built(&self, worker: Arc<dyn Worker>) -> Option<WorkerId> {
+        let Some(feed) = self.door_feed() else {
+            return self.worker_registry.register(worker);
+        };
+        let url = worker.url().to_owned();
+        feed.door
+            .found_built(&Maker::Control, Expect::Nothing, &worker, None)
+            .ok()?;
+        self.worker_registry.get_id_by_url(&url)
+    }
+
+    /// Lay `worker` in the place of the worker that stands at its address,
+    /// with the writer of [`Self::register_built`]. `false` where no worker
+    /// stands there or the door refuses this one.
+    pub fn replace_built(&self, worker: Arc<dyn Worker>) -> bool {
+        let Some(id) = self.worker_registry.get_id_by_url(worker.url()) else {
+            return false;
+        };
+        match self.door_feed() {
+            Some(feed) => feed
+                .door
+                .found_built(&Maker::Control, Expect::Anything, &worker, None)
+                .is_ok(),
+            None => self.worker_registry.replace(&id, worker),
+        }
     }
 
     /// Create AppContext from config with all components initialized
@@ -982,8 +1023,9 @@ impl AppContextBuilder {
     /// Start the policy store with its operators' door, its membership feed,
     /// its host with the host's timer and, under a controller's address, the
     /// follower of that controller's workers. A start the door refuses stops
-    /// this one, by name.
-    fn with_policy_controller(
+    /// this one, by name. A host that assembles its context by hand calls it
+    /// behind the worker registry, where [`Self::from_config`] does.
+    pub fn with_policy_controller(
         mut self,
         config: &RouterConfig,
         stages: Option<Catalog>,
@@ -1064,8 +1106,11 @@ impl AppContextBuilder {
         Ok(self)
     }
 
-    /// Create load monitor
-    fn with_worker_monitor(mut self, config: &RouterConfig) -> Result<Self, String> {
+    /// Create load monitor. Under the policy controller's feed its
+    /// collector writes the store through the feed's sink, so a host that
+    /// assembles its context by hand calls it behind
+    /// [`Self::with_policy_controller`] and both registries.
+    pub fn with_worker_monitor(mut self, config: &RouterConfig) -> Result<Self, String> {
         if config.policy_controller_address.is_some() {
             info!("Skipping worker load monitoring because --policy-controller-address is set");
             return Ok(self);

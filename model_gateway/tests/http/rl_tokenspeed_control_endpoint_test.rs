@@ -221,8 +221,7 @@ fn register_directly(ctx: &Arc<AppContext>, grpc_port: u16, tagged: bool) {
     if tagged {
         builder = builder.model(ModelCard::new(MODEL));
     }
-    ctx.worker_registry
-        .register(Arc::new(builder.build()))
+    ctx.register_built(Arc::new(builder.build()))
         .expect("TokenSpeed worker registered");
 }
 

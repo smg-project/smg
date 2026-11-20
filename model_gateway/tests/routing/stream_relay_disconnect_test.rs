@@ -153,8 +153,8 @@ async fn pd_router_for(prefill_url: &str, decode_url: &str) -> PDRouter {
             .health_config(health)
             .build(),
     );
-    ctx.worker_registry.register(prefill);
-    ctx.worker_registry.register(decode);
+    ctx.register_built(prefill);
+    ctx.register_built(decode);
     PDRouter::new(&ctx).await.unwrap()
 }
 
@@ -174,7 +174,7 @@ async fn http_router_for(upstream_url: &str) -> HttpRouter {
             })
             .build(),
     );
-    ctx.worker_registry.register(worker);
+    ctx.register_built(worker);
     HttpRouter::new(&ctx).await.unwrap()
 }
 

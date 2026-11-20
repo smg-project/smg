@@ -53,7 +53,7 @@ mod upstream_effort_alias_tests {
             .health_config(worker.metadata().health_config.clone())
             .health_endpoint(&worker.metadata().health_endpoint)
             .build();
-        assert!(registry.replace(&worker_id, Arc::new(replacement)));
+        assert!(ctx.app_context.replace_built(Arc::new(replacement)));
     }
 
     fn chat_request(body: &Value) -> Request<Body> {

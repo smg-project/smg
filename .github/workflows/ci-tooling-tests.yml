@@ -10,6 +10,7 @@ on:
       - .github/workflows/pr-naming-check.yml
       - .pre-commit-config.yaml
       - scripts/**
+      - model_gateway/tests/policy_controller_leg.skip
       - e2e_test/**
       - grpc_servicer/**
       - crates/grpc_client/**

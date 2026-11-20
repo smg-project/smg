@@ -113,7 +113,7 @@ async fn app_with(
         None => common::mock_tokenizer_registry(model).await,
     };
     let context = common::create_test_context_with_tokenizer_registry(config, tokenizers).await;
-    context.worker_registry.register(worker).unwrap();
+    context.register_built(worker).unwrap();
     let router = RouterFactory::create_router(&context).await.unwrap();
     let app = common::test_app::create_test_app_with_context(Arc::from(router), context);
     (app, engine.abort_handle())

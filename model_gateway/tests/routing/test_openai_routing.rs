@@ -969,7 +969,7 @@ async fn test_openai_router_models_from_registry() {
             })
             .build(),
     );
-    ctx.worker_registry.register(worker);
+    ctx.register_built(worker);
 
     // No bearer token → registry path returns local workers' models.
     let req = Request::builder()

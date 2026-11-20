@@ -85,7 +85,7 @@ async fn completion_logprobs(stream: bool) -> Value {
         .await
         .unwrap();
     let context = common::create_test_context_with_tokenizer_registry(config, tokenizers).await;
-    context.worker_registry.register(worker).unwrap();
+    context.register_built(worker).unwrap();
     let router = RouterFactory::create_router(&context).await.unwrap();
     let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
     let request = serde_json::from_value(json!({

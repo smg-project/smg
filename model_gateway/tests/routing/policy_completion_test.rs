@@ -78,7 +78,7 @@ async fn router_with_spy(upstream_url: &str) -> (HttpRouter, Arc<CompletionSpy>)
             .build(),
     );
     worker.set_completion_sink(Some(Arc::clone(&spy) as Arc<dyn RequestCompletionSink>));
-    ctx.worker_registry.register(worker);
+    ctx.register_built(worker);
     (HttpRouter::new(&ctx).await.unwrap(), spy)
 }
 

@@ -588,5 +588,68 @@ class RunModeTests(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
 
 
+class PolicyControllerLegTests(unittest.TestCase):
+    """A gateway shard runs its binaries twice: on the classic policies, then with every test
+    gateway deciding through the policy controller, less the cases the skip file lists."""
+
+    SKIPS = REPO / "model_gateway" / "tests" / "policy_controller_leg.skip"
+
+    def gateway_calls(self, mode: str) -> list[str]:
+        """``mode`` of the first gateway shard under a cargo stub on PATH. The stub answers the
+        metadata read with three test binaries, and records the leg's switch and the arguments
+        of every other call."""
+        targets = [{"name": name, "kind": ["test"]} for name in ("api_tests", "b_tests", "c_tests")]
+        metadata = json.dumps({"packages": [{"name": "smg", "targets": targets}]})
+        with tempfile.TemporaryDirectory() as tmp:
+            stubs = Path(tmp) / "bin"
+            stubs.mkdir()
+            calls = Path(tmp) / "calls"
+            calls.write_text("")
+            stub = stubs / "cargo"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                f"if [ \"$1\" = metadata ]; then echo '{metadata}'; exit 0; fi\n"
+                'printf "[%s] %s\\n" "${SMG_TEST_POLICY_CONTROLLER:-}" "$*" >> "$CARGO_STUB_CALLS"\n'
+            )
+            stub.chmod(0o755)
+            subprocess.run(
+                ["bash", str(SCRIPT), mode, "gateway-1"],
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=REPO,
+                env={"PATH": f"{stubs}:/usr/bin:/bin", "CARGO_STUB_CALLS": str(calls)},
+            )
+            return calls.read_text().splitlines()
+
+    def listed(self) -> list[str]:
+        lines = (line.split("#", 1)[0].strip() for line in self.SKIPS.read_text().splitlines())
+        return [line for line in lines if line]
+
+    def test_the_second_leg_runs_the_same_binaries_with_the_switch_set(self):
+        first, second = self.gateway_calls("run")
+        self.assertEqual(first, "[] test --no-fail-fast -p smg --test api_tests")
+        skips = "".join(f" --skip {case}" for case in self.listed())
+        self.assertEqual(
+            second, f"[1] test --no-fail-fast -p smg --test api_tests -- --exact{skips}"
+        )
+
+    def test_the_second_leg_builds_nothing(self):
+        self.assertEqual(self.gateway_calls("build"), ["[] test -p smg --test api_tests --no-run"])
+
+    def test_every_listed_case_stands_once_under_a_reason(self):
+        reason, seen = False, set()
+        for number, line in enumerate(self.SKIPS.read_text().splitlines(), 1):
+            if not line.strip():
+                reason = False
+            elif line.startswith("#"):
+                reason = True
+            else:
+                self.assertTrue(reason, f"line {number}: no reason line above this group")
+                self.assertRegex(line, r"^[a-z0-9_]+(::[a-z0-9_]+)*$", f"line {number}")
+                self.assertNotIn(line, seen, f"line {number}: listed twice")
+                seen.add(line)
+
+
 if __name__ == "__main__":
     unittest.main()

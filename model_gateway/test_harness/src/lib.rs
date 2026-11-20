@@ -28,6 +28,7 @@ mod worker_name_census;
 // Re-export commonly used test builders
 use std::{
     collections::HashMap,
+    env,
     future::Future,
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -52,6 +53,7 @@ use smg::{
         grpc::backend_client::BasicWorkerBuilder,
         RouterFactory, RouterTrait,
     },
+    server::start_worker_loops,
     workflow::Job,
 };
 use smg_data_connector::{
@@ -453,6 +455,28 @@ impl AppTestContext {
     }
 }
 
+/// The environment variable of the suite's second leg. Set to `1`, every
+/// context the harness builds hosts the policy controller, so each case
+/// runs as it does on a gateway started with `policy_controller: true`.
+/// Unset, the suite runs on the classic policies.
+pub const POLICY_CONTROLLER_LEG: &str = "SMG_TEST_POLICY_CONTROLLER";
+
+/// Whether this run is the suite's second leg ([`POLICY_CONTROLLER_LEG`]),
+/// read once a process.
+pub fn policy_controller_leg() -> bool {
+    static LEG: OnceLock<bool> = OnceLock::new();
+    *LEG.get_or_init(|| env::var_os(POLICY_CONTROLLER_LEG).is_some_and(|leg| leg == "1"))
+}
+
+/// Start the loops of a context that hosts the policy controller, as the
+/// server's start does behind its workflow engines: the health checks on
+/// the feed's sink, the load monitor's events, the store's publications
+/// and the workers' cache events. The handles are kept for the process's
+/// life, and a test's runtime ends their tasks.
+pub(crate) fn keep_worker_loops(app_context: &AppContext) {
+    let _kept = Box::leak(Box::new(start_worker_loops(app_context)));
+}
+
 /// Shared `AppContext` construction tail for the `create_test_context_*`
 /// family below: registries, storage backends, worker monitor, job queue,
 /// workflow engines, OpenAI-mode external worker registration, and MCP
@@ -474,6 +498,14 @@ async fn build_test_app_context(
     storages: Option<StorageBundle>,
 ) -> Arc<AppContext> {
     use smg_mcp::McpOrchestrator;
+
+    // The suite's second leg: the context decides in its own process, as a
+    // gateway started with the setting does.
+    let hosted = config.policy_controller || policy_controller_leg();
+    let config = RouterConfig {
+        policy_controller: hosted,
+        ..config
+    };
 
     // See `test_app::create_test_app_context`: no environment proxy in a test's path.
     let client = smg::server::http_client_builder()
@@ -523,49 +555,62 @@ async fn build_test_app_context(
         conversation_item_storage: Arc::new(MemoryConversationItemStorage::new()),
     });
 
-    // Initialize load monitor
-    let worker_monitor = Some(Arc::new(WorkerMonitor::new(
-        worker_registry.clone(),
-        policy_registry.clone(),
-        config.load_monitor_interval_secs,
-        config.engine_metrics,
-        config.disable_load_monitoring,
-    )));
+    // Initialize load monitor: the classic's own. Under the policy
+    // controller the server's step builds it over the feed's sink, below.
+    let worker_monitor = (!hosted).then(|| {
+        Arc::new(WorkerMonitor::new(
+            worker_registry.clone(),
+            policy_registry.clone(),
+            config.load_monitor_interval_secs,
+            config.engine_metrics,
+            config.disable_load_monitoring,
+        ))
+    });
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
     let worker_job_queue = Arc::new(OnceLock::new());
     let workflow_engines = Arc::new(OnceLock::new());
     let mcp_orchestrator_lock = Arc::new(OnceLock::new());
 
-    let app_context = Arc::new(
-        AppContext::builder()
-            // Building applies the configuration's liveness budgets
-            // (process-wide, the first context a test binary builds sets
-            // them), as it does for the server.
-            .router_config(config.clone())
-            .client(client)
-            .rate_limiter(rate_limiter)
-            .rate_limit_manager(rate_limit_manager)
-            .tokenizer_registry(tokenizer_registry)
-            .reasoning_parser_factory(reasoning_parser_factory)
-            .tool_parser_factory(tool_parser_factory)
-            .worker_registry(worker_registry)
-            .policy_registry(policy_registry)
-            .response_storage(response_storage)
-            .conversation_storage(conversation_storage)
-            .conversation_item_storage(conversation_item_storage)
-            .worker_monitor(worker_monitor)
-            .worker_job_queue(worker_job_queue)
-            .workflow_engines(workflow_engines)
-            .mcp_orchestrator(mcp_orchestrator_lock)
-            .build()
-            .unwrap(),
-    );
+    let builder = AppContext::builder()
+        // Building applies the configuration's liveness budgets
+        // (process-wide, the first context a test binary builds sets
+        // them), as it does for the server.
+        .router_config(config.clone())
+        .client(client)
+        .rate_limiter(rate_limiter)
+        .rate_limit_manager(rate_limit_manager)
+        .tokenizer_registry(tokenizer_registry)
+        .reasoning_parser_factory(reasoning_parser_factory)
+        .tool_parser_factory(tool_parser_factory)
+        .worker_registry(worker_registry)
+        .policy_registry(policy_registry)
+        .response_storage(response_storage)
+        .conversation_storage(conversation_storage)
+        .conversation_item_storage(conversation_item_storage)
+        .worker_monitor(worker_monitor)
+        .worker_job_queue(worker_job_queue)
+        .workflow_engines(workflow_engines)
+        .mcp_orchestrator(mcp_orchestrator_lock);
+    // Under the policy controller the server's own two steps start the
+    // store with its feed and build the monitor over the feed's sink, in
+    // the order `AppContextBuilder::from_config` gives them.
+    let builder = if hosted {
+        builder
+            .with_policy_controller(&config, None)
+            .expect("the policy controller starts")
+            .with_worker_monitor(&config)
+            .expect("the load monitor starts")
+    } else {
+        builder
+    };
+    let app_context = Arc::new(builder.build().unwrap());
 
     // Mirror production wiring: start the WorkerMonitor event
     // loop so tests exercise the event-driven group reconciliation
-    // path instead of an inert monitor.
-    if let Some(monitor) = &app_context.worker_monitor {
+    // path instead of an inert monitor. Under the policy controller the
+    // server's loops start it, behind the workflow engines below.
+    if let Some(monitor) = app_context.worker_monitor.as_ref().filter(|_| !hosted) {
         monitor.start_event_loop();
     }
 
@@ -580,11 +625,16 @@ async fn build_test_app_context(
 
     // Initialize typed workflow engines
     use smg::workflow::WorkflowEngines;
-    let engines = WorkflowEngines::new(&config);
+    let engines = WorkflowEngines::for_context(&app_context);
     app_context
         .workflow_engines
         .set(engines)
         .expect("WorkflowEngines should only be initialized once");
+
+    // Under the policy controller, the server's loops behind the engines.
+    if hosted {
+        keep_worker_loops(&app_context);
+    }
 
     // Register external workers for OpenAI mode
     if let RoutingMode::OpenAI { worker_urls, .. } = &config.mode {
@@ -606,7 +656,7 @@ async fn build_test_app_context(
                     })
                     .build(),
             );
-            app_context.worker_registry.register(worker);
+            app_context.register_built(worker);
         }
     }
 

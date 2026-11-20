@@ -85,18 +85,17 @@ async fn upstream(status: StatusCode, body: Value) -> Upstream {
 }
 async fn app_for(upstream: &Upstream, runtime: RuntimeType) -> Router {
     let ctx = create_test_app_context().await;
-    ctx.worker_registry
-        .register(Arc::new(
-            BasicWorkerBuilder::new(&upstream.url)
-                .runtime_type(runtime)
-                .model(ModelCard::new(MODEL).with_alias(ALIAS))
-                .health_config(openai_protocol::worker::HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .build(),
-        ))
-        .unwrap();
+    ctx.register_built(Arc::new(
+        BasicWorkerBuilder::new(&upstream.url)
+            .runtime_type(runtime)
+            .model(ModelCard::new(MODEL).with_alias(ALIAS))
+            .health_config(openai_protocol::worker::HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build(),
+    ))
+    .unwrap();
     let router = Arc::new(HttpRouter::new(&ctx).await.unwrap());
     let gateway = Arc::new(Gateway::new(ctx.worker_registry.clone()));
     gateway.register_router(router_ids::HTTP_REGULAR, router);

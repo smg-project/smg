@@ -71,7 +71,7 @@ async fn app(trust_tenant_header: bool) -> (Router, tokio::task::AbortHandle) {
     config.health_check.disable_health_check = true;
     config.tenant_resolution.trust_tenant_header = trust_tenant_header;
     let context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
-    context.worker_registry.register(worker).unwrap();
+    context.register_built(worker).unwrap();
     let router = RouterFactory::create_router(&context).await.unwrap();
     let app = common::test_app::create_test_app_with_context(Arc::from(router), context);
     (app, engine.abort_handle())

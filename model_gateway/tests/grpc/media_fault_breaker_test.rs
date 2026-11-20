@@ -138,10 +138,7 @@ async fn answers_of(
         .build_unchecked();
     config.health_check.disable_health_check = true;
     let context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
-    context
-        .worker_registry
-        .register(Arc::clone(&worker))
-        .unwrap();
+    context.register_built(Arc::clone(&worker)).unwrap();
     let router = RouterFactory::create_router(&context).await.unwrap();
     let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
     let request: ChatCompletionRequest = serde_json::from_value(json!({

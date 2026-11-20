@@ -241,8 +241,7 @@ async fn gateway_app(port: u16) -> axum::Router {
     );
     worker.set_status(WorkerStatus::Ready);
     app_context
-        .worker_registry
-        .register(Arc::clone(&worker))
+        .register_built(Arc::clone(&worker))
         .expect("register the worker");
     let router = RouterFactory::create_router(&app_context)
         .await

@@ -184,7 +184,7 @@ async fn router_with_cap(
         builder = builder.http_client(client);
     }
     let worker: Arc<dyn Worker> = Arc::new(builder.build());
-    ctx.worker_registry.register(Arc::clone(&worker));
+    ctx.register_built(Arc::clone(&worker));
     (HttpRouter::new(&ctx).await.unwrap(), worker)
 }
 

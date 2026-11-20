@@ -16,7 +16,8 @@ use super::{
     WorkerRemovalWorkflowData, WorkerUpdateWorkflowData,
 };
 use crate::{
-    config::RouterConfig, policy_controller::feed::Feed, workflow::data::WorkerWorkflowData,
+    app_context::AppContext, config::RouterConfig, policy_controller::feed::Feed,
+    workflow::data::WorkerWorkflowData,
 };
 
 /// Retention for terminal workflow state after its last update. Waiters poll
@@ -87,6 +88,16 @@ impl WorkflowEngines {
     /// Must be called within a Tokio runtime: it spawns the periodic state sweepers.
     pub fn new(router_config: &RouterConfig) -> Self {
         Self::with_feed(router_config, None)
+    }
+
+    /// The engines of `context`: [`Self::new`] over its configuration, with
+    /// the worker workflows writing at the door of the context's feed where
+    /// the gateway decides in its own process. The start builds its engines
+    /// here, and so does a host that assembles a gateway by hand.
+    ///
+    /// Must be called within a Tokio runtime, as [`Self::new`] must.
+    pub fn for_context(context: &AppContext) -> Self {
+        Self::with_feed(&context.router_config, context.door_feed())
     }
 
     /// [`Self::new`], with the three worker workflows writing at the door

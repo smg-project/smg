@@ -85,14 +85,13 @@ async fn start_http_upstream() -> String {
 /// The production HTTP app with one regular worker at `upstream`.
 async fn http_app(upstream: &str) -> Router {
     let ctx = create_test_app_context().await;
-    ctx.worker_registry
-        .register(Arc::new(
-            BasicWorkerBuilder::new(upstream)
-                .model(ModelCard::new(MODEL))
-                .health_config(health_checks_off())
-                .build(),
-        ))
-        .unwrap();
+    ctx.register_built(Arc::new(
+        BasicWorkerBuilder::new(upstream)
+            .model(ModelCard::new(MODEL))
+            .health_config(health_checks_off())
+            .build(),
+    ))
+    .unwrap();
     let router = Arc::new(HttpRouter::new(&ctx).await.unwrap());
     let gateway = Arc::new(Gateway::new(ctx.worker_registry.clone()));
     gateway.register_router(router_ids::HTTP_REGULAR, router);

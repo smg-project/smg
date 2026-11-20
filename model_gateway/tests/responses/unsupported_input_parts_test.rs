@@ -74,7 +74,7 @@ async fn answer(request: Value) -> (StatusCode, Value, usize) {
     config.health_check.disable_health_check = true;
     let tokenizers = common::tokenizer_registry_with(MODEL, Arc::new(MockTokenizer::new())).await;
     let context = common::create_test_context_with_tokenizer_registry(config, tokenizers).await;
-    context.worker_registry.register(worker).unwrap();
+    context.register_built(worker).unwrap();
     let router = RouterFactory::create_router(&context).await.unwrap();
     let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
     let request = serde_json::from_value(request).unwrap();

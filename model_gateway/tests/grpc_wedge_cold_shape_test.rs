@@ -280,8 +280,7 @@ async fn build_bed(port: u16) -> Bed {
     );
     worker.set_status(WorkerStatus::Ready);
     app_context
-        .worker_registry
-        .register(Arc::clone(&worker))
+        .register_built(Arc::clone(&worker))
         .expect("register the worker");
     kv_monitor
         .on_worker_added(&worker, SubscriptionKind::Events)

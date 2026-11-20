@@ -86,7 +86,7 @@ pub async fn app(
     let mut config = builder.build_unchecked();
     config.health_check.disable_health_check = true;
     let context = create_test_context_with_mock_tokenizer(config, MODEL).await;
-    context.worker_registry.register(worker).unwrap();
+    context.register_built(worker).unwrap();
     let router = RouterFactory::create_router(&context)
         .await
         .expect("gRPC router");

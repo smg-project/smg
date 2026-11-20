@@ -1,0 +1,102 @@
+# The cases of the gateway's integration suite that its second leg leaves out.
+#
+# The second leg runs every integration binary once more with each test gateway
+# deciding through the policy controller (SMG_TEST_POLICY_CONTROLLER=1, which
+# the test harness reads; scripts/ci_rust_tests.sh runs both legs). A case is
+# listed here by its full name while that leg does not pass it, under a line
+# that says why. A change that makes a case pass takes its line out.
+
+# The controller does not decide a request whose size binds a worker's context window:
+# the request is refused by name, 501.
+grpc::decisions_grpc_test::scoring_context_boundary_accepts_below_and_rejects_at_limit
+grpc::grpc_context_length_test::pd_batched_completion_is_bounded_per_prompt
+grpc::grpc_context_length_test::pd_budget_is_bound_by_the_decode_window_not_the_prefill_window
+grpc::grpc_context_length_test::pd_is_bounded_by_the_tighter_side
+grpc::grpc_context_length_test::pd_over_long_prompt_is_a_400_not_a_prefill_failure
+grpc::grpc_context_length_test::pd_over_long_streaming_prompt_is_a_json_400
+grpc::grpc_context_length_test::regular_budget_beyond_the_window_is_a_400_on_every_route
+grpc::grpc_context_length_test::regular_over_long_chat_prompt_is_a_400
+grpc::grpc_context_length_test::regular_over_long_prompt_is_a_400
+grpc::grpc_context_routing_test::batch_uses_longest_prompt_with_absent_or_zero_output_budget
+grpc::grpc_context_routing_test::capacity_and_availability_are_distinct
+grpc::grpc_context_routing_test::pd_capacity_is_checked_over_compatible_pairs
+grpc::grpc_context_routing_test::pd_filters_both_context_windows
+grpc::grpc_context_routing_test::regular_routes_by_exact_context_without_retries
+grpc::grpc_context_routing_test::unknown_window_remains_eligible
+
+# A retry under a decoding rule has no next attempt under the controller.
+grpc::response_template_test::a_retry_takes_the_auto_tag_in_the_shape_its_own_workers_start_needs
+
+# No worker's pairing descriptor reaches the store, so the pair rule refuses no pair,
+# and a pair of two runtimes is refused under another code.
+grpc_pd::grpc_pd_kv_store_connector_test::a_store_worker_never_pairs_with_a_rendezvous_worker_of_the_same_family
+grpc_pd::grpc_pd_pairing_off_runtime_test::pairing_off_refuses_a_pair_across_two_runtimes_by_name
+grpc_pd::grpc_pd_pairing_off_runtime_test::pairing_off_serves_a_pair_on_one_runtime_that_the_lenient_mode_refuses
+
+# A pair the controller places writes no row into the request's decision record.
+grpc_pd::grpc_pd_pair_trace_test::a_traced_pair_names_both_picks
+
+# A text prompt shorter than one hash window has no key for the ring.
+routing::prefix_hash_test::prefix_hash_tests::test_repeated_prompt_pins_to_one_worker
+
+# Under min_group the count of a worker's keys is not kept, so first keys are not
+# spread evenly.
+routing::manual_routing_test::manual_min_group_tests::test_min_group_concurrent_distribution
+routing::manual_routing_test::manual_min_group_tests::test_min_group_mixed_concurrent_routing
+
+# Every HTTP body is buffered: the streamed path does not ask the controller yet.
+api::messages_threads_test::test_v1_messages_thread_turn_is_buffered_on_the_raw_body_path
+routing::stream_request_body_test::default_config_buffers_small_and_streams_past_one_mib
+routing::stream_request_body_test::large_chat_body_streams_to_worker_chunked
+routing::stream_request_body_test::large_generate_body_streams_to_worker_chunked
+routing::stream_request_body_test::retries_disabled_streams_a_small_body
+
+# The policy document refuses the largest balance_abs_threshold at the start.
+grpc_pd::grpc_pd_prefill_addition_test::a_prefill_worker_that_joins_during_traffic_takes_its_share_of_the_sizes
+grpc_pd::grpc_pd_prefill_removal_test::a_draining_prefill_workers_size_range_goes_to_its_neighbour_at_once
+grpc_pd::grpc_pd_prefill_removal_test::requests_in_a_removed_prefill_workers_size_range_still_find_a_worker
+
+# The policy document refuses a cache-aware eviction interval of 0 at the start.
+routing::stream_request_body_test::text_needing_policy_stays_buffered_past_the_cap
+
+# The policy document refuses routing_key_override at the start: the sticky
+# sessions' rule has no recorded form yet.
+api::messages_threads_test::test_v1_messages_thread_turns_of_one_lineage_pin_to_one_worker_under_the_override
+routing::stream_request_body_test::routing_key_override_buffers_and_prefers_header_over_fresh_rids
+
+# The policy document refuses grouped_dp_sticky = hash at the start: no rule pins
+# a key to one engine of a grouped worker.
+grpc_pd::grpc_pd_grouped_dp_room_test::a_sticky_keys_pd_rooms_carry_its_prefill_rank
+serial::zmq_backend_test::a_routing_key_keeps_its_engine_of_a_grouped_worker
+serial::zmq_backend_test::a_vllm_group_indexed_from_a_later_rank_serves_its_keys_unpinned
+
+# By design: the controller refuses an explicit target worker by name, 501.
+routing::header_routing_hints_test::header_routing_hints_tests::test_target_worker_hint_indexes_the_available_workers
+
+# By design: under the controller the worker API changes no discovery provider's worker.
+routing::worker_management_test::discovery_ownership_tests::the_worker_api_stays_out_of_discovery_ownership
+
+# The case builds a paired router by hand over a configuration of the regular mode,
+# and the policy document of that configuration holds no pair plan.
+http::tenant_rate_limiting_pd_test::a_buffered_success_settles_the_usage_its_body_reports
+http::tenant_rate_limiting_pd_test::a_completions_batch_reserves_every_prompt_under_a_text_reading_policy
+http::tenant_rate_limiting_pd_test::a_denial_the_tenant_can_wait_out_carries_retry_after
+http::tenant_rate_limiting_pd_test::a_retried_request_reserves_once_and_settles_its_final_answer
+http::tenant_rate_limiting_pd_test::a_streamed_answer_resolves_when_its_body_drops
+http::tenant_rate_limiting_pd_test::an_opted_out_endpoint_never_reserves
+http::tenant_rate_limiting_pd_test::the_refusal_is_the_regular_routers_answer
+http::tenant_rate_limiting_pd_test::without_a_tenant_policy_requests_are_served_as_before
+routing::stream_relay_disconnect_test::pd_decode_relay_closes_upstream_when_client_disconnects_during_prefill
+
+# The case expects round robin to start at the first registered worker, as the
+# classic's does. The controller's first pick is another worker in some runs.
+a_decode_workers_own_500_fails_over_to_the_free_decode_worker_on_both_shapes
+grpc_pd::grpc_pd_decode_start_cancelled_test::a_decode_start_the_worker_cancelled_is_retried_on_another_decode_worker
+grpc_pd::grpc_pd_prefill_silence_test::the_request_is_retried_on_another_prefill_worker_and_never_on_the_silent_one_again
+
+# Not read to its cause yet: the case waits for a Ready worker, or for a removal,
+# past its bound.
+discovery::file_discovery_test::an_in_place_edit_updates_the_worker_in_place
+discovery::k8s_discovery_test::kv_annotation_edit_on_a_live_pod_updates_its_worker_in_place
+discovery::k8s_discovery_test::ready_pod_becoming_unready_removes_all_workers_and_recovers
+discovery::k8s_discovery_test::zombie_worker_removed_and_manual_worker_kept

@@ -445,10 +445,7 @@ async fn fixture_options(
             })
             .build(),
     );
-    context
-        .worker_registry
-        .register(registered_worker.clone())
-        .unwrap();
+    context.register_built(registered_worker.clone()).unwrap();
     let router = RouterFactory::create_router(&context).await.unwrap();
     let gateway = Arc::new(Gateway::new(context.worker_registry.clone()));
     let router_id = if pd {
@@ -702,8 +699,7 @@ async fn mixed_model_pool_routes_only_to_supported_sglang_workers() {
     let unsupported = fixture_with(Reply::InvalidArgument, RuntimeType::Vllm, false).await;
     supported
         .context
-        .worker_registry
-        .register(unsupported.registered_worker.clone())
+        .register_built(unsupported.registered_worker.clone())
         .unwrap();
     // Round-robin must complete a full rotation of the eligible set. If the
     // unsupported worker enters it, one of these requests reaches that worker.
@@ -722,8 +718,7 @@ async fn scoring_retry_stays_on_sglang_in_a_mixed_model_pool() {
     let unsupported = fixture_with(Reply::InvalidArgument, RuntimeType::Vllm, false).await;
     supported
         .context
-        .worker_registry
-        .register(unsupported.registered_worker.clone())
+        .register_built(unsupported.registered_worker.clone())
         .unwrap();
     let (status, result) = call(&supported, predicate_request()).await;
     assert_eq!(status, StatusCode::OK, "{result}");

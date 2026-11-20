@@ -172,7 +172,7 @@ async fn app() -> (
         .await
         .unwrap();
     let context = common::create_test_context_with_tokenizer_registry(config, tokenizers).await;
-    context.worker_registry.register(worker).unwrap();
+    context.register_built(worker).unwrap();
     let router = RouterFactory::create_router(&context).await.unwrap();
     let app = common::test_app::create_test_app_with_context(Arc::from(router), context);
     (app, requests, engine.abort_handle())
