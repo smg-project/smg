@@ -91,7 +91,7 @@ impl Targets {
         let mut led = Self::new();
         led.push(target);
         for t in self.as_slice() {
-            if t.id != target.id {
+            if *t != target {
                 led.push(*t);
             }
         }
@@ -716,6 +716,35 @@ mod tests {
             MAX_TARGETS as u64 - 1,
             "the last one left"
         );
+    }
+
+    #[test]
+    fn lead_removes_only_the_equal_target_not_another_rank() {
+        let x_rank_0 = Target {
+            position: 0,
+            id: WorkerId(1),
+            dp_rank: 0,
+            pair: None,
+        };
+        let w_rank_1 = Target {
+            position: 1,
+            id: WorkerId(2),
+            dp_rank: 1,
+            pair: None,
+        };
+        let w_rank_0 = Target {
+            position: 2,
+            dp_rank: 0,
+            ..w_rank_1
+        };
+        let mut targets = Targets::new();
+        for target in [x_rank_0, w_rank_1, w_rank_0] {
+            targets.push(target);
+        }
+
+        targets.lead(w_rank_0);
+
+        assert_eq!(targets.as_slice(), [w_rank_0, x_rank_0, w_rank_1]);
     }
 
     /// The count and its absence are one word: a trace is the size it was
