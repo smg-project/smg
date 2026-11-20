@@ -474,7 +474,8 @@ fn a_document_beside_a_provider_mode_is_refused_by_name() -> Case {
 fn a_provider_mode_of_a_multi_router_gateway_starts_the_store() -> Case {
     // A multi-router gateway mounts the routers of self-hosted workers
     // beside the provider's. The setting stays in force for them, on the
-    // document the routing settings mean under the regular mode.
+    // document the routing settings mean under the regular mode of many
+    // routers.
     for mode in provider_modes() {
         let config = picked(RouterConfig {
             mode,
@@ -485,9 +486,12 @@ fn a_provider_mode_of_a_multi_router_gateway_starts_the_store() -> Case {
         assert_eq!(
             store.world().spec().digest(),
             Some(
-                picked(RouterConfig::default())
-                    .policy_document()?
-                    .digest()?
+                picked(RouterConfig {
+                    enable_igw: true,
+                    ..RouterConfig::default()
+                })
+                .policy_document()?
+                .digest()?
             ),
             "the {} mode",
             config.mode_type()
@@ -932,11 +936,13 @@ async fn the_http_pair_router_refuses_an_explicit_target_a_roles_setting_keeps()
 }
 
 /// A gateway of many routers mounts every family over its one document.
-/// Under a document that plans no pair its HTTP pair keeps the refusal by
-/// name: a pair asked there would be decided as a single. Under a pair
-/// gateway's document it serves. Under a controller's address it refuses by
-/// name though the document plans pairs: the pair is the controller's to
-/// decide there.
+/// That document plans pairs under a regular configuration and under a
+/// pair configuration alike, so the HTTP pair family serves under both.
+/// Under the manual policy the document plans single workers alone, and
+/// the family keeps its refusal by name: a pair asked there would be
+/// decided as a single. Under a controller's address it refuses by name
+/// though the document plans pairs: the pair is the controller's to decide
+/// there.
 #[tokio::test]
 async fn many_routers_mount_the_http_pair_router_where_the_document_plans_pairs() -> Case {
     use crate::routers::{factory::router_ids, RouterFactory};
@@ -955,7 +961,18 @@ async fn many_routers_mount_the_http_pair_router_where_the_document_plans_pairs(
     socket.bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     let mut followed = pair.clone();
     followed.policy_controller_address = Some(socket.local_addr()?.to_string());
-    for (config, serves) in [(regular, false), (pair, true), (followed, false)] {
+    let mut manual = regular.clone();
+    manual.policy = PolicyConfig::Manual {
+        eviction_interval_secs: 60,
+        max_idle_secs: 14_400,
+        assignment_mode: ManualAssignmentMode::Random,
+    };
+    for (config, serves) in [
+        (regular, true),
+        (pair, true),
+        (manual, false),
+        (followed, false),
+    ] {
         let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);
         let routers = RouterFactory::create_igw_routers(&config.policy, &context).await;
         let (_, _, built) = routers
@@ -1015,9 +1032,11 @@ async fn the_grpc_pair_router_is_built_under_the_setting() -> Case {
 }
 
 /// A gateway of many routers mounts every family over its one document.
-/// Under a document that plans no pair the gRPC pair family refuses by
-/// name: a pair asked there would be decided as a single. Under a pair
-/// gateway's document it serves.
+/// That document plans pairs under a regular configuration and under a
+/// pair configuration alike, so the gRPC pair family serves under both.
+/// Under the manual policy the document plans single workers alone, and
+/// the family keeps its refusal by name: a pair asked there would be
+/// decided as a single.
 #[tokio::test]
 async fn many_routers_mount_the_grpc_pair_router_where_the_document_plans_pairs() -> Case {
     use crate::routers::{factory::router_ids, RouterFactory};
@@ -1031,7 +1050,13 @@ async fn many_routers_mount_the_grpc_pair_router_where_the_document_plans_pairs(
         prefill_policy: None,
         decode_policy: None,
     };
-    for (config, serves) in [(regular, false), (pair, true)] {
+    let mut manual = regular.clone();
+    manual.policy = PolicyConfig::Manual {
+        eviction_interval_secs: 60,
+        max_idle_secs: 14_400,
+        assignment_mode: ManualAssignmentMode::Random,
+    };
+    for (config, serves) in [(regular, true), (pair, true), (manual, false)] {
         let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);
         let routers = RouterFactory::create_igw_routers(&config.policy, &context).await;
         let (_, _, built) = routers

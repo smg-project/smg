@@ -1117,10 +1117,11 @@ impl CliArgs {
     }
 
     /// The routing part of the configuration: what a policy document reads,
-    /// and what the validator's routing rules read beside it (the workers'
-    /// discovery, the multi-router mode and the data-parallel setting). A
-    /// start's assembly builds on it and `--print-policy-spec` converts it
-    /// alone, so the two read one routing part. No file is read here.
+    /// the multi-router mode with it, and what the validator's routing rules
+    /// read beside it (the workers' discovery and the data-parallel
+    /// setting). A start's assembly builds on it and `--print-policy-spec`
+    /// converts it alone, so the two read one routing part. No file is read
+    /// here.
     fn routing_part(&self, mode: RoutingMode) -> ConfigResult<RouterConfigBuilder> {
         Ok(RouterConfig::builder()
             .mode(mode)
