@@ -7,7 +7,8 @@
 //! The policy controller decides by a document, not by flags. This function
 //! writes the document that today's routing settings mean, so a gateway can
 //! hand its routing to the controller and keep the routing its flags asked
-//! for. Nothing reads the document yet: no request path calls this module.
+//! for. The store applies the document at startup when the controller is
+//! selected. No request path calls this module.
 //!
 //! # Where a setting lands
 //!
@@ -54,7 +55,7 @@ use smg_policy_controller::{
         PrefixAffinityParams, ProfileSpec, ScoreSpec, ScoreStage, SpillParams, WarmupSliceParams,
         OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS,
     },
-    AppliedSpec, Assignment, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError,
+    AppliedSpec, Assignment, Catalog, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError,
 };
 
 use super::{
@@ -145,13 +146,22 @@ impl RouterConfig {
         Ok(document)
     }
 
-    /// The generation `document` validates into where this gateway hosts the
-    /// controller: the controller's own check, with the gateway's tenant
-    /// header denied to the view. The one check of `--print-policy-spec` and
-    /// of the host, so the two never part.
+    /// Validates the document over the stock stages, with the gateway's
+    /// tenant header denied to the view.
     pub fn hosted_policy(&self, document: &PolicySpec) -> Result<AppliedSpec, SpecError> {
-        let tenant_header = self.tenant_resolution.tenant_header_name.as_str();
-        AppliedSpec::validate_with(document, &[tenant_header])
+        self.hosted_policy_in(document, None)
+    }
+
+    pub(crate) fn hosted_policy_in(
+        &self,
+        document: &PolicySpec,
+        stages: Option<&Catalog>,
+    ) -> Result<AppliedSpec, SpecError> {
+        let denied_headers = [self.tenant_resolution.tenant_header_name.as_str()];
+        match stages {
+            Some(stages) => AppliedSpec::validate_in(document, stages, &denied_headers),
+            None => AppliedSpec::validate_with(document, &denied_headers),
+        }
     }
 }
 
