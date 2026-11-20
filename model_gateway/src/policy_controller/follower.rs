@@ -1,6 +1,17 @@
-//! A single task follows the controller's workers into the policy store.
-//! A watch may reopen or a connection may fail. The same watcher keeps its
-//! place and the store keeps its last fleet until a new snapshot replaces it.
+//! A single task holds the gateway's link to its controller and follows the
+//! controller's workers into the policy store over it.
+//!
+//! The link is the gateway's one connection: its session, its decide stream
+//! and the watch share one channel. A controller keeps one session a
+//! gateway, so the task dials nothing beside the link. The host asks over
+//! the link the task holds ([`Linked`]). The gateway keeps that one link
+//! for its life. Where its session ends the task dials the link again in
+//! place, so a request in flight reports on the session that stands and
+//! the controller's lease ends with the request. A watch that fails on a
+//! session that stands is opened again on it: a new dial would take the
+//! session from under the requests in flight. The watcher keeps its place
+//! across sessions, and the store keeps its last fleet until a new
+//! snapshot replaces it.
 //!
 //! After each event the store takes at a place, the task settles the
 //! gateway's feed: the registry gets the rows' worker objects, and the
@@ -12,11 +23,17 @@
 //! its settle a decision can name a row whose worker the registry does
 //! not hold yet. The host passes that target over and asks again.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use anyhow::Context as _;
+use anyhow::{anyhow, Context as _};
+use arc_swap::ArcSwapOption;
 use smg_policy_controller::{
-    client::{Client, Error, ANSWER_WAIT, KEEPALIVE},
+    client::{Error, Link, Unanswered},
+    door::{Door, Request},
+    handle::Handle,
     store::token,
     watcher::{Ended, Watcher},
 };
@@ -26,21 +43,28 @@ use tokio::{
     time::sleep,
 };
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
-use tracing::warn;
+use tracing::{debug, warn};
 
-use super::feed::Feed;
+use super::{feed::Feed, host::NoAnswer};
 use crate::config::RouterConfig;
 
 const FIRST_RETRY: Duration = Duration::from_millis(250);
 const MAX_RETRY: Duration = Duration::from_secs(5);
+
+/// How long an ask over the link waits for its answer. Each ask states a
+/// shorter time for the controller to decide in
+/// ([`DECIDE_BUDGET_MICROS`](super::host::DECIDE_BUDGET_MICROS)), so an
+/// answer made at that budget's end still arrives inside the wait.
+const ASK_WAIT: Duration = Duration::from_millis(100);
 
 /// What the follower has reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Followed {
     /// No snapshot was taken yet.
     Nothing,
-    /// A snapshot was taken: the store holds the fleet as of a place, and
-    /// the registry holds a worker object for each of its rows.
+    /// A snapshot was taken and settled: the store held the fleet as of a
+    /// place, and the registry a worker object for each of its rows. A
+    /// later snapshot's rows are published before their objects.
     Fleet,
 }
 
@@ -63,9 +87,29 @@ impl Settings {
         }
     }
 
-    async fn connect(&self, address: &str) -> anyhow::Result<Client> {
+    /// Reads each configured TLS file once, so a path that cannot be read
+    /// refuses the start by its option's name. Each dial reads the files
+    /// again.
+    pub(crate) fn readable(&self) -> Result<(), String> {
+        for (option, path) in [
+            ("--policy-controller-tls-ca-cert", &self.ca_cert),
+            ("--policy-controller-tls-cert", &self.cert),
+            ("--policy-controller-tls-key", &self.key),
+        ] {
+            if let Some(path) = path {
+                std::fs::read(path)
+                    .map_err(|error| format!("reading {option} {path:?}: {error}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The endpoint of `address`, with the TLS files where the connection
+    /// is configured with them. Each dial reads the files again, so a
+    /// rotated file is picked up.
+    async fn endpoint(&self, address: &str) -> anyhow::Result<Endpoint> {
         if self.ca_cert.is_none() && self.cert.is_none() {
-            return Ok(Client::connect(&format!("http://{address}"), &self.gateway_id).await?);
+            return Ok(Endpoint::from_shared(format!("http://{address}"))?);
         }
 
         let mut tls = ClientTlsConfig::new();
@@ -84,17 +128,27 @@ impl Settings {
                 .with_context(|| format!("reading --policy-controller-tls-key {key:?}"))?;
             tls = tls.identity(Identity::from_pem(cert, key));
         }
-        // The watch's next event waits with no bound, so the channel is kept
-        // alive as the client's own dial keeps it: a controller gone silent
-        // ends the wait.
-        let endpoint = Endpoint::from_shared(format!("https://{address}"))?
-            .http2_keep_alive_interval(KEEPALIVE)
-            .keep_alive_timeout(ANSWER_WAIT)
-            .keep_alive_while_idle(true);
+        let endpoint = Endpoint::from_shared(format!("https://{address}"))?;
         if let Some(host) = endpoint.uri().host() {
             tls = tls.domain_name(host.trim_matches(['[', ']']));
         }
-        Ok(Client::connect_with(endpoint.tls_config(tls)?, &self.gateway_id).await?)
+        Ok(endpoint.tls_config(tls)?)
+    }
+
+    /// The gateway's one connection to the controller at `address`: its
+    /// session, its decide stream, and the channel the watch opens on. The
+    /// link keeps its channel alive itself, so a controller gone silent
+    /// ends it.
+    async fn dial(&self, address: &str) -> anyhow::Result<Link> {
+        let endpoint = self.endpoint(address).await?;
+        Ok(Link::connect(endpoint, &self.gateway_id).await?)
+    }
+
+    /// The next session of `link`, opened in place at `address`. The
+    /// requests in flight hold the link, so they report on that session.
+    async fn redial(&self, link: &Link, address: &str) -> anyhow::Result<()> {
+        let endpoint = self.endpoint(address).await?;
+        Ok(link.redial(endpoint, &self.gateway_id).await?)
     }
 }
 
@@ -109,12 +163,82 @@ fn gateway_id(hostname: Option<String>) -> String {
         })
 }
 
-/// The gateway's side of a controller's watch: one task that keeps the
-/// process's policy store as the controller tells it.
+/// The link the follower's task holds, as the gateway's host reads it: none
+/// before the first dial reaches a controller, and the same link from then
+/// on. Between two of its sessions an ask gets no answer, and a report
+/// waits for the next one. Beside it stands what the task has reached.
+pub(crate) struct Linked {
+    link: ArcSwapOption<Link>,
+    followed: watch::Receiver<Followed>,
+}
+
+#[cfg(test)]
+impl Default for Linked {
+    /// A holder no task writes: no link, and no fleet.
+    fn default() -> Self {
+        Self::reading(watch::channel(Followed::Nothing).1)
+    }
+}
+
+impl Linked {
+    fn reading(followed: watch::Receiver<Followed>) -> Self {
+        Self {
+            link: ArcSwapOption::empty(),
+            followed,
+        }
+    }
+
+    /// Whether the store holds a fleet the controller told: the first whole
+    /// snapshot stands. From then on the rows are the last told, and the
+    /// door of this process has rows to decide over where the controller
+    /// gives an ask no decision.
+    pub(crate) fn fleet(&self) -> bool {
+        *self.followed.borrow() == Followed::Fleet
+    }
+
+    /// One decision of the controller for `request`, asked at `now` and
+    /// held ([`Handle::asked`]). It waits up to [`ASK_WAIT`].
+    ///
+    /// # Errors
+    ///
+    /// [`NoAnswer`]: no dial has reached a controller yet, or the link gave
+    /// the ask no decision. A link between two sessions gives none.
+    pub(crate) async fn asked(
+        &self,
+        request: &Request<'_>,
+        now: Instant,
+    ) -> Result<Handle<Arc<Door>>, NoAnswer> {
+        let Some(link) = self.link.load_full() else {
+            return Err(NoAnswer::NoLink);
+        };
+        Handle::asked(&link, request, now, ASK_WAIT)
+            .await
+            .map_err(|unanswered| {
+                debug!(?unanswered, "The controller gave an ask no decision");
+                no_answer(&unanswered)
+            })
+    }
+}
+
+/// The gateway's word for an ask its link left with no decision.
+fn no_answer(unanswered: &Unanswered) -> NoAnswer {
+    match unanswered {
+        Unanswered::NoCredit => NoAnswer::NoCredit,
+        Unanswered::Busy(_) => NoAnswer::Busy,
+        Unanswered::Late => NoAnswer::Late,
+        Unanswered::InFlight => NoAnswer::InFlight,
+        Unanswered::Ended => NoAnswer::Ended,
+        Unanswered::Unsent(_) => NoAnswer::Unsent,
+    }
+}
+
+/// The gateway's side of a controller: one task that holds the link and
+/// keeps the process's policy store as the controller's watch tells it.
 pub(crate) struct Follower {
     task: JoinHandle<()>,
     stop: oneshot::Sender<()>,
     followed: watch::Receiver<Followed>,
+    linked: Arc<Linked>,
 }
 
 impl Follower {
@@ -123,6 +247,8 @@ impl Follower {
     pub(crate) fn start(settings: Settings, feed: Feed) -> Self {
         let (stop, stopped) = oneshot::channel();
         let (progress, followed) = watch::channel(Followed::Nothing);
+        let linked = Arc::new(Linked::reading(followed.clone()));
+        let held = Arc::clone(&linked);
         #[expect(
             clippy::disallowed_methods,
             reason = "shutdown signals and joins the follower task"
@@ -131,14 +257,23 @@ impl Follower {
             tokio::select! {
                 biased;
                 _ = stopped => {}
-                () = run(settings, feed, progress) => {}
+                () = run(settings, feed, &held, progress) => {}
             }
+            // A stop drops the task where it waits. The host is left no
+            // link of a task that ended.
+            held.link.store(None);
         });
         Self {
             task,
             stop,
             followed,
+            linked,
         }
+    }
+
+    /// The link the task holds, for the gateway's host.
+    pub(crate) fn linked(&self) -> Arc<Linked> {
+        Arc::clone(&self.linked)
     }
 
     /// What the follower has reached.
@@ -168,7 +303,14 @@ const REDIRECTS: u32 = 2;
 /// replica that does not lead named one, and fewer than [`REDIRECTS`] were
 /// followed since the watch last held a place.
 fn named_leader(error: &anyhow::Error, followed: u32) -> Option<&str> {
-    match error.downcast_ref() {
+    // A dial's refusal is the error itself. A link's end is its shared
+    // cause.
+    let cause = error.downcast_ref::<Error>().or_else(|| {
+        error
+            .downcast_ref::<Arc<Error>>()
+            .map(|cause| cause.as_ref())
+    });
+    match cause {
         Some(Error::NotLeader(leader)) if !leader.is_empty() && followed < REDIRECTS => {
             Some(leader)
         }
@@ -176,7 +318,15 @@ fn named_leader(error: &anyhow::Error, followed: u32) -> Option<&str> {
     }
 }
 
-async fn run(settings: Settings, feed: Feed, progress: watch::Sender<Followed>) {
+/// Why `link` ended, as the next dial reads it.
+fn ended(link: &Link) -> anyhow::Error {
+    link.ended().map_or_else(
+        || anyhow!("the controller's link closed"),
+        anyhow::Error::new,
+    )
+}
+
+async fn run(settings: Settings, feed: Feed, linked: &Linked, progress: watch::Sender<Followed>) {
     let mut watcher = Watcher::new(Arc::clone(feed.store()));
     let mut delay = FIRST_RETRY;
     let mut redirect: Option<String> = None;
@@ -184,17 +334,28 @@ async fn run(settings: Settings, feed: Feed, progress: watch::Sender<Followed>) 
     let mut followed = 0;
     loop {
         let address = redirect.as_deref().unwrap_or(&settings.address);
-        let error = match settings.connect(address).await {
-            Ok(mut client) => follow(
-                &mut client,
-                &mut watcher,
-                &feed,
-                &progress,
-                &mut delay,
-                &mut followed,
-            )
-            .await
-            .into(),
+        // One link for the task's life. The first dial makes it, and each
+        // later one opens its next session in place.
+        let dialed = match linked.link.load_full() {
+            Some(link) => settings.redial(&link, address).await.map(|()| link),
+            None => settings.dial(address).await.map(|link| {
+                let link = Arc::new(link);
+                linked.link.store(Some(Arc::clone(&link)));
+                link
+            }),
+        };
+        let error = match dialed {
+            Ok(link) => {
+                follow(
+                    &link,
+                    &mut watcher,
+                    &feed,
+                    &progress,
+                    &mut delay,
+                    &mut followed,
+                )
+                .await
+            }
             Err(error) => error,
         };
         if let Some(leader) = named_leader(&error, followed) {
@@ -202,7 +363,7 @@ async fn run(settings: Settings, feed: Feed, progress: watch::Sender<Followed>) 
             redirect = Some(leader.to_owned());
             continue;
         }
-        warn!(address, error = %format_args!("{error:#}"), ?delay, "Retrying the controller's worker watch");
+        warn!(address, error = %format_args!("{error:#}"), ?delay, "Retrying the controller's link");
         sleep(delay).await;
         delay = next_delay(delay);
         redirect = None;
@@ -210,25 +371,41 @@ async fn run(settings: Settings, feed: Feed, progress: watch::Sender<Followed>) 
     }
 }
 
+/// Follows the controller's workers over `link` until its session ends or
+/// its replica stops leading, and answers why. A watch that fails on a
+/// session that stands is opened again on it, after the wait.
 async fn follow(
-    client: &mut Client,
+    link: &Link,
     watcher: &mut Watcher,
     feed: &Feed,
     progress: &watch::Sender<Followed>,
     delay: &mut Duration,
     followed: &mut u32,
-) -> Error {
+) -> anyhow::Error {
     loop {
-        let mut following = match watcher.open(client).await {
-            Ok(following) => following,
-            Err(error) => return error,
+        let mut following = match watcher.open_on(link).await {
+            Ok(following) => Some(following),
+            Err(error) => match leaves(link, error) {
+                Ok(why) => return why,
+                Err(error) => {
+                    warn!(%error, delay = ?*delay, "Opening the controller's worker watch again on its link");
+                    None
+                }
+            },
         };
         // Whether this stream brought the watcher to a place. One that ends
         // before it does is opened again after the wait, so a snapshot that
-        // cannot land does not spin.
+        // cannot land does not spin. One that fails waits too.
         let mut placed = false;
-        loop {
-            match following.next().await {
+        while let Some(following) = &mut following {
+            // A watch can outlive its link. The link's end comes first, so
+            // the task never follows a controller it can no longer ask.
+            let event = tokio::select! {
+                biased;
+                () = link.closed() => return ended(link),
+                event = following.next() => event,
+            };
+            match event {
                 Ok(true) => {}
                 // The controller ended the stream with no error: the next
                 // one goes on after the place.
@@ -237,7 +414,14 @@ async fn follow(
                     warn!(?lost, "Lost the controller's worker watch position");
                     break;
                 }
-                Err(Ended::Client(error)) => return error,
+                Err(Ended::Client(error)) => match leaves(link, error) {
+                    Ok(why) => return why,
+                    Err(error) => {
+                        warn!(%error, delay = ?*delay, "Opening the controller's worker watch again on its link");
+                        placed = false;
+                        break;
+                    }
+                },
             }
             if following.watcher().at().is_some() {
                 // The store holds the fleet as of a place. The registry
@@ -254,9 +438,29 @@ async fn follow(
             }
         }
         if !placed {
-            sleep(*delay).await;
+            // The wait ends with the link.
+            tokio::select! {
+                biased;
+                () = link.closed() => return ended(link),
+                () = sleep(*delay) => {}
+            }
             *delay = next_delay(*delay);
         }
+    }
+}
+
+/// Why a watch that failed with `error` ends the follow on `link`. Where
+/// the session has ended its own cause is the answer, so a leader it names
+/// is dialed at once. Where the watch's replica does not lead, the next
+/// dial goes to the leader the watch names. Any other failure is the
+/// watch's own and is handed back: the session stands.
+fn leaves(link: &Link, error: Error) -> Result<anyhow::Error, Error> {
+    if !link.stands() {
+        Ok(ended(link))
+    } else if matches!(error, Error::NotLeader(_)) {
+        Ok(error.into())
+    } else {
+        Err(error)
     }
 }
 
@@ -273,13 +477,19 @@ pub(crate) mod tests {
         x509::X509,
     };
     use smg_policy_controller::{
+        client::Link,
         controller::{Config, Controller, Election, Listener, Scope, State, PRINCIPAL_ENTRY},
+        decision::ShedReason,
+        lease::{LeaseId, TransportClass},
         proto::{self, policy_controller_client::PolicyControllerClient, worker_event::Event},
-        store::{MemoryStore, WorkerStatus, WorkersStore},
-        view::WorkerId,
+        store::{GatewayId, LeaseState, MemoryStore, WorkerStatus, WorkersStore},
+        view::{fingerprint, WorkerId},
     };
     use tokio::{sync::oneshot, time};
-    use tonic::{transport::Channel, Request};
+    use tonic::{
+        transport::{Channel, Endpoint},
+        Request,
+    };
 
     use super::{
         gateway_id, named_leader, next_delay, Error, Followed, Follower, Settings, FIRST_RETRY,
@@ -287,9 +497,10 @@ pub(crate) mod tests {
     };
     use crate::{
         config::RouterConfig,
+        observability::metrics::test_support::render_with_recorder,
         policy_controller::{
             feed::{following, Feed},
-            host::{Ask, Host},
+            host::{Ask, End, Host, NoAnswer, Unplaced},
             start,
         },
         routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BackendConnector},
@@ -373,6 +584,43 @@ pub(crate) mod tests {
             .collect();
         urls.sort_unstable();
         urls
+    }
+
+    /// What the gateway's metrics hold after `case`. One thread runs the
+    /// case, its controller and its follower, so the thread's recorder
+    /// reads what the host counts.
+    fn rendered(case: impl std::future::Future<Output = ()>) -> String {
+        render_with_recorder(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(case);
+        })
+    }
+
+    /// Every one of `lines` stands in `rendered`: a failure names each
+    /// line that does not.
+    fn assert_counted(rendered: &str, lines: &[&str]) {
+        let missing: Vec<_> = lines
+            .iter()
+            .filter(|line| !rendered.lines().any(|held| held == **line))
+            .collect();
+        assert!(missing.is_empty(), "missing {missing:?} in:\n{rendered}");
+    }
+
+    /// The leases a store holds live for a gateway.
+    fn live(store: &MemoryStore, gateway: GatewayId) -> usize {
+        smg_policy_controller::store::LeasesStore::live(store, gateway)
+    }
+
+    /// Whether the store holds `lease` of `gateway` as dispatched.
+    fn dispatched(store: &MemoryStore, gateway: GatewayId, lease: LeaseId) -> bool {
+        let record = smg_policy_controller::store::LeasesStore::get(store, gateway, lease);
+        matches!(
+            record.map(|record| record.state),
+            Some(LeaseState::Dispatched { .. })
+        )
     }
 
     fn operator<T>(body: T) -> Request<T> {
@@ -526,38 +774,392 @@ pub(crate) mod tests {
         controller.stop().await;
     }
 
-    /// A decision names a followed row once the fleet is reported, and the
-    /// registry holds the worker to send to.
-    #[tokio::test]
-    async fn a_request_is_placed_on_a_followed_worker_once_the_fleet_is_reported() {
+    /// The host of a gateway under an address asks its controller. The
+    /// decision and its lease are the controller's, the worker is the
+    /// gateway's object of the picked row, and the request's end takes the
+    /// lease off the controller's file. The decision is counted under the
+    /// remote mode and no profile.
+    #[test]
+    fn a_linked_host_places_a_request_by_its_controllers_decision() {
+        let rendered = rendered(placed_by_the_controller());
+        assert_counted(
+            &rendered,
+            &["smg_policy_decisions_total{model=\"model\",profile=\"\",outcome=\"pick\",mode=\"remote\"} 1"],
+        );
+    }
+
+    async fn placed_by_the_controller() {
         let mut controller = Serving::start().await;
         time::timeout(WAIT, async {
-            let row = register(&mut controller.control, 31001, true).await;
-            let store = start(&RouterConfig {
+            let config = RouterConfig {
                 policy_controller: true,
                 ..RouterConfig::default()
-            })
-            .unwrap()
-            .expect("the controller was picked");
+            };
+            // The controller decides by a document of its own.
+            let document = config.policy_document().unwrap();
+            controller
+                .store
+                .apply(config.hosted_policy(&document).unwrap())
+                .unwrap();
+            let row = register(&mut controller.control, 31001, true).await;
+            let store = start(&config).unwrap().expect("the controller was picked");
             let registry = Arc::new(WorkerRegistry::new());
             let feed = followed(&store, &registry);
-            let host = Host::new(store, Arc::clone(&feed.objects));
+            let objects = Arc::clone(&feed.objects);
             let follower = Follower::start(settings(controller.address), feed);
             until("the first snapshot", || {
                 follower.followed() == Followed::Fleet
             })
             .await;
 
-            let placed = host
-                .place(&Ask::of(b"first", "model"), Instant::now())
+            let host = Host::linked(Arc::clone(&store), objects, follower.linked());
+            let now = Instant::now();
+            let mut placed = host
+                .place(&Ask::of(b"first", "model"), now)
                 .await
-                .expect("a decision picks the followed worker");
+                .expect("the controller picks the followed worker");
             assert_eq!(placed.id(), WorkerId(row.id));
             assert_eq!(placed.worker().url(), url(31001));
+            // The lease is the controller's. This process books none.
+            let gateway = GatewayId(fingerprint(b"test-gateway"));
+            assert_eq!(live(&controller.store, gateway), 1);
+            assert_eq!(live(&store, GatewayId::LOCAL), 0);
+
+            placed.dispatched(now);
+            placed.completed(
+                End {
+                    status: 200,
+                    class: TransportClass::Ok,
+                    ttft_micros: 0,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    duration_micros: 0,
+                },
+                now,
+            );
+            until("the controller to end the lease", || {
+                live(&controller.store, gateway) == 0
+            })
+            .await;
             follower.stop().await;
         })
         .await
-        .expect("the request is placed within five seconds");
+        .expect("the request is placed and ended within five seconds");
+        controller.stop().await;
+    }
+
+    /// A request can outlast the session it was placed over. The follower
+    /// dials its one link again, and what a request reports is said on a
+    /// session that stands: the controller's lease ends with the request.
+    /// One request is dispatched before its session ends and completes on
+    /// the next. The other is sent and ends between the two.
+    #[tokio::test]
+    async fn a_request_placed_over_one_session_ends_its_lease_on_the_next() {
+        let mut controller = Serving::start().await;
+        time::timeout(WAIT, async {
+            let config = RouterConfig {
+                policy_controller: true,
+                ..RouterConfig::default()
+            };
+            let document = config.policy_document().unwrap();
+            controller
+                .store
+                .apply(config.hosted_policy(&document).unwrap())
+                .unwrap();
+            register(&mut controller.control, 31001, true).await;
+            let store = start(&config).unwrap().expect("the controller was picked");
+            let registry = Arc::new(WorkerRegistry::new());
+            let feed = followed(&store, &registry);
+            let objects = Arc::clone(&feed.objects);
+            let follower = Follower::start(settings(controller.address), feed);
+            until("the first snapshot", || {
+                follower.followed() == Followed::Fleet
+            })
+            .await;
+            let linked = follower.linked();
+            let host = Host::linked(Arc::clone(&store), objects, Arc::clone(&linked));
+            let now = Instant::now();
+            let mut sent = host
+                .place(&Ask::of(b"first", "model"), now)
+                .await
+                .expect("the controller picks the followed worker");
+            let mut waiting = host
+                .place(&Ask::of(b"second", "model"), now)
+                .await
+                .expect("the controller picks the followed worker");
+            let gateway = GatewayId(fingerprint(b"test-gateway"));
+            assert_eq!(live(&controller.store, gateway), 2);
+            let end = || End {
+                status: 200,
+                class: TransportClass::Ok,
+                ttft_micros: 0,
+                tokens_in: 0,
+                tokens_out: 0,
+                duration_micros: 0,
+            };
+
+            // The first request is sent while its session stands, and the
+            // controller books the dispatch.
+            sent.dispatched(now);
+            let lease = sent.lease().expect("a pick holds a lease");
+            until("the controller to book the dispatch", || {
+                dispatched(&controller.store, gateway, lease)
+            })
+            .await;
+
+            // A second dial under the gateway's id takes the session from
+            // under both requests.
+            let link = linked
+                .link
+                .load_full()
+                .expect("the follower holds its link");
+            let endpoint = Endpoint::from_shared(format!("http://{}", controller.address)).unwrap();
+            let _second = Link::connect(endpoint, "test-gateway").await.unwrap();
+            until("the link's session to end", || !link.stands()).await;
+
+            // The second request is sent and ends with no session standing:
+            // its reports wait, and the controller keeps both leases.
+            waiting.dispatched(now);
+            waiting.completed(end(), now);
+            assert_eq!(live(&controller.store, gateway), 2);
+            until("the link's next session", || link.stands()).await;
+
+            // The next session says the second request's reports, and its
+            // lease ends. The first request's lease stands, dispatched: a
+            // new session ends no lease by itself.
+            until("the second request's lease to end", || {
+                live(&controller.store, gateway) == 1
+            })
+            .await;
+            assert!(
+                dispatched(&controller.store, gateway, lease),
+                "the dispatched lease stands across the dial"
+            );
+
+            // The first request completes on the next session, and no lease
+            // is left.
+            sent.completed(end(), now);
+            until("the controller to end the first request's lease", || {
+                live(&controller.store, gateway) == 0
+            })
+            .await;
+            follower.stop().await;
+        })
+        .await
+        .expect("the lease ends on the next session within five seconds");
+        controller.stop().await;
+    }
+
+    /// A controller that went away leaves the gateway deciding. The door of
+    /// this process answers in its place over the last rows it told, and
+    /// the lease is this process's own. The ask is counted by the reason it
+    /// had no answer, and the decision under the local mode with its
+    /// profile's name.
+    #[test]
+    fn a_lost_controller_leaves_the_decisions_to_this_process() {
+        let rendered = rendered(placed_here_behind_a_lost_controller());
+        assert_counted(
+            &rendered,
+            &[
+                "smg_policy_unanswered_total{reason=\"ended\"} 1",
+                "smg_policy_decisions_total{model=\"model\",profile=\"\",outcome=\"unanswered\",mode=\"remote\"} 1",
+                "smg_policy_decisions_total{model=\"model\",profile=\"random\",outcome=\"pick\",mode=\"local\"} 1",
+            ],
+        );
+    }
+
+    async fn placed_here_behind_a_lost_controller() {
+        let mut controller = Serving::start().await;
+        let row = time::timeout(WAIT, register(&mut controller.control, 31001, true))
+            .await
+            .unwrap();
+        let store = start(&RouterConfig {
+            policy_controller: true,
+            ..RouterConfig::default()
+        })
+        .unwrap()
+        .expect("the controller was picked");
+        let feed = fed(&store);
+        let objects = Arc::clone(&feed.objects);
+        let follower = Follower::start(settings(controller.address), feed);
+        until("the first snapshot", || {
+            follower.followed() == Followed::Fleet
+        })
+        .await;
+        let linked = follower.linked();
+        let host = Host::linked(Arc::clone(&store), objects, Arc::clone(&linked));
+
+        controller.stop().await;
+        // The gateway keeps its link. Its session is gone with the controller.
+        until("the link's session to end", || {
+            linked
+                .link
+                .load()
+                .as_ref()
+                .is_some_and(|link| !link.stands())
+        })
+        .await;
+        let now = Instant::now();
+        let mut placed = time::timeout(WAIT, host.place(&Ask::of(b"first", "model"), now))
+            .await
+            .unwrap()
+            .expect("the door of this process picks the followed worker");
+        assert_eq!(placed.id(), WorkerId(row.id));
+        assert_eq!(placed.worker().url(), url(31001));
+        assert_eq!(live(&store, GatewayId::LOCAL), 1);
+
+        placed.dispatched(now);
+        placed.completed(
+            End {
+                status: 200,
+                class: TransportClass::Ok,
+                ttft_micros: 0,
+                tokens_in: 0,
+                tokens_out: 0,
+                duration_micros: 0,
+            },
+            now,
+        );
+        until("the lease to end", || live(&store, GatewayId::LOCAL) == 0).await;
+        time::timeout(Duration::from_secs(1), follower.stop())
+            .await
+            .unwrap();
+    }
+
+    /// An ask the link gives no decision is decided by the door of this
+    /// process whatever the reason, and counted under it: a stream that
+    /// holds no credit, then a controller that does not answer in time.
+    #[test]
+    fn an_ask_left_with_no_decision_is_decided_here_and_counted_by_its_reason() {
+        for (window, reason) in [(0, "no_credit"), (8, "late")] {
+            let rendered = rendered(shed_here_under_a_silent_controller(window));
+            let unanswered = format!("smg_policy_unanswered_total{{reason=\"{reason}\"}} 1");
+            assert_counted(
+                &rendered,
+                &[
+                    unanswered.as_str(),
+                    "smg_policy_decisions_total{model=\"model\",profile=\"random\",outcome=\"shed\",mode=\"local\"} 1",
+                ],
+            );
+        }
+    }
+
+    /// One attempt of a linked host under a scripted controller that tells
+    /// an empty fleet, grants `window` asks and answers none. The door of
+    /// this process decides, and over no row it sheds.
+    async fn shed_here_under_a_silent_controller(window: u32) {
+        use axum::{extract::Request, Router};
+        use tokio::{net::TcpListener, task::JoinSet};
+        use tonic::{
+            service::Routes,
+            transport::{server::TcpIncoming, Server},
+        };
+
+        time::timeout(WAIT, async {
+            let socket = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = socket.local_addr().unwrap();
+            let routes = Router::new().fallback(move |request: Request| async move {
+                let path = request.uri().path();
+                if path.ends_with("/Leader") {
+                    grpc(
+                        [proto::LeaderInfo {
+                            term: 1,
+                            ..Default::default()
+                        }],
+                        "0",
+                    )
+                } else if path.ends_with("/Session") {
+                    grpc([granting(window)], "")
+                } else if path.ends_with("/Decide") {
+                    grpc::<proto::DecideAnswer>([], "")
+                } else {
+                    assert!(path.ends_with("/WatchWorkers"));
+                    grpc([snapshot(1, true)], "")
+                }
+            });
+            let mut serving = JoinSet::new();
+            serving.spawn(
+                Server::builder()
+                    .add_routes(Routes::from(routes))
+                    .serve_with_incoming(TcpIncoming::from(socket)),
+            );
+            let store = start(&RouterConfig {
+                policy_controller: true,
+                ..RouterConfig::default()
+            })
+            .unwrap()
+            .expect("the controller was picked");
+            let feed = fed(&store);
+            let objects = Arc::clone(&feed.objects);
+            let follower = Follower::start(settings(address), feed);
+            until("the first snapshot", || {
+                follower.followed() == Followed::Fleet
+            })
+            .await;
+
+            let host = Host::linked(store, objects, follower.linked());
+            let unplaced = host
+                .place(&Ask::of(b"first", "model"), Instant::now())
+                .await
+                .err();
+            assert!(
+                matches!(
+                    unplaced,
+                    Some(Unplaced::Shed {
+                        reason: ShedReason::NoEndpoints,
+                        ..
+                    })
+                ),
+                "{unplaced:?}"
+            );
+            follower.stop().await;
+        })
+        .await
+        .expect("the attempt ends within five seconds");
+    }
+
+    /// A controller keeps one session a gateway. A second dial under the
+    /// gateway's id takes the session, so the session of the follower's
+    /// link ends. The follower dials the same link again, and its watch
+    /// goes on after its place: the fleet is not told whole again.
+    #[tokio::test]
+    async fn a_link_the_controller_ends_is_dialed_again_and_the_watch_keeps_its_place() {
+        let mut controller = Serving::start().await;
+        time::timeout(WAIT, async {
+            register(&mut controller.control, 31001, true).await;
+            let store = Arc::new(MemoryStore::new());
+            let follower = Follower::start(settings(controller.address), fed(&store));
+            until("the first snapshot", || {
+                follower.followed() == Followed::Fleet
+            })
+            .await;
+            let linked = follower.linked();
+            let first = linked
+                .link
+                .load_full()
+                .expect("the follower holds its link");
+            let told = store.history();
+
+            let endpoint = Endpoint::from_shared(format!("http://{}", controller.address)).unwrap();
+            let _second = Link::connect(endpoint, "test-gateway").await.unwrap();
+            until("the link's session to end", || !first.stands()).await;
+            until("the link's next session", || first.stands()).await;
+            let held = linked
+                .link
+                .load_full()
+                .expect("the follower holds its link");
+            assert!(Arc::ptr_eq(&held, &first), "the gateway keeps its one link");
+
+            register(&mut controller.control, 31002, true).await;
+            until("the registration told on the next session", || {
+                rows(&store).len() == 2
+            })
+            .await;
+            assert_eq!(store.history(), told, "the fleet was told whole again");
+            follower.stop().await;
+        })
+        .await
+        .expect("the link is dialed again within five seconds");
         controller.stop().await;
     }
 
@@ -613,15 +1215,33 @@ pub(crate) mod tests {
             .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .unwrap();
         let store = Arc::new(MemoryStore::new());
-        let follower = Follower::start(settings(socket.local_addr().unwrap()), fed(&store));
+        let feed = fed(&store);
+        let objects = Arc::clone(&feed.objects);
+        let follower = Follower::start(settings(socket.local_addr().unwrap()), feed);
         let progress = follower.followed.clone();
         time::sleep(Duration::from_millis(300)).await;
         assert_eq!(follower.followed(), Followed::Nothing);
         assert!(rows(&store).is_empty());
+        // No link stands, so an attempt of the gateway's host has no answer.
+        let host = Host::linked(Arc::clone(&store), objects, follower.linked());
+        let unplaced = host
+            .place(&Ask::of(b"first", "model"), Instant::now())
+            .await
+            .err();
+        assert_eq!(unplaced, Some(Unplaced::Unanswered(NoAnswer::NoLink)));
         time::timeout(Duration::from_secs(1), follower.stop())
             .await
             .unwrap();
         assert!(progress.has_changed().is_err());
+    }
+
+    /// A link that ended because its replica stopped leading names the
+    /// leader in its shared cause, and the next dial goes there at once.
+    #[test]
+    fn a_leader_named_at_a_links_end_is_followed_at_once() {
+        let ended = anyhow::Error::new(Arc::new(Error::NotLeader("b:30100".to_owned())));
+        assert_eq!(named_leader(&ended, 0), Some("b:30100"));
+        assert_eq!(named_leader(&ended, REDIRECTS), None);
     }
 
     #[tokio::test]
@@ -789,7 +1409,10 @@ pub(crate) mod tests {
                         "0",
                     )
                 } else if path.ends_with("/Session") {
-                    grpc([welcome()], "0")
+                    // The session stays open: a link stands while it does.
+                    grpc([welcome()], "")
+                } else if path.ends_with("/Decide") {
+                    grpc::<proto::DecideAnswer>([], "")
                 } else {
                     assert!(path.ends_with("/WatchWorkers"));
                     grpc([snapshot(1, true)], "")
@@ -864,18 +1487,24 @@ pub(crate) mod tests {
     }
 
     fn welcome() -> proto::ControllerFrame {
+        granting(0)
+    }
+
+    /// A welcome whose decide stream holds `window` asks.
+    fn granting(window: u32) -> proto::ControllerFrame {
         proto::ControllerFrame {
             term: 1,
-            frame: Some(proto::controller_frame::Frame::Welcome(
-                proto::Welcome::default(),
-            )),
+            frame: Some(proto::controller_frame::Frame::Welcome(proto::Welcome {
+                decide_window: window,
+                ..Default::default()
+            })),
             ..Default::default()
         }
     }
 
     #[tokio::test]
     #[tracing_test::traced_test]
-    async fn the_follower_reopens_a_watch_and_redials_after_a_stream_error() {
+    async fn the_follower_reopens_a_failed_watch_on_the_link_that_stands() {
         use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
         use axum::{body::to_bytes, extract::Request, Router};
@@ -959,7 +1588,11 @@ pub(crate) mod tests {
                         }
                         if path.ends_with("/Session") {
                             sessions.fetch_add(1, Relaxed);
-                            return grpc([welcome()], "0");
+                            // The session stays open: a link stands while it does.
+                            return grpc([welcome()], "");
+                        }
+                        if path.ends_with("/Decide") {
+                            return grpc::<proto::DecideAnswer>([], "");
                         }
                         assert!(path.ends_with("/WatchWorkers"));
                         let body = to_bytes(request.into_body(), 4096).await.unwrap();
@@ -1013,22 +1646,30 @@ pub(crate) mod tests {
             assert_eq!(calls.recv().await, Some((2, 1, 1)));
             assert_eq!(calls.recv().await, Some((0, 0, 1)));
             assert_eq!(*progress.borrow_and_update(), Followed::Fleet);
+            // The fourth watch ends in an error while the session stays
+            // open. The next one opens on the same link after the wait:
+            // no session more, no dial at the seed, the host's link kept.
+            let held = follower.linked().link.load_full().expect("a link stands");
             let retried = time::Instant::now();
             next.notify_one();
-            assert_eq!(calls.recv().await, Some((3, 1, 2)));
+            assert_eq!(calls.recv().await, Some((3, 1, 1)));
             assert!(!progress.has_changed().unwrap());
-            assert!(retried.elapsed() >= Duration::from_millis(750));
-            assert_eq!(seeds.load(Relaxed), 4);
+            assert!(retried.elapsed() >= Duration::from_millis(250));
+            assert_eq!(seeds.load(Relaxed), 2);
+            let now = follower.linked().link.load_full().expect("the link stands");
+            assert!(Arc::ptr_eq(&held, &now));
+            assert!(now.stands());
+            assert!(logs_contain(
+                "Opening the controller's worker watch again on its link"
+            ));
             assert!(logs_contain("Lost the controller's worker watch position"));
             logs_assert(|lines| {
                 let retries: Vec<_> = lines
                     .iter()
-                    .filter(|line| line.contains("Retrying the controller's worker watch"))
+                    .filter(|line| line.contains("Retrying the controller's link"))
                     .collect();
-                if retries.len() == 3
+                if retries.len() == 1
                     && retries[0].contains("delay=250ms")
-                    && retries[1].contains("delay=250ms")
-                    && retries[2].contains("delay=500ms")
                     && retries.iter().all(|line| !line.contains("address=\"\""))
                 {
                     Ok(())
@@ -1039,7 +1680,125 @@ pub(crate) mod tests {
             follower.stop().await;
         })
         .await
-        .expect("the watch reopens and reconnects within five seconds");
+        .expect("the watch reopens on its link within five seconds");
+    }
+
+    /// A replica can welcome a gateway and stop leading at once. Its link
+    /// ends with the leader's name. A watch that fails behind that end
+    /// answers the link's own cause, so the leader is dialed with no wait
+    /// and the replica is not dialed again.
+    #[tokio::test]
+    async fn a_watch_that_fails_on_an_ended_link_follows_the_leader_the_link_names() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+        use axum::{body::Body, extract::Request, response::Response, Router};
+        use tokio::{net::TcpListener, sync::Notify, task::JoinSet};
+        use tonic::{
+            service::Routes,
+            transport::{server::TcpIncoming, Server},
+        };
+
+        time::timeout(WAIT, async {
+            let lead = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let leader_address = lead.local_addr().unwrap().to_string();
+            let seed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let seed_address = seed.local_addr().unwrap();
+            let seeds = Arc::new(AtomicUsize::new(0));
+            let fail = Arc::new(Notify::new());
+            let seed_routes = Router::new().fallback({
+                let (seeds, fail) = (seeds.clone(), fail.clone());
+                move |request: Request| {
+                    let leader_address = leader_address.clone();
+                    let (seeds, fail) = (seeds.clone(), fail.clone());
+                    async move {
+                        let path = request.uri().path();
+                        if path.ends_with("/Leader") {
+                            return grpc(
+                                [proto::LeaderInfo {
+                                    term: 1,
+                                    ..Default::default()
+                                }],
+                                "0",
+                            );
+                        }
+                        if path.ends_with("/Session") {
+                            seeds.fetch_add(1, Relaxed);
+                            // Welcomed, then told of the leader: the link
+                            // stands and its session ends at once.
+                            let leader = proto::ControllerFrame {
+                                term: 1,
+                                frame: Some(proto::controller_frame::Frame::NotLeader(
+                                    proto::NotLeader {
+                                        leader_address,
+                                        ..Default::default()
+                                    },
+                                )),
+                                ..Default::default()
+                            };
+                            return grpc([welcome(), leader], "0");
+                        }
+                        if path.ends_with("/Decide") {
+                            return grpc::<proto::DecideAnswer>([], "");
+                        }
+                        assert!(path.ends_with("/WatchWorkers"));
+                        // The watch fails once the case saw the session's end.
+                        fail.notified().await;
+                        Response::builder()
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", "14")
+                            .body(Body::empty())
+                            .unwrap()
+                    }
+                }
+            });
+            let leader_routes = Router::new().fallback(|request: Request| async move {
+                let path = request.uri().path();
+                if path.ends_with("/Leader") {
+                    return grpc(
+                        [proto::LeaderInfo {
+                            term: 1,
+                            ..Default::default()
+                        }],
+                        "0",
+                    );
+                }
+                if path.ends_with("/Session") {
+                    return grpc([welcome()], "");
+                }
+                if path.ends_with("/Decide") {
+                    return grpc::<proto::DecideAnswer>([], "");
+                }
+                assert!(path.ends_with("/WatchWorkers"));
+                grpc([snapshot(1, true)], "")
+            });
+            let mut servers = JoinSet::new();
+            for (socket, routes) in [(seed, seed_routes), (lead, leader_routes)] {
+                servers.spawn(
+                    Server::builder()
+                        .add_routes(Routes::from(routes))
+                        .serve_with_incoming(TcpIncoming::from(socket)),
+                );
+            }
+            let follower =
+                Follower::start(settings(seed_address), fed(&Arc::new(MemoryStore::new())));
+            let linked = follower.linked();
+            until("the replica's welcome", || linked.link.load().is_some()).await;
+            let link = linked
+                .link
+                .load_full()
+                .expect("the follower holds its link");
+            until("the session's end at the replica", || !link.stands()).await;
+            fail.notify_one();
+            until("the leader's snapshot", || {
+                follower.followed() == Followed::Fleet
+            })
+            .await;
+            assert_eq!(seeds.load(Relaxed), 1, "the replica is dialed once");
+            assert!(link.stands());
+            follower.stop().await;
+        })
+        .await
+        .expect("the named leader is followed within five seconds");
     }
 
     #[test]

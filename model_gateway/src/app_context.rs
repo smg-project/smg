@@ -44,7 +44,7 @@ use crate::{
         follower::{Follower, Settings},
         host::Host,
         operators::Operators,
-        Started,
+        Hosted, Started,
     },
     rate_limit::RateLimitManager,
     rl_adapter,
@@ -998,10 +998,15 @@ impl AppContextBuilder {
                 .policy_controller_address
                 .as_ref()
                 .map(|address| Settings::new(address.clone(), config));
+            if let Some(settings) = &controller {
+                settings.readable()?;
+            }
             let connector = Arc::clone(&self.engine_connector);
-            let (feed, follower) =
-                policy_controller::feeds(&store, registry, connector, controller);
-            let host = Arc::new(Host::new(Arc::clone(&store), Arc::clone(&feed.objects)));
+            let Hosted {
+                feed,
+                host,
+                follower,
+            } = policy_controller::feeds(&store, registry, connector, controller);
             // The door's clock runs from here on. The timer ends behind
             // the host, so its handle detaches.
             let _timer = policy_controller::upkeep::start(&host);

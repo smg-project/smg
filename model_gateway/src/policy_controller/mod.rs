@@ -36,6 +36,11 @@
 //! One site reads the setting, [`start_with`]. Every other site asks what
 //! the start left in the context.
 //!
+//! Under a controller's address the host asks that controller for each
+//! decision, over the one link the follower holds. Where the controller
+//! gives no answer, the host decides at the door of this process
+//! ([`host::Host::linked`]).
+//!
 //! Under a controller's address a follower keeps the store's worker rows
 //! as that controller's watch tells them ([`follower`]). The gateway then
 //! discovers, registers and probes no worker of its own, and its worker
@@ -88,6 +93,7 @@ pub(crate) mod upkeep;
 
 use feed::Feed;
 use follower::{Follower, Settings};
+use host::Host;
 pub(crate) use undecided::refused;
 use undecided::Undecided;
 
@@ -209,27 +215,57 @@ pub(crate) fn hosted(
     })
 }
 
-/// The store's membership feed and, under a controller's address, the
-/// follower that writes the store in the door's place.
+/// What stands beside a started store in this process.
+pub(crate) struct Hosted {
+    /// The store's membership feed.
+    pub(crate) feed: Feed,
+    /// The host the routers ask.
+    pub(crate) host: Arc<Host>,
+    /// Under a controller's address, the task that holds the link and
+    /// writes the store in the door's place.
+    pub(crate) follower: Option<Follower>,
+}
+
+/// The feed, the host and, under a controller's address, the follower of
+/// `store`.
 ///
-/// The two are made together because they are one rule. A gateway that
-/// follows a controller probes no worker, so its holder copies each row's
-/// status onto the row's object ([`feed::following`]), and its follower
-/// settles the feed after each event. Elsewhere the door is the store's
-/// writer, and it settles the feed itself.
+/// The three are made together because they are one rule. A gateway under
+/// a controller's address probes no worker. Its holder copies each row's
+/// status onto the row's object ([`feed::following`]), its follower
+/// settles the feed after each event, and its host asks the controller
+/// over the link the follower holds ([`Host::linked`]).
+/// Elsewhere the door is the store's writer and settles the feed itself,
+/// and the host decides at the door of this process.
 pub(crate) fn feeds(
     store: &Arc<MemoryStore>,
     registry: &Arc<WorkerRegistry>,
     connector: Arc<dyn EngineConnector>,
     controller: Option<Settings>,
-) -> (Feed, Option<Follower>) {
+) -> Hosted {
     match controller {
         Some(settings) => {
             let feed = feed::following(store, registry, connector);
             let follower = Follower::start(settings, feed.clone());
-            (feed, Some(follower))
+            let host = Host::linked(
+                Arc::clone(store),
+                Arc::clone(&feed.objects),
+                follower.linked(),
+            );
+            Hosted {
+                feed,
+                host: Arc::new(host),
+                follower: Some(follower),
+            }
         }
-        None => (feed::feed(store, registry, connector), None),
+        None => {
+            let feed = feed::feed(store, registry, connector);
+            let host = Host::new(Arc::clone(store), Arc::clone(&feed.objects));
+            Hosted {
+                feed,
+                host: Arc::new(host),
+                follower: None,
+            }
+        }
     }
 }
 

@@ -9,8 +9,14 @@
 //! under the prefill admission lock. The store builds the candidates: the
 //! gateway sends none and keeps no view of the rows.
 //!
-//! The door in this process decides on the calling thread. A pair can
-//! wait for prefill admission and asks again when the queue wakes it.
+//! The door in this process decides on the calling thread. A controller
+//! at an address is asked over the gateway's link, behind the same call
+//! ([`Host::linked`]): the decision is that controller's, its lease is
+//! booked there, and the handle's reports go on the link's session. Where
+//! that controller gives an ask no decision, the door of this process
+//! decides in its place, over the last rows the controller told. Such a
+//! gateway keeps serving while its controller is away. A pair can wait
+//! for prefill admission and asks again when the queue wakes it.
 //!
 //! A router speaks to [`Placed`] and [`Held`], never to the controller's
 //! handle. [`Placed`] holds the workers and the decision's lease. Each
@@ -20,9 +26,11 @@
 //! regular HTTP router holds its placement over the body that carries the
 //! guard.
 //!
-//! The gateway's own check of a target is what it alone knows: the worker's
-//! status as its probes read it, and its circuit breaker. The overload and
-//! stall vetoes are the controller's, read from its rows.
+//! The gateway's own check of a target is the worker's status and its
+//! circuit breaker. In process the status is what the gateway's probes
+//! read. Under a controller's address the gateway probes nothing: the
+//! status is that controller's verdict, copied from the row. The overload
+//! and stall vetoes are the controller's, read from its rows.
 
 use std::{
     cell::Cell,
@@ -53,6 +61,7 @@ use smg_policy_controller::{
 };
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard, WorkerType};
 
+use super::{follower::Linked, refused};
 use crate::{
     middleware::{
         ADMISSION_QUEUE_FULL_CODE, ADMISSION_QUEUE_FULL_STATUS, ADMISSION_QUEUE_TIMEOUT_CODE,
@@ -88,6 +97,17 @@ const GATEWAY: GatewayId = GatewayId::LOCAL;
 /// The asks of one attempt: the first, and two more that name the targets
 /// the gateway could not send to.
 const ASKS: usize = 3;
+
+/// The time an ask over the link gives the controller to decide in, in
+/// microseconds, stated in each request. A request's own budget of 0 means
+/// no bound at the door and a spent request over a link, so the host states
+/// one. It is fixed until the policy document names it.
+pub(crate) const DECIDE_BUDGET_MICROS: u32 = 50_000;
+
+/// The shape of request a gateway under a controller's address does not
+/// decide yet, as its refusal names it: the host asks no pair over its
+/// link.
+const PAIR_UNDER_AN_ADDRESS: &str = "a pair under a controller's address";
 
 /// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied:
 /// it held no candidate before any stage ran.
@@ -294,16 +314,22 @@ impl Maker for Made<'_, '_> {
 
     fn make<'w>(&'w self, world: &'w World) -> Request<'w> {
         let (derived, client_key) = self.ask.keys(world.spec());
-        self.source.set(derived.map(|derived| match derived.source {
-            KeySource::Header(_) => "header",
-            KeySource::Rid => "rid",
-        }));
+        self.source
+            .set(derived.map(|derived| counted_as(&derived.source)));
         let key = derived.map_or(Identity::NONE, |derived| derived.key);
         let mut request = self.ask.request(key, client_key, self.missed);
         // The document's word, like the keys: read from the generation
         // that decides.
         request.constraints.decode_later = self.ask.decode_later(world.spec());
         request
+    }
+}
+
+/// The label the gateway counts a key's source by.
+fn counted_as(source: &KeySource<'_>) -> &'static str {
+    match source {
+        KeySource::Header(_) => "header",
+        KeySource::Rid => "rid",
     }
 }
 
@@ -324,6 +350,13 @@ pub(crate) enum Unplaced {
     Queued,
     /// The door made no decision.
     Refused(Refused),
+    /// The controller at the gateway's address gave no decision, and the
+    /// door of this process had no fleet to decide over: no snapshot was
+    /// taken yet.
+    Unanswered(NoAnswer),
+    /// The controller is picked and does not decide this shape of request
+    /// yet. The shape is named as the refusal says it.
+    Undecided(&'static str),
     /// The gateway could send to no target of its three asks.
     NoTargetHolds,
     /// A pair's ask found no endpoint, and by membership no prefill pairs
@@ -355,6 +388,71 @@ impl PrefillCandidateError for Unplaced {
     }
 }
 
+/// Why a controller at an address gave an attempt no decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoAnswer {
+    /// No link stands: before the first dial, or from a link's end to the
+    /// next dial.
+    NoLink,
+    /// The link's decide stream holds no credit. Nothing was sent.
+    NoCredit,
+    /// The controller left the request to the gateway.
+    Busy,
+    /// No answer came inside the wait.
+    Late,
+    /// An ask under the request's id is in flight already. Nothing was sent.
+    InFlight,
+    /// The link ended under the ask.
+    Ended,
+    /// The request could not be sent, or its answer could not be read.
+    Unsent,
+}
+
+impl NoAnswer {
+    /// The reason, as the gateway's metrics label it.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::NoLink => "no_link",
+            Self::NoCredit => "no_credit",
+            Self::Busy => "busy",
+            Self::Late => "late",
+            Self::InFlight => "in_flight",
+            Self::Ended => "ended",
+            Self::Unsent => "unsent",
+        }
+    }
+}
+
+/// Who decided an ask.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum By {
+    /// The door of this process, for a gateway with no controller's
+    /// address.
+    Door,
+    /// The controller at the gateway's address.
+    Controller,
+    /// The door of this process, in the place of a controller that gave
+    /// the ask no decision.
+    DoorInstead,
+}
+
+impl By {
+    /// The `mode` label of the decision metrics.
+    fn mode(self) -> &'static str {
+        match self {
+            Self::Door => "embedded",
+            Self::Controller => "remote",
+            Self::DoorInstead => "local",
+        }
+    }
+
+    /// Whether the document this process holds decided: its profiles have
+    /// names here.
+    fn here(self) -> bool {
+        self != Self::Controller
+    }
+}
+
 impl Unplaced {
     /// The answer for a request of `model` that has no worker: the status,
     /// the code and the retry hint, one function for every router.
@@ -368,7 +466,8 @@ impl Unplaced {
     /// | The decision's budget passed | 503 `admission_queue_timeout`, with the same hint |
     /// | The prefill admission queue is full or timed out | 429 `pd_prefill_queue_full` or `pd_prefill_queue_timeout` |
     /// | The policy declined the request | 503 `policy_declined` |
-    /// | The door made no decision | 503 `policy_controller_unavailable`, with a retry hint |
+    /// | The door made no decision, or a controller at an address gave none before its first snapshot | 503 `policy_controller_unavailable`, with a retry hint |
+    /// | The controller does not decide the request's shape yet | 501 `not_decided_by_policy_controller` |
     ///
     /// A declined request reads the same message for every cause. Its
     /// refusal line names where the policy declined.
@@ -456,6 +555,14 @@ impl Unplaced {
                 ),
                 0,
             ),
+            Self::Unanswered(_) => hinted(
+                error::service_unavailable(
+                    "policy_controller_unavailable",
+                    "The policy controller gave no decision for this request",
+                ),
+                0,
+            ),
+            Self::Undecided(shape) => refused(shape),
         };
         mark_non_retryable(&mut response);
         response
@@ -487,6 +594,31 @@ pub(crate) struct Asked {
     /// The prefill and decode resolved for each pair target.
     pairs: [[Option<Arc<dyn Worker>>; 2]; MAX_TARGETS],
     handle: Handle<Arc<Door>>,
+    by: By,
+}
+
+/// A routing key copied out of the world it was derived under, for an ask
+/// that waits: a world held across the wait would keep a publication's rows
+/// from their next use.
+struct Key {
+    hash: u64,
+    plain: Option<Box<str>>,
+}
+
+impl Key {
+    fn of(key: Identity<'_>) -> Self {
+        Self {
+            hash: key.hash,
+            plain: key.plain.map(Box::from),
+        }
+    }
+
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            hash: self.hash,
+            plain: self.plain.as_deref(),
+        }
+    }
 }
 
 /// The policy controller's host in this process: the door over the
@@ -494,6 +626,9 @@ pub(crate) struct Asked {
 pub(crate) struct Host {
     door: Arc<Door>,
     workers: Workers,
+    /// The link to the controller that decides, where the gateway was given
+    /// a controller's address. `None`: the door decides in this process.
+    linked: Option<Arc<Linked>>,
 }
 
 /// Where the host finds the worker of a target's row.
@@ -508,11 +643,29 @@ enum Workers {
 
 impl Host {
     /// The host over the controller's `store` and the holder of its worker
-    /// `objects`.
+    /// `objects`. The door decides in this process.
     pub(crate) fn new(store: Arc<MemoryStore>, objects: Arc<Objects<ModelWorkerSnapshot>>) -> Self {
         Self {
             door: Arc::new(Door::new(store)),
             workers: Workers::Held(objects),
+            linked: None,
+        }
+    }
+
+    /// The host of a gateway under a controller's address: each decision is
+    /// that controller's, asked over the link the follower holds. `store`
+    /// holds the controller's rows as its watch tells them, and the commit
+    /// finds a decision's targets among the `objects` the feed's holder
+    /// laid for those rows. An ask the controller leaves with no decision
+    /// is decided at the door over the same store.
+    pub(crate) fn linked(
+        store: Arc<MemoryStore>,
+        objects: Arc<Objects<ModelWorkerSnapshot>>,
+        linked: Arc<Linked>,
+    ) -> Self {
+        Self {
+            linked: Some(linked),
+            ..Self::new(store, objects)
         }
     }
 
@@ -548,6 +701,7 @@ impl Host {
         Self {
             door: Arc::new(Door::new(store)),
             workers: Workers::AtKey(registry),
+            linked: None,
         }
     }
 
@@ -578,6 +732,10 @@ impl Host {
         }
     }
 
+    /// The name of the profile `trace` names in the document this process
+    /// holds. It is asked for a decision of this process's door alone
+    /// ([`By::here`]): a controller at an address decides by its own
+    /// document, which this process holds no copy of.
     fn profile_name(&self, trace: &Trace) -> Option<Arc<str>> {
         self.door.store().with_world(|world| {
             let spec = world.spec();
@@ -636,7 +794,7 @@ impl Host {
         })
     }
 
-    fn trace_decision(&self, decision: &Decision, worker: Option<&Arc<dyn Worker>>) {
+    fn trace_decision(&self, decision: &Decision, worker: Option<&Arc<dyn Worker>>, by: By) {
         cache_trace::decided(|| {
             let trace = decision.trace();
             let shed = match decision {
@@ -653,7 +811,9 @@ impl Host {
                 Decision::Pick(_) | Decision::Queue(_) => None,
             };
             cache_trace::Decided {
-                profile: profile_of(decision).and_then(|_| self.profile_name(trace)),
+                profile: profile_of(decision)
+                    .filter(|_| by.here())
+                    .and_then(|_| self.profile_name(trace)),
                 outcome: outcome(decision),
                 generation: trace.generation,
                 survivors: trace.survivors.get(),
@@ -680,7 +840,12 @@ impl Host {
     /// earlier commits.
     ///
     /// Resolves both workers of each pair before admission can lock the
-    /// queue. The door in this process decides on the calling thread.
+    /// queue. The door of this process decides on the calling thread,
+    /// under the store's own locks, and awaits nothing. A controller at an
+    /// address is asked over the link, and the ask waits for its answer.
+    /// Where it gives none, the door of this process decides at the same
+    /// `now`, once the store holds a fleet that controller told. A decision
+    /// the controller gives late is the link's to release.
     ///
     /// An attempt that keeps one list across its asks asks first with the
     /// list empty: this ask counts as its first then.
@@ -697,10 +862,6 @@ impl Host {
     /// `first` ask, the one that counts its key's source. A pair's attempt
     /// decides again at each wake of the admission queue, from a list a
     /// wait on room leaves empty: its list does not tell its first ask.
-    #[expect(
-        clippy::unused_async,
-        reason = "a controller at an address is asked behind this call, over its session"
-    )]
     async fn ask_as(
         &self,
         ask: &Ask<'_>,
@@ -708,37 +869,50 @@ impl Host {
         first: bool,
         now: Instant,
     ) -> Result<Asked, Unplaced> {
-        let made = Made {
-            ask,
-            missed,
-            source: Cell::new(None),
+        let (decided, source, by) = match &self.linked {
+            None => {
+                let (decided, source) = self.decide(ask, missed, now, By::Door);
+                (decided, source, By::Door)
+            }
+            Some(linked) => {
+                // A pair is not asked over the link yet, as a regular
+                // request is, and it is not decided here in the
+                // controller's place.
+                if ask.phase != Phase::Single {
+                    return Err(Unplaced::Undecided(PAIR_UNDER_AN_ADDRESS));
+                }
+                let started = Instant::now();
+                // The remote ask is boxed at its one call. By value its
+                // future, with the request it sends, would lie in the future
+                // of every selection stage, the local path's too.
+                let (asked, source) = Box::pin(self.asked(linked, ask, missed, now)).await;
+                self.count(ask, asked.as_ref(), By::Controller, started);
+                match asked {
+                    Err(Unplaced::Unanswered(why)) => {
+                        Metrics::record_policy_unanswered(why.reason());
+                        // The door of this process decides in the
+                        // controller's place, over the last rows told.
+                        // Before the first snapshot it has none.
+                        if linked.fleet() {
+                            let instead = By::DoorInstead;
+                            let (decided, source) = self.decide(ask, missed, now, instead);
+                            (decided, source, instead)
+                        } else {
+                            (Err(Unplaced::Unanswered(why)), source, By::Controller)
+                        }
+                    }
+                    asked => (asked, source, By::Controller),
+                }
+            }
         };
-        let started = Instant::now();
-        let decided = Handle::decide_under(Arc::clone(&self.door), GATEWAY, &made, now);
-        let seconds = started.elapsed().as_secs_f64();
         // A key's source counts once an attempt, at its first ask, as a
         // keyed selection of the gateway's own policies counts it: an ask
         // again, behind a missed commit or at a pair's later wake, is the
         // same attempt's.
-        if let Some(source) = made.source.get().filter(|_| first) {
+        if let Some(source) = source.filter(|_| first) {
             Metrics::record_routing_key_source(source);
         }
-        let decision = decided.as_ref().ok().map(Handle::decision);
-        let trace = decision.map(Decision::trace);
-        let generation = trace.map_or(0, |trace| trace.generation);
-        let profile = decision.and_then(profile_of);
-        Metrics::record_policy_decision(
-            ask.model,
-            PolicyDecision {
-                generation,
-                profile,
-                outcome: decision.map_or("refused", outcome),
-                mode: "embedded",
-            },
-            || trace.and_then(|trace| self.profile_name(trace)),
-            seconds,
-        );
-        let handle = decided.map_err(Unplaced::Refused)?;
+        let handle = decided?;
         let decision = *handle.decision();
         match decision {
             Decision::Pick(pick) => {
@@ -752,10 +926,11 @@ impl Host {
                     targets: pick.targets,
                     pairs,
                     handle,
+                    by,
                 })
             }
             Decision::Shed(shed) => {
-                self.trace_decision(&decision, None);
+                self.trace_decision(&decision, None, by);
                 let unpaired = (shed.reason == ShedReason::NoEndpoints)
                     .then(|| self.unpaired(ask))
                     .flatten();
@@ -767,6 +942,89 @@ impl Host {
             }
             Decision::Queue(_) => Err(Unplaced::Queued),
         }
+    }
+
+    /// One decision of the door of this process for `ask`, counted as `by`
+    /// names it, with the label of the source its key came from.
+    fn decide(
+        &self,
+        ask: &Ask<'_>,
+        missed: &[WorkerId],
+        now: Instant,
+        by: By,
+    ) -> (Result<Handle<Arc<Door>>, Unplaced>, Option<&'static str>) {
+        let started = Instant::now();
+        let made = Made {
+            ask,
+            missed,
+            source: Cell::new(None),
+        };
+        let decided = Handle::decide_under(Arc::clone(&self.door), GATEWAY, &made, now)
+            .map_err(Unplaced::Refused);
+        self.count(ask, decided.as_ref(), by, started);
+        (decided, made.source.get())
+    }
+
+    /// Counts one ask's end as `by` names it, with its time since `started`.
+    fn count(
+        &self,
+        ask: &Ask<'_>,
+        decided: Result<&Handle<Arc<Door>>, &Unplaced>,
+        by: By,
+        started: Instant,
+    ) {
+        let seconds = started.elapsed().as_secs_f64();
+        let decision = decided.ok().map(Handle::decision);
+        let trace = decision.map(Decision::trace);
+        let generation = trace.map_or(0, |trace| trace.generation);
+        // A controller's profile has no name here, so its decision counts
+        // under none and its counter keeps one handle.
+        let profile = decision.filter(|_| by.here()).and_then(profile_of);
+        let undecided = match decided {
+            Err(Unplaced::Unanswered(_)) => "unanswered",
+            _ => "refused",
+        };
+        Metrics::record_policy_decision(
+            ask.model,
+            PolicyDecision {
+                generation,
+                profile,
+                outcome: decision.map_or(undecided, outcome),
+                mode: by.mode(),
+            },
+            || trace.and_then(|trace| self.profile_name(trace)),
+            seconds,
+        );
+    }
+
+    /// The controller's decision for `ask` over the gateway's link, with
+    /// the label of the source its key came from.
+    ///
+    /// The request's key is derived by the sources of the document this
+    /// process holds, as the door derives it, and copied out of the world
+    /// before the wait. The controller decides by its own document.
+    async fn asked(
+        &self,
+        linked: &Linked,
+        ask: &Ask<'_>,
+        missed: &[WorkerId],
+        now: Instant,
+    ) -> (Result<Handle<Arc<Door>>, Unplaced>, Option<&'static str>) {
+        let (key, client_key, source) = self.door.store().with_world(|world| {
+            let (derived, client_key) = ask.keys(world.spec());
+            (
+                Key::of(derived.map_or(Identity::NONE, |derived| derived.key)),
+                client_key,
+                derived.map(|derived| counted_as(&derived.source)),
+            )
+        });
+        let mut request = ask.request(key.identity(), client_key, missed);
+        request.facts.budget_micros = DECIDE_BUDGET_MICROS;
+        let decided = linked
+            .asked(&request, now)
+            .await
+            .map_err(Unplaced::Unanswered);
+        (decided, source)
     }
 
     /// The commit: walks the targets of `asked`, best first, and takes the
@@ -802,6 +1060,7 @@ impl Host {
         let Asked {
             targets,
             mut handle,
+            by,
             ..
         } = asked;
         for (index, target) in targets.iter().enumerate() {
@@ -810,7 +1069,7 @@ impl Host {
                 .filter(|worker| routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref()));
             if let Some(worker) = sendable {
                 handle.take(index);
-                self.trace_decision(handle.decision(), Some(&worker));
+                self.trace_decision(handle.decision(), Some(&worker), by);
                 return Some(Placed {
                     worker,
                     id: target.id,
@@ -822,7 +1081,7 @@ impl Host {
         }
         handle.released(ReleaseReason::CommitFailed, now);
         missed.extend(targets.iter().map(|target| target.id));
-        self.trace_decision(handle.decision(), None);
+        self.trace_decision(handle.decision(), None, by);
         None
     }
 
@@ -855,6 +1114,7 @@ impl Host {
             targets,
             pairs,
             mut handle,
+            ..
         } = asked;
         let mut failed = [[None; 2]; MAX_TARGETS];
         let mut no_room = false;
@@ -1165,6 +1425,13 @@ impl Placed {
     #[cfg(test)]
     pub(crate) fn lease_tokens(&self) -> Option<u32> {
         self.handle.lease().map(|leased| leased.lease.tokens)
+    }
+
+    /// The id of the placement's lease, for a case that reads the lease's
+    /// record at its store.
+    #[cfg(test)]
+    pub(crate) fn lease(&self) -> Option<smg_policy_controller::lease::LeaseId> {
+        self.handle.lease().map(|leased| leased.lease.id)
     }
 
     /// The request was sent to the worker at `now`. Said once.

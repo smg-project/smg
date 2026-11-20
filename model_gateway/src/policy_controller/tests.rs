@@ -1356,6 +1356,27 @@ async fn a_rows_status_is_its_workers_under_a_controllers_address_alone() -> Cas
     Ok(())
 }
 
+/// A TLS file that cannot be read refuses the start by its option's name.
+/// The first dial would else be the first to read it, and the gateway would
+/// start and never turn ready. A target with no follower reads no file,
+/// and its start refuses the address itself.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn an_unreadable_tls_file_refuses_the_start_by_its_option() -> Case {
+    let mut config = picked(quiet());
+    config.policy_controller_address = Some("127.0.0.1:1".to_owned());
+    config.policy_controller_tls_ca_cert = Some("/no/such/authority.pem".to_owned());
+    let refusal = match AppContext::from_config(config, 30, None, None).await {
+        Ok(_) => return Err("the context started over an unreadable file".into()),
+        Err(refusal) => refusal.to_string(),
+    };
+    assert!(
+        refusal.contains("--policy-controller-tls-ca-cert") && refusal.contains("authority.pem"),
+        "{refusal}"
+    );
+    Ok(())
+}
+
 /// A context that decides in its own process, with one worker written at
 /// its feed's door under `url`: the context and the worker's row.
 async fn context_with_a_worker(url: &str) -> Result<(AppContext, WorkerId), Box<dyn Error>> {
