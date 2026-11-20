@@ -965,7 +965,8 @@ impl ScoreStage {
 }
 
 /// A filter reference: a bare name, or a name the catalog adds mapped to
-/// the parameters its factory reads.
+/// the parameters its factory reads. A name YAML reads as no string
+/// (`true`, `7`, `~`) is written in quotes.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum FilterSpec {
@@ -2977,7 +2978,7 @@ fn filtered(
         (Some(Found::Built(_)), FilterSpec::Added { written, .. }) => Err(SpecError::BadField {
             path: path(),
             value: written.to_string(),
-            reason: "left out under a filter that takes no parameter",
+            reason: "left out: this filter takes no parameter, write its bare name",
         }),
         (Some(Found::With(build)), entry) => {
             let mut params = match entry {
@@ -2991,12 +2992,8 @@ fn filtered(
                     })?
                     .clone(),
             };
-            // A filter has no weight: the map is the factory's whole, in
-            // the one order a scorer's parameters take.
-            params.sort_keys();
-            params
-                .values_mut()
-                .for_each(serde_json::Value::sort_all_objects);
+            // A filter has no weight: the map is the factory's whole.
+            in_key_order(&mut params);
             let filter = StageBuild::built(
                 &params,
                 profile,
@@ -3087,13 +3084,7 @@ fn scored(
                 Some(value) => check_added_weight(&value, &at)?,
                 None => 1.0,
             };
-            // One order for the factory, the canonical bytes and the
-            // digest: the keys of every map in order, whatever order the
-            // document wrote them in.
-            params.sort_keys();
-            params
-                .values_mut()
-                .for_each(serde_json::Value::sort_all_objects);
+            in_key_order(&mut params);
             let scorer = StageBuild::built(
                 &params,
                 profile,
@@ -3122,6 +3113,16 @@ fn scored(
             reason: "a scorer added in code: a built-in's parameters are typed",
         }),
     }
+}
+
+/// One order of a stage's parameters for its factory, the canonical bytes
+/// and the digest: the keys of every map in order, whatever order the
+/// document wrote them in.
+fn in_key_order(params: &mut serde_json::Map<String, serde_json::Value>) {
+    params.sort_keys();
+    params
+        .values_mut()
+        .for_each(serde_json::Value::sort_all_objects);
 }
 
 fn added_parameters<'a>(
@@ -7712,6 +7713,31 @@ mod tests {
             ));
             assert!(err.contains(message), "{entry}: {err}");
         }
+    }
+
+    /// YAML reads a bare `true`, a number or `~` as no string. A filter of
+    /// such a name is written in quotes, as a scorer of such a name is.
+    #[test]
+    fn a_filter_name_yaml_reads_as_no_string_is_written_in_quotes() {
+        let document = |entry: &str| {
+            format!(
+                "apiVersion: smg.policy/v1\nprofiles: {{p: {{filter: [{entry}], pick: random}}}}\n"
+            )
+        };
+        for bare in ["true", "7", "~"] {
+            let refused = serde_yaml::from_str::<PolicySpec>(&document(bare))
+                .expect_err("no string")
+                .to_string();
+            assert!(
+                refused.contains("a filter name, or one filter name mapped to its parameters"),
+                "{bare}: {refused}"
+            );
+        }
+        let quoted: PolicySpec = serde_yaml::from_str(&document(r#""true""#)).expect("a name");
+        assert_eq!(
+            quoted.profiles["p"].filter,
+            [FilterSpec::Name("true".into())]
+        );
     }
 
     #[test]
