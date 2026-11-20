@@ -1,6 +1,7 @@
 //! The KV event sink: the admission cursor per rank in front of the index
 //! (design 5.1, the KV index row; 5.4, a standby subscribes itself).
 
+use super::index::LaneWriter;
 use crate::view::WorkerId;
 
 /// The header facts of one batch, read by the cursor; the batch itself (the
@@ -146,6 +147,29 @@ pub trait KvEventSink: Send + Sync {
         rank: u16,
         facts: BatchFacts,
         batch: &Self::Batch,
+    ) -> BatchOutcome;
+
+    /// Run one batch of `rank` through its cursor as [`Self::admit`] does
+    /// and, where the cursor admits it, lend the row's lane to `body`: once,
+    /// inside the lane's turn, behind whatever emptying the cursor asked. A
+    /// batch the cursor skips or answers with a gap runs no body. The body
+    /// is the host's own apply rules over the lane's writer: it writes what
+    /// the batch's events leave.
+    ///
+    /// The cursor reads `facts` alone, since it holds no batch to look
+    /// into: a batch that carries the engine's own clear says so in
+    /// [`BatchFacts::clears`].
+    ///
+    /// The body runs under the lane's lock and calls nothing of the sink
+    /// for its own row. A body that unwinds leaves the rank half written:
+    /// the store has the lane start over, as where the worker was reported
+    /// gone, before the unwind goes on.
+    fn admit_through(
+        &self,
+        id: WorkerId,
+        rank: u16,
+        facts: BatchFacts,
+        body: &mut dyn FnMut(&mut LaneWriter<'_>),
     ) -> BatchOutcome;
 
     /// A new stream connection was made for the worker: the first batch on

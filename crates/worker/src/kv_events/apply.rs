@@ -450,12 +450,7 @@ pub fn apply_cleared<I: BlockIndex>(
     worker_blocks: &mut WorkerIndexState<I::Held>,
 ) {
     indexer.apply_cleared(worker_id, &mut worker_blocks.blocks);
-    if let Some(view) = &worker_blocks.groups {
-        view.clear();
-    }
-    worker_blocks.copies.clear();
-    worker_blocks.record_before_clear = worker_blocks.block_of_record;
-    worker_blocks.block_of_record = 0;
+    worker_blocks.index_emptied();
 }
 
 /// Convert a proto `KvBlock` to a kv-index `StoredBlock`, hashing its tokens
@@ -978,6 +973,29 @@ pub struct WorkerIndexState<H: HeldBlocks> {
 }
 
 impl<H: HeldBlocks> WorkerIndexState<H> {
+    /// The index dropped every block of the worker: at a clear of its
+    /// stream ([`apply_cleared`]), or by itself, where an index empties a
+    /// worker's blocks in its own turn and says so here before the worker's
+    /// next event. The worker's group view is emptied, and its copies and
+    /// its block of record are forgotten, as a clear leaves them.
+    pub fn index_emptied(&mut self) {
+        if let Some(view) = &self.groups {
+            view.clear();
+        }
+        self.copies.clear();
+        self.record_before_clear = self.block_of_record;
+        self.block_of_record = 0;
+    }
+
+    /// The worker's block of record: tokens per block of the widest block
+    /// its stores carried since its last clear, and none until a store
+    /// names a width.
+    pub fn block_of_record(&self) -> Option<u32> {
+        u32::try_from(self.block_of_record)
+            .ok()
+            .filter(|&width| width > 0)
+    }
+
     /// Count the verdict and place any group under its view mask.
     fn admit(
         &mut self,

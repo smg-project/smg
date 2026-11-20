@@ -4,10 +4,11 @@
 
 use std::collections::BTreeMap;
 
-use kv_index::{chain_prefix_hash, ApplyError, ReferenceIndexer};
+use kv_index::{chain_prefix_hash, ApplyError, GroupKind, ReferenceIndexer};
 
 use super::{
-    admit, Blocks, ContentHash, KvEvent, LaneCounts, SequenceHash, StoredBlock, INDEX_WORKERS,
+    admit, Blocks, ContentHash, KvEvent, LaneCounts, LaneWriter, SequenceHash, StoredBlock,
+    INDEX_WORKERS,
 };
 use crate::{
     store::{
@@ -399,6 +400,30 @@ mod sent_prefixes {
         admitted(&store, "b");
         let (read, _) = named(&store, None, 16, 7);
         assert!(read.sent_pool().is_some(), "a lane made anew is not heard");
+        Ok(())
+    }
+
+    /// The index speaks for a row from the first admitted batch that wrote,
+    /// whichever body wrote it. A lent body that writes nothing leaves the
+    /// record its cover, as a typed batch with no event does. One that
+    /// stores says its lane heard.
+    #[test]
+    fn a_lent_body_says_its_lane_heard_where_it_writes() -> Case {
+        let store = MemoryStore::new();
+        let a = admitted(&store, "a");
+        store.apply(applied(&merged(1)?)?)?;
+        assert_eq!(
+            store.admit_through(a, 0, batch(1), &mut |_| {}),
+            BatchOutcome::Applied
+        );
+        let (read, _) = named(&store, None, 16, 7);
+        assert!(read.sent_pool().is_some(), "the body wrote nothing");
+
+        let blocks = chain(&[999]);
+        let outcome = store.admit_through(a, 0, batch(2), &mut |lane| write_lent(lane, &blocks));
+        assert_eq!(outcome, BatchOutcome::Applied);
+        let (read, _) = named(&store, None, 16, 7);
+        assert!(read.sent_pool().is_none(), "the lane is heard");
         Ok(())
     }
 
@@ -1490,6 +1515,225 @@ fn a_row_past_the_ceiling_stands_counted_until_its_own_write_finds_a_place() {
         held(&store, MODEL, &[1]),
         BTreeMap::from([(next, 1), (over, 1)])
     );
+}
+
+/// A lent body's write of `blocks` as a chain from the root: the lane's map
+/// is taken for the write and put back.
+fn write_lent(lane: &mut LaneWriter<'_>, blocks: &[StoredBlock]) {
+    let mut map = std::mem::take(lane.map());
+    let placed = lane.stored(blocks, None, &mut map);
+    *lane.map() = map;
+    placed.expect("stored");
+}
+
+/// A lent batch runs through the row's cursor as a typed one does. An
+/// admitted batch runs its body once, inside the lane's turn, and what the
+/// body writes is the row's. A batch the cursor skips or answers with a gap
+/// runs no body, and the typed admit goes on from the same cursor and map.
+#[test]
+fn a_lent_batch_runs_its_body_where_the_cursor_admits_it() {
+    let store = MemoryStore::new();
+    let a = admitted(&store, "a");
+    let blocks = chain(&[1, 2, 3]);
+    let mut ran = 0;
+    let mut body = |lane: &mut LaneWriter<'_>| {
+        ran += 1;
+        write_lent(lane, &blocks);
+    };
+    assert_eq!(
+        store.admit_through(a, 0, batch(1), &mut body),
+        BatchOutcome::Applied
+    );
+    // A duplicate at the cursor, a gap past it, another rank and a row the
+    // store does not hold.
+    assert_eq!(
+        store.admit_through(a, 0, batch(1), &mut body),
+        BatchOutcome::Skipped
+    );
+    assert_eq!(
+        store.admit_through(a, 0, batch(5), &mut body),
+        BatchOutcome::Gap {
+            expected: 2,
+            received: 5
+        }
+    );
+    assert_eq!(
+        store.admit_through(a, 1, batch(2), &mut body),
+        BatchOutcome::Skipped
+    );
+    assert_eq!(
+        store.admit_through(WorkerId(u64::MAX), 0, batch(1), &mut body),
+        BatchOutcome::Skipped
+    );
+    assert_eq!(ran, 1);
+    assert_eq!(held(&store, MODEL, &[1, 2, 3]), BTreeMap::from([(a, 3)]));
+    assert_eq!(store.indexed_blocks(a, 0), 3);
+
+    let evicted = [KvEvent::Removed(vec![blocks[2].seq_hash])];
+    assert_eq!(store.admit(a, 0, batch(2), &evicted), BatchOutcome::Applied);
+    assert_eq!(held(&store, MODEL, &[1, 2, 3]), BTreeMap::from([(a, 2)]));
+}
+
+/// A lent body reads a value that moves each time the store empties the
+/// rank: a resync, a restart its cursor reads, the worker reported gone, a
+/// typed batch's clear. It stands still between them, and the body reads it
+/// over a map that is empty by then.
+#[test]
+fn a_lent_body_reads_each_emptying_of_its_rank() {
+    let store = MemoryStore::new();
+    let a = admitted(&store, "a");
+    let blocks = chain(&[1, 2, 3]);
+    let lent = |sequence, clears| {
+        let facts = BatchFacts {
+            sequence,
+            clears,
+            ..BatchFacts::default()
+        };
+        let mut read = None;
+        let outcome = store.admit_through(a, 0, facts, &mut |lane| {
+            read = Some((lane.emptied(), lane.map().len()));
+            write_lent(lane, &blocks);
+        });
+        assert_eq!(outcome, BatchOutcome::Applied);
+        read.expect("the body ran")
+    };
+    let (first, held) = lent(10, false);
+    assert_eq!(held, 0);
+    assert_eq!(lent(11, false), (first, 3), "no emptying between the two");
+
+    store.resync(a, Some(0), ResyncReason::DataLoss);
+    let (resynced, held) = lent(20, false);
+    assert_eq!(held, 0);
+    assert_ne!(resynced, first);
+    // A clear under the cursor is a restarted publisher: the cursor empties
+    // the rank ahead of the body.
+    let (restarted, held) = lent(5, true);
+    assert_eq!(held, 0);
+    assert_ne!(restarted, resynced);
+    store.removed(a);
+    let (gone, held) = lent(1, false);
+    assert_eq!(held, 0);
+    assert_ne!(gone, restarted);
+    // A typed batch's clear empties the rank through the same routine.
+    assert_eq!(
+        store.admit(a, 0, batch(2), &[KvEvent::Cleared]),
+        BatchOutcome::Applied
+    );
+    let (cleared, held) = lent(3, false);
+    assert_eq!(held, 0);
+    assert_ne!(cleared, gone);
+}
+
+/// The store makes a row's lane again under the row's id: here the row
+/// stops asking for events and asks again. A lane usually sees one resync,
+/// its first snapshot, so two lanes that each counted from nothing would
+/// read alike. The new lane reads another value than the old one did, and
+/// a body that outlives the lane resets its state at the next batch.
+#[test]
+fn a_lane_made_again_under_one_row_id_reads_another_value() {
+    let store = MemoryStore::new();
+    let a = admitted(&store, "a");
+    let read = || {
+        store.resync(a, Some(0), ResyncReason::Snapshot);
+        let mut read = None;
+        let outcome = store.admit_through(a, 0, batch(1), &mut |lane| {
+            read = Some(lane.emptied());
+        });
+        assert_eq!(outcome, BatchOutcome::Applied);
+        read.expect("the body ran")
+    };
+    let old = read();
+
+    let quiet = WorkerFacts {
+        signals: Signals::default(),
+        ..publisher("a", &[MODEL])
+    };
+    assert_eq!(store.upsert(quiet).id(), a, "the row keeps its id");
+    assert_eq!(
+        store.admit_through(a, 0, batch(2), &mut |_| {}),
+        BatchOutcome::Skipped,
+        "a row that asks for no events holds no lane"
+    );
+    assert_eq!(store.upsert(publisher("a", &[MODEL])).id(), a);
+    store.publish_now();
+    assert_ne!(read(), old);
+}
+
+/// A lent body writes the row's view in the model's group views. The view
+/// empties with the rank, and its groups stay. It leaves with the row: the
+/// row that comes next finds a view of its own.
+#[test]
+fn a_rows_group_view_empties_with_its_rank_and_leaves_with_the_row() {
+    let store = MemoryStore::new();
+    let a = admitted(&store, "a");
+    let view_of = |id, sequence| {
+        let mut view = None;
+        let outcome = store.admit_through(id, 0, batch(sequence), &mut |lane| {
+            view = Some(lane.groups());
+        });
+        assert_eq!(outcome, BatchOutcome::Applied);
+        view.expect("the body ran")
+    };
+    let view = view_of(a, 1);
+    view.learn(1, Some(GroupKind::State), 16);
+    view.group_stored(1, &[SequenceHash(7)]);
+    let blocks = |view: &kv_index::WorkerGroups| view.pending_blocks() + view.retained_blocks();
+    assert_eq!(blocks(&view), 1);
+    assert!(std::sync::Arc::ptr_eq(&view, &view_of(a, 2)));
+
+    store.resync(a, Some(0), ResyncReason::DataLoss);
+    assert_eq!(blocks(&view), 0, "the view empties with the rank");
+    assert!(view.knows(1), "its groups stay");
+
+    let successor = store
+        .upsert(WorkerFacts {
+            incarnation: 2,
+            ..publisher("a", &[MODEL])
+        })
+        .id();
+    assert_ne!(successor, a);
+    let next = view_of(successor, 1);
+    assert!(!std::sync::Arc::ptr_eq(&view, &next));
+    assert!(!next.knows(1), "the successor's view is its own");
+}
+
+/// A lent body that unwinds leaves its rank half written. The store has
+/// the lane start over before the unwind goes on, as where the worker was
+/// reported gone: the rank is empty, the cursor reads nothing, and the next
+/// body reads another value over an empty map.
+#[test]
+fn a_lent_body_that_unwinds_starts_its_lane_over() {
+    let store = MemoryStore::new();
+    let a = admitted(&store, "a");
+    let blocks = chain(&[1, 2, 3]);
+    let mut first = None;
+    let outcome = store.admit_through(a, 0, batch(1), &mut |lane| {
+        first = Some(lane.emptied());
+        write_lent(lane, &blocks);
+    });
+    assert_eq!(outcome, BatchOutcome::Applied);
+    assert_eq!(store.indexed_blocks(a, 0), 3);
+    assert!(store.cursor(a, 0).is_some());
+
+    let more = chain(&[4, 5]);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.admit_through(a, 0, batch(2), &mut |lane| {
+            write_lent(lane, &more);
+            panic!("the body's rules failed behind a write");
+        })
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(store.indexed_blocks(a, 0), 0, "the rank is empty");
+    assert!(store.cursor(a, 0).is_none(), "the cursor starts over");
+
+    let mut next = None;
+    let outcome = store.admit_through(a, 0, batch(1), &mut |lane| {
+        next = Some((lane.emptied(), lane.map().len()));
+    });
+    assert_eq!(outcome, BatchOutcome::Applied);
+    let (next, held) = next.expect("the body ran");
+    assert_eq!(held, 0);
+    assert_ne!(Some(next), first);
 }
 
 /// A stand-in for an index at a size cap: it places `room` blocks more and

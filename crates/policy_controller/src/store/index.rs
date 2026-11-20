@@ -62,6 +62,7 @@
 //! the table's, an order no path inverts.
 
 use std::{
+    cell::Cell,
     collections::HashMap,
     sync::{
         atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -69,8 +70,10 @@ use std::{
     },
 };
 
-use kv_index::{ApplyError, ChainBlockMap, ChainIndex};
-pub use kv_index::{ContentHash, SequenceHash, StoredBlock};
+pub use kv_index::{
+    ApplyError, ChainBlockMap, ContentHash, SequenceHash, StoredBlock, WorkerGroups,
+};
+use kv_index::{ChainIndex, GroupViews};
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use rustc_hash::FxHashMap;
 
@@ -141,6 +144,9 @@ struct Held {
     /// The worker's blocks by the engine's hash: the index asks each writer
     /// to keep its own.
     map: ChainBlockMap,
+    /// The value the place took where it was made, and takes at each
+    /// emptying ([`LaneWriter::emptied`]).
+    emptied: u64,
 }
 
 impl Blocks for Held {
@@ -165,6 +171,192 @@ impl Blocks for Held {
 
     fn cleared(&mut self) {
         self.index.chain.apply_cleared(self.worker, &mut self.map);
+        // The row's view of its other cache groups goes with its blocks:
+        // what a reader can see is emptied in the store's own turn.
+        if let Some(view) = self.index.groups.get(self.worker) {
+            view.clear();
+        }
+        // The one routine that empties a rank says so, whoever asked: a
+        // resync, the cursor, the worker reported gone, a typed clear.
+        self.emptied = emptying();
+    }
+}
+
+/// The count a lane's makings and emptyings are drawn from. It is one for
+/// the process and only rises, so no two of them read alike: a lane made
+/// again under a row's id reads another value than the lane before it,
+/// whatever each one counted. A reader tests inequality alone.
+static EMPTYINGS: AtomicU64 = AtomicU64::new(0);
+
+/// The next value of [`EMPTYINGS`].
+fn emptying() -> u64 {
+    EMPTYINGS.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// A row's lane, lent to the body of one admitted batch
+/// ([`KvEventSink::admit_through`](super::KvEventSink::admit_through)): the
+/// chain's calls under the row's id in its model's index, the row's view
+/// in the model's group views, and the row's reverse map.
+///
+/// The map is the lane's between batches, since the store empties a rank
+/// by it. A body whose apply rules hold the map as their own state takes
+/// it for the batch and puts it back before it returns. That call stays
+/// inside the crate: the store empties a rank by the map with no caller's
+/// help, and that rule is no host's contract.
+///
+/// The body runs under the lane's lock. It calls nothing of the sink for
+/// its own row. A body that unwinds leaves its rank half written, so the
+/// store has the lane start over before the unwind goes on.
+pub struct LaneWriter<'a> {
+    held: &'a mut Held,
+    /// Whether the body wrote: the lane says its row heard behind a body
+    /// that did.
+    wrote: Cell<bool>,
+}
+
+impl LaneWriter<'_> {
+    /// The row's id in its model's index.
+    pub fn worker(&self) -> u32 {
+        self.held.worker
+    }
+
+    /// A value that moves each time the store empties the rank, and where
+    /// the lane is made: a resync, a restart or a cleared gap its cursor
+    /// read, the worker reported gone, a typed clear, a lent body that
+    /// unwound. The emptying this batch's admission made has moved it. It
+    /// never repeats under a row,
+    /// across the lanes the store makes for it. A body that keeps state
+    /// beside the map remembers the value it read, and resets that state
+    /// where the next batch reads another.
+    pub fn emptied(&self) -> u64 {
+        self.held.emptied
+    }
+
+    /// The row's blocks by the engine's hash: the reverse map the chain
+    /// asks a writer to keep. The crate's worker host alone takes it.
+    #[cfg(any(test, feature = "worker-host"))]
+    pub(crate) fn map(&mut self) -> &mut ChainBlockMap {
+        &mut self.held.map
+    }
+
+    /// Store `blocks` after `parent`, or from the root when it is absent,
+    /// with `map` the row's reverse map.
+    pub fn stored(
+        &self,
+        blocks: &[StoredBlock],
+        parent: Option<SequenceHash>,
+        map: &mut ChainBlockMap,
+    ) -> Result<(), ApplyError> {
+        self.wrote.set(true);
+        // Before the batch's blocks reach the chain, as in the lane's own
+        // write ([`Held`]).
+        fence(Ordering::Release);
+        self.held
+            .index
+            .chain
+            .apply_stored(self.held.worker, blocks, parent, map)
+    }
+
+    /// Forget the named blocks of the row.
+    pub fn removed(&self, hashes: &[SequenceHash], map: &mut ChainBlockMap) {
+        self.wrote.set(true);
+        self.held
+            .index
+            .chain
+            .apply_removed(self.held.worker, hashes, map);
+    }
+
+    /// Forget every block of the row.
+    pub fn cleared(&self, map: &mut ChainBlockMap) {
+        self.wrote.set(true);
+        self.held.index.chain.apply_cleared(self.held.worker, map);
+    }
+
+    /// The row's view of its cache groups other than main attention, in
+    /// the model's group views, created at the first call.
+    pub fn groups(&self) -> Arc<WorkerGroups> {
+        self.held.index.groups.get_or_create(self.held.worker)
+    }
+}
+
+/// A lane lent to a body. A body that unwinds leaves the rank half
+/// written, and the state its host keeps beside the map half applied. So,
+/// dropped behind such a body, this has the lane start over
+/// ([`Lane::start_over`]), which empties the rank through the one routine
+/// that does: the next body reads another value of
+/// [`LaneWriter::emptied`] and resets what it keeps.
+struct Lent<'a> {
+    lane: &'a mut Lane,
+    /// The body returned.
+    whole: bool,
+}
+
+impl Lent<'_> {
+    /// Lend the lane's place to `body`, once, and say the row heard where
+    /// the body wrote.
+    fn lend(mut self, body: &mut dyn FnMut(&mut LaneWriter<'_>)) {
+        if let Some(held) = &mut self.lane.held {
+            let mut writer = LaneWriter {
+                held: &mut *held,
+                wrote: Cell::new(false),
+            };
+            body(&mut writer);
+            let wrote = writer.wrote.get();
+            hear_written(held, wrote);
+        }
+        self.whole = true;
+    }
+}
+
+impl Drop for Lent<'_> {
+    fn drop(&mut self) {
+        if !self.whole {
+            self.lane.start_over();
+        }
+    }
+}
+
+/// The index speaks for a row from the first admitted batch that wrote:
+/// one that carried an event, or one whose lent body wrote. A batch the
+/// cursor refuses writes no block, and the record of sent prefixes keeps
+/// its cover until one is applied.
+fn hear_written(held: &Held, wrote: bool) {
+    if wrote && !held.index.heard(held.worker) {
+        held.index.hear(held.worker, true);
+    }
+}
+
+/// Run one batch's header through `cursor`, with `clears` the fact that
+/// the batch carries the engine's own clear. `Ok` where the batch is
+/// admitted, with the reason when the cursor emptied the rank ahead of it.
+/// `Err` with the batch's outcome where it is not.
+fn admitted<B: Blocks>(
+    cursor: &mut RankCursor,
+    blocks: &mut B,
+    facts: BatchFacts,
+    clears: bool,
+) -> Result<Option<ResyncReason>, BatchOutcome> {
+    if let Some(chunk) = facts.snapshot {
+        // A chunk only adds: the snapshot's start was said to the row, by
+        // a resync, before its first block.
+        cursor.resync_to(facts.sequence, chunk.unknown_before);
+        return Ok(None);
+    }
+    match cursor.admit(facts.sequence, clears) {
+        Admission::Stale => Err(BatchOutcome::Skipped),
+        Admission::Replay { expected } => Err(BatchOutcome::Gap {
+            expected,
+            received: facts.sequence,
+        }),
+        Admission::Restart => {
+            blocks.cleared();
+            Ok(Some(ResyncReason::PublisherRestart))
+        }
+        Admission::Unrecovered { cleared: true, .. } => {
+            blocks.cleared();
+            Ok(Some(ResyncReason::GapCleared))
+        }
+        Admission::Apply | Admission::Unrecovered { cleared: false, .. } => Ok(None),
     }
 }
 
@@ -178,36 +370,14 @@ fn admit<B: Blocks>(
     events: &[KvEvent],
     counts: &mut LaneCounts,
 ) -> (BatchOutcome, Option<ResyncReason>) {
-    let mut emptied = None;
-    if let Some(chunk) = facts.snapshot {
-        // A chunk only adds: the snapshot's start was said to the row, by
-        // a resync, before its first block.
-        cursor.resync_to(facts.sequence, chunk.unknown_before);
-    } else {
-        // A clear among the events is the header's fact too, wherever it
-        // stands: what a batch that clears leaves owes nothing to what
-        // came before it, so the cursor may start over there.
-        let clears = facts.clears || events.iter().any(|e| matches!(e, KvEvent::Cleared));
-        match cursor.admit(facts.sequence, clears) {
-            Admission::Stale => return (BatchOutcome::Skipped, None),
-            Admission::Replay { expected } => {
-                let gap = BatchOutcome::Gap {
-                    expected,
-                    received: facts.sequence,
-                };
-                return (gap, None);
-            }
-            Admission::Restart => {
-                blocks.cleared();
-                emptied = Some(ResyncReason::PublisherRestart);
-            }
-            Admission::Unrecovered { cleared: true, .. } => {
-                blocks.cleared();
-                emptied = Some(ResyncReason::GapCleared);
-            }
-            Admission::Apply | Admission::Unrecovered { cleared: false, .. } => {}
-        }
-    }
+    // A clear among the events is the header's fact too, wherever it
+    // stands: what a batch that clears leaves owes nothing to what came
+    // before it, so the cursor may start over there.
+    let clears = facts.clears || events.iter().any(|e| matches!(e, KvEvent::Cleared));
+    let emptied = match admitted(cursor, blocks, facts, clears) {
+        Ok(emptied) => emptied,
+        Err(outcome) => return (outcome, None),
+    };
     for event in events {
         match event {
             KvEvent::Stored {
@@ -257,6 +427,20 @@ struct Lane {
     /// removal writes nothing.
     held: Option<Held>,
     counts: LaneCounts,
+}
+
+impl Lane {
+    /// The lane starts over: its cursor reads nothing, its row is unheard
+    /// and its rank is empty. Where its worker was reported gone, and
+    /// where a lent body unwound.
+    fn start_over(&mut self) {
+        self.cursor.reset();
+        self.heard = false;
+        if let Some(held) = &mut self.held {
+            held.index.hear(held.worker, false);
+            held.cleared();
+        }
+    }
 }
 
 /// A row's lane as the table keeps it.
@@ -1425,6 +1609,9 @@ fn name_predicted(
 /// an id's own count carry nothing.
 struct Index {
     chain: ChainIndex,
+    /// Each row's view of its cache groups other than main attention,
+    /// under the row's id: written by a lent body ([`LaneWriter::groups`]).
+    groups: GroupViews,
     /// Index id -> the count its last take made; 0 for an id never taken.
     took: [AtomicU64; INDEX_WORKERS],
     /// How many times a row took an id ([`Self::take`]).
@@ -1451,6 +1638,7 @@ impl Index {
     fn new() -> Self {
         Self {
             chain: ChainIndex::with_max_workers(INDEX_WORKERS),
+            groups: GroupViews::new(),
             took: std::array::from_fn(|_| AtomicU64::new(0)),
             taken: AtomicU64::new(0),
             heard: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -1503,6 +1691,9 @@ impl Index {
         // The row that held the id before may have been heard: the row
         // that takes it is not.
         self.hear(id, false);
+        // Nor does it find the view of the row before it, whatever path
+        // that row left by.
+        self.groups.remove(id);
         let count = self.taken.fetch_add(1, Ordering::Release) + 1;
         if let Some(took) = self.took.get(id as usize) {
             took.store(count, Ordering::Relaxed);
@@ -1726,6 +1917,7 @@ impl KvTables {
                 index,
                 worker,
                 map: ChainBlockMap::new(),
+                emptied: emptying(),
             }),
             counts: LaneCounts::default(),
         };
@@ -1884,8 +2076,13 @@ impl KvTables {
         let Some(entry) = self.table.lock().lanes.remove(&id) else {
             return;
         };
-        if let Some(Held { index, worker, map }) = entry.lane.lock().held.take() {
+        if let Some(Held {
+            index, worker, map, ..
+        }) = entry.lane.lock().held.take()
+        {
             index.chain.remove_worker(worker, map);
+            // The index hands the id to a later row: the view goes too.
+            index.groups.remove(worker);
         }
         let mut table = self.table.lock();
         table.moves += 1;
@@ -1960,14 +2157,52 @@ impl KvTables {
         // The index speaks for the row from the first batch that carried
         // an event and was applied. A batch the cursor refuses writes no
         // block, and the record keeps its cover until one is applied.
-        let applied = outcome == BatchOutcome::Applied && !events.is_empty();
-        if applied && !held.index.heard(held.worker) {
-            held.index.hear(held.worker, true);
-        }
+        hear_written(held, outcome == BatchOutcome::Applied && !events.is_empty());
         if let Some(reason) = emptied {
             self.note(reason);
         }
         outcome
+    }
+
+    /// [`Self::admit`] for a batch its host's own rules apply: the cursor
+    /// reads the header alone, and an admitted batch lends the lane to
+    /// `body`, once, inside the lane's turn. The lane says its row heard
+    /// behind a body that wrote, as behind a typed batch with an event. A
+    /// body that unwinds has the lane start over ([`Lent`]).
+    pub(super) fn admit_through(
+        &self,
+        id: WorkerId,
+        rank: u16,
+        facts: BatchFacts,
+        body: &mut dyn FnMut(&mut LaneWriter<'_>),
+    ) -> BatchOutcome {
+        let Some(lane) = self.lane(id, Some(rank)) else {
+            return BatchOutcome::Skipped;
+        };
+        let mut lane = lane.lock();
+        let Lane {
+            cursor,
+            heard,
+            held,
+            ..
+        } = &mut *lane;
+        let Some(held) = held else {
+            return BatchOutcome::Skipped;
+        };
+        *heard = true;
+        let emptied = match admitted(cursor, held, facts, facts.clears) {
+            Ok(emptied) => emptied,
+            Err(outcome) => return outcome,
+        };
+        if let Some(reason) = emptied {
+            self.note(reason);
+        }
+        Lent {
+            lane: &mut lane,
+            whole: false,
+        }
+        .lend(body);
+        BatchOutcome::Applied
     }
 
     pub(super) fn reconnected(&self, id: WorkerId) {
@@ -2004,13 +2239,7 @@ impl KvTables {
     /// cursor starts over. The lane itself leaves with the row.
     pub(super) fn removed(&self, id: WorkerId) {
         if let Some(lane) = self.lane(id, None) {
-            let mut lane = lane.lock();
-            lane.cursor.reset();
-            lane.heard = false;
-            if let Some(held) = &mut lane.held {
-                held.index.hear(held.worker, false);
-                held.cleared();
-            }
+            lane.lock().start_over();
         }
     }
 

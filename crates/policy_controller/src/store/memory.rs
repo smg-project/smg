@@ -26,7 +26,7 @@ use crate::{
     spec::AppliedSpec,
     store::{
         health::{HealthSink, HealthWrite, LeaderBits, VetoWrite},
-        index::{indexed_under, KvEvent, KvTables, LaneCounts},
+        index::{indexed_under, KvEvent, KvTables, LaneCounts, LaneWriter},
         journal::{Journal, Kinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{
@@ -3118,6 +3118,16 @@ impl KvEventSink for MemoryStore {
         batch: &Self::Batch,
     ) -> BatchOutcome {
         self.kv.admit(id, rank, facts, batch)
+    }
+
+    fn admit_through(
+        &self,
+        id: WorkerId,
+        rank: u16,
+        facts: BatchFacts,
+        body: &mut dyn FnMut(&mut LaneWriter<'_>),
+    ) -> BatchOutcome {
+        self.kv.admit_through(id, rank, facts, body)
     }
 
     fn reconnected(&self, id: WorkerId) {
