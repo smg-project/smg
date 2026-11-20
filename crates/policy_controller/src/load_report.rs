@@ -171,11 +171,16 @@ pub fn signal_values(
                     });
                 }
                 // Every rank before this one stated the name, and this is
-                // the rank's first statement of it, under the same unit.
-                Some(made) if made.ranks == nth && made.unit == stated.unit => {
-                    made.ranks += 1;
-                    made.value = joined(columns[at].across_ranks(), made.value, stated.value);
-                    made.oldest = made.oldest.min(sampled);
+                // the rank's first statement of it. Under another unit the
+                // row has no value: no later statement of the rank is read.
+                Some(made) if made.ranks == nth => {
+                    if made.unit == stated.unit {
+                        made.ranks += 1;
+                        made.value = joined(columns[at].across_ranks(), made.value, stated.value);
+                        made.oldest = made.oldest.min(sampled);
+                    } else {
+                        made.ranks = u32::MAX;
+                    }
                 }
                 // A rank before this one left the name out or stated
                 // another unit, or this rank states the name once more.
@@ -455,12 +460,14 @@ mod tests {
         let columns = columns(&[
             ("mixed", "ms", AcrossRanks::Sum),
             ("partial", "ms", AcrossRanks::Sum),
+            ("turned", "ms", AcrossRanks::Sum),
             ("twice", "ms", AcrossRanks::Sum),
             ("whole", "ms", AcrossRanks::Sum),
         ]);
         let first = stating(vec![
             stated("mixed", "ms", 1.0, None),
             stated("partial", "ms", 1.0, None),
+            stated("turned", "ms", 1.0, None),
             stated("twice", "ms", 1.0, None),
             // A second statement by one rank: its first one is read.
             stated("twice", "ms", 64.0, None),
@@ -470,6 +477,10 @@ mod tests {
         ]);
         let second = stating(vec![
             stated("mixed", "seconds", 2.0, None),
+            // A rank's first statement rules: under another unit the row
+            // has no value, whatever the rank states of the name next.
+            stated("turned", "seconds", 9.0, None),
+            stated("turned", "ms", 2.0, None),
             stated("twice", "ms", 2.0, None),
             stated("whole", "ms", 2.0, None),
         ]);

@@ -13,8 +13,10 @@
 //! over takes its values with it: its source writes none of them.
 //!
 //! A report that leaves a name out removes nothing. The value on file
-//! stands until the signal's maximum age ends it, or until its rank's load
-//! sample goes: a worker that leaves and joins again starts with no value.
+//! stands until the signal's maximum age ends it, until its rank's load
+//! sample goes, or until a new document declares the name under another
+//! unit or reduction. A worker that leaves and joins again starts with no
+//! value.
 //!
 //! [`AppliedSpec::signal_columns`]: crate::AppliedSpec::signal_columns
 //! [`LoadSink`]: super::LoadSink

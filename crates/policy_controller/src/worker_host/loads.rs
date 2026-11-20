@@ -364,7 +364,7 @@ mod tests {
     use smg_worker::{
         load::port::GroupTick,
         registry::WorkerRegistry,
-        worker::{NamedValue, SchedulerLoadSnapshot, WorkerStatus as ObjectStatus},
+        worker::{LoadTelemetry, NamedValue, SchedulerLoadSnapshot, WorkerStatus as ObjectStatus},
     };
 
     use super::*;
@@ -594,6 +594,8 @@ mod tests {
                 num_waiting_reqs: running,
                 gen_throughput: 30.0,
                 prefill_throughput: Some(900.0),
+                // A rank's core: it states neither fixed token count.
+                kept: LoadTelemetry::USED_TOKENS | LoadTelemetry::TOTAL_TOKENS,
                 ..Default::default()
             }],
             ..Default::default()

@@ -1457,16 +1457,18 @@ impl MemoryStore {
         Duration::from_micros(self.world.load().spec().engine().pins_absence_micros())
     }
 
-    /// How many times a publication allocated a pool's rows or its signal
-    /// cells since the store was made. A publication writes a pool's rows
-    /// over rows no world lists any more: the ones the pool published
-    /// before its last, else any of its length that left a pool. It
-    /// allocates when it finds none: at a pool's first publication after a
-    /// membership build, unless rows that build retired fit it, and past
-    /// that only while a reader holds a world from before the pool's last
-    /// publication. A pool's cells are written over the block it published
-    /// before its last, by the same rule. A membership build's own rows
-    /// and cells are not counted.
+    /// How many times a publication allocated a pool's rows since the store
+    /// was made. A publication writes a pool's rows over rows no world
+    /// lists any more: the ones the pool published before its last, else
+    /// any of its length that left a pool. It allocates when it finds
+    /// none: at a pool's first publication after a membership build,
+    /// unless rows that build retired fit it, and past that only while a
+    /// reader holds a world from before the pool's last publication. A
+    /// membership build's own rows are not counted.
+    ///
+    /// A pool's signal cells count with its rows, by the same rule: a
+    /// publication writes them over the block the pool published before
+    /// its last, and a membership build's own cells are not counted.
     pub fn publication_allocations(&self) -> u64 {
         self.loads.lock().writer.allocations()
     }
@@ -3034,7 +3036,9 @@ impl MemoryStore {
         } = &mut *loads;
         // A generation applied since that read has columns of its own: the
         // value is taken where one of them continues the column it was
-        // read under. Its source made it under that column's reduction.
+        // read under, whose reduction its source is taken to have used. A
+        // document applied between the source's own read of the columns
+        // and this write's read is not seen here.
         let spec = writer.spec();
         let column = if spec.generation() == generation {
             column
