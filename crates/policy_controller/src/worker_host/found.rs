@@ -82,6 +82,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
         drain_settle_secs: (checks.drain_settle_secs
             != HealthCheckConfig::default().drain_settle_secs)
             .then(|| u32::try_from(checks.drain_settle_secs).unwrap_or(u32::MAX)),
+        demand_facts: standing.demand_facts,
     }
 }
 
@@ -106,6 +107,7 @@ mod tests {
 
     use super::facts;
     use crate::{
+        demands::DemandFacts,
         store::{
             encoding::{EncodeHandoff, EncodeOffer},
             pairing::PairingDescriptor,
@@ -209,6 +211,7 @@ mod tests {
                 scrape_interval_ms: 3_000,
             },
             reachable_from: Reachability::Gateway(GatewayId(42)),
+            demand_facts: DemandFacts { runtime: 7 },
             ..bare.clone()
         };
         let old = WorkerFacts {

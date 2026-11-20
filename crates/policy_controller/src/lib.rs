@@ -134,6 +134,7 @@ pub mod controller;
 pub mod counts;
 pub mod decider;
 pub mod decision;
+pub mod demands;
 pub mod door;
 pub mod elector;
 pub mod framework;
@@ -176,6 +177,7 @@ pub use decision::{
     Decision, Lifted, Overlap, OverlapSource, Pair, Pick, Queue, Shed, ShedReason, Survivors,
     Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
+pub use demands::{DemandFacts, Demands};
 pub use door::{DecisionRecord, Explained, Names};
 pub use framework::{
     Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,

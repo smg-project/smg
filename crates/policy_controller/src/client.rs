@@ -170,6 +170,11 @@ pub enum Error {
     /// by its path in the contract. The controller ends a stream at such a
     /// frame, and a link's one stream is every caller's: the link refuses
     /// the frame at its own door and sends nothing ([`Link::ask`]).
+    ///
+    /// A hard demand of a host's request is refused under this kind too, as
+    /// `constraints.demands`: this protocol version states none, so a
+    /// handle sends no request that states one
+    /// ([`Handle::asked`](crate::handle::Handle::asked)).
     #[error("an ask's {0} is out of its range in this protocol version")]
     OutOfRange(&'static str),
     /// A link's report queue was full: its session took no report for as
