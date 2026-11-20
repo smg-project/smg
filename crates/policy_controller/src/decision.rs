@@ -77,6 +77,28 @@ impl Targets {
         }
     }
 
+    /// Turns a decode side's targets into a pair's where they stand: each
+    /// names `prefill` with the decode it held, in the order they had.
+    /// Nothing is stated of a pair's first target ([`Pick::overlap`]). The
+    /// entries past the count are not rewritten, as [`Self::clear`] leaves
+    /// them. No accessor goes past the count; the derived equality and
+    /// `Debug` read the whole array.
+    pub(crate) fn pair_under(&mut self, prefill: &Target) {
+        for target in &mut self.items[..usize::from(self.len)] {
+            *target = Target {
+                position: prefill.position,
+                id: prefill.id,
+                dp_rank: prefill.dp_rank,
+                pair: Some(Pair {
+                    decode_position: target.position,
+                    decode_id: target.id,
+                    decode_dp_rank: target.dp_rank,
+                }),
+            };
+        }
+        self.overlap = Overlap::NONE;
+    }
+
     /// Empties the list. What was stated of its first target goes with it
     /// ([`Pick::overlap`]).
     pub fn clear(&mut self) {
@@ -745,6 +767,56 @@ mod tests {
         targets.lead(w_rank_0);
 
         assert_eq!(targets.as_slice(), [w_rank_0, x_rank_0, w_rank_1]);
+    }
+
+    /// A decode side's targets turn into a pair's where they stand. Each
+    /// names the prefill with the decode it held, in the order they had.
+    /// The list equals the one a new list takes push by push, and nothing
+    /// is stated of its first target.
+    #[test]
+    fn a_decodes_targets_turn_into_a_pairs_where_they_stand() {
+        let prefill = Target {
+            position: 7,
+            id: WorkerId(70),
+            dp_rank: 3,
+            pair: None,
+        };
+        let decode = |position: u32| Target {
+            position,
+            id: WorkerId(u64::from(position) + 1),
+            dp_rank: position as u16 + 5,
+            pair: None,
+        };
+        let mut turned = Targets::new();
+        let mut pushed = Targets::new();
+        for position in 0..2u32 {
+            turned.push(decode(position));
+            pushed.push(Target {
+                pair: Some(Pair {
+                    decode_position: position,
+                    decode_id: decode(position).id,
+                    decode_dp_rank: decode(position).dp_rank,
+                }),
+                ..prefill
+            });
+        }
+        turned.state(Overlap {
+            blocks: 3,
+            of: 4,
+            source: OverlapSource::Index,
+            margin_held: false,
+        });
+        turned.pair_under(&prefill);
+        assert_eq!(turned, pushed);
+        let pick = Pick {
+            targets: turned,
+            ..Pick::default()
+        };
+        assert_eq!(pick.overlap(), Overlap::NONE);
+        // An empty list stays empty.
+        let mut none = Targets::new();
+        none.pair_under(&prefill);
+        assert_eq!(none, Targets::new());
     }
 
     /// The count and its absence are one word: a trace is the size it was

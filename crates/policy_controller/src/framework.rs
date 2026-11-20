@@ -1026,7 +1026,18 @@ impl ClassBits {
     }
 
     fn has(&self, class: u32) -> bool {
-        self.words
+        Self::has_in(&self.words, class)
+    }
+
+    /// The set's words, for a pass that reads the set once a row: bound
+    /// ahead of the pass, no row loads their place or their count again.
+    fn words(&self) -> &[u64] {
+        &self.words
+    }
+
+    /// [`Self::has`] over the words a pass bound by [`Self::words`].
+    fn has_in(words: &[u64], class: u32) -> bool {
+        words
             .get(class as usize / 64)
             .is_some_and(|word| word >> (class % 64) & 1 == 1)
     }
@@ -5157,7 +5168,9 @@ impl Engine {
             cx,
             &mut scratch.single,
         );
-        let Decision::Pick(prefill_pick) = prefill else {
+        // The prefill's pick is read where its decision stands: a pick is
+        // 256 bytes, and taking it out copies them.
+        let Decision::Pick(prefill_pick) = &prefill else {
             // A prefill pool its filters emptied says what the decode pool's
             // own stages say about the partners of the prefills the prefill
             // filters keep (those were dropped by the partnered test alone):
@@ -5232,7 +5245,7 @@ impl Engine {
             // alone: the decodes of the classes its class pairs with. A
             // class is a per-candidate fact and the table the decision's
             // own, so no host callback is needed to narrow the set.
-            let decision = run_profile(
+            let mut decision = run_profile(
                 decode_profile,
                 decode_index,
                 &decode_facts,
@@ -5241,29 +5254,18 @@ impl Engine {
                 decode_cx,
                 &mut scratch.decode,
             );
-            match decision {
-                Decision::Pick(decode_pick) => {
-                    let mut targets = Targets::new();
-                    for decode in decode_pick.targets.iter() {
-                        targets.push(Target {
-                            position: prefill_target.position,
-                            id: prefill_target.id,
-                            dp_rank: prefill_target.dp_rank,
-                            pair: Some(Pair {
-                                decode_position: decode.position,
-                                decode_id: decode.id,
-                                decode_dp_rank: decode.dp_rank,
-                            }),
-                        });
-                    }
-                    return Decision::Pick(Pick {
-                        targets,
-                        trace: prefill_pick.trace,
-                        session_verdict: SessionVerdict::None,
-                    });
+            match &mut decision {
+                // The decode's pick becomes the pair's where it stands: its
+                // targets name the prefill, its trace is the prefill's, and
+                // that decision is the one returned.
+                Decision::Pick(paired) => {
+                    paired.targets.pair_under(prefill_target);
+                    paired.trace = prefill_pick.trace;
+                    paired.session_verdict = SessionVerdict::None;
+                    return decision;
                 }
-                Decision::Shed(shed) => last_shed = Some(shed),
-                Decision::Queue(queue) => return Decision::Queue(queue),
+                Decision::Shed(shed) => last_shed = Some(*shed),
+                Decision::Queue(_) => return decision,
             }
         }
         match last_shed {
@@ -7777,6 +7779,31 @@ mod tests {
                 ..candidate(position, 0)
             })
             .collect()
+    }
+
+    /// A pair's trace is its prefill's: the prefill profile's index and the
+    /// rows that profile's filters left of the prefill pool. The decode ran
+    /// another profile over another pool, and its trace is not the pair's.
+    /// Each target names the prefill with a decode, and no session verdict
+    /// stands on a pair.
+    #[test]
+    fn a_pairs_trace_is_its_prefills() {
+        let engine = Engine::new(
+            vec![least_requests_profile(), least_requests_profile()],
+            vec![Binding {
+                decode_profile: Some(1),
+                ..pair_binding()
+            }],
+            1,
+            Needs::default(),
+        );
+        let decision = decide_pair(&engine, &paired(3), &paired(2));
+        let pick = decision.pick().expect("a pair");
+        assert_eq!(pick.trace.profile, 0);
+        assert_eq!(pick.trace.survivors.get(), Some(3));
+        assert!(!pick.targets.is_empty());
+        assert!(pick.targets.iter().all(|target| target.pair.is_some()));
+        assert_eq!(pick.session_verdict, SessionVerdict::None);
     }
 
     /// The position a decision leads with.
