@@ -738,6 +738,21 @@ impl Profile {
             && !needs().any(|needs| needs.events && needs.token_hashes)
     }
 
+    /// What a host names this profile's rows by ([`NamedBy`]), asked of
+    /// its stages once at the engine's build.
+    fn named_by(&self) -> NamedBy {
+        let cap = self.named_cap();
+        let mut rules = self.warm_rules();
+        let first = rules.next();
+        let rule = first.filter(|&first| rules.all(|rule| rule == first));
+        NamedBy {
+            cap,
+            rule,
+            sent: cap > 0 && self.needs().sent_prefixes,
+            sent_alone: self.reads_sent_alone(),
+        }
+    }
+
     /// Whether any stage holds a [`DecisionScope`].
     pub fn scoped(&self) -> bool {
         self.scopes().next().is_some()
@@ -2558,6 +2573,73 @@ impl Binding {
     }
 }
 
+/// What a host names a profile's rows by, where it names them in the
+/// affinity column's place: the cap of each list
+/// ([`Engine::named_for`]), the one ruling of the warming rows
+/// ([`Engine::warm_rule_for`]), and the record of sent prefixes, whether
+/// its holders are named ([`Engine::reads_sent_for`]) and whether ahead
+/// of the index's ([`Engine::reads_sent_alone_for`]). Every input of a
+/// naming that is a profile's own stands here, so two profiles of one
+/// value are named the same rows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NamedBy {
+    /// The cap of each list: `0` where the profile is named no row.
+    cap: u32,
+    /// The one ruling its warm-up stages rule by: `None` where it holds
+    /// no such stage, and where two of them rule by different numbers.
+    rule: Option<WarmRule>,
+    /// Whether the record of sent prefixes names holders for it: a stage
+    /// of it reads them, and it is named rows.
+    sent: bool,
+    /// Whether it reads a request's holders from the record of sent
+    /// prefixes alone: a scorer of it reads the record and none reads the
+    /// holders from the index.
+    sent_alone: bool,
+}
+
+/// How a binding's shadow reads the rows its live decision was handed
+/// ([`Engine::shadow_for`]). A host names rows for the live profile alone,
+/// by what that profile says it is named by ([`NamedBy`]), so they are a
+/// shadow profile's own rows only where the two say one value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShadowRows {
+    /// As the live decision read them: the shadow profile would be handed
+    /// the same.
+    Same,
+    /// Less the rows named for the live profile: the shadow profile reads
+    /// no column, and would be named none.
+    Unnamed,
+    /// Not at all: the shadow profile would be named other rows, or
+    /// handed a column the live decision was not.
+    Apart,
+}
+
+impl ShadowRows {
+    /// How the shadow of `binding` reads its live decision's rows, by what
+    /// each of the two profiles is named by and whether the shadow's reads
+    /// the column at all.
+    fn of(binding: &Binding, named_by: &[NamedBy], needs: &[Needs]) -> Self {
+        let Some(shadow) = binding.single_shadow().map(usize::from) else {
+            return Self::Apart;
+        };
+        let live = usize::from(binding.profile);
+        let (Some(live), Some(by)) = (named_by.get(live), named_by.get(shadow)) else {
+            return Self::Apart;
+        };
+        let column = needs.get(shadow).is_some_and(|needs| needs.affinity);
+        match (live.cap, by.cap) {
+            // Neither is named a row: both read the view as it is handed.
+            (0, 0) => Self::Same,
+            // The live profile alone is named rows. A shadow that reads
+            // no column decides without them, as it would live.
+            (_, 0) if !column => Self::Unnamed,
+            // One value names the same rows.
+            _ if live == by => Self::Same,
+            _ => Self::Apart,
+        }
+    }
+}
+
 /// The engine: validated profiles and the ordered bindings over them, and the
 /// session table the bindings' sessions rules read.
 #[derive(Debug)]
@@ -2569,6 +2651,9 @@ pub struct Engine {
     /// A shadow's placing assignment beside each binding, in the same
     /// order. Empty when no binding names a shadow.
     shadow_placing: Box<[Option<Assignment>]>,
+    /// How each binding's shadow reads the rows its live decision was
+    /// handed ([`ShadowRows`]), in the same order and as empty.
+    shadow_rows: Box<[ShadowRows]>,
     generation: u64,
     needs: Needs,
     /// The needs of every binding that covers a phase, its profile's stages
@@ -2583,14 +2668,12 @@ pub struct Engine {
     /// Per profile, what its stages ask of a host ([`Profile::needs`]),
     /// asked of them once at the build: a decision reads its answer here.
     profile_needs: Vec<Needs>,
-    /// Per profile, the cap of the rows a host names for its decisions
-    /// ([`Self::named_for`]), said once at the build.
-    named: Vec<u32>,
-    /// Per profile, whether it reads a request's holders from the record
-    /// of sent prefixes alone ([`Self::reads_sent_alone_for`]): a scorer
-    /// of it reads the record and none reads the holders from the index.
-    /// Asked of its scorers at the build.
-    sent_alone: Vec<bool>,
+    /// Per profile, what a host names the rows of its decisions by
+    /// ([`NamedBy`]), said once at the build: the cap
+    /// ([`Self::named_for`]), the warm-up ruling
+    /// ([`Self::warm_rule_for`]) and the record of sent prefixes
+    /// ([`Self::reads_sent_for`], [`Self::reads_sent_alone_for`]).
+    named_by: Vec<NamedBy>,
     /// Per profile, its filters as one test of a row, where the engine
     /// holds every one itself ([`RowTests::of`]). A decision that draws
     /// first asks it about a row in place of a call a filter, and a whole
@@ -3646,8 +3729,7 @@ impl Engine {
             .map(|(profile, &order)| Marks::of(profile, order))
             .collect();
         let keeping = marks.iter().any(|marks| marks.scoped());
-        let named: Vec<u32> = profiles.iter().map(Profile::named_cap).collect();
-        let sent_alone: Vec<bool> = profiles.iter().map(Profile::reads_sent_alone).collect();
+        let named_by: Vec<NamedBy> = profiles.iter().map(Profile::named_by).collect();
         let stating = profiles
             .iter()
             .map(|profile| {
@@ -3669,9 +3751,11 @@ impl Engine {
             .iter()
             .any(|binding| binding.shadow.is_some() || binding.decode_shadow.is_some());
         let mut shadow_placing = Vec::new();
+        let mut shadow_rows = Vec::new();
         let mut live = Vec::new();
         if shadows {
             shadow_placing.reserve_exact(bindings.len());
+            shadow_rows.reserve_exact(bindings.len());
             live.resize(profiles.len(), false);
             for binding in &bindings {
                 for phase in PHASES {
@@ -3707,6 +3791,7 @@ impl Engine {
                             .then(|| placed_by(declared, marks.by_assignment()))
                     });
                     shadow_placing.push(placing);
+                    shadow_rows.push(ShadowRows::of(&binding, &named_by, &profile_needs));
                 }
                 Entry {
                     placing: placed_by(declared, by_assignment),
@@ -3719,6 +3804,7 @@ impl Engine {
             profiles,
             bindings,
             shadow_placing: shadow_placing.into_boxed_slice(),
+            shadow_rows: shadow_rows.into_boxed_slice(),
             generation,
             needs,
             phase_needs,
@@ -3726,8 +3812,7 @@ impl Engine {
             assignment: AssignmentStages::default(),
             marks,
             profile_needs,
-            named,
-            sent_alone,
+            named_by,
             row_tests,
             row_asked,
             orders,
@@ -4077,6 +4162,24 @@ impl Engine {
         self.bindings.get(at as usize).map(|entry| &entry.binding)
     }
 
+    /// The binding a request of `phase` for `model` resolves to, where
+    /// its shadow is asked ([`Self::shadow`]): its position in this
+    /// generation, and how that shadow reads the rows a host handed the
+    /// live decision ([`ShadowRows`]). `None` where the binding names no
+    /// shadow: one lookup says so, and a host orders such a request as it
+    /// does under a generation that shadows nowhere.
+    pub(crate) fn shadow_for(&self, model: &str, phase: Phase) -> Option<(u32, ShadowRows)> {
+        let at = self
+            .bindings
+            .iter()
+            .position(|entry| entry.binding.matches(model, phase))?;
+        // The placing stands where the build found the shadow profile
+        // free to run beside the live one.
+        self.shadow_placing.get(at).copied().flatten()?;
+        let rows = *self.shadow_rows.get(at)?;
+        Some((u32::try_from(at).ok()?, rows))
+    }
+
     /// The profile a request resolves to for its phase; `None` when no
     /// binding matches or the binding's plan has no side for the phase.
     pub fn profile_for(&self, model: &str, phase: Phase) -> Option<(u16, &Profile)> {
@@ -4093,10 +4196,8 @@ impl Engine {
     /// is found by model and phase alone, so a pool is decided by one
     /// profile and has one ruling.
     pub fn warm_rule_for(&self, model: &str, phase: Phase) -> Option<WarmRule> {
-        let (_, _, profile) = self.resolve(model, phase)?;
-        let mut rules = profile.warm_rules();
-        let first = rules.next()?;
-        rules.all(|rule| rule == first).then_some(first)
+        let (_, index, _) = self.resolve(model, phase)?;
+        self.named_by[usize::from(index)].rule
     }
 
     /// Whether the profile a decision resolves to reads sent prefixes: a
@@ -4107,10 +4208,9 @@ impl Engine {
     /// is asked again.
     pub(crate) fn reads_sent_for(&self, model: &str, phase: Phase) -> bool {
         self.needs.sent_prefixes
-            && self.resolve(model, phase).is_some_and(|(_, index, _)| {
-                let index = usize::from(index);
-                self.profile_needs[index].sent_prefixes && self.named[index] > 0
-            })
+            && self
+                .resolve(model, phase)
+                .is_some_and(|(_, index, _)| self.named_by[usize::from(index)].sent)
     }
 
     /// Whether that profile reads a request's holders from the record of
@@ -4124,7 +4224,7 @@ impl Engine {
     /// Kept at the build, as [`Self::reads_sent_for`] is.
     pub(crate) fn reads_sent_alone_for(&self, model: &str, phase: Phase) -> bool {
         self.resolve(model, phase)
-            .is_some_and(|(_, index, _)| self.sent_alone[usize::from(index)])
+            .is_some_and(|(_, index, _)| self.named_by[usize::from(index)].sent_alone)
     }
 
     /// The cap of each list of rows a host names in the affinity column's
@@ -4143,7 +4243,7 @@ impl Engine {
     /// is the profile's own, said once at the build: a decision reads it.
     pub fn named_for(&self, model: &str, phase: Phase) -> u32 {
         self.resolve(model, phase)
-            .map_or(0, |(_, index, _)| self.named[usize::from(index)])
+            .map_or(0, |(_, index, _)| self.named_by[usize::from(index)].cap)
     }
 
     /// The test the standing pass of the decision's profile asks of a row
@@ -4452,6 +4552,26 @@ impl Engine {
         // one's pick.
         forget_judged();
         let mut decision = self.decide(facts, pool, candidates, cx, scratch);
+        if let Decision::Pick(pick) = &mut decision {
+            let overlap = self.overlap_of(facts, candidates, pick);
+            pick.targets.state(overlap);
+        }
+        decision
+    }
+
+    /// [`Self::decide_stated`] for a request whose shadow will be asked
+    /// ([`Self::shadow`]): the decision of [`Self::decide_keeping`], with
+    /// the same word stated in the pick.
+    pub fn decide_stated_keeping(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Decision {
+        forget_judged();
+        let mut decision = self.decide_keeping(facts, pool, candidates, cx, scratch);
         if let Decision::Pick(pick) = &mut decision {
             let overlap = self.overlap_of(facts, candidates, pick);
             pick.targets.state(overlap);
@@ -6430,6 +6550,63 @@ mod tests {
         assert!(scratch.sessions_found.is_of(key, &facts));
     }
 
+    /// The stated keeping entry makes the stated entry's decision, word
+    /// and all, and keeps what it read of the key as the keeping entry
+    /// does.
+    #[test]
+    fn shadow_reading_is_kept_by_the_stated_keeping_entry_with_its_word() {
+        let params = PrefixAffinityParams::default();
+        let cache = || Profile {
+            name: "cache".into(),
+            filters: vec![Box::new(Healthy)],
+            scorers: vec![Weighted {
+                scorer: Box::new(PrefixAffinity::new(
+                    &params,
+                    Gates::of(Some(&params), None, Some(16)),
+                )),
+                weight: 1.0,
+            }],
+            picker: Box::new(Best),
+        };
+        // A decision claims its key in its engine's table: each entry
+        // decides on an engine of its own.
+        let engine = || {
+            Engine::new(
+                vec![cache(), by_sessions()],
+                vec![Binding {
+                    shadow: Some(1),
+                    sessions: Some(SESSIONS),
+                    ..single_binding()
+                }],
+                23,
+                Needs::default(),
+            )
+        };
+        // Every row holds eight of the request's sixteen blocks.
+        let column = [AffinityFacts {
+            overlap_blocks: 8,
+            admitted_age_ms: u32::MAX,
+            ..AffinityFacts::default()
+        }; 2];
+        let hashes = [0u64; 16];
+        let facts = RequestFacts {
+            block_hashes: &hashes,
+            prompt_tokens: 256,
+            affinity: &column,
+            ..keyed_at(61, 71)
+        };
+        let key = facts.session().get();
+        let rows = [candidate(0, 13), candidate(1, 3)];
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let stated = engine().decide_stated(&facts, &pool, &rows, &cx, &mut scratch);
+        assert_eq!(stated.pick().map(|pick| pick.overlap().blocks), Some(8));
+        assert!(!scratch.sessions_found.is_of(key, &facts));
+        let keeping = engine().decide_stated_keeping(&facts, &pool, &rows, &cx, &mut scratch);
+        assert_eq!(keeping, stated);
+        assert!(scratch.sessions_found.is_of(key, &facts));
+    }
+
     /// A keeping decision that answers before it reads its key leaves no
     /// reading of an earlier one. The same request is decided again, and
     /// the live filters keep nobody. Its shadow, whose filters keep the
@@ -7380,6 +7557,68 @@ mod tests {
         assert!(run(&reused, "second").is_none());
     }
 
+    /// A host names rows for the live profile alone, by its cap, its
+    /// warm-up ruling and the record of sent prefixes. A shadow reads them
+    /// where its own profile would be named the same, reads the view
+    /// without them where that profile reads no column, and is not asked
+    /// anywhere else.
+    #[test]
+    fn a_shadow_reads_its_live_rows_only_where_it_would_be_handed_them() {
+        use crate::spec::{
+            AffinitySource, BestParams, PickStage, PrefixAffinityParams, ProfileSpec, ScoreStage,
+            WarmupSliceParams,
+        };
+        type Turn<'a> = &'a dyn Fn(&mut ProfileSpec);
+        let rows = |live: &str, shadow: &str, turn: Turn<'_>| {
+            let mut document = PolicySpec::preset(live).expect("a preset");
+            let next = PolicySpec::preset(shadow).expect("a preset");
+            let profile = next.profiles.into_values().next();
+            let mut profile = profile.expect("the preset's profile");
+            turn(&mut profile);
+            document.profiles.insert("second".into(), profile);
+            document.bindings[0].shadow = Some(crate::spec::ShadowSpec::Profile("second".into()));
+            let engine = document.validate().expect("a binding with a shadow");
+            engine.shadow_for("m", Phase::Single).map(|(_, rows)| rows)
+        };
+        let as_it_is = |_: &mut ProfileSpec| {};
+        let sample = |profile: &mut ProfileSpec| {
+            profile.pick = PickStage::Best(BestParams { sample: 8 }).into();
+        };
+        let ruling = |profile: &mut ProfileSpec| {
+            let slice = WarmupSliceParams {
+                weight: 8.0,
+                secs: Some(120),
+                ..WarmupSliceParams::default()
+            };
+            profile.score[0] = ScoreStage::WarmupSlice(slice).into();
+        };
+        // The prefix stage reads the record of sent prefixes alone.
+        let record = |profile: &mut ProfileSpec| {
+            let prefix = PrefixAffinityParams {
+                weight: 4.0,
+                source: Some(AffinitySource::Predictor),
+                ..PrefixAffinityParams::default()
+            };
+            profile.score[1] = ScoreStage::PrefixAffinity(prefix).into();
+        };
+        let cases: [(&str, &str, Turn<'_>, ShadowRows); 7] = [
+            ("cache_aware", "cache_aware", &as_it_is, ShadowRows::Same),
+            ("cache_aware", "cache_aware", &record, ShadowRows::Apart),
+            ("least_load", "random", &as_it_is, ShadowRows::Same),
+            ("cache_aware", "cache_aware", &sample, ShadowRows::Apart),
+            ("cache_aware", "cache_aware", &ruling, ShadowRows::Apart),
+            ("least_load", "cache_aware", &as_it_is, ShadowRows::Apart),
+            ("cache_aware", "least_load", &as_it_is, ShadowRows::Unnamed),
+        ];
+        for (live, shadow, turn, wanted) in cases {
+            assert_eq!(
+                rows(live, shadow, turn),
+                Some(wanted),
+                "{shadow} behind {live}"
+            );
+        }
+    }
+
     #[test]
     fn shadow_needs_join_the_matching_bindings_live_needs() {
         let mut document = PolicySpec::preset("least_load").expect("a preset");
@@ -7403,7 +7642,7 @@ mod tests {
         assert!(
             matches!(engine.needs_rows().as_slice(), [("*", Phase::Single, needs)] if needs.affinity)
         );
-        assert_eq!(engine.named[1], 13);
+        assert_eq!(engine.named_by[1].cap, 13);
         assert!(engine
             .shadow(
                 &RequestFacts {

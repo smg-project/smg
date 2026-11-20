@@ -358,7 +358,8 @@ impl Shared {
             let seats = self
                 .samples
                 .get_or_init(|| (0..deciders).map(|_| Mutex::default()).collect());
-            seats[index].lock().push(answer.0, engine, taken, &answer.1);
+            let mut samples = seats[index].lock();
+            samples.push(answer.0, engine, taken, &answer.1, None);
         }
         Ok(answer)
     }
@@ -938,8 +939,13 @@ impl Deciding {
                 Entry::Single => {
                     let (decision, booking) = decide_in(world, &taken, buffers, own);
                     let named = &buffers.named;
+                    let engine = world.spec().engine();
                     let filed = booking
-                        .map(|booking| issue(store, world, &taken, term, &decision, booking, named))
+                        .map(|booking| {
+                            issue(store, world, &taken, term, booking, named, |lease| {
+                                engine.on_decision_issued(lease, &decision);
+                            })
+                        })
                         .transpose();
                     (decision, filed)
                 }

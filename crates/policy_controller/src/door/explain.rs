@@ -3,13 +3,13 @@
 
 use std::{collections::VecDeque, time::Instant};
 
-use super::{Asked, Taken};
+use super::{Asked, Shadowed, Taken};
 use crate::{
-    decision::Decision,
+    decision::{Decision, ShadowKind},
     framework::{Engine, Plan},
     spec::PlanName,
     store::GatewayId,
-    view::fingerprint,
+    view::{fingerprint, WorkerId},
 };
 
 /// The maximum records a decider holds.
@@ -24,6 +24,11 @@ pub struct DecisionRecord {
     pub binding: Option<u32>,
     /// The instant the request was taken.
     pub at: Instant,
+    /// What the binding's shadow said beside the decision, where one
+    /// was due.
+    pub shadow: Option<ShadowKind>,
+    /// The first target of the shadow's pick.
+    pub shadow_target: Option<WorkerId>,
     gateway: GatewayId,
     request: u64,
 }
@@ -152,7 +157,12 @@ impl Samples {
         engine: &Engine,
         taken: &Taken<'_, A>,
         decision: &Decision,
+        shadow: Option<Shadowed>,
     ) {
+        debug_assert!(
+            matches!(decision, Decision::Pick(_) | Decision::Shed(_)),
+            "a record is a pick's or a shed's: the count keeps no other"
+        );
         if self.term != term {
             *self = Self {
                 term,
@@ -169,6 +179,8 @@ impl Samples {
             decision: *decision,
             binding: engine.binding_position(taken.request.model(), taken.request.phase()),
             at: taken.now,
+            shadow: shadow.map(|said| said.kind),
+            shadow_target: shadow.and_then(|said| said.first),
             gateway: taken.gateway,
             request: fingerprint(taken.request.id()),
         });
@@ -263,6 +275,8 @@ mod tests {
             }),
             binding,
             at: Instant::now(),
+            shadow: None,
+            shadow_target: None,
             gateway: GATEWAY,
             request: fingerprint(b"shed"),
         }
