@@ -22,8 +22,8 @@ use super::{
         drive, open, Connection, End, CONNECTION_WINDOW, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT,
         STREAM_WINDOW,
     },
-    dial_failure_without_peer, is_transport_failure, normalize_grpc_endpoint, testing, BoxError,
-    Channel, RecvBody, Shared, DEFAULT_CONNECT_TIMEOUT,
+    dial_failure_without_peer, is_keep_alive_timeout, is_transport_failure,
+    normalize_grpc_endpoint, testing, BoxError, Channel, RecvBody, Shared, DEFAULT_CONNECT_TIMEOUT,
 };
 use crate::{tokenspeed_proto, TokenSpeedSchedulerClient};
 
@@ -1885,6 +1885,12 @@ async fn a_keep_alive_timeout_under_a_call_is_unavailable() {
     assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
     assert_eq!(status.message(), "keep-alive timed out");
     assert!(!is_transport_failure(&status), "{status:?}");
+    // The timeout is the status's source. A worker's `UNAVAILABLE` in the
+    // same words has none.
+    assert!(is_keep_alive_timeout(&status), "{status:?}");
+    assert!(!is_keep_alive_timeout(&tonic::Status::unavailable(
+        "keep-alive timed out"
+    )));
     assert!(pings.load(Ordering::SeqCst) >= 1, "a ping was sent");
 }
 

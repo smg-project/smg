@@ -4,8 +4,8 @@ use axum::response::Response;
 use http::StatusCode;
 use llm_multimodal::MediaErrorCode;
 use smg_grpc_client::{
-    dial_failure_without_peer, is_constraint_failure, is_constraint_refusal, is_request_timeout,
-    is_transport_failure, WorkerMediaFault,
+    dial_failure_without_peer, is_constraint_failure, is_constraint_refusal, is_keep_alive_timeout,
+    is_request_timeout, is_transport_failure, WorkerMediaFault,
 };
 use smg_policy_controller::lease::TransportClass;
 use tonic::Code;
@@ -13,6 +13,7 @@ use tonic::Code;
 use super::metrics::mark_error_reason;
 use crate::{
     observability::metrics::metrics_labels,
+    policy_controller::host,
     routers::{
         common::retry::{mark_non_retryable, request_timeout_response},
         error,
@@ -61,9 +62,10 @@ pub(crate) trait TonicStatusExt {
     /// The transport class of a dispatch that ended with this status, which
     /// the policy controller reads beside the status: a failed connection
     /// where the status is no answer of the worker's (its connection failed
-    /// under the call, its side ended the call, or the dial failed), else
-    /// the class of the HTTP status it maps to. The same status is the same
-    /// class on either side of the first chunk.
+    /// under the call, its side ended the call, the dial failed, or it
+    /// answered no keep-alive ping), else the class the host gives the HTTP
+    /// status it maps to, as an answer of the worker's. The same status is
+    /// the same class on either side of the first chunk.
     fn transport_class(&self) -> TransportClass;
 
     /// This status's message as an answer to a client carries it: the
@@ -245,10 +247,11 @@ impl TonicStatusExt for tonic::Status {
         if is_transport_failure(self)
             || self.code() == Code::Cancelled
             || dial_failure_without_peer(self).is_some()
+            || is_keep_alive_timeout(self)
         {
             return TransportClass::ConnectFailed;
         }
-        status_class(self.http_status())
+        host::transport_class(self.http_status(), true)
     }
 
     fn client_message(&self) -> &str {
@@ -331,26 +334,18 @@ impl TonicStatusExt for tonic::Status {
     }
 }
 
-/// The transport class of an HTTP status alone.
-fn status_class(status: StatusCode) -> TransportClass {
-    match status {
-        status if status < StatusCode::BAD_REQUEST => TransportClass::Ok,
-        StatusCode::GATEWAY_TIMEOUT => TransportClass::Timeout,
-        status if status.is_client_error() => TransportClass::ClientError,
-        _ => TransportClass::ServerError,
-    }
-}
-
 /// The transport class of the dispatch that `response` ended: the class its
 /// worker's status named, where the response was made of one (see
-/// [`TonicStatusExt::to_http_error`]), else the class of the response's own
-/// status, for an answer the router made itself.
+/// [`TonicStatusExt::to_http_error`]), else the class the host gives the
+/// response's own status as an answered one. An answer the router made
+/// itself is read here only behind a send: a failed connection is classed
+/// at its status, and a failure ahead of the send reports no class.
 pub(crate) fn transport_class_of(response: &Response) -> TransportClass {
     response
         .extensions()
         .get::<TransportClass>()
         .copied()
-        .unwrap_or_else(|| status_class(response.status()))
+        .unwrap_or_else(|| host::transport_class(response.status(), true))
 }
 
 /// Whether `status` is the engine's own report that the request failed (its
@@ -579,9 +574,9 @@ mod tests {
     /// The transport class a status names for the policy controller: a
     /// failed connection where the status is no answer of the worker's (an
     /// HTTP/2 fault under the call, the worker's side cancelling, a dial
-    /// that failed), else the class of its HTTP status. The HTTP answer made
-    /// of the status carries the class. An answer the router made itself is
-    /// classed by its own status.
+    /// that failed, a keep-alive timeout), else the class of its HTTP
+    /// status. The HTTP answer made of the status carries the class. An
+    /// answer the router made itself is classed by its own status.
     #[tokio::test]
     async fn a_status_names_its_transport_class() {
         use smg_grpc_client::h2::{Error, Reason};
@@ -603,6 +598,10 @@ mod tests {
             ),
             (
                 tonic::Status::from_error(refused),
+                TransportClass::ConnectFailed,
+            ),
+            (
+                smg_grpc_client::keep_alive_timeout_status(),
                 TransportClass::ConnectFailed,
             ),
             (

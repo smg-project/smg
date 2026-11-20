@@ -33,7 +33,8 @@ use std::sync::Arc;
 
 pub use abort_on_drop::{AbortOnDropClient, AbortOnDropStream};
 pub use channel::{
-    connect_channel, connect_channel_with_timeout, dial_failure_without_peer, is_transport_failure,
+    connect_channel, connect_channel_with_timeout, dial_failure_without_peer,
+    is_keep_alive_timeout, is_transport_failure, keep_alive_timeout_status,
     normalize_grpc_endpoint, Channel, DEFAULT_CONNECT_TIMEOUT,
 };
 pub use constraint_failure::{
