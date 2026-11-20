@@ -2171,18 +2171,21 @@ impl RouterConfig {
         }
     }
 
-    /// The provider mode's name, where the gateway runs one. A provider mode
-    /// holds one provider's worker and places its requests by no routing
-    /// policy.
-    pub(crate) fn provider_mode(&self) -> Option<&'static str> {
-        match self.mode {
-            RoutingMode::OpenAI { .. } => Some("openai"),
-            RoutingMode::Anthropic { .. } => Some("anthropic"),
-            RoutingMode::Gemini { .. } => Some("gemini"),
+    /// The provider's name, where every router of the gateway is that
+    /// provider's: a provider mode without the multi-router setting
+    /// (`enable_igw`). Such a gateway places its requests by no routing
+    /// policy. A multi-router gateway mounts the routers of self-hosted
+    /// workers beside the provider's, and reads `None` here.
+    pub(crate) fn provider_alone(&self) -> Option<&'static str> {
+        let provider = match self.mode {
+            RoutingMode::OpenAI { .. }
+            | RoutingMode::Anthropic { .. }
+            | RoutingMode::Gemini { .. } => true,
             RoutingMode::Regular { .. }
             | RoutingMode::PrefillDecode { .. }
-            | RoutingMode::EncodePrefillDecode { .. } => None,
-        }
+            | RoutingMode::EncodePrefillDecode { .. } => false,
+        };
+        (provider && !self.enable_igw).then(|| self.mode_type())
     }
 
     /// Check if service discovery is enabled

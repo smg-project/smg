@@ -340,15 +340,18 @@ type Side<'a> = (&'static str, &'a PolicyConfig);
 
 /// The presets the mode's policies name, as one document, with its
 /// profiles: one named for the policy under the regular mode, one a side
-/// under the pair and the encode modes. The pools of a mode are the
+/// under the pair and the encode modes. A provider mode of a multi-router
+/// gateway reads as the regular mode: the document says the policy of the
+/// self-hosted routers beside the provider's. The pools of a mode are the
 /// gateway's and are not read.
 fn presets(config: &RouterConfig) -> Result<(PolicySpec, Vec<Side<'_>>), PolicyDocumentError> {
     let (mode, main) = (&config.mode, &config.policy);
     let (prefill, decode) = (mode.get_prefill_policy(main), mode.get_decode_policy(main));
+    let regular = || -> Result<_, PolicyDocumentError> {
+        Ok((PolicySpec::preset(main.name())?, vec![(main.name(), main)]))
+    };
     let (mut document, sides) = match mode {
-        RoutingMode::Regular { worker_urls: _ } => {
-            (PolicySpec::preset(main.name())?, vec![(main.name(), main)])
-        }
+        RoutingMode::Regular { worker_urls: _ } => regular()?,
         RoutingMode::PrefillDecode {
             prefill_urls: _,
             decode_urls: _,
@@ -372,9 +375,12 @@ fn presets(config: &RouterConfig) -> Result<(PolicySpec, Vec<Side<'_>>), PolicyD
                 vec![("encode", encode), ("prefill", prefill), ("decode", decode)],
             )
         }
-        RoutingMode::OpenAI { worker_urls: _ } => return Err(provider_mode("openai")),
-        RoutingMode::Anthropic { worker_urls: _ } => return Err(provider_mode("anthropic")),
-        RoutingMode::Gemini { worker_urls: _ } => return Err(provider_mode("gemini")),
+        RoutingMode::OpenAI { worker_urls: _ }
+        | RoutingMode::Anthropic { worker_urls: _ }
+        | RoutingMode::Gemini { worker_urls: _ } => match config.provider_alone() {
+            Some(provider) => return Err(provider_mode(provider)),
+            None => regular()?,
+        },
     };
     // A document of several sides runs the pair: the pairing mode is its rule.
     if sides.len() > 1 {

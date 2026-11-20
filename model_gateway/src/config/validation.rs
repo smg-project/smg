@@ -1971,6 +1971,11 @@ impl ConfigValidator {
         {
             return refuse("--policy-controller-tls-cert requires --policy-controller-tls-ca-cert, the one root the connection trusts");
         }
+        // Nothing of a gateway whose every router is a provider's is placed
+        // through a controller: the address would be dropped unsaid.
+        if let Some(mode) = config.provider_alone() {
+            return refuse(&format!("--policy-controller-address supplies the workers, and the {mode} provider mode places its requests by no routing policy"));
+        }
         if config.mode.worker_count() != 0 {
             return refuse("--policy-controller-address supplies the workers and conflicts with --worker-urls, --encode, --prefill and --decode");
         }
@@ -2280,6 +2285,40 @@ mod tests {
             },
             &["--policy-controller-address", "--worker-urls"],
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_controller_address_refuses_a_gateway_of_providers_alone() {
+        for mode in [
+            RoutingMode::OpenAI {
+                worker_urls: Vec::new(),
+            },
+            RoutingMode::Anthropic {
+                worker_urls: Vec::new(),
+            },
+            RoutingMode::Gemini {
+                worker_urls: Vec::new(),
+            },
+        ] {
+            // Nothing of such a gateway is placed through a controller.
+            controller_refusal(
+                &RouterConfig {
+                    mode: mode.clone(),
+                    ..following_config()
+                },
+                &["--policy-controller-address", "provider mode"],
+            );
+            // A multi-router gateway places self-hosted workers beside the
+            // provider's, and the controller supplies them.
+            RouterConfig {
+                mode,
+                enable_igw: true,
+                ..following_config()
+            }
+            .validate()
+            .expect("a multi-router gateway follows a controller beside a provider");
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

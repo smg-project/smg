@@ -493,6 +493,58 @@ fn a_document_beside_a_provider_mode_is_refused_by_name() -> Case {
     Ok(())
 }
 
+#[test]
+fn a_provider_mode_of_a_multi_router_gateway_starts_the_store() -> Case {
+    // A multi-router gateway mounts the routers of self-hosted workers
+    // beside the provider's. The setting stays in force for them, on the
+    // document the routing settings mean under the regular mode.
+    for mode in provider_modes() {
+        let config = picked(RouterConfig {
+            mode,
+            enable_igw: true,
+            ..RouterConfig::default()
+        });
+        let store = start(&config)?.ok_or("a self-hosted request lost the controller")?;
+        assert_eq!(
+            store.world().spec().digest(),
+            Some(
+                picked(RouterConfig::default())
+                    .policy_document()?
+                    .digest()?
+            ),
+            "the {} mode",
+            config.mode_type()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_controller_address_beside_a_provider_mode_stops_the_start() -> Case {
+    // Nothing of such a gateway is placed through a controller. The
+    // validator refuses the address by name. A context built over a
+    // configuration that skipped it stops here: the address is never
+    // dropped in silence.
+    for mode in provider_modes() {
+        let config = picked(RouterConfig {
+            mode,
+            policy_controller_address: Some("controller:30100".to_owned()),
+            ..RouterConfig::default()
+        });
+        let refusal = start(&config)
+            .err()
+            .ok_or("the controller's address was dropped in silence")?;
+        assert!(matches!(refusal, StartError::Document(_)), "{refusal}");
+        assert!(
+            refusal
+                .to_string()
+                .contains("a provider mode places its requests by no routing policy"),
+            "{refusal}"
+        );
+    }
+    Ok(())
+}
+
 /// A configuration with no health probe behind its cases.
 fn quiet() -> RouterConfig {
     let mut config = RouterConfig::default();
