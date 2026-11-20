@@ -25,15 +25,26 @@ fn read_values(values: &[common::NamedValue]) -> Vec<NamedValue> {
     let mut named: Vec<NamedValue> = Vec::with_capacity(values.len().min(MAX_VALUES));
     for sample in values.iter().take(MAX_VALUES) {
         if stands(&sample.name, &sample.unit, sample.value, &named) {
-            named.push(NamedValue {
-                name: Arc::from(sample.name.as_str()),
-                unit: Arc::from(sample.unit.as_str()),
-                value: sample.value,
-                age_ms: sample.age_ms,
-            });
+            named.push(NamedValue::from(sample));
         }
     }
     named
+}
+
+/// A named value as a wire states it, field for field: the one read of an
+/// entry, for a pushed record's list and for a polled answer's. A polled
+/// answer's list is read whole by it, and the load monitor holds that list
+/// to the report's bounds and counts what leaves it, as it does the list
+/// of a poll over HTTP.
+impl From<&common::NamedValue> for NamedValue {
+    fn from(stated: &common::NamedValue) -> Self {
+        Self {
+            name: Arc::from(stated.name.as_str()),
+            unit: Arc::from(stated.unit.as_str()),
+            value: stated.value,
+            age_ms: stated.age_ms,
+        }
+    }
 }
 
 /// A record's fixed fields take the shape of a poll's. The two

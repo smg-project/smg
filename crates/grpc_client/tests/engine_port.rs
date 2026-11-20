@@ -43,6 +43,17 @@ const FAMILIES: [(RuntimeType, &str, bool, bool, bool); 5] = [
     (RuntimeType::TokenSpeed, "tokenspeed", true, true, true),
 ];
 
+/// The named value a scripted engine states on its rank's load, on each
+/// wire whose answer has the list.
+fn stated_value() -> common::NamedValue {
+    common::NamedValue {
+        name: "queue_age".to_string(),
+        unit: "ms".to_string(),
+        value: 6.5,
+        age_ms: Some(37),
+    }
+}
+
 type EventStream = ReceiverStream<Result<common::KvEventBatch, Status>>;
 
 /// What the scripted engines were asked.
@@ -253,6 +264,20 @@ async fn a_load_read_asks_every_section_and_answers_the_ranks() {
                 .map(|rank| rank.num_running_reqs)
                 .collect();
             assert_eq!(running, [3], "{runtime}");
+            // A rank's named values arrive as the engine stated them, on
+            // each wire whose answer has the list.
+            let values: Vec<_> = answer
+                .loads
+                .iter()
+                .flat_map(|rank| &rank.values)
+                .map(|value| (&*value.name, &*value.unit, value.value, value.age_ms))
+                .collect();
+            let stated: &[(&str, &str, f64, Option<u32>)] = if runtime == RuntimeType::Trtllm {
+                &[]
+            } else {
+                &[("queue_age", "ms", 6.5, Some(37))]
+            };
+            assert_eq!(values, stated, "{runtime}");
             assert_eq!(*lock(&seen.load_sections), LOAD_SECTIONS, "{runtime}");
             lock(&seen.load_sections).clear();
         } else {
@@ -517,6 +542,7 @@ impl sglang_proto::sglang_scheduler_server::SglangScheduler for Engine {
             dp_rank_count: 1,
             loads: vec![sglang_proto::SchedulerLoad {
                 num_running_reqs: 3,
+                values: vec![stated_value()],
                 ..Default::default()
             }],
             ..Default::default()
@@ -680,6 +706,7 @@ impl vllm_proto::vllm_engine_server::VllmEngine for Engine {
             dp_rank_count: 1,
             loads: vec![vllm_proto::SchedulerLoad {
                 num_running_reqs: 3,
+                values: vec![stated_value()],
                 ..Default::default()
             }],
             ..Default::default()
@@ -767,6 +794,7 @@ impl tokenspeed_proto::token_speed_scheduler_server::TokenSpeedScheduler for Eng
             dp_rank_count: 1,
             loads: vec![tokenspeed_proto::SchedulerLoad {
                 num_running_reqs: 3,
+                values: vec![stated_value()],
                 ..Default::default()
             }],
             ..Default::default()
