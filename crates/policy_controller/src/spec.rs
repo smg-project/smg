@@ -47,6 +47,7 @@ use crate::{
     framework::{
         Binding, Engine, Filter, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted,
     },
+    reports::Reports,
     ring::ConsistentHash,
     routing_key::KeySources,
     sent::SentCredit,
@@ -301,9 +302,11 @@ pub struct ViewSpec {
     /// With this limit in milliseconds set, `least-load`, `resident-work`,
     /// `least-cost` and the KV-pressure gates of `prefix-affinity` and
     /// `warmup-slice` treat older reports as missing. A report exactly at
-    /// the limit still counts. Overload verdicts can still reflect older
-    /// reports, plugins interpret report age themselves, and host-registered
-    /// stages keep their own rules. Omit it to use reports of any age.
+    /// the limit still counts. A host-registered stage reads a report
+    /// under the limit through its build context's `reports()`, and one
+    /// that reads the row's report itself sees it at any age. Overload
+    /// verdicts can still reflect older reports, and plugins interpret
+    /// report age themselves. Omit it to use reports of any age.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = MAX_REPORT_AGE_MS))]
     pub max_report_age_ms: Option<u64>,
@@ -2821,6 +2824,15 @@ fn picker_of(
     })
 }
 
+/// What a document's stages are built from: the catalog that makes them,
+/// and the view's reading of a report, which a factory's build context
+/// hands out.
+#[derive(Clone, Copy)]
+struct StageInputs<'a> {
+    catalog: &'a Catalog,
+    reports: Reports,
+}
+
 /// The filter the entry at `index` of a profile's list stands for. The
 /// catalog is asked for the name first: a name it does not hold is refused
 /// as unknown whatever is written under it. `at` is the profile's path:
@@ -2831,13 +2843,13 @@ fn filtered(
     profile: &str,
     at: &At,
     index: usize,
-    catalog: &Catalog,
+    from: StageInputs<'_>,
     sent_ttl_ms: Option<u32>,
     sent: &mut Option<Arc<SentCredit>>,
 ) -> Result<Box<dyn Filter>, SpecError> {
     let name = entry.name();
     let path = || format!("{}.filter[{index}].{name}", at.0);
-    match (catalog.find_filter(name), entry) {
+    match (from.catalog.find_filter(name), entry) {
         (Some(Found::Built(filter)), FilterSpec::Name(_)) => Ok(filter),
         // A filter registered with no parameter is written by its name
         // alone: whatever stands under it is refused.
@@ -2864,7 +2876,7 @@ fn filtered(
             params
                 .values_mut()
                 .for_each(serde_json::Value::sort_all_objects);
-            let mut context = StageBuild::new(&params, profile, sent_ttl_ms, sent);
+            let mut context = StageBuild::new(&params, profile, sent_ttl_ms, sent, from.reports);
             let filter = build(&mut context).map_err(|error| error.at(&path()))?;
             let answers = filter.name();
             if answers != name {
@@ -2899,12 +2911,12 @@ fn scored(
     entry: &ScoreSpec,
     profile: &str,
     at: &At,
-    catalog: &Catalog,
+    from: StageInputs<'_>,
     sent_ttl_ms: Option<u32>,
     sent: &mut Option<Arc<SentCredit>>,
 ) -> Result<Scored, SpecError> {
     let name = entry.name();
-    let Some(found) = catalog.find_scorer(name) else {
+    let Some(found) = from.catalog.find_scorer(name) else {
         return Err(SpecError::UnknownScorer {
             profile: profile.to_string(),
             name: name.to_string(),
@@ -2952,7 +2964,7 @@ fn scored(
             params
                 .values_mut()
                 .for_each(serde_json::Value::sort_all_objects);
-            let mut context = StageBuild::new(&params, profile, sent_ttl_ms, sent);
+            let mut context = StageBuild::new(&params, profile, sent_ttl_ms, sent, from.reports);
             let scorer = build(&mut context).map_err(|error| error.at(&at.0))?;
             let answers = scorer.name();
             if answers != name {
@@ -3077,9 +3089,15 @@ fn check_profile(
     // The profile's count of sends, made where a stage's factory first
     // asks for it: a filter's may, ahead of any scorer's.
     let mut sent = None;
+    // A registered stage reads a report through the view's reading: the
+    // limit the built-in scorers are wrapped with below.
+    let from = StageInputs {
+        catalog,
+        reports: Reports::new(view.max_report_age_ms),
+    };
     let mut filters = Vec::with_capacity(p.filter.len());
     for (index, entry) in p.filter.iter().enumerate() {
-        let filter = filtered(entry, name, &at, index, catalog, p.sent_ttl_ms, &mut sent)?;
+        let filter = filtered(entry, name, &at, index, from, p.sent_ttl_ms, &mut sent)?;
         filters.push(filter);
     }
     let mut scorers = Vec::with_capacity(p.score.len());
@@ -3087,7 +3105,7 @@ fn check_profile(
     let mut plain_ring = false;
     for (i, entry) in p.score.iter().enumerate() {
         let entry_at = At::new(format!("{}.score[{i}]", at.0));
-        let stage = match scored(entry, name, &entry_at, catalog, p.sent_ttl_ms, &mut sent)? {
+        let stage = match scored(entry, name, &entry_at, from, p.sent_ttl_ms, &mut sent)? {
             Scored::Typed(stage) => stage,
             Scored::Built(weighted) => {
                 depth.deepen(HashDepth::of(weighted.scorer.needs()));
@@ -6532,7 +6550,10 @@ mod tests {
             entry,
             "p",
             &At::new("profiles.p.score[0]"),
-            &catalog,
+            StageInputs {
+                catalog: &catalog,
+                reports: Reports::new(None),
+            },
             None,
             &mut None,
         )

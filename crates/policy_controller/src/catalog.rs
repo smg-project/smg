@@ -26,6 +26,7 @@ use crate::{
         Passthrough, PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
     },
     framework::{Filter, Picker, Scorer},
+    reports::Reports,
     sent::SentCredit,
     spec::{SpecError, SCORERS},
 };
@@ -70,6 +71,7 @@ pub struct StageBuild<'a> {
     profile: &'a str,
     sent_ttl_ms: Option<u32>,
     sent: &'a mut Option<Arc<SentCredit>>,
+    reports: Reports,
 }
 
 impl<'a> StageBuild<'a> {
@@ -78,12 +80,14 @@ impl<'a> StageBuild<'a> {
         profile: &'a str,
         sent_ttl_ms: Option<u32>,
         sent: &'a mut Option<Arc<SentCredit>>,
+        reports: Reports,
     ) -> Self {
         Self {
             written,
             profile,
             sent_ttl_ms,
             sent,
+            reports,
         }
     }
 }
@@ -110,6 +114,15 @@ impl StageBuild<'_> {
     /// its tally under that profile's `sent_ttl_ms`.
     pub fn sent(&mut self) -> Arc<SentCredit> {
         profile_sent(self.sent, self.profile, self.sent_ttl_ms)
+    }
+
+    /// The view's reading of a row's load report, for a stage that reads
+    /// one: a report older than the document's `view.max_report_age_ms`
+    /// reads as none, as it does for the built-in stages. A stage that
+    /// reads `row.load` itself sees the report at any age. The value is
+    /// `Copy`, and asking for it makes nothing.
+    pub fn reports(&self) -> Reports {
+        self.reports
     }
 }
 

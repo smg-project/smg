@@ -742,10 +742,14 @@ pub(crate) const REPORT_CLOCK_HISTORY_MS: u32 = 3_600_000;
 pub(crate) const MAX_REPORT_AGE_MS: u32 = REPORT_CLOCK_HISTORY_MS - 1;
 
 /// The oldest sample a decision can use under a report age limit.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct ReportCutoff(u64);
 
 impl ReportCutoff {
+    /// The cutoff of a view that sets no limit: no sample is older than
+    /// the clock's origin, so every report is read.
+    pub(crate) const ANY_AGE: Self = Self(0);
+
     pub(crate) fn new(now_micros: u64, max_age_ms: u64) -> Self {
         Self(now_micros.saturating_sub(max_age_ms * 1_000))
     }
