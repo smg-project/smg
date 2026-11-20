@@ -69,10 +69,7 @@ pub use smg_worker::connection::client_factory::{
 };
 use smg_worker::{
     connection::engine::EngineConnector,
-    health::{
-        manager::{WorkerManager, WorkerManagerConfig},
-        port::HealthSink,
-    },
+    health::manager::{WorkerManager, WorkerManagerConfig},
     identity::{basic::ConnectionMode, endpoint::Endpoint},
     jobs::WorkerJobs,
 };
@@ -2301,23 +2298,31 @@ fn start_worker_health_checks(app_context: &AppContext) -> Option<WorkerManager>
         return None;
     }
     let config = &app_context.router_config;
-    // With a feed the loop writes through the feed's sink, so each worker's
-    // health keeps one writer.
-    let health_sink: Arc<dyn HealthSink> = match &app_context.policy_feed {
-        Some(feed) => feed.health_sink(),
-        None => app_context.worker_registry.clone(),
+    let registry = app_context.worker_registry.clone();
+    let manager = WorkerManagerConfig {
+        default_check_interval_secs: config.health_check.check_interval_secs,
+        remove_unhealthy: config.unhealthy_removal_scope(),
     };
-    WorkerManager::maybe_start_with_sink(
-        app_context.worker_registry.clone(),
-        health_sink,
-        WorkerManagerConfig {
-            default_check_interval_secs: config.health_check.check_interval_secs,
-            remove_unhealthy: config.unhealthy_removal_scope(),
-        },
-        app_context
-            .worker_job_queue
-            .get()
-            .map(|queue| Arc::clone(queue) as Arc<dyn WorkerJobs>),
+    let jobs = app_context
+        .worker_job_queue
+        .get()
+        .map(|queue| Arc::clone(queue) as Arc<dyn WorkerJobs>);
+    // With a feed the loop writes through the feed's sink, so each worker's
+    // health keeps one writer. The feed's rows take each move of a worker's
+    // liveness veto from the loop as well, so a feed keeps the loop with the
+    // checks off: it then probes no worker whose own checks are off.
+    if let Some(feed) = &app_context.policy_feed {
+        return Some(WorkerManager::start_with_sink(
+            registry,
+            feed.health_sink(),
+            manager,
+            jobs,
+        ));
+    }
+    WorkerManager::maybe_start(
+        registry,
+        manager,
+        jobs,
         !config.health_check.disable_health_check,
         config.connection_mode == ConnectionMode::Zmq,
     )
@@ -4014,6 +4019,92 @@ mod tests {
                 && error.contains("service_discovery_config"),
             "{error}"
         );
+    }
+
+    /// A gateway that decides in its own process keeps the health loop with
+    /// the checks off. The loop then probes no worker, and it carries each
+    /// move of a worker's liveness veto to the feed's rows, where a decision
+    /// reads it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_feed_takes_a_liveness_move_with_the_checks_off() {
+        use std::time::Instant;
+
+        use smg_policy_controller::{
+            store::{Ask, GatewayId, HealthPolicy, Maker, ViewBuffers, WorkerFacts},
+            view::{Role, WireModes},
+            worker_host::Expect,
+        };
+        use smg_worker::runtime::StallReason;
+
+        const URL: &str = "http://worker:8000";
+        const MODEL: &str = "model-a";
+
+        /// Whether `holds` comes true within five seconds.
+        async fn comes(holds: impl Fn() -> bool) -> bool {
+            for _ in 0..500 {
+                if holds() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            holds()
+        }
+
+        let mut router = RouterConfig {
+            policy_controller: true,
+            ..Default::default()
+        };
+        router.health_check.disable_health_check = true;
+        let context = Arc::new(
+            AppContext::from_config(router, 10, None, None)
+                .await
+                .unwrap(),
+        );
+        let feed = context.policy_feed.as_ref().expect("the store has a feed");
+        let _health = start_worker_health_checks(&context).expect("a feed keeps the loop");
+
+        let stated = WorkerFacts {
+            key: URL.to_owned(),
+            engine: URL.to_owned(),
+            role: Role::Single,
+            wire_modes: WireModes::HTTP,
+            models: vec![MODEL.to_owned()],
+            dp_size: 1,
+            max_running: Some(64),
+            health: HealthPolicy {
+                probes: false,
+                ..HealthPolicy::default()
+            },
+            ..WorkerFacts::default()
+        };
+        feed.door
+            .found(&Maker::Control, Expect::Nothing, URL, &|_| stated.clone())
+            .expect("the worker registers");
+        let worker = context
+            .worker_registry
+            .get_by_url(URL)
+            .expect("the row's object stands");
+        // Whether the next decision reads the pool's worker as stalled.
+        let stalled = || {
+            let ask = Ask {
+                gateway: GatewayId::LOCAL,
+                now: Instant::now(),
+                pinned: None,
+                affinity: false,
+            };
+            feed.store().deciding(|world| {
+                let mut view = ViewBuffers::default();
+                let built = world.build(MODEL, Role::Single, &ask, &mut view).is_some();
+                built && view.candidates.iter().any(|row| row.health.stalled)
+            })
+        };
+        assert!(!stalled());
+
+        assert!(worker.set_stall(Some(StallReason::Unreachable)));
+        assert!(comes(&stalled).await, "the row takes the doubt");
+        assert!(worker.set_stall(None));
+        assert!(comes(|| !stalled()).await, "and its clearing");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

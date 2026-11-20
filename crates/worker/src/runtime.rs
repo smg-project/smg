@@ -794,10 +794,12 @@ impl WorkerRuntime {
     }
 
     /// The loop took the liveness signal: the next move of the veto signals
-    /// again. The loop calls it before its sink reads the veto, so a move
-    /// behind that read is never lost.
+    /// again. The loop calls it before its sink reads the veto, and it is a
+    /// swap, so it reads the mark's last write. A move that marked ahead of
+    /// it is ordered ahead of the sink's read, and a move behind it finds no
+    /// mark and signals again. So no move is lost.
     pub(crate) fn liveness_signal_taken(&self) {
-        self.liveness_signalled.store(false, Ordering::Release);
+        self.liveness_signalled.swap(false, Ordering::AcqRel);
     }
 
     /// The code of the `smg_worker_state` series published last (0 when
