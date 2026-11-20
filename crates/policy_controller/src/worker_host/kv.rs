@@ -33,6 +33,13 @@
 //! rank once its row stands above rank 0. A ticket from before a row's
 //! object was laid again opens no feed.
 //!
+//! A row's stream and a stream's rows are kept under one lock: a row
+//! moves between two streams in one step. A stream that leaves reaches
+//! only the rows it still writes. It clears them in the store outside
+//! that lock, which every row's batch takes, and each stays its row until
+//! its clear ends. A stream that would take one in between passes its
+//! batch over, so a removal clears nothing a new stream wrote.
+//!
 //! # The block size
 //!
 //! A batch the store takes names the model's block size: the widest block
@@ -59,6 +66,8 @@
 //! - A feed's own row laid again in place as rank 0 of another engine is
 //!   written by its old stream until that stream ends. Its end clears
 //!   every row it wrote.
+//! - What a row's old stream had in flight as the row moved, a batch or a
+//!   reset, can land behind the new stream's clear.
 
 use std::{
     collections::HashMap,
@@ -92,17 +101,26 @@ use crate::{
 
 /// The worker crate's KV event port over a store's KV event sink.
 pub struct KvAdapter<S: ?Sized> {
-    /// What the adapter keeps of each row a stream writes, by the row.
-    rows: Mutex<HashMap<WorkerId, Written>>,
+    /// The rows the streams write: a row's stream and a stream's rows,
+    /// which move together under this one lock.
+    rows: Mutex<Rows>,
     /// What the streams said of their models' block sizes.
     sizes: Mutex<Sizes>,
     /// Where the ranks of an engine stand, where a host handed its holder.
     ranks: Option<Arc<dyn Ranks>>,
+    store: Arc<S>,
+}
+
+/// The rows the adapter's streams write, both ways.
+#[derive(Default)]
+struct Rows {
+    /// What the adapter keeps of each row a stream writes, by the row.
+    written: HashMap<WorkerId, Written>,
     /// The rows of other ranks each stream writes, by the stream's row:
     /// what its reset, its new connection and its removal reach beside its
-    /// own.
-    fed: Mutex<HashMap<WorkerId, Vec<WorkerId>>>,
-    store: Arc<S>,
+    /// own. A row stands in the list of the stream its entry names, and in
+    /// no other.
+    fed: HashMap<WorkerId, Vec<WorkerId>>,
 }
 
 /// What the adapter keeps of a row a stream writes.
@@ -114,6 +132,20 @@ struct Written {
     /// itself for a feed's row, its engine's rank 0 row for the row of
     /// another rank.
     stream: WorkerId,
+    /// The stream is leaving, and its removal has not cleared the row in
+    /// the store yet: no stream takes the row until it has.
+    leaving: bool,
+}
+
+impl Written {
+    /// What is kept of a row `stream` begins from nothing.
+    fn begun(stream: WorkerId) -> Self {
+        Self {
+            groups: GroupsShown::default(),
+            stream,
+            leaving: false,
+        }
+    }
 }
 
 /// Where the ranks of an engine stand: the holder's answer, as the adapter
@@ -147,10 +179,9 @@ impl<S: ?Sized> KvAdapter<S> {
 
     fn over(store: Arc<S>, ranks: Option<Arc<dyn Ranks>>) -> Self {
         Self {
-            rows: Mutex::new(HashMap::new()),
+            rows: Mutex::new(Rows::default()),
             sizes: Mutex::new(Sizes::default()),
             ranks,
-            fed: Mutex::new(HashMap::new()),
             store,
         }
     }
@@ -165,18 +196,14 @@ impl<S: ?Sized> KvAdapter<S> {
         }
     }
 
-    /// The rows of other ranks `id`'s stream writes.
-    fn fed_by(&self, id: WorkerId) -> Vec<WorkerId> {
-        self.fed.lock().get(&id).cloned().unwrap_or_default()
-    }
-
-    /// Whether `id`'s stream still writes its own row: no other stream
-    /// took it.
-    fn writes_own(&self, id: WorkerId) -> bool {
-        self.rows
-            .lock()
-            .get(&id)
-            .is_none_or(|written| written.stream == id)
+    /// The rows `id`'s stream writes now, read in one hold of the lock:
+    /// its own first, unless another stream took it, then the rows of
+    /// other ranks.
+    fn written_by(&self, id: WorkerId) -> Vec<WorkerId> {
+        let rows = self.rows.lock();
+        let own = rows.written.get(&id).is_none_or(|own| own.stream == id);
+        let fed = rows.fed.get(&id).into_iter().flatten().copied();
+        own.then_some(id).into_iter().chain(fed).collect()
     }
 }
 
@@ -188,44 +215,69 @@ where
     /// `None` where the stream writes no row any longer: another stream
     /// took its own row, so it is ending, and it writes no row of any
     /// rank. A row of another rank that the stream writes for the first
-    /// time, or that another stream wrote, is taken.
+    /// time, or that another stream wrote, is taken: `None` where it
+    /// cannot be yet.
     fn shown(&self, id: WorkerId, row: WorkerId) -> Option<GroupsShown> {
         let known = {
             let rows = self.rows.lock();
-            if rows.get(&id).is_some_and(|own| own.stream != id) {
+            if rows.written.get(&id).is_some_and(|own| own.stream != id) {
                 return None;
             }
-            rows.get(&row)
+            rows.written
+                .get(&row)
                 .map(|written| (written.stream == id).then(|| written.groups.clone()))
         };
         match known {
             Some(Some(groups)) => Some(groups),
-            // No feed was opened for the stream's own row.
+            // The stream's own row that no entry is kept of.
             None if row == id => Some(GroupsShown::default()),
-            _ => {
-                self.take(id, row);
-                Some(GroupsShown::default())
-            }
+            _ => self.take(id, row).then(GroupsShown::default),
         }
     }
 
     /// `stream` takes `row`. The row begins from nothing, as a feed's own
     /// row does at its open: what the store kept of it was decided by
     /// facts that are gone, or by another stream's batches. The stream
-    /// that wrote it reaches it no longer.
-    fn take(&self, stream: WorkerId, row: WorkerId) {
-        self.store.removed(row);
-        let written = Written {
-            groups: GroupsShown::default(),
-            stream,
-        };
-        let before = self.rows.lock().insert(row, written);
-        let mut fed = self.fed.lock();
-        if let Some(rows) = before.and_then(|before| fed.get_mut(&before.stream)) {
-            rows.retain(|&fed| fed != row);
+    /// that wrote it reaches it no longer: the row changes lists in one
+    /// hold of the lock. `false`, with nothing done, where that stream is
+    /// leaving and still clears the row: the batch is passed over, and a
+    /// later one takes the row.
+    fn take(&self, stream: WorkerId, row: WorkerId) -> bool {
+        {
+            let mut rows = self.rows.lock();
+            let Rows { written, fed } = &mut *rows;
+            if written.get(&row).is_some_and(|before| before.leaving) {
+                return false;
+            }
+            let before = written.insert(row, Written::begun(stream));
+            if let Some(list) = before.and_then(|before| fed.get_mut(&before.stream)) {
+                list.retain(|&other| other != row);
+            }
+            if row != stream {
+                fed.entry(stream).or_default().push(row);
+            }
         }
-        if row != stream {
-            fed.entry(stream).or_default().push(row);
+        // Outside the lock, which every row's batch takes.
+        self.store.removed(row);
+        true
+    }
+
+    /// Keep what `row`'s batch on `id`'s stream showed of its groups,
+    /// where the stream still writes the row.
+    fn show(&self, id: WorkerId, row: WorkerId, groups: GroupsShown) {
+        let mut rows = self.rows.lock();
+        match rows.written.get_mut(&row) {
+            Some(written) if written.stream == id => written.groups = groups,
+            // The stream's own row that no entry is kept of.
+            None if row == id => {
+                let written = Written {
+                    groups,
+                    ..Written::begun(id)
+                };
+                rows.written.insert(row, written);
+            }
+            // Another stream took the row behind the batch's read.
+            _ => {}
         }
     }
 
@@ -331,8 +383,7 @@ where
         match self.store.admit(row, rank, facts, &events) {
             store::BatchOutcome::Applied => {
                 if groups != shown {
-                    let written = Written { groups, stream: id };
-                    self.rows.lock().insert(row, written);
+                    self.show(id, row, groups);
                 }
                 if let Some(width) = width {
                     self.learn(id, width);
@@ -347,10 +398,7 @@ where
     }
 
     fn reconnected(&self, id: WorkerId) {
-        if self.writes_own(id) {
-            self.store.reconnected(id);
-        }
-        for row in self.fed_by(id) {
+        for row in self.written_by(id) {
             self.store.reconnected(row);
         }
     }
@@ -375,10 +423,7 @@ where
             // The stream's reset reaches every row it writes, its own
             // first.
             None => {
-                if self.writes_own(id) {
-                    self.store.resync(id, None, reason);
-                }
-                for row in self.fed_by(id) {
+                for row in self.written_by(id) {
                     self.store.resync(row, None, reason);
                 }
             }
@@ -396,17 +441,35 @@ where
 
     fn removed(&self, id: WorkerId) {
         self.sizes.lock().models.remove(&id);
-        // Its own row, unless its engine's rank 0 stream took it.
-        if self.writes_own(id) {
-            self.rows.lock().remove(&id);
-            self.store.removed(id);
-        }
-        // The rows of other ranks the stream writes go with it: no stream
-        // feeds them now.
-        let fed = self.fed.lock().remove(&id).unwrap_or_default();
-        for row in fed {
-            self.rows.lock().remove(&row);
+        // What the stream still writes goes with it, since no stream feeds
+        // it now: the rows of other ranks, and its own unless another
+        // stream took it. Each is marked in the one hold that reads the
+        // list, cleared in the store outside the lock, and forgotten. A
+        // stream that would take one in between passes its batch over, so
+        // nothing a new stream wrote is cleared here.
+        let leaving = {
+            let mut rows = self.rows.lock();
+            let Rows { written, fed } = &mut *rows;
+            let own = written.get(&id).is_none_or(|own| own.stream == id);
+            let mut leaving = fed.remove(&id).unwrap_or_default();
+            if own {
+                leaving.push(id);
+            }
+            for &row in &leaving {
+                let mark = Written {
+                    leaving: true,
+                    ..Written::begun(id)
+                };
+                written.insert(row, mark);
+            }
+            leaving
+        };
+        for &row in &leaving {
             self.store.removed(row);
+        }
+        let mut rows = self.rows.lock();
+        for row in &leaving {
+            rows.written.remove(row);
         }
     }
 
@@ -636,10 +699,13 @@ where
                 // row's batch takes, and on this task: the clear ends
                 // before the feed is handed back. A row another stream
                 // wrote, as a rank of its engine, begins from nothing too.
+                // One a leaving stream still clears is left to it, and
+                // this feed's batches are passed over until that ends.
                 let own = self
                     .sink
                     .rows
                     .lock()
+                    .written
                     .get(&row)
                     .is_some_and(|written| written.stream == row);
                 if !own {
@@ -1867,11 +1933,8 @@ mod tests {
             .expect("the row's feed");
         assert_eq!(sink.cursor(row, 0), None);
         assert_eq!(f.store.indexed_blocks(row, 0), 0);
-        let fresh = Written {
-            groups: GroupsShown::default(),
-            stream: row,
-        };
-        assert_eq!(sink.rows.lock().get(&row), Some(&fresh));
+        let fresh = Written::begun(row);
+        assert_eq!(sink.rows.lock().written.get(&row), Some(&fresh));
 
         assert_eq!(sink.admit(row, 0, facts(9), &stores), BatchOutcome::Applied);
         let (sink, row) = host
@@ -1921,11 +1984,8 @@ mod tests {
             .expect("the row's feed");
         assert_eq!(sink.cursor(row, RANK), None);
         assert_eq!(f.blocks(), 0);
-        let fresh = Written {
-            groups: GroupsShown::default(),
-            stream: row,
-        };
-        assert_eq!(sink.rows.lock().get(&row), Some(&fresh));
+        let fresh = Written::begun(row);
+        assert_eq!(sink.rows.lock().written.get(&row), Some(&fresh));
     }
 
     #[test]
@@ -2190,8 +2250,8 @@ mod tests {
         f.sink.removed(f.lower);
         assert_eq!(f.blocks(upper), (0, 0));
         assert_eq!(f.store.cursor(upper, 1), None);
-        assert!(f.sink.rows.lock().is_empty());
-        assert!(f.sink.fed.lock().is_empty());
+        let rows = f.sink.rows.lock();
+        assert!(rows.written.is_empty() && rows.fed.is_empty());
     }
 
     /// A new connection of the engine's stream is every fed rank's: a
@@ -2381,5 +2441,49 @@ mod tests {
         assert!(f.host.open(ticket, &worker, MODEL).is_none());
         assert_eq!(f.store.indexed_blocks(row, 1), 1);
         assert_eq!(f.host.unfed().no_row, 1);
+    }
+
+    /// No stream takes a row its leaving stream still clears: a batch
+    /// routed to it is passed over, and the first one behind the removal
+    /// takes it. So a removal clears nothing a new stream wrote.
+    #[test]
+    fn a_row_its_leaving_stream_still_clears_is_passed_over() {
+        let f = Ranked::new();
+        let upper = f.upper();
+        let store = |hash| Data::Stored(wide_store(hash, 16));
+        assert_eq!(f.admit(1, 5, store(1)), BatchOutcome::Applied);
+        let other = f.other(OTHER);
+        let moved = f.store.upsert(rank_facts(UPPER, OTHER, 1)).id();
+        assert_eq!(moved, upper);
+        f.host.objects.follow(f.store.as_ref());
+        // One batch of rank 1 on the other engine's stream.
+        let late = |sequence, hash| {
+            let one = batch([store(hash)]);
+            f.sink.admit(other, 1, facts(sequence), &one)
+        };
+
+        // The first engine's stream is leaving: its removal marked the row
+        // and has not cleared it yet.
+        f.sink
+            .rows
+            .lock()
+            .written
+            .get_mut(&upper)
+            .expect("the row's entry")
+            .leaving = true;
+        assert_eq!(late(2, 2), BatchOutcome::Skipped);
+        assert_eq!(f.store.indexed_blocks(upper, 1), 1);
+
+        // The removal ends: the row is cleared and forgotten, and the
+        // other engine's next batch takes it.
+        f.sink.removed(f.lower);
+        assert_eq!(f.store.indexed_blocks(upper, 1), 0);
+        assert_eq!(late(3, 3), BatchOutcome::Applied);
+        assert_eq!(f.store.indexed_blocks(upper, 1), 1);
+        let rows = f.sink.rows.lock();
+        let stream = rows.written.get(&upper).map(|written| written.stream);
+        assert_eq!(stream, Some(other));
+        assert_eq!(rows.fed.get(&other), Some(&vec![upper]));
+        assert_eq!(rows.fed.get(&f.lower), None);
     }
 }
