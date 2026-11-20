@@ -290,7 +290,14 @@
       "description": "A filter: its bare name, a built-in mapped to its parameters, or the name of a filter the host adds mapped to its parameters.",
       "anyOf": [
         {
-          "type": "string"
+          "type": "string",
+          "examples": [
+            "healthy",
+            "not-overloaded",
+            "has-capacity",
+            "has-room",
+            "not-tried"
+          ]
         },
         {
           "$ref": "#/$defs/FilterStage"
@@ -395,7 +402,18 @@
       "description": "A scorer: its bare name (a stock scorer at its defaults, or a scorer the host adds at weight one), a stock scorer mapped to its weight and parameters, or the name of a scorer the host adds mapped to its weight and parameters. The stock scorers a document names bare: least-load, least-requests, fewest-sessions, session-affinity, prefix-affinity, kv-pressure, warmup-slice, bucket, consistent-hash.",
       "anyOf": [
         {
-          "type": "string"
+          "type": "string",
+          "examples": [
+            "least-load",
+            "least-requests",
+            "fewest-sessions",
+            "session-affinity",
+            "prefix-affinity",
+            "kv-pressure",
+            "warmup-slice",
+            "bucket",
+            "consistent-hash"
+          ]
         },
         {
           "$ref": "#/$defs/ScoreStage"
@@ -1096,7 +1114,17 @@
       "description": "A picker: its bare name, a built-in mapped to its parameters, or the name of a picker the host adds mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool. The stock pickers a document names bare: best, round-robin, random, power-of-two, count-first, power-of-two-count-first, passthrough, manual.",
       "anyOf": [
         {
-          "type": "string"
+          "type": "string",
+          "examples": [
+            "best",
+            "round-robin",
+            "random",
+            "power-of-two",
+            "count-first",
+            "power-of-two-count-first",
+            "passthrough",
+            "manual"
+          ]
         },
         {
           "$ref": "#/$defs/PickStage"
