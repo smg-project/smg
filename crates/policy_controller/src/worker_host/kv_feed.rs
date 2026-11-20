@@ -27,7 +27,10 @@ use smg_worker::{
     registry::{event::WorkerEvent, Generation, WorkerId, WorkerRegistry},
     worker::ConnectionMode,
 };
-use tokio::sync::{broadcast::error::RecvError, watch};
+use tokio::{
+    sync::{broadcast::error::RecvError, watch},
+    task::{JoinError, JoinSet},
+};
 
 use super::{KvHost, Objects};
 use crate::{
@@ -38,7 +41,8 @@ use crate::{
 
 /// A host's cache-event collector and the worker objects it follows.
 pub struct KvFeed<G: Generation> {
-    collector: KvEventCollector<KvHost<G, MemoryStore>>,
+    /// Shared with the tasks the follow hands its removals to.
+    collector: Arc<KvEventCollector<KvHost<G, MemoryStore>>>,
     registry: Arc<WorkerRegistry<G>>,
     store: Arc<MemoryStore>,
     objects: Arc<Objects<G>>,
@@ -53,10 +57,10 @@ impl<G: Generation> KvFeed<G> {
     /// the streams.
     pub fn new(store: Arc<MemoryStore>, objects: Arc<Objects<G>>) -> Self {
         let registry = Arc::clone(objects.registry());
-        let collector = KvEventCollector::new(Arc::new(KvHost::new(
+        let collector = Arc::new(KvEventCollector::new(Arc::new(KvHost::new(
             Arc::clone(&objects),
             Arc::clone(&store),
-        )));
+        ))));
         collector.set_worker_registry(&registry);
         Self {
             collector,
@@ -85,15 +89,28 @@ impl<G: Generation> KvFeed<G> {
     }
 
     /// Follow the registry until `stop` reads true, then end every stream.
+    ///
+    /// A removal runs on a task of its own, so one that is slow holds no
+    /// add behind it, and not the stop's word. The removals under way end
+    /// before the streams are stopped. An add is told in the loop: one
+    /// whose address has a removal under way waits there for the old
+    /// task's end, and holds the events behind it. A removal that panics
+    /// takes the follow down, as a panic in the loop does.
     pub async fn run(&self, mut stop: watch::Receiver<bool>) {
         let mut told = HashSet::new();
+        let mut removals = JoinSet::new();
         // Take events before the whole read so a worker laid during it is heard.
         let mut events = self.registry.subscribe_events();
-        self.reconcile(&mut told).await;
+        self.reconcile(&mut told, &mut removals).await;
         loop {
             let event = tokio::select! {
                 _ = stop.wait_for(|stop| *stop) => break,
                 event = events.recv() => event,
+                // An ended removal is reaped as the loop turns.
+                Some(ended) = removals.join_next() => {
+                    reaped(ended);
+                    continue;
+                }
             };
             match event {
                 Ok(
@@ -108,26 +125,29 @@ impl<G: Generation> KvFeed<G> {
                     told.insert(worker.url().to_owned());
                 }
                 Ok(WorkerEvent::Removed { worker, .. }) => {
-                    self.removed(worker.url(), &mut told).await;
+                    self.removed(worker.url(), &mut told, &mut removals);
                 }
                 Ok(WorkerEvent::StatusChanged { .. }) => {}
-                Err(RecvError::Lagged(_)) => self.reconcile(&mut told).await,
+                Err(RecvError::Lagged(_)) => self.reconcile(&mut told, &mut removals).await,
                 Err(RecvError::Closed) => break,
             }
+        }
+        while let Some(ended) = removals.join_next().await {
+            reaped(ended);
         }
         self.collector.stop().await;
     }
 
     /// Tell the collector of each worker in the read and each URL missing
     /// from it. Keep the read's URLs for the next turn.
-    async fn reconcile(&self, told: &mut HashSet<String>) {
+    async fn reconcile(&self, told: &mut HashSet<String>, removals: &mut JoinSet<()>) {
         let mut present = HashSet::new();
         for (id, worker) in self.registry.get_all_with_ids() {
             self.tell(&id, &worker).await;
             present.insert(worker.url().to_owned());
         }
         for url in told.difference(&present) {
-            self.collector.on_worker_removed(url).await;
+            self.leave(url, removals);
         }
         *told = present;
     }
@@ -168,13 +188,38 @@ impl<G: Generation> KvFeed<G> {
             .then_some(SubscriptionKind::Loads)
     }
 
-    pub(crate) async fn removed(&self, url: &str, told: &mut HashSet<String>) {
+    pub(crate) fn removed(
+        &self,
+        url: &str,
+        told: &mut HashSet<String>,
+        removals: &mut JoinSet<()>,
+    ) {
         // A whole read may already have told the collector of the next worker
         // under this URL. Keep tracking it while it stands.
         if self.registry.get_by_url(url).is_none() {
             told.remove(url);
         }
-        self.collector.on_worker_removed(url).await;
+        self.leave(url, removals);
+    }
+
+    /// Hand `url`'s removal to a task of its own. The collector keeps one
+    /// address's calls in order by itself: each takes a turn of the
+    /// address's slot under the slot lock. An add that comes behind the
+    /// removal's turn waits for the old task's end. One that comes ahead
+    /// of it restarts the stream for the object the registry holds, and
+    /// the removal then leaves that stream alone.
+    fn leave(&self, url: &str, removals: &mut JoinSet<()>) {
+        let collector = Arc::clone(&self.collector);
+        let url = url.to_owned();
+        removals.spawn(async move { collector.on_worker_removed(&url).await });
+    }
+}
+
+/// A removal's task that panicked takes the follow down, as a panic in the
+/// loop does: the panic is raised again where the task is reaped.
+fn reaped(ended: Result<(), JoinError>) {
+    if let Some(panic) = ended.err().and_then(|error| error.try_into_panic().ok()) {
+        std::panic::resume_unwind(panic);
     }
 }
 

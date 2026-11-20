@@ -142,6 +142,34 @@ const RESYNCS: [ResyncReason; 9] = [
     ResyncReason::Snapshot,
 ];
 
+/// A reason's place in [`RESYNCS`]. The match names every reason, so a new
+/// one fails to build here, beside the list that must name it.
+const fn place(reason: ResyncReason) -> usize {
+    match reason {
+        ResyncReason::OutOfRange => 0,
+        ResyncReason::DataLoss => 1,
+        ResyncReason::StreamEnded => 2,
+        ResyncReason::SnapshotAbandoned => 3,
+        ResyncReason::RelayRestart => 4,
+        ResyncReason::EngineReplaced => 5,
+        ResyncReason::PublisherRestart => 6,
+        ResyncReason::GapCleared => 7,
+        ResyncReason::Snapshot => 8,
+    }
+}
+
+// Every place of the list holds its reason, read at the build.
+const _: () = {
+    let mut at = 0;
+    while at < RESYNCS.len() {
+        assert!(
+            place(RESYNCS[at]) == at,
+            "a resync reason is out of its place"
+        );
+        at += 1;
+    }
+};
+
 /// The metadata entry a caller states its name in.
 const PRINCIPAL: &str = "x-smg-principal";
 
