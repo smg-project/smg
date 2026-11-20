@@ -570,5 +570,15 @@ mod tests {
             made(&report(vec![rank(1_000), rank(24)]), &columns, received),
             [value("kv_tokens_used", "tokens", 1_024.0, 50)]
         );
+        // A rank that drains states zero: the row's sum still stands, and a
+        // drained rank alone reads zero where its last count stood.
+        assert_eq!(
+            made(&report(vec![rank(1_000), rank(0)]), &columns, received),
+            [value("kv_tokens_used", "tokens", 1_000.0, 50)]
+        );
+        assert_eq!(
+            made(&report(vec![rank(0)]), &columns, received),
+            [value("kv_tokens_used", "tokens", 0.0, 50)]
+        );
     }
 }

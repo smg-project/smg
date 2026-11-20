@@ -744,40 +744,6 @@ profiles:
 }
 
 #[test]
-fn a_host_refills_its_cells_in_place_and_the_next_decision_reads_them() {
-    let rows = rows(&[31, 32]);
-    // A row's cells in the order of the names: `free`, then `pending`.
-    let first = [cell(10.0, 0), cell(1.0, 0), cell(20.0, 0), cell(2.0, 0)];
-    let mut cells = SignalCells::new(first.to_vec(), 2);
-    assert_eq!(
-        reads(&rows, Some(&cells)),
-        [(31, Some(1.0), Some(10.0)), (32, Some(2.0), Some(20.0))]
-    );
-    let room = cells.cells_mut().capacity();
-    let refilled = cells.cells_mut();
-    refilled.clear();
-    refilled.extend([cell(30.0, 0), cell(3.0, 0), cell(40.0, 0), cell(4.0, 0)]);
-    assert_eq!(
-        cells.cells_mut().capacity(),
-        room,
-        "the refill keeps the room"
-    );
-    assert_eq!(
-        reads(&rows, Some(&cells)),
-        [(31, Some(3.0), Some(30.0)), (32, Some(4.0), Some(40.0))]
-    );
-}
-
-#[test]
-fn the_default_cells_read_no_value() {
-    let rows = rows(&[31, 32]);
-    assert_eq!(
-        reads(&rows, Some(&SignalCells::default())),
-        [(31, None, None), (32, None, None)]
-    );
-}
-
-#[test]
 fn a_signal_declares_how_several_ranks_make_one_value_and_the_sum_is_left_unwritten() {
     use smg_policy_controller::spec::AcrossRanks;
 
@@ -815,4 +781,38 @@ fn a_signal_declares_how_several_ranks_make_one_value_and_the_sum_is_left_unwrit
         "apiVersion: smg.policy/v1\nsignals:\n  depth: { unit: items, across_ranks: median }\nprofiles: { p: { pick: random } }\n",
     );
     assert!(unknown.is_err(), "a word that is no reduction");
+}
+
+#[test]
+fn a_host_refills_its_cells_in_place_and_the_next_decision_reads_them() {
+    let rows = rows(&[31, 32]);
+    // A row's cells in the order of the names: `free`, then `pending`.
+    let first = [cell(10.0, 0), cell(1.0, 0), cell(20.0, 0), cell(2.0, 0)];
+    let mut cells = SignalCells::new(first.to_vec(), 2);
+    assert_eq!(
+        reads(&rows, Some(&cells)),
+        [(31, Some(1.0), Some(10.0)), (32, Some(2.0), Some(20.0))]
+    );
+    let room = cells.cells_mut().capacity();
+    let refilled = cells.cells_mut();
+    refilled.clear();
+    refilled.extend([cell(30.0, 0), cell(3.0, 0), cell(40.0, 0), cell(4.0, 0)]);
+    assert_eq!(
+        cells.cells_mut().capacity(),
+        room,
+        "the refill keeps the room"
+    );
+    assert_eq!(
+        reads(&rows, Some(&cells)),
+        [(31, Some(3.0), Some(30.0)), (32, Some(4.0), Some(40.0))]
+    );
+}
+
+#[test]
+fn the_default_cells_read_no_value() {
+    let rows = rows(&[31, 32]);
+    assert_eq!(
+        reads(&rows, Some(&SignalCells::default())),
+        [(31, None, None), (32, None, None)]
+    );
 }
