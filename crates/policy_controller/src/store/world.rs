@@ -123,8 +123,8 @@ use crate::{
         GatewayId,
     },
     view::{
-        fingerprint, AffinityFacts, Candidate, Engines, HashKind, Health, OverloadRegime, Phase,
-        PoolFacts, Role, WireModes, WorkerId,
+        fingerprint, AffinityFacts, Candidate, Engines, HashKind, Health, NamedHolder,
+        OverloadRegime, Phase, PoolFacts, Role, WireModes, WorkerId,
     },
     EncodePool, EncoderFacts,
 };
@@ -1727,6 +1727,82 @@ impl World {
             return;
         };
         held.sent(rows, named, target);
+    }
+
+    /// Holds the holders just named for `view` ([`World::name`] or
+    /// [`World::name_cut`], by the same `naming`, into `named`) to the
+    /// test the decision's pass asks of a row
+    /// ([`Engine::keeps_for`](crate::framework::Engine::keeps_for)), where
+    /// they fill the naming's cap. A naming shorter than its cap holds
+    /// every holder the index has, and one under no cap names them all: no
+    /// lookup made again reads another, so neither is asked anything and
+    /// `keeps`, which makes the test, is not called.
+    ///
+    /// The holders of a full cap are asked by their rows in the view, up
+    /// to the first the pass keeps. Where one passes the naming stands as
+    /// it was made: no holder outside it is deeper, and the pass drops the
+    /// refused ones itself. Where the pass refuses every holder named, the
+    /// cap is full of rows the request cannot take. Their ids leave the
+    /// rows the lookup is kept within and the lookup is made again, so the
+    /// next deepest holders are read: at most four rounds more, until one
+    /// reads a holder that passes. Where none does the first naming
+    /// stands, and the pass rules on its rows itself. The warming rows are
+    /// not asked. `keeps` answers none where the pass alone can say.
+    #[inline]
+    pub(crate) fn name_kept<K: Fn(&Candidate) -> bool>(
+        &self,
+        model: &str,
+        role: Role,
+        naming: &Naming<'_>,
+        view: &[Candidate],
+        named: &mut Named,
+        keeps: impl FnOnce() -> Option<K>,
+    ) {
+        if naming.cap != 0 && named.holders.len() >= naming.cap as usize {
+            self.name_tested(model, role, naming, view, named, keeps);
+        }
+    }
+
+    /// [`World::name_kept`] for a naming that fills its cap. Out of line:
+    /// a decision that names no row, or fewer than its cap, runs past the
+    /// call and holds nothing of the test in its frame.
+    #[inline(never)]
+    fn name_tested<K: Fn(&Candidate) -> bool>(
+        &self,
+        model: &str,
+        role: Role,
+        naming: &Naming<'_>,
+        view: &[Candidate],
+        named: &mut Named,
+        keeps: impl FnOnce() -> Option<K>,
+    ) {
+        let Some(keeps) = keeps() else {
+            return;
+        };
+        let passes = |holder: &NamedHolder| view.get(holder.row as usize).is_some_and(&keeps);
+        if !named.holders.iter().any(passes) {
+            self.name_again(model, role, naming, view, named, &keeps);
+        }
+    }
+
+    /// [`World::name_kept`] past a cap full of refused holders, out of line.
+    #[cold]
+    #[inline(never)]
+    fn name_again(
+        &self,
+        model: &str,
+        role: Role,
+        naming: &Naming<'_>,
+        view: &[Candidate],
+        named: &mut Named,
+        keeps: &dyn Fn(&Candidate) -> bool,
+    ) {
+        let Some(index) = self.index(model, role) else {
+            return;
+        };
+        if let (Some(rows), Some(Some(held))) = (self.rows.get(index), self.indexes.get(index)) {
+            held.name_again(naming, rows, view, keeps, named);
+        }
     }
 
     /// The pool's standing in its model's index, for the cases: a

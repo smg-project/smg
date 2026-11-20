@@ -705,6 +705,21 @@ impl Profile {
         }
     }
 
+    /// Whether the filters may be asked of a row ahead of its naming
+    /// ([`Engine::keeps_for`]), where `folded` says the engine holds every
+    /// one of them as one test. Each answers row by row, and where they are
+    /// asked by a call no stage holds a scope the call would run ahead of.
+    /// None declares what the door writes behind the test, the naming's
+    /// column or the key's counts: ahead of them no row holds either, and
+    /// such a filter would refuse the holders it keeps once they are
+    /// written. Asked once, at the engine's build.
+    fn asked_by_row(&self, folded: bool) -> bool {
+        let behind = |needs: Needs| needs.affinity || needs.session_in_flight;
+        let later = self.filters.iter().any(|filter| behind(filter.needs()));
+        let called = || !self.scoped() && self.filters.iter().all(|filter| filter.row_wise());
+        !later && (folded || called())
+    }
+
     /// Whether a scorer of this profile reads sent prefixes and no cache
     /// events ([`Engine::reads_sent_alone_for`]): asked of its scorers at
     /// the engine's build.
@@ -2560,6 +2575,10 @@ pub struct Engine {
     /// pass keeps the rows of the single plan's pool by it
     /// ([`keep_folded`]).
     row_tests: Vec<Option<RowTests>>,
+    /// Per profile, whether its filters may be asked of a row ahead of its
+    /// naming ([`Profile::asked_by_row`]), said once at the build: the
+    /// naming's test reads it ([`Self::keeps_for`]).
+    row_asked: Vec<bool>,
     /// Per profile, which of its leading stages are ranks ([`Order`]). A
     /// decision reads it where the profile's mark says so, and no other
     /// decision does.
@@ -3437,6 +3456,43 @@ fn debug_assert_cells(cells: Option<&SignalCells>, pool: &[Candidate]) {
     );
 }
 
+/// The test the standing pass of one decision's profile asks of a row
+/// ([`Engine::keeps_for`]): the profile's filters, the request's facts and
+/// the host's constraints, held for the decision's time.
+pub(crate) struct RowTest<'a> {
+    /// The filters as one test, as this decision asks them; `None` where
+    /// the build did not fold them.
+    tests: Option<RowTests>,
+    /// A veto of the host stands, and the folded health test asks its mask.
+    masked: bool,
+    filters: &'a [Box<dyn Filter>],
+    facts: &'a RequestFacts<'a>,
+    cx: &'a Constraints<'a>,
+}
+
+impl RowTest<'_> {
+    /// Whether the pass keeps `row`. In its caller's loop: the folded test
+    /// is a few bits of the row.
+    #[inline(always)]
+    pub(crate) fn keeps(&self, row: &Candidate) -> bool {
+        match self.tests {
+            Some(tests) => {
+                tests.keeps(self.facts, row, self.cx)
+                    && !(self.masked && self.cx.masks(row.position))
+            }
+            None => self.each(row),
+        }
+    }
+
+    /// The test a call a filter, for a profile the build did not fold.
+    /// Out of line: a folded profile's loop holds none of it.
+    #[inline(never)]
+    fn each(&self, row: &Candidate) -> bool {
+        let mut filters = self.filters.iter();
+        filters.all(|filter| filter.keep(self.facts, row, self.cx))
+    }
+}
+
 impl Engine {
     /// The engine of `profiles` under `bindings`. `needs` is what no stage
     /// declares: a sessions rule's counts and the view's list of headers.
@@ -3525,9 +3581,14 @@ impl Engine {
                 profile.scorers.iter().position(stated)
             })
             .collect();
-        let row_tests = profiles
+        let row_tests: Vec<Option<RowTests>> = profiles
             .iter()
             .map(|profile| RowTests::of(&profile.filters))
+            .collect();
+        let row_asked = profiles
+            .iter()
+            .zip(&row_tests)
+            .map(|(profile, tests)| profile.asked_by_row(tests.is_some()))
             .collect();
         let keepers = Keeper::of(&profiles);
         let shadows = bindings
@@ -3594,6 +3655,7 @@ impl Engine {
             named,
             sent_alone,
             row_tests,
+            row_asked,
             orders,
             seat_flags: (u8::from(keeping) * KEEPS_DECIDERS) | (u8::from(shadows) * SHADOWS),
             explain_sample: 0,
@@ -3977,6 +4039,49 @@ impl Engine {
     pub fn named_for(&self, model: &str, phase: Phase) -> u32 {
         self.resolve(model, phase)
             .map_or(0, |(_, index, _)| self.named[usize::from(index)])
+    }
+
+    /// The test the standing pass of the decision's profile asks of a row
+    /// ([`RowTest::keeps`]),
+    /// for a host to ask of a holder before it names it. It is the test a
+    /// draw asks ([`run_drawn`]): the profile's filters as one test where
+    /// the build folded them, with the host's mask where a veto stands, and
+    /// a call a filter otherwise.
+    ///
+    /// `None` where the pass alone can say which rows stay: a filter of the
+    /// profile does not answer row by row ([`Filter::row_wise`]), a filter
+    /// declares what the door writes behind the test (the naming's column,
+    /// the key's counts), a stage holds a decision's scope
+    /// ([`DecisionScope`]) while the filters are asked by a call, which
+    /// would run ahead of the scope's opening, or the profile stands under
+    /// the key's mark, where a keyed request's pass runs with the overload
+    /// veto lifted ([`Engine::places_by_key`]). The mark alone decides: the
+    /// function reads nothing of the request's key. The profile's own part
+    /// is said once at the build ([`Profile::asked_by_row`]). `None` too
+    /// where no binding matches.
+    pub(crate) fn keeps_for<'a>(
+        &'a self,
+        model: &str,
+        phase: Phase,
+        facts: &'a RequestFacts<'a>,
+        cx: &'a Constraints<'a>,
+    ) -> Option<RowTest<'a>> {
+        let (_, index, profile) = self.resolve(model, phase)?;
+        let at = usize::from(index);
+        let tests = self.row_tests[at];
+        let filters = &profile.filters[..];
+        if self.marks[at].keyed() || !self.row_asked[at] {
+            return None;
+        }
+        Some(RowTest {
+            // The set as this decision asks it, narrowed once as the
+            // draw narrows it.
+            tests: tests.map(|tests| tests.asked(facts, cx)),
+            masked: tests.is_some_and(|tests| tests.masked(cx)),
+            filters,
+            facts,
+            cx,
+        })
     }
 
     /// The binding a request resolves to, with its profile for the phase: one
@@ -13388,13 +13493,11 @@ mod tests {
         || Box::new(PowerOfTwo),
     ];
 
-    #[test]
-    fn a_profile_of_the_engines_own_filters_draws_as_one_asked_a_call_a_filter() {
-        use crate::builtins::filters_of;
-        // By position modulo eight: a row each of four bits refuses and four
-        // the rows' own bits keep, of which the host's mask names one. A
-        // request names one row tried, and the host one excluded.
-        let pool: Vec<Candidate> = (0..64u32)
+    /// The rows the cases of a row's test read, with the host's mask. By
+    /// position modulo eight: a row each of four bits refuses and four the
+    /// rows' own bits keep, of which the mask names one.
+    fn tested_rows() -> (Vec<Candidate>, Vec<u32>) {
+        let pool = (0..64u32)
             .map(|i| {
                 let mut c = Candidate {
                     has_capacity: true,
@@ -13411,7 +13514,14 @@ mod tests {
                 c
             })
             .collect();
-        let mask: Vec<u32> = (0..64).filter(|i| i % 8 == 7).collect();
+        (pool, (0..64).filter(|i| i % 8 == 7).collect())
+    }
+
+    #[test]
+    fn a_profile_of_the_engines_own_filters_draws_as_one_asked_a_call_a_filter() {
+        use crate::builtins::filters_of;
+        // A request names one row tried, and the host one excluded.
+        let (pool, mask) = tested_rows();
         let (mut drew, mut masked) = (0u32, 0u32);
         for set in 0..32u8 {
             for (which, picker) in PICKERS.into_iter().enumerate() {
@@ -13469,6 +13579,129 @@ mod tests {
         // Most decisions drew, some of them under the health filter and a
         // standing veto, where the mask is asked beside the folded test.
         assert!(drew > 1_000 && masked > 200, "{drew} drew, {masked} masked");
+    }
+
+    /// The test a host asks of a holder before it names it is the draw's
+    /// own. Over every set of the engine's filters, as the build folds them
+    /// and as a host's own, the function and a call a filter agree on every
+    /// row: under a mask, a row tried, a row excluded and the overload veto
+    /// lifted.
+    #[test]
+    fn the_namings_test_is_the_draws_own() {
+        use crate::builtins::filters_of;
+        let (pool, mask) = tested_rows();
+        let mut refused = 0u32;
+        for set in 0..32u8 {
+            let folded = engine_of(filters_of(set), Box::new(Random));
+            let hosted = filters_of(set)
+                .into_iter()
+                .map(|filter| Box::new(Hosted(filter)) as Box<dyn Filter>)
+                .collect();
+            let each = engine_of(hosted, Box::new(Random));
+            let asked = filters_of(set);
+            for seed in 0..24u64 {
+                let tried = [pool[(seed as usize * 8 + 5) % pool.len()].id];
+                let excluded = [pool[(seed as usize * 8 + 6) % pool.len()].id];
+                let facts = RequestFacts {
+                    tried: if seed % 2 == 0 { &tried } else { &[] },
+                    ..request(seed)
+                };
+                let cx = Constraints {
+                    excluded: if seed % 3 == 0 { &excluded } else { &[] },
+                    stalled: if seed % 4 < 2 { mask.as_slice() } else { &[] },
+                    overload_lifted: seed % 5 == 0,
+                    ..Constraints::default()
+                };
+                for (built, engine) in [("folded", &folded), ("a host's", &each)] {
+                    let keeps = engine.keeps_for(facts.model, facts.phase, &facts, &cx);
+                    let keeps = keeps.expect("every filter answers row by row");
+                    for row in &pool {
+                        let want = asked.iter().all(|filter| filter.keep(&facts, row, &cx));
+                        let at = format!("set {set:#07b}, {built}, seed {seed}");
+                        assert_eq!(keeps.keeps(row), want, "{at}, row {}", row.position);
+                        refused += u32::from(!want);
+                    }
+                }
+            }
+        }
+        assert!(refused > 10_000, "{refused} rows refused");
+    }
+
+    /// The function answers none where the pass alone can say which rows
+    /// stay: under a filter that does not answer row by row, under one
+    /// that holds a decision's scope, and for a profile under the key's
+    /// mark, whatever the request carries.
+    #[test]
+    fn the_namings_test_is_none_where_the_pass_alone_can_say() {
+        use crate::builtins::filters_of;
+        /// A filter that is shown the whole view: the default word.
+        #[derive(Debug)]
+        struct Whole;
+        impl Filter for Whole {
+            fn name(&self) -> &'static str {
+                "whole"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+        }
+        /// A filter that answers row by row, out of a decision's scope
+        /// where it says it holds one.
+        #[derive(Debug)]
+        struct Scoped(bool);
+        impl Lifecycle for Scoped {}
+        impl DecisionScope for Scoped {
+            fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+
+            fn close(&self) {}
+        }
+        impl Filter for Scoped {
+            fn name(&self) -> &'static str {
+                "scoped"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn row_wise(&self) -> bool {
+                true
+            }
+
+            fn scope(&self) -> Option<&dyn DecisionScope> {
+                self.0.then_some(self as &dyn DecisionScope)
+            }
+        }
+        let cx = Constraints::default();
+        let plain = request(7);
+        let keyed = RequestFacts {
+            session_key: Identity::hashed(59),
+            ..plain
+        };
+        let tests = |engine: &Engine, facts: &RequestFacts<'_>| {
+            let keeps = engine.keeps_for(facts.model, facts.phase, facts, &cx);
+            keeps.is_some()
+        };
+        let whole = engine_of(vec![Box::new(Whole)], Box::new(Random));
+        assert!(!tests(&whole, &plain), "a filter shown the whole view");
+        // A scope opens at the decision, behind the naming: a filter that
+        // answers row by row out of one is asked by its pass alone.
+        let scoped = engine_of(vec![Box::new(Scoped(true))], Box::new(Random));
+        assert!(
+            !tests(&scoped, &plain),
+            "a row-wise filter that holds a scope"
+        );
+        let unscoped = engine_of(vec![Box::new(Scoped(false))], Box::new(Random));
+        assert!(tests(&unscoped, &plain), "the same filter with no scope");
+        // The key's mark, set by hand: the validator sets it for the plain
+        // ring's shape alone, which is named no row. A keyed request is
+        // tested without the mark, and none is under it.
+        let mut marked = engine_of(filters_of(0b11), Box::new(Random));
+        assert!(tests(&marked, &keyed), "no mark: a key is tested");
+        marked.places_by_key(0);
+        assert!(!tests(&marked, &keyed), "a key under the mark");
+        assert!(!tests(&marked, &plain), "no key under the mark");
     }
 
     #[test]

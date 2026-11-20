@@ -99,13 +99,22 @@ pub(crate) trait Asked {
     /// The request's seed.
     fn seed(&self) -> u64;
     /// Hands `decide` the request in the engine's form, with what the
-    /// deciding host's view adds to it.
-    fn read<R>(
+    /// deciding host's view adds to it. `name` is asked first, over that
+    /// form with no row named, and what it answers stands as the request's
+    /// named rows ([`RequestFacts::named`]) for `decide`: the form is built
+    /// once. A decision that names no row hands [`unnamed`].
+    fn read<'n, R>(
         &self,
         lists: &mut Self::Lists,
         viewed: Viewed<'_>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R;
+}
+
+/// The naming of a decision that names no row ([`Asked::read`]).
+pub(crate) fn unnamed(_: &RequestFacts<'_>, _: &Constraints<'_>) -> Option<NamedAffinity<'static>> {
+    None
 }
 
 /// One decider's part of the counts that every decision can move, on cache
@@ -716,10 +725,9 @@ fn pair_with<A: Asked, R, B>(
         held: &[],
         in_flight: None,
         max_block_hashes: request.hashes_read(spec),
-        named: None,
         pins: pins.map(|pins| pins as &dyn PinSource),
     };
-    request.read(lists, viewed, |facts, constraints| {
+    request.read(lists, viewed, unnamed, |facts, constraints| {
         if emptied {
             let emptied_by = if constraints.subset_hint == Some(0) {
                 SUBSET_HINT
@@ -1226,7 +1234,6 @@ pub(crate) fn hand<A: Asked, R>(
         held,
         in_flight: counts,
         max_block_hashes: request.hashes_read(spec),
-        named: None,
         pins: pins.map(|pins| pins as &dyn PinSource),
     };
     // The store's sessions, where the decision's rule has an in-flight
@@ -1252,42 +1259,55 @@ pub(crate) fn hand<A: Asked, R>(
         // The index reads a view by its gateway's wires alone. Rows a
         // demand cut are named within the rows that stay: a row the
         // demand took is named by nobody and takes no place of the cap.
-        if cut {
-            world.name_in::<true>(model, role, &naming, candidates, hash_kind, named);
-        } else {
-            world.name_in::<false>(model, role, &naming, candidates, hash_kind, named);
-        }
+        // The naming is a step of the read: it runs once the request
+        // stands in the engine's form, and the rows it names are written
+        // into that form in place.
+        let name = move |facts: &RequestFacts<'_>, constraints: &Constraints<'_>| {
+            // The names borrow the buffer past this call: the closure
+            // gives its hold of it up.
+            let named = named;
+            if cut {
+                world.name_in::<true>(model, role, &naming, candidates, hash_kind, named);
+            } else {
+                world.name_in::<false>(model, role, &naming, candidates, hash_kind, named);
+            }
+            // Under a cap the holders named may all be rows the pass
+            // refuses, and a warm worker behind them is then never named.
+            // A naming that fills its cap is held to the pass's own test
+            // of a row, where the engine hands one: a cap full of refused
+            // holders is read past. A naming shorter than its cap, or with
+            // none, is asked nothing and the test is not made.
+            world.name_kept(model, role, &naming, candidates, named, || {
+                let test = engine.keeps_for(model, phase, facts, constraints)?;
+                Some(move |row: &Candidate| test.keeps(row))
+            });
+            Some(named.affinity())
+        };
         // Over the rows it named the decider is asked in its form for
         // them, at this arm's own call: a decision that names no row
         // meets no test for it.
-        let viewed = Viewed {
-            named: Some(named.affinity()),
-            ..viewed
-        };
-        let answer = request.read(lists, viewed, |facts, constraints| match sessions {
-            None => decide.over_named(facts, &pool, candidates, constraints, scratch),
-            Some(sessions) => keyed.lend(
-                sessions,
-                facts,
-                constraints,
-                candidates,
-                |facts, constraints| {
-                    decide.over_named(facts, &pool, candidates, constraints, scratch)
-                },
-            ),
+        let answer = request.read(lists, viewed, name, |facts, constraints| {
+            // The engine's ask, written once for the two ways to it: at
+            // once, or behind the key's read.
+            let ask = |facts: &RequestFacts<'_>, constraints: &Constraints<'_>| {
+                decide.over_named(facts, &pool, candidates, constraints, scratch)
+            };
+            match sessions {
+                None => ask(facts, constraints),
+                Some(sessions) => keyed.lend(sessions, facts, constraints, candidates, ask),
+            }
         });
         return (answer, built);
     }
     named.clear_sent();
-    let answer = request.read(lists, viewed, |facts, constraints| match sessions {
-        None => decide.over(facts, &pool, candidates, constraints, scratch),
-        Some(sessions) => keyed.lend(
-            sessions,
-            facts,
-            constraints,
-            candidates,
-            |facts, constraints| decide.over(facts, &pool, candidates, constraints, scratch),
-        ),
+    let answer = request.read(lists, viewed, unnamed, |facts, constraints| {
+        let ask = |facts: &RequestFacts<'_>, constraints: &Constraints<'_>| {
+            decide.over(facts, &pool, candidates, constraints, scratch)
+        };
+        match sessions {
+            None => ask(facts, constraints),
+            Some(sessions) => keyed.lend(sessions, facts, constraints, candidates, ask),
+        }
     });
     (answer, built)
 }
@@ -1432,9 +1452,6 @@ pub(crate) struct Viewed<'a> {
     /// How many of the request's block hashes the deciding generation
     /// reads.
     pub(crate) max_block_hashes: usize,
-    /// The rows the deciding host named in the column's place, where the
-    /// request's profile takes them.
-    pub(crate) named: Option<NamedAffinity<'a>>,
     /// The pins of record the host lends the decision ([`PinSource`]);
     /// `None` where it keeps none.
     pub(crate) pins: Option<&'a dyn PinSource>,
@@ -1765,20 +1782,22 @@ impl Asked for Request<'_> {
         self.facts.seed
     }
 
-    fn read<R>(
+    fn read<'n, R>(
         &self,
         (): &mut (),
         viewed: Viewed<'_>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R {
         let hashes = self.facts.block_hashes;
-        let facts = RequestFacts {
+        let mut facts = RequestFacts {
             // The first hashes, as deep as the generation reads.
             block_hashes: hashes.get(..viewed.max_block_hashes).unwrap_or(hashes),
             budget_micros: viewed.budget_micros,
             now_micros: viewed.now_micros,
             affinity: viewed.affinity,
-            named: viewed.named,
+            // Written below, by the naming's answer.
+            named: None,
             lent_in_flight: viewed.in_flight.as_ref(),
             // The door decides over the store's rows: a list a host lent
             // names rows of its own, and its word that it counted stands
@@ -1799,6 +1818,7 @@ impl Asked for Request<'_> {
             pins: viewed.pins,
             ..self.constraints
         };
+        facts.named = name(&facts, &constraints);
         decide(&facts, &constraints)
     }
 }
@@ -6178,6 +6198,547 @@ pub(crate) mod tests {
         let read = read.lock();
         assert!(!read.is_empty(), "the stage was asked");
         assert!(read.iter().all(Option::is_none), "{read:?}");
+    }
+
+    /// A cap full of holders the pass refuses is read past: the cases, over
+    /// the `cache_aware` preset.
+    mod refused_holders {
+        use std::{
+            cmp::Reverse,
+            sync::atomic::AtomicU64,
+            time::{Duration, Instant},
+        };
+
+        use kv_index::chain_prefix_hash;
+
+        use super::{request, GATEWAY, MODEL};
+        use crate::{
+            demands::{DemandFacts, Demands},
+            door::{hand, Buffers, Request, Scratch, Taken},
+            spec::{AppliedSpec, BestParams, OverloadSpec, PickStage, PolicySpec},
+            store::{
+                Ask, BatchFacts, BatchOutcome, ContentHash, HealthSink, KvEvent, KvEventSink,
+                LoadSink, LoadSource, MemoryStore, Named, Naming, SequenceHash, Signals,
+                StoredBlock, VetoWrite, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+            },
+            view::{Candidate, Constraints, LoadRow, PoolFacts, RequestFacts, Role, WorkerId},
+        };
+
+        /// The blocks of the cases' request.
+        const BLOCKS: [u64; 3] = [1, 2, 3];
+
+        /// A store under the `cache_aware` preset whose picker takes a
+        /// sample of `cap` rows, which caps a naming at `cap`. A worker
+        /// whose engine reports a queued request reads over its thresholds,
+        /// at once: the store publishes with no window.
+        fn sampled(cap: u32) -> MemoryStore {
+            let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
+            let profile = document.profiles.get_mut("cache_aware");
+            let profile = profile.expect("the preset's profile");
+            profile.pick = PickStage::Best(BestParams { sample: cap }).into();
+            document.bindings[0].overload = Some(OverloadSpec {
+                waiting_requests: Some(1),
+                ..OverloadSpec::default()
+            });
+            let store = MemoryStore::with_publish_window(Duration::ZERO);
+            let spec = AppliedSpec::validate(&document).expect("the document validates");
+            store.apply(spec).expect("above the unbound start");
+            store
+        }
+
+        /// A ready member that states `runtime`, reports its blocks and
+        /// holds the first `depth` blocks of the request.
+        fn holder_at(store: &MemoryStore, name: &str, depth: usize, runtime: u32) -> WorkerId {
+            let facts = WorkerFacts {
+                key: name.to_owned(),
+                engine: name.to_owned(),
+                incarnation: 1,
+                role: Role::Single,
+                models: vec![MODEL.to_owned()],
+                dp_size: 1,
+                signals: Signals {
+                    events: true,
+                    ..Signals::default()
+                },
+                demand_facts: DemandFacts { runtime },
+                ..WorkerFacts::default()
+            };
+            let id = store.upsert(facts).id();
+            let row = WorkersStore::get(store, id).expect("the row");
+            if row.status != WorkerStatus::Ready {
+                let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
+                ready.expect("the row stands");
+            }
+            store.publish_now();
+            let mut blocks: Vec<StoredBlock> = Vec::with_capacity(depth);
+            for &content in &BLOCKS[..depth] {
+                let seq_hash = match blocks.last() {
+                    Some(parent) => chain_prefix_hash(parent.seq_hash, ContentHash(content)),
+                    None => SequenceHash(content),
+                };
+                let content_hash = ContentHash(content);
+                blocks.push(StoredBlock {
+                    seq_hash,
+                    content_hash,
+                });
+            }
+            if !blocks.is_empty() {
+                let parent = None;
+                let events = [KvEvent::Stored { parent, blocks }];
+                let batch = BatchFacts {
+                    sequence: 1,
+                    ..BatchFacts::default()
+                };
+                assert_eq!(store.admit(id, 0, batch, &events), BatchOutcome::Applied);
+            }
+            id
+        }
+
+        /// [`holder_at`] for a member that states no runtime.
+        fn holder(store: &MemoryStore, name: &str, depth: usize) -> WorkerId {
+            holder_at(store, name, depth, 0)
+        }
+
+        /// What a decision is handed and decides: the holders named, by
+        /// member with their depths, the deepest first, the members that
+        /// read over their thresholds, and the engine's pick over the rows
+        /// with the overlap it states.
+        struct Decided {
+            holders: Vec<(WorkerId, u32)>,
+            over: Vec<WorkerId>,
+            pick: Option<(WorkerId, u16)>,
+        }
+
+        /// The holders of `named` by their members in `rows`, the deepest
+        /// first.
+        fn by_depth(named: &[crate::NamedHolder], rows: &[Candidate]) -> Vec<(WorkerId, u32)> {
+            let held =
+                |holder: &crate::NamedHolder| (rows[holder.row as usize].id, holder.overlap_blocks);
+            let mut holders: Vec<(WorkerId, u32)> = named.iter().map(held).collect();
+            holders.sort_by_key(|&(_, blocks)| Reverse(blocks));
+            holders
+        }
+
+        /// The decision of `asked` through the door's hand, by the engine.
+        fn decided(store: &MemoryStore, asked: &Request<'_>) -> Decided {
+            let taken = Taken {
+                request: asked,
+                gateway: GATEWAY,
+                now: Instant::now(),
+                left: Duration::MAX,
+                pins: None,
+                place: None,
+            };
+            let mut buffers = Buffers::default();
+            let undialed = AtomicU64::new(0);
+            store.deciding(|world| {
+                let engine = world.spec().engine();
+                let read = |facts: &RequestFacts<'_>,
+                            pool: &PoolFacts<'_>,
+                            rows: &[Candidate],
+                            cx: &Constraints<'_>,
+                            scratch: &mut Scratch| {
+                    let named = facts.named.expect("the profile names its rows");
+                    let holders = by_depth(named.holders, rows);
+                    let over = rows.iter().filter(|row| row.health.overloaded);
+                    let mut over: Vec<WorkerId> = over.map(|row| row.id).collect();
+                    over.sort_unstable();
+                    // The engine's form over named rows: it states the
+                    // pick's overlap.
+                    let decision = engine.decide_stated(facts, pool, rows, cx, scratch);
+                    let pick = decision.pick().and_then(|pick| {
+                        let first = pick.targets.first()?;
+                        Some((first.id, pick.overlap().blocks))
+                    });
+                    Decided {
+                        holders,
+                        over,
+                        pick,
+                    }
+                };
+                hand(world, &taken, &mut buffers, &undialed, read).0
+            })
+        }
+
+        /// The holders a naming under no test names for `facts` under a cap
+        /// of `cap`, as the door names them: by member, the deepest first.
+        fn plainly_named(
+            store: &MemoryStore,
+            facts: &RequestFacts<'_>,
+            cap: u32,
+        ) -> Vec<(WorkerId, u32)> {
+            let mut view = ViewBuffers::default();
+            let mut named = Named::default();
+            store.deciding(|world| {
+                let ask = Ask {
+                    gateway: GATEWAY,
+                    now: Instant::now(),
+                    pinned: None,
+                    affinity: false,
+                };
+                let read = world.view(MODEL, Role::Single, &ask, false, &mut view);
+                let read = read.expect("the pool");
+                let naming = Naming {
+                    gateway: GATEWAY,
+                    block_hashes: facts.block_hashes,
+                    namespace_seed: facts.namespace_seed,
+                    seed: facts.seed,
+                    cap,
+                    wires: None,
+                    now_micros: read.built.now_micros,
+                };
+                world.name(MODEL, Role::Single, &naming, read.candidates, &mut named);
+                by_depth(&named.holders, read.candidates)
+            })
+        }
+
+        /// A host's filter that reads the column the naming writes is asked
+        /// by its pass alone. Ahead of the naming no row holds the column:
+        /// a test made there would refuse the deep holder, which the filter
+        /// keeps once it is named, and the lookup made again would name the
+        /// shallow one in its place.
+        #[test]
+        fn a_filter_that_reads_the_naming_is_asked_by_its_pass_alone() {
+            use crate::{Catalog, Filter, Needs};
+
+            /// Keeps one worker only where the naming says it holds a block.
+            #[derive(Debug)]
+            struct Warm(WorkerId);
+
+            impl Filter for Warm {
+                fn name(&self) -> &'static str {
+                    "warm"
+                }
+
+                fn row_wise(&self) -> bool {
+                    true
+                }
+
+                fn needs(&self) -> Needs {
+                    Needs {
+                        affinity: true,
+                        ..Needs::default()
+                    }
+                }
+
+                fn keep(
+                    &self,
+                    facts: &RequestFacts<'_>,
+                    row: &Candidate,
+                    _: &Constraints<'_>,
+                ) -> bool {
+                    row.id != self.0 || facts.affinity_at(row.position).overlap_blocks != 0
+                }
+            }
+
+            let store = sampled(1);
+            let deep = holder(&store, "deep", 3);
+            holder(&store, "shallow", 1);
+            holder(&store, "idle", 0);
+            let mut catalog = Catalog::builtin();
+            let made = catalog.filter("warm", move || Box::new(Warm(deep)));
+            made.expect("a name the catalog does not hold");
+            let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
+            document.generation += 1;
+            let profile = document.profiles.get_mut("cache_aware");
+            let profile = profile.expect("the preset's profile");
+            profile.pick = PickStage::Best(BestParams { sample: 1 }).into();
+            profile.filter.push("warm".into());
+            let spec = AppliedSpec::validate_in(&document, &catalog, &[]);
+            let applied = store.apply(spec.expect("the document validates"));
+            applied.expect("the next generation");
+            store.publish_now();
+            let mut asked = request(b"warm", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.holders, [(deep, 3)]);
+            assert_eq!(decided.pick, Some((deep, 3)));
+        }
+
+        /// A host's filter that reads the key's counts is asked by its pass
+        /// alone. The counts are lent behind the naming: a test made ahead
+        /// of them would refuse the deep holder, where the key has a
+        /// request in flight, and the shallow one would be picked.
+        #[test]
+        fn a_filter_that_reads_the_keys_counts_is_asked_by_its_pass_alone() {
+            use std::sync::Arc;
+
+            use crate::{
+                door::Door,
+                spec::{PrefixAffinityParams, ScoreStage},
+                view::Identity,
+                Catalog, Filter, Needs,
+            };
+
+            /// Keeps one worker for a streaming request only where its key
+            /// has a request in flight there.
+            #[derive(Debug)]
+            struct KeyLocal(WorkerId);
+
+            impl Filter for KeyLocal {
+                fn name(&self) -> &'static str {
+                    "key-local"
+                }
+
+                fn row_wise(&self) -> bool {
+                    true
+                }
+
+                fn needs(&self) -> Needs {
+                    Needs {
+                        session_in_flight: true,
+                        ..Needs::default()
+                    }
+                }
+
+                fn keep(
+                    &self,
+                    facts: &RequestFacts<'_>,
+                    row: &Candidate,
+                    _: &Constraints<'_>,
+                ) -> bool {
+                    row.id != self.0 || !facts.streaming || facts.session_in_flight(row) > 0
+                }
+            }
+
+            let store = sampled(1);
+            let deep = holder(&store, "deep", 3);
+            holder(&store, "shallow", 2);
+            holder(&store, "idle", 0);
+            let mut catalog = Catalog::builtin();
+            let made = catalog.filter("key-local", move || Box::new(KeyLocal(deep)));
+            made.expect("a name the catalog does not hold");
+            let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
+            document.generation += 1;
+            let profile = document.profiles.get_mut("cache_aware");
+            let profile = profile.expect("the preset's profile");
+            profile.pick = PickStage::Best(BestParams { sample: 1 }).into();
+            profile.filter.push("key-local".into());
+            profile.score =
+                vec![ScoreStage::PrefixAffinity(PrefixAffinityParams::default()).into()];
+            let spec = AppliedSpec::validate_in(&document, &catalog, &[]);
+            let applied = store.apply(spec.expect("the document validates"));
+            applied.expect("the next generation");
+            let door = Door::new(Arc::new(store));
+            let now = Instant::now();
+            // The key's first request goes to the deep holder and stays in
+            // flight there.
+            let mut first = request(b"first", 7);
+            first.facts.block_hashes = &BLOCKS;
+            first.facts.session_key = Identity::hashed(123);
+            let primed = door.decide(GATEWAY, &first, now).expect("the key's first");
+            let target = primed.decision.pick().and_then(|pick| pick.targets.first());
+            assert_eq!(target.map(|target| target.id), Some(deep));
+            assert!(primed.lease.is_some(), "the key's lease is live");
+            // Its second, streaming: the filter keeps the deep holder by
+            // the key's count there.
+            let mut second = request(b"second", 7);
+            second.facts.block_hashes = &BLOCKS;
+            second.facts.session_key = first.facts.session_key;
+            second.facts.streaming = true;
+            let second = door
+                .decide(GATEWAY, &second, now)
+                .expect("the key's second");
+            let pick = second.decision.pick().expect("a pick");
+            let picked = pick.targets.first().map(|target| target.id);
+            assert_eq!((picked, pick.overlap().blocks), (Some(deep), 3));
+        }
+
+        /// Rows a demand took take no round of the lookup made again: it
+        /// is kept within the rows that stay. Five deeper holders of
+        /// another runtime stand ahead of the warm one, more than the
+        /// rounds: the retry is named the warm one all the same.
+        #[test]
+        fn rows_a_demand_took_take_no_round_of_the_lookup_made_again() {
+            let store = sampled(1);
+            let tried = [holder_at(&store, "tried", 3, 7)];
+            for other in 0..5 {
+                holder_at(&store, &format!("other-runtime-{other}"), 2, 9);
+            }
+            let warm = holder_at(&store, "warm", 1, 7);
+            holder_at(&store, "idle", 0, 7);
+            let mut asked = request(b"cut", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            asked.facts.tried = &tried;
+            asked.constraints.demands = Demands { runtime: 7 };
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.holders, [(warm, 1)]);
+            assert_eq!(decided.pick, Some((warm, 1)));
+        }
+
+        /// A retry is named the holder behind the one it tried. Under a
+        /// cap of one the deeper holder would fill the cap, and it is the
+        /// one row the retry may not take: the shallower one is named, and
+        /// the pick states that worker's own overlap.
+        #[test]
+        fn a_retry_is_named_the_holder_behind_the_one_it_tried() {
+            let store = sampled(1);
+            let deep = holder(&store, "deep", 3);
+            let shallow = holder(&store, "shallow", 2);
+            holder(&store, "idle", 0);
+            let tried = [deep];
+            let mut asked = request(b"retry", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            asked.facts.tried = &tried;
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.holders, [(shallow, 2)]);
+            assert_eq!(decided.pick, Some((shallow, 2)));
+        }
+
+        /// A hot prefix: the two workers that hold it whole read over
+        /// their thresholds and would fill a cap of two. Other rows stand
+        /// under theirs, so no veto is lifted, and the holder under its
+        /// thresholds is named.
+        #[test]
+        fn a_cap_full_of_holders_over_their_thresholds_names_the_one_under_them() {
+            let store = sampled(2);
+            let mut hot = [holder(&store, "hot-a", 3), holder(&store, "hot-b", 3)];
+            hot.sort_unstable();
+            let cool = holder(&store, "cool", 1);
+            holder(&store, "idle", 0);
+            let now = Instant::now();
+            for id in hot {
+                let queued = LoadRow {
+                    queued: 1,
+                    ..LoadRow::default()
+                };
+                store.record(id, 0, queued, now, LoadSource::Stream);
+            }
+            store.publish_now();
+            let mut asked = request(b"hot", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.over, hot, "the two read over their thresholds");
+            assert_eq!(decided.holders, [(cool, 1)]);
+            assert_eq!(decided.pick, Some((cool, 1)));
+        }
+
+        /// A cap full of holders behind the asking gateway's veto is read
+        /// past, under a doubt as under a hold: the holder the gateway
+        /// vetoes nothing of is named.
+        #[test]
+        fn a_cap_full_of_holders_behind_the_gateways_veto_is_read_past() {
+            let store = sampled(2);
+            let doubted = holder(&store, "doubted", 3);
+            let held = holder(&store, "held", 3);
+            let free = holder(&store, "free", 1);
+            holder(&store, "idle", 0);
+            let now = Instant::now();
+            let until = now + Duration::from_secs(60);
+            let veto = |member: WorkerId, hold: Option<Instant>, stands: bool| {
+                let written =
+                    store.gateway_veto_noted(GATEWAY, member, Some(until), hold, stands, now);
+                assert_eq!(written, VetoWrite::Written);
+            };
+            veto(doubted, None, false);
+            veto(held, Some(until), false);
+            let mut asked = request(b"veto", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.holders, [(free, 1)]);
+            assert_eq!(decided.pick, Some((free, 1)));
+        }
+
+        /// A holder that is not ready is read past where it fills the cap.
+        #[test]
+        fn a_holder_that_is_not_ready_is_read_past_where_it_fills_the_cap() {
+            let store = sampled(1);
+            let down = holder(&store, "down", 3);
+            let up = holder(&store, "up", 2);
+            holder(&store, "idle", 0);
+            let row = WorkersStore::get(&store, down).expect("the row");
+            let unready = store.set_status(down, WorkerStatus::NotReady, row.revision);
+            unready.expect("the row stands");
+            store.publish_now();
+            let mut asked = request(b"down", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.holders, [(up, 2)]);
+            assert_eq!(decided.pick, Some((up, 2)));
+        }
+
+        /// A naming no holder of which is refused names what a naming
+        /// under no test names: the same rows by the same draw. Three
+        /// holders stand at one depth under a cap of two, so the decision's
+        /// seed draws the two.
+        #[test]
+        fn a_naming_no_holder_of_which_is_refused_names_what_main_names() {
+            let store = sampled(2);
+            for name in ["a", "b", "c"] {
+                holder(&store, name, 2);
+            }
+            holder(&store, "idle", 0);
+            let mut drawn = std::collections::BTreeSet::new();
+            for seed in 0..32 {
+                let mut asked = request(b"plain", seed);
+                asked.facts.block_hashes = &BLOCKS;
+                let plain = plainly_named(&store, &asked.facts, 2);
+                assert_eq!(plain.len(), 2, "seed {seed}");
+                assert_eq!(decided(&store, &asked).holders, plain, "seed {seed}");
+                drawn.insert(plain);
+            }
+            assert!(drawn.len() > 1, "the seed draws the two: {drawn:?}");
+        }
+
+        /// A naming one of whose holders passes stands as it was made. The
+        /// retry tried the deeper of the two a cap of two names and the
+        /// other passes: no lookup is made again, the tried row stays named
+        /// for the pass to drop, and the holder behind the two is not read.
+        #[test]
+        fn a_naming_one_holder_of_which_passes_stands_as_made() {
+            let store = sampled(2);
+            let deep = holder(&store, "deep", 3);
+            let mid = holder(&store, "mid", 2);
+            holder(&store, "shallow", 1);
+            holder(&store, "idle", 0);
+            let tried = [deep];
+            let mut asked = request(b"stands", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            asked.facts.tried = &tried;
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.holders, plainly_named(&store, &asked.facts, 2));
+            assert_eq!(decided.holders, [(deep, 3), (mid, 2)]);
+            assert_eq!(decided.pick, Some((mid, 2)));
+        }
+
+        /// Where no holder passes the first read stands. Every row was
+        /// tried, so the pass's soft filter steps aside and reads the names
+        /// a naming under no test hands it.
+        #[test]
+        fn where_no_holder_passes_the_first_read_stands() {
+            let store = sampled(1);
+            let deep = holder(&store, "deep", 3);
+            let shallow = holder(&store, "shallow", 2);
+            let idle = holder(&store, "idle", 0);
+            let tried = [deep, shallow, idle];
+            let mut asked = request(b"all", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            asked.facts.tried = &tried;
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.holders, plainly_named(&store, &asked.facts, 1));
+            assert_eq!(decided.holders, [(deep, 3)]);
+            assert_eq!(decided.pick, Some((deep, 3)));
+        }
+
+        /// A view a demand cut is named within the rows that stay, and
+        /// its holders are held to the test alike. The demand takes the
+        /// deepest holder and the retry tried the next: the third is named.
+        #[test]
+        fn a_cut_view_is_named_within_the_rows_that_stay_and_asks_the_test() {
+            let store = sampled(1);
+            holder_at(&store, "gone", 3, 9);
+            let deep = holder_at(&store, "deep", 2, 7);
+            let shallow = holder_at(&store, "shallow", 1, 7);
+            holder_at(&store, "idle", 0, 7);
+            let tried = [deep];
+            let mut asked = request(b"cut", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            asked.facts.tried = &tried;
+            asked.constraints.demands = Demands { runtime: 7 };
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.holders, [(shallow, 1)]);
+            assert_eq!(decided.pick, Some((shallow, 1)));
+        }
     }
 
     /// One read of a key's shard names the rows that carry the key's
