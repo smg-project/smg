@@ -521,6 +521,15 @@ impl ShadowKind {
     /// How many kinds there are: the width of a count by kind.
     pub(crate) const COUNT: usize = 4;
 
+    /// Every kind, in the order of its place in a count by kind: what a
+    /// host walks to show such a count.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Agreed,
+        Self::OtherTarget,
+        Self::OtherOutcome,
+        Self::Skipped,
+    ];
+
     /// The kind's place in a count by kind, under [`Self::COUNT`]. Every
     /// kind is named here: one added to the enum does not build until it
     /// takes a place.
@@ -554,6 +563,7 @@ mod tests {
         let places = [Agreed, OtherTarget, OtherOutcome, Skipped].map(ShadowKind::index);
         assert_eq!(places, [0, 1, 2, 3]);
         assert_eq!(places.len(), ShadowKind::COUNT);
+        assert_eq!(ShadowKind::ALL.map(ShadowKind::index), places);
     }
 
     #[test]

@@ -336,6 +336,8 @@ pub(crate) const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
 
 const POLICY_DECISIONS_TOTAL: &str = "smg_policy_decisions_total";
 const POLICY_DECISION_SECONDS: &str = "smg_policy_decision_seconds";
+const POLICY_SHADOW_DECISIONS_TOTAL: &str = "smg_policy_shadow_decisions_total";
+const POLICY_DECISION_FAULTS_TOTAL: &str = "smg_policy_decision_faults_total";
 
 /// Time to first token on edges that resolve it. The same observation as
 /// `smg_router_ttft_seconds`, which keeps the request-duration buckets (and
@@ -796,6 +798,18 @@ pub(crate) fn init_metrics() {
     describe_histogram!(
         POLICY_DECISION_SECONDS,
         "Seconds spent asking the policy controller for one decision, by mode and outcome"
+    );
+    describe_counter!(
+        POLICY_SHADOW_DECISIONS_TOTAL,
+        "Shadow decisions of the policy controller beside a live decision. A row is a \
+         binding's position in the policy document: the last row also counts every binding \
+         behind it, and a document applied later counts on in the same rows. By binding, side \
+         (single) and kind (agreed, other-target, other-outcome, skipped)"
+    );
+    describe_counter!(
+        POLICY_DECISION_FAULTS_TOTAL,
+        "Policy controller decisions that panicked, with the shadow decisions that panicked \
+         beside a live decision that stood"
     );
     describe_counter!(
         "smg_worker_errors_total",
@@ -2343,6 +2357,28 @@ impl Metrics {
             || histogram!(POLICY_DECISION_SECONDS, "mode" => mode, "outcome" => outcome),
             |time| time.record(seconds),
         );
+    }
+
+    /// The count of the shadow decisions that said `kind` beside a live
+    /// decision of the binding at position `binding`, on `side`. The caller
+    /// keeps the handle and sets it from the policy controller's own count.
+    pub fn policy_shadow_decisions(
+        binding: u32,
+        side: &'static str,
+        kind: &'static str,
+    ) -> metrics::Counter {
+        counter!(
+            POLICY_SHADOW_DECISIONS_TOTAL,
+            "binding" => binding.to_string(),
+            "side" => side,
+            "kind" => kind
+        )
+    }
+
+    /// The count of the policy decisions that panicked. The caller keeps the
+    /// handle and sets it from the policy controller's own count.
+    pub fn policy_decision_faults() -> metrics::Counter {
+        counter!(POLICY_DECISION_FAULTS_TOTAL)
     }
 
     /// Record worker error

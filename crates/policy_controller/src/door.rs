@@ -118,9 +118,9 @@ pub(crate) fn unnamed(_: &RequestFacts<'_>, _: &Constraints<'_>) -> Option<Named
 }
 
 /// How many of a generation's bindings count their shadows in a row of
-/// their own ([`Part::shadowed`]). The bindings behind them count in the
-/// last row.
-pub(crate) const SHADOW_ROWS: usize = 16;
+/// their own ([`Door::shadowed`]). The bindings behind them count in the
+/// last row. A host that shows the counts walks this many rows.
+pub const SHADOW_ROWS: usize = 16;
 
 /// One decider's part of the counts that every decision can move, on cache
 /// lines of its own. Where a fleet's gateways speak fewer wires than its
