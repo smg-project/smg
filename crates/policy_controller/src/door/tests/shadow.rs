@@ -416,8 +416,9 @@ fn a_decision_made_again_is_shadowed_from_its_own_reading() {
 
 /// A pool keeps one ruling of its warming rows and one record of sent
 /// prefixes: the live profile's. A shadow profile of another ruling, or
-/// one that reads the record where the live profile reads the index, is
-/// not asked, and is counted as skipped. A shadow of another sample, and
+/// one that reads the record alone where the live profile reads cache
+/// events beside it, is not asked, and is counted as skipped. A shadow
+/// of another sample, and
 /// one that reads cached blocks behind a live profile that is named no
 /// row, are asked over rows named for them alone. A shadow of the live
 /// profile's own sample and ruling is asked over the same rows.
@@ -629,8 +630,9 @@ fn a_budget_under_the_floor_names_no_rows_for_the_shadow() {
 
 /// A shadow's need of the affinity column fills none for a live decision
 /// whose rows it does not read. Behind least load, a shadow that is named
-/// rows of its own and one that is skipped leave the live decision no
-/// column. A live profile that reads the column itself is filled it.
+/// rows of its own leaves the live decision no column, whatever it reads
+/// a request's holders from. A live profile that reads the column itself
+/// is filled it.
 #[test]
 fn a_column_is_filled_for_the_live_profile_and_for_no_shadow_alone() {
     let filled = |document: &PolicySpec| {
@@ -645,15 +647,19 @@ fn a_column_is_filled_for_the_live_profile_and_for_no_shadow_alone() {
         (slot.buffers.view.affinity.len(), skipped)
     };
     assert_eq!(filled(&own_rows(true)), (0, 0), "rows of its own");
-    let mut apart = own_rows(true);
-    let twin = apart.profiles.get_mut("twin").expect("the shadow profile");
+    let mut alone = own_rows(true);
+    let twin = alone.profiles.get_mut("twin").expect("the shadow profile");
     let prefix = PrefixAffinityParams {
         weight: 4.0,
         source: Some(AffinitySource::Predictor),
         ..PrefixAffinityParams::default()
     };
     twin.score[1] = ScoreStage::PrefixAffinity(prefix).into();
-    assert_eq!(filled(&apart), (0, 1), "a shadow that is skipped");
+    assert_eq!(
+        filled(&alone),
+        (0, 0),
+        "by the record of sent prefixes alone"
+    );
     // A live profile of two warm-up rulings is named no row and reads
     // the column whole, with the cache-aware preset's profile behind it.
     let mut whole = PolicySpec::preset("cache_aware").expect("a preset of this build");

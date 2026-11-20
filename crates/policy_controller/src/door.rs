@@ -889,7 +889,9 @@ pub(crate) fn decide_shadowed_in<A: Asked>(
 /// the live decision's is filled where its own profile reads it.
 ///
 /// The buffer the shadow's rows are named on is lent out of `buffers`
-/// for the decision, since the hand holds the rest.
+/// for the decision, since the hand holds the rest. It comes back with
+/// no record to write where no shadow was named: a naming an earlier
+/// decision left is no word of this one's issue.
 pub(crate) fn decide_own_in<A: Asked>(
     world: &World,
     taken: &Taken<'_, A>,
@@ -900,6 +902,7 @@ pub(crate) fn decide_own_in<A: Asked>(
 ) -> ((Decision, Option<Booking>), Shadow) {
     let engine = world.spec().engine();
     let mut named = mem::take(&mut buffers.shadow_named);
+    named.clear_sent();
     let ask = OwnRows {
         world,
         gateway: taken.gateway,
@@ -3341,9 +3344,11 @@ impl Door {
     /// What stands behind a single's decision, in each of its orders
     /// ([`Self::order`], [`Self::order_shadowed`], [`Self::order_own`]):
     /// a pick's lease is issued, the engine that decided is told of it,
-    /// and the record of sent prefixes takes the prefix of `named`, the
-    /// live decision's naming ([`issue`]). A step that joins a
-    /// single's commit is written here, once, and stands in every order.
+    /// and the record of sent prefixes takes the prefix of `named`
+    /// ([`issue`]). `named` is the live decision's naming, or the
+    /// naming of a shadow its pool keeps the record for
+    /// ([`Self::shadowed_order`]). A step that joins a single's commit
+    /// is written here, once, and stands in every order.
     ///
     /// Each order builds a copy of its own (`ORDER`), with a telling of
     /// its own: the store builds its issue for each telling, so no
@@ -3424,6 +3429,14 @@ impl Door {
     /// ([`Self::order_shadowed`], [`Self::order_own`]): the decision
     /// with its shadow, the commit ([`Self::file`]), then what the
     /// shadow said or its fault.
+    ///
+    /// The record of sent prefixes takes the live decision's naming.
+    /// Where the live profile is named no row, its pool keeps the
+    /// record for a shadow that is named rows of its own
+    /// ([`Engine::pool_record_for`]). The issue then writes the prefixes
+    /// that shadow's naming folded, on the live decision's worker: the
+    /// shadow reads where the requests went. A shadow that was not
+    /// asked named nothing, and its decision writes no record.
     #[inline(always)]
     fn shadowed_order<const ORDER: u8>(
         &self,
@@ -3440,7 +3453,11 @@ impl Door {
             OWN_ROWS => decide_own_in(world, taken, buffers, own, word, || taken.left),
             _ => decide_shadowed_in(world, taken, buffers, own, word, || taken.left),
         };
-        let filed = self.file::<ORDER>(world, term, taken, &buffers.named, &decision, booking);
+        let named = match ORDER {
+            OWN_ROWS if buffers.named.sent_pool().is_none() => &buffers.shadow_named,
+            _ => &buffers.named,
+        };
+        let filed = self.file::<ORDER>(world, term, taken, named, &decision, booking);
         if shadow == Shadow::Faulted {
             // The next decision reads nothing the shadow left.
             buffers.scratch = Scratch::default();

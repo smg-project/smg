@@ -18,7 +18,7 @@ use super::{
 use crate::{
     catalog::Catalog,
     decision::ShadowKind,
-    door::{decide_in, entry, Buffers, Decided, Taken},
+    door::{decide_in, entry, Buffers, Decided, Taken, SHADOW_FLOOR},
     framework::Scorer,
     spec::{
         AffinitySource, AppliedSpec, BindingSpec, Match, PolicySpec, ScoreSpec, ScoreStage,
@@ -318,6 +318,132 @@ fn a_shadowed_order_records_the_prefixes_it_sent_as_the_plain_one() -> Case {
     let shadowed = returning(true)?;
     assert_eq!((shadowed.0, shadowed.1), (plain.0, plain.1));
     assert_eq!(shadowed.2, 2, "the twin is asked beside both decisions");
+    Ok(())
+}
+
+/// The `least_load` preset and, where `shadowed`, the `cache_aware`
+/// preset's profile as its binding's shadow: a live profile that is named
+/// no row, and a shadow that reads sent prefixes and is named rows of its
+/// own.
+fn least_load(generation: u64, shadowed: bool) -> Case<PolicySpec> {
+    let mut document = PolicySpec::preset("least_load")?;
+    document.generation = generation;
+    if shadowed {
+        let twin = merged(generation)?.profiles.into_values().next();
+        let twin = twin.ok_or("the preset's profile")?;
+        document.profiles.insert("twin".into(), twin);
+        document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+    }
+    Ok(document)
+}
+
+/// What two leases of one prompt left under a document.
+#[derive(Debug, PartialEq)]
+struct Landed {
+    /// Whether each lease took the lighter worker.
+    lighter: [bool; 2],
+    /// The shadows that agreed, and those that took another worker.
+    kinds: [u64; 2],
+    /// The record's slices under the document, and behind the next one,
+    /// which names no shadow.
+    record: [Option<usize>; 2],
+}
+
+/// Behind a live profile that is named no row, a pool keeps the record of
+/// sent prefixes for a shadow that is named rows of its own. Each lease
+/// writes the live decision's worker under the prefixes that shadow's
+/// naming folded, so the shadow reads where the requests went: it keeps a
+/// returning prompt on the worker least load sent it to, past a lighter
+/// one. The live decisions land as they land with no shadow, and a
+/// document that names none keeps no record.
+#[test]
+fn a_shadow_of_its_own_rows_reads_where_the_live_decisions_went() -> Case {
+    let landing = |shadowed: bool| -> Case<Landed> {
+        let store = fleet();
+        let a = worker(&store, "a", Role::Single, &[MODEL], false)?;
+        let b = worker(&store, "b", Role::Single, &[MODEL], false)?;
+        store.apply(applied(&least_load(1, shadowed)?)?)?;
+        let door = Door::new(store.clone());
+        let asked = token_request(&HASHES[..8]);
+        let placed = |now: Instant| -> Case<WorkerId> {
+            let decided = door.decide(GATEWAY, &asked, now);
+            let decided = decided.map_err(|word| format!("{word:?}"))?;
+            let lease = decided.lease.ok_or("a pick's lease")?.lease;
+            door.report(GATEWAY, lease.id, gone());
+            Ok(lease.booked)
+        };
+        let now = Instant::now() + Duration::from_secs(120);
+        load(&store, a, 0, now);
+        load(&store, b, 1, now);
+        let first = placed(now)? == a;
+        let later = now + Duration::from_millis(20);
+        load(&store, a, 2, later);
+        load(&store, b, 0, later);
+        let second = placed(later)? == b;
+        let kinds = [ShadowKind::Agreed, ShadowKind::OtherTarget];
+        let kinds = kinds.map(|kind| door.shadowed(0, kind));
+        let kept = slices(&store, Role::Single);
+        // The document in force names no shadow again.
+        store.apply(applied(&least_load(2, false)?)?)?;
+        Ok(Landed {
+            lighter: [first, second],
+            kinds,
+            record: [kept, slices(&store, Role::Single)],
+        })
+    };
+    let plain = landing(false)?;
+    assert_eq!(plain.lighter, [true, true], "least load takes the lighter");
+    assert_eq!((plain.kinds, plain.record), ([0, 0], [None, None]));
+    let shadowed = landing(true)?;
+    assert_eq!(
+        shadowed.lighter, plain.lighter,
+        "the live decisions land the same"
+    );
+    assert_eq!(
+        shadowed.kinds,
+        [1, 1],
+        "the shadow returns to the first worker"
+    );
+    assert_eq!(
+        shadowed.record,
+        [Some(2), None],
+        "a slice a lease, then none"
+    );
+    Ok(())
+}
+
+/// A request whose shadow is not asked leaves no entry. Under the floor
+/// no row is named for the shadow, so the lease writes nothing: not the
+/// request's prefixes, and nothing of the naming the request before left
+/// on the thread's buffers.
+#[test]
+fn a_decision_whose_shadow_is_not_asked_writes_no_record() -> Case {
+    let store = fleet();
+    let a = worker(&store, "a", Role::Single, &[MODEL], false)?;
+    let b = worker(&store, "b", Role::Single, &[MODEL], false)?;
+    store.apply(applied(&least_load(1, true)?)?)?;
+    let door = Door::new(store.clone());
+    let floor = u32::try_from(SHADOW_FLOOR.as_micros())?;
+    let placed = |budget_micros: u32, now: Instant| -> Case<WorkerId> {
+        let mut asked = token_request(&HASHES[..8]);
+        asked.facts.budget_micros = budget_micros;
+        let decided = door.decide(GATEWAY, &asked, now);
+        let decided = decided.map_err(|word| format!("{word:?}"))?;
+        let lease = decided.lease.ok_or("a pick's lease")?.lease;
+        door.report(GATEWAY, lease.id, gone());
+        Ok(lease.booked)
+    };
+    let now = Instant::now() + Duration::from_secs(120);
+    load(&store, a, 0, now);
+    load(&store, b, 1, now);
+    assert_eq!(placed(floor, now)?, a);
+    assert_eq!(slices(&store, Role::Single), Some(1));
+    let later = now + Duration::from_millis(20);
+    load(&store, a, 2, later);
+    load(&store, b, 0, later);
+    assert_eq!(placed(floor - 1, later)?, b);
+    assert_eq!(door.shadowed(0, ShadowKind::Skipped), 1);
+    assert_eq!(slices(&store, Role::Single), Some(1), "no entry for it");
     Ok(())
 }
 

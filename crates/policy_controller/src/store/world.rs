@@ -4920,7 +4920,10 @@ fn ruling_of(spec: &AppliedSpec, model: &str, rows: &[Candidate]) -> Option<Warm
     spec.engine().pool_rule_for(model, phase_of(role))
 }
 
-/// The tree's placement bound for a pool whose profile reads sent prefixes.
+/// The tree's placement bound for a pool that keeps a record of sent
+/// prefixes: its profile reads them, or its binding's shadow does where
+/// that profile is named no row
+/// ([`Engine::pool_record_for`](crate::framework::Engine::pool_record_for)).
 fn predict_of(
     spec: &AppliedSpec,
     kv: &KvTables,
@@ -4928,9 +4931,7 @@ fn predict_of(
     rows: &[Candidate],
 ) -> Option<Predict> {
     let phase = phase_of(rows.first()?.role);
-    if !spec.engine().reads_sent_for(model, phase) {
-        return None;
-    }
+    let ahead = spec.engine().pool_record_for(model, phase)?;
     let index = spec.index_for(model);
     if index.kind != IndexKind::Tree {
         return None;
@@ -4942,7 +4943,7 @@ fn predict_of(
     let bound = (index.max_size / u64::from(size)).max(1);
     Some(Predict {
         bound: usize::try_from(bound).unwrap_or(usize::MAX),
-        ahead: spec.engine().reads_sent_alone_for(model, phase),
+        ahead,
     })
 }
 

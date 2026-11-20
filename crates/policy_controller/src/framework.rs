@@ -2615,7 +2615,8 @@ pub(crate) enum ShadowRows {
     /// profile names by another cap than the live one, or the live one
     /// is named no row. A pool keeps one ruling of its warming rows and
     /// one record of sent prefixes, and both are the shadow profile's
-    /// own there ([`Engine::pool_rule_for`]).
+    /// own there ([`Engine::pool_rule_for`],
+    /// [`Engine::pool_record_for`]).
     Own(u32),
     /// Not at all: the shadow profile would be named rows of another
     /// warm-up ruling or another record than the pool keeps, or handed a
@@ -2647,12 +2648,14 @@ impl ShadowRows {
             _ if live == by => Self::Same,
             // The shadow profile is named rows of its own. The pool's
             // warming rows are of one ruling and its record of one
-            // profile: the live one's, and the ruling is left to the
-            // shadow where the live profile is named no row and rules by
+            // profile: the live one's. A live profile that is named no
+            // row reads no record, so the record is left to the shadow
+            // there, and the ruling too where that profile rules by
             // none.
             (live_cap, cap) => {
-                let ruled = live.rule == by.rule || (live_cap == 0 && live.rule.is_none());
-                let recorded = (live.sent, live.sent_alone) == (by.sent, by.sent_alone);
+                let left = live_cap == 0;
+                let ruled = live.rule == by.rule || (left && live.rule.is_none());
+                let recorded = left || (live.sent, live.sent_alone) == (by.sent, by.sent_alone);
                 if ruled && recorded {
                     Self::Own(cap)
                 } else {
@@ -4278,6 +4281,31 @@ impl Engine {
     pub(crate) fn reads_sent_alone_for(&self, model: &str, phase: Phase) -> bool {
         self.resolve(model, phase)
             .is_some_and(|(_, index, _)| self.named_by[usize::from(index)].sent_alone)
+    }
+
+    /// The record of sent prefixes a host keeps for a pool, for the
+    /// decisions of `phase` for `model`: `None` where it keeps none, and
+    /// whether the record's holders are named ahead of the index's. It
+    /// is the live profile's word ([`Self::reads_sent_for`],
+    /// [`Self::reads_sent_alone_for`]) and, where that profile is named
+    /// no row and its binding's shadow is named rows of its own, the
+    /// shadow profile's. A live profile that is named no row reads no
+    /// holder, so the record its pool keeps moves nothing it is handed.
+    /// A document that names no such shadow keeps none there.
+    pub(crate) fn pool_record_for(&self, model: &str, phase: Phase) -> Option<bool> {
+        if self.reads_sent_for(model, phase) {
+            return Some(self.reads_sent_alone_for(model, phase));
+        }
+        // The shadow's rows are its own with another record than the
+        // live profile's only where that profile is named no row
+        // ([`ShadowRows::of`]).
+        let (at, rows) = self.shadow_for(model, phase)?;
+        let ShadowRows::Own(_) = rows else {
+            return None;
+        };
+        let shadow = self.bindings.get(at as usize)?.binding.shadow?;
+        let by = self.named_by.get(usize::from(shadow))?;
+        by.sent.then_some(by.sent_alone)
     }
 
     /// The cap of each list of rows a host names in the affinity column's
@@ -7615,8 +7643,10 @@ mod tests {
     /// its own profile would be named the same, and reads the view
     /// without them where that profile reads no column. It is named rows
     /// of its own where it differs by its cap, or the live profile is
-    /// named none, and the pool's ruling and record are its own. It is
-    /// not asked anywhere else.
+    /// named none, and the pool's ruling and record are its own. Behind
+    /// a live profile that is named no row the record is the shadow's,
+    /// whatever it reads a request's holders from. It is not asked
+    /// anywhere else.
     #[test]
     fn a_shadow_reads_its_live_rows_only_where_it_would_be_handed_them() {
         use crate::spec::{
@@ -7656,15 +7686,25 @@ mod tests {
             };
             profile.score[1] = ScoreStage::PrefixAffinity(prefix).into();
         };
-        let cases: [(&str, &str, Turn<'_>, ShadowRows); 9] = [
+        // The prefix stage reads the index of cache events alone.
+        let index = |profile: &mut ProfileSpec| {
+            let prefix = PrefixAffinityParams {
+                weight: 4.0,
+                source: Some(AffinitySource::Index),
+                ..PrefixAffinityParams::default()
+            };
+            profile.score[1] = ScoreStage::PrefixAffinity(prefix).into();
+        };
+        let cases: [(&str, &str, Turn<'_>, ShadowRows); 10] = [
             ("cache_aware", "cache_aware", &as_it_is, ShadowRows::Same),
             ("cache_aware", "cache_aware", &record, ShadowRows::Apart),
+            ("cache_aware", "cache_aware", &index, ShadowRows::Apart),
             ("least_load", "random", &as_it_is, ShadowRows::Same),
             ("cache_aware", "cache_aware", &sample, ShadowRows::Own(8)),
             ("cache_aware", "cache_aware", &ruling, ShadowRows::Apart),
             ("least_load", "cache_aware", &as_it_is, ShadowRows::Own(16)),
             ("least_load", "cache_aware", &ruling, ShadowRows::Own(16)),
-            ("least_load", "cache_aware", &record, ShadowRows::Apart),
+            ("least_load", "cache_aware", &record, ShadowRows::Own(16)),
             ("cache_aware", "least_load", &as_it_is, ShadowRows::Unnamed),
         ];
         for (live, shadow, turn, wanted) in cases {
@@ -7697,6 +7737,44 @@ mod tests {
         let engine = document.validate().expect("a binding with a shadow");
         assert_eq!(engine.warm_rule_for("m", Phase::Single), None);
         assert_eq!(engine.pool_rule_for("m", Phase::Single), rule);
+    }
+
+    /// A pool keeps one record of sent prefixes: the live profile's, and
+    /// where that profile is named no row and its shadow is named rows of
+    /// its own, the shadow profile's. A document that names no such
+    /// shadow keeps none there.
+    #[test]
+    fn a_pool_keeps_the_record_for_its_shadow_where_the_live_profile_is_named_no_row() {
+        use crate::spec::{AffinitySource, PrefixAffinityParams, ScoreStage, ShadowSpec};
+        let aware = PolicySpec::preset("cache_aware").expect("a preset");
+        let second = aware.profiles.values().next();
+        let second = second.expect("the preset's profile").clone();
+        let aware = aware.validate().expect("the preset validates");
+        // The preset reads each worker by what it has: the index's
+        // holders keep their place ahead of the record's.
+        assert_eq!(aware.pool_record_for("m", Phase::Single), Some(false));
+
+        let mut document = PolicySpec::preset("least_load").expect("a preset");
+        let alone = document.validate().expect("the preset validates");
+        assert_eq!(alone.pool_record_for("m", Phase::Single), None);
+        document.profiles.insert("second".into(), second.clone());
+        document.bindings[0].shadow = Some(ShadowSpec::Profile("second".into()));
+        let engine = document.validate().expect("a binding with a shadow");
+        assert!(!engine.reads_sent_for("m", Phase::Single));
+        assert_eq!(engine.pool_record_for("m", Phase::Single), Some(false));
+
+        // A shadow that reads the record alone is named its holders
+        // ahead of the index's.
+        let mut by_record = second;
+        let prefix = PrefixAffinityParams {
+            weight: 4.0,
+            source: Some(AffinitySource::Predictor),
+            ..PrefixAffinityParams::default()
+        };
+        by_record.score[1] = ScoreStage::PrefixAffinity(prefix).into();
+        document.profiles.insert("second".into(), by_record);
+        let engine = document.validate().expect("a binding with a shadow");
+        assert_eq!(engine.pool_record_for("m", Phase::Single), Some(true));
     }
 
     #[test]

@@ -365,7 +365,7 @@ impl Named {
     }
 
     #[inline]
-    pub(super) fn sent_pool(&self) -> Option<usize> {
+    pub(crate) fn sent_pool(&self) -> Option<usize> {
         (self.sent.pool != NONE).then_some(self.sent.pool as usize)
     }
 }
