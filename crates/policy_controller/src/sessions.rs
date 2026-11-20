@@ -84,9 +84,33 @@ pub(crate) enum Claim {
     /// The decision's own worker is the claim of record; that decision's
     /// commit settles it.
     Made(WorkerId),
-    /// The pin of record is another decision's standing claim, or nothing
-    /// was recorded (an empty key or target): the decision follows it.
-    Standing(WorkerId),
+    /// The claim was not taken: the key's pins are not the ones the
+    /// decision read, or nothing was recorded (an empty key or target).
+    /// It names the worker the decision follows ([`Claim::standing`]) and
+    /// the pins the key held: a shadow reads those against its own pins
+    /// and its own pick.
+    Standing(WorkerId, Pins),
+}
+
+impl Claim {
+    /// The worker a decision follows where the key holds `held` and the
+    /// decision read `seen` and chose `target`. None where the pins stand
+    /// as it read them: its claim is taken. Else the newcomer among them,
+    /// or its own `target` where no pin came in: the pins moved, a claim
+    /// was withdrawn, or a worker left. That last answer is the
+    /// decision's own pick, and no pin for another decision to follow.
+    #[inline(always)]
+    pub(crate) fn standing(held: Pins, seen: Pins, target: WorkerId) -> Option<WorkerId> {
+        if held == seen {
+            return None;
+        }
+        Some(
+            held.iter()
+                .copied()
+                .find(|pin| *pin != WorkerId(0) && !seen.contains(pin))
+                .unwrap_or(target),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -212,7 +236,8 @@ impl SessionTable {
     /// recovery: the pins move now, and the commit finds them in place. When
     /// another decision moved the pins since this one read them (`seen`),
     /// the newcomer among them is the claim to follow instead, when it is
-    /// among this decision's survivors; the pin of record is returned. The
+    /// among this decision's survivors; the pin of record is returned with
+    /// the pins the key held ([`Claim::standing`] is the rule). The
     /// claim is the one pin made before a commit, and it is marked as such:
     /// any dispatch to it confirms it, the claiming decision's own dispatch
     /// elsewhere withdraws it (`dispatched`), the TTL sweeps it otherwise.
@@ -222,26 +247,20 @@ impl SessionTable {
     pub(crate) fn claim(&self, key: Session, seen: Pins, target: WorkerId) -> Claim {
         let key = key.get();
         if key == 0 || target == WorkerId(0) {
-            return Claim::Standing(target);
+            return Claim::Standing(target, seen);
         }
         let mut shard = self.shard(key).lock();
         let entry = shard.entry(key).or_default();
-        if entry.pins == seen {
+        let held = entry.pins;
+        let Some(owner) = Claim::standing(held, seen, target) else {
             match entry.recovery {
                 Recovery::Latest => entry.front(target),
                 Recovery::Original => entry.append(target),
             }
             entry.claim = target;
             return Claim::Made(target);
-        }
-        Claim::Standing(
-            entry
-                .pins
-                .iter()
-                .copied()
-                .find(|pin| *pin != WorkerId(0) && !seen.contains(pin))
-                .unwrap_or(target),
-        )
+        };
+        Claim::Standing(owner, held)
     }
 
     /// A pin of record read for a key the table held no pin of (a key it
@@ -633,7 +652,7 @@ mod tests {
         );
         assert_eq!(
             table.claim(s(5), none, WorkerId(4)),
-            Claim::Standing(WorkerId(3)),
+            Claim::Standing(WorkerId(3), [WorkerId(3), WorkerId(0)]),
             "follows it"
         );
         assert_eq!(table.pins(s(5)), Some([WorkerId(3), WorkerId(0)]));
@@ -655,7 +674,7 @@ mod tests {
         assert_eq!(table.pins(s(5)), Some([WorkerId(4), WorkerId(7)]));
         assert_eq!(
             table.claim(s(5), seen, WorkerId(8)),
-            Claim::Standing(WorkerId(7)),
+            Claim::Standing(WorkerId(7), [WorkerId(4), WorkerId(7)]),
             "the newcomer"
         );
         // Under the latest-first recovery the claim leads at once.
@@ -667,10 +686,33 @@ mod tests {
         assert_eq!(table.pins(s(6)), Some([WorkerId(1), WorkerId(0)]));
         assert_eq!(
             table.claim(s(0), none, WorkerId(9)),
-            Claim::Standing(WorkerId(9)),
+            Claim::Standing(WorkerId(9), none),
             "no key, no claim"
         );
         assert_eq!(table.len(), 2);
+    }
+
+    /// Another request's respill turns the pins behind a decision's read:
+    /// the claim is not taken and no pin came in. The answer is the
+    /// caller's own worker with the pins the key held, and nothing is
+    /// recorded. Another decision that reads the same pins gets its own
+    /// worker: the answer is no pin to follow.
+    #[test]
+    fn a_claim_that_finds_no_new_pin_names_the_callers_own_worker() {
+        let table = SessionTable::new(RULE.sweep_micros);
+        let _ = table.restore(s(3), 10, &RULE, WorkerId(1));
+        table.dispatched(s(3), SessionVerdict::Pinned, WorkerId(2));
+        let seen = table.lookup(s(3), 20, &RULE);
+        assert_eq!(seen, [WorkerId(2), WorkerId(1)]);
+        table.dispatched(s(3), SessionVerdict::Respill, WorkerId(1));
+        let held = [WorkerId(1), WorkerId(2)];
+        assert_eq!(
+            table.claim(s(3), seen, WorkerId(7)),
+            Claim::Standing(WorkerId(7), held)
+        );
+        assert_eq!(table.pins(s(3)), Some(held), "nothing is recorded");
+        assert_eq!(Claim::standing(held, seen, WorkerId(8)), Some(WorkerId(8)));
+        assert_eq!(Claim::standing(seen, seen, WorkerId(8)), None);
     }
 
     /// The owner is down, the decision claims B, the commit refuses B and

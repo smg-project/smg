@@ -870,12 +870,14 @@ pub struct Scratch {
     kept_last: bool,
 }
 
-/// What a live decision under a sessions rule learned of its key, answer
-/// by answer: the key's pins at its read, the host's pin of record where
+/// What a live decision under a sessions rule learned of its key, step
+/// by step: the key's pins at its read, the host's pin of record where
 /// it asked for one, the pins that stood at its write back of that pin,
-/// and the worker that stood where its claim was not taken. The
-/// decision's commit moves the pins, so its shadow asks for none of them
-/// again: it takes each answer at the step the live decision took it
+/// and the pins the table held where its claim was not taken. Each is
+/// what the table or the host held, never an answer worked out of the
+/// live decision's own pick. The decision's commit moves the pins, so
+/// its shadow asks for none of them again: it takes each at the step
+/// the live decision took it, against its own pins and its own pick
 /// ([`Engine::shadow`]). The keeping entry writes it
 /// ([`Engine::decide_keeping`]), and forgets the one before it first: the
 /// scratch holds a reading of its last keeping decision alone.
@@ -897,8 +899,8 @@ struct SessionsFound {
     /// The pins that stood at the write back of that pin: the pin itself
     /// where the write back won, another request's where it lost.
     written: [WorkerId; 2],
-    /// The worker that stood where the decision's claim was not taken.
-    standing: WorkerId,
+    /// The pins the table held where the decision's claim was not taken.
+    standing: [WorkerId; 2],
 }
 
 impl SessionsFound {
@@ -3969,9 +3971,9 @@ impl Engine {
     /// ([`Self::shadow`]). It makes the same decision. Under a sessions
     /// rule it also keeps in the scratch what it learned of the request's
     /// key: the key's pins, the host's pin of record where it asked for
-    /// one, and what the table answered its write back of that pin and
-    /// its claim. The shadow takes each answer where this decision took
-    /// it, since the commit between the two moves the pins. A decision
+    /// one, and the pins the table held at its write back of that pin
+    /// and at a claim it lost. The shadow takes each where this decision
+    /// took it, since the commit between the two moves the pins. A decision
     /// that answers before it reads its key keeps none, and leaves none
     /// of an earlier decision.
     /// A host that shadows a request decides it through this entry, each
@@ -4210,12 +4212,15 @@ impl Engine {
     /// and hand this call its scratch, before the scratch decides again.
     /// Under a sessions rule that decision keeps there what it learned of
     /// the key: the key's pins, the host's pin of record where it asked
-    /// for one, and what the table answered its write back and its claim.
+    /// for one, and the pins the table held at its write back and at a
+    /// claim it lost.
     /// The shadow of the same request (the same key, clock and seed) asks
-    /// for none of them again: it takes each answer where the live
-    /// decision took it. So it decides by the sessions as the live
-    /// decision found them, whether or not that decision is committed
-    /// first: a commit moves the pins.
+    /// for none of them again: it takes each where the live decision took
+    /// it, and reads it against its own pins and its own pick. A claim's
+    /// answer is never replayed: where no pin came in, that answer is the
+    /// live pick, and a shadow of another profile keeps its own. So it
+    /// decides by the sessions as the live decision found them, whether
+    /// or not that decision is committed first: a commit moves the pins.
     /// With no keeping decision of the request on this scratch (behind
     /// [`Self::decide`] or [`Self::decide_stated`] alone, or with another
     /// scratch), the shadow reads the pins as they stand.
@@ -4634,8 +4639,14 @@ impl Engine {
                     self.sessions.claim(key, pins, first)
                 } else if handed && found.late & SessionsFound::STANDING != 0 {
                     // The live decision's claim was not taken: its shadow
-                    // follows the worker that stood, as it did.
-                    Claim::Standing(found.standing)
+                    // reads the pins the table held there against its own
+                    // pins and its own pick, as the table does. Where no
+                    // pin came in, the table's answer was the live pick:
+                    // that is no pin, and the shadow keeps its own.
+                    match Claim::standing(found.standing, pins, first) {
+                        Some(owner) => Claim::Standing(owner, found.standing),
+                        None => return decision,
+                    }
                 } else {
                     return decision;
                 };
@@ -4647,10 +4658,10 @@ impl Engine {
                     // where it is among the survivors: the rule's cap
                     // holds for it as for the pin read first, and it leads
                     // where the placement stood elsewhere.
-                    Claim::Standing(owner) => {
+                    Claim::Standing(owner, held) => {
                         if WRITE_SESSIONS && KEEPS {
-                            // The worker that stood, kept for the shadow.
-                            scratch.sessions_found.standing = owner;
+                            // The pins the table held, kept for the shadow.
+                            scratch.sessions_found.standing = held;
                             scratch.sessions_found.late |= SessionsFound::STANDING;
                         }
                         if let Some(&i) = buf
@@ -6323,12 +6334,130 @@ mod tests {
         assert_eq!(first_of(&shadow), Some(rows[1].id));
     }
 
+    /// Another request's respill turns the key's pins between a decision's
+    /// read and its claim. The claim is not taken and no pin came in, so
+    /// the table answers with the decision's own pick. That pick is no
+    /// pin of the key. A shadow of another profile reads the pins the
+    /// claim found against its own pick and keeps its own placement: it
+    /// counts the other target it chose, and no false agreement.
+    #[test]
+    fn shadow_of_another_profile_keeps_its_pick_where_the_claim_found_no_new_pin() {
+        use std::{
+            sync::{mpsc, Once},
+            time::Duration,
+        };
+
+        /// The best survivor, picked once another thread has had its turn
+        /// at the table: the stages place a request between its read of
+        /// the key and its claim, and one thread has no seam there.
+        #[derive(Debug)]
+        struct Turned {
+            go: mpsc::Sender<()>,
+            done: Mutex<mpsc::Receiver<()>>,
+            once: Once,
+        }
+
+        impl Lifecycle for Turned {}
+
+        impl Picker for Turned {
+            fn name(&self) -> &'static str {
+                "turned"
+            }
+
+            fn pick(
+                &self,
+                facts: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                kept: &[u32],
+                scores: &[f32],
+                band: TieBand,
+                out: &mut Targets,
+            ) {
+                self.once.call_once(|| {
+                    let _ = self.go.send(());
+                    if let Ok(done) = self.done.lock() {
+                        let _ = done.recv_timeout(Duration::from_secs(10));
+                    }
+                });
+                Best.pick(facts, candidates, kept, scores, band, out);
+            }
+        }
+
+        let (go, went) = mpsc::channel();
+        let (did, done) = mpsc::channel();
+        let live = Profile {
+            picker: Box::new(Turned {
+                go,
+                done: Mutex::new(done),
+                once: Once::new(),
+            }),
+            ..least_requests_profile()
+        };
+        let other = Profile {
+            name: "first".into(),
+            picker: Box::new(FirstKept),
+            ..least_requests_profile()
+        };
+        let engine = Engine::new(
+            vec![live, other],
+            vec![Binding {
+                shadow: Some(1),
+                sessions: Some(SESSIONS),
+                ..single_binding()
+            }],
+            23,
+            Needs::default(),
+        );
+        let mut rows = [
+            candidate(0, 0),
+            candidate(1, 0),
+            candidate(2, 1),
+            candidate(3, 0),
+        ];
+        rows[0].health.healthy = false;
+        rows[1].health.healthy = false;
+        let facts = keyed_at(61, 71);
+        let pool = PoolFacts::default();
+        let key = facts.session();
+        let table = engine.sessions();
+        let _ = table.restore(key, 10, &SESSIONS, rows[0].id);
+        table.dispatched(key, SessionVerdict::Pinned, rows[1].id);
+        assert_eq!(table.pins(key), Some([rows[1].id, rows[0].id]));
+        let turned = rows[0].id;
+        let cx = Constraints::default();
+        let mut scratch = Scratch::new();
+        let live = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                // Another request's respill, once the live decision has
+                // read the key: both pins stay, turned.
+                if went.recv_timeout(Duration::from_secs(10)).is_ok() {
+                    table.dispatched(key, SessionVerdict::Respill, turned);
+                }
+                let _ = did.send(());
+            });
+            engine.decide_keeping(&facts, &pool, &rows, &cx, &mut scratch)
+        });
+        // The claim was not taken and nothing was recorded: the pins stand
+        // as the respill left them.
+        assert_eq!(table.pins(key), Some([rows[0].id, rows[1].id]));
+        assert_eq!(first_of(&live), Some(rows[3].id));
+        let shadow = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("a shadow decision");
+        assert_eq!(
+            crate::decision::ShadowKind::of(&live, &shadow),
+            crate::decision::ShadowKind::OtherTarget
+        );
+        assert_eq!(first_of(&shadow), Some(rows[2].id));
+    }
+
     /// A write back that wins is no end of it: another request's pin can
     /// stand behind the record by the time of the claim. The record leads
     /// the pins, so the live decision's sight is that worker alone. Its
     /// lifted placement names a third worker, its claim finds the other
-    /// request's pin standing, and it follows that pin. The shadow takes
-    /// the claim's answer and agrees: without it, it keeps the placement.
+    /// request's pin standing, and it follows that pin. The shadow reads
+    /// the pins the claim found and agrees: without them, it keeps the
+    /// placement.
     /// The other request's pin joins at the host's ask, the last seam one
     /// thread has before the write back.
     #[test]
