@@ -187,8 +187,8 @@ pub use demands::{DemandFacts, Demands, References, Unmet};
 pub use door::{DecisionRecord, Explained, Names};
 pub use framework::{
     Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
-    Front, Narrowed, PairPools, PairTable, PairTableError, Picker, Plan, Profile, Scorer, Scratch,
-    Spread, TieBand, Unit, Weighted, DRAW_BOUND, DRAW_FROM, RANK_FROM,
+    Front, Narrowed, PairPools, PairSide, PairTable, PairTableError, Picker, Plan, Profile, Scorer,
+    Scratch, Spread, TieBand, Unit, Weighted, DRAW_BOUND, DRAW_FROM, RANK_FROM,
 };
 pub use lease::{
     EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason,

@@ -4,6 +4,7 @@
 //! changes, fails or books the live answer.
 
 use std::{
+    collections::BTreeMap,
     error::Error,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -16,15 +17,15 @@ use std::{
 use kv_index::chain_prefix_hash;
 
 use super::{
-    counted, dispatched, fleet, items, keyed, pair_fleet, pair_request, place_one, placed,
-    push_fleet, release, report, request, seated, GATEWAY, MODEL,
+    counted, dispatched, encode_document, fleet, items, keyed, pair_counts, pair_fleet,
+    pair_request, place_one, placed, push_fleet, release, report, request, seated, GATEWAY, MODEL,
 };
 use crate::{
     builtins::target_of,
     catalog::Catalog,
     decision::{Decision, ShadowKind, Targets},
-    door::{Door, ON_SHADOW, SHADOW_FLOOR},
-    framework::{Picker, TieBand},
+    door::{Decided, Door, ON_SHADOW, SHADOW_FLOOR},
+    framework::{EncodePlaced, PairSide, Picker, TieBand},
     lease::{LeaseId, Lifecycle, Side},
     sessions::SessionVerdict,
     spec::{
@@ -780,4 +781,311 @@ fn a_pair_beside_a_shadowed_single_is_ordered_as_before() -> Result<(), Box<dyn 
     assert_eq!(kinds(&door), [0, 1, 0, 0]);
     assert_eq!(shadow_asked.load(Ordering::Relaxed), 1);
     Ok(())
+}
+
+/// The names of a case's pickers on a pair's two sides: the live one's,
+/// then its shadow's.
+const SIDE_PICKERS: [(&str, &str); 2] = [
+    ("takes-prefill", "takes-prefill-next"),
+    ("takes-decode", "takes-decode-next"),
+];
+
+/// Applies `generation` of the stock pair document with a case's picker
+/// on each side: `live[0]` decides the prefill and `live[1]` the decode.
+/// Each side `next` names is shadowed by a profile of the same stages
+/// under that side's own picker. `edit` has the document before it is
+/// applied. The counts are of the decisions that asked each side's
+/// shadow picker, the prefill's then the decode's.
+fn pair_shadowing(
+    store: &MemoryStore,
+    generation: u64,
+    live: [Rule; 2],
+    next: [Option<Rule>; 2],
+    edit: impl FnOnce(&mut PolicySpec),
+) -> [Arc<AtomicUsize>; 2] {
+    let asked = [Arc::default(), Arc::default()];
+    let picker = |name: &'static str, rule: Rule, asked: &Arc<AtomicUsize>| {
+        let asked = Arc::clone(asked);
+        move || -> Box<dyn Picker> {
+            let asked = Arc::clone(&asked);
+            Box::new(Takes { name, rule, asked })
+        }
+    };
+    let mut catalog = Catalog::builtin();
+    let document = PolicySpec::pair_presets("least_load", "least_load");
+    let mut document = document.expect("the stock presets");
+    document.generation = generation;
+    let mut sides = BTreeMap::new();
+    for (at, side) in ["prefill", "decode"].into_iter().enumerate() {
+        let (own, shadow) = SIDE_PICKERS[at];
+        let added = catalog.picker(own, picker(own, live[at], &Arc::default()));
+        added.expect("a free name");
+        let profile = document.profiles.get_mut(side);
+        let profile = profile.expect("the side's profile");
+        profile.filter.clear();
+        profile.pick = own.into();
+        let Some(rule) = next[at] else { continue };
+        let added = catalog.picker(shadow, picker(shadow, rule, &asked[at]));
+        added.expect("a free name");
+        let mut twin = profile.clone();
+        twin.pick = shadow.into();
+        let name = format!("{side}-next");
+        document.profiles.insert(name.clone(), twin);
+        sides.insert(side.to_owned(), name);
+    }
+    if !sides.is_empty() {
+        document.bindings[0].shadow = Some(ShadowSpec::Sides(sides));
+    }
+    edit(&mut document);
+    let digest = document.digest().expect("the document digests");
+    let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+    let applied = store.apply(spec.expect("the document validates"));
+    applied.expect("a later generation");
+    asked
+}
+
+/// A door over two prefills and two decodes that pair each with each,
+/// deciding a pair's sides by `live` and shadowing the sides `next`
+/// names, with the counts of the decisions that asked each shadow.
+fn pair_bed(live: [Rule; 2], next: [Option<Rule>; 2]) -> (Door, [Arc<AtomicUsize>; 2]) {
+    let store = pair_fleet(2, 2).expect("the pair fleet");
+    let asked = pair_shadowing(&store, 2, live, next, |_| {});
+    (Door::new(store), asked)
+}
+
+/// The door's counts of the shadows of `side` of the first binding's
+/// pairs: agreed, another target, another outcome, skipped.
+fn side_kinds(door: &Door, side: PairSide) -> [u64; 4] {
+    use ShadowKind::{Agreed, OtherOutcome, OtherTarget, Skipped};
+    [Agreed, OtherTarget, OtherOutcome, Skipped].map(|kind| door.shadowed_side(0, side, kind))
+}
+
+/// The counts of both sides, the prefill's then the decode's.
+fn both_kinds(door: &Door) -> [[u64; 4]; 2] {
+    PairSide::BOTH.map(|side| side_kinds(door, side))
+}
+
+/// A pair decided at `door`, and the prefill and the decode it leads
+/// with.
+fn paired(door: &Door, id: &'static [u8], now: Instant) -> (Decided, (WorkerId, WorkerId)) {
+    let decided = door.decide(GATEWAY, &pair_request(id), now);
+    let decided = decided.expect("a decision");
+    let pair = pair_of(&decided);
+    (decided, pair)
+}
+
+/// The prefill and the decode a pair's decision names first.
+fn pair_of(decided: &Decided) -> (WorkerId, WorkerId) {
+    let pick = decided.decision.pick();
+    let first = pick.and_then(|pick| pick.targets.first());
+    let first = *first.expect("a pair");
+    let decode = first.pair.expect("the pair's decode").decode_id;
+    (first.id, decode)
+}
+
+/// How many decisions asked each side's shadow.
+fn asks(asked: &[Arc<AtomicUsize>; 2]) -> [usize; 2] {
+    asked.each_ref().map(|asked| asked.load(Ordering::Relaxed))
+}
+
+/// A pair's binding names a shadow a side. With the decode side alone
+/// named, the decode is compared and the prefill is not: one count
+/// moves, the decode side's. The pair is the live profiles' own, and a
+/// pair counts nothing with the singles' shadows.
+#[test]
+fn a_pairs_decode_shadow_alone_is_compared_and_counted_by_its_side() {
+    let now = Instant::now();
+    let (plain, _) = pair_bed([Rule::Place(0); 2], [None; 2]);
+    let (_, live) = paired(&plain, b"pair", now);
+    assert_eq!(both_kinds(&plain), [[0; 4]; 2]);
+    let (door, asked) = pair_bed([Rule::Place(0); 2], [None, Some(Rule::Place(1))]);
+    let (decided, pair) = paired(&door, b"pair", now);
+    assert!(decided.pair());
+    assert_eq!(pair, live, "the pair is the live profiles' own");
+    assert_eq!(both_kinds(&door), [[0; 4], [0, 1, 0, 0]]);
+    assert_eq!(kinds(&door), [0; 4]);
+    assert_eq!(asks(&asked), [0, 1]);
+}
+
+/// With both sides named each is compared with its own: two counts, one
+/// a side. A shadow under its live side's own rule agrees with it.
+#[test]
+fn a_pair_with_both_sides_named_counts_one_a_side() {
+    let next = [Some(Rule::Place(0)), Some(Rule::Place(1))];
+    let (door, asked) = pair_bed([Rule::Place(0); 2], next);
+    paired(&door, b"pair", Instant::now());
+    assert_eq!(both_kinds(&door), [[1, 0, 0, 0], [0, 1, 0, 0]]);
+    assert_eq!(asks(&asked), [1, 1]);
+    // A side's shadow that declines is another outcome.
+    let next = [Some(Rule::Nobody), Some(Rule::Place(0))];
+    let (door, _) = pair_bed([Rule::Place(0); 2], next);
+    paired(&door, b"pair", Instant::now());
+    assert_eq!(both_kinds(&door), [[0, 0, 1, 0], [1, 0, 0, 0]]);
+}
+
+/// A shadowed pair books and leases what the live pair alone does. The
+/// store's counts and leases behind it are those of the same pair under
+/// a document that names no shadow, and the workers the shadows took
+/// hold nothing.
+#[test]
+fn a_shadowed_pair_leaves_the_counts_and_leases_of_the_live_pair() {
+    let now = Instant::now();
+    let (turned, _) = pair_bed([Rule::Place(1); 2], [None; 2]);
+    let (_, others) = paired(&turned, b"pair", now);
+    let left = |next: [Option<Rule>; 2]| {
+        let (door, _) = pair_bed([Rule::Place(0); 2], next);
+        let (_, live) = paired(&door, b"pair", now);
+        assert_ne!((live.0, live.1), others, "the shadows take other workers");
+        let workers = [live.0, live.1, others.0, others.1];
+        let store = door.store();
+        let leases = LeasesStore::live(&**store, GATEWAY);
+        (live, pair_counts(store, workers), leases)
+    };
+    let plain = left([None; 2]);
+    assert_eq!(plain.1, [1, 1, 0, 0]);
+    assert_eq!(left([Some(Rule::Place(1)); 2]), plain);
+}
+
+/// A pair with less than the floor of its budget left keeps it for its
+/// answer: no side's shadow is asked, and each named side is counted as
+/// skipped.
+#[test]
+fn a_pairs_budget_under_the_floor_skips_each_named_side() {
+    let (door, asked) = pair_bed([Rule::Place(0); 2], [Some(Rule::Place(1)); 2]);
+    let floor = u32::try_from(SHADOW_FLOOR.as_micros()).expect("a floor in microseconds");
+    let mut short = pair_request(b"short");
+    short.facts.budget_micros = floor - 1;
+    let decided = door.decide(GATEWAY, &short, Instant::now());
+    assert!(decided.expect("a decision").pair());
+    assert_eq!(both_kinds(&door), [[0, 0, 0, 1]; 2]);
+    assert_eq!(asks(&asked), [0, 0]);
+    let mut held = pair_request(b"held");
+    held.facts.budget_micros = floor;
+    let decided = door.decide(GATEWAY, &held, Instant::now());
+    assert!(decided.expect("a decision").pair());
+    assert_eq!(both_kinds(&door), [[0, 1, 0, 1]; 2]);
+}
+
+/// A side's shadow that panics costs its pair nothing: the pair and its
+/// leases are the live profiles', the fault is counted with the door's,
+/// the side behind it is not asked, and the next pair decides.
+#[test]
+fn a_pairs_shadow_that_panics_leaves_the_pair_and_counts_a_fault() {
+    let now = Instant::now();
+    let next = [Some(Rule::Panics), Some(Rule::Place(1))];
+    let (door, asked) = pair_bed([Rule::Place(0); 2], next);
+    let (decided, live) = paired(&door, b"pair", now);
+    assert!(decided.pair() && decided.lease.is_some());
+    assert_eq!(pair_counts(door.store(), [live.0, live.1]), [1, 1]);
+    assert_eq!(door.faults(), 1);
+    assert_eq!(both_kinds(&door), [[0; 4]; 2]);
+    assert_eq!(asks(&asked), [1, 0], "the side behind a fault is not asked");
+    assert_eq!(paired(&door, b"next", now).1, live);
+    assert_eq!(door.faults(), 2);
+}
+
+/// A sampled pair's record holds what each side's shadow said and that
+/// shadow's first target: the prefill's in the record's first place, the
+/// decode's beside it.
+#[test]
+fn a_sampled_pairs_record_holds_each_sides_kind_and_first_target() {
+    let store = pair_fleet(2, 2).expect("the pair fleet");
+    let next = [Some(Rule::Place(1)), Some(Rule::Place(0))];
+    pair_shadowing(&store, 2, [Rule::Place(0); 2], next, |document| {
+        document.explain.sample = 1;
+    });
+    let door = Door::new(store);
+    let (_, (prefill, decode)) = paired(&door, b"kept", Instant::now());
+    let record = door.explain(GATEWAY, b"kept");
+    let record = record.expect("the sampled pair");
+    assert_eq!(record.shadow, Some(ShadowKind::OtherTarget));
+    assert!(record.shadow_target.is_some_and(|other| other != prefill));
+    assert_ne!(record.shadow_target, Some(decode), "the prefill side's own");
+    assert_eq!(record.decode_shadow, Some(ShadowKind::Agreed));
+    assert_eq!(record.decode_shadow_target, Some(decode));
+}
+
+/// A pair's shadows are counted behind the pair's commit. A pair whose
+/// lease the store refused is ordered again and each side's shadow is
+/// asked again: the one answer counts one shadow a side.
+#[test]
+fn a_pair_ordered_twice_counts_each_sides_shadow_once() {
+    let (door, asked) = pair_bed([Rule::Place(0); 2], [Some(Rule::Place(0)); 2]);
+    seated(0);
+    door.store().spend_ids(0);
+    let (decided, _) = paired(&door, b"retry", Instant::now());
+    assert!(decided.lease.is_some());
+    assert_eq!(asks(&asked), [2, 2]);
+    assert_eq!(both_kinds(&door), [[1, 0, 0, 0]; 2]);
+}
+
+/// A pair of a plan that takes no encode items is decided by the encode
+/// entry as by the plain one: each named side's shadow is asked and
+/// counted there too, the pair is the same, and what was placed is
+/// cleared.
+#[test]
+fn a_pair_by_the_encode_entry_asks_its_sides_shadows() -> Result<(), Box<dyn Error>> {
+    let (donor, _) = push_fleet()?;
+    let now = Instant::now();
+    let next = [None, Some(Rule::Place(1))];
+    let (plain, _) = pair_bed([Rule::Place(0); 2], next);
+    let (_, live) = paired(&plain, b"pair", now);
+    let (door, asked) = pair_bed([Rule::Place(0); 2], next);
+    let mut placed = place_one(&donor, now).expect("a decision");
+    let request = pair_request(b"pair");
+    let answer = door.decide_encode_pair(GATEWAY, &request, items(), &mut placed, now);
+    let answer = answer.expect("a decision");
+    assert!(answer.pair() && !placed.one() && placed.encoders().is_empty());
+    assert_eq!(pair_of(&answer), live, "the pair the plain entry decides");
+    assert_eq!(both_kinds(&door), [[0; 4], [0, 1, 0, 0]]);
+    assert_eq!(both_kinds(&door), both_kinds(&plain));
+    assert_eq!(asks(&asked), [0, 1]);
+    Ok(())
+}
+
+/// An `epd` pair is decided with its encode items, and asks no shadow of
+/// its sides: under a binding that names one, the encode entry places
+/// the request's items as it does under a binding that names none, and
+/// no side's count moves.
+#[test]
+fn a_pair_decided_with_its_encode_items_asks_no_shadow() -> Result<(), Box<dyn Error>> {
+    let (door, encoder) = push_fleet()?;
+    let mut document = encode_document()?;
+    document.generation = 2;
+    let twin = document.profiles.get("decode").cloned();
+    let twin = twin.ok_or("the decode side's profile")?;
+    document.profiles.insert("decode-next".into(), twin);
+    let sides = BTreeMap::from([("decode".to_owned(), "decode-next".to_owned())]);
+    document.bindings[0].shadow = Some(ShadowSpec::Sides(sides));
+    door.store().apply(AppliedSpec::validate(&document)?)?;
+    let mut placed = EncodePlaced::new();
+    let request = pair_request(b"pair");
+    let now = Instant::now();
+    let answer = door.decide_encode_pair(GATEWAY, &request, items(), &mut placed, now);
+    assert!(answer.expect("a decision").pair());
+    let encoders: Vec<_> = placed.encoders().iter().map(|placed| placed.id).collect();
+    assert_eq!(encoders, [encoder, encoder]);
+    assert_eq!(both_kinds(&door), [[0; 4]; 2]);
+    Ok(())
+}
+
+/// A side's shadow profile that would be handed another column than its
+/// live side's pool carries is not asked. The pool is read by the live
+/// profile's ruling and keeps the live profile's record: a shadow that
+/// reads cached blocks, beside a side that reads none, is counted as
+/// skipped. The other side's shadow is asked.
+#[test]
+fn a_pair_sides_shadow_of_another_column_is_skipped_and_counted() {
+    let store = pair_fleet(2, 2).expect("the pair fleet");
+    let next = [Some(Rule::Place(1)); 2];
+    let asked = pair_shadowing(&store, 2, [Rule::Place(0); 2], next, |document| {
+        let aware = PolicySpec::preset("cache_aware").expect("a preset of this build");
+        let aware = aware.profiles.into_values().next();
+        let shadow = document.profiles.get_mut("decode-next");
+        shadow.expect("the decode's shadow").score = aware.expect("the preset's profile").score;
+    });
+    let door = Door::new(store);
+    paired(&door, b"pair", Instant::now());
+    assert_eq!(both_kinds(&door), [[0, 1, 0, 0], [0, 0, 0, 1]]);
+    assert_eq!(asks(&asked), [1, 0]);
 }

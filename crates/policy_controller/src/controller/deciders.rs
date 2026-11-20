@@ -365,7 +365,7 @@ impl Shared {
                 .samples
                 .get_or_init(|| (0..deciders).map(|_| Mutex::default()).collect());
             let mut samples = seats[index].lock();
-            samples.push(answer.0, engine, taken, &answer.1, None);
+            samples.push(answer.0, engine, taken, &answer.1, None, [None; 2]);
         }
         Ok(answer)
     }

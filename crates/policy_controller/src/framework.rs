@@ -2530,6 +2530,17 @@ fn profile_index(binding: &Binding, phase: Phase) -> Option<u16> {
     }
 }
 
+/// The shadow profile a binding names for `phase`, by position: a
+/// single's for each phase, a pair's a side. `None` for a pair's encode
+/// side, which names none.
+fn shadow_index(binding: &Binding, phase: Phase) -> Option<u16> {
+    match (binding.plan, phase) {
+        (Plan::Single, _) | (Plan::PdPair | Plan::Epd { .. }, Phase::Prefill) => binding.shadow,
+        (Plan::PdPair | Plan::Epd { .. }, Phase::Decode) => binding.decode_shadow,
+        (Plan::PdPair | Plan::Epd { .. }, Phase::Single | Phase::Encode) => None,
+    }
+}
+
 /// The overload thresholds a binding hands the pools decided under it
 /// ([`Engine::pool_binding`]): its block's two values, each else the spec's
 /// default, resolved once by validation.
@@ -2731,6 +2742,10 @@ pub(crate) enum ShadowRows {
     /// the record of the same model ([`live_reader_beside`]): a model
     /// keeps one record under one bound.
     Apart,
+    /// A side at a time: the binding is a pair's, and a side that names
+    /// a shadow is decided once more by it ([`Engine::shadow_side`]). A
+    /// pair's sides read their pools' columns and are named no rows.
+    Sides,
 }
 
 impl ShadowRows {
@@ -2789,6 +2804,65 @@ impl ShadowRows {
             }
         }
     }
+}
+
+/// The shadow profile of each side of a pair's binding, the prefill's
+/// then the decode's, where the build finds it free to run beside the
+/// live one: no binding decides by it live and it shows its rows to no
+/// plugin, as a single's shadow ([`Engine::shadow_for`]). None for a
+/// binding of one profile.
+fn side_shadows(binding: &Binding, live: &[bool], marks: &[Marks]) -> [Option<u16>; 2] {
+    if !matches!(binding.plan, Plan::PdPair | Plan::Epd { .. }) {
+        return [None; 2];
+    }
+    [binding.shadow, binding.decode_shadow].map(|shadow| {
+        shadow.filter(|&index| {
+            let at = usize::from(index);
+            live.get(at) == Some(&false) && marks.get(at).is_some_and(|marks| !marks.scoped())
+        })
+    })
+}
+
+/// Whether the shadow profile at `shadow`, of `side` of a pair's
+/// `binding`, would be handed another column than its live side's pool
+/// carries. A pair names no rows: each side reads its pool's column. A
+/// pool is read by one ruling of its warming rows and keeps one record
+/// of sent prefixes: those of the profile a request of the pool's phase
+/// asked alone resolves to ([`Engine::pool_rule_for`],
+/// [`Engine::pool_record_for`]). That profile is the pair's side profile
+/// unless a binding of that phase is listed ahead of the pair's. A
+/// shadow profile of another ruling than its side's, or of another
+/// reading of the record, would be handed another column live. One that
+/// reads no column is handed none either way.
+///
+/// Two limits stand. A pair's column carries each row's admission age
+/// and no overlap: a side reads no holder of a prefix, live or in its
+/// shadow, so the test skips more than today's column tells apart. And
+/// the test compares the binding's own two profiles: under a binding of
+/// the side's phase listed ahead of the pair's, the pool carries that
+/// binding's ruling, for the live side and for its shadow alike, and
+/// the test still answers by the pair's two.
+fn side_reads_another_column(
+    binding: &Binding,
+    side: PairSide,
+    shadow: u16,
+    named_by: &[NamedBy],
+    needs: &[Needs],
+) -> bool {
+    let live = match side {
+        PairSide::Prefill => binding.profile,
+        PairSide::Decode => binding.decode_profile.unwrap_or(binding.profile),
+    };
+    // The ruling, and the record where the pool keeps one: whether its
+    // holders are named ahead of the index's.
+    let carried = |index: u16| {
+        let by = named_by.get(usize::from(index))?;
+        Some((by.rule, by.sent.then_some(by.sent_alone)))
+    };
+    let column = needs
+        .get(usize::from(shadow))
+        .is_some_and(|needs| needs.affinity);
+    column && carried(live) != carried(shadow)
 }
 
 /// Whether a live profile reads the record of sent prefixes for a model
@@ -2850,6 +2924,14 @@ pub struct Engine {
     /// How each binding's shadow reads the rows its live decision was
     /// handed ([`ShadowRows`]), in the same order and as empty.
     shadow_rows: Box<[ShadowRows]>,
+    /// Each side's shadow profile beside each pair's binding, the
+    /// prefill's then the decode's ([`side_shadows`]), in the same order
+    /// and as empty.
+    shadow_sides: Box<[[Option<u16>; 2]]>,
+    /// Per pair's binding and side, whether the side's shadow profile is
+    /// named and not asked ([`side_reads_another_column`]), in the same
+    /// order and as empty.
+    side_apart: Box<[[bool; 2]]>,
     generation: u64,
     needs: Needs,
     /// The needs of every binding that covers a phase, its profile's stages
@@ -3633,10 +3715,32 @@ pub enum PairTableError {
 }
 
 /// One side of a pair decision.
-#[derive(Clone, Copy)]
-enum PairSide {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairSide {
     Prefill,
     Decode,
+}
+
+impl PairSide {
+    /// Both sides, the prefill first: the order a pair decides them in.
+    pub const BOTH: [Self; 2] = [Self::Prefill, Self::Decode];
+
+    /// The side's place in a table of the two ([`Self::BOTH`]).
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Prefill => 0,
+            Self::Decode => 1,
+        }
+    }
+
+    /// The side's label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+        }
+    }
 }
 
 impl<'a> PairPools<'a> {
@@ -3878,8 +3982,7 @@ impl Engine {
                 if let Some(&own) =
                     profile_index(binding, phase).and_then(|i| profile_needs.get(usize::from(i)))
                 {
-                    let shadow = binding
-                        .single_shadow()
+                    let shadow = shadow_index(binding, phase)
                         .and_then(|i| profile_needs.get(usize::from(i)))
                         .copied()
                         .unwrap_or_default();
@@ -3906,7 +4009,14 @@ impl Engine {
                 if let Some(&own) = profile_index(binding, Phase::Decode)
                     .and_then(|i| profile_needs.get(usize::from(i)))
                 {
-                    phase_needs[decode_slot] = phase_needs[decode_slot].or(own);
+                    // The decode side's shadow reads what its profile
+                    // needs, beside the live one.
+                    let shadow = binding
+                        .decode_shadow
+                        .and_then(|i| profile_needs.get(usize::from(i)))
+                        .copied()
+                        .unwrap_or_default();
+                    phase_needs[decode_slot] = phase_needs[decode_slot].or(own).or(shadow);
                 }
             }
             if binding.model == "*" {
@@ -3944,6 +4054,8 @@ impl Engine {
             .any(|binding| binding.shadow.is_some() || binding.decode_shadow.is_some());
         let mut shadow_placing = Vec::new();
         let mut shadow_rows = Vec::new();
+        let mut shadow_sides = Vec::new();
+        let mut side_apart = Vec::new();
         let mut live = Vec::new();
         if shadows {
             shadow_placing.reserve_exact(bindings.len());
@@ -3958,8 +4070,25 @@ impl Engine {
                 }
             }
             // A binding's word is of the whole list: whether a live
-            // profile reads the record beside it.
+            // profile reads the record beside it. A pair's binding has
+            // the word of its sides.
+            let sides = bindings.iter();
+            shadow_sides = sides
+                .map(|binding| side_shadows(binding, &live, &marks))
+                .collect();
+            let apart = |(binding, sides): (&Binding, &[Option<u16>; 2])| {
+                PairSide::BOTH.map(|side| {
+                    sides[side.index()].is_some_and(|shadow| {
+                        let (by, needs) = (&named_by[..], &profile_needs[..]);
+                        side_reads_another_column(binding, side, shadow, by, needs)
+                    })
+                })
+            };
+            side_apart = bindings.iter().zip(&shadow_sides).map(apart).collect();
             let rows = bindings.iter().enumerate().map(|(at, binding)| {
+                if shadow_sides[at] != [None; 2] {
+                    return ShadowRows::Sides;
+                }
                 let beside = || live_reader_beside(&bindings, at, &named_by);
                 ShadowRows::of(binding, &named_by, &profile_needs, beside)
             });
@@ -4002,6 +4131,8 @@ impl Engine {
             bindings,
             shadow_placing: shadow_placing.into_boxed_slice(),
             shadow_rows: shadow_rows.into_boxed_slice(),
+            shadow_sides: shadow_sides.into_boxed_slice(),
+            side_apart: side_apart.into_boxed_slice(),
             generation,
             needs,
             phase_needs,
@@ -4142,7 +4273,7 @@ impl Engine {
             .map(|(entry, index, _)| {
                 (
                     self.profile_needs[usize::from(index)]
-                        .or(self.shadow_needs(&entry.binding))
+                        .or(self.shadow_needs(&entry.binding, phase))
                         .or(session_needs(&entry.binding)),
                     self.marks[usize::from(index)],
                 )
@@ -4220,11 +4351,14 @@ impl Engine {
     /// The needs of the decode profile of `model`'s pair binding
     /// ([`Self::pair_binding`]), nothing where the model has none.
     fn pair_decode_needs(&self, model: &str) -> Needs {
-        self.pair_binding(model)
-            .and_then(|b| profile_index(b, Phase::Decode))
+        let Some(binding) = self.pair_binding(model) else {
+            return Needs::default();
+        };
+        profile_index(binding, Phase::Decode)
             .and_then(|i| self.profile_needs.get(usize::from(i)))
             .copied()
             .unwrap_or_default()
+            .or(self.shadow_needs(binding, Phase::Decode))
     }
 
     /// The needs of the encode profile of `model`'s pair binding
@@ -4296,13 +4430,15 @@ impl Engine {
                 let mut needs = Needs::default();
                 if let Some(own) = own(phase).filter(|_| covers(phase)) {
                     needs = own
-                        .or(self.shadow_needs(binding))
+                        .or(self.shadow_needs(binding, phase))
                         .or(session_needs(binding));
                 }
                 // The decode side of every pair this binding's prefill
-                // lookup starts.
+                // lookup starts, with that side's shadow.
                 if phase == Phase::Decode && pairs && covers(Phase::Prefill) {
-                    needs = needs.or(own(phase).unwrap_or_default());
+                    needs = needs
+                        .or(own(phase).unwrap_or_default())
+                        .or(self.shadow_needs(binding, phase));
                 }
                 if needs == Needs::default() {
                     continue;
@@ -4319,9 +4455,10 @@ impl Engine {
         rows
     }
 
-    fn shadow_needs(&self, binding: &Binding) -> Needs {
-        binding
-            .single_shadow()
+    /// The needs of the shadow profile `binding` names for `phase`
+    /// ([`shadow_index`]), nothing where it names none.
+    fn shadow_needs(&self, binding: &Binding, phase: Phase) -> Needs {
+        shadow_index(binding, phase)
             .and_then(|index| self.profile_needs.get(usize::from(index)))
             .copied()
             .unwrap_or_default()
@@ -4385,20 +4522,24 @@ impl Engine {
     }
 
     /// The binding a request of `phase` for `model` resolves to, where
-    /// its shadow is asked ([`Self::shadow`]): its position in this
-    /// generation, and how that shadow reads the rows a host handed the
-    /// live decision ([`ShadowRows`]). `None` where the binding names no
-    /// shadow: one lookup says so, and a host orders such a request as it
-    /// does under a generation that shadows nowhere.
+    /// its shadow is asked ([`Self::shadow`], and [`Self::shadow_side`]
+    /// for a pair's): its position in this generation, and how that
+    /// shadow reads the rows a host handed the live decision
+    /// ([`ShadowRows`]). `None` where the binding names no shadow: one
+    /// lookup says so, and a host orders such a request as it does under
+    /// a generation that shadows nowhere.
     pub(crate) fn shadow_for(&self, model: &str, phase: Phase) -> Option<(u32, ShadowRows)> {
         let at = self
             .bindings
             .iter()
             .position(|entry| entry.binding.matches(model, phase))?;
-        // The placing stands where the build found the shadow profile
-        // free to run beside the live one.
-        self.shadow_placing.get(at).copied().flatten()?;
         let rows = *self.shadow_rows.get(at)?;
+        // A single's placing stands where the build found the shadow
+        // profile free to run beside the live one. A pair's word says
+        // the same of a side of it.
+        if rows != ShadowRows::Sides {
+            self.shadow_placing.get(at).copied().flatten()?;
+        }
         Some((u32::try_from(at).ok()?, rows))
     }
 
@@ -5896,6 +6037,97 @@ impl Engine {
             Some(last) => Decision::Shed(last),
             None => shed(ShedReason::NoEndpoints, "partners", prefill_pick.trace),
         }
+    }
+
+    /// Whether the pair binding at `at` names a shadow for `side` that
+    /// the build found free to run beside the live profile
+    /// ([`side_shadows`]).
+    pub(crate) fn shadows_side(&self, at: u32, side: PairSide) -> bool {
+        let sides = self.shadow_sides.get(at as usize);
+        sides.is_some_and(|sides| sides[side.index()].is_some())
+    }
+
+    /// Whether the shadow the pair binding at `at` names for `side` is
+    /// not asked: its profile would be handed another column than the
+    /// live side's pool carries ([`side_reads_another_column`]). A host
+    /// says such a side's shadow as skipped.
+    pub(crate) fn side_apart(&self, at: u32, side: PairSide) -> bool {
+        let sides = self.side_apart.get(at as usize);
+        sides.is_some_and(|sides| sides[side.index()])
+    }
+
+    /// One side of a pair's decision, made once more with that side's
+    /// shadow profile over the rows its live side decided over. The
+    /// prefill's shadow reads the prefills the live prefill was shown,
+    /// those with a partner: their classes stand in `scratch` as the
+    /// pair's decision left them, so a caller hands the scratch that
+    /// decision wrote. The decode's shadow reads the partners of the
+    /// live pair's prefill, never of a prefill of its own. `at` is
+    /// the pair binding's position ([`Self::shadow_for`]) and `live` the
+    /// pair's pick, made over the same `pools`. The run writes the
+    /// scratch and the shadow profile's stages, and nothing a commit
+    /// reads.
+    ///
+    /// `None` where the binding names no shadow for the side, where the
+    /// build did not find that profile free to run beside the live one
+    /// ([`side_shadows`]), and where it would be handed another column
+    /// than the live side's pool carries ([`Self::side_apart`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pair's entry and its inputs, beside the side and the live pick"
+    )]
+    pub(crate) fn shadow_side(
+        &self,
+        at: u32,
+        side: PairSide,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        pools: PairPools<'_>,
+        cx: &Constraints<'_>,
+        decode_cx: &Constraints<'_>,
+        live: &Pick,
+        scratch: &mut Scratch,
+    ) -> Option<Decision> {
+        let index = self.shadow_sides.get(at as usize)?[side.index()]?;
+        if self.side_apart(at, side) {
+            return None;
+        }
+        let profile = self.profiles.get(usize::from(index))?;
+        let (prefills, prefill_facts) = pools.side(PairSide::Prefill, facts)?;
+        let (decodes, decode_facts) = pools.side(PairSide::Decode, facts)?;
+        Some(match side {
+            PairSide::Prefill => {
+                // The prefills the live prefill profile was shown: the
+                // classes with a partner stand in the scratch as the
+                // pair's decision left them ([`Self::decide_pair`]). No
+                // stage of a live profile is asked again. Its decision's
+                // scope closed with it, and a stage asked behind it
+                // answers by its fallback.
+                run_profile(
+                    profile,
+                    index,
+                    &prefill_facts,
+                    pool,
+                    Set::side(prefills, None, Some(&scratch.classes)),
+                    cx,
+                    &mut scratch.single,
+                )
+            }
+            PairSide::Decode => {
+                // The partners of the live pair's prefill.
+                let prefill = live.targets.first()?;
+                let class = prefills.get(prefill.position as usize)?.pair_class;
+                run_profile(
+                    profile,
+                    index,
+                    &decode_facts,
+                    pool,
+                    Set::side(decodes, Some(pools.table.of(&class)), None),
+                    decode_cx,
+                    &mut scratch.decode,
+                )
+            }
+        })
     }
 
     /// Decides the decode side for a held prefill. The model's pair binding
@@ -7941,11 +8173,33 @@ mod tests {
     /// such a shadow is named rows of its own. So is one whose filters
     /// are asked by a call each: no two such tests are known to be one.
     /// Under no sample no cap fills, and the shadow reads its live
-    /// decision's rows whatever its filters.
+    /// decision's rows whatever its filters. Two profiles whose filters
+    /// are asked of no row share one naming whatever their filters: no
+    /// test reads past either's cap. One such profile beside one whose
+    /// filters are asked does not.
     #[test]
     fn a_shadow_of_other_filters_is_named_rows_of_its_own_under_a_sample() {
-        use crate::spec::{BestParams, PickStage, ProfileSpec, ShadowSpec};
+        use crate::{
+            catalog::Catalog,
+            spec::{BestParams, PickStage, ProfileSpec, ShadowSpec},
+        };
+        /// A filter that is shown the whole view: the default word. The
+        /// engine asks its profile's filters of no row ahead of a naming.
+        #[derive(Debug)]
+        struct Whole;
+        impl Filter for Whole {
+            fn name(&self) -> &'static str {
+                "whole"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+        }
         type Turn<'a> = &'a dyn Fn(&mut ProfileSpec);
+        let mut catalog = Catalog::builtin();
+        let added = catalog.filter("whole", || Box::new(Whole));
+        added.expect("a free name");
         let rows = |sample: u32, both: Turn<'_>, shadow: Turn<'_>| {
             let mut document = PolicySpec::preset("cache_aware").expect("a preset");
             let live = document.profiles.values_mut().next();
@@ -7959,10 +8213,16 @@ mod tests {
             shadow(&mut second);
             document.profiles.insert("second".into(), second);
             document.bindings[0].shadow = Some(ShadowSpec::Profile("second".into()));
-            let engine = document.validate().expect("a binding with a shadow");
+            let engine = document.validate_in(&catalog, &[]);
+            let engine = engine.expect("a binding with a shadow");
             engine.shadow_for("m", Phase::Single).map(|(_, rows)| rows)
         };
         let as_it_is = |_: &mut ProfileSpec| {};
+        let whole = |profile: &mut ProfileSpec| profile.filter.push("whole".into());
+        // The preset's first filter refuses the rows that are not ready.
+        let first_gone = |profile: &mut ProfileSpec| {
+            profile.filter.remove(0);
+        };
         // The preset's last filter refuses the rows a request tried.
         let fewer = |profile: &mut ProfileSpec| {
             profile.filter.pop();
@@ -7975,12 +8235,18 @@ mod tests {
                 .filter
                 .push(serde_json::from_str(rule).expect("a rule"));
         };
-        let cases: [(u32, Turn<'_>, Turn<'_>, ShadowRows); 5] = [
+        let cases: [(u32, Turn<'_>, Turn<'_>, ShadowRows); 7] = [
             (16, &as_it_is, &as_it_is, ShadowRows::Same),
             (16, &as_it_is, &fewer, ShadowRows::Own),
             (16, &as_it_is, &ruled, ShadowRows::Own),
             (16, &ruled, &as_it_is, ShadowRows::Own),
             (0, &as_it_is, &fewer, ShadowRows::Same),
+            // Neither profile's filters are asked of a row: both namings
+            // stand as made, whatever the filters.
+            (16, &whole, &first_gone, ShadowRows::Same),
+            // The live profile's are not, and its shadow's are: the
+            // shadow drops the filter that is shown the whole view.
+            (16, &whole, &fewer, ShadowRows::Own),
         ];
         for (at, (sample, both, shadow, wanted)) in cases.into_iter().enumerate() {
             assert_eq!(rows(sample, both, shadow), Some(wanted), "pairing {at}");
@@ -11701,6 +11967,290 @@ mod tests {
                 out.push(target_of(&candidates[row as usize]));
             }
         }
+    }
+
+    /// Hands the last survivor alone.
+    #[derive(Debug)]
+    struct LastKept;
+
+    impl Lifecycle for LastKept {}
+
+    impl Picker for LastKept {
+        fn name(&self) -> &'static str {
+            "last-kept"
+        }
+
+        fn pick(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            _: &[f32],
+            _: TieBand,
+            out: &mut Targets,
+        ) {
+            if let Some(&row) = kept.last() {
+                out.push(target_of(&candidates[row as usize]));
+            }
+        }
+    }
+
+    /// A pair's side is decided once more by its shadow profile, over the
+    /// rows its live side decided over. The prefill's shadow reads the
+    /// prefills that have a partner. The decode's shadow reads the
+    /// partners of the live pair's prefill: a decode that pairs with
+    /// another prefill alone is never its pick. A side the binding names
+    /// no shadow for is not asked, and a pair that names none has no
+    /// word for the door.
+    #[test]
+    fn a_pairs_side_is_decided_once_more_over_the_rows_its_live_side_saw() {
+        let profile = |name: &str, picker: Box<dyn Picker>| Profile {
+            name: name.into(),
+            filters: Vec::new(),
+            scorers: Vec::new(),
+            picker,
+        };
+        let engine = |shadow: Option<u16>, decode_shadow: Option<u16>| {
+            let binding = Binding {
+                shadow,
+                decode_shadow,
+                ..pair_binding()
+            };
+            let profiles = vec![
+                profile("live", Box::new(FirstKept)),
+                profile("prefill-next", Box::new(LastKept)),
+                profile("decode-next", Box::new(LastKept)),
+            ];
+            Engine::new(profiles, vec![binding], 1, Needs::default())
+        };
+        // The first prefill pairs with the first two decodes, the second
+        // with the third alone, and the last with none.
+        let of_class = |position, pair_class| Candidate {
+            pair_class,
+            ..candidate(position, 0)
+        };
+        let prefills = [of_class(0, 1), of_class(1, 2), of_class(2, 3)];
+        let decodes = [of_class(0, 1), of_class(1, 1), of_class(2, 2)];
+        let facts = RequestFacts {
+            model: "m",
+            ..RequestFacts::default()
+        };
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes: &decodes,
+            ..PairPools::default()
+        };
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let both = engine(Some(1), Some(2));
+        let live = both.decide_pair(&facts, &pool, pools, &cx, &cx, &mut scratch);
+        let pick = live.pick().expect("a pair");
+        let first = pick.targets.first().expect("the pair's first target");
+        let decode = first.pair.map(|pair| pair.decode_position);
+        assert_eq!((first.position, decode), (0, Some(0)));
+        let word = both.shadow_for("m", Phase::Prefill);
+        assert_eq!(word, Some((0, ShadowRows::Sides)));
+        let mut side = |engine: &Engine, side| {
+            let shadow =
+                engine.shadow_side(0, side, &facts, &pool, pools, &cx, &cx, pick, &mut scratch);
+            shadow.map(|shadow| lead(&shadow))
+        };
+        // The last prefill with a partner: never the one with none.
+        assert_eq!(side(&both, PairSide::Prefill), Some(Some(1)));
+        // The last partner of the live prefill: never the third decode.
+        assert_eq!(side(&both, PairSide::Decode), Some(Some(1)));
+        let decode_alone = engine(None, Some(2));
+        assert_eq!(side(&decode_alone, PairSide::Prefill), None);
+        assert_eq!(side(&decode_alone, PairSide::Decode), Some(Some(1)));
+        assert!(decode_alone.shadows_side(0, PairSide::Decode));
+        assert!(!decode_alone.shadows_side(0, PairSide::Prefill));
+        assert_eq!(engine(None, None).shadow_for("m", Phase::Prefill), None);
+    }
+
+    /// The prefill's shadow asks no stage of a live profile again. The
+    /// live decision's scope closes with it, and a stage asked behind it
+    /// answers by its fallback. The live decode profile's filter here
+    /// keeps a row only while its decision stands open: asked again, it
+    /// would refuse every partner, and the shadow would be shown no
+    /// prefill. The classes the live prefill was shown stand in the
+    /// scratch, and the shadow reads them.
+    #[test]
+    fn a_pair_sides_shadow_asks_no_stage_of_a_live_profile_again() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Keeps every row while its decision stands open, and none
+        /// behind it.
+        #[derive(Debug)]
+        struct WhileOpen(Arc<AtomicBool>);
+
+        impl Filter for WhileOpen {
+            fn name(&self) -> &'static str {
+                "while-open"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                self.0.load(Ordering::Relaxed)
+            }
+        }
+
+        let open = Arc::new(AtomicBool::new(true));
+        let live = Profile {
+            name: "live".into(),
+            filters: vec![Box::new(WhileOpen(Arc::clone(&open)))],
+            scorers: Vec::new(),
+            picker: Box::new(FirstKept),
+        };
+        let next = |name: &str| Profile {
+            name: name.into(),
+            filters: Vec::new(),
+            scorers: Vec::new(),
+            picker: Box::new(LastKept),
+        };
+        let binding = Binding {
+            shadow: Some(1),
+            decode_shadow: Some(2),
+            ..pair_binding()
+        };
+        let profiles = vec![live, next("prefill-next"), next("decode-next")];
+        let engine = Engine::new(profiles, vec![binding], 1, Needs::default());
+        // The first prefill pairs with the first two decodes, and the
+        // second with the third alone.
+        let of_class = |position, pair_class| Candidate {
+            pair_class,
+            ..candidate(position, 0)
+        };
+        let prefills = [of_class(0, 1), of_class(1, 2)];
+        let decodes = [of_class(0, 1), of_class(1, 1), of_class(2, 2)];
+        let facts = RequestFacts {
+            model: "m",
+            ..RequestFacts::default()
+        };
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes: &decodes,
+            ..PairPools::default()
+        };
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let decided = engine.decide_pair(&facts, &pool, pools, &cx, &cx, &mut scratch);
+        let pick = decided.pick().expect("a pair");
+        // The live decision is over: its stages answer as behind a
+        // closed scope.
+        open.store(false, Ordering::Relaxed);
+        let mut side = |side| {
+            let shadow =
+                engine.shadow_side(0, side, &facts, &pool, pools, &cx, &cx, pick, &mut scratch);
+            shadow.map(|shadow| lead(&shadow))
+        };
+        assert_eq!(side(PairSide::Prefill), Some(Some(1)));
+        assert_eq!(side(PairSide::Decode), Some(Some(1)));
+    }
+
+    /// The `cache_aware` preset's profile with its prefix stage alone
+    /// ahead of the load, reading cached blocks from the index: a profile
+    /// that reads the column by no warm-up ruling and no record.
+    fn by_index() -> crate::spec::ProfileSpec {
+        use crate::spec::{AffinitySource, PrefixAffinityParams, ScoreStage};
+        let aware = PolicySpec::preset("cache_aware").expect("a preset");
+        let profile = aware.profiles.into_values().next();
+        let mut profile = profile.expect("the preset's profile");
+        let prefix = PrefixAffinityParams {
+            weight: 4.0,
+            source: Some(AffinitySource::Index),
+            ..PrefixAffinityParams::default()
+        };
+        profile.score = vec![
+            ScoreStage::PrefixAffinity(prefix).into(),
+            "least-load".into(),
+        ];
+        profile
+    }
+
+    /// The stock pair's document under `decode` as its decode preset,
+    /// with `shadow` as the decode side's shadow profile.
+    fn decode_shadowed_document(decode: &str, shadow: crate::spec::ProfileSpec) -> PolicySpec {
+        use crate::spec::ShadowSpec;
+        let document = PolicySpec::pair_presets("least_load", decode);
+        let mut document = document.expect("the stock presets");
+        document.profiles.insert("decode-next".into(), shadow);
+        let sides = [("decode".to_owned(), "decode-next".to_owned())];
+        document.bindings[0].shadow = Some(ShadowSpec::Sides(sides.into()));
+        document
+    }
+
+    /// The engine of that document.
+    fn decode_shadowed(decode: &str, shadow: crate::spec::ProfileSpec) -> Engine {
+        let document = decode_shadowed_document(decode, shadow);
+        document.validate().expect("a pair with a decode shadow")
+    }
+
+    /// A side's shadow reads what its profile needs: its needs join the
+    /// side's, so the column it reads is filled for the pair's pool. The
+    /// other side's needs stay its own. Under a binding of the decode
+    /// phase listed ahead of the pair's, the decode pool still carries
+    /// what the pair's decode shadow reads.
+    #[test]
+    fn a_pair_sides_shadow_joins_its_needs_to_the_sides() {
+        use crate::spec::{BindingSpec, Match};
+        let alone = PolicySpec::pair_presets("least_load", "least_load");
+        let alone = alone.expect("the stock presets").validate();
+        let alone = alone.expect("the pair document");
+        assert!(!alone.reads_for("m", Phase::Decode).0.affinity);
+        let engine = decode_shadowed("least_load", by_index());
+        assert!(
+            !engine.side_apart(0, PairSide::Decode),
+            "the shadow is asked"
+        );
+        assert!(engine.reads_for("m", Phase::Decode).0.affinity);
+        assert!(engine.needs_for_phase(Phase::Decode).affinity);
+        assert!(!engine.reads_for("m", Phase::Prefill).0.affinity);
+        // A decode asked alone resolves to the binding ahead, which reads
+        // no column: the pair's decode side brings its shadow's needs.
+        let mut ahead = decode_shadowed_document("least_load", by_index());
+        let lone = ahead.profiles.get("decode").cloned();
+        let lone = lone.expect("the decode side's profile");
+        ahead.profiles.insert("lone".into(), lone);
+        let first = BindingSpec {
+            matcher: Match {
+                phase: vec![Phase::Decode],
+                ..Match::default()
+            },
+            profile: Some("lone".into()),
+            ..BindingSpec::default()
+        };
+        ahead.bindings.insert(0, first);
+        let ahead = ahead.validate().expect("a decode binding ahead");
+        assert!(ahead.reads_for("m", Phase::Decode).0.affinity);
+    }
+
+    /// A pair names no rows: a side reads the column its pool carries,
+    /// by the live profile's ruling and record. A side's shadow of
+    /// another ruling or another record is named and not asked. One that
+    /// reads the column as the pool carries it is asked, and so is one
+    /// that reads no column.
+    #[test]
+    fn a_pair_sides_shadow_of_another_column_is_not_asked() {
+        let preset = |name: &str| {
+            let preset = PolicySpec::preset(name).expect("a preset");
+            let profile = preset.profiles.into_values().next();
+            profile.expect("the preset's profile")
+        };
+        let apart = |decode: &str, shadow: crate::spec::ProfileSpec| {
+            let engine = decode_shadowed(decode, shadow);
+            assert!(engine.shadows_side(0, PairSide::Decode), "named");
+            assert!(!engine.side_apart(0, PairSide::Prefill), "not named");
+            engine.side_apart(0, PairSide::Decode)
+        };
+        // Behind a side that reads no cached blocks: its pool has no
+        // ruling and keeps no record.
+        assert!(apart("least_load", preset("cache_aware")));
+        assert!(!apart("least_load", by_index()));
+        assert!(!apart("least_load", preset("least_load")));
+        // Behind the preset that rules its warming rows and reads the
+        // record.
+        assert!(!apart("cache_aware", preset("cache_aware")));
+        assert!(apart("cache_aware", by_index()));
+        assert!(!apart("cache_aware", preset("least_load")));
     }
 
     #[test]

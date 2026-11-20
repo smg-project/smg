@@ -29,6 +29,11 @@ pub struct DecisionRecord {
     pub shadow: Option<ShadowKind>,
     /// The first target of the shadow's pick.
     pub shadow_target: Option<WorkerId>,
+    /// What the decode side's shadow said beside a pair's decode, where
+    /// one was due. A pair's prefill side reads in `shadow`.
+    pub decode_shadow: Option<ShadowKind>,
+    /// The first target of the decode side's shadow.
+    pub decode_shadow_target: Option<WorkerId>,
     gateway: GatewayId,
     request: u64,
 }
@@ -158,6 +163,7 @@ impl Samples {
         taken: &Taken<'_, A>,
         decision: &Decision,
         shadow: Option<Shadowed>,
+        sides: [Option<Shadowed>; 2],
     ) {
         debug_assert!(
             matches!(decision, Decision::Pick(_) | Decision::Shed(_)),
@@ -175,12 +181,16 @@ impl Samples {
         if self.records.len() == SLOTS {
             self.records.pop_front();
         }
+        // A single's shadow, or a pair's by its two sides.
+        let [prefill, decode] = sides;
         self.records.push_back(DecisionRecord {
             decision: *decision,
             binding: engine.binding_position(taken.request.model(), taken.request.phase()),
             at: taken.now,
-            shadow: shadow.map(|said| said.kind),
-            shadow_target: shadow.and_then(|said| said.first),
+            shadow: shadow.or(prefill).map(|said| said.kind),
+            shadow_target: shadow.or(prefill).and_then(|said| said.first),
+            decode_shadow: decode.map(|said| said.kind),
+            decode_shadow_target: decode.and_then(|said| said.first),
             gateway: taken.gateway,
             request: fingerprint(taken.request.id()),
         });
@@ -277,6 +287,8 @@ mod tests {
             at: Instant::now(),
             shadow: None,
             shadow_target: None,
+            decode_shadow: None,
+            decode_shadow_target: None,
             gateway: GATEWAY,
             request: fingerprint(b"shed"),
         }
