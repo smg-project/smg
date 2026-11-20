@@ -96,6 +96,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("SignalSink", "signal_columns", Fate::Read),
     ("SignalSink", "signal_value", Fate::Rebuilt(REPORTED)),
     ("KvEventSink", "admit", Fate::Rebuilt(SUBSCRIPTION)),
+    ("KvEventSink", "admit_through", Fate::Rebuilt(SUBSCRIPTION)),
     ("KvEventSink", "reconnected", Fate::Rebuilt(SUBSCRIPTION)),
     ("KvEventSink", "resync", Fate::Rebuilt(SUBSCRIPTION)),
     ("KvEventSink", "cursor", Fate::Read),

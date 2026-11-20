@@ -26,7 +26,7 @@ use crate::{
     spec::AppliedSpec,
     store::{
         health::{HealthSink, HealthWrite, LeaderBits, VetoWrite},
-        index::{indexed_under, KvEvent, KvTables, LaneCounts},
+        index::{indexed_under, KvEvent, KvTables, LaneCounts, LaneWriter},
         journal::{Journal, Kinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{
@@ -1613,8 +1613,9 @@ impl MemoryStore {
         self.kv.indexed_blocks(id, rank)
     }
 
-    /// What the lane of `id` at `rank` counted beside its blocks; `None`
-    /// for a row the store does not index.
+    /// What the lane of `id` at `rank` counted beside its blocks, over its
+    /// typed batches; `None` for a row the store does not index. A batch
+    /// lent to a body moves none of them.
     pub fn lane_counts(&self, id: WorkerId, rank: u16) -> Option<LaneCounts> {
         self.kv.counts(id, rank)
     }
@@ -3267,6 +3268,16 @@ impl KvEventSink for MemoryStore {
         batch: &Self::Batch,
     ) -> BatchOutcome {
         self.kv.admit(id, rank, facts, batch)
+    }
+
+    fn admit_through(
+        &self,
+        id: WorkerId,
+        rank: u16,
+        facts: BatchFacts,
+        body: &mut dyn FnMut(&mut LaneWriter<'_>),
+    ) -> BatchOutcome {
+        self.kv.admit_through(id, rank, facts, body)
     }
 
     fn reconnected(&self, id: WorkerId) {

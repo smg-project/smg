@@ -87,7 +87,8 @@ mod tests;
 pub use encoding::{EncodeClasses, EncodeHandoff, EncodeOffer};
 pub use health::{HealthSink, HealthWrite, LeaderBits, VetoWrite};
 pub use index::{
-    ContentHash, KvEvent, LaneCounts, Named, SequenceHash, StoredBlock, INDEX_WORKERS,
+    ApplyError, ChainBlockMap, ContentHash, KvEvent, LaneCounts, LaneWriter, Named, SequenceHash,
+    StoredBlock, WorkerGroups, INDEX_WORKERS,
 };
 pub use journal::{Journal, Kinds, Position};
 pub use kv_events::{

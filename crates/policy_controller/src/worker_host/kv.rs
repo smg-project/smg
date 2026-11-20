@@ -1,17 +1,26 @@
-//! The worker's KV port over the store's index. The adapter decodes one
-//! batch at a time into the store's events. It reads the groups a batch
-//! shows first and decodes stores of groups other than main attention last.
+//! The worker's KV port over the store's index. The store's cursor reads a
+//! batch's header, and an admitted batch is applied inside the row's lane
+//! by the worker crate's apply rules, the ones every index of cache events
+//! is written by.
 //!
 //! # What the adapter keeps
 //!
-//! A worker names a cache group's kind on the group's stores and leaves it
-//! off the group's other events. Which events are the index's is therefore
-//! decided with what the row's stream showed before: whether a main
-//! attention group was shown, which groups were shown as another kind, and
-//! which groups are the main signal of a worker that has shown no main
-//! group. The adapter keeps those three a row until the worker leaves.
+//! The rules keep state a row beside the index: the copies of a block on
+//! each tier, so a removal takes a block out with its last copy; the block
+//! of record, so a store narrower than it is left out; the row's view of
+//! its cache groups other than main attention; and what the row's stream
+//! showed of its groups. The adapter keeps that state a row until the
+//! worker leaves. The row's reverse map is the lane's: the state holds it
+//! for a batch alone, and nothing between batches.
 //!
-//! A row opened without group facts loses any cached blocks and cursor
+//! The store empties a rank in its own turn: a resync, a restart or a gap
+//! its cursor reads, the worker reported gone. The lane says a value that
+//! moves with each emptying, and a batch that reads another value than the
+//! row's last one resets the row's state first. The table's lock is let go
+//! before a row's state is locked, and a row's state is locked inside its
+//! lane's turn alone.
+//!
+//! A row opened without that state loses any cached blocks and cursor
 //! before its feed starts.
 //!
 //! # The ranks of an engine
@@ -50,9 +59,9 @@
 //!
 //! # The block size
 //!
-//! A batch the store takes names the model's block size: the widest block
-//! of the stores the index takes from it. A store the index passes over
-//! says nothing of the block. The engine's word only rises: an engine also
+//! A batch the store takes that carries a store names the model's block
+//! size: the row's block of record, the widest block its stores carried
+//! since its last clear. The engine's word only rises: an engine also
 //! publishes prefix entries narrower than its block, and a request hashed
 //! at their width would match no whole block. The size of record is put to
 //! the engine's word wherever the two differ. So the first stored block
@@ -63,11 +72,8 @@
 //!
 //! # Limits
 //!
-//! - A block with copies on both indexed tiers leaves the index at its first
-//!   qualifying removal.
-//! - A store narrower than the worker's block size of record is indexed.
-//! - The events of a cache group other than main attention feed no view of
-//!   the group: they are passed over, unless the group is the main signal.
+//! - A store on an indexed tier raises the row's block of record whether or
+//!   not the index takes its blocks.
 //! - A batch of a rank whose row the holder has not laid is passed over.
 //!   That row's index begins with the blocks stored once it is laid.
 //! - An adapter made with no holder writes every batch to its stream's row.
@@ -79,22 +85,19 @@
 
 use std::{
     collections::HashMap,
+    mem,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
 
-use kv_index::salt::namespace_seed;
 use parking_lot::Mutex;
 use smg_worker::{
     common_proto::{kv_cache_event::Data, KvEventBatch},
     identity::basic::Worker,
     kv_events::{
-        apply::{
-            convert_kv_block, indexed_tier, store_width, stored_tier, tokenful, Admission,
-            GroupsShown,
-        },
+        apply::{apply_events, BlockIndex, HeldBlocks, WorkerIndexState},
         port::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         KvEventFeed, KvEventHost,
     },
@@ -103,7 +106,10 @@ use smg_worker::{
 
 use super::Objects;
 use crate::{
-    store::{self, KvEvent, SequenceHash},
+    store::{
+        self, ApplyError, ChainBlockMap, KvEvent, LaneWriter, SequenceHash, StoredBlock,
+        WorkerGroups,
+    },
     view::WorkerId,
 };
 
@@ -133,28 +139,32 @@ struct Rows {
 
 impl Rows {
     /// Write `stream` as `row`'s stream, from nothing shown: the row leaves
-    /// the list of the stream that wrote it. `false`, with nothing done,
-    /// where that stream is leaving and still clears the row.
-    fn claim(&mut self, stream: WorkerId, row: WorkerId) -> bool {
+    /// the list of the stream that wrote it. The row's new state comes
+    /// back. `None`, with nothing done, where that stream is leaving and
+    /// still clears the row.
+    fn claim(&mut self, stream: WorkerId, row: WorkerId) -> Option<Arc<Mutex<Applied>>> {
         if self.written.get(&row).is_some_and(|before| before.leaving) {
-            return false;
+            return None;
         }
-        let before = self.written.insert(row, Written::begun(stream));
+        let begun = Written::begun(stream);
+        let applied = Arc::clone(&begun.applied);
+        let before = self.written.insert(row, begun);
         if let Some(list) = before.and_then(|before| self.fed.get_mut(&before.stream)) {
             list.retain(|&other| other != row);
         }
         if row != stream {
             self.fed.entry(stream).or_default().push(row);
         }
-        true
+        Some(applied)
     }
 }
 
 /// What the adapter keeps of a row a stream writes.
-#[derive(Debug, PartialEq)]
 struct Written {
-    /// What the row's batches showed of its cache groups.
-    groups: GroupsShown,
+    /// What the row's batches left under the apply rules, behind its own
+    /// lock: a batch holds it inside the row's lane, with the table's lock
+    /// let go.
+    applied: Arc<Mutex<Applied>>,
     /// The stream that writes the row, named by its own row: the row
     /// itself for a feed's row, its engine's rank 0 row for the row of
     /// another rank.
@@ -168,9 +178,116 @@ impl Written {
     /// What is kept of a row `stream` begins from nothing.
     fn begun(stream: WorkerId) -> Self {
         Self {
-            groups: GroupsShown::default(),
+            applied: Arc::default(),
             stream,
             leaving: false,
+        }
+    }
+}
+
+/// A row's state under the worker crate's apply rules.
+#[derive(Default)]
+struct Applied {
+    /// The rules' own state of the row. Its map is the lane's, here for a
+    /// batch alone ([`Lending`]).
+    state: WorkerIndexState<Lent>,
+    /// The value the row's lane said when the state was last applied
+    /// ([`LaneWriter::emptied`]), and none until the row's first batch. A
+    /// batch that reads another resets the state first: the store emptied
+    /// the rank in between.
+    emptied: Option<u64>,
+}
+
+/// The row's reverse map inside the rules' state. The map is the lane's,
+/// since the store empties a rank by it. So this holds it for a batch
+/// alone and nothing between batches, where no read answers for the row.
+#[derive(Default)]
+struct Lent(Option<ChainBlockMap>);
+
+impl Lent {
+    /// The map, inside a batch. The rules read it there alone: a read at
+    /// rest is the adapter's fault, and a debug build says so.
+    fn lent(&self) -> Option<&ChainBlockMap> {
+        debug_assert!(
+            self.0.is_some(),
+            "the row's map is the lane's between batches"
+        );
+        self.0.as_ref()
+    }
+}
+
+impl HeldBlocks for Lent {
+    fn contains_key(&self, hash: SequenceHash) -> bool {
+        self.lent().is_some_and(|map| map.contains_key(hash))
+    }
+
+    fn len(&self) -> usize {
+        self.lent().map_or(0, ChainBlockMap::len)
+    }
+
+    fn hashes(&self) -> Vec<SequenceHash> {
+        self.lent()
+            .map(|map| map.iter().map(|(hash, _)| hash).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// A lent lane as the apply rules' index. The rules name the row's id in
+/// the index, and the lane writes under that id by itself.
+struct Lane<'a, 'w>(&'a LaneWriter<'w>);
+
+impl BlockIndex for Lane<'_, '_> {
+    type Held = Lent;
+
+    fn apply_stored(
+        &self,
+        _: u32,
+        blocks: &[StoredBlock],
+        parent: Option<SequenceHash>,
+        held: &mut Lent,
+    ) -> Result<(), ApplyError> {
+        match &mut held.0 {
+            Some(map) => self.0.stored(blocks, parent, map),
+            None => Err(ApplyError::WorkerNotTracked),
+        }
+    }
+
+    fn apply_removed(&self, _: u32, hashes: &[SequenceHash], held: &mut Lent) {
+        if let Some(map) = &mut held.0 {
+            self.0.removed(hashes, map);
+        }
+    }
+
+    fn apply_cleared(&self, _: u32, held: &mut Lent) {
+        if let Some(map) = &mut held.0 {
+            self.0.cleared(map);
+        }
+    }
+
+    fn groups(&self, _: u32) -> Arc<WorkerGroups> {
+        self.0.groups()
+    }
+}
+
+/// The lane's map inside a row's state for one batch. Dropped, it puts the
+/// map back, also behind rules that unwound: the store then empties the
+/// rank by a map that names every block the row wrote.
+struct Lending<'a, 'w> {
+    lane: &'a mut LaneWriter<'w>,
+    state: &'a mut WorkerIndexState<Lent>,
+}
+
+impl<'a, 'w> Lending<'a, 'w> {
+    fn new(lane: &'a mut LaneWriter<'w>, state: &'a mut WorkerIndexState<Lent>) -> Self {
+        state.blocks = Lent(Some(mem::take(lane.map())));
+        Self { lane, state }
+    }
+}
+
+impl Drop for Lending<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(map) = self.state.blocks.0.take() {
+            *self.lane.map() = map;
         }
     }
 }
@@ -246,13 +363,15 @@ impl<S> KvAdapter<S>
 where
     S: store::KvEventSink<Batch = [KvEvent]> + ?Sized,
 {
-    /// What `row`'s batches showed so far, for a batch on `id`'s stream.
+    /// The state of `row` for a batch on `id`'s stream, and whether the
+    /// table keeps it: the stream's own row that no entry is kept of gets a
+    /// state the table takes once the store took a batch ([`Self::keep`]).
     /// `None` where the stream writes no row any longer: another stream
     /// took its own row, so it is ending, and it writes no row of any
     /// rank. A row of another rank that the stream writes for the first
     /// time, or that another stream wrote, is taken: `None` where it
     /// cannot be yet.
-    fn shown(&self, id: WorkerId, row: WorkerId) -> Option<GroupsShown> {
+    fn applied(&self, id: WorkerId, row: WorkerId) -> Option<(Arc<Mutex<Applied>>, bool)> {
         let known = {
             let rows = self.rows.lock();
             if rows.written.get(&id).is_some_and(|own| own.stream != id) {
@@ -260,13 +379,13 @@ where
             }
             rows.written
                 .get(&row)
-                .map(|written| (written.stream == id).then(|| written.groups.clone()))
+                .map(|written| (written.stream == id).then(|| Arc::clone(&written.applied)))
         };
         match known {
-            Some(Some(groups)) => Some(groups),
+            Some(Some(applied)) => Some((applied, true)),
             // The stream's own row that no entry is kept of.
-            None if row == id => Some(GroupsShown::default()),
-            _ => self.take(id, row).then(GroupsShown::default),
+            None if row == id => Some((Arc::default(), false)),
+            _ => self.take(id, row).map(|applied| (applied, true)),
         }
     }
 
@@ -274,14 +393,14 @@ where
     /// begins from nothing, as a feed's own row does at its open: what the
     /// store kept of it was decided by facts that are gone, or by another
     /// stream's batches. The stream that wrote it reaches it no longer:
-    /// the row changes lists in one hold of the lock. `false`, with
-    /// nothing done, where the row is not this stream's to take, and the
-    /// batch is passed over. Its stream is leaving and still clears it: a
-    /// later batch takes the row. Or it is an open feed's own row that the
-    /// holder still stands at rank 0: only a route read before the row
-    /// was laid again asks for it.
-    fn take(&self, stream: WorkerId, row: WorkerId) -> bool {
-        {
+    /// the row changes lists in one hold of the lock. The row's new state
+    /// comes back. `None`, with nothing done, where the row is not this
+    /// stream's to take, and the batch is passed over. Its stream is
+    /// leaving and still clears it: a later batch takes the row. Or it is
+    /// an open feed's own row that the holder still stands at rank 0: only
+    /// a route read before the row was laid again asks for it.
+    fn take(&self, stream: WorkerId, row: WorkerId) -> Option<Arc<Mutex<Applied>>> {
+        let applied = {
             let mut rows = self.rows.lock();
             let own_feed = rows
                 .written
@@ -289,15 +408,13 @@ where
                 .is_some_and(|before| before.stream == row);
             // The holder is asked in the hold, and for such a row alone.
             if own_feed && self.stands_lowest(row) {
-                return false;
+                return None;
             }
-            if !rows.claim(stream, row) {
-                return false;
-            }
-        }
+            rows.claim(stream, row)?
+        };
         // Outside the lock, which every row's batch takes.
         self.store.removed(row);
-        true
+        Some(applied)
     }
 
     /// A feed's own row begins. `false`, with nothing done, where `stands`
@@ -323,7 +440,7 @@ where
                 .written
                 .get(&row)
                 .is_some_and(|written| written.stream == row);
-            if own || !rows.claim(row, row) {
+            if own || rows.claim(row, row).is_none() {
                 return true;
             }
         }
@@ -333,28 +450,21 @@ where
         true
     }
 
-    /// Keep what `row`'s batch on `id`'s stream showed of its groups,
-    /// where the stream still writes the row.
-    fn show(&self, id: WorkerId, row: WorkerId, groups: GroupsShown) {
+    /// Keep the state `id`'s own row was applied under, where the table
+    /// kept none of the row as its batch began. An entry made in between is
+    /// left: another stream took the row behind the batch's read.
+    fn keep(&self, id: WorkerId, applied: Arc<Mutex<Applied>>) {
         let mut rows = self.rows.lock();
-        match rows.written.get_mut(&row) {
-            Some(written) if written.stream == id => written.groups = groups,
-            // The stream's own row that no entry is kept of.
-            None if row == id => {
-                let written = Written {
-                    groups,
-                    ..Written::begun(id)
-                };
-                rows.written.insert(row, written);
-            }
-            // Another stream took the row behind the batch's read.
-            _ => {}
-        }
+        rows.written.entry(id).or_insert(Written {
+            applied,
+            stream: id,
+            leaving: false,
+        });
     }
 
-    /// A store the index took from `id`'s stream is `size` tokens wide: what
-    /// it says of the block size of the model the row streams for, by the
-    /// module's rule. A row no feed was opened for names no model.
+    /// A row `id`'s stream writes holds a block of record of `size` tokens:
+    /// what it says of the block size of the model the row streams for, by
+    /// the module's rule. A row no feed was opened for names no model.
     fn learn(&self, id: WorkerId, size: u32) {
         // Held through the store's calls: two rows of one model learn in turn.
         let mut sizes = self.sizes.lock();
@@ -404,46 +514,10 @@ where
         let Some(row) = self.routed(id, rank) else {
             return BatchOutcome::Skipped;
         };
-        // The batch is decoded against a copy of what the row showed. The
-        // copy stands only where the store took the batch: one it skipped
-        // shows nothing.
         // Another stream took this stream's own row: it writes none now.
-        let Some(shown) = self.shown(id, row) else {
+        let Some((applied, kept)) = self.applied(id, row) else {
             return BatchOutcome::Skipped;
         };
-        let mut groups = shown.clone();
-        let (restarted, mut events, width) = events(batch, &mut groups);
-        // The store reads a clear among a batch's events as the header's
-        // fact: the engine's own clear, which makes a batch at or under the
-        // row's cursor a restarted publisher. The header counts an unowned
-        // clear alone. So where the header counts none, a clear reaches the
-        // store only above the cursor.
-        let cleared = |event: &KvEvent| matches!(event, KvEvent::Cleared);
-        if restarted || (!facts.clears && events.iter().any(cleared)) {
-            // One stream writes a row's rank, so the cursor read here is the
-            // one the batch meets. A cursor that reads 0 holds batch 0, or
-            // no batch since a resync, which emptied the rank: a batch 0
-            // read as late there loses a clear that had nothing to empty.
-            let late = facts.snapshot.is_none()
-                && self
-                    .store
-                    .cursor(row, rank)
-                    .is_some_and(|cursor| facts.sequence <= cursor.applied);
-            if !late {
-                if restarted {
-                    // The main signal's blocks go ahead of the batch's own
-                    // events.
-                    events.insert(0, KvEvent::Cleared);
-                }
-            } else if !facts.clears {
-                // The store skips the batch or empties the rank itself, and
-                // what stands ahead of a batch's last clear is gone by it:
-                // the events behind that clear are the batch's.
-                if let Some(last) = events.iter().rposition(cleared) {
-                    events.drain(..=last);
-                }
-            }
-        }
         let facts = store::BatchFacts {
             sequence: facts.sequence,
             clears: facts.clears,
@@ -451,12 +525,42 @@ where
                 unknown_before: chunk.unknown_before,
             }),
         };
-        match self.store.admit(row, rank, facts, &events) {
-            store::BatchOutcome::Applied => {
-                if groups != shown {
-                    self.show(id, row, groups);
+        // A batch that carries a store names the model's block size.
+        let stores = batch
+            .events
+            .iter()
+            .any(|event| matches!(event.data, Some(Data::Stored(_))));
+        let mut record = None;
+        // The cursor reads the header alone. The body runs where it admits
+        // the batch: inside the lane's turn, with the table's lock let go.
+        let outcome = self.store.admit_through(row, rank, facts, &mut |lane| {
+            let mut applied = applied.lock();
+            let Applied { state, emptied } = &mut *applied;
+            if *emptied != Some(lane.emptied()) {
+                // The store emptied the rank since the row's last batch, or
+                // the row begins: what the rules kept beside the map goes
+                // with the blocks.
+                state.index_emptied();
+                // The view is the index's, under the row's id there. A
+                // lane made again holds another: the rules write that one.
+                if state.groups.is_some() {
+                    state.groups = Some(lane.groups());
                 }
-                if let Some(width) = width {
+            }
+            let worker = lane.worker();
+            {
+                let lending = Lending::new(lane, state);
+                apply_events(&batch.events, worker, &Lane(lending.lane), lending.state);
+            }
+            *emptied = Some(lane.emptied());
+            record = state.block_of_record();
+        });
+        match outcome {
+            store::BatchOutcome::Applied => {
+                if !kept {
+                    self.keep(id, applied);
+                }
+                if let Some(width) = record.filter(|_| stores) {
                     self.learn(id, width);
                 }
                 BatchOutcome::Applied
@@ -550,104 +654,6 @@ where
 
     fn set_block_size(&self, model: &str, size: u32) {
         self.store.set_block_size(model, size);
-    }
-}
-
-/// Decode the events the store can index against what the row's stream
-/// showed of its groups, as the gateway's index applies a batch: what the
-/// batch's stores show is read ahead of its events, and the stores of groups
-/// other than main attention come last. `true` with the events when the
-/// batch restarts the worker: the index is to let the main signal's blocks
-/// go ahead of them. Last, the widest block the stores among the events
-/// name: what the batch says of the model's block size.
-fn events(batch: &KvEventBatch, groups: &mut GroupsShown) -> (bool, Vec<KvEvent>, Option<u32>) {
-    let (restarted, _) = groups.show_batch(&batch.events);
-    let mut events = Vec::with_capacity(batch.events.len() + 1);
-    let mut width = None;
-    let mut deferred = Vec::new();
-    for data in batch.events.iter().filter_map(|event| event.data.as_ref()) {
-        if matches!(data, Data::Stored(stored) if groups.is_group_store(stored)) {
-            deferred.push(data);
-            continue;
-        }
-        if let Some(event) = decode(data, groups) {
-            width = width.max(width_of(data));
-            events.push(event);
-        }
-    }
-    for data in deferred {
-        if let Some(event) = decode(data, groups) {
-            width = width.max(width_of(data));
-            events.push(event);
-        }
-    }
-    (restarted.is_some(), events, width)
-}
-
-/// The width a wire store names, and none for any other event.
-fn width_of(data: &Data) -> Option<u32> {
-    match data {
-        Data::Stored(stored) => store_width(stored),
-        Data::Removed(_) | Data::Cleared(_) => None,
-    }
-}
-
-/// One wire event as the store's, `None` for one that is not the index's.
-fn decode(data: &Data, groups: &mut GroupsShown) -> Option<KvEvent> {
-    match data {
-        Data::Stored(stored) => {
-            let tokens = tokenful(stored);
-            let admission = groups.admit(
-                stored.kv_cache_spec_kind.as_deref(),
-                stored.group_idx,
-                tokens,
-                stored.locality,
-                stored.ownership.as_deref(),
-            );
-            // A kind-less store of a group that is the main signal is the
-            // index's, as its tokenful stores are.
-            let indexed = matches!(
-                admission,
-                Admission::Main | Admission::MainSignal | Admission::MainAndGroup(_)
-            );
-            if !(indexed && tokens && stored_tier(stored).is_some()) {
-                return None;
-            }
-            let seed = namespace_seed(stored.lora_name.as_deref(), stored.cache_salt.as_deref());
-            Some(KvEvent::Stored {
-                parent: stored.parent_block_hash.map(SequenceHash::from),
-                blocks: stored
-                    .blocks
-                    .iter()
-                    .map(|block| convert_kv_block(block, seed))
-                    .collect(),
-            })
-        }
-        Data::Removed(removed) => {
-            let admission = groups.admit(
-                None,
-                removed.group_idx,
-                false,
-                removed.locality,
-                removed.ownership.as_deref(),
-            );
-            let indexed = matches!(admission, Admission::Main | Admission::MainAndGroup(_));
-            if !(indexed && indexed_tier(removed.tier, removed.cache_level).is_some()) {
-                return None;
-            }
-            Some(KvEvent::Removed(
-                removed
-                    .block_hashes
-                    .iter()
-                    .copied()
-                    .map(SequenceHash::from)
-                    .collect(),
-            ))
-        }
-        Data::Cleared(cleared) => {
-            let admission = groups.admit(None, None, false, None, cleared.ownership.as_deref());
-            (admission == Admission::Main).then_some(KvEvent::Cleared)
-        }
     }
 }
 
@@ -794,7 +800,7 @@ where
 mod tests {
     use std::time::Instant;
 
-    use kv_index::salt::content_hash_with_seed;
+    use kv_index::salt::{content_hash_with_seed, namespace_seed};
     use smg_worker::{
         common_proto::{
             KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheCleared, KvCacheEvent,
@@ -886,6 +892,15 @@ mod tests {
             sequence,
             ..BatchFacts::default()
         }
+    }
+
+    /// Whether the adapter keeps `row` as its own stream's, begun from
+    /// nothing: no batch was applied under its state.
+    fn begun(sink: &KvAdapter<Store>, row: WorkerId) -> bool {
+        let rows = sink.rows.lock();
+        rows.written.get(&row).is_some_and(|written| {
+            written.stream == row && !written.leaving && written.applied.lock().emptied.is_none()
+        })
     }
 
     /// The header's facts of `batch` at `sequence`, by the collector's rule:
@@ -1578,7 +1593,7 @@ mod tests {
         let f = Fixture::new();
         let empty = batch([Data::Stored(KvBlocksStored::default())]);
         f.applied(1, &empty);
-        assert!(events(&empty, &mut GroupsShown::default()).1.is_empty());
+        assert_eq!(f.blocks(), 0);
     }
 
     #[test]
@@ -1588,13 +1603,163 @@ mod tests {
         event.blocks.push(block(2, &[3, 4]));
         f.applied(1, &batch([Data::Stored(event)]));
         assert_eq!(f.blocks(), 2);
-        let removal = KvBlocksRemoved {
+        // The rules count a block's copies a tier. A removal on the tier
+        // that holds no copy of the blocks takes none out.
+        let from_host = KvBlocksRemoved {
             tier: Some(KvCacheTier::Host as i32),
             cache_level: Some(2),
             ..removed(&[-1, 2])
         };
-        f.applied(2, &batch([Data::Removed(removal)]));
+        f.applied(2, &batch([Data::Removed(from_host)]));
+        assert_eq!(f.blocks(), 2);
+        f.applied(3, &batch([Data::Removed(removed(&[-1, 2]))]));
         assert_eq!(f.blocks(), 0);
+    }
+
+    /// A block stored on the device and on the host is one block of the
+    /// index with two copies. It leaves with its last copy.
+    #[test]
+    fn a_block_leaves_the_index_with_its_last_copy() {
+        let f = Fixture::new();
+        let on_host = KvBlocksStored {
+            tier: Some(KvCacheTier::Host as i32),
+            ..stored(1)
+        };
+        f.applied(1, &batch([Data::Stored(stored(1)), Data::Stored(on_host)]));
+        assert_eq!(f.blocks(), 1);
+        f.applied(2, &batch([Data::Removed(removed(&[1]))]));
+        assert_eq!(f.blocks(), 1, "the host still holds a copy");
+        let from_host = KvBlocksRemoved {
+            tier: Some(KvCacheTier::Host as i32),
+            ..removed(&[1])
+        };
+        f.applied(3, &batch([Data::Removed(from_host)]));
+        assert_eq!(f.blocks(), 0);
+    }
+
+    /// Two copies on one tier need two removals.
+    #[test]
+    fn two_copies_on_a_tier_need_two_removals() {
+        let f = Fixture::new();
+        f.applied(
+            1,
+            &batch([Data::Stored(stored(1)), Data::Stored(stored(1))]),
+        );
+        assert_eq!(f.blocks(), 1);
+        f.applied(2, &batch([Data::Removed(removed(&[1]))]));
+        assert_eq!(f.blocks(), 1, "the other copy is still cached");
+        f.applied(3, &batch([Data::Removed(removed(&[1]))]));
+        assert_eq!(f.blocks(), 0);
+    }
+
+    /// The store empties a rank in its own turn, here at a resync. The
+    /// row's next batch reads another value of its lane and forgets the
+    /// copies it counted: a block stored once behind the resync leaves at
+    /// its one removal.
+    #[test]
+    fn a_rank_the_store_emptied_forgets_the_copies_it_counted() {
+        let f = Fixture::new();
+        f.applied(
+            1,
+            &batch([Data::Stored(stored(1)), Data::Stored(stored(1))]),
+        );
+        f.store
+            .resync(f.row, Some(RANK), store::ResyncReason::DataLoss);
+        assert_eq!(f.blocks(), 0);
+        f.applied(5, &batch([Data::Stored(stored(1))]));
+        assert_eq!(f.blocks(), 1);
+        f.applied(6, &batch([Data::Removed(removed(&[1]))]));
+        assert_eq!(f.blocks(), 0, "one copy stood behind the resync");
+    }
+
+    /// A store narrower than the row's block of record is left out: an
+    /// engine's prefix entry at its hash granularity, which no request
+    /// chunked at the block matches.
+    #[test]
+    fn a_store_narrower_than_the_block_of_record_is_left_out() {
+        let f = Fixture::new();
+        f.applied(1, &wide(1, 32));
+        assert_eq!(f.blocks(), 1);
+        f.applied(2, &wide(77, 4));
+        assert_eq!(f.blocks(), 1);
+        // A wider store raises the record, and what was indexed stays.
+        f.applied(3, &wide(2, 64));
+        assert_eq!(f.blocks(), 2);
+        f.applied(4, &wide(3, 32));
+        assert_eq!(f.blocks(), 2);
+    }
+
+    /// The store empties a rank in its own turn, and the row's next batch
+    /// forgets its block of record: an engine that comes back with a
+    /// narrower block has its stores indexed as they come.
+    #[test]
+    fn a_rank_the_store_emptied_forgets_its_block_of_record() {
+        let f = Fixture::new();
+        f.applied(1, &wide(1, 32));
+        f.store
+            .resync(f.row, Some(RANK), store::ResyncReason::DataLoss);
+        f.applied(5, &wide(2, 16));
+        assert_eq!(f.blocks(), 1, "the narrower block is the row's block now");
+    }
+
+    /// The row's view in the store's index, read by a lent batch with no
+    /// event at `sequence`.
+    fn view(f: &Fixture, sequence: u64) -> Arc<WorkerGroups> {
+        let facts = store::BatchFacts {
+            sequence,
+            ..store::BatchFacts::default()
+        };
+        let mut view = None;
+        let outcome = f
+            .store
+            .admit_through(f.row, RANK, facts, &mut |lane| view = Some(lane.groups()));
+        assert_eq!(outcome, store::BatchOutcome::Applied);
+        view.expect("the body ran")
+    }
+
+    /// A main store and a window group's store of the same block, as a
+    /// hybrid engine writes them.
+    fn hybrid() -> KvEventBatch {
+        batch([
+            Data::Stored(main_store(1, 0)),
+            Data::Stored(window_store(&[1], 1, false)),
+        ])
+    }
+
+    /// A store of a cache group other than main attention feeds the row's
+    /// view in the store's index, where a decision can read it.
+    #[test]
+    fn a_group_store_feeds_the_rows_view_in_the_stores_index() {
+        let f = Fixture::new();
+        f.applied(1, &hybrid());
+        assert_eq!(f.blocks(), 1);
+        let view = view(&f, 2);
+        assert!(view.knows(1), "the window group is the view's");
+        assert_eq!(view.named_blocks(), 1, "the main block is named in it");
+    }
+
+    /// The store makes a row's lane again under the row's id, and its index
+    /// holds another view for the row. The row's next batch reads another
+    /// value of its lane and takes that view: what its group stores name
+    /// is in the store's index, not in the view of the lane before.
+    #[test]
+    fn a_lane_made_again_gives_the_rows_state_the_indexs_new_view() {
+        let f = Fixture::new();
+        f.applied(1, &hybrid());
+        let old = view(&f, 2);
+        // The row stops asking for its events, and asks again.
+        let facts = f.store.get(f.row).expect("the row").facts;
+        let quiet = WorkerFacts {
+            signals: Signals::default(),
+            ..facts.clone()
+        };
+        assert_eq!(f.store.upsert(quiet).id(), f.row);
+        assert_eq!(f.store.upsert(facts).id(), f.row);
+        f.applied(1, &hybrid());
+        let new = view(&f, 2);
+        assert!(!Arc::ptr_eq(&old, &new));
+        assert!(new.knows(1), "the new view is the one the row writes");
+        assert_eq!(new.named_blocks(), 1);
     }
 
     #[test]
@@ -1658,7 +1823,7 @@ mod tests {
             ..KvEventBatch::default()
         };
         f.applied(1, &missing);
-        assert!(events(&missing, &mut GroupsShown::default()).1.is_empty());
+        assert_eq!(f.blocks(), 0);
     }
 
     #[test]
@@ -1670,16 +1835,10 @@ mod tests {
             Data::Cleared(KvCacheCleared::default()),
             Data::Stored(stored(2)),
         ]);
+        // The store behind the clear stands: the three were applied in the
+        // batch's order.
         f.applied(2, &ordered);
         assert_eq!(f.blocks(), 1);
-        assert!(matches!(
-            events(&ordered, &mut GroupsShown::default()).1.as_slice(),
-            [
-                KvEvent::Removed(_),
-                KvEvent::Cleared,
-                KvEvent::Stored { .. }
-            ]
-        ));
     }
 
     #[test]
@@ -1986,8 +2145,7 @@ mod tests {
             .expect("the row's feed");
         assert_eq!(sink.cursor(row, 0), None);
         assert_eq!(f.store.indexed_blocks(row, 0), 0);
-        let fresh = Written::begun(row);
-        assert_eq!(sink.rows.lock().written.get(&row), Some(&fresh));
+        assert!(begun(&sink, row));
 
         assert_eq!(sink.admit(row, 0, facts(9), &stores), BatchOutcome::Applied);
         let (sink, row) = host
@@ -2037,8 +2195,7 @@ mod tests {
             .expect("the row's feed");
         assert_eq!(sink.cursor(row, RANK), None);
         assert_eq!(f.blocks(), 0);
-        let fresh = Written::begun(row);
-        assert_eq!(sink.rows.lock().written.get(&row), Some(&fresh));
+        assert!(begun(&sink, row));
     }
 
     #[test]
@@ -2555,7 +2712,7 @@ mod tests {
         assert_eq!(f.other(UPPER), upper);
 
         // A batch of the old stream that read its route before the lay.
-        assert_eq!(f.sink.shown(f.lower, upper), None);
+        assert!(f.sink.applied(f.lower, upper).is_none());
         let own = batch([store(2)]);
         assert_eq!(
             f.sink.admit(upper, 0, facts(1), &own),
@@ -2572,8 +2729,11 @@ mod tests {
         let f = Fixture::single(Some(BLOCK_SIZE));
         let sink = &f.sink;
         assert!(sink.begin(f.row, || sink.rows.try_lock().is_none()));
-        let begun = Written::begun(f.row);
-        assert_eq!(sink.rows.lock().written.get(&f.row), Some(&begun));
+        {
+            let rows = sink.rows.lock();
+            let begun = rows.written.get(&f.row).expect("the row's entry");
+            assert_eq!((begun.stream, begun.leaving), (f.row, false));
+        }
         // A row its object stands for no longer begins nothing.
         sink.removed(f.row);
         assert!(!sink.begin(f.row, || false));
