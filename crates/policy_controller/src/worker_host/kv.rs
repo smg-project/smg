@@ -363,13 +363,14 @@ where
             Ok(row) => {
                 // A row the adapter holds no facts for begins from nothing:
                 // what the store kept of its stream was decided by facts
-                // that are gone. The store is called outside the facts'
-                // lock, which every row's batch takes.
+                // that are gone. The store drops the row's lane at whatever
+                // rank it keeps it, and a row with none loses nothing. The
+                // store is called outside the facts' lock, which every
+                // row's batch takes, and on this task: the clear ends
+                // before the feed is handed back.
                 let known = self.sink.rows.lock().contains_key(&row);
                 if !known {
-                    if self.sink.store.cursor(row, 0).is_some() {
-                        self.sink.store.removed(row);
-                    }
+                    self.sink.store.removed(row);
                     self.sink.rows.lock().entry(row).or_default();
                 }
                 Some((Arc::clone(&self.sink), row))
@@ -1494,6 +1495,39 @@ mod tests {
             BatchOutcome::Applied
         );
         assert_eq!(f.store.indexed_blocks(row, 0), 1);
+    }
+
+    /// The store keeps a row's lane at the row's own rank. A row above
+    /// rank 0 is given no feed yet. Where one is opened for it, it begins
+    /// from nothing as every row does.
+    #[test]
+    fn a_row_above_rank_0_the_adapter_never_fed_begins_from_nothing_too() {
+        let f = Fixture::new();
+        let stores = batch([
+            Data::Stored(main_store(1, 0)),
+            Data::Stored(window_store(&[1], 2, false)),
+        ]);
+        f.applied(7, &stores);
+        assert_eq!(
+            f.store.cursor(f.row, RANK).map(|cursor| cursor.applied),
+            Some(7)
+        );
+        assert_eq!(f.blocks(), 1);
+
+        // A host's own adapter over the same store holds no facts for the
+        // row.
+        let host = f.host();
+        let worker = host
+            .objects
+            .registry()
+            .get_by_url(URL)
+            .expect("the worker's object");
+        let (sink, row) = host
+            .open(Ok(f.row), &worker, MODEL)
+            .expect("the row's feed");
+        assert_eq!(sink.cursor(row, RANK), None);
+        assert_eq!(f.blocks(), 0);
+        assert_eq!(sink.rows.lock().get(&row), Some(&GroupsShown::default()));
     }
 
     #[test]
