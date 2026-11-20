@@ -5195,6 +5195,37 @@ fn told_ids() -> Vec<(u64, Said)> {
         .collect()
 }
 
+thread_local! {
+    static LEASE_HASHES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[derive(Default)]
+pub(super) struct LeaseHashes;
+
+impl std::hash::BuildHasher for LeaseHashes {
+    type Hasher = rustc_hash::FxHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        LEASE_HASHES.set(LEASE_HASHES.get() + 1);
+        Self::Hasher::default()
+    }
+}
+
+#[test]
+fn dispatch_and_completion_each_look_up_the_lease_once() {
+    let now = Instant::now();
+    let (store, _, ids) = handed_bed(1, now);
+    let hand = Hand::new(GatewayId(1));
+    let hashes = |said| {
+        LEASE_HASHES.set(0);
+        store.hand(&hand, ids[0], said);
+        LEASE_HASHES.get()
+    };
+    let dispatch = Said::Dispatched(Dispatch::default(), now);
+    let complete = Said::Completed(done(Side::Single));
+    assert_eq!((hashes(dispatch), hashes(complete)), (1, 1));
+}
+
 #[test]
 fn a_frame_handed_where_nobody_is_at_work_is_applied_by_its_hand() {
     let now = Instant::now();
