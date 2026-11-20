@@ -211,7 +211,10 @@ mod tests {
                 scrape_interval_ms: 3_000,
             },
             reachable_from: Reachability::Gateway(GatewayId(42)),
-            demand_facts: DemandFacts { runtime: 7 },
+            demand_facts: DemandFacts {
+                runtime: 7,
+                ..DemandFacts::default()
+            },
             ..bare.clone()
         };
         let old = WorkerFacts {

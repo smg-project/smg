@@ -14,6 +14,29 @@
 //! sides state and derives nothing: it names no label and no runtime.
 //!
 //! A request that demands nothing reads no column and pays one test.
+//!
+//! A pool the demands leave nobody is shed with no endpoint, under the
+//! stage of one demand ([`Unmet::stage`]). A row is judged by the demand it
+//! fails first, in the order a host answers for them ([`Unmet`]), and the
+//! pool is shed under the last of those: where a host cuts a pool one
+//! demand after another, that is the demand that took its last worker.
+
+/// Where a request's media by reference may be processed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum References {
+    /// The request carries no media by reference.
+    #[default]
+    None,
+    /// By a worker that processes media by reference, whichever pipeline
+    /// it runs.
+    Any,
+    /// By a worker that processes it by its registering host's own
+    /// pipeline, and by no other.
+    Host,
+    /// By a worker that processes it by a pipeline of its own, and by no
+    /// other.
+    Worker,
+}
 
 /// What a request demands of the worker that takes it. The default demands
 /// nothing.
@@ -24,56 +47,207 @@ pub struct Demands {
     /// only a worker that registered the same number takes it. `0` demands
     /// none.
     pub runtime: u32,
+    /// Whether the request carries pixel media: only a worker that takes it
+    /// ([`DemandFacts::pixels`]) takes the request.
+    pub pixels: bool,
+    /// Where the request's media by reference may be processed.
+    pub references: References,
 }
 
 impl Demands {
     /// Whether the request demands nothing: its door reads no fact then.
     #[must_use]
     pub const fn is_none(self) -> bool {
-        self.runtime == 0
+        self.runtime == 0 && !self.pixels && matches!(self.references, References::None)
+    }
+
+    /// The demand a worker that states `facts` fails first, in the order of
+    /// [`Unmet`]; `None` where it meets every demand.
+    #[must_use]
+    pub const fn unmet_by(self, facts: DemandFacts) -> Option<Unmet> {
+        if self.runtime != 0 && self.runtime != facts.runtime {
+            return Some(Unmet::Runtime);
+        }
+        if self.pixels && !facts.pixels {
+            return Some(Unmet::Pixels);
+        }
+        let host = match self.references {
+            References::None => return None,
+            References::Any => facts.host_pipeline,
+            References::Host => true,
+            References::Worker => false,
+        };
+        if !facts.references {
+            Some(Unmet::References)
+        } else if facts.host_pipeline != host {
+            Some(Unmet::Pipeline)
+        } else {
+            None
+        }
     }
 
     /// Whether a worker that states `facts` meets every demand.
     #[must_use]
     pub const fn met_by(self, facts: DemandFacts) -> bool {
-        self.runtime == 0 || self.runtime == facts.runtime
+        self.unmet_by(facts).is_none()
     }
 }
 
 /// What a worker states for the hard demands of a request, by its
-/// registration: one entry a row, in a column beside the rows.
+/// registration: one entry a row, in a column beside the rows. The default
+/// states nothing, and meets no demand.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DemandFacts {
     /// The worker's runtime as a number its registering host names: equal
     /// numbers are one runtime, and the crate reads no more of it. `0`
     /// states none, and meets no demand for one.
     pub runtime: u32,
+    /// Whether the worker takes pixel media.
+    pub pixels: bool,
+    /// Whether the worker processes media by reference.
+    pub references: bool,
+    /// Whether it processes that media by its registering host's own
+    /// pipeline, and not by one of its own. Read only beside
+    /// [`Self::references`].
+    pub host_pipeline: bool,
+}
+
+/// The demand a worker fails first. The order is the order a host answers
+/// for them: a pool is cut to its request's runtime, then to the workers
+/// that take pixel media, then to those that process media by reference,
+/// then to the pipeline the request names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Unmet {
+    /// Another runtime than the request stays on, or none stated.
+    Runtime,
+    /// The worker takes no pixel media.
+    Pixels,
+    /// The worker processes no media by reference.
+    References,
+    /// The worker processes media by reference by the other pipeline.
+    Pipeline,
+}
+
+impl Unmet {
+    /// The stage a pool this demand left nobody is shed under. A runtime is
+    /// the rest of a request's wire, and is shed as its gateway's wires
+    /// are.
+    #[must_use]
+    pub const fn stage(self) -> &'static str {
+        match self {
+            Self::Runtime => "wires",
+            Self::Pixels => "pixels",
+            Self::References => "references",
+            Self::Pipeline => "pipeline",
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DemandFacts, Demands};
+    use super::{DemandFacts, Demands, References, Unmet};
 
     /// A request that demands nothing is met by every worker, and one that
     /// demands a runtime by the workers that registered its number alone: a
     /// worker that states no runtime meets no demand for one.
     #[test]
     fn a_runtime_demand_is_met_by_the_same_number_alone() {
-        let (first, other, none) = (
-            DemandFacts { runtime: 7 },
-            DemandFacts { runtime: 8 },
-            DemandFacts::default(),
-        );
+        let of = |runtime: u32| DemandFacts {
+            runtime,
+            ..DemandFacts::default()
+        };
+        let (first, other, none) = (of(7), of(8), DemandFacts::default());
         let nothing = Demands::default();
         assert!(nothing.is_none());
         assert!([first, other, none]
             .iter()
             .all(|facts| nothing.met_by(*facts)));
-        let stays = Demands { runtime: 7 };
+        let stays = Demands {
+            runtime: 7,
+            ..Demands::default()
+        };
         assert!(!stays.is_none());
         assert_eq!(
             [first, other, none].map(|facts| stays.met_by(facts)),
             [true, false, false]
+        );
+    }
+
+    /// Each media demand is a demand, and a worker is judged by the one it
+    /// fails first: its runtime, then pixel media, then media by reference,
+    /// then the pipeline that processes it.
+    #[test]
+    fn a_worker_is_judged_by_the_demand_it_fails_first() {
+        let worker = |pixels: bool, references: bool, host_pipeline: bool| DemandFacts {
+            runtime: 7,
+            pixels,
+            references,
+            host_pipeline,
+        };
+        let asks = |pixels: bool, references: References| Demands {
+            runtime: 7,
+            pixels,
+            references,
+        };
+        for demands in [
+            asks(true, References::None),
+            asks(false, References::Any),
+            asks(false, References::Host),
+            asks(false, References::Worker),
+        ] {
+            assert!(!demands.is_none(), "{demands:?}");
+        }
+        let (plain, host, own) = (
+            worker(true, false, false),
+            worker(true, true, true),
+            worker(false, true, false),
+        );
+        let table = [
+            (asks(true, References::None), plain, None),
+            (asks(true, References::None), own, Some(Unmet::Pixels)),
+            (asks(false, References::Any), plain, Some(Unmet::References)),
+            (asks(false, References::Any), host, None),
+            (asks(false, References::Any), own, None),
+            (asks(false, References::Host), host, None),
+            (asks(false, References::Host), own, Some(Unmet::Pipeline)),
+            (asks(false, References::Worker), host, Some(Unmet::Pipeline)),
+            (asks(false, References::Worker), own, None),
+            (
+                asks(false, References::Worker),
+                plain,
+                Some(Unmet::References),
+            ),
+            // Pixel media is judged before media by reference.
+            (asks(true, References::Any), own, Some(Unmet::Pixels)),
+            (asks(true, References::Host), host, None),
+        ];
+        for (demands, facts, unmet) in table {
+            assert_eq!(demands.unmet_by(facts), unmet, "{demands:?} {facts:?}");
+            assert_eq!(demands.met_by(facts), unmet.is_none());
+        }
+        // The runtime is judged before any of them.
+        let elsewhere = DemandFacts {
+            runtime: 8,
+            ..DemandFacts::default()
+        };
+        let every = asks(true, References::Host);
+        assert_eq!(every.unmet_by(elsewhere), Some(Unmet::Runtime));
+    }
+
+    /// The demands stand in the order a host answers for them, and each has
+    /// the stage its pool is shed under.
+    #[test]
+    fn the_demands_stand_in_a_hosts_order_each_with_its_stage() {
+        let order = [
+            Unmet::Runtime,
+            Unmet::Pixels,
+            Unmet::References,
+            Unmet::Pipeline,
+        ];
+        assert!(order.is_sorted());
+        assert_eq!(
+            order.map(Unmet::stage),
+            ["wires", "pixels", "references", "pipeline"]
         );
     }
 }

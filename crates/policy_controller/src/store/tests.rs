@@ -133,7 +133,10 @@ fn a_replacement_carries_a_matching_registrations_status_and_a_changed_one_start
     // What a registration states for a hard demand is none of the three
     // facts: its next life is handed the status too.
     let mut other_runtime = facts("http://w:8000", 3);
-    other_runtime.demand_facts = DemandFacts { runtime: 9 };
+    other_runtime.demand_facts = DemandFacts {
+        runtime: 9,
+        ..DemandFacts::default()
+    };
     let stated = store.upsert(other_runtime).id();
     assert_eq!(
         WorkersStore::get(&store, stated).expect("the row").status,

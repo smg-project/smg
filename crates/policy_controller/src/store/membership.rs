@@ -396,7 +396,10 @@ mod tests {
     #[test]
     fn a_changed_demand_fact_is_another_life() {
         let stating = |runtime| WorkerFacts {
-            demand_facts: DemandFacts { runtime },
+            demand_facts: DemandFacts {
+                runtime,
+                ..DemandFacts::default()
+            },
             ..WorkerFacts::default()
         };
         for (standing, fresh) in [(7, 9), (7, 0), (0, 7)] {

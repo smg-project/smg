@@ -183,7 +183,7 @@ pub use decision::{
     Decision, Lifted, Overlap, OverlapSource, Pair, Pick, Queue, Shed, ShedReason, Survivors,
     Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
-pub use demands::{DemandFacts, Demands};
+pub use demands::{DemandFacts, Demands, References, Unmet};
 pub use door::{DecisionRecord, Explained, Names};
 pub use framework::{
     Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,

@@ -1076,7 +1076,10 @@ pub(super) mod tests {
         let maker = Maker::provider("pool", "first").expect("a maker");
         let stating = |runtime| WorkerFacts {
             models: vec![MODEL.to_owned()],
-            demand_facts: DemandFacts { runtime },
+            demand_facts: DemandFacts {
+                runtime,
+                ..DemandFacts::default()
+            },
             ..stated()
         };
         door.found(&maker, Expect::Anything, URL, &|_| stating(7))
@@ -1096,7 +1099,10 @@ pub(super) mod tests {
         let decide = |id: &[u8], runtime: u32| {
             let mut retry = request(id, 7);
             retry.constraints.wire_modes = WireModes::HTTP;
-            retry.constraints.demands = Demands { runtime };
+            retry.constraints.demands = Demands {
+                runtime,
+                ..Demands::default()
+            };
             let decided = policy.decide(GATEWAY, &retry, Instant::now());
             decided.expect("a decision")
         };
@@ -1114,7 +1120,13 @@ pub(super) mod tests {
             })
         );
         assert_eq!(store.get(old.id), None);
-        assert_eq!(row.facts.demand_facts, DemandFacts { runtime: 9 });
+        assert_eq!(
+            row.facts.demand_facts,
+            DemandFacts {
+                runtime: 9,
+                ..DemandFacts::default()
+            }
+        );
         assert_eq!(row.status, WorkerStatus::Ready, "handed on by the store");
 
         let refused = decide(b"after", 7);
