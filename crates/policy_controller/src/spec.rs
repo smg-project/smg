@@ -1404,6 +1404,77 @@ impl<'de> Deserialize<'de> for Written {
     }
 }
 
+/// What an author who wrote an empty rule is told to write.
+const EMPTY_RULE: &str =
+    "write `has-room` bare to read the host's bit, or give the rule its `used` and `capacity`";
+
+/// What stands under `has-room`'s name, read into the rule's parameters. A
+/// null and an empty map are refused ahead of the typed read, with what to
+/// write: their author most likely meant the bare name. Any other map goes
+/// to the parameters' own read key by key, so each of its refusals keeps
+/// its text.
+struct HasRoomWritten;
+
+impl<'de> de::DeserializeSeed<'de> for HasRoomWritten {
+    type Value = HasRoomParams;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<HasRoomParams, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for HasRoomWritten {
+    type Value = HasRoomParams;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the rule's map of `used`, `capacity` and `headroom`")
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<HasRoomParams, E> {
+        Err(E::custom(EMPTY_RULE))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<HasRoomParams, A::Error> {
+        let Some(first) = map.next_key::<String>()? else {
+            return Err(de::Error::custom(EMPTY_RULE));
+        };
+        HasRoomParams::deserialize(de::value::MapAccessDeserializer::new(KeyRead {
+            first: Some(first),
+            rest: map,
+        }))
+    }
+}
+
+/// A map whose first key was read ahead: the key is handed out again, then
+/// the rest of the map as it stands.
+struct KeyRead<A> {
+    first: Option<String>,
+    rest: A,
+}
+
+impl<'de, A: MapAccess<'de>> MapAccess<'de> for KeyRead<A> {
+    type Error = A::Error;
+
+    fn next_key_seed<K: de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, A::Error> {
+        match self.first.take() {
+            Some(key) => seed
+                .deserialize(de::value::StringDeserializer::new(key))
+                .map(Some),
+            None => self.rest.next_key_seed(seed),
+        }
+    }
+
+    fn next_value_seed<V: de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: V,
+    ) -> Result<V::Value, A::Error> {
+        self.rest.next_value_seed(seed)
+    }
+}
+
 impl<'de> Deserialize<'de> for FilterSpec {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct FilterVisitor;
@@ -1428,7 +1499,7 @@ impl<'de> Deserialize<'de> for FilterSpec {
                     return Err(de::Error::custom("a filter entry names one filter"));
                 };
                 let entry = if name == HasRoomRule::NAME {
-                    FilterSpec::Params(FilterStage::HasRoom(map.next_value()?))
+                    FilterSpec::Params(FilterStage::HasRoom(map.next_value_seed(HasRoomWritten)?))
                 } else {
                     let Written(written) = map.next_value()?;
                     FilterSpec::Added { name, written }
@@ -3260,6 +3331,15 @@ fn has_room_of(
             Some(term) => terms.push((term, coefficient)),
             None => request_tokens = coefficient,
         }
+    }
+    // The request's size alone is one answer for every row: such a rule
+    // keeps every row or steps aside, and asks nothing of a worker.
+    if terms.is_empty() {
+        return Err(at.bad(
+            "used",
+            HasRoomRule::REQUEST_TOKENS,
+            "at least one field of the worker beside the request's size",
+        ));
     }
     let capacity = match &p.capacity {
         Capacity::Fixed(capacity) if capacity.is_finite() && *capacity > 0.0 => *capacity,

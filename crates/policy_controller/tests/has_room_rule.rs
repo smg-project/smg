@@ -329,6 +329,13 @@ fn each_part_of_the_rule_is_refused_at_its_path() {
             "{}",
             "at least one field with its coefficient",
         ),
+        // The request's size alone asks nothing of a worker.
+        (
+            r#"{"used":{"request.prompt_tokens":1},"capacity":10}"#,
+            "used",
+            "request.prompt_tokens",
+            "at least one field of the worker beside the request's size",
+        ),
         (
             r#"{"used":{"load.nothing":1},"capacity":10}"#,
             "used",
@@ -392,8 +399,13 @@ fn each_part_of_the_rule_is_refused_at_its_path() {
 /// An empty map is no rule: only the bare name is the host's bit.
 #[test]
 fn a_rule_that_leaves_a_part_out_is_refused_at_the_parse() {
+    // An empty rule's author most likely meant the host's bit, and is
+    // told what to write.
+    let empty = "write `has-room` bare to read the host's bit";
     for (rule, message) in [
-        ("{}", "missing field `used`"),
+        ("{}", empty),
+        ("null", empty),
+        (r#"{"capacity":10}"#, "missing field `used`"),
         (r#"{"used":{"load.running":1}}"#, "missing field `capacity`"),
         (
             r#"{"used":{"load.running":1},"capacity":10,"room":2}"#,
