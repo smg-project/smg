@@ -1161,6 +1161,27 @@ fn admitted(store: &MemoryStore, key: &str) -> WorkerId {
     id
 }
 
+/// A membership write that moves no member, no lane, no block size of
+/// record and no row's word to record walks no pool: each stands in its
+/// model's index as it did. A registration refreshed with the offer it had
+/// is such a write. A worker more makes a lane, and the pools are walked.
+#[test]
+fn a_write_that_moves_no_member_walks_no_pool() {
+    let store = MemoryStore::new();
+    admitted(&store, "a");
+    admitted(&store, "b");
+    let walks = store.pool_walks();
+    let refreshed = WorkerFacts {
+        priority: 7,
+        ..publisher("a", &[MODEL])
+    };
+    store.upsert(refreshed);
+    store.publish_now();
+    assert_eq!(store.pool_walks(), walks, "every pool stands as it did");
+    admitted(&store, "c");
+    assert_eq!(store.pool_walks(), walks + 1, "a lane was made");
+}
+
 /// The facts of the row of `engine` at `rank` of `ranks`.
 fn ranked(engine: &str, rank: u16, ranks: u16) -> WorkerFacts {
     WorkerFacts {
