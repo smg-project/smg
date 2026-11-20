@@ -761,7 +761,17 @@ pub struct LeastCostParams {
     pub weight: f32,
     /// Field names and their coefficients. At least one field is required.
     #[serde(deserialize_with = "keyed_once")]
-    #[schemars(extend("minProperties" = 1))]
+    #[schemars(extend(
+        "minProperties" = 1,
+        "propertyNames" = { "enum": Term::NAMES.map(|(name, _)| name) },
+        "additionalProperties" = {
+            "type": "number",
+            "format": "double",
+            "minimum": -COST_PARAMETER_LIMIT,
+            "maximum": COST_PARAMETER_LIMIT,
+            "not": { "const": 0 }
+        }
+    ))]
     pub terms: BTreeMap<String, f64>,
     /// How far above the least cost a row still ties for the top score.
     #[serde(default)]

@@ -9,18 +9,27 @@ pub(crate) enum Term {
 }
 
 impl Term {
+    /// Every name a document may write, with the term it reads.
+    pub(crate) const NAMES: [(&str, Self); 7] = [
+        ("candidate.in_flight", Self::InFlight),
+        ("load.active_kv_permille", Self::Load(LoadField::ActiveKv)),
+        ("load.kv_usage_permille", Self::Load(LoadField::KvUsage)),
+        ("load.queued", Self::Load(LoadField::Queued)),
+        (
+            "load.resident_tokens",
+            Self::Load(LoadField::ResidentTokens),
+        ),
+        ("load.running", Self::Load(LoadField::Running)),
+        (
+            "load.waiting_uncached_tokens",
+            Self::Load(LoadField::WaitingUncachedTokens),
+        ),
+    ];
+
     pub(crate) fn named(name: &str) -> Option<Self> {
-        let field = match name {
-            "candidate.in_flight" => return Some(Self::InFlight),
-            "load.active_kv_permille" => LoadField::ActiveKv,
-            "load.kv_usage_permille" => LoadField::KvUsage,
-            "load.queued" => LoadField::Queued,
-            "load.resident_tokens" => LoadField::ResidentTokens,
-            "load.running" => LoadField::Running,
-            "load.waiting_uncached_tokens" => LoadField::WaitingUncachedTokens,
-            _ => return None,
-        };
-        Some(Self::Load(field))
+        Self::NAMES
+            .iter()
+            .find_map(|&(written, term)| (written == name).then_some(term))
     }
 
     pub(crate) fn reads_load(self) -> bool {

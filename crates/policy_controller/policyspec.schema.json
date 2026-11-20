@@ -801,9 +801,25 @@
           "type": "object",
           "additionalProperties": {
             "type": "number",
-            "format": "double"
+            "format": "double",
+            "minimum": -1000000000000000.0,
+            "maximum": 1000000000000000.0,
+            "not": {
+              "const": 0
+            }
           },
-          "minProperties": 1
+          "minProperties": 1,
+          "propertyNames": {
+            "enum": [
+              "candidate.in_flight",
+              "load.active_kv_permille",
+              "load.kv_usage_permille",
+              "load.queued",
+              "load.resident_tokens",
+              "load.running",
+              "load.waiting_uncached_tokens"
+            ]
+          }
         },
         "margin": {
           "description": "How far above the least cost a row still ties for the top score.",

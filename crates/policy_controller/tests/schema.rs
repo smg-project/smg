@@ -52,10 +52,24 @@ fn the_committed_schema_admits_least_cost_with_terms_and_a_margin() {
     );
     let params = &defs["LeastCostParams"];
     assert_eq!(params["required"], serde_json::json!(["terms"]));
+    let terms = &params["properties"]["terms"];
     assert_eq!(
-        params["properties"]["terms"]["additionalProperties"]["type"],
-        "number"
+        terms["propertyNames"]["enum"],
+        serde_json::json!([
+            "candidate.in_flight",
+            "load.active_kv_permille",
+            "load.kv_usage_permille",
+            "load.queued",
+            "load.resident_tokens",
+            "load.running",
+            "load.waiting_uncached_tokens",
+        ])
     );
+    let coefficient = &terms["additionalProperties"];
+    assert_eq!(coefficient["type"], "number");
+    assert_eq!(coefficient["minimum"], -1e15);
+    assert_eq!(coefficient["maximum"], 1e15);
+    assert_eq!(coefficient["not"]["const"], 0);
     assert_eq!(params["properties"]["margin"]["$ref"], "#/$defs/CostMargin");
     assert_eq!(defs["CostMargin"]["properties"]["absolute"]["default"], 0.0);
     assert_eq!(defs["CostMargin"]["properties"]["relative"]["default"], 0.0);
