@@ -7,7 +7,7 @@
 //! (`mock_streams`: a vLLM-shaped run with a restart, an SGLang-shaped run,
 //! two data-parallel ranks merged by receive order, and a run with a host
 //! tier) leave the engine on its publisher wire and go through the relay's
-//! decoder and normalizer, then through `KvEventMonitor::apply_event`, so
+//! decoder and normalizer, then through [`apply_event`], so
 //! what reaches the index is what reaches it in production; at every
 //! checkpoint the backends must also predict for every prompt the hit the
 //! engine itself holds. A seeded synthetic corpus then does what an engine's
@@ -32,15 +32,13 @@ use smg_grpc_client::common_proto::{
     kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent, KvCacheTier,
     KvEventBatch,
 };
+use smg_worker::kv_events::apply::{apply_event, WorkerIndexState};
 
 use super::{
     mock_streams::{self, Shape, Stream},
-    KvIndex,
+    KvIndex, WorkerBlocks,
 };
-use crate::{
-    policies::kv_index::event_monitor::{KvEventMonitor, WorkerIndexState},
-    routers::common::snapshot::test_support::kv_cache_cleared,
-};
+use crate::routers::common::snapshot::test_support::kv_cache_cleared;
 
 // ---------------------------------------------------------------------------
 // The two backends side by side
@@ -48,7 +46,7 @@ use crate::{
 
 struct Backend {
     index: KvIndex,
-    workers: BTreeMap<String, (u32, WorkerIndexState)>,
+    workers: BTreeMap<String, (u32, WorkerIndexState<WorkerBlocks>)>,
 }
 
 impl Backend {
@@ -59,7 +57,7 @@ impl Backend {
         }
     }
 
-    fn worker(&mut self, name: &str) -> &mut (u32, WorkerIndexState) {
+    fn worker(&mut self, name: &str) -> &mut (u32, WorkerIndexState<WorkerBlocks>) {
         if !self.workers.contains_key(name) {
             let id = self.index.intern_worker(name).expect("worker id");
             self.workers
@@ -136,7 +134,7 @@ impl Pair {
             }
             let (id, state) = workers.get_mut(worker).expect("present");
             for event in &batch.events {
-                KvEventMonitor::apply_event(event, *id, index, state);
+                apply_event(event, *id, index, state);
             }
         }
     }
