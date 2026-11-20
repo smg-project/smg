@@ -1796,25 +1796,35 @@ fn a_followed_key_registered_again_as_the_worker_it_was_takes_its_pins() {
 }
 
 /// A follower counts a key's absence by its own clock, from the removal
-/// it followed: a key registered again past that time takes no pin.
+/// it followed. A key registered again past that time takes no pin, at
+/// its followed registration and at a snapshot that holds it again.
 #[test]
 fn a_followed_key_registered_again_past_the_absences_time_takes_no_pin() {
-    let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
-    follower
-        .apply(manual_ruled(1, 1, 1))
-        .expect("above the unbound start");
+    let leader = MemoryStore::new();
+    let followers = [MemoryStore::new(), MemoryStore::new()];
     let joined = leader.upsert(facts("http://a:8000", 1));
-    followed(&leader, &follower, joined);
-    let sessions: &dyn SessionsStore = &follower;
-    sessions.pin(11, joined.id(), Instant::now(), None);
     let revision = WorkersStore::get(&leader, joined.id()).expect("the row");
+    for follower in &followers {
+        follower
+            .apply(manual_ruled(1, 1, 1))
+            .expect("above the unbound start");
+        followed(&leader, follower, joined);
+        SessionsStore::pin(follower, 11, joined.id(), Instant::now(), None);
+    }
     let removed = leader.remove(joined.id(), revision.revision);
-    followed(&leader, &follower, removed.expect("removed"));
-    assert!(sessions.lookup(11).is_some(), "inside its time");
+    let removed = removed.expect("removed");
+    for follower in &followers {
+        followed(&leader, follower, removed);
+        let pin = SessionsStore::lookup(follower, 11);
+        assert!(pin.is_some(), "inside its time");
+    }
     std::thread::sleep(Duration::from_millis(1_100));
     let again = leader.upsert(facts("http://a:8000", 2));
-    followed(&leader, &follower, again);
-    assert_eq!(sessions.lookup(11), None);
+    followed(&leader, &followers[0], again);
+    assert!(followers[1].watch_from(leader.cut(Kinds::Watched)));
+    for follower in &followers {
+        assert_eq!(SessionsStore::lookup(follower, 11), None);
+    }
 }
 
 /// A follower files the key of a removal it followed. Where it leads
@@ -1831,6 +1841,117 @@ fn a_key_a_follower_saw_leave_takes_its_pins_at_the_followers_own_write() {
     followed(&leader, &follower, removed.expect("removed"));
     let again = follower.upsert(facts("http://a:8000", 2)).id();
     assert_eq!(sessions.lookup(11).map(|pin| pin.worker), Some(again));
+}
+
+/// A snapshot's rows move a key's session pins as the writes it stands
+/// for would have, in the engine's table and of record, at a gateway's
+/// watch and at a standby's restore. A key the cut holds under a new id
+/// takes its pins where it is the worker it was. Another worker's pins
+/// leave. A key the cut drops keeps its pins on file, and takes them at
+/// its followed registration.
+#[test]
+fn a_snapshot_moves_the_pins_of_the_rows_it_drops() {
+    for restore in [false, true] {
+        let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
+        let lay = || {
+            let cut = leader.cut(Kinds::All);
+            if restore {
+                follower.restore_from(cut)
+            } else {
+                follower.watch_from(cut)
+            }
+        };
+        let keys = [
+            "http://a:8000",
+            "http://b:8000",
+            "http://c:8000",
+            "http://d:8000",
+        ];
+        let [a, b, c, d] = keys.map(|key| leader.upsert(facts(key, 1)).id());
+        assert!(lay());
+        let sessions: &dyn SessionsStore = &follower;
+        let now = Instant::now();
+        for (key, worker) in [(11, a), (12, b), (13, c), (14, d)] {
+            sessions.pin(key, worker, now, None);
+        }
+        let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
+        // The follower's engine holds a pin of its own.
+        let key = Session::from_raw(21);
+        let world = follower.world();
+        let table = world.spec().engine().sessions();
+        table.dispatched(key, SessionVerdict::Pinned, a);
+        let held = || table.pins(key).map(|pins| pins[0]);
+        // The follower hears none of these writes.
+        let leave = |id: WorkerId| {
+            let revision = WorkersStore::get(&leader, id).expect("the row").revision;
+            leader.remove(id, revision).expect("removed");
+        };
+        leave(a);
+        let again = leader.upsert(facts("http://a:8000", 2)).id();
+        leave(b);
+        leader.upsert(WorkerFacts {
+            role: Role::Decode,
+            ..facts("http://b:8000", 2)
+        });
+        leave(c);
+        assert!(lay());
+        assert_eq!((of(11), held()), (Some(again), Some(again)));
+        assert_eq!(of(12), None, "another worker under the key");
+        assert_eq!((of(13), of(14)), (Some(c), Some(d)), "none is dropped");
+        let back = leader.upsert(facts("http://c:8000", 2));
+        followed(&leader, &follower, back);
+        assert_eq!(of(13), Some(back.id()), "the dropped key was on file");
+    }
+}
+
+/// A key on file when a snapshot comes stays there where the cut does not
+/// hold it. Where the cut holds it again as the worker it was, it takes
+/// its pins.
+#[test]
+fn a_snapshot_returns_a_key_that_had_left_to_its_pins() {
+    let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
+    let [a, b] = ["http://a:8000", "http://b:8000"].map(|key| {
+        let change = leader.upsert(facts(key, 1));
+        followed(&leader, &follower, change);
+        change.id()
+    });
+    let sessions: &dyn SessionsStore = &follower;
+    let now = Instant::now();
+    sessions.pin(11, a, now, None);
+    sessions.pin(12, b, now, None);
+    let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
+    for id in [a, b] {
+        let revision = WorkersStore::get(&leader, id).expect("the row").revision;
+        let change = leader.remove(id, revision).expect("removed");
+        followed(&leader, &follower, change);
+    }
+    assert!(follower.watch_from(leader.cut(Kinds::Watched)));
+    assert_eq!((of(11), of(12)), (Some(a), Some(b)), "both stay on file");
+    let again = leader.upsert(facts("http://a:8000", 2)).id();
+    assert!(follower.watch_from(leader.cut(Kinds::Watched)));
+    assert_eq!((of(11), of(12)), (Some(again), Some(b)));
+    let back = leader.upsert(facts("http://b:8000", 2));
+    followed(&leader, &follower, back);
+    assert_eq!(of(12), Some(back.id()), "still on file behind two cuts");
+}
+
+/// The rows a snapshot drops are filed while the list has room. Past it
+/// a row's pins leave at once.
+#[test]
+fn a_snapshot_files_no_more_keys_than_the_list_holds() {
+    use super::memory::GONE_KEYS;
+    let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
+    let ids: Vec<WorkerId> = (0..GONE_KEYS + 2)
+        .map(|at| leader.upsert(facts(&format!("http://w{at}:8000"), 1)).id())
+        .collect();
+    assert!(follower.watch_from(leader.cut(Kinds::Watched)));
+    let sessions: &dyn SessionsStore = &follower;
+    let now = Instant::now();
+    for (key, &id) in (1..).zip(&ids) {
+        sessions.pin(key, id, now, None);
+    }
+    assert!(follower.watch_from(MemoryStore::new().cut(Kinds::Watched)));
+    assert_eq!(sessions.len(), GONE_KEYS);
 }
 
 /// The door of a writer that knows a key's rule by its lease alone: the
