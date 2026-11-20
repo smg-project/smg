@@ -75,7 +75,10 @@ pub const SPEC_GENERATION: &str = "smg_policy_spec_generation";
 pub const SPEC_APPLY_TOTAL: &str = "smg_policy_spec_apply_total";
 /// Decide requests answered `Busy`, by the `reason` the answer carries
 /// (`unspecified`, `queue_depth`, `no_credit`, `budget_gone_on_arrival`,
-/// `not_leader`): each is one the gateway decided locally.
+/// `not_leader`): each is one the gateway decided locally. A refused
+/// decode call counts under a reason of its own (`decode_no_lease`,
+/// `decode_not_chosen`, `decode_prefill_not_held`, `decode_stands`): its
+/// gateway sends the decode its first pick named.
 pub const DECIDE_BUSY_TOTAL: &str = "smg_policy_controller_decide_busy_total";
 /// Decide requests this build had no decision for, by `cause` (`fault`,
 /// `pair_side`, `prompt_text`, `decider_gone`, `lease_ids_spent`,
@@ -180,7 +183,7 @@ struct LoadCounters {
 /// the deciders' and the streams' atomics at each render.
 struct DecideCounters {
     /// In the order of [`Counts::BUSY`].
-    busy: [Counter; 5],
+    busy: [Counter; 9],
     /// `fault`, `pair_side`, `prompt_text`, `decider_gone`,
     /// `lease_ids_spent`, `document_awaited`.
     no_decision: [Counter; 6],
@@ -837,17 +840,21 @@ mod tests {
             "decide_busy_total{reason=\"no_credit\"} 3",
             "decide_busy_total{reason=\"budget_gone_on_arrival\"} 4",
             "decide_busy_total{reason=\"not_leader\"} 5",
-            "decide_no_decision_total{cause=\"fault\"} 6",
-            "decide_no_decision_total{cause=\"pair_side\"} 7",
-            "decide_no_decision_total{cause=\"prompt_text\"} 8",
-            "decide_no_decision_total{cause=\"decider_gone\"} 9",
-            "decide_answers_dropped_total{cause=\"queue_full\"} 10",
-            "decide_answers_dropped_total{cause=\"stream_gone\"} 11",
-            "decide_budget_outlasted_total 12",
-            "decide_no_decision_total{cause=\"lease_ids_spent\"} 13",
-            "decide_no_decision_total{cause=\"document_awaited\"} 14",
-            "decide_asked_again_total{earlier_lease=\"none\"} 15",
-            "decide_asked_again_total{earlier_lease=\"ended\"} 16",
+            "decide_busy_total{reason=\"decode_no_lease\"} 6",
+            "decide_busy_total{reason=\"decode_not_chosen\"} 7",
+            "decide_busy_total{reason=\"decode_prefill_not_held\"} 8",
+            "decide_busy_total{reason=\"decode_stands\"} 9",
+            "decide_no_decision_total{cause=\"fault\"} 10",
+            "decide_no_decision_total{cause=\"pair_side\"} 11",
+            "decide_no_decision_total{cause=\"prompt_text\"} 12",
+            "decide_no_decision_total{cause=\"decider_gone\"} 13",
+            "decide_answers_dropped_total{cause=\"queue_full\"} 14",
+            "decide_answers_dropped_total{cause=\"stream_gone\"} 15",
+            "decide_budget_outlasted_total 16",
+            "decide_no_decision_total{cause=\"lease_ids_spent\"} 17",
+            "decide_no_decision_total{cause=\"document_awaited\"} 18",
+            "decide_asked_again_total{earlier_lease=\"none\"} 19",
+            "decide_asked_again_total{earlier_lease=\"ended\"} 20",
             "decide_candidates_undialed_total 31",
             "decide_hashes_cut_total 42",
         ] {

@@ -192,15 +192,17 @@ use crate::{
     decider::Decider,
     decision::Decision,
     door::{
-        decide_in, decider_of, entry, issue, issue_pair, pair_in, past_mark, summed, Asked,
-        Buffers, DecisionRecord, Entry, Part, SampleCount, Samples, StorePins, Taken,
+        decide_in, decider_of, decode_in, entry, issue, issue_decode, issue_pair, issuing, pair_in,
+        past_mark, summed, Asked, Buffers, DecisionRecord, Entry, Part, SampleCount, Samples,
+        StorePins, Taken,
     },
     elector::{term_said, Fence},
     framework::{release, Engine},
-    lease::{Lease, Lifecycle, ReleaseReason},
+    lease::{Lease, LeaseId, Lifecycle, ReleaseReason},
     proto::{self, busy::Reason},
     store::{
-        leases::DISPATCH_TTL, AtWork, GatewayId, LeaseRefused, MemoryStore, Said, Watch, World,
+        leases::DISPATCH_TTL, AtWork, DecodeIssue, DecodeRefused, GatewayId, LeaseRefused,
+        MemoryStore, Watch, World,
     },
     view::fingerprint,
 };
@@ -216,7 +218,7 @@ use crate::{
 #[derive(Debug, Default)]
 pub(crate) struct Counts {
     /// `Busy` answers, each at its reason's number on the wire.
-    pub(crate) busy: [AtomicU64; 5],
+    pub(crate) busy: [AtomicU64; 9],
     /// Decisions that panicked.
     pub(crate) faults: AtomicU64,
     /// Requests for a side of a pair plan that is not the pair's one
@@ -262,12 +264,16 @@ const PARTS: usize = 16;
 
 impl Counts {
     /// The reasons of a `Busy`, in the order of their numbers on the wire.
-    pub(crate) const BUSY: [&'static str; 5] = [
+    pub(crate) const BUSY: [&'static str; 9] = [
         "unspecified",
         "queue_depth",
         "no_credit",
         "budget_gone_on_arrival",
         "not_leader",
+        "decode_no_lease",
+        "decode_not_chosen",
+        "decode_prefill_not_held",
+        "decode_stands",
     ];
 
     /// The part decider `index` counts in.
@@ -550,10 +556,22 @@ impl Deciders {
         &self.reads.counts
     }
 
-    /// Hands `job` to its model's decider, without waiting. `Some` is the
-    /// request back with why it took no place: its submitter answers it.
+    /// Hands `job` to its decider, without waiting: its model's, or for a
+    /// decode call the one whose file holds the call's lease
+    /// ([`MemoryStore::file_of`]). A file is its decider's own, so a
+    /// decode call is decided, and its issue taken back, by the thread at
+    /// work at its lease's file, whatever model the call names and
+    /// whichever term minted the lease. A file past the queues, which a
+    /// store built with a file a decider never names, falls to the
+    /// model's decider. `Some` is the request back with why it took no
+    /// place: its submitter answers it.
     pub(crate) fn submit(&self, job: Job) -> Option<(Refused, Job)> {
-        match self.queues[self.of(job.request.model())].try_send(job) {
+        let home = job.request.decode_of().and_then(|lease| {
+            let file = self.reads.store.file_of(lease);
+            self.queues.get(file)
+        });
+        let queue = home.unwrap_or_else(|| &self.queues[self.of(job.request.model())]);
+        match queue.try_send(job) {
             Ok(()) => None,
             Err(TrySendError::Full(job)) => Some((Refused::Full, job)),
             Err(TrySendError::Disconnected(job)) => Some((Refused::Gone, job)),
@@ -736,7 +754,9 @@ impl Deciding {
     /// Gives up the lease of an answer its stream did not take: the queue
     /// was full, or the stream had ended. No gateway will name a dispatch
     /// for it, and it would book its worker to its dispatch deadline. The
-    /// decider hands its release to its own file as abandoned, as a
+    /// decider hands the give-up's word to its own file as abandoned
+    /// ([`wire::Leased::given_up`]: a decode call's answer takes its one
+    /// issue back, any other lease is released whole), as a
     /// stream does for a decision it stops at the send, and gives the hand
     /// back as a stream does at its end ([`MemoryStore::hand_back`]): it
     /// takes its file's turn, whoever holds it, and the release is applied
@@ -746,7 +766,7 @@ impl Deciding {
     /// outside any decision, as is a full ring's, where the hand applies
     /// in place. A stage's call that panics at either take is held where
     /// the engine is told, as every call of a lease's event is: the hand
-    /// is through, and the lease is off its file.
+    /// is through, and the file holds what the word left.
     #[cold]
     fn unsent(&self, gateway: GatewayId, answer: wire::Decided) {
         let wire::Decided::Decision {
@@ -757,8 +777,8 @@ impl Deciding {
             return;
         };
         let hand = lifecycle::open(&self.reads.store, gateway);
-        let abandoned = Said::Released(None, ReleaseReason::Abandoned);
-        self.reads.store.hand(&hand, leased.lease.id, abandoned);
+        let abandoned = ReleaseReason::Abandoned;
+        leased.given_up(&self.reads.store, &hand, abandoned);
         // The decider is at work at that file, so the hand left the frame
         // to it: it takes the turn here.
         self.reads.store.hand_back(hand);
@@ -877,7 +897,13 @@ impl Deciding {
                 return Err(Reason::Unspecified);
             }
             if request.again() {
-                self.asked_again(request, gateway);
+                // Beside a lease's decode side the word reaches that side
+                // alone: no search by the id's fingerprint, which could
+                // end another request's lease.
+                match request.decode_of() {
+                    Some(lease) => self.decode_asked_again(gateway, lease),
+                    None => self.asked_again(request, gateway),
+                }
             }
         }
         let taken = Taken::at(request, gateway, received, now);
@@ -895,6 +921,20 @@ impl Deciding {
     fn asked_again(&self, request: &Checked, gateway: GatewayId) {
         let Reads { store, counts, .. } = &self.reads;
         let ended = store.asked_again(gateway, fingerprint(request.id()));
+        counts.again[usize::from(ended)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A decode call its gateway asks again, holding no answer to the
+    /// first: the side that call issued returns to chosen here, where no
+    /// dispatch named it ([`MemoryStore::take_back_decode`]). It returns
+    /// ahead of the repeat's own decision, so whatever the repeat answers
+    /// the first pick's dispatch books the side, and a pick of the repeat
+    /// issues it anew. Counted as a request asked again, by whether an
+    /// issue was taken back.
+    #[cold]
+    fn decode_asked_again(&self, gateway: GatewayId, lease: LeaseId) {
+        let Reads { store, counts, .. } = &self.reads;
+        let ended = store.take_back_decode(gateway, lease, ReleaseReason::Abandoned);
         counts.again[usize::from(ended)].fetch_add(1, Ordering::Relaxed);
     }
 
@@ -935,6 +975,7 @@ impl Deciding {
             // and a stage's call with the build before them. A pair's
             // pick is filed its decode side's lease beside it.
             let mut decode = None;
+            let mut undo = None;
             let (decision, filed) = match entry(world, &taken) {
                 Entry::Single => {
                     let (decision, booking) = decide_in(world, &taken, buffers, own);
@@ -951,8 +992,17 @@ impl Deciding {
                 }
                 Entry::Pair => pair(store, world, &taken, term, buffers, own, &mut decode),
                 Entry::Side => {
-                    counts.pair_sides.fetch_add(1, Ordering::Relaxed);
-                    return Err(Reason::Unspecified);
+                    // A side has one decision of its own: the decode of a
+                    // lease its request names. It is read here alone, so a
+                    // single and a pair pay nothing for it.
+                    let Some(lease) = taken.request.decode_of() else {
+                        counts.pair_sides.fetch_add(1, Ordering::Relaxed);
+                        return Err(Reason::Unspecified);
+                    };
+                    match decode_side(store, world, &taken, lease, buffers, own, &mut undo) {
+                        Ok(decided) => decided,
+                        Err(refused) => return Err(busy_of(refused)),
+                    }
                 }
             };
             // No pick, while the start's document of a replica under a
@@ -996,15 +1046,20 @@ impl Deciding {
                         decision,
                         lease.map(|lease| wire::Leased {
                             lease,
-                            decode: decode.map(|decode: Lease| {
-                                // At its issue a pair's decode side differs
-                                // from its prefill's by the side and the key.
-                                debug_assert_eq!(
-                                    (decode.tokens, decode.target_index),
-                                    (lease.tokens, lease.target_index)
-                                );
-                                decode.session
-                            }),
+                            beside: match (decode, undo) {
+                                (Some(decode), _) => {
+                                    // At its issue a pair's decode side
+                                    // differs from its prefill's by the
+                                    // side and the key.
+                                    debug_assert_eq!(
+                                        (decode.tokens, decode.target_index),
+                                        (lease.tokens, lease.target_index)
+                                    );
+                                    wire::Beside::Decode(decode.session)
+                                }
+                                (None, Some(issue)) => wire::Beside::Issue(issue),
+                                (None, None) => wire::Beside::Alone,
+                            },
                             left,
                             due: taken.due(),
                         }),
@@ -1023,7 +1078,10 @@ impl Deciding {
             // The answer does not leave, and the lease filed for it goes
             // with it.
             if let Ok(Some(lease)) = filed {
-                give_up(store, world, taken.gateway, &lease, decode.as_ref(), ended);
+                match undo {
+                    Some(issue) => take_back(store, world, taken.gateway, &lease, issue, ended),
+                    None => give_up(store, world, taken.gateway, &lease, decode.as_ref(), ended),
+                }
             }
             Err(busy)
         };
@@ -1047,8 +1105,10 @@ impl Deciding {
 /// pair plan at its prefill ([`Entry::Pair`]): decided for both sides
 /// ([`pair_in`]) and, for a pick, issued a lease a side
 /// ([`issue_pair`]). The prefill side's lease is the one filed, as a
-/// single's is, and the decode side's is laid in `decode`. Out of line: a
-/// single's decision carries no part of a pair's.
+/// single's is, and the decode side's is laid in `decode`. A decode side
+/// its request asked for later is chosen and not issued: none is laid, and
+/// the answer carries the prefill's lease alone. Out of line: a single's
+/// decision carries no part of a pair's.
 #[inline(never)]
 fn pair(
     store: &MemoryStore,
@@ -1063,13 +1123,78 @@ fn pair(
     let filed = booking
         .map(|booking| issue_pair(store, world, taken, term, &decision, booking))
         .transpose();
+    let later = taken.request.decode_later();
     let filed = filed.map(|leases| {
         leases.map(|(prefill, side)| {
-            *decode = Some(side);
+            *decode = (!later).then_some(side);
             prefill
         })
     });
     (decision, filed)
+}
+
+/// A decode call's decision and its side's issue, for the one request that
+/// names the decode side of `lease` (`DecideRequest.decode_of`): decided over
+/// the held prefill's partners ([`decode_in`]) and, for a pick, issued
+/// under the lease's id ([`issue_decode`]). The lease filed is the decode
+/// side's, and its issue's count is laid in `undo`. Out of line: no other
+/// request carries a part of it.
+///
+/// # Errors
+///
+/// [`DecodeRefused`]: why the lease takes no decode side. Nothing is filed.
+#[inline(never)]
+fn decode_side(
+    store: &MemoryStore,
+    world: &World,
+    taken: &Taken<'_, Checked>,
+    lease: LeaseId,
+    buffers: &mut Buffers<<Checked as Asked>::Lists>,
+    own: &Part,
+    undo: &mut Option<DecodeIssue>,
+) -> Result<(Decision, Result<Option<Lease>, LeaseRefused>), DecodeRefused> {
+    let (decision, booking) = decode_in(world, store, taken, lease, buffers, own)?;
+    let filed = booking
+        .map(|booking| issue_decode(store, world, taken, lease, &decision, booking))
+        .transpose()?;
+    let lease = filed.map(|(lease, issue)| {
+        *undo = Some(issue);
+        lease
+    });
+    Ok((decision, Ok(lease)))
+}
+
+/// The `Busy` a refused decode call leaves under: a reason of its own for
+/// each refusal of the store, never a decision that sheds. A gateway that
+/// read a shed would refuse a request whose prefill is running.
+const fn busy_of(refused: DecodeRefused) -> Reason {
+    match refused {
+        DecodeRefused::NoLease => Reason::DecodeNoLease,
+        DecodeRefused::NotChosen => Reason::DecodeNotChosen,
+        DecodeRefused::PrefillNotHeld => Reason::DecodePrefillNotHeld,
+        DecodeRefused::DecodeStands => Reason::DecodeStands,
+    }
+}
+
+/// Takes back the issue of a decode call whose answer does not leave: the
+/// side stands as the call found it and its booking is freed
+/// ([`MemoryStore::unissue_decode`]), then the engine that heard the issue
+/// is told the side's release, once: the engine of the lease's generation
+/// ([`issuing`]), where it still stands. A side that moved since was ended
+/// or issued anew by another hand, and nothing is told of it here.
+fn take_back(
+    store: &MemoryStore,
+    world: &World,
+    gateway: GatewayId,
+    lease: &Lease,
+    issue: DecodeIssue,
+    reason: ReleaseReason,
+) {
+    if store.unissue_decode(gateway, lease.id, issue) {
+        if let Some(engine) = issuing(world.spec(), lease) {
+            engine.on_released(lease, reason);
+        }
+    }
 }
 
 impl<'a> Taken<'a, Checked> {
@@ -1168,11 +1293,11 @@ pub(crate) mod tests {
     };
 
     use super::{
-        watched, Buffers, Clock, Counts, Deciders, Deciding, Job, Part, Reads, Refused, Taken,
-        LOOK_CAP, LOOK_FLOOR, PARTS,
+        decode_side, watched, Buffers, Clock, Counts, Deciders, Deciding, Job, Part, Reads,
+        Refused, Taken, LOOK_CAP, LOOK_FLOOR, PARTS,
     };
     use crate::{
-        builtins::Random,
+        builtins::{Best, Random},
         catalog::Catalog,
         controller::{
             election::Standing,
@@ -1185,16 +1310,19 @@ pub(crate) mod tests {
         },
         decider::Decider,
         decision::{Decision, Overlap, OverlapSource, Pick, Targets},
-        door::{self, cut_reach, keeps_a_row, narrow, pair_in, Asked, Door, Request, TERM_MARK},
+        door::{
+            self, cut_reach, keeps_a_row, narrow, pair_in, tests::pair_counts, Asked, Door,
+            Request, TERM_MARK,
+        },
         elector::{Elector, Tick, TERM_CEILING},
         framework::{DecisionScope, Filter, Picker, Scratch, TieBand},
-        lease::{Lease, LeaseId, Lifecycle, ReleaseReason},
+        lease::{Lease, LeaseId, Lifecycle, ReleaseReason, Side},
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome},
         spec::{AppliedSpec, PolicySpec, PowerOfTwoMetric},
         store::{
-            leases::DISPATCH_TTL, Ask, Built, Dispatch, GatewayId, HealthSink, LeaseState,
-            LeasesStore, MemoryStore, Said, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
-            World,
+            leases::DISPATCH_TTL, Ask, Built, DecodeIssue, Dispatch, GatewayId, HealthSink,
+            LeaseState, LeasesStore, MemoryStore, Said, ViewBuffers, WorkerFacts, WorkerStatus,
+            WorkersStore, World,
         },
         view::{
             fingerprint, AffinityFacts, Candidate, Constraints, PoolFacts, RequestFacts, Role,
@@ -1347,7 +1475,7 @@ pub(crate) mod tests {
 
     /// The member `name`, serving `model` in `role` and stating `wires`,
     /// ready: written again where it stood, with its status as it was.
-    fn ready(
+    pub(crate) fn ready(
         store: &MemoryStore,
         name: &str,
         model: &str,
@@ -1508,6 +1636,7 @@ pub(crate) mod tests {
             }),
             constraints: None,
             again: false,
+            ..Default::default()
         }
     }
 
@@ -3900,7 +4029,7 @@ pub(crate) mod tests {
         };
         let answer = bed.ask(frame(1, 1)).await;
         assert!(bed.workers.contains(&picked(&answer)), "{answer:?}");
-        assert_eq!(counted(&bed.counts), [0; 5]);
+        assert_eq!(counted(&bed.counts), [0; 9]);
         assert_eq!(
             busy(&bed.ask(frame(2, 2)).await),
             Reason::BudgetGoneOnArrival
@@ -3910,8 +4039,8 @@ pub(crate) mod tests {
             assert_eq!(busy(&bed.ask(frame(id, 1)).await), Reason::NotLeader);
         }
         // In the order of the reasons' numbers on the wire.
-        assert_eq!(Counts::BUSY[3..], ["budget_gone_on_arrival", "not_leader"]);
-        assert_eq!(counted(&bed.counts), [1, 0, 0, 1, 2]);
+        assert_eq!(Counts::BUSY[3..5], ["budget_gone_on_arrival", "not_leader"]);
+        assert_eq!(counted(&bed.counts), [1, 0, 0, 1, 2, 0, 0, 0, 0]);
         // The counts are sized by hand beside the wire's enum: every reason
         // the contract names has a place, and the number past them is no
         // reason. A reason added to the contract fails here, not silently.
@@ -5538,7 +5667,7 @@ pub(crate) mod tests {
             (0, 2, 1, 0)
         );
         // Each of the three is a `Busy` with no reason, and counted as one.
-        assert_eq!(busies.each_ref().map(counted), [3, 0, 0, 0, 0]);
+        assert_eq!(busies.each_ref().map(counted), [3, 0, 0, 0, 0, 0, 0, 0, 0]);
         // The same document's other phases are decided: the single binding
         // covers them.
         for (id, phase) in [(4, proto::Phase::Single), (5, proto::Phase::Encode)] {
@@ -6867,5 +6996,774 @@ pub(crate) mod tests {
         // counted: the skip reads the request's own words, never the pool.
         assert!(keeps_a_row(Some(WireModes::GRPC), None));
         assert_eq!(narrowed(Some(WireModes::GRPC), None), 0);
+    }
+
+    /// What the engine told the stage of the decode-later bed of leases:
+    /// the side and the worker of an issue, and of a release with its
+    /// reason.
+    pub(crate) type SideCalls = Vec<(Side, WorkerId, Option<ReleaseReason>)>;
+
+    /// The `best` picker, keeping what the engine tells it of leases by
+    /// their side.
+    #[derive(Debug)]
+    struct ToldSides(Arc<Mutex<SideCalls>>);
+
+    impl Lifecycle for ToldSides {
+        fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
+            self.0.lock().push((lease.side, lease.booked, None));
+        }
+
+        fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+            self.0.lock().push((lease.side, lease.booked, Some(reason)));
+        }
+    }
+
+    impl Picker for ToldSides {
+        fn name(&self) -> &'static str {
+            "told-sides"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Best.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// The bed of the decode-later cases: a pair plan whose sides score by
+    /// the least load, the decode's picking through [`ToldSides`], over the
+    /// fleet's prefill and its decode beside one more decode. With the bed:
+    /// what the engine told that stage, and the prefill.
+    fn later_bed() -> (Bed, Arc<Mutex<SideCalls>>, WorkerId) {
+        later_bed_of(1)
+    }
+
+    /// [`later_bed`] behind `deciders` deciders.
+    fn later_bed_of(deciders: usize) -> (Bed, Arc<Mutex<SideCalls>>, WorkerId) {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let bed = bed(Some(later_spec(1, &told)), true, (deciders, 8), []);
+        ready(&bed.store, "d1", MODEL, Role::Decode, WireModes::NONE);
+        let prefill = WorkersStore::by_key(&*bed.store, "http://p0:8000");
+        let prefill = prefill.expect("the fleet's prefill").id;
+        (bed, told, prefill)
+    }
+
+    /// The document of [`later_bed`] as `generation`, whose decode side
+    /// keeps what its engine tells it in `told`.
+    pub(crate) fn later_spec(generation: u64, told: &Arc<Mutex<SideCalls>>) -> AppliedSpec {
+        let kept = Arc::clone(told);
+        let mut catalog = Catalog::builtin();
+        catalog
+            .picker("told-sides", move || Box::new(ToldSides(Arc::clone(&kept))))
+            .expect("a free name");
+        let mut document: PolicySpec = serde_json::from_str(
+            r#"{
+              "apiVersion": "smg.policy/v1",
+              "generation": 1,
+              "profiles": {
+                "side": { "score": ["least-load"], "pick": "best" },
+                "told": { "score": ["least-load"], "pick": "told-sides" }
+              },
+              "bindings": [
+                { "match": { "phase": ["prefill", "decode"] }, "plan": "pd-pair",
+                  "profiles": { "prefill": "side", "decode": "told" } },
+                { "profile": "side" }
+              ]
+            }"#,
+        )
+        .expect("a document of this build");
+        document.generation = generation;
+        let digest = document.digest().expect("the document digests");
+        AppliedSpec::validate_digested(&document, digest, &catalog, &[])
+            .expect("the catalog holds the stage")
+    }
+
+    /// A pair's one request under `id`, whose decode is asked for after
+    /// its prefill where `later`.
+    pub(crate) fn pair_frame(id: u8, later: bool) -> proto::DecideRequest {
+        let mut frame = phased(frame(id, 77), proto::Phase::Prefill);
+        frame.decode_later = later;
+        frame
+    }
+
+    /// The decode call of the pair's lease `lease`, for the request `id`.
+    pub(crate) fn call(id: u8, lease: u64) -> proto::DecideRequest {
+        let mut frame = pair_frame(id, false);
+        frame.decode_of = Some(lease);
+        frame
+    }
+
+    /// A dispatch of `side` to the pick's first target.
+    pub(crate) fn sent(side: Side) -> Dispatch {
+        Dispatch {
+            side,
+            target_index: 0,
+            since_decision_micros: 0,
+        }
+    }
+
+    /// A pair asked with its decode later, and its prefill dispatched: the
+    /// lease's id and the first pick's two decodes, the chosen one first.
+    /// A second pair asked whole then books the chosen decode, so the
+    /// least load sends a call to the other: that pair's lease comes last.
+    async fn held(bed: &mut Bed) -> (u64, [WorkerId; 2], u64) {
+        let answer = bed.ask(pair_frame(1, true)).await;
+        let (targets, sides) = pair_of(&answer);
+        let id = sides.first().expect("the prefill's lease").0;
+        let decodes = [0, 1].map(|at| WorkerId(targets[at].1.expect("a pair's target")));
+        // One seed, the same decode rows: the whole pair takes the same.
+        let whole = bed.ask(pair_frame(2, false)).await;
+        let (targets, sides) = pair_of(&whole);
+        assert_eq!(targets[0].1, Some(decodes[0].0));
+        let whole = sides.first().expect("the whole pair's lease").0;
+        let store: &dyn LeasesStore = bed.store.as_ref();
+        let at = bed.script.taken;
+        assert!(store.dispatched(GATEWAY, LeaseId(id), sent(Side::Prefill), at));
+        (id, decodes, whole)
+    }
+
+    /// The decode side of `lease` as the file holds it.
+    fn decode_on_file(bed: &Bed, lease: u64) -> (LeaseState, WorkerId) {
+        let sides = bed.store.sides(GATEWAY, LeaseId(lease));
+        let decode = sides.and_then(|sides| sides.decode);
+        let decode = decode.expect("the decode side on file");
+        (decode.state, decode.target)
+    }
+
+    /// A served pair asked with its decode later is issued its prefill
+    /// alone: the answer carries one lease, and the pick's decode stands
+    /// chosen on file and books nobody. The same frame without the word
+    /// carries a lease a side, as before.
+    #[tokio::test]
+    async fn a_served_pair_asked_with_its_decode_later_issues_the_prefill_alone() {
+        let (mut bed, told, prefill) = later_bed();
+        let answer = bed.ask(pair_frame(1, true)).await;
+        let (targets, sides) = pair_of(&answer);
+        let id = sides.first().map_or(0, |side| side.0);
+        assert_eq!(sides, [(id, proto::Side::Prefill, 0)]);
+        let decode = WorkerId(targets[0].1.expect("a pair's target"));
+        assert_eq!(targets[0].0, prefill.0);
+        assert_eq!(decode_on_file(&bed, id), (LeaseState::Chosen, decode));
+        assert_eq!(pair_counts(&bed.store, [prefill, decode]), [1, 0]);
+        assert_eq!(*told.lock(), [(Side::Prefill, prefill, None)]);
+        // Without the word: two leases of one id, and the decode booked.
+        let answer = bed.ask(pair_frame(2, false)).await;
+        let (targets, sides) = pair_of(&answer);
+        let whole = sides.first().map_or(0, |side| side.0);
+        let both = [proto::Side::Prefill, proto::Side::Decode];
+        assert_eq!(sides, both.map(|side| (whole, side, 0)));
+        assert_eq!(targets[0], (prefill.0, Some(decode.0)));
+        assert_eq!(pair_counts(&bed.store, [prefill, decode]), [2, 1]);
+    }
+
+    /// The decode call answers a decode pick under the pair's own lease:
+    /// decided on the counts of its instant, its targets name the held
+    /// prefill, and the new pick's decode is booked in the first's place.
+    #[tokio::test]
+    async fn a_served_decode_call_answers_a_decode_pick_under_the_same_lease() {
+        let (mut bed, told, prefill) = later_bed();
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        assert_eq!(pair_counts(&bed.store, [prefill, chosen, other]), [2, 1, 0]);
+        let answer = bed.ask(call(1, id)).await;
+        let (targets, sides) = pair_of(&answer);
+        assert_eq!(sides, [(id, proto::Side::Decode, 0)]);
+        // The chosen decode took a lease since: the call picks the other.
+        assert_eq!(targets[0], (prefill.0, Some(other.0)));
+        assert!(targets.iter().all(|target| target.0 == prefill.0));
+        assert_eq!(decode_on_file(&bed, id), (LeaseState::ISSUED, other));
+        assert_eq!(pair_counts(&bed.store, [prefill, chosen, other]), [2, 1, 1]);
+        assert_eq!(told.lock().last(), Some(&(Side::Decode, other, None)));
+        assert_eq!(asked_again(&bed), [0, 0]);
+    }
+
+    /// Each refusal of the call leaves as a `Busy` of its own reason,
+    /// never as a decision, and moves nothing: no lease under the id, a
+    /// pair filed whole, a prefill not yet sent, and a side a call issued.
+    #[tokio::test]
+    async fn each_refusal_of_the_call_is_a_busy_of_its_own_reason_and_moves_nothing() {
+        let (mut bed, told, prefill) = later_bed();
+        let lease = |answer: &proto::DecideAnswer| sides_of(answer)[0].0;
+        let later = lease(&bed.ask(pair_frame(1, true)).await);
+        let whole = lease(&bed.ask(pair_frame(2, false)).await);
+        let store = Arc::clone(&bed.store);
+        let decodes = ["d0", "d1"].map(|name| {
+            let row = WorkersStore::by_key(&*store, &format!("http://{name}:8000"));
+            row.expect("a decode of the fleet").id
+        });
+        let file = || {
+            let sides = [later, whole].map(|id| store.sides(GATEWAY, LeaseId(id)));
+            let counts = pair_counts(&store, [prefill, decodes[0], decodes[1]]);
+            (sides, counts, told.lock().len())
+        };
+        let rows = [
+            (later + 100, Reason::DecodeNoLease),
+            (whole, Reason::DecodeNotChosen),
+            (later, Reason::DecodePrefillNotHeld),
+        ];
+        for (id, reason) in rows {
+            let before = file();
+            assert_eq!(busy(&bed.ask(call(1, id)).await), reason);
+            assert_eq!(file(), before, "{reason:?}");
+        }
+        // The fourth: a side a first call issued stands.
+        let leases: &dyn LeasesStore = store.as_ref();
+        let at = bed.script.taken;
+        assert!(leases.dispatched(GATEWAY, LeaseId(later), sent(Side::Prefill), at));
+        let issued = bed.ask(call(1, later)).await;
+        assert!(matches!(outcome(&issued), Outcome::Pick(_)));
+        let before = file();
+        assert_eq!(busy(&bed.ask(call(1, later)).await), Reason::DecodeStands);
+        assert_eq!(file(), before);
+        // Each is counted at its own reason, once.
+        let counted = |reason: Reason| bed.counts.busy[reason as usize].load(Ordering::Relaxed);
+        let reasons = [
+            Reason::DecodeNoLease,
+            Reason::DecodeNotChosen,
+            Reason::DecodePrefillNotHeld,
+            Reason::DecodeStands,
+        ];
+        assert_eq!(reasons.map(counted), [1; 4]);
+    }
+
+    /// A call that sheds is a decision, as any shed is: nothing is issued
+    /// and the side stays chosen with the first pick's targets. A dispatch
+    /// then books the first pick's decode.
+    #[tokio::test]
+    async fn a_shed_at_the_call_is_a_decision_and_leaves_the_side_chosen() {
+        let (mut bed, told, prefill) = later_bed();
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        let before = store.sides(GATEWAY, LeaseId(id));
+        let heard = told.lock().len();
+        let answer = bed.ask(constrained(call(1, id), 0, Some(0))).await;
+        let Outcome::Shed(shed) = outcome(&answer) else {
+            panic!("a shed: {answer:?}");
+        };
+        assert_eq!(shed.emptied_by, "subset-hint");
+        assert!(sides_of(&answer).is_empty());
+        assert_eq!(store.sides(GATEWAY, LeaseId(id)), before);
+        assert_eq!(decode_on_file(&bed, id), (LeaseState::Chosen, chosen));
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 1, 0]);
+        assert_eq!(told.lock().len(), heard);
+        let leases: &dyn LeasesStore = store.as_ref();
+        let at = bed.script.taken;
+        assert!(leases.dispatched(GATEWAY, LeaseId(id), sent(Side::Decode), at));
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 2, 0]);
+    }
+
+    /// A decode issued under a term that ended returns to chosen. The
+    /// answer leaves as `Busy`, the lease stands as the call found it with
+    /// the first pick's targets, the new pick's booking is freed and the
+    /// engine hears that issue's release once. A dispatch then books the
+    /// first pick's decode.
+    #[tokio::test]
+    async fn a_decode_issued_under_a_term_that_ended_returns_to_chosen() {
+        let (mut bed, told, prefill) = later_bed();
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        let before = store.sides(GATEWAY, LeaseId(id));
+        // The call's first read finds the fence open; its read at the
+        // hand-over is past the renew deadline.
+        let steps = [Step::At(Duration::ZERO), Step::At(FENCED)];
+        bed.script.steps.lock().extend(steps);
+        let answer = bed.ask(call(1, id)).await;
+        assert_eq!(busy(&answer), Reason::NotLeader);
+        assert_eq!(store.sides(GATEWAY, LeaseId(id)), before);
+        assert_eq!(decode_on_file(&bed, id), (LeaseState::Chosen, chosen));
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 1, 0]);
+        let abandoned = Some(ReleaseReason::Abandoned);
+        let heard = told.lock().clone();
+        let issue = [
+            (Side::Decode, other, None),
+            (Side::Decode, other, abandoned),
+        ];
+        assert_eq!(heard[heard.len() - 2..], issue);
+        let leases: &dyn LeasesStore = store.as_ref();
+        let at = bed.script.taken;
+        assert!(leases.dispatched(GATEWAY, LeaseId(id), sent(Side::Decode), at));
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 2, 0]);
+    }
+
+    /// A frame that says neither word decides as before: a single is a
+    /// pick under one lease, and a pair one answer under two leases of one
+    /// id with both sides issued and booked.
+    #[tokio::test]
+    async fn a_frame_with_neither_field_decides_as_before() {
+        let (mut bed, _, prefill) = later_bed();
+        let plain = frame(1, 77);
+        assert_eq!((plain.decode_later, plain.decode_of), (false, None));
+        let answer = bed.ask(plain).await;
+        assert!(bed.workers.contains(&picked(&answer)), "{answer:?}");
+        assert_eq!(sides_of(&answer).len(), 1);
+        let answer = bed.ask(pair_frame(2, false)).await;
+        let (targets, sides) = pair_of(&answer);
+        let id = sides.first().map_or(0, |side| side.0);
+        let both = [proto::Side::Prefill, proto::Side::Decode];
+        assert_eq!(sides, both.map(|side| (id, side, 0)));
+        let decode = WorkerId(targets[0].1.expect("a pair's target"));
+        assert_eq!(decode_on_file(&bed, id), (LeaseState::ISSUED, decode));
+        assert_eq!(pair_counts(&bed.store, [prefill, decode]), [1, 1]);
+        assert_eq!(asked_again(&bed), [0, 0]);
+    }
+
+    /// A repeat of the call frees the lost issue and issues the side anew
+    /// under the same lease id. The word takes back the first call's
+    /// issue, ahead of the repeat's own decision, and the engine hears
+    /// that issue's release as abandoned.
+    #[tokio::test]
+    async fn a_repeat_of_the_call_frees_the_lost_issue_and_issues_the_side_anew() {
+        let (mut bed, told, prefill) = later_bed();
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        let first = bed.ask(call(1, id)).await;
+        assert_eq!(pair_of(&first).0[0].1, Some(other.0));
+        // The loads move while the answer is lost: two more requests on
+        // the decode the first call issued.
+        for extra in [1, 2] {
+            file(&store, extra, other, bed.script.taken);
+        }
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 1, 3]);
+        let repeat = bed.ask(again(call(1, id))).await;
+        let (targets, sides) = pair_of(&repeat);
+        assert_eq!(sides, [(id, proto::Side::Decode, 0)]);
+        assert_eq!(targets[0], (prefill.0, Some(chosen.0)));
+        assert_eq!(decode_on_file(&bed, id), (LeaseState::ISSUED, chosen));
+        // The first call's decode gave its booking back, and the repeat's
+        // took one.
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 2, 2]);
+        let abandoned = Some(ReleaseReason::Abandoned);
+        let heard = told.lock().clone();
+        let words = [
+            (Side::Decode, other, abandoned),
+            (Side::Decode, chosen, None),
+        ];
+        assert_eq!(heard[heard.len() - 2..], words);
+        assert_eq!(asked_again(&bed), [0, 1]);
+    }
+
+    /// A repeat that sheds leaves the side chosen, as its first decision
+    /// filed it: the word took the lost issue back ahead of the repeat's
+    /// decision, whatever its answer. The gateway then sends the decode its
+    /// first pick named, and that dispatch books the side.
+    #[tokio::test]
+    async fn a_repeat_that_sheds_leaves_the_side_chosen_for_the_first_picks_dispatch() {
+        let (mut bed, told, prefill) = later_bed();
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        let lease = LeaseId(id);
+        let filed = store.sides(GATEWAY, lease);
+        bed.ask(call(1, id)).await;
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 1, 1]);
+        assert_ne!(store.sides(GATEWAY, lease), filed);
+        let repeat = again(constrained(call(1, id), 0, Some(0)));
+        let answer = bed.ask(repeat).await;
+        assert!(matches!(outcome(&answer), Outcome::Shed(_)), "{answer:?}");
+        // The lease stands as its first decision filed it, both its parts:
+        // the first pick's targets and the lease's dispatch deadline.
+        assert_eq!(store.sides(GATEWAY, lease), filed);
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 1, 0]);
+        let abandoned = Some(ReleaseReason::Abandoned);
+        assert_eq!(told.lock().last(), Some(&(Side::Decode, other, abandoned)));
+        assert_eq!(asked_again(&bed), [0, 1]);
+        // The first pick's decode goes out: its dispatch books the side.
+        let leases: &dyn LeasesStore = store.as_ref();
+        let at = bed.script.taken;
+        assert!(leases.dispatched(GATEWAY, lease, sent(Side::Decode), at));
+        let sent_to = (LeaseState::Dispatched { at }, chosen);
+        assert_eq!(decode_on_file(&bed, id), sent_to);
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 2, 0]);
+    }
+
+    /// A repeat on a side still chosen is a first call: no call issued the
+    /// side, and the word ends nothing.
+    #[tokio::test]
+    async fn a_repeat_on_a_chosen_side_is_a_first_call() {
+        let (mut bed, told, prefill) = later_bed();
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let heard = told.lock().len();
+        let answer = bed.ask(again(call(1, id))).await;
+        let (targets, sides) = pair_of(&answer);
+        assert_eq!(sides, [(id, proto::Side::Decode, 0)]);
+        assert_eq!(targets[0].1, Some(other.0));
+        assert_eq!(pair_counts(&bed.store, [prefill, chosen, other]), [2, 1, 1]);
+        assert_eq!(told.lock()[heard..], [(Side::Decode, other, None)]);
+        assert_eq!(asked_again(&bed), [1, 0]);
+    }
+
+    /// A repeat on a side its gateway named a dispatch for is refused as
+    /// standing: the word ends no side that was sent.
+    #[tokio::test]
+    async fn a_repeat_on_a_dispatched_side_is_refused_as_standing() {
+        let (mut bed, told, prefill) = later_bed();
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        bed.ask(call(1, id)).await;
+        let leases: &dyn LeasesStore = store.as_ref();
+        let at = bed.script.taken;
+        assert!(leases.dispatched(GATEWAY, LeaseId(id), sent(Side::Decode), at));
+        let file = || (store.sides(GATEWAY, LeaseId(id)), told.lock().len());
+        let before = file();
+        let answer = bed.ask(again(call(1, id))).await;
+        assert_eq!(busy(&answer), Reason::DecodeStands);
+        assert_eq!(file(), before);
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 1, 1]);
+        assert_eq!(asked_again(&bed), [1, 0]);
+    }
+
+    /// A decode frame runs no search by its id's fingerprint, with the
+    /// word or without: another request of the gateway under the same id
+    /// keeps the lease it waits under.
+    #[tokio::test]
+    async fn a_decode_frame_runs_no_search_by_its_ids_fingerprint() {
+        let (mut bed, _, _) = later_bed();
+        let (id, _, _) = held(&mut bed).await;
+        // A single of the gateway under the id the call's frame carries:
+        // its lease waits for a dispatch.
+        let single = bed.ask(frame(9, 77)).await;
+        let waits = LeaseId(lease_of(&single).id);
+        let answer = bed.ask(again(call(9, id))).await;
+        assert_eq!(sides_of(&answer), [(id, proto::Side::Decode, 0)]);
+        let leases: &dyn LeasesStore = bed.store.as_ref();
+        assert!(leases.get(GATEWAY, waits).is_some(), "the single's lease");
+        assert_eq!(asked_again(&bed), [1, 0]);
+    }
+
+    /// The issue that stands of `lease`'s decode side, taken back by the
+    /// case's own hand once the bed's decider left its work: a thread acts
+    /// at a file where nobody is at work, and beside nobody.
+    async fn taken_back_by_hand(store: &MemoryStore, lease: LeaseId) {
+        let abandoned = ReleaseReason::Abandoned;
+        settled(|| store.take_back_decode(GATEWAY, lease, abandoned)).await;
+    }
+
+    /// One decode call's order by the case's own hand, at the bed's first
+    /// instant: the issue its decider would undo.
+    fn issued_by_hand(bed: &Bed, frame: proto::DecideRequest) -> DecodeIssue {
+        let request = checked(frame);
+        let now = bed.script.taken;
+        let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+        let (mut buffers, mut undo) = (Buffers::default(), None);
+        let part = Part::default();
+        let lease = request.decode_of().expect("a decode call's frame");
+        let decided = bed.store.deciding(|world| {
+            decode_side(
+                &bed.store,
+                world,
+                &taken,
+                lease,
+                &mut buffers,
+                &part,
+                &mut undo,
+            )
+        });
+        assert!(decided.is_ok(), "a decode pick");
+        undo.expect("a pick's issue")
+    }
+
+    /// An undo undoes its own issue alone, under one reading of the clock.
+    /// Where the word took that issue back, and where a repeat issued the
+    /// side since, the first call's undo moves nothing and frees nothing:
+    /// the place counts the side's issues, and an undo names its own.
+    #[tokio::test]
+    async fn an_undo_behind_a_repeats_issue_moves_nothing() {
+        let (mut bed, _, prefill) = later_bed();
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        let lease = LeaseId(id);
+        let file = || {
+            let counts = pair_counts(&store, [prefill, chosen, other]);
+            (store.sides(GATEWAY, lease), counts)
+        };
+        let first = issued_by_hand(&bed, call(1, id));
+        taken_back_by_hand(&store, lease).await;
+        let ended = file();
+        assert!(!store.unissue_decode(GATEWAY, lease, first));
+        assert_eq!(file(), ended);
+        issued_by_hand(&bed, again(call(1, id)));
+        let issued = file();
+        assert_eq!(issued.1, [2, 1, 1]);
+        assert!(!store.unissue_decode(GATEWAY, lease, first));
+        assert_eq!(file(), issued);
+    }
+
+    /// An undo behind the prefill's end takes the lease off the file: the
+    /// side would stand chosen beside a prefill that ended, and no later
+    /// event ends a side that is not live.
+    #[tokio::test]
+    async fn an_undo_behind_its_prefills_end_takes_the_lease_off_the_file() {
+        let (mut bed, _, prefill) = later_bed();
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        let lease = LeaseId(id);
+        let issue = issued_by_hand(&bed, call(1, id));
+        let leases: &dyn LeasesStore = store.as_ref();
+        let gone = ReleaseReason::ClientGone;
+        assert!(leases.released(GATEWAY, lease, Some(Side::Prefill), gone));
+        assert!(store.sides(GATEWAY, lease).is_some(), "the issued decode");
+        assert!(store.unissue_decode(GATEWAY, lease, issue));
+        assert_eq!(store.sides(GATEWAY, lease), None);
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [1, 1, 0]);
+    }
+
+    /// A decode call's answer that its stream does not take gives its one
+    /// issue back, and no more of the lease: the prefill that runs under
+    /// the same id keeps its booking. The side stands chosen with the
+    /// first pick's targets, the engine hears the issue's release as
+    /// abandoned, and the first pick's dispatch then books the side.
+    #[tokio::test]
+    async fn a_decode_calls_answer_its_stream_does_not_take_gives_its_issue_back() {
+        let (mut bed, told, prefill) = later_bed();
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        let lease = LeaseId(id);
+        let filed = store.sides(GATEWAY, lease);
+        // A stream that ended takes no answer.
+        let (sender, answers) = mpsc::channel(1);
+        drop(answers);
+        let job = Job {
+            request: checked(call(1, id)),
+            gateway: GATEWAY,
+            received: bed.script.taken,
+            answers: sender,
+        };
+        assert!(bed.deciders.submit(job).is_none());
+        // One decider decides a model's requests in order: it is past the
+        // call, and past its answer's give-up, when it answers the next.
+        bed.ask(frame(9, 9)).await;
+        assert_eq!(store.sides(GATEWAY, lease), filed);
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 1, 0]);
+        let abandoned = (Side::Decode, other, Some(ReleaseReason::Abandoned));
+        assert!(told.lock().contains(&abandoned), "{:?}", told.lock());
+        let leases: &dyn LeasesStore = store.as_ref();
+        let at = bed.script.taken;
+        assert!(leases.dispatched(GATEWAY, lease, sent(Side::Decode), at));
+        let sent_to = (LeaseState::Dispatched { at }, chosen);
+        assert_eq!(decode_on_file(&bed, id), sent_to);
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 2, 0]);
+    }
+
+    /// A decode side's answer of `lease` as its stream's queue holds it,
+    /// handed over with `beside` at `at`.
+    fn queued(lease: LeaseId, beside: wire::Beside, at: Instant) -> wire::Leased {
+        wire::Leased {
+            lease: Lease {
+                id: lease,
+                side: Side::Decode,
+                ..Lease::default()
+            },
+            beside,
+            left: DISPATCH_TTL,
+            due: at + DISPATCH_TTL,
+        }
+    }
+
+    /// A side takes as many issues as its count holds and no more. The
+    /// call behind the last is refused as a decode that stands, with the
+    /// word or without, and nothing moves: no count repeats, so an undo
+    /// names one issue for the lease's life. The first pick's dispatch
+    /// still books the side.
+    #[tokio::test]
+    async fn a_side_whose_count_of_issues_is_full_takes_no_more_calls() {
+        let (mut bed, _, prefill) = later_bed();
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        let lease = LeaseId(id);
+        let file = || {
+            let counts = pair_counts(&store, [prefill, chosen, other]);
+            (store.sides(GATEWAY, lease), counts)
+        };
+        let filed = file();
+        for _ in 0..u8::MAX {
+            issued_by_hand(&bed, call(1, id));
+            taken_back_by_hand(&store, lease).await;
+        }
+        assert_eq!(file(), filed);
+        for full in [call(1, id), again(call(1, id))] {
+            assert_eq!(busy(&bed.ask(full).await), Reason::DecodeStands);
+        }
+        assert_eq!(file(), filed);
+        let leases: &dyn LeasesStore = store.as_ref();
+        let at = bed.script.taken;
+        assert!(leases.dispatched(GATEWAY, lease, sent(Side::Decode), at));
+        let sent_to = (LeaseState::Dispatched { at }, chosen);
+        assert_eq!(decode_on_file(&bed, id), sent_to);
+    }
+
+    /// A decode call's answer given up while a decider is at work at the
+    /// lease's file moves nothing and tells nothing on the thread that
+    /// gives it up: the word waits in the file's ring. The decider applies
+    /// it at its next take, ahead of its own decision: the issue goes back
+    /// and the engine hears its release there, so no stage hears a word of
+    /// a lease beside its decider at work.
+    #[tokio::test]
+    async fn an_answer_given_up_beside_a_decider_at_work_is_left_to_that_decider() {
+        let (mut bed, told, prefill) = later_bed();
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        let lease = LeaseId(id);
+        let filed = store.sides(GATEWAY, lease);
+        let issue = issued_by_hand(&bed, call(1, id));
+        let answer = queued(lease, wire::Beside::Issue(issue), bed.script.taken);
+        let heard = told.lock().len();
+        // The next decision is held at its first read of the clock: its
+        // decider has the job at hand, at the lease's file.
+        let (reached, held) = std_mpsc::sync_channel(1);
+        let (go, word) = std_mpsc::sync_channel(1);
+        let hold = Step::Hold { reached, go: word };
+        bed.script.steps.lock().push_back(hold);
+        assert_eq!(bed.submit(frame(9, 9)), None);
+        held.recv_timeout(PATIENCE)
+            .expect("the decider reads the clock");
+        let hand = lifecycle::open(&store, GATEWAY);
+        let late = ReleaseReason::LateDecision;
+        // A take-back in place is refused beside the decider at work.
+        assert!(!store.take_back_decode(GATEWAY, lease, late));
+        answer.given_up(&store, &hand, late);
+        assert_eq!(told.lock().len(), heard, "left to the decider at work");
+        go.send(()).expect("the decider holds the other end");
+        bed.answer().await;
+        assert_eq!(store.sides(GATEWAY, lease), filed);
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 1, 0]);
+        let released = (Side::Decode, other, Some(late));
+        assert_eq!(told.lock().get(heard), Some(&released));
+        store.hand_back(hand);
+    }
+
+    /// A decode call is decided at its lease's file, whatever model it
+    /// names: its job goes to the decider that issued the lease, not to
+    /// the decider of the model the call names. A repeat under such a
+    /// name takes the call's issue back there, and the first pick's decode
+    /// stands chosen where the named model has no pair.
+    #[tokio::test]
+    async fn a_decode_call_is_decided_by_its_leases_decider_whatever_model_it_names() {
+        let (mut bed, _, prefill) = later_bed_of(4);
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let home = format!("decide-{}", bed.deciders.of(MODEL));
+        let elsewhere = (0..64)
+            .map(|index| format!("model-{index}"))
+            .find(|model| bed.deciders.of(model) != bed.deciders.of(MODEL))
+            .expect("some model of sixty-four has another key");
+        let answer = bed.ask(call(1, id)).await;
+        assert_eq!(sides_of(&answer), [(id, proto::Side::Decode, 0)]);
+        assert_eq!(decode_on_file(&bed, id), (LeaseState::ISSUED, other));
+        bed.script.readers.lock().clear();
+        let mut repeat = again(call(1, id));
+        let facts = repeat.facts.as_mut().expect("the case's frame has facts");
+        facts.model = elsewhere;
+        bed.ask(repeat).await;
+        let readers = mem::take(&mut *bed.script.readers.lock());
+        assert!(
+            !readers.is_empty() && readers.iter().all(|reader| *reader == home),
+            "{readers:?}"
+        );
+        assert_eq!(asked_again(&bed), [0, 1]);
+        assert_eq!(decode_on_file(&bed, id), (LeaseState::Chosen, chosen));
+        assert_eq!(pair_counts(&bed.store, [prefill, chosen, other]), [2, 1, 0]);
+    }
+
+    /// What an answer that does not leave gives up, by what its lease is
+    /// handed over with. A decode call's answer takes back its own issue
+    /// alone, by its count: behind a repeat's issue it moves nothing. Any
+    /// other answer's lease is released whole, both its sides.
+    #[tokio::test]
+    async fn an_answer_given_up_takes_back_its_own_issue_or_releases_its_lease_whole() {
+        let (mut bed, told, prefill) = later_bed();
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        let lease = LeaseId(id);
+        let filed = store.sides(GATEWAY, lease);
+        let file = || {
+            let counts = pair_counts(&store, [prefill, chosen, other]);
+            (store.sides(GATEWAY, lease), counts)
+        };
+        let at = bed.script.taken;
+        let answer = |beside| queued(lease, beside, at);
+        let hand = lifecycle::open(&store, GATEWAY);
+        let late = ReleaseReason::LateDecision;
+        // The first call's answer, given up behind a repeat's issue.
+        let first = answer(wire::Beside::Issue(issued_by_hand(&bed, call(1, id))));
+        taken_back_by_hand(&store, lease).await;
+        let repeat = answer(wire::Beside::Issue(issued_by_hand(&bed, call(1, id))));
+        let issued = file();
+        assert_eq!(issued.1, [2, 1, 1]);
+        first.given_up(&store, &hand, late);
+        assert_eq!(file(), issued);
+        // The repeat's answer, given up: its own issue goes back. Its word
+        // is applied by the hand, or by a decider that leaves its work.
+        repeat.given_up(&store, &hand, late);
+        settled(|| file() == (filed, [2, 1, 0])).await;
+        assert_eq!(told.lock().last(), Some(&(Side::Decode, other, Some(late))));
+        // A pair's first answer, given up: the lease leaves whole.
+        let whole = answer(wire::Beside::Decode(crate::view::Session::NONE));
+        whole.given_up(&store, &hand, late);
+        store.hand_back(hand);
+        assert_eq!(file(), (None, [1, 1, 0]));
+    }
+
+    /// A give-up that names a chosen decode side ends it: a lost call that
+    /// runs late behind the give-up is refused as standing, with the word
+    /// or without, and books nobody.
+    #[tokio::test]
+    async fn a_give_up_that_names_a_chosen_side_ends_it() {
+        let (mut bed, _, prefill) = later_bed();
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        let leases: &dyn LeasesStore = store.as_ref();
+        let abandoned = ReleaseReason::Abandoned;
+        assert!(leases.released(GATEWAY, LeaseId(id), Some(Side::Decode), abandoned));
+        let ended = (LeaseState::Released(abandoned), chosen);
+        assert_eq!(decode_on_file(&bed, id), ended);
+        for late in [call(1, id), again(call(1, id))] {
+            assert_eq!(busy(&bed.ask(late).await), Reason::DecodeStands);
+        }
+        assert_eq!(decode_on_file(&bed, id), ended);
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 1, 0]);
+    }
+
+    /// A decode call whose model a reload bound to no pair plan is a
+    /// side's request still: it is not decided as a single. Its decision
+    /// sheds, nothing is issued and the side stays chosen.
+    #[tokio::test]
+    async fn a_decode_call_behind_a_reload_to_no_pair_plan_is_no_single() {
+        let (mut bed, _, prefill) = later_bed();
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        let reloaded = store.apply(preset("random", 2));
+        reloaded.expect("a later generation");
+        let live = LeasesStore::live(&*store, GATEWAY);
+        let answer = bed.ask(call(1, id)).await;
+        assert!(matches!(outcome(&answer), Outcome::Shed(_)), "{answer:?}");
+        assert!(sides_of(&answer).is_empty());
+        assert_eq!(decode_on_file(&bed, id), (LeaseState::Chosen, chosen));
+        assert_eq!(LeasesStore::live(&*store, GATEWAY), live);
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 1, 0]);
+    }
+
+    /// A call's issue taken back behind a reload is told to no engine. The
+    /// engine of the call's instant heard no issue of the lease, whose
+    /// generation is the first decision's: it hears no release of it.
+    #[tokio::test]
+    async fn a_decode_taken_back_behind_a_reload_is_told_to_no_engine() {
+        let (mut bed, told, prefill) = later_bed();
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        let before = told.lock().len();
+        let reloaded = Arc::new(Mutex::new(Vec::new()));
+        let applied = store.apply(later_spec(2, &reloaded));
+        applied.expect("a later generation");
+        let steps = [Step::At(Duration::ZERO), Step::At(FENCED)];
+        bed.script.steps.lock().extend(steps);
+        let answer = bed.ask(call(1, id)).await;
+        assert_eq!(busy(&answer), Reason::NotLeader);
+        assert_eq!(decode_on_file(&bed, id), (LeaseState::Chosen, chosen));
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 1, 0]);
+        assert_eq!(*reloaded.lock(), []);
+        assert_eq!(told.lock().len(), before);
     }
 }

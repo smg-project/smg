@@ -240,6 +240,7 @@ async fn placed(gateway: &mut Client, replica: &Replica, key: u64, n: u64) -> Re
         }),
         constraints: None,
         again: false,
+        ..Default::default()
     };
     let began = Instant::now();
     let answer = loop {

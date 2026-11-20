@@ -155,6 +155,7 @@ async fn decide(replica: &Replica) -> Option<decide_answer::Answer> {
             }),
             constraints: None,
             again: false,
+            ..Default::default()
         })
         .await
         .expect("the stream takes the request");

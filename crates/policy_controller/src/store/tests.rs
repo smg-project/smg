@@ -2276,8 +2276,8 @@ fn a_call_issues_the_chosen_side_afresh_and_books_it_once() {
     assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
     let mut heard = None;
     assert!(store.unlocked());
-    let issued = store
-        .issue_decided_decode(gateway, id, decode, None, now, |lease| {
+    let (issued, _) = store
+        .issue_decided_decode(gateway, id, (decode, None), now, |lease| {
             assert!(!store.unlocked(), "the issue is told under the turn");
             heard = Some(*lease);
         })

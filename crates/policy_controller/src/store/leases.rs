@@ -380,7 +380,8 @@ pub enum DecodeRefused {
     /// The prefill side is waiting for dispatch or has ended.
     PrefillNotHeld,
     /// The chosen side was already issued or dispatched, even if it has
-    /// ended, or its host gave it up.
+    /// ended, or its host gave it up, or it took as many calls as one
+    /// lease takes.
     DecodeStands,
 }
 

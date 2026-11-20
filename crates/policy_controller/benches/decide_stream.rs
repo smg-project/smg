@@ -1451,6 +1451,7 @@ fn request(id: u64, models: &[String], pair: bool) -> DecideRequest {
         }),
         constraints: None,
         again: false,
+        ..Default::default()
     }
 }
 

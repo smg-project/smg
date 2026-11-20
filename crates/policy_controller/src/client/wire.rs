@@ -87,6 +87,9 @@ pub(crate) fn request(request: &door::Request<'_>) -> (proto::DecideRequest, usi
             subset_hint: constraints.subset_hint,
         }),
         again: false,
+        // No link asks its decode later: the controller issues both sides.
+        decode_later: false,
+        decode_of: None,
     };
     (asked, facts.block_hashes.len() - held)
 }
@@ -355,7 +358,7 @@ mod tests {
     use super::{decided, frame, request};
     use crate::{
         client::MAX_HASHES,
-        controller::wire::{Checked, Decided, Leased, Lists, Viewed},
+        controller::wire::{Beside, Checked, Decided, Leased, Lists, Viewed},
         decision::{
             Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
             Trace,
@@ -661,7 +664,11 @@ mod tests {
                 decision,
                 Some(Leased {
                     lease,
-                    decode: paired.then_some(lease.session),
+                    beside: if paired {
+                        Beside::Decode(lease.session)
+                    } else {
+                        Beside::Alone
+                    },
                     left: Duration::from_millis(17),
                     due: now + Duration::from_secs(1),
                 }),
@@ -789,7 +796,7 @@ mod tests {
                     side: Side::Prefill,
                     ..Lease::default()
                 },
-                decode: Some(crate::view::Session::NONE),
+                beside: Beside::Decode(crate::view::Session::NONE),
                 left: Duration::from_secs(1),
                 due: now + Duration::from_secs(1),
             }),
@@ -841,7 +848,7 @@ mod tests {
                     id: LeaseId(17),
                     ..Lease::default()
                 },
-                decode: None,
+                beside: Beside::Alone,
                 left: Duration::from_secs(1),
                 due: now + Duration::from_secs(1),
             }),
@@ -860,7 +867,7 @@ mod tests {
                     id: LeaseId(17),
                     ..Lease::default()
                 },
-                decode: None,
+                beside: Beside::Alone,
                 left: Duration::from_secs(1),
                 due: now + Duration::from_secs(1),
             }),

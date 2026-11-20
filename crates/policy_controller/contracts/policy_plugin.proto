@@ -524,6 +524,16 @@ message Busy {
     REASON_NO_CREDIT = 2;
     REASON_BUDGET_GONE_ON_ARRIVAL = 3;
     REASON_NOT_LEADER = 4;
+    // The decode call names no lease of this gateway.
+    REASON_DECODE_NO_LEASE = 5;
+    // The lease's decode side was never chosen: its first request did not say
+    // that the decode comes later, or the lease is no pair's.
+    REASON_DECODE_NOT_CHOSEN = 6;
+    // The lease's prefill is not held: not dispatched yet, or ended.
+    REASON_DECODE_PREFILL_NOT_HELD = 7;
+    // The decode side stands: a call issued it, a dispatch named it, its
+    // gateway ended it, or it took as many calls as one lease takes (255).
+    REASON_DECODE_STANDS = 8;
   }
   Reason reason = 1;
   uint32 retry_after_micros = 2;
