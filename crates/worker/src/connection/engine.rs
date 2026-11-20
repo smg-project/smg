@@ -25,6 +25,7 @@ type ConnectionCell = OnceCell<Arc<dyn EngineConnection>>;
 
 /// A worker's connection generation. Compatible replacements adopt the slot
 /// itself so a probe from either worker can retire its observed generation.
+/// The rank workers of one ZMQ engine group hold one cache between them.
 pub struct EngineConnectionCache {
     slot: ArcSwap<ArcSwap<ConnectionCell>>,
 }

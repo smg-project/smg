@@ -512,7 +512,7 @@ fn dp_expansion_pins_only_multi_rank_widths() {
         model_id: "m".to_string(),
     };
     assert_eq!(
-        dp_rank_expansion(Some(&multi), ConnectionMode::Grpc, "grpc://w:1").unwrap(),
+        dp_rank_expansion(Some(&multi)),
         vec![Some((0, 3)), Some((1, 3)), Some((2, 3))]
     );
 
@@ -522,14 +522,8 @@ fn dp_expansion_pins_only_multi_rank_widths() {
         dp_size: 1,
         model_id: "m".to_string(),
     };
-    assert_eq!(
-        dp_rank_expansion(Some(&single), ConnectionMode::Grpc, "grpc://w:1").unwrap(),
-        vec![None]
-    );
-    assert_eq!(
-        dp_rank_expansion(None, ConnectionMode::Grpc, "grpc://w:1").unwrap(),
-        vec![None]
-    );
+    assert_eq!(dp_rank_expansion(Some(&single)), vec![None]);
+    assert_eq!(dp_rank_expansion(None), vec![None]);
 }
 
 #[test]
@@ -770,31 +764,53 @@ fn zmq_disaggregated_workers_are_rejected_as_a_create_worker_failure() {
     }
 }
 
-#[test]
-fn zmq_data_parallel_is_rejected_as_a_create_worker_failure() {
-    // dp_size > 1 over ZMQ is the only rejected combination, and it must
-    // surface as a create_worker StepFailed.
-    let err = validate_zmq_dp(ConnectionMode::Zmq, 2, "ipc:///tmp/smg-zmq/ts0.ipc")
-        .expect_err("dp_size > 1 over ZMQ must be rejected");
-    match err {
-        WorkflowError::StepFailed { step_id, message } => {
-            assert_eq!(step_id, StepId::new("create_worker"));
-            assert!(message.contains("dp_size=2"), "message was: {message}");
-        }
-        other => panic!("expected StepFailed, got {other:?}"),
-    }
-}
+/// A ZMQ engine group registered dp-aware becomes one worker per rank, as a
+/// gRPC engine does, and the rank workers hold one connection slot: the
+/// group's engines dial one socket set.
+#[tokio::test]
+async fn a_dp_aware_zmq_group_becomes_rank_workers_sharing_one_connection() {
+    let mut spec = WorkerSpec::new("ipc:///tmp/smg-zmq/ts0.ipc");
+    spec.runtime_type = RuntimeType::TokenSpeed;
+    spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+    spec.dp_size = Some(3);
+    let mut data = local_data(
+        spec,
+        ConnectionMode::Zmq,
+        ProbingHost::reading_dp(ScriptedConnector::default()),
+    );
+    data.dp_info = Some(DpInfo {
+        dp_size: 3,
+        model_id: "m".to_string(),
+    });
+    let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
 
-#[test]
-fn single_engine_zmq_and_data_parallel_grpc_are_accepted() {
-    // Single-engine ZMQ is the supported ZMQ shape; gRPC/HTTP data
-    // parallelism is untouched by the ZMQ guard.
-    validate_zmq_dp(ConnectionMode::Zmq, 1, "ipc:///tmp/smg-zmq/ts0.ipc")
-        .expect("single-engine ZMQ must be accepted");
-    validate_zmq_dp(ConnectionMode::Grpc, 4, "grpc://worker:8080")
-        .expect("gRPC data parallelism must be accepted");
-    validate_zmq_dp(ConnectionMode::Http, 4, "http://worker:8080")
-        .expect("HTTP data parallelism must be accepted");
+    assert_eq!(
+        CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+        StepResult::Success
+    );
+
+    let workers = ctx.data.actual_workers.as_ref().unwrap();
+    let ranks: Vec<&BasicWorker> = workers
+        .iter()
+        .map(|worker| worker.as_any().downcast_ref::<BasicWorker>().unwrap())
+        .collect();
+    assert_eq!(
+        ranks.iter().map(|rank| rank.url()).collect::<Vec<_>>(),
+        [
+            "ipc:///tmp/smg-zmq/ts0.ipc@0",
+            "ipc:///tmp/smg-zmq/ts0.ipc@1",
+            "ipc:///tmp/smg-zmq/ts0.ipc@2",
+        ]
+    );
+    for (index, rank) in ranks.iter().enumerate() {
+        assert_eq!(rank.dp_rank(), Some(index));
+        assert_eq!(rank.base_url(), "ipc:///tmp/smg-zmq/ts0.ipc");
+        assert_eq!(rank.metadata.zmq_engine_count(), Some(3));
+        assert!(Arc::ptr_eq(
+            &rank.engine_connection,
+            &ranks[0].engine_connection
+        ));
+    }
 }
 
 #[test]

@@ -3,6 +3,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use tokio::sync::OnceCell;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
@@ -12,6 +13,7 @@ use super::{
     runtimes::{zmq_runtime, zmq_runtime_names, DEFAULT_RUNTIME},
 };
 use crate::{
+    connection::engine::EngineConnectionCache,
     health::resilience::resolve_resilience,
     identity::{
         basic::{
@@ -139,7 +141,8 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
             &config.url,
         )?;
 
-        // A grouped ZMQ worker serves every rank over one set of sockets.
+        // A ZMQ worker that is not expanded into rank workers serves every
+        // rank over one set of sockets, as one grouped worker.
         let zmq_engine_group = config
             .dp_size
             .filter(|&n| n > 1 && *connection_mode == ConnectionMode::Zmq);
@@ -165,7 +168,7 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
         let health_endpoint = &settings.health_endpoint;
 
         let dp_ranks: Vec<Option<(usize, usize)>> = if settings.dp_aware {
-            dp_rank_expansion(context.data.dp_info.as_ref(), *connection_mode, &config.url)?
+            dp_rank_expansion(context.data.dp_info.as_ref())
         } else {
             vec![None] // single worker, no DP
         };
@@ -180,6 +183,11 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
         spec.kv_connector = None;
         spec.kv_role = None;
         spec.kv_engine_id = None;
+
+        // The engines of a ZMQ group dial one socket set, whichever worker
+        // binds it: the group's rank workers share one connection.
+        let zmq_rank_connection = (*connection_mode == ConnectionMode::Zmq && dp_ranks.len() > 1)
+            .then(|| Arc::new(EngineConnectionCache::new(OnceCell::new())));
 
         let workers: Vec<Arc<dyn Worker>> = dp_ranks
             .into_iter()
@@ -225,8 +233,11 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
                 if let Some(ref address) = config.zmq_handshake_address {
                     builder = builder.zmq_handshake_address(address.clone());
                 }
-                if let Some(group_size) = zmq_engine_group {
+                if let (None, Some(group_size)) = (dp, zmq_engine_group) {
                     builder = builder.zmq_engine_group(group_size);
+                }
+                if let Some(ref slot) = zmq_rank_connection {
+                    builder = builder.shared_engine_connection(Arc::clone(slot));
                 }
                 // A new or recovered connection can wake the health manager.
                 builder = builder.connect_signal_tx(registry.connect_signal_sender());
@@ -687,46 +698,13 @@ fn attention_dp_width(labels: &HashMap<String, String>, size: usize) -> Option<u
 /// register a plain worker: there is no placement to choose, and pinning
 /// rank 0 anyway still alters engine-side scheduling. The DP read already
 /// logged the degradation for the missing-label case.
-fn dp_rank_expansion(
-    dp_info: Option<&DpInfo>,
-    connection_mode: ConnectionMode,
-    url: &str,
-) -> Result<Vec<Option<(usize, usize)>>, WorkflowError> {
+fn dp_rank_expansion(dp_info: Option<&DpInfo>) -> Vec<Option<(usize, usize)>> {
     match dp_info {
-        Some(dp_info) if dp_info.dp_size > 1 => {
-            validate_zmq_dp(connection_mode, dp_info.dp_size, url)?;
-            Ok((0..dp_info.dp_size)
-                .map(|r| Some((r, dp_info.dp_size)))
-                .collect())
-        }
-        Some(_) | None => Ok(vec![None]),
+        Some(dp_info) if dp_info.dp_size > 1 => (0..dp_info.dp_size)
+            .map(|r| Some((r, dp_info.dp_size)))
+            .collect(),
+        Some(_) | None => vec![None],
     }
-}
-
-/// Reject a data-parallel worker the ZMQ path cannot serve.
-///
-/// dp-aware expansion creates one rank-pinned worker per DP rank, but each
-/// ZMQ worker owns its own socket bind — N expanded workers would fight over
-/// the same ipc paths. ZMQ DP runs as a *grouped* worker instead (`dp_size: N`
-/// on the worker spec: one worker, one socket set, N engines dialing in), so
-/// reject the expansion loudly and point at the grouped form. gRPC/HTTP
-/// expansion and single-engine ZMQ are fine.
-fn validate_zmq_dp(
-    connection_mode: ConnectionMode,
-    dp_size: usize,
-    url: &str,
-) -> Result<(), WorkflowError> {
-    if connection_mode == ConnectionMode::Zmq && dp_size > 1 {
-        return Err(WorkflowError::StepFailed {
-            step_id: StepId::new("create_worker"),
-            message: format!(
-                "ZMQ worker {} cannot be dp-aware expanded (dp_size={dp_size}); \
-                 configure a grouped ZMQ worker (`dp_size` on the worker spec) instead",
-                Endpoint::redacted_str(url)
-            ),
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]
