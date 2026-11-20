@@ -14,7 +14,10 @@ use smg_policy_controller::{
 use smg_worker::identity::basic::ConnectionMode;
 
 use super::{
-    tests::{create_test_pd_router, spawn_cut_body_stub, spawn_delayed_stub, spawn_recording_stub},
+    tests::{
+        create_test_pd_router, spawn_cut_body_stub, spawn_delayed_stub, spawn_recording_stub,
+        spawn_stub,
+    },
     *,
 };
 use crate::{
@@ -444,6 +447,147 @@ async fn a_drained_prefill_that_breaks_off_is_told_as_no_success() -> Case {
     Ok(())
 }
 
+/// A server whose answer's head and first bytes leave at once, with more
+/// bytes an eighth into `hold`, and whose body ends at `hold`: whole, or
+/// broken off.
+async fn spawn_held_body_stub(hold: Duration, whole: bool) -> String {
+    let app = axum::Router::new().fallback(axum::routing::any(move || async move {
+        let first = futures_util::stream::iter([Ok(Bytes::from_static(b"{\"partial\":"))]);
+        let middle = futures_util::stream::once(async move {
+            tokio::time::sleep(hold / 8).await;
+            Ok(Bytes::from_static(b" "))
+        });
+        let end = futures_util::stream::once(async move {
+            tokio::time::sleep(hold - hold / 8).await;
+            if whole {
+                Ok(Bytes::from_static(b"1}"))
+            } else {
+                Err(std::io::Error::other("the engine went away"))
+            }
+        });
+        (
+            [(CONTENT_TYPE, "application/json")],
+            Body::from_stream(first.chain(middle).chain(end)),
+        )
+    }));
+    spawn_stub(app).await
+}
+
+/// The held body of the three cases below ends this long after its head.
+const DRAIN_HOLD: Duration = Duration::from_millis(800);
+
+/// Whether the prefill still holds its lease, read well inside its body's
+/// hold. A reader that came late says nothing: `None`.
+fn leased_inside_the_hold(store: &MemoryStore, start: Instant) -> Option<bool> {
+    (start.elapsed() < DRAIN_HOLD / 2).then(|| LeasesStore::live(store, GATEWAY) == 1)
+}
+
+/// A drain that outlives the answer's body tells the prefill's end itself.
+/// The decode's answer ends at once and the prefill's body later: the
+/// prefill stays leased until then, and a drain that breaks off is told as
+/// no success though the answer went out whole. A whole drain is the
+/// control.
+#[tokio::test]
+async fn a_drain_that_outlives_its_answer_tells_the_prefills_end() -> Case {
+    for whole in [true, false] {
+        let prefill = spawn_held_body_stub(DRAIN_HOLD, whole).await;
+        let (decode, _) = spawn_recording_stub(r#"{"text":"done"}"#).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+        let row = store
+            .by_key(&prefill)
+            .ok_or("the prefill worker had no row")?;
+        let router = router(registry, host);
+        let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+        let request = serde_json::from_value(json!({"text": "hi", "stream": true}))?;
+        let start = Instant::now();
+
+        let response = router.route_generate(None, &meta, request, MODEL).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        let leased = leased_inside_the_hold(&store, start);
+        assert_ne!(leased, Some(false), "the prefill ended with the answer");
+        assert_eq!(live(&store, 0).await, 0);
+        let ok = HealthSink::completed_ok_since(&*store, GATEWAY, row.id, start);
+        assert_eq!(ok, whole, "drained whole: {whole}");
+    }
+    Ok(())
+}
+
+/// A client that leaves mid-stream gives up the decode, and the prefill
+/// stays with its drain, which the gateway keeps: the prefill is leased
+/// until the drain ends, and hears the drain's own end.
+#[tokio::test]
+async fn a_client_that_leaves_mid_stream_leaves_the_prefill_to_its_drain() -> Case {
+    for whole in [true, false] {
+        let prefill = spawn_held_body_stub(DRAIN_HOLD, whole).await;
+        let decode = spawn_held_body_stub(DRAIN_HOLD * 20, true).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+        let row = store
+            .by_key(&prefill)
+            .ok_or("the prefill worker had no row")?;
+        let router = router(registry, host);
+        let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+        let request = serde_json::from_value(json!({"text": "hi", "stream": true}))?;
+        let start = Instant::now();
+
+        let response = router.route_generate(None, &meta, request, MODEL).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+        let leased = leased_inside_the_hold(&store, start);
+        assert_ne!(
+            leased,
+            Some(false),
+            "the prefill ended at the client's leave"
+        );
+        assert_eq!(live(&store, 0).await, 0);
+        let ok = HealthSink::completed_ok_since(&*store, GATEWAY, row.id, start);
+        assert_eq!(ok, whole, "drained whole: {whole}");
+    }
+    Ok(())
+}
+
+/// While the answer's body runs, a drained prefill ends at the answer's
+/// next frame: its row hears the success well ahead of the answer's end.
+#[tokio::test]
+async fn a_drained_prefill_ends_at_the_answers_next_frame() -> Case {
+    let (prefill, _) = spawn_recording_stub("{}").await;
+    let decode = spawn_held_body_stub(DRAIN_HOLD, true).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+    let row = store
+        .by_key(&prefill)
+        .ok_or("the prefill worker had no row")?;
+    let router = router(registry, host);
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    let request = serde_json::from_value(json!({"text": "hi", "stream": true}))?;
+    let start = Instant::now();
+
+    let response = router.route_generate(None, &meta, request, MODEL).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let early = async {
+        // The patience ends inside the answer's hold: a prefill that ends
+        // with the answer is read as not ended here.
+        let deadline = start + DRAIN_HOLD / 2;
+        while Instant::now() < deadline {
+            if HealthSink::completed_ok_since(&*store, GATEWAY, row.id, start) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    };
+    let whole = axum::body::to_bytes(response.into_body(), usize::MAX);
+    let (_, ended) = tokio::join!(whole, early);
+    assert!(ended, "the prefill stayed booked to the answer's end");
+    assert_eq!(live(&store, 0).await, 0);
+    Ok(())
+}
+
 /// A prefill that is read whole ends where its guard drops, ahead of the
 /// answer its decode writes. The decode here holds its answer, and the
 /// prefill's row hears its success well inside that hold. Both shapes: the
@@ -467,7 +611,8 @@ async fn a_prefill_read_whole_ends_ahead_of_its_decodes_answer() -> Case {
         let early = async {
             // The patience ends inside the decode's hold: a prefill that
             // ends with the answer is read as not ended here.
-            for _ in 0..100 {
+            let deadline = start + hold / 2;
+            while Instant::now() < deadline {
                 let held = decode_seen.lock().is_ok_and(|seen| !seen.is_empty());
                 if held && HealthSink::completed_ok_since(&*store, GATEWAY, row.id, start) {
                     return true;

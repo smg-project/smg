@@ -897,7 +897,9 @@ async fn the_http_pair_router_is_built_under_the_setting() -> Case {
 /// A gateway of many routers mounts every family over its one document.
 /// Under a document that plans no pair its HTTP pair keeps the refusal by
 /// name: a pair asked there would be decided as a single. Under a pair
-/// gateway's document it serves.
+/// gateway's document it serves. Under a controller's address it refuses by
+/// name though the document plans pairs: the pair is the controller's to
+/// decide there.
 #[tokio::test]
 async fn many_routers_mount_the_http_pair_router_where_the_document_plans_pairs() -> Case {
     use crate::routers::{factory::router_ids, RouterFactory};
@@ -911,7 +913,12 @@ async fn many_routers_mount_the_http_pair_router_where_the_document_plans_pairs(
         prefill_policy: None,
         decode_policy: None,
     };
-    for (config, serves) in [(regular, false), (pair, true)] {
+    // A socket that never listens: the follower dials it and tells nothing.
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let mut followed = pair.clone();
+    followed.policy_controller_address = Some(socket.local_addr()?.to_string());
+    for (config, serves) in [(regular, false), (pair, true), (followed, false)] {
         let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);
         let routers = RouterFactory::create_igw_routers(&config.policy, &context).await;
         let (_, _, built) = routers
@@ -923,6 +930,10 @@ async fn many_routers_mount_the_http_pair_router_where_the_document_plans_pairs(
             assert_eq!(router.router_type(), "pd");
         } else {
             assert_refusing_router(router.as_ref(), "HTTP pair, many routers").await?;
+        }
+        if let Some(follower) = &context.policy_follower {
+            let follower = follower.lock().take().ok_or("the follower was taken")?;
+            follower.stop().await;
         }
     }
     Ok(())

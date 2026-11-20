@@ -162,9 +162,7 @@ impl RouterFactory {
         );
 
         let config = ctx.router_config.clone();
-        // Under the policy controller a side's rank is its target's: no rank
-        // policy is built.
-        if config.dp_minimum_tokens_scheduler && ctx.policy_host.is_none() {
+        if config.dp_minimum_tokens_scheduler {
             let mini_tokens_policy = MinimumTokensPolicy::new(
                 ctx.worker_monitor
                     .as_ref()
