@@ -1114,6 +1114,12 @@ impl MemoryStore {
                 found
             }
             Said::Released(side, reason) => leases.released(&key, side, reason),
+            #[cfg(feature = "controller")]
+            Said::TakenBack(issue, _) => leases.taken_back(&key, Some(super::DecodeIssue(issue))),
+            // The served door alone takes an issue back: without it
+            // nothing stands for the word.
+            #[cfg(not(feature = "controller"))]
+            Said::TakenBack(..) => None,
         };
         if let Some(found) = found {
             self.tell(at, one.world(self), &found, said);

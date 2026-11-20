@@ -1209,6 +1209,10 @@ pub struct Constraints<'a> {
     /// not: its host says so here.
     pub overload_lifted: bool,
     /// This pair's decode is sent after its prefill has run. Default: false.
+    /// A door in process reads it. A link does not carry it yet: it sends
+    /// the field as false, the controller issues both sides at the first
+    /// ask, and a decode call over the link answers that the side was not
+    /// chosen.
     pub decode_later: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,

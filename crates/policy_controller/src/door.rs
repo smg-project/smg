@@ -1987,6 +1987,14 @@ fn tell(store: &MemoryStore, world: &World, found: &Sides, said: Said) {
                 found.each_ending(side, |lease| engine.on_released(lease, reason));
             }
         }
+        // An issue taken back is the decode side's release to the stages.
+        Said::TakenBack(_, reason) => {
+            if let Some(engine) = issuing() {
+                found.each_ending(Some(Side::Decode), |lease| {
+                    engine.on_released(lease, reason);
+                });
+            }
+        }
     }
 }
 

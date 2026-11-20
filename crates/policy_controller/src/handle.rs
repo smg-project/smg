@@ -58,6 +58,9 @@
 //! After reporting the prefill dispatch and before reporting its end,
 //! the host can call [`Handle::decide_decode`] for a fresh pick or send a
 //! decode from the first pick. A decode still chosen leaves with its prefill.
+//! That holds for a handle over a door in process. A handle over a link
+//! sends the field as false: the controller issues both sides at the first
+//! ask, and [`Handle::decide_decode`] answers that the side was not chosen.
 
 use std::{
     fmt,
@@ -393,7 +396,9 @@ impl<D: Deref<Target = Door>> Handle<D> {
                         door.report(*gateway, lease, said);
                     });
                 }
-                Said::Dispatched(..) | Said::Released(..) => door.report(*gateway, lease, said),
+                Said::Dispatched(..) | Said::Released(..) | Said::TakenBack(..) => {
+                    door.report(*gateway, lease, said);
+                }
             },
             #[cfg(feature = "client")]
             Arm::Link(link) => {

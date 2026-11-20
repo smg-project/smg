@@ -339,7 +339,7 @@ impl<S> Answers<S> {
             return wire::decided(id, term, &decision, lease.as_ref());
         };
         if let Some(leased) = lease {
-            leased.given_up(&self.shared.store, &self.hand, self.gateway, release);
+            leased.given_up(&self.shared.store, &self.hand, release);
         }
         deciders.busy(id, reason)
     }
@@ -437,7 +437,7 @@ impl<S> Drop for Answers<S> {
                 ..
             } = decided
             {
-                leased.given_up(&self.shared.store, &self.hand, self.gateway, abandoned);
+                leased.given_up(&self.shared.store, &self.hand, abandoned);
             }
         }
         if dropped != 0 {
@@ -1721,13 +1721,15 @@ mod tests {
             other => panic!("an answer within the case's patience: {other:?}"),
         };
         assert_eq!(busy(&stopped), Reason::NotLeader);
+        // Each give-up hands its word to the lease's file: the file's
+        // decider applies it as it leaves its work, or this read does.
         let (first, filed) = &pairs[0];
-        assert_eq!(store.sides(gateway, *first), *filed);
+        settled(|| store.sides(gateway, *first) == *filed).await;
         // The stream ends with the second call's answer in its queue.
         let (second, filed) = &pairs[1];
         assert_ne!(store.sides(gateway, *second), *filed);
         drop(stream);
-        assert_eq!(store.sides(gateway, *second), *filed);
+        settled(|| store.sides(gateway, *second) == *filed).await;
         // The engine heard each issue's release, and no prefill's.
         let abandoned = Some(ReleaseReason::Abandoned);
         let released = |side| {

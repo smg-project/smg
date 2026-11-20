@@ -348,6 +348,13 @@ pub(crate) fn frame(lease: LeaseId, side: Side, said: Said) -> Frame {
             }
             .into(),
         }),
+        // No host says the word, and no frame carries an issue's count: the
+        // nearest frame gives the decode side up.
+        Said::TakenBack(_, reason) => Frame::Released(proto::Released {
+            what: Some(What::LeaseId(lease.0)),
+            reason: Reason::from(reason).into(),
+            side: proto::Side::Decode.into(),
+        }),
     }
 }
 

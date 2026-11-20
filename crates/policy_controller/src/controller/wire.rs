@@ -62,7 +62,7 @@ use crate::{
     operator::{Document, NeedsRow, Status},
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
     spec::{AppliedSpec, MAX_HEADERS},
-    store::{DecodeIssue, GatewayId, Hand, MemoryStore, Said},
+    store::{DecodeIssue, Hand, MemoryStore, Said},
     view::{
         fingerprint, key_of_session, Constraints, HashKind, Header, Identity, MediaCounts,
         ModelFingerprint, NamedAffinity, Phase, RequestFacts, Session, WireModes, WorkerId,
@@ -603,22 +603,16 @@ impl Leased {
     }
 
     /// Gives the lease up for an answer that does not leave, under
-    /// `reason`. A decode call's answer takes its one issue back, with its
-    /// engine told, and the side stands chosen for the first pick's
-    /// dispatch ([`MemoryStore::take_back_decode`]). Any other lease is
-    /// released whole by a word handed to its file through `hand`, as a
-    /// `Released` frame's word is: whoever holds the file's turn next ends
-    /// the lease and tells its engine.
-    pub(crate) fn given_up(
-        &self,
-        store: &MemoryStore,
-        hand: &Hand,
-        gateway: GatewayId,
-        reason: ReleaseReason,
-    ) {
+    /// `reason`, by a word handed to its file through `hand`, as a
+    /// `Released` frame's word is: whoever may act at the file next applies
+    /// it and tells its engine, so no stage hears it beside its decider at
+    /// work. A decode call's answer takes its one issue back, and the side
+    /// stands chosen for the first pick's dispatch ([`Said::TakenBack`]).
+    /// Any other lease is released whole.
+    pub(crate) fn given_up(&self, store: &MemoryStore, hand: &Hand, reason: ReleaseReason) {
         match self.beside {
             Beside::Issue(issue) => {
-                store.take_back_decode(gateway, self.lease.id, Some(issue), reason);
+                store.hand(hand, self.lease.id, Said::TakenBack(issue.count(), reason));
             }
             Beside::Alone | Beside::Decode(_) => {
                 store.hand(hand, self.lease.id, Said::Released(None, reason));

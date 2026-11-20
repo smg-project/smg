@@ -3527,6 +3527,15 @@ struct HeldDecode {
 )]
 pub(crate) struct DecodeIssue(u8);
 
+#[cfg(feature = "controller")]
+impl DecodeIssue {
+    /// The issue's count, as a word of the leases' file names the issue
+    /// ([`Said::TakenBack`]).
+    pub(crate) fn count(self) -> u8 {
+        self.0
+    }
+}
+
 /// What an issue of a chosen decode side replaced: the side and the
 /// lease's dispatch deadline as they stood.
 #[cfg(feature = "controller")]
@@ -3798,7 +3807,10 @@ impl Leases {
     }
 
     /// The place a decode call can issue into, while its prefill is held:
-    /// a side still chosen. A side a repeat's ending put back is one.
+    /// a side still chosen. A side a repeat's ending put back is one. A
+    /// side whose count of issues is full is none: it is refused as one
+    /// that stands, so no count repeats, an undo names one issue for the
+    /// lease's life, and the first pick's dispatch still books the side.
     fn chosen_decode(&mut self, key: &Key) -> Result<(&mut Held, &mut HeldDecode), DecodeRefused> {
         let held = self.records.get_mut(key).ok_or(DecodeRefused::NoLease)?;
         let found = held
@@ -3815,6 +3827,9 @@ impl Leases {
         }
         if !matches!(held.record.state, LeaseState::Dispatched { .. }) {
             return Err(DecodeRefused::PrefillNotHeld);
+        }
+        if found.issues == u8::MAX {
+            return Err(DecodeRefused::DecodeStands);
         }
         Ok((held, found))
     }
@@ -3900,6 +3915,7 @@ impl Leases {
         let (held, found) = self.chosen_decode(&key)?;
         #[cfg(feature = "controller")]
         let kept = (held.decode, (found.side, held.record.dispatch_deadline));
+        // The place's own test left room for one more: nothing wraps.
         let count = found.issues.wrapping_add(1);
         decode.state = LeaseState::issued(decode.state.session_ttl_micros());
         decode.target_index = 0;
@@ -4477,29 +4493,29 @@ impl MemoryStore {
         Ok((lease, issue))
     }
 
-    /// Takes back an issue of the decode side of `gateway`'s lease `lease`
-    /// where a call issued the side and no dispatch named it: no dispatch
-    /// will name what that issue's answer carried. With `issue` it is that
-    /// issue alone, for an answer of the call that does not leave. With
-    /// none it is the issue that stands, for a gateway that asks the call
-    /// again and holds no answer to it. The issue is released under
-    /// `reason` with its engine told, and the side holds the first pick's
-    /// targets again: that pick's dispatch books it, and a later call
-    /// issues it anew. The lease's prefill keeps its booking. `false`
-    /// where no such issue stands: a side still chosen, one a dispatch
-    /// named, one that ended, one issued anew since.
+    /// Takes back the issue that stands of the decode side of `gateway`'s
+    /// lease `lease`, where a call issued the side and no dispatch named
+    /// it: for a gateway that asks the call again and holds no answer to
+    /// it, so no dispatch will name what that answer carried. The caller
+    /// is the lease's decider, the thread at work at its file. An answer
+    /// that does not leave its stream is given up on the stream's task,
+    /// and hands the file a word instead ([`Said::TakenBack`]). The issue
+    /// is released under `reason` with its engine told, and the side holds
+    /// the first pick's targets again: that pick's dispatch books it, and
+    /// a later call issues it anew. The lease's prefill keeps its booking.
+    /// `false` where no issue stands: a side still chosen, one a dispatch
+    /// named, one that ended.
     #[cfg(feature = "controller")]
     #[cold]
     pub(crate) fn take_back_decode(
         &self,
         gateway: GatewayId,
         lease: LeaseId,
-        issue: Option<DecodeIssue>,
         reason: ReleaseReason,
     ) -> bool {
         let at = self.file_of(lease);
         let mut leases = self.turn_of(at);
-        let Some(found) = leases.taken_back(&(gateway, lease), issue) else {
+        let Some(found) = leases.taken_back(&(gateway, lease), None) else {
             return false;
         };
         let mut one = turn::OneLoad::default();
