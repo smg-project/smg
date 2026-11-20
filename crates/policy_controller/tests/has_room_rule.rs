@@ -238,6 +238,30 @@ fn a_report_past_the_views_limit_reads_as_no_report() {
 }
 
 #[test]
+fn a_count_that_holds_no_send_leaves_the_other_terms_of_the_rule() {
+    let policy = policy(
+        r#"{"has-room":{"used":{"load.resident_tokens":1,"sent.tokens":1},"capacity":1000}}"#,
+    );
+    let rows = [row(0, 999), row(1, 1_001)];
+    // No row holds an entry: the pass reads no count, and the report's
+    // term still drops the second row.
+    assert_eq!(kept(&policy, 0, &request(0), &rows), [0]);
+    // A send behind the first row's sample enters the count, and the pass
+    // reads it.
+    let lease = Lease {
+        issued_micros: NOW + 1,
+        tokens: 2,
+        ..Lease::default()
+    };
+    let target = Target {
+        id: rows[0].id,
+        ..Target::default()
+    };
+    policy.on_dispatched(&lease, &target, Side::Single, 0);
+    assert_eq!(kept(&policy, 0, &request(0), &rows), [0u32; 0]);
+}
+
+#[test]
 fn a_send_takes_room_until_a_report_or_the_profiles_limit_ends_it() {
     const START: u64 = 91_300;
     const DELAY: u32 = 47;

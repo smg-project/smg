@@ -124,10 +124,24 @@ impl SentCredit {
 
     /// One pass's reads. The pass loads the tally map once and reads each
     /// row's count when asked. A request clock of zero applies no time limit.
+    #[inline]
     pub fn reads<'a>(&'a self, facts: &RequestFacts<'_>) -> SentReads<'a> {
         SentReads {
             tally: self.credits.tally.load(),
             cutoff: facts.now_micros.saturating_sub(self.ttl_micros),
+            credit: PhantomData,
+        }
+    }
+
+    /// [`Self::reads`] for a count that sets no time limit
+    /// ([`Self::limited`]): the pass has no cutoff, and none is worked
+    /// out.
+    #[inline(always)]
+    pub(crate) fn reads_unlimited(&self) -> SentReads<'_> {
+        debug_assert!(!self.limited(), "the count sets no time limit");
+        SentReads {
+            tally: self.credits.tally.load(),
+            cutoff: 0,
             credit: PhantomData,
         }
     }
@@ -143,6 +157,15 @@ pub struct SentReads<'a> {
 }
 
 impl SentReads<'_> {
+    /// Whether the count holds an entry of any row. A row enters at its
+    /// first send and leaves with its removal, so a count that holds none
+    /// reads zero of every row: a pass that only sums its reads skips
+    /// them.
+    #[inline(always)]
+    pub(crate) fn holds_any(&self) -> bool {
+        !self.tally.is_empty()
+    }
+
     /// The sends since the later of the row's sample and the time cutoff.
     /// A row without a report has a sample instant of zero.
     ///
@@ -178,11 +201,7 @@ impl SentReads<'_> {
             .get(&(row.id, row.dp_rank))
             .map_or_else(SentCounts::default, |since| {
                 let sample = row.load.map_or(0, |_| row.load_sampled_at_micros);
-                let (tokens, requests) = since.credit_through(sample.max(self.cutoff));
-                SentCounts {
-                    requests: requests as u32,
-                    tokens,
-                }
+                since.credit_through(sample.max(self.cutoff)).counts()
             })
     }
 
