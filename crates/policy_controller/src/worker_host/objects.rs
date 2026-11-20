@@ -1298,7 +1298,7 @@ mod tests {
         let standing = replica.objects.standing(&id);
         replica.told();
         let revision = replica.row(A).revision;
-        replica.store.probe_outcome(row, true, revision);
+        replica.store.probe_outcome(row, true, revision, &|| true);
         let moved = replica.store.set_status(row, WorkerStatus::Ready, revision);
         assert!(moved.is_some());
         assert_eq!(replica.row(A).revision, revision);

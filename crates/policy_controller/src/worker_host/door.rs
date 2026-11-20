@@ -203,7 +203,7 @@ pub(crate) fn lay(
     };
     if !probes {
         if let Some(row) = store.get(change.id()) {
-            store.connected(row.id, row.revision);
+            store.connected(row.id, row.revision, &|| true);
         }
     }
     Ok(wrote)

@@ -301,7 +301,7 @@ impl Door {
         // from the old incarnation. Read before the connect signal moves it.
         let carried = now.status != WorkerStatus::Pending;
         if !now.facts.health.probes {
-            self.store.connected(id, now.revision);
+            self.store.connected(id, now.revision, &|| true);
             if request.wait_ready {
                 (now, epoch, at) = (self.read(id)?, self.store.epoch(), self.place());
             }

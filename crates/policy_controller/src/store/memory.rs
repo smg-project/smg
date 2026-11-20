@@ -2023,11 +2023,22 @@ fn next_status(row: &mut Row, ok: bool) -> Option<WorkerStatus> {
 }
 
 impl HealthSink for MemoryStore {
-    fn probe_outcome(&self, id: WorkerId, ok: bool, revision: u64) -> HealthWrite {
+    fn probe_outcome(
+        &self,
+        id: WorkerId,
+        ok: bool,
+        revision: u64,
+        leads: &dyn Fn() -> bool,
+    ) -> HealthWrite {
         let mut workers = self.writing();
         let Some(row) = workers.guarded(id, revision) else {
             return workers.unjudged(id);
         };
+        // The writer's last word, behind the lock this write waited for:
+        // past a no, no probe is counted and no status moves.
+        if !leads() {
+            return HealthWrite::Stale;
+        }
         let from = row.row.status;
         let Some(to) = next_status(row, ok) else {
             return HealthWrite::Stood(from);
@@ -2043,11 +2054,15 @@ impl HealthSink for MemoryStore {
         HealthWrite::Moved { from, to }
     }
 
-    fn connected(&self, id: WorkerId, revision: u64) -> HealthWrite {
+    fn connected(&self, id: WorkerId, revision: u64, leads: &dyn Fn() -> bool) -> HealthWrite {
         let mut workers = self.writing();
         let Some(row) = workers.guarded(id, revision) else {
             return workers.unjudged(id);
         };
+        // The writer's last word, as at a probe's outcome.
+        if !leads() {
+            return HealthWrite::Stale;
+        }
         let from = row.row.status;
         if matches!(from, WorkerStatus::Draining | WorkerStatus::Ready) {
             return HealthWrite::Stood(from);
