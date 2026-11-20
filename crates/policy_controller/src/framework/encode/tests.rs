@@ -284,6 +284,65 @@ fn a_request_without_items_reads_no_encoder_and_places_none() {
 }
 
 #[test]
+fn a_pair_only_epd_call_ignores_unused_encode_columns() {
+    let mut bed = Bed::new();
+    bed.keys.clear();
+    let engine = engine();
+    let expected = bed.pair(&engine);
+    let (facts, pool) = bed.asked();
+    let cx = Constraints::default();
+    let mut scratch = Scratch::new();
+    let mut placed = EncodePlaced::new();
+    let decision = engine.decide_encode_pair(
+        &facts,
+        &pool,
+        bed.pools(),
+        EncodePool::default(),
+        EncodeItems::default(),
+        &cx,
+        &cx,
+        &cx,
+        &mut scratch,
+        &mut placed,
+    );
+
+    assert_eq!(decision, expected);
+    assert!(scratch.encode.is_none());
+    assert!(placed.encoders().is_empty());
+}
+
+#[test]
+fn a_pair_only_image_decode_ignores_unused_encode_columns() {
+    let mut bed = Bed::new();
+    bed.keys.clear();
+    let engine = engine();
+    // The bed's decode takes images, so its pair answer is expected.
+    let expected = bed.pair(&engine);
+    let (facts, pool) = bed.asked();
+    let cx = Constraints::default();
+    let mut scratch = Scratch::new();
+    let mut placed = EncodePlaced::new();
+    let decision = engine.decide_encode_pair(
+        &facts,
+        &pool,
+        bed.pools(),
+        EncodePool::default(),
+        EncodeItems {
+            decode_images: true,
+            ..EncodeItems::default()
+        },
+        &cx,
+        &cx,
+        &cx,
+        &mut scratch,
+        &mut placed,
+    );
+
+    assert_eq!(decision, expected);
+    assert!(placed.encoders().is_empty());
+}
+
+#[test]
 fn the_one_key_is_placed_under_a_class_that_pushes_and_under_no_other() {
     let mut bed = Bed::new();
     bed.keys = vec![Identity::hashed(11), Identity::hashed(12)];
@@ -990,8 +1049,8 @@ fn a_hosts_count_past_the_cap_asks_the_admitted_copy_for_no_cell() {
 /// The decision of `bed` over a fresh scratch under `table`, and the words
 /// each of the encode side's four sets of bits holds after it: the open and
 /// the member encode classes, the decodes' classes and those that take
-/// images.
-fn decided_widths(bed: &Bed, table: PairTable<'_>) -> (Decision, [usize; 4]) {
+/// images. A call that needs no encode side returns no widths.
+fn decided_widths(bed: &Bed, table: PairTable<'_>) -> (Decision, Option<[usize; 4]>) {
     let (facts, pool) = bed.asked();
     let pools = PairPools {
         table,
@@ -1024,12 +1083,11 @@ fn decided_widths(bed: &Bed, table: PairTable<'_>) -> (Decision, [usize; 4]) {
         &mut scratch,
         &mut EncodePlaced::new(),
     );
-    let side = scratch
-        .encode
-        .as_deref()
-        .expect("the entry leaves its side in the scratch");
-    let sets = [&side.open, &side.member, &side.decodes_of, &side.vision_of];
-    (decision, sets.map(|set| set.words.len()))
+    let widths = scratch.encode.as_deref().map(|side| {
+        let sets = [&side.open, &side.member, &side.decodes_of, &side.vision_of];
+        sets.map(|set| set.words.len())
+    });
+    (decision, widths)
 }
 
 #[test]
@@ -1044,12 +1102,12 @@ fn a_class_number_above_the_fleet_sizes_no_set() {
     bed.decodes = vec![far(0, 0), far(1, 1), far(2, 9)];
     let (decision, words) = decided_widths(&bed, none);
     assert!(decision.pick().is_some(), "{decision:?}");
-    assert_eq!(words, [1, 1, 1, 1]);
+    assert_eq!(words, Some([1, 1, 1, 1]));
     // A far number no decode names is no partner.
     bed.decodes = vec![far(0, 1), far(1, 9)];
     let (decision, words) = decided_widths(&bed, none);
     assert!(decision.pick().is_none(), "{decision:?}");
-    assert_eq!(words[2..], [1, 1]);
+    assert_eq!(words.map(|words| [words[2], words[3]]), Some([1, 1]));
     // Under a table a number above the table's count is no class of it, and
     // the sets are the table's width.
     let (ends, classes) = ([1], [1]);
@@ -1057,14 +1115,14 @@ fn a_class_number_above_the_fleet_sizes_no_set() {
     bed.decodes = vec![row(0, Role::Decode, 1, 0), far(1, 0)];
     let (decision, words) = decided_widths(&bed, PairTable::new(&ends, &classes));
     assert!(decision.pick().is_some(), "{decision:?}");
-    assert_eq!(words[2..], [1, 1]);
+    assert_eq!(words.map(|words| [words[2], words[3]]), Some([1, 1]));
     // An encode class far above the rows handed sizes no set either.
     let mut bed = Bed::new();
     bed.facts = vec![pushing(u32::MAX)];
     bed.prefill_classes = vec![u32::MAX];
     let (decision, words) = decided_widths(&bed, none);
     assert!(decision.pick().is_some(), "{decision:?}");
-    assert_eq!(words[..2], [1, 1]);
+    assert_eq!(words.map(|words| [words[0], words[1]]), Some([1, 1]));
 }
 
 #[test]
@@ -1105,14 +1163,13 @@ fn an_encode_class_above_the_rows_handed_is_a_class_still() {
 
 #[test]
 fn a_request_without_items_reads_no_membership() {
-    // No answer of the membership pass is asked: the sets stay as a fresh
-    // scratch holds them, and the pair is the pair entry's.
+    // The request takes the pair entry's answer without encode scratch.
     let mut bed = Bed::new();
     bed.keys.clear();
     bed.images = 0;
     let (decision, words) = decided_widths(&bed, PairTable::default());
     assert_eq!(decision, bed.pair(&engine()));
-    assert_eq!(words, [0, 0, 0, 0]);
+    assert_eq!(words, None);
 }
 
 /// A stage that shows its rows to a plugin and counts each time it is
