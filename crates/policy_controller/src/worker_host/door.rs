@@ -438,7 +438,7 @@ pub(super) mod tests {
 
     /// A generation whose prefill profile of `pd/*` reads the index, and no
     /// other profile of it.
-    fn prefill_reads_the_index() -> crate::AppliedSpec {
+    fn prefill_reads_the_index() -> AppliedSpec {
         let text = r#"{
           "apiVersion": "smg.policy/v1",
           "profiles": {
@@ -451,10 +451,9 @@ pub(super) mod tests {
             { "match": { "model": "*" }, "profile": "default" }
           ]
         }"#;
-        let mut spec: crate::PolicySpec =
-            serde_json::from_str(text).expect("a well-formed document");
+        let mut spec: PolicySpec = serde_json::from_str(text).expect("a well-formed document");
         spec.generation = 1;
-        crate::AppliedSpec::validate(&spec).expect("the document validates")
+        AppliedSpec::validate(&spec).expect("the document validates")
     }
 
     /// The door states a found row's event signal itself, whatever the
@@ -497,10 +496,10 @@ pub(super) mod tests {
             assert_eq!(indexed_under(&row).is_some(), asked);
 
             // Every profile of the cache-aware preset reads the index.
-            let mut later = crate::PolicySpec::preset("cache_aware").expect("the preset");
+            let mut later = PolicySpec::preset("cache_aware").expect("the preset");
             later.generation = 2;
             store
-                .apply(crate::AppliedSpec::validate(&later).expect("the preset validates"))
+                .apply(AppliedSpec::validate(&later).expect("the preset validates"))
                 .expect("the second generation");
             door.found(&Maker::Control, Expect::Anything, URL, &|_| found.clone())
                 .expect("laid again");
