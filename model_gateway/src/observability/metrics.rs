@@ -163,6 +163,8 @@ mod handles {
         /// Decision counters for the newest generation seen on this thread,
         /// by static labels, then by the bounded set of interned models.
         pub(super) static POLICY_DECISIONS: RefCell<(u64, ByLabels<DecisionLabels, Counter>)> = RefCell::new((0, FxHashMap::default()));
+        /// `smg_policy_unanswered_total` by reason.
+        pub(super) static POLICY_UNANSWERED: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
         /// Decision times by mode and outcome.
         pub(super) static POLICY_DECISION_SECONDS: RefCell<FxHashMap<(&'static str, &'static str), Histogram>> = RefCell::new(FxHashMap::default());
         /// `smg_cache_aware_policy_branch_total` by branch.
@@ -204,6 +206,7 @@ mod handles {
         WORKER_SELECTIONS.with_borrow_mut(HashMap::clear);
         POLICY_DECISIONS.set((0, FxHashMap::default()));
         POLICY_DECISION_SECONDS.with_borrow_mut(HashMap::clear);
+        POLICY_UNANSWERED.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_BRANCHES.with_borrow_mut(HashMap::clear);
         MANUAL_BRANCHES.with_borrow_mut(HashMap::clear);
         CONSISTENT_HASHING_BRANCHES.with_borrow_mut(HashMap::clear);
@@ -336,6 +339,7 @@ pub(crate) const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
 
 const POLICY_DECISIONS_TOTAL: &str = "smg_policy_decisions_total";
 const POLICY_DECISION_SECONDS: &str = "smg_policy_decision_seconds";
+const POLICY_UNANSWERED_TOTAL: &str = "smg_policy_unanswered_total";
 
 /// Time to first token on edges that resolve it. The same observation as
 /// `smg_router_ttft_seconds`, which keeps the request-duration buckets (and
@@ -791,7 +795,11 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         POLICY_DECISIONS_TOTAL,
-        "Policy controller decisions by model, profile, outcome (pick, shed, queue, refused) and mode (embedded)"
+        "Policy controller decisions by model, profile, outcome (pick, shed, queue, refused, unanswered) and mode (embedded, remote, local)"
+    );
+    describe_counter!(
+        POLICY_UNANSWERED_TOTAL,
+        "Asks the policy controller at the gateway's address gave no decision, by reason (no_link, no_credit, busy, late, in_flight, ended, unsent)"
     );
     describe_histogram!(
         POLICY_DECISION_SECONDS,
@@ -1377,9 +1385,13 @@ pub struct PolicyDecision {
     /// The profile that decided, `None` where none did: a refused ask, and
     /// a request the engine declined ahead of every profile.
     pub profile: Option<u16>,
-    /// `pick`, `shed`, `queue`, or `refused` where the controller made no decision.
+    /// `pick`, `shed`, `queue`, `refused` where the door of this process
+    /// made no decision, or `unanswered` where a controller at an address
+    /// gave none.
     pub outcome: &'static str,
-    /// `embedded` for decisions made in this process.
+    /// `embedded` for decisions made in this process, `remote` for a
+    /// controller's, asked over the gateway's link, and `local` for those
+    /// this process made where that controller gave none.
     pub mode: &'static str,
 }
 
@@ -2342,6 +2354,17 @@ impl Metrics {
             (mode, outcome),
             || histogram!(POLICY_DECISION_SECONDS, "mode" => mode, "outcome" => outcome),
             |time| time.record(seconds),
+        );
+    }
+
+    /// Count one ask the controller at the gateway's address gave no
+    /// decision, by `reason`.
+    pub fn record_policy_unanswered(reason: &'static str) {
+        handles::with_static(
+            &handles::POLICY_UNANSWERED,
+            reason,
+            || counter!(POLICY_UNANSWERED_TOTAL, "reason" => reason),
+            |count| count.increment(1),
         );
     }
 

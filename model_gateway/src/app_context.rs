@@ -44,7 +44,7 @@ use crate::{
         follower::{Follower, Settings},
         host::Host,
         operators::Operators,
-        Started,
+        Hosted, Started,
     },
     rate_limit::RateLimitManager,
     rl_adapter,
@@ -1008,12 +1008,17 @@ impl AppContextBuilder {
                 .policy_controller_address
                 .as_ref()
                 .map(|address| Settings::new(address.clone(), config));
+            if let Some(settings) = &controller {
+                settings.readable()?;
+            }
             let connector = Arc::clone(&self.engine_connector);
-            let (feed, follower) =
-                policy_controller::feeds(&store, registry, connector, controller);
-            let host = Host::new(Arc::clone(&store), Arc::clone(&feed.objects));
+            let Hosted {
+                feed,
+                host,
+                follower,
+            } = policy_controller::feeds(&store, registry, connector, controller);
             self.policy_feed = Some(feed);
-            self.policy_host = Some(Arc::new(host));
+            self.policy_host = Some(host);
             self.policy_follower = follower.map(|follower| Arc::new(Mutex::new(Some(follower))));
             self.policy_operators = Some(Arc::new(Operators::new(Arc::clone(&store), door)));
             self.policy_store = Some(store);

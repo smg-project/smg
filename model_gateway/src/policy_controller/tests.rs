@@ -1286,8 +1286,8 @@ async fn a_starts_context_holds_the_feed_where_it_holds_the_store() -> Case {
 
 /// Under a controller's address the gateway probes no worker, so a row's
 /// status is its worker's. Elsewhere a worker's status is the gateway's own
-/// to write, and a row's change leaves it. On both paths the worker dials
-/// through the connector the gateway was started with.
+/// to write, and a row's change leaves it. On both paths the worker keeps
+/// the connector the gateway was started with.
 #[tokio::test]
 async fn a_rows_status_is_its_workers_under_a_controllers_address_alone() -> Case {
     const URL: &str = "http://worker:8000";
@@ -1297,7 +1297,7 @@ async fn a_rows_status_is_its_workers_under_a_controllers_address_alone() -> Cas
     // A connector of the case's own: each path's worker holds the one
     // handed over, and no stock one by name.
     let handed: Arc<dyn EngineConnector> = Arc::new(BackendConnector);
-    let mut dials_through_it = Vec::new();
+    let mut keeps_it = Vec::new();
     for following in [false, true] {
         let mut config = picked(quiet());
         config.policy_controller_address = following.then(|| address.clone());
@@ -1333,7 +1333,7 @@ async fn a_rows_status_is_its_workers_under_a_controllers_address_alone() -> Cas
         let connector = worker
             .engine_connector()
             .ok_or("the worker has no connector")?;
-        dials_through_it.push(Arc::ptr_eq(&connector, &handed));
+        keeps_it.push(Arc::ptr_eq(&connector, &handed));
         assert!(!worker.is_healthy());
         let revision = store.get(row).ok_or("the row left")?.revision;
         store
@@ -1347,7 +1347,28 @@ async fn a_rows_status_is_its_workers_under_a_controllers_address_alone() -> Cas
             follower.stop().await;
         }
     }
-    assert_eq!(dials_through_it, [true, true]);
+    assert_eq!(keeps_it, [true, true]);
+    Ok(())
+}
+
+/// A TLS file that cannot be read refuses the start by its option's name.
+/// The first dial would else be the first to read it, and the gateway would
+/// start and never turn ready. A target with no follower reads no file,
+/// and its start refuses the address itself.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn an_unreadable_tls_file_refuses_the_start_by_its_option() -> Case {
+    let mut config = picked(quiet());
+    config.policy_controller_address = Some("127.0.0.1:1".to_owned());
+    config.policy_controller_tls_ca_cert = Some("/no/such/authority.pem".to_owned());
+    let refusal = match AppContext::from_config(config, 30, None, None).await {
+        Ok(_) => return Err("the context started over an unreadable file".into()),
+        Err(refusal) => refusal.to_string(),
+    };
+    assert!(
+        refusal.contains("--policy-controller-tls-ca-cert") && refusal.contains("authority.pem"),
+        "{refusal}"
+    );
     Ok(())
 }
 

@@ -46,6 +46,7 @@ use smg_policy_controller::{
         fingerprint, Candidate, Identity, LoadRow, MediaCounts, Phase, RequestFacts, Role,
         WireModes, WorkerId,
     },
+    worker_host::Objects,
     AppliedSpec, Catalog, DerivedKey, KeySource, Lease, LeaseId, Lifecycle, Membership, Outcome,
     Picker, PolicySpec, ReleaseReason, Side, Target, Targets, TieBand, TransportClass,
 };
@@ -67,6 +68,7 @@ use crate::{
         ADMISSION_QUEUE_TIMEOUT_STATUS,
     },
     observability::{cache_trace, metrics::test_support::render_with_recorder},
+    policy_controller::follower::Linked,
     routers::{
         common::{
             placement::refusal_reason,
@@ -495,13 +497,14 @@ async fn a_pick_lands_on_the_gateways_worker_of_its_row() {
     assert_eq!((placed.decode_id(), placed.decode_rank()), (None, None));
 }
 
-fn assert_decisions(rendered: &str, profile: &str, outcome: &str, count: u32) {
+/// The two decision families hold `count` asks of `outcome` under `mode`.
+fn assert_counted(rendered: &str, mode: &str, profile: &str, outcome: &str, count: u32) {
     for expected in [
         format!(
-            "smg_policy_decisions_total{{model=\"{MODEL}\",profile=\"{profile}\",outcome=\"{outcome}\",mode=\"embedded\"}} {count}"
+            "smg_policy_decisions_total{{model=\"{MODEL}\",profile=\"{profile}\",outcome=\"{outcome}\",mode=\"{mode}\"}} {count}"
         ),
         format!(
-            "smg_policy_decision_seconds_count{{mode=\"embedded\",outcome=\"{outcome}\"}} {count}"
+            "smg_policy_decision_seconds_count{{mode=\"{mode}\",outcome=\"{outcome}\"}} {count}"
         ),
     ] {
         assert!(
@@ -509,6 +512,10 @@ fn assert_decisions(rendered: &str, profile: &str, outcome: &str, count: u32) {
             "missing {expected} in:\n{rendered}"
         );
     }
+}
+
+fn assert_decisions(rendered: &str, profile: &str, outcome: &str, count: u32) {
+    assert_counted(rendered, "embedded", profile, outcome, count);
 }
 
 #[test]
@@ -589,6 +596,53 @@ fn a_shed_and_each_attempt_to_take_a_target_are_counted() {
     });
     assert_decisions(&rendered, "random", "shed", 1);
     assert_decisions(&rendered, "random", "pick", 3);
+}
+
+/// Under a controller's address a pair is not asked over the link and is
+/// not decided here. It is refused by the name a pair gateway answers
+/// under the controller today, and nothing is counted of it.
+#[test]
+fn a_pair_under_an_address_is_refused_by_name_and_asks_no_link() {
+    let (_, store, _) = bed(&["http://w0:8000"]);
+    let objects = Arc::new(Objects::new(Arc::new(WorkerRegistry::new())));
+    let host = Host::linked(store, objects, Arc::<Linked>::default());
+    let pair = pair_ask();
+    let rendered = render_with_recorder(|| {
+        let asked = host.ask(&pair, &[], Instant::now());
+        assert_eq!(
+            asked.now_or_never().unwrap().err(),
+            Some(Unplaced::Undecided(super::PAIR_UNDER_AN_ADDRESS))
+        );
+    });
+    assert!(!rendered.contains("mode=\"remote\""), "{rendered}");
+    assert!(
+        !rendered.contains("smg_policy_unanswered_total{"),
+        "{rendered}"
+    );
+}
+
+/// Under a controller's address an ask that gets no decision is counted as
+/// its own outcome, under the remote mode and no profile.
+#[test]
+fn an_unanswered_ask_is_counted_under_the_remote_mode() {
+    let (_, store, _) = bed(&["http://w0:8000"]);
+    let objects = Arc::new(Objects::new(Arc::new(WorkerRegistry::new())));
+    let host = Host::linked(store, objects, Arc::<Linked>::default());
+    let rendered = render_with_recorder(|| {
+        assert_eq!(
+            host.place(&first(b"r1"), Instant::now())
+                .now_or_never()
+                .unwrap()
+                .err(),
+            Some(Unplaced::Unanswered(super::NoAnswer::NoLink))
+        );
+    });
+    assert_counted(&rendered, "remote", "", "unanswered", 1);
+    let reason = "smg_policy_unanswered_total{reason=\"no_link\"} 1";
+    assert!(
+        rendered.lines().any(|line| line == reason),
+        "missing {reason} in:\n{rendered}"
+    );
 }
 
 #[test]
@@ -1078,6 +1132,23 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
             "policy_controller_unavailable",
             Some("1"),
             None,
+        ),
+        (
+            Unplaced::Unanswered(super::NoAnswer::Late),
+            unavailable,
+            "policy_controller_unavailable",
+            Some("1"),
+            None,
+        ),
+        (
+            Unplaced::Undecided(super::PAIR_UNDER_AN_ADDRESS),
+            StatusCode::NOT_IMPLEMENTED,
+            "not_decided_by_policy_controller",
+            None,
+            Some(
+                "The policy controller is picked for this gateway and does not decide a pair \
+                 under a controller's address yet",
+            ),
         ),
     ];
     for (unplaced, status, code, retry_after, message) in rows {
