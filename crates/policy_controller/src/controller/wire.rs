@@ -44,9 +44,9 @@
 //! dropped at the check, so a frame that waits in a queue holds none.
 //!
 //! A pick's answer carries the lease its decider had the store file for it
-//! ([`decided`]): one a decision, minted under the answer's term, a credit
-//! on the pick's first target, with the time its gateway has to name the
-//! dispatch. A shed and a queue ticket carry none.
+//! ([`decided`]), with the time its gateway has to name the dispatch.
+//! A pair carries two sides under one id, prefill first. A shed and a
+//! queue ticket carry no lease.
 
 use std::{
     mem,
@@ -55,7 +55,7 @@ use std::{
 
 pub(crate) use crate::door::Viewed;
 use crate::{
-    decision::{Decision, ShedReason, Target, Trace},
+    decision::{Decision, ShedReason, Target},
     door::Asked,
     lease::{Lease, Side},
     operator::{Document, NeedsRow, Status},
@@ -650,7 +650,7 @@ pub(super) fn decision(decision: &Decision) -> proto::Decision {
     proto::Decision {
         leases: Vec::new(),
         outcome: Some(outcome),
-        trace: Some(trace(decision.trace())),
+        trace: Some(decision.trace().wire()),
     }
 }
 
@@ -672,32 +672,6 @@ const fn shed_reason(reason: ShedReason) -> proto::ShedReason {
         ShedReason::NoEndpoints => proto::ShedReason::NoEndpoints,
         ShedReason::PolicyDeclined => proto::ShedReason::PolicyDeclined,
         ShedReason::Deadline => proto::ShedReason::Deadline,
-    }
-}
-
-/// The record's trace: the five facts it holds. Its count fills two of the
-/// wire's fields: `survivors` where a pass counted, and `drew_first` where
-/// the decision drew and counted none. The observability contract fills
-/// the wire's other fields; they stay unset until then.
-fn trace(trace: &Trace) -> proto::Trace {
-    proto::Trace {
-        profile: u32::from(trace.profile),
-        survivors: trace.survivors.get(),
-        drew_first: trace.drew_first(),
-        top: trace
-            .top
-            .iter()
-            .take(usize::from(trace.top_len))
-            .map(|&(id, score)| proto::Scored {
-                worker_id: id.0,
-                score,
-                ..proto::Scored::default()
-            })
-            .collect(),
-        seed: trace.seed,
-        generation: trace.generation,
-        lifted: proto::LiftedVeto::from(trace.lifted) as i32,
-        ..proto::Trace::default()
     }
 }
 
@@ -1650,12 +1624,9 @@ mod tests {
             lifted: Lifted::Overload,
             ..Trace::default()
         };
+        assert_eq!(steered.wire().lifted, proto::LiftedVeto::Overload as i32);
         assert_eq!(
-            super::trace(&steered).lifted,
-            proto::LiftedVeto::Overload as i32
-        );
-        assert_eq!(
-            super::trace(&Trace::default()).lifted,
+            Trace::default().wire().lifted,
             proto::LiftedVeto::None as i32
         );
     }
@@ -1710,6 +1681,30 @@ mod tests {
             ),
             other => panic!("a decision's answer: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_first_profile_pick_keeps_its_trace_bytes_and_an_early_shed_adds_one_field() {
+        use prost::Message as _;
+
+        let pick = Decision::Pick(Pick {
+            trace: Trace {
+                profile: 0,
+                survivors: Survivors::counted(1),
+                generation: 6,
+                ..Trace::default()
+            },
+            ..Pick::default()
+        });
+        let shed = crate::door::shed(ShedReason::NoEndpoints, "wires", 0, 6);
+        let encoded = |decision| {
+            super::decision(decision)
+                .trace
+                .expect("a trace")
+                .encode_to_vec()
+        };
+        assert_eq!(encoded(&pick), [0x10, 1, 0x28, 6]);
+        assert_eq!(encoded(&shed), [0x10, 0, 0x28, 6, 0x70, 1]);
     }
 
     #[test]

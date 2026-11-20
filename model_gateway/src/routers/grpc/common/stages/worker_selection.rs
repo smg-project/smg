@@ -766,11 +766,7 @@ impl WorkerSelectionStage {
         // fact.
         let wire = Some(ctx.wire);
         let media_refs = ctx.wire.requires_media_refs;
-        let media = MediaDemands {
-            media_refs,
-            vision: ctx.routing.needs_vision,
-            pipeline: ctx.wire.pipeline,
-        };
+        let media = retry_media(ctx);
         // A retry skips the workers that already answered this request
         // definitively (see `routers::common::attempt_ledger`), and stays on
         // the workers that decide its constraint as the first attempt's did
@@ -1139,6 +1135,17 @@ impl<'a> RegularAttempt<'a> {
             Self::First(_) => None,
             Self::Retry(ctx) => Some(&ctx.ledger),
         }
+    }
+}
+
+/// What a retry's media demands of a candidate. The retained wire carries
+/// the media-refs pin and the pipeline pin, the routing snapshot the
+/// pixel-media fact.
+fn retry_media(ctx: &DispatchContext) -> MediaDemands {
+    MediaDemands {
+        media_refs: ctx.wire.requires_media_refs,
+        vision: ctx.routing.needs_vision,
+        pipeline: ctx.wire.pipeline,
     }
 }
 
@@ -1757,6 +1764,49 @@ impl WorkerSelectionStage {
         )
     }
 
+    /// The name of a shape of regular attempt the controller does not place
+    /// yet, or none. The store builds the candidates and reads none of these
+    /// demands. The commit's rule only passes a target over, and a demand
+    /// few workers meet could end the asks with no worker. So these shapes
+    /// are refused by name until a request can state them.
+    fn undecided(
+        &self,
+        model_id: &str,
+        context: ContextRequirements,
+        media: MediaDemands,
+        retry_under_rule: bool,
+    ) -> Option<&'static str> {
+        if media != MediaDemands::NONE {
+            return Some("media input");
+        }
+        let demand = context.left_by(
+            &self.worker_registry.get_routing_snapshot(model_id),
+            &[RoutingPool::GrpcPipelineRegular],
+            model_id,
+        );
+        if !demand.binds_nobody() {
+            return Some("a context demand a worker's window binds");
+        }
+        retry_under_rule.then_some("a retry under a decoding rule")
+    }
+
+    /// Whether a retry of `ctx` can be placed at all. Under the controller's
+    /// host a retry of a shape the stage refuses by name has no next
+    /// attempt: the refusal must not stand where a worker's failure does.
+    /// The classic selection answers every retry itself.
+    pub(crate) fn places_retry(&self, ctx: &DispatchContext) -> bool {
+        self.host.is_none()
+            || self.mode != WorkerSelectionMode::Regular
+            || self
+                .undecided(
+                    &ctx.model_id,
+                    ctx.routing.context_requirements,
+                    retry_media(ctx),
+                    ctx.constraint_decided_on.is_some(),
+                )
+                .is_none()
+    }
+
     /// Place a regular attempt through the configured host or the classic policies.
     async fn select_regular_attempt(
         &self,
@@ -1787,25 +1837,10 @@ impl WorkerSelectionStage {
                 .ok_or_else(no_worker);
         };
 
-        // The store builds the candidates and reads none of these demands.
-        // The commit's rule only passes a target over, and a demand few
-        // workers meet could end the asks with no worker. So these shapes
-        // are refused by name until a request can state them.
-        if media != MediaDemands::NONE {
-            return Err(policy_controller::refused("media input"));
-        }
-        let demand = context.left_by(
-            &self.worker_registry.get_routing_snapshot(model_id),
-            &[RoutingPool::GrpcPipelineRegular],
-            model_id,
-        );
-        if !demand.binds_nobody() {
-            return Err(policy_controller::refused(
-                "a context demand a worker's window binds",
-            ));
-        }
-        if matches!(attempt, RegularAttempt::Retry(ctx) if ctx.constraint_decided_on.is_some()) {
-            return Err(policy_controller::refused("a retry under a decoding rule"));
+        let under_rule =
+            matches!(attempt, RegularAttempt::Retry(ctx) if ctx.constraint_decided_on.is_some());
+        if let Some(shape) = self.undecided(model_id, context, media, under_rule) {
+            return Err(policy_controller::refused(shape));
         }
 
         let id = host::mark();

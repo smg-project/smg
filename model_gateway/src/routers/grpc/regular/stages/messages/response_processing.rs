@@ -72,7 +72,8 @@ impl ProcessStage for MessageResponseProcessingStage {
                 ctx.workers.as_ref(),
                 &dispatch,
                 metrics_labels::ENDPOINT_MESSAGES,
-            );
+            )
+            .with_placement(ctx.placement().cloned());
             let response = self
                 .streaming_processor
                 .clone()

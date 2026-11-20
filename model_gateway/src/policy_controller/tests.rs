@@ -1,6 +1,6 @@
 //! Cases of the store's start and of the router a server answers with.
 
-use std::{error::Error, sync::Arc};
+use std::{cell::Cell, error::Error, sync::Arc};
 
 use axum::{
     body::{to_bytes, Body},
@@ -15,15 +15,22 @@ use openai_protocol::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
+use smg_policy_controller::{
+    framework::{Scorer, TieBand},
+    lease::Lifecycle,
+    view::{Candidate, RequestFacts},
+    AppliedSpec, Catalog, CatalogError, PolicySpec, SpecError,
+};
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType};
 
-use super::{refused, start, undecided::ROUTER_TYPE, StartError};
+use super::{refused, start, start_with, undecided::ROUTER_TYPE, StartError};
 use crate::{
     app_context::AppContext,
-    config::{ManualAssignmentMode, PolicyConfig, RouterConfig},
+    config::{ManualAssignmentMode, PolicyConfig, PolicyDocumentError, RouterConfig},
     middleware::{RouteRequestMeta, TenantKey},
     routers::{
-        common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder, RouterTrait,
+        common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder,
+        http::router::Router, RouterTrait,
     },
     server::{serving_router, ServerConfig},
 };
@@ -411,6 +418,115 @@ async fn refused_whole(config: RouterConfig) -> Case {
     Ok(())
 }
 
+const SCORER: &str = "steady-score";
+
+#[derive(Debug)]
+struct SteadyScore;
+
+impl Lifecycle for SteadyScore {}
+
+impl Scorer for SteadyScore {
+    fn name(&self) -> &'static str {
+        SCORER
+    }
+
+    fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
+        out.fill(1.0);
+        TieBand(0.0)
+    }
+}
+
+fn host_stages() -> Result<Catalog, CatalogError> {
+    let mut stages = Catalog::builtin();
+    stages.scorer(SCORER, || Box::new(SteadyScore))?;
+    Ok(stages)
+}
+
+fn scorer_document(config: &RouterConfig, name: &str) -> Result<PolicySpec, PolicyDocumentError> {
+    let mut document = config.policy_document()?;
+    let profile = document
+        .profiles
+        .get_mut("random")
+        .expect("the random profile");
+    profile.score = vec![name.into()];
+    profile.pick = "best".into();
+    Ok(document)
+}
+
+#[test]
+fn the_store_starts_with_a_registered_scorer() -> Case {
+    let config = picked(RouterConfig::default());
+    let document = scorer_document(&config, SCORER)?;
+    let digest = document.digest()?;
+    let generation = document.generation;
+    let store = start_with(&config, Some(host_stages()?), |_| Ok(document))?
+        .ok_or("the controller was picked and no store started")?;
+    let world = store.world();
+    assert_eq!(world.spec().generation(), generation);
+    assert_eq!(world.spec().digest(), Some(digest));
+    Ok(())
+}
+
+#[test]
+fn the_stock_store_names_the_unknown_scorer() -> Case {
+    let config = picked(RouterConfig::default());
+    let refusal = start_with(&config, None, |config| scorer_document(config, SCORER))
+        .err()
+        .ok_or("the stock start took a scorer it does not hold")?;
+    assert!(matches!(
+        refusal,
+        StartError::Spec(SpecError::UnknownScorer { .. })
+    ));
+    assert_eq!(
+        refusal.to_string(),
+        format!("profile \"random\": unknown scorer {SCORER:?}")
+    );
+    Ok(())
+}
+
+#[test]
+fn the_classic_policies_skip_a_document_the_catalog_would_refuse() -> Case {
+    let document = |config: &RouterConfig| scorer_document(config, "unknown-score");
+    let config = RouterConfig::default();
+    assert!(matches!(
+        start_with(&picked(config.clone()), Some(host_stages()?), document),
+        Err(StartError::Spec(SpecError::UnknownScorer { .. }))
+    ));
+
+    let read = Cell::new(false);
+    let store = start_with(&config, Some(host_stages()?), |config| {
+        read.set(true);
+        document(config)
+    })?;
+    assert!(store.is_none());
+    assert!(!read.get());
+    Ok(())
+}
+
+#[test]
+fn the_gateways_tenant_header_is_denied_with_a_host_catalog() -> Case {
+    let mut config = picked(RouterConfig::default());
+    let tenant_header = "x-account-scope";
+    config.tenant_resolution.tenant_header_name = tenant_header.into();
+    let mut document = scorer_document(&config, SCORER)?;
+    document.view.headers.push(tenant_header.into());
+    let stages = host_stages()?;
+    AppliedSpec::validate_in(&document, &stages, &[])?;
+
+    let refusal = start_with(&config, Some(stages), |_| Ok(document))
+        .err()
+        .ok_or("the start took a view that reads the tenant header")?;
+    assert!(matches!(
+        refusal,
+        StartError::Spec(SpecError::DeniedHeader { .. })
+    ));
+    assert_eq!(
+        refusal.to_string(),
+        format!("view.headers[0]: header {tenant_header:?} is on the deny-list")
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn every_request_is_refused_by_name_where_one_router_would_be_built() -> Case {
     Box::pin(refused_whole(picked(quiet()))).await
@@ -449,5 +565,55 @@ async fn a_starts_context_holds_the_store_where_the_controller_was_picked() -> C
         refusal.as_deref(),
         Some("routing_key_override.enabled = true: the controller holds no recorded form of the sticky sessions' rule yet")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_starts_context_holds_the_host_where_it_holds_the_store() -> Case {
+    let hosted = Arc::new(AppContext::from_config(picked(quiet()), 30, None, None).await?);
+    assert!(hosted.policy_store.is_some());
+    assert!(hosted.policy_host.is_some());
+    // A worker the registry holds and the store has no row for. The
+    // controller answers for it; the classic policy would have sent to it.
+    let worker = BasicWorkerBuilder::new("http://127.0.0.1:1")
+        .model(ModelCard::new("model-a"))
+        .status(WorkerStatus::Ready)
+        .build();
+    hosted
+        .worker_registry
+        .register(Arc::new(worker))
+        .ok_or("the worker did not register")?;
+    let router = Router::new(&hosted).await?;
+    let meta = RouteRequestMeta::new(TenantKey::from("test-tenant"));
+    let routed = router
+        .route_generate(None, &meta, body(json!({"text": "hi"})), "model-a")
+        .await;
+    assert_eq!(
+        refusal(routed).await,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_available_workers".to_owned()
+        )
+    );
+
+    let classic = AppContext::from_config(quiet(), 30, None, None).await?;
+    assert!(classic.policy_store.is_none());
+    assert!(classic.policy_host.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_starts_context_holds_the_feed_where_it_holds_the_store() -> Case {
+    let hosted = AppContext::from_config(picked(quiet()), 30, None, None).await?;
+    assert!(hosted.policy_store.is_some());
+    let feed = hosted.policy_feed.as_ref().ok_or("the store has no feed")?;
+    assert!(Arc::ptr_eq(
+        feed.objects.registry(),
+        &hosted.worker_registry
+    ));
+
+    let classic = AppContext::from_config(quiet(), 30, None, None).await?;
+    assert!(classic.policy_store.is_none());
+    assert!(classic.policy_feed.is_none());
     Ok(())
 }

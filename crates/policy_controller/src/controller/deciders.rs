@@ -47,8 +47,8 @@
 //!    budget or the span.
 //!
 //! A pick or shed past the last read can be sampled for Explain. Each
-//! decider keeps its own ring for the term, with a lock held only for a
-//! sample's write or one scan.
+//! decider counts its own answers and takes its ring's lock only to keep
+//! a sample. A reader takes the lock for one scan.
 //!
 //! A lease is what the next decisions read. The store counts the leases on
 //! file by the worker each books, and a decision reads that count as each
@@ -193,7 +193,7 @@ use crate::{
     decision::Decision,
     door::{
         decide_in, decider_of, entry, issue, issue_pair, pair_in, past_mark, summed, Asked,
-        Buffers, DecisionRecord, Entry, Part, Samples, StorePins, Taken,
+        Buffers, DecisionRecord, Entry, Part, SampleCount, Samples, StorePins, Taken,
     },
     elector::{term_said, Fence},
     framework::{release, Engine},
@@ -336,7 +336,7 @@ struct Mark {
 #[derive(Default)]
 struct Shared {
     mark: Mark,
-    /// One lock per decider, laid out on the first sampling write.
+    /// One lock per decider, laid out on the first kept sample.
     samples: OnceLock<Box<[Mutex<Samples>]>>,
 }
 
@@ -347,28 +347,20 @@ impl Shared {
     #[inline(never)]
     fn sampled(
         &self,
-        seat: (usize, usize),
+        (index, deciders): (usize, usize),
+        count: &mut SampleCount,
         engine: &Engine,
         taken: &Taken<'_, Checked>,
         order: impl FnOnce() -> Answered,
     ) -> Answered {
         let answer = order()?;
-        self.keep(seat, answer.0, engine, taken, &answer.1);
+        if count.keeps(answer.0, engine, &answer.1) {
+            let seats = self
+                .samples
+                .get_or_init(|| (0..deciders).map(|_| Mutex::default()).collect());
+            seats[index].lock().push(answer.0, engine, taken, &answer.1);
+        }
         Ok(answer)
-    }
-
-    fn keep(
-        &self,
-        (index, deciders): (usize, usize),
-        term: u64,
-        engine: &Engine,
-        taken: &Taken<'_, Checked>,
-        decision: &Decision,
-    ) {
-        let seats = self
-            .samples
-            .get_or_init(|| (0..deciders).map(|_| Mutex::default()).collect());
-        seats[index].lock().keep(term, engine, taken, decision);
     }
 }
 
@@ -474,6 +466,7 @@ impl Deciders {
                 let decider = Deciding {
                     reads: reads.clone(),
                     buffers: Buffers::default(),
+                    sample_count: SampleCount::default(),
                     faulted: false,
                     index,
                     marked: None,
@@ -587,6 +580,7 @@ fn watched(
 struct Deciding {
     reads: Reads,
     buffers: Buffers<Lists>,
+    sample_count: SampleCount,
     /// The last decision panicked: a streak of them writes one line.
     faulted: bool,
     /// Its place among the deciders, which names its part of a count.
@@ -1030,6 +1024,7 @@ impl Deciding {
             if world.samples_decisions() {
                 self.shared.sampled(
                     (self.index, store.deciders()),
+                    &mut self.sample_count,
                     world.spec().engine(),
                     &taken,
                     || order(world),
@@ -1467,6 +1462,7 @@ pub(crate) mod tests {
         Deciding {
             reads: bed.reads.clone(),
             buffers: Buffers::default(),
+            sample_count: Default::default(),
             faulted: false,
             working: None,
             name: None,
@@ -3904,6 +3900,48 @@ pub(crate) mod tests {
         assert_eq!(bed.script.readers.lock().len(), 2);
     }
 
+    #[test]
+    fn a_served_decision_that_keeps_no_record_answers_during_a_read() {
+        let mut document = PolicySpec::preset("random").expect("a preset");
+        document.generation = 1;
+        document.explain.sample = 2;
+        let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("the case's runtime");
+        for id in 1..=2 {
+            runtime.block_on(bed.ask(frame(id, 1)));
+        }
+
+        let shared = Arc::clone(&bed.deciders.shared);
+        let rings = shared.samples.get().expect("the ring of the first sample");
+        let _read = rings[0].lock();
+        let answer = runtime.block_on(bed.ask(frame(3, 1)));
+        assert!(matches!(outcome(&answer), Outcome::Pick(_)));
+    }
+
+    #[tokio::test]
+    async fn a_new_term_restarts_the_served_sample_count() {
+        let mut document = PolicySpec::preset("random").expect("a preset");
+        document.generation = 1;
+        document.explain.sample = 2;
+        let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
+        let first = bed.ask(frame(1, 1)).await;
+        assert!(matches!(outcome(&first), Outcome::Pick(_)));
+
+        assert!(bed.elector.release().expect("the release"));
+        assert_eq!(
+            bed.elector.tick(bed.script.taken).expect("the take"),
+            Tick::Acquired { term: 2 }
+        );
+        bed.store.set_term(2);
+        let answer = bed.ask(frame(2, 1)).await;
+        assert_eq!(answer.term, 2);
+        assert!(matches!(outcome(&answer), Outcome::Pick(_)));
+        assert!(bed.deciders.explain(2, GATEWAY, &[2]).is_none());
+    }
+
     #[tokio::test]
     async fn a_fence_open_under_a_later_term_at_the_hand_over_sends_busy_too() {
         let (reached, at_read) = std_mpsc::sync_channel(1);
@@ -4147,7 +4185,7 @@ pub(crate) mod tests {
         let mut document = PolicySpec::preset("random").expect("a preset of this build");
         document.generation = 1;
         for profile in document.profiles.values_mut() {
-            profile.filter.push("shown".to_string());
+            profile.filter.push("shown".into());
         }
         let digest = document.digest().expect("the document digests");
         let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])

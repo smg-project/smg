@@ -325,8 +325,8 @@ fn trace_record() -> &'static [&'static str] {
 }
 
 /// The lease's session crosses under the name both contracts still spell,
-/// `session_key`: the change that first reads a lease from the wire renames
-/// the field in both and takes this pair out.
+/// `session_key`. A gateway's client reads it under that name. A change that
+/// renames the field renames it in both contracts and takes this pair out.
 fn lease_record() -> &'static [&'static str] {
     record!(
         Lease,
@@ -780,6 +780,8 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "affinity_source",
                 // The record reads it from its count ([`Trace::drew_first`]).
                 "drew_first",
+                // The record marks this in `profile` ([`Trace::made_under`]).
+                "no_profile",
             ],
             wire: &[
                 ("profile", Type::Uint32),
@@ -795,6 +797,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("affinity_source", Type::Enum),
                 ("drew_first", Type::Bool),
                 ("lifted", Type::Enum),
+                ("no_profile", Type::Bool),
             ],
             repeated: &["top", "drops"],
             optional: &["survivors"],

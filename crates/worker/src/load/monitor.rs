@@ -232,6 +232,9 @@ enum NativeLoads {
     Available(WorkerLoadResponse),
     /// The backend answered, and the endpoint is not there. Memoizable.
     Absent,
+    /// The backend answered success with a body that is no load response.
+    /// What that says of the route depends on whether it ever answered.
+    Unreadable,
     /// Nothing was learned about the endpoint — retry on the next tick.
     Inconclusive,
 }
@@ -378,10 +381,12 @@ impl PushedFile {
     }
 }
 
-/// The ranks `report` holds at or past `width`, its worker's own width: a
-/// report taken off the file, or the load of a row the batch removed. The
-/// sentinel of the worker's series covers the width and each of these,
-/// and no rank between: a far rank costs one sentinel.
+/// The rank of each entry `report` holds at or past `width`, its worker's
+/// own width: a report taken off the file, or the load of a row the batch
+/// removed. A rollup's row names a rank once for each downstream worker
+/// that holds it, so a rank can come more than once. The sentinel of the
+/// worker's series covers the width and each of these ranks once, and no
+/// rank between.
 fn ranks_past(report: &WorkerLoadResponse, width: usize) -> impl Iterator<Item = i32> + '_ {
     report
         .loads
@@ -407,13 +412,17 @@ fn write_sentinel(
 ) {
     let url = worker.url();
     let width = worker.dp_size().unwrap_or(1).max(1);
-    let ranks = (0..width)
+    let mut ranks: Vec<i32> = (0..width)
         .filter_map(|rank| i32::try_from(rank).ok())
         .chain(
             ended
                 .into_iter()
                 .flat_map(|report| ranks_past(report, width)),
-        );
+        )
+        .collect();
+    // An ended row can name a far rank more than once: one pass a rank.
+    ranks.sort_unstable();
+    ranks.dedup();
     // A worker can serve multiple models (one load group per model),
     // so sentinel every model's series — not just the primary.
     let models = worker_model_ids(worker);
@@ -1639,7 +1648,12 @@ impl<G: Generation> WorkerMonitor<G> {
                     response = Some((path, load));
                     break;
                 }
-                NativeLoads::Absent => memo.record_absent(path),
+                // On a route that had answered, a body that does not read is
+                // one bad answer: the memo keeps the route and the next tick
+                // asks it again. On a route that never answered it means
+                // something else is mounted here, as definitive as a 404.
+                NativeLoads::Unreadable if known.answered == Some(path) => {}
+                NativeLoads::Absent | NativeLoads::Unreadable => memo.record_absent(path),
                 NativeLoads::Inconclusive => {}
             }
         }
@@ -1730,9 +1744,9 @@ impl<G: Generation> WorkerMonitor<G> {
                 response.loads = loads;
                 NativeLoads::Available(response)
             }
-            // A 200 that is not a load response means something else is
-            // mounted here; that is as definitive as a 404.
-            Err(_) => NativeLoads::Absent,
+            // Not a load response. Whether the route is absent is the
+            // caller's to say: it knows if the route ever answered.
+            Err(_) => NativeLoads::Unreadable,
         }
     }
 
@@ -1839,7 +1853,9 @@ impl<G: Generation> WorkerMonitor<G> {
     /// the rank workers of a data-parallel engine under `--dp-aware`, which
     /// share it. The engine answers once; each member's report is that
     /// answer scoped to its own rank, as its own poll would have had it (a
-    /// rank the answer omits is an empty report).
+    /// rank the answer omits is an empty report). A report's named values
+    /// stand under the report's bounds, and what left them is counted for
+    /// its member.
     async fn fetch_engine_loads(
         members: Vec<Arc<dyn Worker>>,
         connection_mode: ConnectionMode,
@@ -1881,7 +1897,20 @@ impl<G: Generation> WorkerMonitor<G> {
                 }
             }
         }
-        members.into_iter().zip(reports).collect()
+        let mut answers: Vec<_> = members.into_iter().zip(reports).collect();
+        // A polled list is held to the bounds a pushed record's is read
+        // under, here: ahead of the sink and of every reader.
+        for (member, report) in &mut answers {
+            let dropped: usize = report
+                .iter_mut()
+                .flat_map(|answer| &mut answer.loads)
+                .map(SchedulerLoadSnapshot::bound_values)
+                .sum();
+            if dropped != 0 {
+                Metrics::record_engine_load_values_dropped(member.url(), dropped);
+            }
+        }
+        answers
     }
 }
 
@@ -2282,7 +2311,10 @@ mod native_loads_tests {
     use crate::{
         identity::basic::{ConnectionMode, WorkerLoadGuard, WorkerType},
         model_card::ModelCard,
-        test_support::{BasicWorkerBuilder, LoadReaders, WorkerMonitor, WorkerRegistry},
+        test_support::{
+            assert_metric, render_with_recorder, BasicWorkerBuilder, LoadReaders, WorkerMonitor,
+            WorkerRegistry,
+        },
         worker::{HealthCheckConfig, OverloadUpdate},
     };
 
@@ -2294,6 +2326,9 @@ mod native_loads_tests {
     /// gauge for — so its presence identifies which path answered.
     const NATIVE_BODY: &str = r#"{"loads":[{"dp_rank":0,"num_running_reqs":3,
         "num_waiting_reqs":4,"num_waiting_uncached_tokens":900,"token_usage":0.25}]}"#;
+
+    /// A native response but for one value: a bare token no JSON reader takes.
+    const UNREADABLE_NATIVE_BODY: &str = r#"{"loads":[{"dp_rank":0,"num_running_reqs":NaN}]}"#;
 
     const NATIVE_DP_BODY: &str = r#"{"dp_rank_count":2,"loads":[
         {"dp_rank":0,"num_running_reqs":3,"token_usage":0.25},
@@ -2313,28 +2348,30 @@ mod native_loads_tests {
         gateway_query: Arc<Mutex<Option<String>>>,
     }
 
-    /// Loopback backend stub. Each native route answers with the status and
-    /// body it was given and counts its hits; `/metrics` always serves the
-    /// first family's gauges.
+    /// Loopback backend stub. Each native route answers with the statuses and
+    /// bodies it was given, in order, the last one repeating, and counts its
+    /// hits; `/metrics` always serves the first family's gauges.
     async fn spawn_backend(
-        gateway: (StatusCode, &'static str),
-        engine: (StatusCode, &'static str),
+        gateway: &[(StatusCode, &'static str)],
+        engine: &[(StatusCode, &'static str)],
     ) -> Stub {
         fn route(
             hits: &Arc<AtomicUsize>,
             query: &Arc<Mutex<Option<String>>>,
-            (status, body): (StatusCode, &'static str),
+            answers: &[(StatusCode, &'static str)],
         ) -> axum::routing::MethodRouter {
+            assert!(!answers.is_empty());
+            let answers: Arc<[_]> = answers.into();
             let counter = Arc::clone(hits);
             let sink = Arc::clone(query);
             axum::routing::get(
                 move |axum::extract::RawQuery(raw): axum::extract::RawQuery| {
-                    let counter = Arc::clone(&counter);
+                    let hit = counter.fetch_add(1, Ordering::SeqCst);
+                    let answer = answers[hit.min(answers.len() - 1)];
                     let sink = Arc::clone(&sink);
                     async move {
-                        counter.fetch_add(1, Ordering::SeqCst);
                         *sink.lock() = raw;
-                        (status, body)
+                        answer
                     }
                 },
             )
@@ -2371,12 +2408,12 @@ mod native_loads_tests {
 
     /// An engine: serves `/v1/loads`, 404s the gateway route.
     async fn spawn_engine(status: StatusCode, body: &'static str) -> Stub {
-        spawn_backend((StatusCode::NOT_FOUND, ""), (status, body)).await
+        spawn_backend(&[(StatusCode::NOT_FOUND, "")], &[(status, body)]).await
     }
 
     /// A gateway registered as a worker: serves `/loads` only.
     async fn spawn_gateway(body: &'static str) -> Stub {
-        spawn_backend((StatusCode::OK, body), (StatusCode::NOT_FOUND, "")).await
+        spawn_backend(&[(StatusCode::OK, body)], &[(StatusCode::NOT_FOUND, "")]).await
     }
 
     fn gauge_worker(url: &str) -> Arc<dyn Worker> {
@@ -2792,6 +2829,127 @@ mod native_loads_tests {
         );
     }
 
+    /// Seventy named values for rank 0, and for rank 1 a `values` key of
+    /// the engine's own shape.
+    fn named_body() -> &'static str {
+        let entries: Vec<String> = (0..70)
+            .map(|index| format!(r#"{{"name":"ready_{index}","unit":"items","value":{index}}}"#))
+            .collect();
+        Box::leak(
+            format!(
+                r#"{{"dp_rank_count":2,"loads":[
+                {{"dp_rank":0,"num_running_reqs":3,"values":[{}]}},
+                {{"dp_rank":1,"num_running_reqs":9,"values":{{"depth":3}}}}]}}"#,
+                entries.join(",")
+            )
+            .into_boxed_str(),
+        )
+    }
+
+    /// One tick's fetch: each member with its report.
+    type Answers = Vec<(Arc<dyn Worker>, Option<WorkerLoadResponse>)>;
+
+    /// One tick's fetch for `members` of the engine behind `body`, with
+    /// the scrape its counters wrote.
+    fn fetched(
+        body: &'static str,
+        members: impl FnOnce(&str) -> Vec<Arc<dyn Worker>>,
+    ) -> (Answers, String) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let stub = runtime.block_on(spawn_engine(StatusCode::OK, body));
+        let members = members(&stub.url);
+        let memo = DashMap::new();
+        let mut answers = Vec::new();
+        let rendered = render_with_recorder(|| {
+            answers = runtime.block_on(WorkerMonitor::fetch_engine_loads(
+                members,
+                ConnectionMode::Http,
+                &memo,
+            ));
+        });
+        (answers, rendered)
+    }
+
+    /// A polled answer's named values stand under the bounds a pushed
+    /// record's do, and what left them is counted for the worker. A
+    /// `values` key of another shape is the engine's own: its rank is
+    /// read, with no list.
+    #[test]
+    fn a_polled_answers_named_values_are_bound_and_counted() {
+        let (mut answers, rendered) = fetched(named_body(), |url| vec![gauge_worker(url)]);
+        let (worker, report) = answers.pop().expect("the one member");
+        let report = report.expect("the native answer");
+        assert_eq!(report.loads.len(), 2);
+        assert_eq!(report.loads[0].values.len(), 64);
+        assert_eq!(report.loads[0].values[63].name.as_ref(), "ready_63");
+        assert_eq!(report.loads[1].num_running_reqs, 9);
+        assert!(report.loads[1].values.is_empty());
+        assert_metric(
+            &rendered,
+            "smg_engine_load_values_dropped_total",
+            &[&format!("worker=\"{}\"", worker.url())],
+            "6",
+        );
+    }
+
+    /// The rank workers of one engine share its answer. Each one's report
+    /// is bound, and what left a rank's list is counted for that rank's
+    /// worker alone.
+    #[test]
+    fn a_ranks_dropped_values_are_counted_for_its_own_worker() {
+        let (answers, rendered) = fetched(named_body(), |url| {
+            vec![gauge_dp_worker(url, 0, 2), gauge_dp_worker(url, 1, 2)]
+        });
+        let lists: Vec<usize> = answers
+            .iter()
+            .map(|(_, report)| {
+                report.as_ref().expect("its rank's report").loads[0]
+                    .values
+                    .len()
+            })
+            .collect();
+        assert_eq!(lists, [64, 0]);
+        let series: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_engine_load_values_dropped_total{"))
+            .collect();
+        assert_eq!(series.len(), 1, "{rendered}");
+        assert_metric(
+            &rendered,
+            "smg_engine_load_values_dropped_total",
+            &[&format!("worker=\"{}\"", answers[0].0.url())],
+            "6",
+        );
+    }
+
+    /// A `values` key of another shape fails no native answer: the
+    /// engine's route stays the worker's load source.
+    #[tokio::test]
+    async fn a_values_key_of_another_shape_keeps_the_native_route() {
+        let stub = spawn_engine(
+            StatusCode::OK,
+            r#"{"loads":[{"dp_rank":0,"num_running_reqs":3,
+                "num_waiting_uncached_tokens":900,"values":{"depth":3}}]}"#,
+        )
+        .await;
+        let worker = gauge_worker(&stub.url);
+        let memo = DashMap::new();
+
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+            .await
+            .expect("load response");
+
+        assert_eq!(resp.loads[0].num_waiting_uncached_tokens, 900);
+        assert!(resp.loads[0].values.is_empty());
+        assert_eq!(
+            memo.get(worker.url()).and_then(|hit| hit.answered()),
+            Some(NativeLoadsPath::Engine)
+        );
+    }
+
     /// The load probe of a dp-aware HTTP worker goes to its engine's address:
     /// the `@rank` suffix of the worker's URL is the router's, not a host. The
     /// test checks the address (one probe, the engine's native report read);
@@ -2924,9 +3082,71 @@ mod native_loads_tests {
     }
 
     #[tokio::test]
+    async fn a_route_that_had_answered_survives_a_body_that_does_not_read() {
+        let stub = spawn_backend(
+            &[(StatusCode::NOT_FOUND, "")],
+            &[
+                (StatusCode::OK, NATIVE_BODY),
+                (StatusCode::OK, UNREADABLE_NATIVE_BODY),
+                (StatusCode::OK, NATIVE_BODY),
+            ],
+        )
+        .await;
+        let worker = gauge_worker(&stub.url);
+        let memo = DashMap::new();
+        let route = NativeLoadsPath::Engine;
+
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo)).await;
+        assert_eq!(
+            resp.as_ref()
+                .map(WorkerLoadResponse::total_waiting_uncached_tokens),
+            Some(900),
+            "first tick uses the native report"
+        );
+        assert_eq!(
+            memo.get(worker.url()).and_then(|hit| hit.answered()),
+            Some(route),
+            "first tick records the answering route"
+        );
+
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo)).await;
+        assert_eq!(
+            resp.as_ref().map(WorkerLoadResponse::total_running_reqs),
+            Some(7),
+            "second tick uses the gauge report"
+        );
+        let hit = *memo.get(worker.url()).expect("second tick keeps the memo");
+        assert_eq!(
+            hit.answered(),
+            Some(route),
+            "second tick keeps the answering route"
+        );
+        assert!(!hit.is_absent(route), "route stays eligible");
+
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo)).await;
+        assert_eq!(
+            resp.as_ref()
+                .map(WorkerLoadResponse::total_waiting_uncached_tokens),
+            Some(900),
+            "third tick uses the native report again"
+        );
+        assert_eq!(
+            stub.probes.load(Ordering::SeqCst),
+            3,
+            "the answering route is probed on all three ticks"
+        );
+        assert_eq!(
+            stub.gateway_probes.load(Ordering::SeqCst),
+            1,
+            "the other route is probed only at discovery"
+        );
+    }
+
+    #[tokio::test]
     /// Unrelated JSON and malformed load fields cannot suppress metrics fallback.
     async fn non_load_body_on_200_is_treated_as_absent() {
         for body in [
+            UNREADABLE_NATIVE_BODY,
             "<html>nope</html>",
             "{}",
             r#"{"status":"ok"}"#,

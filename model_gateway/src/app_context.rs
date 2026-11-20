@@ -15,7 +15,7 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
-use smg_policy_controller::store::MemoryStore;
+use smg_policy_controller::{store::MemoryStore, Catalog};
 use smg_worker::{
     connection::{
         engine::EngineConnector,
@@ -40,6 +40,7 @@ use crate::{
     policies::{kv_index::event_monitor::KvEventMonitor, PolicyRegistry},
     policy_controller::{
         self,
+        feed::Feed,
         follower::{Follower, Settings},
         host::Host,
     },
@@ -116,6 +117,7 @@ pub struct AppContext {
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
+    engine_connector: Arc<dyn EngineConnector>,
     pub prefill_admission: Option<Arc<PrefillAdmission>>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub gateway: Option<Arc<Gateway>>,
@@ -146,6 +148,12 @@ pub struct AppContext {
     /// The policy controller's host. Routers ask it for placement wherever
     /// the policy store is present.
     pub(crate) policy_host: Option<Arc<Host>>,
+    /// The membership feed over [`Self::policy_store`], present wherever the store is.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the context holds the feed for membership writes")
+    )]
+    pub(crate) policy_feed: Option<Feed>,
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
     pub rl: Option<Arc<smg_rl::RlState>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
@@ -225,6 +233,7 @@ pub struct AppContextBuilder {
     reasoning_parser_factory: Option<ReasoningParserFactory>,
     tool_parser_factory: Option<ToolParserFactory>,
     worker_registry: Option<Arc<WorkerRegistry>>,
+    engine_connector: Arc<dyn EngineConnector>,
     policy_registry: Option<Arc<PolicyRegistry>>,
     gateway: Option<Arc<Gateway>>,
     response_storage: Option<Arc<dyn ResponseStorage>>,
@@ -238,6 +247,10 @@ pub struct AppContextBuilder {
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
     policy_store: Option<Arc<MemoryStore>>,
+    /// The membership feed, built with the policy store.
+    policy_feed: Option<Feed>,
+    /// The host over the feed's holder, built with the feed.
+    policy_host: Option<Arc<Host>>,
     policy_follower: Option<Arc<Mutex<Option<Follower>>>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
@@ -263,7 +276,7 @@ impl WorkflowHost for AppContext {
     }
 
     fn engine_connector(&self) -> Arc<dyn EngineConnector> {
-        BackendConnector::shared()
+        Arc::clone(&self.engine_connector)
     }
 }
 
@@ -289,12 +302,32 @@ impl AppContext {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
+        Self::from_config_with_extensions(
+            router_config,
+            request_timeout_secs,
+            webrtc_bind_addr,
+            webrtc_stun_server,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn from_config_with_extensions(
+        router_config: RouterConfig,
+        request_timeout_secs: u64,
+        webrtc_bind_addr: Option<std::net::IpAddr>,
+        webrtc_stun_server: Option<String>,
+        stages: Option<Catalog>,
+        connector: Option<Arc<dyn EngineConnector>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
         Box::pin(async move {
-            Box::pin(AppContextBuilder::from_config(
+            Box::pin(AppContextBuilder::from_config_with_extensions(
                 router_config,
                 request_timeout_secs,
                 webrtc_bind_addr,
                 webrtc_stun_server,
+                stages,
+                connector,
             ))
             .await?
             .build()
@@ -339,6 +372,10 @@ fn has_https_worker(config: &RouterConfig) -> bool {
 
 impl AppContextBuilder {
     pub fn new() -> Self {
+        Self::new_with_connector(None)
+    }
+
+    fn new_with_connector(connector: Option<Arc<dyn EngineConnector>>) -> Self {
         Self {
             client: None,
             router_config: None,
@@ -348,6 +385,7 @@ impl AppContextBuilder {
             reasoning_parser_factory: None,
             tool_parser_factory: None,
             worker_registry: None,
+            engine_connector: connector.unwrap_or_else(BackendConnector::shared),
             policy_registry: None,
             gateway: None,
             response_storage: None,
@@ -361,6 +399,8 @@ impl AppContextBuilder {
             wasm_manager: None,
             kv_event_monitor: None,
             policy_store: None,
+            policy_feed: None,
+            policy_host: None,
             policy_follower: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
@@ -627,11 +667,6 @@ impl AppContextBuilder {
         );
 
         let rl = rl_adapter::build_rl_state(&worker_registry, &worker_client_cache, &router_config);
-        let policy_host = self
-            .policy_store
-            .as_ref()
-            .map(|store| Arc::new(Host::new(Arc::clone(store), Arc::clone(&worker_registry))));
-
         Ok(AppContext {
             gateway_auth,
             client: self
@@ -649,6 +684,7 @@ impl AppContextBuilder {
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
+            engine_connector: self.engine_connector,
             prefill_admission,
             policy_registry,
             gateway: self.gateway,
@@ -680,7 +716,8 @@ impl AppContextBuilder {
             kv_event_monitor: self.kv_event_monitor,
             policy_store: self.policy_store,
             policy_follower: self.policy_follower,
-            policy_host,
+            policy_host: self.policy_host,
+            policy_feed: self.policy_feed,
             rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
@@ -696,6 +733,25 @@ impl AppContextBuilder {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> Result<Self, String> {
+        Box::pin(Self::from_config_with_extensions(
+            router_config,
+            request_timeout_secs,
+            webrtc_bind_addr,
+            webrtc_stun_server,
+            None,
+            None,
+        ))
+        .await
+    }
+
+    async fn from_config_with_extensions(
+        router_config: RouterConfig,
+        request_timeout_secs: u64,
+        webrtc_bind_addr: Option<std::net::IpAddr>,
+        webrtc_stun_server: Option<String>,
+        stages: Option<Catalog>,
+        connector: Option<Arc<dyn EngineConnector>>,
+    ) -> Result<Self, String> {
         // A served model aliased under a vendor name keeps that vendor's
         // contract profile after the alias is resolved into the served name.
         ProviderProfile::register_model_aliases(
@@ -708,7 +764,7 @@ impl AppContextBuilder {
         // registry is built below (the first call wins; `build` keeps its
         // call for a context assembled without this constructor).
         liveness::configure_from(router_config.worker_liveness_budgets());
-        Ok(Self::new()
+        Ok(Self::new_with_connector(connector)
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
             .maybe_rate_limit_manager(&router_config)?
@@ -717,7 +773,7 @@ impl AppContextBuilder {
             .with_tool_parser_factory()
             .with_worker_registry()
             .with_policy_registry(&router_config)
-            .with_policy_controller(&router_config)?
+            .with_policy_controller(&router_config, stages)?
             .with_storage(&router_config)
             .await?
             .with_worker_monitor(&router_config)?
@@ -889,15 +945,32 @@ impl AppContextBuilder {
     /// Create worker registry
     fn with_worker_registry(mut self) -> Self {
         self.worker_registry = Some(Arc::new(
-            WorkerRegistry::new().with_engine_connector(BackendConnector::shared()),
+            WorkerRegistry::new().with_engine_connector(Arc::clone(&self.engine_connector)),
         ));
         self
     }
 
-    /// Start the policy store and, when configured, its worker watch.
-    fn with_policy_controller(mut self, config: &RouterConfig) -> Result<Self, String> {
+    /// Start the policy store with its membership feed and host and, when
+    /// configured, its worker watch. A start the store refuses stops this
+    /// one, by name.
+    fn with_policy_controller(
+        mut self,
+        config: &RouterConfig,
+        stages: Option<Catalog>,
+    ) -> Result<Self, String> {
         self.policy_store =
-            policy_controller::start(config).map_err(|refusal| refusal.to_string())?;
+            policy_controller::start_with(config, stages, RouterConfig::policy_document)
+                .map_err(|refusal| refusal.to_string())?;
+        if let Some(store) = &self.policy_store {
+            let registry = self.worker_registry.as_ref().ok_or_else(|| {
+                "worker_registry must be set before the policy controller".to_string()
+            })?;
+            let feed =
+                policy_controller::feed::feed(store, registry, Arc::clone(&self.engine_connector));
+            let host = Host::new(Arc::clone(store), Arc::clone(&feed.objects));
+            self.policy_feed = Some(feed);
+            self.policy_host = Some(Arc::new(host));
+        }
         if let (Some(address), Some(store)) =
             (&config.policy_controller_address, &self.policy_store)
         {
@@ -1750,7 +1823,7 @@ pub(crate) mod testing {
 
     use smg_worker::connection::http_client::WorkerHttpClientCache;
 
-    use super::{AppContext, ToolParserFactory};
+    use super::{AppContext, BackendConnector, ToolParserFactory};
     use crate::{
         admin::worker_service::WorkerService,
         config::RouterConfig,
@@ -1786,6 +1859,7 @@ pub(crate) mod testing {
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,
             worker_registry: Arc::clone(&worker_registry),
+            engine_connector: BackendConnector::shared(),
             prefill_admission: None,
             policy_registry: Arc::new(
                 PolicyRegistry::with_override(
@@ -1828,6 +1902,7 @@ pub(crate) mod testing {
             policy_store: None,
             policy_follower: None,
             policy_host: None,
+            policy_feed: None,
             rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,

@@ -978,6 +978,7 @@ jobs:
               - 'crates/tokenizer/**'
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/kv_index/**'
               - 'crates/workflow/**'
             rust-multimodal:
               - *rust-infra
@@ -990,6 +991,7 @@ jobs:
               - 'crates/response_template/**'
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/kv_index/**'
               - 'crates/workflow/**'
             rust-agentic:
               - *rust-infra
@@ -1004,6 +1006,7 @@ jobs:
               - *rust-infra
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/kv_index/**'
               - 'crates/workflow/**'
               - 'crates/external_router/**'
               - 'crates/service_discovery/**'

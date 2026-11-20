@@ -185,10 +185,10 @@
       "type": "object",
       "properties": {
         "filter": {
-          "description": "The hard filters, in order. Which workers the hard filters keep does\nnot turn on their order; a shed's reason does: a shed names the\nfirst filter, in this order, that left nobody.",
+          "description": "The hard filters, in order: each a name, or the name of a filter the\ncatalog adds mapped to its parameters. Which workers the hard\nfilters keep does not turn on their order; a shed's reason does: a\nshed names the first filter, in this order, that left nobody.",
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/FilterSpec"
           },
           "default": []
         },
@@ -217,6 +217,22 @@
       "additionalProperties": false,
       "required": [
         "pick"
+      ]
+    },
+    "FilterSpec": {
+      "description": "A filter: its bare name, or the name of a filter the host adds mapped to its parameters.",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 1,
+          "additionalProperties": {
+            "type": "object"
+          }
+        }
       ]
     },
     "ScoreSpec": {

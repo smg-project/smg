@@ -23,7 +23,6 @@ use tracing::{debug, info, warn};
 
 use super::tool_handler::FunctionCallInProgress;
 use crate::{
-    error,
     header_utils::ApiProvider,
     mcp_utils::{prepare_hosted_dispatch_args, DEFAULT_MAX_ITERATIONS},
     metrics::{metrics_labels, Metrics},
@@ -34,6 +33,7 @@ use crate::{
         ResponseTransformer,
     },
     sse::{SseEncoder, SseSender},
+    upstream_body::error_body_text,
 };
 
 /// State for tracking multi-turn tool calling loop
@@ -1214,8 +1214,7 @@ async fn upstream_round(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        let body = error::sanitize_error_body(&body);
+        let body = error_body_text(response).await;
         return Err(format!("upstream error {status}: {body}"));
     }
 

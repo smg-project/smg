@@ -1,6 +1,6 @@
-//! The health sink: the prober's verdicts, the connect signal and the
-//! gateways' standing masks (design 5.1, the health row and the precedence
-//! rule).
+//! The health sink: the prober's verdicts, the connect signal, the leader's
+//! own doubt of a worker and the gateways' standing masks (design 5.1, the
+//! health row and the precedence rule).
 
 use std::time::Instant;
 
@@ -66,9 +66,20 @@ impl HealthWrite {
     }
 }
 
+/// What the leader's own worker object knows of a worker beside its status
+/// ([`HealthSink::leader_bits`]): one projection of that object onto the
+/// row's bits, so a later bit of the object rides the same write.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LeaderBits {
+    /// The object's liveness veto stands: by the leader's own contact with
+    /// the worker it is unreachable or wedged.
+    pub stalled: bool,
+}
+
 /// Where health is written. The pool's view is the prober's and the reports';
 /// a gateway's breaker and liveness vetoes are its own and mask the worker
-/// for that gateway alone.
+/// for that gateway alone. The leader's own doubt of a worker masks it for
+/// every gateway.
 ///
 /// The precedence rule a view builder applies: a worker the prober cannot
 /// reach stays routable for the gateways whose completed dispatches on it
@@ -91,6 +102,35 @@ pub trait HealthSink: Send + Sync {
     /// revision guard. A ready or a draining row stands, and its counters
     /// with it.
     fn connected(&self, id: WorkerId, revision: u64) -> HealthWrite;
+
+    /// What the leader's own worker object knows of the worker, written
+    /// whole. Its liveness veto is the row's stalled bit, for every
+    /// gateway and with no hold: a stage reads it as it reads a gateway's
+    /// doubt of the worker's liveness
+    /// ([`gateway_veto_noted`](Self::gateway_veto_noted)), and the
+    /// all-vetoed rule lifts it as its last resort. A gateway's own vetoes
+    /// stand beside it. The write moves no status and publishes at once
+    /// where a bit moved. It is judged under the revision guard of a
+    /// probe's outcome: the answer is the status that stands
+    /// ([`HealthWrite::Stood`]), a revision the row left, or no row.
+    ///
+    /// `leads` is the writer's last word. The store asks it behind the
+    /// last lock the write waits for, as an admitted apply asks its own.
+    /// Where it says no, nothing is written and the write is stale: a term
+    /// that ended while the write waited writes nothing. It is asked under
+    /// the store's locks and takes none of them.
+    ///
+    /// The bits are the leader's own and no journal carries them: a
+    /// standby holds none, and a new leader writes what its own objects
+    /// know. They stand with the row across its revisions and leave with
+    /// it: a key's new incarnation starts with none.
+    fn leader_bits(
+        &self,
+        id: WorkerId,
+        revision: u64,
+        bits: LeaderBits,
+        leads: &dyn Fn() -> bool,
+    ) -> HealthWrite;
 
     /// A gateway's standing veto on a worker until `until`; `None` clears
     /// it. A veto standing across a reconnect is re-asserted in the

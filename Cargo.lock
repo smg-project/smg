@@ -8100,6 +8100,7 @@ name = "smg-policy-controller"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "axum",
  "clap",
  "criterion",
@@ -8147,6 +8148,7 @@ dependencies = [
  "tracing-subscriber",
  "wasmtime",
  "wat",
+ "wfaas",
  "wit-component",
  "wit-parser",
 ]
@@ -8345,6 +8347,7 @@ dependencies = [
  "dashmap",
  "futures",
  "http",
+ "kv-index",
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-util",

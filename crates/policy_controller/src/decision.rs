@@ -7,7 +7,7 @@
 use std::fmt;
 
 #[cfg(feature = "controller")]
-use crate::proto::LiftedVeto;
+use crate::proto::{self, LiftedVeto};
 use crate::{sessions::SessionVerdict, view::WorkerId};
 
 /// Targets a decision carries at most: the pick and its alternates.
@@ -218,9 +218,10 @@ impl From<Lifted> for LiftedVeto {
 /// This is the first step's subset of the record; per-filter drops,
 /// per-scorer contributions, the plan, the picker and the shadow pick join it
 /// with the observability contract.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Trace {
-    /// The profile that decided.
+    /// The position of the profile the decision was made under, or
+    /// [`Self::NO_PROFILE`] where it was made ahead of every profile.
     pub profile: u16,
     /// Candidates after the filters, where the decision counted them
     /// ([`Survivors`]).
@@ -246,7 +247,39 @@ pub struct Trace {
     pub lifted: Lifted,
 }
 
+impl Default for Trace {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            profile: Self::NO_PROFILE,
+            survivors: Survivors::default(),
+            top: Default::default(),
+            top_len: 0,
+            seed: 0,
+            generation: 0,
+            lifted: Lifted::default(),
+        }
+    }
+}
+
 impl Trace {
+    /// The value of `profile` where the decision was made ahead of every
+    /// profile: no binding resolved one. An engine holds at most this many
+    /// profiles, so the value is no profile's position.
+    pub const NO_PROFILE: u16 = u16::MAX;
+
+    /// The position of the profile the decision was made under: none where
+    /// it was made ahead of every profile. A shed made once a profile is
+    /// resolved names it, though no stage of it ran.
+    #[must_use]
+    pub const fn made_under(&self) -> Option<u16> {
+        if self.profile == Self::NO_PROFILE {
+            None
+        } else {
+            Some(self.profile)
+        }
+    }
+
     /// Whether the decision drew first: its picker drew the rows it hands
     /// out and every filter of the profile was asked about each of them
     /// alone ([`Picker::draw_first`](crate::Picker::draw_first)). No pass
@@ -255,6 +288,32 @@ impl Trace {
     /// is of the rows drawn.
     pub const fn drew_first(&self) -> bool {
         self.survivors.get().is_none()
+    }
+
+    /// The trace on the wire. Ahead of every profile the position stays zero.
+    #[cfg(feature = "controller")]
+    pub(crate) fn wire(&self) -> proto::Trace {
+        let profile = self.made_under();
+        proto::Trace {
+            profile: u32::from(profile.unwrap_or_default()),
+            no_profile: profile.is_none(),
+            survivors: self.survivors.get(),
+            drew_first: self.drew_first(),
+            top: self
+                .top
+                .iter()
+                .take(usize::from(self.top_len))
+                .map(|&(id, score)| proto::Scored {
+                    worker_id: id.0,
+                    score,
+                    ..proto::Scored::default()
+                })
+                .collect(),
+            seed: self.seed,
+            generation: self.generation,
+            lifted: LiftedVeto::from(self.lifted) as i32,
+            ..proto::Trace::default()
+        }
     }
 }
 
@@ -505,6 +564,29 @@ mod tests {
         ] {
             assert_eq!(kind.as_str(), label);
         }
+    }
+
+    #[test]
+    fn a_default_trace_marks_no_profile_and_keeps_its_other_defaults() {
+        let trace = Trace::default();
+        assert_eq!(
+            trace,
+            Trace {
+                profile: u16::MAX,
+                survivors: Survivors::counted(0),
+                top: [(WorkerId(0), 0.0); TRACE_TOP],
+                top_len: 0,
+                seed: 0,
+                generation: 0,
+                lifted: Lifted::None,
+            }
+        );
+        assert_eq!(trace.made_under(), None);
+        let last = Trace {
+            profile: u16::MAX - 1,
+            ..trace
+        };
+        assert_eq!(last.made_under(), Some(u16::MAX - 1));
     }
 
     /// The mark of a lifted veto costs the trace no byte: it sits in one the

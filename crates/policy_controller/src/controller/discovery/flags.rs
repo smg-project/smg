@@ -12,8 +12,9 @@ use clap::{
     ArgAction, ValueEnum,
 };
 use smg_service_discovery::{
-    ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig, KubernetesDiscoveryConfig,
-    ModelIdSource, Roles, SlurmDiscoveryConfig, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+    ConsulDiscoveryConfig, DiscoveryConfig, DiscoveryConfigError, FileDiscoveryConfig,
+    KubernetesDiscoveryConfig, ModelIdSource, Roles, SlurmDiscoveryConfig,
+    DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
 };
 
 use super::DiscoverySettings;
@@ -480,6 +481,58 @@ fn labels(flag: &'static str, entries: &[String]) -> Result<HashMap<String, Stri
 fn parse_model_id_from(value: &str) -> Result<String, String> {
     ModelIdSource::parse(value)?;
     Ok(value.to_owned())
+}
+
+/// The refusal of settings the discovery crate refuses, under the flag
+/// that sets the refused field. A refusal that names no field stands under
+/// the provider's flag.
+pub(super) fn refuse_settings(
+    config: &DiscoveryConfig,
+    roles: Roles,
+    error: DiscoveryConfigError,
+) -> ConfigError {
+    const PROVIDER_FLAG: &str = "--discovery-provider";
+    const ROLES: &str =
+        "the roles follow the prefill, decode and encode selectors and job names given";
+    let DiscoveryConfigError::InvalidValue { field, .. } = &error else {
+        // The settings' own check names no field only where it refuses the
+        // roles, in the words of a host that has a routing mode. The
+        // controller has none, so it says where its roles come from. A
+        // refusal from elsewhere, such as a provider that fails to build,
+        // keeps its own words.
+        let words = error.to_string();
+        let reason = match config.validate(roles) {
+            Err(check) if check.to_string() == words => format!("{words}; {ROLES}"),
+            _ => words,
+        };
+        return refuse(PROVIDER_FLAG, reason);
+    };
+    let flag = match (config, field.as_str()) {
+        (_, "discovery.check_interval_secs") => "--discovery-check-interval-secs",
+        (DiscoveryConfig::Kubernetes(_), "discovery.port") => "--service-discovery-port",
+        (DiscoveryConfig::Kubernetes(_), "discovery.kv_connector_annotation") => {
+            "--kv-connector-annotation"
+        }
+        (DiscoveryConfig::Kubernetes(_), "discovery.kv_engine_id_annotation") => {
+            "--kv-engine-id-annotation"
+        }
+        (DiscoveryConfig::Kubernetes(_), "discovery.model_id_source") => "--model-id-from",
+        (DiscoveryConfig::File(_), "discovery.path") => "--discovery-file",
+        (DiscoveryConfig::Slurm(_), "discovery.port") => "--slurm-port",
+        (DiscoveryConfig::Slurm(_), "discovery.bootstrap_port") => "--slurm-bootstrap-port",
+        (DiscoveryConfig::Slurm(_), "discovery.job_names") => "--slurm-job-name",
+        (DiscoveryConfig::Slurm(_), "discovery.encode_job_names") => "--slurm-encode-job-name",
+        (DiscoveryConfig::Slurm(_), "discovery.prefill_job_names") => "--slurm-prefill-job-name",
+        (DiscoveryConfig::Slurm(_), "discovery.decode_job_names") => "--slurm-decode-job-name",
+        (DiscoveryConfig::Slurm(_), "discovery.user") => "--slurm-user",
+        (DiscoveryConfig::Slurm(_), "discovery.account") => "--slurm-account",
+        (DiscoveryConfig::Slurm(_), "discovery.partition") => "--slurm-partition",
+        (DiscoveryConfig::Consul(_), "discovery.service") => "--consul-service",
+        (DiscoveryConfig::Consul(_), "discovery.address") => "--consul-address",
+        (DiscoveryConfig::Consul(_), "discovery.datacenter") => "--consul-datacenter",
+        _ => PROVIDER_FLAG,
+    };
+    refuse(flag, error.to_string())
 }
 
 fn refuse(flag: &'static str, reason: impl Into<String>) -> ConfigError {

@@ -48,6 +48,7 @@ use smg_mesh::{
     ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
     PreparedMeshServer,
 };
+use smg_policy_controller::Catalog;
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
@@ -67,6 +68,7 @@ pub use smg_worker::connection::client_factory::{
     blocking_http_client, http_client, http_client_builder, install_crypto_provider,
 };
 use smg_worker::{
+    connection::engine::EngineConnector,
     health::manager::{WorkerManager, WorkerManagerConfig},
     identity::{basic::ConnectionMode, endpoint::Endpoint},
     jobs::WorkerJobs,
@@ -1135,6 +1137,56 @@ impl ServerConfig {
     }
 }
 
+/// What a host binary adds to the gateway at startup.
+#[non_exhaustive]
+pub struct Extensions {
+    stages: Option<Catalog>,
+    connector: Option<Arc<dyn EngineConnector>>,
+}
+
+impl Extensions {
+    /// Use the stock stages and connector.
+    pub fn new() -> Self {
+        Self {
+            stages: None,
+            connector: None,
+        }
+    }
+
+    /// Set the catalog of stages a policy document may name. Start with
+    /// [`Catalog::builtin`] and register the host's stages on it. The
+    /// catalog is read only when startup selects the policy controller.
+    #[must_use]
+    pub fn stages(mut self, stages: Catalog) -> Self {
+        self.stages = Some(stages);
+        self
+    }
+
+    /// Set the connector workers of this gateway use to probe and connect
+    /// to their engines. Delegate to [`BackendConnector::shared`] for engines
+    /// you want the gateway to connect to as usual.
+    ///
+    /// For gRPC or ZMQ inference, and for a ZMQ worker's label refresh, the
+    /// gateway requires a [`BackendClient`]. It refuses other connections with
+    /// `its engine connection is not the gateway's backend client`.
+    /// If the connection supplies load reports, let the worker runtime be
+    /// the only poller of that engine's load.
+    ///
+    /// [`BackendConnector::shared`]: crate::routers::grpc::backend_client::BackendConnector::shared
+    /// [`BackendClient`]: crate::routers::grpc::backend_client::BackendClient
+    #[must_use]
+    pub fn connector(mut self, connector: Arc<dyn EngineConnector>) -> Self {
+        self.connector = Some(connector);
+        self
+    }
+}
+
+impl Default for Extensions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// `Router::layer` for an application-wide layer a configuration may leave
 /// out.
 ///
@@ -1988,24 +2040,34 @@ async fn prepare_mesh_server(
     Ok(Some(prepared))
 }
 
-/// [`startup`] on `runtime` to its end, then the process-wide observability
+/// Run the gateway on `runtime` with the stock stages. See [`run_with`] for
+/// shutdown behavior.
+pub fn run(
+    runtime: &tokio::runtime::Runtime,
+    config: ServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_with(runtime, config, Extensions::default())
+}
+
+/// [`startup_with`] on `runtime` to its end, then the process-wide observability
 /// closed behind it, on every exit alike: the log writers are flushed and
 /// stopped, then the tracer is flushed and shut down (a bounded wait, see
 /// [`otel_trace::shutdown_otel`]), and only then is the result read. A
 /// failed start-up used to return before the tracer's shutdown, and the
 /// spans the batch exporter still held were lost with the process. The
-/// result is `startup`'s own: the error line and the exit code are the
+/// result is `startup_with`'s own: the error line and the exit code are the
 /// caller's, as before. The runtime stays up throughout: the exporter's
 /// connection lives on it, and the shutdown is driven from it, so a
 /// current-thread runtime serves as well as a multi-thread one.
 ///
 /// For a caller whose process goes on after the server (a language
-/// binding), [`startup`] alone is the entry point.
-pub fn run(
+/// binding), [`startup_with`] alone is the entry point.
+pub fn run_with(
     runtime: &tokio::runtime::Runtime,
     config: ServerConfig,
+    extensions: Extensions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let served = runtime.block_on(Box::pin(startup(config)));
+    let served = runtime.block_on(Box::pin(startup_with(config, extensions)));
     // The writer threads outlive `startup` (a process may start more than one
     // router); flush and stop them now that this process is done logging.
     logging::close_logging();
@@ -2266,8 +2328,35 @@ impl Drop for FollowerOnExit<'_> {
     }
 }
 
+/// The context of this process, built over what the host added: its stages
+/// and its worker connector.
+async fn build_app_context(
+    config: &ServerConfig,
+    extensions: Extensions,
+) -> Result<Arc<AppContext>, String> {
+    Ok(Arc::new(
+        AppContext::from_config_with_extensions(
+            config.router_config.clone(),
+            config.router_config.request_timeout_secs,
+            config.webrtc_bind_addr,
+            config.webrtc_stun_server.clone(),
+            extensions.stages,
+            extensions.connector,
+        )
+        .await?,
+    ))
+}
+
 /// Start the gateway listeners and drain them within the configured shutdown budget.
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    Box::pin(startup_with(config, Extensions::default())).await
+}
+
+/// [`startup`] with the host's extensions.
+pub async fn startup_with(
+    config: ServerConfig,
+    extensions: Extensions,
+) -> Result<(), Box<dyn std::error::Error>> {
     install_crypto_provider();
 
     // Defense in depth: the CLI and Python bindings both validate via
@@ -2472,15 +2561,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.max_payload_size / (1024 * 1024)
     );
 
-    let app_context = Arc::new(
-        AppContext::from_config(
-            config.router_config.clone(),
-            config.router_config.request_timeout_secs,
-            config.webrtc_bind_addr,
-            config.webrtc_stun_server.clone(),
-        )
-        .await?,
-    );
+    let app_context = build_app_context(&config, extensions).await?;
     let follower_on_exit = app_context
         .follows_controller()
         .then(|| FollowerOnExit(&app_context));
@@ -3688,6 +3769,8 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
 
 #[cfg(test)]
 mod tests {
+    mod connector;
+
     use std::convert::Infallible;
 
     use axum::response::sse::{Event, Sse};

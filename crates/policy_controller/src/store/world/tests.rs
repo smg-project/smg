@@ -19,9 +19,9 @@ use crate::{
     lease::{Lease, Lifecycle, Side},
     spec::{BindingSpec, Match, OverloadSpec, Pairing},
     store::{
-        loads::LoadSample, pairing::Refusal, GatewayId, HealthSink, LeasesStore, LoadSink,
-        LoadSource, MembershipTail, MemoryStore, Overload, PairingDescriptor, Reachability,
-        VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        loads::LoadSample, pairing::Refusal, GatewayId, HealthSink, LeaderBits, LeasesStore,
+        LoadSink, LoadSource, MembershipTail, MemoryStore, Overload, PairingDescriptor,
+        Reachability, VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
@@ -33,6 +33,7 @@ use crate::{
 mod encode_classes;
 mod encode_door;
 mod engines;
+mod leader_bits;
 mod list_room;
 mod load_call;
 mod membership_call;
@@ -48,15 +49,19 @@ const ASKER: GatewayId = GatewayId(1);
 
 /// A store's write gives each member its slot. The cases here hand a writer
 /// rows no store filed and read no count of theirs, so a row is given the
-/// next slot of the writer's counts where it is handed.
+/// next slot of the writer's counts where it is handed. No leader said a
+/// word of such a row.
 trait Filed {
-    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot)>;
+    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot, LeaderBits)>;
 }
 
 impl Filed for [WorkerRow] {
-    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot)> {
+    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot, LeaderBits)> {
         let counts = writer.counts();
-        let filed: Vec<_> = self.iter().map(|row| (row, counts.claim())).collect();
+        let filed: Vec<_> = self
+            .iter()
+            .map(|row| (row, counts.claim(), LeaderBits::default()))
+            .collect();
         filed.into_iter()
     }
 }
@@ -2497,10 +2502,9 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
             0 => {
                 let n = next(12) as usize;
                 present[n] = !present[n];
-                let members = all
-                    .iter()
-                    .zip(present)
-                    .filter_map(|(row, here)| here.then_some((row, counts.claim())));
+                let members = all.iter().zip(present).filter_map(|(row, here)| {
+                    here.then_some((row, counts.claim(), LeaderBits::default()))
+                });
                 writer.rebuild(step + 2, members, |_, _| None, Classes::Derive);
             }
             // A window's publication, which drops what its instant ended.

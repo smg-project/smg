@@ -29,7 +29,7 @@ use crate::{
         DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     secrets::SecretFiles,
-    server::{self, posture::SecretSources, ServerConfig, DEFAULT_SHUTDOWN_GRACE_SECS},
+    server::{self, posture::SecretSources, Extensions, ServerConfig, DEFAULT_SHUTDOWN_GRACE_SECS},
     version,
 };
 
@@ -1977,11 +1977,14 @@ fn parse_cli_args(clap_args: Vec<String>) -> (CliArgs, bool) {
 
 /// Phase 4, serve: the async runtime (tokio's container-aware default size
 /// unless `--runtime-worker-threads` pins one; the size is logged by
-/// `startup` once the log subscriber is up), then [`server::run`]: the
+/// startup once the log subscriber is up), then [`server::run_with`]: the
 /// server until it stops, the log writers flushed and the tracer shut down
 /// on every exit, a clean stop and a failed start-up alike. The runtime is
 /// built only now: a refusal before this point costs no threads.
-fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+fn serve(
+    server_config: ServerConfig,
+    extensions: Extensions,
+) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = match server_config.router_config.runtime_worker_threads {
         Some(n) => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(n)
@@ -1989,7 +1992,7 @@ fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> 
             .build()?,
         None => tokio::runtime::Runtime::new()?,
     };
-    server::run(&runtime, server_config)
+    server::run_with(&runtime, server_config, extensions)
 }
 
 /// Says the refusal of a `--print-policy-spec` on stderr, as its type writes
@@ -2014,7 +2017,9 @@ fn refused_print(refusal: &str) -> ExitCode {
     clippy::print_stdout,
     reason = "the answers of the version flags and of --print-policy-spec"
 )]
-pub(super) fn main_from_args() -> Result<ExitCode, Box<dyn std::error::Error>> {
+pub(super) fn main_from_args(
+    extensions: Extensions,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if let Some(version) = version_flag(&args) {
         println!("{version}");
@@ -2040,7 +2045,7 @@ pub(super) fn main_from_args() -> Result<ExitCode, Box<dyn std::error::Error>> {
         &command_line.encode_urls,
     );
     let server_config = cli_args.configure(command_line.prefill_urls, command_line.encode_urls)?;
-    serve(server_config)?;
+    serve(server_config, extensions)?;
     Ok(ExitCode::SUCCESS)
 }
 

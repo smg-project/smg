@@ -38,6 +38,11 @@ use smg_grpc_client::{
     tokenspeed_proto as ts, vllm_proto,
 };
 use smg_mcp::{McpConfig, McpOrchestrator};
+use smg_policy_controller::{
+    lease::TransportClass,
+    store::{GatewayId, HealthSink, LeasesStore, MemoryStore, WorkersStore},
+    view::WorkerId,
+};
 use smg_worker::{
     health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
     identity::basic::{ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType},
@@ -53,6 +58,7 @@ use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerS
 use super::*;
 use crate::{
     config::types::PolicyConfig,
+    policy_controller::host::testing as host_testing,
     routers::{
         common::{
             openai_bridge::FormatRegistry, prefill_admission::test_support::select_worker,
@@ -64,6 +70,7 @@ use crate::{
                 background::{queued_response, store_record},
                 BackgroundResponses, BackgroundStream,
             },
+            context::test_support::{assert_end, dispatch_context, dispatched, place_worker},
             harmony::serve_harmony_responses_stream,
             multimodal::{MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings},
             proto_wrapper::ENGINE_ERROR_MESSAGE,
@@ -74,13 +81,102 @@ use crate::{
             test_engine::serve_on_loopback,
             testing::unreadable_model_dir,
             tokenizer_cache,
-            utils::tonic_ext::TonicStatusExt,
+            utils::{tonic_ext::TonicStatusExt, WorkerDecoding},
         },
     },
     tenant::TenantKey,
 };
 
 const MODEL: &str = "request-release-test-model";
+
+#[tokio::test]
+async fn a_placed_answer_settles_with_its_tokens() {
+    let (placed, store) = place_worker().await;
+    let mut ctx = dispatch_context(placed);
+    let guards = dispatched(ctx.placed.take().expect("a placement"), Instant::now());
+    let ends = guards.placement().expect("a dispatched placement").ends();
+    ctx.load_guards = Some(guards);
+    RequestPipeline::settle_success(
+        &ctx,
+        UsageSettlement {
+            actual_input_tokens: 23,
+            completion_tokens: 7,
+            cached_input_tokens: 11,
+            reasoning_tokens: 3,
+        },
+    )
+    .await;
+    assert_end(&ends, &store, 200, TransportClass::Ok, 23, 7);
+}
+
+#[tokio::test]
+async fn a_failed_attempt_ends_its_lease_before_its_guards_go() {
+    use smg_grpc_client::h2::{Error, Reason};
+
+    // The answers a collected stream's reader makes of the worker's own
+    // failure and of its connection failing under the call.
+    for (status, http, class) in [
+        (
+            Status::internal("worker failed"),
+            500,
+            TransportClass::ServerError,
+        ),
+        (
+            Status::from_error(Box::new(Error::from(Reason::PROTOCOL_ERROR))),
+            502,
+            TransportClass::ConnectFailed,
+        ),
+    ] {
+        let (placed, store) = place_worker().await;
+        let row = placed.id();
+        let worker = Arc::clone(placed.worker());
+        let mut ctx = dispatch_context(placed);
+        let guards = dispatched(ctx.placed.take().expect("a placement"), Instant::now());
+        let ends = guards.placement().expect("a dispatched placement").ends();
+        ctx.load_guards = Some(guards);
+        let failure = status.to_http_error("stream_failed", String::new());
+        assert_eq!(worker.load(), 1);
+        ctx.release_attempt(&failure, Instant::now());
+        assert_eq!(*ctx.tried_rows, [row]);
+        assert_end(&ends, &store, http, class, 0, 0);
+        assert!(ctx.load_guards.is_none());
+        assert_eq!(worker.load(), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_retry_the_selection_cannot_place_does_not_follow() {
+    let pipeline_over = |host| {
+        let deps = PipelineDeps::pair(
+            Arc::new(WorkerRegistry::new()),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        )
+        .with_host(host);
+        RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+            .expect("completion pipeline")
+    };
+    let (host, _, _) = host_testing::bed(&[]);
+    let hosted = pipeline_over(Some(Arc::new(host)));
+
+    let (placed, _store) = place_worker().await;
+    let plain = dispatch_context(placed);
+    assert!(hosted.retry_follows(false, &plain));
+    assert!(!hosted.retry_follows(true, &plain));
+
+    // A retry under a decoding rule would be refused by name: no next
+    // attempt, so the failed attempt's own answer stands.
+    let (placed, _store) = place_worker().await;
+    let mut under_rule = dispatch_context(placed);
+    under_rule.constraint_decided_on = Some(WorkerDecoding::of(None));
+    assert!(!hosted.retry_follows(false, &under_rule));
+
+    // The classic selection answers every retry itself.
+    assert!(pipeline_over(None).retry_follows(false, &under_rule));
+}
+
 /// A valid 1x1 PNG, as a client sends an inline image.
 const ONE_PIXEL_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 /// The worker label of an engine without a vision encoder (vLLM
@@ -633,10 +729,10 @@ async fn image_to_a_worker_without_a_vision_verdict_is_not_refused() {
     )
     .await;
     let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
-    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
     assert_eq!(
-        body["error"]["code"], "invalid_multimodal_request",
+        body["error"]["code"], "multimodal_processing_failed",
         "{body}"
     );
 }
@@ -887,10 +983,10 @@ async fn image_to_a_pool_whose_engine_takes_images_goes_on_into_media_processing
     let (pipeline, components, _) =
         chat_pipeline_over(RuntimeType::Sglang, &[], model_dir.path()).await;
     let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
-    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
     assert_eq!(
-        body["error"]["code"], "invalid_multimodal_request",
+        body["error"]["code"], "multimodal_processing_failed",
         "{body}"
     );
 }
@@ -961,15 +1057,22 @@ async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_
             .await
             .expect("drain body");
         let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
-        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
         if refused {
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
             assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
             assert_eq!(
                 body["error"]["message"], "backend mlx does not support image inputs",
                 "{body}"
             );
         } else {
-            assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
+            // Past the matrix the request goes on into media resolution, to
+            // the config lookup the test's model directory cannot satisfy:
+            // the deployment's fault, answered in the server's class.
+            assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+            assert_eq!(
+                body["error"]["code"], "multimodal_processing_failed",
+                "{body}"
+            );
         }
         assert!(
             seen_ids
@@ -2454,11 +2557,20 @@ async fn responses_context_over(
         None,
         Duration::from_secs(60),
     );
-    let pipeline = RequestPipeline::build(endpoint, mode, &deps)
+    responses_context_with_deps(endpoint, mode, &deps, background_slots).await
+}
+
+async fn responses_context_with_deps(
+    endpoint: Endpoint,
+    mode: Mode,
+    deps: &PipelineDeps,
+    background_slots: usize,
+) -> ResponsesContext {
+    let pipeline = RequestPipeline::build(endpoint, mode, deps)
         .unwrap_or_else(|| panic!("a {endpoint:?} pipeline in {mode:?} mode"));
     ResponsesContext::new(
         Arc::new(pipeline),
-        components(Arc::clone(worker_registry)).await,
+        components(Arc::clone(&deps.worker_registry)).await,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
         Arc::new(MemoryConversationItemStorage::new()),
@@ -2825,6 +2937,63 @@ async fn a_streaming_harmony_responses_iteration_releases_its_share_once_its_str
         1,
         "the iteration's context released its share once its stream was drained"
     );
+}
+
+async fn placed_harmony_responses_context() -> (ResponsesContext, Arc<MemoryStore>, WorkerId) {
+    let port = spawn_stub(GatedScheduler::default()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = register_worker(&registry, port, WorkerType::Regular);
+    let (_, store, _) = host_testing::bed(&[worker.url()]);
+    let mut facts = store.by_key(worker.url()).expect("the worker's row").facts;
+    facts.models = vec![MODEL.to_string()];
+    let row = store.upsert(facts).id();
+    store.publish_now();
+
+    let deps = PipelineDeps::pair(
+        Arc::clone(&registry),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    )
+    .with_host(Some(Arc::new(Host::at_keys(Arc::clone(&store), registry))));
+    let ctx = responses_context_with_deps(Endpoint::Harmony, Mode::Regular, &deps, 0).await;
+    (ctx, store, row)
+}
+
+#[tokio::test]
+async fn a_placed_harmony_responses_iteration_completes_its_lease() {
+    let (ctx, store, row) = placed_harmony_responses_context().await;
+    let mut request = responses_request(false);
+    Arc::make_mut(&mut request).stream = Some(false);
+    let started = Instant::now();
+    ctx.pipeline
+        .execute_harmony_responses(&request, &ctx, None)
+        .await
+        .expect("the iteration answered");
+    assert!(store.completed_ok_since(GatewayId::LOCAL, row, started));
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+}
+
+#[tokio::test]
+async fn a_placed_harmony_responses_stream_completes_its_lease() {
+    let (ctx, store, row) = placed_harmony_responses_context().await;
+    let started = Instant::now();
+    let response = serve_harmony_responses_stream(
+        &ctx,
+        Arc::unwrap_or_clone(responses_request(false)),
+        anonymous(),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("the stream's body");
+    let text = std::str::from_utf8(&body).expect("UTF-8 SSE");
+    assert!(text.contains("event: response.completed"), "{text}");
+    assert!(store.completed_ok_since(GatewayId::LOCAL, row, started));
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
 }
 
 /// Harmony Responses over the gRPC PD path: the same client leaves while

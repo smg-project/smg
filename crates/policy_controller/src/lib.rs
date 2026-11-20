@@ -86,11 +86,10 @@
 //!   handle, and its timer calls the door's clock ([`door::Door::sweep`]).
 //!   The standalone controller runs the same order on its deciders'
 //!   threads.
-//! - The handle ([`handle`]): one decision of the door, held until its
-//!   request ends. A host that holds a [`handle::Handle`] says the target
-//!   it took, the dispatch, and the completion or the release, and the
-//!   handle says each report to the door once, whatever way the request
-//!   ends.
+//! - The handle ([`handle`]): one decision held until its request ends.
+//!   A host that holds a [`handle::Handle`] says the target it took, the
+//!   dispatch, and the completion or the release. The handle reports to
+//!   the in-process door or, with the `client` feature, over a link.
 //! - Behind the `controller` feature, the standalone controller
 //!   (`controller`): the listeners with their credentialed scopes, the
 //!   health service on each, the admin endpoints, readiness, the drain and
@@ -176,7 +175,7 @@ pub use decision::{
     Decision, Lifted, Overlap, OverlapSource, Pair, Pick, Queue, Shed, ShedReason, Survivors,
     Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
-pub use door::{Explained, Names};
+pub use door::{DecisionRecord, Explained, Names};
 pub use framework::{
     Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
     Front, Narrowed, PairPools, PairTable, PairTableError, Picker, Plan, Profile, Scorer, Scratch,

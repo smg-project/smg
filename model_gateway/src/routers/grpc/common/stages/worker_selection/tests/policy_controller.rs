@@ -7,7 +7,6 @@ use smg_policy_controller::{
     store::{GatewayId, LeasesStore, MemoryStore, WorkersStore},
     view::fingerprint,
 };
-use smg_worker::health::circuit_breaker::CircuitBreakerConfig;
 
 use super::*;
 use crate::{middleware::request_id::RequestId, routers::grpc::context::LoadGuards};
@@ -48,7 +47,7 @@ fn stage_with_workers(
             .build();
         assert!(registry.register(Arc::new(worker)).is_some());
     }
-    let host = Host::new(Arc::clone(&store), Arc::clone(&registry));
+    let host = Host::at_keys(Arc::clone(&store), Arc::clone(&registry));
     (
         regular_stage(registry).with_host(Some(Arc::new(host))),
         store,
@@ -173,25 +172,6 @@ async fn each_ask_carries_a_mark_of_its_own() {
     let leases = store.expire(Instant::now() + Duration::from_secs(60));
     assert_eq!(leases.len(), 2);
     assert_ne!(leases[0].request, leases[1].request);
-}
-
-#[tokio::test]
-async fn a_worker_with_an_open_breaker_is_passed_over() {
-    let (stage, _) = stage_with_host(&URLS);
-    let mut ctx = ingress(&stage.worker_registry);
-    stage.execute(&mut ctx).await.expect("an initial pick");
-    let initial = ctx.state.placed.as_ref().expect("a placement");
-    let blocked = Arc::clone(initial.worker());
-    drop(ctx);
-    for _ in 0..CircuitBreakerConfig::default().failure_threshold {
-        blocked.record_outcome(503);
-    }
-    assert!(!blocked.circuit_breaker_can_execute());
-
-    let mut ctx = ingress(&stage.worker_registry);
-    stage.execute(&mut ctx).await.expect("the other worker");
-    let placed = ctx.state.placed.as_ref().expect("a placement");
-    assert_ne!(placed.worker().url(), blocked.url());
 }
 
 #[tokio::test]
@@ -369,6 +349,34 @@ async fn an_attempt_with_no_worker_on_its_wire_reads_the_hosts_answer() {
 }
 
 #[tokio::test]
+async fn a_retry_of_a_shape_refused_by_name_has_no_next_attempt() -> anyhow::Result<()> {
+    let (stage, store) = stage_with_host(&URLS[..1]);
+    // A plain retry is placed, so a next attempt may follow.
+    let plain = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
+    assert!(stage.places_retry(&plain));
+
+    // Each shape the stage refuses by name ends the attempts.
+    let mut under_rule = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
+    under_rule.constraint_decided_on = Some(utils::WorkerDecoding::of(None));
+    assert!(!stage.places_retry(&under_rule));
+    let mut with_media = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
+    with_media.wire.requires_media_refs = true;
+    assert!(!stage.places_retry(&with_media));
+
+    // Asked all the same, the stage still refuses by name.
+    let refused = stage
+        .reselect(&mut under_rule, &retained_plan(&[1]))
+        .await
+        .expect_err("the retry carries a decoding rule");
+    assert_named_refusal(refused, "a retry under a decoding rule", &store).await?;
+
+    // The classic selection answers every retry itself.
+    let classic = regular_stage(Arc::clone(&stage.worker_registry));
+    assert!(classic.places_retry(&under_rule));
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_retry_names_the_rows_of_its_failed_attempts() {
     let (stage, store) = stage_with_host(&URLS);
     let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
@@ -392,7 +400,8 @@ async fn a_retry_names_the_rows_of_its_failed_attempts() {
         .get_by_url(other_url)
         .expect("the other worker");
     // The attempt fails ahead of its send, and its row is named all the same.
-    ctx.release_attempt();
+    let failure = error::internal_error("attempt_failed", "Attempt failed");
+    ctx.release_attempt(&failure, Instant::now());
     assert_eq!(*ctx.tried_rows, [first_row]);
 
     stage
@@ -430,7 +439,7 @@ async fn a_retry_never_returns_to_a_worker_that_answered_definitively() {
     mark_upstream_answer(&mut failure);
     ctx.ledger.settle(&mut failure, [&closed], []);
     assert!(!ctx.ledger.admits(closed.as_ref()));
-    ctx.release_attempt();
+    ctx.release_attempt(&failure, Instant::now());
 
     // The second attempt's worker fails in passing: its row is tried too,
     // and its window stays open.
@@ -440,7 +449,8 @@ async fn a_retry_never_returns_to_a_worker_that_answered_definitively() {
         .expect("the other worker");
     let open = Arc::clone(ctx.placed.as_ref().expect("a placement").worker());
     assert!(!Arc::ptr_eq(&open, &closed));
-    ctx.release_attempt();
+    let passing = error::service_unavailable("upstream", "Passing failure");
+    ctx.release_attempt(&passing, Instant::now());
     assert_eq!(ctx.tried_rows.len(), 2);
 
     // Every row is tried now, so the controller's soft filter hands both
@@ -478,7 +488,8 @@ async fn a_failed_attempt_lets_its_worker_go_and_names_its_row() {
         Instant::now(),
     ));
     assert_eq!(worker.load(), 1);
-    ctx.release_attempt();
+    let failure = error::internal_error("attempt_failed", "Attempt failed");
+    ctx.release_attempt(&failure, Instant::now());
     assert!(ctx.load_guards.is_none());
     assert_eq!(*ctx.tried_rows, [sent]);
     assert_eq!(
@@ -491,7 +502,7 @@ async fn a_failed_attempt_lets_its_worker_go_and_names_its_row() {
     stage.reselect(&mut ctx, &plan).await.expect("a placement");
     let unsent = ctx.placed.as_ref().expect("the placement").id();
     assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
-    ctx.release_attempt();
+    ctx.release_attempt(&failure, Instant::now());
     assert!(ctx.placed.is_none());
     assert_eq!(*ctx.tried_rows, [sent, unsent]);
     assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);

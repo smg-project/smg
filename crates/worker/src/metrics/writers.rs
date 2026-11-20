@@ -498,9 +498,10 @@ pub fn describe_series() {
     );
     describe_counter!(
         "smg_engine_load_values_dropped_total",
-        "Named values of pushed load records dropped at the report's bounds, by worker: an \
-         entry past the first 64 of a record, an empty name, a name over 63 bytes, a unit \
-         over 31 bytes, a value that is not finite, a name the record states again"
+        "Named values of pushed load records and polled load answers dropped at the report's \
+         bounds, by worker: an entry past the first 64 of a list, an empty name, a name over \
+         63 bytes, a unit over 31 bytes, a value that is not finite, a name the list states \
+         again, an entry of an answer that is no named value"
     );
     describe_counter!(
         "smg_kv_event_gaps_total",
@@ -1041,8 +1042,8 @@ impl Metrics {
             .set(if unavailable { 1.0 } else { 0.0 });
     }
 
-    /// Named values a pushed load record stated and its snapshot dropped at
-    /// a bound.
+    /// Named values a pushed load record or a polled answer stated and the
+    /// report dropped at a bound.
     pub fn record_engine_load_values_dropped(worker_url: &str, dropped: usize) {
         counter!(
             "smg_engine_load_values_dropped_total",

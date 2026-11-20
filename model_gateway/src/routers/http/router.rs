@@ -40,6 +40,7 @@ use openai_protocol::{
     UNKNOWN_MODEL_ID,
 };
 use reqwest::multipart::{Form, Part};
+use smg_policy_controller::view::WorkerId;
 use smg_worker::{
     identity::{
         basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
@@ -69,15 +70,19 @@ use crate::{
         otel_trace::inject_trace_context_http,
     },
     policies::{CacheNamespace, PolicyRegistry},
+    policy_controller::{
+        self,
+        host::{self, Ask, Host, Placed, Sent},
+    },
     rate_limit::RateLimitManager,
     routers::{
         common::{
             attach_sized_body,
-            attempt_ledger::{mark_upstream_answer, AttemptLedger},
+            attempt_ledger::{mark_upstream_answer, AttemptLedger, UpstreamAnswer},
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
-                REASON_WORKER_MUTATES_BODY,
+                REASON_PLACED_BY_CONTROLLER, REASON_WORKER_MUTATES_BODY,
             },
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload, placement,
@@ -138,10 +143,19 @@ struct StreamRelayMode {
     rechunk: Option<RechunkPolicy>,
 }
 
+/// The regular HTTP router's rule at the host's commit: the membership of
+/// the classic pool it draws from. The router sends plain HTTP to a regular
+/// worker's URL, so a target of another wire or of another role is passed
+/// over.
+fn regular_http(worker: &dyn Worker) -> bool {
+    *worker.worker_type() == WorkerType::Regular
+        && *worker.connection_mode() == ConnectionMode::Http
+}
+
 /// One dispatch attempt of a typed request: the inputs every stage of
 /// `Router::route_typed_request_once` reads. The route builds it once and
 /// every retry attempt reads the same one; the lease, the ledger and the
-/// tried list are the state the attempts share.
+/// tried lists are the state the attempts share.
 struct TypedAttempt<'a, T> {
     headers: Option<&'a HeaderMap>,
     /// The parsed request and its routing derivatives, held until the
@@ -160,12 +174,22 @@ struct TypedAttempt<'a, T> {
     /// The engines a failed attempt of this request dispatched to; a retry
     /// re-selects away from them while another available worker is left.
     tried: &'a parking_lot::Mutex<Vec<String>>,
+    /// The store rows the request's failed attempts were sent to, one an
+    /// attempt. A retry names them in its ask, and their count is the ask's
+    /// retry number. Classic policies leave it empty.
+    tried_rows: &'a parking_lot::Mutex<Vec<WorkerId>>,
+    /// The request's own id, kept where the router's host asks: a source
+    /// of the request's routing key.
+    rid: Option<&'a str>,
 }
 
-/// Regular router that uses injected load balancing policies
+/// The regular HTTP router places typed requests through its host or its
+/// injected load balancing policies.
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
+    /// The policy controller's host, when it places this router's requests.
+    host: Option<Arc<Host>>,
     retry_config: RetryConfig,
     /// Cap on buffered worker response bodies, mirroring the ingress limit.
     max_payload_size: usize,
@@ -240,6 +264,7 @@ impl Router {
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
+            host: ctx.policy_host.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             max_payload_size: ctx.router_config.max_payload_size,
             stream_stall_timeout: match ctx.router_config.stream_body_stall_timeout_secs {
@@ -366,12 +391,17 @@ impl Router {
     ///
     /// Uses the shared [`WorkerSelector`] (least-loaded) filtered to regular
     /// HTTP workers advertising the `realtime` label, so realtime traffic
-    /// never lands on a worker that can't serve it.
+    /// never lands on a worker that can't serve it. Under the policy
+    /// controller's host every realtime route is refused by name here: the
+    /// selector asks no controller and takes no lease.
     async fn select_realtime_worker(
         &self,
         model_id: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<Arc<dyn Worker>, Response> {
+        if self.host.is_some() {
+            return Err(policy_controller::refused("a realtime request"));
+        }
         WorkerSelector::new(&self.worker_registry)
             .select_worker(&SelectWorkerRequest {
                 model_id,
@@ -477,6 +507,12 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let routing = self.routing_derivatives(headers, &typed_req);
+        // The lease frees the parsed request at its dispatch, so the host's
+        // asks read the request's own id from here.
+        let rid = self
+            .host
+            .as_ref()
+            .and_then(|_| typed_req.rid().map(str::to_owned));
         // Resolve once, here, so every registry, policy and metrics lookup
         // below is keyed by the canonical model ID. Only `get_by_model`
         // understands aliases; retry configs, hash rings and policies do not,
@@ -512,6 +548,7 @@ impl Router {
             let (reservation, denial) = tenant_rate_limit::reserve(estimate, model_id).await;
             // The state the attempts share; `TypedAttempt` names each piece.
             let tried = parking_lot::Mutex::new(Vec::new());
+            let tried_rows = parking_lot::Mutex::new(Vec::new());
             let ledger = AttemptLedger::default();
             let attempt = TypedAttempt {
                 headers,
@@ -522,6 +559,8 @@ impl Router {
                 is_stream,
                 ledger: &ledger,
                 tried: &tried,
+                tried_rows: &tried_rows,
+                rid: rid.as_deref(),
             };
 
             let response = if let Some(denied) = denial {
@@ -692,29 +731,38 @@ impl Router {
     }
 
     /// One attempt of a typed request as a sequence of named stages: the
-    /// worker, the dispatch-time overload re-check, the adapter, the
-    /// dispatch, the adapter's verdict, the accounting. Every stage reads the
-    /// same `TypedAttempt`; its lease, ledger and tried list carry what the
-    /// next attempt must know.
+    /// placement or classic selection with its overload re-check, the adapter,
+    /// the dispatch, the adapter's verdict and the accounting. A successful
+    /// stream carries its placement to the body's end. Other attempts report
+    /// their status before returning.
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize>(
         &self,
         attempt: &TypedAttempt<'_, T>,
     ) -> Response {
-        let worker = match self.select_worker_for_attempt(attempt) {
-            Ok(worker) => worker,
-            Err(refusal) => return refusal,
-        };
+        let (worker, mut placed) = match &self.host {
+            None => {
+                let worker = match self.select_worker_for_attempt(attempt) {
+                    Ok(worker) => worker,
+                    Err(refusal) => return refusal,
+                };
 
-        // Dispatch-time re-check of the one chosen worker: O(1), and the only
-        // thing that closes the window between selection and dispatch in which
-        // a load report can flip the veto.
-        if let Some(shed) = overload::shed_if_worker_overloaded(
-            worker.as_ref(),
-            attempt.model_id,
-            self.worker_registry.overload_shed_enabled(),
-        ) {
-            return shed;
-        }
+                // Dispatch-time re-check of the one chosen worker: O(1), and the only
+                // thing that closes the window between selection and dispatch in which
+                // a load report can flip the veto.
+                if let Some(shed) = overload::shed_if_worker_overloaded(
+                    worker.as_ref(),
+                    attempt.model_id,
+                    self.worker_registry.overload_shed_enabled(),
+                ) {
+                    return shed;
+                }
+                (worker, None)
+            }
+            Some(host) => match self.place_attempt(host, attempt).await {
+                Ok(placed) => (Arc::clone(placed.worker()), Some(Sent::from(placed))),
+                Err(refusal) => return refusal,
+            },
+        };
 
         let mut decision_adapter =
             match Self::decision_adapter_for_attempt(attempt, worker.as_ref()) {
@@ -723,7 +771,7 @@ impl Router {
             };
 
         let response = self
-            .dispatch_attempt(attempt, &worker, &mut decision_adapter)
+            .dispatch_attempt(attempt, &worker, &mut decision_adapter, placed.as_mut())
             .await;
 
         // A streamed head's success was recorded before its relay task was
@@ -743,7 +791,100 @@ impl Router {
 
         events::RequestReceivedEvent {}.emit();
 
-        self.account_attempt_outcome(attempt, &worker, response, head_success_recorded)
+        let response = self.account_attempt_outcome(
+            attempt,
+            &worker,
+            response,
+            head_success_recorded,
+            placed.as_ref().map(|sent| sent.id()),
+        );
+
+        match placed {
+            None => response,
+            Some(placed) if head_success_recorded => placed.held_to_the_end_of(response),
+            Some(placed) => {
+                let answered = response.extensions().get::<UpstreamAnswer>().is_some();
+                placed.ended(response.status(), answered, Instant::now());
+                response
+            }
+        }
+    }
+
+    /// Resolve an unnamed request to the one model this router's workers
+    /// serve. Use the no-model id when no worker has a model, and return
+    /// `None` when the workers serve several distinct models.
+    fn model_of_an_unnamed_request(&self) -> Option<String> {
+        let pool = self
+            .worker_registry
+            .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
+        let mut models = pool
+            .iter()
+            .map(|worker| worker.model_id())
+            .filter(|&model| model != UNKNOWN_MODEL_ID);
+        let model = models.next().unwrap_or(UNKNOWN_MODEL_ID);
+        models.all(|other| other == model).then(|| model.to_owned())
+    }
+
+    /// The attempt's placement by the policy controller, or the answer of a
+    /// request it did not place. The commit keeps to this router's own pool
+    /// ([`regular_http`]) and to the workers the request's ledger admits: a
+    /// worker that answered the request definitively takes no later attempt,
+    /// as on the classic arm. The controller reads the tried rows softly, so
+    /// the rule is held here.
+    async fn place_attempt<T>(
+        &self,
+        host: &Host,
+        attempt: &TypedAttempt<'_, T>,
+    ) -> Result<Placed, Response> {
+        let model = if attempt.model_id == UNKNOWN_MODEL_ID {
+            let Some(model) = self.model_of_an_unnamed_request() else {
+                return Err(self.report_refusal(
+                    "Router::route_typed_request",
+                    attempt.model_id,
+                    error::model_not_found(UNKNOWN_MODEL_ID),
+                ));
+            };
+            Cow::Owned(model)
+        } else {
+            Cow::Borrowed(attempt.model_id)
+        };
+        if self
+            .worker_registry
+            .get_routing_pool(&model, RoutingPool::HttpRegular)
+            .is_empty()
+        {
+            return Err(self.report_refusal(
+                "Router::route_typed_request",
+                attempt.model_id,
+                error::model_not_found(&model),
+            ));
+        }
+        let id = host::mark();
+        let tried = attempt.tried_rows.lock().clone();
+        let ask = Ask {
+            id: &id,
+            model: &model,
+            streaming: attempt.is_stream,
+            headers: attempt.headers,
+            rid: attempt.rid,
+            tried: &tried,
+            hashes: None,
+        };
+        let ledger = attempt.ledger;
+        let placed = host
+            .place_where(
+                &ask,
+                |worker| regular_http(worker) && ledger.admits(worker),
+                Instant::now(),
+            )
+            .await;
+        placed.map_err(|unplaced| {
+            self.report_refusal(
+                "Router::route_typed_request",
+                attempt.model_id,
+                unplaced.answer(&model),
+            )
+        })
     }
 
     /// The worker of one attempt: selected away from the engines the request
@@ -830,13 +971,15 @@ impl Router {
 
     /// The attempt's dispatch: the worker's load guard, the request-sent
     /// event, the trace headers, the relay mode, the serialized body and the
-    /// send through the relay. Once the bytes exist the lease frees the parsed
-    /// request when retries are disabled.
+    /// send through the relay. Once the bytes exist the request lease frees
+    /// the parsed request when retries are disabled. The placement reports
+    /// dispatch at the send.
     async fn dispatch_attempt<T: GenerationRequest + serde::Serialize>(
         &self,
         attempt: &TypedAttempt<'_, T>,
         worker: &Arc<dyn Worker>,
         decision_adapter: &mut Option<SglangDecisionAdapter>,
+        placed: Option<&mut Sent>,
     ) -> Response {
         let headers = attempt.headers;
         let lease = attempt.lease;
@@ -879,12 +1022,19 @@ impl Router {
                 if let Some(adapter) = decision_adapter.as_mut() {
                     adapter.release_request();
                 }
+                let mut source = RelaySource::new(attempt.model_id, route, Arc::clone(worker));
+                if let Some(placed) = placed {
+                    placed.dispatched(Instant::now());
+                    if attempt.is_stream {
+                        source = source.marking(placed.cut_mark());
+                    }
+                }
                 self.send_serialized_request(
                     headers,
                     body,
                     upstream_route,
                     mode,
-                    RelaySource::new(attempt.model_id, route, Arc::clone(worker)),
+                    source,
                     load_guard,
                 )
                 .await
@@ -956,14 +1106,16 @@ impl Router {
     /// The attempt's answer on the request's ledger: the worker's breaker
     /// outcome, unless a streamed head already recorded a success that the
     /// verdict kept; the retry window settled on a definitive answer; the
-    /// engine on the tried list after a replayable failure; the worker error
-    /// metric on a server error.
+    /// worker on the tried list after a replayable failure, with its row on
+    /// the controller's list where it was placed. A server error records a
+    /// worker error metric.
     fn account_attempt_outcome<T>(
         &self,
         attempt: &TypedAttempt<'_, T>,
         worker: &Arc<dyn Worker>,
         mut response: Response,
         head_success_recorded: bool,
+        row: Option<WorkerId>,
     ) -> Response {
         let model_id = attempt.model_id;
         let ledger = attempt.ledger;
@@ -983,6 +1135,9 @@ impl Router {
         // A replayable failure: the retry re-selects away from this engine
         // while another available worker is left to take the request.
         if is_retryable_response(&response) {
+            if let Some(row) = row {
+                attempt.tried_rows.lock().push(row);
+            }
             let mut tried = attempt.tried.lock();
             if !tried.iter().any(|engine| engine == worker.base_url()) {
                 tried.push(worker.base_url().to_string());
@@ -1225,6 +1380,9 @@ impl Router {
         model_id: &str,
         routing: &RoutingDerivatives,
     ) -> Result<Arc<dyn Worker>, Response> {
+        if self.host.is_some() {
+            return Err(policy_controller::refused("a transcription request"));
+        }
         let all_workers = self
             .worker_registry
             .get_routing_pool(model_id, RoutingPool::HttpRegular);
@@ -2257,6 +2415,10 @@ impl Router {
         route: &'static str,
         wasm_request_hooks: bool,
     ) -> Result<Response, Request<Body>> {
+        if self.host.is_some() {
+            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_PLACED_BY_CONTROLLER);
+            return Err(req);
+        }
         let stream_reason = match self.request_body_path(req.headers(), wasm_request_hooks) {
             BodyPath::Buffer(reason) => {
                 Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
@@ -2908,6 +3070,9 @@ impl RouterTrait for Router {
 }
 
 #[cfg(test)]
+mod placed_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{
         net::SocketAddr,
@@ -3038,6 +3203,7 @@ mod tests {
         Router {
             worker_registry,
             policy_registry,
+            host: None,
             retry_config: RetryConfig::default(),
             max_payload_size: 536_870_912,
             stream_stall_timeout: Some(Duration::from_secs(60)),
@@ -3105,6 +3271,7 @@ mod tests {
         ));
         let router = Router {
             worker_registry,
+            host: None,
             ..create_test_regular_router()
         };
 
@@ -3387,29 +3554,33 @@ mod tests {
         );
     }
 
-    /// Loopback POST /generate stub answering `status` with a JSON body on
-    /// every request, counting the requests it saw.
+    /// Loopback POST stub answering `status` with a JSON body on the given
+    /// paths, counting the requests it saw.
     #[expect(
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    async fn fixed_status_upstream(status: StatusCode) -> (String, Arc<AtomicUsize>) {
+    pub(super) async fn fixed_status_upstream(
+        paths: &[&str],
+        status: StatusCode,
+    ) -> (String, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&hits);
-        let app = axum::Router::new().route(
-            "/generate",
-            axum::routing::post(move || {
-                let seen = Arc::clone(&seen);
-                async move {
-                    seen.fetch_add(1, AtomicOrdering::SeqCst);
-                    (
-                        status,
-                        [(CONTENT_TYPE, "application/json")],
-                        r#"{"error":{"message":"upstream failed","type":"InternalServerError"}}"#,
-                    )
-                }
-            }),
-        );
+        let post = axum::routing::post(move || {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.fetch_add(1, AtomicOrdering::SeqCst);
+                (
+                    status,
+                    [(CONTENT_TYPE, "application/json")],
+                    r#"{"error":{"message":"upstream failed","type":"InternalServerError"}}"#,
+                )
+            }
+        });
+        let mut app = axum::Router::new();
+        for path in paths {
+            app = app.route(path, post.clone());
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -3451,6 +3622,7 @@ mod tests {
         Router {
             worker_registry,
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            host: None,
             retry_config: retry,
             max_payload_size: 536_870_912,
             stream_stall_timeout: Some(Duration::from_secs(60)),
@@ -3482,7 +3654,8 @@ mod tests {
     /// attempts.
     #[tokio::test]
     async fn transient_upstream_failures_charge_the_breaker_once_per_request() {
-        let (url, hits) = fixed_status_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
+        let (url, hits) =
+            fixed_status_upstream(&["/generate"], StatusCode::SERVICE_UNAVAILABLE).await;
         let router = breaker_router(&[&url], fast_retry_config(3), 2);
         let worker = router.worker_registry.get_all().remove(0);
 
@@ -3512,7 +3685,8 @@ mod tests {
     /// returned at once rather than replayed, and the worker is charged once.
     #[tokio::test]
     async fn a_workers_own_500_is_not_replayed_on_it() {
-        let (url, hits) = fixed_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let (url, hits) =
+            fixed_status_upstream(&["/generate"], StatusCode::INTERNAL_SERVER_ERROR).await;
         let router = breaker_router(&[&url], fast_retry_config(5), 2);
         let worker = router.worker_registry.get_all().remove(0);
 
@@ -3537,8 +3711,10 @@ mod tests {
     /// definitive answer stands.
     #[tokio::test]
     async fn a_workers_own_500_moves_the_request_to_another_worker_once() {
-        let (url_a, hits_a) = fixed_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
-        let (url_b, hits_b) = fixed_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let (url_a, hits_a) =
+            fixed_status_upstream(&["/generate"], StatusCode::INTERNAL_SERVER_ERROR).await;
+        let (url_b, hits_b) =
+            fixed_status_upstream(&["/generate"], StatusCode::INTERNAL_SERVER_ERROR).await;
         let router = breaker_router(&[&url_a, &url_b], fast_retry_config(5), 5);
 
         let response = generate(&router, "bad payload").await;
@@ -3572,6 +3748,7 @@ mod tests {
             ReleasePoint::from_retry_config(&router.retry_config),
         );
         let tried = parking_lot::Mutex::new(Vec::new());
+        let tried_rows = parking_lot::Mutex::new(Vec::new());
         let ledger = AttemptLedger::default();
         let attempt = TypedAttempt {
             headers: None,
@@ -3582,6 +3759,8 @@ mod tests {
             is_stream: false,
             ledger: &ledger,
             tried: &tried,
+            tried_rows: &tried_rows,
+            rid: None,
         };
         let select = || {
             let worker = router
@@ -3617,7 +3796,7 @@ mod tests {
     /// not inside a backoff: the 503 is terminal for the retry loop.
     #[tokio::test]
     async fn no_retry_runs_against_a_pool_of_open_breakers() {
-        let (url, hits) = fixed_status_upstream(StatusCode::OK).await;
+        let (url, hits) = fixed_status_upstream(&["/generate"], StatusCode::OK).await;
         let router = breaker_router(&[&url], fast_retry_config(5), 1);
         let worker = router.worker_registry.get_all().remove(0);
         worker.record_outcome(500);
@@ -4216,6 +4395,7 @@ mod tests {
         Router {
             worker_registry,
             policy_registry,
+            host: None,
             retry_config: RetryConfig::default(),
             max_payload_size,
             stream_stall_timeout: Some(Duration::from_secs(60)),
@@ -4268,7 +4448,7 @@ mod tests {
         (format!("http://{addr}"), captured)
     }
 
-    fn streamed_request(chunks: &[&'static [u8]]) -> Request<Body> {
+    pub(super) fn streamed_request(chunks: &[&'static [u8]]) -> Request<Body> {
         let total: usize = chunks.iter().map(|c| c.len()).sum();
         let chunks: Vec<Result<Bytes, std::io::Error>> =
             chunks.iter().map(|c| Ok(Bytes::from_static(c))).collect();
@@ -5704,6 +5884,7 @@ mod tests {
         ));
         let router = Router {
             worker_registry,
+            host: None,
             ..create_test_regular_router()
         };
 

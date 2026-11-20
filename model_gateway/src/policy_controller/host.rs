@@ -3,11 +3,10 @@
 //!
 //! An attempt has two halves. The ask ([`Host::ask`]) states what the
 //! attempt knows of its request and gets a decision through the
-//! controller's handle. The commit ([`Host::commit`]) walks the decision's
-//! targets under the gateway's own locks and takes the first it can send
-//! to. [`Host::place`] is their loop for the regular shapes. The store
-//! builds the candidates: the gateway sends none and keeps no view of the
-//! rows.
+//! controller's handle. The commit ([`Host::commit`]) looks up the decision's
+//! targets and takes the first it can send to. [`Host::place`] is their loop
+//! for the regular shapes. The store builds the candidates: the gateway
+//! sends none and keeps no view of the rows.
 //!
 //! The ask is the one function that may wait. In process the door decides
 //! on the calling thread and the ask is ready at once. A controller at an
@@ -18,13 +17,15 @@
 //! the router says the dispatch at the send, then the request's end, or a
 //! release before any send. One dropped with a report owed says it, as the
 //! handle does. [`Held`] carries the worker crate's load guard beside it,
-//! so one value travels with a response to its end.
+//! so one value travels with a response to its end. The regular HTTP router
+//! holds its placement over the body that carries the guard.
 //!
 //! The gateway's own check of a target is what it alone knows: the worker's
 //! status as its probes read it, and its circuit breaker. The overload and
 //! stall vetoes are the controller's, read from its rows.
 
 use std::{
+    cell::Cell,
     fmt,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -34,7 +35,7 @@ use std::{
 };
 
 use axum::{
-    http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
+    http::{header::RETRY_AFTER, HeaderMap, HeaderValue, StatusCode},
     response::Response,
 };
 use rand::RngExt;
@@ -43,14 +44,20 @@ use smg_policy_controller::{
     door::{Door, Maker, Refused, Request},
     handle::Handle,
     lease::{Outcome, ReleaseReason, Side, TransportClass},
-    store::{GatewayId, MemoryStore, WorkersStore, World},
+    store::{GatewayId, MemoryStore, World},
     view::{Constraints, HashKind, Identity, Phase, RequestFacts, WorkerId},
-    AppliedSpec,
+    worker_host::Objects,
+    AppliedSpec, DerivedKey, KeySource,
 };
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard};
 
+#[cfg(test)]
+use crate::routers::common::snapshot::WorkerRegistry;
 use crate::{
-    middleware::SHED_RETRY_AFTER_SECS,
+    middleware::{
+        ADMISSION_QUEUE_FULL_CODE, ADMISSION_QUEUE_FULL_STATUS, ADMISSION_QUEUE_TIMEOUT_CODE,
+        ADMISSION_QUEUE_TIMEOUT_STATUS, SHED_RETRY_AFTER_SECS,
+    },
     observability::{
         cache_trace,
         metrics::{Metrics, PolicyDecision},
@@ -58,8 +65,9 @@ use crate::{
     routers::{
         common::{
             overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
-            placement::no_available_workers_because, retry::mark_non_retryable,
-            snapshot::WorkerRegistry,
+            placement::{self, no_available_workers_because},
+            retry::mark_non_retryable,
+            snapshot::ModelWorkerSnapshot,
         },
         error,
     },
@@ -178,26 +186,22 @@ impl<'a> Ask<'a> {
     }
 
     /// The request's routing key by the sources its binding names in `spec`:
-    /// the first that holds a value
+    /// the first that holds a value, with the source it came from
     /// ([`KeySources::derive`](smg_policy_controller::KeySources::derive)).
-    /// [`Identity::NONE`] where the binding names no source, or none of them
-    /// holds a value.
+    /// `None` where the binding names no source, or none of them holds a
+    /// value.
     ///
     /// The key borrows the document. The door hands the ask the world it
     /// decides under, and the key is derived there
     /// ([`Handle::decide_under`]).
-    fn key<'s>(&self, spec: &'s AppliedSpec) -> Identity<'s>
+    fn key<'s>(&self, spec: &'s AppliedSpec) -> Option<DerivedKey<'s>>
     where
         'a: 's,
     {
-        let Some(sources) = spec.key_sources_for(self.model, Phase::Single) else {
-            return Identity::NONE;
-        };
+        let sources = spec.key_sources_for(self.model, Phase::Single)?;
         let headers = self.headers;
         let header = |name: &str| headers?.get(name).map(HeaderValue::as_bytes);
-        sources
-            .derive(header, self.rid)
-            .map_or(Identity::NONE, |derived| derived.key)
+        sources.derive(header, self.rid)
     }
 
     /// The request as the controller reads it, with its routing `key` and
@@ -245,6 +249,11 @@ impl<'a> Ask<'a> {
 struct Made<'r, 'a> {
     ask: &'r Ask<'a>,
     missed: &'r [WorkerId],
+    /// Where the key of the last making came from, under the label the
+    /// gateway counts it by. The door may make the request a second time,
+    /// behind a lease the store refused: the host counts after the
+    /// decision, once.
+    source: Cell<Option<&'static str>>,
 }
 
 impl Maker for Made<'_, '_> {
@@ -253,7 +262,12 @@ impl Maker for Made<'_, '_> {
     }
 
     fn make<'w>(&'w self, world: &'w World) -> Request<'w> {
-        let key = self.ask.key(world.spec());
+        let derived = self.ask.key(world.spec());
+        self.source.set(derived.map(|derived| match derived.source {
+            KeySource::Header(_) => "header",
+            KeySource::Rid => "rid",
+        }));
+        let key = derived.map_or(Identity::NONE, |derived| derived.key);
         self.ask.request(key, self.missed)
     }
 }
@@ -265,7 +279,8 @@ pub(crate) enum Unplaced {
     Shed {
         /// Why.
         reason: ShedReason,
-        /// The stage that left no candidate.
+        /// The stage that left no candidate, or what of the policy
+        /// declined.
         emptied_by: &'static str,
         /// The seconds after which a retry may find room.
         retry_after_secs: u16,
@@ -289,8 +304,11 @@ impl Unplaced {
     /// | No endpoint is left, or the gateway can send to no target | 503 `no_available_workers`, with a retry hint |
     /// | A queue is at its limit | 429 `admission_queue_full`, with the admission queue's retry hint |
     /// | The decision's budget passed | 503 `admission_queue_timeout`, with the same hint |
-    /// | The picker declined every candidate | 503 `policy_declined` |
+    /// | The policy declined the request | 503 `policy_declined` |
     /// | The door made no decision | 503 `policy_controller_unavailable`, with a retry hint |
+    ///
+    /// A declined request reads the same message for every cause. Its
+    /// refusal line names where the policy declined.
     ///
     /// No answer is retried in process: a second ask a moment later reads
     /// the same rows. A route that asks for a side of a pair refuses by name
@@ -331,8 +349,9 @@ impl Unplaced {
                 reason: ShedReason::FlowLimit,
                 ..
             } => hinted(
-                error::too_many_requests(
-                    "admission_queue_full",
+                error::create_error(
+                    ADMISSION_QUEUE_FULL_STATUS,
+                    ADMISSION_QUEUE_FULL_CODE,
                     "a queue of the policy controller is at its limit",
                 ),
                 SHED_RETRY_AFTER_SECS,
@@ -341,8 +360,9 @@ impl Unplaced {
                 reason: ShedReason::Deadline,
                 ..
             } => hinted(
-                error::service_unavailable(
-                    "admission_queue_timeout",
+                error::create_error(
+                    ADMISSION_QUEUE_TIMEOUT_STATUS,
+                    ADMISSION_QUEUE_TIMEOUT_CODE,
                     "the decision's budget passed before a worker was picked",
                 ),
                 SHED_RETRY_AFTER_SECS,
@@ -351,12 +371,7 @@ impl Unplaced {
                 reason: ShedReason::PolicyDeclined,
                 emptied_by,
                 ..
-            } => error::service_unavailable(
-                "policy_declined",
-                format!(
-                    "The policy's {emptied_by} stage declined every worker for model '{model}'"
-                ),
-            ),
+            } => return placement::policy_declined(model, emptied_by),
             Self::Refused(_) => hinted(
                 error::service_unavailable(
                     "policy_controller_unavailable",
@@ -397,33 +412,56 @@ pub(crate) struct Asked {
 }
 
 /// The policy controller's host in this process: the door over the
-/// controller's store, and the registry the gateway's workers stand in.
+/// controller's store, and the holder of the gateway's worker objects.
 pub(crate) struct Host {
     door: Arc<Door>,
-    registry: Arc<WorkerRegistry>,
+    workers: Workers,
+}
+
+/// Where the host finds the worker of a target's row.
+enum Workers {
+    /// The object the feed's holder laid for the row.
+    Held(Arc<Objects<ModelWorkerSnapshot>>),
+    /// The registry's worker at the row's key, for a bed that registers its
+    /// workers by hand. A key is not one life of a worker.
+    #[cfg(test)]
+    AtKey(Arc<WorkerRegistry>),
 }
 
 impl Host {
-    /// The host over the controller's `store`, for the workers of
-    /// `registry`.
-    pub(crate) fn new(store: Arc<MemoryStore>, registry: Arc<WorkerRegistry>) -> Self {
+    /// The host over the controller's `store` and the holder of its worker
+    /// `objects`.
+    pub(crate) fn new(store: Arc<MemoryStore>, objects: Arc<Objects<ModelWorkerSnapshot>>) -> Self {
         Self {
             door: Arc::new(Door::new(store)),
-            registry,
+            workers: Workers::Held(objects),
         }
     }
 
-    /// The gateway's worker of a target: the one function that resolves a
-    /// row of the store to a worker. `None` where the row is gone, or the
-    /// registry holds no worker at its key.
-    ///
-    /// This body reads the row whole and looks its key up as a URL. A URL is
-    /// not one life of a worker, and the read clones the row: the host
-    /// resolves by the row's id, through the registry's projection of the
-    /// store, before a router calls it.
+    /// The host of a bed that registers its workers by hand in `registry`.
+    #[cfg(test)]
+    pub(crate) fn at_keys(store: Arc<MemoryStore>, registry: Arc<WorkerRegistry>) -> Self {
+        Self {
+            door: Arc::new(Door::new(store)),
+            workers: Workers::AtKey(registry),
+        }
+    }
+
+    /// The gateway's worker of a target, found by the row's id: the one
+    /// function that resolves a row of the store to a worker. `None` where
+    /// the holder has laid no object for the row or the object has left the
+    /// registry. So a row the store shows ahead of its object, as a
+    /// replacement inside its own write, takes no request.
     fn worker(&self, id: WorkerId) -> Option<Arc<dyn Worker>> {
-        let row = WorkersStore::get(&**self.door.store(), id)?;
-        self.registry.get_by_url(&row.facts.key)
+        match &self.workers {
+            Workers::Held(objects) => objects.registry().get(&objects.object(id)?),
+            #[cfg(test)]
+            Workers::AtKey(registry) => {
+                use smg_policy_controller::store::WorkersStore;
+                let row = WorkersStore::get(&**self.door.store(), id)?;
+                registry.get_by_url(&row.facts.key)
+            }
+        }
     }
 
     fn profile_name(&self, trace: &Trace) -> Option<Arc<str>> {
@@ -493,10 +531,20 @@ impl Host {
         missed: &[WorkerId],
         now: Instant,
     ) -> Result<Asked, Unplaced> {
-        let made = Made { ask, missed };
+        let made = Made {
+            ask,
+            missed,
+            source: Cell::new(None),
+        };
         let started = Instant::now();
         let decided = Handle::decide_under(Arc::clone(&self.door), GATEWAY, &made, now);
         let seconds = started.elapsed().as_secs_f64();
+        // A key's source counts once an attempt, at its first ask, as a
+        // keyed selection of the gateway's own policies counts it: an ask
+        // again behind a missed commit is the same attempt's.
+        if let Some(source) = made.source.get().filter(|_| missed.is_empty()) {
+            Metrics::record_routing_key_source(source);
+        }
         let decision = decided.as_ref().ok().map(Handle::decision);
         let trace = decision.map(Decision::trace);
         let generation = trace.map_or(0, |trace| trace.generation);
@@ -532,10 +580,8 @@ impl Host {
     }
 
     /// The commit: walks the targets of `asked`, best first, and takes the
-    /// first the gateway can send to. It awaits nothing. It reads each
-    /// target's row under the store's membership lock, which a publication
-    /// holds through a rebuild: until the host resolves a target by its id,
-    /// a caller holds no lock of its own across it.
+    /// first the gateway can send to. It awaits nothing and takes the
+    /// holder's read lock once for each target it looks up.
     ///
     /// Where no target holds, the decision's lease is given up by name at
     /// `now` and its targets join `missed`: the next ask names them.
@@ -617,11 +663,11 @@ impl Host {
 /// A request's end, as its router read it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct End {
-    /// The status the worker answered with, 0 where none was read.
+    /// The response status, 0 where none was read.
     pub status: u16,
     /// What became of the transport.
     pub class: TransportClass,
-    /// The time to the first token, in microseconds.
+    /// The time to the first token or data frame, in microseconds.
     pub ttft_micros: u32,
     /// The tokens the worker read.
     pub tokens_in: u32,
@@ -629,6 +675,43 @@ pub(crate) struct End {
     pub tokens_out: u32,
     /// The time from the send to the end, in microseconds.
     pub duration_micros: u32,
+}
+
+/// What became of the transport, for the status a request ended with.
+/// `answered` says the worker gave that status itself.
+pub(crate) fn transport_class(status: StatusCode, answered: bool) -> TransportClass {
+    match status {
+        status if status < StatusCode::BAD_REQUEST => TransportClass::Ok,
+        StatusCode::GATEWAY_TIMEOUT => TransportClass::Timeout,
+        status if status.is_client_error() => TransportClass::ClientError,
+        _ if answered => TransportClass::ServerError,
+        _ => TransportClass::ConnectFailed,
+    }
+}
+
+impl End {
+    /// An HTTP answer with timing from the send and any first data frame.
+    fn http(
+        status: StatusCode,
+        class: TransportClass,
+        sent: Instant,
+        first: Option<Instant>,
+        now: Instant,
+    ) -> Self {
+        Self {
+            status: status.as_u16(),
+            class,
+            ttft_micros: first.map_or(0, |first| elapsed_micros(first, sent)),
+            tokens_in: 0,
+            tokens_out: 0,
+            duration_micros: elapsed_micros(now, sent),
+        }
+    }
+}
+
+/// The time since `sent` in whole microseconds, saturating at `u32::MAX`.
+fn elapsed_micros(now: Instant, sent: Instant) -> u32 {
+    u32::try_from(now.saturating_duration_since(sent).as_micros()).unwrap_or(u32::MAX)
 }
 
 /// An attempt's worker, with its decision's lease held to the request's
@@ -723,6 +806,8 @@ impl Held {
     }
 }
 
+mod ride;
+pub(crate) use ride::Sent;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]

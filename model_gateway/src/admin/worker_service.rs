@@ -34,7 +34,7 @@ use tracing::warn;
 use crate::{
     config::{unused_credentials_warning, validate_worker_url, RouterConfig},
     routers::{common::snapshot::WorkerRegistry, provider_support},
-    workflow::{Job, JobQueue, WorkerRegistrationMode},
+    workflow::{job_queue::cancel_registration, Job, JobQueue, WorkerRegistrationMode},
 };
 
 /// Validate the URL of an incoming worker-management request, translating a
@@ -924,8 +924,7 @@ impl WorkerService {
         // flight reserves nothing), so no DELETE reaches this path for such a
         // registration before its worker exists.
         if self.worker_registry.get(&worker_id).is_none() {
-            let cancelled = job_queue
-                .cancel_registration(&url, &worker_id)
+            let cancelled = cancel_registration(job_queue, &url, &worker_id)
                 .await
                 .map_err(|message| WorkerServiceError::QueueSubmitFailed { message })?;
             if cancelled > 0 && self.worker_registry.get(&worker_id).is_none() {
@@ -1044,12 +1043,13 @@ impl WorkerService {
 #[cfg(test)]
 mod tests {
     use openai_protocol::model_card::ModelCard;
-    use smg_worker::identity::basic::WorkerType;
+    use smg_worker::{identity::basic::WorkerType, jobs::queue::testing::QueueTest};
 
     use super::*;
     use crate::{
         app_context::testing::app_context_for_tests,
-        routers::grpc::backend_client::BasicWorkerBuilder, workflow::JobQueueConfig,
+        routers::grpc::backend_client::BasicWorkerBuilder,
+        workflow::{job_queue::recording_for_tests, JobQueueConfig},
     };
 
     fn make_service(registry: Arc<WorkerRegistry>) -> WorkerService {
@@ -1131,7 +1131,7 @@ mod tests {
         use crate::app_context::testing::create_test_app_context;
 
         let context = create_test_app_context();
-        let (queue, mut next_job) = JobQueue::recording_for_tests(&context);
+        let (queue, mut next_job) = recording_for_tests(&context);
         context.worker_job_queue.set(queue).unwrap();
         let registry = &context.worker_registry;
         let registered = |url| {
@@ -1565,7 +1565,7 @@ mod tests {
             .expect("the DELETE is admitted");
         assert_eq!(deleted.worker_id, id);
         assert!(
-            queue.kept_for(url),
+            QueueTest::kept_for(&queue, url),
             "the DELETE's removal is kept for the removal in flight to run on its heels"
         );
     }

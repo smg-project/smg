@@ -46,14 +46,16 @@ vendored-openssl = ["openssl/vendored"]
 name = "smg"
 crate-type = ["rlib"]
 
+# Both binaries use the library's command line. Its unit tests run with the
+# library, so neither builds a test harness.
 [[bin]]
 name = "smg"
 path = "src/main.rs"
+test = false
 
 [[bin]]
 name = "amg"
 path = "src/main.rs"
-# Both binaries use the library's command line. Its unit tests run with the library.
 test = false
 
 [dependencies]
@@ -107,9 +109,10 @@ smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
 smg-rl.workspace = true
 # The policy document, its presets, and the controller's store, door and
-# handle in this process: every target builds them, with none of the crate's
-# features. The crate's client is two targets': see the end of this file.
-smg-policy-controller.workspace = true
+# handle in this process: every target builds them. The worker-host feature
+# supplies the membership door and the holder of worker objects. The crate's
+# client is two targets': see the end of this file.
+smg-policy-controller = { workspace = true, features = ["worker-host"] }
 smg-grpc-client.workspace = true
 engine-zmq-client.workspace = true
 engine-zmq-adapter.workspace = true
@@ -198,7 +201,7 @@ rsa = { version = "0.9", features = ["sha2"] }
 rustls-pemfile = "2.2"
 jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
 validator = "0.20.0"
-tracing-test = "0.2"
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 tokio = { workspace = true, features = ["test-util"] }
 kv-index.workspace = true
 # The bellwether render-parity test reads the fixture manifests (TOML).

@@ -242,8 +242,8 @@ pub(crate) async fn prepare_placeholder_tokens(
 /// image override the model's spec does not take, media for a model with no
 /// media spec on the router. The stage that finds it in a failure's chain
 /// writes one WARN and marks its answer; every other failure of the
-/// preparation is the deployment's (the model's files, its vocabulary) and
-/// keeps the stage's ERROR line.
+/// preparation keeps the stage's ERROR line, the ones a site marks as the
+/// deployment's own ([`DeploymentFault`]) among them.
 #[derive(Debug)]
 pub(crate) struct RequestRefusal(String);
 
@@ -255,7 +255,7 @@ impl RequestRefusal {
 
     /// `message` as the failure for a registry `error`: this refusal for a
     /// variant the request brings (a modality the spec does not take, more
-    /// items than its limit), a plain failure for every other variant: one
+    /// items than its limit), a deployment fault for every other variant: one
     /// about the model's files, or one no request can bring (a modality
     /// counted twice, when the plan counts each modality once).
     fn of_registry(error: &ModelRegistryError, message: String) -> anyhow::Error {
@@ -266,7 +266,7 @@ impl RequestRefusal {
         ) {
             Self(message).into()
         } else {
-            anyhow::anyhow!(message)
+            DeploymentFault(message).into()
         }
     }
 }
@@ -278,6 +278,35 @@ impl fmt::Display for RequestRefusal {
 }
 
 impl std::error::Error for RequestRefusal {}
+
+/// A failure of the placeholder preparation that its site knows as the
+/// deployment's own, whatever the request holds: a `config.json` this
+/// gateway holds and cannot read or parse, a spec's media limits or its
+/// placeholder token that the model's files do not resolve, a vocabulary
+/// without the token. The stage that finds it in a failure answers in the
+/// server's class ([`super::preparation_fault_response`]). A failure with
+/// neither this mark nor [`RequestRefusal`] keeps the 400 it had. That
+/// includes unclassified failures while resolving the model's configuration
+/// directory, such as an absent or inaccessible configuration and local
+/// client or cache setup failures.
+#[derive(Debug)]
+pub(crate) struct DeploymentFault(pub(crate) String);
+
+impl DeploymentFault {
+    /// Whether `error` carries this mark: as its root, or as the context a
+    /// site put on a cause it keeps.
+    pub(crate) fn is(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
+}
+
+impl fmt::Display for DeploymentFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DeploymentFault {}
 
 /// `prepare_placeholder_tokens` with the deployment-wide limit override (the
 /// `SMG_*_MAX_COUNT` variables, read once per process) passed in: a test
@@ -341,7 +370,10 @@ async fn prepare_placeholder_tokens_with_env(
         );
     }
     let spec_limits = spec.modality_limits(&metadata).map_err(|error| {
-        anyhow::anyhow!("reading the {} spec's media limits: {error}", spec.name())
+        DeploymentFault(format!(
+            "reading the {} spec's media limits: {error}",
+            spec.name()
+        ))
     })?;
     // The router's own limits, capped by the engine's where its workers
     // advertise one; the refusal names the limit and what set it.
@@ -373,14 +405,16 @@ async fn prepare_placeholder_tokens_with_env(
             // The validation above has accepted the modality, so a failure
             // here is about the spec or the model's files, never the request.
             .map_err(|error| {
-                anyhow::anyhow!(
+                DeploymentFault(format!(
                     "model {} supports {modality} but its placeholder token could not be resolved: {error}",
                     spec.name()
-                )
+                ))
             })?;
         anyhow::ensure!(
             tokenizer.token_to_id(&token).is_some(),
-            "{modality} placeholder token '{token}' is missing from the tokenizer vocabulary"
+            DeploymentFault(format!(
+                "{modality} placeholder token '{token}' is missing from the tokenizer vocabulary"
+            ))
         );
         if let Some(marker) = spec.rendered_marker_for(modality) {
             placeholders.add_rendered_marker(marker.to_string(), token.clone());
@@ -1283,35 +1317,52 @@ pub(crate) mod tests {
         assert!(message.contains("--mm-processing worker"), "{message}");
     }
 
-    /// Only a registry refusal the request brings is typed as the request's:
-    /// a modality the spec does not take, more items than its limit. A config
+    /// Registry failures the request brings are typed as the request's: a
+    /// modality the spec does not take, or more items than its limit. A config
     /// field the model's files lack, a token its vocabulary lacks and a
-    /// modality counted twice (the plan counts each once) are not.
+    /// modality counted twice (the plan counts each once) are typed as the
+    /// deployment's.
     #[test]
-    fn only_a_registry_refusal_the_request_brings_is_typed_as_the_requests() {
+    fn registry_failures_are_typed_by_who_can_fix_them() {
         let typed = |error: ModelRegistryError| {
-            RequestRefusal::is(&RequestRefusal::of_registry(&error, error.to_string()))
+            let error = RequestRefusal::of_registry(&error, error.to_string());
+            (RequestRefusal::is(&error), DeploymentFault::is(&error))
         };
-        assert!(typed(ModelRegistryError::UnsupportedModality {
-            spec: "s",
-            modality: Modality::Audio,
-        }));
-        assert!(typed(ModelRegistryError::ModalityLimitExceeded {
-            spec: "s",
-            modality: Modality::Image,
-            limit: 1,
-            requested: 2,
-        }));
-        assert!(!typed(ModelRegistryError::MissingConfigField {
-            field: "image_token_id".to_string(),
-        }));
-        assert!(!typed(ModelRegistryError::TokenNotFound {
-            token: "<image>".to_string(),
-        }));
-        assert!(!typed(ModelRegistryError::DuplicateModality {
-            spec: "s",
-            modality: Modality::Image,
-        }));
+        assert_eq!(
+            typed(ModelRegistryError::UnsupportedModality {
+                spec: "s",
+                modality: Modality::Audio,
+            }),
+            (true, false)
+        );
+        assert_eq!(
+            typed(ModelRegistryError::ModalityLimitExceeded {
+                spec: "s",
+                modality: Modality::Image,
+                limit: 1,
+                requested: 2,
+            }),
+            (true, false)
+        );
+        assert_eq!(
+            typed(ModelRegistryError::MissingConfigField {
+                field: "image_token_id".to_string(),
+            }),
+            (false, true)
+        );
+        assert_eq!(
+            typed(ModelRegistryError::TokenNotFound {
+                token: "<image>".to_string(),
+            }),
+            (false, true)
+        );
+        assert_eq!(
+            typed(ModelRegistryError::DuplicateModality {
+                spec: "s",
+                modality: Modality::Image,
+            }),
+            (false, true)
+        );
     }
 
     /// A chat request with one image part, its `max_long_side_pixel` as `cap`.
