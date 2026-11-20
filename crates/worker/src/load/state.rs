@@ -251,6 +251,7 @@ impl<G: Generation> LoadState<G> {
     /// lives: a row that went under its successor's, and a row pruned with
     /// no fresh one. Whether such a row's worker has left is the caller's
     /// to ask the registry: the read here is by pointer alone.
+    #[must_use = "a returned row's series end only where the caller ends them"]
     pub(crate) fn publish_group(
         &self,
         group_urls: &[String],
@@ -499,10 +500,10 @@ mod tests {
         let worker = ready_worker("http://w1:8080", "m");
         registry.register(Arc::clone(&worker)).unwrap();
 
-        state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
         let held = state.snapshot();
 
-        state.publish_group(&[], vec![(Arc::clone(&worker), load(2))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&worker), load(2))]);
 
         // The held snapshot is immutable and stays scannable as-is...
         assert_eq!(waiting_of(&held, "http://w1:8080"), Some(1));
@@ -529,7 +530,8 @@ mod tests {
                     let group_urls = vec![worker.url().to_string()];
                     barrier.wait();
                     for round in 0..100 {
-                        state.publish_group(&group_urls, vec![(Arc::clone(&worker), load(round))]);
+                        let _ = state
+                            .publish_group(&group_urls, vec![(Arc::clone(&worker), load(round))]);
                     }
                 })
             })
@@ -549,7 +551,7 @@ mod tests {
         let (registry, state) = setup();
         let worker = ready_worker("http://w1:8080", "m");
         registry.register(Arc::clone(&worker)).unwrap();
-        state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
 
         worker.set_status(WorkerStatus::NotReady);
         state.enqueue_eviction(Arc::clone(&worker));
@@ -566,7 +568,7 @@ mod tests {
         let (registry, state) = setup();
         let worker = ready_worker("http://w1:8080", "m");
         let id = registry.register(Arc::clone(&worker)).unwrap();
-        state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
 
         registry.remove(&id);
         state.enqueue_eviction(Arc::clone(&worker));
@@ -577,7 +579,7 @@ mod tests {
         // incarnation fence drops it instead of re-inserting the dead worker
         // (which the pre-snapshot code did, permanently — the group's next
         // tick no longer listed the URL to prune).
-        state.publish_group(&[], vec![(Arc::clone(&worker), load(2))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&worker), load(2))]);
         assert!(state.snapshot().is_empty());
     }
 
@@ -588,7 +590,7 @@ mod tests {
         registry.register(Arc::clone(&worker)).unwrap();
 
         worker.set_status(WorkerStatus::NotReady);
-        state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
 
         assert!(state.snapshot().is_empty());
     }
@@ -598,7 +600,7 @@ mod tests {
         let (registry, state) = setup();
         let old = ready_worker("http://w1:8080", "m");
         let old_id = registry.register(Arc::clone(&old)).unwrap();
-        state.publish_group(&[], vec![(Arc::clone(&old), load(1))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&old), load(1))]);
 
         // Replace: same URL, new incarnation.
         registry.remove(&old_id);
@@ -613,7 +615,7 @@ mod tests {
 
         // ...and once the replacement has republished, a LATE flush of the
         // old incarnation's eviction must not tear down the fresh entry.
-        state.publish_group(&[], vec![(Arc::clone(&new), load(2))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&new), load(2))]);
         state.enqueue_eviction(Arc::clone(&old));
         let ended = state.apply_pending_evictions();
         assert!(
@@ -635,10 +637,10 @@ mod tests {
         let new = ready_worker("http://w1:8080", "m");
         registry.register(Arc::clone(&new)).unwrap();
 
-        state.publish_group(&[], vec![(Arc::clone(&old), load(1))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&old), load(1))]);
         assert!(state.snapshot().is_empty(), "the old worker's poll is late");
 
-        state.publish_group(&[], vec![(Arc::clone(&new), load(2))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&new), load(2))]);
         assert_eq!(waiting_of(&state.snapshot(), "http://w1:8080"), Some(2));
     }
 
@@ -735,7 +737,7 @@ mod tests {
             .iter()
             .map(|w| (Arc::clone(w), load(1)))
             .collect::<Vec<_>>();
-        state.publish_group(&[], fresh);
+        let _ = state.publish_group(&[], fresh);
         assert_eq!(state.snapshot().len(), 50);
 
         for worker in &workers {
@@ -759,7 +761,7 @@ mod tests {
         let (registry, state) = setup();
         let worker = ready_worker("http://w1:8080", "m");
         registry.register(Arc::clone(&worker)).unwrap();
-        state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
         state.enqueue_eviction(Arc::clone(&worker));
 
         state.clear();
@@ -776,7 +778,7 @@ mod tests {
         let (registry, state) = setup();
         let worker = ready_worker("http://w1:8080", "m");
         registry.register(Arc::clone(&worker)).unwrap();
-        state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
+        let _ = state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
         worker.set_status(WorkerStatus::NotReady);
         state.enqueue_eviction(Arc::clone(&worker));
         worker.set_status(WorkerStatus::Ready);
