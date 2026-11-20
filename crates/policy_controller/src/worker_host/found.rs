@@ -391,6 +391,17 @@ mod tests {
             assert_eq!(stated.transport.as_deref(), worker.pd_pairing().transport());
         }
 
+        // The row holds what the rule reads. A worker keeps a connector it
+        // does not know as it stands, blanks and all, and the row reads the
+        // name past them.
+        let mut spec = WorkerSpec::new(URL.to_owned());
+        spec.runtime_type = RuntimeType::Vllm;
+        spec.kv_connector = Some(" Custom ".to_owned());
+        let padded = <BasicWorkerBuilder>::from_spec(spec).build();
+        assert_eq!(padded.pd_pairing().transport(), Some(" custom "));
+        let read = pairing(&padded).expect("a descriptor");
+        assert_eq!(read.transport.as_deref(), Some("custom"));
+
         // A worker that reports nothing offers no descriptor, and withdraws
         // the standing row's at a door that reads its own.
         let silent = offering(RuntimeType::Sglang, &[("version", " ")]);

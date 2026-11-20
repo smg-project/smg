@@ -937,7 +937,7 @@ pub(super) mod tests {
     use crate::{
         demands::{DemandFacts, Demands},
         door::{
-            tests::{request, GATEWAY, MODEL},
+            tests::{pair_request, request, GATEWAY, MODEL},
             Door,
         },
         spec::{AppliedSpec, Pairing, PolicySpec},
@@ -2152,25 +2152,38 @@ pub(super) mod tests {
     /// A holder still takes the object for the row's, since the table keeps
     /// the row's own descriptor, and the same registration again writes
     /// nothing. A refresh that moves the version label moves the
-    /// descriptor, and under the strict rule the pair classes read the new
-    /// version at once: the pair is gone, by name.
+    /// descriptor, and under the strict rule the next decision reads it:
+    /// the pair's request finds no pair, by name, and is placed again once
+    /// the prefill follows.
     #[test]
     fn the_stores_door_states_the_pairing_its_worker_derived() {
         const DECODE: &str = "http://decode:8000";
         let (store, door) = door();
-        let mut strict = PolicySpec::preset("round_robin").expect("a preset of this build");
+        let mut strict =
+            PolicySpec::pair_presets("least_load", "least_load").expect("the pair presets");
         strict.generation = 1;
         strict.plans.pd_pair.pairing = Pairing::Strict;
+        for side in ["prefill", "decode"] {
+            let profile = strict.profiles.get_mut(side).expect("the side's profile");
+            profile
+                .filter
+                .retain(|stage| !matches!(stage.name(), "has-capacity" | "has-room"));
+        }
         store
             .apply(AppliedSpec::validate(&strict).expect("the document validates"))
             .expect("the first generation");
         let prefill = partner(URL, WorkerType::Prefill, "1");
         let decode = partner(DECODE, WorkerType::Decode, "1");
-        for built in [&prefill, &decode] {
+        // Each row is laid, and a check's word makes it ready.
+        let ready = |built: &Arc<dyn Worker>| {
             let wrote = door.found_built(&Maker::Control, Expect::Nothing, built, None);
             assert!(wrote.is_ok(), "{wrote:?}");
-        }
-        let row = store.by_key(DECODE).expect("the decode's row");
+            let laid = store.by_key(built.url()).expect("the registered row");
+            let _ = store.set_status(laid.id, WorkerStatus::Ready, laid.revision);
+            store.by_key(built.url()).expect("the ready row")
+        };
+        let first = ready(&prefill);
+        let row = ready(&decode);
         let said = row.facts.pairing.as_deref().expect("a descriptor");
         assert_eq!(said.transport.as_deref(), Some("nixl"));
         assert_eq!(said.version.as_deref(), Some("1"));
@@ -2188,8 +2201,22 @@ pub(super) mod tests {
                 )
             })
         };
+        // A pair's request, decided over the rows as they stand: the
+        // prefill and its decode, or nobody.
+        let policy = Door::new(Arc::clone(&store));
+        let placed = |id: &'static [u8]| {
+            store.publish_now();
+            let mut asked = pair_request(id);
+            asked.constraints.wire_modes = WireModes::HTTP;
+            let decided = policy.decide(GATEWAY, &asked, Instant::now());
+            let decided = decided.expect("a decision");
+            let target = decided.decision.pick()?.targets.first()?;
+            Some((target.id, target.pair.map(|pair| pair.decode_id)))
+        };
         assert_eq!(pairs(), (1, None));
+        assert_eq!(placed(b"first"), Some((first.id, Some(row.id))));
 
+        // The decode comes back on another version: no pair, by name.
         let rebuilt = partner(DECODE, WorkerType::Decode, "2");
         let wrote = door.refreshed(standing(&row), &rebuilt, &decode);
         assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
@@ -2201,6 +2228,14 @@ pub(super) mod tests {
             .and_then(|said| said.version.as_deref());
         assert_eq!(version, Some("2"));
         assert_eq!(pairs(), (0, Some(vec!["version".to_owned()])));
+        assert_eq!(placed(b"second"), None);
+
+        // The prefill follows, and the same request is placed again.
+        let followed = partner(URL, WorkerType::Prefill, "2");
+        let wrote = door.refreshed(standing(&first), &followed, &prefill);
+        assert_eq!(wrote, Ok(Wrote::InPlace(first.id)));
+        assert_eq!(pairs(), (1, None));
+        assert_eq!(placed(b"third"), Some((first.id, Some(row.id))));
     }
 
     #[test]
