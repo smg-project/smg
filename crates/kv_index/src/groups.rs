@@ -913,9 +913,6 @@ mod tests {
         );
     }
 
-    /// Two groups: each shrinks the candidate in turn until nothing moves. A state block at 5
-    /// takes the window's tail at 6..9 out of reach, and the window group then finds no tail
-    /// at or below 6 and no leading run: the engine recomputes the whole prompt.
     /// One lookup's holders pass through a model's views alike in either shape the index
     /// hands them out. A holder with a view is shrunk to what its groups serve and handed on,
     /// one shrunk to nothing leaves, and a holder with no view stands. A fleet with no view
@@ -966,6 +963,9 @@ mod tests {
         assert_eq!(kept, scored);
     }
 
+    /// Two groups: each shrinks the candidate in turn until nothing moves. A state block at 5
+    /// takes the window's tail at 6..9 out of reach, and the window group then finds no tail
+    /// at or below 6 and no leading run: the engine recomputes the whole prompt.
     #[test]
     fn the_rule_is_the_fixed_point_over_the_groups() {
         let path = prefixes(10);

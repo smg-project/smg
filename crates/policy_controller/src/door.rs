@@ -796,13 +796,15 @@ impl<'a> OwnRows<'a> {
             wires,
             now_micros: facts.now_micros,
         };
-        let (model, kind) = (facts.model, facts.hash_kind);
+        // The request's blocks as its host counted them: their kind and
+        // their size.
+        let (model, kind, size) = (facts.model, facts.hash_kind, facts.block_size);
         if cut {
-            world.name_in::<true>(model, role, &naming, candidates, kind, named);
+            world.name_in::<true>(model, role, &naming, candidates, (kind, size), named);
         } else {
-            world.name_in::<false>(model, role, &naming, candidates, kind, named);
+            world.name_in::<false>(model, role, &naming, candidates, (kind, size), named);
         }
-        world.name_kept(model, role, &naming, candidates, named, || {
+        world.name_kept(model, role, (&naming, size), candidates, named, || {
             let test = engine.shadow_keeps_at(binding, facts, constraints)?;
             Some(move |row: &Candidate| test.keeps(row))
         });
@@ -1917,10 +1919,13 @@ pub(crate) fn hand<A: Asked, R>(
             // The names borrow the buffer past this call: the closure
             // gives its hold of it up.
             let named = named;
+            // The request's blocks as its host counted them: their kind
+            // and their size.
+            let counted = (hash_kind, facts.block_size);
             if unmet.is_some() {
-                world.name_in::<true>(model, role, &naming, candidates, hash_kind, named);
+                world.name_in::<true>(model, role, &naming, candidates, counted, named);
             } else {
-                world.name_in::<false>(model, role, &naming, candidates, hash_kind, named);
+                world.name_in::<false>(model, role, &naming, candidates, counted, named);
             }
             // Under a cap the holders named may all be rows the pass
             // refuses, and a warm worker behind them is then never named.
@@ -1928,7 +1933,8 @@ pub(crate) fn hand<A: Asked, R>(
             // of a row, where the engine hands one: a cap full of refused
             // holders is read past. A naming shorter than its cap, or with
             // none, is asked nothing and the test is not made.
-            world.name_kept(model, role, &naming, candidates, named, || {
+            let asked = (&naming, facts.block_size);
+            world.name_kept(model, role, asked, candidates, named, || {
                 let test = engine.keeps_for(model, phase, facts, constraints)?;
                 Some(move |row: &Candidate| test.keeps(row))
             });

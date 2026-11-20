@@ -165,7 +165,7 @@ mod sent_prefixes {
             };
             let rows = &view.candidates;
             world.name(MODEL, Role::Single, &naming, rows, &mut named);
-            world.name_kept(MODEL, Role::Single, &naming, rows, &mut named, || {
+            world.name_kept(MODEL, Role::Single, (&naming, 0), rows, &mut named, || {
                 Some(&keeps)
             });
         });
@@ -2520,7 +2520,7 @@ mod named {
             Ask, BatchOutcome, GatewayId, KvEventSink, LoadSink, LoadSource, MemoryStore, Named,
             Naming, Reachability, Signals, ViewBuffers, WorkerFacts, WorkerRow, WorkersStore,
         },
-        view::{Candidate, LoadRow, Role, WireModes, WorkerId},
+        view::{Candidate, HashKind, LoadRow, Role, WireModes, WorkerId},
         AppliedSpec, PolicySpec,
     };
 
@@ -2797,6 +2797,148 @@ mod named {
         assert_eq!(store.block_size(MODEL), Some(size));
     }
 
+    /// The holders a decision of the local gateway is named for a token
+    /// `request` whose host counted its blocks by `stated` tokens, under a
+    /// cap of `cap`, once the naming is held to a test that refuses the
+    /// rows of `refused`: by their workers, the deepest first.
+    fn served_stating(
+        store: &MemoryStore,
+        request: &[u64],
+        (stated, cap): (u32, u32),
+        refused: &[WorkerId],
+    ) -> Vec<(WorkerId, u32)> {
+        let mut view = ViewBuffers::default();
+        let mut named = Named::default();
+        store.deciding(|world| {
+            let ask = Ask {
+                gateway: GatewayId::LOCAL,
+                now: Instant::now(),
+                pinned: None,
+                affinity: false,
+                signal_cells: false,
+            };
+            let built = world.build(MODEL, Role::Single, &ask, &mut view);
+            let naming = Naming {
+                gateway: GatewayId::LOCAL,
+                block_hashes: request,
+                namespace_seed: 0,
+                seed: 7,
+                cap,
+                wires: None,
+                now_micros: built.expect("the pool").now_micros,
+            };
+            let rows = &view.candidates;
+            let counted = (HashKind::Token, stated);
+            world.name_in::<false>(MODEL, Role::Single, &naming, rows, counted, &mut named);
+            let keeps = |row: &Candidate| !refused.contains(&row.id);
+            world.name_kept(
+                MODEL,
+                Role::Single,
+                (&naming, stated),
+                rows,
+                &mut named,
+                || Some(keeps),
+            );
+        });
+        let mut holders: Vec<(WorkerId, u32)> = named
+            .holders
+            .iter()
+            .map(|holder| {
+                (
+                    view.candidates[holder.row as usize].id,
+                    holder.overlap_blocks,
+                )
+            })
+            .collect();
+        holders.sort_unstable_by_key(|&(_, blocks)| std::cmp::Reverse(blocks));
+        holders
+    }
+
+    /// Where a model has no block size of record, a group's window is
+    /// counted in the size the request's host counted its blocks by, and
+    /// in the generation's where the host states none: at the naming, and
+    /// at the lookup made again past a cap full of refused holders. A size
+    /// of record stands over the one a request states.
+    #[test]
+    fn a_groups_window_is_counted_in_the_size_a_request_states() {
+        let store = MemoryStore::new();
+        store.apply(sampled(1)).expect("above the unbound start");
+        let size = store.deciding(|world| world.spec().block_size());
+        // A window of two blocks of the generation's size and one token:
+        // it needs two blocks retained at the hit by that size, and one by
+        // twice it.
+        let window = GroupKind::SlidingWindow {
+            window: 2 * size + 1,
+        };
+        let request = [1, 2, 3, 4, 5, 6, 7, 8];
+        let (short, long) = (admitted(&store, "short"), admitted(&store, "long"));
+        // One holds six blocks and retains the last of them, the other
+        // holds all eight and retains the last two.
+        serves_by(&store, short, &request[..6], window, &[5]);
+        serves_by(&store, long, &request, window, &[6, 7]);
+        assert_eq!(store.block_size(MODEL), None);
+        let stating = |stated: u32, cap: u32, refused: &[WorkerId]| {
+            served_stating(&store, &request, (stated, cap), refused)
+        };
+        // No size stated: the generation's, by which one block is no tail.
+        assert_eq!(stating(0, 16, &[]), [(long, 8)]);
+        assert_eq!(stating(size, 16, &[]), [(long, 8)]);
+        // Twice it stated: one block is the tail.
+        assert_eq!(stating(2 * size, 16, &[]), [(long, 8), (short, 6)]);
+        // The lookup made again counts by the same size. Under a cap of
+        // one the deeper row is named and refused: the other is read at
+        // what its groups serve by the size stated, and by the generation's
+        // it serves nothing, so the first naming stands.
+        assert_eq!(stating(2 * size, 1, &[]), [(long, 8)]);
+        assert_eq!(stating(2 * size, 1, &[long]), [(short, 6)]);
+        assert_eq!(stating(0, 1, &[long]), [(long, 8)]);
+        // A size of record stands over the one a request states.
+        store.set_block_size(MODEL, size);
+        assert_eq!(stating(2 * size, 16, &[]), [(long, 8)]);
+        assert_eq!(stating(2 * size, 1, &[long]), [(long, 8)]);
+    }
+
+    /// A model's cell of its block size of record leaves with whichever
+    /// goes last, the size or the model's index: a model that comes and
+    /// goes leaves no cell behind, in either order.
+    #[test]
+    fn a_models_block_size_cell_leaves_with_the_last_of_its_size_and_its_index() {
+        let store = MemoryStore::new();
+        store.apply(sampled(1)).expect("above the unbound start");
+        let remove = |id| {
+            let revision = WorkersStore::get(&store, id).expect("the row").revision;
+            store.remove(id, revision).expect("removed");
+        };
+        let stands = || (store.kv().indexes(), store.kv().block_size_cells());
+        assert_eq!(stands(), (0, 0));
+        // The size goes first: its cell stays for the index that reads it,
+        // and leaves with the model's last row.
+        let row = admitted(&store, "first");
+        store.set_block_size(MODEL, 32);
+        store.forget_block_size(MODEL);
+        assert_eq!((store.block_size(MODEL), stands()), (None, (1, 1)));
+        remove(row);
+        assert_eq!(stands(), (0, 0));
+        // The index goes first: the size stays of record for a row that
+        // returns, and its cell leaves at the forget.
+        let row = admitted(&store, "second");
+        store.set_block_size(MODEL, 32);
+        remove(row);
+        assert_eq!((store.block_size(MODEL), stands()), (Some(32), (0, 1)));
+        store.forget_block_size(MODEL);
+        assert_eq!((store.block_size(MODEL), stands()), (None, (0, 0)));
+        // A model that never told a size leaves no cell either.
+        let row = admitted(&store, "third");
+        assert_eq!(stands(), (1, 1));
+        remove(row);
+        assert_eq!(stands(), (0, 0));
+        // A size told while no index stood is forgotten whole.
+        store.set_block_size(MODEL, 64);
+        assert_eq!(stands(), (0, 1));
+        store.forget_block_size(MODEL);
+        assert_eq!(stands(), (0, 0));
+    }
+
     /// The depth the cap cuts is drawn evenly among the rows that serve it:
     /// of three rows whose groups serve four blocks beside one that serves
     /// six, a cap of two names the deeper and one of the three, each by
@@ -2991,7 +3133,7 @@ mod named {
                     let keeps = |row: &Candidate| !refused.contains(&row.id);
                     let rows = &view.candidates;
                     let made = || Some(keeps);
-                    world.name_kept(MODEL, Role::Single, &naming, rows, &mut named, made);
+                    world.name_kept(MODEL, Role::Single, (&naming, 0), rows, &mut named, made);
                 }
                 let holders = named.holders.iter();
                 each.push(
@@ -3243,7 +3385,7 @@ mod named {
             let rows = &view.candidates;
             world.name(MODEL, Role::Single, &naming, rows, &mut named);
             let keeps = |row: &Candidate| !refused.contains(&row.id);
-            world.name_kept(MODEL, Role::Single, &naming, rows, &mut named, || {
+            world.name_kept(MODEL, Role::Single, (&naming, 0), rows, &mut named, || {
                 Some(keeps)
             });
         });

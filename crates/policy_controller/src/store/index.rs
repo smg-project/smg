@@ -45,8 +45,10 @@
 //! with a view is named at what its groups can serve of the depth the
 //! chain scored, by the index crate's one rule for every host
 //! (`Index::served_into`). A group's window is counted in the model's
-//! block size of record, and in the generation's where it has none. A
-//! model none of whose rows holds a view pays one load for all of it.
+//! block size of record. Where the model has none it is counted in the
+//! size the request's host counted its blocks by, and in the generation's
+//! where the host states none. A model none of whose rows holds a view
+//! pays one load for all of it.
 //!
 //! A pool whose profile reads sent prefixes holds its model's record of
 //! sends. The record speaks for a row until the row's lane is heard: a row
@@ -1248,7 +1250,7 @@ impl PoolIndex {
     /// which rows the holders' lookup is kept within, and a build a
     /// caller keeps each caller's lookup in a frame of its own. The pair
     /// after the view says how the request's blocks are counted: their
-    /// kind, and the block size of the world's generation
+    /// kind, and their size as the world that names hands it
     /// ([`Index::served_into`]).
     fn name_in<const CUT: bool>(
         &self,
@@ -1823,9 +1825,10 @@ impl Index {
     /// each row that has a view and drops one it leaves nothing, and the
     /// cap then keeps the deepest of what stands ([`deepest_of`]). A
     /// group's window is counted in the model's block size of record, and
-    /// in `block_size` where the model has none: the block size of the
-    /// decision's generation, as the world that names hands it, which is
-    /// the size such a request was hashed by.
+    /// in `block_size` where the model has none: the size the request's
+    /// host counted its blocks by, or the block size of the decision's
+    /// generation where the host states none, as the world that names
+    /// hands it. That is the size such a request was hashed by.
     ///
     /// Out of line, and behind one load of the views' count: a model none
     /// of whose rows holds a view keeps the bounded lookup, and pays that
@@ -1920,7 +1923,9 @@ struct Table {
     allowed: FxHashMap<WorkerId, Weak<AtomicBool>>,
     /// Each model's block size of record, one cell a model
     /// ([`of_record`]), which the model's index reads too ([`Index`]). A
-    /// model that forgets its size keeps its cell.
+    /// cell stands while it holds a size or the model's index stands: a
+    /// model that forgets its size keeps its cell for its index, and the
+    /// cell leaves with whichever of the two goes last.
     block_sizes: HashMap<String, Arc<AtomicU64>>,
     /// How many times a lane was made or retired, a model's block size of
     /// record moved, or a worker's word to record was cleared: a pool's
@@ -2234,6 +2239,13 @@ impl KvTables {
         });
         if last {
             table.indexes.remove(&entry.model);
+            // The index read the model's cell: one that holds no size
+            // leaves with it.
+            let model: &str = &entry.model;
+            let unset = |cell: &Arc<AtomicU64>| cell.load(Ordering::Relaxed) == 0;
+            if table.block_sizes.get(model).is_some_and(unset) {
+                table.block_sizes.remove(model);
+            }
         }
     }
 
@@ -2402,11 +2414,19 @@ impl KvTables {
         }
     }
 
-    /// Drop the size of record so a returning model can set it anew.
+    /// Drop the size of record so a returning model can set it anew. The
+    /// cell stays where the model's index stands, which reads it, and
+    /// leaves here where none does.
     pub(super) fn forget_block_size(&self, model: &str) {
         let mut table = self.table.lock();
         let cell = table.block_sizes.get(model);
-        if cell.is_some_and(|cell| cell.swap(0, Ordering::Relaxed) != 0) {
+        let Some(stood) = cell.map(|cell| cell.swap(0, Ordering::Relaxed) != 0) else {
+            return;
+        };
+        if !table.indexes.contains_key(model) {
+            table.block_sizes.remove(model);
+        }
+        if stood {
             table.moves += 1;
         }
     }
@@ -2476,6 +2496,12 @@ impl KvTables {
     #[cfg(test)]
     pub(super) fn indexes(&self) -> usize {
         self.table.lock().indexes.len()
+    }
+
+    /// How many models hold a cell of their block size of record.
+    #[cfg(test)]
+    pub(super) fn block_size_cells(&self) -> usize {
+        self.table.lock().block_sizes.len()
     }
 
     /// Blocks `model`'s index holds across its workers (a block two hold

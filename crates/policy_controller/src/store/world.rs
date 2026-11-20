@@ -1848,7 +1848,7 @@ impl World {
         view: &[Candidate],
         named: &mut Named,
     ) {
-        self.name_in::<false>(model, role, naming, view, HashKind::Token, named);
+        self.name_in::<false>(model, role, naming, view, (HashKind::Token, 0), named);
     }
 
     /// [`World::name`] for rows its caller cut by more than its gateway's
@@ -1865,20 +1865,24 @@ impl World {
         view: &[Candidate],
         named: &mut Named,
     ) {
-        self.name_in::<true>(model, role, naming, view, HashKind::Token, named);
+        self.name_in::<true>(model, role, naming, view, (HashKind::Token, 0), named);
     }
 
     /// The one naming behind [`World::name`] and [`World::name_cut`], built
-    /// once for each. Those two name a token request. The door names a
-    /// request by the kind it was hashed by: a text request is named by
-    /// the record of sent prefixes alone.
+    /// once for each. Those two name a token request whose host states no
+    /// block size. The door names a request as its host counted it: by the
+    /// kind it was hashed by, and by the size of one of its blocks
+    /// ([`RequestFacts::block_size`](crate::RequestFacts::block_size)),
+    /// `0` for this generation's. A text request is named by the record of
+    /// sent prefixes alone, so the size it states, a window in bytes, is
+    /// read by no cap.
     pub(crate) fn name_in<const CUT: bool>(
         &self,
         model: &str,
         role: Role,
         naming: &Naming<'_>,
         view: &[Candidate],
-        hash_kind: HashKind,
+        (hash_kind, block_size): (HashKind, u32),
         named: &mut Named,
     ) {
         named.clear();
@@ -1898,10 +1902,10 @@ impl World {
             return;
         };
         let pool: (u32, &[Candidate]) = (index as u32, rows);
-        // The request's blocks as they are counted: their kind, and the
-        // block size of this world's generation, which a row's cache groups
-        // are read by where its model has no size of record.
-        let counted = (hash_kind, self.spec.block_size());
+        // The request's blocks as they are counted: their kind, and their
+        // size, which a row's cache groups are read by where its model has
+        // no size of record.
+        let counted = (hash_kind, self.counted_by(block_size));
         if CUT {
             held.name_cut(naming, pool, &shape.locals, view, counted, named);
         } else {
@@ -1930,8 +1934,9 @@ impl World {
     }
 
     /// Holds the holders just named for `view` ([`World::name`] or
-    /// [`World::name_cut`], by the same `naming`, into `named`) to the
-    /// test the decision's pass asks of a row
+    /// [`World::name_cut`], by the same `naming` and the same block size
+    /// of its request, into `named`) to the test the decision's pass asks
+    /// of a row
     /// ([`Engine::keeps_for`](crate::framework::Engine::keeps_for)), where
     /// they fill the naming's cap. A naming shorter than its cap holds
     /// every holder the index has, and one under no cap names them all: no
@@ -1953,13 +1958,13 @@ impl World {
         &self,
         model: &str,
         role: Role,
-        naming: &Naming<'_>,
+        (naming, block_size): (&Naming<'_>, u32),
         view: &[Candidate],
         named: &mut Named,
         keeps: impl FnOnce() -> Option<K>,
     ) {
         if naming.cap != 0 && named.holders.len() >= naming.cap as usize {
-            self.name_tested(model, role, naming, view, named, keeps);
+            self.name_tested(model, role, (naming, block_size), view, named, keeps);
         }
     }
 
@@ -1971,7 +1976,7 @@ impl World {
         &self,
         model: &str,
         role: Role,
-        naming: &Naming<'_>,
+        asked: (&Naming<'_>, u32),
         view: &[Candidate],
         named: &mut Named,
         keeps: impl FnOnce() -> Option<K>,
@@ -1981,7 +1986,7 @@ impl World {
         };
         let passes = |holder: &NamedHolder| view.get(holder.row as usize).is_some_and(&keeps);
         if !named.holders.iter().any(passes) {
-            self.name_again(model, role, naming, view, named, &keeps);
+            self.name_again(model, role, asked, view, named, &keeps);
         }
     }
 
@@ -1992,7 +1997,7 @@ impl World {
         &self,
         model: &str,
         role: Role,
-        naming: &Naming<'_>,
+        (naming, block_size): (&Naming<'_>, u32),
         view: &[Candidate],
         named: &mut Named,
         keeps: &dyn Fn(&Candidate) -> bool,
@@ -2001,8 +2006,20 @@ impl World {
             return;
         };
         if let (Some(rows), Some(Some(held))) = (self.rows.get(index), self.indexes.get(index)) {
-            let asked = (naming, self.spec.block_size());
+            let asked = (naming, self.counted_by(block_size));
             held.name_again(asked, rows, view, keeps, named);
+        }
+    }
+
+    /// The size the blocks of a request are counted by, in tokens: the
+    /// one its host states, else this generation's
+    /// ([`AppliedSpec::block_size`]), as the generation reads its hashes
+    /// ([`AppliedSpec::block_hashes_read`]).
+    #[inline]
+    fn counted_by(&self, stated: u32) -> u32 {
+        match stated {
+            0 => self.spec.block_size(),
+            stated => stated,
         }
     }
 

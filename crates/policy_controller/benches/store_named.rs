@@ -22,6 +22,13 @@
 //! reads every row. `best_column/<n>` is that miss decided over the column
 //! instead: the two feeds of one decision, side by side.
 //!
+//! `policy_store_named/viewed_hit/<n>` and `viewed_shared/<n>` are the
+//! first cells' hit and shared decision over a fleet each of whose workers
+//! also holds a view of its cache groups: one state group that retains the
+//! last block of each prompt. Every holder of the request is scored and
+//! read at what its groups serve, which is all it holds, before the cap
+//! cuts: the price of the views on one decision.
+//!
 //! `policy_store_named/publish/<n>` is one window's publication of that
 //! fleet: under the preset's warm-up ruling it reads each row's index size
 //! and rules the pool's warming rows again.
@@ -39,7 +46,7 @@ use std::{
 };
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use kv_index::{compute_content_hash, request_prefix_hashes, ContentHash};
+use kv_index::{compute_content_hash, request_prefix_hashes, ContentHash, GroupKind};
 use smg_policy_controller::{
     store::{
         Ask, BatchFacts, BatchOutcome, GatewayId, KvEvent, KvEventSink, LoadSink, LoadSource,
@@ -137,6 +144,42 @@ fn fleet_picking(n: usize, pick: Option<&str>) -> (MemoryStore, Vec<WorkerId>) {
     for (p, id) in ids.iter().enumerate() {
         stores(&store, *id, 1, &prompt(p));
         stores(&store, *id, 2, &prompt(SHARED));
+    }
+    (store, ids)
+}
+
+/// The index of the one group a worker's view holds beside main attention.
+const GROUP: u32 = 1;
+
+/// [`fleet`] each of whose workers holds a view of its cache groups: one
+/// state group that retains the last block of the worker's own prompt and
+/// of the shared one, written through the worker's lent lane. Its groups
+/// serve every block a worker holds.
+fn fleet_viewed(n: usize) -> (MemoryStore, Vec<WorkerId>) {
+    let (store, ids) = fleet(n);
+    for (p, id) in ids.iter().enumerate() {
+        let mut view = None;
+        let facts = BatchFacts {
+            sequence: 3,
+            ..BatchFacts::default()
+        };
+        let outcome = store.admit_through(*id, 0, facts, &mut |lane| {
+            view = Some(lane.groups());
+        });
+        assert_eq!(outcome, BatchOutcome::Applied);
+        let view = view.expect("the body ran");
+        view.learn(GROUP, Some(GroupKind::State), 0);
+        for tokens in [prompt(p), prompt(SHARED)] {
+            let contents: Vec<ContentHash> =
+                tokens.chunks(BLOCK).map(compute_content_hash).collect();
+            let main: Vec<_> = request_prefix_hashes(&contents)
+                .into_iter()
+                .zip(contents)
+                .collect();
+            view.main_stored(None, &main);
+            let last = main.last().expect("a prompt has blocks").0;
+            view.group_stored(GROUP, &[last]);
+        }
     }
     (store, ids)
 }
@@ -276,6 +319,36 @@ fn decisions(c: &mut Criterion) {
             b.iter(|| {
                 seed += 1;
                 decide(&store, &mut host, black_box(&shared), now, seed, true)
+            });
+        });
+        // A fleet of the same making with a view of its cache groups a
+        // worker: every holder is read at what its groups serve, and a hit
+        // is still its one holder's.
+        let (viewed, views) = fleet_viewed(n);
+        for (p, id) in views.iter().enumerate() {
+            let picked = decide(&viewed, &mut host, &held[p], now, p as u64, true);
+            assert_eq!(picked, Some(*id), "{n}: prompt {p} goes to its holder");
+        }
+        let mut next = 0usize;
+        group.bench_with_input(BenchmarkId::new("viewed_hit", n), &n, |b, _| {
+            b.iter(|| {
+                let tokens = &held[next % n];
+                next += 1;
+                decide(
+                    &viewed,
+                    &mut host,
+                    black_box(tokens),
+                    now,
+                    next as u64,
+                    true,
+                )
+            });
+        });
+        let mut seed = 0u64;
+        group.bench_with_input(BenchmarkId::new("viewed_shared", n), &n, |b, _| {
+            b.iter(|| {
+                seed += 1;
+                decide(&viewed, &mut host, black_box(&shared), now, seed, true)
             });
         });
         // The same fleet under a picker that takes no sample: named every
