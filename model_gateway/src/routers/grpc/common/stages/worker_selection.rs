@@ -58,7 +58,7 @@ use crate::{
                 PreparationOutput, RequestContext, RequestInput, RequestType, RoutingSnapshot,
                 WireConstraint, WorkerSelection,
             },
-            multimodal,
+            multimodal, utils,
         },
         prefill_queue_full, prefill_queue_timeout,
     },
@@ -807,17 +807,10 @@ impl WorkerSelectionStage {
         let wire = Some(ctx.wire);
         let media_refs = ctx.wire.requires_media_refs;
         let media = retry_media(ctx);
-        // A retry skips the workers that already answered this request
-        // definitively (see `routers::common::attempt_ledger`), and stays on
-        // the workers that decide its constraint as the first attempt's did
-        // (`utils::WorkerDecoding::decides_alike`): the retained plan carries
-        // that decision.
-        let ledger = &ctx.ledger;
-        let decided_on = ctx.constraint_decided_on;
-        let admits = |worker: &dyn Worker| {
-            ledger.admits(worker)
-                && decided_on.is_none_or(|decoding| decoding.decides_alike(worker))
-        };
+        // What a retry holds its workers to (`RetryRule`): the ledger of
+        // its attempts, and the decision the retained plan carries.
+        let retry = RetryRule::of(ctx);
+        let admits = |worker: &dyn Worker| retry.admits(worker);
 
         let (workers, placed) = match self.mode {
             WorkerSelectionMode::Regular => {
@@ -1227,8 +1220,6 @@ enum Shape {
     Window,
     /// An explicit target worker the classic would keep.
     Target,
-    /// A retry under a decoding rule.
-    RetryUnderRule,
 }
 
 impl Shape {
@@ -1238,7 +1229,6 @@ impl Shape {
             Self::Media => "media input",
             Self::Window => "a context demand a worker's window binds",
             Self::Target => "an explicit target worker",
-            Self::RetryUnderRule => "a retry under a decoding rule",
         }
     }
 
@@ -1292,12 +1282,12 @@ impl<'a> Attempt<'a> {
         }
     }
 
-    /// The ledger of the request's attempts, where this is a retry: a
-    /// worker that answered the request definitively takes no next attempt.
-    fn ledger(&self) -> Option<&'a AttemptLedger> {
-        match self {
+    /// What a retry holds its workers to ([`RetryRule`]). A first attempt
+    /// holds them to nothing.
+    fn retry(&self) -> Option<RetryRule<'a>> {
+        match *self {
             Self::First(_) => None,
-            Self::Retry(ctx) => Some(&ctx.ledger),
+            Self::Retry(ctx) => Some(RetryRule::of(ctx)),
         }
     }
 
@@ -1337,22 +1327,59 @@ fn route_wires(wire: Option<WireConstraint>) -> WireModes {
     }
 }
 
+/// What a retry holds its workers to. A worker that answered the request
+/// definitively takes no next attempt (`routers::common::attempt_ledger`).
+/// A retry also stays on the workers that decide its constraint as the
+/// first attempt's did ([`utils::WorkerDecoding::decides_alike`]): the
+/// retained plan carries that decision, made on a request that is gone.
+///
+/// The classic selection takes the rule as its candidates' filter. The
+/// controller's commit takes it as a part of the route's rule
+/// ([`on_route`]), and passes over a target it refuses.
+#[derive(Clone, Copy)]
+struct RetryRule<'a> {
+    /// The ledger of the request's attempts.
+    ledger: &'a AttemptLedger,
+    /// The decoding the request's constraint was decided on, where the
+    /// policy chose one.
+    decided_on: Option<utils::WorkerDecoding>,
+}
+
+impl<'a> RetryRule<'a> {
+    /// The rule of a retry of `ctx`.
+    fn of(ctx: &'a DispatchContext) -> Self {
+        Self {
+            ledger: &ctx.ledger,
+            decided_on: ctx.constraint_decided_on,
+        }
+    }
+
+    /// Whether a retry may take `worker`.
+    fn admits(self, worker: &dyn Worker) -> bool {
+        self.ledger.admits(worker)
+            && self
+                .decided_on
+                .is_none_or(|decoding| decoding.decides_alike(worker))
+    }
+}
+
 /// The route's rule for a worker of `pool`, built from the classic
-/// selection's own rules: the pool's match, the request's wire, and on a
-/// retry the ledger's admit. The controller reads none of them. At a
-/// commit a target one of them refuses is passed over like one the gateway
-/// cannot send to: a regular target, or a pair either of whose workers its
-/// own pool's rule refuses. A demand the controller keeps ahead of its
-/// stages takes this function's place once a request can state it.
+/// selection's own rules: the pool's match, the request's wire, and what a
+/// retry holds its workers to ([`RetryRule`]). The controller reads none
+/// of them. At a commit a target one of them refuses is passed over like
+/// one the gateway cannot send to: a regular target, or a pair either of
+/// whose workers its own pool's rule refuses. A demand the controller
+/// keeps ahead of its stages takes this function's place once a request
+/// can state it.
 fn on_route<'a>(
     pool: RoutingPool,
     wire: Option<WireConstraint>,
-    ledger: Option<&'a AttemptLedger>,
+    retry: Option<RetryRule<'a>>,
 ) -> impl Fn(&dyn Worker) -> bool + Send + Sync + 'a {
     move |worker| {
         pool.matches(worker)
             && WireConstraint::admits(wire, worker)
-            && ledger.is_none_or(|ledger| ledger.admits(worker))
+            && retry.is_none_or(|retry| retry.admits(worker))
     }
 }
 
@@ -1973,12 +2000,18 @@ impl WorkerSelectionStage {
 
     /// The shape of an attempt the controller does not place yet, or none:
     /// a `media` input, a `context` demand a window of `pools` binds, an
-    /// explicit target in `headers` the classic would keep, a retry under a
-    /// decoding rule. The store builds the candidates and reads none of
-    /// these demands. The commit's rule only passes a target over, and a
-    /// demand few workers meet could end the asks with no worker. So these
-    /// shapes are refused by name until a request can state them, but for a
-    /// demand no window holds ([`Shape::refusal`]).
+    /// explicit target in `headers` the classic would keep. The store
+    /// builds the candidates and reads none of these demands. The commit's
+    /// rule only passes a target over, and a demand few workers meet could
+    /// end the asks with no worker. So these shapes are refused by name
+    /// until a request can state them, but for a demand no window holds
+    /// ([`Shape::refusal`]).
+    ///
+    /// A retry's rule is no such shape ([`RetryRule`]): the commit takes
+    /// it. Its decoding rule admits every worker that decides a grammar as
+    /// the first attempt's did, in a fleet of one engine all of them.
+    /// Refused, the first failure would answer a request the classic
+    /// serves on its next attempt.
     fn undecided(
         &self,
         model_id: &str,
@@ -1986,7 +2019,6 @@ impl WorkerSelectionStage {
         pools: &[RoutingPool],
         media: bool,
         headers: Option<&HeaderMap>,
-        retry_under_rule: bool,
     ) -> Option<Shape> {
         if media {
             return Some(Shape::Media);
@@ -1999,10 +2031,8 @@ impl WorkerSelectionStage {
         if !demand.binds_nobody() {
             return Some(Shape::Window);
         }
-        if self.strict_target(model_id, headers) {
-            return Some(Shape::Target);
-        }
-        retry_under_rule.then_some(Shape::RetryUnderRule)
+        self.strict_target(model_id, headers)
+            .then_some(Shape::Target)
     }
 
     /// Whether a retry of `ctx` can be placed at all. Under the controller's
@@ -2028,7 +2058,6 @@ impl WorkerSelectionStage {
             pools,
             media,
             ctx.headers.as_ref(),
-            ctx.constraint_decided_on.is_some(),
         )
         .is_none()
     }
@@ -2063,18 +2092,9 @@ impl WorkerSelectionStage {
                 .ok_or_else(no_worker);
         };
 
-        let under_rule =
-            matches!(attempt, Attempt::Retry(ctx) if ctx.constraint_decided_on.is_some());
         let pools = [RoutingPool::GrpcPipelineRegular];
         let media_input = media != MediaDemands::NONE;
-        let shape = self.undecided(
-            model_id,
-            context,
-            &pools,
-            media_input,
-            inputs.headers,
-            under_rule,
-        );
+        let shape = self.undecided(model_id, context, &pools, media_input, inputs.headers);
         if let Some(shape) = shape {
             return Err(shape.refusal(|| {
                 let capable = self.capable_regular(model_id, wire, media.with_wire(wire));
@@ -2085,7 +2105,7 @@ impl WorkerSelectionStage {
         let prompt = host::Prompt::of(inputs.tokens, inputs.cache_namespace);
         let hashes = host.hashes(model_id, &prompt);
         let id = host::mark();
-        let rule = on_route(RoutingPool::GrpcPipelineRegular, wire, attempt.ledger());
+        let rule = on_route(RoutingPool::GrpcPipelineRegular, wire, attempt.retry());
         let ask = Ask {
             wires: route_wires(wire),
             ..attempt.ask(model_id, &id, &hashes)
@@ -2140,10 +2160,10 @@ impl WorkerSelectionStage {
     /// The ask states the wires the route dials, so the controller names no
     /// pair on another wire. The pair's commit takes the route's rule a side
     /// at a time, and passes over a pair either of whose workers it refuses:
-    /// one off its pool, or one a retry's pin or ledger refuses. No rule of
-    /// a side tells a pair of two runtimes. Such a pair is still given up as
-    /// a failed commit and refused, as the regular helper refuses an attempt
-    /// no target holds.
+    /// one off its pool, or one a retry's pin or its rule refuses
+    /// ([`RetryRule`]). No rule of a side tells a pair of two runtimes. Such
+    /// a pair is still given up as a failed commit and refused, as the
+    /// regular helper refuses an attempt no target holds.
     #[expect(
         clippy::too_many_arguments,
         reason = "the pair's selection threads every input the classic placement consumes"
@@ -2160,8 +2180,6 @@ impl WorkerSelectionStage {
         attempt: Attempt<'_>,
     ) -> Result<(PdAttempt, PrefillLoadGuard), Response> {
         let (prefill_pool, decode_pool) = PdWire::Grpc.pools();
-        let under_rule =
-            matches!(attempt, Attempt::Retry(ctx) if ctx.constraint_decided_on.is_some());
         let media_input =
             media != MediaDemands::NONE || demand.prefill || demand.decode || demand.refs;
         let pools = [prefill_pool, decode_pool];
@@ -2171,7 +2189,6 @@ impl WorkerSelectionStage {
             &pools,
             media_input,
             inputs.headers,
-            under_rule,
         );
         if let Some(shape) = shape {
             return Err(shape.refusal(|| {
@@ -2196,7 +2213,7 @@ impl WorkerSelectionStage {
         };
         let hashes = host.hashes(model_id, &prompt);
         let id = host::mark();
-        let ledger = attempt.ledger();
+        let retry = attempt.retry();
         let ask = Ask {
             phase: Phase::Prefill,
             attempt: Some(attempt.number()),
@@ -2205,8 +2222,8 @@ impl WorkerSelectionStage {
         };
         // A worker passes the rule of its own pool: a pool matches its own
         // type alone.
-        let on_prefill = on_route(prefill_pool, wire, ledger);
-        let on_decode = on_route(decode_pool, wire, ledger);
+        let on_prefill = on_route(prefill_pool, wire, retry);
+        let on_decode = on_route(decode_pool, wire, retry);
         let (mut placed, guard) = host
             .place_pair_where(
                 &ask,

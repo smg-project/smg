@@ -550,16 +550,82 @@ async fn a_prompt_no_window_holds_reads_the_classic_400_under_the_host() -> anyh
     Ok(())
 }
 
-#[tokio::test]
-async fn a_retry_under_a_decoding_rule_is_refused_by_name() -> anyhow::Result<()> {
-    let (stage, store) = stage_with_host(&URLS[..1]);
+/// The decoding a request's constraint is decided on at the registered
+/// worker at `url`.
+fn decoding_at(registry: &WorkerRegistry, url: &str) -> utils::WorkerDecoding {
+    let worker = registry.get_by_url(url).expect("the worker");
+    utils::WorkerDecoding::of(Some(&WorkerSelection::Single { worker }))
+}
+
+/// Labels the registered worker at `url` as one that takes a grammar on
+/// every turn and starts it at the first token, so the whole turn's grammar
+/// applies there. Answers the decoding decided on it.
+fn takes_the_whole_turn(registry: &WorkerRegistry, url: &str) -> utils::WorkerDecoding {
+    let worker = registry.get_by_url(url).expect("the worker");
+    let labelled = BasicWorkerBuilder::carrying(&worker)
+        .label("constrained_decoding", "always")
+        .label("constrained_decoding_start", "first_token")
+        .build();
+    let _id = registry.register_or_replace(Arc::new(labelled));
+    decoding_at(registry, url)
+}
+
+/// The workers a retry of `stage` lands on under the decoding `rule`: the
+/// placed worker's URL, and the decode's where the stage places a pair. A
+/// next attempt follows the failure, and the selection places it.
+async fn retried_under(
+    stage: &WorkerSelectionStage,
+    rule: utils::WorkerDecoding,
+) -> (String, Option<String>) {
     let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
-    ctx.constraint_decided_on = Some(utils::WorkerDecoding::of(None));
-    let refused = stage
+    ctx.constraint_decided_on = Some(rule);
+    assert!(stage.places_retry(&ctx));
+    stage
         .reselect(&mut ctx, &retained_plan(&[1]))
         .await
-        .expect_err("the retry carries a decoding rule");
-    assert_named_refusal(refused, "a retry under a decoding rule", &store).await
+        .expect("a worker the rule admits");
+    let placed = ctx.placed.as_ref().expect("a placement");
+    let decode = placed.decode().map(|decode| decode.url().to_owned());
+    (placed.worker().url().to_owned(), decode)
+}
+
+/// A regular retry under a decoding rule is placed, and lands on a worker
+/// that decides the request's constraint as the first attempt's did. The
+/// commit passes over a target that decides it otherwise, as the classic
+/// selection's filter leaves it out. Where no worker decides alike, the
+/// retry reads the host's answer for an attempt no target holds.
+#[tokio::test]
+async fn a_retry_under_a_decoding_rule_lands_on_a_worker_that_decides_alike() {
+    const FLEET: [&str; 3] = ["http://w0:8000", "http://w1:8000", "http://w2:8000"];
+    let (stage, store) = stage_with_host(&FLEET);
+    let registry = &stage.worker_registry;
+    let when_asked = decoding_at(registry, FLEET[0]);
+    let whole_turn = takes_the_whole_turn(registry, FLEET[2]);
+
+    // Decided on the worker that takes the whole turn's grammar: the retry
+    // is its own, whichever target the controller names first.
+    for _ in 0..16 {
+        let (worker, _) = retried_under(&stage, whole_turn).await;
+        assert_eq!(worker, FLEET[2]);
+    }
+    // Decided on a worker that takes a grammar when asked: the retry is
+    // one of the two that do.
+    for _ in 0..16 {
+        let (worker, _) = retried_under(&stage, when_asked).await;
+        assert_ne!(worker, FLEET[2]);
+    }
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+
+    // Alone, a worker that decides otherwise takes no such retry.
+    let (alone, store) = stage_with_host(&FLEET[..1]);
+    let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
+    ctx.constraint_decided_on = Some(whole_turn);
+    assert!(alone.places_retry(&ctx));
+    let refused = alone
+        .reselect(&mut ctx, &retained_plan(&[1]))
+        .await
+        .expect_err("no worker decides alike");
+    assert_no_target_holds(&refused, &store);
 }
 
 #[tokio::test]
@@ -749,28 +815,29 @@ fn an_unpinned_ask_states_the_wires_of_the_pipelines_connections() {
 #[tokio::test]
 async fn a_retry_of_a_shape_refused_by_name_has_no_next_attempt() -> anyhow::Result<()> {
     let (stage, store) = stage_with_host(&URLS[..1]);
-    // A plain retry is placed, so a next attempt may follow.
+    // A plain retry is placed, so a next attempt may follow. So is a retry
+    // under a decoding rule: the commit holds it to the rule.
     let plain = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
     assert!(stage.places_retry(&plain));
-
-    // Each shape the stage refuses by name ends the attempts.
     let mut under_rule = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
     under_rule.constraint_decided_on = Some(utils::WorkerDecoding::of(None));
-    assert!(!stage.places_retry(&under_rule));
+    assert!(stage.places_retry(&under_rule));
+
+    // A shape the stage refuses by name ends the attempts.
     let mut with_media = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
     with_media.wire.requires_media_refs = true;
     assert!(!stage.places_retry(&with_media));
 
     // Asked all the same, the stage still refuses by name.
     let refused = stage
-        .reselect(&mut under_rule, &retained_plan(&[1]))
+        .reselect(&mut with_media, &retained_plan(&[1]))
         .await
-        .expect_err("the retry carries a decoding rule");
-    assert_named_refusal(refused, "a retry under a decoding rule", &store).await?;
+        .expect_err("the retry carries media references");
+    assert_named_refusal(refused, "media input", &store).await?;
 
     // The classic selection answers every retry itself.
     let classic = regular_stage(Arc::clone(&stage.worker_registry));
-    assert!(classic.places_retry(&under_rule));
+    assert!(classic.places_retry(&with_media));
     Ok(())
 }
 
@@ -1153,17 +1220,12 @@ async fn a_pair_shape_the_controller_does_not_place_is_refused_by_name() -> anyh
     let refused = stage.execute(&mut ctx).await.expect_err("the window binds");
     assert_named_refusal(refused, "a context demand a worker's window binds", &store).await?;
 
-    // A retry under a decoding rule has no next attempt, and is refused by
-    // name when asked all the same. A plain retry is placed.
+    // A plain retry is placed, and so is one under a decoding rule.
     let mut under_rule = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
     under_rule.constraint_decided_on = Some(utils::WorkerDecoding::of(None));
-    assert!(!stage.places_retry(&under_rule));
+    assert!(stage.places_retry(&under_rule));
     assert!(stage.places_retry(&dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm))));
-    let refused = stage
-        .reselect(&mut under_rule, &retained_plan(&[1]))
-        .await
-        .expect_err("the retry carries a decoding rule");
-    assert_named_refusal(refused, "a retry under a decoding rule", &store).await
+    Ok(())
 }
 
 /// A fleet of mixed wires holds four pairs, and one of them is on the
@@ -1307,6 +1369,37 @@ async fn a_pinned_retry_passes_over_a_pair_of_another_runtime() {
             placed.decode().map(|decode| decode.url()),
             Some(OTHER_DECODE)
         );
+    }
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+}
+
+/// A pair retry under a decoding rule is placed, and its decode decides the
+/// request's constraint as the first attempt's did: the pair's commit
+/// passes over a pair whose decode decides it otherwise. A prefill
+/// generates no token a grammar constrains, so the rule holds none back.
+#[tokio::test]
+async fn a_pair_retry_under_a_decoding_rule_keeps_a_decode_that_decides_alike() {
+    const OTHER_DECODE: &str = "http://d1:8000";
+    let (stage, store) = pair_stage(
+        WorkerSelectionMode::PrefillDecode,
+        &[(PREFILL, RuntimeType::Vllm)],
+        &[
+            (DECODE, RuntimeType::Vllm),
+            (OTHER_DECODE, RuntimeType::Vllm),
+        ],
+    );
+    let registry = &stage.worker_registry;
+    let when_asked = decoding_at(registry, OTHER_DECODE);
+    let whole_turn = takes_the_whole_turn(registry, DECODE);
+    // The one prefill is labelled as the first decode is. Under the other
+    // decode's rule it still takes the retry.
+    assert_eq!(takes_the_whole_turn(registry, PREFILL), whole_turn);
+    for (rule, decode) in [(whole_turn, DECODE), (when_asked, OTHER_DECODE)] {
+        for _ in 0..16 {
+            let (prefill, placed) = retried_under(&stage, rule).await;
+            assert_eq!(prefill, PREFILL);
+            assert_eq!(placed.as_deref(), Some(decode));
+        }
     }
     assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
 }

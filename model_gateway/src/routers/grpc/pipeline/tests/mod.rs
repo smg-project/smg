@@ -166,15 +166,22 @@ async fn a_retry_the_selection_cannot_place_does_not_follow() {
     assert!(hosted.retry_follows(false, &plain));
     assert!(!hosted.retry_follows(true, &plain));
 
-    // A retry under a decoding rule would be refused by name: no next
-    // attempt, so the failed attempt's own answer stands.
+    // A retry under a decoding rule is placed: the commit holds it to the
+    // rule, so a next attempt follows.
     let (placed, _store) = place_worker().await;
     let mut under_rule = dispatch_context(placed);
     under_rule.constraint_decided_on = Some(WorkerDecoding::of(None));
-    assert!(!hosted.retry_follows(false, &under_rule));
+    assert!(hosted.retry_follows(false, &under_rule));
+
+    // A retry with media references would be refused by name: no next
+    // attempt, so the failed attempt's own answer stands.
+    let (placed, _store) = place_worker().await;
+    let mut with_media = dispatch_context(placed);
+    with_media.wire.requires_media_refs = true;
+    assert!(!hosted.retry_follows(false, &with_media));
 
     // The classic selection answers every retry itself.
-    assert!(pipeline_over(None).retry_follows(false, &under_rule));
+    assert!(pipeline_over(None).retry_follows(false, &with_media));
 }
 
 /// A valid 1x1 PNG, as a client sends an inline image.
