@@ -13,6 +13,11 @@
 //! the id it names and writes nothing. So the guard tells lives apart where
 //! the host numbers each life apart, as a registration door does with
 //! [`life`](crate::store::membership::life).
+//!
+//! The projection ([`HealthAdapter::project`]) writes what the object knows
+//! of its worker onto the row, under the same lock and the same fences. It
+//! reads the object at its write and is handed no reading, so of two
+//! projections the later one's reading stands on the row.
 
 use std::sync::Arc;
 
@@ -24,7 +29,7 @@ use smg_worker::{
 };
 
 use super::{object::status, Lead, Objects, Standing};
-use crate::store::{HealthSink as StoreHealthSink, HealthWrite};
+use crate::store::{HealthSink as StoreHealthSink, HealthWrite, LeaderBits};
 
 /// The health sink for a replica that keeps its workers in the store.
 pub struct HealthAdapter<G, S: ?Sized> {
@@ -46,6 +51,33 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
         }
     }
 
+    /// Write what the object under `worker_id` knows of its worker onto
+    /// the row it stands for ([`StoreHealthSink::leader_bits`]): its
+    /// liveness veto ([`Worker::stall_reason`]) is the row's stalled bit.
+    /// The fences are a health write's: the term, the object the holder
+    /// laid, and the revision that object was built from. The object is
+    /// read under its mutation lock, at the write. A host calls this at
+    /// each change of the object's veto, and for an object it lays over
+    /// another: a replacement takes the running state of the object it
+    /// replaces, its veto with the rest.
+    ///
+    /// Stale where the adapter's term ended, where no object stands under
+    /// the id, where the holder laid another, and where the row left the
+    /// revision the object was built from.
+    pub fn project(&self, worker_id: &ObjectId) -> HealthWrite {
+        // The revision of the object that stands now: the guard under the
+        // lock refuses the call where another took its place since.
+        let Some(object) = self.objects.registry().get(worker_id) else {
+            return HealthWrite::Stale;
+        };
+        self.write(worker_id, object.revision(), |store, standing, object| {
+            let bits = LeaderBits {
+                stalled: object.stall_reason().is_some(),
+            };
+            store.leader_bits(standing.row, standing.revision, bits)
+        })
+    }
+
     fn leads(&self) -> bool {
         self.lead.term() == Some(self.term)
     }
@@ -54,7 +86,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
         &self,
         worker_id: &ObjectId,
         revision: u64,
-        write_row: impl FnOnce(&S, Standing) -> HealthWrite,
+        write_row: impl FnOnce(&S, Standing, &dyn Worker) -> HealthWrite,
     ) -> HealthWrite {
         if !self.leads() {
             return HealthWrite::Stale;
@@ -68,7 +100,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
             let Some(standing) = self.objects.standing_of(worker_id, object) else {
                 return (HealthWrite::Stale, None);
             };
-            let write = write_row(self.store.as_ref(), standing);
+            let write = write_row(self.store.as_ref(), standing, object.as_ref());
             (write, write.stands().map(status))
         };
         self.objects
@@ -88,7 +120,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized + 'static> HealthSink for Health
         revision: u64,
         _launched: ObjectStatus,
     ) -> ProbeAnswer {
-        match self.write(worker_id, revision, |store, standing| {
+        match self.write(worker_id, revision, |store, standing, _| {
             store.probe_outcome(standing.row, passed, standing.revision)
         }) {
             HealthWrite::Moved { from, to } => ProbeAnswer::Moved {
@@ -105,7 +137,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized + 'static> HealthSink for Health
         worker_id: &ObjectId,
         revision: u64,
     ) -> Option<(ObjectStatus, ObjectStatus)> {
-        self.write(worker_id, revision, |store, standing| {
+        self.write(worker_id, revision, |store, standing, _| {
             store.connected(standing.row, standing.revision)
         })
         .moved()
@@ -115,20 +147,27 @@ impl<G: Generation, S: StoreHealthSink + ?Sized + 'static> HealthSink for Health
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use parking_lot::Mutex;
-    use smg_worker::registry::{event::WorkerEvent, WorkerRegistry};
+    use smg_worker::{
+        registry::{event::WorkerEvent, WorkerRegistry},
+        runtime::StallReason,
+    };
     use tokio::sync::broadcast::error::TryRecvError;
 
     use super::*;
     use crate::{
         store::{
-            membership::life, HealthPolicy, MemoryStore, WorkerFacts, WorkerPatch,
-            WorkerStatus as RowStatus, WorkersStore,
+            membership::life, Ask, GatewayId, HealthPolicy, MemoryStore, ViewBuffers, WorkerFacts,
+            WorkerPatch, WorkerStatus as RowStatus, WorkersStore,
         },
+        view::Role,
         worker_host::{object, Members, SoleLead},
     };
 
     const URL: &str = "http://a:8000";
+    const MODEL: &str = "m";
 
     struct Replica {
         store: Arc<MemoryStore>,
@@ -144,6 +183,7 @@ mod tests {
             let row = store
                 .upsert(WorkerFacts {
                     key: URL.to_string(),
+                    models: vec![MODEL.to_string()],
                     health: HealthPolicy {
                         success_threshold,
                         probes,
@@ -171,6 +211,28 @@ mod tests {
                 Arc::new(SoleLead),
                 SoleLead::TERM,
             )
+        }
+
+        fn object(&self) -> Arc<dyn Worker> {
+            let registry = self.objects.registry();
+            registry.get(&self.id).expect("a worker")
+        }
+
+        /// Whether a decision reads the worker as doubted: the stalled bit
+        /// of its row in the model's pool, as any gateway is handed it.
+        fn doubted(&self) -> bool {
+            let ask = Ask {
+                gateway: GatewayId(1),
+                now: Instant::now(),
+                pinned: None,
+                affinity: false,
+            };
+            let mut out = ViewBuffers::default();
+            // A registration is in force at its window's publication: the
+            // case asks for one.
+            self.store.publish_now();
+            let built = self.store.build_view(MODEL, Role::Single, &ask, &mut out);
+            built.is_some() && out.candidates.iter().any(|row| row.health.stalled)
         }
 
         #[track_caller]
@@ -279,6 +341,54 @@ mod tests {
     }
 
     #[test]
+    fn a_projection_writes_the_objects_veto_onto_its_row_and_clears_it() {
+        let replica = Replica::new(1, true).expect("a laid worker");
+        let adapter = replica.adapter();
+        let stood = HealthWrite::Stood(RowStatus::Pending);
+        // No veto stands on the object: its projection writes no doubt.
+        assert_eq!(adapter.project(&replica.id), stood);
+        assert!(!replica.doubted());
+        // The veto alone moves no row. The projection writes it, and moves
+        // no status of the row or of the object.
+        assert!(replica.object().set_stall(Some(StallReason::Unreachable)));
+        assert!(!replica.doubted());
+        assert_eq!(adapter.project(&replica.id), stood);
+        assert!(replica.doubted());
+        replica.assert_statuses(Some(RowStatus::Pending), ObjectStatus::Pending);
+        // The object is read at the write: the veto it dropped is gone
+        // from the row at the next projection.
+        assert!(replica.object().set_stall(None));
+        assert_eq!(adapter.project(&replica.id), stood);
+        assert!(!replica.doubted());
+    }
+
+    #[test]
+    fn a_projection_the_row_outran_is_stale_and_the_object_laid_next_carries_the_veto() {
+        let replica = Replica::new(1, true).expect("a laid worker");
+        let adapter = replica.adapter();
+        let row = replica.store.by_key(URL).expect("a row");
+        let patch = WorkerPatch {
+            priority: Some(1),
+            ..WorkerPatch::default()
+        };
+        assert!(replica.store.patch(row.id, patch, row.revision).is_some());
+        assert!(replica.object().set_stall(Some(StallReason::Wedged)));
+        // The object still names the row's earlier revision.
+        assert_eq!(adapter.project(&replica.id), HealthWrite::Stale);
+        assert!(!replica.doubted());
+        // The holder lays the row's next revision in the object's place.
+        // The replacement takes its running state, the veto with the rest,
+        // and its projection writes the doubt.
+        replica.objects.follow(replica.store.as_ref());
+        assert_ne!(replica.object().revision(), replica.revision);
+        assert_eq!(
+            adapter.project(&replica.id),
+            HealthWrite::Stood(RowStatus::Pending)
+        );
+        assert!(replica.doubted());
+    }
+
+    #[test]
     fn an_outcome_at_a_revision_the_object_left_is_stale() {
         let replica = Replica::new(1, true).expect("a laid worker");
         let adapter = replica.adapter();
@@ -334,6 +444,7 @@ mod tests {
             ProbeAnswer::Stale
         );
         assert_eq!(adapter.connected(&replica.id, revision), None);
+        assert_eq!(adapter.project(&replica.id), HealthWrite::Stale);
         replica.assert_statuses(Some(RowStatus::Pending), ObjectStatus::Pending);
     }
 
@@ -349,6 +460,11 @@ mod tests {
         );
         assert_eq!(adapter.connected(&replica.id, replica.revision), None);
         replica.assert_statuses(None, ObjectStatus::Pending);
+        // The projection is answered by the store while the object stands,
+        // and finds no object once the holder followed the removal.
+        assert_eq!(adapter.project(&replica.id), HealthWrite::NoRow);
+        replica.objects.follow(replica.store.as_ref());
+        assert_eq!(adapter.project(&replica.id), HealthWrite::Stale);
     }
 
     /// A URL's next life, numbered as a registration door numbers one, is
@@ -376,6 +492,7 @@ mod tests {
             ProbeAnswer::Stale
         );
         assert_eq!(adapter.connected(&replica.id, replica.revision), None);
+        assert_eq!(adapter.project(&replica.id), HealthWrite::NoRow);
         replica.assert_statuses(Some(RowStatus::Pending), ObjectStatus::Pending);
     }
 
@@ -422,6 +539,7 @@ mod tests {
             ProbeAnswer::Stale
         );
         assert_eq!(adapter.connected(&replica.id, replica.revision), None);
+        assert_eq!(adapter.project(&replica.id), HealthWrite::Stale);
         replica.assert_statuses(Some(RowStatus::Pending), ObjectStatus::Pending);
     }
 
@@ -449,6 +567,7 @@ mod tests {
             under_term_one().connected(&replica.id, replica.revision),
             None
         );
+        assert_eq!(under_term_one().project(&replica.id), HealthWrite::Stale);
         replica.assert_statuses(Some(RowStatus::Pending), ObjectStatus::Pending);
     }
 
@@ -468,6 +587,7 @@ mod tests {
             ProbeAnswer::Stale
         );
         assert_eq!(adapter.connected(&replica.id, replica.revision), None);
+        assert_eq!(adapter.project(&replica.id), HealthWrite::Stale);
         replica.assert_statuses(Some(RowStatus::Pending), ObjectStatus::Pending);
     }
 }

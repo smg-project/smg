@@ -21,7 +21,7 @@ use crate::{
     lease::{LeaseId, Lifecycle, Membership, Outcome, ReleaseReason, Side, TransportClass},
     spec::AppliedSpec,
     store::{
-        health::{HealthSink, HealthWrite, VetoWrite},
+        health::{HealthSink, HealthWrite, LeaderBits, VetoWrite},
         index::{indexed_under, KvEvent, KvTables, LaneCounts},
         journal::{Journal, Kinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
@@ -488,11 +488,7 @@ impl MemoryStore {
                     Row { row, ..kept }
                 } else {
                     loads.ranks.insert(id, Ranks::default());
-                    Row {
-                        row,
-                        probes: Probes::default(),
-                        slot: self.join(id),
-                    }
+                    Row::new(row, self.join(id))
                 };
                 workers.rows.insert(id, held);
             }
@@ -587,9 +583,8 @@ impl MemoryStore {
                     && !workers.by_key.contains_key(&row.facts.key) =>
             {
                 workers.by_key.insert(row.facts.key.clone(), id);
-                let probes = Probes::default();
                 let slot = self.join(id);
-                workers.rows.insert(id, Row { row, probes, slot });
+                workers.rows.insert(id, Row::new(row, slot));
                 (change, None)
             }
             (
@@ -624,9 +619,8 @@ impl MemoryStore {
             {
                 let left = workers.rows.remove(&old).map(|held| held.row);
                 workers.by_key.insert(row.facts.key.clone(), new);
-                let probes = Probes::default();
                 let slot = self.join(new);
-                workers.rows.insert(new, Row { row, probes, slot });
+                workers.rows.insert(new, Row::new(row, slot));
                 self.forget_worker(old);
                 (change, left)
             }
@@ -855,7 +849,7 @@ impl MemoryStore {
             let (world, before) = writer.apply(
                 Arc::clone(&spec),
                 workers.epoch,
-                workers.rows.values().map(|row| (&row.row, row.slot)),
+                workers.members(),
                 |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
             )?;
             world.tell_kept_loads();
@@ -1002,7 +996,7 @@ impl MemoryStore {
         writer.clear_listed();
         let world = writer.rebuild(
             workers.epoch,
-            workers.rows.values().map(|row| (&row.row, row.slot)),
+            workers.members(),
             |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
             Classes::Derive,
         );
@@ -1136,12 +1130,9 @@ impl MemoryStore {
         let (world, built) = match at {
             Some(now) if !writer.build_due(now) => (writer.publish_if_due(now), false),
             _ => {
-                let world = writer.build_owed(
-                    at,
-                    workers.epoch,
-                    workers.rows.values().map(|row| (&row.row, row.slot)),
-                    |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
-                );
+                let world = writer.build_owed(at, workers.epoch, workers.members(), |id, rank| {
+                    ranks.get(&id)?.samples.get(&rank).copied()
+                });
                 let built = world.is_some();
                 (world, built)
             }
@@ -1205,6 +1196,15 @@ impl MemoryStore {
     fn show_status(&self, id: WorkerId, status: WorkerStatus) {
         let mut loads = self.loads.lock();
         let world = loads.writer.fold_status(id, status);
+        self.show(&mut loads.writer, world);
+    }
+
+    /// Fold what the leader's own worker object knows of a worker into the
+    /// world and publish it at once. Called under the workers lock, as the
+    /// bits were written.
+    fn show_leader(&self, id: WorkerId, bits: LeaderBits) {
+        let mut loads = self.loads.lock();
+        let world = loads.writer.fold_leader(id, bits);
         self.show(&mut loads.writer, world);
     }
 
@@ -1476,11 +1476,28 @@ struct Workers {
 struct Row {
     row: WorkerRow,
     probes: Probes,
+    /// What the leader's own worker object knows of the worker
+    /// ([`HealthSink::leader_bits`]): this replica's own, in no journal and
+    /// no snapshot. It stands across the row's revisions.
+    leader: LeaderBits,
     /// The slot of the worker's count of the leases on file, given at the
     /// write that first files it ([`MemoryStore::join`]). A member keeps
     /// it across builds, and the slot of a worker that left is given to no
     /// one: the leases still on file for it end on the count they booked.
     slot: Slot,
+}
+
+impl Row {
+    /// A row at its first write: no probe is counted, and the leader's own
+    /// worker object said no word of the worker.
+    fn new(row: WorkerRow, slot: Slot) -> Self {
+        Self {
+            row,
+            probes: Probes::default(),
+            leader: LeaderBits::default(),
+            slot,
+        }
+    }
 }
 
 /// The prober's counters for one row.
@@ -1492,6 +1509,14 @@ struct Probes {
 }
 
 impl Workers {
+    /// Every member as a build reads it: its row, the slot of its count
+    /// and what the leader's own worker object knows of it.
+    fn members(&self) -> impl Iterator<Item = (&WorkerRow, Slot, LeaderBits)> {
+        self.rows
+            .values()
+            .map(|row| (&row.row, row.slot, row.leader))
+    }
+
     /// The row under `id` when `revision` is still its revision.
     fn guarded(&mut self, id: WorkerId, revision: u64) -> Option<&mut Row> {
         self.rows
@@ -1694,8 +1719,8 @@ impl WorkersStore for MemoryStore {
             workers.by_key.insert(facts.key.clone(), new_id);
             workers.rows.insert(
                 new_id,
-                Row {
-                    row: WorkerRow {
+                Row::new(
+                    WorkerRow {
                         id: new_id,
                         facts,
                         status,
@@ -1705,9 +1730,8 @@ impl WorkersStore for MemoryStore {
                         // incarnation, and so does its maker.
                         maker: old.as_ref().map_or(maker, |old| old.row.maker.clone()),
                     },
-                    probes: Probes::default(),
-                    slot: self.join(new_id),
-                },
+                    self.join(new_id),
+                ),
             );
             // The old incarnation's tables leave with its row, as on a
             // removal, under the same lock and before the replacement is
@@ -1747,8 +1771,8 @@ impl WorkersStore for MemoryStore {
         workers.by_key.insert(facts.key.clone(), id);
         workers.rows.insert(
             id,
-            Row {
-                row: WorkerRow {
+            Row::new(
+                WorkerRow {
                     id,
                     facts,
                     status: WorkerStatus::Pending,
@@ -1756,9 +1780,8 @@ impl WorkersStore for MemoryStore {
                     admitted_at: now,
                     maker,
                 },
-                probes: Probes::default(),
-                slot: self.join(id),
-            },
+                self.join(id),
+            ),
         );
         // Recorded before the row's load entry exists: no load of a worker
         // stands before its registration in the journal.
@@ -2020,6 +2043,20 @@ impl HealthSink for MemoryStore {
             from,
             to: WorkerStatus::Ready,
         }
+    }
+
+    fn leader_bits(&self, id: WorkerId, revision: u64, bits: LeaderBits) -> HealthWrite {
+        // The membership lock with no word to the journal: the bits are
+        // this replica's own, and no standby applies them.
+        let mut workers = self.workers.lock();
+        let Some(row) = workers.guarded(id, revision) else {
+            return workers.unjudged(id);
+        };
+        let status = row.row.status;
+        if mem::replace(&mut row.leader, bits) != bits {
+            self.show_leader(id, bits);
+        }
+        HealthWrite::Stood(status)
     }
 
     fn gateway_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) {

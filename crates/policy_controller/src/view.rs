@@ -137,8 +137,11 @@ pub struct Health {
     /// breaker bit too. A host writes it into a row it copies for the
     /// decision. Over a publication's own rows the asking host's vetoes
     /// stand beside the rows instead, and a reader of this bit asks both
-    /// ([`Constraints::masks`]). The all-vetoed rule lifts it as its last
-    /// resort, on a row whose breaker bit is clear.
+    /// ([`Constraints::masks`]). A store's own rows carry the bit for one
+    /// doubt, the leader's own, whoever asks
+    /// ([`HealthSink::leader_bits`](crate::store::HealthSink::leader_bits)).
+    /// The all-vetoed rule lifts it as its last resort, on a row whose
+    /// breaker bit is clear.
     pub stalled: bool,
     /// Being drained; nothing new goes there.
     pub draining: bool,
