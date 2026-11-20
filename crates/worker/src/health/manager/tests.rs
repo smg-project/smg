@@ -3376,3 +3376,58 @@ fn a_promoted_workers_next_check_follows_the_status_it_took() {
         "an interval out, not at once"
     );
 }
+
+/// One loop holds the registry's connect-signal receiver, and hands it back
+/// at its end: a loop started behind it is signalled from then on. A host
+/// that runs a loop for each term of its lead starts the next as the last
+/// one ends, so the second loop here starts while the first still runs.
+#[tokio::test]
+async fn a_loop_started_behind_another_is_signalled_once_the_first_ends() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = unprobed_worker("http://unprobed:1");
+    let worker_id = registry.register(worker.clone()).unwrap();
+    let signal = || {
+        registry
+            .connect_signal_sender()
+            .send(WorkerConnected {
+                url: worker.url().to_string(),
+                revision: worker.revision(),
+            })
+            .expect("the channel has its receiver");
+    };
+    let first_sink = Arc::new(RecordingSink::answering(ProbeAnswer::Stale));
+    let second_sink = Arc::new(RecordingSink::answering(ProbeAnswer::Stale));
+    let first =
+        WorkerManager::start_with_sink(registry.clone(), first_sink.clone(), test_config(), None);
+    let _second =
+        WorkerManager::start_with_sink(registry.clone(), second_sink.clone(), test_config(), None);
+
+    // The first loop holds the receiver: its sink is told, the second's
+    // is not.
+    signal();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    wait_until(deadline, "the first loop reads the signal", || {
+        first_sink.connects.lock().len() == 1
+    })
+    .await;
+    assert!(second_sink.connects.lock().is_empty());
+
+    // The first loop ends, by the abort at its manager's drop. The second
+    // takes the receiver and reads the next signal.
+    drop(first);
+    signal();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    wait_until(deadline, "the second loop reads the signal", || {
+        second_sink.connects.lock().len() == 1
+    })
+    .await;
+    assert_eq!(
+        *second_sink.connects.lock(),
+        vec![(worker_id, worker.revision())]
+    );
+    assert_eq!(
+        first_sink.connects.lock().len(),
+        1,
+        "the first read no more"
+    );
+}
