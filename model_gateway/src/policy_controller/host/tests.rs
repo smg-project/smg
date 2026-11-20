@@ -2813,6 +2813,7 @@ impl EncodeBed {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let mut view = ViewBuffers::default();
             let Some(built) = world.build(MODEL, Role::Encode, &ask, &mut view) else {
