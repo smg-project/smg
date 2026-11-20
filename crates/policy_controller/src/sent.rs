@@ -169,8 +169,9 @@ impl SentReads<'_> {
 
     /// The requests and the stated tokens of [`Self::of`], for a stage
     /// that prices no send of unstated size. It releases what a report or
-    /// the time limit reaches, as [`Self::of`] does, and never loads the
-    /// third number's word. Inlined into its caller's row loop.
+    /// the time limit reaches, as [`Self::of`] does, and loads two words
+    /// where it releases none: the third number's word is read only by a
+    /// release. Inlined into its caller's row loop.
     #[inline(always)]
     pub fn counts(&self, row: &Candidate) -> SentCounts {
         self.tally

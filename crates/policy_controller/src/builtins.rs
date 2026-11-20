@@ -2417,7 +2417,7 @@ impl ResidentWork {
             // number stale, so the test rides that release: a row that
             // holds none at or before its sample reads the word alone.
             if since.reaches(row.load_sampled_at_micros) {
-                self.release(since, row);
+                return self.release(since, row);
             }
             since.held_credit()
         });
@@ -2432,15 +2432,19 @@ impl ResidentWork {
     /// Releases the dispatches `row`'s report reflects, as a stage told
     /// nothing does, and sends back a number kept of an earlier report:
     /// the release may have taken dispatches that number counts
-    /// ([`ResidentWork::settle`]). Cold and out of line: a decision reads
-    /// a row far more often than a report releases from it.
+    /// ([`ResidentWork::settle`]). Hands back the held token-work and
+    /// requests behind the release, which settling does not write, so
+    /// the pass keeps nothing of the row across this call. Cold and out
+    /// of line: a decision reads a row far more often than a report
+    /// releases from it.
     #[cold]
     #[inline(never)]
-    fn release(&self, since: &SinceReport, row: &Candidate) {
-        since.release_through(row.load_sampled_at_micros);
+    fn release(&self, since: &SinceReport, row: &Candidate) -> (u64, u64) {
+        let (held, _) = since.release_through(row.load_sampled_at_micros);
         if since.keeps_before(row.load_sampled_at_micros) {
             self.settle(None, since, row, Slot::NONE);
         }
+        SinceReport::credit_of(held)
     }
 }
 
