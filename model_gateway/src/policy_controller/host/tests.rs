@@ -1640,6 +1640,44 @@ async fn a_prefill_without_room_is_passed_over_for_the_next_pair_target() {
     assert_eq!(placed.decode_id(), Some(bed.decodes[0].0));
 }
 
+/// The commit names the target it took to the handle, so the decode's
+/// dispatch names the decode that is sent and not the pick's first. A
+/// pick's targets share its prefill and differ by decode.
+#[tokio::test]
+async fn a_pair_taken_past_the_picks_first_target_dispatches_under_the_one_taken() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 2, 2).expect("a pair fleet");
+    let now = Instant::now();
+    let asked = bed.host.ask(&pair_ask(), &[], now).await.expect("a pair");
+    let mut sides = asked.targets.iter().filter_map(|target| target.pair);
+    let (first, second) = (
+        sides.next().expect("the pick's first target").decode_id,
+        sides.next().expect("a target behind it").decode_id,
+    );
+    assert_ne!(first, second);
+    let cut = bed.decodes.iter().find(|(id, _)| *id == first);
+    cut.expect("the first decode")
+        .1
+        .record_circuit_breaker_outcome(false);
+    let mut missed = Vec::new();
+    let mut placed = bed
+        .host
+        .commit_pair(asked, None, &mut missed, now)
+        .expect("the target behind the first");
+    let prefill = bed.prefills[0].0;
+    assert_eq!((placed.id(), placed.decode_id()), (prefill, Some(second)));
+    assert!(missed.is_empty());
+    bed.calls.lock().clear();
+    placed.dispatched(now + Duration::from_micros(5));
+    placed.decode_dispatched(now + Duration::from_micros(8));
+    assert_eq!(
+        *bed.calls.lock(),
+        [
+            PairCall::Dispatched(Side::Prefill, prefill, 5),
+            PairCall::Dispatched(Side::Decode, second, 8),
+        ]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_pair_that_finds_no_room_queues_and_is_decided_again_at_its_admission() {
     let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");

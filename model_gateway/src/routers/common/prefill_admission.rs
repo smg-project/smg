@@ -257,8 +257,7 @@ where
     let mut again = 0;
     let Some(admission) = admission else {
         loop {
-            let decision = decide().await.map_err(PrefillAcquireError::Candidate)?;
-            match commit(decision, None) {
+            match decide().await.and_then(|decision| commit(decision, None)) {
                 Ok(candidate) => {
                     let guard = PrefillLoadGuard::unbounded(prefill_of(&candidate), routing_key);
                     return Ok((candidate, guard));
@@ -1950,7 +1949,13 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let _recorder = metrics::set_default_local_recorder(&recorder);
         let admission = PrefillAdmission::new(1, 0, Duration::ZERO);
-        for admission in [Some(&admission), None] {
+        // The error of either half decides again, with admission or without.
+        for (admission, decision_fails) in [
+            (Some(&admission), false),
+            (Some(&admission), true),
+            (None, false),
+            (None, true),
+        ] {
             let decisions = AtomicUsize::new(0);
             let result = acquire_decided(
                 admission,
@@ -1959,7 +1964,11 @@ mod tests {
                 no_probe,
                 || {
                     decisions.fetch_add(1, Ordering::Relaxed);
-                    ready(Ok(()))
+                    ready(if decision_fails {
+                        Err(CandidateError::Again)
+                    } else {
+                        Ok(())
+                    })
                 },
                 |(), _| Err(CandidateError::Again),
             )
@@ -1968,13 +1977,13 @@ mod tests {
                 result,
                 Err(PrefillAcquireError::Candidate(CandidateError::Again))
             ));
-            assert_eq!(decisions.load(Ordering::Relaxed), 3);
+            assert_eq!(decisions.load(Ordering::Relaxed), 3, "{decision_fails}");
         }
         assert_metric(
             &recorder.handle().render(),
             "smg_pd_prefill_admission_rejections_total",
             &[r#"reason="unavailable""#],
-            "1",
+            "2",
         );
     }
 
