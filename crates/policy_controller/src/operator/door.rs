@@ -48,9 +48,9 @@
 //! digest and the time the door lists it by, and takes no lock an apply
 //! holds.
 //!
-//! A source that keeps running hands a refusal back here
-//! ([`SpecDoor::reject`]): it is one event and one count, and the
-//! running generation stays.
+//! A refusal an apply or a write returns is one event and one count, and
+//! the running generation stays. A source that keeps running hands its
+//! own findings back the same way ([`SpecDoor::reject`]).
 //!
 //! The number and the digest have one holder, the store's
 //! ([`World::spec`](crate::store::World::spec)). What lives here is the
@@ -297,6 +297,12 @@ fn publish_local(store: &MemoryStore, spec: AppliedSpec) -> Result<bool, StaleGe
     store.apply(spec).map(|()| true)
 }
 
+/// The refusal of a write where no spec store is bound: the document has
+/// nowhere to be persisted.
+fn no_spec_store() -> SpecRejected {
+    SpecRejected::Unpersisted("no spec store is bound".to_owned())
+}
+
 /// What a write answers: the number its document runs under, its digest,
 /// and what a host must feed under it, `None` where it is the standing
 /// document again.
@@ -399,7 +405,8 @@ impl SpecDoor {
 
     /// Applies a source's document through the store's own entry. A host
     /// with one source can apply its start's document here. For an
-    /// operator write, use [`SpecDoor::enforce`].
+    /// operator write, use [`SpecDoor::enforce`]. A refusal is counted,
+    /// once, and the running generation stays.
     pub fn apply(&self, document: Vec<u8>, format: Format) -> Result<Applied, SpecRejected> {
         self.apply_where(document, format, |_| None, publish_local)
     }
@@ -409,7 +416,12 @@ impl SpecDoor {
     /// held during both callbacks. For a changed document, `publish` runs
     /// the store's entry under the document lock. It can return `false`
     /// to leave both the store and the door as they were. An unchanged
-    /// document does not call `publish`.
+    /// document does not call `publish`. A refusal is counted as
+    /// [`SpecDoor::apply`] counts one.
+    ///
+    /// Both callbacks run under the door's locks. Neither may call a
+    /// method of this door: `status`, `document` and the other reads take
+    /// the same locks and would wait on themselves.
     pub fn apply_where(
         &self,
         document: Vec<u8>,
@@ -418,6 +430,7 @@ impl SpecDoor {
         publish: impl FnOnce(&MemoryStore, AppliedSpec) -> Result<bool, StaleGeneration>,
     ) -> Result<Applied, SpecRejected> {
         self.apply_notifying(document, format, unread, publish, |_| {}, |_, _| {})
+            .map_err(|rejected| self.reject(rejected))
     }
 
     /// Reports the pass under the apply lock before the second admission
@@ -683,9 +696,7 @@ impl SpecDoor {
         let before = needs_rows(world.spec().engine());
         let written = match applying.as_mut() {
             Some(dir) => self.write(dir, standing, document, format, Line::Next),
-            None => Err(SpecRejected::Unpersisted(
-                "no spec store is bound".to_owned(),
-            )),
+            None => Err(no_spec_store()),
         };
         drop(applying);
         Ok(self.enforced(standing, before, written))
@@ -699,15 +710,17 @@ impl SpecDoor {
     /// document is no change. A generation that is not on file is not held.
     /// A document that does not run now, or that the directory does not
     /// give or take, is refused with the running generation kept, and
-    /// counted as rejected.
+    /// counted as rejected. So is every roll back where no spec store is
+    /// bound, in the words an enforce is refused by there.
     pub fn roll_back(&self, wanted: u64) -> Result<Enforced, Unanswered> {
         let mut applying = self.applying.lock();
-        let found = applying.as_mut().and_then(|dir| {
-            let on_file = dir.kept().iter().copied();
-            let persisted = on_file.rev().find(|kept| kept.generation == wanted)?;
-            Some((dir, persisted))
-        });
-        let Some((dir, persisted)) = found else {
+        let Some(dir) = applying.as_mut() else {
+            let standing = self.standing();
+            drop(applying);
+            return Ok(self.enforced(standing, Vec::new(), Err(no_spec_store())));
+        };
+        let on_file = dir.kept().iter().copied();
+        let Some(persisted) = on_file.rev().find(|kept| kept.generation == wanted) else {
             return Err(Unanswered::NotHeld(self.not_held(wanted)));
         };
         let world = self.store.world();
@@ -831,8 +844,10 @@ impl SpecDoor {
         }
     }
 
-    /// Whether the spec's source takes writes: a spec store is bound.
-    pub(crate) fn writable(&self) -> bool {
+    /// Whether the spec's source takes writes: a spec store is bound. A
+    /// host asks before it offers an [`enforce`](Self::enforce) or a
+    /// [`roll_back`](Self::roll_back).
+    pub fn writable(&self) -> bool {
         self.dir.get().is_some()
     }
 

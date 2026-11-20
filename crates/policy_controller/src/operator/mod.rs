@@ -9,15 +9,17 @@ mod answers;
 mod door;
 pub(crate) mod reader;
 pub mod snapshot;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod spec_store;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[path = "no_spec_store.rs"]
 pub(crate) mod spec_store;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod turn;
 
-#[cfg(all(test, feature = "controller"))]
-pub(crate) use answers::OnFile;
 pub use answers::{
-    Applied, Counts, Document, DryRun, Enforced, NeedsRow, NotHeld, SpecRejected, Status,
+    Applied, Counts, Document, DryRun, Enforced, NeedsRow, NotHeld, OnFile, SpecRejected, Status,
     Unanswered,
 };
 #[cfg(all(test, feature = "controller"))]
@@ -29,6 +31,5 @@ pub(crate) use door::Validate;
 pub(crate) use door::{above, over_bound, Checked, Held, Line};
 #[cfg(feature = "controller")]
 pub(crate) use door::{DRY_RUNS_WAITING, WRITES_WAITING};
-pub use reader::Format;
-pub(crate) use reader::MAX_DOCUMENT_BYTES;
+pub use reader::{Format, MAX_DOCUMENT_BYTES};
 pub use turn::Turn;
