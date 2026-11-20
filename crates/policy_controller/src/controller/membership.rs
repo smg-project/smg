@@ -279,15 +279,26 @@ impl Door {
             read => read.map_err(invalid)?,
         };
         // An engine that stands as ranks takes a registration that states
-        // its width: a plain row beside its ranks is the engine twice.
+        // its width: a plain row beside its ranks is the engine twice, and
+        // one rank laid alone would offer what the others do not. The URL
+        // may be the engine's or a rank's own. A caller that did not make
+        // the ranks is told so first, as the wide call tells it: an add
+        // asks no maker.
         #[cfg(feature = "worker-host")]
-        if self
-            .store
-            .of_engine(&spec.url)
-            .iter()
-            .any(|row| row.facts.key != spec.url)
         {
-            return Err(Status::failed_precondition(AS_RANKS));
+            let engine = standing
+                .as_ref()
+                .map_or(spec.url.as_str(), |row| row.facts.engine.as_str());
+            let mut ranks = self.store.of_engine(engine);
+            ranks.retain(|row| row.facts.key != engine);
+            if !ranks.is_empty() {
+                if mode != Mode::Add {
+                    for row in &ranks {
+                        made_by(row, maker)?;
+                    }
+                }
+                return Err(Status::failed_precondition(AS_RANKS));
+            }
         }
         if request.wait_ready && facts.health.probes {
             return Err(invalid(NO_HANDSHAKE));
@@ -496,11 +507,27 @@ fn refused(refusal: &HostRefused) -> Status {
     }
 }
 
+/// What a write made of its row, as its audit line names it, and the row.
+#[cfg(feature = "worker-host")]
+fn made(wrote: Wrote) -> (&'static str, WorkerId) {
+    match wrote {
+        Wrote::Registered(id) => ("registered", id),
+        Wrote::InPlace(id) => ("relabelled", id),
+        Wrote::Another { new, .. } => ("replaced", new),
+        Wrote::Unmoved(id) => ("nothing", id),
+        Wrote::Draining(id) => ("status", id),
+        Wrote::Removed(id) => ("removed", id),
+    }
+}
+
 /// The turn of a control call that states several ranks: the door's term
-/// and its lives, and each row as its write left it, for the call's answer.
+/// and its lives, each row as its write left it, for the call's answer,
+/// and each write's audit line as it lands. A call refused behind its
+/// first write leaves the lines of the writes that stand.
 #[cfg(feature = "worker-host")]
 struct CallTurn<'a> {
     door: &'a Door,
+    by: &'a Principal,
     term: u64,
     laid: RefCell<Vec<WorkerRow>>,
 }
@@ -530,6 +557,12 @@ impl Turn for CallTurn<'_> {
 
     fn laid(&self, row: &WorkerRow) {
         self.laid.borrow_mut().push(row.clone());
+    }
+
+    fn told(&self, wrote: Wrote) {
+        let (made, worker) = made(wrote);
+        let (epoch, at) = (self.door.store.epoch(), self.door.place());
+        audit_write(REGISTER, self.by, worker.0, made, epoch, at, None);
     }
 }
 
@@ -593,6 +626,7 @@ impl Door {
         let before = self.store.of_engine(&spec.url);
         let turn = CallTurn {
             door: self,
+            by,
             term: admitted,
             laid: RefCell::new(Vec::new()),
         };
@@ -603,35 +637,30 @@ impl Door {
         let mut rows = Vec::with_capacity(wrote.len());
         for (rank, wrote) in wrote.into_iter().enumerate() {
             let old = stood.get(rank).and_then(Option::as_ref);
-            let (event, made, worker) = match wrote {
-                Wrote::Registered(id) => {
+            let event = match wrote {
+                Wrote::Registered(_) => {
                     let row = self.answered(laid.next(), request)?;
-                    (worker_wire::registered(&row), "registered", id)
+                    worker_wire::registered(&row)
                 }
-                Wrote::InPlace(id) => {
+                Wrote::InPlace(_) => {
                     let row = self.answered(laid.next(), request)?;
-                    (worker_wire::relabelled(&row), "relabelled", id)
+                    worker_wire::relabelled(&row)
                 }
-                Wrote::Another { new, .. } => {
+                Wrote::Another { .. } => {
                     // A fresh row is pending: any other status came over
                     // from the old life, read before a connect signal.
                     let written = laid.next().ok_or_else(moved)?;
                     let carried = written.status != WorkerStatus::Pending;
                     let row = self.answered(Some(written), request)?;
-                    let old = old.ok_or_else(moved)?;
-                    (worker_wire::replaced(old, &row, carried), "replaced", new)
+                    worker_wire::replaced(old.ok_or_else(moved)?, &row, carried)
                 }
-                Wrote::Unmoved(id) => {
-                    let row = old.ok_or_else(moved)?;
-                    (worker_wire::relabelled(row), "nothing", id)
-                }
+                Wrote::Unmoved(_) => worker_wire::relabelled(old.ok_or_else(moved)?),
                 Wrote::Removed(id) => {
                     let last = before.iter().find(|row| row.id == id);
-                    (worker_wire::removed(last.ok_or_else(moved)?), "removed", id)
+                    worker_wire::removed(last.ok_or_else(moved)?)
                 }
                 Wrote::Draining(_) => return Err(moved()),
             };
-            audit_write(REGISTER, by, worker.0, made, epoch, at, None);
             rows.extend(worker_wire::rank_row(event));
         }
         Ok(worker_wire::event(
@@ -729,14 +758,7 @@ impl Hosted {
     }
 
     fn audit(&self, call: &'static str, wrote: Wrote, asker: Option<&str>) {
-        let (made, worker) = match wrote {
-            Wrote::Registered(id) => ("registered", id),
-            Wrote::InPlace(id) => ("relabelled", id),
-            Wrote::Another { new, .. } => ("replaced", new),
-            Wrote::Unmoved(id) => ("nothing", id),
-            Wrote::Draining(id) => ("status", id),
-            Wrote::Removed(id) => ("removed", id),
-        };
+        let (made, worker) = made(wrote);
         audit_write(
             call,
             &self.by,
@@ -1655,15 +1677,20 @@ pub(crate) mod tests {
         let (store, door) = door();
         door.register(&operator(), under(TERM), &ask(wide(URL, 2), Mode::Add))
             .expect("ranks");
+        // Under the engine's URL and under a rank's own: one rank laid
+        // alone would offer what the engine's other rank does not.
+        let rank = format!("{URL}@0");
         for mode in [Mode::Add, Mode::Replace, Mode::Upsert] {
-            let refused = door
-                .register(&operator(), under(TERM), &ask(spec(URL), mode))
-                .expect_err("the engine stands as ranks");
-            assert_eq!(
-                (refused.code(), refused.message()),
-                (Code::FailedPrecondition, super::AS_RANKS),
-                "{mode:?}"
-            );
+            for url in [URL, rank.as_str()] {
+                let refused = door
+                    .register(&operator(), under(TERM), &ask(spec(url), mode))
+                    .expect_err("the engine stands as ranks");
+                assert_eq!(
+                    (refused.code(), refused.message()),
+                    (Code::FailedPrecondition, super::AS_RANKS),
+                    "{mode:?} {url}"
+                );
+            }
         }
         assert_eq!(store.epoch(), 2);
 
@@ -1680,6 +1707,155 @@ pub(crate) mod tests {
         door.register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
             .expect("the plain row");
         assert!(store.by_key(URL).is_some());
+    }
+
+    /// A one-rank replacement or upsert over ranks another maker laid is
+    /// told who made them, ahead of the engine's form, as the wide call
+    /// tells it. An add asks no maker.
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_registration_of_one_rank_over_another_makers_ranks_is_told_the_maker_first() {
+        let (store, door) = door();
+        door.upsert(
+            &operator(),
+            &found(URL),
+            TERM,
+            &ask(wide(URL, 2), Mode::Add),
+        )
+        .expect("a provider's ranks");
+        let rank = format!("{URL}@0");
+        let register = |spec: proto::WorkerSpec, mode| {
+            door.register(&operator(), under(TERM), &ask(spec, mode))
+                .expect_err("ranks of another maker")
+        };
+        for mode in [Mode::Replace, Mode::Upsert] {
+            for asked in [spec(URL), spec(&rank), wide(URL, 2)] {
+                let url = asked.url.clone();
+                let refused = register(asked, mode);
+                assert_eq!(refused.code(), Code::PermissionDenied, "{mode:?} {url}");
+            }
+        }
+        for url in [URL, rank.as_str()] {
+            let refused = register(spec(url), Mode::Add);
+            assert_eq!(
+                (refused.code(), refused.message()),
+                (Code::FailedPrecondition, super::AS_RANKS),
+                "{url}"
+            );
+        }
+        assert_eq!(store.epoch(), 2);
+    }
+
+    /// The door's log as its store's journal, which leaves its term as the
+    /// first membership write lands: a lead lost inside one call.
+    #[cfg(feature = "worker-host")]
+    struct LosesTheLead {
+        log: Arc<crate::replication::Log>,
+        lost: AtomicBool,
+    }
+
+    #[cfg(feature = "worker-host")]
+    impl store::Journal for LosesTheLead {
+        fn member(
+            &self,
+            at: Option<Position>,
+            epoch: u64,
+            change: store::MembershipChange,
+            row: Option<&WorkerRow>,
+            left: Option<&WorkerRow>,
+        ) {
+            self.log.member(at, epoch, change, row, left);
+            if !self.lost.swap(true, Ordering::Relaxed) {
+                let next = Position {
+                    seq: 40,
+                    term: TERM + 1,
+                };
+                assert!(self.log.restart(next).is_ok(), "a place the log takes");
+            }
+        }
+
+        fn load(&self, at: Option<Position>, id: WorkerId, rank: u16, sample: &store::LoadSample) {
+            self.log.load(at, id, rank, sample);
+        }
+
+        fn generation(&self, at: Option<Position>, generation: u64) {
+            self.log.generation(at, generation);
+        }
+
+        fn term_rose(&self, term: u64) {
+            self.log.term_rose(term);
+        }
+
+        fn term_followed(&self, at: Position) {
+            self.log.term_followed(at);
+        }
+
+        fn carries_loads(&self) -> bool {
+            self.log.carries_loads()
+        }
+
+        fn head(&self, kinds: store::Kinds) -> Position {
+            self.log.head(kinds)
+        }
+
+        fn followed(&self) -> Option<u64> {
+            self.log.followed()
+        }
+
+        fn released(&self) {
+            self.log.released();
+        }
+
+        fn restart(&self, at: Position) -> bool {
+            self.log.restart(at).is_ok()
+        }
+    }
+
+    /// A wide call that loses its lead between two ranks is refused. The
+    /// rank written before the refusal stands, and its write leaves its
+    /// audit line ahead of the refusal's.
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_term_lost_between_two_ranks_leaves_the_first_rank_and_its_audit_line() {
+        let lines = Logged::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _kept = tracing::subscriber::set_default(subscriber);
+
+        let (_, feed) = journaled_from(&LeasePlace::Process, 0);
+        let journal = Arc::new(LosesTheLead {
+            log: Arc::clone(&feed.log),
+            lost: AtomicBool::new(false),
+        });
+        let store = Arc::new(MemoryStore::journaled(journal).with_deciders(1));
+        store::LeasesStore::set_term(store.as_ref(), TERM);
+        let door = Door::based(Arc::clone(&store), Arc::clone(&feed.log), 0);
+
+        let refused = door
+            .register(&operator(), under(TERM), &ask(wide(URL, 2), Mode::Add))
+            .expect_err("the lead was lost at the second rank");
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (Code::Unavailable, super::LEADS_NO_TERM)
+        );
+        assert!(store.by_key(&format!("{URL}@0")).is_some());
+        assert!(store.by_key(&format!("{URL}@1")).is_none());
+
+        let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+        let lines: Vec<&str> = logged.lines().collect();
+        let [written, refusal] = lines.as_slice() else {
+            panic!("one write's line and the refusal's: {logged}");
+        };
+        assert!(
+            written.contains("membership write") && written.contains("made=\"registered\""),
+            "{written}"
+        );
+        assert!(refusal.contains("membership call refused"), "{refusal}");
+        assert!(!logged.contains(URL), "{logged}");
     }
 
     /// A registration states at most 64 ranks. At the bound, with every rank

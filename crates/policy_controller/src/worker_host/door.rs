@@ -39,7 +39,9 @@ impl Wrote {
     }
 }
 
-/// A write the door refused. Nothing was written.
+/// A write the door refused. Nothing was written, with one exception: a
+/// registration's rows refused as [`Refused::NotLeading`] behind their first
+/// write keep the rows written before the lead was lost.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Refused {
