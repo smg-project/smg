@@ -271,6 +271,10 @@ pub(crate) trait Turn {
     /// store's measure.
     fn room(&self, facts: &WorkerFacts, maker: &Maker) -> Result<(), Refused>;
 
+    /// Hear a row as its write left it, ahead of the connect signal of a
+    /// row whose checks are off.
+    fn laid(&self, _: &WorkerRow) {}
+
     /// Hear a row's write at its place in the turn.
     fn told(&self, _: Wrote) {}
 }
@@ -319,7 +323,7 @@ pub(crate) fn stating<T>(
 
 /// What a stated row leaves to write: its facts, and what laying them makes
 /// of the row that stands under its URL.
-type Ready = (WorkerFacts, Option<(WorkerId, Laid)>);
+pub(crate) type Ready = (WorkerFacts, Option<(WorkerId, Laid)>);
 
 /// Whether a registration states its engine as one row: the row stands
 /// under the engine's own URL and states no rank. Such a row is the engine
@@ -419,17 +423,35 @@ pub(crate) fn lay(
         };
         return lay_one(turn, maker, expect, row.url, row.state).map(|wrote| vec![wrote]);
     }
-    let store = turn.store();
     let mut ready = Vec::with_capacity(rows.len());
     for row in rows {
         ready.push(ready_row(turn, maker, expect, row)?);
     }
+    lay_ready(turn, maker, expect == Expect::Nothing, ready)
+}
 
+/// The group's rule over the rows one registration states, then the rows
+/// that leave and the writes. A door that states its rows by a rule of its
+/// own enters here, behind that rule: `adds` says the registration expects
+/// no row of the engine to stand.
+pub(crate) fn lay_ready(
+    turn: &impl Turn,
+    maker: &Maker,
+    adds: bool,
+    ready: Vec<Ready>,
+) -> Result<Vec<Wrote>, Refused> {
+    let store = turn.store();
+    let Some((first, _)) = ready.first() else {
+        return Err(Refused::Past(Past {
+            fact: "rows",
+            why: "a registration states at least one row",
+        }));
+    };
     // The engine is the one the first row states. The others are held to
     // it below, and the store is asked by it.
-    let engine = ready[0].0.engine.as_str();
+    let engine = first.engine.as_str();
     if !states_the_engine_whole(&ready) {
-        let width = usize::from(ready[0].0.dp_size);
+        let width = usize::from(first.dp_size);
         if width < 2 || width != ready.len() {
             return Err(RANKS);
         }
@@ -457,12 +479,12 @@ pub(crate) fn lay(
     let mut left: Vec<_> = store
         .of_engine(engine)
         .into_iter()
-        .filter(|row| rows.iter().all(|stated| stated.url != row.facts.key))
+        .filter(|row| ready.iter().all(|(facts, _)| facts.key != row.facts.key))
         .collect();
     left.sort_by_key(|row| row.facts.dp_rank);
     for row in &left {
         // An add retires no row: the engine stands in another form.
-        if expect == Expect::Nothing {
+        if adds {
             return Err(Refused::Stands);
         }
         made_by(row, maker)?;
@@ -513,8 +535,10 @@ fn write_row(
             return Err(Refused::Moved);
         }
     };
-    if !probes {
-        if let Some(row) = store.get(change.id()) {
+    // The row as its write left it: a connect signal moves it next.
+    if let Some(row) = store.get(change.id()) {
+        turn.laid(&row);
+        if !probes {
             store.connected(row.id, row.revision, &|| true);
         }
     }
