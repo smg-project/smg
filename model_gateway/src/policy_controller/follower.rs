@@ -10,7 +10,7 @@
 //! The store publishes a snapshot's rows as it lays them, and so it does
 //! a replaced incarnation and a status change. Between such an event and
 //! its settle a decision can name a row whose worker the registry does
-//! not hold yet. The host passes that target over and asks again.
+//! not hold yet. The policy engine passes that target over and asks again.
 
 use std::{sync::Arc, time::Duration};
 
@@ -288,8 +288,8 @@ pub(crate) mod tests {
     use crate::{
         config::RouterConfig,
         policy_controller::{
+            engine::{Ask, PolicyEngine},
             feed::{following, Feed},
-            host::{Ask, Host},
             start,
         },
         routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BackendConnector},
@@ -541,14 +541,14 @@ pub(crate) mod tests {
             .expect("the controller was picked");
             let registry = Arc::new(WorkerRegistry::new());
             let feed = followed(&store, &registry);
-            let host = Host::new(store, Arc::clone(&feed.objects));
+            let policy_engine = PolicyEngine::new(store, Arc::clone(&feed.objects));
             let follower = Follower::start(settings(controller.address), feed);
             until("the first snapshot", || {
                 follower.followed() == Followed::Fleet
             })
             .await;
 
-            let placed = host
+            let placed = policy_engine
                 .place(&Ask::of(b"first", "model"), Instant::now())
                 .await
                 .expect("a decision picks the followed worker");

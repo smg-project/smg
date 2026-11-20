@@ -81,7 +81,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
     },
     policies::PolicyRegistry,
-    policy_controller::host::{Host, Placed},
+    policy_controller::engine::{Placed, PolicyEngine},
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
         common::{
@@ -119,7 +119,7 @@ pub(crate) enum Endpoint {
 pub(crate) struct PipelineDeps {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
-    host: Option<Arc<Host>>,
+    policy_engine: Option<Arc<PolicyEngine>>,
     /// Whether the pair's policy settings keep a request to the worker it
     /// names (`placement::pair_keeps_target`). No role policy is built under
     /// the policy controller, so the selection stage is told.
@@ -165,7 +165,7 @@ impl PipelineDeps {
         Self {
             worker_registry,
             policy_registry,
-            host: None,
+            policy_engine: None,
             pair_keeps_target: false,
             prefill_admission,
             tool_parser_factory,
@@ -191,7 +191,7 @@ impl PipelineDeps {
         Self {
             worker_registry,
             policy_registry,
-            host: None,
+            policy_engine: None,
             pair_keeps_target: false,
             prefill_admission,
             tool_parser_factory: ToolParserFactory::default(),
@@ -222,11 +222,11 @@ impl PipelineDeps {
         self
     }
 
-    /// Place regular requests through the policy controller's `host`, where
+    /// Place regular requests through the policy engine `policy_engine`, where
     /// the context holds one.
     #[must_use]
-    pub(crate) fn with_host(mut self, host: Option<Arc<Host>>) -> Self {
-        self.host = host;
+    pub(crate) fn with_policy_engine(mut self, policy_engine: Option<Arc<PolicyEngine>>) -> Self {
+        self.policy_engine = policy_engine;
         self
     }
 
@@ -298,7 +298,7 @@ impl PipelineDeps {
         Self {
             worker_registry: Arc::new(WorkerRegistry::new()),
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
-            host: None,
+            policy_engine: None,
             pair_keeps_target: false,
             prefill_admission: None,
             tool_parser_factory: ToolParserFactory::default(),
@@ -380,7 +380,7 @@ impl RequestPipeline {
             mode.worker_selection(),
             deps.prefill_admission.clone(),
         )
-        .with_host(deps.host.clone())
+        .with_policy_engine(deps.policy_engine.clone())
         .with_pair_keeps_target(deps.pair_keeps_target)
         .with_queue_timeout(deps.queue_timeout);
         let plan_settings = mode.plan_settings();
@@ -619,7 +619,7 @@ impl RequestPipeline {
 
     /// Whether client acquisition re-checks the chosen workers' overload
     /// flag: under `--worker-overload-shed`, for a selection the classic
-    /// policies made. A placement the controller's host made is not
+    /// policies made. A placement the policy engine made is not
     /// re-checked. There the overload veto is the controller's, read from
     /// its rows, and the flag on the object mirrors it for the gateway's
     /// other readers: a worker flagged under another pool's thresholds

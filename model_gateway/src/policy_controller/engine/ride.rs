@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use smg_policy_controller::{lease::TransportClass, ReleaseReason};
 use smg_worker::identity::basic::Worker;
 
-use super::{transport_class, Ask, End, Host, Placed};
+use super::{transport_class, Ask, End, Placed, PolicyEngine};
 use crate::{middleware::metrics::BodyProgress, routers::common::attempt_ledger::UpstreamAnswer};
 
 /// Response extension: the gateway made this answer behind the worker's own
@@ -85,8 +85,8 @@ impl DrainEnd {
 
 /// A placement with what an HTTP router alone knows of its send:
 /// the instant, and the mark its streamed answer's relay writes at a cut.
-/// The host's [`Placed`] keeps neither, so a route that needs none carries
-/// none.
+/// The policy engine's [`Placed`] keeps neither, so a route that needs none
+/// carries none.
 pub(crate) struct Sent {
     placed: Placed,
     at: Option<Instant>,
@@ -140,12 +140,12 @@ impl Sent {
     /// ([`Placed::decode_again`]).
     pub(crate) fn decode_again(
         &mut self,
-        host: &Host,
+        policy_engine: &PolicyEngine,
         ask: &Ask<'_>,
         holds: impl Fn(&Arc<dyn Worker>) -> bool,
         now: Instant,
     ) -> Option<&Arc<dyn Worker>> {
-        self.placed.decode_again(host, ask, holds, now)
+        self.placed.decode_again(policy_engine, ask, holds, now)
     }
 
     /// A pair's prefill answered `status` at `now`, ahead of the end of the

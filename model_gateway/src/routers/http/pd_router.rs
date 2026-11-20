@@ -61,7 +61,7 @@ use crate::{
         otel_trace::with_trace_context_http,
     },
     policies::{CacheNamespace, PolicyRegistry, WorkerRole},
-    policy_controller::host::{self, Ask, Hashes, Host, Prompt, Sent, Unplaced},
+    policy_controller::engine::{self, Ask, Hashes, PolicyEngine, Prompt, Sent, Unplaced},
     rate_limit::RateLimitManager,
     routers::{
         common::{
@@ -149,7 +149,7 @@ struct PairAsked<'a> {
     id: [u8; 8],
     model: Cow<'a, str>,
     /// The prompt's hashes, made once an attempt for the model the ask
-    /// names. The ask states no count beside them: the host takes the
+    /// names. The ask states no count beside them: the policy engine takes the
     /// request's size from them, by one rule for token ids and for text.
     hashes: Hashes,
     /// The attempt's number. The tried rows do not count the attempts: a
@@ -179,10 +179,11 @@ impl PairAsked<'_> {
     }
 }
 
-/// What the sequential dispatch asks a pair's decode again with: the host,
-/// the attempt's ask, and the key the decode's load guard is taken under.
+/// What the sequential dispatch asks a pair's decode again with: the policy
+/// engine, the attempt's ask, and the key the decode's load guard is taken
+/// under.
 struct DecodeAgain<'a> {
-    host: &'a Host,
+    policy_engine: &'a PolicyEngine,
     asked: &'a PairAsked<'a>,
     sticky_key: Option<&'a str>,
 }
@@ -280,8 +281,8 @@ pub struct PDRouter {
     /// tenant reserves through it before its first dispatch
     /// (`tenant_rate_limit::reserve`).
     rate_limit_manager: Option<Arc<RateLimitManager>>,
-    /// The policy controller's host, when it places this router's pairs.
-    host: Option<Arc<Host>>,
+    /// The policy engine, when it places this router's pairs.
+    policy_engine: Option<Arc<PolicyEngine>>,
     /// Whether the pair's policy settings keep a request to the worker it
     /// names ([`placement::pair_keeps_target`]). No role policy is built
     /// under the policy controller, so the router keeps what its settings
@@ -318,7 +319,7 @@ struct PDRequestContext<'a> {
     model_id: &'a str,
     headers: Option<HeaderMap>,
     /// The request's own id, the `rid` of its body, where the policy
-    /// controller's host places the request: a source of its routing key.
+    /// engine places the request: a source of its routing key.
     rid: Option<&'a str>,
 }
 
@@ -592,7 +593,7 @@ impl PDRouter {
             prefill_admission: ctx.prefill_admission.clone(),
             moriio_dp_turn: AtomicUsize::new(0),
             rate_limit_manager: ctx.rate_limit_manager.clone(),
-            host: ctx.policy_host.clone(),
+            policy_engine: ctx.policy_engine.clone(),
             keeps_target: placement::pair_keeps_target(
                 &ctx.router_config.mode,
                 &ctx.router_config.policy,
@@ -756,9 +757,9 @@ impl PDRouter {
         body: R,
         model_id: &str,
     ) -> Response {
-        // The host hashes the prompt for the document in force, whatever
-        // the classic policies read.
-        let (text, tokens) = if self.host.is_some() || self.policies_need_request_text() {
+        // The policy engine hashes the prompt for the document in force,
+        // whatever the classic policies read.
+        let (text, tokens) = if self.policy_engine.is_some() || self.policies_need_request_text() {
             body.routing_inputs()
         } else {
             (None, None)
@@ -772,10 +773,10 @@ impl PDRouter {
                 .map(str::to_string),
             cache_namespace: CacheNamespace::derive(&body.cache_partition()),
         };
-        // The host's ask reads the body's own id after the dispatch took the
-        // body. The classic path copies nothing.
+        // The policy engine's ask reads the body's own id after the dispatch
+        // took the body. The classic path copies nothing.
         let rid = self
-            .host
+            .policy_engine
             .as_ref()
             .and_then(|_| body.rid().map(str::to_owned));
         let context = PDRequestContext {
@@ -857,9 +858,9 @@ impl PDRouter {
 
         // What the request's attempts tell the worker pool: a retry selects
         // around a worker whose answer was definitive (`attempt_ledger`).
-        let ledger = AttemptLedger::of(self.host.is_some());
+        let ledger = AttemptLedger::of(self.policy_engine.is_some());
         // The rows of the pairs the request's failed attempts were sent to,
-        // for the policy controller's host. The classic path leaves it empty.
+        // for the policy engine. The classic path leaves it empty.
         let tried_rows = parking_lot::Mutex::new(Vec::new());
 
         let response = if let Some(denied) = denial {
@@ -974,7 +975,7 @@ impl PDRouter {
         // Admission may queue the request, so the classic selection's inputs
         // are copied out of the lease's synchronous view first. The hosted
         // arm hashes its prompt under the view and copies none of it.
-        let hosted = self.host.is_some();
+        let hosted = self.policy_engine.is_some();
         let (text, tokens, rid_key, cache_namespace) = lease.with_view(|view| {
             let (text, tokens) = if hosted {
                 (None, None)
@@ -999,7 +1000,7 @@ impl PDRouter {
             if attempt == 0 { None } else { Some(&admits) };
         // The dispatch takes the context; the settle reads the model after it.
         let model_id = context.model_id;
-        let (prefill, decode, guards, mut placed, asked) = match &self.host {
+        let (prefill, decode, guards, mut placed, asked) = match &self.policy_engine {
             None => {
                 let selected = self
                     .select_pd_pair_with_admission(
@@ -1048,10 +1049,11 @@ impl PDRouter {
                 }
                 (prefill, decode, guards, None, None)
             }
-            // The host places the pair. The controller's own overload verdict,
-            // from its document's thresholds, stands in for the gateway's
-            // dispatch-time re-check, as on the regular router's hosted path.
-            Some(host) => {
+            // The policy engine places the pair. The controller's own overload
+            // verdict, from its document's thresholds, stands in for the
+            // gateway's dispatch-time re-check, as on the regular router's
+            // hosted path.
+            Some(policy_engine) => {
                 // The prompt the classic selection routes by, hashed under
                 // the lease's view as the regular route hashes it: the
                 // request's token ids where it has them, else its text.
@@ -1061,12 +1063,18 @@ impl PDRouter {
                             text: view.text,
                             ..Prompt::of(view.tokens, view.cache_namespace)
                         };
-                        host.hashes(model, &prompt)
+                        policy_engine.hashes(model, &prompt)
                     })
                 };
                 let placed = self
                     .place_pair_attempt(
-                        host, &context, attempt, hashed, sticky_key, tried_rows, ledger,
+                        policy_engine,
+                        &context,
+                        attempt,
+                        hashed,
+                        sticky_key,
+                        tried_rows,
+                        ledger,
                     )
                     .await;
                 match placed {
@@ -1243,15 +1251,15 @@ impl PDRouter {
 
             // Under the policy controller the sequential dispatch can ask
             // the decode again behind its prefill's answer.
-            let again = self
-                .host
-                .as_deref()
-                .zip(asked.as_ref())
-                .map(|(host, asked)| DecodeAgain {
-                    host,
-                    asked,
-                    sticky_key,
-                });
+            let again =
+                self.policy_engine
+                    .as_deref()
+                    .zip(asked.as_ref())
+                    .map(|(policy_engine, asked)| DecodeAgain {
+                        policy_engine,
+                        asked,
+                        sticky_key,
+                    });
             // Outcome accounting happens per-side inside the sequential path:
             // a prefill-only failure must not feed the decode worker's
             // circuit breaker (the decode side was never contacted).
@@ -1425,8 +1433,8 @@ impl PDRouter {
 
     /// The refusal of a request that names its worker, where a role's
     /// classic policy holds it to that worker ([`placement::strict_target`]).
-    /// The host reads no explicit target yet and would place the pair on
-    /// other workers, so the shape is refused by name.
+    /// The policy engine reads no explicit target yet and would place the pair
+    /// on other workers, so the shape is refused by name.
     fn explicit_target_refusal(&self, headers: Option<&HeaderMap>) -> Option<Response> {
         // A request that names no worker pays the header's probe alone.
         header_utils::extract_target_worker(headers)?;
@@ -1454,7 +1462,7 @@ impl PDRouter {
     )]
     async fn place_pair_attempt<'a>(
         &self,
-        host: &Host,
+        policy_engine: &PolicyEngine,
         context: &PDRequestContext<'a>,
         attempt: u32,
         hashed: impl FnOnce(&str) -> Hashes,
@@ -1474,7 +1482,7 @@ impl PDRouter {
         if let Some(refusal) = self.explicit_target_refusal(context.headers.as_ref()) {
             return Err(refusal);
         }
-        let id = host::mark();
+        let id = engine::mark();
         let tried = tried_rows.lock().clone();
         let hashes = hashed(&model);
         let asked = PairAsked {
@@ -1484,7 +1492,7 @@ impl PDRouter {
             attempt: u8::try_from(attempt).unwrap_or(u8::MAX),
             tried,
         };
-        let placed = host
+        let placed = policy_engine
             .place_pair_where(
                 &asked.ask(context),
                 on_pair_route(ledger),
@@ -2344,7 +2352,9 @@ impl PDRouter {
                 let rule = |worker: &Arc<dyn Worker>| {
                     on_route(worker.as_ref()) && !is_moriio_worker(worker.as_ref())
                 };
-                if let Some(moved) = placed.decode_again(again.host, &ask, rule, Instant::now()) {
+                if let Some(moved) =
+                    placed.decode_again(again.policy_engine, &ask, rule, Instant::now())
+                {
                     decode = Arc::clone(moved);
                     decode_guard = WorkerLoadGuard::with_key(Arc::clone(moved), again.sticky_key);
                 }
@@ -3969,7 +3979,7 @@ mod tests {
             prefill_admission: None,
             moriio_dp_turn: AtomicUsize::new(0),
             rate_limit_manager: None,
-            host: None,
+            policy_engine: None,
             keeps_target: false,
         }
     }

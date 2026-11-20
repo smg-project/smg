@@ -13,7 +13,7 @@ use tonic::Code;
 use super::metrics::mark_error_reason;
 use crate::{
     observability::metrics::metrics_labels,
-    policy_controller::host,
+    policy_controller::engine,
     routers::{
         common::retry::{mark_non_retryable, request_timeout_response},
         error,
@@ -74,8 +74,8 @@ pub(crate) trait TonicStatusExt {
     /// the policy controller reads beside the status: a failed connection
     /// where the status is no answer of the worker's (its connection failed
     /// under the call, its side ended the call, the dial failed, or it
-    /// answered no keep-alive ping), else the class the host gives the HTTP
-    /// status it maps to, as an answer of the worker's. The same status is
+    /// answered no keep-alive ping), else the class the policy engine gives the
+    /// HTTP status it maps to, as an answer of the worker's. The same status is
     /// the same class on either side of the first chunk.
     fn transport_class(&self) -> TransportClass;
 
@@ -278,7 +278,7 @@ impl TonicStatusExt for tonic::Status {
         {
             return TransportClass::ConnectFailed;
         }
-        host::transport_class(self.http_status(), true)
+        engine::transport_class(self.http_status(), true)
     }
 
     fn client_message(&self) -> &str {
@@ -380,8 +380,8 @@ impl TonicStatusExt for tonic::Status {
 
 /// The transport class of the dispatch that `response` ended: the class its
 /// worker's status named, where the response was made of one (see
-/// [`TonicStatusExt::to_http_error`]), else the class the host gives the
-/// response's own status as an answered one. An answer the router made
+/// [`TonicStatusExt::to_http_error`]), else the class the policy engine gives
+/// the response's own status as an answered one. An answer the router made
 /// itself is read here only behind a send: a failed connection is classed
 /// at its status, and a failure ahead of the send reports no class.
 pub(crate) fn transport_class_of(response: &Response) -> TransportClass {
@@ -389,7 +389,7 @@ pub(crate) fn transport_class_of(response: &Response) -> TransportClass {
         .extensions()
         .get::<TransportClass>()
         .copied()
-        .unwrap_or_else(|| host::transport_class(response.status(), true))
+        .unwrap_or_else(|| engine::transport_class(response.status(), true))
 }
 
 /// Whether `status` is the engine's own report that the request failed (its

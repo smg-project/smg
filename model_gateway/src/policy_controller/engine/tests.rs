@@ -1,5 +1,5 @@
-//! Cases of the host over the module's test support: rows written by hand
-//! through the store's own door, beside workers registered by hand.
+//! Cases of the policy engine over the module's test support: rows written by
+//! hand through the store's own door, beside workers registered by hand.
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -57,7 +57,7 @@ use smg_worker::{
 use super::{
     elapsed_micros, left_no_worker, mark, profile_of,
     testing::{bed, bed_under, cache_bed, record_bed, store_blocks, MODEL},
-    transport_class, Ask, End, Hashes, Held, Host, Placed, Prompt, Sent, Unplaced, GATEWAY,
+    transport_class, Ask, End, Hashes, Held, Placed, PolicyEngine, Prompt, Sent, Unplaced, GATEWAY,
     NO_STAGE,
 };
 use crate::{
@@ -255,9 +255,14 @@ fn live(store: &MemoryStore, expected: usize) -> usize {
 
 #[tokio::test]
 async fn a_placement_never_sent_says_nothing_at_its_end() {
-    let (host, store, _) = bed(&["http://w0:8000"]);
+    let (policy_engine, store, _) = bed(&["http://w0:8000"]);
     let now = Instant::now();
-    let placed = Sent::from(host.place(&first(b"r1"), now).await.expect("a worker"));
+    let placed = Sent::from(
+        policy_engine
+            .place(&first(b"r1"), now)
+            .await
+            .expect("a worker"),
+    );
     let row = placed.id();
     assert_eq!(live(&store, 1), 1);
 
@@ -268,9 +273,14 @@ async fn a_placement_never_sent_says_nothing_at_its_end() {
 
 #[tokio::test]
 async fn a_whole_end_records_a_success_at_its_instant() {
-    let (host, store, _) = bed(&["http://w0:8000"]);
+    let (policy_engine, store, _) = bed(&["http://w0:8000"]);
     let sent = Instant::now();
-    let mut placed = Sent::from(host.place(&first(b"r1"), sent).await.expect("a worker"));
+    let mut placed = Sent::from(
+        policy_engine
+            .place(&first(b"r1"), sent)
+            .await
+            .expect("a worker"),
+    );
     let row = placed.id();
     placed.dispatched(sent);
     let end = sent + Duration::from_millis(1);
@@ -284,9 +294,14 @@ async fn a_whole_end_records_a_success_at_its_instant() {
 #[tokio::test]
 async fn a_body_keeps_its_head_and_reports_what_its_frames_show() {
     for failed in [false, true] {
-        let (host, store, _) = bed(&["http://w0:8000"]);
+        let (policy_engine, store, _) = bed(&["http://w0:8000"]);
         let sent = Instant::now();
-        let mut placed = Sent::from(host.place(&first(b"r1"), sent).await.expect("a worker"));
+        let mut placed = Sent::from(
+            policy_engine
+                .place(&first(b"r1"), sent)
+                .await
+                .expect("a worker"),
+        );
         let row = placed.id();
         placed.dispatched(sent);
 
@@ -327,9 +342,14 @@ async fn a_body_keeps_its_head_and_reports_what_its_frames_show() {
 
 #[tokio::test]
 async fn a_body_the_relay_marked_cut_ends_as_a_failure() {
-    let (host, store, _) = bed(&["http://w0:8000"]);
+    let (policy_engine, store, _) = bed(&["http://w0:8000"]);
     let sent = Instant::now();
-    let mut placed = Sent::from(host.place(&first(b"r1"), sent).await.expect("a worker"));
+    let mut placed = Sent::from(
+        policy_engine
+            .place(&first(b"r1"), sent)
+            .await
+            .expect("a worker"),
+    );
     let row = placed.id();
     placed.dispatched(sent);
     // The relay ends a cut body cleanly and writes the cut on the mark.
@@ -349,9 +369,14 @@ async fn a_body_the_relay_marked_cut_ends_as_a_failure() {
 #[tokio::test]
 async fn a_sized_body_ends_its_lease_at_its_last_declared_byte() {
     for whole in [true, false] {
-        let (host, store, _) = bed(&["http://w0:8000"]);
+        let (policy_engine, store, _) = bed(&["http://w0:8000"]);
         let sent = Instant::now();
-        let mut placed = Sent::from(host.place(&first(b"r1"), sent).await.expect("a worker"));
+        let mut placed = Sent::from(
+            policy_engine
+                .place(&first(b"r1"), sent)
+                .await
+                .expect("a worker"),
+        );
         let row = placed.id();
         placed.dispatched(sent);
 
@@ -397,9 +422,14 @@ async fn a_response_with_nothing_to_send_ends_its_lease_at_its_head() {
         (StatusCode::NOT_MODIFIED, false, None, None, true),
         (OK, true, None, Some(StatusCode::GATEWAY_TIMEOUT), false),
     ] {
-        let (host, store, _) = bed(&["http://w0:8000"]);
+        let (policy_engine, store, _) = bed(&["http://w0:8000"]);
         let sent = Instant::now();
-        let mut placed = Sent::from(host.place(&first(b"r1"), sent).await.expect("a worker"));
+        let mut placed = Sent::from(
+            policy_engine
+                .place(&first(b"r1"), sent)
+                .await
+                .expect("a worker"),
+        );
         let row = placed.id();
         placed.dispatched(sent);
         if let Some(cut) = cut {
@@ -428,9 +458,14 @@ async fn a_response_with_nothing_to_send_ends_its_lease_at_its_head() {
 /// nobody. Its lease ends cancelled, like one dropped mid-way.
 #[tokio::test]
 async fn a_pending_stream_dropped_unpolled_is_cancelled() {
-    let (host, store, _) = bed(&["http://w0:8000"]);
+    let (policy_engine, store, _) = bed(&["http://w0:8000"]);
     let sent = Instant::now();
-    let mut placed = Sent::from(host.place(&first(b"r1"), sent).await.expect("a worker"));
+    let mut placed = Sent::from(
+        policy_engine
+            .place(&first(b"r1"), sent)
+            .await
+            .expect("a worker"),
+    );
     let row = placed.id();
     placed.dispatched(sent);
 
@@ -455,9 +490,14 @@ async fn the_placement_drops_before_its_body() {
         }
     }
 
-    let (host, store, workers) = bed(&["http://w0:8000"]);
+    let (policy_engine, store, workers) = bed(&["http://w0:8000"]);
     let sent = Instant::now();
-    let mut placed = Sent::from(host.place(&first(b"r1"), sent).await.expect("a worker"));
+    let mut placed = Sent::from(
+        policy_engine
+            .place(&first(b"r1"), sent)
+            .await
+            .expect("a worker"),
+    );
     let row = placed.id();
     placed.dispatched(sent);
     let observed = Arc::new(AtomicUsize::new(1));
@@ -484,8 +524,8 @@ async fn the_placement_drops_before_its_body() {
 
 #[tokio::test]
 async fn a_pick_lands_on_the_gateways_worker_of_its_row() {
-    let (host, store, _workers) = bed(&["http://w0:8000", "http://w1:8000"]);
-    let placed = host
+    let (policy_engine, store, _workers) = bed(&["http://w0:8000", "http://w1:8000"]);
+    let placed = policy_engine
         .place(&first(b"r1"), Instant::now())
         .await
         .expect("a worker");
@@ -513,7 +553,7 @@ fn assert_decisions(rendered: &str, profile: &str, outcome: &str, count: u32) {
 
 #[test]
 fn a_placement_counts_and_times_its_documents_profile() {
-    let (host, store, _) = bed(&["http://w0:8000"]);
+    let (policy_engine, store, _) = bed(&["http://w0:8000"]);
     let document: PolicySpec = serde_yaml::from_str(
         "apiVersion: smg.policy/v1
 generation: 2
@@ -530,7 +570,7 @@ bindings:
     store
         .apply(AppliedSpec::validate(&document).unwrap())
         .unwrap();
-    assert!(host
+    assert!(policy_engine
         .profile_name(&Trace {
             generation: 1,
             ..Trace::default()
@@ -539,7 +579,7 @@ bindings:
     let before = Instant::now();
     let rendered = render_with_recorder(|| {
         let now = before - Duration::from_secs(60);
-        assert!(host
+        assert!(policy_engine
             .place(&first(b"r1"), now)
             .now_or_never()
             .unwrap()
@@ -593,7 +633,7 @@ fn a_shed_and_each_attempt_to_take_a_target_are_counted() {
 
 #[test]
 fn a_request_no_binding_covers_is_shed_under_no_profile() {
-    let (host, store, _) = bed(&["http://w0:8000"]);
+    let (policy_engine, store, _) = bed(&["http://w0:8000"]);
     let document: PolicySpec = serde_yaml::from_str(
         "apiVersion: smg.policy/v1
 generation: 2
@@ -609,7 +649,10 @@ bindings:
         .unwrap();
     let rendered = render_with_recorder(|| {
         cache_trace::scope(true, async {
-            let unplaced = host.place(&first(b"r1"), Instant::now()).await.err();
+            let unplaced = policy_engine
+                .place(&first(b"r1"), Instant::now())
+                .await
+                .err();
             assert!(
                 matches!(
                     unplaced,
@@ -658,11 +701,11 @@ fn only_a_shed_ahead_of_every_profile_names_no_profile() {
 
 #[test]
 fn a_refused_ask_is_counted_without_a_profile() {
-    let (host, store, _) = bed(&["http://w0:8000"]);
+    let (policy_engine, store, _) = bed(&["http://w0:8000"]);
     // A term above the lease id's term bits cannot mint a lease.
     LeasesStore::set_term(&*store, 1 << 31);
     let rendered = render_with_recorder(|| {
-        let refused = host
+        let refused = policy_engine
             .ask(&first(b"r1"), &[], Instant::now())
             .now_or_never()
             .unwrap()
@@ -674,16 +717,16 @@ fn a_refused_ask_is_counted_without_a_profile() {
 
 #[tokio::test]
 async fn a_trace_records_the_worker_taken_each_miss_and_the_shed() {
-    let (host, store, workers) = bed(&["http://w0:8000", "http://w1:8000"]);
+    let (policy_engine, store, workers) = bed(&["http://w0:8000", "http://w1:8000"]);
     let ask = first(b"r1");
     let now = Instant::now();
-    let asked = host.ask(&ask, &[], now).await.unwrap();
+    let asked = policy_engine.ask(&ask, &[], now).await.unwrap();
     let targets = asked.targets;
-    let preferred = host.worker(targets.first().unwrap().id).unwrap();
+    let preferred = policy_engine.worker(targets.first().unwrap().id).unwrap();
     preferred.set_status(WorkerStatus::NotReady);
     drop(asked);
     cache_trace::scope(true, async {
-        let placed = host.place(&ask, now).await.unwrap();
+        let placed = policy_engine.place(&ask, now).await.unwrap();
         assert_ne!(placed.worker().url(), preferred.url());
         let rows = cache_trace::captured_selections();
         assert_eq!(rows.len(), 1);
@@ -706,7 +749,10 @@ async fn a_trace_records_the_worker_taken_each_miss_and_the_shed() {
     }
     cache_trace::scope(true, async {
         assert_eq!(
-            host.place(&first(b"r2"), Instant::now()).await.err(),
+            policy_engine
+                .place(&first(b"r2"), Instant::now())
+                .await
+                .err(),
             Some(Unplaced::NoTargetHolds)
         );
         let rows = cache_trace::captured_selections();
@@ -725,7 +771,7 @@ async fn a_trace_records_the_worker_taken_each_miss_and_the_shed() {
     }
     store.publish_now();
     cache_trace::scope(true, async {
-        let result = host.place(&first(b"r3"), Instant::now()).await;
+        let result = policy_engine.place(&first(b"r3"), Instant::now()).await;
         assert!(matches!(
             result,
             Err(Unplaced::Shed {
@@ -746,10 +792,10 @@ async fn a_trace_records_the_worker_taken_each_miss_and_the_shed() {
 
 #[tokio::test]
 async fn a_drawn_pick_is_not_the_same_worker_for_every_request() {
-    let (host, _store, _workers) = bed(&["http://w0:8000", "http://w1:8000"]);
+    let (policy_engine, _store, _workers) = bed(&["http://w0:8000", "http://w1:8000"]);
     let mut picked = BTreeSet::new();
     for turn in 0..64u8 {
-        let placed = host
+        let placed = policy_engine
             .place(&first(&[turn]), Instant::now())
             .await
             .expect("a worker");
@@ -764,7 +810,7 @@ async fn a_drawn_pick_is_not_the_same_worker_for_every_request() {
 async fn a_returning_prefix_lands_on_the_worker_that_holds_it() {
     let tokens: Vec<u32> = (1..=64).collect();
     for block_size in [32, 16] {
-        let (host, store, holder) = cache_bed();
+        let (policy_engine, store, holder) = cache_bed();
         store.set_block_size(MODEL, block_size);
         let blocks = compute_request_content_hashes(&tokens, block_size as usize);
         assert_eq!(store_blocks(&store, holder, &blocks), BatchOutcome::Applied);
@@ -801,11 +847,15 @@ async fn a_returning_prefix_lands_on_the_worker_that_holds_it() {
                 ..plain
             };
             assert_eq!(
-                host.place(&returning, now).await.expect("a worker").id(),
+                policy_engine
+                    .place(&returning, now)
+                    .await
+                    .expect("a worker")
+                    .id(),
                 holder,
                 "block size {block_size}, request {turn}"
             );
-            let placed = host.place(&plain, now).await.expect("a worker");
+            let placed = policy_engine.place(&plain, now).await.expect("a worker");
             plain_matches += usize::from(placed.id() == holder);
         }
         assert!(plain_matches < 32, "block size {block_size}");
@@ -835,7 +885,7 @@ async fn a_returning_prompt_lands_on_the_worker_it_was_sent_to() {
         ..Prompt::default()
     };
     for prompt in [as_text, as_tokens] {
-        let (host, store) = record_bed();
+        let (policy_engine, store) = record_bed();
         let hashes = Hashes::of(&store, MODEL, &prompt);
         assert!(!hashes.blocks.is_empty());
         let now = Instant::now();
@@ -843,7 +893,11 @@ async fn a_returning_prompt_lands_on_the_worker_it_was_sent_to() {
             hashes: Some(&hashes),
             ..first(b"cold")
         };
-        let sent = host.place(&cold, now).await.expect("a worker").id();
+        let sent = policy_engine
+            .place(&cold, now)
+            .await
+            .expect("a worker")
+            .id();
         // Every other row reports less load: the record alone brings it back.
         for row in store.snapshot().1 {
             let running = u32::from(row.id == sent);
@@ -863,9 +917,12 @@ async fn a_returning_prompt_lands_on_the_worker_it_was_sent_to() {
                 hashes: Some(&hashes),
                 ..plain
             };
-            let placed = host.place(&returning, now).await.expect("a worker");
+            let placed = policy_engine
+                .place(&returning, now)
+                .await
+                .expect("a worker");
             assert_eq!(placed.id(), sent, "request {turn}");
-            let placed = host.place(&plain, now).await.expect("a worker");
+            let placed = policy_engine.place(&plain, now).await.expect("a worker");
             plain_matches += usize::from(placed.id() == sent);
         }
         assert!(plain_matches < 32);
@@ -877,7 +934,7 @@ async fn a_worker_the_gateway_cannot_send_to_is_passed_over() {
     // The filter's two halves: a worker that is not ready, and a ready
     // worker whose breaker is open.
     for open_breaker in [false, true] {
-        let (host, _store, workers) = bed(&["http://w0:8000", "http://w1:8000"]);
+        let (policy_engine, _store, workers) = bed(&["http://w0:8000", "http://w1:8000"]);
         if open_breaker {
             for _ in 0..CircuitBreakerConfig::default().failure_threshold {
                 workers[0].record_outcome(503);
@@ -887,7 +944,7 @@ async fn a_worker_the_gateway_cannot_send_to_is_passed_over() {
             workers[0].set_status(WorkerStatus::NotReady);
         }
         for turn in 0..8u8 {
-            let placed = host
+            let placed = policy_engine
                 .place(&first(&[turn]), Instant::now())
                 .await
                 .expect("the other worker");
@@ -898,9 +955,9 @@ async fn a_worker_the_gateway_cannot_send_to_is_passed_over() {
 
 #[tokio::test]
 async fn a_target_the_routes_rule_refuses_is_passed_over() {
-    let (host, _store, _workers) = bed(&["http://w0:8000", "http://w1:8000"]);
+    let (policy_engine, _store, _workers) = bed(&["http://w0:8000", "http://w1:8000"]);
     for turn in 0..8u8 {
-        let placed = host
+        let placed = policy_engine
             .place_where(
                 &first(&[turn]),
                 |worker| worker.url() != "http://w0:8000",
@@ -914,8 +971,8 @@ async fn a_target_the_routes_rule_refuses_is_passed_over() {
 
 #[tokio::test]
 async fn a_rule_that_refuses_every_target_ends_the_attempt_and_its_leases() {
-    let (host, store, _workers) = bed(&["http://w0:8000", "http://w1:8000"]);
-    let unplaced = host
+    let (policy_engine, store, _workers) = bed(&["http://w0:8000", "http://w1:8000"]);
+    let unplaced = policy_engine
         .place_where(&first(b"r1"), |_| false, Instant::now())
         .await
         .err();
@@ -925,8 +982,8 @@ async fn a_rule_that_refuses_every_target_ends_the_attempt_and_its_leases() {
 
 #[tokio::test]
 async fn a_store_with_no_row_sheds_by_the_controllers_reason() {
-    let (host, _store, _workers) = bed(&[]);
-    let unplaced = host
+    let (policy_engine, _store, _workers) = bed(&[]);
+    let unplaced = policy_engine
         .place(&first(b"r1"), Instant::now())
         .await
         .expect_err("no row, no worker");
@@ -945,30 +1002,39 @@ async fn a_store_with_no_row_sheds_by_the_controllers_reason() {
 
 #[tokio::test]
 async fn an_attempt_the_gateway_can_send_nowhere_ends_after_its_asks() {
-    let (host, _store, workers) = bed(&["http://w0:8000"]);
+    let (policy_engine, _store, workers) = bed(&["http://w0:8000"]);
     workers[0].set_status(WorkerStatus::NotReady);
-    let unplaced = host.place(&first(b"r1"), Instant::now()).await.err();
+    let unplaced = policy_engine
+        .place(&first(b"r1"), Instant::now())
+        .await
+        .err();
     assert_eq!(unplaced, Some(Unplaced::NoTargetHolds));
 }
 
 #[tokio::test]
 async fn the_commit_gives_the_lease_up_and_names_its_misses() {
-    let (host, store, workers) = bed(&["http://w0:8000"]);
+    let (policy_engine, store, workers) = bed(&["http://w0:8000"]);
     workers[0].set_status(WorkerStatus::NotReady);
     let now = Instant::now();
-    let asked = host.ask(&first(b"r1"), &[], now).await.expect("a decision");
+    let asked = policy_engine
+        .ask(&first(b"r1"), &[], now)
+        .await
+        .expect("a decision");
     assert_eq!(live(&store, 1), 1);
     let mut missed = Vec::new();
-    assert!(host.commit(asked, &mut missed, now).is_none());
+    assert!(policy_engine.commit(asked, &mut missed, now).is_none());
     assert_eq!(missed.len(), 1, "the one target is a miss: {missed:?}");
     assert_eq!(live(&store, 0), 0);
 }
 
 #[tokio::test]
 async fn a_lease_ends_once_by_its_completion_and_by_a_drop() {
-    let (host, store, _workers) = bed(&["http://w0:8000"]);
+    let (policy_engine, store, _workers) = bed(&["http://w0:8000"]);
     let now = Instant::now();
-    let mut placed = host.place(&first(b"r1"), now).await.expect("a worker");
+    let mut placed = policy_engine
+        .place(&first(b"r1"), now)
+        .await
+        .expect("a worker");
     assert_eq!(live(&store, 1), 1);
     placed.dispatched(now);
     placed.completed(ok(), now);
@@ -977,15 +1043,23 @@ async fn a_lease_ends_once_by_its_completion_and_by_a_drop() {
     placed.released(ReleaseReason::ClientGone, now);
     drop(placed);
     // A placement dropped before any send gives its lease up.
-    drop(host.place(&first(b"r2"), now).await.expect("a worker"));
+    drop(
+        policy_engine
+            .place(&first(b"r2"), now)
+            .await
+            .expect("a worker"),
+    );
     assert_eq!(live(&store, 0), 0);
 }
 
 #[tokio::test]
 async fn a_held_request_dropped_after_its_send_ends_its_lease_and_its_load() {
-    let (host, store, workers) = bed(&["http://w0:8000"]);
+    let (policy_engine, store, workers) = bed(&["http://w0:8000"]);
     let now = Instant::now();
-    let placed = host.place(&first(b"r1"), now).await.expect("a worker");
+    let placed = policy_engine
+        .place(&first(b"r1"), now)
+        .await
+        .expect("a worker");
     let mut held = Held::new(placed, |worker| {
         WorkerLoadGuard::with_key(Arc::clone(worker), None)
     });
@@ -1118,10 +1192,10 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
 
 #[tokio::test]
 async fn a_placement_names_the_rank_its_decision_named() {
-    let (host, store, _workers) = bed(&["http://w0:8000"]);
+    let (policy_engine, store, _workers) = bed(&["http://w0:8000"]);
     // The bed's row is rank 0 of 1, which a constant would answer too: the
     // row is written again as rank 1 of 2.
-    let unranked = host
+    let unranked = policy_engine
         .place(&first(b"r0"), Instant::now())
         .await
         .expect("a worker");
@@ -1142,7 +1216,7 @@ async fn a_placement_names_the_rank_its_decision_named() {
             .expect("the row stands");
         store.publish_now();
     }
-    let placed = host
+    let placed = policy_engine
         .place(&first(b"r1"), Instant::now())
         .await
         .expect("a worker");
@@ -1305,7 +1379,7 @@ async fn a_key_is_read_by_the_documents_sources_in_their_order() {
 /// with no key counts none.
 #[tokio::test]
 async fn an_attempt_counts_the_source_of_its_key_once() {
-    let (host, store, _) = bed_under(PolicyConfig::ConsistentHashing, &URLS);
+    let (policy_engine, store, _) = bed_under(PolicyConfig::ConsistentHashing, &URLS);
     let block = RoutingKeySpec {
         sources: vec![
             header(KEY_HEADER),
@@ -1331,14 +1405,14 @@ async fn an_attempt_counts_the_source_of_its_key_once() {
         // An attempt's first ask counts its key's source. Its ask again,
         // behind a commit that missed, names the missed target and counts
         // nothing.
-        let asked = host.ask(&by_header, &[], now).now_or_never();
+        let asked = policy_engine.ask(&by_header, &[], now).now_or_never();
         let asked = asked.expect("the door decides at once").expect("a pick");
         let missed = [asked.targets.first().expect("a target").id];
         drop(asked);
-        let again = host.ask(&by_header, &missed, now).now_or_never();
+        let again = policy_engine.ask(&by_header, &missed, now).now_or_never();
         assert!(again.expect("the door decides at once").is_ok());
         for ask in [by_rid, first(b"no key")] {
-            let placed = host.place(&ask, now).now_or_never();
+            let placed = policy_engine.place(&ask, now).now_or_never();
             assert!(placed.expect("the door decides at once").is_ok());
         }
     });
@@ -1353,19 +1427,19 @@ async fn an_attempt_counts_the_source_of_its_key_once() {
 
 #[tokio::test]
 async fn a_key_keeps_its_worker_across_requests_under_the_manual_policy() {
-    let (host, store, _) = bed_under(manual(), &URLS);
+    let (policy_engine, store, _) = bed_under(manual(), &URLS);
     let now = Instant::now();
     let headers = keyed(KEY_HEADER, "conv-1");
     let ask = Ask {
         headers: Some(&headers),
         ..first(b"first")
     };
-    let mut placed = host.place(&ask, now).await.expect("a worker");
+    let mut placed = policy_engine.place(&ask, now).await.expect("a worker");
     placed.dispatched(now);
     placed.completed(ok(), now);
 
     for turn in 0..8u8 {
-        let mut next = host
+        let mut next = policy_engine
             .place(&Ask { id: &[turn], ..ask }, now)
             .await
             .expect("the pinned worker");
@@ -1379,17 +1453,17 @@ async fn a_key_keeps_its_worker_across_requests_under_the_manual_policy() {
 
 #[tokio::test]
 async fn a_key_keeps_its_worker_under_consistent_hashing() {
-    let (host, store, _) = bed_under(PolicyConfig::ConsistentHashing, &URLS);
+    let (policy_engine, store, _) = bed_under(PolicyConfig::ConsistentHashing, &URLS);
     let now = Instant::now();
     let headers = keyed(KEY_HEADER, "conv-1");
     let ask = Ask {
         headers: Some(&headers),
         ..first(b"first")
     };
-    let mut placed = host.place(&ask, now).await.expect("a worker");
+    let mut placed = policy_engine.place(&ask, now).await.expect("a worker");
     placed.released(ReleaseReason::ClientGone, now);
     for turn in 0..8u8 {
-        let mut next = host
+        let mut next = policy_engine
             .place(&Ask { id: &[turn], ..ask }, now)
             .await
             .expect("the ring's owner");
@@ -1404,7 +1478,7 @@ async fn a_key_keeps_its_worker_under_consistent_hashing() {
             headers: Some(&headers),
             ..first(&id)
         };
-        let mut placed = host.place(&ask, now).await.expect("a worker");
+        let mut placed = policy_engine.place(&ask, now).await.expect("a worker");
         owners.insert(placed.id());
         placed.released(ReleaseReason::ClientGone, now);
     }
@@ -1414,7 +1488,7 @@ async fn a_key_keeps_its_worker_under_consistent_hashing() {
 
 #[tokio::test]
 async fn a_clients_key_keeps_its_worker_under_consistent_hashing() {
-    let (host, store, _) = bed_under(PolicyConfig::ConsistentHashing, &URLS);
+    let (policy_engine, store, _) = bed_under(PolicyConfig::ConsistentHashing, &URLS);
     let now = Instant::now();
     // No routing key: the ring places each client's requests by its cookie.
     let mut owners = BTreeSet::new();
@@ -1427,7 +1501,7 @@ async fn a_clients_key_keeps_its_worker_under_consistent_hashing() {
                 headers: Some(&headers),
                 ..first(&id)
             };
-            let mut placed = host.place(&ask, now).await.expect("a worker");
+            let mut placed = policy_engine.place(&ask, now).await.expect("a worker");
             placed_at.insert(placed.id());
             placed.released(ReleaseReason::ClientGone, now);
         }
@@ -1443,13 +1517,13 @@ async fn a_clients_key_keeps_its_worker_under_consistent_hashing() {
 async fn a_retry_of_a_key_steps_off_the_worker_it_tried() {
     let headers = keyed(KEY_HEADER, "conv-1");
     for urls in [&URLS[..2], &URLS[..1]] {
-        let (host, _, _) = bed_under(manual(), urls);
+        let (policy_engine, _, _) = bed_under(manual(), urls);
         let ask = Ask {
             headers: Some(&headers),
             ..first(b"request")
         };
         let now = Instant::now();
-        let mut placed = host.place(&ask, now).await.expect("a worker");
+        let mut placed = policy_engine.place(&ask, now).await.expect("a worker");
         placed.dispatched(now);
         placed.completed(
             End {
@@ -1462,7 +1536,7 @@ async fn a_retry_of_a_key_steps_off_the_worker_it_tried() {
 
         let tried = [placed.id()];
         let now = Instant::now();
-        let mut retry = host
+        let mut retry = policy_engine
             .place(
                 &Ask {
                     tried: &tried,
@@ -1480,18 +1554,18 @@ async fn a_retry_of_a_key_steps_off_the_worker_it_tried() {
 
 #[tokio::test]
 async fn a_key_whose_client_left_before_the_send_keeps_no_pin() {
-    let (host, store, _) = bed_under(manual(), &URLS);
+    let (policy_engine, store, _) = bed_under(manual(), &URLS);
     let now = Instant::now();
     let headers = keyed(KEY_HEADER, "conv-1");
     let ask = Ask {
         headers: Some(&headers),
         ..first(b"left")
     };
-    let mut placed = host.place(&ask, now).await.expect("a worker");
+    let mut placed = policy_engine.place(&ask, now).await.expect("a worker");
     placed.released(ReleaseReason::ClientGone, now);
     assert!(SessionsStore::is_empty(&*store));
 
-    let mut sent = host
+    let mut sent = policy_engine
         .place(&Ask { id: b"sent", ..ask }, now)
         .await
         .expect("a worker");
@@ -1626,7 +1700,7 @@ fn pair_spec(
 }
 
 struct PairBed {
-    host: Host,
+    policy_engine: PolicyEngine,
     store: Arc<MemoryStore>,
     prefills: Vec<(WorkerId, Arc<dyn Worker>)>,
     decodes: Vec<(WorkerId, Arc<dyn Worker>)>,
@@ -1719,7 +1793,7 @@ impl PairBed {
         store.apply(pair_spec(mode, decode_targets, 1, &calls, None, None)?)?;
         store.publish_now();
         Ok(Self {
-            host: Host::at_keys(Arc::clone(&store), registry),
+            policy_engine: PolicyEngine::at_keys(Arc::clone(&store), registry),
             store,
             prefills,
             decodes,
@@ -1729,8 +1803,9 @@ impl PairBed {
 
     async fn commit(&self) -> Result<Placed, Unplaced> {
         let now = Instant::now();
-        let asked = self.host.ask(&pair_ask(), &[], now).await?;
-        self.host.commit_pair(asked, None, &mut Vec::new(), now)
+        let asked = self.policy_engine.ask(&pair_ask(), &[], now).await?;
+        self.policy_engine
+            .commit_pair(asked, None, &mut Vec::new(), now)
     }
 
     fn issued(&self, side: Side) -> Vec<Lease> {
@@ -1786,11 +1861,15 @@ async fn a_pair_lands_on_a_prefill_and_its_decode_with_the_ranks_its_targets_nam
         let (prefill, worker) = &bed.prefills[0];
         let (decode, decoder) = &bed.decodes[0];
         let now = Instant::now();
-        let asked = bed.host.ask(&pair_ask(), &[], now).await.expect("a pair");
+        let asked = bed
+            .policy_engine
+            .ask(&pair_ask(), &[], now)
+            .await
+            .expect("a pair");
         let target = *asked.targets.first().expect("a target");
         let partner = target.pair.expect("a decode target");
         let placed = bed
-            .host
+            .policy_engine
             .commit_pair(asked, None, &mut Vec::new(), now)
             .expect("a placement");
         assert_eq!((placed.id(), placed.rank()), (*prefill, target.dp_rank));
@@ -1847,7 +1926,7 @@ async fn a_prefill_without_room_is_passed_over_for_the_next_pair_target() {
         .expect("held load");
     let now = Instant::now();
     let asked = bed
-        .host
+        .policy_engine
         .ask(&pair_ask(), &[], now)
         .await
         .expect("the first pair");
@@ -1856,7 +1935,7 @@ async fn a_prefill_without_room_is_passed_over_for_the_next_pair_target() {
     let mut asked = Some(asked);
     let result = admission
         .admit(None, |room| {
-            let result = bed.host.commit_pair(
+            let result = bed.policy_engine.commit_pair(
                 asked.take().expect("one commit"),
                 Some(room),
                 &mut missed,
@@ -1870,7 +1949,7 @@ async fn a_prefill_without_room_is_passed_over_for_the_next_pair_target() {
     assert_eq!(missed, [WorkerId(0)]);
     assert_eq!(live(&bed.store, 0), 0);
     let other = bed
-        .host
+        .policy_engine
         .ask(&pair_ask(), &[*full], now)
         .await
         .expect("the other pair");
@@ -1878,7 +1957,7 @@ async fn a_prefill_without_room_is_passed_over_for_the_next_pair_target() {
     let admitted = admission
         .admit(None, |room| {
             let placed = bed
-                .host
+                .policy_engine
                 .commit_pair(
                     other.take().expect("one commit"),
                     Some(room),
@@ -1902,7 +1981,11 @@ async fn a_prefill_without_room_is_passed_over_for_the_next_pair_target() {
 async fn a_pair_taken_past_the_picks_first_target_dispatches_under_the_one_taken() {
     let bed = PairBed::new(Pairing::Lenient, 1, 2, 2).expect("a pair fleet");
     let now = Instant::now();
-    let asked = bed.host.ask(&pair_ask(), &[], now).await.expect("a pair");
+    let asked = bed
+        .policy_engine
+        .ask(&pair_ask(), &[], now)
+        .await
+        .expect("a pair");
     let mut sides = asked.targets.iter().filter_map(|target| target.pair);
     let (first, second) = (
         sides.next().expect("the pick's first target").decode_id,
@@ -1915,7 +1998,7 @@ async fn a_pair_taken_past_the_picks_first_target_dispatches_under_the_one_taken
         .record_circuit_breaker_outcome(false);
     let mut missed = Vec::new();
     let mut placed = bed
-        .host
+        .policy_engine
         .commit_pair(asked, None, &mut missed, now)
         .expect("the target behind the first");
     let prefill = bed.prefills[0].0;
@@ -1950,11 +2033,11 @@ async fn a_pair_that_finds_no_room_queues_and_is_decided_again_at_its_admission(
         Placed::worker,
         || ready(None),
         || {
-            bed.host
+            bed.policy_engine
                 .ask(&ask, &[], clock.next().expect("one decision per wake"))
         },
         |asked, room| {
-            bed.host
+            bed.policy_engine
                 .commit_pair(asked, room, &mut Vec::new(), Instant::now())
         },
     );
@@ -2005,7 +2088,7 @@ async fn a_decode_the_gateway_cannot_send_to_is_passed_over_and_named_in_the_nex
             bed.decodes[0].1.record_circuit_breaker_outcome(false);
         }
         let (placed, _) = bed
-            .host
+            .policy_engine
             .place_pair(&pair_ask(), None, None)
             .await
             .expect("the other decode");
@@ -2029,19 +2112,19 @@ async fn a_missing_prefill_and_an_open_decode_breaker_are_both_misses() {
     let bed = PairBed::new(Pairing::Lenient, 1, 2, 2).expect("a pair fleet");
     let (prefill, worker) = &bed.prefills[0];
     let (decode, decoder) = &bed.decodes[0];
-    bed.host
+    bed.policy_engine
         .registry()
         .remove_by_url(worker.url())
         .expect("the prefill leaves the registry");
     decoder.record_circuit_breaker_outcome(false);
     let now = Instant::now();
     let asked = bed
-        .host
+        .policy_engine
         .ask(&pair_ask(), &[], now)
         .await
         .expect("the store still sees the pair");
     let mut missed = Vec::new();
-    let result = bed.host.commit_pair(asked, None, &mut missed, now);
+    let result = bed.policy_engine.commit_pair(asked, None, &mut missed, now);
     assert_eq!(
         result.expect_err("no target holds"),
         Unplaced::NoTargetHolds
@@ -2059,7 +2142,7 @@ async fn three_passes_with_no_target_end_the_attempt() {
     for (_, worker) in &bed.decodes {
         worker.set_status(WorkerStatus::NotReady);
     }
-    let result = bed.host.place_pair(&pair_ask(), None, None).await;
+    let result = bed.policy_engine.place_pair(&pair_ask(), None, None).await;
     assert!(matches!(result, Err(Unplaced::NoTargetHolds)));
     let issued: Vec<_> = bed
         .issued(Side::Decode)
@@ -2085,10 +2168,10 @@ async fn a_queued_head_whose_decode_cannot_be_sent_to_asks_again_in_its_place() 
         .await
         .expect("held load");
     let ask = pair_ask();
-    let head = bed.host.place_pair(&ask, Some(&admission), None);
+    let head = bed.policy_engine.place_pair(&ask, Some(&admission), None);
     tokio::pin!(head);
     assert!(poll!(head.as_mut()).is_pending());
-    let behind = bed.host.place_pair(&ask, Some(&admission), None);
+    let behind = bed.policy_engine.place_pair(&ask, Some(&admission), None);
     tokio::pin!(behind);
     assert!(poll!(behind.as_mut()).is_pending());
     assert_eq!(admission.queued_requests(), 2);
@@ -2138,7 +2221,7 @@ async fn a_keyed_pair_that_wakes_twice_counts_its_keys_source_once() {
         let occupied = occupied.now_or_never().expect("no waiter stands ahead");
         let occupied = occupied.expect("held load");
         let _beside = WorkerLoadGuard::with_key(Arc::clone(prefill), None);
-        let mut head = pin!(bed.host.place_pair(&ask, Some(&admission), None));
+        let mut head = pin!(bed.policy_engine.place_pair(&ask, Some(&admission), None));
         assert!(head.as_mut().poll(&mut cx).is_pending());
         let decided = bed.issued(Side::Prefill).len();
         assert_ne!(decided, 0, "the head decides as it arrives");
@@ -2166,13 +2249,13 @@ async fn the_queues_refusals_leave_no_lease_on_file() {
         .await
         .expect("held load");
     let ask = pair_ask();
-    let waiting = bed.host.place_pair(&ask, Some(&admission), None);
+    let waiting = bed.policy_engine.place_pair(&ask, Some(&admission), None);
     tokio::pin!(waiting);
     assert!(poll!(waiting.as_mut()).is_pending());
     assert_eq!(live(&bed.store, 0), 0);
     let decided = bed.issued(Side::Prefill).len();
     assert!(matches!(
-        bed.host
+        bed.policy_engine
             .place_pair(&pair_ask(), Some(&admission), None)
             .await,
         Err(Unplaced::Admission(PrefillAdmissionRejection::QueueFull))
@@ -2197,9 +2280,13 @@ async fn the_queues_refusals_leave_no_lease_on_file() {
 async fn each_side_of_a_placed_pair_reports_its_own_dispatch_and_end() {
     let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
     let now = Instant::now();
-    let asked = bed.host.ask(&pair_ask(), &[], now).await.expect("a pair");
+    let asked = bed
+        .policy_engine
+        .ask(&pair_ask(), &[], now)
+        .await
+        .expect("a pair");
     let mut placed = bed
-        .host
+        .policy_engine
         .commit_pair(asked, None, &mut Vec::new(), now)
         .expect("a placement");
     let (prefill, decode) = (bed.prefills[0].0, bed.decodes[0].0);
@@ -2261,8 +2348,8 @@ async fn each_side_of_a_placed_pair_reports_its_own_dispatch_and_end() {
 
 /// A fleet whose pools hold workers and no prefill pairs with a decode. The
 /// store's pair classes judge it from membership alone, as the classic pair
-/// index does, and the host answers by them: each pool's keys and what the
-/// pools disagree on. An ask that states no wire, or the wire of another
+/// index does, and the policy engine answers by them: each pool's keys and what
+/// the pools disagree on. An ask that states no wire, or the wire of another
 /// side, reads the controller's own shed.
 #[tokio::test]
 async fn a_fleet_that_pairs_nothing_is_refused_by_the_pair_classes() {
@@ -2283,7 +2370,11 @@ async fn a_fleet_that_pairs_nothing_is_refused_by_the_pair_classes() {
         wires: WireModes::HTTP,
         ..pair_ask()
     };
-    let refused = bed.host.place_pair(&on_http, None, None).await.err();
+    let refused = bed
+        .policy_engine
+        .place_pair(&on_http, None, None)
+        .await
+        .err();
     assert_eq!(refused, Some(unpaired));
     // An ask that states no wire does not say which side it draws from, and
     // no row serves gRPC: that side holds no refusal.
@@ -2293,7 +2384,7 @@ async fn a_fleet_that_pairs_nothing_is_refused_by_the_pair_classes() {
     };
     let no_endpoint = ShedReason::NoEndpoints;
     for ask in [pair_ask(), on_grpc] {
-        let shed = bed.host.place_pair(&ask, None, None).await.err();
+        let shed = bed.policy_engine.place_pair(&ask, None, None).await.err();
         assert!(
             matches!(shed, Some(Unplaced::Shed { reason, .. }) if reason == no_endpoint),
             "{shed:?}"
@@ -2313,7 +2404,11 @@ async fn the_routes_rule_passes_over_a_pair_at_its_commit() {
         let decode = bed.decodes.iter().find(|(id, _)| *id == row);
         decode.expect("a decode of the bed").1.url().to_owned()
     };
-    let asked = bed.host.ask(&pair_ask(), &[], now).await.expect("a pair");
+    let asked = bed
+        .policy_engine
+        .ask(&pair_ask(), &[], now)
+        .await
+        .expect("a pair");
     let rows: Vec<_> = asked
         .targets
         .iter()
@@ -2323,7 +2418,7 @@ async fn the_routes_rule_passes_over_a_pair_at_its_commit() {
     let refused = url_of(first);
     let mut missed = Vec::new();
     let placed = bed
-        .host
+        .policy_engine
         .commit_pair_where(
             asked,
             |worker| worker.url() != refused,
@@ -2336,11 +2431,15 @@ async fn the_routes_rule_passes_over_a_pair_at_its_commit() {
     assert!(missed.is_empty());
     drop(placed);
 
-    let asked = bed.host.ask(&pair_ask(), &[], now).await.expect("a pair");
+    let asked = bed
+        .policy_engine
+        .ask(&pair_ask(), &[], now)
+        .await
+        .expect("a pair");
     let rows = asked.targets.iter().filter_map(|target| target.pair);
     let rows: Vec<_> = rows.map(|pair| pair.decode_id).collect();
     let refused = [url_of(first), url_of(second)];
-    let none = bed.host.commit_pair_where(
+    let none = bed.policy_engine.commit_pair_where(
         asked,
         |worker| !refused.iter().any(|url| url == worker.url()),
         None,
@@ -2436,10 +2535,13 @@ async fn the_next_decode_of_the_same_prefill_is_taken_before_the_decode_is_sent(
     assert_eq!(placed.decode_id(), Some(decodes[0]));
     let ids = [prefill, decodes[0], decodes[1], decodes[2]];
     assert_eq!(bed.counts(&ids), Some(vec![1, 1, 0, 0]));
-    assert!(!placed.next_decode(&bed.host), "the prefill must go first");
+    assert!(
+        !placed.next_decode(&bed.policy_engine),
+        "the prefill must go first"
+    );
     placed.dispatched(Instant::now());
     bed.decodes[1].1.set_status(WorkerStatus::NotReady);
-    assert!(placed.next_decode(&bed.host));
+    assert!(placed.next_decode(&bed.policy_engine));
     assert_eq!((placed.id(), placed.rank()), (prefill, rank));
     assert_eq!(
         (placed.decode_id(), placed.decode_rank()),
@@ -2450,7 +2552,7 @@ async fn the_next_decode_of_the_same_prefill_is_taken_before_the_decode_is_sent(
         &bed.decodes[2].1
     ));
     assert!(
-        !placed.next_decode(&bed.host),
+        !placed.next_decode(&bed.policy_engine),
         "the earlier decodes stay behind"
     );
     assert_eq!(bed.counts(&ids), Some(vec![1, 1, 0, 0]));
@@ -2465,7 +2567,7 @@ async fn a_pair_without_admission_is_one_ask_and_one_commit() {
     let prefill = &bed.prefills[0].1;
     let _occupied = WorkerLoadGuard::with_key(Arc::clone(prefill), None);
     let (placed, guard) = bed
-        .host
+        .policy_engine
         .place_pair(&pair_ask(), None, Some("request"))
         .await
         .expect("a placement");
@@ -2494,7 +2596,11 @@ async fn an_ask_that_states_its_wire_is_placed_among_the_rows_that_serve_it() {
         ..pair_ask()
     };
     let now = Instant::now();
-    let unplaced = bed.host.ask(&ask(WireModes::GRPC), &[], now).await.err();
+    let unplaced = bed
+        .policy_engine
+        .ask(&ask(WireModes::GRPC), &[], now)
+        .await
+        .err();
     assert!(
         matches!(
             unplaced,
@@ -2508,10 +2614,10 @@ async fn an_ask_that_states_its_wire_is_placed_among_the_rows_that_serve_it() {
     );
     assert_eq!(live(&bed.store, 0), 0);
 
-    let asked = bed.host.ask(&ask(WireModes::HTTP), &[], now).await;
+    let asked = bed.policy_engine.ask(&ask(WireModes::HTTP), &[], now).await;
     let asked = asked.expect("the rows serve the wire");
     let placed = bed
-        .host
+        .policy_engine
         .commit_pair(asked, None, &mut Vec::new(), now)
         .expect("a placement");
     assert_eq!(placed.id(), bed.prefills[0].0);
@@ -2522,7 +2628,7 @@ async fn a_commit_under_a_held_publication_returns() {
     let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
     let now = Instant::now();
     let asked = bed
-        .host
+        .policy_engine
         .ask(&pair_ask(), &[], now)
         .await
         .expect("a decision before publication");
@@ -2542,9 +2648,9 @@ async fn a_commit_under_a_held_publication_returns() {
             .recv_timeout(deadline)
             .expect("the writer holds membership");
         let (returned, result) = mpsc::channel();
-        let host = &bed.host;
+        let policy_engine = &bed.policy_engine;
         scope.spawn(move || {
-            let placement = host.commit_pair(asked, None, &mut Vec::new(), now);
+            let placement = policy_engine.commit_pair(asked, None, &mut Vec::new(), now);
             let _ = returned.send(placement);
         });
         let committed = result.recv_timeout(deadline);
@@ -2573,7 +2679,7 @@ async fn a_decision_whose_targets_read_full_asks_again_and_names_them() {
         .await
         .expect("held load");
     let (placed, _guard) = bed
-        .host
+        .policy_engine
         .place_pair(&pair_ask(), Some(&admission), None)
         .await
         .expect("the next decision finds room");
@@ -2605,7 +2711,7 @@ async fn a_request_behind_a_waiter_whose_fleet_is_gone_is_answered_at_once() {
         } else {
             &bed.decodes[0]
         };
-        bed.host
+        bed.policy_engine
             .registry()
             .remove_by_url(worker.url())
             .expect("the worker leaves the registry");
@@ -2614,7 +2720,7 @@ async fn a_request_behind_a_waiter_whose_fleet_is_gone_is_answered_at_once() {
             .remove(*id, row.revision)
             .expect("the row leaves the store");
         let ask = pair_ask();
-        let request = bed.host.place_pair(&ask, Some(&admission), None);
+        let request = bed.policy_engine.place_pair(&ask, Some(&admission), None);
         tokio::pin!(request);
         assert!(matches!(
             poll!(request.as_mut()),
@@ -2646,7 +2752,7 @@ async fn a_probe_refuses_a_decode_ask_and_releases_a_pick_before_queuing() {
         phase: Phase::Decode,
         ..pair_ask()
     };
-    let refused = bed.host.place_pair(&side, Some(&admission), None);
+    let refused = bed.policy_engine.place_pair(&side, Some(&admission), None);
     tokio::pin!(refused);
     assert!(matches!(
         poll!(refused.as_mut()),
@@ -2655,7 +2761,7 @@ async fn a_probe_refuses_a_decode_ask_and_releases_a_pick_before_queuing() {
     assert_eq!(admission.queued_requests(), 1);
 
     let ask = pair_ask();
-    let picked = bed.host.place_pair(&ask, Some(&admission), None);
+    let picked = bed.policy_engine.place_pair(&ask, Some(&admission), None);
     tokio::pin!(picked);
     assert!(poll!(picked.as_mut()).is_pending());
     assert_eq!(admission.queued_requests(), 2);
@@ -2681,7 +2787,7 @@ async fn a_decision_that_reads_every_target_full_waits_and_is_admitted_at_a_rele
         .expect("held load");
     assert!(admission.reads_full(prefill));
     let ask = pair_ask();
-    let request = bed.host.place_pair(&ask, Some(&admission), None);
+    let request = bed.policy_engine.place_pair(&ask, Some(&admission), None);
     tokio::pin!(request);
     assert!(poll!(request.as_mut()).is_pending());
     assert_eq!(admission.queued_requests(), 1);

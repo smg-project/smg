@@ -40,8 +40,8 @@ use crate::{
     app_context::AppContext,
     config::RouterConfig,
     policy_controller::{
+        engine::Ask,
         feed::signal_tests::{stages, values_read, Read, SINGLE, SLOTS},
-        host::Ask,
     },
     routers::grpc::backend_client::{
         get_backend_client, BackendConnector, BasicWorkerBuilder, Fronted,
@@ -576,9 +576,9 @@ async fn signal_gateway(extensions: Extensions) -> (Arc<AppContext>, Read) {
     (app, read)
 }
 
-/// The address the host places a request on after one poll of `engines`,
-/// each an address, its engine kind and the free slots it states, the
-/// least first. A ready gRPC row is laid for each at the feed's door. The
+/// The address the policy engine places a request on after one poll of
+/// `engines`, each an address, its engine kind and the free slots it states,
+/// the least first. A ready gRPC row is laid for each at the feed's door. The
 /// load monitor polls their group once, each engine through its
 /// connection, and the feed's sink hands the store what the answers state
 /// by name. The decision then read each engine's own value: a tie's draw
@@ -629,9 +629,11 @@ async fn placed_after_one_poll(
     let taken = u64::try_from(engines.len()).unwrap();
     assert_eq!(store.counts().signal_writes, [taken, 0, 0, 0, 0, 0]);
 
-    let host = app.policy_host.as_ref().unwrap();
+    let policy_engine = app.policy_engine.as_ref().unwrap();
     let ask = Ask::of(b"polled", MODEL_ID);
-    let placed = host.place(&ask, now + Duration::from_millis(10)).await;
+    let placed = policy_engine
+        .place(&ask, now + Duration::from_millis(10))
+        .await;
     let stated: Vec<_> = engines.iter().map(|&(_, _, free)| Some(free)).collect();
     assert_eq!(values_read(read), stated);
     placed.unwrap().worker().url().to_owned()
@@ -640,7 +642,7 @@ async fn placed_after_one_poll(
 /// Under a document that declares a signal, the values a host's connections
 /// state in their polled load answers decide a placement. The gateway's
 /// context is built with the host's connector and the host's stage, and the
-/// host places on the engine that states the most.
+/// policy engine places on the engine that states the most.
 #[tokio::test]
 async fn a_placement_follows_the_values_a_host_connections_polled_answer_states() {
     let host = Extensions::new().connector(Arc::new(StatingConnector));
@@ -654,8 +656,8 @@ async fn a_placement_follows_the_values_a_host_connections_polled_answer_states(
 
 /// The same under the gateway's own connector, on each stock gRPC wire: an
 /// engine states its free slots in its answer to a load poll, the stock
-/// client reads the list, and the host places on the engine that states the
-/// most.
+/// client reads the list, and the policy engine places on the engine that
+/// states the most.
 #[tokio::test]
 async fn a_placement_follows_the_values_a_stock_grpc_polls_answer_states() {
     for wire in [

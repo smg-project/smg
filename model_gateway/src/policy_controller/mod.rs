@@ -8,9 +8,9 @@
 //!
 //! The setting starts the store with the policy document for the routing
 //! configuration. The context holds the membership feed over that store and
-//! a host over the feed's holder, and starts the host's timer, which runs
-//! the door's clock and shows its counts as series, on no request's path
-//! ([`upkeep`]). A regular HTTP router with that host asks
+//! a policy engine over the feed's holder, and starts the engine's timer, which
+//! runs the door's clock and shows its counts as series, on no request's path
+//! ([`upkeep`]). A regular HTTP router with that policy engine asks
 //! it to place typed requests: for the model a request names, or for the one
 //! primary model the router's workers serve where it names none. A regular
 //! gRPC router and a gRPC pair router ask it in their selection stage. An
@@ -24,7 +24,7 @@
 //! worker by no routing policy serve as under the classic policies: a
 //! provider's router, a realtime session and a proxied GET. A local worker's
 //! registration writes its row at the feed's door. With the setting off, the
-//! context holds neither the store, its feed nor its host.
+//! context holds neither the store, its feed nor its policy engine.
 //!
 //! The document in force reaches the store through the policy crate's
 //! operators' door as YAML: the bytes `--print-policy-spec` prints where
@@ -71,17 +71,17 @@ pub(crate) mod follower;
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "the gateway holds the feed for membership writes")
-)]
-pub(crate) mod feed;
-#[cfg_attr(
-    not(test),
     expect(
         dead_code,
         reason = "the rank accessor, explicit release and Held are exercised by tests"
     )
 )]
-pub(crate) mod host;
+pub(crate) mod engine;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the gateway holds the feed for membership writes")
+)]
+pub(crate) mod feed;
 pub(crate) mod operators;
 mod undecided;
 pub(crate) mod upkeep;
@@ -239,7 +239,7 @@ pub(crate) fn feeds(
 /// the classic policies.
 pub(crate) fn undecided(context: &AppContext) -> Option<Box<dyn RouterTrait>> {
     context
-        .policy_host
+        .policy_engine
         .is_some()
         .then(|| Box::new(Undecided) as Box<dyn RouterTrait>)
 }

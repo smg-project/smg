@@ -18,7 +18,7 @@ use smg_worker::identity::basic::{Worker, WorkerType};
 
 use super::{
     testing::{pair_bed_picking, pair_in_flight, MODEL},
-    Ask, End, Host, KeptAsk, Placed, GATEWAY,
+    Ask, End, KeptAsk, Placed, PolicyEngine, GATEWAY,
 };
 
 const PREFILL: &str = "http://prefill-0:8000";
@@ -37,10 +37,10 @@ const SERVED: End = End {
 /// One prefill and two decodes under the stock pair presets, with the
 /// document's word for when a pair's decode is picked. The two decodes'
 /// rows come with it.
-fn bed(decode: DecodePick) -> (Host, Arc<MemoryStore>, [WorkerId; 2]) {
-    let (host, store, _) = pair_bed_picking(decode, &[PREFILL], &DECODES);
+fn bed(decode: DecodePick) -> (PolicyEngine, Arc<MemoryStore>, [WorkerId; 2]) {
+    let (policy_engine, store, _) = pair_bed_picking(decode, &[PREFILL], &DECODES);
     let rows = DECODES.map(|url| store.by_key(url).expect("the decode's row").id);
-    (host, store, rows)
+    (policy_engine, store, rows)
 }
 
 /// The engines report `busy` deep in its queue and `idle` empty, and the
@@ -72,8 +72,8 @@ fn ask(id: &'static [u8], decode_again: bool) -> Ask<'static> {
     }
 }
 
-async fn place(host: &Host, ask: &Ask<'_>) -> Placed {
-    let (placed, _room) = host
+async fn place(policy_engine: &PolicyEngine, ask: &Ask<'_>) -> Placed {
+    let (placed, _room) = policy_engine
         .place_pair(ask, None, None)
         .await
         .expect("the pair is placed");
@@ -107,12 +107,12 @@ fn end(mut placed: Placed, now: Instant) {
 
 #[tokio::test]
 async fn a_decode_picked_after_its_prefill_is_chosen_on_the_loads_of_that_instant() {
-    let (host, store, [d0, d1]) = bed(DecodePick::AfterPrefill);
+    let (policy_engine, store, [d0, d1]) = bed(DecodePick::AfterPrefill);
     // The second decode reports a deep queue, so the first decision names
     // the first one.
     report(&store, d1, d0);
     let asked = ask(b"pair", true);
-    let mut placed = place(&host, &asked).await;
+    let mut placed = place(&policy_engine, &asked).await;
     let prefill = placed.id();
     assert_eq!(decode_of(&placed), d0);
     // That decision booked the prefill alone.
@@ -124,7 +124,7 @@ async fn a_decode_picked_after_its_prefill_is_chosen_on_the_loads_of_that_instan
     // While the prefill runs the loads turn over.
     let answered = report(&store, d0, d1);
     let moved = placed
-        .decode_again(&host, &asked, |_| true, answered)
+        .decode_again(&policy_engine, &asked, |_| true, answered)
         .map(|decode| decode.url().to_owned());
     assert_eq!(decode_of(&placed), d1, "the second ask read the loads");
     assert_eq!(moved.as_deref(), Some(DECODES[1]));
@@ -137,7 +137,7 @@ async fn a_decode_picked_after_its_prefill_is_chosen_on_the_loads_of_that_instan
     assert_eq!(pair_in_flight(&store, d1), 1);
     assert_eq!(pair_in_flight(&store, d0), 0);
     // A decode asked once is not asked twice.
-    let again = placed.decode_again(&host, &asked, |_| true, answered);
+    let again = placed.decode_again(&policy_engine, &asked, |_| true, answered);
     assert!(again.is_none());
     assert_eq!(decode_of(&placed), d1);
 
@@ -156,10 +156,10 @@ async fn a_decode_picked_with_its_prefill_is_decided_once() {
         (DecodePick::default(), true),
         (DecodePick::AfterPrefill, false),
     ] {
-        let (host, store, [d0, d1]) = bed(rule);
+        let (policy_engine, store, [d0, d1]) = bed(rule);
         report(&store, d1, d0);
         let asked = ask(b"pair", decode_again);
-        let mut placed = place(&host, &asked).await;
+        let mut placed = place(&policy_engine, &asked).await;
         assert_eq!(decode_of(&placed), d0, "{rule:?} {decode_again}");
         assert!(!placed.decode_waits(), "{rule:?} {decode_again}");
         assert_eq!(pair_in_flight(&store, placed.id()), 1);
@@ -168,7 +168,7 @@ async fn a_decode_picked_with_its_prefill_is_decided_once() {
         placed.dispatched(Instant::now());
         // The loads turn over, and nothing asks the decode again.
         let answered = report(&store, d0, d1);
-        let again = placed.decode_again(&host, &asked, |_| true, answered);
+        let again = placed.decode_again(&policy_engine, &asked, |_| true, answered);
         assert!(again.is_none(), "{rule:?} {decode_again}");
         assert_eq!(decode_of(&placed), d0, "the first pick's decode stands");
         assert_eq!(pair_in_flight(&store, d1), 0);
@@ -180,16 +180,16 @@ async fn a_decode_picked_with_its_prefill_is_decided_once() {
 
 #[tokio::test]
 async fn a_second_ask_no_decode_of_which_the_route_admits_sends_the_first_decode() {
-    let (host, store, decodes) = bed(DecodePick::AfterPrefill);
+    let (policy_engine, store, decodes) = bed(DecodePick::AfterPrefill);
     let asked = ask(b"pair", true);
-    let mut placed = place(&host, &asked).await;
+    let mut placed = place(&policy_engine, &asked).await;
     let first = decode_of(&placed);
     let now = Instant::now();
     placed.dispatched(now);
 
     // The route's rule refuses every decode the second ask names.
     let no_decode = |worker: &Arc<dyn Worker>| *worker.worker_type() != WorkerType::Decode;
-    let again = placed.decode_again(&host, &asked, no_decode, Instant::now());
+    let again = placed.decode_again(&policy_engine, &asked, no_decode, Instant::now());
     assert!(again.is_none());
     assert_eq!(decode_of(&placed), first, "the first pick's decode is sent");
     // The decode side was given up: nothing stays booked for it.
@@ -209,15 +209,15 @@ async fn a_second_ask_no_decode_of_which_the_route_admits_sends_the_first_decode
 async fn a_kept_ask_is_asked_again_under_the_routes_rule_and_the_calls() {
     let other = |worker: &dyn Worker| worker.url() != DECODES[1];
     for (kept_rule, call_rule) in [(true, false), (false, true)] {
-        let (host, store, [d0, d1]) = bed(DecodePick::AfterPrefill);
-        let host = Arc::new(host);
+        let (policy_engine, store, [d0, d1]) = bed(DecodePick::AfterPrefill);
+        let policy_engine = Arc::new(policy_engine);
         report(&store, d1, d0);
         let asked = ask(b"pair", true);
-        let mut placed = place(&host, &asked).await;
+        let mut placed = place(&policy_engine, &asked).await;
         assert_eq!(decode_of(&placed), d0);
         // One of the two rules refuses the second decode, the other nobody.
         let kept = move |worker: &dyn Worker| !kept_rule || other(worker);
-        placed.keep_ask(KeptAsk::of(&host, &asked, kept));
+        placed.keep_ask(KeptAsk::of(&policy_engine, &asked, kept));
         placed.dispatched(Instant::now());
         let answered = report(&store, d0, d1);
         let call = |worker: &Arc<dyn Worker>| !call_rule || other(worker.as_ref());
@@ -246,12 +246,12 @@ async fn a_kept_ask_is_asked_again_under_the_routes_rule_and_the_calls() {
 #[tokio::test]
 async fn a_placement_keeps_an_ask_for_a_waiting_decode_alone() {
     // A decode decided with its prefill keeps nothing.
-    let (host, store, [d0, d1]) = bed(DecodePick::WithPrefill);
-    let host = Arc::new(host);
+    let (policy_engine, store, [d0, d1]) = bed(DecodePick::WithPrefill);
+    let policy_engine = Arc::new(policy_engine);
     report(&store, d1, d0);
     let asked = ask(b"pair", true);
-    let mut placed = place(&host, &asked).await;
-    placed.keep_ask(KeptAsk::of(&host, &asked, |_| true));
+    let mut placed = place(&policy_engine, &asked).await;
+    placed.keep_ask(KeptAsk::of(&policy_engine, &asked, |_| true));
     placed.dispatched(Instant::now());
     let answered = report(&store, d0, d1);
     assert!(placed.decode_again_kept(|_| true, answered).is_none());
@@ -261,11 +261,11 @@ async fn a_placement_keeps_an_ask_for_a_waiting_decode_alone() {
 
     // A waiting decode whose route lets the kept ask go keeps its first
     // decode, booked there and then: nothing asks it again.
-    let (host, store, [d0, d1]) = bed(DecodePick::AfterPrefill);
-    let host = Arc::new(host);
+    let (policy_engine, store, [d0, d1]) = bed(DecodePick::AfterPrefill);
+    let policy_engine = Arc::new(policy_engine);
     report(&store, d1, d0);
-    let mut placed = place(&host, &asked).await;
-    placed.keep_ask(KeptAsk::of(&host, &asked, |_| true));
+    let mut placed = place(&policy_engine, &asked).await;
+    placed.keep_ask(KeptAsk::of(&policy_engine, &asked, |_| true));
     let sent = Instant::now();
     placed.dispatched(sent);
     assert_eq!(pair_in_flight(&store, d0), 0, "a chosen decode is booked");
@@ -283,8 +283,8 @@ async fn a_placement_keeps_an_ask_for_a_waiting_decode_alone() {
 
 #[tokio::test]
 async fn a_first_decode_sent_with_no_second_ask_is_booked_at_its_send() {
-    let (host, store, _) = bed(DecodePick::AfterPrefill);
-    let mut placed = place(&host, &ask(b"pair", true)).await;
+    let (policy_engine, store, _) = bed(DecodePick::AfterPrefill);
+    let mut placed = place(&policy_engine, &ask(b"pair", true)).await;
     let first = decode_of(&placed);
     assert_eq!(pair_in_flight(&store, first), 0);
 
