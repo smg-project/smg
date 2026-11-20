@@ -531,10 +531,11 @@ impl DispatchContext {
     ///
     /// Both workers stay booked through the gate's wait, as the prefill's
     /// admission slot does. A shed at the gate drops the placement: each
-    /// side ends as cancelled, on a worker that was sent nothing. A span the
-    /// router states runs from the send, which the guards read after the
-    /// gate. A cancelled side's span is the lease's own, and it runs from
-    /// this commit.
+    /// side ends as cancelled, on a worker that was sent nothing. By then
+    /// the commit has written the key's pin under a sessions rule, and the
+    /// stages have heard a dispatch. A span the router states runs from the
+    /// send, which the guards read after the gate. A cancelled side's span
+    /// is the lease's own, and it runs from this commit.
     pub(crate) async fn admit(
         &mut self,
         sub_requests: usize,

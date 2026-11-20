@@ -3005,7 +3005,7 @@ async fn the_factory_builds_a_pair_router_that_serves_under_the_policy_controlle
         config::test_support::pd_routing_mode,
         routers::{
             grpc::testing::{grpc_config, grpc_ctx_from, mcp_orchestrator},
-            RouterFactory, RouterTrait,
+            RouterFactory,
         },
     };
 
