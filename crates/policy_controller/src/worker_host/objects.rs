@@ -220,6 +220,46 @@ impl<G: Generation> Objects<G> {
         credentials.forget(address, read)
     }
 
+    /// Lay again the object of each row that dials `address` and holds
+    /// another credential than the keeper holds there now. Each is built
+    /// anew from its row and takes its standing object's place, under its
+    /// id and with its running state. A registration calls it where its
+    /// write moved no row and its credential differs
+    /// ([`KeptCredential::differs`](super::KeptCredential::differs)), once
+    /// the token is accepted, and where its put-back said an object was
+    /// built with the refused credential. The call follows `store` first
+    /// and holds the follow's turn to its end. Return how many objects
+    /// were laid again: none where no keeper was handed in, where no row
+    /// dials the address, or where each object there holds what the keeper
+    /// holds.
+    pub fn lay_again<S: WorkersStore + ?Sized>(&self, store: &S, address: &str) -> usize {
+        let mut place = self.read_to.lock();
+        self.follow_from(store, &mut place);
+        let Some(credentials) = &self.credentials else {
+            return 0;
+        };
+        let stale: Vec<WorkerId> = {
+            let held = self.held.read();
+            held.rows
+                .values()
+                .filter(|laid| {
+                    held.facts
+                        .get(&laid.standing.row)
+                        .is_some_and(|facts| dial_address(facts) == address)
+                        && !credentials.holds(address, laid.object.api_key().map(String::as_str))
+                })
+                .map(|laid| laid.standing.row)
+                .collect()
+        };
+        let mut laid = 0;
+        // A row that left behind the read above is the next follow's.
+        for row in stale.into_iter().filter_map(|id| store.get(id)) {
+            self.lay(store, &row);
+            laid += 1;
+        }
+        laid
+    }
+
     /// The registry the objects stand in.
     pub fn registry(&self) -> &Arc<WorkerRegistry<G>> {
         &self.registry
@@ -720,6 +760,7 @@ mod tests {
         let laid = registry.get_by_url(A).expect("the row's object");
         assert!(laid.api_key().is_none());
         assert!(!objects.forget_credential(&store, B));
+        assert_eq!(objects.lay_again(&store, A), 0);
     }
 
     #[test]
@@ -894,6 +935,103 @@ mod tests {
         replica.store.upsert(facts(A, 1));
         replica.follow();
         assert!(replica.holds_credential(A, Some(KEY_A)));
+    }
+
+    #[test]
+    fn a_registration_that_moved_no_row_behind_a_new_credential_is_laid_again_with_it() {
+        let mut replica = Replica::new();
+        replica.keep(A, Some(KEY_A));
+        replica.store.upsert(facts(A, 1));
+        replica.follow();
+        let id = replica.id(A);
+        let standing = replica.objects.standing(&id);
+        replica.told();
+
+        // The same worker registered with another credential: a door
+        // writes nothing over equal facts, so no row moves and no object
+        // is built. The token says the credential differs.
+        let again = replica.kept(A, Some(KEY_B));
+        assert!(again.differs());
+        again.accepted();
+        replica.follow();
+        assert!(replica.holds_credential(A, Some(KEY_A)));
+
+        // The holder lays the object again: one replacement under its id,
+        // at the revision its row stands at.
+        assert_eq!(replica.objects.lay_again(replica.store.as_ref(), A), 1);
+        assert!(replica.holds_credential(A, Some(KEY_B)));
+        assert_eq!(replica.told(), [("replaced", id.clone())]);
+        assert_eq!(replica.objects.standing(&id), standing);
+
+        // An object that holds what the keeper holds is not laid again.
+        assert_eq!(replica.objects.lay_again(replica.store.as_ref(), A), 0);
+        assert!(replica.told().is_empty());
+
+        // A registration that states no credential differs too, and the
+        // object is laid again without one.
+        let cleared = replica.kept(A, None);
+        assert!(cleared.differs());
+        cleared.accepted();
+        assert_eq!(replica.objects.lay_again(replica.store.as_ref(), A), 1);
+        assert!(replica.holds_credential(A, None));
+    }
+
+    #[test]
+    fn an_object_built_with_a_refused_credential_is_laid_again_with_what_stood() {
+        let replica = Replica::new();
+        replica.keep(A, Some(KEY_A));
+        replica.store.upsert(facts(A, 1));
+        replica.follow();
+
+        // The standing row is written again while a registration is in
+        // flight: its object is built with the stated credential.
+        let refused = replica.kept(A, Some(KEY_B));
+        replica.store.upsert(facts(A, 1));
+        replica.follow();
+        assert!(replica.holds_credential(A, Some(KEY_B)));
+
+        // The put-back says so, and the holder lays the object again.
+        assert!(refused.put_back());
+        assert_eq!(replica.objects.lay_again(replica.store.as_ref(), A), 1);
+        assert!(replica.holds_credential(A, Some(KEY_A)));
+    }
+
+    #[test]
+    fn laying_again_reaches_each_rank_row_that_dials_the_address_and_no_other() {
+        let replica = Replica::new();
+        replica.keep(C, Some(KEY_C));
+        replica.keep(D, Some(KEY_A));
+        replica.store.upsert(rank_facts(A, C, 0));
+        replica.store.upsert(rank_facts(B, C, 1));
+        replica.store.upsert(facts(D, 1));
+        replica.follow();
+        let other = replica.at(D);
+
+        replica.keep(C, Some(KEY_B));
+        assert_eq!(replica.objects.lay_again(replica.store.as_ref(), C), 2);
+        assert!(replica.holds_credential(A, Some(KEY_B)));
+        assert!(replica.holds_credential(B, Some(KEY_B)));
+        assert!(Arc::ptr_eq(&other, &replica.at(D)));
+
+        // An address no row dials lays nothing.
+        assert_eq!(replica.objects.lay_again(replica.store.as_ref(), E), 0);
+    }
+
+    #[test]
+    fn laying_again_follows_the_store_first() {
+        let replica = Replica::new();
+        replica.keep(A, Some(KEY_A));
+        replica.store.upsert(facts(A, 1));
+        // No follow ran: the call reads the row and builds its object with
+        // what the keeper holds, so nothing is left to lay again.
+        assert_eq!(replica.objects.lay_again(replica.store.as_ref(), A), 0);
+        assert!(replica.holds_credential(A, Some(KEY_A)));
+
+        // A row that left behind the last follow is ended, not laid.
+        replica.keep(A, Some(KEY_B));
+        replica.remove(A);
+        assert_eq!(replica.objects.lay_again(replica.store.as_ref(), A), 0);
+        assert!(replica.objects.registry().get_by_url(A).is_none());
     }
 
     #[test]

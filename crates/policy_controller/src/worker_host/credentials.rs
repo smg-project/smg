@@ -25,9 +25,10 @@ use parking_lot::RwLock;
 /// A registration makes three calls. It calls [`Self::keep`] before its
 /// write, with `None` where it has no credential. It writes the row. Then
 /// it answers the token `keep` returned: [`KeptCredential::accepted`] where
-/// the write moved the row, [`KeptCredential::put_back`] where it was
-/// refused or moved nothing. It answers at the door's answer, with no
-/// await between the two. A token dropped with no answer is put back.
+/// the write moved the row or the credential alone changed,
+/// [`KeptCredential::put_back`] where it was refused or changed nothing.
+/// It answers at the door's answer, with no await between the two. A token
+/// dropped with no answer is put back.
 ///
 /// One registration is in flight at an address. A keep at an address whose
 /// last keep has no answer yet takes nothing and returns
@@ -38,12 +39,16 @@ use parking_lot::RwLock;
 /// the credential it stated. A write that moves the row's revision makes
 /// the holder build the object with it. A write that moves nothing builds
 /// nothing: a door answers [`Wrote::Unmoved`](super::Wrote::Unmoved) for
-/// equal facts. Put such a keep back: the object that stands keeps the
-/// credential it was built with, and the keeper keeps the same one.
+/// equal facts. Where the token says the stated credential differs
+/// ([`KeptCredential::differs`]), accept it and have the holder lay the
+/// address's objects again
+/// ([`Objects::lay_again`](super::Objects::lay_again)). Where it does not,
+/// put the keep back: nothing changed.
 ///
 /// A put-back restores what stood at the address when the registration
 /// kept. It says whether an object was built with the refused credential
-/// meanwhile. Such an object holds it until its row is written again.
+/// meanwhile. Have the holder lay the address's objects again then: each
+/// takes what stood.
 ///
 /// Write the removal before calling
 /// [`Objects::forget_credential`](super::Objects::forget_credential). The
@@ -126,6 +131,8 @@ pub struct KeptCredential {
     held: Arc<RwLock<Held>>,
     address: String,
     in_flight: bool,
+    /// Whether the stated credential is another than the one that stood.
+    differs: bool,
 }
 
 /// A keep found a registration in flight at its address and took nothing.
@@ -151,18 +158,30 @@ impl fmt::Debug for KeptCredential {
 }
 
 impl KeptCredential {
-    /// The write moved the row: the stated credential stands at the
-    /// address. Call it at the door's answer, with no await between the
-    /// two: a token dropped there puts back a credential the row's object
-    /// was built with.
+    /// Whether the registration stated another credential than the one
+    /// that stood at the address when it kept: another key, a key where
+    /// none stood, or none where one stood. A write that moves no row
+    /// builds no object. Where this is `true` behind such a write, accept
+    /// the token and have the holder lay the address's objects again
+    /// ([`Objects::lay_again`](super::Objects::lay_again)).
+    pub fn differs(&self) -> bool {
+        self.differs
+    }
+
+    /// The write moved the row, or moved nothing and the stated credential
+    /// differs: the stated credential stands at the address. Call it at
+    /// the door's answer, with no await between the two: a token dropped
+    /// there puts back a credential the row's object was built with.
     pub fn accepted(mut self) {
         self.end(true);
     }
 
-    /// The write was refused, or moved nothing: restore what stood at the
-    /// address when the registration kept. Return `true` if an object was
-    /// built with the credential put back meanwhile. That object holds it
-    /// until its row is written again.
+    /// The write was refused, or changed nothing: restore what stood at
+    /// the address when the registration kept. Return `true` if an object
+    /// was built with the credential put back meanwhile. That object holds
+    /// it until the holder lays it again
+    /// ([`Objects::lay_again`](super::Objects::lay_again)) or its row is
+    /// written again.
     pub fn put_back(mut self) -> bool {
         self.end(false)
     }
@@ -220,36 +239,43 @@ impl Credentials {
 
     /// State the credential of the registration at `address`, before its
     /// write. Pass `None` for a registration without one. An object built
-    /// at the address from here on takes it. Where the address's last keep
-    /// has no answer yet, take nothing and return [`RegistrationInFlight`].
+    /// at the address from here on takes it. The token says whether it is
+    /// another than the one that stood ([`KeptCredential::differs`]). Where
+    /// the address's last keep has no answer yet, take nothing and return
+    /// [`RegistrationInFlight`].
     pub fn keep(
         &self,
         address: &str,
         credential: Option<String>,
     ) -> Result<KeptCredential, RegistrationInFlight> {
         let mut held = self.held.write();
-        match held.entries.get_mut(address) {
+        let differs = match held.entries.get_mut(address) {
             Some(entry) if entry.flight.is_some() => return Err(RegistrationInFlight),
             Some(entry) => {
                 let stood = Stood {
                     credential: mem::replace(&mut entry.credential, credential),
                     taken_at: entry.taken_at,
                 };
+                let differs = stood.credential != entry.credential;
                 entry.flight = Some(Flight::over(Some(stood)));
+                differs
             }
             None => {
+                let differs = credential.is_some();
                 let entry = Entry {
                     credential,
                     taken_at: 0,
                     flight: Some(Flight::over(None)),
                 };
                 held.entries.insert(address.to_owned(), entry);
+                differs
             }
-        }
+        };
         Ok(KeptCredential {
             held: Arc::clone(&self.held),
             address: address.to_owned(),
             in_flight: true,
+            differs,
         })
     }
 
@@ -278,6 +304,16 @@ impl Credentials {
             flight.built.store(true, Relaxed);
         }
         entry.credential.clone()
+    }
+
+    /// Whether an object built at `address` now would take `credential`:
+    /// what the keeper holds there. The read marks no flight.
+    pub(super) fn holds(&self, address: &str, credential: Option<&str>) -> bool {
+        let held = self.held.read();
+        held.entries
+            .get(address)
+            .and_then(|entry| entry.credential.as_deref())
+            == credential
     }
 
     /// The keeper's clock: how many registrations were answered as taken.
@@ -378,6 +414,52 @@ mod tests {
             }
         }
         assert!(!token.put_back());
+    }
+
+    #[test]
+    fn a_keep_says_whether_its_credential_differs_from_what_stood() {
+        let credentials = Credentials::new();
+        // At an address that held nothing, a credential differs and none
+        // does not.
+        let none = keep(&credentials, ADDRESS, None);
+        assert!(!none.differs());
+        none.accepted();
+        let first = keep(&credentials, ADDRESS, Some(KEY_A));
+        assert!(first.differs());
+        first.accepted();
+        assert!(keep(&credentials, OTHER_ADDRESS, Some(KEY_A)).differs());
+
+        // The credential that stands differs in nothing. Another does, and
+        // so does none.
+        let same = keep(&credentials, ADDRESS, Some(KEY_A));
+        assert!(!same.differs());
+        assert!(!same.put_back());
+        let other = keep(&credentials, ADDRESS, Some(KEY_B));
+        assert!(other.differs());
+        other.accepted();
+        let cleared = keep(&credentials, ADDRESS, None);
+        assert!(cleared.differs());
+
+        // A put-back restores what stood: the next keep is held against it.
+        assert!(!cleared.put_back());
+        assert!(!keep(&credentials, ADDRESS, Some(KEY_B)).differs());
+    }
+
+    #[test]
+    fn what_the_keeper_holds_is_read_with_no_mark_on_a_flight() {
+        let credentials = Credentials::new();
+        assert!(credentials.holds(ADDRESS, None));
+        register(&credentials, ADDRESS, Some(KEY_A));
+        assert!(credentials.holds(ADDRESS, Some(KEY_A)));
+        assert!(!credentials.holds(ADDRESS, Some(KEY_B)));
+        assert!(!credentials.holds(ADDRESS, None));
+
+        // A flight's stated credential is what an object would take, and
+        // the read is no build: the put-back says no object was built.
+        let flight = keep(&credentials, ADDRESS, Some(KEY_C));
+        assert!(credentials.holds(ADDRESS, Some(KEY_C)));
+        assert!(!flight.put_back());
+        assert!(credentials.holds(ADDRESS, Some(KEY_A)));
     }
 
     #[test]
