@@ -1758,7 +1758,7 @@
           "type": "string"
         },
         {
-          "description": "Shadow profiles by side. Validation currently refuses this form.",
+          "description": "A pair's shadow profiles by side: `prefill`, `decode` or both.",
           "type": "object",
           "additionalProperties": {
             "type": "string"

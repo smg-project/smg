@@ -2224,7 +2224,7 @@ impl PlanName {
 pub enum ShadowSpec {
     /// The shadow of a binding that names one live profile.
     Profile(String),
-    /// Shadow profiles by side. Validation currently refuses this form.
+    /// A pair's shadow profiles by side: `prefill`, `decode` or both.
     Sides(BTreeMap<String, String>),
 }
 
@@ -4350,42 +4350,65 @@ fn resolve_shadow_profile(
     Ok(position)
 }
 
+/// The binding's shadow profiles by position: a single's, or the prefill
+/// side's of a pair, then the decode side's of a pair. A pair names its
+/// shadows by side, and a side the map leaves out is not shadowed. The
+/// encode side takes none.
 fn check_shadow(
     shadow: &ShadowSpec,
     plan: PlanName,
     cx: &BindingContext<'_>,
     at: &At,
     deferred: &mut Deferred,
-) -> Result<Option<u16>, SpecError> {
+) -> Result<[Option<u16>; 2], SpecError> {
     let shadow_at = at.sub("shadow");
     match shadow {
         ShadowSpec::Profile(name) if plan == PlanName::Single => {
-            resolve_shadow_profile(name, shadow_at, cx, deferred).map(Some)
+            let single = resolve_shadow_profile(name, shadow_at, cx, deferred)?;
+            Ok([Some(single), None])
         }
         ShadowSpec::Profile(name) => {
             Err(at.bad("shadow", name, "a map of shadow profiles by side"))
         }
+        // A binding of one profile names its shadow by a profile's
+        // name, and a map that names no side names no shadow: either
+        // loads as a document that shadows nothing, where its writer
+        // meant one.
+        ShadowSpec::Sides(_) if plan == PlanName::Single => {
+            Err(at.bad("shadow", "a map", "one shadow profile's name"))
+        }
+        ShadowSpec::Sides(sides) if sides.is_empty() => {
+            let sides = "a profile on the prefill or the decode side of a pair";
+            Err(at.bad("shadow", "{}", sides))
+        }
         ShadowSpec::Sides(sides) => {
+            let mut by_side = [None; 2];
             for (side, name) in sides {
-                if !plan.sides().contains(&side.as_str()) {
-                    return Err(shadow_at.bad(side, name, "a profile on a side of the plan"));
-                }
-                resolve_shadow_profile(name, shadow_at.sub(side), cx, deferred)?;
+                let place = match side.as_str() {
+                    "prefill" => 0,
+                    "decode" => 1,
+                    _ => {
+                        let sides = "a profile on the prefill or the decode side of a pair";
+                        return Err(shadow_at.bad(side, name, sides));
+                    }
+                };
+                let profile = resolve_shadow_profile(name, shadow_at.sub(side), cx, deferred)?;
+                by_side[place] = Some(profile);
             }
-            deferred.note(shadow_at.0, "a shadow map");
-            Ok(None)
+            Ok(by_side)
         }
     }
 }
 
 /// The binding's rules around the decision, in shape; the ones this build
-/// does not evaluate are noted as deferred. Returns the shadow's position.
+/// does not evaluate are noted as deferred. Returns the shadows' positions
+/// ([`check_shadow`]).
 fn check_binding_rules(
     b: &BindingSpec,
     cx: &BindingContext<'_>,
     at: &At,
     deferred: &mut Deferred,
-) -> Result<Option<u16>, SpecError> {
+) -> Result<[Option<u16>; 2], SpecError> {
     if let Some(overload) = &b.overload {
         check_overload(overload, &at.sub("overload"))?;
     }
@@ -4401,7 +4424,7 @@ fn check_binding_rules(
     }
     let shadow = match &b.shadow {
         Some(shadow) => check_shadow(shadow, b.plan.unwrap_or_default(), cx, at, deferred)?,
-        None => None,
+        None => [None; 2],
     };
     if let Some(canary) = &b.canary {
         check_canary(canary, cx, &at.sub("canary"))?;
@@ -4423,7 +4446,7 @@ fn check_binding_rules(
 fn resolve_plan(
     b: &BindingSpec,
     cx: &BindingContext<'_>,
-    shadow: Option<u16>,
+    [shadow, decode_shadow]: [Option<u16>; 2],
 ) -> Result<Option<Binding>, SpecError> {
     let index = cx.index;
     let plan = b.plan.unwrap_or_default();
@@ -4459,7 +4482,7 @@ fn resolve_plan(
         profile,
         decode_profile,
         shadow,
-        decode_shadow: None,
+        decode_shadow,
         sessions: None,
         overload: overload_thresholds(b.overload.as_ref()),
     };
@@ -6127,21 +6150,38 @@ mod tests {
         );
     }
 
+    /// A pair names its shadows by side: the map's keys are `prefill` and
+    /// `decode`, and a side it leaves out is not shadowed. Each value is a
+    /// profile no binding decides by live. Any other key, and a map on a
+    /// binding of one profile, are refused by path.
     #[test]
-    fn shadow_map_checks_its_sides_and_names_before_deferral() {
+    fn a_pairs_shadow_map_names_a_profile_a_side() {
         let pair = |shadow: &str| {
             spec_with_binding(&format!(
                 r#"{{"plan":"pd-pair","profiles":{{"prefill":"p","decode":"p"}},"shadow":{shadow}}}"#,
             ))
         };
-        assert_eq!(
-            not_in_build(&pair(r#"{"decode":"q"}"#)),
-            ("bindings[0].shadow".to_string(), "a shadow map")
-        );
+        let sides = |shadow: &str| {
+            let engine = pair(shadow).validate().expect("a pair's shadow map");
+            let binding = engine.binding("m", Phase::Prefill);
+            let binding = binding.expect("the pair's binding");
+            (binding.shadow, binding.decode_shadow)
+        };
+        // `q` is the document's second profile.
+        assert_eq!(sides(r#"{"decode":"q"}"#), (None, Some(1)));
+        assert_eq!(sides(r#"{"prefill":"q"}"#), (Some(1), None));
+        assert_eq!(sides(r#"{"prefill":"q","decode":"q"}"#), (Some(1), Some(1)));
         assert_eq!(
             bad_field(&pair(r#"{"encode":"q"}"#)),
             "bindings[0].shadow.encode"
         );
+        // A binding of one profile takes no map, and no plan an empty
+        // one: either would load as a document that shadows nothing.
+        let single = spec_with_binding(r#"{"profile":"p","shadow":{"decode":"q"}}"#);
+        assert_eq!(bad_field(&single), "bindings[0].shadow");
+        let empty = spec_with_binding(r#"{"profile":"p","shadow":{}}"#);
+        assert_eq!(bad_field(&empty), "bindings[0].shadow");
+        assert_eq!(bad_field(&pair("{}")), "bindings[0].shadow");
         assert_eq!(
             pair(r#"{"decode":"absent"}"#)
                 .validate()
