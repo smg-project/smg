@@ -1,5 +1,5 @@
-//! The recent decisions of one seat. The seat's holder counts and writes,
-//! and a reader copies a matching record under the seat's ring lock.
+//! A seat's holder counts picks and sheds before it takes the ring lock.
+//! The lock holds a push or a scan of the seat's recent decisions.
 
 use std::{collections::VecDeque, time::Instant};
 
@@ -95,46 +95,69 @@ impl DecisionRecord {
     }
 }
 
+/// A decider's count toward its next sample, kept under one term and
+/// generation. A door in process uses term zero throughout.
 #[derive(Default)]
-pub(crate) struct Samples {
-    records: VecDeque<DecisionRecord>,
-    /// A served decider's lead. A door in process uses zero throughout.
+pub(crate) struct SampleCount {
     term: u64,
     generation: u64,
     count: u32,
 }
 
+impl SampleCount {
+    /// Counts a pick or shed, restarting under a new term or generation.
+    /// Returns true when the count reaches the sampling rate.
+    pub(crate) fn keeps(&mut self, term: u64, engine: &Engine, decision: &Decision) -> bool {
+        if !matches!(decision, Decision::Pick(_) | Decision::Shed(_)) {
+            return false;
+        }
+        let generation = engine.generation();
+        if self.term != term || self.generation != generation {
+            *self = Self {
+                term,
+                generation,
+                count: 0,
+            };
+        }
+        self.count += 1;
+        if self.count != engine.explain_sample() {
+            return false;
+        }
+        self.count = 0;
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn counted(&self) -> u32 {
+        self.count
+    }
+}
+
+/// A seat's recent decisions. The seat's holder counts separately and
+/// takes the ring lock to push. A reader takes it for one scan.
+#[derive(Default)]
+pub(crate) struct Samples {
+    records: VecDeque<DecisionRecord>,
+    term: u64,
+}
+
 impl Samples {
-    /// Counts a pick or shed under a sampling generation, allocating the
-    /// ring on the first kept decision. A new generation starts its count
-    /// over. A new lead starts with an empty ring.
+    /// Pushes one record, allocating the ring on its first write. A new
+    /// lead starts with an empty ring.
     #[cold]
-    pub(crate) fn keep<A: Asked>(
+    pub(crate) fn push<A: Asked>(
         &mut self,
         term: u64,
         engine: &Engine,
         taken: &Taken<'_, A>,
         decision: &Decision,
     ) {
-        if !matches!(decision, Decision::Pick(_) | Decision::Shed(_)) {
-            return;
-        }
         if self.term != term {
             *self = Self {
                 term,
                 ..Self::default()
             };
         }
-        let generation = engine.generation();
-        if self.generation != generation {
-            self.generation = generation;
-            self.count = 0;
-        }
-        self.count += 1;
-        if self.count != engine.explain_sample() {
-            return;
-        }
-        self.count = 0;
         if self.records.capacity() == 0 {
             self.records = VecDeque::with_capacity(SLOTS);
         }
@@ -171,11 +194,6 @@ impl Samples {
     pub(super) fn slots(&self) -> usize {
         self.records.capacity()
     }
-
-    #[cfg(test)]
-    pub(super) fn counted(&self) -> u32 {
-        self.count
-    }
 }
 
 #[cfg(test)]
@@ -184,7 +202,7 @@ mod tests {
     use crate::{
         builtins::{Best, FewestSessions, Healthy, LeastRequests, NotTried},
         decision::{Queue, Shed, ShedReason, Trace},
-        door::tests::{request, GATEWAY},
+        door::tests::GATEWAY,
         framework::{Binding, Profile, Weighted},
         Needs, PolicySpec,
     };
@@ -290,25 +308,17 @@ mod tests {
     #[test]
     fn a_queue_ticket_does_not_count_toward_a_sample() {
         let mut document = PolicySpec::preset("random").expect("a preset");
-        document.explain.sample = 1;
+        document.explain.sample = 2;
         let engine = document.validate().expect("a valid document");
-        let taken = Taken {
-            request: &request(b"queued", 7),
-            gateway: GATEWAY,
-            now: Instant::now(),
-            left: std::time::Duration::MAX,
-            pins: None,
-            place: None,
-        };
         let ticket = Decision::Queue(Queue {
             ticket: 1,
             max_wait_micros: 2,
             trace: Trace::default(),
         });
-        let mut samples = Samples::default();
-        samples.keep(0, &engine, &taken, &ticket);
-        assert_eq!(samples.counted(), 0);
-        assert_eq!(samples.slots(), 0);
-        assert!(samples.find(0, GATEWAY, fingerprint(b"queued")).is_none());
+        let shed = record(engine.generation(), None, 0).decision;
+        let mut count = SampleCount::default();
+        assert!(!count.keeps(0, &engine, &ticket));
+        assert!(!count.keeps(0, &engine, &shed));
+        assert!(count.keeps(0, &engine, &shed));
     }
 }
