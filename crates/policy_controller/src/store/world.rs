@@ -1895,6 +1895,10 @@ fn row_of(
         load_sampled_at_micros: sample.map_or(0, |sample| micros(origin, sample.sampled_at)),
         host_local: facts.reachable_from != Reachability::Any,
         vision: facts.vision,
+        // No admission window is the store's to know: both bits read open,
+        // and the host that asks gates capacity at its own commit.
+        has_capacity: true,
+        has_room: true,
         // The low 32 bits of the registration key's fingerprint.
         key: fingerprint(facts.key.as_bytes()) as u32,
         engine_kind: listed.engine_kind,

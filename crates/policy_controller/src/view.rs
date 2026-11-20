@@ -713,9 +713,11 @@ pub struct Candidate {
     /// with.
     pub pair_class: u32,
     /// Host-supplied admission bit: the prefill capacity window has a slot.
+    /// The store knows no window, so a row it builds reads the bit open.
     pub has_capacity: bool,
     /// Host-supplied admission bit: the decode's running window has a room
-    /// nobody waiting at its gate is in line for.
+    /// nobody waiting at its gate is in line for. Open on a row the store
+    /// builds, as [`Self::has_capacity`] is.
     pub has_room: bool,
     /// The zone, as a position into the spec's declared list; `0` when
     /// unzoned.
