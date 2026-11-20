@@ -3,10 +3,10 @@
 use std::{error::Error, time::Duration};
 
 use serde_json::json;
-use smg_policy_controller::store::{GatewayId, LeasesStore, MemoryStore, WorkersStore};
+use smg_policy_controller::store::{GatewayId, HealthSink, LeasesStore, MemoryStore, WorkersStore};
 
 use super::{
-    tests::{create_test_pd_router, spawn_delayed_stub, spawn_recording_stub},
+    tests::{create_test_pd_router, spawn_cut_body_stub, spawn_delayed_stub, spawn_recording_stub},
     *,
 };
 use crate::{
@@ -198,5 +198,82 @@ async fn a_decode_that_waits_on_its_prefill_outlives_the_dispatch_deadline() -> 
     assert_eq!(swept, 0, "the sweep ended a side of the pair");
     assert_eq!(decode_seen.lock().map_err(|e| e.to_string())?.len(), 1);
     assert_eq!(live(&store, 0).await, 0);
+    Ok(())
+}
+
+/// A retry is not placed on a worker that answered the request
+/// definitively. The pair's commit asks the request's ledger of both
+/// workers, so a pick that names the closed decode is passed over for the
+/// other one, whichever the pick lists first.
+#[tokio::test]
+async fn a_retry_is_not_placed_on_a_worker_the_ledger_closed() -> Case {
+    for closed in [0, 1] {
+        let (prefill, _) = spawn_recording_stub("{}").await;
+        let (first, _) = spawn_recording_stub("{}").await;
+        let (second, _) = spawn_recording_stub("{}").await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let bed = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&first, &second]);
+        let (host, store, [prefills, decodes]) = bed;
+        let ledger = AttemptLedger::default();
+        let mut failed = error::internal_error("worker_failed", "the worker failed the request");
+        mark_failed_side(&mut failed, decodes[closed].as_ref());
+        ledger.settle(
+            &mut failed,
+            [&prefills[0], &decodes[closed]],
+            decodes.iter(),
+        );
+        let router = router(registry, host);
+        let host = router.host.as_deref().ok_or("the router holds the host")?;
+        let context = PDRequestContext {
+            route: "/generate",
+            batch_size: None,
+            is_stream: false,
+            return_logprob: false,
+            model_id: MODEL,
+            headers: None,
+            rid: None,
+        };
+        let tried = parking_lot::Mutex::new(Vec::new());
+        for _ in 0..4 {
+            let placed = router
+                .place_pair_attempt(host, &context, 0, None, &tried, &ledger)
+                .await;
+            let (sent, (_, decode), _guards) =
+                placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
+            assert_eq!(decode.url(), decodes[1 - closed].url(), "closed {closed}");
+            drop(sent);
+        }
+        assert_eq!(live(&store, 0).await, 0);
+    }
+    Ok(())
+}
+
+/// A streamed answer its decode worker cuts is told as the cut it was. The
+/// relay answers the client with an error frame and a clean end, and writes
+/// the cut on the placement's mark: the decode's row hears no success. A
+/// whole answer over the same path is the control.
+#[tokio::test]
+async fn a_streamed_answer_its_decode_cuts_is_told_as_no_success() -> Case {
+    let whole = spawn_recording_stub(r#"{"text":"done"}"#).await.0;
+    for (decode, served) in [(whole, true), (spawn_cut_body_stub().await, false)] {
+        let (prefill, _) = spawn_recording_stub("{}").await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+        let row = store
+            .by_key(&decode)
+            .ok_or("the decode worker had no row")?;
+        let router = router(registry, host);
+        let start = Instant::now();
+        let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+        let request = serde_json::from_value(json!({"text": "hi", "stream": true}))?;
+
+        let response = router.route_generate(None, &meta, request, MODEL).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert_eq!(live(&store, 0).await, 0);
+        let ok = HealthSink::completed_ok_since(&*store, GATEWAY, row.id, start);
+        assert_eq!(ok, served, "served whole: {served}");
+    }
     Ok(())
 }

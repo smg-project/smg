@@ -2154,6 +2154,56 @@ async fn each_side_of_a_placed_pair_reports_its_own_dispatch_and_end() {
     );
 }
 
+/// A route's rule at the pair's commit: a target whose decode the rule
+/// refuses is passed over like one the gateway cannot send to. With every
+/// target refused the pick is released and the refused rows are missed.
+#[tokio::test]
+async fn the_routes_rule_passes_over_a_pair_at_its_commit() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 2, 2).expect("a pair fleet");
+    let now = Instant::now();
+    let url_of = |row: WorkerId| {
+        let decode = bed.decodes.iter().find(|(id, _)| *id == row);
+        decode.expect("a decode of the bed").1.url().to_owned()
+    };
+    let asked = bed.host.ask(&pair_ask(), &[], now).await.expect("a pair");
+    let rows: Vec<_> = asked
+        .targets
+        .iter()
+        .filter_map(|target| target.pair)
+        .collect();
+    let (first, second) = (rows[0].decode_id, rows[1].decode_id);
+    let refused = url_of(first);
+    let mut missed = Vec::new();
+    let placed = bed
+        .host
+        .commit_pair_where(
+            asked,
+            |worker| worker.url() != refused,
+            None,
+            &mut missed,
+            now,
+        )
+        .expect("the target behind the first");
+    assert_eq!(placed.decode_id(), Some(second));
+    assert!(missed.is_empty());
+    drop(placed);
+
+    let asked = bed.host.ask(&pair_ask(), &[], now).await.expect("a pair");
+    let rows = asked.targets.iter().filter_map(|target| target.pair);
+    let rows: Vec<_> = rows.map(|pair| pair.decode_id).collect();
+    let refused = [url_of(first), url_of(second)];
+    let none = bed.host.commit_pair_where(
+        asked,
+        |worker| !refused.iter().any(|url| url == worker.url()),
+        None,
+        &mut missed,
+        now,
+    );
+    assert_eq!(none.err(), Some(Unplaced::NoTargetHolds));
+    assert_eq!(missed, rows);
+    assert_eq!(live(&bed.store, 0), 0);
+}
+
 /// A pair's router says the prefill's end where the prefill is done with,
 /// ahead of the answer its decode writes. The answer's end then ends the
 /// decode alone, so the prefill hears one completion.

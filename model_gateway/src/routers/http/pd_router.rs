@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU16, AtomicUsize, Ordering},
         Arc,
     },
     time::Instant,
@@ -971,14 +971,22 @@ impl PDRouter {
                 }
                 (prefill, decode, guards, None)
             }
-            // The host places the pair. Its commit read both workers, so no
-            // dispatch-time re-check follows.
+            // The host places the pair. The controller's own overload verdict,
+            // from its document's thresholds, stands in for the gateway's
+            // dispatch-time re-check, as on the regular router's hosted path.
             Some(host) => {
                 let prompt_tokens = tokens
                     .as_deref()
                     .map_or(0, |tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX));
                 let placed = self
-                    .place_pair_attempt(host, &context, prompt_tokens, sticky_key, tried_rows)
+                    .place_pair_attempt(
+                        host,
+                        &context,
+                        prompt_tokens,
+                        sticky_key,
+                        tried_rows,
+                        ledger,
+                    )
                     .await;
                 match placed {
                     Ok((placed, (prefill, decode), guards)) => {
@@ -1319,7 +1327,10 @@ impl PDRouter {
     /// The attempt's pair as the policy controller placed it, with the load
     /// both sides hold, or the answer of a request it did not place. The
     /// prefill's guard is the admission's and the decode's is taken here, as
-    /// on the classic path. The controller reads the tried rows softly.
+    /// on the classic path. The controller reads the tried rows softly. The
+    /// commit asks `ledger` of both workers, as the classic selection's
+    /// filter does: a worker that answered the request definitively takes no
+    /// further attempt of it, at any of its ranks.
     async fn place_pair_attempt(
         &self,
         host: &Host,
@@ -1327,6 +1338,7 @@ impl PDRouter {
         prompt_tokens: u32,
         sticky_key: Option<&str>,
         tried_rows: &parking_lot::Mutex<Vec<WorkerId>>,
+        ledger: &AttemptLedger,
     ) -> Result<(Sent, PdPair, PdLoadGuards), Response> {
         let model = if context.model_id == UNKNOWN_MODEL_ID {
             let Some(model) = self.model_of_an_unnamed_request() else {
@@ -1348,8 +1360,9 @@ impl PDRouter {
             tried: &tried,
             ..Ask::of(&id, &model)
         };
+        let admits = |worker: &dyn Worker| ledger.admits(worker);
         let placed = host
-            .place_pair(&ask, self.prefill_admission.as_deref(), sticky_key)
+            .place_pair_where(&ask, admits, self.prefill_admission.as_deref(), sticky_key)
             .await;
         let (placed, prefill_guard) = match placed {
             Ok(placed) => placed,
@@ -1369,6 +1382,12 @@ impl PDRouter {
             decode: WorkerLoadGuard::with_key(Arc::clone(&decode), sticky_key),
         };
         Ok((Sent::from(placed), (prefill, decode), guards))
+    }
+
+    /// The mark the relay of a streamed answer writes a cut's status on,
+    /// where the policy controller placed the attempt.
+    fn cut_mark_of(placed: Option<&mut Sent>, is_stream: bool) -> Option<Arc<AtomicU16>> {
+        placed.filter(|_| is_stream).map(Sent::cut_mark)
     }
 
     /// The end of an attempt the policy controller placed. The rows of a
@@ -1566,7 +1585,7 @@ impl PDRouter {
     /// forwarded.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the sequential decode handoff carries its request ledger"
+        reason = "the sequential decode handoff carries its request ledger and the placement's mark"
     )]
     async fn forward_decode_head(
         &self,
@@ -1577,6 +1596,7 @@ impl PDRouter {
         runtime: &'static str,
         dispatch_start: Instant,
         ledger: &AttemptLedger,
+        cut: Option<Arc<AtomicU16>>,
     ) -> Response {
         events::RequestReceivedEvent {}.emit();
         let status = decode_response.status();
@@ -1602,6 +1622,7 @@ impl PDRouter {
             decode_guard,
             None,
             Some(ledger),
+            cut,
         )
         .await
     }
@@ -1774,6 +1795,7 @@ impl PDRouter {
             placed.dispatched(dispatch_start);
             placed.decode_dispatched(dispatch_start);
         }
+        let cut = Self::cut_mark_of(placed.as_deref_mut(), context.is_stream);
         let prefill_fut = async {
             let resp = send_with_stale_conn_retry(prefill_request)
                 .await
@@ -1923,6 +1945,7 @@ impl PDRouter {
             decode_guard,
             prefill_body,
             None,
+            cut,
         )
         .await
     }
@@ -2243,6 +2266,7 @@ impl PDRouter {
             headers,
             dp_rank,
         );
+        let cut = Self::cut_mark_of(placed.as_deref_mut(), context.is_stream);
         // A decode sent behind its prefill said its dispatch at that send,
         // and a second say tells nothing. A decode sent alone says it here.
         if let Some(placed) = placed {
@@ -2261,6 +2285,7 @@ impl PDRouter {
             runtime,
             dispatch_start,
             ledger,
+            cut,
         )
         .await
     }
@@ -2313,6 +2338,7 @@ impl PDRouter {
             placed.dispatched(dispatch_start);
             placed.decode_dispatched(dispatch_start);
         }
+        let cut = Self::cut_mark_of(placed.as_deref_mut(), context.is_stream);
         let prefill_request = self.build_post_with_headers(
             prefill.as_ref(),
             context.route,
@@ -2410,6 +2436,7 @@ impl PDRouter {
             runtime,
             dispatch_start,
             ledger,
+            cut,
         )
         .await
     }
@@ -2473,6 +2500,10 @@ impl PDRouter {
     /// sequential PD dispatch paths.
     /// `outcome_ledger` records an unstreamed answer's status on the decode
     /// worker here when the caller does not record the attempt itself.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the decode side as its dispatch body holds it, and the placement's mark"
+    )]
     async fn forward_decode_body(
         &self,
         decode_response: reqwest::Response,
@@ -2481,6 +2512,7 @@ impl PDRouter {
         decode_guard: WorkerLoadGuard,
         prefill_body: Option<Bytes>,
         outcome_ledger: Option<&AttemptLedger>,
+        cut: Option<Arc<AtomicU16>>,
     ) -> Response {
         let status = decode_response.status();
         if context.is_stream {
@@ -2498,12 +2530,19 @@ impl PDRouter {
                 header_utils::preserve_response_headers(decode_response.headers());
             header_utils::insert_routed_worker_id(&mut response_headers, decode.redacted_url());
 
+            // The relay answers a cut body with an error frame and a clean
+            // end. It writes the cut on the placement's mark, so the body's
+            // end is told as the cut it was.
+            let mut source = RelaySource::decode_side(context.model_id, context.route, decode);
+            if let Some(cut) = cut {
+                source = source.marking(cut);
+            }
             self.create_streaming_response(
                 decode_response.bytes_stream(),
                 status,
                 prefill_logprobs,
                 context.return_logprob,
-                RelaySource::decode_side(context.model_id, context.route, decode),
+                source,
                 Some(response_headers),
                 decode_guard,
             )
@@ -4688,7 +4727,7 @@ mod tests {
     /// A server whose answer's head and first bytes leave at once and whose
     /// body then breaks off, on every path and method: a worker that dies
     /// mid-answer.
-    async fn spawn_cut_body_stub() -> String {
+    pub(super) async fn spawn_cut_body_stub() -> String {
         let app = axum::Router::new().fallback(axum::routing::any(|| async {
             let head = futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
                 b"{\"partial\":",

@@ -29,6 +29,10 @@ pub(crate) const MODEL: &str = "model-a";
 /// A host, its store, and the registry's workers in the URLs' order.
 type Bed = (Host, Arc<MemoryStore>, Vec<Arc<dyn Worker>>);
 
+/// A host, its store, and the registry's workers of each side in its URLs'
+/// order: the prefill workers, then the decode workers.
+type PairBed = (Host, Arc<MemoryStore>, [Vec<Arc<dyn Worker>>; 2]);
+
 /// The store a start makes under the controller with one ready row a URL,
 /// a registry with one worker a URL, and the host over the two.
 pub(crate) fn bed(urls: &[&str]) -> Bed {
@@ -156,7 +160,7 @@ pub(crate) fn pair_bed_over(
     registry: Arc<WorkerRegistry>,
     prefill_urls: &[&str],
     decode_urls: &[&str],
-) -> (Host, Arc<MemoryStore>, [Vec<Arc<dyn Worker>>; 2]) {
+) -> PairBed {
     pair_bed_running(RuntimeType::default(), registry, prefill_urls, decode_urls)
 }
 
@@ -167,7 +171,7 @@ pub(crate) fn pair_bed_running(
     registry: Arc<WorkerRegistry>,
     prefill_urls: &[&str],
     decode_urls: &[&str],
-) -> (Host, Arc<MemoryStore>, [Vec<Arc<dyn Worker>>; 2]) {
+) -> PairBed {
     let config = RouterConfig {
         policy_controller: true,
         mode: RoutingMode::PrefillDecode {
