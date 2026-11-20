@@ -224,6 +224,11 @@ pub struct PDRouter {
     rate_limit_manager: Option<Arc<RateLimitManager>>,
     /// The policy controller's host, when it places this router's pairs.
     host: Option<Arc<Host>>,
+    /// Whether the pair's policy settings keep a request to the worker it
+    /// names ([`placement::pair_keeps_target`]). No role policy is built
+    /// under the policy controller, so the router keeps what its settings
+    /// say.
+    keeps_target: bool,
 }
 
 impl std::fmt::Debug for PDRouter {
@@ -530,6 +535,10 @@ impl PDRouter {
             moriio_dp_turn: AtomicUsize::new(0),
             rate_limit_manager: ctx.rate_limit_manager.clone(),
             host: ctx.policy_host.clone(),
+            keeps_target: placement::pair_keeps_target(
+                &ctx.router_config.mode,
+                &ctx.router_config.policy,
+            ),
         })
     }
 
@@ -1325,6 +1334,17 @@ impl PDRouter {
         models.all(|other| other == model).then(|| model.to_owned())
     }
 
+    /// The refusal of a request that names its worker, where a role's
+    /// classic policy holds it to that worker ([`placement::strict_target`]).
+    /// The host reads no explicit target yet and would place the pair on
+    /// other workers, so the shape is refused by name.
+    fn explicit_target_refusal(&self, headers: Option<&HeaderMap>) -> Option<Response> {
+        // A request that names no worker pays the header's probe alone.
+        header_utils::extract_target_worker(headers)?;
+        self.keeps_target
+            .then(|| crate::policy_controller::refused("an explicit target worker"))
+    }
+
     /// The attempt's pair as the policy controller placed it, with the load
     /// both sides hold, or the answer of a request it did not place. The
     /// prefill's guard is the admission's and the decode's is taken here, as
@@ -1351,6 +1371,9 @@ impl PDRouter {
         } else {
             Cow::Borrowed(context.model_id)
         };
+        if let Some(refusal) = self.explicit_target_refusal(context.headers.as_ref()) {
+            return Err(refusal);
+        }
         let id = host::mark();
         let tried = tried_rows.lock().clone();
         let ask = Ask {
@@ -3808,6 +3831,7 @@ mod tests {
             moriio_dp_turn: AtomicUsize::new(0),
             rate_limit_manager: None,
             host: None,
+            keeps_target: false,
         }
     }
 
