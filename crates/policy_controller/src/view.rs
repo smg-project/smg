@@ -1149,7 +1149,9 @@ pub struct Constraints<'a> {
     /// them: an engine handed rows by a host of its own is handed rows
     /// that meet them. A pair's sides keep none yet: a door sheds a
     /// pair's request that states a demand, under the stage `wires`,
-    /// whatever its sides state. In-process only.
+    /// whatever its sides state. In-process only: this protocol version
+    /// states no demand, and a handle refuses a request that states one
+    /// before it sends it over a link (`Handle::asked`).
     pub demands: crate::Demands,
     /// The rows a standing veto of this host masks, by position, in order,
     /// where the host did not write them into the rows: a view of a
