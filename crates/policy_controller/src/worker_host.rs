@@ -45,8 +45,12 @@
 //! promotion comes back as any promotion does. The host's vetoes stand.
 //! The id and the revision stand beside the object in the
 //! holder ([`Standing`]). No credential and no connector is a row's fact. A
-//! host hands the holder its connector ([`Objects::with_connector`]); a
-//! credential has no door yet.
+//! host hands the holder its connector ([`Objects::with_connector`]). It
+//! keeps its workers' credentials in [`Credentials`] and hands the keeper
+//! to the holder ([`Objects::with_credentials`]). A credential is bound to
+//! the rows its registrations wrote: a row no registration of this host
+//! stated takes none. Where a registration's answer says so, the host has
+//! the holder lay the address's objects again ([`Objects::lay_again`]).
 //!
 //! # The adapters
 //!
@@ -86,6 +90,7 @@
 //! drives. The collector under it starts a task for each worker it streams
 //! and ends them at the stop. It names nothing of the controller.
 
+mod credentials;
 mod door;
 mod found;
 mod health;
@@ -97,6 +102,7 @@ mod object;
 mod objects;
 pub mod steps;
 
+pub use credentials::{Credentials, KeptCredential, RegistrationInFlight};
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use door::tests::{
     check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,

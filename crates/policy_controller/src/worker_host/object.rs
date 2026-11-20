@@ -26,12 +26,12 @@ pub fn object(row: &WorkerRow) -> Arc<dyn Worker> {
     Arc::new(builder(row).build())
 }
 
-/// [`object`] before its build: what the holder builds from where its host
-/// handed it a connector, which no row holds.
+/// [`object`] before its build. The holder can give it the host's connector
+/// and credential.
 pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
     let WorkerFacts {
         key,
-        engine,
+        engine: _,
         incarnation: _,
         role,
         wire_modes,
@@ -71,11 +71,9 @@ pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
         .collect();
     spec.kv_block_size = kv_block_size.and_then(|size| usize::try_from(size).ok());
     spec.bootstrap_port = *bootstrap_port;
-    // The object dials its base address where it has one, else its URL: a
-    // rank's row names its engine there, and a row that is its own engine
-    // dials its key.
-    if !engine.is_empty() && engine != key {
-        spec.dp_base_url = Some(engine.clone());
+    let address = dial_address(&row.facts);
+    if address != key {
+        spec.dp_base_url = Some(address.to_owned());
     }
     if *dp_size > 1 {
         spec.dp_rank = Some(usize::from(*dp_rank));
@@ -93,6 +91,16 @@ pub(super) fn role(worker_type: WorkerType) -> Role {
         WorkerType::Prefill => Role::Prefill,
         WorkerType::Decode => Role::Decode,
         WorkerType::Encode => Role::Encode,
+    }
+}
+
+/// The address the row's object dials, as written. A row that names no
+/// engine dials its key.
+pub(super) fn dial_address(facts: &WorkerFacts) -> &str {
+    if facts.engine.is_empty() {
+        &facts.key
+    } else {
+        &facts.engine
     }
 }
 
