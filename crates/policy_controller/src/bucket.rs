@@ -734,15 +734,18 @@ impl Lifecycle for Bucket {
     /// A stage that books at the issue books the worker that serves. A
     /// lease is issued on its pick's first target, and the lease a host
     /// tells at its first dispatch names the target that dispatch took and
-    /// the worker its issue booked ([`Lease::booked`]). Where the dispatch
-    /// took the first target, or another target of that worker (another
-    /// rank of it, or the one prefill of a pair pick), the booking of the
-    /// issue stands and the call returns at once. Under a host that names
-    /// no such worker, the first target alone is read as the issue's. A
-    /// dispatch on another worker books the lease's tokens there too, at
-    /// the dispatch's instant, unless it aged before it was told. The
-    /// booking of the issue ages off the first target with its interval:
-    /// nothing is un-booked. A host tells a lease's first dispatch alone.
+    /// the worker its issue booked ([`Lease::booked`]). A pair's decode
+    /// that no call issued is issued at its dispatch, on the target that
+    /// dispatch took, and its lease names that worker as booked. Where the
+    /// dispatch took the first target, or another target of the worker the
+    /// issue booked (another rank of it, or the one prefill of a pair
+    /// pick), the booking of the issue stands and the call returns at
+    /// once. Under a host that names no such worker, the first target
+    /// alone is read as the issue's. A dispatch on another worker books
+    /// the lease's tokens there too, at the dispatch's instant, unless it
+    /// aged before it was told. The booking of the issue ages off its
+    /// worker with its interval: nothing is un-booked. A host tells a
+    /// lease's first dispatch alone.
     fn on_dispatched(
         &self,
         lease: &Lease,

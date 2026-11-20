@@ -21,7 +21,9 @@
 //!   emptied the pool, or a [`Queue`] ticket (specified in v1; no built-in
 //!   issues one yet). A decision books nothing by itself: its door files
 //!   the pick's lease at the issue, which books the first target, and the
-//!   host reports the lifecycle back.
+//!   host reports the lifecycle back. One issue books another target: a
+//!   pair's decode asked for later and sent with no decode call is issued
+//!   at its dispatch, on the target that dispatch took.
 //! - 4.3, the lifecycle ([`lease`]): the [`Lease`] a decision carries and the
 //!   [`Lifecycle`] hooks a stateful stage learns from (issued, dispatched,
 //!   completed, released, membership, signal).
