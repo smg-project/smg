@@ -10,7 +10,7 @@ use smg_worker::worker::{NamedValue, WorkerLoadResponse};
 
 use crate::{
     signals::SignalColumn,
-    spec::AcrossRanks,
+    spec::{AcrossRanks, MAX_SIGNALS},
     view::{permille, LoadRow, Role, SignalSource},
 };
 
@@ -110,6 +110,10 @@ fn narrow(count: i64) -> u32 {
 /// one rank, as a rank's own record and a scoped answer are, hands that
 /// rank's values as they are and allocates nothing.
 ///
+/// The report is read as one sample. A pushed record of a worker over
+/// several ranks is not one: its report lists each rank at its latest
+/// record. A source makes that worker's values through [`RankValues`].
+///
 /// `sampled_at` is the sample instant of the report's row: a record's
 /// own, a polled answer's stamp, else the poll's start. A value is
 /// sampled then, less its own age where the report states one: the age
@@ -125,16 +129,6 @@ pub fn signal_values(
     if columns.is_empty() {
         return;
     }
-    let column_of = |name: &str| {
-        let found = columns.binary_search_by(|column| column.name().cmp(name));
-        found.ok()
-    };
-    let sampled = |stated: &NamedValue| {
-        stated.age_ms.map_or(sampled_at, |age| {
-            let age = Duration::from_millis(u64::from(age));
-            sampled_at.checked_sub(age).unwrap_or(sampled_at)
-        })
-    };
     let ranks = match report.loads.as_slice() {
         [] => return,
         // One rank: nothing is kept. Each declared name has a bit, set at
@@ -142,13 +136,14 @@ pub fn signal_values(
         [rank] if columns.len() <= u64::BITS as usize => {
             let mut read = 0u64;
             for stated in rank.named_values() {
-                let Some(at) = column_of(&stated.name) else {
+                let Some(at) = column_of(columns, &stated.name) else {
                     continue;
                 };
                 let bit = 1u64 << at;
                 if read & bit == 0 {
                     read |= bit;
-                    each(&columns[at], &stated.unit, stated.value, sampled(&stated));
+                    let sampled = sampled(&stated, sampled_at);
+                    each(&columns[at], &stated.unit, stated.value, sampled);
                 }
             }
             return;
@@ -158,40 +153,48 @@ pub fn signal_values(
     let mut made: Vec<Option<Made>> = vec![None; columns.len()];
     for (nth, rank) in (0u32..).zip(ranks) {
         for stated in rank.named_values() {
-            let Some(at) = column_of(&stated.name) else {
+            let Some(at) = column_of(columns, &stated.name) else {
                 continue;
             };
-            let sampled = sampled(&stated);
-            match &mut made[at] {
-                slot @ None if nth == 0 => {
-                    *slot = Some(Made {
-                        ranks: 1,
-                        unit: stated.unit,
-                        value: stated.value,
-                        oldest: sampled,
-                    });
-                }
-                // Every rank before this one stated the name, and this is
-                // the rank's first statement of it. Under another unit the
-                // row has no value: its slot is emptied, and a slot is
-                // filled at the first rank alone, so no later statement
-                // is read.
-                Some(row) if row.ranks == nth => {
-                    if row.unit == stated.unit {
-                        row.ranks += 1;
-                        row.value = joined(columns[at].across_ranks(), row.value, stated.value);
-                        row.oldest = row.oldest.min(sampled);
-                    } else {
-                        made[at] = None;
-                    }
-                }
-                // A rank before this one left the name out or stated
-                // another unit, or this rank states the name once more.
-                _ => {}
-            }
+            let sampled = sampled(&stated, sampled_at);
+            let across = columns[at].across_ranks();
+            Made::join(
+                &mut made[at],
+                nth,
+                across,
+                stated.unit,
+                stated.value,
+                sampled,
+            );
         }
     }
-    let count = ranks.len() as u32;
+    hand(columns, made, ranks.len() as u32, each);
+}
+
+/// The place of the declared signal `name` among `columns`, which stand in
+/// name order.
+fn column_of(columns: &[SignalColumn], name: &str) -> Option<usize> {
+    let found = columns.binary_search_by(|column| column.name().cmp(name));
+    found.ok()
+}
+
+/// When `stated` was sampled, by a report sampled at `sampled_at`: then,
+/// less the value's own age where the report states one.
+fn sampled(stated: &NamedValue, sampled_at: Instant) -> Instant {
+    stated.age_ms.map_or(sampled_at, |age| {
+        let age = Duration::from_millis(u64::from(age));
+        sampled_at.checked_sub(age).unwrap_or(sampled_at)
+    })
+}
+
+/// Hands `each` the value of every column that all `count` ranks joined
+/// ([`Made::join`]), made one as the column's signal declares.
+fn hand(
+    columns: &[SignalColumn],
+    made: impl IntoIterator<Item = Option<Made>>,
+    count: u32,
+    mut each: impl FnMut(&SignalColumn, &str, f64, Instant),
+) {
     for (column, made) in columns.iter().zip(made) {
         let Some(made) = made.filter(|made| made.ranks == count) else {
             continue;
@@ -205,13 +208,55 @@ pub fn signal_values(
 }
 
 /// One declared signal's value over the ranks read so far.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Made {
     /// How many ranks stated the name, each rank from the first.
     ranks: u32,
     unit: Arc<str>,
     value: f64,
     oldest: Instant,
+}
+
+impl Made {
+    /// Joins the `nth` rank's statement of a name to the name's `slot`:
+    /// its `value` under its `unit`, sampled at `sampled`. A rank's later
+    /// statement of the same name is passed over.
+    fn join(
+        slot: &mut Option<Self>,
+        nth: u32,
+        across: AcrossRanks,
+        unit: Arc<str>,
+        value: f64,
+        sampled: Instant,
+    ) {
+        match slot {
+            None if nth == 0 => {
+                *slot = Some(Self {
+                    ranks: 1,
+                    unit,
+                    value,
+                    oldest: sampled,
+                });
+            }
+            // Every rank before this one stated the name, and this is
+            // the rank's first statement of it. Under another unit the
+            // row has no value: its slot is emptied, and a slot is
+            // filled at the first rank alone, so no later statement
+            // is read.
+            Some(row) if row.ranks == nth => {
+                if row.unit == unit {
+                    row.ranks += 1;
+                    row.value = joined(across, row.value, value);
+                    row.oldest = row.oldest.min(sampled);
+                } else {
+                    *slot = None;
+                }
+            }
+            // A rank before this one left the name out or stated
+            // another unit, or this rank states the name once more.
+            _ => {}
+        }
+    }
 }
 
 /// The value over one more rank. A rank's value that is no finite number
@@ -225,6 +270,213 @@ fn joined(across: AcrossRanks, so_far: f64, next: f64) -> f64 {
         }
         AcrossRanks::Max => so_far.max(next),
         AcrossRanks::Min => so_far.min(next),
+    }
+}
+
+/// What each rank of one worker last stated of the declared signals, each
+/// statement under its own sample instant: what the row's values of a
+/// worker over several ranks are made of, report after report.
+///
+/// Such a worker's pushed record is one rank's, and the report it comes
+/// with lists every rank at its latest record. The entries are of as many
+/// instants, and a record may leave out a name an earlier one stated.
+/// Read as one sample ([`signal_values`]), a rank that fell silent would
+/// count as fresh under the newest record's instant, and one record
+/// without a name would leave the row with no new value. So a source
+/// keeps one of these a worker and makes the row's values through it
+/// ([`Self::values`]).
+///
+/// A report of one rank keeps nothing and is handed as it is: the store's
+/// cell holds that worker's last value. It ends no statement either: a
+/// worker's first records list one rank until the others report. What is
+/// kept is bounded by the declared signals times the report's ranks. A
+/// rank that a report of several ranks lists no more takes its statements
+/// with it. A statement stands for the column it was read under, so a
+/// document that declares other columns ends them all, as it starts the
+/// store's cells with no value.
+#[derive(Debug, Default)]
+pub struct RankValues {
+    /// The columns the statements were read under.
+    columns: Option<Arc<[SignalColumn]>>,
+    /// The ranks that stated a declared name, in rank order.
+    ranks: Vec<RankStated>,
+    /// The slots of one reduction, kept for their room.
+    made: Vec<Option<Made>>,
+}
+
+/// What one rank last stated: one statement a declared name at the most.
+#[derive(Debug)]
+struct RankStated {
+    rank: i32,
+    stated: Vec<Stated>,
+}
+
+/// One rank's last statement of one declared name.
+#[derive(Debug)]
+struct Stated {
+    /// The name's place among the columns.
+    column: usize,
+    unit: Arc<str>,
+    value: f64,
+    sampled: Instant,
+}
+
+// A rank's first statement of each declared name is marked in the bits of
+// one word ([`RankValues::keep`]): a document's cap of names fits them.
+const _: () = assert!(MAX_SIGNALS <= u64::BITS as usize);
+
+/// Whether `report` lists each of its ranks once.
+fn lists_each_rank_once(report: &WorkerLoadResponse) -> bool {
+    let mut rest = report.loads.iter();
+    while let Some(rank) = rest.next() {
+        if rest.clone().any(|later| later.dp_rank == rank.dp_rank) {
+            return false;
+        }
+    }
+    true
+}
+
+impl RankValues {
+    /// Whether a keeper keeps `report`: one of several ranks of one
+    /// engine, each listed once, under a document that declares a signal.
+    /// Any other report is one sample, and [`signal_values`] makes its
+    /// values with nothing kept. A gateway's rollup of its own workers is
+    /// one: its entries are workers, and they repeat a rank, so one
+    /// worker's statement would be kept in the place of another's.
+    pub fn keeps(report: &WorkerLoadResponse, columns: &[SignalColumn]) -> bool {
+        !columns.is_empty()
+            && report.loads.len() > 1
+            && report.ranks_are_dp_ranks()
+            && lists_each_rank_once(report)
+    }
+
+    /// One row's values of the declared signals from a report of its
+    /// worker, each handed to `each` as [`signal_values`] hands it.
+    ///
+    /// A report of several ranks is kept first ([`Self::keep`]). The row's
+    /// values are then made over what each of the report's ranks last
+    /// stated, by the rule of one report: every rank states the name,
+    /// under one unit, and the ranks' values are made one as the signal
+    /// declares. Each value is dated by the oldest of its statements. So a
+    /// rank that fell silent ages the row's value, and a name one record
+    /// leaves out keeps the statement its rank made before.
+    pub fn values(
+        &mut self,
+        report: &WorkerLoadResponse,
+        record_of: Option<i32>,
+        columns: &Arc<[SignalColumn]>,
+        sampled_at: Instant,
+        each: impl FnMut(&SignalColumn, &str, f64, Instant),
+    ) {
+        if !self.keep(report, record_of, columns, sampled_at) {
+            signal_values(report, columns, sampled_at, each);
+            return;
+        }
+        self.made.clear();
+        self.made.resize(columns.len(), None);
+        for (nth, rank) in (0u32..).zip(&report.loads) {
+            let kept = self.ranks.iter().find(|kept| kept.rank == rank.dp_rank);
+            for stated in kept.into_iter().flat_map(|kept| &kept.stated) {
+                let slot = self.made.get_mut(stated.column);
+                let (Some(slot), Some(column)) = (slot, columns.get(stated.column)) else {
+                    continue;
+                };
+                let unit = Arc::clone(&stated.unit);
+                let across = column.across_ranks();
+                Made::join(slot, nth, across, unit, stated.value, stated.sampled);
+            }
+        }
+        let ranks = report.loads.len() as u32;
+        hand(columns, self.made.drain(..), ranks, each);
+    }
+
+    /// Keeps what a report of several ranks states, and says whether
+    /// `report` is one ([`Self::keeps`]): nothing is kept of any other.
+    ///
+    /// `record_of` is the rank a pushed record came from. That rank's
+    /// entry alone is the record's own, sampled at `sampled_at`: the other
+    /// entries are what their ranks' earlier records left, and are not
+    /// read. `None` is a polled answer, one sample of every rank.
+    ///
+    /// A rank's statement takes the place of its last one of that name,
+    /// unless that one was sampled later: a later report of an older
+    /// sample leaves it, as the store's cell does. A name the rank does
+    /// not state keeps its last statement. A rank that states a name twice
+    /// is read at its first statement.
+    pub fn keep(
+        &mut self,
+        report: &WorkerLoadResponse,
+        record_of: Option<i32>,
+        columns: &Arc<[SignalColumn]>,
+        sampled_at: Instant,
+    ) -> bool {
+        if !Self::keeps(report, columns) {
+            return false;
+        }
+        let read_under = |kept: &Arc<[SignalColumn]>| Arc::ptr_eq(kept, columns);
+        if !self.columns.as_ref().is_some_and(read_under) {
+            self.ranks.clear();
+            self.columns = Some(Arc::clone(columns));
+        }
+        let listed = |kept: &RankStated| report.loads.iter().any(|rank| rank.dp_rank == kept.rank);
+        self.ranks.retain(listed);
+        for rank in &report.loads {
+            if record_of.is_some_and(|own| own != rank.dp_rank) {
+                continue;
+            }
+            // Each declared name has a bit, set at the name's first
+            // statement. A document declares no more names than the bits.
+            let mut read = 0u64;
+            for stated in rank.named_values() {
+                let column = column_of(columns, &stated.name);
+                let bit = column.and_then(|at| 1u64.checked_shl(u32::try_from(at).ok()?));
+                let (Some(column), Some(bit)) = (column, bit) else {
+                    continue;
+                };
+                if read & bit != 0 {
+                    continue;
+                }
+                read |= bit;
+                let sampled = sampled(&stated, sampled_at);
+                self.state(rank.dp_rank, column, stated, sampled);
+            }
+        }
+        true
+    }
+
+    /// `rank`'s statement of the name at `column`, sampled at `sampled`,
+    /// in the place of the rank's last one of that name unless that one
+    /// was sampled later.
+    fn state(&mut self, rank: i32, column: usize, stated: NamedValue, sampled: Instant) {
+        let at = match self.ranks.binary_search_by_key(&rank, |kept| kept.rank) {
+            Ok(at) => at,
+            Err(at) => {
+                let stated = Vec::new();
+                self.ranks.insert(at, RankStated { rank, stated });
+                at
+            }
+        };
+        let Some(kept) = self.ranks.get_mut(at) else {
+            return;
+        };
+        let NamedValue { unit, value, .. } = stated;
+        match kept.stated.iter_mut().find(|kept| kept.column == column) {
+            Some(kept) if kept.sampled > sampled => {}
+            Some(kept) => {
+                *kept = Stated {
+                    column,
+                    unit,
+                    value,
+                    sampled,
+                };
+            }
+            None => kept.stated.push(Stated {
+                column,
+                unit,
+                value,
+                sampled,
+            }),
+        }
     }
 }
 
@@ -580,5 +832,270 @@ mod tests {
             made(&report(vec![rank(0)]), &columns, received),
             [value("kv_tokens_used", "tokens", 0.0, 50)]
         );
+    }
+
+    /// One rank's entry of a worker's report: `rank` states `values`.
+    fn ranked(rank: i32, values: Vec<NamedValue>) -> SchedulerLoadSnapshot {
+        SchedulerLoadSnapshot {
+            dp_rank: rank,
+            ..stating(values)
+        }
+    }
+
+    fn depth(value: f64) -> Vec<NamedValue> {
+        vec![stated("depth", "items", value, None)]
+    }
+
+    /// The depth alone, summed over a worker's ranks, as an applied
+    /// document shares its columns.
+    fn depth_alone() -> Arc<[SignalColumn]> {
+        columns(&[("depth", "items", AcrossRanks::Sum)]).into()
+    }
+
+    /// What `keeper` hands of `report`, sampled at `sampled_at`: a record
+    /// of the rank `record_of`, or a polled answer. Each value by its name
+    /// and unit, with its age at `now` in milliseconds.
+    fn kept(
+        keeper: &mut RankValues,
+        report: &WorkerLoadResponse,
+        record_of: Option<i32>,
+        columns: &Arc<[SignalColumn]>,
+        (sampled_at, now): (Instant, Instant),
+    ) -> Vec<(String, String, f64, u128)> {
+        let mut handed = Vec::new();
+        keeper.values(
+            report,
+            record_of,
+            columns,
+            sampled_at,
+            |column, unit, value, at| {
+                let age = now.duration_since(at).as_millis();
+                handed.push((column.name().to_owned(), unit.to_owned(), value, age));
+            },
+        );
+        handed
+    }
+
+    /// A worker over two ranks. Rank 1 states its depth once and falls
+    /// silent, and rank 0 states its own each second. The row's value
+    /// stays as old as rank 1's statement, where one sample of the whole
+    /// report dates both ranks by the newest record.
+    #[test]
+    fn a_silent_ranks_statement_keeps_its_own_sample_instant() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let columns = depth_alone();
+        let file = report(vec![ranked(0, depth(1.0)), ranked(1, depth(100.0))]);
+        let mut keeper = RankValues::default();
+        // Rank 1's record states its own rank alone: the row has no value
+        // until rank 0 states the name too.
+        let first = kept(&mut keeper, &file, Some(1), &columns, (at(0), at(0)));
+        assert!(first.is_empty());
+        for second in 1..=9 {
+            let now = at(second * 1_000);
+            let handed = kept(&mut keeper, &file, Some(0), &columns, (now, now));
+            let age = u128::from(second) * 1_000;
+            assert_eq!(handed, [value("depth", "items", 101.0, age)]);
+        }
+        let mut one_sample = Vec::new();
+        signal_values(&file, &columns, at(9_000), |_, _, value, sampled| {
+            one_sample.push((value, at(9_000).duration_since(sampled).as_millis()));
+        });
+        assert_eq!(one_sample, [(101.0, 0)]);
+    }
+
+    /// A record may leave a name out: the entry then holds no value of it,
+    /// and the rank's last statement stands for the row.
+    #[test]
+    fn a_record_that_leaves_a_name_out_keeps_its_ranks_last_statement() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let now = at(1_000);
+        let columns = depth_alone();
+        let mut keeper = RankValues::default();
+        let both = report(vec![ranked(0, depth(1.0)), ranked(1, depth(2.0))]);
+        kept(&mut keeper, &both, Some(1), &columns, (at(0), now));
+        let whole = kept(&mut keeper, &both, Some(0), &columns, (at(10), now));
+        assert_eq!(whole, [value("depth", "items", 3.0, 1_000)]);
+        // Rank 1's next record states no value, then rank 0 states 3.
+        let bare = report(vec![ranked(0, depth(1.0)), ranked(1, Vec::new())]);
+        let stands = kept(&mut keeper, &bare, Some(1), &columns, (at(20), now));
+        assert_eq!(stands, [value("depth", "items", 3.0, 1_000)]);
+        let moved = report(vec![ranked(0, depth(3.0)), ranked(1, Vec::new())]);
+        let later = kept(&mut keeper, &moved, Some(0), &columns, (at(30), now));
+        assert_eq!(later, [value("depth", "items", 5.0, 1_000)]);
+        // One sample of that report makes no value: rank 1 states none.
+        let mut one_sample = 0;
+        signal_values(&moved, &columns, at(30), |_, _, _, _| one_sample += 1);
+        assert_eq!(one_sample, 0);
+    }
+
+    #[test]
+    fn a_record_states_its_own_rank_alone_and_a_polled_answer_every_rank() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let now = at(10_000);
+        let columns = depth_alone();
+        let mut keeper = RankValues::default();
+        // The report lists rank 1 at a record of another instant: rank
+        // 0's record does not read that entry.
+        let file = report(vec![ranked(0, depth(1.0)), ranked(1, depth(50.0))]);
+        let alone = kept(&mut keeper, &file, Some(0), &columns, (at(0), now));
+        assert!(alone.is_empty());
+        // A polled answer is one sample of every rank.
+        let answer = report(vec![ranked(0, depth(4.0)), ranked(1, depth(6.0))]);
+        let polled = kept(&mut keeper, &answer, None, &columns, (at(1_000), now));
+        assert_eq!(polled, [value("depth", "items", 10.0, 9_000)]);
+        // Rank 0's next record: its own statement, beside the answer's of
+        // rank 1.
+        let next = report(vec![ranked(0, depth(5.0)), ranked(1, depth(50.0))]);
+        let pushed = kept(&mut keeper, &next, Some(0), &columns, (at(2_000), now));
+        assert_eq!(pushed, [value("depth", "items", 11.0, 9_000)]);
+    }
+
+    #[test]
+    fn a_ranks_statement_stands_until_a_newer_one_of_its_name() {
+        let start = Instant::now() + Duration::from_secs(10);
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let now = at(10_000);
+        let columns = depth_alone();
+        let mut keeper = RankValues::default();
+        // Rank 1 stated 10 at the eighth second. Rank 0 states `own` by a
+        // record sampled at `ms`.
+        let both = report(vec![ranked(0, depth(1.0)), ranked(1, depth(10.0))]);
+        kept(&mut keeper, &both, Some(1), &columns, (at(8_000), now));
+        let mut rank_zero = |own: Vec<NamedValue>, ms| {
+            let file = report(vec![ranked(0, own), ranked(1, depth(10.0))]);
+            kept(&mut keeper, &file, Some(0), &columns, (at(ms), now))
+        };
+        let first = rank_zero(depth(1.0), 5_000);
+        assert_eq!(first, [value("depth", "items", 11.0, 5_000)]);
+        // A later record of a sample two seconds old: the newer one stands.
+        let older = rank_zero(vec![stated("depth", "items", 9.0, Some(2_000))], 6_000);
+        assert_eq!(older, [value("depth", "items", 11.0, 5_000)]);
+        let newer = rank_zero(vec![stated("depth", "items", 2.0, Some(500))], 7_000);
+        assert_eq!(newer, [value("depth", "items", 12.0, 3_500)]);
+        // A rank that states a name twice is read at its first statement.
+        let twice = [3.0, 7.0].map(|value| stated("depth", "items", value, None));
+        let read = rank_zero(twice.into(), 7_500);
+        assert_eq!(read, [value("depth", "items", 13.0, 2_500)]);
+    }
+
+    #[test]
+    fn the_kept_statements_are_made_one_by_the_rule_of_one_report() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let now = at(1_000);
+        let columns: Arc<[SignalColumn]> = columns(&[
+            ("largest", "ms", AcrossRanks::Max),
+            ("middle", "ms", AcrossRanks::Mean),
+            ("mixed", "ms", AcrossRanks::Sum),
+            ("partial", "ms", AcrossRanks::Sum),
+        ])
+        .into();
+        let zero = vec![
+            stated("largest", "ms", 2.0, None),
+            stated("middle", "ms", 2.0, None),
+            stated("mixed", "ms", 1.0, None),
+            stated("partial", "ms", 1.0, None),
+        ];
+        let one = vec![
+            stated("largest", "ms", 5.0, None),
+            stated("middle", "ms", 6.0, None),
+            stated("mixed", "s", 1.0, None),
+        ];
+        let file = report(vec![ranked(0, zero), ranked(1, one)]);
+        let mut keeper = RankValues::default();
+        kept(&mut keeper, &file, Some(1), &columns, (at(0), now));
+        // Two units make no value, and neither does a name one rank never
+        // stated.
+        assert_eq!(
+            kept(&mut keeper, &file, Some(0), &columns, (at(100), now)),
+            [
+                value("largest", "ms", 5.0, 1_000),
+                value("middle", "ms", 4.0, 1_000),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rank_that_leaves_the_report_and_another_list_of_columns_end_the_statements() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let now = at(1_000);
+        let columns = depth_alone();
+        let mut keeper = RankValues::default();
+        let both = report(vec![ranked(0, depth(1.0)), ranked(1, depth(2.0))]);
+        kept(&mut keeper, &both, Some(1), &columns, (at(0), now));
+        kept(&mut keeper, &both, Some(0), &columns, (at(0), now));
+        // The report lists rank 2 where rank 1 stood: rank 1's statement
+        // went with it, and is not there when the rank is listed again.
+        let other = report(vec![ranked(0, depth(1.0)), ranked(2, depth(4.0))]);
+        let swapped = kept(&mut keeper, &other, Some(2), &columns, (at(10), now));
+        assert_eq!(swapped, [value("depth", "items", 5.0, 1_000)]);
+        let back = kept(&mut keeper, &both, Some(0), &columns, (at(20), now));
+        assert!(back.is_empty());
+        let whole = kept(&mut keeper, &both, Some(1), &columns, (at(30), now));
+        assert_eq!(whole, [value("depth", "items", 3.0, 980)]);
+        // Another list of columns ends every statement, though it declares
+        // the same signal: a statement stands for the column it was read
+        // under.
+        let again = depth_alone();
+        let ended = kept(&mut keeper, &both, Some(0), &again, (at(40), now));
+        assert!(ended.is_empty());
+        let restated = kept(&mut keeper, &both, Some(1), &again, (at(50), now));
+        assert_eq!(restated, [value("depth", "items", 3.0, 960)]);
+    }
+
+    /// A worker of one rank has its last value in the store's cell: its
+    /// report is handed as it is, and the keeper takes no room.
+    #[test]
+    fn a_report_of_one_rank_keeps_nothing_and_takes_no_room() {
+        let now = Instant::now();
+        let columns = depth_alone();
+        let mut keeper = RankValues::default();
+        let one = report(vec![ranked(3, depth(2.0))]);
+        assert!(!RankValues::keeps(&one, &columns));
+        for record_of in [Some(3), None] {
+            let handed = kept(&mut keeper, &one, record_of, &columns, (now, now));
+            assert_eq!(handed, [value("depth", "items", 2.0, 0)]);
+        }
+        // Several ranks under a document that declares no signal keep
+        // nothing either.
+        let none: Arc<[SignalColumn]> = Vec::new().into();
+        let two = report(vec![ranked(0, depth(1.0)), ranked(1, depth(2.0))]);
+        assert!(!RankValues::keeps(&two, &none));
+        assert!(kept(&mut keeper, &two, Some(0), &none, (now, now)).is_empty());
+        assert!(keeper.columns.is_none());
+        assert_eq!((keeper.ranks.capacity(), keeper.made.capacity()), (0, 0));
+        assert!(RankValues::keeps(&two, &columns));
+    }
+
+    /// A gateway's rollup lists its workers, and they repeat a rank: kept
+    /// by rank, one worker's statement would stand in the place of
+    /// another's. An answer that lists a rank twice is as little an
+    /// engine's ranks. Each is one sample, handed as it is, and nothing of
+    /// it is kept.
+    #[test]
+    fn a_report_that_repeats_a_rank_is_one_sample_and_keeps_nothing() {
+        let now = Instant::now();
+        let columns = depth_alone();
+        let of = |worker: &str, rank: i32, value: f64| SchedulerLoadSnapshot {
+            worker: Some(worker.to_owned()),
+            ..ranked(rank, depth(value))
+        };
+        let rollup = report(vec![of("a", 0, 3.0), of("b", 0, 4.0)]);
+        // Two of a gateway's workers at ranks of their own are no engine's
+        // ranks either.
+        let apart = report(vec![of("a", 0, 3.0), of("b", 1, 4.0)]);
+        let twice = report(vec![ranked(0, depth(3.0)), ranked(0, depth(4.0))]);
+        let mut keeper = RankValues::default();
+        for one_sample in [&rollup, &apart, &twice] {
+            assert!(!RankValues::keeps(one_sample, &columns));
+            let handed = kept(&mut keeper, one_sample, None, &columns, (now, now));
+            assert_eq!(handed, [value("depth", "items", 7.0, 0)]);
+        }
+        assert!(keeper.columns.is_none());
+        assert!(keeper.ranks.is_empty());
     }
 }
