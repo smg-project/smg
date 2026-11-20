@@ -28,7 +28,7 @@ use crate::{
         host::testing::{pair_in_flight, MODEL},
         start,
     },
-    routers::grpc::backend_client::BasicWorkerBuilder,
+    routers::{common::test_support::fast_retry_config, grpc::backend_client::BasicWorkerBuilder},
     tenant::TenantKey,
 };
 
@@ -637,6 +637,38 @@ async fn a_retry_is_not_placed_on_a_worker_the_ledger_closed() -> Case {
         }
         assert_eq!(live(&store, 0).await, 0);
     }
+    Ok(())
+}
+
+/// A hosted pair's retry window does not read the overload flag the mirror
+/// writes on the worker objects. Both decode workers read overloaded and
+/// both fail the request themselves, so each is asked once, whichever the
+/// pick took first.
+#[tokio::test]
+async fn a_placed_pairs_definitive_failure_moves_on_past_the_overload_flag() -> Case {
+    let refused = json!({"error": {"message": "refused"}});
+    let failing = || {
+        spawn_delayed_stub(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            refused.clone(),
+            Duration::ZERO,
+        )
+    };
+    let (prefill, _) = spawn_recording_stub("{}").await;
+    let (first, first_seen) = failing().await;
+    let (second, second_seen) = failing().await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let bed = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&first, &second]);
+    let (host, _store, [_, decodes]) = bed;
+    for decode in &decodes {
+        assert!(registry.set_worker_overloaded(decode, true));
+    }
+    let mut router = router(registry, host);
+    router.retry_config = fast_retry_config(4);
+    let response = generate(&router).await?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let asked = [&first_seen, &second_seen].map(|seen| seen.lock().map_or(0, |seen| seen.len()));
+    assert_eq!(asked, [1, 1], "each decode worker was asked once");
     Ok(())
 }
 

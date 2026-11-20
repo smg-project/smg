@@ -551,6 +551,28 @@ async fn a_worker_that_answered_definitively_takes_no_later_attempt() -> Case {
     Ok(())
 }
 
+/// The store's overload verdict is mirrored on the worker objects, and a
+/// hosted request's retry window does not read it: the retry's placement
+/// answers for the veto. Both workers read overloaded and both fail the
+/// request themselves, so each is asked once, whichever was placed first.
+#[tokio::test]
+async fn a_placed_requests_definitive_failure_moves_on_past_the_overload_flag() -> Case {
+    let (a, hits_a) = fixed_status_upstream(&[CHAT], StatusCode::INTERNAL_SERVER_ERROR).await;
+    let (b, hits_b) = fixed_status_upstream(&[CHAT], StatusCode::INTERNAL_SERVER_ERROR).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, _store, workers) = bed_over(Arc::clone(&registry), &[&a, &b]);
+    for worker in &workers {
+        assert!(registry.set_worker_overloaded(worker, true));
+    }
+    let mut router = router(registry, Some(host));
+    router.retry_config = fast_retry_config(8);
+    let response = chat(&router).await?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let hits = (hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst));
+    assert_eq!(hits, (1, 1), "each worker answered once");
+    Ok(())
+}
+
 #[test]
 fn a_failed_placement_adds_its_row_each_time() -> Case {
     let url = "http://127.0.0.1:1";
