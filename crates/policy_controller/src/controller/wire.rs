@@ -419,7 +419,8 @@ impl Checked {
                 lent_in_flight: view.in_flight.as_ref(),
                 // The frame carries no count of the key's requests: the
                 // door hands the store's beside the rows, for a request
-                // whose rule has an in-flight cap.
+                // whose rule has an in-flight cap or reads the keys each
+                // worker carries.
                 lent_session_in_flight: None,
                 session_counted: false,
                 // The frame carries no signal cells: they stand beside

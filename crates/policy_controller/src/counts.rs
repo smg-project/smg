@@ -123,6 +123,10 @@ impl<T> Pieces<T> {
 pub(crate) struct Counts {
     /// A cell a slot, its piece laid when its first slot is given.
     cells: Pieces<AtomicU32>,
+    /// The session keys with a request in flight on each slot's worker
+    /// ([`Counts::book_key`]): a cell a slot, its piece laid at the first
+    /// key booked there.
+    keys: Pieces<AtomicU32>,
     /// The slots given so far.
     given: AtomicU32,
 }
@@ -177,6 +181,32 @@ impl Counts {
             let one_less = |held: u32| held.saturating_sub(1);
             cell.update(Ordering::Relaxed, Ordering::Relaxed, one_less);
         }
+    }
+
+    /// One session key more has a request in flight on the worker of
+    /// `slot`: the store's session tables say it where a key's first
+    /// request lands on a worker. One atomic step, as a lease's booking.
+    pub(crate) fn book_key(&self, slot: Slot) {
+        if let Some(cell) = self.keys.lay(slot) {
+            let one_more = |held: u32| held.saturating_add(1);
+            cell.update(Ordering::Relaxed, Ordering::Relaxed, one_more);
+        }
+    }
+
+    /// The last request of a session key on the worker of `slot` left
+    /// the file: a count at zero stays there.
+    pub(crate) fn free_key(&self, slot: Slot) {
+        if let Some(cell) = self.keys.cell(slot) {
+            let one_less = |held: u32| held.saturating_sub(1);
+            cell.update(Ordering::Relaxed, Ordering::Relaxed, one_less);
+        }
+    }
+
+    /// The session keys with a request in flight on the worker of `slot`
+    /// at this call: zero for a slot that names no cell.
+    pub(crate) fn keys(&self, slot: Slot) -> u32 {
+        let cell = self.keys.cell(slot);
+        cell.map_or(0, |cell| cell.load(Ordering::Relaxed))
     }
 
     /// A lease's booking moves from the worker of `from` to the worker of
@@ -260,6 +290,15 @@ impl<'a> LentCounts<'a> {
     #[inline]
     pub(crate) fn at(&self, position: u32) -> u32 {
         self.run().at(position)
+    }
+
+    /// The session keys with a request in flight on the worker of the
+    /// row at `position`, at this call: zero past the rows. The number is
+    /// not kept for the decision: a stage reads it once a row.
+    #[inline]
+    pub(crate) fn keys_at(&self, position: u32) -> u32 {
+        let slot = self.slots.get(position as usize);
+        slot.map_or(0, |&slot| self.counts.keys(slot))
     }
 
     /// The table's first piece, the slots and the decision's cells, each

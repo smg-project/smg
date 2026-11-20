@@ -736,9 +736,11 @@ pub struct Candidate {
     pub vision: bool,
     /// Reachable from one gateway only (a host-local wire).
     pub host_local: bool,
-    /// Session keys with a request in flight on this worker. Last because the
-    /// wire numbers its fields in the record's order and this one came after
-    /// the contract's first cut.
+    /// Session keys with a request in flight on this worker. A view of a
+    /// publication's own rows leaves this zero and lends the count beside
+    /// them ([`RequestFacts::active_sessions`]). Last because the wire
+    /// numbers its fields in the record's order and this one came after the
+    /// contract's first cut.
     pub active_sessions: u16,
     /// The worker's stable identity for placement: its registration key's
     /// fingerprint (the low 32 bits), equal across the handles of one worker
@@ -1092,6 +1094,19 @@ impl<'a> RequestFacts<'a> {
         match self.lent_in_flight {
             Some(lent) => lent.at(row.position),
             None => row.in_flight,
+        }
+    }
+
+    /// The session keys with a request in flight on `row`'s worker: what
+    /// the host's table counts for the row's position where it lent one
+    /// ([`RequestFacts::lent_in_flight`]), the row's own count otherwise
+    /// ([`Candidate::active_sessions`]). Read at the call. A row's
+    /// requests are kept for the decision; this number is not.
+    #[inline]
+    pub fn active_sessions(&self, row: &Candidate) -> u32 {
+        match self.lent_in_flight {
+            Some(lent) => lent.keys_at(row.position),
+            None => u32::from(row.active_sessions),
         }
     }
 

@@ -1354,9 +1354,11 @@ impl World {
     /// Writes over `rows`, the candidates `built` left for `ask` before
     /// anything narrowed them, what the leases on file book on each row's
     /// worker at this call: one load a row, in the build's own walk of the
-    /// rows the asking gateway reaches. For rows that are written: a
-    /// decision over lent rows reads the table beside them
-    /// ([`World::view`]). `built` is a build of this world.
+    /// rows the asking gateway reaches. Where a stage of the generation
+    /// reads the keys each worker carries, their count is written too
+    /// ([`Candidate::active_sessions`]): one load more a row. For rows
+    /// that are written: a decision over lent rows reads the table beside
+    /// them ([`World::view`]). `built` is a build of this world.
     pub fn count_in_flight(&self, built: &Built, ask: &Ask, rows: &mut [Candidate]) {
         let Some(shape) = self.derived.pools.get(built.pool as usize) else {
             return;
@@ -1365,12 +1367,20 @@ impl World {
         // would lay a count on another worker's row.
         debug_assert_eq!(rows.len(), built.pool_size as usize);
         let counts = &self.derived.counts;
+        // The keys each worker carries, where a stage of the generation
+        // reads them: one load more a row.
+        let keyed = self.spec.engine().needs().active_sessions;
         let mut at = 0;
         for (from, to) in Segments::of(&shape.locals, ask.gateway, shape.booked.len()) {
             let booked = shape.booked.get(from..to).unwrap_or_default();
             let reached = rows.get_mut(at..).unwrap_or_default();
             for (row, in_flight) in reached.iter_mut().zip(counts.of(booked)) {
                 row.in_flight = in_flight;
+            }
+            if keyed {
+                for (row, &slot) in reached.iter_mut().zip(booked) {
+                    row.active_sessions = u16::try_from(counts.keys(slot)).unwrap_or(u16::MAX);
+                }
             }
             at += booked.len();
         }
@@ -1423,14 +1433,15 @@ impl World {
     /// buffers hold the rows' signal cells, each row's at its position
     /// here ([`ViewBuffers::cells`]).
     ///
-    /// A row's in-flight count is not written here: every decision moves
-    /// the count of the leases on file, so no publication carries it, and
-    /// a decision that reads it has it written over these rows
-    /// ([`World::count_in_flight`]).
+    /// A row's in-flight count is not written here, nor the keys its
+    /// worker carries: every decision moves the counts of the leases on
+    /// file, so no publication carries them, and a decision that reads
+    /// one has it written over these rows ([`World::count_in_flight`]).
     ///
     /// What no fact of the store feeds yet reads as the row's default: the
-    /// two session counts, the two admission bits, the four positions into
-    /// declared lists, the encode bit, and the column's four index facts.
+    /// count of the request's own key, the two admission bits, the four
+    /// positions into declared lists, the encode bit, and the column's
+    /// four index facts.
     /// The breaker bit reads a hold of the asking gateway and nothing else
     /// yet. The
     /// healthy bit is the status alone: the health sink's precedence rule

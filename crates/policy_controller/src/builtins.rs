@@ -1165,13 +1165,14 @@ impl Scorer for FewestSessions {
 
     fn score(
         &self,
-        _: &RequestFacts<'_>,
+        facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
         for (slot, &i) in out.iter_mut().zip(kept) {
-            *slot = f32::from(candidates[i as usize].active_sessions);
+            let keys = facts.active_sessions(&candidates[i as usize]);
+            *slot = f32::from(u16::try_from(keys).unwrap_or(u16::MAX));
         }
         normalize_costs(out);
         TieBand::NORMALIZED

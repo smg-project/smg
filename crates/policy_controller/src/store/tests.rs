@@ -2235,6 +2235,32 @@ fn a_chosen_decode_side_books_nothing_and_waits_under_no_deadline() {
     );
 }
 
+/// A decode side a call issued and no dispatch named goes back to chosen:
+/// its key leaves the worker's keys at the place the issue booked, and a
+/// call issues the side anew.
+#[cfg(feature = "controller")]
+#[test]
+fn a_decode_side_taken_back_leaves_its_workers_session_keys() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+    issue_pair(leases, chosen_pair(id.0, p, &[d], now)).expect("the key is free");
+    assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    let (_, mut decode) = pair(0, p, &[d], now);
+    decode.session = Session::from_raw(42);
+    for _ in 0..2 {
+        assert_eq!(leases.issue_decode(gateway, id, decode, now), Ok(()));
+        assert_eq!(booked(&store, &[p, d]), [1, 1]);
+        assert_eq!(store.keys_on(d), 1);
+        assert!(store.take_back_decode(gateway, id, ReleaseReason::Abandoned));
+        assert_eq!(booked(&store, &[p, d]), [1, 0]);
+        assert_eq!(store.keys_on(d), 0);
+        assert!(carried(&store, decode.session).is_empty());
+    }
+}
+
 #[test]
 fn a_call_issues_the_chosen_side_afresh_and_books_it_once() {
     let store = MemoryStore::new().with_deciders(2);

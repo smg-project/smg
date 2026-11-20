@@ -1991,6 +1991,33 @@ pub(crate) mod tests {
         }
     }
 
+    /// A served request's lease books its session key where its rule reads
+    /// the keys each worker carries. Nine first keys, one after another,
+    /// spread three to a worker under `min_group`.
+    #[tokio::test]
+    async fn served_first_keys_spread_evenly_under_min_group() {
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        document.generation = 1;
+        let rule = document.bindings[0].sessions.as_mut();
+        rule.expect("the preset's rule").assignment = crate::Assignment::MinGroup;
+        let mut bed = bed(Some(applied(&document)), true, (2, 8), []);
+        let mut picks = Vec::new();
+        for id in 1..=9u8 {
+            let mut keyed = frame(id, u64::from(id));
+            let facts = keyed.facts.as_mut().expect("the case's frame has facts");
+            facts.session_key = Some(proto::Identity {
+                form: Some(proto::identity::Form::Hash(100 + u64::from(id))),
+            });
+            picks.push(picked(&bed.ask(keyed).await));
+        }
+        let mut workers = picks.clone();
+        workers.sort_unstable();
+        workers.dedup();
+        let keys = |worker: &WorkerId| picks.iter().filter(|held| *held == worker).count();
+        let spread: Vec<usize> = workers.iter().map(keys).collect();
+        assert_eq!(spread, [3, 3, 3], "{picks:?}");
+    }
+
     /// A decision reads its rows behind what was handed while its decider
     /// worked: a release handed while the decider is held at a request is
     /// applied by that request ahead of its reads. Under the fewest

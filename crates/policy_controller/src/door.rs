@@ -230,7 +230,7 @@ pub(crate) struct Buffers<L> {
     pub(crate) lists: L,
     pub(crate) named: Named,
     /// What a keyed decision reads of its key in the store, where its
-    /// rule has an in-flight cap.
+    /// rule has an in-flight cap or reads the keys each worker carries.
     pub(crate) keyed: Keyed,
 }
 
@@ -246,7 +246,7 @@ pub(crate) struct Taken<'a, A> {
     /// The store's sessions lent to the decision, where its host keeps
     /// them: its engine asks them for a key its own table holds no pin
     /// of, and the door reads there the count of a key whose rule has an
-    /// in-flight cap.
+    /// in-flight cap or reads the keys each worker carries.
     pub(crate) pins: Option<&'a StorePins<'a>>,
     /// The place of the decider that decides, at its file of leases: a
     /// decision whose profile holds a stage that may refuse by a report
@@ -311,8 +311,9 @@ impl PinSource for StorePins<'_> {
     }
 }
 
-/// What a keyed decision under a rule with an in-flight cap reads of its
-/// key in the store: the lists a decider keeps across its decisions.
+/// What a keyed decision reads of its key in the store, under a rule
+/// that has an in-flight cap or reads the keys each worker carries: the
+/// lists a decider keeps across its decisions.
 #[derive(Debug, Default)]
 pub(crate) struct Keyed {
     /// The workers that carry the key's requests in flight, each with its
@@ -2076,9 +2077,11 @@ pub(crate) fn hand<A: Asked, R>(
         signal_cells: cells,
     };
     // The store's sessions, where the decision's rule has an in-flight
-    // cap: a keyed request reads its key's count there. Under any other
-    // rule the engine is asked at once, past the key's read.
-    let sessions = pins.filter(|_| needs.session_in_flight);
+    // cap or reads the keys each worker carries: a keyed request reads
+    // its key's count there, and its lease then books the key on its
+    // worker. Under any other rule the engine is asked at once, past the
+    // key's read.
+    let sessions = pins.filter(|_| needs.session_in_flight || needs.active_sessions);
     if names {
         // A row is named by its place among the rows the decision is made
         // over: the lent rows, or the built ones after their narrowing.
@@ -4375,6 +4378,7 @@ pub(crate) mod tests {
         DecisionRecord, References, Unmet,
     };
 
+    mod session_count;
     mod shadow;
 
     pub(crate) const MODEL: &str = "model-a";
