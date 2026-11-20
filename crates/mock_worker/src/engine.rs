@@ -34,7 +34,7 @@ use std::{
 
 use futures::{stream, Stream, StreamExt};
 use smg_grpc_client::common_proto as common;
-use tokio::sync::{broadcast, mpsc, oneshot, Notify};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use tonic::Status;
 
 // ---------------------------------------------------------------------------
@@ -689,6 +689,8 @@ struct EngineShared {
     cache_mirror: RwLock<HashMap<u64, u8>>,
     /// Fault hooks, switched on through the admin API.
     faults: Faults,
+    /// Ends every open event stream when its value changes (the cut hook).
+    cut_streams: watch::Sender<u64>,
     /// Wakes a paused actor.
     resume: Notify,
     /// The actor's last pass (or the dispatch onto an idle engine), in
@@ -736,14 +738,25 @@ impl PublishedLoad {
     }
 }
 
-/// Fault hooks the admin API switches on: batches lost on the wire, delayed
-/// publishing, delayed admission, a frozen engine, a publisher restart, and
-/// requests answered with an error status, held back or cut mid-stream.
+/// Fault hooks the admin API switches on: batches lost on the wire, published
+/// twice or in the other order, event streams cut, delayed publishing,
+/// delayed admission, a frozen engine, a publisher restart, and requests
+/// answered with an error status, held back or cut mid-stream.
 #[derive(Default)]
 struct Faults {
     /// Event batches still to lose on the wire.
     drop_batches: AtomicU32,
     dropped_total: AtomicU64,
+    /// Event batches still to publish twice.
+    duplicate_batches: AtomicU32,
+    duplicated_total: AtomicU64,
+    /// Pairs of event batches still to publish in the other order.
+    swap_pairs: AtomicU32,
+    swapped_total: AtomicU64,
+    /// The first batch of a pair under way: it goes out behind the next.
+    swap_held: Mutex<Option<(Published, Instant)>>,
+    /// Times the hook cut the event streams.
+    stream_cuts: AtomicU64,
     /// Publishing delay after a pass ends, in ms.
     delay_ms: AtomicU64,
     /// How long each new request is held before the engine sees it, in ms:
@@ -822,6 +835,11 @@ pub(crate) struct Injected {
 pub(crate) struct FaultStatus {
     pub drop_pending: u32,
     pub dropped_total: u64,
+    pub duplicate_pending: u32,
+    pub duplicated_total: u64,
+    pub swap_pending: u32,
+    pub swapped_total: u64,
+    pub stream_cuts: u64,
     pub delay_ms: u64,
     pub admit_delay_ms: u64,
     pub admit_per_sec: u64,
@@ -1098,6 +1116,7 @@ impl Engine {
             name,
             cache_mirror: RwLock::new(HashMap::new()),
             faults: Faults::default(),
+            cut_streams: watch::channel(0).0,
             resume: Notify::new(),
             output_clock: Instant::now(),
             last_output_ms: AtomicU64::new(0),
@@ -1140,6 +1159,44 @@ impl Engine {
             .faults
             .drop_batches
             .store(batches, Ordering::Relaxed);
+    }
+
+    /// Publish each of the next `batches` event batches twice (the replay
+    /// buffer keeps one).
+    pub(crate) fn fault_duplicate(&self, batches: u32) {
+        self.shared
+            .faults
+            .duplicate_batches
+            .store(batches, Ordering::Relaxed);
+    }
+
+    /// Publish the next `pairs` pairs of event batches in the other order:
+    /// the first of a pair waits for the second and goes out behind it.
+    /// Zero releases a batch that waits.
+    pub(crate) fn fault_swap(&self, pairs: u32) {
+        let faults = &self.shared.faults;
+        faults.swap_pairs.store(pairs, Ordering::Relaxed);
+        if pairs == 0 {
+            let held = faults
+                .swap_held
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            if let Some(held) = held {
+                let _ = self.shared.publish_tx.send(held);
+            }
+        }
+    }
+
+    /// End every open event stream of the engine with `UNAVAILABLE`, as a
+    /// cut connection does. The engine, its sequence and its replay buffer
+    /// stay, so a subscriber that comes back resumes after its cursor.
+    pub(crate) fn fault_cut_streams(&self) {
+        self.shared
+            .faults
+            .stream_cuts
+            .fetch_add(1, Ordering::Relaxed);
+        self.shared.cut_streams.send_modify(|cuts| *cuts += 1);
     }
 
     /// Publish every batch `ms` milliseconds after its pass ends (0 clears).
@@ -1343,6 +1400,11 @@ impl Engine {
         FaultStatus {
             drop_pending: f.drop_batches.load(Ordering::Relaxed),
             dropped_total: f.dropped_total.load(Ordering::Relaxed),
+            duplicate_pending: f.duplicate_batches.load(Ordering::Relaxed),
+            duplicated_total: f.duplicated_total.load(Ordering::Relaxed),
+            swap_pending: f.swap_pairs.load(Ordering::Relaxed),
+            swapped_total: f.swapped_total.load(Ordering::Relaxed),
+            stream_cuts: f.stream_cuts.load(Ordering::Relaxed),
             delay_ms: f.delay_ms.load(Ordering::Relaxed),
             admit_delay_ms: f.admit_delay_ms.load(Ordering::Relaxed),
             admit_per_sec: f.admit_per_sec.load(Ordering::Relaxed),
@@ -1499,17 +1561,33 @@ impl Engine {
                 .collect()
         };
         let replay_stream = stream::iter(replay.into_iter().map(Ok));
-        let live_stream = stream::unfold(live_rx, |mut rx| async move {
+        let cut = self.shared.cut_streams.subscribe();
+        let live_stream = stream::unfold(Some((live_rx, cut)), |open| async move {
+            let (mut rx, mut cut) = open?;
             loop {
-                match rx.recv().await {
-                    // A batch lost on the wire (drop hook) never reaches a live
-                    // subscriber; it waits in the replay buffer.
-                    Ok(item) if item.dropped => continue,
-                    Ok(item) => return Some((Ok(item.batch), rx)),
-                    // A lagged slow consumer leaves a gap; the gateway detects it
-                    // and reconnects, replaying from the buffer. Skip and continue.
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return None,
+                tokio::select! {
+                    changed = cut.changed() => {
+                        return match changed {
+                            // The cut hook ends the stream as a lost connection
+                            // does: nothing follows the status.
+                            Ok(()) => Some((
+                                Err(Status::unavailable("mock-worker: the event streams were cut")),
+                                None,
+                            )),
+                            // The engine is gone: the stream ends as it did.
+                            Err(_) => None,
+                        };
+                    }
+                    item = rx.recv() => match item {
+                        // A batch lost on the wire (drop hook) never reaches a live
+                        // subscriber; it waits in the replay buffer.
+                        Ok(item) if item.dropped => {}
+                        Ok(item) => return Some((Ok(item.batch), Some((rx, cut)))),
+                        // A lagged slow consumer leaves a gap; the gateway detects it
+                        // and reconnects, replaying from the buffer. Skip and continue.
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    },
                 }
             }
         });
@@ -1637,12 +1715,46 @@ async fn run(
                 dropped,
                 generation: faults.generation.load(Ordering::Relaxed),
             };
-            let _ = shared.publish_tx.send((item, release_at));
+            release(&shared, item, release_at);
         }
         shared.note_output();
         shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
         shared.publish(&state, step.snapshot);
     }
+}
+
+/// Hand a batch to the publisher task: twice, or behind the next one, where
+/// a hook says so. A batch a drop hook lost reaches no live subscriber, so
+/// it goes out once and in its turn.
+fn release(shared: &EngineShared, item: Published, release_at: Instant) {
+    let faults = &shared.faults;
+    let take = |counter: &AtomicU32| {
+        counter
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+    };
+    if item.dropped {
+        let _ = shared.publish_tx.send((item, release_at));
+        return;
+    }
+    let mut held = faults.swap_held.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((first, first_at)) = held.take() {
+        // The second of a pair goes out ahead of the first.
+        faults.swapped_total.fetch_add(1, Ordering::Relaxed);
+        let _ = shared.publish_tx.send((item, release_at));
+        let _ = shared.publish_tx.send((first, release_at.max(first_at)));
+        return;
+    }
+    if take(&faults.swap_pairs) {
+        *held = Some((item, release_at));
+        return;
+    }
+    drop(held);
+    if take(&faults.duplicate_batches) {
+        faults.duplicated_total.fetch_add(1, Ordering::Relaxed);
+        let _ = shared.publish_tx.send((item.clone(), release_at));
+    }
+    let _ = shared.publish_tx.send((item, release_at));
 }
 
 /// Release batches to every transport in order, each at its release time.
@@ -1745,6 +1857,12 @@ fn handle_msg(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clear();
+            // A batch that waits for its pair belongs to the old sequence.
+            *shared
+                .faults
+                .swap_held
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
             shared.faults.generation.fetch_add(1, Ordering::Relaxed);
             shared.faults.restarts.fetch_add(1, Ordering::Relaxed);
             let _ = ack.send(());
@@ -5347,6 +5465,97 @@ mod tests {
         );
         let status = engine.fault_status();
         assert_eq!((status.drop_pending, status.dropped_total), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn duplicate_hook_publishes_a_batch_twice_and_keeps_one_for_replay() {
+        let engine = live();
+        let mut live_stream = engine.subscribe_kv(0);
+        engine.fault_duplicate(1);
+        let _rx = submit(&engine, "a", vec![1; 64]);
+        let first = next_batch(&mut live_stream, Duration::from_secs(5))
+            .await
+            .expect("a live batch");
+        let again = next_batch(&mut live_stream, Duration::from_secs(5))
+            .await
+            .expect("the same batch a second time");
+        assert_eq!((first.sequence_number, again.sequence_number), (1, 1));
+        let mut replay = engine.subscribe_kv(0);
+        let replayed = next_batch(&mut replay, Duration::from_secs(1))
+            .await
+            .expect("replay");
+        assert_eq!(replayed.sequence_number, 1);
+        assert!(
+            next_batch(&mut replay, Duration::from_millis(200))
+                .await
+                .is_none(),
+            "the replay buffer keeps the batch once"
+        );
+        let status = engine.fault_status();
+        assert_eq!((status.duplicate_pending, status.duplicated_total), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn swap_hook_publishes_the_second_batch_of_a_pair_first() {
+        let engine = live();
+        let mut live_stream = engine.subscribe_kv(0);
+        engine.fault_swap(1);
+        let mut rx1 = submit(&engine, "a", vec![1; 64]);
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(5), rx1.recv())
+            .await
+            .expect("events")
+        {
+            if matches!(event, GenEvent::Done { .. }) {
+                break;
+            }
+        }
+        assert!(
+            next_batch(&mut live_stream, Duration::from_millis(200))
+                .await
+                .is_none(),
+            "the first batch of the pair waits for the second"
+        );
+        let _rx2 = submit(&engine, "b", vec![2; 64]);
+        let first = next_batch(&mut live_stream, Duration::from_secs(5))
+            .await
+            .expect("the second batch, first");
+        let second = next_batch(&mut live_stream, Duration::from_secs(5))
+            .await
+            .expect("the first batch, behind it");
+        assert_eq!((first.sequence_number, second.sequence_number), (2, 1));
+        let status = engine.fault_status();
+        assert_eq!((status.swap_pending, status.swapped_total), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn cut_hook_ends_the_open_streams_and_a_new_one_resumes() {
+        use tonic::Code;
+
+        let engine = live();
+        let mut live_stream = engine.subscribe_kv(0);
+        let _rx1 = submit(&engine, "a", vec![1; 64]);
+        let first = next_batch(&mut live_stream, Duration::from_secs(5))
+            .await
+            .expect("a live batch");
+        engine.fault_cut_streams();
+        let cut = tokio::time::timeout(Duration::from_secs(5), live_stream.next())
+            .await
+            .expect("the cut reaches the stream")
+            .expect("as an item")
+            .expect_err("that is a status");
+        assert_eq!(cut.code(), Code::Unavailable);
+        assert!(
+            live_stream.next().await.is_none(),
+            "nothing follows the status"
+        );
+        // The engine and its sequence stay: a new stream resumes after the cursor.
+        let _rx2 = submit(&engine, "b", vec![2; 64]);
+        let mut resumed = engine.subscribe_kv(first.sequence_number);
+        let next = next_batch(&mut resumed, Duration::from_secs(5))
+            .await
+            .expect("the next batch");
+        assert_eq!(next.sequence_number, 2);
+        assert_eq!(engine.fault_status().stream_cuts, 1);
     }
 
     #[tokio::test]
