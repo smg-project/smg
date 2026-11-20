@@ -251,6 +251,15 @@ fn test_intern_string_empty() {
     assert_eq!(&*s1, "");
 }
 
+/// A rank's label is its decimal text, from the table and past it: a
+/// rank's series keep one name whichever way the label is built.
+#[test]
+fn a_ranks_label_is_its_decimal_text_in_the_table_and_past_it() {
+    for rank in [0, 1, 15, 16, 1000, -1] {
+        assert_eq!(&*rank_label(rank), rank.to_string());
+    }
+}
+
 #[test]
 fn test_interner_size_grows() {
     let initial_size = interner_size();

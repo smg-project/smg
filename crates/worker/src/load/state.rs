@@ -54,6 +54,10 @@ use crate::{
 /// scan.
 pub type LoadReceiver = watch::Receiver<Arc<LoadSnapshot>>;
 
+/// A worker of an eviction batch's sentinel set, with the load of its own
+/// entry where the batch removed it.
+pub(crate) type Evicted = (Arc<dyn Worker>, Option<Arc<WorkerLoadResponse>>);
+
 /// One worker's published load and the incarnation that produced it.
 #[derive(Clone)]
 struct LoadEntry {
@@ -269,9 +273,10 @@ impl<G: Generation> LoadState<G> {
     }
 
     /// Whether `worker` is the `Ready` worker the registry holds at its URL
-    /// now, by pointer. One test at four places: the publish fence, the
-    /// pushers a reset keeps, the eviction batch and the leave a status
-    /// event tells.
+    /// now, by pointer. One test for every place that asks it: the publish
+    /// fence and a tick's series, the pushers a reset keeps, the eviction
+    /// batch, the leave a status event tells, a held report's flush and
+    /// the sentinel's guard.
     pub(crate) fn is_current_incarnation(&self, worker: &Arc<dyn Worker>) -> bool {
         self.registry
             .get_by_url(worker.url())
@@ -281,14 +286,14 @@ impl<G: Generation> LoadState<G> {
     }
 
     /// The row at `worker`'s URL, where it came from another worker that
-    /// is the registry's `Ready` worker now: that worker and the ranks in
-    /// its row. Such a worker is a live writer of those ranks' engine
-    /// series under its own models: a poll writes them with the row it
+    /// is the registry's `Ready` worker now: that worker and its row's
+    /// load. Such a worker is a live writer of the engine series that load
+    /// carries, under its own models: a poll writes them with the row it
     /// publishes, and a pushed record ahead of its row.
     pub(crate) fn another_live_workers_row(
         &self,
         worker: &Arc<dyn Worker>,
-    ) -> Option<(Arc<dyn Worker>, Vec<i32>)> {
+    ) -> Option<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)> {
         let (source, load) = self
             .tx
             .borrow()
@@ -299,7 +304,7 @@ impl<G: Generation> LoadState<G> {
                 Some((source, Arc::clone(&entry.load)))
             })?;
         (!Arc::ptr_eq(&source, worker) && self.is_current_incarnation(&source))
-            .then(|| (source, load.loads.iter().map(|rank| rank.dp_rank).collect()))
+            .then_some((source, load))
     }
 
     /// Queue a worker's eviction and wake the flusher. The snapshot changes
@@ -315,20 +320,24 @@ impl<G: Generation> LoadState<G> {
         self.eviction_notify.notified().await;
     }
 
-    /// Apply every queued eviction in one rebuild. Returns the workers whose
-    /// own entry was actually removed (the metrics sentinel set): a same-URL
-    /// replacement that already republished keeps its fresh entry, and its
-    /// series simply continues under the same URL. A worker that is the
-    /// registry's `Ready` worker again is not evicted: it left and came
-    /// back ahead of the batch. Its row stands until what it publishes next
-    /// replaces it, and it is not in the sentinel set.
-    pub(crate) fn apply_pending_evictions(&self) -> Vec<Arc<dyn Worker>> {
+    /// Apply every queued eviction in one rebuild. Returns the metrics
+    /// sentinel set: the workers whose own entry was removed, each with
+    /// that entry's load, whose ranks the sentinel covers, and those whose
+    /// URL holds another worker's entry, with none. A same-URL replacement
+    /// that already republished keeps its fresh entry. The entry of the
+    /// worker it replaced went under it, so that worker's series end here
+    /// too, but for the ones the replacement writes (the collector's
+    /// guard). A worker that is the registry's `Ready` worker again is not
+    /// evicted: it left and came back ahead of the batch. Its row stands
+    /// until what it publishes next replaces it, and it is not in the
+    /// sentinel set.
+    pub(crate) fn apply_pending_evictions(&self) -> Vec<Evicted> {
         let pending: Vec<Arc<dyn Worker>> = std::mem::take(&mut *self.pending_evictions.lock());
         if pending.is_empty() {
             return Vec::new();
         }
 
-        let mut removed: Vec<Arc<dyn Worker>> = Vec::new();
+        let mut ended = Vec::new();
         self.rebuild(|entries| {
             let mut changed = false;
             for worker in &pending {
@@ -337,7 +346,7 @@ impl<G: Generation> LoadState<G> {
                 if self.is_current_incarnation(worker) {
                     continue;
                 }
-                let evict = entries.get(worker.url()).is_some_and(|entry| {
+                let own = entries.get(worker.url()).map(|entry| {
                     match entry.source.upgrade() {
                         // The entry belongs to the evicted incarnation.
                         Some(source) => Arc::ptr_eq(&source, worker),
@@ -346,15 +355,22 @@ impl<G: Generation> LoadState<G> {
                         None => true,
                     }
                 });
-                if evict {
-                    entries.remove(worker.url());
-                    removed.push(Arc::clone(worker));
-                    changed = true;
+                match own {
+                    Some(true) => {
+                        let row = entries.remove(worker.url()).map(|entry| entry.load);
+                        ended.push((Arc::clone(worker), row));
+                        changed = true;
+                    }
+                    // Another worker's entry stands at the URL: this
+                    // worker's own went under it. The entry stays, and
+                    // the worker joins the sentinel set.
+                    Some(false) => ended.push((Arc::clone(worker), None)),
+                    None => {}
                 }
             }
             changed
         });
-        removed
+        ended
     }
 
     /// Drop every published entry and any queued evictions (monitor
@@ -489,7 +505,8 @@ mod tests {
         let removed = state.apply_pending_evictions();
 
         assert_eq!(removed.len(), 1);
-        assert!(Arc::ptr_eq(&removed[0], &worker));
+        assert!(Arc::ptr_eq(&removed[0].0, &worker));
+        assert!(removed[0].1.is_some(), "with the row the batch removed");
         assert!(state.snapshot().is_empty());
     }
 
@@ -547,10 +564,10 @@ mod tests {
         // old incarnation's eviction must not tear down the fresh entry.
         state.publish_group(&[], vec![(Arc::clone(&new), load(2))]);
         state.enqueue_eviction(Arc::clone(&old));
-        let removed = state.apply_pending_evictions();
+        let ended = state.apply_pending_evictions();
         assert!(
-            removed.is_empty(),
-            "the replacement's entry is not the old worker's"
+            ended.len() == 1 && Arc::ptr_eq(&ended[0].0, &old) && ended[0].1.is_none(),
+            "the old worker's entry went under the replacement's: its series end"
         );
         assert_eq!(waiting_of(&state.snapshot(), "http://w1:8080"), Some(2));
     }
