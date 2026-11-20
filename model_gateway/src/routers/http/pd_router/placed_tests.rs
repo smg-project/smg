@@ -46,7 +46,8 @@ fn pair_bed_over(
     prefill_urls: &[&str],
     decode_urls: &[&str],
 ) -> PairBed {
-    pair_bed_of(|_, worker| worker, registry, prefill_urls, decode_urls)
+    let plain = |_: &str, worker: BasicWorkerBuilder| (worker, WireModes::HTTP);
+    pair_bed_of(plain, registry, prefill_urls, decode_urls)
 }
 
 /// [`pair_bed_over`] with every worker of `runtime`: a pair router picks its
@@ -57,14 +58,15 @@ fn pair_bed_running(
     prefill_urls: &[&str],
     decode_urls: &[&str],
 ) -> PairBed {
-    let running = |_: &str, worker: BasicWorkerBuilder| worker.runtime_type(runtime);
+    let running =
+        |_: &str, worker: BasicWorkerBuilder| (worker.runtime_type(runtime), WireModes::HTTP);
     pair_bed_of(running, registry, prefill_urls, decode_urls)
 }
 
-/// [`pair_bed_over`] with each registry worker as `shaped` leaves it, by
-/// its URL. The rows are written the same for every shape.
+/// [`pair_bed_over`] with each registry worker as `shaped` leaves it and
+/// its row's wires as `shaped` states them, by its URL.
 fn pair_bed_of(
-    shaped: impl Fn(&str, BasicWorkerBuilder) -> BasicWorkerBuilder,
+    shaped: impl Fn(&str, BasicWorkerBuilder) -> (BasicWorkerBuilder, WireModes),
     registry: Arc<WorkerRegistry>,
     prefill_urls: &[&str],
     decode_urls: &[&str],
@@ -96,13 +98,14 @@ fn pair_bed_of(
                 .model(ModelCard::new(MODEL))
                 .worker_type(worker_type)
                 .status(WorkerStatus::Ready);
-            let worker: Arc<dyn Worker> = Arc::new(shaped(url, builder).build());
+            let (builder, wire_modes) = shaped(url, builder);
+            let worker: Arc<dyn Worker> = Arc::new(builder.build());
             let facts = WorkerFacts {
                 key: worker.url().to_string(),
                 engine: url.to_string(),
                 incarnation: 1,
                 role,
-                wire_modes: WireModes::HTTP,
+                wire_modes,
                 models: vec![MODEL.to_string()],
                 dp_size: 1,
                 max_running: Some(64),
@@ -128,6 +131,17 @@ fn pair_bed_of(
 }
 
 const GATEWAY: GatewayId = GatewayId::LOCAL;
+
+/// A unary generate request of the bed's model, as an attempt reads it.
+const UNARY: PDRequestContext<'static> = PDRequestContext {
+    route: "/generate",
+    batch_size: None,
+    is_stream: false,
+    return_logprob: false,
+    model_id: MODEL,
+    headers: None,
+    rid: None,
+};
 
 fn router(worker_registry: Arc<WorkerRegistry>, host: Host) -> PDRouter {
     PDRouter {
@@ -433,10 +447,11 @@ async fn decode_arrivals_over(
     let registry = Arc::new(WorkerRegistry::new());
     let shaped = |url: &str, worker: BasicWorkerBuilder| {
         let worker = worker.runtime_type(RuntimeType::Vllm);
-        match second_connector.filter(|_| url == second) {
+        let worker = match second_connector.filter(|_| url == second) {
             Some(connector) => worker.kv_connector(connector),
             None => worker,
-        }
+        };
+        (worker, WireModes::HTTP)
     };
     let bed = pair_bed_of(
         shaped,
@@ -507,9 +522,10 @@ async fn a_decode_its_prefill_was_told_is_booked_at_the_prefills_send() -> Case 
     let registry = Arc::new(WorkerRegistry::new());
     let read = |_: &str, worker: BasicWorkerBuilder| {
         let worker = worker.runtime_type(RuntimeType::Vllm);
-        worker
+        let worker = worker
             .kv_connector(MORIIO_CONNECTOR)
-            .label("moriio_mode", "read")
+            .label("moriio_mode", "read");
+        (worker, WireModes::HTTP)
     };
     let bed = pair_bed_of(read, Arc::clone(&registry), &[&prefill], &[&decode]);
     let (host, store, _) = bed;
@@ -577,19 +593,10 @@ async fn a_retry_is_not_placed_on_a_worker_the_ledger_closed() -> Case {
         );
         let router = router(registry, host);
         let host = router.host.as_deref().ok_or("the router holds the host")?;
-        let context = PDRequestContext {
-            route: "/generate",
-            batch_size: None,
-            is_stream: false,
-            return_logprob: false,
-            model_id: MODEL,
-            headers: None,
-            rid: None,
-        };
         let tried = parking_lot::Mutex::new(Vec::new());
         for _ in 0..4 {
             let placed = router
-                .place_pair_attempt(host, &context, 0, None, &tried, &ledger)
+                .place_pair_attempt(host, &UNARY, 0, 0, None, &tried, &ledger)
                 .await;
             let (sent, (_, decode), _guards, _asked) =
                 placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
@@ -848,42 +855,36 @@ async fn a_prefill_read_whole_ends_ahead_of_its_decodes_answer() -> Case {
     Ok(())
 }
 
-/// A pair of another wire is not placed: the commit asks each side's HTTP
-/// pool of its worker, so a pick that names the gRPC decode is passed over
-/// for the HTTP one, whichever the pick lists first.
+/// A row can state the route's wire while its worker dials another: the
+/// stated wire keeps the row, and the controller names it. The commit asks
+/// each side's HTTP pool of its worker, so a pick that names the decode
+/// which dials gRPC is passed over for the HTTP one, whichever the pick
+/// lists first.
 #[tokio::test]
-async fn a_pair_of_another_wire_is_passed_over_at_its_commit() -> Case {
+async fn a_row_whose_worker_dials_another_wire_is_passed_over_at_its_commit() -> Case {
     for other in [0, 1] {
         let (prefill, _) = spawn_recording_stub("{}").await;
         let (first, _) = spawn_recording_stub("{}").await;
         let (second, _) = spawn_recording_stub("{}").await;
         let urls = [first.as_str(), second.as_str()];
         let grpc = |url: &str, worker: BasicWorkerBuilder| {
-            if url == urls[other] {
+            let worker = if url == urls[other] {
                 worker.connection_mode(ConnectionMode::Grpc)
             } else {
                 worker
-            }
+            };
+            (worker, WireModes::HTTP)
         };
         let registry = Arc::new(WorkerRegistry::new());
         let bed = pair_bed_of(grpc, Arc::clone(&registry), &[&prefill], &urls);
         let (host, store, [_, decodes]) = bed;
         let router = router(registry, host);
         let host = router.host.as_deref().ok_or("the router holds the host")?;
-        let context = PDRequestContext {
-            route: "/generate",
-            batch_size: None,
-            is_stream: false,
-            return_logprob: false,
-            model_id: MODEL,
-            headers: None,
-            rid: None,
-        };
         let tried = parking_lot::Mutex::new(Vec::new());
         let ledger = AttemptLedger::default();
         for _ in 0..4 {
             let placed = router
-                .place_pair_attempt(host, &context, 0, None, &tried, &ledger)
+                .place_pair_attempt(host, &UNARY, 0, 0, None, &tried, &ledger)
                 .await;
             let (sent, (_, decode), _guards, _asked) =
                 placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
@@ -892,6 +893,66 @@ async fn a_pair_of_another_wire_is_passed_over_at_its_commit() -> Case {
                 decodes[1 - other].url(),
                 "the gRPC decode {other}"
             );
+            drop(sent);
+        }
+        assert_eq!(live(&store, 0).await, 0);
+    }
+    Ok(())
+}
+
+/// The prefills of another wire in the case below: four times the targets
+/// the asks of one attempt can name.
+const OTHER_WIRE_PREFILLS: usize = 48;
+
+/// The ask states the route's wire, so the controller places among the rows
+/// that serve it. A prefill of another wire pairs with a decode of that
+/// wire. Were the wire left to the commit, an attempt's asks would name
+/// twelve such pairs at most, the commit would pass each over, and the
+/// attempt would end with no worker while the route's own pair stands,
+/// first or last among the rows.
+#[tokio::test]
+async fn a_pair_is_placed_past_more_pairs_of_another_wire_than_an_attempt_asks() -> Case {
+    const OWN_DECODE: &str = "http://decode-own";
+    const OTHER_DECODE: &str = "http://decode-other";
+    let names: Vec<String> = (0..=OTHER_WIRE_PREFILLS)
+        .map(|at| format!("http://prefill-{at}"))
+        .collect();
+    let prefills: Vec<&str> = names.iter().map(String::as_str).collect();
+    for own in [0, OTHER_WIRE_PREFILLS] {
+        let other_wire = |url: &str, worker: BasicWorkerBuilder| {
+            if url == prefills[own] || url == OWN_DECODE {
+                (worker, WireModes::HTTP)
+            } else {
+                (
+                    worker.connection_mode(ConnectionMode::Grpc),
+                    WireModes::GRPC,
+                )
+            }
+        };
+        let decodes = if own == 0 {
+            [OWN_DECODE, OTHER_DECODE]
+        } else {
+            [OTHER_DECODE, OWN_DECODE]
+        };
+        let registry = Arc::new(WorkerRegistry::new());
+        let bed = pair_bed_of(other_wire, Arc::clone(&registry), &prefills, &decodes);
+        let (host, store, _) = bed;
+        let router = router(registry, host);
+        let host = router.host.as_deref().ok_or("the router holds the host")?;
+        let tried = parking_lot::Mutex::new(Vec::new());
+        let ledger = AttemptLedger::default();
+        for _ in 0..4 {
+            let placed = router
+                .place_pair_attempt(host, &UNARY, 0, 0, None, &tried, &ledger)
+                .await;
+            let (sent, (prefill, decode), _guards, _asked) =
+                placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
+            assert_eq!(
+                prefill.url(),
+                prefills[own],
+                "the route's prefill stands at {own}"
+            );
+            assert_eq!(decode.url(), OWN_DECODE);
             drop(sent);
         }
         assert_eq!(live(&store, 0).await, 0);

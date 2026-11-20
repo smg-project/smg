@@ -35,7 +35,7 @@ use serde_json::{
     value::{to_raw_value, RawValue},
     Value,
 };
-use smg_policy_controller::view::{Phase, WorkerId};
+use smg_policy_controller::view::{Phase, WireModes, WorkerId};
 use smg_worker::{
     identity::{
         basic::{RuntimeType, Worker, WorkerLoadGuard, WorkerType},
@@ -149,13 +149,17 @@ struct PairAsked<'a> {
     id: [u8; 8],
     model: Cow<'a, str>,
     prompt_tokens: u32,
+    /// The attempt's number. The tried rows do not count the attempts: a
+    /// failed pair names up to two of them.
+    attempt: u8,
     tried: Vec<WorkerId>,
 }
 
 impl PairAsked<'_> {
-    /// The ask of the request `context` describes. Its route can ask the
-    /// decode again: the sequential dispatch does, behind its prefill's
-    /// answer.
+    /// The ask of the request `context` describes. It states the route's
+    /// wire, so the controller places among the rows that serve HTTP. Its
+    /// route can ask the decode again: the sequential dispatch does, behind
+    /// its prefill's answer.
     fn ask<'s>(&'s self, context: &'s PDRequestContext<'_>) -> Ask<'s> {
         Ask {
             streaming: context.is_stream,
@@ -164,7 +168,9 @@ impl PairAsked<'_> {
             phase: Phase::Prefill,
             decode_again: true,
             prompt_tokens: self.prompt_tokens,
+            wires: WireModes::HTTP,
             tried: &self.tried,
+            attempt: Some(self.attempt),
             ..Ask::of(&self.id, &self.model)
         }
     }
@@ -179,7 +185,8 @@ struct DecodeAgain<'a> {
 }
 
 /// The pair route's own rule at a commit of the policy controller's pick.
-/// The controller reads neither part, so a target one of them refuses is
+/// A row can state more wires than the one its worker dials, and the
+/// controller does not read the ledger. A target either part refuses is
 /// passed over like one the gateway cannot send to.
 fn on_pair_route(ledger: &AttemptLedger) -> impl Fn(&dyn Worker) -> bool + Send + Sync + '_ {
     move |worker| {
@@ -1040,6 +1047,7 @@ impl PDRouter {
                     .place_pair_attempt(
                         host,
                         &context,
+                        attempt,
                         prompt_tokens,
                         sticky_key,
                         tried_rows,
@@ -1414,15 +1422,23 @@ impl PDRouter {
     /// The attempt's pair as the policy controller placed it, with the load
     /// both sides hold, or the answer of a request it did not place. The
     /// prefill's guard is the admission's and the decode's is taken here, as
-    /// on the classic path. The controller reads the tried rows softly. The
-    /// commit asks the route's rule of both workers, made of the classic
+    /// on the classic path. The ask states the route's wire, so the
+    /// controller places among the rows that serve HTTP. It states the
+    /// attempt's number too: a failed pair names up to two tried rows, which
+    /// the controller reads softly, so the rows do not count the attempts.
+    /// The commit asks the route's rule of both workers, made of the classic
     /// selection's own: a worker of the HTTP pair pools, and one `ledger`
     /// admits. A worker that answered the request definitively takes no
     /// further attempt of it, at any of its ranks.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one attempt's ask: its request, its number and size, and what the attempts before it closed"
+    )]
     async fn place_pair_attempt<'a>(
         &self,
         host: &Host,
         context: &PDRequestContext<'a>,
+        attempt: u32,
         prompt_tokens: u32,
         sticky_key: Option<&str>,
         tried_rows: &parking_lot::Mutex<Vec<WorkerId>>,
@@ -1446,6 +1462,7 @@ impl PDRouter {
             id,
             model,
             prompt_tokens,
+            attempt: u8::try_from(attempt).unwrap_or(u8::MAX),
             tried,
         };
         let placed = host
