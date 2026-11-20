@@ -659,6 +659,15 @@ impl<G: Generation> Objects<G> {
             .map(|&(_, row)| row)
     }
 
+    /// The object that stands for `row`: what the row's series are named
+    /// by, and what a writer of those series holds through its writes.
+    /// `None` where the holder holds no object for `row`.
+    pub(super) fn row_worker(&self, row: WorkerId) -> Option<Arc<dyn Worker>> {
+        let held = self.held.read();
+        let object = held.objects.get(&row)?;
+        Some(Arc::clone(&held.rows.get(object)?.object))
+    }
+
     /// How many objects stand.
     pub fn len(&self) -> usize {
         self.held.read().objects.len()
