@@ -9,9 +9,17 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use smg_policy_controller::{
     store::{Maker, MemoryStore, WorkerFacts},
-    worker_host::{Expect, Membership, Objects, Refused, Remover, Standing, StoreDoor, Wrote},
+    worker_host::{
+        Expect, HealthAdapter, Membership, Objects, Refused, Remover, SoleLead, Standing,
+        StoreDoor, Wrote,
+    },
 };
-use smg_worker::connection::engine::EngineConnector;
+use smg_worker::{
+    connection::engine::EngineConnector,
+    health::port::{HealthSink, ProbeAnswer},
+    registry::WorkerId,
+    worker::WorkerStatus,
+};
 
 use crate::routers::common::snapshot::{ModelWorkerSnapshot, WorkerRegistry};
 
@@ -32,6 +40,20 @@ pub(crate) struct Feed {
 }
 
 impl Feed {
+    /// The health sink of a gateway that keeps its workers in the store.
+    pub(crate) fn health_sink(&self) -> Arc<dyn HealthSink> {
+        Arc::new(FeedHealth {
+            objects: Arc::clone(&self.objects),
+            adapter: HealthAdapter::new(
+                Arc::clone(&self.objects),
+                Arc::clone(&self.store),
+                Arc::new(SoleLead),
+                SoleLead::TERM,
+            ),
+            registry: Arc::clone(self.objects.registry()),
+        })
+    }
+
     /// Bring the registry to the store's rows, then publish them: the two
     /// calls the door's listener makes after each write. It is here for a
     /// follower that applies a served controller's events; no product line
@@ -40,6 +62,46 @@ impl Feed {
     pub(crate) fn settle(&self) {
         let _turn = self.turn.lock();
         settle(&self.objects, &self.store);
+    }
+}
+
+/// The adapter writes a row's health and mirrors its status on the worker.
+/// The registry writes the health of workers without a row.
+/// The adapter answers stale for those workers, so it cannot promote them.
+struct FeedHealth {
+    objects: Arc<Objects<ModelWorkerSnapshot>>,
+    adapter: HealthAdapter<ModelWorkerSnapshot, MemoryStore>,
+    registry: Arc<WorkerRegistry>,
+}
+
+impl FeedHealth {
+    fn sink(&self, worker_id: &WorkerId) -> &dyn HealthSink {
+        if self.objects.standing(worker_id).is_some() {
+            &self.adapter
+        } else {
+            self.registry.as_ref()
+        }
+    }
+}
+
+impl HealthSink for FeedHealth {
+    fn probe_outcome(
+        &self,
+        worker_id: &WorkerId,
+        passed: bool,
+        revision: u64,
+        launched: WorkerStatus,
+    ) -> ProbeAnswer {
+        self.sink(worker_id)
+            .probe_outcome(worker_id, passed, revision, launched)
+    }
+
+    fn connected(
+        &self,
+        worker_id: &WorkerId,
+        revision: u64,
+    ) -> Option<(WorkerStatus, WorkerStatus)> {
+        self.sink(worker_id).connected(worker_id, revision)
     }
 }
 

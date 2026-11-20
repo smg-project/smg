@@ -149,10 +149,6 @@ pub struct AppContext {
     /// the policy store is present.
     pub(crate) policy_host: Option<Arc<Host>>,
     /// The membership feed over [`Self::policy_store`], present wherever the store is.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the context holds the feed for membership writes")
-    )]
     pub(crate) policy_feed: Option<Feed>,
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
     pub rl: Option<Arc<smg_rl::RlState>>,
