@@ -172,6 +172,13 @@ mod tests {
     };
 
     const BLOCK_SIZE: u32 = 16;
+    /// A text of two windows and a tail, at a block of sixteen tokens.
+    const RECORDED_TEXT: &str = "A request's text is hashed by windows of its bytes, as deep as \
+                                 the generation reads, and a tail shorter than one window gives \
+                                 no hash at all.";
+    const RECORDED_TOKENS: [u64; 2] = [0xea06_fc71_a5ee_6e88, 0x1fbf_39bd_106b_e0b5];
+    const RECORDED_SCOPED_TOKENS: [u64; 2] = [0x3c6f_83b1_c88e_dc76, 0xcbfd_d2b6_595c_c9c6];
+    const RECORDED_WINDOWS: [u64; 2] = [0xc67b_5989_9662_3ba3, 0x627b_9253_c3e5_d0f8];
 
     fn plain_prompt(tokens: &[u32]) -> Prompt<'_> {
         Prompt {
@@ -507,6 +514,40 @@ mod tests {
         assert_eq!(facts.block_size, defaults.block_size);
         assert_eq!(facts.namespace_seed, defaults.namespace_seed);
         assert_eq!(facts.prompt_tokens, defaults.prompt_tokens);
+    }
+
+    /// The block hashes of three prompts, as values of record: a plain
+    /// token prompt, the same tokens under a partition's event seed, and a
+    /// text prompt. They hold the hashing still while it moves.
+    #[test]
+    fn a_prompts_hashes_are_the_recorded_ones() {
+        let (_, store, _) = cache_bed();
+        store.set_block_size(MODEL, BLOCK_SIZE);
+        let tokens: Vec<u32> = (1..=40).collect();
+        let plain = Hashes::of(&store, MODEL, &plain_prompt(&tokens));
+        assert_eq!(plain.blocks, RECORDED_TOKENS);
+        let namespace = CacheNamespace::derive(&CachePartition {
+            cache_salt: Some("partition"),
+            ..CachePartition::default()
+        })
+        .expect("the namespace");
+        let scoped = Hashes::of(
+            &store,
+            MODEL,
+            &Prompt {
+                namespace: Some(namespace),
+                ..plain_prompt(&tokens)
+            },
+        );
+        assert_eq!(scoped.blocks, RECORDED_SCOPED_TOKENS);
+        assert_eq!(scoped.namespace_seed, namespace.partition_seed());
+        let text = Prompt {
+            text: Some(RECORDED_TEXT),
+            ..Prompt::default()
+        };
+        let windows = Hashes::of(&store, MODEL, &text);
+        assert_eq!(windows.blocks, RECORDED_WINDOWS);
+        assert_eq!(windows.prompt_tokens, RECORDED_TEXT.len() as u32 / 4);
     }
 
     #[test]
