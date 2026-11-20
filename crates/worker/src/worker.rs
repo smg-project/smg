@@ -1827,6 +1827,18 @@ pub struct SchedulerLoadSnapshot {
     #[serde(skip)]
     #[schemars(skip)]
     pub kept: LoadTelemetry,
+    /// When the engine's state behind this entry was sampled, on the
+    /// gateway's clock, where the entry stands on a worker's pushed report.
+    /// That report's entries are written at as many instants: a rank's
+    /// record writes its own, under the record's sample instant, and a
+    /// polled answer laid on the report writes each entry it lays, under
+    /// the poll's start. The report's own instant is its last record's.
+    /// Unset on a polled answer, which is one sample: a reader takes an
+    /// entry that says none as its report's own sample. Never serialized,
+    /// as the report's own instant is not.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub sampled_at: Option<std::time::Instant>,
 }
 
 impl SchedulerLoadSnapshot {

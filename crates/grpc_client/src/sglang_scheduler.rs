@@ -765,6 +765,9 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             // A polled answer states its own figures: none is kept from an
             // older record.
             kept: Default::default(),
+            // An answer is one sample: the load monitor sets an entry's own
+            // instant where the entry stands on a pushed report.
+            sampled_at: None,
         }
     }
 }

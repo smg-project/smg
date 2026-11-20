@@ -11,13 +11,11 @@
 //! on a poll answer. What a worker over several ranks stated has a lock of
 //! its own, in the worker's entry. It is taken behind the map's release
 //! and held across the store's writes of that worker's values. The store
-//! calls no adapter, so nothing takes the two the other way. What the
-//! entry keeps of its worker's ranks, a note or that keeper's handle, has
-//! a lock taken inside the map's, which holds no other. The adapter calls
-//! no collector.
+//! calls no adapter, so nothing takes the two the other way. The adapter
+//! calls no collector.
 
 use std::{
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -49,73 +47,34 @@ struct KeptMember {
     worker: Arc<dyn Worker>,
     id: ObjectId,
     member: Member,
-    /// What the entry keeps of its worker's ranks. It goes with the entry,
-    /// and at a report under a document that declares no signal.
-    shown: Mutex<Shown>,
-}
-
-/// What a worker's entry keeps of the ranks its reports showed.
-enum Shown {
-    /// One rank at the most. It holds the rank and the sample instant of
-    /// the last report of one rank the worker's report took, where it took
-    /// one: what dates that rank's entry at the first report of several
-    /// ranks.
-    OneRank(Option<(i32, Instant)>),
-    /// Several ranks: what each last stated of the declared signals, made
-    /// at the first sign of them.
-    Several(Keeper),
+    /// What each rank of the worker last stated of the declared signals,
+    /// made at its first report of several ranks. It goes with the entry.
+    keeper: OnceLock<Keeper>,
 }
 
 /// What each rank of one worker last stated, behind the worker's own lock.
 type Keeper = Arc<Mutex<RankValues>>;
 
-/// A report's part in what its worker's entry keeps of the ranks.
+/// A report, and the signals the document in force declares.
 struct Heard<'a> {
     report: &'a WorkerLoadResponse,
     columns: &'a [SignalColumn],
-    /// The report's sample instant, where the worker's report took it: a
-    /// pushed record always, a polled answer once the store took its row.
-    taken_at: Option<Instant>,
 }
 
 impl KeptMember {
     /// The entry's keeper for `heard`'s report: the one it has, or one
-    /// made at the first sign that the worker stands over several ranks.
-    /// The signs are a report of several ranks, and a report of one rank
-    /// behind a report of another rank. Until then a report of one rank
-    /// leaves its rank and its instant in the entry, and nothing is
-    /// allocated.
-    ///
-    /// Under a document that declares no signal nothing is read, and what
-    /// the entry keeps goes. It would stand behind a report it was not
-    /// told, and it dates a rank's entry right only while it is told every
-    /// report: the next keeper starts with no note.
+    /// made at the worker's first report of several ranks. A worker of one
+    /// rank has none, and allocates nothing. Under a document that
+    /// declares no signal nothing is read.
     fn keeper_for(&self, heard: &Heard<'_>) -> Option<Keeper> {
-        let mut shown = self.shown.lock();
         if heard.columns.is_empty() {
-            *shown = Shown::OneRank(None);
             return None;
         }
-        let alone = match &*shown {
-            Shown::Several(keeper) => return Some(Arc::clone(keeper)),
-            Shown::OneRank(alone) => *alone,
-        };
-        let only = match heard.report.loads.as_slice() {
-            [only] if only.worker.is_none() => Some(only.dp_rank),
-            _ => None,
-        };
-        let another = only
-            .zip(alone)
-            .is_some_and(|(rank, (last, _))| rank != last);
-        if another || RankValues::keeps(heard.report, heard.columns) {
-            let keeper = Arc::new(Mutex::new(RankValues::behind(alone)));
-            *shown = Shown::Several(Arc::clone(&keeper));
-            return Some(keeper);
+        if let Some(keeper) = self.keeper.get() {
+            return Some(Arc::clone(keeper));
         }
-        if let Some(taken) = only.zip(heard.taken_at) {
-            *shown = Shown::OneRank(Some(taken));
-        }
-        None
+        RankValues::keeps(heard.report, heard.columns)
+            .then(|| Arc::clone(self.keeper.get_or_init(Keeper::default)))
     }
 }
 
@@ -150,20 +109,14 @@ impl KeptMember {
 /// is one rank's, and its report lists every rank at its latest record. So
 /// that worker's values are made over what each rank last stated, each
 /// statement under its own sample instant ([`RankValues`]). The statements
-/// are kept in the worker's entry from its first sign of several ranks: a
-/// report of several ranks, or a report of one rank behind a report of
-/// another. From then on the keeper is told every report of the worker.
-/// Until then a report of one rank leaves its rank and its instant in the
-/// entry, which dates that rank's entry at the first report of several
-/// ranks: a worker's first records list one rank, and a worker of one
-/// rank allocates nothing. The statements go with the entry at a forget,
-/// at a reset and when another object takes its address, and end at a new
-/// document. A report under a document that declares no signal is not
-/// read, so it ends what the entry keeps, the keeper and the note alike.
-/// A rank's entry the keeper was told nothing of is not read: behind a
-/// reset, and behind a document that declared no signal, each rank counts
-/// at its next report. A polled answer is one sample of every rank it
-/// lists, and states them all, though its row is passed over.
+/// are kept in the worker's entry from its first report of several ranks:
+/// a worker of one rank allocates nothing. The collector writes each
+/// entry's sample instant where it writes the entry, so the keeper reads
+/// another rank's entry under the instant the entry says. The statements
+/// go with the entry at a forget, at a reset and when another object takes
+/// its address, and end at a new document. A polled answer is one sample
+/// of every rank it lists, and states them all, though its row is passed
+/// over.
 pub struct LoadAdapter<G, S: ?Sized> {
     objects: Arc<Objects<G>>,
     store: Arc<S>,
@@ -230,7 +183,7 @@ impl<G: Generation, S: StoreLoadSink + SignalSink + ?Sized> LoadAdapter<G, S> {
                 rank: u16::try_from(worker.dp_rank().unwrap_or(0)).ok()?,
                 role: role(*worker.worker_type()),
             },
-            shown: Mutex::new(Shown::OneRank(None)),
+            keeper: OnceLock::new(),
         })
     }
 
@@ -265,17 +218,6 @@ impl<G: Generation, S: StoreLoadSink + SignalSink + ?Sized> LoadAdapter<G, S> {
         Some(member)
     }
 
-    /// A polled answer of one rank whose row the store took: its rank and
-    /// instant go to the worker's entry, where the entry has no keeper.
-    fn heard_alone(&self, worker: &Arc<dyn Worker>, heard: &Heard<'_>) {
-        let members = self.members.read();
-        if let Some(kept) = members.get(worker.url()) {
-            if Arc::ptr_eq(&kept.worker, worker) {
-                kept.keeper_for(heard);
-            }
-        }
-    }
-
     fn write_report<'a>(
         &self,
         answer: impl Iterator<Item = (&'a Arc<dyn Worker>, Option<&'a WorkerLoadResponse>)>,
@@ -295,8 +237,8 @@ impl<G: Generation, S: StoreLoadSink + SignalSink + ?Sized> LoadAdapter<G, S> {
             ConnectionMode::Http | ConnectionMode::Zmq => LoadSource::Scrape,
         };
         let columns = self.store.signal_columns();
-        // Each row's worker and report, kept past its row where the
-        // document declares a signal.
+        // Each row's report and its worker's keeper, kept past the row
+        // where the document declares a signal.
         let mut stated = Vec::new();
         let rows: Vec<_> = answer
             .filter_map(|(worker, report)| {
@@ -306,20 +248,16 @@ impl<G: Generation, S: StoreLoadSink + SignalSink + ?Sized> LoadAdapter<G, S> {
                     return None;
                 }
                 let report = report.filter(|report| !report.loads.is_empty());
-                // The answer's part in what the worker's entry keeps of
-                // its ranks. Whether the store takes its row is known
-                // behind the rows.
                 let heard = report.map(|report| Heard {
                     report,
                     columns: &columns,
-                    taken_at: None,
                 });
                 let (member, keeper) = self.member_heard(worker, heard.as_ref())?;
                 let row = report.map(|report| {
                     load_row(report, member.role, received_at, received_at, source.into())
                 });
                 if !columns.is_empty() {
-                    stated.push((worker, report, keeper));
+                    stated.push((report, keeper));
                 }
                 Some((member.row, member.rank, row))
             })
@@ -333,9 +271,7 @@ impl<G: Generation, S: StoreLoadSink + SignalSink + ?Sized> LoadAdapter<G, S> {
         // the poll's start. The positions the store passed over stand in
         // the answer's order.
         let mut skipped = passed.iter().copied().peekable();
-        for (position, (&(row, rank, _), (worker, report, keeper))) in
-            rows.iter().zip(stated).enumerate()
-        {
+        for (position, (&(row, rank, _), (report, keeper))) in rows.iter().zip(stated).enumerate() {
             let passed_over = skipped.next_if_eq(&position).is_some();
             let Some(report) = report else {
                 continue;
@@ -345,30 +281,18 @@ impl<G: Generation, S: StoreLoadSink + SignalSink + ?Sized> LoadAdapter<G, S> {
             };
             let Some(keeper) = keeper else {
                 // A worker that showed one rank: its answer is one sample.
-                // Where the store took its row, its rank and its instant
-                // stay in the worker's entry.
                 if !passed_over {
                     signal_values(report, &columns, polled_at, write);
-                    let taken = Heard {
-                        report,
-                        columns: &columns,
-                        taken_at: Some(polled_at),
-                    };
-                    self.heard_alone(worker, &taken);
                 }
                 continue;
             };
             // An answer is one sample of each rank it lists: the keeper is
-            // told them all, though the store passed its row over. The
-            // worker's report then keeps the member's own pushed entry.
+            // told them all, though the store passed its row over.
             let mut keeper = keeper.lock();
             if passed_over {
-                let pushed = Some(i32::from(rank));
-                let of = ReportOf::EveryRank { pushed };
-                keeper.keep(report, of, &columns, polled_at);
+                keeper.keep(report, ReportOf::EveryRank, &columns, polled_at);
             } else {
-                let of = ReportOf::EveryRank { pushed: None };
-                keeper.values(report, of, &columns, polled_at, write);
+                keeper.values(report, ReportOf::EveryRank, &columns, polled_at, write);
             }
         }
         passed
@@ -405,12 +329,11 @@ where
             return;
         };
         // What the document in force declares, read ahead of the lookup:
-        // the record's part in what the worker's entry keeps of its ranks.
+        // a report of several ranks under it makes the entry's keeper.
         let columns = self.store.signal_columns();
         let heard = Heard {
             report,
             columns: &columns,
-            taken_at: Some(sampled_at),
         };
         let Some((member, keeper)) = self.member_heard(worker, Some(&heard)) else {
             return;
@@ -435,8 +358,8 @@ where
         };
         // The worker stands over several ranks, and its report lists each
         // at its latest record: this record states its own rank. Another
-        // rank's entry is read where nothing of it is kept yet, as old as
-        // the keeper was told that entry is.
+        // rank's entry is read under the instant the entry says, where it
+        // was written since the keeper last read it.
         let of = ReportOf::OneRank {
             rank: i32::from(rank),
         };
@@ -1619,6 +1542,75 @@ mod tests {
         cells(replica)[&id][0]
     }
 
+    /// A worker's pushed report as the collector keeps it: one entry a
+    /// rank, each under the sample instant of what wrote it, a rank's
+    /// record or a polled answer laid on the report.
+    struct Pushed<'a> {
+        adapter: &'a LoadAdapter<Members, Store>,
+        worker: &'a Arc<dyn Worker>,
+        report: WorkerLoadResponse,
+    }
+
+    impl<'a> Pushed<'a> {
+        /// The report of `worker`, which no record started yet.
+        fn of(adapter: &'a LoadAdapter<Members, Store>, worker: &'a Arc<dyn Worker>) -> Self {
+            Self {
+                adapter,
+                worker,
+                report: WorkerLoadResponse::default(),
+            }
+        }
+
+        /// A record of `rank`, received and sampled at `at`, with the
+        /// depth it states by name where it states one.
+        fn record(&mut self, rank: i32, depth: Option<f64>, at: Instant) {
+            self.record_sampled(rank, depth, at, at);
+        }
+
+        /// As [`Self::record`], received at `received_at` and sampled at
+        /// `sampled_at`: the rank's entry is written under its sample
+        /// instant, and the adapter hears the record.
+        fn record_sampled(
+            &mut self,
+            rank: i32,
+            depth: Option<f64>,
+            received_at: Instant,
+            sampled_at: Instant,
+        ) {
+            let mut entry = file(&[(rank, depth)]).loads.remove(0);
+            entry.sampled_at = Some(sampled_at);
+            let loads = &mut self.report.loads;
+            match loads.binary_search_by_key(&rank, |load| load.dp_rank) {
+                Ok(at) => loads[at] = entry,
+                Err(at) => loads.insert(at, entry),
+            }
+            self.report.dp_rank_count = i32::try_from(loads.len()).unwrap_or(i32::MAX);
+            self.adapter
+                .record(self.worker, rank, &self.report, received_at, sampled_at);
+        }
+
+        /// A poll's answer that began at `polled_at`. The adapter hears
+        /// it, and the collector lays it: a rank whose stream is the newer
+        /// keeps its entry, and any other entry on file takes the answer's
+        /// for its rank, as old as the poll's start. Returns the ranks
+        /// whose stream is the newer.
+        fn polled(&mut self, answer: &WorkerLoadResponse, polled_at: Instant) -> Vec<i32> {
+            let heard = [polled(self.worker, Some(answer))];
+            let ranks = self.adapter.report(&heard, polled_at);
+            for row in &mut self.report.loads {
+                let laid = answer
+                    .loads
+                    .iter()
+                    .find(|entry| entry.dp_rank == row.dp_rank);
+                if let Some(entry) = laid.filter(|_| !ranks.newer.contains(&row.dp_rank)) {
+                    row.clone_from(entry);
+                    row.sampled_at = Some(polled_at);
+                }
+            }
+            ranks.newer
+        }
+    }
+
     /// One row over an engine of two ranks. Rank 1 states its depth once
     /// and falls silent, and rank 0 states its own each second. The row's
     /// sum stays as old as rank 1's statement, so the signal's maximum age
@@ -1631,11 +1623,10 @@ mod tests {
         let adapter = replica.lead();
         let start = Instant::now() + Duration::from_secs(1);
         let at = |ms: u64| start + Duration::from_millis(ms);
-        let both = file(&[(0, Some(1.0)), (1, Some(100.0))]);
-        adapter.record(&worker, 1, &both, at(0), at(0));
+        let mut pushed = Pushed::of(&adapter, &worker);
+        pushed.record(1, Some(100.0), at(0));
         for second in 1..=9 {
-            let now = at(second * 1_000);
-            adapter.record(&worker, 0, &both, now, now);
+            pushed.record(0, Some(1.0), at(second * 1_000));
         }
         let silent = replica.store.memory.micros(at(0));
         assert_eq!(depth(&replica, id), Some((101.0, silent)));
@@ -1652,14 +1643,12 @@ mod tests {
         let adapter = replica.lead();
         let start = Instant::now() + Duration::from_secs(1);
         let at = |ms: u64| start + Duration::from_millis(ms);
-        let both = file(&[(0, Some(1.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 1, &both, at(0), at(0));
-        adapter.record(&worker, 0, &both, at(10), at(10));
+        let mut pushed = Pushed::of(&adapter, &worker);
+        pushed.record(1, Some(2.0), at(0));
+        pushed.record(0, Some(1.0), at(10));
         assert_eq!(depth(&replica, id).map(|(value, _)| value), Some(3.0));
-        let bare = file(&[(0, Some(1.0)), (1, None)]);
-        adapter.record(&worker, 1, &bare, at(20), at(20));
-        let moved = file(&[(0, Some(3.0)), (1, None)]);
-        adapter.record(&worker, 0, &moved, at(30), at(30));
+        pushed.record(1, None, at(20));
+        pushed.record(0, Some(3.0), at(30));
         assert_eq!(depth(&replica, id).map(|(value, _)| value), Some(5.0));
     }
 
@@ -1672,33 +1661,31 @@ mod tests {
         let start = Instant::now() + Duration::from_secs(1);
         let at = |ms: u64| start + Duration::from_millis(ms);
         let micros = |at: Instant| replica.store.memory.micros(at);
-        let both = file(&[(0, Some(1.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 1, &both, at(0), at(0));
-        adapter.record(&worker, 0, &both, at(10), at(10));
+        let mut pushed = Pushed::of(&adapter, &worker);
+        pushed.record(1, Some(2.0), at(0));
+        pushed.record(0, Some(1.0), at(10));
         // Rank 0 pushes while a poll is out: the store passes the answer's
         // row over, and the row's value stays the records' own.
         let asked = at(1_000);
-        let pushed = file(&[(0, Some(5.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 0, &pushed, at(1_001), at(1_001));
+        pushed.record(0, Some(5.0), at(1_001));
         let answer = file(&[(0, Some(4.0)), (1, Some(6.0))]);
-        let ranks = adapter.report(&[polled(&worker, Some(&answer))], asked);
-        assert_eq!(ranks.newer, [0]);
+        assert_eq!(pushed.polled(&answer, asked), [0]);
         assert_eq!(depth(&replica, id), Some((7.0, micros(at(0)))));
         // Rank 0's next record reads rank 1 as the answer stated it, at
         // the poll's start. Rank 0's own record is newer than the answer.
-        adapter.record(&worker, 0, &pushed, at(1_500), at(1_500));
+        pushed.record(0, Some(5.0), at(1_500));
         assert_eq!(depth(&replica, id), Some((11.0, micros(asked))));
         // An answer whose row the store takes writes the row's value.
         let later = at(3_000);
         let answer = file(&[(0, Some(1.0)), (1, Some(1.0))]);
-        let ranks = adapter.report(&[polled(&worker, Some(&answer))], later);
-        assert!(ranks.newer.is_empty());
+        assert!(pushed.polled(&answer, later).is_empty());
         assert_eq!(depth(&replica, id), Some((2.0, micros(later))));
     }
 
     /// A worker's statements go with its entry, at a reset and at a
-    /// forget. The new entry was told nothing of the ranks: each counts at
-    /// its next record.
+    /// forget. The next keeper reads each rank's entry again, under the
+    /// instant the entry says: what goes for good is a name the rank's
+    /// latest record left out, until the rank states it again.
     #[test]
     fn a_workers_statements_go_with_its_entry() {
         let replica = Replica::new();
@@ -1707,27 +1694,31 @@ mod tests {
         let adapter = replica.lead();
         let start = Instant::now() + Duration::from_secs(1);
         let at = |ms: u64| start + Duration::from_millis(ms);
-        let both = file(&[(0, Some(1.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 1, &both, at(0), at(0));
-        // A reset drops the entry, and with it rank 1's statement and its
-        // instant: rank 0's record alone makes no value.
+        let micros = |at: Instant| replica.store.memory.micros(at);
+        let mut pushed = Pushed::of(&adapter, &worker);
+        pushed.record(0, Some(1.0), at(0));
+        pushed.record(1, Some(2.0), at(10));
+        pushed.record(1, None, at(20));
+        pushed.record(0, Some(1.0), at(30));
+        assert_eq!(depth(&replica, id), Some((3.0, micros(at(10)))));
+        // A reset drops the entry, and with it what rank 1 stated. Its
+        // latest record states no depth, so rank 0's next record makes no
+        // value, and the row's cell keeps its last one.
         adapter.reset();
-        adapter.record(&worker, 0, &both, at(10), at(10));
-        assert_eq!(depth(&replica, id), None);
-        adapter.record(&worker, 1, &both, at(20), at(20));
-        adapter.record(&worker, 0, &both, at(30), at(30));
-        let restated = replica.store.memory.micros(at(20));
-        assert_eq!(depth(&replica, id), Some((3.0, restated)));
+        pushed.record(0, Some(5.0), at(40));
+        assert_eq!(depth(&replica, id), Some((3.0, micros(at(10)))));
+        pushed.record(1, Some(2.0), at(50));
+        pushed.record(0, Some(5.0), at(60));
+        assert_eq!(depth(&replica, id), Some((7.0, micros(at(50)))));
         // A forget drops it too, with the row's cells.
         adapter.forget(&worker);
-        adapter.record(&worker, 0, &both, at(40), at(40));
         assert_eq!(depth(&replica, id), None);
     }
 
     /// A worker's first records list one rank, and are read as a worker
     /// of one rank. The next rank's first record reads the first rank's
-    /// entry, under that rank's own record: a rank that stated once and
-    /// fell silent counts all the same, as old as it is.
+    /// entry, under the instant the entry says: a rank that stated once
+    /// and fell silent counts all the same, as old as it is.
     #[test]
     fn a_ranks_first_statement_counts_at_the_next_ranks_first_record() {
         let replica = Replica::new();
@@ -1736,33 +1727,31 @@ mod tests {
         let adapter = replica.lead();
         let start = Instant::now() + Duration::from_secs(1);
         let at = |ms: u64| start + Duration::from_millis(ms);
-        let alone = file(&[(1, Some(100.0))]);
-        adapter.record(&worker, 1, &alone, at(0), at(0));
+        let mut pushed = Pushed::of(&adapter, &worker);
+        pushed.record(1, Some(100.0), at(0));
         assert_eq!(depth(&replica, id), None);
-        let both = file(&[(0, Some(1.0)), (1, Some(100.0))]);
-        adapter.record(&worker, 0, &both, at(9_000), at(9_000));
+        pushed.record(0, Some(1.0), at(9_000));
         let first = replica.store.memory.micros(at(0));
         assert_eq!(depth(&replica, id), Some((101.0, first)));
     }
 
     /// A new document ends the statements, though it declares the same
-    /// signals. The next record reads each rank's latest record again,
-    /// under that rank's own instant, so the row's value moves at once.
+    /// signals. The next record reads each rank's entry again, under the
+    /// instant the entry says, so the row's value moves at once.
     #[test]
-    fn a_new_document_reads_each_ranks_latest_record_again() {
+    fn a_new_document_reads_each_ranks_entry_again() {
         let replica = Replica::new();
         let (id, worker) = replica.add(facts(URL));
         declare(&replica);
         let adapter = replica.lead();
         let start = Instant::now() + Duration::from_secs(1);
         let at = |ms: u64| start + Duration::from_millis(ms);
-        let both = file(&[(0, Some(1.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 1, &both, at(0), at(0));
-        adapter.record(&worker, 0, &both, at(10), at(10));
+        let mut pushed = Pushed::of(&adapter, &worker);
+        pushed.record(1, Some(2.0), at(0));
+        pushed.record(0, Some(1.0), at(10));
         assert_eq!(depth(&replica, id).map(|(value, _)| value), Some(3.0));
         declare_as(&replica, 3, &DECLARED);
-        let moved = file(&[(0, Some(4.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 0, &moved, at(30), at(30));
+        pushed.record(0, Some(4.0), at(30));
         let first = replica.store.memory.micros(at(0));
         assert_eq!(depth(&replica, id), Some((6.0, first)));
     }
@@ -1779,31 +1768,28 @@ mod tests {
         let adapter = replica.lead();
         let start = Instant::now() + Duration::from_secs(1);
         let at = |ms: u64| start + Duration::from_millis(ms);
-        let both = file(&[(0, Some(1.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 1, &both, at(0), at(0));
-        adapter.record(&worker, 0, &both, at(10), at(10));
-        let bare = file(&[(0, Some(1.0)), (1, None)]);
-        adapter.record(&worker, 1, &bare, at(20), at(20));
+        let mut pushed = Pushed::of(&adapter, &worker);
+        pushed.record(1, Some(2.0), at(0));
+        pushed.record(0, Some(1.0), at(10));
+        pushed.record(1, None, at(20));
         assert_eq!(depth(&replica, id).map(|(value, _)| value), Some(3.0));
         // Two documents between two reports: the depth goes, and comes
         // back as it was declared.
         declare_as(&replica, 3, &DECLARED[1..]);
         declare_as(&replica, 4, &DECLARED);
-        let moved = file(&[(0, Some(4.0)), (1, None)]);
-        adapter.record(&worker, 0, &moved, at(30), at(30));
+        pushed.record(0, Some(4.0), at(30));
         assert_eq!(depth(&replica, id), None);
-        let both = file(&[(0, Some(4.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 1, &both, at(40), at(40));
-        adapter.record(&worker, 0, &both, at(50), at(50));
+        pushed.record(1, Some(2.0), at(40));
+        pushed.record(0, Some(4.0), at(50));
         let restated = replica.store.memory.micros(at(40));
         assert_eq!(depth(&replica, id), Some((6.0, restated)));
     }
 
     /// A poll's row stands in the place of a silent rank's sample at the
     /// row's own rank, though its answer leaves that rank out and the
-    /// rank's pushed entry stays on file. The entry is as old as the
-    /// rank's own record, which the worker's entry noted: it is not dated
-    /// by the poll, and no old value reads fresh.
+    /// rank's pushed entry stays on file. The entry says the instant of
+    /// the rank's own record: it is not dated by the poll, and no old
+    /// value reads fresh.
     #[test]
     fn a_polls_row_in_a_ranks_place_dates_no_entry() {
         let replica = Replica::new();
@@ -1812,16 +1798,14 @@ mod tests {
         let adapter = replica.lead();
         let start = Instant::now() + Duration::from_secs(1);
         let at = |ms: u64| start + Duration::from_millis(ms);
-        let alone = file(&[(0, Some(100.0))]);
-        adapter.record(&worker, 0, &alone, at(0), at(0));
+        let mut pushed = Pushed::of(&adapter, &worker);
+        pushed.record(0, Some(100.0), at(0));
         // An answer that lists rank 1 alone, with no depth: its row takes
         // the place of rank 0's sample.
         let answer = file(&[(1, None)]);
-        adapter.report(&[polled(&worker, Some(&answer))], at(9_000));
-        let both = file(&[(0, Some(100.0)), (1, Some(1.0))]);
-        adapter.record(&worker, 1, &both, at(10_000), at(10_000));
-        let bare = file(&[(0, None), (1, Some(1.0))]);
-        adapter.record(&worker, 0, &bare, at(11_000), at(11_000));
+        pushed.polled(&answer, at(9_000));
+        pushed.record(1, Some(1.0), at(10_000));
+        pushed.record(0, None, at(11_000));
         // Rank 0's depth counts as old as rank 0 stated it.
         let first = replica.store.memory.micros(at(0));
         assert_eq!(depth(&replica, id), Some((101.0, first)));
@@ -1838,18 +1822,15 @@ mod tests {
         let adapter = replica.lead();
         let start = Instant::now() + Duration::from_secs(1);
         let at = |ms: u64| start + Duration::from_millis(ms);
-        let alone = file(&[(0, Some(1.0))]);
-        adapter.record(&worker, 0, &alone, at(0), at(0));
+        let mut pushed = Pushed::of(&adapter, &worker);
+        pushed.record(0, Some(1.0), at(0));
         let answer = file(&[(0, Some(2.0))]);
         let asked = at(5_000);
-        let ranks = adapter.report(&[polled(&worker, Some(&answer))], asked);
-        assert!(ranks.newer.is_empty());
-        // The report after rank 1's first record: rank 0 as the answer
-        // laid it, and rank 1's own.
-        let both = file(&[(0, Some(2.0)), (1, Some(100.0))]);
-        adapter.record(&worker, 1, &both, at(6_000), at(6_000));
-        let bare = file(&[(0, None), (1, Some(100.0))]);
-        adapter.record(&worker, 0, &bare, at(7_000), at(7_000));
+        assert!(pushed.polled(&answer, asked).is_empty());
+        // Rank 1's first record, then a record of rank 0 with no depth:
+        // rank 0 counts as the answer laid it.
+        pushed.record(1, Some(100.0), at(6_000));
+        pushed.record(0, None, at(7_000));
         let answered = replica.store.memory.micros(asked);
         assert_eq!(depth(&replica, id), Some((102.0, answered)));
     }
@@ -1866,25 +1847,49 @@ mod tests {
         let start = Instant::now() + Duration::from_secs(1);
         let at = |ms: u64| start + Duration::from_millis(ms);
         let micros = |at: Instant| replica.store.memory.micros(at);
-        let all = file(&[(0, Some(1.0)), (1, Some(2.0)), (2, Some(4.0))]);
-        adapter.record(&worker, 2, &all, at(0), at(0));
-        adapter.record(&worker, 1, &all, at(10), at(10));
-        adapter.record(&worker, 0, &all, at(20), at(20));
+        let mut pushed = Pushed::of(&adapter, &worker);
+        pushed.record(2, Some(4.0), at(0));
+        pushed.record(1, Some(2.0), at(10));
+        pushed.record(0, Some(1.0), at(20));
         assert_eq!(depth(&replica, id), Some((7.0, micros(at(0)))));
         // Rank 0 pushes while a poll is out, and the answer lists ranks 0
         // and 1 alone: the store passes its row over.
         let asked = at(1_000);
-        let pushed = file(&[(0, Some(3.0)), (1, Some(2.0)), (2, Some(4.0))]);
-        adapter.record(&worker, 0, &pushed, at(1_001), at(1_001));
+        pushed.record(0, Some(3.0), at(1_001));
         assert_eq!(depth(&replica, id), Some((9.0, micros(at(0)))));
         let answer = file(&[(0, Some(3.0)), (1, Some(2.0))]);
-        let ranks = adapter.report(&[polled(&worker, Some(&answer))], asked);
-        assert_eq!(ranks.newer, [0]);
+        assert_eq!(pushed.polled(&answer, asked), [0]);
         // Rank 0's next record still counts rank 2, as old as rank 2's
         // own record.
-        let next = file(&[(0, Some(5.0)), (1, Some(2.0)), (2, Some(4.0))]);
-        adapter.record(&worker, 0, &next, at(1_500), at(1_500));
+        pushed.record(0, Some(5.0), at(1_500));
         assert_eq!(depth(&replica, id), Some((11.0, micros(at(0)))));
+    }
+
+    /// An answer may list fewer ranks than its engine has, and no report's
+    /// list ends a statement. With no pushed record at all, a rank an
+    /// answer leaves out counts what it stated when an answer lists it
+    /// again.
+    #[test]
+    fn an_answer_that_lists_fewer_ranks_ends_no_statement() {
+        let replica = Replica::new();
+        let (id, worker) = replica.add(facts(URL));
+        declare(&replica);
+        let adapter = replica.lead();
+        let start = Instant::now() + Duration::from_secs(1);
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let micros = |at: Instant| replica.store.memory.micros(at);
+        let first = file(&[(0, Some(1.0)), (1, Some(2.0))]);
+        adapter.report(&[polled(&worker, Some(&first))], at(0));
+        assert_eq!(depth(&replica, id), Some((3.0, micros(at(0)))));
+        // An answer of two ranks that lists rank 0 alone, with no depth.
+        let mut fewer = file(&[(0, None)]);
+        fewer.dp_rank_count = 2;
+        adapter.report(&[polled(&worker, Some(&fewer))], at(1_000));
+        // Rank 0 states 5 beside a rank 1 with no depth: rank 1 counts
+        // what the first answer stated.
+        let next = file(&[(0, Some(5.0)), (1, None)]);
+        adapter.report(&[polled(&worker, Some(&next))], at(2_000));
+        assert_eq!(depth(&replica, id), Some((7.0, micros(at(0)))));
     }
 
     /// An answer's entry is laid over a rank's entry on the pushed report,
@@ -1900,31 +1905,26 @@ mod tests {
         let start = Instant::now() + Duration::from_secs(1);
         let at = |ms: u64| start + Duration::from_millis(ms);
         let micros = |at: Instant| replica.store.memory.micros(at);
-        let all = file(&[(0, Some(1.0)), (1, Some(2.0)), (2, Some(4.0))]);
-        adapter.record(&worker, 2, &all, at(0), at(0));
-        adapter.record(&worker, 1, &all, at(10), at(10));
-        adapter.record(&worker, 0, &all, at(20), at(20));
+        let mut pushed = Pushed::of(&adapter, &worker);
+        pushed.record(2, Some(4.0), at(0));
+        pushed.record(1, Some(2.0), at(10));
+        pushed.record(0, Some(1.0), at(20));
         // A poll goes out. Rank 2 pushes with no depth and rank 0 pushes,
         // so the store passes the answer's row over. The answer states 7
         // for rank 2, and that entry is laid on the pushed report.
         let asked = at(1_000);
-        let bare = file(&[(0, Some(1.0)), (1, Some(2.0)), (2, None)]);
-        adapter.record(&worker, 2, &bare, at(2_000), at(2_000));
-        adapter.record(&worker, 0, &bare, at(2_100), at(2_100));
+        pushed.record(2, None, at(2_000));
+        pushed.record(0, Some(1.0), at(2_100));
         let answer = file(&[(0, Some(1.0)), (1, Some(2.0)), (2, Some(7.0))]);
-        let ranks = adapter.report(&[polled(&worker, Some(&answer))], asked);
-        assert_eq!(ranks.newer, [0]);
+        assert_eq!(pushed.polled(&answer, asked), [0]);
         // A later answer leaves rank 2 out, and is passed over as well.
         let later = at(3_000);
-        let laid = file(&[(0, Some(1.0)), (1, Some(2.0)), (2, Some(7.0))]);
-        adapter.record(&worker, 0, &laid, at(3_100), at(3_100));
+        pushed.record(0, Some(1.0), at(3_100));
         let partial = file(&[(0, Some(1.0)), (1, Some(2.0))]);
-        let ranks = adapter.report(&[polled(&worker, Some(&partial))], later);
-        assert_eq!(ranks.newer, [0]);
+        assert_eq!(pushed.polled(&partial, later), [0]);
         // Ranks 1 and 0 push: rank 2 counts 7, as old as the first poll.
-        adapter.record(&worker, 1, &laid, at(3_500), at(3_500));
-        let next = file(&[(0, Some(5.0)), (1, Some(2.0)), (2, Some(7.0))]);
-        adapter.record(&worker, 0, &next, at(4_000), at(4_000));
+        pushed.record(1, Some(2.0), at(3_500));
+        pushed.record(0, Some(5.0), at(4_000));
         assert_eq!(depth(&replica, id), Some((14.0, micros(asked))));
     }
 
@@ -1940,26 +1940,24 @@ mod tests {
         let start = Instant::now() + Duration::from_secs(1);
         let at = |ms: u64| start + Duration::from_millis(ms);
         let micros = |at: Instant| replica.store.memory.micros(at);
+        let mut pushed = Pushed::of(&adapter, &worker);
         let asked = at(0);
         let answer = file(&[(0, Some(1.0)), (1, Some(2.0))]);
-        adapter.report(&[polled(&worker, Some(&answer))], asked);
+        pushed.polled(&answer, asked);
         assert_eq!(depth(&replica, id), Some((3.0, micros(asked))));
         // Each rank's first record leaves the depth out, and the first
         // pushed report lists rank 0 alone.
-        let alone = file(&[(0, None)]);
-        adapter.record(&worker, 0, &alone, at(1_000), at(1_000));
-        let both = file(&[(0, None), (1, None)]);
-        adapter.record(&worker, 1, &both, at(1_100), at(1_100));
+        pushed.record(0, None, at(1_000));
+        pushed.record(1, None, at(1_100));
         // Rank 0 states 5: rank 1 counts as the answer stated it.
-        let moved = file(&[(0, Some(5.0)), (1, None)]);
-        adapter.record(&worker, 0, &moved, at(2_000), at(2_000));
+        pushed.record(0, Some(5.0), at(2_000));
         assert_eq!(depth(&replica, id), Some((7.0, micros(asked))));
     }
 
     /// A record can be sampled long before it is received. One received
     /// while a poll is out keeps its entry on the worker's report, though
-    /// the answer lists its rank: the entry stays as old as the record's
-    /// sample, and the poll's start dates nothing of it.
+    /// the answer lists its rank: the entry says the record's own sample
+    /// instant, and the poll's start dates nothing of it.
     #[test]
     fn a_passed_over_answer_dates_no_entry_the_report_keeps() {
         let replica = Replica::new();
@@ -1968,30 +1966,26 @@ mod tests {
         let adapter = replica.lead();
         let start = Instant::now() + Duration::from_secs(1);
         let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut pushed = Pushed::of(&adapter, &worker);
         let asked = at(9_000);
         // Rank 0's first record: received behind the poll's start, and
         // sampled nine seconds ahead of it.
-        let alone = file(&[(0, Some(100.0))]);
-        adapter.record(&worker, 0, &alone, at(10_000), at(0));
+        pushed.record_sampled(0, Some(100.0), at(10_000), at(0));
         let answer = file(&[(0, None), (1, None)]);
-        let ranks = adapter.report(&[polled(&worker, Some(&answer))], asked);
-        assert_eq!(ranks.newer, [0]);
-        let both = file(&[(0, Some(100.0)), (1, Some(1.0))]);
-        adapter.record(&worker, 1, &both, at(11_000), at(11_000));
-        let bare = file(&[(0, None), (1, Some(1.0))]);
-        adapter.record(&worker, 0, &bare, at(12_000), at(12_000));
+        assert_eq!(pushed.polled(&answer, asked), [0]);
+        pushed.record(1, Some(1.0), at(11_000));
+        pushed.record(0, None, at(12_000));
         let sampled = replica.store.memory.micros(at(0));
         assert_eq!(depth(&replica, id), Some((101.0, sampled)));
     }
 
-    /// A report under a document that declares no signal is not read, so
-    /// the keeper is not told it. Here an answer's entry of rank 1 is as
-    /// old as its poll, and under such a document rank 1 pushes a record
-    /// sampled long before that poll. Once the depth is declared again
-    /// that entry is not dated by the poll: the keeper went, and rank 1
-    /// counts at its next record. The row's cell moves at its own rank's.
+    /// Under a document that declares no signal nothing is read, and the
+    /// reports go on. An entry written meanwhile says its own instant
+    /// like any other. Here rank 1's record comes in under such a
+    /// document, sampled long before the last poll: once the depth is
+    /// declared again it counts as old as that sample, not as the poll.
     #[test]
-    fn a_report_under_no_signal_ends_what_the_keeper_was_told() {
+    fn an_entry_written_under_no_signal_counts_under_its_own_instant() {
         let replica = Replica::new();
         let (id, worker) = replica.add(facts(URL));
         declare(&replica);
@@ -1999,62 +1993,18 @@ mod tests {
         let start = Instant::now() + Duration::from_secs(1);
         let at = |ms: u64| start + Duration::from_millis(ms);
         let micros = |at: Instant| replica.store.memory.micros(at);
-        let both = file(&[(0, Some(1.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 1, &both, at(0), at(0));
-        adapter.record(&worker, 0, &both, at(10), at(10));
+        let mut pushed = Pushed::of(&adapter, &worker);
+        pushed.record(1, Some(2.0), at(0));
+        pushed.record(0, Some(1.0), at(10));
         let asked = at(5_000);
         let answer = file(&[(0, Some(5.0)), (1, Some(6.0))]);
-        let ranks = adapter.report(&[polled(&worker, Some(&answer))], asked);
-        assert!(ranks.newer.is_empty());
+        assert!(pushed.polled(&answer, asked).is_empty());
         assert_eq!(depth(&replica, id), Some((11.0, micros(asked))));
-        // No signal is declared, and rank 1's record comes in: sampled
-        // four seconds ahead of the poll, with another depth.
         declare_as(&replica, 3, &[]);
-        let late = file(&[(0, Some(5.0)), (1, Some(60.0))]);
-        adapter.record(&worker, 1, &late, at(6_000), at(1_000));
+        pushed.record_sampled(1, Some(60.0), at(6_000), at(1_000));
         declare_as(&replica, 4, &DECLARED);
-        let moved = file(&[(0, Some(7.0)), (1, Some(60.0))]);
-        adapter.record(&worker, 0, &moved, at(7_000), at(7_000));
-        assert_eq!(depth(&replica, id), None);
-        let next = file(&[(0, Some(7.0)), (1, Some(61.0))]);
-        adapter.record(&worker, 1, &next, at(8_000), at(8_000));
-        adapter.record(&worker, 0, &next, at(9_000), at(9_000));
-        assert_eq!(depth(&replica, id), Some((68.0, micros(at(8_000)))));
-    }
-
-    /// The entry's note of a report of one rank goes the same way. An
-    /// answer of rank 0 alone is noted at its poll, and under a document
-    /// that declares no signal rank 0 pushes a record sampled long before
-    /// it. Rank 1's first record then finds no note: rank 0's entry is not
-    /// dated by the poll, and rank 0 counts when it states its depth again.
-    #[test]
-    fn a_report_under_no_signal_ends_the_entrys_note() {
-        let replica = Replica::new();
-        let (id, worker) = replica.add(facts(URL));
-        declare(&replica);
-        let adapter = replica.lead();
-        let start = Instant::now() + Duration::from_secs(1);
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let micros = |at: Instant| replica.store.memory.micros(at);
-        let alone = file(&[(0, Some(1.0))]);
-        adapter.record(&worker, 0, &alone, at(0), at(0));
-        let asked = at(5_000);
-        let answer = file(&[(0, Some(5.0))]);
-        let ranks = adapter.report(&[polled(&worker, Some(&answer))], asked);
-        assert!(ranks.newer.is_empty());
-        assert_eq!(depth(&replica, id), Some((5.0, micros(asked))));
-        declare_as(&replica, 3, &[]);
-        let late = file(&[(0, Some(60.0))]);
-        adapter.record(&worker, 0, &late, at(6_000), at(1_000));
-        declare_as(&replica, 4, &DECLARED);
-        let both = file(&[(0, Some(60.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 1, &both, at(7_000), at(7_000));
-        let bare = file(&[(0, None), (1, Some(2.0))]);
-        adapter.record(&worker, 0, &bare, at(8_000), at(8_000));
-        assert_eq!(depth(&replica, id), None);
-        let next = file(&[(0, Some(61.0)), (1, Some(2.0))]);
-        adapter.record(&worker, 0, &next, at(9_000), at(9_000));
-        assert_eq!(depth(&replica, id), Some((63.0, micros(at(7_000)))));
+        pushed.record(0, Some(7.0), at(7_000));
+        assert_eq!(depth(&replica, id), Some((67.0, micros(at(1_000)))));
     }
 
     /// A rank worker's report is one rank's, by a record and by a poll:
@@ -2082,7 +2032,6 @@ mod tests {
         assert_eq!(depth(&replica, one), Some((6.0, at)));
         let members = adapter.members.read();
         assert_eq!(members.len(), 2);
-        let one_rank = |kept: &KeptMember| matches!(*kept.shown.lock(), Shown::OneRank(_));
-        assert!(members.values().all(one_rank));
+        assert!(members.values().all(|kept| kept.keeper.get().is_none()));
     }
 }

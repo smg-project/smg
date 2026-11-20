@@ -126,7 +126,9 @@ pub trait LoadSink: Send + Sync {
     /// A record pushed on the worker's stream for `rank`, received at
     /// `received_at`. `report` is the worker's report after the record, in
     /// the poll's shape with its ranks sorted, and `sampled_at` is when the
-    /// engine's state behind the record was sampled. Hot: once a record.
+    /// engine's state behind the record was sampled. Each entry of the
+    /// report says when its own was (`SchedulerLoadSnapshot::sampled_at`):
+    /// the other ranks' entries are older writes. Hot: once a record.
     /// The report is borrowed, so a sink that keeps none of it allocates
     /// nothing.
     fn record(

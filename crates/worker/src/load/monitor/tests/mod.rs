@@ -1199,6 +1199,62 @@ async fn a_workers_first_record_files_its_receipt_under_its_own_rank() {
     );
 }
 
+/// The entries of a pushed report are written at as many instants, and
+/// each says its own. A rank's record writes its entry under the record's
+/// sample instant, which is the report's own until the next record. A
+/// polled answer laid on the report writes each entry it lays under the
+/// poll's start, and a rank whose own record is the newer keeps its entry
+/// and its instant.
+#[tokio::test]
+async fn each_entry_of_a_pushed_report_says_its_own_sample_instant() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let url = "grpc://w1:9000";
+    let interval = Duration::from_secs(10);
+    let t0 = Instant::now();
+    // Each entry's rank and instant, and the report's own instant.
+    let on_file = || {
+        let reports = monitor.pushed_reports.lock();
+        let report = &reports.get(url).expect("a report on file").report;
+        let entries: Vec<_> = report
+            .loads
+            .iter()
+            .map(|entry| (entry.dp_rank, entry.sampled_at))
+            .collect();
+        (entries, report.sampled_at)
+    };
+    monitor.apply_pushed_load(&worker, 1, &pushed(8), t0);
+    let (entries, first) = on_file();
+    assert!(first.is_some());
+    assert_eq!(entries, [(1, first)]);
+    // Rank 0's record a second later: rank 1's entry keeps its instant.
+    monitor.apply_pushed_load(&worker, 0, &pushed(3), t0 + Duration::from_secs(1));
+    let (entries, second) = on_file();
+    assert!(second > first);
+    assert_eq!(entries, [(0, second), (1, first)]);
+    // A poll goes out and rank 0 pushes while it is in flight. The answer
+    // is laid over rank 1's entry alone, as old as the poll's start.
+    let polled_at = t0 + interval;
+    let in_flight = polled_at + Duration::from_millis(1);
+    monitor.apply_pushed_load(&worker, 0, &pushed(4), in_flight);
+    let (_, third) = on_file();
+    let entry = |dp_rank: i32| SchedulerLoadSnapshot {
+        dp_rank,
+        num_running_reqs: 9,
+        ..Default::default()
+    };
+    let answer = WorkerLoadResponse {
+        dp_rank_count: 2,
+        loads: vec![entry(0), entry(1)],
+        ..Default::default()
+    };
+    monitor.apply_polled_load(url, &answer, polled_at);
+    let (entries, last) = on_file();
+    assert_eq!(entries, [(0, third), (1, Some(polled_at))]);
+    assert_eq!(last, third, "the report's own instant is its last record's");
+}
+
 /// Under data parallelism a quiet rank's record stops arriving while
 /// the other rank's heartbeats keep the stream alive, and the tick
 /// falls back to the poll for the worker. The poll's figure for the

@@ -750,6 +750,9 @@ impl<G: Generation> WorkerMonitor<G> {
         // record's, and none of the last record's is kept.
         let mut fresh = record.snapshot();
         fresh.dp_rank = dp_rank;
+        // The entry says when its own sample was: the report's other
+        // entries were written at other instants.
+        fresh.sampled_at = Some(sampled_at);
         // The values the record named and its snapshot does not hold were
         // dropped at the snapshot's bounds. They are counted here, where
         // the record and its snapshot stand together.
@@ -865,24 +868,26 @@ impl<G: Generation> WorkerMonitor<G> {
             let on_file = reports.get(url).map(|file| &file.report);
             classic.merge(url, load, on_file, polled_at, &mut ranks);
         }
-        Self::lay_polled(&mut reports, url, load, &ranks)
+        Self::lay_polled(&mut reports, url, load, &ranks, polled_at)
     }
 
     /// The file's half of a poll's answer with rows for one member (`load`,
     /// the report of `url`), by the ranks the sink named for the member's
     /// engine: the row of a rank whose stream is the newer stays and is
-    /// handed back, any other takes the answer's entry for it, and the row
-    /// of a rank that leaves is dropped, so the worker's next pushed record
-    /// does not publish it again. A worker with no pushed record on file has
-    /// no report to lay: the poll's report stands on its own. Returns the
-    /// rows of the newer ranks and, when there are any, the report on file's
-    /// sample instant, for a publish that carries them over the poll's under
-    /// their own sample boundary.
+    /// handed back, any other takes the answer's entry for it, as old as
+    /// the poll's start (`polled_at`), and the row of a rank that leaves is
+    /// dropped, so the worker's next pushed record does not publish it
+    /// again. A worker with no pushed record on file has no report to lay:
+    /// the poll's report stands on its own. Returns the rows of the newer
+    /// ranks and, when there are any, the report on file's sample instant,
+    /// for a publish that carries them over the poll's under their own
+    /// sample boundary.
     fn lay_polled(
         reports: &mut FxHashMap<String, PushedFile>,
         url: &str,
         load: &WorkerLoadResponse,
         ranks: &PolledRanks,
+        polled_at: Instant,
     ) -> (Vec<SchedulerLoadSnapshot>, Option<Instant>) {
         // A rollup from a gateway registered as a worker is keyed by
         // downstream worker, not by rank: its entries all say rank 0 and
@@ -903,6 +908,7 @@ impl<G: Generation> WorkerMonitor<G> {
             }
             if let Some(entry) = load.loads.iter().find(|entry| entry.dp_rank == row.dp_rank) {
                 row.clone_from(entry);
+                row.sampled_at = Some(polled_at);
                 return true;
             }
             !ranks.leaving.contains(&row.dp_rank)
@@ -1082,7 +1088,7 @@ impl<G: Generation> WorkerMonitor<G> {
             for (worker, response) in engine.iter() {
                 kept.push(match response {
                     Some(load) if !load.loads.is_empty() => {
-                        Self::lay_polled(&mut reports, worker.url(), load, &ranks)
+                        Self::lay_polled(&mut reports, worker.url(), load, &ranks, polled_at)
                     }
                     Some(_) => {
                         Self::drop_leaving(&mut reports, worker.url(), &ranks.leaving);
