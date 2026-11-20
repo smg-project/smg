@@ -62,12 +62,14 @@ impl Hashes {
             // No engine hashes text: its seed is the whole partition's.
             let seed = prompt
                 .namespace
-                .map_or(XXH3_SEED, CacheNamespace::text_seed);
+                .map_or(XXH3_SEED, CacheNamespace::partition_seed);
             return prompt.text.map_or_else(Self::default, |text| {
                 Self::of_text(store, model, text, seed)
             });
         };
-        let namespace_seed = prompt
+        // The blocks are hashed as the engines hash theirs, so the index of
+        // cache events finds them. That seed folds no extra key.
+        let event_seed = prompt
             .namespace
             .map_or(XXH3_SEED, CacheNamespace::event_seed);
         let tokens = if prompt.namespace.is_some() {
@@ -83,10 +85,16 @@ impl Hashes {
         });
         let size = block_size as usize;
         let end = tokens.len().min(depth.saturating_mul(size));
-        let blocks = request_content_hashes_with_seed(&tokens[..end], size, namespace_seed)
+        let blocks = request_content_hashes_with_seed(&tokens[..end], size, event_seed)
             .into_iter()
             .map(|hash| hash.0)
             .collect();
+        // A prefix is named under the partition's whole identity. The
+        // record of sent prefixes and the ring keep two partitions apart
+        // that differ by the extra key alone, as an engine's cache does.
+        let namespace_seed = prompt
+            .namespace
+            .map_or(XXH3_SEED, CacheNamespace::partition_seed);
         Self {
             blocks,
             kind: HashKind::Token,
@@ -100,7 +108,7 @@ impl Hashes {
     /// text's bytes, as deep as the generation reads. A window is the
     /// model's block size times [`TEXT_BYTES_PER_TOKEN`], so one number a
     /// model sizes both kinds. The text is hashed as it stands: its whole
-    /// partition is in the seed ([`CacheNamespace::text_seed`]), and no
+    /// partition is in the seed ([`CacheNamespace::partition_seed`]), and no
     /// marker stands before it.
     fn of_text(store: &MemoryStore, model: &str, text: &str, namespace_seed: u64) -> Self {
         let bytes = text.as_bytes();
@@ -228,7 +236,7 @@ mod tests {
             world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
             assert!(named.holders.is_empty());
         });
-        assert_eq!(facts.namespace_seed, namespace.event_seed());
+        assert_eq!(facts.namespace_seed, namespace.partition_seed());
         assert_eq!(facts.prompt_tokens, tokens.len() as u32);
         assert_eq!(facts.hash_kind, HashKind::Token);
     }
@@ -331,7 +339,35 @@ mod tests {
             .iter()
             .zip(&hashes.blocks)
             .all(|(a, b)| a != b));
-        assert_eq!(scoped.namespace_seed, keyed.text_seed());
+        assert_eq!(scoped.namespace_seed, keyed.partition_seed());
+    }
+
+    #[test]
+    fn a_token_prompt_under_another_extra_key_is_named_apart() {
+        let (_, store, _) = cache_bed();
+        store.set_block_size(MODEL, BLOCK_SIZE);
+        let tokens: Vec<u32> = (1..=BLOCK_SIZE * 2).collect();
+        let under = |extra_key| {
+            let namespace = CacheNamespace::derive(&CachePartition {
+                extra_key: Some(extra_key),
+                ..CachePartition::default()
+            })
+            .expect("the namespace");
+            let prompt = Prompt {
+                namespace: Some(namespace),
+                ..plain_prompt(&tokens)
+            };
+            Hashes::of(&store, MODEL, &prompt)
+        };
+        let (a, b) = (under("a"), under("b"));
+        // The engines' events fold no extra key: the blocks are one, and
+        // the index of cache events finds them under either partition.
+        assert!(!a.blocks.is_empty());
+        assert_eq!(a.blocks, b.blocks);
+        // The prefix is named under each partition's own seed, so the
+        // record of sent prefixes and the ring keep the two apart.
+        assert_ne!(a.namespace_seed, b.namespace_seed);
+        assert_ne!(a.namespace_seed, XXH3_SEED);
     }
 
     #[test]

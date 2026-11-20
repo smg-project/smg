@@ -113,11 +113,12 @@ impl CacheNamespace {
         self.event_seed
     }
 
-    /// The XXH3 seed a text request's windows for this partition are hashed
-    /// under. No engine hashes text, so this seed matches none: it is the
-    /// partition's whole identity, the extra key included, and two requests
-    /// share a window only where their partitions are one.
-    pub fn text_seed(self) -> u64 {
+    /// The partition's whole identity as an XXH3 seed, the extra key
+    /// included. A host names a request's prefix under it, so two requests
+    /// share a named prefix only where their partitions are one, as they
+    /// share an engine's cache. A text request's windows are hashed under
+    /// it too: no engine hashes text, so that seed need match none.
+    pub fn partition_seed(self) -> u64 {
         self.marker
     }
 
@@ -220,11 +221,11 @@ mod tests {
     }
 
     #[test]
-    fn text_seed_follows_every_field() {
+    fn partition_seed_follows_every_field() {
         let seed = |salt, extra, lora| {
             CacheNamespace::derive(&partition(salt, extra, lora))
                 .expect("a partition")
-                .text_seed()
+                .partition_seed()
         };
         // The extra key moves it, where the event seed stays the plain one.
         let extra_only = seed(None, Some("k"), None);
