@@ -2939,6 +2939,53 @@ async fn a_streaming_harmony_responses_iteration_releases_its_share_once_its_str
     );
 }
 
+/// A pair gateway serves a request under the policy controller. The store
+/// is the one such a gateway starts: the document its configuration makes,
+/// over rows as the store builds them. Both sides go out to engines, the
+/// answer is whole, the decode worker is the routed one, and the pair's
+/// lease ends with the answer.
+#[tokio::test]
+async fn a_pair_gateway_serves_a_pair_under_the_policy_controller() {
+    let prefill_port = spawn_stub(GatedScheduler::default()).await;
+    let decode_port = spawn_stub(GatedScheduler::default()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let prefill = register_worker(&registry, prefill_port, WorkerType::Prefill);
+    let decode = register_worker(&registry, decode_port, WorkerType::Decode);
+    let (_, store, _) = host_testing::pair_bed_started(MODEL, &[prefill.url()], &[decode.url()]);
+    let host = Host::at_keys(Arc::clone(&store), Arc::clone(&registry));
+    let deps = PipelineDeps::pair(
+        Arc::clone(&registry),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    )
+    .with_host(Some(Arc::new(host)));
+    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::PrefillDecode, &deps)
+        .expect("completion pipeline");
+    let components = components(registry).await;
+
+    let response = pipeline
+        .execute_completion(
+            completion_request(false),
+            None,
+            MODEL.to_string(),
+            components,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-smg-routed-worker-id"],
+        format!("grpc://127.0.0.1:{decode_port}")
+    );
+    drop(response);
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+}
+
 async fn placed_harmony_responses_context() -> (ResponsesContext, Arc<MemoryStore>, WorkerId) {
     let port = spawn_stub(GatedScheduler::default()).await;
     let registry = Arc::new(WorkerRegistry::new());
