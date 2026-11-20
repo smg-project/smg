@@ -5,7 +5,10 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering::Relaxed},
+        Arc,
+    },
 };
 
 use parking_lot::{Mutex, RwLock};
@@ -114,11 +117,11 @@ struct Held {
 /// which carries the standing object's running state over. An entry's
 /// revision never moves under an object that is kept.
 ///
-/// With a keeper ([`Self::with_credentials`]), a read that ends the last
-/// object that dialed an address forgets the keeper's entry there, whoever
-/// wrote the removal. The keeper's clock is read ahead of the store: a
-/// registration answered behind that read keeps its credential, and so
-/// does what a registration in flight stated.
+/// With a keeper ([`Self::with_credentials`]), each read has the keeper
+/// forget the rows that left, whoever wrote the removal, and an entry goes
+/// with its last row. The keeper's clock is read ahead of the store: a row
+/// bound behind that read stays, and the next read forgets it whatever it
+/// finds.
 ///
 /// The holder is the registry's one writer: an object any other writer left
 /// under a row's URL is replaced by the row's.
@@ -136,12 +139,13 @@ pub struct Objects<G> {
     /// What makes an object's engine connection, where the host handed one.
     connector: Option<Arc<dyn EngineConnector>>,
     status_followed: bool,
-    /// What the host keeps for its workers, by the address they dial.
+    /// What the host keeps for its workers, by the address they dial and
+    /// the row a registration wrote.
     credentials: Option<Arc<Credentials>>,
-    /// The addresses whose rows' objects ended since the last forgetting,
-    /// where a keeper was handed in. Written and drained under the
+    /// Whether the keeper kept a row that left, bound behind the read that
+    /// asked: the next read asks again. Written and read under the
     /// follow's turn.
-    left: Mutex<Vec<String>>,
+    forgetting_owed: AtomicBool,
     /// Where the last read ended. Held through a read: one follows at a
     /// time.
     read_to: Mutex<Place>,
@@ -175,7 +179,7 @@ impl<G: Generation> Objects<G> {
             connector: None,
             status_followed: false,
             credentials: None,
-            left: Mutex::new(Vec::new()),
+            forgetting_owed: AtomicBool::new(false),
             read_to: Mutex::new(Place::default()),
             held: RwLock::new(Held::default()),
         }
@@ -191,69 +195,37 @@ impl<G: Generation> Objects<G> {
         self
     }
 
-    /// Hand each object the credential the keeper holds for its address
-    /// when it is built. The host supplies the keeper. An object is built
-    /// without a credential if there is no keeper or it holds none for the
-    /// address.
+    /// Hand each object the credential the keeper holds for its row, at
+    /// the address it dials, when it is built. The host supplies the
+    /// keeper. An object is built without a credential if there is no
+    /// keeper, or no registration of this host bound its row.
     #[must_use]
     pub fn with_credentials(mut self, credentials: Arc<Credentials>) -> Self {
         self.credentials = Some(credentials);
         self
     }
 
-    /// Forget the credential the rows that left held at `address`. A
-    /// follow forgets by itself the address its last row left: this call
-    /// names an address, for a worker removed before its first object. The
-    /// call follows `store` first, so a removal just written is seen, and
-    /// holds the follow's turn to its end: no object is built between its
-    /// read and the forgetting. Return `true` if a credential was
-    /// forgotten. Return `false` if no keeper was handed in, a row still
-    /// dials the address, or the keeper holds no credential for the
-    /// address. A registration answered behind the start of the call's
-    /// read may have written behind it: its credential stays for the next
-    /// call. Where a registration is in flight at the address, what it
-    /// displaced is forgotten and what it stated stays.
-    pub fn forget_credential<S: WorkersStore + ?Sized>(&self, store: &S, address: &str) -> bool {
-        let mut place = self.read_to.lock();
-        let Some(credentials) = &self.credentials else {
-            self.follow_from(store, &mut place);
-            return false;
-        };
-        // The keeper's clock ahead of the read of the store.
-        let read = credentials.taken();
-        let forgotten = self.follow_from(store, &mut place);
-        if forgotten.iter().any(|left| left == address) {
-            return true;
-        }
-        let held = self.held.read();
-        if held
-            .facts
-            .values()
-            .any(|facts| dial_address(facts) == address)
-        {
-            return false;
-        }
-        credentials.forget(address, read)
-    }
-
-    /// Lay again the object of each row that dials `address` and holds
-    /// another credential than the keeper holds there now. Each is built
+    /// Lay again the object of each row that dials the address of `facts`
+    /// and holds another credential than its row takes now. Each is built
     /// anew from its row and takes its standing object's place, under its
     /// id and with its running state. A registration calls it where its
-    /// write moved no row and its credential differs
-    /// ([`KeptCredential::differs`](super::KeptCredential::differs)), once
-    /// the token is accepted, and where its put-back said an object was
-    /// built with the refused credential. The call follows `store` first
-    /// and holds the follow's turn to its end. Return how many objects
-    /// were laid again: none where no keeper was handed in, where no row
-    /// dials the address, or where each object there holds what the keeper
-    /// holds.
-    pub fn lay_again<S: WorkersStore + ?Sized>(&self, store: &S, address: &str) -> usize {
+    /// token's answer says so
+    /// ([`KeptCredential::accepted`](super::KeptCredential::accepted),
+    /// [`KeptCredential::put_back`](super::KeptCredential::put_back)),
+    /// with the facts it kept. The call follows `store` first and holds
+    /// the follow's turn to its end. It reads the keeper as a build does:
+    /// where a registration is in flight at the address, an object that
+    /// holds what it stated marks the flight, and its put-back says so.
+    /// Return how many objects were laid again: none where no keeper was
+    /// handed in, where no row dials the address, or where each object
+    /// there holds what its row takes.
+    pub fn lay_again<S: WorkersStore + ?Sized>(&self, store: &S, facts: &WorkerFacts) -> usize {
         let mut place = self.read_to.lock();
         self.follow_from(store, &mut place);
         let Some(credentials) = &self.credentials else {
             return 0;
         };
+        let address = dial_address(facts);
         let stale: Vec<WorkerId> = {
             let held = self.held.read();
             held.rows
@@ -261,8 +233,9 @@ impl<G: Generation> Objects<G> {
                 .filter(|laid| {
                     held.facts
                         .get(&laid.standing.row)
-                        .is_some_and(|facts| dial_address(facts) == address)
-                        && !credentials.holds(address, laid.object.api_key().map(String::as_str))
+                        .is_some_and(|dialing| dial_address(dialing) == address)
+                        && credentials.of(address, laid.standing.row).as_ref()
+                            != laid.object.api_key()
                 })
                 .map(|laid| laid.standing.row)
                 .collect()
@@ -345,13 +318,11 @@ impl<G: Generation> Objects<G> {
         self.follow_from(store, &mut self.read_to.lock());
     }
 
-    /// [`Self::follow`] for the caller that holds the turn. Return the
-    /// addresses at which a credential was forgotten.
-    fn follow_from<S: WorkersStore + ?Sized>(&self, store: &S, place: &mut Place) -> Vec<String> {
-        let mut forgotten = Vec::new();
+    /// [`Self::follow`] for the caller that holds the turn.
+    fn follow_from<S: WorkersStore + ?Sized>(&self, store: &S, place: &mut Place) {
         loop {
-            // The keeper's clock ahead of the read of the store: a
-            // registration answered behind it keeps its credential.
+            // The keeper's clock ahead of the read of the store: a row a
+            // registration bound behind it is kept by the forgetting.
             let read = self
                 .credentials
                 .as_ref()
@@ -367,7 +338,12 @@ impl<G: Generation> Objects<G> {
             match tail {
                 MembershipTail::Changes(changes) => {
                     let Some(&(last, _)) = changes.last() else {
-                        return forgotten;
+                        // A read that found nothing forgets what an
+                        // earlier one owed, and no more.
+                        if self.forgetting_owed.load(Relaxed) {
+                            self.forget_left(read);
+                        }
+                        return;
                     };
                     for (_, change) in changes {
                         self.apply(store, change);
@@ -383,29 +359,22 @@ impl<G: Generation> Objects<G> {
                     };
                 }
             }
-            self.forget_left(read, &mut forgotten);
+            self.forget_left(read);
         }
     }
 
-    /// Forget what the rows that left in this read held: the keeper's
-    /// entry at each address no row dials any more, by the keeper's clock
-    /// as it read ahead of the store. An address whose credential went is
-    /// added to `forgotten`.
-    fn forget_left(&self, read: Option<u64>, forgotten: &mut Vec<String>) {
+    /// Have the keeper forget the rows that left: each row a registration
+    /// bound that no longer stands here, by the keeper's clock as it read
+    /// ahead of the store. One pass over the keeper's rows, behind a read
+    /// that found a change. The keeper says where it kept a row bound
+    /// behind that clock, and the next read asks again.
+    fn forget_left(&self, read: Option<u64>) {
         let (Some(credentials), Some(read)) = (&self.credentials, read) else {
             return;
         };
-        let left = std::mem::take(&mut *self.left.lock());
-        if left.is_empty() {
-            return;
-        }
         let held = self.held.read();
-        let dialed: HashSet<&str> = held.facts.values().map(dial_address).collect();
-        for address in left {
-            if !dialed.contains(address.as_str()) && credentials.forget(&address, read) {
-                forgotten.push(address);
-            }
-        }
+        let owed = credentials.forget_left(read, |row| held.facts.contains_key(&row));
+        self.forgetting_owed.store(owed, Relaxed);
     }
 
     /// One change of the tail: a row it says left ends its object, then the
@@ -537,12 +506,7 @@ impl<G: Generation> Objects<G> {
         let mut entries = self.held.write();
         entries.objects.remove(&id);
         entries.rows.remove(&held);
-        let facts = entries.facts.remove(&id);
-        drop(entries);
-        // The address the row dialed, for the forgetting behind this read.
-        if let (Some(_), Some(facts)) = (&self.credentials, facts) {
-            self.left.lock().push(dial_address(&facts).to_owned());
-        }
+        entries.facts.remove(&id);
     }
 
     /// Build `row`'s object and put it in the registry: registered under a
@@ -558,7 +522,7 @@ impl<G: Generation> Objects<G> {
         if let Some(credential) = self
             .credentials
             .as_ref()
-            .and_then(|credentials| credentials.of(dial_address(&row.facts)))
+            .and_then(|credentials| credentials.of(dial_address(&row.facts), row.id))
         {
             worker = worker.api_key(credential);
         }
@@ -712,16 +676,28 @@ mod tests {
             self.objects.registry().get_by_url(url).expect("an object")
         }
 
-        /// A registration's keep, its write taken.
-        fn keep(&self, address: &str, credential: Option<&str>) {
-            self.kept(address, credential).accepted();
+        /// A registration taken: its keep, its write, the token accepted
+        /// with the row the door answered, and the address laid again
+        /// where the acceptance says so. Return the row.
+        fn register(&self, facts: WorkerFacts, credential: Option<&str>) -> WorkerId {
+            let token = self.kept(&facts, credential);
+            let row = self.store.upsert(facts.clone()).id();
+            if token.accepted(row) {
+                self.lay_again(&facts);
+            }
+            row
         }
 
         /// A registration's keep, its answer left to the case.
-        fn kept(&self, address: &str, credential: Option<&str>) -> KeptCredential {
+        fn kept(&self, facts: &WorkerFacts, credential: Option<&str>) -> KeptCredential {
             self.credentials
-                .keep(address, credential.map(str::to_owned))
+                .keep(facts, credential.map(str::to_owned))
                 .expect("no registration in flight at the address")
+        }
+
+        /// The holder lays again the objects at the address `facts` dial.
+        fn lay_again(&self, facts: &WorkerFacts) -> usize {
+            self.objects.lay_again(self.store.as_ref(), facts)
         }
 
         fn holds_credential(&self, url: &str, credential: Option<&str>) -> bool {
@@ -783,17 +759,18 @@ mod tests {
     #[test]
     fn a_row_laid_behind_a_kept_credential_builds_an_object_that_holds_it() {
         let replica = Replica::new();
-        replica.keep(A, Some(KEY_A));
-        replica.store.upsert(facts(A, 1));
+        replica.register(facts(A, 1), Some(KEY_A));
         replica.follow();
         assert!(replica.holds_credential(A, Some(KEY_A)));
 
-        replica.keep(B, Some(KEY_B));
-        replica.store.upsert(WorkerFacts {
+        // A row that names no engine dials its key: the keeper works the
+        // address out as the holder does.
+        let keyed = WorkerFacts {
             engine: String::new(),
             ..facts(B, 1)
-        });
-        replica.keep(&format!("{C}/"), Some(KEY_C));
+        };
+        replica.register(keyed, Some(KEY_B));
+        // A row no registration here stated takes none.
         replica.store.upsert(facts(C, 1));
         replica.follow();
         assert!(replica.holds_credential(A, Some(KEY_A)));
@@ -810,18 +787,34 @@ mod tests {
         objects.follow(&store);
         let laid = registry.get_by_url(A).expect("the row's object");
         assert!(laid.api_key().is_none());
-        assert!(!objects.forget_credential(&store, B));
-        assert_eq!(objects.lay_again(&store, A), 0);
+        assert_eq!(objects.lay_again(&store, &facts(A, 1)), 0);
     }
 
     #[test]
     fn each_rank_row_of_an_engine_holds_the_engines_credential() {
         let replica = Replica::new();
-        replica.keep(C, Some(KEY_C));
-        replica.store.upsert(rank_facts(A, C, 0));
-        replica.store.upsert(rank_facts(B, C, 1));
+        replica.register(rank_facts(A, C, 0), Some(KEY_C));
+        replica.register(rank_facts(B, C, 1), Some(KEY_C));
         replica.follow();
         assert!(replica.holds_credential(A, Some(KEY_C)));
+        assert!(replica.holds_credential(B, Some(KEY_C)));
+    }
+
+    #[test]
+    fn a_rank_row_another_host_registered_takes_no_credential_until_it_is_stated_here() {
+        let replica = Replica::new();
+        replica.register(rank_facts(A, C, 0), Some(KEY_C));
+        // The engine's other rank came through another host: no keep here.
+        let other = replica.store.upsert(rank_facts(B, C, 1)).id();
+        replica.follow();
+        assert!(replica.holds_credential(A, Some(KEY_C)));
+        assert!(replica.holds_credential(B, None));
+
+        // It is stated here too. A door writes nothing over equal facts,
+        // and the acceptance says the address is to be laid again.
+        let stated = replica.kept(&rank_facts(B, C, 1), Some(KEY_C));
+        assert!(stated.accepted(other));
+        assert_eq!(replica.lay_again(&rank_facts(B, C, 1)), 1);
         assert!(replica.holds_credential(B, Some(KEY_C)));
     }
 
@@ -829,267 +822,29 @@ mod tests {
     fn a_registration_refreshed_behind_a_new_credential_is_laid_with_it() {
         let mut replica = Replica::new();
         let registered = facts(A, 1);
-        replica.keep(A, Some(KEY_A));
-        replica.store.upsert(registered.clone());
+        replica.register(registered.clone(), Some(KEY_A));
         replica.follow();
         assert!(replica.holds_credential(A, Some(KEY_A)));
         let id = replica.id(A);
         replica.told();
 
-        replica.keep(A, Some(KEY_B));
-        replica.store.upsert(registered);
+        // The row is written again behind another credential, and the
+        // follow builds its object while the registration is in flight.
+        let refreshed = replica.kept(&registered, Some(KEY_B));
+        let row = replica.store.upsert(registered.clone()).id();
         replica.follow();
         assert_eq!(replica.told(), [("replaced", id)]);
         assert!(replica.holds_credential(A, Some(KEY_B)));
-    }
 
-    #[test]
-    fn a_credential_kept_with_no_write_of_its_row_waits_for_the_next_lay() {
-        let replica = Replica::new();
-        replica.keep(A, Some(KEY_A));
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
-        let before = replica.at(A);
-
-        replica.keep(A, Some(KEY_B));
-        replica.follow();
-        assert!(Arc::ptr_eq(&before, &replica.at(A)));
-        assert!(replica.holds_credential(A, Some(KEY_A)));
-    }
-
-    #[test]
-    fn a_credential_forgotten_behind_a_removal_is_in_no_object_built_after() {
-        let replica = Replica::new();
-        replica.keep(A, Some(KEY_A));
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
-        replica.remove(A);
-
-        assert!(replica.objects.forget_credential(replica.store.as_ref(), A));
-        assert!(replica.credentials.is_empty());
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
-        assert!(replica.holds_credential(A, None));
-    }
-
-    #[test]
-    fn a_removal_that_overlaps_a_registration_forgets_nothing_of_it() {
-        let replica = Replica::new();
-        replica.keep(A, Some(KEY_A));
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
-        assert!(replica.holds_credential(A, Some(KEY_A)));
-
-        replica.remove(A);
-        let next = replica.kept(A, Some(KEY_B));
-        // The removed row's credential goes. The one in flight stays.
-        assert!(replica.objects.forget_credential(replica.store.as_ref(), A));
-        assert_eq!(replica.credentials.len(), 1);
-        replica.store.upsert(facts(A, 2));
-        next.accepted();
-        replica.follow();
-        assert!(replica.holds_credential(A, Some(KEY_B)));
-    }
-
-    #[test]
-    fn a_removal_after_a_registration_that_moved_nothing_forgets_the_credential() {
-        // On either answer of the registration that moved nothing.
-        for put_back in [true, false] {
-            let replica = Replica::new();
-            replica.keep(A, Some(KEY_A));
-            replica.store.upsert(facts(A, 1));
-            replica.follow();
-
-            // The same registration again: a door writes nothing over
-            // equal facts.
-            let again = replica.kept(A, Some(KEY_A));
-            if put_back {
-                assert!(!again.put_back());
-            } else {
-                again.accepted();
-            }
-            replica.follow();
-
-            replica.remove(A);
-            assert!(replica.objects.forget_credential(replica.store.as_ref(), A));
-            assert!(replica.credentials.is_empty());
-        }
-    }
-
-    #[test]
-    fn a_worker_removed_before_its_first_object_leaves_no_credential() {
-        let replica = Replica::new();
-        replica.keep(A, Some(KEY_A));
-        replica.store.upsert(facts(A, 1));
-        replica.remove(A);
-        assert!(replica.objects.forget_credential(replica.store.as_ref(), A));
-        assert!(replica.credentials.is_empty());
-        assert!(replica.objects.is_empty());
-    }
-
-    #[test]
-    fn one_rank_row_that_leaves_forgets_nothing_while_another_dials_the_address() {
-        let replica = Replica::new();
-        replica.keep(C, Some(KEY_C));
-        replica.store.upsert(rank_facts(A, C, 0));
-        replica.store.upsert(rank_facts(B, C, 1));
-        replica.follow();
-
-        replica.remove(A);
-        assert!(!replica.objects.forget_credential(replica.store.as_ref(), C));
-        replica.store.upsert(rank_facts(B, C, 1));
-        replica.follow();
-        assert!(replica.holds_credential(B, Some(KEY_C)));
-
-        replica.remove(B);
-        assert!(replica.objects.forget_credential(replica.store.as_ref(), C));
-        assert!(replica.credentials.is_empty());
-        assert!(!replica.objects.forget_credential(replica.store.as_ref(), C));
-    }
-
-    #[test]
-    fn a_registration_refused_at_an_address_that_stands_leaves_the_standing_workers_credential() {
-        let replica = Replica::new();
-        replica.keep(A, Some(KEY_A));
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
-
-        let before = replica.at(A);
-        assert!(!replica.kept(A, Some(KEY_B)).put_back());
-        replica.follow();
-        assert!(Arc::ptr_eq(&before, &replica.at(A)));
-
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
-        assert!(!Arc::ptr_eq(&before, &replica.at(A)));
-        assert!(replica.holds_credential(A, Some(KEY_A)));
-    }
-
-    #[test]
-    fn a_refused_registration_says_that_an_object_was_built_with_its_credential() {
-        let replica = Replica::new();
-        replica.keep(A, Some(KEY_A));
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
-
-        // The standing row is written again while a registration is in flight.
-        let refused = replica.kept(A, Some(KEY_B));
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
-        assert!(replica.holds_credential(A, Some(KEY_B)));
-        assert!(refused.put_back());
-
-        // The object holds the refused credential until its row is
-        // written again.
-        replica.follow();
-        assert!(replica.holds_credential(A, Some(KEY_B)));
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
-        assert!(replica.holds_credential(A, Some(KEY_A)));
-    }
-
-    #[test]
-    fn a_registration_that_moved_no_row_behind_a_new_credential_is_laid_again_with_it() {
-        let mut replica = Replica::new();
-        replica.keep(A, Some(KEY_A));
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
-        let id = replica.id(A);
-        let standing = replica.objects.standing(&id);
-        replica.told();
-
-        // The same worker registered with another credential: a door
-        // writes nothing over equal facts, so no row moves and no object
-        // is built. The token says the credential differs.
-        let again = replica.kept(A, Some(KEY_B));
-        assert!(again.differs());
-        again.accepted();
-        replica.follow();
-        assert!(replica.holds_credential(A, Some(KEY_A)));
-
-        // The holder lays the object again: one replacement under its id,
-        // at the revision its row stands at.
-        assert_eq!(replica.objects.lay_again(replica.store.as_ref(), A), 1);
-        assert!(replica.holds_credential(A, Some(KEY_B)));
-        assert_eq!(replica.told(), [("replaced", id.clone())]);
-        assert_eq!(replica.objects.standing(&id), standing);
-
-        // An object that holds what the keeper holds is not laid again.
-        assert_eq!(replica.objects.lay_again(replica.store.as_ref(), A), 0);
-        assert!(replica.told().is_empty());
-
-        // A registration that states no credential differs too, and the
-        // object is laid again without one.
-        let cleared = replica.kept(A, None);
-        assert!(cleared.differs());
-        cleared.accepted();
-        assert_eq!(replica.objects.lay_again(replica.store.as_ref(), A), 1);
-        assert!(replica.holds_credential(A, None));
-    }
-
-    #[test]
-    fn an_object_built_with_a_refused_credential_is_laid_again_with_what_stood() {
-        let replica = Replica::new();
-        replica.keep(A, Some(KEY_A));
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
-
-        // The standing row is written again while a registration is in
-        // flight: its object is built with the stated credential.
-        let refused = replica.kept(A, Some(KEY_B));
-        replica.store.upsert(facts(A, 1));
-        replica.follow();
-        assert!(replica.holds_credential(A, Some(KEY_B)));
-
-        // The put-back says so, and the holder lays the object again.
-        assert!(refused.put_back());
-        assert_eq!(replica.objects.lay_again(replica.store.as_ref(), A), 1);
-        assert!(replica.holds_credential(A, Some(KEY_A)));
-    }
-
-    #[test]
-    fn laying_again_reaches_each_rank_row_that_dials_the_address_and_no_other() {
-        let replica = Replica::new();
-        replica.keep(C, Some(KEY_C));
-        replica.keep(D, Some(KEY_A));
-        replica.store.upsert(rank_facts(A, C, 0));
-        replica.store.upsert(rank_facts(B, C, 1));
-        replica.store.upsert(facts(D, 1));
-        replica.follow();
-        let other = replica.at(D);
-
-        replica.keep(C, Some(KEY_B));
-        assert_eq!(replica.objects.lay_again(replica.store.as_ref(), C), 2);
-        assert!(replica.holds_credential(A, Some(KEY_B)));
-        assert!(replica.holds_credential(B, Some(KEY_B)));
-        assert!(Arc::ptr_eq(&other, &replica.at(D)));
-
-        // An address no row dials lays nothing.
-        assert_eq!(replica.objects.lay_again(replica.store.as_ref(), E), 0);
-    }
-
-    #[test]
-    fn laying_again_follows_the_store_first() {
-        let replica = Replica::new();
-        replica.keep(A, Some(KEY_A));
-        replica.store.upsert(facts(A, 1));
-        // No follow ran: the call reads the row and builds its object with
-        // what the keeper holds, so nothing is left to lay again.
-        assert_eq!(replica.objects.lay_again(replica.store.as_ref(), A), 0);
-        assert!(replica.holds_credential(A, Some(KEY_A)));
-
-        // A row that left behind the last follow is ended, not laid.
-        replica.keep(A, Some(KEY_B));
-        replica.remove(A);
-        assert_eq!(replica.objects.lay_again(replica.store.as_ref(), A), 0);
-        assert!(replica.objects.registry().get_by_url(A).is_none());
+        // The object already holds what its row takes.
+        assert!(refreshed.accepted(row));
+        assert_eq!(replica.lay_again(&registered), 0);
     }
 
     #[test]
     fn a_follow_forgets_the_credential_of_an_address_its_last_row_left() {
         let replica = Replica::new();
-        replica.keep(A, Some(KEY_A));
-        replica.store.upsert(facts(A, 1));
+        replica.register(facts(A, 1), Some(KEY_A));
         replica.follow();
 
         // The removal is another writer's: this host calls nothing.
@@ -1101,23 +856,55 @@ mod tests {
         replica.store.upsert(facts(A, 2));
         replica.follow();
         assert!(replica.holds_credential(A, None));
-        // The forgetting was the follow's: none is left for the call.
+    }
+
+    #[test]
+    fn a_follow_forgets_a_worker_removed_before_its_first_object() {
+        let replica = Replica::new();
+        replica.follow();
+        let token = replica.kept(&facts(A, 1), Some(KEY_A));
+        let row = replica.store.upsert(facts(A, 1)).id();
+        assert!(token.accepted(row));
+        // Another writer's removal, before this holder's next follow.
         replica.remove(A);
         replica.follow();
-        assert!(!replica.objects.forget_credential(replica.store.as_ref(), A));
+        assert!(replica.credentials.is_empty());
+        replica.store.upsert(facts(A, 2));
+        replica.follow();
+        assert!(replica.holds_credential(A, None));
+    }
+
+    #[test]
+    fn a_worker_that_takes_a_removed_workers_address_between_two_follows_is_built_without_its_key()
+    {
+        let replica = Replica::new();
+        replica.register(facts(A, 1), Some(KEY_A));
+        replica.follow();
+        assert!(replica.holds_credential(A, Some(KEY_A)));
+
+        // Another host takes the removal and registers the next worker at
+        // the address, before this holder follows. The read that builds
+        // the new object has not forgotten the old row yet.
+        replica.remove(A);
+        replica.store.upsert(facts(A, 2));
+        replica.follow();
+        assert!(replica.holds_credential(A, None));
+        assert!(replica.credentials.is_empty());
     }
 
     #[test]
     fn a_follow_forgets_nothing_while_another_row_dials_the_address() {
         let replica = Replica::new();
-        replica.keep(C, Some(KEY_C));
-        replica.store.upsert(rank_facts(A, C, 0));
-        replica.store.upsert(rank_facts(B, C, 1));
+        replica.register(rank_facts(A, C, 0), Some(KEY_C));
+        replica.register(rank_facts(B, C, 1), Some(KEY_C));
         replica.follow();
 
         replica.remove(A);
         replica.follow();
         assert_eq!(replica.credentials.len(), 1);
+        // The other rank's row is written again: it is bound still.
+        replica.store.upsert(rank_facts(B, C, 1));
+        replica.follow();
         assert!(replica.holds_credential(B, Some(KEY_C)));
         replica.remove(B);
         replica.follow();
@@ -1127,33 +914,247 @@ mod tests {
     #[test]
     fn a_follow_keeps_what_a_registration_in_flight_stated() {
         let replica = Replica::new();
-        replica.keep(A, Some(KEY_A));
-        replica.store.upsert(facts(A, 1));
+        replica.register(facts(A, 1), Some(KEY_A));
         replica.follow();
+        assert!(replica.holds_credential(A, Some(KEY_A)));
 
         replica.remove(A);
-        let next = replica.kept(A, Some(KEY_B));
+        let next = replica.kept(&facts(A, 2), Some(KEY_B));
         replica.follow();
-        // The removed row's credential goes. The one in flight stays.
+        // The removed row is forgotten. What the flight stated stays.
         assert_eq!(replica.credentials.len(), 1);
-        replica.store.upsert(facts(A, 2));
-        next.accepted();
+        let row = replica.store.upsert(facts(A, 2)).id();
+        assert!(next.accepted(row));
         replica.follow();
         assert!(replica.holds_credential(A, Some(KEY_B)));
     }
 
     #[test]
+    fn a_removal_after_a_registration_that_moved_nothing_forgets_the_credential() {
+        // On either answer of the registration that moved nothing.
+        for put_back in [true, false] {
+            let replica = Replica::new();
+            let row = replica.register(facts(A, 1), Some(KEY_A));
+            replica.follow();
+
+            // The same registration again: a door writes nothing over
+            // equal facts, and nothing is to be laid again.
+            let again = replica.kept(&facts(A, 1), Some(KEY_A));
+            if put_back {
+                assert!(!again.put_back());
+            } else {
+                assert!(!again.accepted(row));
+            }
+            replica.follow();
+
+            replica.remove(A);
+            replica.follow();
+            assert!(replica.credentials.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_registration_refused_at_an_address_that_stands_leaves_the_standing_workers_credential() {
+        let replica = Replica::new();
+        replica.register(facts(A, 1), Some(KEY_A));
+        replica.follow();
+
+        let before = replica.at(A);
+        assert!(!replica.kept(&facts(A, 1), Some(KEY_B)).put_back());
+        replica.follow();
+        assert!(Arc::ptr_eq(&before, &replica.at(A)));
+
+        replica.store.upsert(facts(A, 1));
+        replica.follow();
+        assert!(!Arc::ptr_eq(&before, &replica.at(A)));
+        assert!(replica.holds_credential(A, Some(KEY_A)));
+    }
+
+    #[test]
+    fn a_registration_that_moved_no_row_behind_a_new_credential_is_laid_again_with_it() {
+        let mut replica = Replica::new();
+        let row = replica.register(facts(A, 1), Some(KEY_A));
+        replica.follow();
+        let id = replica.id(A);
+        let standing = replica.objects.standing(&id);
+        replica.told();
+
+        // The same worker registered with another credential: a door
+        // writes nothing over equal facts, so no row moves and no object
+        // is built. The acceptance says the address is to be laid again.
+        let again = replica.kept(&facts(A, 1), Some(KEY_B));
+        assert!(again.accepted(row));
+        replica.follow();
+        assert!(replica.holds_credential(A, Some(KEY_A)));
+
+        // The holder lays the object again: one replacement under its id,
+        // at the revision its row stands at.
+        assert_eq!(replica.lay_again(&facts(A, 1)), 1);
+        assert!(replica.holds_credential(A, Some(KEY_B)));
+        assert_eq!(replica.told(), [("replaced", id.clone())]);
+        assert_eq!(replica.objects.standing(&id), standing);
+
+        // An object that holds what its row takes is not laid again.
+        assert_eq!(replica.lay_again(&facts(A, 1)), 0);
+        assert!(replica.told().is_empty());
+
+        // A registration that states no credential changes it too, and
+        // the object is laid again without one.
+        assert!(replica.kept(&facts(A, 1), None).accepted(row));
+        assert_eq!(replica.lay_again(&facts(A, 1)), 1);
+        assert!(replica.holds_credential(A, None));
+    }
+
+    #[test]
+    fn an_object_built_with_a_refused_credential_is_laid_again_with_what_stood() {
+        let replica = Replica::new();
+        replica.register(facts(A, 1), Some(KEY_A));
+        replica.follow();
+
+        // The standing row is written again while a registration is in
+        // flight: its object is built with the stated credential.
+        let refused = replica.kept(&facts(A, 1), Some(KEY_B));
+        replica.store.upsert(facts(A, 1));
+        replica.follow();
+        assert!(replica.holds_credential(A, Some(KEY_B)));
+
+        // The put-back says so, and the holder lays the object again.
+        assert!(refused.put_back());
+        assert_eq!(replica.lay_again(&facts(A, 1)), 1);
+        assert!(replica.holds_credential(A, Some(KEY_A)));
+    }
+
+    #[test]
+    fn a_row_built_while_a_first_registration_is_in_flight_loses_its_credential_at_a_put_back() {
+        let replica = Replica::new();
+        // The row came through another host while a registration here
+        // stated a credential for its address and was then refused.
+        let refused = replica.kept(&facts(A, 1), Some(KEY_A));
+        replica.store.upsert(facts(A, 1));
+        replica.follow();
+        assert!(replica.holds_credential(A, Some(KEY_A)));
+
+        assert!(refused.put_back());
+        assert_eq!(replica.lay_again(&facts(A, 1)), 1);
+        assert!(replica.holds_credential(A, None));
+        assert!(replica.credentials.is_empty());
+    }
+
+    #[test]
+    fn a_registration_refused_behind_a_rotation_not_yet_laid_leaves_the_rotated_credential() {
+        let replica = Replica::new();
+        let row = replica.register(facts(A, 1), Some(KEY_A));
+        replica.follow();
+
+        // The credential alone changes. It is accepted, and the holder
+        // has not laid the address again yet.
+        assert!(replica.kept(&facts(A, 1), Some(KEY_B)).accepted(row));
+        // The next registration states the first credential again. The
+        // holder lays the address meanwhile: the object already holds
+        // what is stated, and the read marks the flight.
+        let refused = replica.kept(&facts(A, 1), Some(KEY_A));
+        assert_eq!(replica.lay_again(&facts(A, 1)), 0);
+        // Refused: the rotated credential stands again, and the put-back
+        // says an object holds the refused one.
+        if refused.put_back() {
+            replica.lay_again(&facts(A, 1));
+        }
+        assert!(replica.holds_credential(A, Some(KEY_B)));
+    }
+
+    #[test]
+    fn laying_again_reaches_each_rank_row_that_dials_the_address_and_no_other() {
+        let replica = Replica::new();
+        let first = replica.register(rank_facts(A, C, 0), Some(KEY_C));
+        replica.register(rank_facts(B, C, 1), Some(KEY_C));
+        replica.register(facts(D, 1), Some(KEY_A));
+        replica.follow();
+        let other = replica.at(D);
+
+        // One rank's registration states another credential: it is the
+        // engine's, for each rank row bound there.
+        let rotated = replica.kept(&rank_facts(A, C, 0), Some(KEY_B));
+        assert!(rotated.accepted(first));
+        assert_eq!(replica.lay_again(&rank_facts(A, C, 0)), 2);
+        assert!(replica.holds_credential(A, Some(KEY_B)));
+        assert!(replica.holds_credential(B, Some(KEY_B)));
+        assert!(Arc::ptr_eq(&other, &replica.at(D)));
+
+        // An address no row dials lays nothing.
+        assert_eq!(replica.lay_again(&facts(E, 1)), 0);
+    }
+
+    #[test]
+    fn laying_again_follows_the_store_first() {
+        let replica = Replica::new();
+        let token = replica.kept(&facts(A, 1), Some(KEY_A));
+        let row = replica.store.upsert(facts(A, 1)).id();
+        assert!(token.accepted(row));
+        // No follow ran: the call reads the row and builds its object with
+        // its credential, so nothing is left to lay again.
+        assert_eq!(replica.lay_again(&facts(A, 1)), 0);
+        assert!(replica.holds_credential(A, Some(KEY_A)));
+
+        // A row that left behind the last follow is ended, not laid.
+        assert!(replica.kept(&facts(A, 1), Some(KEY_B)).accepted(row));
+        replica.remove(A);
+        assert_eq!(replica.lay_again(&facts(A, 1)), 0);
+        assert!(replica.objects.registry().get_by_url(A).is_none());
+    }
+
+    #[test]
     fn a_registration_with_no_credential_clears_one_a_removed_worker_left() {
         let replica = Replica::new();
-        replica.keep(A, Some(KEY_A));
-        replica.store.upsert(facts(A, 1));
+        replica.register(facts(A, 1), Some(KEY_A));
         replica.follow();
         replica.remove(A);
 
-        replica.keep(A, None);
-        replica.store.upsert(facts(A, 1));
+        replica.register(facts(A, 1), None);
         replica.follow();
         assert!(replica.holds_credential(A, None));
+    }
+
+    /// A registration answered behind the follow's read of the keeper's
+    /// clock binds a row the read may not hold yet, so the forgetting
+    /// behind that read keeps it. Its worker left inside the same read:
+    /// the next read finds nothing, and forgets the row all the same.
+    #[test]
+    fn a_forgetting_the_clock_refused_is_tried_again_behind_the_next_read() {
+        let registry = Arc::new(WorkerRegistry::<Members>::new());
+        let credentials = Arc::new(Credentials::new());
+        let objects =
+            Objects::new(Arc::clone(&registry)).with_credentials(Arc::clone(&credentials));
+        let store = Late::default();
+        let token = credentials
+            .keep(&facts(A, 1), Some(KEY_A.to_owned()))
+            .expect("no registration in flight at the address");
+        let first = store.upsert(facts(A, 1)).id();
+        assert!(token.accepted(first));
+        objects.follow(&store);
+
+        // Between the follow's read of the clock and its read of the
+        // tail: the worker leaves, a second one registers at the address
+        // with another key, and leaves too.
+        let keeper = Arc::clone(&credentials);
+        *store.before_tail.lock() = Some(Box::new(move |store| {
+            let row = store.by_key(A).expect("the first worker's row");
+            assert!(store.remove(row.id, row.revision).is_some());
+            let token = keeper
+                .keep(&facts(A, 2), Some(KEY_B.to_owned()))
+                .expect("no registration in flight at the address");
+            let second = store.upsert(facts(A, 2)).id();
+            assert!(token.accepted(second));
+            let row = store.by_key(A).expect("the second worker's row");
+            assert!(store.remove(row.id, row.revision).is_some());
+        }));
+        objects.follow(&store);
+        assert!(credentials.is_empty(), "the second worker's too");
+
+        // A later worker at the address takes no key.
+        store.upsert(facts(A, 3));
+        objects.follow(&store);
+        let later = registry.get_by_url(A).expect("the later worker's object");
+        assert!(later.api_key().is_none());
     }
 
     #[test]
@@ -1625,12 +1626,13 @@ mod tests {
         assert_eq!(replica.told().len(), 1);
     }
 
-    /// A store that runs a callback after one row read and can take another
-    /// store's rows whole just before a tail read.
+    /// A store that runs a callback after one row read, another just before
+    /// a tail read, and can take another store's rows whole there.
     #[derive(Default)]
     struct Late {
         store: Arc<MemoryStore>,
         after_get: Mutex<Option<AfterGet>>,
+        before_tail: Mutex<Option<AfterGet>>,
         turn: Mutex<Option<(MemoryStore, WorkerId)>>,
     }
 
@@ -1688,6 +1690,9 @@ mod tests {
         }
 
         fn changes_since(&self, epoch: u64) -> MembershipTail {
+            if let Some(before_tail) = self.before_tail.lock().take() {
+                before_tail(&self.store);
+            }
             if let Some((other, row)) = self.turn.lock().take() {
                 assert!(self.store.restore_from(other.cut(Kinds::Watched)));
                 let revision = self.store.get(row).expect("the row").revision;

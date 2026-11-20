@@ -47,9 +47,10 @@
 //! holder ([`Standing`]). No credential and no connector is a row's fact. A
 //! host hands the holder its connector ([`Objects::with_connector`]). It
 //! keeps its workers' credentials in [`Credentials`] and hands the keeper
-//! to the holder ([`Objects::with_credentials`]). A registration that
-//! changes a credential and moves no row has the holder lay the address's
-//! objects again ([`Objects::lay_again`]).
+//! to the holder ([`Objects::with_credentials`]). A credential is bound to
+//! the rows its registrations wrote: a row no registration of this host
+//! stated takes none. Where a registration's answer says so, the host has
+//! the holder lay the address's objects again ([`Objects::lay_again`]).
 //!
 //! # The adapters
 //!
