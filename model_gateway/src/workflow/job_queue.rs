@@ -19,7 +19,10 @@ use smg_worker::{
     registry::WorkerId,
 };
 use tracing::{debug, info};
-use wfaas::{StateStore, WorkflowData, WorkflowEngine, WorkflowError, WorkflowId, WorkflowStatus};
+use wfaas::{
+    StateStore, WorkflowData, WorkflowDefinition, WorkflowEngine, WorkflowError, WorkflowId,
+    WorkflowStatus,
+};
 
 use crate::{
     app_context::AppContext,
@@ -99,9 +102,9 @@ impl Job {
     pub fn job_type(&self) -> &'static str {
         match self {
             Job::AddWorker { .. } => Self::REGISTRATION_TYPE,
-            Job::UpdateWorker { .. } => "UpdateWorker",
-            Job::RefreshWorkerLabels { .. } => "RefreshWorkerLabels",
-            Job::RemoveWorker { .. } => "RemoveWorker",
+            Job::UpdateWorker { .. } => WorkerJob::UPDATE_TYPE,
+            Job::RefreshWorkerLabels { .. } => WorkerJob::REFRESH_LABELS_TYPE,
+            Job::RemoveWorker { .. } => WorkerJob::REMOVAL_TYPE,
             Job::InitializeWorkersFromConfig { .. } => "InitializeWorkersFromConfig",
             Job::InitializeMcpServers { .. } => "InitializeMcpServers",
             Job::RegisterMcpServer { .. } => "RegisterMcpServer",
@@ -456,16 +459,20 @@ fn take_mark(marks: &DashSet<WorkerId>, own_id: Option<&WorkerId>) -> bool {
     own_id.is_some_and(|id| marks.remove(id).is_some())
 }
 
-/// How long a removal job waits for its run: the bounds of the removal's
-/// steps, added up. Each step has one attempt, so the run ends within the
-/// sum. A job that gave up earlier would report a failure and free the URL
-/// while its run went on to remove the worker.
+/// How long a removal job waits for its run. A job that gave up earlier
+/// would report a failure and free the URL while its run went on to remove
+/// the worker.
 fn removal_wait() -> Duration {
-    let workflow = create_worker_removal_workflow();
+    run_bound(&create_worker_removal_workflow())
+}
+
+/// The longest a run of `workflow` spends in its steps: each step's bound
+/// times its attempts, added up. The backoff between attempts is not counted.
+fn run_bound<D: WorkflowData>(workflow: &WorkflowDefinition<D>) -> Duration {
     workflow
         .steps
         .iter()
-        .map(|step| workflow.get_timeout(step))
+        .map(|step| workflow.get_timeout(step) * workflow.get_retry_policy(step).max_attempts)
         .sum()
 }
 
@@ -1262,6 +1269,8 @@ mod tests {
         QueueTest::keep(&kept, url, removal(WorkerJobAsker::Health, "first", 1));
         QueueTest::keep(&kept, url, removal(WorkerJobAsker::Api, "second", 2));
         QueueTest::keep(&kept, url, removal(WorkerJobAsker::Health, "third", 3));
+        // This one merges behind the health manager's removal and keeps its place.
+        QueueTest::keep(&kept, url, removal(WorkerJobAsker::Api, "fourth", 4));
 
         assert!(QueueTest::take_next(&kept, url, |_| false).is_none());
         {
@@ -1275,7 +1284,7 @@ mod tests {
             assert!(matches!(
                 &slots.removals[1],
                 Job::RemoveWorker { asker: WorkerJobAsker::Api, expected_revisions: Some(guards), .. }
-                    if *guards == pins(&[("second", Some(2))])
+                    if *guards == pins(&[("second", Some(2)), ("fourth", Some(4))])
             ));
         }
 
@@ -3798,5 +3807,26 @@ mod tests {
             removal_wait(),
             SETTLE_STEP_TIMEOUT + Duration::from_secs(330)
         );
+    }
+
+    /// A step that may run twice counts twice, so the wait holds through a
+    /// retry of the policy cleanup.
+    #[test]
+    fn a_runs_bound_counts_every_attempt_of_a_step() {
+        use wfaas::{BackoffStrategy, RetryPolicy, StepId};
+
+        let mut workflow = create_worker_removal_workflow();
+        let once = run_bound(&workflow);
+        let cleanup = workflow
+            .steps
+            .iter_mut()
+            .find(|step| step.id == StepId::new("remove_from_policy_registry"))
+            .expect("the policy cleanup step");
+        cleanup.retry_policy = Some(RetryPolicy {
+            max_attempts: 2,
+            backoff: BackoffStrategy::Fixed(Duration::ZERO),
+        });
+
+        assert_eq!(run_bound(&workflow), once + Duration::from_secs(300));
     }
 }

@@ -156,15 +156,25 @@ pub enum WorkerJob {
     },
 }
 
+impl WorkerJob {
+    /// The type word of an update, as the queue files a status under it.
+    /// A host whose own job wraps this one reads the words here.
+    pub const UPDATE_TYPE: &'static str = "UpdateWorker";
+    /// The type word of a labels refresh.
+    pub const REFRESH_LABELS_TYPE: &'static str = "RefreshWorkerLabels";
+    /// The type word of a removal.
+    pub const REMOVAL_TYPE: &'static str = "RemoveWorker";
+}
+
 impl QueueJob for WorkerJob {
     const REGISTRATION_TYPE: &'static str = "AddWorker";
 
     fn job_type(&self) -> &'static str {
         match self {
             Self::Add { .. } => Self::REGISTRATION_TYPE,
-            Self::Update { .. } => "UpdateWorker",
-            Self::RefreshLabels { .. } => "RefreshWorkerLabels",
-            Self::Remove { .. } => "RemoveWorker",
+            Self::Update { .. } => Self::UPDATE_TYPE,
+            Self::RefreshLabels { .. } => Self::REFRESH_LABELS_TYPE,
+            Self::Remove { .. } => Self::REMOVAL_TYPE,
         }
     }
 
@@ -185,6 +195,8 @@ impl QueueJob for WorkerJob {
         matches!(self, Self::Remove { .. })
     }
 
+    /// Two removals of one asker merge into one job with the pins of both.
+    /// A key so keeps at most one removal for each asker.
     fn merge_removals(mut held: Self, mut newer: Self) -> Result<Self, (Self, Self)> {
         match (&mut held, &mut newer) {
             (
