@@ -8,32 +8,25 @@
 //! provider's worker stays outside the store, and the step writes it in
 //! the registry as the classic line does.
 //!
-//! A row holds no credential, no priority and no cost yet. The worker API
-//! refuses an update that states one before it queues a job. A job that
-//! reaches a row all the same is refused here by the same names, before
-//! any worker is written. A label refresh leaves a row's worker as it is:
-//! the door takes the engine's labels from no writer yet.
+//! A row holds no credential, no priority and no cost. The rebuilt worker
+//! holds them, so an update that states one moves the object the holder
+//! keeps, though it moves no fact of the row. A label refresh leaves a
+//! row's worker as it is: the door takes the engine's labels from no
+//! writer yet.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use openai_protocol::worker::WorkerUpdateRequest;
 use smg_policy_controller::worker_host::{
     maker_of, Expect, Membership, Objects, Refused, Standing,
 };
 use smg_worker::{identity::basic::Worker, jobs::WorkerJobAsker, registry::WorkerId};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::{
-    refuse_worker_key::WORKER_KEY_UNSUPPORTED, update_worker_properties::UpdateWorkerPropertiesStep,
-};
+use super::update_worker_properties::UpdateWorkerPropertiesStep;
 use crate::{
     routers::common::snapshot::ModelWorkerSnapshot, workflow::data::WorkerUpdateWorkflowData,
 };
-
-/// The name of the refusal of a priority or a cost, in the step's error and
-/// in the worker API's answer.
-pub(crate) const WORKER_FIELD_UNSUPPORTED: &str = "POLICY_CONTROLLER_WORKER_FIELD_UNSUPPORTED";
 
 /// The update step beside the rows whose objects `rows` holds, writing at
 /// `door`.
@@ -70,29 +63,6 @@ impl UpdateAtDoorStep {
                 self.rows.standing_of(id, worker)
             })
             .collect()
-    }
-
-    /// The refusal of an update of `worker`, a row's, that states what no
-    /// row holds yet, by the name the worker API answers with: the
-    /// credential first, then the priority, then the cost.
-    pub(super) fn refuse_unheld(
-        request: &WorkerUpdateRequest,
-        worker: &dyn Worker,
-    ) -> WorkflowResult<()> {
-        let (name, stated) = if request.api_key.is_some() {
-            (WORKER_KEY_UNSUPPORTED, "an API key")
-        } else if request.priority.is_some() {
-            (WORKER_FIELD_UNSUPPORTED, "a priority")
-        } else if request.cost.is_some() {
-            (WORKER_FIELD_UNSUPPORTED, "a cost")
-        } else {
-            return Ok(());
-        };
-        Err(step_failed(format!(
-            "{name}: the update of worker {} states {stated}, and the worker API sets none \
-             on a worker of the policy controller's store yet",
-            worker.redacted_url()
-        )))
     }
 
     /// Lay the labels and the health checks of `updated` over the row

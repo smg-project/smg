@@ -57,11 +57,12 @@ fn the_context_stamps_its_credential_and_the_discovered_budget() {
     assert_eq!(spec.max_connection_attempts, 40);
 }
 
-/// Under the policy controller the context states its credential on a
-/// provider's worker alone. A discovered self-hosted worker becomes a row of
-/// the store, and a row holds no credential yet.
+/// Under the policy controller the context states its credential as under
+/// the classic policies: on a discovered self-hosted worker, which becomes a
+/// row of the store, and on a provider's. A row holds no credential, and the
+/// row's object holds the key.
 #[tokio::test]
-async fn under_the_policy_controller_the_context_states_its_credential_on_a_provider_alone() {
+async fn under_the_policy_controller_the_context_states_its_credential_as_the_classic_does() {
     let mut router_config = RouterConfig::builder()
         .api_key("router-key")
         .build_unchecked();
@@ -73,7 +74,7 @@ async fn under_the_policy_controller_the_context_states_its_credential_on_a_prov
     let mut row = WorkerSpec::new("http://10.0.0.1:8080");
     row.api_key = Some("stale-key".to_string());
     context.stamp(&mut row);
-    assert_eq!(row.api_key, None);
+    assert_eq!(row.api_key.as_deref(), Some("router-key"));
     assert_eq!(row.max_connection_attempts, 40);
 
     let mut provider = WorkerSpec::new("https://api.openai.com/v1");

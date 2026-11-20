@@ -92,18 +92,10 @@ impl UpdateWorkerPropertiesStep {
 
         let mut updated_workers: Vec<Arc<dyn Worker>> = Vec::with_capacity(workers_to_update.len());
 
-        // The row behind each worker, where the line writes at a door. What
-        // no row holds is refused before any worker is written.
+        // The row behind each worker, where the line writes at a door.
         let rows = at_door
             .map(|door| door.rows_behind(snapshot.as_deref(), &workers_to_update))
             .unwrap_or_default();
-        let first_row = workers_to_update
-            .iter()
-            .zip(&rows)
-            .find(|(_, row)| row.is_some());
-        if let Some((worker, _)) = first_row {
-            UpdateAtDoorStep::refuse_unheld(request, worker.as_ref())?;
-        }
 
         // The labels each worker ends up with: the request's merged into its
         // own. The admin check held the cap against the labels the worker had

@@ -19,12 +19,10 @@ pub use local::{
     ReleaseTokenizerStep, RemoveFromPolicyRegistryStep, UpdatePoliciesForWorkerStep,
     UpdateRemainingPoliciesStep, UpdateWorkerPropertiesStep,
 };
-pub(crate) use local::{
-    worker_removal_line, worker_update_line, WORKER_FIELD_UNSUPPORTED, WORKER_KEY_UNSUPPORTED,
-};
+pub(crate) use local::{worker_removal_line, worker_update_line};
 use local::{
-    CheckLocalWorkerStep, DiscoverZmqLabelsStep, EnsureHarmonyEncodingStep, RefuseWorkerKeyStep,
-    SubmitTokenizerJobStep, CHECK_LOCAL_WORKER_STEP, REFUSE_WORKER_KEY_STEP, ZMQ_LABELS_STEP,
+    CheckLocalWorkerStep, DiscoverZmqLabelsStep, EnsureHarmonyEncodingStep, SubmitTokenizerJobStep,
+    CHECK_LOCAL_WORKER_STEP, ZMQ_LABELS_STEP,
 };
 use openai_protocol::worker::WorkerSpec;
 pub(crate) use shared::rows_written;
@@ -102,9 +100,7 @@ pub fn create_worker_registration_workflow(
 ///       +------------+------------------+
 ///       |  (LOCAL branch)               |  (EXTERNAL branch)
 ///       v                               v
-///  refuse_worker_key              discover_models
-///       |                               |
-///  (the local steps above)              |
+///  (the local steps above)        discover_models
 ///       |                               |
 ///  ensure_harmony_encoding       create_external_workers
 ///       |                               |
@@ -117,9 +113,8 @@ pub fn create_worker_registration_workflow(
 ///                 |             |
 ///            submit_tok   activate_workers
 /// ```
-/// - A local registration that states an API key is refused by name
-///   behind the classification and ahead of the detection's probes: a row
-///   holds no credential.
+/// - A local registration that states an API key registers as any other: a
+///   row holds no credential, and the row's object holds the key.
 /// - The store crate's write at the feed's door stands behind the encoding
 ///   step, and no other step waits on that step. It writes a local worker's
 ///   row, and the holder lays the row's object in the registry.
@@ -188,8 +183,8 @@ pub(crate) fn worker_registration_line(
     .with_timeout(Duration::from_secs(5))
     .with_failure_action(FailureAction::FailWorkflow);
 
-    // The crate's line. Under a feed its detection waits on the key's
-    // refusal, and it ends with the write at the feed's door.
+    // The crate's line. Under a feed it ends with the write at the feed's
+    // door.
     let gates = |detection| RegistrationGates {
         detection: Some(detection),
         creation: Some(ZMQ_LABELS_STEP),
@@ -200,20 +195,10 @@ pub(crate) fn worker_registration_line(
         }
         Some(feed) => registration_at_door::<AppContext>(
             &settings,
-            gates(REFUSE_WORKER_KEY_STEP),
+            gates("classify_worker_type"),
             Arc::clone(&feed.door),
             Arc::clone(&feed.objects),
             &["ensure_harmony_encoding"],
-        )
-        .add_step(
-            StepDefinition::new(
-                REFUSE_WORKER_KEY_STEP,
-                "Refuse Worker Key",
-                Arc::new(RefuseWorkerKeyStep),
-            )
-            .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["classify_worker_type"]),
         ),
     }
     // Step 0: Classify worker type (Local vs External)
@@ -351,7 +336,7 @@ mod tests {
     };
 
     use http::StatusCode;
-    use openai_protocol::worker::{ConnectionMode, RuntimeType, WorkerStatus};
+    use openai_protocol::worker::WorkerStatus;
     use serde_json::{json, Value};
     use smg_policy_controller::store::{
         Maker, MemoryStore, WorkerStatus as RowStatus, WorkersStore,
@@ -363,7 +348,7 @@ mod tests {
             WORKER_REGISTRATION_WORKFLOW,
         },
     };
-    use wfaas::{StepId, StepStatus, WorkflowEngine, WorkflowId, WorkflowState, WorkflowStatus};
+    use wfaas::{StepId, WorkflowEngine, WorkflowId, WorkflowState, WorkflowStatus};
 
     use super::{local::test_support::serve_json_routes, *};
     use crate::{
@@ -689,20 +674,18 @@ mod tests {
 
     /// Under the feed a local worker's branch ends with the write at the
     /// door, behind the encoding step alone and ahead of the register step.
-    /// The key's refusal stands ahead of the detection. No step writes the
-    /// classic policies.
+    /// No step writes the classic policies.
     #[test]
     fn under_the_feed_the_local_line_writes_at_the_door() {
         let config = picked(config_with(1800, 30));
         let (_, _, feed) = started(&config).expect("the store starts");
         let line = written(&[
-            ("detect_connection_mode", &["refuse_worker_key"]),
+            ("detect_connection_mode", &["classify_worker_type"]),
             ("detect_backend", &["detect_connection_mode"]),
             ("discover_metadata", &["detect_backend"]),
             ("discover_dp_info", &["discover_metadata"]),
             ("create_local_worker", &["discover_zmq_labels"]),
             ("write_workers_at_door", &["ensure_harmony_encoding"]),
-            ("refuse_worker_key", &["classify_worker_type"]),
             ("classify_worker_type", &[]),
             ("discover_zmq_labels", &["discover_dp_info"]),
             ("check_local_worker", &["create_local_worker"]),
@@ -748,7 +731,7 @@ mod tests {
                 (
                     "classify_worker_type".to_string(),
                     vec![
-                        "refuse_worker_key".to_string(),
+                        "detect_connection_mode".to_string(),
                         "discover_models".to_string()
                     ]
                 ),
@@ -1094,34 +1077,33 @@ mod tests {
         assert_eq!(placed.id(), row.id);
     }
 
-    /// A local worker that states an API key fails its job by name ahead of
-    /// every probe, and no row is written: a row keeps no credential.
+    /// A local worker that states an API key registers as any other. A row
+    /// holds no credential, and the row's object in the registry holds the
+    /// key.
     #[tokio::test]
-    async fn a_keyed_local_workers_job_fails_by_name_and_writes_no_row() {
-        let config = picked(config_with(1, 1));
+    async fn a_keyed_local_workers_job_ends_as_a_row_whose_object_holds_the_key() {
+        let url = serve_json_routes(vec![
+            ("/health", StatusCode::OK, json!({"status": "ok"})),
+            (
+                "/model_info",
+                StatusCode::OK,
+                json!({"model_path": "m", "is_generation": true}),
+            ),
+            ("/server_info", StatusCode::OK, json!({"version": "test"})),
+        ])
+        .await;
+        let config = picked(config_with(5, 1));
         let (store, registry, feed) = started(&config).expect("the store starts");
-        let url = "ipc:///tmp/worker-keyed.ipc";
-        let mut spec = WorkerSpec::new(url);
-        spec.connection_mode = ConnectionMode::Zmq;
-        spec.runtime_type = RuntimeType::Vllm;
-        spec.labels.insert("model_id".into(), "m".into());
+        let mut spec = WorkerSpec::new(&url);
         spec.api_key = Some("secret-key".into());
 
         let state = registered_under_the_feed(&config, &registry, &feed, spec)
             .await
             .expect("the run ends");
-        assert_eq!(state.status, WorkflowStatus::Failed);
-        let refusal = &state.step_states[&StepId::new(REFUSE_WORKER_KEY_STEP)];
-        assert_eq!(refusal.status, StepStatus::Failed);
-        let error = refusal.last_error.as_deref().unwrap_or_default();
-        assert!(error.contains(WORKER_KEY_UNSUPPORTED), "{error}");
-        assert!(!error.contains("secret-key"), "{error}");
-        let probed = state
-            .step_states
-            .get(&StepId::new(DETECT_CONNECTION_MODE_STEP))
-            .is_some_and(|detection| detection.status == StepStatus::Succeeded);
-        assert!(!probed, "the worker was probed");
-        assert!(store.by_key(url).is_none());
-        assert!(registry.is_empty());
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        let row = store.by_key(&url).expect("the worker's row");
+        assert_eq!(row.status, RowStatus::Ready);
+        let object = registry.get_by_url(&url).expect("the row's object");
+        assert_eq!(object.api_key().map(String::as_str), Some("secret-key"));
     }
 }

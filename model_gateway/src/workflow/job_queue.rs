@@ -847,11 +847,7 @@ impl JobHost for AppContext {
                     spec.worker_type = proto_worker_type;
                     spec.bootstrap_port = bootstrap_port;
                     apply_startup_worker_config(&mut spec, router_config);
-                    // The runtime is stated by now. A worker that becomes a row
-                    // of the policy controller's store takes no key.
-                    if !context.registers_at_door(&spec) {
-                        spec.api_key.clone_from(&api_key);
-                    }
+                    spec.api_key.clone_from(&api_key);
                     let config = spec;
 
                     let job = Job::AddWorker {
@@ -1714,13 +1710,11 @@ mod tests {
     }
 
     /// A gateway that holds an API key and decides by the policy controller
-    /// still registers its start-up workers. Its start-up list states the
-    /// key on a provider's worker alone: a self-hosted worker becomes a row
-    /// of the store, and a row holds no credential yet. The start says so,
-    /// and the keyless registration ends with the worker's row ready. Under
-    /// the classic policies the list states the key on both.
+    /// states the key on its start-up workers as under the classic policies:
+    /// on a self-hosted worker, which becomes a row of the store, and on a
+    /// provider's. A row holds no credential, and the row's object in the
+    /// registry holds the key.
     #[tokio::test]
-    #[tracing_test::traced_test]
     async fn under_the_policy_controller_a_keyed_gateways_startup_worker_becomes_a_row() {
         use smg_policy_controller::store::{WorkerStatus as RowStatus, WorkersStore};
 
@@ -1753,21 +1747,19 @@ mod tests {
             .expect("the classic start-up list");
         assert_eq!(stated(&next_job()), Some((url.clone(), key.clone())));
         assert_eq!(stated(&next_job()), Some((provider.clone(), key.clone())));
-        assert!(!logs_contain("holds no worker credential yet"));
 
         config.policy_controller = true;
         let hosted = AppContext::from_config(config.clone(), 30, None, None)
             .await
             .expect("the context");
         let hosted = Arc::new(hosted);
-        assert!(logs_contain("holds no worker credential yet"));
         let (queue, mut next_job) = recording_for_tests(&hosted);
         hosted.worker_job_queue.set(queue).unwrap();
         execute_job(&startup(&config), &hosted, &marks, None)
             .await
             .expect("the start-up list");
         let registration = next_job();
-        assert_eq!(stated(&registration), Some((url.clone(), None)));
+        assert_eq!(stated(&registration), Some((url.clone(), key.clone())));
         assert_eq!(stated(&next_job()), Some((provider, key)));
 
         let engines = WorkflowEngines::with_feed(&config, hosted.door_feed());
@@ -1777,6 +1769,12 @@ mod tests {
         let store = hosted.policy_store.as_ref().expect("the store");
         let row = store.by_key(&url).expect("the worker's row");
         assert_eq!(row.status, RowStatus::Ready);
+        let object = hosted
+            .worker_registry
+            .get_by_url(&url)
+            .expect("the row's object");
+        let held = object.api_key();
+        assert_eq!(held.map(String::as_str), Some("gateway-key"));
     }
 
     /// A gateway that decides by the policy controller, its queue recording
@@ -1815,12 +1813,12 @@ mod tests {
 
     /// Under the policy controller a label refresh leaves a row's worker
     /// alone and ends well: the door takes the engine's labels from no
-    /// writer yet. An update job that states what no row holds fails by the
-    /// worker API's name for it, and writes nothing. The registry keeps the
-    /// object the holder laid, so the removal behind them still takes the
-    /// worker.
+    /// writer yet. An update job that states an API key, a priority or a
+    /// cost moves the object the holder keeps, though no fact of the row
+    /// moves: each job hands its rebuilt worker in. The removal behind
+    /// them still takes the worker.
     #[tokio::test]
-    async fn under_the_policy_controller_a_refresh_and_an_unheld_field_leave_a_rows_worker() {
+    async fn under_the_policy_controller_an_update_moves_a_rows_key_priority_and_cost() {
         let (hosted, url, _, _jobs) = a_hosted_gateway_with_a_row().await;
         let registry = &hosted.worker_registry;
         let laid = registry.get_by_url(&url).expect("the row's object");
@@ -1841,31 +1839,37 @@ mod tests {
             refreshed.as_ref().is_ok_and(|text| text.contains(left)),
             "{refreshed:?}"
         );
-        for (body, name) in [
-            (
-                serde_json::json!({"api_key": "secret-key", "labels": {"tier": "a"}}),
-                "POLICY_CONTROLLER_WORKER_KEY_UNSUPPORTED",
-            ),
-            (
-                serde_json::json!({"priority": 7, "labels": {"tier": "a"}}),
-                "POLICY_CONTROLLER_WORKER_FIELD_UNSUPPORTED",
-            ),
-            (
-                serde_json::json!({"cost": 2.5}),
-                "POLICY_CONTROLLER_WORKER_FIELD_UNSUPPORTED",
-            ),
-        ] {
-            let updated = execute_job(&update(body), &hosted, &marks, None).await;
-            assert!(
-                updated
-                    .as_ref()
-                    .is_err_and(|text| text.contains(name) && !text.contains("secret-key")),
-                "{updated:?}"
-            );
-        }
         let stands = registry.get_by_url(&url).expect("the worker");
         assert!(Arc::ptr_eq(&stands, &laid));
-        assert!(!stands.metadata().spec.labels.contains_key("tier"));
+
+        // One job a field. Each object is the job's rebuilt worker and
+        // keeps what the jobs before it set.
+        type Held = fn(&dyn Worker) -> bool;
+        type Field = (serde_json::Value, Held);
+        let fields: [Field; 3] = [
+            (serde_json::json!({"api_key": "secret-key"}), |worker| {
+                worker.api_key().map(String::as_str) == Some("secret-key")
+            }),
+            (serde_json::json!({"priority": 7}), |worker| {
+                worker.metadata().spec.priority == 7
+            }),
+            (serde_json::json!({"cost": 2.5}), |worker| {
+                (worker.metadata().spec.cost - 2.5).abs() < f32::EPSILON
+            }),
+        ];
+        let mut held: Vec<Held> = Vec::new();
+        for (body, holds) in fields {
+            let before = registry.get_by_url(&url).expect("the worker");
+            assert!(!holds(before.as_ref()), "{body}");
+            let updated = execute_job(&update(body.clone()), &hosted, &marks, None).await;
+            assert!(updated.is_ok(), "{body}: {updated:?}");
+            let stands = registry.get_by_url(&url).expect("the worker");
+            assert!(!Arc::ptr_eq(&stands, &before), "{body}");
+            held.push(holds);
+            assert!(held.iter().all(|holds| holds(stands.as_ref())), "{body}");
+        }
+        let feed = hosted.door_feed().expect("the feed");
+        assert_eq!(feed.objects.unhanded(), 0);
 
         let removal = Job::RemoveWorker {
             url: url.clone(),
