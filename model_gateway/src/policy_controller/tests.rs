@@ -15,7 +15,7 @@ use axum::{
 use openai_protocol::{
     model_card::ModelCard,
     transcription::{AudioFile, TranscriptionRequest},
-    worker::WorkerStatus,
+    worker::{WorkerSpec, WorkerStatus},
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -1239,5 +1239,28 @@ async fn a_worker_written_at_the_contexts_door_is_placed_by_its_host() -> Case {
         .get_by_url(URL)
         .ok_or("the registry holds no worker at the URL")?;
     assert!(Arc::ptr_eq(placed.worker(), &laid));
+    Ok(())
+}
+
+/// Under a controller's address the store mirrors that controller's rows.
+/// The context holds the feed for the follower, and its worker workflows
+/// get none: a write of the gateway's own would set the mirror apart. A
+/// local worker's registration writes no row there.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_followed_gateway_hands_its_worker_workflows_no_feed() -> Case {
+    let local = WorkerSpec::new("http://worker:8000");
+    let hosted = AppContext::from_config(picked(quiet()), 30, None, None).await?;
+    assert!(hosted.door_feed().is_some());
+    assert!(hosted.registers_at_door(&local));
+
+    let mut config = picked(quiet());
+    config.policy_controller_address = Some("127.0.0.1:1".to_owned());
+    let followed = AppContext::from_config(config, 30, None, None).await?;
+    assert!(followed.follows_controller());
+    assert!(followed.policy_feed.is_some());
+    assert!(followed.door_feed().is_none());
+    assert!(!followed.registers_at_door(&local));
+    assert!(!followed.holds_row_at("http://worker:8000"));
     Ok(())
 }

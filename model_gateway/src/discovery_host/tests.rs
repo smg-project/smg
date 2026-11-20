@@ -22,7 +22,10 @@ use tokio::time;
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowInstanceId};
 
 use crate::{
-    app_context::testing::{app_context_for_tests, create_test_app_context},
+    app_context::{
+        testing::{app_context_for_tests, create_test_app_context},
+        AppContext,
+    },
     config::RouterConfig,
     routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
     server::http_client,
@@ -52,6 +55,30 @@ fn the_context_stamps_its_credential_and_the_discovered_budget() {
             .connection_attempt_budget(RouterConfig::DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS)
     );
     assert_eq!(spec.max_connection_attempts, 40);
+}
+
+/// Under the policy controller the context states its credential on a
+/// provider's worker alone. A discovered self-hosted worker becomes a row of
+/// the store, and a row holds no credential yet.
+#[tokio::test]
+async fn under_the_policy_controller_the_context_states_its_credential_on_a_provider_alone() {
+    let mut router_config = RouterConfig::builder()
+        .api_key("router-key")
+        .build_unchecked();
+    router_config.policy_controller = true;
+    let context = AppContext::from_config(router_config, 30, None, None)
+        .await
+        .expect("the context");
+
+    let mut row = WorkerSpec::new("http://10.0.0.1:8080");
+    row.api_key = Some("stale-key".to_string());
+    context.stamp(&mut row);
+    assert_eq!(row.api_key, None);
+    assert_eq!(row.max_connection_attempts, 40);
+
+    let mut provider = WorkerSpec::new("https://api.openai.com/v1");
+    context.stamp(&mut provider);
+    assert_eq!(provider.api_key.as_deref(), Some("router-key"));
 }
 
 /// The context answers a worker's origin as the registry holds it: `Local`

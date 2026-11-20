@@ -1020,7 +1020,7 @@ async fn refuse_worker_write(_: Request, _: axum::middleware::Next) -> impl Into
             error:
                 "With --policy-controller-address, add, change and remove workers at the controller"
                     .to_owned(),
-            code: "CONFLICT".to_owned(),
+            code: "WORKER_CONTROLLER_OWNED".to_owned(),
         }),
     )
 }
@@ -1917,8 +1917,9 @@ async fn start_workflow_engines(
         .set(worker_job_queue)
         .expect("JobQueue should only be initialized once");
 
-    // Initialize typed workflow engines
-    let engines = WorkflowEngines::new(&config.router_config);
+    // Initialize typed workflow engines. Where the gateway decides in its
+    // own process, the worker workflows write at its store's door.
+    let engines = WorkflowEngines::with_feed(&config.router_config, app_context.door_feed());
 
     // Subscribe logging to all workflow engines
     engines.subscribe_all(Arc::new(LoggingSubscriber)).await;
@@ -3836,6 +3837,7 @@ mod tests {
 
         use crate::{
             app_context::testing::app_context_for_tests, routers::common::snapshot::WorkerRegistry,
+            workflow::job_queue::recording_for_tests,
         };
 
         let missing = "/workers/00000000-0000-0000-0000-000000000001";
@@ -3846,8 +3848,21 @@ mod tests {
                 ..Default::default()
             };
             let context = app_context_for_tests(config, Arc::new(WorkerRegistry::new()), None);
+            // A following gateway has a queue to refuse ahead of.
+            let _jobs = following.then(|| {
+                let (queue, jobs) = recording_for_tests(&context);
+                assert!(context.worker_job_queue.set(queue).is_ok());
+                jobs
+            });
             let probes = ProbeState::new(context.inflight_tracker.clone());
-            let app = worker_test_app(context, probes);
+            let app = worker_test_app(Arc::clone(&context), probes);
+            // A GET by id asks the queue: not found where one stands, an
+            // error where none does.
+            let by_id = if following {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
             for (method, path, body, classic) in [
                 (
                     "POST",
@@ -3864,7 +3879,7 @@ mod tests {
                 ("PATCH", missing, "{}", StatusCode::NOT_FOUND),
                 ("DELETE", missing, "", StatusCode::NOT_FOUND),
                 ("GET", "/workers", "", StatusCode::OK),
-                ("GET", missing, "", StatusCode::INTERNAL_SERVER_ERROR),
+                ("GET", missing, "", by_id),
             ] {
                 let response = app
                     .clone()
@@ -3882,6 +3897,7 @@ mod tests {
                     assert_eq!(response.status(), StatusCode::CONFLICT, "{method} {path}");
                     let body = to_bytes(response.into_body(), 4096).await.unwrap();
                     let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["code"], "WORKER_CONTROLLER_OWNED", "{method} {path}");
                     assert!(
                         body["error"]
                             .as_str()
@@ -3892,6 +3908,15 @@ mod tests {
                 } else {
                     assert_eq!(response.status(), classic, "{method} {path}");
                 }
+            }
+            if following {
+                // The refusal stands ahead of the worker API: no job was
+                // queued and no id reserved.
+                let url = "http://worker:8000";
+                let queue = context.worker_job_queue.get().unwrap();
+                assert!(queue.get_status(url).is_none());
+                let registry = &context.worker_registry;
+                assert!(registry.get_id_by_url_or_reservation(url).is_none());
             }
         }
     }

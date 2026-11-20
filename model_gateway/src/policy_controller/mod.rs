@@ -18,10 +18,9 @@
 //! id ([`undecided()`]) whenever the store started, with or without a
 //! controller's address. The routes that pick a
 //! worker by no routing policy serve as under the classic policies: a
-//! provider's router, a realtime session and a proxied GET. The gateway's
-//! workflows leave the feed's door unused, so without an address nothing
-//! feeds the store yet. With the setting off, the context holds neither the
-//! store, its feed nor its host.
+//! provider's router, a realtime session and a proxied GET. A local worker's
+//! registration writes its row at the feed's door. With the setting off, the
+//! context holds neither the store, its feed nor its host.
 //!
 //! The document in force reaches the store through the policy crate's
 //! operators' door as YAML: the bytes `--print-policy-spec` prints where
@@ -35,9 +34,10 @@
 //!
 //! Under a controller's address a follower keeps the store's worker rows
 //! as that controller's watch tells them ([`follower`]). The gateway then
-//! discovers, registers and probes no worker of its own. Each row has its
-//! worker object in the registry before the gateway reports a fleet, and
-//! the object's status is the row's ([`feeds`]).
+//! discovers, registers and probes no worker of its own, and its worker
+//! workflows write no row: a write of its own would set the mirror apart.
+//! Each row has its worker object in the registry before the gateway
+//! reports a fleet, and the object's status is the row's ([`feeds`]).
 
 use std::sync::Arc;
 

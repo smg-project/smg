@@ -5,7 +5,7 @@ use std::{
 
 use dashmap::DashSet;
 use llm_tokenizer::registry::TokenizerRegistry;
-use openai_protocol::profile::ProviderProfile;
+use openai_protocol::{profile::ProviderProfile, worker::WorkerSpec};
 use parking_lot::Mutex;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use reqwest::Client;
@@ -26,11 +26,11 @@ use smg_worker::{
     },
     health::liveness,
     settings::RegistrationSettings,
-    workflow::WorkflowHost,
+    workflow::{find_workers_by_url, WorkerKind, WorkflowHost},
 };
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     admin::worker_service::WorkerService,
@@ -66,7 +66,10 @@ use crate::{
     },
     server::http_client_builder,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    workflow::{data::RegistrationNotes, JobQueue, TokenizerLoadFailures, WorkflowEngines},
+    workflow::{
+        data::RegistrationNotes, steps::stated_kind, JobQueue, TokenizerLoadFailures,
+        WorkflowEngines,
+    },
 };
 
 /// Error type for AppContext builder
@@ -284,6 +287,15 @@ impl WorkflowHost for AppContext {
     }
 }
 
+/// The feed a gateway's worker workflows write at: `feed` where the gateway
+/// decides in its own process, and none where it `follows` a controller.
+/// There the store mirrors that controller's rows, and a write of the
+/// gateway's own would set the mirror apart from the controller: its
+/// workflows stay the classic ones.
+fn workflows_feed(feed: Option<&Feed>, follows: bool) -> Option<&Feed> {
+    feed.filter(|_| !follows)
+}
+
 impl AppContext {
     pub fn builder() -> AppContextBuilder {
         AppContextBuilder::new()
@@ -296,6 +308,34 @@ impl AppContext {
     /// health checks and the discovery.
     pub(crate) fn follows_controller(&self) -> bool {
         self.policy_follower.is_some()
+    }
+
+    /// The feed this gateway's worker workflows write at: its own where it
+    /// decides in its own process, and none where a controller supplies its
+    /// workers ([`workflows_feed`]).
+    pub(crate) fn door_feed(&self) -> Option<&Feed> {
+        workflows_feed(self.policy_feed.as_ref(), self.follows_controller())
+    }
+
+    /// Whether a registration of `spec` writes a row of the policy
+    /// controller's store: where the workflows write at the door, every
+    /// worker but a stated provider's. A row holds no credential yet, so
+    /// the gateway states its own API key on no such worker, at start-up or
+    /// from discovery.
+    pub(crate) fn registers_at_door(&self, spec: &WorkerSpec) -> bool {
+        self.door_feed().is_some() && stated_kind(spec) != Some(WorkerKind::External)
+    }
+
+    /// Whether a row of the policy controller's store stands for a worker
+    /// `url` selects. The holder is then the one writer of that worker's
+    /// object in the registry.
+    pub(crate) fn holds_row_at(&self, url: &str) -> bool {
+        self.door_feed().is_some_and(|feed| {
+            find_workers_by_url(&self.worker_registry, url)
+                .iter()
+                .filter_map(|worker| self.worker_registry.get_id_by_url(worker.url()))
+                .any(|id| feed.objects.standing(&id).is_some())
+        })
     }
 
     /// Create AppContext from config with all components initialized
@@ -655,12 +695,20 @@ impl AppContextBuilder {
             policy_registry.keep_rings_warm(&worker_registry, &runtime);
         }
 
-        // Create WorkerService from the already-built components
-        let worker_service = Arc::new(WorkerService::new(
+        // Create WorkerService from the already-built components. Where
+        // the workflows write at the door a local worker is a row of the
+        // store.
+        let worker_service = WorkerService::new(
             worker_registry.clone(),
             worker_job_queue.clone(),
             router_config.clone(),
-        ));
+        );
+        let rows = workflows_feed(self.policy_feed.as_ref(), self.policy_follower.is_some());
+        let worker_service = Arc::new(if rows.is_some() {
+            worker_service.with_local_workers_as_rows()
+        } else {
+            worker_service
+        });
 
         let worker_client_cache = Arc::new(WorkerHttpClientCache::new(
             router_config.worker_http_client_settings(),
@@ -981,6 +1029,13 @@ impl AppContextBuilder {
             self.policy_follower = follower.map(|follower| Arc::new(Mutex::new(Some(follower))));
             self.policy_operators = Some(Arc::new(Operators::new(door)));
             self.policy_store = Some(store);
+        }
+        if self.policy_store.is_some() && config.api_key.is_some() {
+            warn!(
+                "The policy controller's store holds no worker credential yet: the gateway \
+                 sends its API key to no self-hosted worker in its own calls, and a worker \
+                 that demands a key refuses them"
+            );
         }
         Ok(self)
     }

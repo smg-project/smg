@@ -6,11 +6,12 @@ use std::{
 };
 
 use async_trait::async_trait;
+use smg_policy_controller::worker_host::{Objects, WRITE_WORKERS_AT_DOOR_STEP};
 use smg_worker::{
     health::bootstrap_probe,
     identity::basic::Worker,
     registry::{worker_model_ids, WorkerId},
-    workflow::{pool_group, refresh_worker_pool_sizes, PoolGroups},
+    workflow::{pool_group, refresh_worker_pool_sizes, PoolGroups, WorkerKind},
 };
 use tracing::debug;
 use wfaas::{
@@ -19,11 +20,17 @@ use wfaas::{
 };
 
 use crate::{
+    app_context::AppContext,
     routers::{
-        common::{pd_admission, snapshot::WorkerRegistry},
+        common::{
+            pd_admission,
+            snapshot::{ModelWorkerSnapshot, WorkerRegistry},
+        },
         grpc::regular::symphony::telemetry,
     },
-    workflow::data::{require_app_context, WorkerRegistrationData, WorkerRegistrationMode},
+    workflow::data::{
+        require_app_context, WorkerRegistrationData, WorkerRegistrationMode, WorkerWorkflowData,
+    },
 };
 
 /// Unified step to register workers in the registry.
@@ -35,6 +42,28 @@ pub struct RegisterWorkersStep;
 
 /// The step's id in the registration DAGs.
 pub(crate) const REGISTER_WORKERS_STEP: &str = "register_workers";
+
+/// The register step of a line whose local workers are rows of the policy
+/// controller's store.
+///
+/// The holder lays a row's object in the registry, so the step writes no
+/// local worker: it keeps what a registration does beside that write. A
+/// provider's workers stay outside the store: the step writes them, and
+/// refuses one at a URL a row's object holds. It writes no classic policy,
+/// which decides nothing there.
+pub(crate) struct RegisterBesideRowsStep {
+    rows: Arc<Objects<ModelWorkerSnapshot>>,
+}
+
+/// The name of the refusal of a provider's worker at a URL a row holds.
+const WORKER_URL_TAKEN: &str = "POLICY_CONTROLLER_WORKER_URL_TAKEN";
+
+impl RegisterBesideRowsStep {
+    /// The step beside the rows whose objects `rows` holds.
+    pub(crate) fn new(rows: Arc<Objects<ModelWorkerSnapshot>>) -> Self {
+        Self { rows }
+    }
+}
 
 /// Whether the registry step of `state` completed: the registration's workers
 /// are in the registry, whatever the workflow did after it (a cancellation or
@@ -66,6 +95,39 @@ pub fn registered_entries<D: WorkerRegistrationData>(
             let id = registry.get_id_by_url(worker.url())?;
             let entry = registry.get(&id)?;
             Arc::ptr_eq(&entry, worker).then(|| (id.as_str().to_string(), entry.revision()))
+        })
+        .collect()
+}
+
+/// [`registered_entries`] for the rows of a line that writes at the store's
+/// door: the registration's workers whose rows stand now, by the id and
+/// revision of the objects the holder laid for them. The holder's object is
+/// never the one the job built, so the state says whether the door's write
+/// was this registration's: a row that stood before a refused add is not.
+/// A cancellation written while the write ran reads as no write.
+pub(crate) fn rows_written<D: WorkerRegistrationData>(
+    registry: &WorkerRegistry,
+    rows: &Objects<ModelWorkerSnapshot>,
+    state: &WorkflowState<D>,
+) -> HashMap<String, u64> {
+    let wrote = state
+        .step_states
+        .get(&StepId::new(WRITE_WORKERS_AT_DOOR_STEP))
+        .is_some_and(|step| step.status == StepStatus::Succeeded);
+    if !wrote {
+        return HashMap::new();
+    }
+    state
+        .context
+        .data
+        .get_actual_workers()
+        .into_iter()
+        .flatten()
+        .filter_map(|worker| {
+            let id = registry.get_id_by_url(worker.url())?;
+            let entry = registry.get(&id)?;
+            rows.standing_of(&id, &entry)?;
+            Some((id.as_str().to_string(), entry.revision()))
         })
         .collect()
 }
@@ -180,6 +242,114 @@ fn models_left(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -> HashSe
         .collect()
 }
 
+/// Write a batch to the registry, whole or not at all, and do what follows
+/// the write ([`after_write`]).
+fn write_batch(
+    app_context: &AppContext,
+    workers: &[Arc<dyn Worker>],
+    registration_mode: &WorkerRegistrationMode,
+    symphony_table: Option<&'static str>,
+) -> WorkflowResult<()> {
+    let registry = &app_context.worker_registry;
+    check_batch(registry, workers, registration_mode)?;
+
+    // Taken before the registry is written: a replacement that changes a
+    // worker's group must refresh the group it leaves as well as the one
+    // it joins, and only the registry as it is now knows the former.
+    let touched_groups = pool_groups_touched(registry, workers);
+
+    let mut worker_ids = Vec::with_capacity(workers.len());
+    for worker in workers {
+        let worker_id = register_worker(registry, Arc::clone(worker), registration_mode)?;
+        debug!(
+            "Registered worker {} (model: {}) with ID {:?}",
+            worker.redacted_url(),
+            worker.model_id(),
+            worker_id
+        );
+        // A decode worker's running window is the PD admission bound; one
+        // that reports none leaves the gate off for it, which is said here
+        // rather than inferred later from absent series.
+        pd_admission::announce_decode_window(worker.as_ref());
+        worker_ids.push(worker_id);
+    }
+
+    after_write(app_context, workers, &touched_groups, symphony_table);
+
+    // WorkerMonitor subscribes to registry events directly (see
+    // `smg_worker::load::monitor::WorkerMonitor::start_event_loop`), so this
+    // step no longer has to push group-add notifications. The
+    // monitor's event loop reconciles the impacted groups as soon as the
+    // registry emits `WorkerEvent::Registered` or `WorkerEvent::Replaced`.
+
+    // Note: worker_ids are stored for potential future use but not persisted
+    // as they are internal registry identifiers
+    debug!(
+        "Registered {} workers with IDs: {:?}",
+        worker_ids.len(),
+        worker_ids
+    );
+    Ok(())
+}
+
+/// What a registration does beside the registry's write, once every worker
+/// of the batch stands in the registry: the parser series of
+/// `symphony_table`, the port probe, the retry settings of each model and
+/// the pool sizes of `groups`.
+fn after_write(
+    app_context: &AppContext,
+    workers: &[Arc<dyn Worker>],
+    groups: &PoolGroups,
+    symphony_table: Option<&'static str>,
+) {
+    // Under Symphony the failure classes of the table that reads these
+    // workers' model exist at zero from here, once every worker of the
+    // batch is in the registry: a registration refused before leaves no
+    // series behind. The table was resolved where the model card and the
+    // names are (none for an HTTP worker, the legacy parsers or a model
+    // no table reads).
+    if let Some(table) = symphony_table {
+        telemetry::init_table_series(table);
+    }
+
+    // The rendezvous port a disaggregated worker advertises is probed once
+    // the worker is in the registry (DP ranks share the port), off the
+    // registration path: a registration refused before, or a workflow
+    // that failed before this step, is never reported as a registered
+    // worker with a dead port.
+    if let Some(worker) = workers.first() {
+        bootstrap_probe::spawn_bootstrap_port_probe(worker.as_ref());
+    }
+
+    // Update per-model retry config (last write wins).
+    // Only update if the worker has non-empty retry overrides in its spec.
+    for worker in workers {
+        let resilience_spec = &worker.metadata().spec.resilience;
+        let has_retry_overrides = resilience_spec.max_retries.is_some()
+            || resilience_spec.initial_backoff_ms.is_some()
+            || resilience_spec.max_backoff_ms.is_some()
+            || resilience_spec.backoff_multiplier.is_some()
+            || resilience_spec.jitter_factor.is_some()
+            || resilience_spec.disable_retry.is_some();
+
+        if has_retry_overrides {
+            let resolved = worker.resilience();
+            let retry_config = resolved.retry.clone();
+            for model_id in worker_model_ids(worker) {
+                app_context.worker_registry.set_model_retry_config(
+                    &model_id,
+                    retry_config.clone(),
+                    resolved.retry_enabled,
+                );
+            }
+        }
+    }
+
+    // Update Layer 3 worker pool size metrics per unique
+    // `(worker_type, connection_mode, model_id)` the registration touched.
+    refresh_worker_pool_sizes(&app_context.worker_registry, groups);
+}
+
 /// A test's hold on the registry step, between the engine's cancel read for
 /// the step and the step's registry write: the window a `DELETE`'s cancel
 /// lands in while the step runs, whose worker the job's end then reads from
@@ -239,82 +409,18 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
             }
         }
 
-        let mut worker_ids = Vec::with_capacity(workers.len());
         let registration_mode = context.data.registration_mode();
 
-        check_batch(&app_context.worker_registry, workers, &registration_mode)?;
-
-        // Taken before the registry is written: a replacement that changes a
-        // worker's group must refresh the group it leaves as well as the one
-        // it joins, and only the registry as it is now knows the former.
-        let touched_groups = pool_groups_touched(&app_context.worker_registry, workers);
+        // Read before the registry is written: only the registry as it is
+        // now knows the workers this registration replaces.
         let left_models = models_left(&app_context.worker_registry, workers);
 
-        for worker in workers {
-            let worker_id = register_worker(
-                &app_context.worker_registry,
-                Arc::clone(worker),
-                &registration_mode,
-            )?;
-            debug!(
-                "Registered worker {} (model: {}) with ID {:?}",
-                worker.redacted_url(),
-                worker.model_id(),
-                worker_id
-            );
-            // A decode worker's running window is the PD admission bound; one
-            // that reports none leaves the gate off for it, which is said here
-            // rather than inferred later from absent series.
-            pd_admission::announce_decode_window(worker.as_ref());
-            worker_ids.push(worker_id);
-        }
-
-        // Under Symphony the failure classes of the table that reads these
-        // workers' model exist at zero from here, once every worker of the
-        // batch is in the registry: a registration refused above leaves no
-        // series behind. The table was resolved where the model card and the
-        // names are (none for an HTTP worker, the legacy parsers or a model
-        // no table reads).
-        if let Some(table) = context.data.symphony_table() {
-            telemetry::init_table_series(table);
-        }
-
-        // The rendezvous port a disaggregated worker advertises is probed once
-        // the worker is in the registry (DP ranks share the port), off the
-        // registration path: a registration refused above, or a workflow
-        // that failed before this step, is never reported as a registered
-        // worker with a dead port.
-        if let Some(worker) = workers.first() {
-            bootstrap_probe::spawn_bootstrap_port_probe(worker.as_ref());
-        }
-
-        // Update per-model retry config (last write wins).
-        // Only update if the worker has non-empty retry overrides in its spec.
-        for worker in workers {
-            let resilience_spec = &worker.metadata().spec.resilience;
-            let has_retry_overrides = resilience_spec.max_retries.is_some()
-                || resilience_spec.initial_backoff_ms.is_some()
-                || resilience_spec.max_backoff_ms.is_some()
-                || resilience_spec.backoff_multiplier.is_some()
-                || resilience_spec.jitter_factor.is_some()
-                || resilience_spec.disable_retry.is_some();
-
-            if has_retry_overrides {
-                let resolved = worker.resilience();
-                let retry_config = resolved.retry.clone();
-                for model_id in worker_model_ids(worker) {
-                    app_context.worker_registry.set_model_retry_config(
-                        &model_id,
-                        retry_config.clone(),
-                        resolved.retry_enabled,
-                    );
-                }
-            }
-        }
-
-        // Update Layer 3 worker pool size metrics per unique
-        // `(worker_type, connection_mode, model_id)` the registration touched.
-        refresh_worker_pool_sizes(&app_context.worker_registry, &touched_groups);
+        write_batch(
+            &app_context,
+            workers,
+            &registration_mode,
+            context.data.symphony_table(),
+        )?;
 
         // A replacement that moved a worker to another model, or that lists
         // a model fewer, takes the policy of each model no worker of this
@@ -325,19 +431,65 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
             }
         }
 
-        // WorkerMonitor subscribes to registry events directly (see
-        // `smg_worker::load::monitor::WorkerMonitor::start_event_loop`), so this
-        // step no longer has to push group-add notifications. The
-        // monitor's event loop reconciles the impacted groups as soon as the
-        // registry emits `WorkerEvent::Registered` or `WorkerEvent::Replaced`.
+        Ok(StepResult::Success)
+    }
 
-        // Note: worker_ids are stored for potential future use but not persisted
-        // as they are internal registry identifiers
-        debug!(
-            "Registered {} workers with IDs: {:?}",
-            worker_ids.len(),
-            worker_ids
-        );
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        false
+    }
+}
+
+#[async_trait]
+impl StepExecutor<WorkerWorkflowData> for RegisterBesideRowsStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<WorkerWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let app_context = require_app_context(context.data.get_app_context())?.clone();
+        let Some(kind) = context.data.worker_kind else {
+            return Ok(StepResult::Skip);
+        };
+        let workers = context
+            .data
+            .get_actual_workers()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
+        let symphony_table = context.data.symphony_table();
+
+        match kind {
+            // The door wrote these workers' rows, and the holder laid their
+            // objects in the registry.
+            WorkerKind::Local => {
+                for worker in workers {
+                    pd_admission::announce_decode_window(worker.as_ref());
+                }
+                let groups = workers
+                    .iter()
+                    .map(|worker| pool_group(worker.as_ref()))
+                    .collect();
+                after_write(&app_context, workers, &groups, symphony_table);
+            }
+            WorkerKind::External => {
+                let registry = &app_context.worker_registry;
+                for worker in workers {
+                    let row_holds_url = registry
+                        .get_id_by_url(worker.url())
+                        .is_some_and(|id| self.rows.standing(&id).is_some());
+                    if row_holds_url {
+                        return Err(step_failed(format!(
+                            "{WORKER_URL_TAKEN}: worker {} is a row of the policy \
+                             controller's store",
+                            worker.redacted_url()
+                        )));
+                    }
+                }
+                write_batch(
+                    &app_context,
+                    workers,
+                    &context.data.registration_mode(),
+                    symphony_table,
+                )?;
+            }
+        }
 
         Ok(StepResult::Success)
     }
@@ -349,11 +501,22 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::model_card::ModelCard;
+    use openai_protocol::{model_card::ModelCard, worker::WorkerSpec};
+    use smg_policy_controller::{
+        store::{Maker, MemoryStore},
+        worker_host::{facts, Expect},
+    };
     use smg_worker::jobs::WorkerJobAsker;
+    use wfaas::WorkflowInstanceId;
 
     use super::*;
-    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+    use crate::{
+        app_context::testing::app_context_for_tests,
+        config::RouterConfig,
+        policy_controller::feed::{feed, Feed},
+        routers::grpc::backend_client::{BackendConnector, BasicWorkerBuilder},
+        workflow::steps::create_worker_workflow_data,
+    };
 
     fn worker_at(url: &str, model_id: &str) -> Arc<dyn Worker> {
         Arc::new(
@@ -365,6 +528,90 @@ mod tests {
 
     fn worker(model_id: &str) -> Arc<dyn Worker> {
         worker_at("http://worker:8080", model_id)
+    }
+
+    /// A registry with a feed over it, and a host that reads the registry.
+    fn beside_rows() -> (Arc<WorkerRegistry>, Feed, Arc<AppContext>) {
+        let registry = Arc::new(WorkerRegistry::new());
+        let feed = feed(
+            &Arc::new(MemoryStore::default()),
+            &registry,
+            BackendConnector::shared(),
+        );
+        let host = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        (registry, feed, host)
+    }
+
+    /// The step's context once a registration of `kind` built `worker`.
+    fn built(
+        host: &Arc<AppContext>,
+        kind: WorkerKind,
+        worker: &Arc<dyn Worker>,
+    ) -> WorkflowContext<WorkerWorkflowData> {
+        let mut data = create_worker_workflow_data(
+            WorkerSpec::new(worker.url()),
+            WorkerRegistrationMode::Upsert,
+            Arc::clone(host),
+            WorkerJobAsker::Api,
+        );
+        data.worker_kind = Some(kind);
+        data.actual_workers = Some(vec![Arc::clone(worker)]);
+        WorkflowContext::new(WorkflowInstanceId::new(), data)
+    }
+
+    /// A local worker is its row's to lay in the registry: the step writes
+    /// no entry for it and keeps what follows a registration, here the
+    /// retry settings of its model. A provider's worker stays outside the
+    /// store: the step registers it.
+    #[tokio::test]
+    async fn beside_rows_the_step_registers_a_providers_worker_and_no_local_one() {
+        let (registry, feed, host) = beside_rows();
+        let step = RegisterBesideRowsStep::new(Arc::clone(&feed.objects));
+
+        let mut spec = WorkerSpec::new("http://local:8000");
+        spec.models = vec![ModelCard::new("m")].into();
+        spec.resilience.max_retries = Some(7);
+        let local: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::from_spec(spec).build());
+        let mut context = built(&host, WorkerKind::Local, &local);
+        assert_eq!(
+            step.execute(&mut context).await.unwrap(),
+            StepResult::Success
+        );
+        assert!(registry.is_empty());
+        assert!(registry.get_retry_config("m").is_some());
+
+        let provider = worker_at("https://provider.example/v1", "p");
+        let mut context = built(&host, WorkerKind::External, &provider);
+        assert_eq!(
+            step.execute(&mut context).await.unwrap(),
+            StepResult::Success
+        );
+        let id = registry.get_id_by_url(provider.url()).unwrap();
+        assert!(registry
+            .get(&id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry, &provider)));
+        assert!(feed.objects.standing(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_provider_at_a_url_a_row_holds_is_refused_by_name() {
+        let (registry, feed, host) = beside_rows();
+        let url = "http://worker:8080";
+        let row = worker("m");
+        feed.door
+            .found(&Maker::Control, Expect::Anything, url, &|standing| {
+                facts(row.as_ref(), standing)
+            })
+            .unwrap();
+        let laid = registry.get_by_url(url).unwrap();
+
+        let step = RegisterBesideRowsStep::new(Arc::clone(&feed.objects));
+        let mut context = built(&host, WorkerKind::External, &worker("p"));
+        let error = step.execute(&mut context).await.unwrap_err().to_string();
+        assert!(error.contains(WORKER_URL_TAKEN), "{error}");
+        assert!(registry
+            .get_by_url(url)
+            .is_some_and(|entry| Arc::ptr_eq(&entry, &laid)));
     }
 
     /// The registry names what a registration left in it: its own workers
