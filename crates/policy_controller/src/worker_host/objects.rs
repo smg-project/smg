@@ -100,13 +100,42 @@ struct Held {
     /// The facts a row's object was built from, by the row's id: what a
     /// snapshot read holds the row against.
     facts: HashMap<WorkerId, WorkerFacts>,
+    /// The rows of each engine's ranks, by the address they dial: what
+    /// routes a rank's batch on the engine's one events stream.
+    ranks: HashMap<String, Vec<(u16, WorkerId)>>,
 }
 
 impl Held {
     /// State `row`'s facts in the entry, where every lay states them: at a
-    /// build, at a hand-in, and where a kept object's entry moves.
+    /// build, at a hand-in, and where a kept object's entry moves. The
+    /// row's place among its engine's ranks moves with them: a row laid
+    /// again leaves the rank its old facts stated.
     fn state(&mut self, row: &WorkerRow) {
+        self.unrank(row.id);
+        self.rank(row.id, &row.facts);
         self.facts.insert(row.id, row.facts.clone());
+    }
+
+    /// `row` stands among its engine's ranks, by the facts it is laid from.
+    fn rank(&mut self, row: WorkerId, facts: &WorkerFacts) {
+        self.ranks
+            .entry(dial_address(facts).to_owned())
+            .or_default()
+            .push((facts.dp_rank, row));
+    }
+
+    /// Take `row` out of its engine's ranks, by the facts it was laid from.
+    fn unrank(&mut self, row: WorkerId) {
+        let Some(address) = self.facts.get(&row).map(dial_address) else {
+            return;
+        };
+        let Some(rows) = self.ranks.get_mut(address) else {
+            return;
+        };
+        rows.retain(|&(_, ranked)| ranked != row);
+        if rows.is_empty() {
+            self.ranks.remove(address);
+        }
     }
 }
 
@@ -426,6 +455,24 @@ impl<G: Generation> Objects<G> {
         self.held.read().objects.get(&row).cloned()
     }
 
+    /// The row of rank `rank` of the engine that `row` is a rank of: `row`
+    /// itself where that is its own rank, else the row that dials the same
+    /// address under that rank. `None` where the holder laid no such row,
+    /// or holds no object for `row`. A writer that holds an engine's one
+    /// events stream routes a rank's batch by it.
+    pub fn rank_row(&self, row: WorkerId, rank: u16) -> Option<WorkerId> {
+        let held = self.held.read();
+        let facts = held.facts.get(&row)?;
+        if facts.dp_rank == rank {
+            return Some(row);
+        }
+        held.ranks
+            .get(dial_address(facts))?
+            .iter()
+            .find(|&&(ranked, _)| ranked == rank)
+            .map(|&(_, row)| row)
+    }
+
     /// How many objects stand.
     pub fn len(&self) -> usize {
         self.held.read().objects.len()
@@ -657,6 +704,7 @@ impl<G: Generation> Objects<G> {
         let mut entries = self.held.write();
         entries.objects.remove(&id);
         entries.rows.remove(&held);
+        entries.unrank(id);
         entries.facts.remove(&id);
     }
 
@@ -2643,5 +2691,101 @@ mod tests {
             "{at_replacement:?}"
         );
         WATCHED.set(None);
+    }
+
+    /// An engine's ranks are answered by their rows, from either of them. A
+    /// rank no row holds is answered by none, and a row that is its own
+    /// engine has its one rank.
+    #[test]
+    fn an_engines_ranks_are_answered_by_their_rows() {
+        let replica = Replica::new();
+        let lower = replica.store.upsert(rank_facts(A, C, 0)).id();
+        let upper = replica.store.upsert(rank_facts(B, C, 1)).id();
+        let alone = replica.store.upsert(facts(D, 1)).id();
+        replica.follow();
+        let objects = &replica.objects;
+        for row in [lower, upper] {
+            assert_eq!(objects.rank_row(row, 0), Some(lower));
+            assert_eq!(objects.rank_row(row, 1), Some(upper));
+            assert_eq!(objects.rank_row(row, 2), None);
+        }
+        assert_eq!(objects.rank_row(alone, 0), Some(alone));
+        assert_eq!(objects.rank_row(alone, 1), None);
+    }
+
+    #[test]
+    fn a_rank_row_that_leaves_is_answered_no_longer() {
+        let replica = Replica::new();
+        let lower = replica.store.upsert(rank_facts(A, C, 0)).id();
+        let upper = replica.store.upsert(rank_facts(B, C, 1)).id();
+        replica.follow();
+        assert_eq!(replica.objects.rank_row(lower, 1), Some(upper));
+
+        replica.remove(B);
+        replica.follow();
+        assert_eq!(replica.objects.rank_row(lower, 1), None);
+        assert_eq!(replica.objects.rank_row(upper, 1), None);
+        assert_eq!(replica.objects.rank_row(lower, 0), Some(lower));
+    }
+
+    /// A rank's key that comes back as a new incarnation is another row, and
+    /// the rank is answered by it. A row whose facts move to another rank is
+    /// answered under its new rank alone.
+    #[test]
+    fn a_rank_row_laid_again_is_answered_by_its_new_row() {
+        let replica = Replica::new();
+        let lower = replica.store.upsert(rank_facts(A, C, 0)).id();
+        let upper = replica.store.upsert(rank_facts(B, C, 1)).id();
+        replica.follow();
+
+        let again = replica
+            .store
+            .upsert(WorkerFacts {
+                incarnation: 2,
+                ..rank_facts(B, C, 1)
+            })
+            .id();
+        replica.follow();
+        assert_ne!(again, upper);
+        assert_eq!(replica.objects.rank_row(lower, 1), Some(again));
+
+        let moved = replica
+            .store
+            .upsert(WorkerFacts {
+                incarnation: 2,
+                dp_rank: 2,
+                dp_size: 3,
+                ..rank_facts(B, C, 1)
+            })
+            .id();
+        replica.follow();
+        assert_eq!(moved, again);
+        assert_eq!(replica.objects.rank_row(lower, 1), None);
+        assert_eq!(replica.objects.rank_row(lower, 2), Some(again));
+    }
+
+    /// A kept object's row that moves with no hand-in keeps its object, and
+    /// its entry moves to the row's facts: the engine's rank is answered by
+    /// them.
+    #[test]
+    fn a_kept_row_that_moves_with_no_hand_in_is_answered_under_its_new_rank() {
+        let (replica, door) = handing();
+        let lower = replica.store.upsert(rank_facts(A, C, 0)).id();
+        let kept = built(B, KEY_B);
+        registered(&replica, &door, &kept, Expect::Anything).expect("the write");
+        let row = replica.row(B);
+        assert_eq!(replica.objects.rank_row(lower, 1), None);
+
+        // The row becomes rank 1 of the first row's engine.
+        let moved = WorkerFacts {
+            engine: C.to_string(),
+            dp_rank: 1,
+            dp_size: 2,
+            ..row.facts.clone()
+        };
+        assert_eq!(replica.store.upsert(moved).id(), row.id);
+        replica.follow();
+        assert!(Arc::ptr_eq(&replica.at(B), &kept));
+        assert_eq!(replica.objects.rank_row(lower, 1), Some(row.id));
     }
 }

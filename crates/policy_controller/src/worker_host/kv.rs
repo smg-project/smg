@@ -14,6 +14,16 @@
 //! A row opened without group facts loses any cached blocks and cursor
 //! before its feed starts.
 //!
+//! # The ranks of an engine
+//!
+//! A data-parallel engine is one row a rank, and it publishes one events
+//! stream for all of them. The stream is its rank 0 row's: a row above
+//! rank 0 opens no feed. A batch names its rank, and the adapter writes it
+//! to that rank's row, which it asks the holder for. What a row's batches
+//! showed of its groups is kept for the row a batch is written to. A
+//! stream's reset, its new connection and its removal reach every rank's
+//! row the stream fed.
+//!
 //! # The block size
 //!
 //! A batch the store takes names the model's block size: the widest block
@@ -34,8 +44,9 @@
 //! - A store narrower than the worker's block size of record is indexed.
 //! - The events of a cache group other than main attention feed no view of
 //!   the group: they are passed over, unless the group is the main signal.
-//! - A row above rank 0 of a data-parallel worker opens no feed, so its rank
-//!   is not indexed: a stream is its engine's and resumes by rank 0.
+//! - A batch of a rank whose row the holder has not laid is passed over.
+//!   That row's index begins with the blocks stored once it is laid.
+//! - An adapter made with no holder writes every batch to its stream's row.
 
 use std::{
     collections::HashMap,
@@ -69,11 +80,30 @@ use crate::{
 
 /// The worker crate's KV event port over a store's KV event sink.
 pub struct KvAdapter<S: ?Sized> {
-    /// What each row's stream showed of its cache groups.
+    /// What each row's batches showed of its cache groups, by the row a
+    /// batch is written to.
     rows: Mutex<HashMap<WorkerId, GroupsShown>>,
     /// What the streams said of their models' block sizes.
     sizes: Mutex<Sizes>,
+    /// Where the ranks of an engine stand, where a host handed its holder.
+    ranks: Option<Arc<dyn Ranks>>,
+    /// The rows of other ranks each stream fed, by the stream's row: what
+    /// its reset, its new connection and its removal reach beside its own.
+    fed: Mutex<HashMap<WorkerId, Vec<WorkerId>>>,
     store: Arc<S>,
+}
+
+/// Where the ranks of an engine stand: the holder's answer, as the adapter
+/// reads it to route a batch.
+trait Ranks: Send + Sync {
+    /// The row of rank `rank` of the engine `row` is a rank of.
+    fn row_of(&self, row: WorkerId, rank: u16) -> Option<WorkerId>;
+}
+
+impl<G: Generation> Ranks for Objects<G> {
+    fn row_of(&self, row: WorkerId, rank: u16) -> Option<WorkerId> {
+        self.rank_row(row, rank)
+    }
 }
 
 /// What the adapter keeps to name a model's block size from its streams.
@@ -87,13 +117,34 @@ struct Sizes {
 }
 
 impl<S: ?Sized> KvAdapter<S> {
-    /// An adapter that writes `store`.
+    /// An adapter that writes `store`, every batch to its stream's row.
     pub fn new(store: Arc<S>) -> Self {
+        Self::over(store, None)
+    }
+
+    fn over(store: Arc<S>, ranks: Option<Arc<dyn Ranks>>) -> Self {
         Self {
             rows: Mutex::new(HashMap::new()),
             sizes: Mutex::new(Sizes::default()),
+            ranks,
+            fed: Mutex::new(HashMap::new()),
             store,
         }
+    }
+
+    /// The row a batch of `rank` on `id`'s stream is written to. Rank 0 is
+    /// the stream's own row, which alone opens a feed. Another rank is the
+    /// holder's answer: none while it has laid no row of that rank.
+    fn routed(&self, id: WorkerId, rank: u16) -> Option<WorkerId> {
+        match &self.ranks {
+            Some(ranks) if rank != 0 => ranks.row_of(id, rank),
+            _ => Some(id),
+        }
+    }
+
+    /// The rows of other ranks `id`'s stream fed.
+    fn fed_by(&self, id: WorkerId) -> Vec<WorkerId> {
+        self.fed.lock().get(&id).cloned().unwrap_or_default()
     }
 }
 
@@ -101,6 +152,23 @@ impl<S> KvAdapter<S>
 where
     S: store::KvEventSink<Batch = [KvEvent]> + ?Sized,
 {
+    /// What `row`'s batches showed so far. A row of another rank that
+    /// `id`'s stream feeds for the first time begins from nothing, as a
+    /// feed's own row does at its open: what the store kept of it was
+    /// decided by facts that are gone.
+    fn shown(&self, id: WorkerId, row: WorkerId) -> GroupsShown {
+        let known = self.rows.lock().get(&row).cloned();
+        if let Some(shown) = known {
+            return shown;
+        }
+        if row != id {
+            self.store.removed(row);
+            self.rows.lock().entry(row).or_default();
+            self.fed.lock().entry(id).or_default().push(row);
+        }
+        GroupsShown::default()
+    }
+
     /// A store the index took from `id`'s stream is `size` tokens wide: what
     /// it says of the block size of the model the row streams for, by the
     /// module's rule. A row no feed was opened for names no model.
@@ -149,10 +217,14 @@ where
         facts: BatchFacts,
         batch: &KvEventBatch,
     ) -> BatchOutcome {
+        // A rank whose row the holder has not laid has no place yet.
+        let Some(row) = self.routed(id, rank) else {
+            return BatchOutcome::Skipped;
+        };
         // The batch is decoded against a copy of what the row showed. The
         // copy stands only where the store took the batch: one it skipped
         // shows nothing.
-        let shown = self.rows.lock().get(&id).cloned().unwrap_or_default();
+        let shown = self.shown(id, row);
         let mut groups = shown.clone();
         let (restarted, mut events, width) = events(batch, &mut groups);
         // The store reads a clear among a batch's events as the header's
@@ -169,7 +241,7 @@ where
             let late = facts.snapshot.is_none()
                 && self
                     .store
-                    .cursor(id, rank)
+                    .cursor(row, rank)
                     .is_some_and(|cursor| facts.sequence <= cursor.applied);
             if !late {
                 if restarted {
@@ -193,10 +265,10 @@ where
                 unknown_before: chunk.unknown_before,
             }),
         };
-        match self.store.admit(id, rank, facts, &events) {
+        match self.store.admit(row, rank, facts, &events) {
             store::BatchOutcome::Applied => {
                 if groups != shown {
-                    self.rows.lock().insert(id, groups);
+                    self.rows.lock().insert(row, groups);
                 }
                 if let Some(width) = width {
                     self.learn(id, width);
@@ -212,6 +284,9 @@ where
 
     fn reconnected(&self, id: WorkerId) {
         self.store.reconnected(id);
+        for row in self.fed_by(id) {
+            self.store.reconnected(row);
+        }
     }
 
     fn resync(&self, id: WorkerId, rank: Option<u16>, reason: ResyncReason) {
@@ -223,11 +298,27 @@ where
             ResyncReason::GapCleared => store::ResyncReason::GapCleared,
             ResyncReason::Snapshot => store::ResyncReason::Snapshot,
         };
-        self.store.resync(id, rank, reason);
+        match rank {
+            // One rank's reset is its own row's, and a rank with no row
+            // holds nothing to reset.
+            Some(rank) => {
+                if let Some(row) = self.routed(id, rank) {
+                    self.store.resync(row, Some(rank), reason);
+                }
+            }
+            // The stream's reset reaches every row it fed, its own first.
+            None => {
+                self.store.resync(id, None, reason);
+                for row in self.fed_by(id) {
+                    self.store.resync(row, None, reason);
+                }
+            }
+        }
     }
 
     fn cursor(&self, id: WorkerId, rank: u16) -> Option<KvCursor> {
-        self.store.cursor(id, rank).map(|cursor| KvCursor {
+        let row = self.routed(id, rank)?;
+        self.store.cursor(row, rank).map(|cursor| KvCursor {
             applied: cursor.applied,
             replay_pending: cursor.replay_pending,
             degraded: cursor.degraded,
@@ -238,6 +329,13 @@ where
         self.rows.lock().remove(&id);
         self.sizes.lock().models.remove(&id);
         self.store.removed(id);
+        // The rows of other ranks the stream fed go with it: no stream
+        // feeds them now.
+        let fed = self.fed.lock().remove(&id).unwrap_or_default();
+        for row in fed {
+            self.rows.lock().remove(&row);
+            self.store.removed(row);
+        }
     }
 
     fn block_size(&self, model: &str) -> Option<u32> {
@@ -374,18 +472,22 @@ pub struct KvHost<G, S: ?Sized> {
     upper_rank: AtomicU64,
 }
 
-impl<G, S: ?Sized> KvHost<G, S> {
+impl<G: Generation, S: ?Sized> KvHost<G, S> {
     /// A host whose subscriptions feed `store`, each under the row
-    /// `objects` holds for its worker.
+    /// `objects` holds for its worker. A batch of another rank of the
+    /// worker's engine is written to the row `objects` holds for that rank.
     pub fn new(objects: Arc<Objects<G>>, store: Arc<S>) -> Self {
+        let ranks: Arc<dyn Ranks> = Arc::clone(&objects) as _;
         Self {
             objects,
-            sink: Arc::new(KvAdapter::new(store)),
+            sink: Arc::new(KvAdapter::over(store, Some(ranks))),
             no_row: AtomicU64::new(0),
             upper_rank: AtomicU64::new(0),
         }
     }
+}
 
+impl<G, S: ?Sized> KvHost<G, S> {
     /// How many subscriptions got no feed so far, by the reason.
     pub fn unfed(&self) -> Unfed {
         Unfed {
@@ -414,8 +516,8 @@ where
         {
             self.sink.set_block_size(model, size);
         }
-        // A stream is its engine's and resumes by rank 0: a feed that is one
-        // row cannot hold a rank above it to that.
+        // A stream is its engine's and resumes by rank 0: a row above it
+        // opens no feed, and its engine's rank 0 stream feeds it.
         if worker.dp_rank().is_some_and(|rank| rank > 0) {
             return Err(NoFeed::UpperRank);
         }
@@ -470,7 +572,7 @@ where
                 self.upper_rank.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     worker_url = %worker.redacted_url(),
-                    "no KV event feed for a rank above 0: its rank is not indexed"
+                    "no KV event feed for a rank above 0: its engine's rank 0 stream feeds it"
                 );
                 None
             }
@@ -1825,5 +1927,224 @@ mod tests {
         assert_eq!(f.store.block_size(MODEL), None);
         f.store.set_block_size(MODEL, 16);
         assert_eq!(f.store.block_size(MODEL), Some(16));
+    }
+
+    const UPPER: &str = "http://a:8000#1";
+
+    /// The row of one rank of the engine at [`URL`], which asks for events.
+    fn rank_facts(key: &str, dp_rank: u16) -> WorkerFacts {
+        WorkerFacts {
+            key: key.into(),
+            engine: URL.into(),
+            incarnation: 1,
+            models: vec![MODEL.into()],
+            dp_rank,
+            dp_size: 2,
+            signals: Signals {
+                events: true,
+                ..Signals::default()
+            },
+            ..WorkerFacts::default()
+        }
+    }
+
+    /// An engine of two ranks: its rank 0 row, the host that follows the
+    /// store, and the feed the host opened for that row.
+    struct Ranked {
+        store: Arc<MemoryStore>,
+        host: KvHost<Members, Store>,
+        sink: Arc<KvAdapter<Store>>,
+        lower: WorkerId,
+    }
+
+    impl Ranked {
+        /// Rank 0's row alone: rank 1's is laid by [`Self::upper`].
+        fn new() -> Self {
+            let store = Arc::new(MemoryStore::new());
+            let lower = store.upsert(rank_facts(URL, 0)).id();
+            let objects = Arc::new(Objects::new(Arc::new(WorkerRegistry::new())));
+            objects.follow(store.as_ref());
+            let host = KvHost::new(objects, Arc::clone(&store) as Arc<Store>);
+            let worker = host
+                .objects
+                .registry()
+                .get_by_url(URL)
+                .expect("the rank 0 row's object");
+            let (sink, row) = host
+                .open(host.enroll(&worker, MODEL), &worker, MODEL)
+                .expect("the rank 0 row's feed");
+            assert_eq!(row, lower);
+            Self {
+                store,
+                host,
+                sink,
+                lower,
+            }
+        }
+
+        /// Rank 1's row, laid where it is not yet.
+        fn upper(&self) -> WorkerId {
+            let upper = self.store.upsert(rank_facts(UPPER, 1)).id();
+            self.host.objects.follow(self.store.as_ref());
+            upper
+        }
+
+        /// One batch of `rank` on the engine's stream, at `sequence`.
+        fn admit(&self, rank: u16, sequence: u64, data: Data) -> BatchOutcome {
+            self.sink
+                .admit(self.lower, rank, facts(sequence), &batch([data]))
+        }
+
+        /// The blocks rank 0's row and rank 1's row hold.
+        fn blocks(&self, upper: WorkerId) -> (usize, usize) {
+            (
+                self.store.indexed_blocks(self.lower, 0),
+                self.store.indexed_blocks(upper, 1),
+            )
+        }
+    }
+
+    /// A batch of rank 1 on the engine's one stream is indexed under rank
+    /// 1's row, and a batch of rank 0 under the stream's own.
+    #[test]
+    fn a_batch_of_rank_one_is_indexed_under_rank_ones_row() {
+        let f = Ranked::new();
+        let upper = f.upper();
+        let store = |hash| Data::Stored(wide_store(hash, 16));
+        assert_eq!(f.admit(1, 1, store(1)), BatchOutcome::Applied);
+        assert_eq!(f.blocks(upper), (0, 1));
+        assert_eq!(f.admit(0, 1, store(2)), BatchOutcome::Applied);
+        assert_eq!(f.admit(0, 2, store(3)), BatchOutcome::Applied);
+        assert_eq!(f.blocks(upper), (2, 1));
+    }
+
+    /// A batch of a rank whose row the holder has not laid is passed over,
+    /// and the same batch is taken once the row is laid.
+    #[test]
+    fn a_batch_of_a_rank_with_no_row_is_passed_over() {
+        let f = Ranked::new();
+        let store = Data::Stored(wide_store(1, 16));
+        assert_eq!(f.admit(1, 1, store.clone()), BatchOutcome::Skipped);
+        assert_eq!(f.sink.cursor(f.lower, 1), None);
+        let upper = f.upper();
+        assert_eq!(f.admit(1, 1, store), BatchOutcome::Applied);
+        assert_eq!(f.blocks(upper), (0, 1));
+    }
+
+    /// A rank's cursor and its reset are its own row's. A rank with no row
+    /// has no cursor and resets nothing. The stream's reset reaches every
+    /// rank it fed.
+    #[test]
+    fn a_ranks_cursor_and_resync_reach_its_own_row() {
+        let f = Ranked::new();
+        let upper = f.upper();
+        let store = |hash| Data::Stored(wide_store(hash, 16));
+        assert_eq!(f.admit(0, 3, store(1)), BatchOutcome::Applied);
+        assert_eq!(f.admit(1, 7, store(2)), BatchOutcome::Applied);
+        let applied = |rank| f.sink.cursor(f.lower, rank).map(|cursor| cursor.applied);
+        assert_eq!(
+            (applied(0), applied(1), applied(2)),
+            (Some(3), Some(7), None)
+        );
+
+        f.sink.resync(f.lower, Some(1), ResyncReason::GapCleared);
+        assert_eq!(f.blocks(upper), (1, 0));
+        f.sink.resync(f.lower, Some(2), ResyncReason::GapCleared);
+        assert_eq!(f.store.resyncs(store::ResyncReason::GapCleared), 1);
+
+        assert_eq!(f.admit(1, 8, store(3)), BatchOutcome::Applied);
+        assert_eq!(f.blocks(upper), (1, 1));
+        f.sink.resync(f.lower, None, ResyncReason::OutOfRange);
+        assert_eq!(f.blocks(upper), (0, 0));
+        assert_eq!(f.store.resyncs(store::ResyncReason::OutOfRange), 2);
+    }
+
+    /// An engine that leaves clears every rank its stream fed, and the
+    /// adapter keeps nothing of them.
+    #[test]
+    fn a_removed_engine_clears_every_rank() {
+        let f = Ranked::new();
+        let upper = f.upper();
+        let store = |hash| Data::Stored(wide_store(hash, 16));
+        assert_eq!(f.admit(0, 1, store(1)), BatchOutcome::Applied);
+        assert_eq!(f.admit(1, 1, store(2)), BatchOutcome::Applied);
+        assert_eq!(f.blocks(upper), (1, 1));
+        f.sink.removed(f.lower);
+        assert_eq!(f.blocks(upper), (0, 0));
+        assert_eq!(f.store.cursor(upper, 1), None);
+        assert!(f.sink.rows.lock().is_empty());
+        assert!(f.sink.fed.lock().is_empty());
+    }
+
+    /// A new connection of the engine's stream is every fed rank's: a
+    /// rank's first batch below its cursor then reads as a publisher that
+    /// started over.
+    #[test]
+    fn a_reconnect_reaches_every_rank() {
+        let f = Ranked::new();
+        let upper = f.upper();
+        assert_eq!(
+            f.admit(1, 7, Data::Stored(wide_store(1, 16))),
+            BatchOutcome::Applied
+        );
+        f.sink.reconnected(f.lower);
+        assert_eq!(
+            f.sink.admit(f.lower, 1, facts(6), &batch([])),
+            BatchOutcome::Applied
+        );
+        assert_eq!(f.blocks(upper), (0, 0));
+    }
+
+    /// What a rank's batches showed of its groups is its own row's. A group
+    /// shown as another kind on rank 1 keeps that group's removal from rank
+    /// 1's index, and means nothing for rank 0.
+    #[test]
+    fn the_admission_state_is_the_routed_rows() {
+        let f = Ranked::new();
+        let upper = f.upper();
+        let shown = batch([
+            Data::Stored(main_store(1, 0)),
+            Data::Stored(window_store(&[1], 2, false)),
+        ]);
+        assert_eq!(
+            f.sink.admit(f.lower, 1, facts(1), &shown),
+            BatchOutcome::Applied
+        );
+        assert_eq!(
+            f.admit(0, 1, Data::Stored(stored(1))),
+            BatchOutcome::Applied
+        );
+        assert_eq!(f.blocks(upper), (1, 1));
+        let removal = || Data::Removed(group_removal(&[1], 2));
+        // On rank 1 the removal is the window group's: the main block stays.
+        assert_eq!(f.admit(1, 2, removal()), BatchOutcome::Applied);
+        // Rank 0 showed no group: the same removal is its main block's.
+        assert_eq!(f.admit(0, 2, removal()), BatchOutcome::Applied);
+        assert_eq!(f.blocks(upper), (0, 1));
+    }
+
+    /// A rank's row the stream feeds for the first time begins from
+    /// nothing, as a feed's own row does at its open: what the store kept
+    /// of it was another writer's.
+    #[test]
+    fn a_ranks_row_the_stream_feeds_first_begins_from_nothing() {
+        let f = Ranked::new();
+        let upper = f.upper();
+        // Another adapter over the same store wrote the row before.
+        let other = KvAdapter::new(Arc::clone(&f.store) as Arc<Store>);
+        let before = batch([Data::Stored(wide_store(1, 16))]);
+        assert_eq!(
+            other.admit(upper, 1, facts(7), &before),
+            BatchOutcome::Applied
+        );
+        assert_eq!(f.blocks(upper), (0, 1));
+        // A batch below that cursor is the stream's first for the row.
+        assert_eq!(
+            f.admit(1, 3, Data::Stored(wide_store(2, 16))),
+            BatchOutcome::Applied
+        );
+        assert_eq!(f.blocks(upper), (0, 1));
+        let applied = f.sink.cursor(f.lower, 1).map(|cursor| cursor.applied);
+        assert_eq!(applied, Some(3));
     }
 }
