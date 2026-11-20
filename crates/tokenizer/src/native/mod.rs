@@ -298,9 +298,10 @@ const PIECE_CACHE_TOTAL_CAPACITY: usize = 16 * PIECE_CACHE_CAPACITY;
 /// thread of eight to sixteen holds 131,072 packed slots, and the table
 /// 262,144 for each of them, where a thread held 524,288; the maps and the
 /// wide tables, bounded by the same share, hold a quarter. An encoder that
-/// fewer threads call, or whose misses do not wait (the sentencepiece path,
-/// and a byte-level table that does not merge every short piece), is as it
-/// was: the whole share, and no learned table.
+/// fewer threads call, or whose `misses_wait` flag is off (the sentencepiece
+/// path waits by its own rule on a far seed, but its threads do not share;
+/// a byte-level table that does not merge every short piece does not wait),
+/// is as it was: the whole share, and no learned table.
 const GROWN_SHARE_PART: usize = 4;
 /// The threads that must call an encoder before its threads share what
 /// they merge: eight, and only on an encoder whose misses wait
@@ -528,6 +529,12 @@ const WAITING_PIECES: usize = 32;
 /// few pieces waiting over hundreds of tokens, 3 to 7 % of the time of a
 /// text of 2k tokens).
 const WAITING_GAP: usize = 32;
+/// Slots of a seed up to which its lines are near a thread (4 MiB of
+/// entries and tags): a first sight of the sentencepiece path waits only on
+/// a larger seed (measured: with the wait, new text of 256 and of 2k tokens
+/// was 11 to 13 % slower on a vocabulary of 32k entries and 5 to 15 %
+/// faster by its median text on one of 262k).
+const NEAR_SEED_SLOTS: usize = 131_072;
 
 /// A short piece the thread's packed table missed, waiting for its answer
 /// (see `Native::waits`): where the probe ended, with the piece's key; where
@@ -602,6 +609,9 @@ struct PieceCache {
     /// The entries the count-bounded tiers must hold before a thread that
     /// rests asks again; zero for a thread that does not rest.
     asks_from: usize,
+    /// The vocabulary's form of a waiting piece being merged on the
+    /// sentencepiece path: a scratch string of the thread.
+    mapped: String,
 }
 
 impl PieceCache {
@@ -626,6 +636,7 @@ impl PieceCache {
             asked: 0,
             of_use: 0,
             asks_from: 0,
+            mapped: String::new(),
         }
     }
 
@@ -1446,7 +1457,9 @@ pub(crate) struct NativeEncoder {
     /// table merges every short piece
     /// ([`Self::merges_every_short_piece`]). Only a miss that waits asks
     /// the learned table, so only such an encoder's threads share what
-    /// they merge ([`Self::enough_callers`]).
+    /// they merge ([`Self::enough_callers`]). The sentencepiece path, whose
+    /// character symbols merge every piece, waits by its own rule
+    /// ([`Self::seeded_raw`]) with this flag off: its threads do not share.
     misses_wait: bool,
     /// The vocabulary's entries longer than the seed's keys as a filter,
     /// read with the seed when the pass read every entry (`None` on the
@@ -3887,7 +3900,8 @@ impl NativeEncoder {
     }
 
     /// The wait of a miss of a young thread or of one that shares
-    /// (`PieceCache::shares`; [`Self::seeded`] asks). A first sight reads
+    /// (`PieceCache::shares`; [`Self::seeded`] and [`Self::seeded_raw`] ask).
+    /// A first sight reads
     /// lines of the seed that are far from the thread, as are the lines of
     /// the learned table a thread that shares asks, and a piece answered
     /// where it is met waits for its own lines alone. A miss within
@@ -3953,14 +3967,17 @@ impl NativeEncoder {
     /// not hold is merged and told to it. The thread counts these asks and
     /// those the table answers, and rests where it answers under one in
     /// two (`PieceCache::judge_asks`).
-    /// The merge is the table's and asks no model, so the answer comes
-    /// wherever it is due: a piece waits only on an encoder whose table
-    /// merges every short piece ([`Self::merges_every_short_piece`]).
+    /// The merge is the table's, or the character symbols' on the
+    /// sentencepiece path, and asks no model, so the answer comes wherever
+    /// it is due: a piece waits only where every short piece is merged so
+    /// ([`Self::seeded`], [`Self::seeded_raw`]).
     #[cold]
     #[inline(never)]
     fn answer_waiting(&self, ids: &mut Vec<u32>, cache: &mut PieceCache) {
         let waiting = std::mem::take(&mut cache.waiting);
         let mut answer = std::mem::take(&mut cache.answer);
+        // A sentencepiece piece in the vocabulary's form, for its merge.
+        let mut mapped = std::mem::take(&mut cache.mapped);
         let mut touched = 0u8;
         for piece in &waiting {
             touched ^= self.seed.touch(piece.vacancy.key());
@@ -4016,17 +4033,28 @@ impl NativeEncoder {
                             } else {
                                 // A writer needs the part to itself.
                                 drop(part);
-                                // Nobody holds it: the table merges it as
-                                // the slow call merges a piece, from its
-                                // pre-formed characters when it has them,
-                                // and the thread remembers it.
+                                // Nobody holds it: it is merged as the slow
+                                // call of its path merges a piece (the table
+                                // from its pre-formed characters when it has
+                                // them, the sentencepiece path from the
+                                // character symbols of the raw piece the key
+                                // holds), and the thread remembers it.
                                 let (bytes, len) = key.bytes();
                                 let piece = &bytes[..len];
                                 debug_assert!(
-                                    self.misses_wait,
-                                    "the table merges every short piece"
+                                    self.misses_wait || self.chars.is_some(),
+                                    "every short piece is merged"
                                 );
-                                if let Some(table) = &self.merges {
+                                if let Some(chars) = &self.chars {
+                                    // A piece is cut between characters:
+                                    // nothing of it is replaced here.
+                                    let raw = String::from_utf8_lossy(piece);
+                                    chars.merge(
+                                        CharSymbols::normalized(&raw, &mut mapped),
+                                        &mut cache.symbols,
+                                        &mut answer,
+                                    );
+                                } else if let Some(table) = &self.merges {
                                     if piece.is_ascii()
                                         || !table.merge_preformed(piece, &mut answer)
                                     {
@@ -4083,6 +4111,7 @@ impl NativeEncoder {
         cache.waiting = waiting;
         cache.waiting.clear();
         cache.answer = answer;
+        cache.mapped = mapped;
         if learned.is_some() {
             cache.judge_asks(asked, of_use);
         }
@@ -4164,11 +4193,19 @@ impl NativeEncoder {
         self.seeded_alone(vacancy, ids, cache)
     }
 
-    /// [`Self::seeded`] for a piece of the sentencepiece path, which does
-    /// not wait: the seed's answer where the piece is met.
+    /// [`Self::seeded`] for a piece of the sentencepiece path, whose
+    /// character symbols merge every piece with no model: a young thread's
+    /// miss waits as well ([`Self::waits`]), where the seed is far
+    /// (`NEAR_SEED_SLOTS`); else the seed answers where the piece is met.
     #[cold]
     #[inline(never)]
     fn seeded_raw(&self, vacancy: Vacancy, ids: &mut Vec<u32>, cache: &mut PieceCache) -> bool {
+        if cache.packed.slots() <= THREAD_BACKING_SLOTS
+            && self.seed.slots() > NEAR_SEED_SLOTS
+            && self.waits(vacancy, ids, cache)
+        {
+            return true;
+        }
         self.seeded_alone(vacancy, ids, cache)
     }
 
