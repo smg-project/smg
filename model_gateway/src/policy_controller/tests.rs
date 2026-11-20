@@ -1,6 +1,10 @@
 //! Cases of the store's start and of the router a server answers with.
 
-use std::{error::Error, sync::Arc};
+use std::{
+    error::Error,
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
 use axum::{
     body::{to_bytes, Body},
@@ -18,10 +22,14 @@ use serde_json::{json, Value};
 use smg_policy_controller::{
     framework::{Scorer, TieBand},
     lease::Lifecycle,
-    view::{Candidate, RequestFacts},
+    store::{WorkerFacts, WorkerStatus as RowStatus, WorkersStore},
+    view::{Candidate, RequestFacts, Role, WireModes},
     AppliedSpec, Catalog, CatalogError, PolicySpec, SpecError,
 };
-use smg_worker::identity::basic::{ConnectionMode, RuntimeType};
+use smg_worker::{
+    connection::engine::EngineConnector,
+    identity::basic::{ConnectionMode, RuntimeType},
+};
 
 use super::{refused, start, start_with, undecided::ROUTER_TYPE, StartError};
 use crate::{
@@ -29,8 +37,10 @@ use crate::{
     config::{ManualAssignmentMode, PolicyConfig, PolicyDocumentError, RouterConfig},
     middleware::{RouteRequestMeta, TenantKey},
     routers::{
-        common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder,
-        http::router::Router, RouterTrait,
+        common::snapshot::WorkerRegistry,
+        grpc::backend_client::{BackendConnector, BasicWorkerBuilder},
+        http::router::Router,
+        RouterTrait,
     },
     server::{serving_router, ServerConfig},
 };
@@ -685,5 +695,72 @@ async fn a_starts_context_holds_the_feed_where_it_holds_the_store() -> Case {
     let classic = AppContext::from_config(quiet(), 30, None, None).await?;
     assert!(classic.policy_store.is_none());
     assert!(classic.policy_feed.is_none());
+    Ok(())
+}
+
+/// Under a controller's address the gateway probes no worker, so a row's
+/// status is its worker's. Elsewhere a worker's status is the gateway's own
+/// to write, and a row's change leaves it. On both paths the worker dials
+/// through the connector the gateway was started with.
+#[tokio::test]
+async fn a_rows_status_is_its_workers_under_a_controllers_address_alone() -> Case {
+    const URL: &str = "http://worker:8000";
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let address = socket.local_addr()?.to_string();
+    // A connector of the case's own: each path's worker holds the one
+    // handed over, and no stock one by name.
+    let handed: Arc<dyn EngineConnector> = Arc::new(BackendConnector);
+    let mut dials_through_it = Vec::new();
+    for following in [false, true] {
+        let mut config = picked(quiet());
+        config.policy_controller_address = following.then(|| address.clone());
+        let connector = Some(Arc::clone(&handed));
+        let context =
+            AppContext::from_config_with_extensions(config, 30, None, None, None, connector)
+                .await?;
+        assert_eq!(context.follows_controller(), following);
+        let store = context.policy_store.as_ref().ok_or("no store started")?;
+        let feed = context
+            .policy_feed
+            .as_ref()
+            .ok_or("the store has no feed")?;
+
+        // A row written past the door, as a watch writes it, and then its
+        // promotion.
+        let row = store
+            .upsert(WorkerFacts {
+                key: URL.to_owned(),
+                engine: URL.to_owned(),
+                role: Role::Single,
+                wire_modes: WireModes::HTTP,
+                models: vec!["model".to_owned()],
+                dp_size: 1,
+                ..WorkerFacts::default()
+            })
+            .id();
+        feed.settle();
+        let worker = context
+            .worker_registry
+            .get_by_url(URL)
+            .ok_or("the row has no worker")?;
+        let connector = worker
+            .engine_connector()
+            .ok_or("the worker has no connector")?;
+        dials_through_it.push(Arc::ptr_eq(&connector, &handed));
+        assert!(!worker.is_healthy());
+        let revision = store.get(row).ok_or("the row left")?.revision;
+        store
+            .set_status(row, RowStatus::Ready, revision)
+            .ok_or("the status did not move")?;
+        feed.settle();
+        assert_eq!(worker.is_healthy(), following);
+
+        if let Some(follower) = &context.policy_follower {
+            let follower = follower.lock().take().ok_or("the follower was taken")?;
+            follower.stop().await;
+        }
+    }
+    assert_eq!(dials_through_it, [true, true]);
     Ok(())
 }

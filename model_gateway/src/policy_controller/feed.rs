@@ -3,6 +3,9 @@
 //! The gateway has no publication loop, so each write asks for publication
 //! before it returns. A row holds no credential, so its worker object
 //! carries none.
+//!
+//! Under a controller's address the follower writes the store in the door's
+//! place, and settles the feed after each event it takes ([`following`]).
 
 use std::sync::Arc;
 
@@ -55,13 +58,18 @@ impl Feed {
     }
 
     /// Bring the registry to the store's rows, then publish them: the two
-    /// calls the door's listener makes after each write. It is here for a
-    /// follower that applies a served controller's events; no product line
-    /// calls it yet. It takes the feed's turn, so it never runs between a
-    /// write at the door and that write's listener.
+    /// calls the door's listener makes after each write. A follower that
+    /// applies a served controller's events calls this after each event.
+    /// It takes the feed's turn, so it never runs between a write at the
+    /// door and that write's listener.
     pub(crate) fn settle(&self) {
         let _turn = self.turn.lock();
         settle(&self.objects, &self.store);
+    }
+
+    /// The store the door writes and the holder follows.
+    pub(crate) fn store(&self) -> &Arc<MemoryStore> {
+        &self.store
     }
 }
 
@@ -119,7 +127,33 @@ pub(crate) fn feed(
     registry: &Arc<WorkerRegistry>,
     connector: Arc<dyn EngineConnector>,
 ) -> Feed {
-    let objects = Arc::new(Objects::new(Arc::clone(registry)).with_connector(connector));
+    over(store, holder(registry, connector))
+}
+
+/// The feed of a gateway that follows a controller at an address.
+///
+/// Such a gateway probes no worker of its own. The controller's verdict is
+/// each row's status, and the holder copies it onto the row's object. The
+/// follower writes the store and settles this feed after each event.
+/// Nothing writes at its door.
+pub(crate) fn following(
+    store: &Arc<MemoryStore>,
+    registry: &Arc<WorkerRegistry>,
+    connector: Arc<dyn EngineConnector>,
+) -> Feed {
+    over(store, holder(registry, connector).with_status_followed())
+}
+
+/// A holder that writes `registry` and lays each object with `connector`.
+fn holder(
+    registry: &Arc<WorkerRegistry>,
+    connector: Arc<dyn EngineConnector>,
+) -> Objects<ModelWorkerSnapshot> {
+    Objects::new(Arc::clone(registry)).with_connector(connector)
+}
+
+fn over(store: &Arc<MemoryStore>, objects: Objects<ModelWorkerSnapshot>) -> Feed {
+    let objects = Arc::new(objects);
     let door = StoreDoor::new(Arc::clone(store)).telling({
         let objects = Arc::clone(&objects);
         let store = Arc::clone(store);

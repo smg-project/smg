@@ -2334,7 +2334,8 @@ impl FollowerOnExit<'_> {
 
 impl Drop for FollowerOnExit<'_> {
     fn drop(&mut self) {
-        drop(self.take());
+        // The follower leaves the context here, and its task ends with it.
+        let _follower = self.take();
     }
 }
 
