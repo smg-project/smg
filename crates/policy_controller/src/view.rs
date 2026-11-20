@@ -789,6 +789,16 @@ pub struct MediaCounts {
     pub bytes: u32,
 }
 
+impl MediaCounts {
+    /// No media: every count at zero, and no bytes.
+    pub const NONE: Self = Self {
+        images: 0,
+        audio: 0,
+        video: 0,
+        bytes: 0,
+    };
+}
+
 /// An allow-listed header: its name as a position into the spec's declared
 /// header list, and its value. A value never pairs with a name the spec did
 /// not allow.
@@ -1846,6 +1856,11 @@ mod tests {
         assert!(!WireModes::ZMQ.intersects(both));
         assert_eq!(WireModes::from_bits(0xff).bits(), 0b111);
         assert!(WireModes::NONE.is_empty());
+    }
+
+    #[test]
+    fn no_media_is_the_default_of_the_counts() {
+        assert_eq!(MediaCounts::NONE, MediaCounts::default());
     }
 
     #[test]
