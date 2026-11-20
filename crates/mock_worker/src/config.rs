@@ -6,6 +6,8 @@ use std::{
     time::Duration,
 };
 
+use smg_grpc_client::common_proto::NamedValue;
+
 use crate::{
     engine::{Calibration, EngineParams, KvCacheGroup, LoadsLike, OutputSeed, TimingModel},
     kv_zmq::{KvZmqConfig, Wire},
@@ -89,6 +91,13 @@ pub struct Config {
     /// Per-worker pass-time scales (`--worker-pass-time-scale`,
     /// [`EngineParams::pass_time_scale`]), keyed the same way.
     pub worker_pass_time_scale: BTreeMap<String, f64>,
+    /// Named values the named workers state in their load reports
+    /// (`--worker-load-values`), keyed the same way; a data-parallel rank's
+    /// own name (`grpc:<port>:r<k>`) states that rank's list in place of
+    /// its worker's. A worker states its list as given, in the flag's
+    /// order and under no bound, on every load path it has: each wire's
+    /// `GetLoads`, `/v1/loads` and the pushed load record.
+    pub worker_load_values: BTreeMap<String, Vec<NamedValue>>,
     /// Extra `server_args` entries the gRPC `GetServerInfo` advertises, as
     /// string values (e.g. `rl.control_url`). Empty leaves `server_args` unset.
     pub server_args: BTreeMap<String, String>,
@@ -386,6 +395,7 @@ impl Default for Config {
             engine: EngineParams::default(),
             worker_kv_tokens: BTreeMap::new(),
             worker_pass_time_scale: BTreeMap::new(),
+            worker_load_values: BTreeMap::new(),
             server_args: BTreeMap::new(),
             weight_version: None,
             admin_port: None,
@@ -498,6 +508,10 @@ impl Config {
                 "--worker-pass-time-scale" => {
                     let raw = value(&mut args, &flag)?;
                     parse_per_worker(raw, &flag, &mut cfg.worker_pass_time_scale)?;
+                }
+                "--worker-load-values" => {
+                    let raw = value(&mut args, &flag)?;
+                    parse_load_values(&raw, &flag, &mut cfg.worker_load_values)?;
                 }
                 "--global-l3-blocks" => {
                     cfg.engine.global_l3_blocks = parse(value(&mut args, &flag)?, &flag)?;
@@ -615,6 +629,7 @@ impl Config {
             return Err("--grpc-dp-size above 1 needs --engine realistic".to_string());
         }
         cfg.check_worker_overrides()?;
+        cfg.check_load_values()?;
         cfg.check_global_l3()?;
         if cfg.kv_events_wire == Wire::Sglang && cfg.engine.kv_cache_groups.len() > 1 {
             return Err(
@@ -721,6 +736,47 @@ impl Config {
             params.pass_time_scale = scale;
         }
         params
+    }
+
+    /// The named values rank `rank` of the worker named `worker` states in
+    /// its load reports (`--worker-load-values`): the rank's own list where
+    /// its name (`<worker>:r<rank>`) has one, else its worker's, else none.
+    pub fn load_values(&self, worker: &str, rank: impl std::fmt::Display) -> Vec<NamedValue> {
+        if self.worker_load_values.is_empty() {
+            return Vec::new();
+        }
+        self.worker_load_values
+            .get(&format!("{worker}:r{rank}"))
+            .or_else(|| self.worker_load_values.get(worker))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Refuse named values no report would state: those of a name that is
+    /// no gRPC or HTTP worker of this process and no rank of one. A ZMQ
+    /// rank's report has no place for a named value. A rank is named as
+    /// its report names it, `r1` and never `r01`: under another spelling
+    /// its list would be taken and never read.
+    fn check_load_values(&self) -> Result<(), String> {
+        let rank_as_named = |name: &str| {
+            name.rsplit_once(":r").is_some_and(|(_, rank)| {
+                rank.parse::<u16>()
+                    .is_ok_and(|parsed| parsed.to_string() == rank)
+            })
+        };
+        for worker in self.worker_load_values.keys() {
+            let reports = !worker.starts_with("zmq:")
+                && (self.serves(worker)
+                    || (self.worker_of_rank(worker).is_some() && rank_as_named(worker)));
+            if !reports {
+                return Err(format!(
+                    "--worker-load-values names {worker}, which is no gRPC or HTTP worker of \
+                     this process and no rank of one (a worker is named grpc:<port> or \
+                     http:<port>, a rank grpc:<port>:r<k>)"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Refuse a per-worker override that would not take: one on a canned
@@ -971,6 +1027,44 @@ fn parse_per_worker<T: std::str::FromStr>(
     Ok(())
 }
 
+/// `worker=name:value[:unit[:age_ms]],...`: the named values a worker
+/// states in its load reports. A worker named again states one more value,
+/// in the flag's order. The value is any number a float reads, one that is
+/// not finite included, and a name may be empty or stated twice: a bed
+/// states what a report's bounds drop.
+fn parse_load_values(
+    raw: &str,
+    flag: &str,
+    into: &mut BTreeMap<String, Vec<NamedValue>>,
+) -> Result<(), String> {
+    for item in raw.split(',') {
+        let invalid =
+            || format!("invalid value for {flag}: {item} (want worker=name:value[:unit[:age_ms]])");
+        let (worker, stated) = item.split_once('=').ok_or_else(invalid)?;
+        let mut parts = stated.splitn(4, ':').map(str::trim);
+        let name = parts.next().unwrap_or_default();
+        let value = parts
+            .next()
+            .and_then(|value| value.parse::<f64>().ok())
+            .ok_or_else(invalid)?;
+        let unit = parts.next().unwrap_or_default();
+        let age_ms = parts
+            .next()
+            .map(str::parse::<u32>)
+            .transpose()
+            .map_err(|_| invalid())?;
+        into.entry(worker.trim().to_string())
+            .or_default()
+            .push(NamedValue {
+                name: name.to_string(),
+                unit: unit.to_string(),
+                value,
+                age_ms,
+            });
+    }
+    Ok(())
+}
+
 /// `kind[:window],...`: the KV cache groups a realistic engine publishes,
 /// exactly one of them its main-attention group, at any index (`full_attention`
 /// alone by default; a hybrid engine adds `sliding_window:<tokens>` or `mamba`
@@ -1102,6 +1196,10 @@ pub fn usage() -> String {
                                 keeps the fleet's step time: a pool's size is room, not speed\n\
        --worker-pass-time-scale <worker=f,..>  the named workers' passes take f times the\n\
                                 timing model's duration (0.001 to 1000; above 1 a slower engine)\n\
+       --worker-load-values <worker=name:value[:unit[:age_ms]],..>  named values the named\n\
+                                workers state on every load report (GetLoads, /v1/loads, the\n\
+                                pushed record), as given; a worker named again states one\n\
+                                more, and grpc:<port>:r<k> names one rank's own list\n\
        --global-l3-blocks <n>   process-wide shared KV tier every engine writes to and restores\n\
                                 prefixes from, in blocks (default 0: off; a generating worker's\n\
                                 realistic engine, --prefix-cache true and one main-attention\n\
@@ -1274,6 +1372,83 @@ mod tests {
             calibrated.engine_for("grpc:19001").decode_reference_tokens,
             Some(393_216)
         );
+    }
+
+    /// `--worker-load-values` gives a worker its named values in the flag's
+    /// order, a worker named again one more, and a rank's own name that
+    /// rank's list in place of its worker's. A value that is not finite is
+    /// stated as given. A name that is no gRPC or HTTP worker of the process
+    /// and no rank of one is refused, a rank spelled another way than its
+    /// report names it among them, and so is an item with no number.
+    #[test]
+    fn load_values_are_stated_per_worker_and_per_rank_in_the_flags_order() {
+        let fleet = [
+            "--engine",
+            "realistic",
+            "--grpc-base-port",
+            "19000",
+            "--grpc-count",
+            "2",
+            "--grpc-dp-size",
+            "2",
+            "--http-base-port",
+            "18000",
+            "--http-count",
+            "1",
+        ];
+        let with = |flags: &[&str]| parse(&[&fleet[..], flags].concat());
+        let cfg = with(&[
+            "--worker-load-values",
+            "grpc:19000=queue_age:6.5:ms:37,grpc:19000=read_rate:0.125,grpc:19000:r1=queue_age:1.5:ms",
+            "--worker-load-values",
+            "http:18000=queue_age:nan",
+        ])
+        .expect("values on two workers and a rank");
+        let value = |name: &str, unit: &str, value: f64, age_ms| NamedValue {
+            name: name.to_string(),
+            unit: unit.to_string(),
+            value,
+            age_ms,
+        };
+        assert_eq!(
+            cfg.load_values("grpc:19000", 0),
+            [
+                value("queue_age", "ms", 6.5, Some(37)),
+                value("read_rate", "", 0.125, None)
+            ]
+        );
+        assert_eq!(
+            cfg.load_values("grpc:19000", 1),
+            [value("queue_age", "ms", 1.5, None)]
+        );
+        assert!(cfg.load_values("grpc:19001", 0).is_empty());
+        let stated = cfg.load_values("http:18000", 0);
+        assert!(stated.len() == 1 && stated[0].value.is_nan());
+        let refused = |item: &str, reason: &str| {
+            let err = with(&["--worker-load-values", item]).expect_err("refused");
+            assert!(err.contains(reason), "{item}: {err}");
+        };
+        for worker in [
+            "grpc:19002",
+            "http:19000",
+            "zmq:0",
+            "grpc:19000:r2",
+            "grpc:19000:r01",
+            "grpc:19000:r+1",
+        ] {
+            refused(
+                &format!("{worker}=queue_age:1"),
+                "no gRPC or HTTP worker of this process",
+            );
+        }
+        for item in [
+            "grpc:19000",
+            "grpc:19000=queue_age",
+            "grpc:19000=queue_age:fast",
+            "grpc:19000=queue_age:1:ms:soon",
+        ] {
+            refused(item, "want worker=name:value");
+        }
     }
 
     /// A per-worker override that would not take is refused: one on a canned

@@ -216,7 +216,7 @@ async fn loads(State(state): State<Arc<AppState>>) -> Response {
         .engine
         .as_ref()
         .map(|e| e.load().as_reported_by(state.cfg.loads_like));
-    let value = match load {
+    let mut value = match load {
         Some(s) => json!({
             "dp_rank": 0,
             "num_running_reqs": s.num_running_reqs,
@@ -253,6 +253,22 @@ async fn loads(State(state): State<Arc<AppState>>) -> Response {
             })
         }
     };
+    // The worker's named values (`--worker-load-values`), where it states
+    // any: a `values` key on its one entry, as a gRPC worker's rows carry.
+    let values = state.cfg.load_values(&state.name, 0);
+    if !values.is_empty() {
+        value["values"] = values
+            .iter()
+            .map(|stated| {
+                let mut entry =
+                    json!({ "name": stated.name, "unit": stated.unit, "value": stated.value });
+                if let Some(age_ms) = stated.age_ms {
+                    entry["age_ms"] = json!(age_ms);
+                }
+                entry
+            })
+            .collect();
+    }
     Json(json!({ "timestamp": "", "dp_rank_count": 1, "loads": [value] })).into_response()
 }
 
@@ -1847,6 +1863,57 @@ mod tests {
             "say apricot"
         );
         assert_eq!(extract_prompt_text(&json!({"prompt": [1, 2, 3]})), "");
+    }
+
+    /// The worker `--worker-load-values` names states its list on its one
+    /// `/v1/loads` entry, each value with its unit and the age it has. A
+    /// worker the flag does not name states no `values` key.
+    #[tokio::test]
+    async fn a_worker_states_its_named_values_on_the_loads_list() {
+        use smg_grpc_client::common_proto::NamedValue;
+        let value = |name: &str, unit: &str, value: f64, age_ms| NamedValue {
+            name: name.to_string(),
+            unit: unit.to_string(),
+            value,
+            age_ms,
+        };
+        let cfg = Arc::new(Config {
+            worker_load_values: [(
+                "http:65201".to_string(),
+                vec![
+                    value("queue_age", "ms", 6.5, Some(37)),
+                    value("read_rate", "items/s", 0.125, None),
+                ],
+            )]
+            .into(),
+            ..Config::default()
+        });
+        let entry = |name: &'static str| {
+            let state = Arc::new(AppState {
+                cfg: Arc::clone(&cfg),
+                name: name.to_string(),
+                engine: None,
+                in_flight: WorkerInFlight::default(),
+                ops: AdminOps::register(name),
+                bootstrap_port: None,
+            });
+            async move {
+                let body = loads(State(state)).await.into_body();
+                let bytes = axum::body::to_bytes(body, usize::MAX)
+                    .await
+                    .expect("a body");
+                let answer: Value = serde_json::from_slice(&bytes).expect("json");
+                answer["loads"][0].clone()
+            }
+        };
+        assert_eq!(
+            entry("http:65201").await["values"],
+            json!([
+                { "name": "queue_age", "unit": "ms", "value": 6.5, "age_ms": 37 },
+                { "name": "read_rate", "unit": "items/s", "value": 0.125 },
+            ])
+        );
+        assert!(entry("http:65202").await.get("values").is_none());
     }
 
     fn token() -> engine::GenEvent {

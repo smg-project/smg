@@ -186,6 +186,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 memory: None,
                 queues: None,
                 num_resident_tokens: s.num_resident_tokens,
+                values: self.load_values(dp_rank),
             })
             .collect();
         Ok(Response::new(ts::GetLoadsResponse {

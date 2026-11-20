@@ -50,6 +50,7 @@ impl From<&vllm_proto::SchedulerLoad> for common::EngineLoad {
     /// Preserve optional input capacity when converting a poll to a pushed record.
     fn from(load: &vllm_proto::SchedulerLoad) -> Self {
         Self {
+            values: load.values.clone(),
             prefill_throughput: load.prefill_throughput,
             cache_hit_rate: Some(load.cache_hit_rate),
             num_used_tokens: Some(load.num_used_tokens),
@@ -89,6 +90,7 @@ impl From<&trtllm_proto::SchedulerLoad> for common::EngineLoad {
 impl From<&sglang_proto::SchedulerLoad> for common::EngineLoad {
     fn from(load: &sglang_proto::SchedulerLoad) -> Self {
         Self {
+            values: load.values.clone(),
             prefill_throughput: load.prefill_throughput,
             cache_hit_rate: Some(load.cache_hit_rate),
             num_used_tokens: Some(load.num_used_tokens),
@@ -145,6 +147,7 @@ impl From<&sglang_proto::SchedulerLoad> for common::EngineLoad {
 impl From<&tokenspeed_proto::SchedulerLoad> for common::EngineLoad {
     fn from(load: &tokenspeed_proto::SchedulerLoad) -> Self {
         Self {
+            values: load.values.clone(),
             prefill_throughput: load.prefill_throughput,
             active_token_usage: load.active_token_usage,
             num_resident_tokens: load
@@ -193,7 +196,8 @@ pub fn core_only(record: &mut common::EngineLoad) {
 mod tests {
     use std::time::Duration;
 
-    use openai_protocol::worker::{LoadRecord, LoadTelemetry, SchedulerLoadSnapshot};
+    use openai_protocol::worker::{LoadRecord, LoadTelemetry, NamedValue, SchedulerLoadSnapshot};
+    use prost::Message;
 
     use super::*;
 
@@ -233,6 +237,99 @@ mod tests {
         }
     }
 
+    fn value(name: &str, unit: &str, value: f64, age_ms: Option<u32>) -> common::NamedValue {
+        common::NamedValue {
+            name: name.to_string(),
+            unit: unit.to_string(),
+            value,
+            age_ms,
+        }
+    }
+
+    /// A rank's named values are one list on its polled answer and on its
+    /// pushed record: under the record's field number on every wire, and
+    /// read alike from either, each entry with its unit and its own age.
+    /// An answer with no list states no value.
+    #[test]
+    fn a_ranks_named_values_read_alike_from_its_poll_and_from_its_pushed_record() {
+        let stated = vec![
+            value("queue_age", "ms", 6.5, Some(37)),
+            value("read_rate", "items/s", 0.125, None),
+        ];
+        let read = [
+            NamedValue {
+                name: "queue_age".into(),
+                unit: "ms".into(),
+                value: 6.5,
+                age_ms: Some(37),
+            },
+            NamedValue {
+                name: "read_rate".into(),
+                unit: "items/s".into(),
+                value: 0.125,
+                age_ms: None,
+            },
+        ];
+        let on_the_record = common::EngineLoad {
+            values: stated.clone(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        macro_rules! wire {
+            ($proto:ident) => {{
+                let rank = $proto::SchedulerLoad {
+                    values: stated.clone(),
+                    ..Default::default()
+                };
+                assert_eq!(rank.encode_to_vec(), on_the_record);
+                let record = common::EngineLoad::from(&rank);
+                assert_eq!(record.values, stated);
+                assert_eq!(SchedulerLoadSnapshot::from(&record).values, read);
+                assert_eq!(SchedulerLoadSnapshot::from(rank).values, read);
+                let old = $proto::SchedulerLoad::default();
+                assert!(common::EngineLoad::from(&old).values.is_empty());
+                assert!(SchedulerLoadSnapshot::from(old).values.is_empty());
+            }};
+        }
+        wire!(sglang_proto);
+        wire!(tokenspeed_proto);
+        wire!(vllm_proto);
+    }
+
+    /// A polled list is read whole, and the bounds a report holds it to keep
+    /// what a pushed record of the same entries keeps, so what leaves the
+    /// polled list is counted as what the record's read leaves out is.
+    #[test]
+    fn a_polled_list_past_the_bounds_keeps_what_its_pushed_record_keeps() {
+        let mut stated: Vec<_> = (0..70)
+            .map(|at| value(&format!("ready_{at}"), "items", f64::from(at), None))
+            .collect();
+        stated[3] = value("", "items", 1.0, None);
+        stated[5] = value("ready_4", "items", 2.0, None);
+        stated[7] = value("ready_7", "items", f64::INFINITY, None);
+        stated[9] = value(&"n".repeat(64), "items", 3.0, None);
+        stated[11] = value("ready_11", &"u".repeat(32), 4.0, None);
+        macro_rules! wire {
+            ($proto:ident) => {{
+                let rank = $proto::SchedulerLoad {
+                    values: stated.clone(),
+                    ..Default::default()
+                };
+                let record = common::EngineLoad::from(&rank);
+                let pushed = SchedulerLoadSnapshot::from(&record).values;
+                assert_eq!(pushed.len(), 59);
+                let mut polled = SchedulerLoadSnapshot::from(rank);
+                assert_eq!(polled.values.len(), 70);
+                assert_eq!(polled.bound_values(), 11);
+                assert_eq!(polled.values, pushed);
+                assert_eq!(record.values_sent() - pushed.len(), 11);
+            }};
+        }
+        wire!(sglang_proto);
+        wire!(tokenspeed_proto);
+        wire!(vllm_proto);
+    }
+
     /// Polling and core-only push records preserve optional input capacity.
     #[test]
     fn prefill_capacity_survives_poll_push_and_core_only_and_clears_when_absent() {
@@ -242,8 +339,8 @@ mod tests {
                 gen_throughput: 0.5,
                 ..Default::default()
             };
-            let polled = SchedulerLoadSnapshot::from(load);
             let mut pushed = common::EngineLoad::from(&load);
+            let polled = SchedulerLoadSnapshot::from(load);
             core_only(&mut pushed);
             let pushed = SchedulerLoadSnapshot::from(&pushed);
             assert_eq!(polled.prefill_throughput, rate);
@@ -302,6 +399,7 @@ mod tests {
                 paused: 0,
                 retracted: 2,
             }),
+            values: Vec::new(),
         }
     }
 
@@ -358,8 +456,9 @@ mod tests {
                 retracted: 1,
             }),
             num_resident_tokens: Some(70_000),
+            values: Vec::new(),
         };
-        let polled = SchedulerLoadSnapshot::from(rank);
+        let polled = SchedulerLoadSnapshot::from(rank.clone());
         let record = common::EngineLoad::from(&rank);
         assert!(polled.values.is_empty() && record.values.is_empty());
         assert!(record.memory.is_some() && record.disaggregation.is_none());
@@ -388,8 +487,9 @@ mod tests {
             utilization: 0.1479,
             max_running_requests: 256,
             num_waiting_uncached_tokens: 0,
+            values: Vec::new(),
         };
-        let polled = SchedulerLoadSnapshot::from(rank);
+        let polled = SchedulerLoadSnapshot::from(rank.clone());
         let record = common::EngineLoad::from(&rank);
         assert!(polled.values.is_empty() && record.values.is_empty());
         assert!(record.memory.is_none() && record.queues.is_none());

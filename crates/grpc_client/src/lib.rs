@@ -577,11 +577,23 @@ macro_rules! impl_embed {
 }
 pub(crate) use impl_embed;
 
+/// A polled answer's named values as its wire states them: the whole list,
+/// each entry by the worker crate's one read of an entry. The load monitor
+/// holds the list to the report's bounds and counts what leaves it, as it
+/// does the list of a poll over HTTP, so nothing is dropped here unseen.
+pub(crate) fn stated_values(
+    values: &[common_proto::NamedValue],
+) -> Vec<openai_protocol::worker::NamedValue> {
+    values.iter().map(Into::into).collect()
+}
+
 /// The load conversions of a wire whose `SchedulerLoad` carries a rank's poll
 /// figures alone: field for field, the measured input capacity where the
-/// servicer reports one, every other canonical field absent.
+/// servicer reports one, every other canonical field absent. A wire whose
+/// message has the named values passes the list's field, and the snapshot
+/// takes the list as the answer states it ([`stated_values`]).
 macro_rules! impl_rank_load_conversions {
-    ($proto:ident) => {
+    ($proto:ident $(, $values:ident)?) => {
         impl From<$proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapshot {
             fn from(load: $proto::SchedulerLoad) -> Self {
                 Self {
@@ -598,7 +610,7 @@ macro_rules! impl_rank_load_conversions {
                     cache_hit_rate: load.cache_hit_rate,
                     utilization: load.utilization,
                     max_running_requests: load.max_running_requests,
-                    values: Vec::new(),
+                    $(values: $crate::stated_values(&load.$values),)?
                     ..Default::default()
                 }
             }

@@ -429,6 +429,12 @@ message SchedulerLoad {
   // Context tokens (prompt plus committed output) of every request the rank
   // holds: the attention work its decode steps read. Absent on old workers.
   optional int64 num_resident_tokens = 17;
+  // Values the engine reports by name, as a pushed record carries them
+  // (smg.grpc.common.EngineLoad.values, under the same field number). An
+  // answer's list is that answer's alone: a name it leaves out says nothing
+  // about that value. A value's age_ms is its sample's age as the answer is
+  // made. An old worker's answer has no list and states no value.
+  repeated smg.grpc.common.NamedValue values = 24;
 }
 
 message MemoryMetrics {
