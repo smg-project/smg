@@ -6685,6 +6685,111 @@ pub(crate) mod tests {
         );
     }
 
+    /// A hint of 0 keeps no row whatever the request demands: its pool is
+    /// shed under the hint's stage, and under no demand's.
+    #[test]
+    fn a_hint_of_none_beside_a_demand_is_shed_under_the_hint() {
+        let (store, _) = stating_facts(&[(false, DemandFacts::default())]);
+        let door = Door::new(store);
+        let mut asked = request(b"both", 1);
+        asked.constraints.subset_hint = Some(0);
+        asked.constraints.demands = Demands {
+            vision: true,
+            ..Demands::default()
+        };
+        let decided = door.decide(GATEWAY, &asked, Instant::now());
+        let shed = match decided.expect("a decision").decision {
+            Decision::Shed(shed) => Ok((shed.reason, shed.emptied_by)),
+            decision => Err(decision.pick().is_some()),
+        };
+        assert_eq!(shed, Ok((ShedReason::NoEndpoints, super::SUBSET_HINT)));
+    }
+
+    /// A model no member serves is no pool the request's own narrowing
+    /// emptied: a request for it that states a demand is shed under no
+    /// stage, as one that states none is.
+    #[test]
+    fn a_demand_for_a_model_no_member_serves_is_shed_under_no_stage() {
+        let (store, _) = stating_facts(&[(true, DemandFacts::default())]);
+        let door = Door::new(store);
+        let mut asked = request(b"absent", 1);
+        asked.facts.model = "a-model-nobody-serves";
+        asked.constraints.demands = Demands {
+            vision: true,
+            ..Demands::default()
+        };
+        let decided = door.decide(GATEWAY, &asked, Instant::now());
+        let shed = match decided.expect("a decision").decision {
+            Decision::Shed(shed) => Ok((shed.reason, shed.emptied_by)),
+            decision => Err(decision.pick().is_some()),
+        };
+        assert_eq!(shed, Ok((ShedReason::NoEndpoints, "none")));
+    }
+
+    /// A row a vision demand took is named by nobody, as one a runtime took
+    /// is: the member that holds the request's first block takes no image,
+    /// and the request is decided over the member that does.
+    #[test]
+    fn a_vision_demand_that_took_the_holder_names_the_rows_that_stay() {
+        use crate::store::{
+            BatchFacts, BatchOutcome, ContentHash, KvEvent, KvEventSink, SequenceHash, Signals,
+            StoredBlock,
+        };
+
+        let store = MemoryStore::new();
+        let applied = store.apply(preset("cache_aware", 1));
+        applied.expect("above the unbound start");
+        let member = |name: &str, vision: bool| {
+            let facts = WorkerFacts {
+                key: name.to_owned(),
+                engine: name.to_owned(),
+                incarnation: 1,
+                role: Role::Single,
+                models: vec![MODEL.to_owned()],
+                dp_size: 1,
+                vision,
+                signals: Signals {
+                    events: true,
+                    ..Signals::default()
+                },
+                ..WorkerFacts::default()
+            };
+            let id = store.upsert(facts).id();
+            let row = WorkersStore::get(&store, id).expect("the row");
+            if row.status != WorkerStatus::Ready {
+                let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
+                ready.expect("the row stands");
+            }
+            id
+        };
+        let (blind, sighted) = (member("blind", false), member("sighted", true));
+        store.publish_now();
+        let hashes = [17_u64];
+        let events = [KvEvent::Stored {
+            parent: None,
+            blocks: vec![StoredBlock {
+                seq_hash: SequenceHash(hashes[0]),
+                content_hash: ContentHash(hashes[0]),
+            }],
+        }];
+        let batch = BatchFacts {
+            sequence: 1,
+            ..BatchFacts::default()
+        };
+        assert_eq!(store.admit(blind, 0, batch, &events), BatchOutcome::Applied);
+        let door = Door::new(Arc::new(store));
+        let mut asked = request(b"seen", 1);
+        asked.facts.block_hashes = &hashes;
+        asked.constraints.demands = Demands {
+            vision: true,
+            ..Demands::default()
+        };
+        let decided = door.decide(GATEWAY, &asked, Instant::now());
+        let decision = decided.expect("a decision").decision;
+        let first = decision.pick().and_then(|pick| pick.targets.first());
+        assert_eq!(first.map(|target| target.id), Some(sighted));
+    }
+
     /// One pass narrows a built view by its gateway's wires and its
     /// request's demands: the rows kept take their places in order, and the
     /// affinity column and the facts follow them. The rows a demand took
