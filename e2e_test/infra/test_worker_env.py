@@ -285,6 +285,7 @@ def test_rewritten_gptoss_checkpoint_keeps_request_model_in_servicer_metadata(
     launcher.launch_router = lambda *_a, **_kw: pytest.fail("must not launch a router")
     router_args = types.ModuleType("smg.router_args")
     router_args.RouterArgs = object
+    router_args._policy_name = lambda *_a, **_kw: pytest.fail("must not resolve a router policy")
     monkeypatch.setitem(sys.modules, "smg.launch_router", launcher)
     monkeypatch.setitem(sys.modules, "smg.router_args", router_args)
     # Record the old module/package attribute so this isolated CLI import
