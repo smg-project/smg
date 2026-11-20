@@ -1081,6 +1081,7 @@ impl MemoryStore {
     /// repeat's take-back or a later issue, nothing moves and nothing is
     /// told.
     #[cfg(feature = "controller")]
+    #[cold]
     pub(crate) fn hand_taken_back(
         &self,
         hand: &Hand,
@@ -1091,7 +1092,10 @@ impl MemoryStore {
         self.hand_word(hand, lease, Word::TakenBack(issue, reason));
     }
 
-    /// [`Self::hand`] for either word of the ring.
+    /// [`Self::hand`] for either word of the ring, laid into it: a frame's
+    /// word keeps the loop the served hand was, and the door's own word
+    /// pays its copy on a path few answers take.
+    #[inline(always)]
     fn hand_word(&self, hand: &Hand, lease: LeaseId, word: Word) {
         let at = self.file_of(lease);
         let mut looks = 0_u32;
