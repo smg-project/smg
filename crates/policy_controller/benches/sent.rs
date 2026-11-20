@@ -1,8 +1,10 @@
 //! The cost of scoring with a profile's send tally over a whole pool. Each
 //! cell reads rows with no sends, a send held per row, or a send per row
 //! that reaches its time limit at the decision. The `policy_sent` cells read
-//! the tally from a registered scorer, the `policy_engine/least_cost_sent`
-//! cells through `least-cost` terms. The `policy_sent/dispatch` cells read
+//! the requests and the stated tokens from a registered scorer, the
+//! `policy_sent_whole` cells all three numbers, the
+//! `policy_engine/least_cost_sent` cells through `least-cost` terms. The
+//! `policy_sent/dispatch` cells read
 //! what 64 dispatch reports cost a profile of `least-load`, alone and
 //! beside a registered scorer that reads the same sends.
 
@@ -41,26 +43,66 @@ impl Scorer for SentScore {
     ) -> TieBand {
         let reads = self.0.reads(facts);
         for (&index, score) in kept.iter().zip(out) {
-            let sent = reads.of(&candidates[index as usize]);
+            let sent = reads.counts(&candidates[index as usize]);
             *score = 1.0 / (1.0 + sent.requests as f32 + sent.tokens as f32 / 1024.0);
         }
         TieBand::NORMALIZED
     }
 }
 
-fn engine() -> Engine {
+/// A registered scorer that prices a send of no stated size too: it reads
+/// all three numbers.
+#[derive(Debug)]
+struct SentWhole(Arc<SentCredit>);
+
+impl Lifecycle for SentWhole {}
+
+impl Scorer for SentWhole {
+    fn name(&self) -> &'static str {
+        "sent-whole"
+    }
+
+    fn score(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        let reads = self.0.reads(facts);
+        for (&index, score) in kept.iter().zip(out) {
+            let sent = reads.of(&candidates[index as usize]);
+            let tokens = sent.tokens as f32 / 1024.0 + sent.unsized_requests as f32;
+            *score = 1.0 / (1.0 + sent.requests as f32 + tokens);
+        }
+        TieBand::NORMALIZED
+    }
+}
+
+/// A profile of the registered scorer `name` alone, under the time limit.
+fn registered(name: &str) -> Engine {
     let mut catalog = Catalog::builtin();
     catalog
         .scorer_with("sent-score", |build| Ok(Box::new(SentScore(build.sent()))))
+        .expect("a free name")
+        .scorer_with("sent-whole", |build| Ok(Box::new(SentWhole(build.sent()))))
         .expect("a free name");
     let document: PolicySpec = serde_json::from_value(serde_json::json!({
         "apiVersion": API_VERSION,
         "profiles": {
-            "work": { "sent_ttl_ms": TTL_MS, "score": ["sent-score"], "pick": "best" }
+            "work": { "sent_ttl_ms": TTL_MS, "score": [name], "pick": "best" }
         }
     }))
     .expect("a document");
     document.validate_in(&catalog, &[]).expect("validates")
+}
+
+fn engine() -> Engine {
+    registered("sent-score")
+}
+
+fn whole() -> Engine {
+    registered("sent-whole")
 }
 
 fn least_cost() -> Engine {
@@ -211,6 +253,7 @@ fn dispatch(c: &mut Criterion) {
 
 fn sent(c: &mut Criterion) {
     cells(c, "policy_sent", engine, 1);
+    cells(c, "policy_sent_whole", whole, 1);
     cells(c, "policy_engine/least_cost_sent", least_cost, 17);
     dispatch(c);
 }
