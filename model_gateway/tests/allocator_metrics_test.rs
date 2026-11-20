@@ -1,8 +1,8 @@
 //! Verifies the final-artifact contract for jemalloc metrics.
 //!
 //! This integration test is a separate executable. It takes the stock
-//! allocator by the library's macro, as a host's own binary does, and makes
-//! the registration the shipped SMG binary makes.
+//! allocator by the library's macro, as a host's own binary does, and tells
+//! the library nothing more: the gateway finds out which allocator serves it.
 
 #![cfg(all(
     feature = "jemalloc-stats",
@@ -10,14 +10,12 @@
     not(target_env = "musl")
 ))]
 
-use smg::observability::metrics::{
-    register_jemalloc_as_global_allocator, start_prometheus, PrometheusConfig,
-};
+use smg::observability::metrics::{start_prometheus, PrometheusConfig};
 
 smg::stock_allocator!();
 
 #[test]
-fn registered_global_jemalloc_exposes_allocator_gauges() {
+fn a_binary_on_the_stock_allocator_publishes_its_gauges_untold() {
     use tikv_jemalloc_ctl::thread;
 
     // A cumulative, thread-local counter proves an ordinary Rust allocation
@@ -34,7 +32,6 @@ fn registered_global_jemalloc_exposes_allocator_gauges() {
     let arenas = tikv_jemalloc_ctl::opt::narenas::read().expect("the arenas option");
     assert_eq!(arenas, 16, "the stock options were not exported");
 
-    register_jemalloc_as_global_allocator();
     let handle = start_prometheus(PrometheusConfig {
         port: 0,
         host: "127.0.0.1".to_string(),
@@ -50,7 +47,7 @@ fn registered_global_jemalloc_exposes_allocator_gauges() {
     ] {
         assert!(
             body.lines().any(|line| line.starts_with(metric)),
-            "registered allocator metric {metric} missing:\n{body}"
+            "allocator metric {metric} missing:\n{body}"
         );
     }
 }
