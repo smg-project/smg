@@ -2557,6 +2557,10 @@ pub(super) struct Writer {
     /// it ([`KvTables::moves`]): while it stands, no pool's place in an
     /// index moved.
     lanes: u64,
+    /// How many membership writes walked the pools
+    /// ([`Self::index_pools`]), for the cases.
+    #[cfg(test)]
+    walks: u64,
     /// The store's index tables, where a membership write reads each
     /// pool's standing ([`Self::over`]). A writer made alone holds tables
     /// of its own with no lane.
@@ -2656,6 +2660,8 @@ impl Writer {
             indexes: Arc::default(),
             reading: Reading::default(),
             lanes: 0,
+            #[cfg(test)]
+            walks: 0,
             kv: Arc::default(),
             retired: None,
             engines: Vec::new(),
@@ -4308,6 +4314,13 @@ impl Writer {
         self.derivations.get(model).map(Derivation::wholes)
     }
 
+    /// How many membership writes walked the pools to stand each in its
+    /// model's index ([`Self::index_pools`]).
+    #[cfg(test)]
+    pub(super) fn walks(&self) -> u64 {
+        self.walks
+    }
+
     /// Each pool's standing in its model's index as this membership write
     /// leaves it. A pool the write did not move keeps its standing: its
     /// tables, and its warming rows as a write or a window last read them.
@@ -4350,6 +4363,10 @@ impl Writer {
         let still = mem::replace(lanes, moves) == moves;
         if still && classes == Classes::Carry {
             return;
+        }
+        #[cfg(test)]
+        {
+            self.walks += 1;
         }
         let ruled = classes != Classes::Derive;
         // The list is copied at the first pool whose standing is new:

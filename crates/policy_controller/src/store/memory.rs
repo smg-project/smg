@@ -1321,6 +1321,13 @@ impl MemoryStore {
         self.loads.lock().writer.whole_derivations(model)
     }
 
+    /// How many membership writes walked the pools to stand each in its
+    /// model's index.
+    #[cfg(test)]
+    pub(super) fn pool_walks(&self) -> u64 {
+        self.loads.lock().writer.walks()
+    }
+
     /// Whether no lock a journaled write takes is held at this instant:
     /// the membership lock, the turn of the leases' file and the load lock,
     /// each tried.
