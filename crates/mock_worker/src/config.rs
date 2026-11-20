@@ -755,19 +755,12 @@ impl Config {
     /// Refuse named values no report would state: those of a name that is
     /// no gRPC or HTTP worker of this process and no rank of one. A ZMQ
     /// rank's report has no place for a named value. A rank is named as
-    /// its report names it, `r1` and never `r01`: under another spelling
-    /// its list would be taken and never read.
+    /// the ranks are listed, `r1` and never `r01` ([`Self::worker_of_rank`]):
+    /// under another spelling its list would be taken and never read.
     fn check_load_values(&self) -> Result<(), String> {
-        let rank_as_named = |name: &str| {
-            name.rsplit_once(":r").is_some_and(|(_, rank)| {
-                rank.parse::<u16>()
-                    .is_ok_and(|parsed| parsed.to_string() == rank)
-            })
-        };
         for worker in self.worker_load_values.keys() {
             let reports = !worker.starts_with("zmq:")
-                && (self.serves(worker)
-                    || (self.worker_of_rank(worker).is_some() && rank_as_named(worker)));
+                && (self.serves(worker) || self.worker_of_rank(worker).is_some());
             if !reports {
                 return Err(format!(
                     "--worker-load-values names {worker}, which is no gRPC or HTTP worker of \
@@ -857,7 +850,9 @@ impl Config {
 
     /// Whether `worker` is the name of one of this process's workers, as it
     /// registers it: `grpc:<port>` and `http:<port>` on their wire's ports,
-    /// `zmq:<index>` on the ZMQ ranks' engine indexes.
+    /// `zmq:<index>` on the ZMQ ranks' engine indexes. A listener is named
+    /// by the port it binds, so port 0 names no worker: one on an assigned
+    /// port has no name a flag can state.
     fn serves(&self, worker: &str) -> bool {
         let Some((wire, id)) = worker.split_once(':') else {
             return false;
@@ -867,10 +862,10 @@ impl Config {
             return false;
         };
         let (first, count) = match wire {
-            "grpc" if id <= u32::from(u16::MAX) => {
+            "grpc" if (1..=u32::from(u16::MAX)).contains(&id) => {
                 (u32::from(self.grpc_base_port), self.grpc_count)
             }
-            "http" if id <= u32::from(u16::MAX) => {
+            "http" if (1..=u32::from(u16::MAX)).contains(&id) => {
                 (u32::from(self.http_base_port), self.http_count)
             }
             "zmq" => (self.zmq_start_index, self.zmq_count),
@@ -885,7 +880,11 @@ impl Config {
     /// this process's gRPC workers.
     fn worker_of_rank<'a>(&self, name: &'a str) -> Option<&'a str> {
         let (whole, rank) = name.rsplit_once(":r")?;
-        let rank: u16 = rank.parse().ok()?;
+        // A decimal rank with no sign or leading zero, as the ranks are listed.
+        let rank = rank
+            .parse::<u16>()
+            .ok()
+            .filter(|parsed| parsed.to_string() == rank)?;
         let is_rank = self.grpc_dp_size > 1 && rank < self.grpc_dp_size;
         (is_rank && whole.starts_with("grpc:") && self.serves(whole)).then_some(whole)
     }
@@ -1448,6 +1447,25 @@ mod tests {
             "grpc:19000=queue_age:1:ms:soon",
         ] {
             refused(item, "want worker=name:value");
+        }
+        // Two workers this process serves and no flag can give a value: a
+        // ZMQ rank, whose report has no place for one, and an HTTP worker
+        // on an assigned port, which is named by the port it binds.
+        for (fleet, worker) in [
+            (
+                ["--zmq-count", "1", "--zmq-handshake", "ipc://unused"],
+                "zmq:0",
+            ),
+            (["--http-count", "1", "--http-base-port", "0"], "http:0"),
+        ] {
+            parse(&fleet).expect("the fleet alone");
+            let item = format!("{worker}=queue_age:1");
+            let err = parse(&[&fleet[..], &["--worker-load-values", item.as_str()]].concat())
+                .expect_err("refused");
+            assert!(
+                err.contains("no gRPC or HTTP worker of this process"),
+                "{err}"
+            );
         }
     }
 

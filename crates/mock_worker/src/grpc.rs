@@ -2939,8 +2939,9 @@ mod tests {
 
     /// The worker `--worker-load-values` names states its list on every
     /// load path it has: each rank's `GetLoads` row on each wire and each
-    /// rank's pushed record. A rank named by itself states its own list,
-    /// and a worker the flag does not name states none.
+    /// rank's pushed record, on a records-only stream and ahead of the
+    /// first batch of a stream of cache events. A rank named by itself
+    /// states its own list, and a worker the flag does not name states none.
     #[tokio::test]
     async fn the_worker_a_values_flag_names_states_its_list_on_every_load_path() {
         use smg_grpc_client::{
@@ -3000,6 +3001,27 @@ mod tests {
                 let batch = tokio::time::timeout(Duration::from_secs(2), records.next())
                     .await
                     .expect("a record at the first tick")
+                    .expect("an item")
+                    .expect("a batch");
+                assert_eq!(batch.dp_rank, i32::try_from(rank).ok());
+                let record = batch.load.expect("a load record");
+                assert_eq!(&record.values, stated, "{} rank {rank}", service.name);
+            }
+            drop(records);
+            let mut events = TokenSpeedScheduler::subscribe_kv_events(
+                service,
+                Request::new(common::SubscribeKvEventsRequest {
+                    load_records_before_first_batch: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("subscribed")
+            .into_inner();
+            for (rank, stated) in stated.iter().enumerate() {
+                let batch = tokio::time::timeout(Duration::from_secs(2), events.next())
+                    .await
+                    .expect("a record ahead of the first batch")
                     .expect("an item")
                     .expect("a batch");
                 assert_eq!(batch.dp_rank, i32::try_from(rank).ok());
