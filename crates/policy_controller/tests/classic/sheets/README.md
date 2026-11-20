@@ -451,6 +451,14 @@ fails once the reason no longer holds.
   name, and the replay keeps the gateway's words for each: a model no worker serves and a wire no worker is on
   are no model, a pool over its thresholds on every worker of the wire is overloaded where shedding is on, and
   any other pool left nobody is unavailable. The `message` and `retry_after` are no part of a decision.
-- `media_refs.json`, `context_window.json`, `constraint_decider.json`, `rank_pin.json`: owed whole. Of a
-  request's hard demands the crate keeps the wire of a retry alone yet, so no module replays these sheets, and
-  the replay names each as owed until the change that keeps its demand brings its module.
+- `media_refs.json`: every row replays. A worker states three facts, the three its row records: whether it
+  takes images, which is its own vision bit, whether it processes media by reference, and whether by the
+  gateway's own pipeline. The labels a row also records are the gateway's source of those facts, and the
+  replay reads none. A request states that it needs vision and the pipeline pin of its references as hard
+  demands. Each media demand that leaves a pool nobody is shed under a stage of its own, and the replay keeps
+  the gateway's words for each: no worker with vision and a pin that never takes the gateway's pipeline are
+  an unsupported input, no worker that processes references is no capable worker, and a pin that takes only
+  the gateway's pipeline is an unsupported model.
+- `context_window.json`, `constraint_decider.json`, `rank_pin.json`: owed whole. Of a request's hard demands
+  the crate keeps the wire of a retry and its media yet, so no module replays these sheets, and the replay
+  names each as owed until the change that keeps its demand brings its module.
