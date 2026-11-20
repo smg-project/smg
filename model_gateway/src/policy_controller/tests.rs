@@ -9,7 +9,7 @@ use std::{
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Response,
 };
 use openai_protocol::{
@@ -862,6 +862,43 @@ async fn the_http_pair_router_is_built_under_the_setting() -> Case {
     let unset = policies.get_default_policy();
     assert!(Arc::ptr_eq(&policies.get_prefill_policy(), &unset));
     assert!(Arc::ptr_eq(&policies.get_decode_policy(), &unset));
+    Ok(())
+}
+
+/// The HTTP pair router reads what its roles' policy settings keep. Under
+/// the setting the registry holds no role policy, and its main policy here
+/// reads no target, so a role's own setting alone refuses a request that
+/// names its worker. Under settings that keep no target the request goes on
+/// to the host.
+#[tokio::test]
+async fn the_http_pair_router_refuses_an_explicit_target_a_roles_setting_keeps() -> Case {
+    let mut named = HeaderMap::new();
+    named.insert("x-smg-target-worker", "0".parse()?);
+    let meta = RouteRequestMeta::new(TenantKey::from("test-tenant"));
+    let hashing = || Some(PolicyConfig::ConsistentHashing);
+    for (prefill_policy, decode_policy, kept) in [
+        (hashing(), None, true),
+        (None, hashing(), true),
+        (None, None, false),
+    ] {
+        let mut config = picked(quiet());
+        config.policy = PolicyConfig::RoundRobin;
+        config.mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy,
+            decode_policy,
+        };
+        let gateway = build_gateway(config).await?;
+        let router = gateway
+            .select_router_for_request(None)
+            .ok_or("the HTTP pair router is missing")?;
+        let routed = router
+            .route_generate(Some(&named), &meta, body(json!({"text": "hi"})), "model-a")
+            .await;
+        let (status, code) = refusal(routed).await;
+        assert_eq!(code == BY_NAME, kept, "{status} {code}");
+    }
     Ok(())
 }
 

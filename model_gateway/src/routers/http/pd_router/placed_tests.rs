@@ -190,6 +190,53 @@ async fn a_hosted_pair_is_sent_to_the_prefill_and_the_decode_the_controller_plac
     Ok(())
 }
 
+/// A pair that names its worker is refused by name where the pair's policy
+/// settings keep it to that worker, and neither worker is asked: the
+/// controller reads no explicit target yet and would place the pair
+/// elsewhere. A request that names no worker, and one under settings that
+/// keep no target, are placed as before.
+#[tokio::test]
+async fn a_pair_that_names_its_worker_is_refused_where_its_settings_keep_it() -> Case {
+    let mut named = HeaderMap::new();
+    named.insert("x-smg-target-worker", "0".parse()?);
+    for (keeps_target, headers, refused) in [
+        (true, Some(&named), true),
+        (true, None, false),
+        (false, Some(&named), false),
+    ] {
+        let (prefill, prefill_seen) = spawn_recording_stub("{}").await;
+        let (decode, decode_seen) = spawn_recording_stub(r#"{"text":"done"}"#).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+        let router = PDRouter {
+            keeps_target,
+            ..router(registry, host)
+        };
+        let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+        let request = serde_json::from_value(json!({"text": "hi"}))?;
+
+        let response = router.route_generate(headers, &meta, request, MODEL).await;
+
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body = String::from_utf8_lossy(&body);
+        let asked = prefill_seen.lock().map_err(|e| e.to_string())?.len()
+            + decode_seen.lock().map_err(|e| e.to_string())?.len();
+        if refused {
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+            assert!(body.contains("not_decided_by_policy_controller"), "{body}");
+            assert!(body.contains("an explicit target worker"), "{body}");
+            assert_eq!(asked, 0, "a refused pair asked a worker");
+        } else {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(asked, 2, "a placed pair asks both of its workers");
+        }
+        // No lease is left behind either way.
+        assert_eq!(live(&store, 0).await, 0);
+    }
+    Ok(())
+}
+
 /// The store's rows decide, not the registry's workers: with the decode's
 /// row gone the request is refused, though both workers stand registered
 /// and the classic selection would pair them.
