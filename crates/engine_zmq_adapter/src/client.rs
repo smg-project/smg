@@ -53,7 +53,7 @@ use crate::{
         refuse_unenforceable_constraint, StructuredOutputsBackendConfig, StructuredOutputsSupport,
     },
     tokenspeed::{
-        constraint_ref as tokenspeed_constraint_ref, fan_out_tokenspeed_requests,
+        constraint_ref as tokenspeed_constraint_ref, fan_out_tokenspeed_requests, loads_by_rank,
         translate_encode_request, translate_request_tokenspeed_for, EncodeRendezvous, GridTensors,
         LogprobColumns, RankIndices, TokenSpeedGenerateStream,
     },
@@ -1720,13 +1720,22 @@ impl ZmqEngineClient {
 
     /// Per-rank load from the piggybacked scheduler stats (SMG's DP routing
     /// signal), in the same shape as the gRPC `GetLoads` response. A rank that
-    /// has not reported yet has no entry.
+    /// has not reported yet has no entry. A TokenSpeed entry is numbered by
+    /// the rank a pin reaches ([`RankIndices`]), which is the engine's index
+    /// only when its ranks dialled in at indices 0..n in rank order.
     pub fn get_loads(&self) -> WorkerLoadResponse {
-        let loads: Vec<SchedulerLoadSnapshot> = self
-            .engines()
-            .iter()
-            .filter_map(|engine| self.rank_load(engine.engine_id.engine_index()?))
-            .collect();
+        let loads: Vec<SchedulerLoadSnapshot> = match &self.backend {
+            ZmqBackend::TokenSpeed(client) => {
+                loads_by_rank(&RankIndices::of(client.engines()), |index| {
+                    self.rank_load(index)
+                })
+            }
+            ZmqBackend::Vllm(_) | ZmqBackend::Sglang(_) | ZmqBackend::Trtllm(_) => self
+                .engines()
+                .iter()
+                .filter_map(|engine| self.rank_load(engine.engine_id.engine_index()?))
+                .collect(),
+        };
         WorkerLoadResponse {
             timestamp: String::new(),
             dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),

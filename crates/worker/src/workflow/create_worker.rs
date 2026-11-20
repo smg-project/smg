@@ -56,16 +56,9 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
                 WorkflowError::ContextValueNotFound("connection_mode".to_string())
             })?;
 
-        if context.data.registration_mode == WorkerRegistrationMode::CreateOnly
-            && registry.get_by_url(&config.url).is_some()
-        {
-            return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("create_worker"),
-                message: format!(
-                    "Worker {} already exists",
-                    Endpoint::redacted_str(&config.url)
-                ),
-            });
+        let create_only = context.data.registration_mode == WorkerRegistrationMode::CreateOnly;
+        if create_only && registry.get_by_url(&config.url).is_some() {
+            return Err(already_exists(&config.url));
         }
 
         // Labels from the spec take precedence over discovered labels.
@@ -172,6 +165,16 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
         } else {
             vec![None] // single worker, no DP
         };
+        // Rank workers register at `{base}@{rank}`, which the base address
+        // checked above does not find.
+        if create_only
+            && dp_ranks
+                .iter()
+                .flatten()
+                .any(|(rank, _)| registry.get_by_url(&format!("{url}@{rank}")).is_some())
+        {
+            return Err(already_exists(&config.url));
+        }
 
         // Keep the spec's other fields. Set the resolved address, model,
         // labels, KV transfer fields and placement on each worker below.
@@ -698,6 +701,14 @@ fn attention_dp_width(labels: &HashMap<String, String>, size: usize) -> Option<u
 /// register a plain worker: there is no placement to choose, and pinning
 /// rank 0 anyway still alters engine-side scheduling. The DP read already
 /// logged the degradation for the missing-label case.
+/// The refusal of a create for an address that already has a worker.
+fn already_exists(url: &str) -> WorkflowError {
+    WorkflowError::StepFailed {
+        step_id: StepId::new("create_worker"),
+        message: format!("Worker {} already exists", Endpoint::redacted_str(url)),
+    }
+}
+
 fn dp_rank_expansion(dp_info: Option<&DpInfo>) -> Vec<Option<(usize, usize)>> {
     match dp_info {
         Some(dp_info) if dp_info.dp_size > 1 => (0..dp_info.dp_size)

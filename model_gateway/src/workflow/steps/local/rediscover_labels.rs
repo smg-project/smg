@@ -8,8 +8,6 @@
 //! engine) are handed to the update step, which rebuilds the worker only
 //! when they change anything. Without a refresh request the step is skipped.
 
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 use smg_worker::{
     identity::basic::ConnectionMode,
@@ -74,9 +72,11 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
             // and the grammar start, which no rank shares. The link's labels
             // replace the record's in engine space: the context window, and
             // a TokenSpeed group's running window with the width its ranks
-            // share it by.
-            let mut fresh = HashMap::clone(&worker.metadata().discovered_labels);
-            fresh.extend(zmq_client::link_labels(client));
+            // share it by (`refreshed_labels`).
+            let fresh = zmq_client::refreshed_labels(
+                &worker.metadata().discovered_labels,
+                zmq_client::link_labels(client),
+            );
             debug!(
                 worker_url = %worker.redacted_url(),
                 labels = fresh.len(),
@@ -127,7 +127,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use openai_protocol::worker::{WorkerStatus, WorkerUpdateRequest};
     use smg_worker::{identity::basic::Worker, jobs::WorkerJobAsker};

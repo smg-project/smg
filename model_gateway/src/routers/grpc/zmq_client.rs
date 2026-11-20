@@ -67,6 +67,24 @@ pub(crate) fn link_labels(client: &ZmqEngineClient) -> HashMap<String, String> {
     labels
 }
 
+/// The labels of [`tokenspeed_running_window`].
+const RUNNING_WINDOW_LABELS: [&str; 2] = ["max_num_seqs", "attn_dp_size"];
+
+/// A ZMQ worker's `record` of its engine's labels with what its link reports
+/// now. The record holds a rank worker's running window as that rank's
+/// share, and a refresh reads the report as the whole group's, so the
+/// record's share is dropped: left in place under a link that reports no
+/// window, every refresh would divide it by the ranks again.
+pub(crate) fn refreshed_labels(
+    record: &HashMap<String, String>,
+    link: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut fresh = record.clone();
+    fresh.retain(|key, _| !RUNNING_WINDOW_LABELS.contains(&key.as_str()));
+    fresh.extend(link);
+    fresh
+}
+
 /// A TokenSpeed link's running window as the engine's report carries it:
 /// `max_num_seqs`, which every engine of a group declares as the whole
 /// group's, and the number of attention-DP ranks that share it, so a rank
@@ -165,5 +183,29 @@ mod tests {
             HashMap::from([("max_num_seqs".to_string(), "80".to_string())])
         );
         assert!(tokenspeed_running_window(0, 16).is_empty());
+    }
+
+    /// A rank worker's record holds its share of the running window. A link
+    /// that reports the window replaces the share with the group's; one that
+    /// reports none leaves no share behind to be divided again.
+    #[test]
+    fn a_refresh_drops_the_running_window_its_link_no_longer_reports() {
+        let record = HashMap::from([
+            ("max_num_seqs".to_string(), "16".to_string()),
+            ("attn_dp_size".to_string(), "16".to_string()),
+            ("default_temperature".to_string(), "0.6".to_string()),
+        ]);
+        assert_eq!(
+            refreshed_labels(&record, tokenspeed_running_window(256, 16)),
+            HashMap::from([
+                ("max_num_seqs".to_string(), "256".to_string()),
+                ("attn_dp_size".to_string(), "16".to_string()),
+                ("default_temperature".to_string(), "0.6".to_string()),
+            ])
+        );
+        assert_eq!(
+            refreshed_labels(&record, tokenspeed_running_window(0, 16)),
+            HashMap::from([("default_temperature".to_string(), "0.6".to_string())])
+        );
     }
 }

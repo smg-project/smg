@@ -813,6 +813,47 @@ async fn a_dp_aware_zmq_group_becomes_rank_workers_sharing_one_connection() {
     }
 }
 
+/// The rank workers of a group register at `{base}@{rank}`: a second
+/// create-only registration of the group finds them there and is refused.
+#[tokio::test]
+async fn create_only_refuses_a_group_whose_rank_workers_are_registered() {
+    let base = "ipc:///tmp/smg-zmq/ts0.ipc";
+    let host = ProbingHost::reading_dp(ScriptedConnector::default());
+    let group = |host: Arc<ProbingHost>| {
+        let mut spec = WorkerSpec::new(base);
+        spec.runtime_type = RuntimeType::TokenSpeed;
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        spec.dp_size = Some(2);
+        let mut data = local_data(spec, ConnectionMode::Zmq, host);
+        data.dp_info = Some(DpInfo {
+            dp_size: 2,
+            model_id: "m".to_string(),
+        });
+        data.registration_mode = WorkerRegistrationMode::CreateOnly;
+        WorkflowContext::new(WorkflowInstanceId::new(), data)
+    };
+
+    let mut first = group(Arc::clone(&host));
+    assert_eq!(
+        CreateLocalWorkerStep.execute(&mut first).await.unwrap(),
+        StepResult::Success
+    );
+    for worker in first.data.actual_workers.take().unwrap() {
+        host.worker_registry().register(worker).unwrap();
+    }
+
+    let mut second = group(host);
+    let error = CreateLocalWorkerStep
+        .execute(&mut second)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Step failed: create_worker - Worker ipc:///tmp/smg-zmq/ts0.ipc already exists"
+    );
+    assert!(second.data.actual_workers.is_none());
+}
+
 #[test]
 fn model_alias_map_does_not_duplicate_user_provided_alias() {
     // POST /workers can already carry aliases in the spec; the router map
