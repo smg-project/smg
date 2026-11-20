@@ -32,7 +32,8 @@
 //!   override adds the request's own id.
 //! - A number that means never lands as the largest its place holds: a
 //!   balance threshold past the document's width, and the sweep interval of
-//!   an index the configuration never sweeps.
+//!   an index the configuration never sweeps. The classic trims an index at
+//!   its sweep alone, so that index's size bound lands as the largest too.
 //!
 //! # What is refused
 //!
@@ -56,8 +57,11 @@
 //! load poll, retries and the breaker, the prefill queue and the decode
 //! rooms. The pin of a sticky key to one engine of a grouped worker is the
 //! dispatch's as well: it runs behind the decision, on the worker the
-//! decision names. The copy of the cache boundaries at the top of the
-//! configuration decides nothing either: each policy reads its own.
+//! decision names. Its key is the gateway's own, read from the routing-key
+//! headers: a supplied document that keys its requests on another header
+//! leaves the pin without a key. The copy of the cache boundaries at the
+//! top of the configuration decides nothing either: each policy reads its
+//! own.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -860,20 +864,27 @@ impl Shared<'_> {
                 .map(|at| narrow("cache_boundaries", *at))
                 .collect::<Result<_, _>>()?;
         }
-        let index = self
-            .index
-            .map(|(kind, ttl_s, max_size, sweep_s)| IndexSpec {
+        let index = self.index.map(|(kind, ttl_s, max_size, sweep_s)| {
+            // The classic trims its index at its sweep alone, and sweeps
+            // nothing at an interval of zero: that index is never trimmed.
+            // The document's cadence and size both start at one, so its
+            // longest cadence and its largest size say it. No sweep falls
+            // inside a process's life, and no write meets the bound.
+            let (max_size, sweep_s) = if sweep_s == 0 {
+                (u64::MAX, u32::MAX)
+            } else {
+                (max_size, sweep_s)
+            };
+            IndexSpec {
                 kind: match kind {
                     CacheIndexKind::Tree => IndexKind::Tree,
                     CacheIndexKind::Hash => IndexKind::Hash,
                 },
                 ttl_s,
                 max_size,
-                // The classic sweeps nothing at an interval of zero. The
-                // document's cadence starts at one second, so its longest
-                // says it: no sweep falls inside a process's life.
-                sweep_s: if sweep_s == 0 { u32::MAX } else { sweep_s },
-            });
+                sweep_s,
+            }
+        });
         if let Some(index) = index.and_then(|index| unless(index, IndexSpec::default())) {
             document.index.insert("*".to_string(), index);
         }
@@ -2136,20 +2147,35 @@ mod tests {
     }
 
     #[test]
-    fn an_index_the_configuration_never_sweeps_lands_at_the_longest_cadence() {
-        // The classic sweeps nothing at an interval of zero. The document's
-        // cadence starts at one second, so its longest stands for never.
+    fn an_index_the_configuration_never_sweeps_is_never_trimmed() {
+        // The classic trims its index at its sweep alone, and sweeps nothing
+        // at an interval of zero: the configured size bounds nothing. The
+        // document says so with its longest cadence and its largest size,
+        // which no write of the controller's record meets.
         let swept_every = |secs| PolicyConfig::cache_aware(0.3, 64, 1.5, secs, 67_108_864);
         let unswept = config(swept_every(0));
         let document = unswept.policy_document().expect("a document");
         assert_eq!(
             document.index.get("*"),
             Some(&IndexSpec {
+                max_size: u64::MAX,
                 sweep_s: u32::MAX,
                 ..IndexSpec::default()
             })
         );
         assert_eq!(unswept.hosted_policy(&document).err(), None);
+        // A swept index keeps the size it is trimmed to.
+        let swept = config(PolicyConfig::cache_aware(0.3, 64, 1.5, 60, 1024))
+            .policy_document()
+            .expect("a document");
+        assert_eq!(
+            swept.index.get("*"),
+            Some(&IndexSpec {
+                max_size: 1024,
+                sweep_s: 60,
+                ..IndexSpec::default()
+            })
+        );
 
         // Two sides are still compared as the configuration spells them.
         let sides = RouterConfig {
