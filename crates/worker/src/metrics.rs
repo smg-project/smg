@@ -69,7 +69,7 @@ impl BoundedLabels {
         }
         let mut admitted = self.admitted.load(Ordering::Relaxed);
         loop {
-            if admitted >= self.cap {
+            if self.is_full(admitted) {
                 return Arc::clone(&BOUNDED_LABEL_SENTINEL_ARC);
             }
             match self.admitted.compare_exchange_weak(
@@ -91,11 +91,56 @@ impl BoundedLabels {
             Entry::Vacant(entry) => Arc::clone(&*entry.insert(Arc::from(s))),
         }
     }
+
+    /// Whether the set admits no value more: `admitted` is at its cap, or
+    /// a test reads the set as full on its own thread. Asked only for a
+    /// value the set does not hold.
+    fn is_full(&self, admitted: usize) -> bool {
+        #[cfg(test)]
+        if labels_full::on_this_thread() {
+            return true;
+        }
+        admitted >= self.cap
+    }
 }
 
 /// Intern a client-supplied model label, bounded by `MAX_MODEL_LABELS`.
 pub fn intern_model_label(model_id: &str) -> Arc<str> {
     MODEL_LABELS.intern(model_id)
+}
+
+/// For this crate's tests: a thread's say that the bounded label sets are
+/// full. A value a set does not hold then gets the sentinel, as it does
+/// past the set's cap, and no process-wide set is filled under the other
+/// tests.
+#[cfg(test)]
+pub(crate) mod labels_full {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FULL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The say, held: it ends when this drops, so a case that fails leaves
+    /// none behind on its thread.
+    #[must_use = "the say ends when the guard drops"]
+    pub(crate) struct Full(());
+
+    impl Drop for Full {
+        fn drop(&mut self) {
+            FULL.set(false);
+        }
+    }
+
+    /// Have this thread read the sets as full until the guard drops.
+    pub(crate) fn hold_on_this_thread() -> Full {
+        FULL.set(true);
+        Full(())
+    }
+
+    pub(super) fn on_this_thread() -> bool {
+        FULL.get()
+    }
 }
 
 /// Per-thread caches of the handles the per-request records go through.
@@ -378,5 +423,19 @@ mod tests {
         let b2 = labels.intern("m2");
         assert!(Arc::ptr_eq(&b, &b2));
         assert_ne!(&*a, BOUNDED_LABEL_SENTINEL);
+    }
+
+    #[test]
+    fn a_thread_reads_the_label_sets_as_full_until_the_say_drops() {
+        let admitted = intern_model_label("a-model-admitted-ahead");
+        {
+            let _full = labels_full::hold_on_this_thread();
+            let again = intern_model_label("a-model-admitted-ahead");
+            assert!(Arc::ptr_eq(&again, &admitted));
+            let met = intern_model_label("a-model-met-while-full");
+            assert_eq!(&*met, BOUNDED_LABEL_SENTINEL);
+        }
+        let met = intern_model_label("a-model-met-while-full");
+        assert_eq!(&*met, "a-model-met-while-full");
     }
 }

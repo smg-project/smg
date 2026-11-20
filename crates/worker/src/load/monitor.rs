@@ -87,7 +87,10 @@ use crate::{
         port::{GroupTick, LoadSink, PollMode, PolledMember, PolledRanks, PolledReport},
         state::{LoadReceiver, LoadSnapshot, LoadState},
     },
-    metrics::writers::{LoadTest, Metrics},
+    metrics::{
+        intern_model_label,
+        writers::{LoadTest, Metrics},
+    },
     registry::{event::WorkerEvent, worker_model_ids, Generation, WorkerRegistry},
     worker::{
         LoadRecord, LoadTelemetry, RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey,
@@ -401,9 +404,9 @@ fn ranks_past(report: &WorkerLoadResponse, width: usize) -> impl Iterator<Item =
 /// model. `ended` is the report or the row that ends with the worker's
 /// feed, where there is one. A series a live writer writes is left: the
 /// writer asks `live` whether a live writer holds an entry of the rank
-/// that passes the series' test, under a model or, given none, under any
-/// ([`Metrics::remove_engine_rank_metrics`]). Its callers hold the lock
-/// of the reports, under which every series is written.
+/// that passes the series' test, under a model's label or, given none,
+/// under any ([`Metrics::remove_engine_rank_metrics`]). Its callers hold
+/// the lock of the reports, under which every series is written.
 #[cold]
 fn write_sentinel(
     worker: &Arc<dyn Worker>,
@@ -427,8 +430,8 @@ fn write_sentinel(
     // so sentinel every model's series — not just the primary.
     let models = worker_model_ids(worker);
     for rank in ranks {
-        Metrics::remove_engine_rank_metrics(url, &models, rank, |model_id, test| {
-            live(model_id, rank, test)
+        Metrics::remove_engine_rank_metrics(url, &models, rank, |label, test| {
+            live(label, rank, test)
         });
     }
 }
@@ -1532,6 +1535,8 @@ impl<G: Generation> WorkerMonitor<G> {
     /// and a load can name a rank more than once: every entry is asked.
     /// The pair series carry the engine's role and no model: one is a live
     /// writer's under the role such an entry reports, whatever its model.
+    /// A load series carries its model's label, and two models share one
+    /// past the label cap: a writer's model is matched by that label.
     /// A report with a held record is no live writer: its worker was not
     /// `Ready` at that record, and the flush that finds it `Ready` writes
     /// its series. `reports` is the locked map of the pushed reports, and
@@ -1554,22 +1559,35 @@ impl<G: Generation> WorkerMonitor<G> {
             .load_state
             .another_live_workers_row(worker)
             .map(|(source, load)| (worker_model_ids(&source), load));
-        let row = row.as_ref();
+        // Each live writer's labels are read once, and the guard compares
+        // texts alone. The read is the intern the writers use, so it gives
+        // the label a writer's series carry, and it admits at most the
+        // label that writer's own first write admits. A second kind of
+        // read of the label map would stop the compiler inlining the
+        // map's lookup into the intern, a cost to every record that
+        // builds its own keys.
+        let row = row.as_ref().map(|(models, load)| {
+            let labels: Vec<Arc<str>> = models
+                .iter()
+                .map(|model| intern_model_label(model))
+                .collect();
+            (labels, load)
+        });
         let other = reports
             .get(worker.url())
-            .filter(|other| !Arc::ptr_eq(&other.pusher, worker) && !other.series_held);
-        write_sentinel(worker, ended, |model_id, rank, carries| {
+            .filter(|other| !Arc::ptr_eq(&other.pusher, worker) && !other.series_held)
+            .map(|other| (intern_model_label(other.pusher.model_id()), other));
+        write_sentinel(worker, ended, |label, rank, carries| {
             let holds = |loads: &[SchedulerLoadSnapshot]| {
                 loads
                     .iter()
                     .any(|load| load.dp_rank == rank && carries(load))
             };
-            row.is_some_and(|(models, load)| {
-                model_id.is_none_or(|id| models.iter().any(|model| model == id))
+            row.as_ref().is_some_and(|(labels, load)| {
+                label.is_none_or(|label| labels.iter().any(|own| **own == *label))
                     && holds(&load.loads)
-            }) || other.is_some_and(|other| {
-                model_id.is_none_or(|id| other.pusher.model_id() == id)
-                    && holds(&other.report.loads)
+            }) || other.as_ref().is_some_and(|(own, other)| {
+                label.is_none_or(|label| **own == *label) && holds(&other.report.loads)
             })
         });
     }

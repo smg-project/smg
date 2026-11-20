@@ -1553,8 +1553,10 @@ impl Metrics {
     ///
     /// A series a live writer writes is left. The writer asks `live`,
     /// series by series: does a live writer at the URL hold an entry of
-    /// this rank that passes the series' test, under a model for the load
-    /// gauges and under any (`None`) for the pair gauges? The tests are
+    /// this rank that passes the series' test, under a model's label for
+    /// the load gauges and under any (`None`) for the pair gauges? A load
+    /// series carries its model's label, and two models share one past
+    /// the label cap ([`intern_model_label`]). The tests are
     /// [`Self::record_engine_rank_load`]'s own conditions: any entry for
     /// the five core gauges, one that carries the capacity for the
     /// capacity gauge, one that reports the role and carries the figure
@@ -1573,13 +1575,12 @@ impl Metrics {
         let worker = intern_string(worker_url);
         let dp_rank = rank_label(dp_rank);
         for model_id in models {
-            let model_id = model_id.as_str();
-            let core = live(Some(model_id), &|_| true);
-            let capacity = live(Some(model_id), &|load| load.max_total_num_tokens > 0);
+            let model = intern_model_label(model_id);
+            let core = live(Some(&model), &|_| true);
+            let capacity = live(Some(&model), &|load| load.max_total_num_tokens > 0);
             if core && capacity {
                 continue;
             }
-            let model = intern_model_label(model_id);
             for (name, written) in [
                 ("smg_engine_running_requests", core),
                 ("smg_engine_waiting_requests", core),
