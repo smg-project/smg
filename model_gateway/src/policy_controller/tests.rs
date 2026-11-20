@@ -922,3 +922,59 @@ async fn a_rows_status_is_its_workers_under_a_controllers_address_alone() -> Cas
     assert_eq!(dials_through_it, [true, true]);
     Ok(())
 }
+
+/// The host the context builds stands over the feed's own holder. A worker
+/// written at the context's feed door is placed by the context's host, on
+/// the object the holder laid in the context's registry.
+#[tokio::test]
+async fn a_worker_written_at_the_contexts_door_is_placed_by_its_host() -> Case {
+    use std::time::Instant;
+
+    use smg_policy_controller::{
+        store::{HealthPolicy, Maker},
+        worker_host::{Expect, Wrote},
+    };
+
+    use super::host::Ask;
+
+    const URL: &str = "http://127.0.0.1:1";
+    let context = AppContext::from_config(picked(quiet()), 30, None, None).await?;
+    let feed = context
+        .policy_feed
+        .as_ref()
+        .ok_or("the store has no feed")?;
+    let host = context
+        .policy_host
+        .as_ref()
+        .ok_or("the store has no host")?;
+    let wrote = feed
+        .door
+        .found(&Maker::Control, Expect::Nothing, URL, &|_| WorkerFacts {
+            key: URL.to_owned(),
+            engine: URL.to_owned(),
+            role: Role::Single,
+            wire_modes: WireModes::HTTP,
+            models: vec!["model-a".to_owned()],
+            dp_size: 1,
+            max_running: Some(64),
+            health: HealthPolicy {
+                probes: false,
+                ..HealthPolicy::default()
+            },
+            ..WorkerFacts::default()
+        });
+    let Ok(Wrote::Registered(row)) = wrote else {
+        return Err(format!("expected a registration, got {wrote:?}").into());
+    };
+    let placed = host
+        .place(&Ask::of(b"r1", "model-a"), Instant::now())
+        .await
+        .map_err(|_| "the context's host placed no worker")?;
+    assert_eq!(placed.id(), row);
+    let laid = context
+        .worker_registry
+        .get_by_url(URL)
+        .ok_or("the registry holds no worker at the URL")?;
+    assert!(Arc::ptr_eq(placed.worker(), &laid));
+    Ok(())
+}
