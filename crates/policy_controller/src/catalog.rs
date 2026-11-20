@@ -28,7 +28,7 @@ use crate::{
     framework::{Filter, Picker, Scorer},
     reports::Reports,
     sent::SentCredit,
-    signals::SignalColumn,
+    signals::{column_named, SignalColumn},
     spec::{Needs, SpecError, SCORERS},
 };
 
@@ -186,14 +186,11 @@ impl StageBuild<'_> {
     /// a host hands the cells to the profiles that read them and to no
     /// other.
     pub fn signal_column(&mut self, name: &str) -> Result<SignalColumn, StageError> {
-        let found = self
-            .signals
-            .binary_search_by(|column| column.name().cmp(name));
-        let column = found.map_err(|_| {
+        let column = column_named(self.signals, name).ok_or_else(|| {
             StageError::other(format!("{name} is not a signal the document declares"))
         })?;
         self.resolved_signal = true;
-        Ok(self.signals[column].clone())
+        Ok(column.clone())
     }
 }
 

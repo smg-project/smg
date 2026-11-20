@@ -27,6 +27,7 @@ use crate::{
     },
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
     sent::{Sent, SentCounts, SentCredit, SentReads},
+    signals::{SignalColumn, SignalSums, SignalTerm},
     spec::{CostMargin, Needs, Unreported},
     terms::{Coefficients, Term},
     view::{
@@ -191,18 +192,22 @@ impl Filter for HasRoom {
 /// Asks `$rule.$method` with the three flags of a report's sum
 /// ([`Coefficients::add_report`]) settled from the names the rule reads. A
 /// flag left on for a name it does not read would drop a row for a value
-/// nobody named.
+/// nobody named. With a stage named behind the rule, the stage is asked
+/// under the rule's flags: a stage that wraps the rule.
 macro_rules! by_names {
     ($rule:expr, $method:ident($($arg:expr),*)) => {
+        by_names!($rule, $rule, $method($($arg),*))
+    };
+    ($rule:expr, $stage:expr, $method:ident($($arg:expr),*)) => {
         match ($rule.resident, $rule.waiting, $rule.kv_or_running) {
-            (false, false, false) => $rule.$method::<false, false, false>($($arg),*),
-            (false, false, true) => $rule.$method::<false, false, true>($($arg),*),
-            (false, true, false) => $rule.$method::<false, true, false>($($arg),*),
-            (false, true, true) => $rule.$method::<false, true, true>($($arg),*),
-            (true, false, false) => $rule.$method::<true, false, false>($($arg),*),
-            (true, false, true) => $rule.$method::<true, false, true>($($arg),*),
-            (true, true, false) => $rule.$method::<true, true, false>($($arg),*),
-            (true, true, true) => $rule.$method::<true, true, true>($($arg),*),
+            (false, false, false) => $stage.$method::<false, false, false>($($arg),*),
+            (false, false, true) => $stage.$method::<false, false, true>($($arg),*),
+            (false, true, false) => $stage.$method::<false, true, false>($($arg),*),
+            (false, true, true) => $stage.$method::<false, true, true>($($arg),*),
+            (true, false, false) => $stage.$method::<true, false, false>($($arg),*),
+            (true, false, true) => $stage.$method::<true, false, true>($($arg),*),
+            (true, true, false) => $stage.$method::<true, true, false>($($arg),*),
+            (true, true, true) => $stage.$method::<true, true, true>($($arg),*),
         }
     };
 }
@@ -271,14 +276,17 @@ impl HasRoomRule {
     /// ([`SentReads::counts`]), or `None` where the rule reads no count.
     /// The sum runs in name order: the count in flight, the report's
     /// fields, the request's part as `asked` ([`Self::asked`]), the sends.
+    /// `within` says whether that sum is within the row's bound: the
+    /// rule's own test, or the signal form's behind its signals.
     #[inline(always)]
-    fn fits<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
+    fn fits_with<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
         &self,
         asked: f64,
         facts: &RequestFacts<'_>,
         row: &Candidate,
         load: Option<&LoadRow>,
         sent: impl FnOnce() -> Option<SentCounts>,
+        within: impl FnOnce(f64) -> bool,
     ) -> bool {
         let mut used = 0.0;
         if self.in_flight {
@@ -297,10 +305,24 @@ impl HasRoomRule {
         }
         used += asked;
         if let Some(sent) = sent() {
-            used += f64::from(sent.requests) * self.terms.sent_requests;
-            used += sent.tokens as f64 * self.terms.sent_tokens;
+            self.terms.add_sent(&mut used, sent);
         }
-        used <= self.bound
+        within(used)
+    }
+
+    /// [`Self::fits_with`] under the rule's own bound.
+    #[inline(always)]
+    fn fits<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
+        &self,
+        asked: f64,
+        facts: &RequestFacts<'_>,
+        row: &Candidate,
+        load: Option<&LoadRow>,
+        sent: impl FnOnce() -> Option<SentCounts>,
+    ) -> bool {
+        self.fits_with::<RESIDENT, WAITING, KV_OR_RUNNING>(asked, facts, row, load, sent, |used| {
+            used <= self.bound
+        })
     }
 
     /// [`Filter::keep`] of one row, by the report `load` hands.
@@ -464,6 +486,235 @@ pub(crate) fn has_room_rule(rule: HasRoomRule, max_age_ms: Option<u64>) -> Box<d
     match max_age_ms.filter(|_| rule.loads) {
         Some(max_age_ms) => Box::new(HasRoomWithin { rule, max_age_ms }),
         None => Box::new(rule),
+    }
+}
+
+/// [`HasRoomRule`] where the document names a signal: in the rule's sum, as
+/// its capacity, or both. A type of its own, chosen where the stage is
+/// built, so a rule that names no signal runs the pass that reads none.
+///
+/// The signals close the sum, in name order. A row with no fresh value for
+/// one of them has no room. Under a signal's capacity the bound is worked
+/// a row: one less the headroom, times the row's capacity. A row whose
+/// capacity has no fresh value has no room, and neither has one whose
+/// capacity reads zero or less.
+///
+/// The view's report age limit reaches the report's fields, as it does in
+/// [`HasRoomWithin`]. A signal's maximum age reaches that signal alone.
+#[derive(Debug)]
+pub(crate) struct HasRoomSignals {
+    /// The rule's other terms. Under a signal's capacity its bound is one
+    /// less the headroom: the bound of a capacity of one.
+    rule: HasRoomRule,
+    /// The signals the rule sums, in name order.
+    signals: Box<[SignalTerm]>,
+    /// The capacity's signal, where the rule names one.
+    capacity: Option<SignalColumn>,
+    /// The view's report age limit, where the document sets one and a term
+    /// reads a report.
+    max_age_ms: Option<u64>,
+}
+
+impl HasRoomSignals {
+    pub(crate) fn new(
+        rule: HasRoomRule,
+        signals: Box<[SignalTerm]>,
+        capacity: Option<SignalColumn>,
+        max_age_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            max_age_ms: max_age_ms.filter(|_| rule.loads),
+            rule,
+            signals,
+            capacity,
+        }
+    }
+
+    /// Whether `used` is within the row's bound. `capacity` reads the
+    /// row's capacity under the signal that holds it.
+    #[inline(always)]
+    fn within(&self, used: f64, capacity: impl FnOnce(&SignalColumn) -> Option<f64>) -> bool {
+        match &self.capacity {
+            // A capacity of zero or less holds nothing, by a test of its
+            // own: a plain compare would pass a row that holds nothing.
+            Some(signal) => capacity(signal)
+                .is_some_and(|capacity| capacity > 0.0 && used <= self.rule.bound * capacity),
+            None => used <= self.rule.bound,
+        }
+    }
+
+    /// [`Filter::keep`] of one row, by the report `load` hands. A drawn
+    /// row reads each signal through [`SignalColumn::read`].
+    fn keep_with(&self, facts: &RequestFacts<'_>, row: &Candidate, load: Option<&LoadRow>) -> bool {
+        let rule = &self.rule;
+        // The count is read behind the rule's flag, as
+        // [`HasRoomRule::keep_with`] reads it and for its reason.
+        let sent = || {
+            rule.sent
+                .as_ref()
+                .map_or_else(SentCounts::default, |sent| sent.reads(facts).counts(row))
+        };
+        let asked = rule.asked(facts);
+        by_names!(
+            rule,
+            fits_with(
+                asked,
+                facts,
+                row,
+                load,
+                || rule.sent.is_some().then(sent),
+                |mut used| {
+                    for (signal, coefficient) in &self.signals {
+                        let Some(value) = signal.read(facts, row) else {
+                            return false;
+                        };
+                        used += value * coefficient;
+                    }
+                    self.within(used, |capacity| capacity.read(facts, row))
+                }
+            )
+        )
+    }
+
+    /// One pass over the kept rows, as [`HasRoomRule::rows`] makes it. A
+    /// count that holds no row's entry is not read, as there. The pass is
+    /// made once for a count to read and once for none, so a row tests
+    /// neither.
+    #[inline(always)]
+    fn rows<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &mut Vec<u32>,
+        load: impl Fn(&Candidate) -> Option<&LoadRow>,
+    ) {
+        let sends = self
+            .rule
+            .sent
+            .as_ref()
+            .map(|sent| sent.reads(facts))
+            .filter(|sends| sends.holds_any());
+        match &sends {
+            Some(sends) => self.rows_by::<RESIDENT, WAITING, KV_OR_RUNNING>(
+                facts,
+                candidates,
+                kept,
+                load,
+                |row| Some(sends.counts(row)),
+            ),
+            None => self.rows_by::<RESIDENT, WAITING, KV_OR_RUNNING>(
+                facts,
+                candidates,
+                kept,
+                load,
+                |_| None,
+            ),
+        }
+    }
+
+    /// [`Self::rows`] by the sends `sent` counts of each row. The facts'
+    /// cells and each signal's oldest instant still read are taken once a
+    /// pass, and a row's cells once a row.
+    #[inline(always)]
+    fn rows_by<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &mut Vec<u32>,
+        load: impl Fn(&Candidate) -> Option<&LoadRow>,
+        sent: impl Fn(&Candidate) -> Option<SentCounts>,
+    ) {
+        let rule = &self.rule;
+        let asked = rule.asked(facts);
+        let sums = SignalSums::new(facts, &self.signals);
+        let capacity_oldest = self
+            .capacity
+            .as_ref()
+            .map_or(0, |capacity| capacity.oldest(facts));
+        let mut held = 0;
+        for at in 0..kept.len() {
+            let i = kept[at];
+            let row = &candidates[i as usize];
+            let fits = rule.fits_with::<RESIDENT, WAITING, KV_OR_RUNNING>(
+                asked,
+                facts,
+                row,
+                load(row),
+                || sent(row),
+                |used| {
+                    let cells = sums.row(row);
+                    let (used, whole) = sums.add(used, cells);
+                    whole && self.within(used, |capacity| capacity.among(cells?, capacity_oldest))
+                },
+            );
+            kept[held] = i;
+            held += usize::from(fits);
+        }
+        kept.truncate(held);
+    }
+
+    /// [`Filter::retain`], by the report `load` hands of each row.
+    fn retain_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &mut Vec<u32>,
+        load: impl Fn(&Candidate) -> Option<&LoadRow>,
+    ) {
+        by_names!(self.rule, self, rows(facts, candidates, kept, load));
+    }
+}
+
+impl Filter for HasRoomSignals {
+    fn name(&self) -> &'static str {
+        self.rule.name()
+    }
+
+    fn refuses_by_reports(&self) -> bool {
+        self.rule.refuses_by_reports()
+    }
+
+    fn row_wise(&self) -> bool {
+        self.rule.row_wise()
+    }
+
+    fn soft(&self) -> bool {
+        self.rule.soft()
+    }
+
+    // The cells stand beside the rows of a profile whose stage says it
+    // reads a signal. A signal alone asks for no load report.
+    fn needs(&self) -> Needs {
+        Needs {
+            signal_cells: true,
+            ..self.rule.needs()
+        }
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
+        match self.max_age_ms {
+            Some(max_age_ms) => {
+                let cutoff = ReportCutoff::new(facts.now_micros, max_age_ms);
+                self.keep_with(facts, c, cutoff.load(c))
+            }
+            None => self.keep_with(facts, c, c.load.as_ref()),
+        }
+    }
+
+    fn retain(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        _: &Constraints<'_>,
+        kept: &mut Vec<u32>,
+    ) {
+        match self.max_age_ms {
+            Some(max_age_ms) => {
+                let cutoff = ReportCutoff::new(facts.now_micros, max_age_ms);
+                self.retain_with(facts, candidates, kept, |row| cutoff.load(row));
+            }
+            None => self.retain_with(facts, candidates, kept, |row| row.load.as_ref()),
+        }
     }
 }
 
@@ -3035,11 +3286,130 @@ impl ReadsLoad for LeastCostSent {
             for (&row, cost) in kept.iter().zip(costs.iter_mut()) {
                 if let RowCost::Sum(sum) = cost {
                     let sent = sends.counts(&candidates[row as usize]);
-                    *sum += f64::from(sent.requests) * terms.sent_requests;
-                    *sum += sent.tokens as f64 * terms.sent_tokens;
+                    terms.add_sent(sum, sent);
                     bounds.include(*sum);
                 }
             }
+            self.cost.price_and_score(out, costs, bounds, pending)
+        })
+    }
+}
+
+/// `least-cost` where the document names a `signal.` term: the sum of
+/// [`LeastCost`], then the profile's sends where a term names them, then
+/// the signals in name order. A row with no fresh value for a signal a
+/// term names is unreported for the scorer: under `over-least` it is
+/// priced over the least by its requests in flight, as a row with no
+/// report is, and under `missing-as-zero` the term adds nothing. A
+/// document that names no signal is built as one of the other two and
+/// reads no cell.
+#[derive(Debug)]
+pub(crate) struct LeastCostSignals {
+    cost: LeastCost,
+    /// The profile's count of sends, where a term reads it.
+    sent: Option<Arc<SentCredit>>,
+    signals: Box<[SignalTerm]>,
+}
+
+impl LeastCostSignals {
+    pub(crate) fn new(
+        cost: LeastCost,
+        sent: Option<Arc<SentCredit>>,
+        signals: Box<[SignalTerm]>,
+    ) -> Self {
+        Self {
+            cost,
+            sent,
+            signals,
+        }
+    }
+}
+
+impl Lifecycle for LeastCostSignals {}
+
+impl Scorer for LeastCostSignals {
+    fn name(&self) -> &'static str {
+        self.cost.name()
+    }
+
+    fn refuses_by_reports(&self) -> bool {
+        self.cost.refuses_by_reports()
+    }
+
+    fn row_wise(&self) -> bool {
+        self.cost.row_wise()
+    }
+
+    // A report ends the sends before it, so the sends need the reports
+    // though no term may read one. The cells stand beside the rows of a
+    // profile whose stage says it reads a signal.
+    fn needs(&self) -> Needs {
+        Needs {
+            loads: self.cost.loads || self.sent.is_some(),
+            signal_cells: true,
+            ..Needs::default()
+        }
+    }
+
+    fn score(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        self.score_with(facts, candidates, kept, out, |c| c.load.as_ref())
+    }
+}
+
+impl ReadsLoad for LeastCostSignals {
+    fn score_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
+    ) -> TieBand {
+        with_costs(|costs| {
+            let (_, mut pending) = self
+                .cost
+                .collect_costs(facts, candidates, kept, costs, load);
+            // The sends close the fields' sum and the signals close the
+            // sends': `signal.` sorts behind every other name. A row priced
+            // over the least kept no sum and takes none. Both move the ends
+            // of the sums, so the ends are taken here and the walk's are
+            // dropped.
+            let terms = &self.cost.terms;
+            let sends = self.sent.as_ref().map(|sent| sent.reads(facts));
+            // Once a pass: the facts' cells and each signal's oldest
+            // instant still read. Once a row: the row's cells.
+            let signals = SignalSums::new(facts, &self.signals);
+            let mut bounds = CostBounds::EMPTY;
+            with_counts!(facts, |counts| {
+                for (&i, cost) in kept.iter().zip(costs.iter_mut()) {
+                    let RowCost::Sum(sum) = cost else {
+                        continue;
+                    };
+                    let row = &candidates[i as usize];
+                    if let Some(sends) = &sends {
+                        let sent = sends.counts(row);
+                        terms.add_sent(sum, sent);
+                    }
+                    let (priced, whole) = signals.add(*sum, signals.row(row));
+                    *sum = priced;
+                    // A signal with no fresh value leaves the row open under
+                    // `over-least`, as no report does in the walk: its sum
+                    // is dropped and its requests in flight price it.
+                    match self.cost.request_cost.filter(|_| !whole) {
+                        Some(price) => {
+                            *cost = RowCost::OverLeast(f64::from(counts(row)) * price);
+                            pending = true;
+                        }
+                        None => bounds.include(priced),
+                    }
+                }
+            });
             self.cost.price_and_score(out, costs, bounds, pending)
         })
     }

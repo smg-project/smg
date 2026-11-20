@@ -332,7 +332,7 @@
       "type": "object",
       "properties": {
         "used": {
-          "description": "What a worker holds: field names and their coefficients, summed. At\nleast one field of the worker is required under a capacity that is a\nnumber: the request's size alone reads nothing of a worker there.\nA worker that lacks a named value has no room.",
+          "description": "What a worker holds: field names and their coefficients, summed. At\nleast one is required. A name written `signal.<name>` reads a signal\nthe document declares. Under a capacity that is a number, a field\nor a signal of the worker is required: the request's size alone\nreads nothing of a worker there. A worker that lacks a named value\nhas no room.",
           "type": "object",
           "additionalProperties": {
             "type": "number",
@@ -345,22 +345,29 @@
           },
           "minProperties": 1,
           "propertyNames": {
-            "enum": [
-              "candidate.in_flight",
-              "load.active_kv_permille",
-              "load.kv_usage_permille",
-              "load.queued",
-              "load.resident_tokens",
-              "load.running",
-              "load.waiting_uncached_tokens",
-              "request.prompt_tokens",
-              "sent.requests",
-              "sent.tokens"
+            "anyOf": [
+              {
+                "enum": [
+                  "candidate.in_flight",
+                  "load.active_kv_permille",
+                  "load.kv_usage_permille",
+                  "load.queued",
+                  "load.resident_tokens",
+                  "load.running",
+                  "load.waiting_uncached_tokens",
+                  "request.prompt_tokens",
+                  "sent.requests",
+                  "sent.tokens"
+                ]
+              },
+              {
+                "pattern": "^signal\\.[a-z][a-z0-9_]{0,62}$"
+              }
             ]
           }
         },
         "capacity": {
-          "description": "What a worker can hold, in the units of `used`.",
+          "description": "What a worker can hold, in the units of `used`: a number, or a\nsignal the document declares. A worker whose capacity reads zero or\nless has no room.",
           "$ref": "#/$defs/Capacity"
         },
         "headroom": {
@@ -379,7 +386,7 @@
       ]
     },
     "Capacity": {
-      "description": "What a worker can hold: a number above zero in the units of `used`, or the name of a field that holds one. No field of this build holds a capacity.",
+      "description": "What a worker can hold: a number above zero in the units of `used`, or a signal the document declares, written `signal.<name>`.",
       "anyOf": [
         {
           "type": "number",
@@ -387,7 +394,8 @@
           "exclusiveMinimum": 0
         },
         {
-          "type": "string"
+          "type": "string",
+          "pattern": "^signal\\.[a-z][a-z0-9_]{0,62}$"
         }
       ]
     },
@@ -983,7 +991,7 @@
           "maximum": 1000000000000000.0
         },
         "terms": {
-          "description": "Field names and their coefficients. At least one field is required.",
+          "description": "Field names and their coefficients. At least one field is required.\nA name written `signal.<name>` reads a signal the document declares.",
           "type": "object",
           "additionalProperties": {
             "type": "number",
@@ -996,29 +1004,47 @@
           },
           "minProperties": 1,
           "propertyNames": {
-            "enum": [
-              "candidate.in_flight",
-              "load.active_kv_permille",
-              "load.kv_usage_permille",
-              "load.queued",
-              "load.resident_tokens",
-              "load.running",
-              "load.waiting_uncached_tokens",
-              "sent.requests",
-              "sent.tokens"
+            "anyOf": [
+              {
+                "enum": [
+                  "candidate.in_flight",
+                  "load.active_kv_permille",
+                  "load.kv_usage_permille",
+                  "load.queued",
+                  "load.resident_tokens",
+                  "load.running",
+                  "load.waiting_uncached_tokens",
+                  "sent.requests",
+                  "sent.tokens"
+                ]
+              },
+              {
+                "pattern": "^signal\\.[a-z][a-z0-9_]{0,62}$"
+              }
             ]
           }
         },
         "margin": {
-          "description": "How far above the least cost a row still ties for the top score.",
-          "$ref": "#/$defs/CostMargin",
+          "description": "How far above the least cost a row still ties for the top score: the\nmap of its two parts, or a bare number, the absolute margin.",
+          "anyOf": [
+            {
+              "description": "The absolute margin, in cost units.",
+              "type": "number",
+              "format": "double",
+              "minimum": 0,
+              "maximum": 1000000000000000.0
+            },
+            {
+              "$ref": "#/$defs/CostMargin"
+            }
+          ],
           "default": {
             "absolute": 0.0,
             "relative": 0.0
           }
         },
         "unreported": {
-          "description": "What a row costs when a named value is missing. Required for terms\nthat read a report.",
+          "description": "What a row costs when a named value is missing. Required for terms\nthat read a report or a signal.",
           "anyOf": [
             {
               "$ref": "#/$defs/Unreported"
