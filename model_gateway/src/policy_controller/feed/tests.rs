@@ -45,7 +45,10 @@ use crate::{
         start,
     },
     routers::{
-        common::snapshot::WorkerRegistry,
+        common::{
+            snapshot::WorkerRegistry,
+            worker_selection::{SelectWorkerRequest, WorkerSelector},
+        },
         grpc::backend_client::{BackendConnector, BasicWorkerBuilder},
     },
 };
@@ -777,6 +780,81 @@ async fn the_loop_shows_a_waiting_write_at_its_due_instant() {
     // No later write comes: the loop shows it when the window ends.
     sleep_until((now + 2 * PUBLISH_WINDOW).into()).await;
     assert_eq!(loads.vetoed(), Some(false));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_loop_writes_the_stores_overload_verdict_on_the_workers_object() {
+    let loads = Loads::new().expect("the bed stands");
+    let _publications = loads.feed.publications();
+    let over = || loads.registry.overloaded_worker_count(MODEL);
+    let now = Instant::now();
+    // The store shows the first record by itself. The object's flag does
+    // not move at the record: the loop writes it at its wake.
+    loads.pushed(6, now);
+    assert_eq!(loads.vetoed(), Some(true));
+    assert!(!loads.worker.is_overloaded());
+    yield_now().await;
+    assert!(loads.worker.is_overloaded());
+    assert_eq!(over(), 1);
+    // The queue drains inside the window. The verdict waits for the
+    // window's end, and the flag with it.
+    loads.pushed(0, now + PUBLISH_WINDOW / 4);
+    yield_now().await;
+    assert!(loads.worker.is_overloaded());
+    // The loop's publication shows the verdict cleared and clears the flag.
+    sleep_until((now + 2 * PUBLISH_WINDOW).into()).await;
+    assert_eq!(loads.vetoed(), Some(false));
+    assert!(!loads.worker.is_overloaded());
+    assert_eq!(over(), 0);
+}
+
+#[test]
+fn a_settle_writes_the_stores_overload_verdict_on_a_replaced_object() {
+    let loads = Loads::new().expect("the bed stands");
+    loads.pushed(6, Instant::now());
+    loads.feed.settle();
+    assert!(loads.worker.is_overloaded());
+    // The row's facts move at the door, and the holder replaces its
+    // object. The registry releases the verdict the first carried, and
+    // the write's own settle writes it on the second.
+    let moved = || WorkerFacts {
+        max_running: Some(32),
+        ..limited()
+    };
+    let door = &loads.feed.door;
+    door.found(&Maker::Control, Expect::Anything, URL, &|_| moved())
+        .expect("the row moves in place");
+    let second = loads.registry.get_by_url(URL).expect("the row's object");
+    assert!(!Arc::ptr_eq(&loads.worker, &second));
+    assert!(second.is_overloaded());
+    assert_eq!(loads.registry.overloaded_worker_count(MODEL), 1);
+}
+
+/// A route that picks by no routing policy reads the flag the feed mirrors,
+/// as it reads the monitor's under the classic policies. Where every
+/// candidate reads overloaded the selector still hands out the least loaded
+/// one, and under `--worker-overload-shed` it refuses instead.
+#[tokio::test]
+async fn a_classic_selection_reads_the_stores_overload_verdict() {
+    let loads = Loads::new().expect("the bed stands");
+    let selector = WorkerSelector::new(&loads.registry);
+    let request = SelectWorkerRequest {
+        model_id: MODEL,
+        ..Default::default()
+    };
+    loads.pushed(6, Instant::now());
+    loads.feed.settle();
+    assert!(loads.worker.is_overloaded());
+
+    let picked = selector.select_worker(&request).await;
+    assert!(picked.is_ok_and(|picked| Arc::ptr_eq(&picked, &loads.worker)));
+
+    loads.registry.set_overload_shed(true);
+    let refused = selector.select_worker(&request).await;
+    assert_eq!(
+        refused.err().map(|shed| shed.status()),
+        Some(http::StatusCode::SERVICE_UNAVAILABLE)
+    );
 }
 
 #[tokio::test(start_paused = true)]
