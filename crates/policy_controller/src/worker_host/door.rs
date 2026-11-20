@@ -42,6 +42,8 @@ pub enum Refused {
     NotLeading(String),
     /// Another writer moved the row under the call.
     Moved,
+    /// A row stands under the URL of a registration that expects none.
+    Stands,
     /// The row's maker is outside the health removal scope.
     OutOfScope,
 }
@@ -62,15 +64,33 @@ pub enum Remover<'a> {
     Health(UnhealthyRemovalScope),
 }
 
+/// What a registration expects to stand under its URL. Its facts are laid
+/// by one rule whatever it expects: an absent URL is registered, and a
+/// standing row is left, changed in place or replaced as its facts say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expect {
+    /// Nothing: an add. A standing row refuses it ([`Refused::Stands`]),
+    /// whoever made the row.
+    Nothing,
+    /// The row its asker saw, at the revision it saw: a replacement by id.
+    /// No row refuses it ([`Refused::Absent`]), and so does another row or
+    /// revision ([`Refused::Moved`]).
+    Seen(Standing),
+    /// Anything: an upsert.
+    Anything,
+}
+
 /// The membership door a host hands its registration and removal steps.
 pub trait Membership: Send + Sync + 'static {
-    /// Register a worker, or refresh the maker's row. The callback states
-    /// facts for `url` during the door's turn and must leave writes to the door.
-    /// Facts whose key is not `url` are refused: the maker was asked of the
-    /// row under `url`, and the store writes by the facts' key.
+    /// Lay a registration's facts under `url`, over what it expects to
+    /// stand there. The callback states facts for `url` during the door's
+    /// turn and must leave writes to the door. Facts whose key is not `url`
+    /// are refused: the maker was asked of the row under `url`, and the
+    /// store writes by the facts' key.
     fn found(
         &self,
         maker: &Maker,
+        expect: Expect,
         url: &str,
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
     ) -> Result<Wrote, Refused>;
@@ -99,15 +119,35 @@ fn made_by(row: &WorkerRow, maker: &Maker) -> Result<(), Refused> {
         .map_err(|not| Refused::NotMaker(not.to_string()))
 }
 
-/// Lay a registration over the standing facts while the door holds its turn.
+/// The row an asker saw, where it still stands under the URL at the
+/// revision the asker saw.
+fn seen_row(store: &MemoryStore, url: &str, seen: Standing) -> Result<WorkerRow, Refused> {
+    let row = store.by_key(url).ok_or(Refused::Absent)?;
+    if (row.id, row.revision) != (seen.row, seen.revision) {
+        return Err(Refused::Moved);
+    }
+    Ok(row)
+}
+
+/// Lay a registration over what it expects to stand while the door holds
+/// its turn.
 pub(crate) fn lay(
     turn: &impl Turn,
     maker: &Maker,
+    expect: Expect,
     url: &str,
     state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
 ) -> Result<Wrote, Refused> {
     let store = turn.store();
-    let standing = store.by_key(url);
+    let standing = match expect {
+        Expect::Seen(seen) => Some(seen_row(store, url, seen)?),
+        Expect::Nothing | Expect::Anything => store.by_key(url),
+    };
+    // An add changes no standing row, so it asks no maker and states no
+    // fact: its refusal is the same whoever made the row.
+    if expect == Expect::Nothing && standing.is_some() {
+        return Err(Refused::Stands);
+    }
     if let Some(row) = &standing {
         made_by(row, maker)?;
     }
@@ -168,10 +208,7 @@ fn removal_row(
     url: &str,
     seen: Standing,
 ) -> Result<WorkerRow, Refused> {
-    let row = store.by_key(url).ok_or(Refused::Absent)?;
-    if (row.id, row.revision) != (seen.row, seen.revision) {
-        return Err(Refused::Moved);
-    }
+    let row = seen_row(store, url, seen)?;
     match by {
         Remover::Maker(maker) => made_by(&row, maker)?,
         Remover::Provider(name) => match &row.maker {
@@ -290,10 +327,11 @@ impl Membership for StoreDoor {
     fn found(
         &self,
         maker: &Maker,
+        expect: Expect,
         url: &str,
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
     ) -> Result<Wrote, Refused> {
-        self.call(|| lay(self, maker, url, state))
+        self.call(|| lay(self, maker, expect, url, state))
     }
 
     fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
@@ -318,7 +356,9 @@ pub(super) mod tests {
 
     use smg_worker::settings::UnhealthyRemovalScope;
 
-    use super::{changed, lay, Membership, Refused, Remover, Standing, StoreDoor, Turn, Wrote};
+    use super::{
+        changed, lay, Expect, Membership, Refused, Remover, Standing, StoreDoor, Turn, Wrote,
+    };
     use crate::{
         store::{
             membership::{self, Past},
@@ -364,6 +404,90 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_registration_is_laid_over_what_it_expects() {
+        check_expectations(local_door);
+    }
+
+    /// An add registers an absent URL, and a standing row refuses it before
+    /// a fact is stated, whoever made the row. A replacement is laid over
+    /// the row its asker saw by the rule every registration takes, and is
+    /// refused where that row moved or left.
+    pub(crate) fn check_expectations(
+        open: impl FnOnce() -> (Arc<MemoryStore>, Box<dyn Membership>),
+    ) {
+        let (store, door) = open();
+        let control = Maker::Control;
+        let pool = Maker::provider("pool", "private/key").expect("a maker");
+        let unstated = |_: Option<&WorkerFacts>| -> WorkerFacts { panic!("no fact is stated") };
+
+        let added = door.found(&control, Expect::Nothing, URL, &|_| stated());
+        let row = store.by_key(URL).expect("the added row");
+        assert_eq!(added, Ok(Wrote::Registered(row.id)));
+        let epoch = store.epoch();
+        for maker in [&control, &pool] {
+            assert_eq!(
+                door.found(maker, Expect::Nothing, URL, &unstated),
+                Err(Refused::Stands)
+            );
+        }
+
+        let seen = Expect::Seen(standing(&row));
+        assert_eq!(
+            door.found(&control, seen, URL, &|_| stated()),
+            Ok(Wrote::Unmoved(row.id))
+        );
+        assert_eq!(
+            door.found(&pool, seen, URL, &unstated),
+            Err(Refused::NotMaker(
+                "the row was made by a control call: its maker alone changes it".to_owned()
+            ))
+        );
+        assert_eq!(store.epoch(), epoch);
+
+        // New labels are laid in place, and the row's revision moves on.
+        let relabelled = |_: Option<&WorkerFacts>| WorkerFacts {
+            labels: [("tier".to_owned(), "gold".to_owned())].into(),
+            ..stated()
+        };
+        assert_eq!(
+            door.found(&control, seen, URL, &relabelled),
+            Ok(Wrote::InPlace(row.id))
+        );
+        assert_eq!(
+            door.found(&control, seen, URL, &unstated),
+            Err(Refused::Moved)
+        );
+
+        // Other models are the URL's next life, as under an upsert.
+        let moved = store.by_key(URL).expect("the relabelled row");
+        let other = |_: Option<&WorkerFacts>| WorkerFacts {
+            models: vec!["other".to_owned()],
+            ..stated()
+        };
+        let wrote = door.found(&control, Expect::Seen(standing(&moved)), URL, &other);
+        let next = store.by_key(URL).expect("the next life");
+        assert_eq!(
+            wrote,
+            Ok(Wrote::Another {
+                old: row.id,
+                new: next.id
+            })
+        );
+
+        // The row its asker saw left.
+        let seen = standing(&next);
+        assert_eq!(
+            door.gone(Remover::Maker(&control), URL, seen),
+            Ok(Wrote::Removed(next.id))
+        );
+        assert_eq!(
+            door.found(&control, Expect::Seen(seen), URL, &unstated),
+            Err(Refused::Absent)
+        );
+        assert_eq!(store.by_key(URL), None);
+    }
+
+    #[test]
     fn a_removal_takes_only_the_row_its_asker_saw() {
         check_guard(local_door).expect("both registrations stand in turn");
     }
@@ -374,10 +498,12 @@ pub(super) mod tests {
         let (store, door) = open();
         let maker = Maker::Control;
         let by = Remover::Maker(&maker);
-        assert!(door.found(&maker, URL, &|_| stated()).is_ok());
+        assert!(door
+            .found(&maker, Expect::Anything, URL, &|_| stated())
+            .is_ok());
         let first = store.by_key(URL).ok_or("the first row")?;
         assert!(door
-            .found(&maker, URL, &|_| WorkerFacts {
+            .found(&maker, Expect::Anything, URL, &|_| WorkerFacts {
                 role: Role::Decode,
                 ..stated()
             })
@@ -426,7 +552,9 @@ pub(super) mod tests {
             ),
         ] {
             let (store, door) = open();
-            assert!(door.found(&maker, URL, &|_| stated()).is_ok());
+            assert!(door
+                .found(&maker, Expect::Anything, URL, &|_| stated())
+                .is_ok());
             let row = store.by_key(URL).ok_or("the registered row")?;
             let by = Remover::Provider("pool");
             let seen = standing(&row);
@@ -460,7 +588,9 @@ pub(super) mod tests {
         ] {
             for (maker, allowed) in [(&Maker::Control, control), (&provider, discovered)] {
                 let (store, door) = open();
-                assert!(door.found(maker, URL, &|_| stated()).is_ok());
+                assert!(door
+                    .found(maker, Expect::Anything, URL, &|_| stated())
+                    .is_ok());
                 let row = store.by_key(URL).ok_or("the registered row")?;
                 let by = Remover::Health(scope);
                 let seen = standing(&row);
@@ -488,7 +618,9 @@ pub(super) mod tests {
     ) -> Result<(), &'static str> {
         let (store, door) = open();
         let maker = Maker::provider("pool", "private/key").map_err(|_| "the source's maker")?;
-        assert!(door.found(&maker, URL, &|_| stated()).is_ok());
+        assert!(door
+            .found(&maker, Expect::Anything, URL, &|_| stated())
+            .is_ok());
         let row = store.by_key(URL).ok_or("the registered row")?;
         assert_eq!(
             door.drained(Remover::Provider("pool"), URL, standing(&row)),
@@ -508,7 +640,7 @@ pub(super) mod tests {
     fn a_found_worker_is_registered_under_its_maker() {
         let (store, door) = door();
         let maker = Maker::provider("pool", "first").expect("a maker");
-        let wrote = door.found(&maker, URL, &|standing| {
+        let wrote = door.found(&maker, Expect::Anything, URL, &|standing| {
             assert!(standing.is_none());
             stated()
         });
@@ -537,10 +669,11 @@ pub(super) mod tests {
             heard.fetch_add(1, Ordering::Relaxed);
         });
         let maker = Maker::provider("pool", "first").expect("a maker");
-        door.found(&maker, URL, &|_| stated()).expect("registered");
+        door.found(&maker, Expect::Anything, URL, &|_| stated())
+            .expect("registered");
         let row = store.by_key(URL).expect("the registered row");
         assert_eq!(
-            door.found(&maker, URL, &|_| stated()),
+            door.found(&maker, Expect::Anything, URL, &|_| stated()),
             Ok(Wrote::Unmoved(row.id))
         );
         let seen = standing(&row);
@@ -559,14 +692,15 @@ pub(super) mod tests {
     fn a_changed_label_is_written_in_place_and_a_changed_role_is_another_life() {
         let (store, door) = door();
         let maker = Maker::provider("pool", "first").expect("a maker");
-        door.found(&maker, URL, &|_| stated()).expect("registered");
+        door.found(&maker, Expect::Anything, URL, &|_| stated())
+            .expect("registered");
         let old = store.by_key(URL).expect("the registered row");
         let labelled = WorkerFacts {
             labels: [("tier".to_owned(), "gold".to_owned())].into(),
             ..stated()
         };
         assert_eq!(
-            door.found(&maker, URL, &|_| labelled.clone()),
+            door.found(&maker, Expect::Anything, URL, &|_| labelled.clone()),
             Ok(Wrote::InPlace(old.id))
         );
         let standing = store.by_key(URL).expect("the refreshed row");
@@ -576,7 +710,7 @@ pub(super) mod tests {
         assert_eq!(standing.revision, 2);
 
         let before = store.epoch();
-        let wrote = door.found(&maker, URL, &|_| WorkerFacts {
+        let wrote = door.found(&maker, Expect::Anything, URL, &|_| WorkerFacts {
             role: Role::Decode,
             ..labelled.clone()
         });
@@ -612,11 +746,14 @@ pub(super) mod tests {
             ),
         ] {
             let (store, door) = door();
-            door.found(&maker, URL, &|_| stated()).expect("registered");
+            door.found(&maker, Expect::Anything, URL, &|_| stated())
+                .expect("registered");
             let row = store.by_key(URL).expect("the registered row");
             let expected = Err(Refused::NotMaker(why.to_owned()));
             assert_eq!(
-                door.found(&caller, URL, &|_| panic!("only the maker states facts")),
+                door.found(&caller, Expect::Anything, URL, &|_| panic!(
+                    "only the maker states facts"
+                )),
                 expected
             );
             assert_eq!(
@@ -663,10 +800,17 @@ pub(super) mod tests {
             fact: "models",
             why: "a model id is at most 256 bytes",
         }));
-        assert_eq!(door.found(&maker, URL, &|_| invalid.clone()), no);
-        assert_eq!(lay(&Shut(&store), &maker, URL, &|_| invalid.clone()), no);
         assert_eq!(
-            lay(&Shut(&store), &maker, URL, &|_| stated()),
+            door.found(&maker, Expect::Anything, URL, &|_| invalid.clone()),
+            no
+        );
+        assert_eq!(
+            lay(&Shut(&store), &maker, Expect::Anything, URL, &|_| invalid
+                .clone()),
+            no
+        );
+        assert_eq!(
+            lay(&Shut(&store), &maker, Expect::Anything, URL, &|_| stated()),
             Err(Refused::Past(Past {
                 fact: "row",
                 why: "no room"
@@ -677,7 +821,10 @@ pub(super) mod tests {
 
         store.upsert_by(invalid.clone(), maker.clone());
         let standing = store.by_key(URL);
-        assert_eq!(door.found(&maker, URL, &|_| invalid.clone()), no);
+        assert_eq!(
+            door.found(&maker, Expect::Anything, URL, &|_| invalid.clone()),
+            no
+        );
         assert_eq!(store.by_key(URL), standing);
         assert_eq!(store.epoch(), 1);
     }
@@ -686,7 +833,8 @@ pub(super) mod tests {
     fn a_drain_marks_the_makers_row_once_and_a_removal_takes_it() {
         let (store, door) = door();
         let maker = Maker::provider("pool", "first").expect("a maker");
-        door.found(&maker, URL, &|_| stated()).expect("registered");
+        door.found(&maker, Expect::Anything, URL, &|_| stated())
+            .expect("registered");
         let row = store.by_key(URL).expect("the registered row");
         let stale = row.revision - 1;
         assert_eq!(
@@ -759,7 +907,7 @@ pub(super) mod tests {
         });
         let (done, finished) = mpsc::channel();
         let writer = thread::spawn(move || {
-            let found = door.found(&maker, URL, &|_| stated());
+            let found = door.found(&maker, Expect::Anything, URL, &|_| stated());
             let seen = standing(&store.by_key(URL).expect("the registered row"));
             let by = Remover::Maker(&maker);
             let drained = door.drained(by, URL, seen);
@@ -782,12 +930,13 @@ pub(super) mod tests {
     fn a_worker_whose_checks_are_off_is_ready_at_once() {
         let (store, door) = door();
         let maker = Maker::provider("pool", "first").expect("a maker");
-        door.found(&maker, URL, &|_| stated()).expect("registered");
+        door.found(&maker, Expect::Anything, URL, &|_| stated())
+            .expect("registered");
         assert_eq!(
             store.by_key(URL).map(|row| row.status),
             Some(WorkerStatus::Pending)
         );
-        let wrote = door.found(&maker, URL, &|_| {
+        let wrote = door.found(&maker, Expect::Anything, URL, &|_| {
             let mut facts = stated();
             facts.health.probes = false;
             facts
@@ -798,7 +947,7 @@ pub(super) mod tests {
 
         door.gone(Remover::Maker(&maker), URL, standing(&row))
             .expect("removed");
-        let wrote = door.found(&maker, URL, &|_| row.facts.clone());
+        let wrote = door.found(&maker, Expect::Anything, URL, &|_| row.facts.clone());
         let fresh = store.by_key(URL).expect("the newly registered row");
         assert_eq!(wrote, Ok(Wrote::Registered(fresh.id)));
         assert_eq!((fresh.status, fresh.revision), (WorkerStatus::Ready, 1));
@@ -814,7 +963,7 @@ pub(super) mod tests {
                 .map(|_| {
                     scope.spawn(|| {
                         ready.wait();
-                        door.found(&maker, URL, &|_| {
+                        door.found(&maker, Expect::Anything, URL, &|_| {
                             assert!(
                                 door.turn.is_locked(),
                                 "the facts are stated in the door's turn"
@@ -851,13 +1000,13 @@ pub(super) mod tests {
     fn the_facts_are_stated_over_the_row_that_stands() {
         let (store, door) = door();
         let maker = Maker::provider("pool", "first").expect("a maker");
-        door.found(&maker, URL, &|_| WorkerFacts {
+        door.found(&maker, Expect::Anything, URL, &|_| WorkerFacts {
             zone: Some("east".to_owned()),
             ..stated()
         })
         .expect("registered");
         let old = store.by_key(URL).expect("the registered row");
-        let wrote = door.found(&maker, URL, &|standing| {
+        let wrote = door.found(&maker, Expect::Anything, URL, &|standing| {
             assert_eq!(standing, Some(&old.facts));
             WorkerFacts {
                 zone: standing.and_then(|facts| facts.zone.clone()),
@@ -872,7 +1021,7 @@ pub(super) mod tests {
 
         // Facts under another key are refused in every build: the store
         // writes by the facts' key, and no maker was asked of that row.
-        let mismatch = door.found(&maker, URL, &|_| WorkerFacts {
+        let mismatch = door.found(&maker, Expect::Anything, URL, &|_| WorkerFacts {
             key: "http://another".to_owned(),
             ..stated()
         });
