@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[3]
 GATEWAY_SRC = ROOT / "model_gateway" / "src"
 CLI_DIR = GATEWAY_SRC / "cli"
 CLI_MODULE = CLI_DIR / "mod.rs"
+NATIVE_MODULE = ROOT / "bindings" / "python" / "src" / "lib.rs"
 
 
 def cli_source() -> str:
@@ -622,6 +623,13 @@ def test_the_launchers_list_the_same_options_a_document_replaces():
     cli.remove("disable_worker_overload_protection")
     cli[cli.index("eviction_interval")] = "eviction_interval_secs"
     assert list(DOCUMENT_REPLACES) == cli
+
+
+def test_the_native_start_lists_the_same_options_a_document_replaces():
+    # The native start refuses by its own copy of the list: a third home.
+    block = re.search(r"let moved: Vec<&str> = moved!\[(.*?)\]", NATIVE_MODULE.read_text(), re.S)
+    assert block, "the native start's list of the settings a document replaces moved"
+    assert re.findall(r"[a-z_0-9]+", block[1]) == list(DOCUMENT_REPLACES)
 
 
 @pytest.mark.parametrize("use_router_prefix", [False, True])

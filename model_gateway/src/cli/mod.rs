@@ -178,7 +178,9 @@ struct CliArgs {
 /// The routing flags a policy document replaces. `--policy-spec` conflicts
 /// with each of them, and the parser knows where a value came from: a flag
 /// typed beside a document is refused by both names, at its default value
-/// too. A flag the gateway still reads under a document is not listed.
+/// too. A flag the gateway still reads under a document is not listed, but
+/// for `grouped_dp_sticky`: the dispatch pins by the gateway's own key, and
+/// a supplied document names its own key sources.
 const DOCUMENT_REPLACES: [&str; 45] = [
     "policy",
     "cache_threshold",
