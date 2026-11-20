@@ -24,6 +24,19 @@ pub(crate) struct Prompt<'a> {
     pub namespace: Option<CacheNamespace>,
 }
 
+impl<'a> Prompt<'a> {
+    /// A prompt of `tokens` under the request's cache partition, with no
+    /// text. A stage that states a text names it over this one, and a stage
+    /// that states none names no field of the prompt.
+    pub(crate) const fn of(tokens: Option<&'a [u32]>, namespace: Option<CacheNamespace>) -> Self {
+        Self {
+            tokens,
+            text: None,
+            namespace,
+        }
+    }
+}
+
 /// A request's block hashes as the door reads them. The attempt owns the
 /// buffer, and its asks share it.
 #[derive(Debug, Default)]

@@ -97,6 +97,15 @@ pub(crate) fn cache_bed() -> (Host, Arc<MemoryStore>, WorkerId) {
 /// Three ready rows that publish no cache events, under the cache-aware
 /// preset with its prefix stage reading the record of sent prefixes.
 pub(crate) fn record_bed() -> (Host, Arc<MemoryStore>) {
+    let urls = ["http://w0:8000", "http://w1:8000", "http://w2:8000"];
+    record_bed_over(Arc::new(WorkerRegistry::new()), &urls)
+}
+
+/// [`record_bed`] with one row a URL, over workers registered in `registry`.
+pub(crate) fn record_bed_over(
+    registry: Arc<WorkerRegistry>,
+    urls: &[&str],
+) -> (Host, Arc<MemoryStore>) {
     let store = Arc::new(MemoryStore::new());
     let mut document = PolicySpec::preset("cache_aware").expect("the preset");
     let stages = document.profiles.values_mut();
@@ -107,9 +116,7 @@ pub(crate) fn record_bed() -> (Host, Arc<MemoryStore>) {
     }
     let applied = AppliedSpec::validate(&document).expect("the document validates");
     store.apply(applied).expect("the store takes the document");
-    let urls = ["http://w0:8000", "http://w1:8000", "http://w2:8000"];
     let rows = urls.iter().map(|&url| (url, Some(MODEL)));
-    let registry = Arc::new(WorkerRegistry::new());
     let (host, store, _) = bed_publishing(store, registry, rows, None, false);
     (host, store)
 }
