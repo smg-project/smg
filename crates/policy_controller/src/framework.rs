@@ -739,17 +739,24 @@ impl Profile {
     }
 
     /// What a host names this profile's rows by ([`NamedBy`]), asked of
-    /// its stages once at the engine's build.
-    fn named_by(&self) -> NamedBy {
+    /// its stages once at the engine's build. `folded` holds its filters
+    /// as one test, where the engine holds every one of them itself.
+    fn named_by(&self, folded: Option<RowTests>) -> NamedBy {
         let cap = self.named_cap();
         let mut rules = self.warm_rules();
         let first = rules.next();
         let rule = first.filter(|&first| rules.all(|rule| rule == first));
+        let held = match folded {
+            _ if !self.asked_by_row(folded.is_some()) => Held::Unasked,
+            Some(tests) => Held::Folded(tests),
+            None => Held::Called,
+        };
         NamedBy {
             cap,
             rule,
             sent: cap > 0 && self.needs().sent_prefixes,
             sent_alone: self.reads_sent_alone(),
+            held,
         }
     }
 
@@ -2619,10 +2626,12 @@ enum Pattern<'a> {
 /// ([`Engine::named_for`]), the one ruling of the warming rows
 /// ([`Engine::warm_rule_for`]), and the record of sent prefixes, whether
 /// its holders are named ([`Engine::reads_sent_for`]) and whether ahead
-/// of the index's ([`Engine::reads_sent_alone_for`]). Every input of a
-/// naming that is a profile's own stands here, so two profiles of one
-/// value are named the same rows.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// of the index's ([`Engine::reads_sent_alone_for`]). A naming that
+/// fills its cap is held to a test of the profile's own too
+/// ([`Engine::keeps_for`]). Every input of a naming that is a profile's
+/// own stands here: two profiles are named the same rows where
+/// [`Self::names_as`] says so.
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct NamedBy {
     /// The cap of each list: `0` where the profile is named no row.
     cap: u32,
@@ -2636,14 +2645,60 @@ pub(crate) struct NamedBy {
     /// prefixes alone: a scorer of it reads the record and none reads the
     /// holders from the index.
     sent_alone: bool,
+    /// The test a naming that fills its cap is held to: the profile's
+    /// filters, asked of a row ahead of its naming.
+    held: Held,
+}
+
+impl NamedBy {
+    /// Whether a profile named by `other` is named the rows this one is:
+    /// by one cap, one ruling and one reading of the record. A naming
+    /// that fills its cap is held to its profile's own test of a row. So
+    /// under a cap that can fill, the two are held to one test too.
+    fn names_as(&self, other: &Self) -> bool {
+        let fills = self.cap != u32::MAX;
+        (self.cap, self.rule) == (other.cap, other.rule)
+            && (self.sent, self.sent_alone) == (other.sent, other.sent_alone)
+            && (!fills || self.held.same_test(other.held))
+    }
+}
+
+/// What a naming that fills its cap is held to: the test its profile's
+/// standing pass asks of a row ([`Engine::keeps_for`]), as far as one
+/// profile's can be told from another's. The key's mark is no part of
+/// it: the mark is set behind the build, and the test reads it where it
+/// is made.
+#[derive(Clone, Copy, Debug)]
+enum Held {
+    /// To no test: the pass alone can say which rows stay
+    /// ([`Profile::asked_by_row`]), and the naming stands as it is made.
+    Unasked,
+    /// To the profile's filters as the one test the build folded them
+    /// into: two profiles of one set refuse the same rows.
+    Folded(RowTests),
+    /// To the profile's filters by a call each: no two such profiles are
+    /// known to refuse the same rows.
+    Called,
+}
+
+impl Held {
+    /// Whether a naming held to `other` is held to the same test.
+    fn same_test(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Unasked, Self::Unasked) => true,
+            (Self::Folded(own), Self::Folded(others)) => own == others,
+            _ => false,
+        }
+    }
 }
 
 /// How a binding's shadow reads the rows its live decision was handed
 /// ([`Engine::shadow_for`]). A host names rows for the live profile by
 /// what that profile says it is named by ([`NamedBy`]). They are the
 /// shadow profile's own rows where the two say one value. Where the two
-/// differ by the cap alone, or the live profile is named no row, a host
-/// names the shadow's rows again ([`Self::Own`]).
+/// differ by the cap alone, or by the test a full cap is held to, or the
+/// live profile is named no row, a host names the shadow's rows again
+/// ([`Self::Own`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShadowRows {
     /// As the live decision read them: the shadow profile would be handed
@@ -2653,8 +2708,10 @@ pub(crate) enum ShadowRows {
     /// no column, and would be named none.
     Unnamed,
     /// By rows the host names again for it, under the shadow profile's
-    /// own cap ([`Engine::shadow_cap_at`]): that profile names by
-    /// another cap than the live one, or the live one is named no row.
+    /// own cap ([`Engine::shadow_cap_at`]) and its own test of a row
+    /// ([`Engine::shadow_keeps_at`]): that profile names by another cap
+    /// than the live one, a cap the two share can fill and they hold it
+    /// to different tests, or the live one is named no row.
     /// A pool keeps one ruling of its warming rows and one record of
     /// sent prefixes, and both are the shadow profile's own there
     /// ([`Engine::pool_rule_for`], [`Engine::pool_record_for`]). The
@@ -2698,8 +2755,9 @@ impl ShadowRows {
             // no column decides without them, as it would live.
             (_, 0) if !column => Self::Unnamed,
             (_, 0) => Self::Apart,
-            // One value names the same rows.
-            _ if live == by => Self::Same,
+            // One value names the same rows: a cap that can fill is
+            // held to one test of a row by both.
+            _ if live.names_as(by) => Self::Same,
             // The shadow profile is named rows of its own. The pool's
             // warming rows are of one ruling and its record of one
             // profile: the live one's. A live profile that is named no
@@ -2803,8 +2861,9 @@ pub struct Engine {
     /// Per profile, what a host names the rows of its decisions by
     /// ([`NamedBy`]), said once at the build: the cap
     /// ([`Self::named_for`]), the warm-up ruling
-    /// ([`Self::warm_rule_for`]) and the record of sent prefixes
-    /// ([`Self::reads_sent_for`], [`Self::reads_sent_alone_for`]).
+    /// ([`Self::warm_rule_for`]), the record of sent prefixes
+    /// ([`Self::reads_sent_for`], [`Self::reads_sent_alone_for`]) and
+    /// the test a full cap is held to ([`Self::keeps_for`]).
     named_by: Vec<NamedBy>,
     /// Per profile, its filters as one test of a row, where the engine
     /// holds every one itself ([`RowTests::of`]). A decision that draws
@@ -2812,10 +2871,6 @@ pub struct Engine {
     /// pass keeps the rows of the single plan's pool by it
     /// ([`keep_folded`]).
     row_tests: Vec<Option<RowTests>>,
-    /// Per profile, whether its filters may be asked of a row ahead of its
-    /// naming ([`Profile::asked_by_row`]), said once at the build: the
-    /// naming's test reads it ([`Self::keeps_for`]).
-    row_asked: Vec<bool>,
     /// Per profile, which of its leading stages are ranks ([`Order`]). A
     /// decision reads it where the profile's mark says so, and no other
     /// decision does.
@@ -3861,7 +3916,6 @@ impl Engine {
             .map(|(profile, &order)| Marks::of(profile, order))
             .collect();
         let keeping = marks.iter().any(|marks| marks.scoped());
-        let named_by: Vec<NamedBy> = profiles.iter().map(Profile::named_by).collect();
         let stating = profiles
             .iter()
             .map(|profile| {
@@ -3873,10 +3927,10 @@ impl Engine {
             .iter()
             .map(|profile| RowTests::of(&profile.filters))
             .collect();
-        let row_asked = profiles
+        let named_by: Vec<NamedBy> = profiles
             .iter()
             .zip(&row_tests)
-            .map(|(profile, tests)| profile.asked_by_row(tests.is_some()))
+            .map(|(profile, &folded)| profile.named_by(folded))
             .collect();
         let keepers = Keeper::of(&profiles);
         let shadows = bindings
@@ -3951,7 +4005,6 @@ impl Engine {
             profile_needs,
             named_by,
             row_tests,
-            row_asked,
             orders,
             seat_flags: (u8::from(keeping) * KEEPS_DECIDERS) | (u8::from(shadows) * SHADOWS),
             explain_sample: 0,
@@ -4479,13 +4532,43 @@ impl Engine {
         facts: &'a RequestFacts<'a>,
         cx: &'a Constraints<'a>,
     ) -> Option<RowTest<'a>> {
-        let (_, index, profile) = self.resolve(model, phase)?;
+        let (_, index, _) = self.resolve(model, phase)?;
+        self.keeps_at(index, facts, cx)
+    }
+
+    /// [`Self::keeps_for`] for the shadow profile of the binding at `at`:
+    /// the test that profile's own standing pass asks of a row. A host
+    /// that names the shadow rows of its own ([`ShadowRows::Own`]) holds
+    /// a naming that fills its cap to it. `None` too where the binding
+    /// names no shadow.
+    pub(crate) fn shadow_keeps_at<'a>(
+        &'a self,
+        at: u32,
+        facts: &'a RequestFacts<'a>,
+        cx: &'a Constraints<'a>,
+    ) -> Option<RowTest<'a>> {
+        let shadow = self.bindings.get(at as usize)?.binding.shadow?;
+        self.keeps_at(shadow, facts, cx)
+    }
+
+    /// The test the standing pass of the profile at `index` asks of a
+    /// row ([`Self::keeps_for`]).
+    fn keeps_at<'a>(
+        &'a self,
+        index: u16,
+        facts: &'a RequestFacts<'a>,
+        cx: &'a Constraints<'a>,
+    ) -> Option<RowTest<'a>> {
         let at = usize::from(index);
-        let tests = self.row_tests[at];
-        let filters = &profile.filters[..];
-        if self.marks[at].keyed() || !self.row_asked[at] {
+        let filters = &self.profiles.get(at)?.filters[..];
+        if self.marks.get(at)?.keyed() {
             return None;
         }
+        let tests = match self.named_by.get(at)?.held {
+            Held::Unasked => return None,
+            Held::Folded(tests) => Some(tests),
+            Held::Called => None,
+        };
         Some(RowTest {
             // The set as this decision asks it, narrowed once as the
             // draw narrows it.
@@ -7843,6 +7926,58 @@ mod tests {
                 Some((wanted, cap)),
                 "{shadow} behind {live}"
             );
+        }
+    }
+
+    /// A naming that fills its cap is held to its profile's own test of a
+    /// row: a shadow of other filters than its live profile's would be
+    /// named other rows where a full cap is refused whole. Under a sample
+    /// such a shadow is named rows of its own. So is one whose filters
+    /// are asked by a call each: no two such tests are known to be one.
+    /// Under no sample no cap fills, and the shadow reads its live
+    /// decision's rows whatever its filters.
+    #[test]
+    fn a_shadow_of_other_filters_is_named_rows_of_its_own_under_a_sample() {
+        use crate::spec::{BestParams, PickStage, ProfileSpec, ShadowSpec};
+        type Turn<'a> = &'a dyn Fn(&mut ProfileSpec);
+        let rows = |sample: u32, both: Turn<'_>, shadow: Turn<'_>| {
+            let mut document = PolicySpec::preset("cache_aware").expect("a preset");
+            let live = document.profiles.values_mut().next();
+            let live = live.expect("the preset's profile");
+            live.pick = match sample {
+                0 => "best".into(),
+                sample => PickStage::Best(BestParams { sample }).into(),
+            };
+            both(live);
+            let mut second = live.clone();
+            shadow(&mut second);
+            document.profiles.insert("second".into(), second);
+            document.bindings[0].shadow = Some(ShadowSpec::Profile("second".into()));
+            let engine = document.validate().expect("a binding with a shadow");
+            engine.shadow_for("m", Phase::Single).map(|(_, rows)| rows)
+        };
+        let as_it_is = |_: &mut ProfileSpec| {};
+        // The preset's last filter refuses the rows a request tried.
+        let fewer = |profile: &mut ProfileSpec| {
+            profile.filter.pop();
+        };
+        // A rule of the document is a stage of its own: the engine folds
+        // its profile into no one test.
+        let ruled = |profile: &mut ProfileSpec| {
+            let rule = r#"{"has-room":{"used":{"candidate.in_flight":1},"capacity":8}}"#;
+            profile
+                .filter
+                .push(serde_json::from_str(rule).expect("a rule"));
+        };
+        let cases: [(u32, Turn<'_>, Turn<'_>, ShadowRows); 5] = [
+            (16, &as_it_is, &as_it_is, ShadowRows::Same),
+            (16, &as_it_is, &fewer, ShadowRows::Own),
+            (16, &as_it_is, &ruled, ShadowRows::Own),
+            (16, &ruled, &as_it_is, ShadowRows::Own),
+            (0, &as_it_is, &fewer, ShadowRows::Same),
+        ];
+        for (at, (sample, both, shadow, wanted)) in cases.into_iter().enumerate() {
+            assert_eq!(rows(sample, both, shadow), Some(wanted), "pairing {at}");
         }
     }
 

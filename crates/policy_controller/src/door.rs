@@ -741,7 +741,7 @@ impl ShadowAsk for OwnRows<'_> {
         // A profile that is named rows of its own reads them in the
         // column's place, as it does live.
         let cap = engine.shadow_cap_at(self.binding);
-        let named = self.name(cap, facts, candidates);
+        let named = self.name(engine, cap, facts, candidates, constraints);
         let own = RequestFacts {
             named: Some(named.affinity()),
             affinity: &[],
@@ -756,15 +756,24 @@ impl<'a> OwnRows<'a> {
     /// under `cap`, as [`hand`] names a live profile's: by the request's
     /// block hashes as the engine reads them, on the decision's seed, at
     /// the instant its view was built. A cap full of holders the shadow
-    /// profile's pass refuses is not read past: that lookup
-    /// ([`World::name_kept`]) takes the live profile's test of a row.
-    fn name(self, cap: u32, facts: &RequestFacts<'_>, candidates: &[Candidate]) -> &'a Named {
+    /// profile's pass refuses is read past as a live profile's is
+    /// ([`World::name_kept`]), by the shadow profile's own test of a row
+    /// ([`Engine::shadow_keeps_at`]).
+    fn name(
+        self,
+        engine: &Engine,
+        cap: u32,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+    ) -> &'a Named {
         let Self {
             world,
             gateway,
             wires,
             cut,
             named,
+            binding,
             ..
         } = self;
         let role = role_of(facts.phase);
@@ -783,6 +792,10 @@ impl<'a> OwnRows<'a> {
         } else {
             world.name_in::<false>(model, role, &naming, candidates, kind, named);
         }
+        world.name_kept(model, role, &naming, candidates, named, || {
+            let test = engine.shadow_keeps_at(binding, facts, constraints)?;
+            Some(move |row: &Candidate| test.keeps(row))
+        });
         named
     }
 }
@@ -7945,6 +7958,72 @@ pub(crate) mod tests {
             let decided = decided(&store, &asked);
             assert_eq!(decided.holders, [(shallow, 2)]);
             assert_eq!(decided.pick, Some((shallow, 2)));
+        }
+
+        /// A shadow's rows are held to its own profile's test of a row,
+        /// not to its live profile's. Under a cap of one, a live profile
+        /// that refuses the rows a request tried is named the holder
+        /// behind the tried one. Its shadow holds no such filter: it is
+        /// named the deep holder, which its own pass keeps, and takes it.
+        /// The other way about the live profile keeps the deep holder,
+        /// and its shadow is named the one behind it.
+        #[test]
+        fn a_shadow_of_other_filters_is_named_by_its_own_test_of_a_row() {
+            use std::sync::Arc;
+
+            use crate::{decision::ShadowKind, door::Door, spec::ShadowSpec};
+
+            // A retry of the deep holder, where the live profile or else
+            // its shadow refuses the rows a request tried: the live
+            // answer, what the shadow said with its first target, and
+            // the depths of the holders named for the shadow alone.
+            let retried = |shadow_refuses: bool| {
+                let mut document =
+                    PolicySpec::preset("cache_aware").expect("a preset of this build");
+                document.explain.sample = 1;
+                let live = document.profiles.get_mut("cache_aware");
+                let live = live.expect("the preset's profile");
+                live.pick = PickStage::Best(BestParams { sample: 1 }).into();
+                let mut twin = live.clone();
+                // The preset's last filter refuses the rows a request
+                // tried: one of the two profiles goes without it.
+                let loose = if shadow_refuses { live } else { &mut twin };
+                loose.filter.pop();
+                document.profiles.insert("twin".into(), twin);
+                document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+                let store = MemoryStore::with_publish_window(Duration::ZERO).with_deciders(1);
+                let spec = AppliedSpec::validate(&document).expect("the document validates");
+                store.apply(spec).expect("above the unbound start");
+                let deep = holder(&store, "deep", 3);
+                let shallow = holder(&store, "shallow", 2);
+                holder(&store, "idle", 0);
+                let door = Door::new(Arc::new(store));
+                let tried = [deep];
+                let mut asked = request(b"retry", 7);
+                asked.facts.block_hashes = &BLOCKS;
+                asked.facts.tried = &tried;
+                let decided = door.decide(GATEWAY, &asked, Instant::now());
+                let decided = decided.expect("a decision");
+                let live = decided
+                    .decision
+                    .pick()
+                    .and_then(|pick| pick.targets.first());
+                let live = live.map(|target| target.id);
+                let record = door.explain(GATEWAY, b"retry");
+                let record = record.expect("the sampled decision");
+                let named = door.own_named[0].named.lock();
+                let depths = named.holders.iter().map(|holder| holder.overlap_blocks);
+                let depths: Vec<u32> = depths.collect();
+                let shadow = (record.shadow, record.shadow_target);
+                ((live, shadow, depths), (deep, shallow))
+            };
+            let other = Some(ShadowKind::OtherTarget);
+            let ((live, shadow, depths), (deep, shallow)) = retried(false);
+            assert_eq!(live, Some(shallow));
+            assert_eq!((shadow, depths), ((other, Some(deep)), vec![3]));
+            let ((live, shadow, depths), (deep, shallow)) = retried(true);
+            assert_eq!(live, Some(deep));
+            assert_eq!((shadow, depths), ((other, Some(shallow)), vec![2]));
         }
 
         /// A hot prefix: the two workers that hold it whole read over
