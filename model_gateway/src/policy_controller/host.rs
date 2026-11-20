@@ -28,7 +28,7 @@
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicU16, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::Instant,
@@ -566,8 +566,6 @@ impl Host {
                     worker,
                     target: *target,
                     handle,
-                    sent: None,
-                    cut: None,
                 });
             }
         }
@@ -662,10 +660,6 @@ pub(crate) struct Placed {
     worker: Arc<dyn Worker>,
     target: Target,
     handle: Handle<Arc<Door>>,
-    /// The instant of the send, `None` before one.
-    sent: Option<Instant>,
-    /// The mark the relay of a streamed answer writes at a cut.
-    cut: Option<Arc<AtomicU16>>,
 }
 
 impl Placed {
@@ -687,31 +681,7 @@ impl Placed {
 
     /// The request was sent to the worker at `now`. Said once.
     pub(crate) fn dispatched(&mut self, now: Instant) {
-        self.sent = Some(now);
         self.handle.dispatched(now);
-    }
-
-    /// The mark for the relay of this placement's streamed answer: the relay
-    /// writes the status of a cut's class on it, and the body's end reads it.
-    pub(crate) fn cut_mark(&mut self) -> Arc<AtomicU16> {
-        Arc::clone(self.cut.get_or_insert_with(Arc::default))
-    }
-
-    /// The status of the cut's class, where the relay marked one.
-    fn cut(&self) -> Option<StatusCode> {
-        StatusCode::from_u16(self.cut.as_ref()?.load(Ordering::Relaxed)).ok()
-    }
-
-    /// The request ended with a whole answer of `status` at `now`.
-    /// `answered` says the worker gave it itself. Before dispatch, the
-    /// placement's drop gives the lease up as abandoned.
-    pub(crate) fn ended(mut self, status: StatusCode, answered: bool, now: Instant) {
-        if let Some(sent) = self.sent {
-            self.completed(
-                End::http(status, transport_class(status, answered), sent, None, now),
-                now,
-            );
-        }
     }
 
     /// The request ended with `end`, as the router read it at `now`. Said
@@ -777,6 +747,7 @@ impl Held {
 }
 
 mod ride;
+pub(crate) use ride::Sent;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]

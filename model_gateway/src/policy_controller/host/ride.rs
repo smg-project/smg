@@ -1,7 +1,13 @@
-//! A placement held by the regular HTTP router's response body.
+//! A placement as the regular HTTP router holds it, to the end of its
+//! response's body.
 
 use std::{
+    ops::Deref,
     pin::Pin,
+    sync::{
+        atomic::{AtomicU16, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
     time::Instant,
 };
@@ -16,14 +22,80 @@ use smg_policy_controller::lease::TransportClass;
 
 use super::{transport_class, End, Placed};
 
-impl Placed {
+/// A placement with what the regular HTTP router alone knows of its send:
+/// the instant, and the mark its streamed answer's relay writes at a cut.
+/// The host's [`Placed`] keeps neither, so a route that needs none carries
+/// none.
+pub(crate) struct Sent {
+    placed: Placed,
+    at: Option<Instant>,
+    cut: Option<Arc<AtomicU16>>,
+}
+
+impl From<Placed> for Sent {
+    fn from(placed: Placed) -> Self {
+        Self {
+            placed,
+            at: None,
+            cut: None,
+        }
+    }
+}
+
+impl Deref for Sent {
+    type Target = Placed;
+
+    fn deref(&self) -> &Placed {
+        &self.placed
+    }
+}
+
+impl Sent {
+    /// The request was sent to the worker at `now`. Said once.
+    pub(crate) fn dispatched(&mut self, now: Instant) {
+        self.at = Some(now);
+        self.placed.dispatched(now);
+    }
+
+    /// The mark for the relay of this placement's streamed answer: the relay
+    /// writes the status of a cut's class on it, and the body's end reads it.
+    pub(crate) fn cut_mark(&mut self) -> Arc<AtomicU16> {
+        Arc::clone(self.cut.get_or_insert_with(Arc::default))
+    }
+
+    /// The status of the cut's class, where the relay marked one.
+    fn cut(&self) -> Option<StatusCode> {
+        StatusCode::from_u16(self.cut.as_ref()?.load(Ordering::Relaxed)).ok()
+    }
+
+    /// The request ended with a whole answer of `status` at `now`.
+    /// `answered` says the worker gave it itself. Before dispatch, the
+    /// placement's drop gives the lease up as abandoned.
+    pub(crate) fn ended(self, status: StatusCode, answered: bool, now: Instant) {
+        self.end(status, transport_class(status, answered), None, now);
+    }
+
+    /// Say the placement's end where it was sent.
+    fn end(
+        mut self,
+        status: StatusCode,
+        class: TransportClass,
+        first: Option<Instant>,
+        now: Instant,
+    ) {
+        if let Some(at) = self.at {
+            self.placed
+                .completed(End::http(status, class, at, first, now), now);
+        }
+    }
+
     /// `response` with this placement held to the end of its body. The
     /// stream reports at EOF, using the time of the first data frame, or at
     /// the body's error frame. A body dropped before either is cancelled.
     pub(crate) fn held_to_the_end_of(self, response: Response) -> Response {
         let (parts, body) = response.into_parts();
         let body = Body::from_stream(Ride {
-            placed: Some(self),
+            sent: Some(self),
             inner: body.into_data_stream(),
             status: parts.status,
             first: None,
@@ -42,23 +114,10 @@ impl Placed {
 /// polls no further. On an early drop the handle reports the cancellation.
 /// The stream reads the frame results without reading their bytes.
 struct Ride {
-    placed: Option<Placed>,
+    sent: Option<Sent>,
     inner: BodyDataStream,
     status: StatusCode,
     first: Option<Instant>,
-}
-
-impl Ride {
-    /// Say the placement's end, once, where it was sent.
-    fn end(&mut self, class: TransportClass) {
-        let Some(mut placed) = self.placed.take() else {
-            return;
-        };
-        if let Some(sent) = placed.sent {
-            let now = Instant::now();
-            placed.completed(End::http(self.status, class, sent, self.first, now), now);
-        }
-    }
 }
 
 impl Stream for Ride {
@@ -67,14 +126,20 @@ impl Stream for Ride {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let next = Pin::new(&mut this.inner).poll_next(cx);
-        match &next {
-            Poll::Ready(Some(Ok(_))) if this.first.is_none() => this.first = Some(Instant::now()),
-            Poll::Ready(Some(Err(_))) => this.end(TransportClass::ServerError),
-            Poll::Ready(None) => {
-                let cut = this.placed.as_ref().and_then(Placed::cut);
-                this.end(transport_class(cut.unwrap_or(this.status), true));
+        let class = match &next {
+            Poll::Ready(Some(Ok(_))) => {
+                this.first.get_or_insert_with(Instant::now);
+                return next;
             }
-            _ => {}
+            Poll::Ready(Some(Err(_))) => TransportClass::ServerError,
+            Poll::Ready(None) => {
+                let cut = this.sent.as_ref().and_then(Sent::cut);
+                transport_class(cut.unwrap_or(this.status), true)
+            }
+            Poll::Pending => return next,
+        };
+        if let Some(sent) = this.sent.take() {
+            sent.end(this.status, class, this.first, Instant::now());
         }
         next
     }
@@ -97,7 +162,7 @@ mod tests {
             Ok(Bytes::from_static(b"b")),
         ];
         let mut ride = Ride {
-            placed: None,
+            sent: None,
             inner: Body::from_stream(stream::iter(frames)).into_data_stream(),
             status: StatusCode::OK,
             first: None,

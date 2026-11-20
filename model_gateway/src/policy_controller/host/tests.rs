@@ -41,7 +41,7 @@ use smg_worker::identity::basic::WorkerLoadGuard;
 use super::{
     elapsed_micros, left_no_worker, mark, profile_of,
     testing::{bed, bed_under, cache_bed, store_blocks, MODEL},
-    transport_class, Ask, End, Hashes, Held, Prompt, Unplaced, GATEWAY, NO_STAGE,
+    transport_class, Ask, End, Hashes, Held, Prompt, Sent, Unplaced, GATEWAY, NO_STAGE,
 };
 use crate::{
     config::{ManualAssignmentMode, PolicyConfig, RouterConfig},
@@ -238,7 +238,7 @@ fn live(store: &MemoryStore, expected: usize) -> usize {
 async fn a_placement_never_sent_says_nothing_at_its_end() {
     let (host, store, _) = bed(&["http://w0:8000"]);
     let now = Instant::now();
-    let placed = host.place(&first(b"r1"), now).await.expect("a worker");
+    let placed = Sent::from(host.place(&first(b"r1"), now).await.expect("a worker"));
     let row = placed.id();
     assert_eq!(live(&store, 1), 1);
 
@@ -251,7 +251,7 @@ async fn a_placement_never_sent_says_nothing_at_its_end() {
 async fn a_whole_end_records_a_success_at_its_instant() {
     let (host, store, _) = bed(&["http://w0:8000"]);
     let sent = Instant::now();
-    let mut placed = host.place(&first(b"r1"), sent).await.expect("a worker");
+    let mut placed = Sent::from(host.place(&first(b"r1"), sent).await.expect("a worker"));
     let row = placed.id();
     placed.dispatched(sent);
     let end = sent + Duration::from_millis(1);
@@ -267,7 +267,7 @@ async fn a_body_keeps_its_head_and_reports_what_its_frames_show() {
     for failed in [false, true] {
         let (host, store, _) = bed(&["http://w0:8000"]);
         let sent = Instant::now();
-        let mut placed = host.place(&first(b"r1"), sent).await.expect("a worker");
+        let mut placed = Sent::from(host.place(&first(b"r1"), sent).await.expect("a worker"));
         let row = placed.id();
         placed.dispatched(sent);
 
@@ -310,7 +310,7 @@ async fn a_body_keeps_its_head_and_reports_what_its_frames_show() {
 async fn a_body_the_relay_marked_cut_ends_as_a_failure() {
     let (host, store, _) = bed(&["http://w0:8000"]);
     let sent = Instant::now();
-    let mut placed = host.place(&first(b"r1"), sent).await.expect("a worker");
+    let mut placed = Sent::from(host.place(&first(b"r1"), sent).await.expect("a worker"));
     let row = placed.id();
     placed.dispatched(sent);
     // The relay ends a cut body cleanly and writes the cut on the mark.
@@ -340,7 +340,7 @@ async fn the_placement_drops_before_its_body() {
 
     let (host, store, workers) = bed(&["http://w0:8000"]);
     let sent = Instant::now();
-    let mut placed = host.place(&first(b"r1"), sent).await.expect("a worker");
+    let mut placed = Sent::from(host.place(&first(b"r1"), sent).await.expect("a worker"));
     let row = placed.id();
     placed.dispatched(sent);
     let observed = Arc::new(AtomicUsize::new(1));

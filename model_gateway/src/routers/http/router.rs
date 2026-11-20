@@ -72,7 +72,7 @@ use crate::{
     policies::{CacheNamespace, PolicyRegistry},
     policy_controller::{
         self,
-        host::{self, Ask, Host, Placed},
+        host::{self, Ask, Host, Placed, Sent},
     },
     rate_limit::RateLimitManager,
     routers::{
@@ -759,7 +759,7 @@ impl Router {
                 (worker, None)
             }
             Some(host) => match self.place_attempt(host, attempt).await {
-                Ok(placed) => (Arc::clone(placed.worker()), Some(placed)),
+                Ok(placed) => (Arc::clone(placed.worker()), Some(Sent::from(placed))),
                 Err(refusal) => return refusal,
             },
         };
@@ -796,7 +796,7 @@ impl Router {
             &worker,
             response,
             head_success_recorded,
-            placed.as_ref().map(Placed::id),
+            placed.as_ref().map(|sent| sent.id()),
         );
 
         match placed {
@@ -979,7 +979,7 @@ impl Router {
         attempt: &TypedAttempt<'_, T>,
         worker: &Arc<dyn Worker>,
         decision_adapter: &mut Option<SglangDecisionAdapter>,
-        placed: Option<&mut Placed>,
+        placed: Option<&mut Sent>,
     ) -> Response {
         let headers = attempt.headers;
         let lease = attempt.lease;
