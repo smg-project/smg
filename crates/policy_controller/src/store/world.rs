@@ -1632,6 +1632,36 @@ impl World {
         view: &[Candidate],
         named: &mut Named,
     ) {
+        self.name_in::<false>(model, role, naming, view, named);
+    }
+
+    /// [`World::name`] for rows its caller cut by more than its gateway's
+    /// wires since their build: the rows a request's hard demands took
+    /// are out of `view`, and nothing else says which. The holders'
+    /// lookup is kept within the view's own rows, so the cap is filled
+    /// from the rows that stay, and a warming row is named where the view
+    /// holds it.
+    pub fn name_cut(
+        &self,
+        model: &str,
+        role: Role,
+        naming: &Naming<'_>,
+        view: &[Candidate],
+        named: &mut Named,
+    ) {
+        self.name_in::<true>(model, role, naming, view, named);
+    }
+
+    /// The one naming behind [`World::name`] and [`World::name_cut`], built
+    /// once for each.
+    fn name_in<const CUT: bool>(
+        &self,
+        model: &str,
+        role: Role,
+        naming: &Naming<'_>,
+        view: &[Candidate],
+        named: &mut Named,
+    ) {
         named.clear();
         // A view with no row (a subset hint of 0, wires no member shares)
         // names nobody and reads no index.
@@ -1648,7 +1678,11 @@ impl World {
         ) else {
             return;
         };
-        held.name(naming, rows, &shape.locals, view, named);
+        if CUT {
+            held.name_cut(naming, rows, &shape.locals, view, named);
+        } else {
+            held.name(naming, rows, &shape.locals, view, named);
+        }
     }
 
     /// The pool's standing in its model's index, for the cases: a

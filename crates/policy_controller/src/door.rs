@@ -1116,8 +1116,8 @@ pub(crate) fn hand<A: Asked, R>(
     // row's bits and ages as the row's own fields. A request that states a
     // hard demand is handed written rows, as one that states wires is.
     let by_door = wires.is_none() && request.subset() != Some(0) && demands.is_none();
-    // Whether a demand took a row of the build: the rows left are named by
-    // no index then.
+    // Whether a demand took a row of the build: the rows left are named
+    // within themselves then.
     let mut cut = false;
     let (pool, now_micros, candidates, masks, affinity, counts, built): Read<'_> = if by_door {
         match world.view(model, role, &ask, shown, view) {
@@ -1212,10 +1212,14 @@ pub(crate) fn hand<A: Asked, R>(
             wires,
             now_micros,
         };
-        // The index reads a view by its gateway's wires alone: rows a
-        // demand cut are handed it as no rows, and it names nobody.
-        let over: &[Candidate] = if cut { &[] } else { candidates };
-        world.name(model, role, &naming, over, named);
+        // The index reads a view by its gateway's wires alone. Rows a
+        // demand cut are named within the rows that stay: a row the
+        // demand took is named by nobody and takes no place of the cap.
+        if cut {
+            world.name_cut(model, role, &naming, candidates, named);
+        } else {
+            world.name(model, role, &naming, candidates, named);
+        }
         // Over the rows it named the decider is asked in its form for
         // them, at this arm's own call: a decision that names no row
         // meets no test for it.
@@ -3948,6 +3952,98 @@ pub(crate) mod tests {
         let [by_grpc, by_zmq] = drawn;
         assert_eq!((by_grpc.len(), by_zmq.len()), (16, 16));
         assert!(by_grpc.is_disjoint(&by_zmq));
+    }
+
+    /// A request whose demand took a row is named over the rows that stay:
+    /// the member that holds its first block is named a holder at its place
+    /// among them, and a holder the demand took is named by nobody.
+    #[test]
+    fn a_demand_that_took_a_row_names_the_rows_that_stay() {
+        use std::{sync::atomic::AtomicU64, time::Duration};
+
+        use super::{hand, Buffers, Constraints, PoolFacts, Scratch, Taken};
+        use crate::store::{
+            BatchFacts, BatchOutcome, ContentHash, KvEvent, KvEventSink, SequenceHash, Signals,
+            StoredBlock,
+        };
+
+        let store = MemoryStore::new();
+        let applied = store.apply(preset("cache_aware", 1));
+        applied.expect("above the unbound start");
+        // Three members that publish their blocks. Two state the runtime,
+        // and one of them and the third hold the request's first block.
+        let member = |name: &str, runtime: u32, holds: bool| {
+            let facts = WorkerFacts {
+                key: name.to_owned(),
+                engine: name.to_owned(),
+                incarnation: 1,
+                role: Role::Single,
+                models: vec![MODEL.to_owned()],
+                dp_size: 1,
+                signals: Signals {
+                    events: true,
+                    ..Signals::default()
+                },
+                demand_facts: DemandFacts { runtime },
+                ..WorkerFacts::default()
+            };
+            let id = store.upsert(facts).id();
+            let row = WorkersStore::get(&store, id).expect("the row");
+            if row.status != WorkerStatus::Ready {
+                let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
+                ready.expect("the row stands");
+            }
+            store.publish_now();
+            if holds {
+                let block = StoredBlock {
+                    seq_hash: SequenceHash(5),
+                    content_hash: ContentHash(5),
+                };
+                let events = [KvEvent::Stored {
+                    parent: None,
+                    blocks: vec![block],
+                }];
+                let batch = BatchFacts {
+                    sequence: 1,
+                    ..BatchFacts::default()
+                };
+                assert_eq!(store.admit(id, 0, batch, &events), BatchOutcome::Applied);
+            }
+            id
+        };
+        let holder = member("held", 7, true);
+        let other = member("other", 7, false);
+        member("elsewhere", 9, true);
+        let hashes = [5_u64];
+        let mut asked = request(b"named", 7);
+        asked.facts.block_hashes = &hashes;
+        asked.constraints.demands = Demands { runtime: 7 };
+        let taken = Taken {
+            request: &asked,
+            gateway: GATEWAY,
+            now: Instant::now(),
+            left: Duration::MAX,
+            pins: None,
+            place: None,
+        };
+        let mut buffers = Buffers::default();
+        let undialed = AtomicU64::new(0);
+        // What the decider is handed: its rows, and the holders named.
+        let read = |facts: &RequestFacts<'_>,
+                    _: &PoolFacts<'_>,
+                    rows: &[Candidate],
+                    _: &Constraints<'_>,
+                    _: &mut Scratch| {
+            let named = facts.named.expect("the profile names its rows");
+            let holders = named.holders.iter();
+            let holders: Vec<WorkerId> = holders.map(|held| rows[held.row as usize].id).collect();
+            let rows: BTreeSet<WorkerId> = rows.iter().map(|row| row.id).collect();
+            (rows, holders)
+        };
+        let handed = store.deciding(|world| hand(world, &taken, &mut buffers, &undialed, read));
+        let ((rows, holders), _) = handed;
+        assert_eq!(rows, [holder, other].into_iter().collect());
+        assert_eq!(holders, [holder]);
     }
 
     /// One pass narrows a built view by its gateway's wires and its
