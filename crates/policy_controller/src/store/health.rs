@@ -100,8 +100,10 @@ pub trait HealthSink: Send + Sync {
     /// lock the write waits for, before the probe is counted. Where it
     /// says no, the outcome is stale: a term that ended while the write
     /// waited there counts nothing, moves no status and tells the journal
-    /// nothing. It is asked under the store's lock and takes none. A
-    /// writer with no term to end hands a word that always holds.
+    /// nothing. It is asked under the store's lock and takes none of the
+    /// store's: a lock it takes is never held by its writer across a write
+    /// of the store. A writer with no term to end hands a word that always
+    /// holds.
     fn probe_outcome(
         &self,
         id: WorkerId,
