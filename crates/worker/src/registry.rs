@@ -1364,7 +1364,8 @@ impl<G: Generation> WorkerRegistry<G> {
             }
         }
 
-        let old_models: HashSet<String> = worker_model_ids(&old_worker).into_iter().collect();
+        let old_listed = self.models_left_by(&old_worker);
+        let old_models: HashSet<String> = old_listed.iter().cloned().collect();
         let new_models: HashSet<String> = worker_model_ids(&new_worker).into_iter().collect();
 
         // URL changes are not supported via replace — use remove + register instead
@@ -1441,10 +1442,8 @@ impl<G: Generation> WorkerRegistry<G> {
 
         // Update aliases after canonical indexes so alias removal can inspect
         // the final worker set for each canonical model.
-        for model in old_worker.models() {
-            for alias in model.aliases {
-                self.remove_model_alias_if_unused(&alias, &model.id);
-            }
+        for (alias, canonical_id) in self.aliases_of(&old_listed) {
+            self.remove_model_alias_if_unused(&alias, &canonical_id);
         }
         for model in new_worker.models() {
             for alias in model.aliases {
@@ -1706,17 +1705,7 @@ impl<G: Generation> WorkerRegistry<G> {
         // Stored before the publish: a snapshot published from here on reads
         // the new cards.
         worker.set_models(models);
-        let holding: Vec<String> = self
-            .model_index
-            .iter()
-            .filter(|entry| {
-                entry
-                    .members()
-                    .iter()
-                    .any(|member| Arc::ptr_eq(member, worker))
-            })
-            .map(|entry| entry.key().clone())
-            .collect();
+        let holding = self.indexed_under(worker);
         // As in add_worker_to_model_index: a replaced snapshot drops after
         // its shard guard, not under it.
         let mut previous = Vec::with_capacity(holding.len());
@@ -1730,6 +1719,54 @@ impl<G: Generation> WorkerRegistry<G> {
         let _order = self.global_membership_order.read();
         self.bump_global_routing_epoch();
         true
+    }
+
+    /// The models whose index entry holds `worker`, by its handle.
+    ///
+    /// The index is written from a worker's model list as it registers or
+    /// takes another's place, and a refresh of the list leaves the index as
+    /// it is ([`Self::refresh_models`]). So the entries that hold a worker
+    /// are read from the index, and not from its list of the minute.
+    fn indexed_under(&self, worker: &Arc<dyn Worker>) -> Vec<String> {
+        self.model_index
+            .iter()
+            .filter(|entry| {
+                entry
+                    .members()
+                    .iter()
+                    .any(|member| Arc::ptr_eq(member, worker))
+            })
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
+    /// The models a removal or a replacement takes `worker` out of: the ones
+    /// it lists now, and every one whose index entry still holds it. A
+    /// refresh of its list can leave out a model the index keeps, and the
+    /// lookup by that model would hand the worker out past its removal.
+    fn models_left_by(&self, worker: &Arc<dyn Worker>) -> Vec<String> {
+        let mut model_ids = worker_model_ids(worker);
+        for held in self.indexed_under(worker) {
+            if !model_ids.contains(&held) {
+                model_ids.push(held);
+            }
+        }
+        model_ids
+    }
+
+    /// The aliases that resolve to one of `model_ids`, each with its model,
+    /// read from the alias index: an alias can outlive the card that
+    /// declared it, where a refresh dropped the card.
+    fn aliases_of(&self, model_ids: &[String]) -> Vec<(String, String)> {
+        self.model_alias_index
+            .iter()
+            .filter(|entry| {
+                model_ids
+                    .iter()
+                    .any(|id| id.as_str() == entry.value().as_ref())
+            })
+            .map(|entry| (entry.key().clone(), entry.value().to_string()))
+            .collect()
     }
 
     /// Reserve (or retrieve) a stable UUID for a worker URL.
@@ -1861,21 +1898,20 @@ impl<G: Generation> WorkerRegistry<G> {
             self.worker_origins.remove(worker_id);
             self.import_records.remove(worker_id);
 
-            for model_id in worker_model_ids(&worker) {
-                self.remove_worker_from_model_index(&model_id, worker.url());
+            let left = self.models_left_by(&worker);
+            for model_id in &left {
+                self.remove_worker_from_model_index(model_id, worker.url());
                 // Drop the per-model retry config when the last worker leaves.
                 let model_empty = self
                     .model_index
-                    .get(&model_id)
+                    .get(model_id)
                     .is_none_or(|w| w.members().is_empty());
                 if model_empty {
-                    self.model_retry_configs.remove(&model_id);
+                    self.model_retry_configs.remove(model_id);
                 }
             }
-            for model in worker.models() {
-                for alias in model.aliases {
-                    self.remove_model_alias_if_unused(&alias, &model.id);
-                }
+            for (alias, canonical_id) in self.aliases_of(&left) {
+                self.remove_model_alias_if_unused(&alias, &canonical_id);
             }
             if let Some(mut type_workers) = self.type_workers.get_mut(worker.worker_type()) {
                 type_workers.retain(|id| id != worker_id);

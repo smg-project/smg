@@ -3294,3 +3294,91 @@ fn a_replacement_publishes_its_own_series_where_it_enters() {
         assert!(trips.ends_with(" 1"), "{trips}");
     });
 }
+
+/// A refresh of a worker's model list leaves the model index as the
+/// registration wrote it. So a removal takes the worker out of every entry
+/// that holds it, and not out of the models it lists that minute alone: the
+/// lookup by a model its refresh left out must not hand out a removed worker.
+#[test]
+fn a_removed_worker_leaves_every_model_the_index_holds_it_under() {
+    let registry = WorkerRegistry::new();
+    let endpoint: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![ModelCard::new("qwen"), ModelCard::new("llama")])
+            .build(),
+    );
+    let id = registry.register(Arc::clone(&endpoint)).unwrap();
+    assert!(registry.refresh_models(&endpoint, vec![ModelCard::new("llama")]));
+    assert_eq!(registry.get_by_model("qwen").len(), 1);
+
+    assert!(registry.remove(&id).is_some());
+    assert!(registry.get_by_model("llama").is_empty());
+    assert!(registry.get_by_model("qwen").is_empty());
+    // The registry holds no worker now, so it lists no model.
+    assert!(registry.get_models().is_empty());
+}
+
+/// The same for a worker registered without model cards: it is indexed
+/// under its primary model alone, and a list it discovers later leaves
+/// that model out.
+#[test]
+fn a_removed_worker_registered_without_cards_leaves_its_primary_model() {
+    let registry = WorkerRegistry::new();
+    let labelled: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://labelled:8080")
+            .label("model_id", "llama")
+            .build(),
+    );
+    let id = registry.register(Arc::clone(&labelled)).unwrap();
+    assert!(registry.refresh_models(&labelled, vec![ModelCard::new("qwen")]));
+
+    assert!(registry.remove(&id).is_some());
+    assert!(registry.get_by_model("llama").is_empty());
+}
+
+/// A replacement takes the old handle out of every entry that holds it
+/// too: the worker that takes its place stands under the models it lists,
+/// and the old handle under none.
+#[test]
+fn a_replaced_worker_leaves_every_model_the_index_holds_it_under() {
+    let registry = WorkerRegistry::new();
+    let endpoint: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![ModelCard::new("qwen"), ModelCard::new("llama")])
+            .build(),
+    );
+    let id = registry.register(Arc::clone(&endpoint)).unwrap();
+    assert!(registry.refresh_models(&endpoint, vec![ModelCard::new("llama")]));
+    let next: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![ModelCard::new("llama")])
+            .build(),
+    );
+
+    assert!(registry.replace(&id, Arc::clone(&next)));
+    assert!(registry.get_by_model("qwen").is_empty());
+    let llama = registry.get_by_model("llama");
+    assert_eq!(llama.len(), 1);
+    assert!(Arc::ptr_eq(&llama[0], &next));
+}
+
+/// An alias goes with its model: the alias of a model the refresh left out
+/// resolves to nothing once the worker is removed.
+#[test]
+fn a_removed_workers_alias_goes_with_a_model_its_refresh_left_out() {
+    let registry = WorkerRegistry::new();
+    let endpoint: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![
+                ModelCard::new("qwen").with_alias("qwen-latest"),
+                ModelCard::new("llama"),
+            ])
+            .build(),
+    );
+    let id = registry.register(Arc::clone(&endpoint)).unwrap();
+    assert!(registry.refresh_models(&endpoint, vec![ModelCard::new("llama")]));
+
+    assert!(registry.remove(&id).is_some());
+    assert!(registry.resolve_model_alias("qwen-latest").is_none());
+    assert!(registry.get_by_model("qwen-latest").is_empty());
+}
