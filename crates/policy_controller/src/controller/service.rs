@@ -1191,6 +1191,15 @@ mod tests {
     /// The election's writer and one listener's service over the fence of
     /// `elector`, handed back beside them.
     fn over(elector: Elector, scopes: &[Scope]) -> (Elector, watch::Sender<Standing>, Service) {
+        over_in(elector, scopes, Catalog::builtin())
+    }
+
+    /// [`over`]'s service, its documents naming the stages of `catalog`.
+    fn over_in(
+        elector: Elector,
+        scopes: &[Scope],
+        catalog: Catalog,
+    ) -> (Elector, watch::Sender<Standing>, Service) {
         let (standing, stood) = watch::channel(Standing::default());
         let shared = Arc::new(
             Shared::new(
@@ -1199,7 +1208,7 @@ mod tests {
                 &elector,
                 stood,
                 journaled_for(&LeasePlace::Process, 0, 2),
-                Arc::new(Catalog::builtin()),
+                Arc::new(catalog),
                 2,
             )
             .expect("the deciders start"),
@@ -2417,6 +2426,11 @@ mod tests {
     /// hour's deadline), with no spec source: the leader where `leads`,
     /// else a follower whose last look saw `controller-1` hold the lease.
     fn electing(leads: bool) -> (Elector, watch::Sender<Standing>, Service) {
+        electing_in(leads, Catalog::builtin())
+    }
+
+    /// [`electing`]'s service, its documents naming the stages of `catalog`.
+    fn electing_in(leads: bool, catalog: Catalog) -> (Elector, watch::Sender<Standing>, Service) {
         let hour = Duration::from_secs(3600);
         let settings = ElectionSettings {
             duration: 2 * hour,
@@ -2424,7 +2438,7 @@ mod tests {
             renew_deadline: hour,
         };
         let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
-        let (mut elector, standing, control) = over(elector, &[Scope::Control]);
+        let (mut elector, standing, control) = over_in(elector, &[Scope::Control], catalog);
         if leads {
             elector.lead_at(Instant::now());
             // The store enters the term, as the election has it at a take: a
@@ -2750,6 +2764,78 @@ mod tests {
             "profile \"default\": unknown filter \"nowhere\""
         );
 
+        assert_eq!(control.shared.generations.standing(), standing);
+    }
+
+    /// A dry run a registered filter's factory refuses names the parameter's
+    /// own field: the path an operator edits.
+    #[tokio::test]
+    async fn a_dry_run_names_the_field_a_registered_filters_factory_refuses() {
+        /// Keeps the workers with `slots` of their eight request slots free.
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct MinFree {
+            slots: u32,
+        }
+
+        impl crate::Filter for MinFree {
+            fn name(&self) -> &'static str {
+                "min-free"
+            }
+
+            fn keep(
+                &self,
+                _: &crate::RequestFacts<'_>,
+                candidate: &crate::Candidate,
+                _: &crate::Constraints<'_>,
+            ) -> bool {
+                candidate.in_flight.saturating_add(self.slots) <= 8
+            }
+        }
+
+        const FIELD: &str = "profiles.default.filter[1].min-free.slots";
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter_with("min-free", |build| {
+                let rule: MinFree = build.params()?;
+                if rule.slots == 0 {
+                    return Err(crate::StageError::bad("slots", rule.slots, "above zero"));
+                }
+                Ok(Box::new(rule))
+            })
+            .expect("a free name");
+        let (_elector, _standing, control) = electing_in(true, catalog);
+        control
+            .shared
+            .generations
+            .apply(LEAST_LOAD.into(), Format::Yaml)
+            .expect("a valid document");
+        let standing = control.shared.generations.standing();
+        let dry_run = |slots: u32| {
+            let document = format!(
+                "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy, {{ min-free: {{ slots: {slots} }} }}]\n    pick: random\n"
+            );
+            apply(proto::ApplyMode::DryRun, document, "yaml", "")
+        };
+
+        let would = control
+            .apply_policy_spec(dry_run(2))
+            .await
+            .expect("a verdict")
+            .into_inner();
+        assert!(would.accepted, "{would:?}");
+
+        let refused = control
+            .apply_policy_spec(dry_run(0))
+            .await
+            .expect("a verdict")
+            .into_inner();
+        assert!(!refused.accepted, "{refused:?}");
+        let [issue] = refused.issues.as_slice() else {
+            panic!("one issue: {refused:?}")
+        };
+        assert_eq!(issue.field_path, FIELD);
+        assert_eq!(issue.message, format!("{FIELD} = 0 is not above zero"));
         assert_eq!(control.shared.generations.standing(), standing);
     }
 

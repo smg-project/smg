@@ -614,7 +614,7 @@ mod tests {
     fn engine_filtering(filters: &[&str], shed: bool) -> Engine {
         let mut spec = PolicySpec::preset("round_robin").expect("the preset's form");
         for profile in spec.profiles.values_mut() {
-            profile.filter = filters.iter().map(ToString::to_string).collect();
+            profile.filter = filters.iter().map(|&name| name.into()).collect();
         }
         if shed {
             spec.bindings
