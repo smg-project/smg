@@ -1033,13 +1033,18 @@ impl FilterStage {
 /// `has-room` by a rule: a worker has room where what it holds is at most
 /// its capacity less the headroom, `used <= (1 - headroom) * capacity`.
 /// The filter stays soft: where no worker has room, every worker stands.
-/// Written bare, `has-room` reads the bit its host sets.
+/// Written bare, `has-room` reads the bit its host sets. A null under the
+/// name, the slip of a bare name written with a colon, is refused with
+/// both forms named. A reader that takes a null for an empty map refuses
+/// it by the part it lacks.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[serde(expecting = "a rule with `used` and `capacity`, or the bare name `has-room`")]
 pub struct HasRoomParams {
     /// What a worker holds: field names and their coefficients, summed. At
-    /// least one field is required. A worker that lacks a named value has
-    /// no room.
+    /// least one field of the worker is required under a capacity that is a
+    /// number: the request's size alone reads nothing of a worker there.
+    /// A worker that lacks a named value has no room.
     #[serde(deserialize_with = "keyed_once")]
     #[schemars(extend(
         "minProperties" = 1,
@@ -3304,6 +3309,17 @@ fn has_room_of(
             return Err(at.bad("capacity", name, "a field this build reads"));
         }
     };
+    // Under a capacity that is a number, the request's size alone is one
+    // answer for every row: such a rule reads nothing of a worker, and it
+    // keeps every row or steps aside. A capacity read of each worker would
+    // make it a rule, so the capacity is settled first.
+    if terms.is_empty() {
+        return Err(at.bad(
+            "used",
+            HasRoomRule::REQUEST_TOKENS,
+            "at least one field of the worker beside the request's size",
+        ));
+    }
     if !(0.0..1.0).contains(&p.headroom) {
         return Err(at.bad("headroom", p.headroom, "a number from 0 to under 1"));
     }

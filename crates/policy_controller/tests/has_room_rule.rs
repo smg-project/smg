@@ -329,6 +329,22 @@ fn each_part_of_the_rule_is_refused_at_its_path() {
             "{}",
             "at least one field with its coefficient",
         ),
+        // Under a capacity that is a number, the request's size alone
+        // asks nothing of a worker.
+        (
+            r#"{"used":{"request.prompt_tokens":1},"capacity":10}"#,
+            "used",
+            "request.prompt_tokens",
+            "at least one field of the worker beside the request's size",
+        ),
+        // The capacity is settled first: under one read by a field's name
+        // the refusal is the capacity's, which this build does not read.
+        (
+            r#"{"used":{"request.prompt_tokens":1},"capacity":"load.capacity"}"#,
+            "capacity",
+            "load.capacity",
+            "a field this build reads",
+        ),
         (
             r#"{"used":{"load.nothing":1},"capacity":10}"#,
             "used",
@@ -389,11 +405,27 @@ fn each_part_of_the_rule_is_refused_at_its_path() {
     }
 }
 
-/// An empty map is no rule: only the bare name is the host's bit.
+/// An empty map is no rule: only the bare name is the host's bit. A null
+/// under the name is the slip of a bare name written with a colon, and its
+/// author is told both forms. YAML's own typed read takes that null for an
+/// empty map and refuses it by the part it lacks, at the rule's path.
 #[test]
 fn a_rule_that_leaves_a_part_out_is_refused_at_the_parse() {
+    let slip = "expected a rule with `used` and `capacity`, or the bare name `has-room`";
+    let yaml = format!(
+        "apiVersion: {API_VERSION}\nprofiles:\n  p:\n    filter:\n      - has-room:\n    pick: random\n"
+    );
+    let slipped = serde_yaml::from_str::<PolicySpec>(&yaml)
+        .expect_err("an empty rule")
+        .to_string();
+    assert!(
+        slipped.contains("profiles.p.filter[0].has-room: missing field `used`"),
+        "{slipped}"
+    );
     for (rule, message) in [
+        ("null", slip),
         ("{}", "missing field `used`"),
+        (r#"{"capacity":10}"#, "missing field `used`"),
         (r#"{"used":{"load.running":1}}"#, "missing field `capacity`"),
         (
             r#"{"used":{"load.running":1},"capacity":10,"room":2}"#,
@@ -415,6 +447,17 @@ fn a_rule_that_leaves_a_part_out_is_refused_at_the_parse() {
         .to_string();
         assert!(error.contains(message), "{rule}: {error}");
     }
+}
+
+/// The rule's read is its type's own, whole: its parts written as a list,
+/// in the type's order, read as the map does.
+#[test]
+fn a_rule_written_as_a_list_reads_as_its_map() {
+    let listed = document(r#"{"has-room":[{"load.running":1},10,0.25]}"#);
+    let mapped =
+        document(r#"{"has-room":{"used":{"load.running":1},"capacity":10,"headroom":0.25}}"#);
+    assert_eq!(listed, mapped);
+    listed.validate().expect("the listed rule builds");
 }
 
 #[test]
