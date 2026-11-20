@@ -673,9 +673,12 @@ pub(crate) struct SinceReport {
     /// held word's count of requests, which bounds it. A word of its own,
     /// written behind the held word at a record and lowered ahead of it
     /// at a release and at a retirement, so it never counts a dispatch
-    /// the held word does not. A read loads the two words apart: across a
-    /// record or a release it may see one without the other for the
-    /// dispatch in flight, and across a retirement for its batch.
+    /// the held word does not. The held word's subtraction there is a
+    /// `Release` and the read of both words loads the held word with
+    /// `Acquire`, so a reader finds that order on every target. A read
+    /// loads the two words apart: across a record or a release it may see
+    /// one without the other for the dispatch in flight, and across a
+    /// retirement for its batch.
     unsized_held: AtomicU16,
     /// The lowest of the lanes' front instants; `u64::MAX` when none. A
     /// dispatch lowers it under its lane's lock; a release recomputes it
@@ -880,9 +883,13 @@ impl SinceReport {
         }
     }
 
+    /// Takes a lane's oldest dispatch out of the held word. The
+    /// subtraction is a `Release`: a read that loads the word with
+    /// `Acquire` finds every write made ahead of it, the count of the
+    /// dispatches of no tokens among them ([`Self::sent_through`]).
     fn pop_oldest(&self, dispatches: &mut Dispatches) {
         if let Some((_, tokens)) = dispatches.pop_front() {
-            self.held.fetch_sub(Self::weight(tokens), Ordering::Relaxed);
+            self.held.fetch_sub(Self::weight(tokens), Ordering::Release);
         }
     }
 
@@ -946,7 +953,8 @@ impl SinceReport {
         }
         self.unsized_held
             .fetch_sub(unsized_retired, Ordering::Relaxed);
-        self.held.fetch_sub(retired, Ordering::Relaxed);
+        // A `Release`, as a release's subtraction is: see `pop_oldest`.
+        self.held.fetch_sub(retired, Ordering::Release);
         for (dispatches, lane) in held_lanes.iter().zip(&self.lanes) {
             lane.publish_oldest(dispatches);
         }
@@ -974,13 +982,20 @@ impl SinceReport {
     }
 
     /// [`Self::credit_through`] with the count of the held dispatches of
-    /// no tokens: a third load.
+    /// no tokens: a third load. The held word is loaded with `Acquire`,
+    /// against the `Release` of a release's and a retirement's
+    /// subtraction: the count is read as it stood at that write or later,
+    /// so no read finds more dispatches of no tokens than dispatches
+    /// across a release, on any target.
     #[inline(always)]
     pub(crate) fn sent_through(&self, through_micros: u64) -> Sent {
-        let (tokens, requests) = self.credit_through(through_micros);
+        if self.reaches(through_micros) {
+            self.release_through(through_micros);
+        }
+        let held = self.held.load(Ordering::Acquire);
         Sent {
-            requests: requests as u32,
-            tokens,
+            requests: (held & REQUEST_MASK) as u32,
+            tokens: held >> REQUEST_BITS,
             unsized_requests: u32::from(self.unsized_held.load(Ordering::Relaxed)),
         }
     }
