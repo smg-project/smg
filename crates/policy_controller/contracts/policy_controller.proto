@@ -653,7 +653,10 @@ message Maker {
   // The provider's name: one token of visible ASCII (0x21 to 0x7E) with no
   // comma, at most 128 bytes, the form of a principal's stated name.
   string provider = 1;
-  // The provider's own key for the worker, at most 2048 bytes.
+  // The provider's own key for the worker, at most 2048 bytes. A redacted
+  // snapshot does not tell it verbatim where it may hold a credential: a key
+  // with a scheme loses its userinfo as a URL does, and any other key that
+  // holds an `@` reads as `<unparsable address>`.
   string key = 2;
 }
 

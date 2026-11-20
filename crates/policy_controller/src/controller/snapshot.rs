@@ -588,9 +588,10 @@ mod tests {
     }
 
     /// A provider's key for a worker is its own text and may hold an
-    /// address with a credential: a redacted row tells it as it tells the
-    /// row's own address, without the userinfo. A key with no `@` is told
-    /// as it stands, and a control call's row names no maker.
+    /// address with a credential: a redacted row tells a key that is a URL
+    /// without its userinfo, and any other key that holds an `@` as the
+    /// marker. A key with no `@` is told as it stands, and a control
+    /// call's row names no maker.
     #[test]
     fn a_makers_key_is_told_without_its_userinfo() {
         use crate::store::Maker;
@@ -623,12 +624,19 @@ mod tests {
                 "the row tells {secret}"
             );
         }
-        row.maker = Maker::provider("pool", "pods/a").expect("a whole maker");
-        assert_eq!(told(&row).as_deref(), Some("pods/a"));
-        // A key that is all userinfo cleans to no text, which no maker
-        // holds: the row tells the marker.
-        row.maker = Maker::provider("pool", "operator-name:s3cret-word@").expect("a whole maker");
-        assert_eq!(told(&row).as_deref(), Some(UNPARSABLE));
+        // A key with no `@` is told whole. One with an `@` and no scheme
+        // is no URL to clean: it reads as the marker, never as a part of
+        // itself.
+        for (key, reads) in [
+            ("pods/a", "pods/a"),
+            ("model-a@pool/pods/a", UNPARSABLE),
+            ("pods/a@node-3", UNPARSABLE),
+            ("operator-name:s3cret-word@", UNPARSABLE),
+            ("http://pool.example/pods/a@node-3", UNPARSABLE),
+        ] {
+            row.maker = Maker::provider("pool", key).expect("a whole maker");
+            assert_eq!(told(&row).as_deref(), Some(reads), "the key {key}");
+        }
     }
 
     /// The caller's limit leaves rows out, and the mark says so: the rows
