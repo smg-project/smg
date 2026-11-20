@@ -486,9 +486,10 @@ struct Tables {
 
 impl Tables {
     /// Whether the record of sent prefixes speaks for the pool's row at
-    /// `row`: the row holds no lane, or no batch with an event ran through
-    /// its lane. One decision's naming and its write both ask here, so the
-    /// two read one bit.
+    /// `row` now: the row holds no lane, or no batch with an event ran
+    /// through its lane. A decision's write asks here, at its own later
+    /// instant: that read orders nothing against the one its naming made
+    /// for the whole pool ([`Self::unheard`]).
     fn covered(&self, row: usize) -> bool {
         match (self.id_of[row], &self.index) {
             (NONE, _) | (_, None) => true,
@@ -496,16 +497,39 @@ impl Tables {
         }
     }
 
-    /// Whether the record speaks for a row of the pool now. Where every
-    /// row holds a lane this is one read of the index's heard bits against
-    /// the pool's members, a word for 64 rows: a pool whose events flow
-    /// pays that for the record it holds.
-    fn covers(&self) -> bool {
-        self.lacking
-            || self
-                .index
-                .as_ref()
-                .is_some_and(|index| index.unheard_among(&self.members))
+    /// The pool's lanes the record speaks for, a bit an id: those no batch
+    /// with an event ran through. `None` where it speaks for no row of the
+    /// pool: every row holds a lane and every lane was heard. That is one
+    /// read of the index's heard bits against the pool's members, a word
+    /// for 64 rows, and all a pool whose events flow pays for the record
+    /// it holds.
+    ///
+    /// A naming reads each word once, here, and that one read serves its
+    /// whole run: whether the record is read at all, which rows the record
+    /// may name ([`Self::spoken`]) and which lanes the lookup is kept
+    /// within ([`heard_within`]). So for a request hashed by its token ids
+    /// a member is asked of the index or of the record, never of both and
+    /// never of neither, whatever a lane hears or loses meanwhile. A
+    /// request hashed by windows of its text asks the record alone: a
+    /// heard lane is cold for it. A pair names two pools and reads once
+    /// for each.
+    fn unheard(&self) -> Option<[u64; MASK_WORDS]> {
+        let index = self.index.as_deref();
+        let among = index.and_then(|index| index.unheard_among(&self.members));
+        among.or_else(|| self.lacking.then_some([0; MASK_WORDS]))
+    }
+
+    /// Whether the record speaks for the pool's row at `row` under one
+    /// naming's read of the unheard lanes ([`Self::unheard`]): the row
+    /// holds no lane, or its lane's bit stands there.
+    fn spoken(&self, row: usize, unheard: &[u64; MASK_WORDS]) -> bool {
+        match self.id_of[row] {
+            NONE => true,
+            id => {
+                let word = unheard.get((id / 64) as usize);
+                word.is_some_and(|word| word & (1 << (id % 64)) != 0)
+            }
+        }
     }
 
     /// The workers a read is kept within for the view a decision holds: the
@@ -732,6 +756,8 @@ mod seam {
     /// Where inside a naming a hook runs.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Point {
+        /// Behind the record's holders named ahead, ahead of the lookup.
+        Recorded,
         /// Behind the naming's lookup, ahead of its fence and its question.
         Looked,
         /// Ahead of a lookup made again, behind the ids it is kept within.
@@ -1019,13 +1045,22 @@ impl PoolIndex {
         };
         let mut draw = Draw::new(naming.seed ^ HOLDERS_STREAM);
         let hashed = !naming.block_hashes.is_empty();
+        // The count the tables are whole at, read before every read it
+        // covers: the pool's unheard lanes, then the lookup. A membership
+        // write that keeps the tables tells a later count, and that count
+        // covers only what is read after it. A row that takes an id behind
+        // this read is refused by the count, and is cold for this decision.
+        let whole_at = tables.taken.load(Ordering::Acquire);
         // The record is read where it speaks for a row of the pool: a pool
         // whose lanes are all heard reads the heard bits and no record.
-        let record = tables.predicted.as_ref();
-        let record = record.filter(|_| hashed && tables.covers());
+        // The lanes it speaks for are read once, for the whole naming: the
+        // record names those rows and the lookup is kept within the
+        // others, so no row is named twice ([`Tables::unheard`]).
+        let record = tables.predicted.as_ref().filter(|_| hashed);
+        let record = record.and_then(|predicted| Some((predicted, tables.unheard()?)));
         // The record's holders, in the room the cap leaves where this runs.
         let name_record = |named: &mut Named, draw: &mut Draw| {
-            let Some(predicted) = record else {
+            let Some((predicted, unheard)) = &record else {
                 return;
             };
             // The row of the view a recorded worker stands at, where the
@@ -1033,7 +1068,7 @@ impl PoolIndex {
             // is not another gateway's host-local row.
             let row_of = |id: WorkerId| -> Option<u32> {
                 let row = pool.binary_search_by_key(&id, |row| row.id).ok()?;
-                if !tables.covered(row) {
+                if !tables.spoken(row, unheard) {
                     return None;
                 }
                 let row = row as u32;
@@ -1053,6 +1088,8 @@ impl PoolIndex {
         let ahead = self.predict.is_some_and(|predict| predict.ahead);
         if ahead {
             name_record(named, &mut draw);
+            #[cfg(test)]
+            seam::at(seam::Point::Recorded);
         }
         let room = cap.saturating_sub(named.holders.len());
         // An engine's events are token blocks. A request hashed by windows
@@ -1066,10 +1103,17 @@ impl PoolIndex {
             } else {
                 tables.within(naming, locals, &mut mask)
             };
-            // The count the tables are whole at, read before the lookup: a
-            // membership write that keeps them tells a later count, and
-            // that count covers only what is read after it.
-            let whole_at = tables.taken.load(Ordering::Acquire);
+            // A lane the record speaks for is the record's to name: the
+            // lookup is kept within the others, by the naming's one read.
+            let heard;
+            let within = match &record {
+                Some((_, unheard)) => {
+                    let words = within.len().min(MASK_WORDS);
+                    heard = heard_within(within, unheard);
+                    &heard[..words]
+                }
+                None => within,
+            };
             // The naming's own lookup, in its own frame: one instantiation
             // with a second caller goes out of line for every decision
             // ([`Index::deepest_again`]).
@@ -1296,6 +1340,17 @@ impl Predicted {
     }
 }
 
+/// The ids of `within` less the lanes of `unheard`, a bit an id: what a
+/// naming's lookup is kept within where its record speaks for those lanes
+/// ([`Tables::unheard`]).
+fn heard_within(within: &[u64], unheard: &[u64; MASK_WORDS]) -> [u64; MASK_WORDS] {
+    let mut heard = [0u64; MASK_WORDS];
+    for ((heard, &within), &unheard) in heard.iter_mut().zip(within).zip(unheard) {
+        *heard = within & !unheard;
+    }
+    heard
+}
+
 /// The deepest group's workers that stand at a row of the view (`row_of`),
 /// behind the holders the index gave: the index's first, then a draw from
 /// this group where it would fill more than the room the cap leaves.
@@ -1375,12 +1430,16 @@ struct Index {
     /// A bit an index id: a batch that carried an event ran through the
     /// lane of the row that holds the id ([`Lane::heard`]). A batch with no
     /// event sets nothing: the index holds nothing of the row yet, so the
-    /// record keeps its cover. The lane writes its own bit under
-    /// its lock, and a decision reads it with no lock: until the bit is
-    /// set the record of sent prefixes speaks for the row
-    /// ([`Tables::covered`]). The bit is a hint of this instant and orders
-    /// nothing: a decision that reads it a batch late names or writes one
-    /// prediction more or fewer.
+    /// record keeps its cover. The lane writes its own bit under its lock,
+    /// and a decision reads it with no lock: until the bit is set the
+    /// record of sent prefixes speaks for the row. A naming reads the
+    /// pool's bits once for its whole run ([`Tables::unheard`]), and a
+    /// write reads its row's bit at its own instant ([`Tables::covered`]).
+    /// The bit is a hint of the instant it was read at and orders nothing.
+    /// A lane first heard behind a naming's read is spoken for by the
+    /// record once more, and its index entries are left unread for that
+    /// decision. A lane reset behind it is the index's for that decision:
+    /// the lookup names what it read of the lane. Neither is named twice.
     heard: [AtomicU64; MASK_WORDS],
 }
 
@@ -1394,7 +1453,8 @@ impl Index {
         }
     }
 
-    /// The lane that holds `id` says whether a batch ran through it.
+    /// The lane that holds `id` says whether a batch that carried an event
+    /// ran through it.
     fn hear(&self, id: u32, heard: bool) {
         let Some(word) = self.heard.get((id / 64) as usize) else {
             return;
@@ -1407,16 +1467,28 @@ impl Index {
         }
     }
 
-    /// Whether a batch ran through the lane that holds `id`.
+    /// Whether a batch that carried an event ran through the lane that
+    /// holds `id`.
     fn heard(&self, id: u32) -> bool {
         let word = self.heard.get((id / 64) as usize);
         word.is_some_and(|word| word.load(Ordering::Relaxed) & (1 << (id % 64)) != 0)
     }
 
-    /// Whether a lane among `members`, a bit an id, was not heard.
-    fn unheard_among(&self, members: &[u64]) -> bool {
-        let mut words = members.iter().zip(&self.heard);
-        words.any(|(&members, heard)| members & !heard.load(Ordering::Relaxed) != 0)
+    /// The lanes among `members` that were not heard, a bit an id; `None`
+    /// where every one was heard. Each word is read once: the words ahead
+    /// of the first unheard lane are read and not written, so a pool whose
+    /// lanes are all heard pays the reads alone.
+    fn unheard_among(&self, members: &[u64]) -> Option<[u64; MASK_WORDS]> {
+        let words = members.iter().zip(&self.heard).enumerate();
+        let mut words =
+            words.map(|(at, (&members, heard))| (at, members & !heard.load(Ordering::Relaxed)));
+        let (first, word) = words.find(|&(_, word)| word != 0)?;
+        let mut unheard = [0u64; MASK_WORDS];
+        unheard[first] = word;
+        for (at, word) in words {
+            unheard[at] = word;
+        }
+        Some(unheard)
     }
 
     /// A row takes `id`, which the chain just handed out: the take is

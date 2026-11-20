@@ -33,8 +33,8 @@ mod sent_prefixes {
         predictor::Predictor,
         spec::AffinitySource,
         store::{
-            index::Predicted, Ask, GatewayId, Kinds, Named, Naming, Position, Reachability,
-            ViewBuffers,
+            index::{seam, Predicted},
+            Ask, GatewayId, Kinds, Named, Naming, Position, Reachability, ViewBuffers,
         },
         view::{Candidate, Role, WireModes},
     };
@@ -381,6 +381,100 @@ mod sent_prefixes {
         let holder = named.holders[0];
         assert_eq!(rows[holder.row as usize], event);
         assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (4, 0));
+        Ok(())
+    }
+
+    /// The naming reads the pool's heard bits once. A lane reset between
+    /// its lookup and its read of the record leaves the worker to the
+    /// index, which read it: the record, which still holds a placement of
+    /// it, does not name it a second time.
+    #[test]
+    fn a_lane_reset_behind_the_lookup_names_its_worker_once() -> Case {
+        let store = Arc::new(MemoryStore::new());
+        let event = admitted(&store, "event");
+        admitted(&store, "other-event");
+        plain(&store, "plain", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        publish(&store, event);
+        predicted(&store, event).ok_or("a record with a placement")?;
+        let reset = Arc::clone(&store);
+        seam::set(seam::Point::Looked, move || {
+            KvEventSink::removed(&*reset, event);
+        });
+        let (raced, rows) = named(&store, None, 16, 7);
+        assert!(!seam::pending(), "the reset ran behind the lookup");
+        assert_eq!(raced.holders.len(), 1, "the worker is named once");
+        let holder = raced.holders[0];
+        assert_eq!(rows[holder.row as usize], event);
+        assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (4, 0));
+        // The next naming reads the lane as it stands: the record speaks.
+        let (next, rows) = named(&store, None, 16, 7);
+        assert_eq!(next.holders.len(), 1);
+        let holder = next.holders[0];
+        assert_eq!(rows[holder.row as usize], event);
+        assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (0, 4));
+        Ok(())
+    }
+
+    /// The other order: a profile whose record is named ahead. A lane
+    /// first heard between the record's holders and the lookup stays the
+    /// record's for that naming, and its new blocks are left unread.
+    #[test]
+    fn a_lane_first_heard_behind_the_record_names_its_worker_once() -> Case {
+        let store = Arc::new(MemoryStore::new());
+        let event = admitted(&store, "event");
+        admitted(&store, "other-event");
+        let mut document = merged(1)?;
+        use_sent_prefixes(&mut document, AffinitySource::Predictor);
+        store.apply(applied(&document)?)?;
+        predicted(&store, event).ok_or("a record with a placement")?;
+        let heard = Arc::clone(&store);
+        seam::set(seam::Point::Recorded, move || publish(&heard, event));
+        let (raced, rows) = named(&store, None, 16, 7);
+        assert!(
+            !seam::pending(),
+            "the batch ran behind the record's holders"
+        );
+        assert_eq!(raced.holders.len(), 1, "the worker is named once");
+        let holder = raced.holders[0];
+        assert_eq!(rows[holder.row as usize], event);
+        assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (0, 4));
+        // The next naming reads the lane as heard: the index speaks.
+        let (next, rows) = named(&store, None, 16, 7);
+        assert_eq!(next.holders.len(), 1);
+        let holder = next.holders[0];
+        assert_eq!(rows[holder.row as usize], event);
+        assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (4, 0));
+        Ok(())
+    }
+
+    /// A pool past one word of lanes: the naming's one read holds every
+    /// unheard lane, the words behind the first unheard one among them.
+    #[test]
+    fn a_pool_past_one_word_of_lanes_is_read_whole() -> Case {
+        let store = MemoryStore::new();
+        let ids: Vec<WorkerId> = (0..70)
+            .map(|at| admitted(&store, &format!("event-{at:02}")))
+            .collect();
+        store.apply(applied(&merged(1)?)?)?;
+        for &id in &ids {
+            predicted(&store, id).ok_or("a record with a placement")?;
+        }
+        let blocks = |named: &Named| -> Vec<(u32, u32)> {
+            let holders = named.holders.iter();
+            holders
+                .map(|holder| (holder.overlap_blocks, holder.predicted_blocks))
+                .collect()
+        };
+        // Under no cap the record names every row it speaks for.
+        let (unheard, _) = named(&store, None, 0, 7);
+        assert_eq!(blocks(&unheard), vec![(0, 4); 70]);
+        // Heard, each lane is the index's, whichever word holds its bit.
+        for &id in &ids {
+            publish(&store, id);
+        }
+        let (heard, _) = named(&store, None, 0, 7);
+        assert_eq!(blocks(&heard), vec![(4, 0); 70]);
         Ok(())
     }
 
