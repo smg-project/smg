@@ -21,6 +21,7 @@ use super::{
 use crate::{
     decider::Decider,
     decision::{Target, Targets},
+    demands::DemandFacts,
     lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
     replication::Log,
     sessions::SessionVerdict,
@@ -129,7 +130,16 @@ fn a_replacement_carries_a_matching_registrations_status_and_a_changed_one_start
         WorkersStore::get(&store, same).expect("the row").status,
         WorkerStatus::Ready
     );
-    let mut other_role = facts("http://w:8000", 3);
+    // What a registration states for a hard demand is none of the three
+    // facts: its next life is handed the status too.
+    let mut other_runtime = facts("http://w:8000", 3);
+    other_runtime.demand_facts = DemandFacts { runtime: 9 };
+    let stated = store.upsert(other_runtime).id();
+    assert_eq!(
+        WorkersStore::get(&store, stated).expect("the row").status,
+        WorkerStatus::Ready
+    );
+    let mut other_role = facts("http://w:8000", 4);
     other_role.role = Role::Prefill;
     let changed = store.upsert(other_role).id();
     assert_eq!(

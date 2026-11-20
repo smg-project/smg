@@ -661,9 +661,11 @@ fn pair_with<A: Asked, R>(
     let (wires, subset) = (request.wires(), request.subset());
     // The store narrows a pair's sides by its gateway's wires and keeps no
     // hard demand there yet: a request that states one is shed as an
-    // emptied side is, never placed past its demand. It reads under the
-    // wires' name until the store keeps the demand: a stage of its own
-    // would leave the hosts' tables again with that change.
+    // emptied side is, never placed past its demand. Where both sides were
+    // built it reads under the wires' name until the store keeps the
+    // demand: a stage of its own would leave the hosts' tables again with
+    // that change. Where a side has no pool it reads `none`, as a pair
+    // that states no demand does.
     let demanded = !request.demands().is_none();
     let mut emptied = false;
     let built = build(rows, engine, model, ask, wires, subset).map(|(built, (took, none))| {
@@ -2613,7 +2615,7 @@ pub(crate) mod tests {
         DecisionRecord,
     };
 
-    const MODEL: &str = "model-a";
+    pub(crate) const MODEL: &str = "model-a";
     pub(crate) const GATEWAY: GatewayId = GatewayId(11);
 
     /// A preset of this build as generation `generation`.

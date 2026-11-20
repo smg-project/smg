@@ -352,7 +352,7 @@ pub(super) mod tests {
             mpsc, Arc, Barrier, Weak,
         },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use smg_worker::settings::UnhealthyRemovalScope;
@@ -361,6 +361,12 @@ pub(super) mod tests {
         changed, lay, Expect, Membership, Refused, Remover, Standing, StoreDoor, Turn, Wrote,
     };
     use crate::{
+        demands::{DemandFacts, Demands},
+        door::{
+            tests::{request, GATEWAY, MODEL},
+            Door,
+        },
+        spec::{AppliedSpec, PolicySpec},
         store::{
             membership::{self, Past},
             Maker, MemoryStore, WorkerFacts, WorkerRow, WorkerStatus, WorkersStore,
@@ -731,6 +737,69 @@ pub(super) mod tests {
             membership::life(0, door.base, before)
         );
         assert_eq!((row.facts.role, row.revision), (Role::Decode, 1));
+    }
+
+    /// A refresh that changes the runtime a worker states starts another
+    /// life. The row that stated the old number is gone when the write is
+    /// answered: with no publication awaited, a retry that demands the old
+    /// runtime is decided over nobody, and one that demands the new runtime
+    /// is placed on the new life. The new life is handed the old one's
+    /// status: the worker's checks are on, and none runs between the two.
+    #[test]
+    fn a_changed_demand_fact_is_another_life_and_the_old_one_takes_no_retry() {
+        let (store, door) = door();
+        let maker = Maker::provider("pool", "first").expect("a maker");
+        let stating = |runtime| WorkerFacts {
+            models: vec![MODEL.to_owned()],
+            demand_facts: DemandFacts { runtime },
+            ..stated()
+        };
+        door.found(&maker, Expect::Anything, URL, &|_| stating(7))
+            .expect("registered");
+        // Its checks are on: a check's word makes the first life ready.
+        let pending = store.by_key(URL).expect("the registered row");
+        store
+            .set_status(pending.id, WorkerStatus::Ready, pending.revision)
+            .expect("ready");
+        let old = store.by_key(URL).expect("the ready row");
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        document.generation = 1;
+        let applied = AppliedSpec::validate(&document).expect("the document validates");
+        store.apply(applied).expect("above the unbound start");
+        store.publish_now();
+        let policy = Door::new(Arc::clone(&store));
+        let decide = |id: &[u8], runtime: u32| {
+            let mut retry = request(id, 7);
+            retry.constraints.wire_modes = WireModes::HTTP;
+            retry.constraints.demands = Demands { runtime };
+            let decided = policy.decide(GATEWAY, &retry, Instant::now());
+            decided.expect("a decision")
+        };
+        let placed = decide(b"before", 7);
+        let target = placed.decision.pick().expect("the worker states runtime 7");
+        assert_eq!(target.targets.first().map(|target| target.id), Some(old.id));
+
+        let wrote = door.found(&maker, Expect::Anything, URL, &|_| stating(9));
+        let row = store.by_key(URL).expect("the replaced row");
+        assert_eq!(
+            wrote,
+            Ok(Wrote::Another {
+                old: old.id,
+                new: row.id
+            })
+        );
+        assert_eq!(store.get(old.id), None);
+        assert_eq!(row.facts.demand_facts, DemandFacts { runtime: 9 });
+        assert_eq!(row.status, WorkerStatus::Ready, "handed on by the store");
+
+        let refused = decide(b"after", 7);
+        assert!(
+            refused.decision.pick().is_none() && refused.lease.is_none(),
+            "the worker states runtime 9: {refused:?}"
+        );
+        let moved = decide(b"moved", 9);
+        let target = moved.decision.pick().expect("the worker states runtime 9");
+        assert_eq!(target.targets.first().map(|target| target.id), Some(row.id));
     }
 
     #[test]
