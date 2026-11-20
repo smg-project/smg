@@ -176,8 +176,9 @@ impl Default for ElectionSettings {
 }
 
 impl ElectionSettings {
-    /// The order the fence rests on: a renew period above zero, a renew
-    /// deadline longer than it, a duration longer than the deadline.
+    /// The bounds and order the fence rests on: a renew period above zero,
+    /// a renew deadline longer than it, and a record-sized duration longer
+    /// than the deadline.
     pub fn validate(&self) -> Result<(), ElectError> {
         if self.renew_period.is_zero() {
             return Err(ElectError::Settings("the renew period is zero"));
@@ -192,6 +193,7 @@ impl ElectionSettings {
                 "the duration is not longer than the renew deadline",
             ));
         }
+        whole_millis_up(self.duration)?;
         Ok(())
     }
 }
@@ -701,7 +703,7 @@ impl Elector {
         let released = LeaseRecord {
             holder: String::new(),
             term: self.highest_term.max(mine.term),
-            duration_ms: whole_millis_up(self.owed()),
+            duration_ms: whole_millis_up(self.owed())?,
             renewed_at_micros: next_wall_micros(mine.renewed_at_micros),
             ..mine.clone()
         };
@@ -1172,7 +1174,7 @@ impl Elector {
                 acquired_at_micros
             },
             renewed_at_micros: wall,
-            duration_ms: whole_millis_up(self.settings.duration),
+            duration_ms: whole_millis_up(self.settings.duration)?,
         };
         // The take says here whether it had a holder to wait for. Its
         // lead's opening is dated once the write has returned, never from
@@ -1247,14 +1249,15 @@ fn later(at: Instant, by: Duration) -> Instant {
 /// never shorter than the settings' and so never shorter than the renew
 /// deadline the fence runs on, and a wait handed on is never shorter than
 /// what was owed.
-fn whole_millis_up(duration: Duration) -> u64 {
+fn whole_millis_up(duration: Duration) -> Result<u64, ElectError> {
     let whole = duration.as_millis();
     let rounded = if duration.subsec_nanos().is_multiple_of(1_000_000) {
         whole
     } else {
         whole + 1
     };
-    u64::try_from(rounded).unwrap_or(u64::MAX)
+    u64::try_from(rounded)
+        .map_err(|_| ElectError::Settings("the duration is too large for the lease record"))
 }
 
 /// The wall clock in microseconds since the Unix epoch, and at least one
@@ -3373,8 +3376,8 @@ mod tests {
             record.duration() > fine.renew_deadline,
             "a follower waits past the fence"
         );
-        assert_eq!(whole_millis_up(Duration::from_secs(3)), 3_000);
-        assert_eq!(whole_millis_up(Duration::from_millis(1)), 1);
+        assert!(matches!(whole_millis_up(Duration::from_secs(3)), Ok(3_000)));
+        assert!(matches!(whole_millis_up(Duration::from_millis(1)), Ok(1)));
     }
 
     /// A backend whose write lands and then reports an error while `fails`
@@ -4475,25 +4478,39 @@ mod tests {
     }
 
     #[test]
-    fn a_renew_deadline_past_the_clocks_reach_never_comes() {
-        // Settings no clock outlasts are in order: the sums that date the
-        // fence stay inside the clock, and a wait that long does not end.
+    fn a_shared_records_duration_outlasts_its_fence() {
+        let duration = Duration::from_millis(u64::MAX);
         let settings = ElectionSettings {
-            duration: Duration::MAX,
+            duration,
             renew_period: S,
-            renew_deadline: Duration::MAX - S,
+            renew_deadline: duration - S,
         };
-        let lease = MemoryLease::new();
+        let mut lease = MemoryLease::new();
+        let released = held_by("", 1, 0);
+        assert_eq!(lease.write(None, &released).expect("seed"), Written::Done);
         let mut a = Elector::new(Box::new(lease.clone()), "a@host:1", settings).expect("settings");
+        let mut b = Elector::new(Box::new(lease.clone()), "b@host:2", settings).expect("settings");
         let t0 = Instant::now() + AHEAD;
-        assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
-        assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
-        assert!(a.waits_to_lead());
-        assert_eq!(a.fence().leader_term(t0 + 3600 * S), None);
-        // An elector alone leads at its take, to a deadline as far.
-        let mut alone = Elector::alone("b@host:2", settings).expect("settings");
-        assert_eq!(alone.tick(t0).expect("take"), Tick::Acquired { term: 1 });
-        assert_eq!(alone.fence().leader_term(t0 + 3600 * S), Some(1));
+        assert!(
+            t0.checked_add(Duration::MAX).is_none(),
+            "the greatest duration is past the clock's reach"
+        );
+        assert!(
+            later(t0, Duration::MAX) > t0 + 3600 * S,
+            "the clock-overflow fallback stays in the distant future"
+        );
+        assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 2 });
+        assert_eq!(a.fence().leader_term(t0), Some(2));
+        assert!(matches!(
+            b.tick(t0).expect("follow"),
+            Tick::Following { .. }
+        ));
+        let Some(take) = t0.checked_add(duration) else {
+            panic!("the record's greatest duration is inside the clock's reach");
+        };
+        assert_eq!(a.fence().leader_term(take), None);
+        assert_eq!(b.tick(take).expect("take"), Tick::Acquired { term: 3 });
+        assert_eq!(b.fence().leader_term(take), Some(3));
     }
 
     #[test]
@@ -4533,6 +4550,25 @@ mod tests {
             renew_deadline: Duration::from_secs(10),
         };
         assert!(long.validate().is_ok());
+    }
+
+    #[test]
+    fn a_duration_too_large_for_the_record_is_refused() {
+        // The whole milliseconds fit; rounded up they do not.
+        let edge = Duration::from_millis(u64::MAX) + Duration::from_nanos(1);
+        for duration in [edge, Duration::MAX] {
+            let settings = ElectionSettings {
+                duration,
+                renew_period: S,
+                renew_deadline: duration - S,
+            };
+            let err =
+                Elector::new(Box::new(MemoryLease::new()), "a", settings).expect_err("refused");
+            assert_eq!(
+                err.to_string(),
+                "election settings: the duration is too large for the lease record"
+            );
+        }
     }
 
     #[test]
