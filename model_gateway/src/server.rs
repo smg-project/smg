@@ -1166,8 +1166,8 @@ impl Extensions {
     /// to their engines. Delegate to [`BackendConnector::shared`] for engines
     /// you want the gateway to connect to as usual.
     ///
-    /// For gRPC or ZMQ inference the gateway requires a [`BackendClient`].
-    /// It refuses other connections with
+    /// For gRPC or ZMQ inference, and for a ZMQ worker's label refresh, the
+    /// gateway requires a [`BackendClient`]. It refuses other connections with
     /// `its engine connection is not the gateway's backend client`.
     /// If the connection supplies load reports, let the worker runtime be
     /// the only poller of that engine's load.
