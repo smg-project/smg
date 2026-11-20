@@ -44,6 +44,9 @@ pub enum Refused {
     Moved,
     /// A row stands under the URL of a registration that expects none.
     Stands,
+    /// The row a replacement names is draining: its removal takes the
+    /// worker.
+    Draining,
     /// The row's maker is outside the health removal scope.
     OutOfScope,
 }
@@ -74,9 +77,9 @@ pub enum Expect {
     /// whoever made the row.
     Nothing,
     /// The row its asker saw, at the revision it saw: a replacement by id.
-    /// No row refuses it ([`Refused::Absent`]), as does a draining row,
-    /// whose removal wins. Another row or revision refuses it too
-    /// ([`Refused::Moved`]).
+    /// No row refuses it ([`Refused::Absent`]), and so does another row or
+    /// revision ([`Refused::Moved`]). A draining row refuses it too
+    /// ([`Refused::Draining`]): its removal wins.
     Seen(Standing),
     /// Anything: an upsert.
     Anything,
@@ -142,16 +145,7 @@ pub(crate) fn lay(
 ) -> Result<Wrote, Refused> {
     let store = turn.store();
     let standing = match expect {
-        Expect::Seen(seen) => {
-            let row = seen_row(store, url, seen)?;
-            // A draining row is leaving. Laid over, it would take the URL's
-            // next life and its removal would leave the worker: the removal
-            // wins, and the replacement reads the row as gone.
-            if row.status == WorkerStatus::Draining {
-                return Err(Refused::Absent);
-            }
-            Some(row)
-        }
+        Expect::Seen(seen) => Some(seen_row(store, url, seen)?),
         Expect::Nothing | Expect::Anything => store.by_key(url),
     };
     // An add changes no standing row, so it asks no maker and states no
@@ -161,6 +155,12 @@ pub(crate) fn lay(
     }
     if let Some(row) = &standing {
         made_by(row, maker)?;
+        // A draining row is leaving. Laid over, it would take the URL's
+        // next life and its removal would leave the worker: the removal
+        // wins over a replacement.
+        if matches!(expect, Expect::Seen(_)) && row.status == WorkerStatus::Draining {
+            return Err(Refused::Draining);
+        }
     }
 
     let mut facts = state(standing.as_ref().map(|row| &row.facts));
@@ -485,7 +485,8 @@ pub(super) mod tests {
             })
         );
 
-        // A draining row is leaving: its removal wins over a replacement.
+        // A draining row is leaving: its removal wins over a replacement,
+        // which is told so. Another maker is told the row is not its own.
         let seen = standing(&next);
         assert_eq!(
             door.drained(Remover::Maker(&control), URL, seen),
@@ -493,8 +494,12 @@ pub(super) mod tests {
         );
         assert_eq!(
             door.found(&control, Expect::Seen(seen), URL, &unstated),
-            Err(Refused::Absent)
+            Err(Refused::Draining)
         );
+        assert!(matches!(
+            door.found(&pool, Expect::Seen(seen), URL, &unstated),
+            Err(Refused::NotMaker(_))
+        ));
         assert_eq!(
             store.by_key(URL).map(|row| (row.id, row.status)),
             Some((next.id, WorkerStatus::Draining))

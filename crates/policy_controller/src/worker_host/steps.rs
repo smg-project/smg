@@ -189,6 +189,10 @@ fn registration_refusal(url: &str, refusal: Refused) -> WorkflowError {
         Refused::NotLeading(_) => NOT_LEADING.to_owned(),
         Refused::Moved => MOVED.to_owned(),
         Refused::Stands => format!("Worker {} already exists", Endpoint::redacted_str(url)),
+        Refused::Draining => format!(
+            "Worker {} is draining, so the replacement was dropped",
+            Endpoint::redacted_str(url)
+        ),
         Refused::OutOfScope => Refused::OUT_OF_SCOPE.to_owned(),
     };
     failed(WRITE_WORKERS_AT_DOOR_STEP, message)
@@ -299,6 +303,25 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
     }
 }
 
+/// What the registry holds for a removal's worker at a step's second read.
+enum Held {
+    /// The object under the id.
+    Is(Arc<dyn Worker>),
+    /// No object under the id and none under the URL: the worker left.
+    Gone,
+    /// No object under the id and another under the URL: the worker was
+    /// registered anew between the two reads.
+    Anew,
+}
+
+fn held<G: Generation>(registry: &WorkerRegistry<G>, id: &ObjectId, url: &str) -> Held {
+    match registry.get(id) {
+        Some(worker) => Held::Is(worker),
+        None if registry.get_id_by_url(url).is_some() => Held::Anew,
+        None => Held::Gone,
+    }
+}
+
 fn skipped(url: &str, why: &str) {
     debug!(worker_url = %Endpoint::redacted_str(url), why, "Worker left alone");
 }
@@ -336,6 +359,9 @@ fn removal_answer(step: &str, url: &str, answer: Result<Wrote, Refused>) -> Work
         Err(Refused::OutOfScope) => refused(Refused::OUT_OF_SCOPE.to_owned()),
         Err(Refused::NotLeading(_)) => return Err(failed(step, NOT_LEADING)),
         Err(Refused::Stands) => return Err(failed(step, "the door answered a removal as an add")),
+        Err(Refused::Draining) => {
+            return Err(failed(step, "the door answered a removal as a replacement"))
+        }
         Err(Refused::Past(past)) => {
             return Err(failed(step, format!("{}: {}", past.fact, past.why)))
         }
@@ -377,17 +403,20 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
                     continue;
                 }
             };
-            // Gone between the two reads: the job's, as a worker gone
-            // ahead of them.
-            let Some(current) = registry.get(&id) else {
-                skipped(url, "no worker stands in the registry");
-                kept.push(Arc::clone(worker));
-                continue;
+            let current = match held(registry, &id, url) {
+                Held::Is(current) if current.revision() == revision => current,
+                // Gone between the two reads: the job's, as a worker gone
+                // ahead of them.
+                Held::Gone => {
+                    skipped(url, "no worker stands in the registry");
+                    kept.push(Arc::clone(worker));
+                    continue;
+                }
+                Held::Is(_) | Held::Anew => {
+                    skipped(url, "the worker moved after selection");
+                    continue;
+                }
             };
-            if current.revision() != revision {
-                skipped(url, "the worker moved after selection");
-                continue;
-            }
             // An object no row stands for is not the store's: the job keeps
             // it for the host's own steps.
             let Some(seen) = self.objects.standing_of(&id, &current) else {
@@ -455,15 +484,18 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
                 skipped(url, "no worker stands in the registry");
                 continue;
             };
-            let Some(current) = registry.get(&id) else {
-                skipped(url, "no worker stands in the registry");
-                continue;
+            let current = match held(registry, &id, url) {
+                Held::Is(current) if Arc::ptr_eq(&current, worker) => current,
+                Held::Gone => {
+                    skipped(url, "no worker stands in the registry");
+                    continue;
+                }
+                Held::Is(_) | Held::Anew => {
+                    skipped(url, "the worker moved while draining");
+                    standing.push(url.to_owned());
+                    continue;
+                }
             };
-            if !Arc::ptr_eq(&current, worker) {
-                skipped(url, "the worker moved while draining");
-                standing.push(url.to_owned());
-                continue;
-            }
             let Some(seen) = self.objects.standing_of(&id, &current) else {
                 skipped(url, "no row stands for this object");
                 continue;
@@ -1140,7 +1172,48 @@ mod tests {
             Some("silver")
         );
         f.objects.follow(&*f.store);
-        assert_eq!(f.host.registry.get_id_by_url(URL), Some(id));
+        assert_eq!(f.host.registry.get_id_by_url(URL), Some(id.clone()));
+
+        // The worker drains: its removal wins, and the replacement is told.
+        let live = f.host.registry.get(&id).expect("the worker");
+        let seen = f.objects.standing_of(&id, &live).expect("its row");
+        f.door
+            .drained(Remover::Maker(&Maker::Control), URL, seen)
+            .expect("draining");
+        let mut cx = f.registration(WorkerJobAsker::Api, vec![relabelled()]);
+        cx.data.registration_mode = by_id(id.as_str(), live.revision());
+        let error = write.execute(&mut cx).await.expect_err("draining");
+        assert_eq!(
+            error.to_string(),
+            "Step failed: write_workers_at_door - Worker http://worker:8000 is draining, \
+             so the replacement was dropped"
+        );
+    }
+
+    /// At a step's second read a worker registered anew under the URL is
+    /// told from one that left.
+    #[tokio::test]
+    async fn a_worker_registered_anew_between_a_steps_reads_is_told_from_one_gone() {
+        let f = Fixture::new();
+        f.seed(&Maker::Control, worker(URL, "model").as_ref())
+            .expect("registered");
+        let first = f.host.registry.get_id_by_url(URL).expect("its id");
+        assert!(matches!(held(&f.host.registry, &first, URL), Held::Is(_)));
+
+        // Other models: the URL's next life, under a new id.
+        f.seed(&Maker::Control, worker(URL, "other").as_ref())
+            .expect("registered anew");
+        let second = f.host.registry.get_id_by_url(URL).expect("the new id");
+        assert_ne!(first, second);
+        assert!(matches!(held(&f.host.registry, &first, URL), Held::Anew));
+
+        let live = f.host.registry.get(&second).expect("the worker");
+        let seen = f.objects.standing_of(&second, &live).expect("its row");
+        f.door
+            .gone(Remover::Maker(&Maker::Control), URL, seen)
+            .expect("removed");
+        f.objects.follow(&*f.store);
+        assert!(matches!(held(&f.host.registry, &second, URL), Held::Gone));
     }
 
     #[tokio::test]
