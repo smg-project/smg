@@ -580,7 +580,8 @@ async fn a_hosts_catalog_and_document_reach_the_store_through_the_context() -> C
 
     let stages = Some(host_stages()?);
     let hosted =
-        AppContext::from_config_with_stages(config.clone(), 30, None, None, stages).await?;
+        AppContext::from_config_with_extensions(config.clone(), 30, None, None, stages, None)
+            .await?;
     let store = hosted
         .policy_store
         .as_ref()
