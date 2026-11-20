@@ -256,6 +256,12 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
         .filter(|name| *name != "best-with-temperature")
         .collect();
     assert_eq!(bare("PickSpec"), pickers);
+    // A picker the host adds is written under any name but a typed
+    // built-in's: the third form leaves those two keys to the second.
+    assert_eq!(
+        defs["PickSpec"]["anyOf"][2]["propertyNames"]["not"]["enum"],
+        serde_json::json!(["best", "best-with-temperature"])
+    );
     assert_eq!(
         pickers,
         [

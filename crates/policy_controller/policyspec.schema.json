@@ -239,7 +239,7 @@
           "default": []
         },
         "pick": {
-          "description": "The picker.",
+          "description": "The picker: a name, a built-in mapped to its parameters, or the name\nof a picker the catalog adds mapped to its parameters.",
           "$ref": "#/$defs/PickSpec"
         },
         "sent_ttl_ms": {
@@ -1050,7 +1050,7 @@
       ]
     },
     "PickSpec": {
-      "description": "A picker: its bare name, or the name mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool.",
+      "description": "A picker: its bare name, a built-in mapped to its parameters, or the name of a picker the host adds mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool.",
       "anyOf": [
         {
           "type": "string",
@@ -1067,6 +1067,22 @@
         },
         {
           "$ref": "#/$defs/PickStage"
+        },
+        {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 1,
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "best",
+                "best-with-temperature"
+              ]
+            }
+          },
+          "additionalProperties": {
+            "type": "object"
+          }
         }
       ]
     },
