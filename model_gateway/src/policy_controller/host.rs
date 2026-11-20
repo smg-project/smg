@@ -1100,6 +1100,12 @@ impl Placed {
         self.rank
     }
 
+    /// The size the placement's lease states, for a case that reads it.
+    #[cfg(test)]
+    pub(crate) fn lease_tokens(&self) -> Option<u32> {
+        self.handle.lease().map(|leased| leased.lease.tokens)
+    }
+
     /// The request was sent to the worker at `now`. Said once.
     pub(crate) fn dispatched(&mut self, now: Instant) {
         self.handle.dispatched(now);

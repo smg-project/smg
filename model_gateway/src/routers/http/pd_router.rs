@@ -61,7 +61,7 @@ use crate::{
         otel_trace::with_trace_context_http,
     },
     policies::{CacheNamespace, PolicyRegistry, WorkerRole},
-    policy_controller::host::{self, Ask, Host, Sent, Unplaced},
+    policy_controller::host::{self, Ask, Hashes, Host, Prompt, Sent, Unplaced},
     rate_limit::RateLimitManager,
     routers::{
         common::{
@@ -148,7 +148,10 @@ struct PdLoadGuards {
 struct PairAsked<'a> {
     id: [u8; 8],
     model: Cow<'a, str>,
-    prompt_tokens: u32,
+    /// The prompt's hashes, made once an attempt for the model the ask
+    /// names. The ask states no count beside them: the host takes the
+    /// request's size from them, by one rule for token ids and for text.
+    hashes: Hashes,
     /// The attempt's number. The tried rows do not count the attempts: a
     /// failed pair names up to two of them.
     attempt: u8,
@@ -167,10 +170,10 @@ impl PairAsked<'_> {
             rid: context.rid,
             phase: Phase::Prefill,
             decode_again: true,
-            prompt_tokens: self.prompt_tokens,
             wires: WireModes::HTTP,
             tried: &self.tried,
             attempt: Some(self.attempt),
+            hashes: Some(&self.hashes),
             ..Ask::of(&self.id, &self.model)
         }
     }
@@ -753,7 +756,9 @@ impl PDRouter {
         body: R,
         model_id: &str,
     ) -> Response {
-        let (text, tokens) = if self.policies_need_request_text() {
+        // The host hashes the prompt for the document in force, whatever
+        // the classic policies read.
+        let (text, tokens) = if self.host.is_some() || self.policies_need_request_text() {
             body.routing_inputs()
         } else {
             (None, None)
@@ -966,12 +971,19 @@ impl PDRouter {
         ledger: &AttemptLedger,
         tried_rows: &parking_lot::Mutex<Vec<WorkerId>>,
     ) -> Response {
-        // Admission may queue the request, so the selection inputs are copied
-        // out of the lease's synchronous view first.
+        // Admission may queue the request, so the classic selection's inputs
+        // are copied out of the lease's synchronous view first. The hosted
+        // arm hashes its prompt under the view and copies none of it.
+        let hosted = self.host.is_some();
         let (text, tokens, rid_key, cache_namespace) = lease.with_view(|view| {
+            let (text, tokens) = if hosted {
+                (None, None)
+            } else {
+                (view.text.map(str::to_string), view.tokens.map(Vec::from))
+            };
             (
-                view.text.map(str::to_string),
-                view.tokens.map(Vec::from),
+                text,
+                tokens,
                 view.rid_key.map(str::to_string),
                 view.cache_namespace,
             )
@@ -1040,18 +1052,21 @@ impl PDRouter {
             // from its document's thresholds, stands in for the gateway's
             // dispatch-time re-check, as on the regular router's hosted path.
             Some(host) => {
-                let prompt_tokens = tokens
-                    .as_deref()
-                    .map_or(0, |tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX));
+                // The prompt the classic selection routes by, hashed under
+                // the lease's view as the regular route hashes it: the
+                // request's token ids where it has them, else its text.
+                let hashed = |model: &str| {
+                    lease.with_view(|view| {
+                        let prompt = Prompt {
+                            text: view.text,
+                            ..Prompt::of(view.tokens, view.cache_namespace)
+                        };
+                        host.hashes(model, &prompt)
+                    })
+                };
                 let placed = self
                     .place_pair_attempt(
-                        host,
-                        &context,
-                        attempt,
-                        prompt_tokens,
-                        sticky_key,
-                        tried_rows,
-                        ledger,
+                        host, &context, attempt, hashed, sticky_key, tried_rows, ledger,
                     )
                     .await;
                 match placed {
@@ -1426,20 +1441,23 @@ impl PDRouter {
     /// controller places among the rows that serve HTTP. It states the
     /// attempt's number too: a failed pair names up to two tried rows, which
     /// the controller reads softly, so the rows do not count the attempts.
+    /// It states the prompt's hashes, which `hashed` makes once for the model
+    /// the attempt resolved, and the request's size comes from them, as on
+    /// the regular route.
     /// The commit asks the route's rule of both workers, made of the classic
     /// selection's own: a worker of the HTTP pair pools, and one `ledger`
     /// admits. A worker that answered the request definitively takes no
     /// further attempt of it, at any of its ranks.
     #[expect(
         clippy::too_many_arguments,
-        reason = "one attempt's ask: its request, its number and size, and what the attempts before it closed"
+        reason = "one attempt's ask: its request, its number and hashes, and what the attempts before it closed"
     )]
     async fn place_pair_attempt<'a>(
         &self,
         host: &Host,
         context: &PDRequestContext<'a>,
         attempt: u32,
-        prompt_tokens: u32,
+        hashed: impl FnOnce(&str) -> Hashes,
         sticky_key: Option<&str>,
         tried_rows: &parking_lot::Mutex<Vec<WorkerId>>,
         ledger: &AttemptLedger,
@@ -1458,10 +1476,11 @@ impl PDRouter {
         }
         let id = host::mark();
         let tried = tried_rows.lock().clone();
+        let hashes = hashed(&model);
         let asked = PairAsked {
             id,
             model,
-            prompt_tokens,
+            hashes,
             attempt: u8::try_from(attempt).unwrap_or(u8::MAX),
             tried,
         };
