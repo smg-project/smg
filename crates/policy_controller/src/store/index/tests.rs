@@ -1131,8 +1131,23 @@ mod named {
         gateway: GatewayId,
         wires: Option<WireModes>,
         request: &[u64],
+        cut: (u32, u64),
+        at: Instant,
+    ) -> Handed {
+        handed_less(store, gateway, wires, request, cut, at, &[])
+    }
+
+    /// [`handed_at`] for a view its caller cut further: the rows of `taken`
+    /// leave the narrowed view before it is named, as the rows a request's
+    /// hard demands take, and the view is named as one cut so.
+    fn handed_less(
+        store: &MemoryStore,
+        gateway: GatewayId,
+        wires: Option<WireModes>,
+        request: &[u64],
         (cap, seed): (u32, u64),
         at: Instant,
+        taken: &[WorkerId],
     ) -> Handed {
         let mut view = ViewBuffers::default();
         let mut named = Named::default();
@@ -1150,6 +1165,7 @@ mod named {
                 view.candidates
                     .retain(|row| row.wire_modes.intersects(wires));
             }
+            view.candidates.retain(|row| !taken.contains(&row.id));
             let naming = Naming {
                 gateway,
                 block_hashes: request,
@@ -1158,7 +1174,11 @@ mod named {
                 wires,
                 now_micros: built.now_micros,
             };
-            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            if taken.is_empty() {
+                world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            } else {
+                world.name_cut(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            }
         });
         let rows: Vec<WorkerId> = view.candidates.iter().map(|row| row.id).collect();
         let places = |list: &[u32]| list.windows(2).all(|pair| pair[0] < pair[1]);
@@ -2028,6 +2048,72 @@ mod named {
                 assert!(!view.is_empty(), "every set of wires has a member");
             }
         }
+    }
+
+    /// A view its caller cut by more than its gateway's wires is named
+    /// within its own rows: a holder the cut took is named by nobody and
+    /// takes no place of the cap, which the holders that stay fill, and the
+    /// warming rows named are the view's.
+    #[test]
+    fn a_view_cut_further_is_named_within_the_rows_that_stay() {
+        let store = MemoryStore::new();
+        store.apply(sampled(1)).expect("above the unbound start");
+        let ids: Vec<WorkerId> = (0..6).map(|n| admitted(&store, &format!("w{n}"))).collect();
+        // One holds the whole request, two its first two blocks, one none.
+        holds(&store, ids[0], &[1, 2, 3, 4]);
+        holds(&store, ids[1], &[1, 2]);
+        holds(&store, ids[2], &[1, 2]);
+        // Two fill past the level's floor with another chain's blocks, so
+        // the four above are the warming rows at the next window.
+        let filled: Vec<u64> = (101..=1_200).collect();
+        holds(&store, ids[4], &filled);
+        holds(&store, ids[5], &filled);
+        let window = Instant::now() + Duration::from_secs(1);
+        store.record(ids[4], 0, LoadRow::default(), window, LoadSource::Stream);
+        let request = [1, 2, 3, 4];
+        let less = |taken: &[WorkerId], cap: u32, seed: u64| {
+            let at = Instant::now();
+            handed_less(
+                &store,
+                GatewayId::LOCAL,
+                None,
+                &request,
+                (cap, seed),
+                at,
+                taken,
+            )
+        };
+        // The whole view under a cap of one: the deepest holder alone.
+        assert_eq!(less(&[], 1, 7).holders, [(ids[0], 4)]);
+        // The deepest holder cut: the cap's one place goes to a holder that
+        // stays, each of the two by some seed.
+        let mut drawn = std::collections::BTreeSet::new();
+        for seed in 0..40 {
+            let cut = less(&ids[..1], 1, seed);
+            assert_eq!((cut.rows.len(), cut.holders.len()), (5, 1), "seed {seed}");
+            assert_eq!(cut.holders[0].1, 2, "seed {seed}");
+            drawn.insert(cut.holders[0].0);
+        }
+        assert_eq!(drawn, [ids[1], ids[2]].into_iter().collect());
+        // Under no cap: every holder that stays, and the warming rows the
+        // whole view is named, less the row the cut took.
+        let (whole, cut) = (less(&[], 0, 7), less(&ids[..1], 0, 7));
+        let mut stay = vec![(ids[1], 2), (ids[2], 2)];
+        stay.sort_unstable();
+        assert_eq!(cut.holders, stay);
+        let mut short = ids[..4].to_vec();
+        short.sort_unstable();
+        assert_eq!(whole.warming, short);
+        short.retain(|&id| id != ids[0]);
+        assert_eq!(cut.warming, short);
+        // Under a cap of one the draw is among the three that stay.
+        let mut warm = std::collections::BTreeSet::new();
+        for seed in 0..60 {
+            let cut = less(&ids[..1], 1, seed).warming;
+            assert_eq!(cut.len(), 1, "seed {seed}");
+            warm.insert(cut[0]);
+        }
+        assert_eq!(warm, short.into_iter().collect());
     }
 
     /// A young row's naming ends at its own instant, with no window

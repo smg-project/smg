@@ -1024,10 +1024,12 @@ type Read<'a> = (
 /// handed no column: the rows the store names for it stand in the column's
 /// place ([`World::name`]), at most its sample of each list, and every
 /// holder and every warming row where it takes none
-/// ([`Engine::named_for`](crate::framework::Engine::named_for)). The
-/// naming is the store's one reader of its index: the column it builds
-/// holds a row's age and no holder. Over the rows it named the decision
-/// is asked in the decider's form for them ([`Decides::over_named`]).
+/// ([`Engine::named_for`](crate::framework::Engine::named_for)). Where a
+/// demand took a row, the rows that stay are named within themselves
+/// ([`World::name_cut`]). The naming is the store's one reader of its
+/// index: the column it builds holds a row's age and no holder. Over the
+/// rows it named the decision is asked in the decider's form for them
+/// ([`Decides::over_named`]).
 ///
 /// A request whose profile holds a stage that may refuse by a report of
 /// leases ([`Filter::refuses_by_reports`](crate::framework::Filter::refuses_by_reports))
@@ -1111,8 +1113,8 @@ pub(crate) fn hand<A: Asked, R>(
     // row's bits and ages as the row's own fields. A request that states a
     // hard demand is handed written rows, as one that states wires is.
     let by_door = wires.is_none() && request.subset() != Some(0) && demands.is_none();
-    // Whether a demand took a row of the build: the rows left are named by
-    // no index then.
+    // Whether a demand took a row of the build: the rows left are named
+    // within themselves then.
     let mut cut = false;
     let (pool, now_micros, candidates, masks, affinity, counts, built): Read<'_> = if by_door {
         match world.view(model, role, &ask, shown, view) {
@@ -1208,10 +1210,14 @@ pub(crate) fn hand<A: Asked, R>(
             wires,
             now_micros,
         };
-        // The index reads a view by its gateway's wires alone: rows a
-        // demand cut are handed it as no rows, and it names nobody.
-        let over: &[Candidate] = if cut { &[] } else { candidates };
-        world.name(model, role, &naming, over, named);
+        // The index reads a view by its gateway's wires alone. Rows a
+        // demand cut are named within the rows that stay: a row the
+        // demand took is named by nobody and takes no place of the cap.
+        if cut {
+            world.name_cut(model, role, &naming, candidates, named);
+        } else {
+            world.name(model, role, &naming, candidates, named);
+        }
         // Over the rows it named the decider is asked in its form for
         // them, at this arm's own call: a decision that names no row
         // meets no test for it.
@@ -4133,6 +4139,122 @@ pub(crate) mod tests {
         let [by_grpc, by_zmq] = drawn;
         assert_eq!((by_grpc.len(), by_zmq.len()), (16, 16));
         assert!(by_grpc.is_disjoint(&by_zmq));
+    }
+
+    /// A request whose demand took a row is named over the rows that stay:
+    /// the member that holds its first block is named a holder at its place
+    /// among them and the member short of the level a warming row at its
+    /// own. The member the demand took, a holder short of the level too,
+    /// is named by nobody.
+    #[test]
+    fn a_demand_that_took_a_row_names_the_rows_that_stay() {
+        use std::{sync::atomic::AtomicU64, time::Duration};
+
+        use kv_index::chain_prefix_hash;
+
+        use super::{hand, Buffers, Constraints, PoolFacts, Scratch, Taken};
+        use crate::{
+            store::{
+                BatchFacts, BatchOutcome, ContentHash, KvEvent, KvEventSink, LoadSink, LoadSource,
+                SequenceHash, Signals, StoredBlock,
+            },
+            view::LoadRow,
+        };
+
+        let store = MemoryStore::new();
+        let applied = store.apply(preset("cache_aware", 1));
+        applied.expect("above the unbound start");
+        // A member that publishes its blocks and holds the chain of
+        // `contents`.
+        let member = |name: &str, runtime: u32, contents: &[u64]| {
+            let facts = WorkerFacts {
+                key: name.to_owned(),
+                engine: name.to_owned(),
+                incarnation: 1,
+                role: Role::Single,
+                models: vec![MODEL.to_owned()],
+                dp_size: 1,
+                signals: Signals {
+                    events: true,
+                    ..Signals::default()
+                },
+                demand_facts: DemandFacts { runtime },
+                ..WorkerFacts::default()
+            };
+            let id = store.upsert(facts).id();
+            let row = WorkersStore::get(&store, id).expect("the row");
+            if row.status != WorkerStatus::Ready {
+                let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
+                ready.expect("the row stands");
+            }
+            store.publish_now();
+            let mut blocks: Vec<StoredBlock> = Vec::with_capacity(contents.len());
+            for &content in contents {
+                let seq_hash = match blocks.last() {
+                    Some(parent) => chain_prefix_hash(parent.seq_hash, ContentHash(content)),
+                    None => SequenceHash(content),
+                };
+                blocks.push(StoredBlock {
+                    seq_hash,
+                    content_hash: ContentHash(content),
+                });
+            }
+            if !blocks.is_empty() {
+                let events = [KvEvent::Stored {
+                    parent: None,
+                    blocks,
+                }];
+                let batch = BatchFacts {
+                    sequence: 1,
+                    ..BatchFacts::default()
+                };
+                assert_eq!(store.admit(id, 0, batch, &events), BatchOutcome::Applied);
+            }
+            id
+        };
+        // One member fills past the level's floor, so the two short of it
+        // are the warming rows at the next window. The demand takes one of
+        // those two, which holds the request's first block as the full
+        // member does.
+        let filled: Vec<u64> = (1..=1_100).collect();
+        let full = member("full", 7, &filled);
+        let short = member("short", 7, &[]);
+        member("gone", 9, &[1]);
+        let window = Instant::now() + Duration::from_secs(1);
+        store.record(full, 0, LoadRow::default(), window, LoadSource::Stream);
+        let hashes = [1_u64];
+        let mut asked = request(b"named", 7);
+        asked.facts.block_hashes = &hashes;
+        asked.constraints.demands = Demands { runtime: 7 };
+        let taken = Taken {
+            request: &asked,
+            gateway: GATEWAY,
+            now: Instant::now(),
+            left: Duration::MAX,
+            pins: None,
+            place: None,
+        };
+        let mut buffers = Buffers::default();
+        let undialed = AtomicU64::new(0);
+        // What the decider is handed: its rows, and the rows named, each by
+        // its member.
+        let read = |facts: &RequestFacts<'_>,
+                    _: &PoolFacts<'_>,
+                    rows: &[Candidate],
+                    _: &Constraints<'_>,
+                    _: &mut Scratch| {
+            let named = facts.named.expect("the profile names its rows");
+            let id_of = |row: u32| rows[row as usize].id;
+            let holders: Vec<WorkerId> = named.holders.iter().map(|held| id_of(held.row)).collect();
+            let warming: Vec<WorkerId> = named.warming.iter().map(|&row| id_of(row)).collect();
+            let rows: BTreeSet<WorkerId> = rows.iter().map(|row| row.id).collect();
+            (rows, holders, warming)
+        };
+        let handed = store.deciding(|world| hand(world, &taken, &mut buffers, &undialed, read));
+        let ((rows, holders, warming), _) = handed;
+        assert_eq!(rows, [full, short].into_iter().collect());
+        assert_eq!(holders, [full]);
+        assert_eq!(warming, [short]);
     }
 
     /// One pass narrows a built view by its gateway's wires and its
