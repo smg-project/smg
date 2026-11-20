@@ -224,8 +224,8 @@ repository of your own needs its tag.
 ## What it leaves out
 
 - Parameters. `Pack` takes none from the document beyond its weight. A scorer
-  registered with `scorer_with` reads typed parameters, and a filter and a
-  picker take none yet.
+  registered with `scorer_with` and a filter registered with `filter_with` read
+  typed parameters, and a picker takes none yet.
 - A filter and a picker. They register as the scorer does.
 - State. `Lifecycle` reports what became of each decision to a scorer that
   learns from it. A scorer that keeps a number of each worker's load report

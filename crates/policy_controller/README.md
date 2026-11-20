@@ -46,9 +46,28 @@ profiles:
 | `healthy` | Hard. Reads ready, draining, breaker and stall flags and the asking host's veto mask. Keeps ready workers clear of those vetoes. | None |
 | `not-overloaded` | Hard. Reads the latched overload bit and the host's overload lift. | None on the stage. The binding's `overload` block sets thresholds, 8 queued requests or 0.8 active KV usage by default. |
 | `has-capacity` | Hard. Reads the host's bit for a free prefill admission slot. | None |
-| `has-room` | Soft. Reads the host's bit for free room in the decode running window. | None |
+| `has-room` | Soft. Written bare, reads the host's bit for free room in the decode running window. Written with a rule, keeps the workers whose named fields sum to at most the capacity less the headroom. | None for the bare name. The rule takes `used` (required), `capacity` (required) and `headroom` (zero). |
 | `not-tried` | Soft. Reads earlier attempts and the host's exclusions. Keeps rows outside both lists while any remain. | None |
 <!-- filters: end -->
+
+`has-room` takes a rule the document writes:
+
+```text
+filter:
+  - healthy
+  - has-room:
+      used: { load.resident_tokens: 1, sent.tokens: 1, request.prompt_tokens: 1 }
+      capacity: 200000
+      headroom: 0.05
+```
+
+- A worker has room where `used <= (1 - headroom) * capacity`. `used` adds each named value times its coefficient, in the document's units.
+- The names are the ones `least-cost` reads, and `request.prompt_tokens`, the request's size.
+- A worker that lacks a named value has no room: one with no report under a `load.` name, or one whose report does not count its resident tokens. Under `view.max_report_age_ms` an older report reads as none.
+- The filter stays soft. Where no worker has room, every worker stands, and the filter sheds nothing.
+- A `sent.` name reads the profile's count of sends, so the profile may set `sent_ttl_ms`.
+- `capacity` is a number above zero, and `headroom` is from 0 to under 1. An empty map is refused: only the bare name reads the host's bit.
+- A profile that names the rule is asked a filter at a time. The bare name still folds into the one test of a row.
 
 ### Scorers
 
@@ -234,6 +253,21 @@ In the gateway shipped in this checkout, `--print-policy-spec` can print the doc
 
 The controller exposes the gRPC health service on each gRPC listener. The admin listener serves `/liveness` and `/health` even while draining, `/readiness` (200 for leader and ready follower, 503 otherwise), `/version` and `/metrics`. [Controller protocol](contracts/policy_controller.proto)
 
+### Holding a decision
+
+A host that decides in process calls `Handle::decide` with its door. A host with the `client` feature can share a `Link` to a controller and ask for the same kind of handle.
+
+```rust
+let now = Instant::now();
+let mut handle = Handle::<&Door>::asked(&link, &request, now, budget).await?;
+```
+
+Give the controller time to decide in `request.facts.budget_micros`. On the wire, zero means that time is spent. The separate `budget` is how long the link waits for the answer. The handle counts the time to dispatch and the lease's dispatch span from `now`.
+
+Use `take` to choose a target, then say `dispatched` and `completed`, or `released` if the request is given up. For a pair, use `dispatched_decode` for the decode and name each side in its completion. Dropping a handle gives up any sides still owed. A linked handle reports on the session, and the controller writes the completion on the worker that served. The controller's session rule covers leases when the link ends.
+
+Linked targets carry worker ids and ranks. Candidate positions stay with the controller, and a shed reads `controller` as its stage name. An answer the handle cannot read returns `Unanswered::Unsent` and the link releases its leases as late. The caller handles an unanswered request.
+
 ### Following a controller's workers
 
 With the `client` feature, a host can keep a copy of the controller's worker rows in a `MemoryStore` through a `Watcher`. Use `Watcher::open_on(&link)` to take the snapshot and the changes that follow it over the link's channel. The watch opens within the same five-second bound as `Client::watch_workers`. Once open, it has its own stream, so the link can answer asks and carry reports while the watch waits. Use one link for the gateway id. A second session with that id takes the first one's place.
@@ -256,7 +290,7 @@ let end = loop {
 
 `None` means the link ended. `Some` gives the watch's own end. `Link::ended()` gives the cause once the link ends. A closed send queue can refuse an ask or a report before its stream reader sees the end. A full report queue ends the link at once.
 
-Drop the stream before opening the watch again. The watcher asks for changes after the last event it took, or for a snapshot if it has no place. When a link ends, the host dials a new one.
+Drop the stream before opening the watch again. The watcher asks for changes after the last event it took, or for a snapshot if it has no place. When a link ends, the host dials a new one. An ended link lets its channel go, and `Link::watch_workers` on it answers `Error::LinkEnded`.
 
 When the watch starts from a snapshot, its last page puts the rows into use through `MemoryStore::watch_from`. The watch carries worker rows and their status. The store keeps its own load reports for workers still present.
 
@@ -327,10 +361,51 @@ score:
 - The factory runs for each entry that names it, at every start, apply and dry run. A value it refuses with `StageError::bad` is reported at its field's path in the document. A parameter that fails to deserialize is reported at the entry's path.
 - Derive `deny_unknown_fields` on the parameters' type. Without it a misspelled key is ignored and its default runs.
 - The keys of a parameter map carry no order. The factory reads them in key order, and two files that differ in that order alone have one digest. A key written twice is refused.
-- A filter and a picker take no parameters yet.
+- A picker takes no parameters yet.
 - A stage is asked what it needs while the document that names it is built, and not at a decision. The engine keeps the answer, so a stage's `needs` must give the same answer every time it is asked.
 - The scorer's `name()` must return the name it is registered under. `scorer`, `filter` and `picker` run the factory once at registration and refuse another name there. `scorer_with` runs no factory then, so validation refuses the name.
 - A `scorer_with` factory can call `build.sent()` for the profile's `SentCredit`: what the host sent each row since that row's last load report. The scorer reads a row's `Sent { requests, tokens, unsized_requests }` with `read`. `tokens` holds the prompt tokens the sends stated. `unsized_requests` counts the sends that stated none, and the scorer chooses their price. The type is open to further numbers: code outside the crate reads the fields and matches them with `..`. A send is a dispatch the host reports. It stops counting at a report of the row sampled at or after it, at the profile's `sent_ttl_ms`, or at the row's removal. When a send arrives with 8,192 already held on a row, the tally retires the row's oldest batch, at any age.
+
+A filter can take settings from the document too. Register it with `filter_with`, and write its entry as the name mapped to its parameters.
+
+```rust
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MinFree {
+    slots: u32,
+}
+
+impl Filter for MinFree {
+    fn name(&self) -> &'static str {
+        "min-free"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, candidate: &Candidate, _: &Constraints<'_>) -> bool {
+        candidate.in_flight.saturating_add(self.slots) <= 8
+    }
+}
+
+stages.filter_with("min-free", |build| {
+    let rule: MinFree = build.params()?;
+    if rule.slots == 0 {
+        return Err(StageError::bad("slots", rule.slots, "above zero"));
+    }
+    Ok(Box::new(rule))
+})?;
+```
+
+```text
+filter:
+  - healthy
+  - min-free: { slots: 2 }
+```
+
+- A filter has no weight, so the whole map is the factory's. A bare name hands it an empty map.
+- The rules of a scorer's parameters hold. The factory runs for each entry that names it, at every start, apply and dry run. A value it refuses is reported at its field's path, `profiles.<profile>.filter[<index>].<name>.<field>`. The keys carry no order, and a key written twice is refused.
+- A filter registered with `filter` takes no parameter, and neither does a stock filter but `has-room`. Whatever a document writes under such a name is refused.
+- `filter_with` runs no factory at registration, so validation refuses a filter that answers another name.
+- The factory can call `build.sent()` for the profile's `SentCredit`, as a scorer's can. A profile whose filter reads it may set `sent_ttl_ms`.
+- A Rust caller that builds a `ProfileSpec` by hand holds its filters as `spec::FilterSpec`. `"healthy".into()` reads as before. A `String` pushed or compared does not: use `.into()` and `FilterSpec::name()`.
 
 The stock schema lists the stock catalog. Validate an extended document against the host's catalog. Stateful scorers and pickers can observe issue, dispatch, completion, release, membership and signals when the host supplies them. A stage that keeps a number of each worker's load report says so through `Lifecycle::keeps_loads`. The controller then tells it every report before a decision can read that report, through `Lifecycle::on_signal`. A stage that does not say so is told no report. In process the load signal names two more things: the worker's slot in the host's counts and the report's sample instant. A host that builds the signal itself fills both. A scorer of your own can state a pick's overlap too: implement `Scorer::states_overlap` and `Scorer::said`. Both have a default that says nothing. `said` is asked once a decision, of the first target alone. The standalone validator refuses stages that declare a need for the full lifecycle. [Runnable Rust example](../../examples/policy-controller) · [Catalog API](src/catalog.rs)
 
@@ -351,6 +426,8 @@ The library sets no allocator. Write `smg::stock_allocator!();` once at the root
 The gateway validates its policy document over that catalog at startup, where the policy controller is selected. A refusal stops the start and names what was refused. The gateway keeps its tenant header out of the document's view.
 
 The document the routing flags mean names stock stages alone. To run a stage of yours, name it in a document of your own and start the gateway with `--policy-controller on` and `--policy-spec FILE`. The document replaces the routing flags: a routing flag typed beside it is refused by name.
+
+The same gateway startup can take a worker connector. With an `Arc<dyn EngineConnector>` in `connector`, use `Extensions::new().stages(stages()?).connector(connector)`. The gateway uses it for worker probes and engine connections. Delegate to `BackendConnector::shared()` for workers that use the gateway's own client. Inference over gRPC or ZMQ requires that client. If the connection provides the engine's load reports, let the worker runtime be the only poller of that engine's load.
 
 ### Load a WebAssembly component
 
@@ -427,7 +504,7 @@ Use `apiVersion: smg.policy/v1` and at least one profile. Both YAML and JSON use
 | `view.block_size` | Positive fallback block size when the request gives none. The prefix stages fall back to 16 if omitted. |
 | `view.boundaries` | Positive, strictly ascending token positions, default empty. Used by prefix keying and required for a `hash` index entry. With a prefix-keyed scorer every boundary and `prefix_tokens` must cover at least one whole configured block and fit the hash cap. |
 | `view.max_block_hashes` | 1–8190, default 256. The generation can read fewer, down to zero when no stage needs hashes. |
-| `view.max_report_age_ms` | 1–3599999 ms, default unset. `least-load`, `resident-work`, `least-cost` and the load gates of `prefix-affinity` and `warmup-slice` use their unreported paths for older reports. Overload verdicts can still reflect older reports, plugins interpret report age themselves, and host-registered stages keep their own rules. A report at the limit still counts. |
+| `view.max_report_age_ms` | 1–3599999 ms, default unset. `least-load`, `resident-work`, `least-cost`, `has-room` with a rule and the load gates of `prefix-affinity` and `warmup-slice` use their unreported paths for older reports. Overload verdicts can still reflect older reports, plugins interpret report age themselves, and host-registered stages keep their own rules. A report at the limit still counts. |
 | `view.labels`, `view.zones`, `view.engines` | Unique names, default empty. At most 64, 256 and 64 respectively. Labels are `key` or `key=value` with nonempty sides. |
 | `index.<model glob>` | Defaults to an empty map. An entry has `kind` (`tree` by default, or `hash`), `ttl_s` (180 seconds for a hash placement), `max_size` (67108864 characters for text or tokens otherwise for a tree), and `sweep_s` (120 seconds). Numbers are positive. These are settings a host can read for its index. The crate's own store reads none of them. Exact keys win, then the longest literal prefix or suffix, then `*`. Equal-length prefix and suffix globs are refused. |
 | `plans.pd-pair.pairing` | `off`, `lenient` (default), or `strict`. Used for prefill/decode compatibility, including the pair in `epd`. |
@@ -465,7 +542,7 @@ bindings:
 
 `bindings[].sessions` configures sticky placement under `single`. `bindings[].routing_key` names the sources of a request's key, for a ring or a sessions rule. See [Session keys](#session-keys). A multi-sided plan refuses a sessions rule or a picker that places by session assignment.
 
-A `single` binding can name a second profile with `shadow: next`. Its stages run through the library's `Engine::shadow` for comparison. Request handling runs the live profile. Use native stages and a profile that no binding uses live.
+A `single` binding can name a second profile with `shadow: next`. Its stages run through the library's `Engine::shadow` for comparison. Request handling runs the live profile. Use native stages and a profile that no binding uses live. Make the request's live decision through `Engine::decide_keeping`, and call `Engine::shadow` with that decision's scratch. Under a sessions rule the shadow then starts from the session pins that decision read, whether or not the decision is committed first. Behind `Engine::decide` or `Engine::decide_stated`, or with any other scratch, it reads the pins as they stand. A host that shadows a request decides it through `Engine::decide_keeping`, each time it decides it. A debug build stops on a mix of the two entries on one request.
 
 The validator checks reserved fields for shape and refuses their active use. This includes `match.tenant`, `match.priority`, `match.header`, `match.prompt_tokens`, a nonempty `match.labels`, `canary`, `override: allowed`, `admission.enabled: true`, and `sessions.issue_session_id: true`. The bounds use `min` and `max`. A header matcher uses `name` and `values`. A canary would name a `profile` and exactly one of `percent` (1–100), `tenants` or `header`. Use `override: locked` (the default) and leave admission and session ID issuance off.
 
@@ -593,7 +670,7 @@ A pick's first target is booked at issue by the door or service. The caller can 
 
 ### When a gateway loses its stream
 
-A gateway asks the stock controller for decisions on a stream. Each decision is a **lease** on its worker: the worker counts as booked for that request. A lease that no dispatch names within five seconds is given up.
+A gateway asks the stock controller for decisions on a stream. A pick carries a **lease** that books its worker, or both sides of a pair under one id. A side that no dispatch names within five seconds is given up.
 
 A stream can end with requests unanswered. Two rules keep one lease standing for one request.
 
@@ -663,7 +740,7 @@ profiles.default.pick: the best-with-temperature picker is not in this build
 
 ### Explain and metrics
 
-Set `explain: { sample: N }` to keep every Nth pick or shed per decider. Zero turns it off and one keeps every pick or shed. Each decider allocates its 1024-slot ring on its first sampled write and overwrites its oldest records. With sampling on, a decision takes its decider's ring lock only when it keeps a record. That write can wait for an `Explain` read of the ring. At R eligible decisions a second on that decider, a full ring covers about `1024 × N / R` seconds. A new generation restarts counting. Older samples can still be read under the same term. The remote lookup uses `gateway_id` and `request_id`. Use the subject the gateway authenticates as on the gateway listener for `gateway_id`, because `Explain` hashes it the same way as the decide stream. Use `Door::explain` in process with the store gateway ID. `Door::explained` returns that record with its names: the plan, the profile, and that profile's picker, filters and scorers in their declared order. The names are `None` once another generation stands, or when the request matched no binding. A shed made ahead of every profile names the plan alone, unless the binding's profile is the document's first. A term change makes old samples unavailable on the service.
+Set `explain: { sample: N }` to keep every Nth pick or shed per decider. Zero turns it off and one keeps every pick or shed. Each decider allocates its 1024-slot ring on its first sampled write and overwrites its oldest records. With sampling on, a decision takes its decider's ring lock only when it keeps a record. That write can wait for an `Explain` read of the ring. At R eligible decisions a second on that decider, a full ring covers about `1024 × N / R` seconds. A new generation restarts counting. Older samples can still be read under the same term. The remote lookup uses `gateway_id` and `request_id`. Use the subject the gateway authenticates as on the gateway listener for `gateway_id`, because `Explain` hashes it the same way as the decide stream. Use `Door::explain` in process with the store gateway ID. `Door::explained` returns that record with its names: the plan, the profile, and that profile's picker, filters and scorers in their declared order. The names are `None` once another generation stands, or when the request matched no binding. A shed made ahead of every profile names the plan alone. A subset hint of zero on a pool with members is one example. In process, `Trace::made_under()` gives the profile's position, or `None` for such a shed. On the wire, read `trace.no_profile` first: when it is true, the decision was made ahead of every profile and `trace.profile` is 0. A term change makes old samples unavailable on the service.
 
 A record echoes the lookup key and gives the decision and its trace without a lease. It keeps up to three top scores. The control call keeps the record's original binding position and trace. `binding` is 0 when no binding matched or when the first binding matched. The name fields are empty for unmatched decisions and records from older generations. It leaves the decision ID, full candidate list, view digest, plugin projections and lifecycle outcome unset. It omits request facts, headers and session keys.
 
@@ -863,7 +940,7 @@ bindings:
 
 ### `prefix_hash`
 
-Uses the routing key first, then the last whole block at the deepest reached boundary or the configured 256-token depth when no boundary is reached. When no key can be used, the in-flight-count scorer places the request. The binding names the routing key header as the key's source. A sessions rule added to the binding names no header of its own.
+Uses the routing key first, then the prompt's prefix: every block from the first through the last whole block at the deepest reached boundary, or at the configured 256-token depth when no boundary is reached. Two prompts that differ anywhere in that prefix take different keys, so they spread over the workers. When no key can be used, the in-flight-count scorer places the request. The binding names the routing key header as the key's source. A sessions rule added to the binding names no header of its own.
 
 <!-- preset: prefix_hash -->
 ```yaml
@@ -1010,10 +1087,11 @@ Each removal write has one attempt. A worker that an `Upsert` job finds again wh
 - The `best-with-temperature` picker, and three settings of `prefix-affinity`: `decay`, `accounting_ttl_ms` and `spill.uncached_credit`.
 - The `bucket` scorer in the stock controller. The library runs it. The stock controller refuses a document that names it, because it does not yet report every request's end to a stage.
 - `prefix-affinity` with `source` set to `predictor` or `merged` in the stock controller. Both read the prefixes sent to each worker. The library validates them for a host that fills that column. The crate's `Predictor` keeps that record for such a host: it folds a request's keys once (`Predictor::fold_into`), reads by a shared reference, and writes with a tick of the host's clock. The stock controller refuses a document that names either, because it does not yet record the prefixes it sent.
-- Cache events from an engine that asks for a key, or from a data-parallel worker's rows above rank 0. The stock controller builds its worker objects without credentials, so an engine that asks for a key gives it no stream. Its `PushKvEvents` call is not served. Every replica of the stock controller opens a cache-event stream to each gRPC worker whose row asks for events and names a model, and keeps those streams while the active document reads no index. A host built with the `worker-host` feature has the feed's two parts: `worker_host::KvAdapter` writes a worker's cache events to the index, and `worker_host::KvHost` gives each event subscription its row.
+- Cache events from an engine that asks for a key, or from a data-parallel worker's rows above rank 0. The stock controller builds its worker objects without credentials, so an engine that asks for a key gives it no stream. Its `PushKvEvents` call is not served. Every replica of the stock controller opens a cache-event stream to each gRPC worker whose row asks for events and names a model, and keeps those streams while the active document reads no index. A host built with the `worker-host` feature has the feed's two parts: `worker_host::KvAdapter` writes a worker's cache events to the index, and `worker_host::KvHost` gives each event subscription its row. A host that opens a row's feed without the row's cache group state clears the row's blocks and cursor first, so the subscription starts at the head of the stream.
 - One more input in the stock controller. A worker's circuit-breaker bit has one source there: a veto of the asking gateway that holds, as its breaker's open window does. Such a veto takes the worker out of that gateway's decisions, and no rule lifts it. Its row reads as stalled too, as under every veto of that gateway, so a filter that reads the stalled bit refuses it. The controller keeps no breaker of its own.
 - An engine connection over the host-local ZMQ wire. A controller built with the `worker-host` feature hands each worker object a gRPC connector alone, and an object connects to its engine at its first use. A worker that serves only the ZMQ wire gets no connection there, so nothing that controller reads from an engine reaches it for that worker. No field of a registration or of a worker object names a gateway yet, so the controller's doors refuse a worker of that wire.
 - The worker crate's load collector in the controller's own service. The `worker-host` feature has the two sinks. `worker_host::HealthAdapter` writes probe outcomes and connect signals to the store's rows. `worker_host::LoadAdapter` writes the load collector's pushed records and poll answers to the store, while its host leads. A gateway that decides in its own process runs the worker crate's health checker and load collector over them. The controller's own service runs the health checker over `HealthAdapter` while it leads. It runs no load collector over `LoadAdapter` yet: its leader polls its workers' loads itself.
+- A driver for the leader's own doubt of a worker. The store takes the write and a decision reads it as the row's stalled bit, for every gateway (`HealthSink::leader_bits`, `HealthAdapter::project`). No driver calls the projection yet. Until one does, a worker the leader's liveness check doubts reads as routable to a decision unless a gateway's own veto masks it.
 - A plugin named in the document. The format has no field for one.
 - Four calls of the contract: `PushLoad`, `PushKvEvents`, `StepDown` and `WatchRegime`. The stock controller answers each as not served.
 - Eight of the ten slices of the snapshot call, `GetSnapshot`. The stock controller serves the worker rows and the spec's status. It refuses a request for any other slice by the slice's name, and a request that names no slice asks for all ten. It also refuses a request for identifiers in clear.
