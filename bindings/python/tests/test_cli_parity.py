@@ -39,12 +39,12 @@ def test_the_executable_registers_its_allocator_before_running_the_command_line(
     registration = "register_jemalloc_as_global_allocator();"
     call = "smg::main_from_args()"
 
-    assert "#[global_allocator]" in executable
+    assert "smg::stock_allocator!();" in executable
     assert registration in executable
     assert call in executable
     assert executable.index(registration) < executable.index(call)
     assert "pub fn main_from_args()" in library
-    assert registration not in library
+    assert registration not in re.sub(r"(?m)^\s*//.*$", "", library)
     assert registration not in cli
     assert "#[global_allocator]" not in cli
 

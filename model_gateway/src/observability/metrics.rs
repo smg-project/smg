@@ -1,5 +1,7 @@
 #[cfg(test)]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 
 use llm_tokenizer::{
@@ -436,14 +438,13 @@ fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
     }
 }
 
-/// Jemalloc's run-time options for a long-running gateway, for every final
-/// artifact (the `smg` executable, the Python extension, the Go FFI library)
-/// to export as `_rjem_malloc_conf` next to its `#[global_allocator]`. The
+/// Jemalloc's run-time options for a long-running gateway. Binaries that use
+/// [`crate::stock_allocator!`] and the Python and Go bindings export them as
+/// `_rjem_malloc_conf` next to their `#[global_allocator]`. The
 /// multimodal crate's baseline harness (`crates/multimodal/examples/mm_baseline.rs`)
 /// sits below this crate and repeats the bytes by hand; the test
 /// `the_multimodal_harness_repeats_the_malloc_conf` keeps that copy equal. With
-/// the stock
-/// settings a thread's freed pages decay back to the OS only when that thread
+/// the allocator's defaults, a thread's freed pages decay back only when it
 /// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB
 /// resident over ~270 MB of live objects (soak s2, ten hours). A background
 /// thread purges on schedule instead; dirty pages are returned after 10 s and
@@ -508,20 +509,25 @@ fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
 pub const SERVER_MALLOC_CONF: &[u8; 100] =
     b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432\0";
 
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+static JEMALLOC_IS_GLOBAL: AtomicBool = AtomicBool::new(false);
+
 /// Marks jemalloc as the final artifact's Rust global allocator.
 ///
-/// Call this before [`start_prometheus`] only from a binary or extension that
-/// declares `tikv_jemallocator::Jemalloc` with `#[global_allocator]`. Keeping
-/// this registration at the artifact boundary prevents `smg` rlib consumers
-/// that use the system allocator from publishing statistics for an unused
-/// linked jemalloc instance.
+/// Call this from a binary or extension that declares jemalloc with
+/// `#[global_allocator]`, including binaries using [`crate::stock_allocator!`].
+/// Register before [`crate::main_from_args`] to skip its warning and before
+/// [`start_prometheus`] to publish statistics for this allocator. A binary
+/// on another allocator must not call this: it would publish the statistics
+/// of a linked jemalloc that serves nothing.
 pub fn register_jemalloc_as_global_allocator() {
-    #[cfg(all(
-        feature = "jemalloc-stats",
-        not(target_env = "msvc"),
-        not(target_env = "musl")
-    ))]
-    allocator_stats::register_global_allocator();
+    #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+    JEMALLOC_IS_GLOBAL.store(true, Ordering::Release);
+}
+
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+pub(crate) fn jemalloc_is_global() -> bool {
+    JEMALLOC_IS_GLOBAL.load(Ordering::Acquire)
 }
 
 pub(crate) fn init_metrics() {
@@ -1262,22 +1268,12 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     not(target_env = "musl")
 ))]
 pub(crate) mod allocator_stats {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use metrics::{describe_gauge, gauge};
 
-    static JEMALLOC_IS_GLOBAL: AtomicBool = AtomicBool::new(false);
-
-    pub(super) fn register_global_allocator() {
-        JEMALLOC_IS_GLOBAL.store(true, Ordering::Release);
-    }
-
-    fn is_global_allocator() -> bool {
-        JEMALLOC_IS_GLOBAL.load(Ordering::Acquire)
-    }
+    use super::jemalloc_is_global;
 
     pub(crate) fn describe() {
-        if !is_global_allocator() {
+        if !jemalloc_is_global() {
             return;
         }
         describe_gauge!(
@@ -1320,7 +1316,7 @@ pub(crate) mod allocator_stats {
     /// Registration at the final-artifact boundary keeps these gauges tied to
     /// Rust's actual global allocator.
     pub(crate) fn start_reporting() {
-        if !is_global_allocator() {
+        if !jemalloc_is_global() {
             return;
         }
         record();
