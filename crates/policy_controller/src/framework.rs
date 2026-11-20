@@ -4195,8 +4195,9 @@ impl Engine {
     /// and seed) starts from that reading and reads neither again. So it
     /// decides by the sessions as the live decision found them, whether
     /// or not that decision is committed first: a commit moves the pins.
-    /// Behind [`Self::decide`] or [`Self::decide_stated`], or with another
-    /// scratch, the shadow reads the pins as they stand.
+    /// With no keeping decision of the request on this scratch (behind
+    /// [`Self::decide`] or [`Self::decide_stated`] alone, or with another
+    /// scratch), the shadow reads the pins as they stand.
     ///
     /// A host that shadows a request decides it through the keeping
     /// entry, each time it decides it. Behind a plain decision the
@@ -4409,6 +4410,19 @@ impl Engine {
                 _ => [WorkerId(0); 2],
             }
         };
+        if WRITE_SESSIONS && KEEPS {
+            // What the table gave, apart from any pin this decision
+            // writes: its shadow starts from it. The decision adds the
+            // host's pin of record where it asks for one, and the pins
+            // that stand where a write back of that pin loses.
+            scratch.sessions_found = SessionsFound {
+                key: key.get(),
+                now_micros: facts.now_micros,
+                seed: facts.seed,
+                pins,
+                record: WorkerId(0),
+            };
+        }
         let restore = |stored| {
             if WRITE_SESSIONS {
                 self.sessions.restore(key, facts.now_micros, rule, stored)
@@ -4433,12 +4447,6 @@ impl Engine {
         // A pin of record whose worker that pass left out: the kept form
         // asks for it again, after its lifted pass.
         let mut left_out = None;
-        // The pin of record the host told this decision, for its reading.
-        let mut told = WorkerId(0);
-        // The pins that stood where the write back of that pin lost to
-        // another request's pin: the decision follows them, and so does
-        // its shadow.
-        let mut stood = None;
         let owner = owner.or_else(|| {
             if pins[0] != WorkerId(0) {
                 return None;
@@ -4453,7 +4461,11 @@ impl Engine {
             } else {
                 cx.pins?.pinned(key, rule.ttl_micros)?
             };
-            told = stored;
+            if WRITE_SESSIONS && KEEPS {
+                // The reading keeps the host's answer whether or not the
+                // filters keep its worker.
+                scratch.sessions_found.record = stored;
+            }
             if !buf
                 .kept
                 .iter()
@@ -4464,25 +4476,16 @@ impl Engine {
             }
             let pins = restore(stored);
             if KEEPS && pins[0] != stored {
-                stood = Some(pins);
+                // The write back lost to another request's pin: the
+                // decision follows the pins that stand, and its shadow
+                // starts from them.
+                scratch.sessions_found.pins = pins;
             }
             pins.iter()
                 .filter(|p| **p != WorkerId(0))
                 .find_map(|p| buf.kept.iter().find(|&&i| candidates[i as usize].id == *p))
                 .copied()
         });
-        if WRITE_SESSIONS && KEEPS {
-            // What the table and the host gave, apart from any pin this
-            // decision writes: its shadow starts from it. Where the write
-            // back lost, the pins that stood.
-            scratch.sessions_found = SessionsFound {
-                key: key.get(),
-                now_micros: facts.now_micros,
-                seed: facts.seed,
-                pins: stood.unwrap_or(pins),
-                record: told,
-            };
-        }
         if let Some(i) = owner {
             let c = &candidates[i as usize];
             if Self::at_cap(rule, facts, c) {
@@ -4544,6 +4547,11 @@ impl Engine {
                     let written = restore(stored);
                     if written[0] == stored {
                         pins = [stored, WorkerId(0)];
+                    } else if KEEPS {
+                        // This write back lost too: the claim below
+                        // follows the pin that stands, and the reading
+                        // keeps it for the shadow.
+                        scratch.sessions_found.pins = written;
                     }
                 }
             }
@@ -6278,6 +6286,55 @@ mod tests {
             .shadow(&facts, &pool, &rows, &cx, &mut scratch)
             .expect("a shadow decision");
         assert_eq!(first_of(&shadow), Some(rows[1].id));
+    }
+
+    /// A kept key's decision writes the host's pin back behind its lifted
+    /// pass, where the standing pass left the recorded worker out. That
+    /// write back can lose to another first request of the key too. The
+    /// live decision's claim follows the pin that request wrote, and the
+    /// reading keeps it, so an equal shadow agrees.
+    #[test]
+    fn shadow_follows_the_pins_that_stood_where_a_kept_keys_write_back_lost() {
+        let stages = || Profile {
+            filters: vec![Box::new(Healthy), Box::new(NotOverloaded)],
+            ..least_requests_profile()
+        };
+        let mut engine = Engine::new(
+            vec![stages(), stages()],
+            vec![Binding {
+                shadow: Some(1),
+                sessions: Some(SESSIONS),
+                ..single_binding()
+            }],
+            23,
+            Needs::default(),
+        );
+        engine.places_by_key(0);
+        engine.places_by_key(1);
+        let mut rows = [candidate(0, 13), candidate(1, 3), candidate(2, 1)];
+        rows[0].health.overloaded = true;
+        let facts = keyed_at(61, 71);
+        let pool = PoolFacts::default();
+        let racing = Racing {
+            engine: &engine,
+            rule: SESSIONS,
+            stored: rows[0].id,
+            other: rows[1].id,
+        };
+        let cx = Constraints {
+            pins: Some(&racing),
+            ..Constraints::default()
+        };
+        let mut scratch = Scratch::new();
+        let live = engine.decide_keeping(&facts, &pool, &rows, &cx, &mut scratch);
+        assert_eq!(first_of(&live), Some(rows[1].id));
+        let shadow = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("a shadow decision");
+        assert_eq!(
+            crate::decision::ShadowKind::of(&live, &shadow),
+            crate::decision::ShadowKind::Agreed
+        );
     }
 
     /// The shadow's entry takes its inputs as the live one does: a debug
