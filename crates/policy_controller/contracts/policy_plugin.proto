@@ -318,6 +318,13 @@ message RequestFacts {
   // view's. Under the text kind it is the window's size in bytes, and a text
   // request always states it.
   uint32 block_size = 19;
+  // The fingerprint of the request's client, as the host derives it from the
+  // client sources of its binding's routing key; 0 where the request names
+  // none. A plain ring places a request that has no session key by it, and
+  // nothing else reads it: it lifts no overload veto, pins no session and is
+  // counted under no key. Host to controller alone: a plugin's frame carries
+  // 0 under every exposure.
+  fixed64 client_key = 20;
 }
 
 // What only the deciding gateway knows now. Its standing vetoes are not here:

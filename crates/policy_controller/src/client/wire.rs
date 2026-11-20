@@ -78,6 +78,7 @@ pub(crate) fn request(request: &door::Request<'_>) -> (proto::DecideRequest, usi
             seed: facts.seed,
             prompt_text: Vec::new(),
             block_size: facts.block_size,
+            client_key: facts.client_key,
         }),
         constraints: Some(proto::Constraints {
             excluded: constraints.excluded.iter().map(|id| id.0).collect(),
@@ -407,6 +408,7 @@ mod tests {
                 },
                 seed: 24,
                 block_size: 25,
+                client_key: 29,
                 ..RequestFacts::default()
             },
             constraints: Constraints {
@@ -451,6 +453,7 @@ mod tests {
             let (sent, left_out) = request(&asked);
             assert_eq!(left_out, 0);
             let facts = sent.facts.as_ref().expect("request facts");
+            assert_eq!(facts.client_key, want.client_key);
             if tenant.is_none() {
                 assert!(facts.tenant.is_none());
             }

@@ -370,9 +370,7 @@ impl Checked {
                 // The frame carries no signal cells: they stand beside
                 // the rows of the host that decides.
                 signal_cells: None,
-                // The wire carries no client key yet: a request with no
-                // session key is placed as one with no key.
-                client_key: 0,
+                client_key: facts.client_key,
             },
             Constraints {
                 excluded: &lists.excluded,
@@ -1184,6 +1182,7 @@ mod tests {
                 seed: 24,
                 prompt_text: Vec::new(),
                 block_size: 25,
+                client_key: 29,
             }),
             constraints: Some(proto::Constraints {
                 excluded: vec![26, 27, 28],
@@ -1273,6 +1272,7 @@ mod tests {
                 }
             );
             assert_eq!((facts.seed, facts.block_size), (24, 25));
+            assert_eq!(facts.client_key, 29);
             // The view's three facts are the decision's own, not the
             // frame's: the frame's budget of 2,000 is not what the engine
             // is told is left.
