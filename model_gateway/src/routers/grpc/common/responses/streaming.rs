@@ -8,7 +8,6 @@ use futures::Stream;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use openai_protocol::{
     chat::ChatCompletionStreamResponse,
-    common::Usage,
     event_types::{
         ContentPartEvent, FunctionCallEvent, McpEvent, OutputItemEvent, OutputTextEvent,
         ResponseEvent,
@@ -1219,7 +1218,7 @@ impl ResponseStreamEventEmitter {
     /// This constructs the final ResponsesResponse from all accumulated output items
     /// for persistence. Should be called after streaming is complete.
     /// Reads non-destructively so `emit_completed()` can still drain state afterwards.
-    pub fn finalize(&self, usage: Option<Usage>) -> ResponsesResponse {
+    pub fn finalize(&self, usage: Option<ResponseUsage>) -> ResponsesResponse {
         // Build output array from tracked items, read in place (emit_completed drains later)
         let output: Vec<ResponseOutputItem> = self
             .output_items
@@ -1245,8 +1244,8 @@ impl ResponseStreamEventEmitter {
             })
             .collect();
 
-        // The usage the terminal event carries, through the one conversion.
-        let responses_usage = usage.map(|u| ResponsesUsage::Modern(ResponseUsage::from(&u)));
+        // The response-level usage the terminal event carries.
+        let responses_usage = usage.map(ResponsesUsage::Modern);
 
         // Match the streamed terminal event: a `length` finish reports
         // status=incomplete with the truncation reason, a cut call without one.
@@ -1275,7 +1274,7 @@ impl ResponseStreamEventEmitter {
     /// the terminal, which drains the items: the stored object keeps them.
     pub fn finalize_failed(
         &self,
-        usage: Option<Usage>,
+        usage: Option<ResponseUsage>,
         error: serde_json::Value,
     ) -> ResponsesResponse {
         let mut response = self.finalize(usage);
@@ -2268,6 +2267,8 @@ mod tests {
         );
     }
 
+    use openai_protocol::common::Usage;
+
     use super::*;
     use crate::routers::grpc::common::responses::utils::{
         assert_responses_api_usage, responses_api_test_usage,
@@ -2789,7 +2790,10 @@ mod tests {
             "message": "Reached the max_tool_calls limit (1) before executing the remaining tool calls.",
         });
 
-        let response = emitter.finalize_failed(Some(Usage::from_counts(3, 2)), error.clone());
+        let response = emitter.finalize_failed(
+            Some(ResponseUsage::from(&Usage::from_counts(3, 2))),
+            error.clone(),
+        );
 
         assert_eq!(response.status, ResponseStatus::Failed);
         assert_eq!(response.error, Some(error.clone()));
@@ -2853,7 +2857,7 @@ mod tests {
         let emitter =
             ResponseStreamEventEmitter::new("resp_test".to_string(), "test-model".to_string(), 1);
 
-        let usage = responses_api_test_usage();
+        let usage = ResponseUsage::from(&responses_api_test_usage());
         let wire = serde_json::to_value(emitter.finalize(Some(usage)))
             .expect("finalized response should serialize");
         assert_responses_api_usage(&wire);
