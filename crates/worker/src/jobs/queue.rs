@@ -38,6 +38,8 @@ pub trait QueueJob: Clone + Send + Sync + 'static {
     /// Whether the job is a removal, which the kept slot takes first.
     fn is_removal(&self) -> bool;
     /// One job for two kept removals that can run together, or both back.
+    /// The bound on the removals kept for a key is the job type's: a type
+    /// that merges none keeps every one.
     fn merge_removals(held: Self, newer: Self) -> Result<Self, (Self, Self)>;
     /// The asker shown in logs and used to identify a kept removal.
     fn asker(&self) -> Option<&WorkerJobAsker> {
