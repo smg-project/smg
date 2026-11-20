@@ -754,11 +754,20 @@ impl Config {
 
     /// Refuse named values no report would state: those of a name that is
     /// no gRPC or HTTP worker of this process and no rank of one. A ZMQ
-    /// rank's report has no place for a named value.
+    /// rank's report has no place for a named value. A rank is named as
+    /// its report names it, `r1` and never `r01`: under another spelling
+    /// its list would be taken and never read.
     fn check_load_values(&self) -> Result<(), String> {
+        let rank_as_named = |name: &str| {
+            name.rsplit_once(":r").is_some_and(|(_, rank)| {
+                rank.parse::<u16>()
+                    .is_ok_and(|parsed| parsed.to_string() == rank)
+            })
+        };
         for worker in self.worker_load_values.keys() {
             let reports = !worker.starts_with("zmq:")
-                && (self.serves(worker) || self.worker_of_rank(worker).is_some());
+                && (self.serves(worker)
+                    || (self.worker_of_rank(worker).is_some() && rank_as_named(worker)));
             if !reports {
                 return Err(format!(
                     "--worker-load-values names {worker}, which is no gRPC or HTTP worker of \
@@ -1369,7 +1378,8 @@ mod tests {
     /// order, a worker named again one more, and a rank's own name that
     /// rank's list in place of its worker's. A value that is not finite is
     /// stated as given. A name that is no gRPC or HTTP worker of the process
-    /// and no rank of one is refused, and so is an item with no number.
+    /// and no rank of one is refused, a rank spelled another way than its
+    /// report names it among them, and so is an item with no number.
     #[test]
     fn load_values_are_stated_per_worker_and_per_rank_in_the_flags_order() {
         let fleet = [
@@ -1418,7 +1428,14 @@ mod tests {
             let err = with(&["--worker-load-values", item]).expect_err("refused");
             assert!(err.contains(reason), "{item}: {err}");
         };
-        for worker in ["grpc:19002", "http:19000", "zmq:0", "grpc:19000:r2"] {
+        for worker in [
+            "grpc:19002",
+            "http:19000",
+            "zmq:0",
+            "grpc:19000:r2",
+            "grpc:19000:r01",
+            "grpc:19000:r+1",
+        ] {
             refused(
                 &format!("{worker}=queue_age:1"),
                 "no gRPC or HTTP worker of this process",
