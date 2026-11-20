@@ -3022,6 +3022,15 @@ fn waits(found: &Sides, side: Side) -> bool {
     side.is_some_and(|(_, state)| state.is_issued())
 }
 
+/// Whether a dispatch moves `side` of the lease `found`
+/// ([`Leases::dispatched_side`]): a side that waits for it, or a pair's
+/// decode side still chosen, which its dispatch books. A handed frame's
+/// dispatch is told by this.
+fn takes_dispatch(found: &Sides, side: Side) -> bool {
+    let side = found.side(side);
+    side.is_some_and(|(_, state)| state.is_issued() || state.is_chosen())
+}
+
 /// `record`, of a lease the dispatch deadline's end took, as that end
 /// left it: released as abandoned where it waited. A pair's record is its
 /// prefill part, which stands as it was where a dispatch had named it.
@@ -3444,7 +3453,8 @@ impl Leases {
     /// Ends `side` of the pair's lease under `key` as `ended` and gives
     /// that side's count and its key's booking back; the lease leaves the
     /// file with its last side. A side the lease does not hold, or one
-    /// that ended, changes nothing.
+    /// that ended, changes nothing. A chosen decode side books nothing:
+    /// its end is its state alone, and no later call issues it.
     fn end_side(&mut self, key: &Key, side: Side, ended: LeaseState) {
         let Some(held) = self.records.get_mut(key) else {
             return;
@@ -3463,7 +3473,7 @@ impl Leases {
             Side::Decode => (&mut decode.side.state, &mut decode.booked),
             Side::Single | Side::Encode => return,
         };
-        if !state.is_live() {
+        if !(state.is_live() || state.is_chosen()) {
             return;
         }
         *state = ended;
