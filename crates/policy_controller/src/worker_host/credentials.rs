@@ -54,8 +54,10 @@ use crate::{store::WorkerFacts, view::WorkerId};
 /// The holder forgets by itself. Each of its reads drops the rows that
 /// left from the keeper, and an entry goes with its last row. The holder
 /// reads the keeper's clock ahead of the store: a row bound behind that
-/// read may have been written behind it, and stays for the next read. A
-/// forgetting that misses a row leaves a binding no later worker matches.
+/// read may have been written behind it, and stays. Once the clock is
+/// past the last forgetting, the next read forgets again whatever it
+/// finds: an answer may bind a row that left before it. A forgetting
+/// that misses a row leaves a binding no later worker matches.
 ///
 /// The address is the one the row's object dials. The keeper works it out
 /// of the facts by the holder's own rule, so a host states no address.
@@ -168,7 +170,8 @@ impl fmt::Debug for KeptCredential {
 
 impl KeptCredential {
     /// The write was taken: the stated credential stands at the address,
-    /// bound to `row`, the row the door answered, beside the rows bound
+    /// bound to `row`, the row the door answered (the `new` row of a
+    /// [`Wrote::Another`](super::Wrote::Another)), beside the rows bound
     /// there before. Call it whether or not the write moved the row: a
     /// worker stated again binds its row on a host that had not bound it.
     /// Call it at the door's answer, with no await between the two: a
@@ -345,23 +348,17 @@ impl Credentials {
     /// later than `read` is dropped: it left the store the holder read.
     /// One bound later stays: its row may have been written behind that
     /// read. An entry with no row and no registration in flight goes.
-    /// Return whether a row that does not stand was kept: the holder calls
-    /// again behind its next read, whatever that read finds.
-    pub(super) fn forget_left(&self, read: u64, stands: impl Fn(WorkerId) -> bool) -> bool {
+    /// The holder calls again behind its next read once the clock is past
+    /// `read`: a registration answered since bound a row this call did
+    /// not ask about.
+    pub(super) fn forget_left(&self, read: u64, stands: impl Fn(WorkerId) -> bool) {
         let mut held = self.held.write();
-        let mut owed = false;
         held.entries.retain(|_, entry| {
-            entry.rows.retain(|bound| {
-                if stands(bound.row) {
-                    return true;
-                }
-                let later = bound.taken_at > read;
-                owed |= later;
-                later
-            });
+            entry
+                .rows
+                .retain(|bound| stands(bound.row) || bound.taken_at > read);
             !entry.rows.is_empty() || entry.flight.is_some()
         });
-        owed
     }
 }
 
@@ -419,8 +416,8 @@ mod tests {
     }
 
     /// A forgetting whose read of the store begins now and finds no row.
-    fn forget(credentials: &Credentials) -> bool {
-        credentials.forget_left(credentials.taken(), |_| false)
+    fn forget(credentials: &Credentials) {
+        credentials.forget_left(credentials.taken(), |_| false);
     }
 
     fn has_entry(credentials: &Credentials, address: &str) -> bool {
@@ -529,7 +526,7 @@ mod tests {
         register(&credentials, ADDRESS, ROW, None);
         assert!(credentials.is_empty());
         assert!(builds_with(&credentials, ADDRESS, ROW, None));
-        assert!(!forget(&credentials));
+        forget(&credentials);
         assert!(!has_entry(&credentials, ADDRESS));
         assert!(!has_entry(&credentials, OTHER_ADDRESS));
     }
@@ -637,33 +634,33 @@ mod tests {
         let read = credentials.taken();
 
         // One row left: the other keeps the address's credential.
-        assert!(!credentials.forget_left(read, |row| row == OTHER_ROW));
+        credentials.forget_left(read, |row| row == OTHER_ROW);
         assert!(builds_with(&credentials, ADDRESS, ROW, None));
         assert!(builds_with(&credentials, ADDRESS, OTHER_ROW, Some(KEY_A)));
         assert_eq!(credentials.len(), 1);
 
         // The last row left: the entry goes.
-        assert!(!credentials.forget_left(read, |_| false));
+        credentials.forget_left(read, |_| false);
         assert!(!has_entry(&credentials, ADDRESS));
         assert!(credentials.is_empty());
     }
 
     #[test]
-    fn a_forgetting_keeps_a_row_bound_behind_its_read_and_says_so() {
+    fn a_forgetting_keeps_a_row_bound_behind_its_read() {
         let credentials = Credentials::new();
         let read = credentials.taken();
         // Its row may have been written behind the holder's read.
         register(&credentials, ADDRESS, ROW, Some(KEY_A));
-        assert!(credentials.forget_left(read, |_| false));
+        credentials.forget_left(read, |_| false);
         assert!(builds_with(&credentials, ADDRESS, ROW, Some(KEY_A)));
 
         // A put-back leaves the binding as it was taken.
         assert!(!keep(&credentials, ADDRESS, Some(KEY_B)).put_back());
-        assert!(credentials.forget_left(read, |_| false));
+        credentials.forget_left(read, |_| false);
         assert!(builds_with(&credentials, ADDRESS, ROW, Some(KEY_A)));
 
         // A read that begins behind the answer forgets it.
-        assert!(!forget(&credentials));
+        forget(&credentials);
         assert!(!has_entry(&credentials, ADDRESS));
     }
 
@@ -674,7 +671,7 @@ mod tests {
 
         // The row left while the next registration is in flight.
         let next = keep(&credentials, ADDRESS, Some(KEY_B));
-        assert!(!forget(&credentials));
+        forget(&credentials);
         assert_eq!(credentials.len(), 1);
         assert!(next.accepted(OTHER_ROW));
         assert!(builds_with(&credentials, ADDRESS, OTHER_ROW, Some(KEY_B)));
@@ -682,7 +679,7 @@ mod tests {
 
         // Refused instead: no row is bound any more, so nothing is left.
         let refused = keep(&credentials, ADDRESS, Some(KEY_C));
-        assert!(!forget(&credentials));
+        forget(&credentials);
         assert!(!refused.put_back());
         assert!(!has_entry(&credentials, ADDRESS));
     }

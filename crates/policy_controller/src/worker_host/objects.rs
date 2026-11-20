@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     sync::{
-        atomic::{AtomicBool, Ordering::Relaxed},
+        atomic::{AtomicU64, Ordering::Relaxed},
         Arc,
     },
 };
@@ -142,10 +142,11 @@ pub struct Objects<G> {
     /// What the host keeps for its workers, by the address they dial and
     /// the row a registration wrote.
     credentials: Option<Arc<Credentials>>,
-    /// Whether the keeper kept a row that left, bound behind the read that
-    /// asked: the next read asks again. Written and read under the
-    /// follow's turn.
-    forgetting_owed: AtomicBool,
+    /// The keeper's clock as the last forgetting read it. Once the clock
+    /// is past it, a registration answered since bound a row that
+    /// forgetting did not ask about, and the next read forgets again.
+    /// Written and read under the follow's turn.
+    forgotten_at: AtomicU64,
     /// Where the last read ended. Held through a read: one follows at a
     /// time.
     read_to: Mutex<Place>,
@@ -179,7 +180,7 @@ impl<G: Generation> Objects<G> {
             connector: None,
             status_followed: false,
             credentials: None,
-            forgetting_owed: AtomicBool::new(false),
+            forgotten_at: AtomicU64::new(0),
             read_to: Mutex::new(Place::default()),
             held: RwLock::new(Held::default()),
         }
@@ -338,9 +339,11 @@ impl<G: Generation> Objects<G> {
             match tail {
                 MembershipTail::Changes(changes) => {
                     let Some(&(last, _)) = changes.last() else {
-                        // A read that found nothing forgets what an
-                        // earlier one owed, and no more.
-                        if self.forgetting_owed.load(Relaxed) {
+                        // A read that found nothing forgets all the same
+                        // once the keeper's clock is past the last
+                        // forgetting: an answer since bound a row that
+                        // may have left before it.
+                        if read.is_some_and(|read| read > self.forgotten_at.load(Relaxed)) {
                             self.forget_left(read);
                         }
                         return;
@@ -366,15 +369,15 @@ impl<G: Generation> Objects<G> {
     /// Have the keeper forget the rows that left: each row a registration
     /// bound that no longer stands here, by the keeper's clock as it read
     /// ahead of the store. One pass over the keeper's rows, behind a read
-    /// that found a change. The keeper says where it kept a row bound
-    /// behind that clock, and the next read asks again.
+    /// that found a change, and behind any read once the clock is past
+    /// the last pass.
     fn forget_left(&self, read: Option<u64>) {
         let (Some(credentials), Some(read)) = (&self.credentials, read) else {
             return;
         };
         let held = self.held.read();
-        let owed = credentials.forget_left(read, |row| held.facts.contains_key(&row));
-        self.forgetting_owed.store(owed, Relaxed);
+        credentials.forget_left(read, |row| held.facts.contains_key(&row));
+        self.forgotten_at.store(read, Relaxed);
     }
 
     /// One change of the tail: a row it says left ends its object, then the
@@ -867,6 +870,31 @@ mod tests {
         assert!(token.accepted(row));
         // Another writer's removal, before this holder's next follow.
         replica.remove(A);
+        replica.follow();
+        assert!(replica.credentials.is_empty());
+        replica.store.upsert(facts(A, 2));
+        replica.follow();
+        assert!(replica.holds_credential(A, None));
+    }
+
+    /// A removal followed before its registration's answer leaves that
+    /// read's forgetting no bound row. The answer then binds the row that
+    /// left: the next read finds nothing in the store, and forgets it by
+    /// the keeper's clock.
+    #[test]
+    fn a_follow_forgets_a_worker_removed_before_its_registration_was_answered() {
+        let replica = Replica::new();
+        replica.follow();
+        let token = replica.kept(&facts(A, 1), Some(KEY_A));
+        let row = replica.store.upsert(facts(A, 1)).id();
+        // Another writer's removal, followed before the door's answer
+        // reaches the token.
+        replica.remove(A);
+        replica.follow();
+        assert!(token.accepted(row));
+        assert_eq!(replica.lay_again(&facts(A, 1)), 0);
+
+        // A read that finds nothing forgets the row all the same.
         replica.follow();
         assert!(replica.credentials.is_empty());
         replica.store.upsert(facts(A, 2));
