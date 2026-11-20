@@ -35,6 +35,9 @@ use crate::{
 
 /// How often a step waiting out its backoff reads its workflow's cancellation.
 const CANCELLATION_READ_INTERVAL: Duration = Duration::from_millis(250);
+/// The error text of a step that failed without an error of its own: a plain
+/// `Failure` result, or a panic whose message goes to the log only.
+const PLAIN_FAILURE: &str = "Step failed";
 
 #[derive(Default)]
 struct StepTracker {
@@ -216,8 +219,8 @@ enum Gate {
     /// The context the condition reads could not be loaded; the step fails
     /// with this text rather than proceeding blindly.
     Fail(String),
-    /// The condition panicked, with this text. The step fails by its failure
-    /// action, as a step whose `execute` panics does.
+    /// The condition panicked, with the same fixed failure text used when a
+    /// step's `execute` panics. The step fails by its failure action.
     Panic(String),
 }
 
@@ -285,7 +288,7 @@ impl Completion {
 
     /// A step whose condition panicked, folded with its failure action: under
     /// `ContinueNextStep` it signals as a skip and is recorded as skipped,
-    /// with the panic's text kept.
+    /// with the failure text kept.
     fn panicked(error: String, on_failure: FailureAction) -> Self {
         match on_failure {
             FailureAction::FailWorkflow | FailureAction::RetryIndefinitely => Self::failed(error),
@@ -973,11 +976,13 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     Gate::Skip
                 }
                 Err(panic) => {
-                    // Under `ContinueNextStep` the workflow goes on, so this
-                    // line is where the panic is told.
-                    let words = panic_words(panic.as_ref());
-                    tracing::warn!(step_id = %step.id, panic = words, "run_if panicked");
-                    Gate::Panic(format!("run_if panicked: {words}"))
+                    tracing::error!(
+                        instance_id = %instance_id,
+                        step_id = %step.id,
+                        panic = panic_words(panic.as_ref()),
+                        "run_if panicked"
+                    );
+                    Gate::Panic(PLAIN_FAILURE.to_string())
                 }
             },
             Err(e) => {
@@ -1283,7 +1288,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             Ok(Ok(Ok(StepResult::Success))) => Outcome::Success,
             Ok(Ok(Ok(StepResult::Skip))) => Outcome::Skip,
             Ok(Ok(Ok(StepResult::Failure))) => Outcome::Failed {
-                error: "Step failed".to_string(),
+                error: PLAIN_FAILURE.to_string(),
                 retryable: false,
             },
             Ok(Ok(Err(e))) => Outcome::Failed {
@@ -1300,10 +1305,18 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     }),
             },
             // A panic fails the attempt, and no further attempt is made.
-            Ok(Err(panic)) => Outcome::Failed {
-                error: format!("Step panicked: {}", panic_words(panic.as_ref())),
-                retryable: false,
-            },
+            Ok(Err(panic)) => {
+                tracing::error!(
+                    instance_id = %instance_id,
+                    step_id = %step.id,
+                    panic = panic_words(panic.as_ref()),
+                    "Step panicked"
+                );
+                Outcome::Failed {
+                    error: PLAIN_FAILURE.to_string(),
+                    retryable: false,
+                }
+            }
             Err(_) => Outcome::Failed {
                 error: format!("Step timeout after {step_timeout:?}"),
                 // Timeouts are retryable
