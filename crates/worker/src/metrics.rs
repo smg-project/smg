@@ -69,7 +69,7 @@ impl BoundedLabels {
         }
         let mut admitted = self.admitted.load(Ordering::Relaxed);
         loop {
-            if admitted >= self.cap {
+            if self.is_full(admitted) {
                 return Arc::clone(&BOUNDED_LABEL_SENTINEL_ARC);
             }
             match self.admitted.compare_exchange_weak(
@@ -92,41 +92,64 @@ impl BoundedLabels {
         }
     }
 
-    /// `s`'s label where a test reads the set as full: its own where the
-    /// set admitted it, the sentinel where not.
-    #[cfg(test)]
-    fn admitted(&self, s: &str) -> Arc<str> {
-        self.map.get(s).map_or_else(
-            || Arc::clone(&BOUNDED_LABEL_SENTINEL_ARC),
-            |entry| Arc::clone(entry.value()),
-        )
+    /// Whether the set admits no value more: `admitted` is at its cap, or
+    /// a test reads the set as full on its own thread. Asked for a value
+    /// the set does not hold alone, never for one it holds.
+    fn is_full(&self, admitted: usize) -> bool {
+        #[cfg(test)]
+        if labels_full::on_this_thread() {
+            return true;
+        }
+        admitted >= self.cap
     }
 }
 
 /// Intern a client-supplied model label, bounded by `MAX_MODEL_LABELS`.
 pub fn intern_model_label(model_id: &str) -> Arc<str> {
-    #[cfg(test)]
-    if model_labels_full::on_this_thread() {
-        return MODEL_LABELS.admitted(model_id);
-    }
     MODEL_LABELS.intern(model_id)
 }
 
-/// For this crate's tests: a thread's say that the set of model labels is
-/// full. A model the set has not admitted then gets the sentinel, as it
-/// does past `MAX_MODEL_LABELS`, and the process-wide set is not filled
-/// under the other tests.
+/// The label a model's series carry, read without admitting the model: its
+/// own text where the set of model labels holds it or has room for it, the
+/// sentinel where the set is full and never took it.
+#[cfg(feature = "runtime")]
+pub(crate) fn model_label(model_id: &str) -> &str {
+    let labels = &*MODEL_LABELS;
+    if labels.map.contains_key(model_id) || !labels.is_full(labels.admitted.load(Ordering::Relaxed))
+    {
+        model_id
+    } else {
+        BOUNDED_LABEL_SENTINEL
+    }
+}
+
+/// For this crate's tests: a thread's say that the bounded label sets are
+/// full. A value a set does not hold then gets the sentinel, as it does
+/// past the set's cap, and no process-wide set is filled under the other
+/// tests.
 #[cfg(test)]
-pub(crate) mod model_labels_full {
+pub(crate) mod labels_full {
     use std::cell::Cell;
 
     thread_local! {
         static FULL: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// Have this thread read the set as full, or as it is.
-    pub(crate) fn force_on_this_thread(full: bool) {
-        FULL.set(full);
+    /// The say, held: it ends when this drops, so a case that fails leaves
+    /// none behind on its thread.
+    #[must_use = "the say ends when the guard drops"]
+    pub(crate) struct Full(());
+
+    impl Drop for Full {
+        fn drop(&mut self) {
+            FULL.set(false);
+        }
+    }
+
+    /// Have this thread read the sets as full until the guard drops.
+    pub(crate) fn hold_on_this_thread() -> Full {
+        FULL.set(true);
+        Full(())
     }
 
     pub(super) fn on_this_thread() -> bool {
@@ -417,15 +440,35 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_reads_the_set_of_model_labels_as_full() {
+    fn a_thread_reads_the_label_sets_as_full_until_the_say_drops() {
         let admitted = intern_model_label("a-model-admitted-ahead");
-        model_labels_full::force_on_this_thread(true);
-        let again = intern_model_label("a-model-admitted-ahead");
-        assert!(Arc::ptr_eq(&again, &admitted));
-        let met = intern_model_label("a-model-met-while-full");
-        assert_eq!(&*met, BOUNDED_LABEL_SENTINEL);
-        model_labels_full::force_on_this_thread(false);
+        {
+            let _full = labels_full::hold_on_this_thread();
+            let again = intern_model_label("a-model-admitted-ahead");
+            assert!(Arc::ptr_eq(&again, &admitted));
+            let met = intern_model_label("a-model-met-while-full");
+            assert_eq!(&*met, BOUNDED_LABEL_SENTINEL);
+        }
         let met = intern_model_label("a-model-met-while-full");
         assert_eq!(&*met, "a-model-met-while-full");
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn a_models_label_is_read_without_admitting_it() {
+        let admitted = intern_model_label("a-model-whose-label-is-read");
+        assert_eq!(model_label("a-model-whose-label-is-read"), &*admitted);
+        // The set has room: a model it never met would carry its own text.
+        assert_eq!(
+            model_label("a-model-never-admitted"),
+            "a-model-never-admitted"
+        );
+        // Read as full, the set shows that the read above admitted nothing.
+        let _full = labels_full::hold_on_this_thread();
+        assert_eq!(model_label("a-model-whose-label-is-read"), &*admitted);
+        assert_eq!(
+            model_label("a-model-never-admitted"),
+            BOUNDED_LABEL_SENTINEL
+        );
     }
 }

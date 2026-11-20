@@ -88,7 +88,7 @@ use crate::{
         state::{LoadReceiver, LoadSnapshot, LoadState},
     },
     metrics::{
-        intern_model_label,
+        model_label,
         writers::{LoadTest, Metrics},
     },
     registry::{event::WorkerEvent, worker_model_ids, Generation, WorkerRegistry},
@@ -1550,23 +1550,26 @@ impl<G: Generation> WorkerMonitor<G> {
             .load_state
             .another_live_workers_row(worker)
             .map(|(source, load)| (worker_model_ids(&source), load));
-        let row = row.as_ref();
+        // Each live writer's labels are read once, and the read admits no
+        // model to the label set: the guard compares texts alone.
+        let row = row.as_ref().map(|(models, load)| {
+            let labels: Vec<&str> = models.iter().map(|model| model_label(model)).collect();
+            (labels, load)
+        });
         let other = reports
             .get(worker.url())
-            .filter(|other| !Arc::ptr_eq(&other.pusher, worker) && !other.series_held);
+            .filter(|other| !Arc::ptr_eq(&other.pusher, worker) && !other.series_held)
+            .map(|other| (model_label(other.pusher.model_id()), other));
         write_sentinel(worker, ended, |label, rank, carries| {
             let holds = |loads: &[SchedulerLoadSnapshot]| {
                 loads
                     .iter()
                     .any(|load| load.dp_rank == rank && carries(load))
             };
-            let same = |model: &str, label: &str| *intern_model_label(model) == *label;
-            row.is_some_and(|(models, load)| {
-                label.is_none_or(|label| models.iter().any(|model| same(model, label)))
-                    && holds(&load.loads)
-            }) || other.is_some_and(|other| {
-                label.is_none_or(|label| same(other.pusher.model_id(), label))
-                    && holds(&other.report.loads)
+            row.as_ref().is_some_and(|(labels, load)| {
+                label.is_none_or(|label| labels.contains(&label)) && holds(&load.loads)
+            }) || other.as_ref().is_some_and(|(own, other)| {
+                label.is_none_or(|label| *own == label) && holds(&other.report.loads)
             })
         });
     }

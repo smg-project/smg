@@ -3251,10 +3251,10 @@ async fn an_eviction_clears_the_series_of_a_model_its_successor_does_not_serve()
 /// guard matches a live writer's model by the series' label.
 #[tokio::test]
 async fn an_eviction_leaves_the_series_its_successor_shares_past_the_label_cap() {
-    use crate::metrics::model_labels_full;
+    use crate::metrics::labels_full;
 
     let rendered = render_with_recorder(|| {
-        model_labels_full::force_on_this_thread(true);
+        let _full = labels_full::hold_on_this_thread();
         let (registry, monitor) = build_monitor();
         let first = ready_worker("http://w:1", "a-model-past-the-cap");
         let id = registry.register(Arc::clone(&first)).unwrap();
@@ -3264,7 +3264,6 @@ async fn an_eviction_leaves_the_series_its_successor_shares_past_the_label_cap()
         polled(&monitor, &next, answer_of(0, 9));
 
         monitor.evict_worker_loads(&first);
-        model_labels_full::force_on_this_thread(false);
     });
     assert!(
         running_series_under(&rendered, "other").ends_with(" 9"),
