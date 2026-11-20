@@ -111,6 +111,8 @@
 //! - A replay still asked for at a reset is not counted as missed: the
 //!   store's reset says no count of what it dropped.
 //! - A rank's worker reads its own rank's degraded word alone.
+//! - A stream that starts for a degraded rank's worker sets its series
+//!   to none. The rank reads degraded again at its next batch.
 //! - A feed's own row that another stream wrote begins from nothing at
 //!   the feed's open. Its index-blocks gauge shows that at the feed's
 //!   first batch.
@@ -688,8 +690,11 @@ where
                     | store::Admission::Stale
                     | store::Admission::Replay { .. } => {}
                 }
-                // The rank's own word, where it moved.
-                if *degraded != read.degraded {
+                // The rank's own word: where it moved, and at each batch
+                // while the rank is degraded. A stream that starts for the
+                // row's worker sets the worker's series to none, and the
+                // rank may be degraded still.
+                if read.degraded || *degraded {
                     *degraded = read.degraded;
                     Metrics::set_kv_event_degraded_ranks(url, usize::from(read.degraded));
                 }
@@ -3077,6 +3082,40 @@ mod tests {
                 let resets = "smg_kv_event_resyncs_total";
                 let lost = &["reason=\"data_loss\""];
                 assert_eq!(series.read_of(OTHER, resets, lost), None);
+            });
+        }
+
+        /// A stream that starts for a rank's worker sets the worker's
+        /// series to none, as the collector does ahead of every stream.
+        /// A rank that is degraded still says so again at its next batch.
+        #[test]
+        fn a_degraded_rank_says_so_again_behind_a_streams_start() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                let (_host, sink) = opened(&f);
+                let applied = BatchOutcome::Applied;
+                assert_eq!(sink.admit(f.row, 0, facts(1), &wide(1, 32)), applied);
+                let gap = BatchOutcome::Gap {
+                    expected: 2,
+                    received: 5,
+                };
+                assert_eq!(sink.admit(f.row, 0, facts(5), &wide(5, 32)), gap);
+                assert_eq!(sink.admit(f.row, 0, facts(7), &wide(7, 32)), applied);
+                let degraded = "smg_kv_event_degraded_ranks";
+                assert_eq!(series.read(degraded, &[]), Some(1.0));
+
+                Metrics::init_kv_event_series(URL);
+                assert_eq!(series.read(degraded, &[]), Some(0.0));
+                assert_eq!(sink.admit(f.row, 0, facts(8), &wide(8, 32)), applied);
+                assert_eq!(series.read(degraded, &[]), Some(1.0));
+
+                // Behind a reset the rank is whole. Its batch writes no word:
+                // a mark set by hand stands.
+                sink.resync(f.row, None, ResyncReason::DataLoss);
+                Metrics::set_kv_event_degraded_ranks(URL, 7);
+                assert_eq!(sink.admit(f.row, 0, facts(9), &wide(9, 32)), applied);
+                assert_eq!(series.read(degraded, &[]), Some(7.0));
             });
         }
     }
