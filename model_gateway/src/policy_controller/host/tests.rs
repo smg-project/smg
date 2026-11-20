@@ -36,7 +36,7 @@ use smg_policy_controller::{
     view::{fingerprint, Identity, LoadRow},
     AppliedSpec, DerivedKey, KeySource, PolicySpec,
 };
-use smg_worker::identity::basic::WorkerLoadGuard;
+use smg_worker::{health::circuit_breaker::CircuitBreakerConfig, identity::basic::WorkerLoadGuard};
 
 use super::{
     elapsed_micros, left_no_worker, mark, profile_of,
@@ -702,14 +702,25 @@ async fn a_returning_prefix_lands_on_the_worker_that_holds_it() {
 
 #[tokio::test]
 async fn a_worker_the_gateway_cannot_send_to_is_passed_over() {
-    let (host, _store, workers) = bed(&["http://w0:8000", "http://w1:8000"]);
-    workers[0].set_status(WorkerStatus::NotReady);
-    for turn in 0..8u8 {
-        let placed = host
-            .place(&first(&[turn]), Instant::now())
-            .await
-            .expect("the other worker");
-        assert_eq!(placed.worker().url(), "http://w1:8000");
+    // The filter's two halves: a worker that is not ready, and a ready
+    // worker whose breaker is open.
+    for open_breaker in [false, true] {
+        let (host, _store, workers) = bed(&["http://w0:8000", "http://w1:8000"]);
+        if open_breaker {
+            for _ in 0..CircuitBreakerConfig::default().failure_threshold {
+                workers[0].record_outcome(503);
+            }
+            assert!(!workers[0].circuit_breaker_can_execute());
+        } else {
+            workers[0].set_status(WorkerStatus::NotReady);
+        }
+        for turn in 0..8u8 {
+            let placed = host
+                .place(&first(&[turn]), Instant::now())
+                .await
+                .expect("the other worker");
+            assert_eq!(placed.worker().url(), "http://w1:8000");
+        }
     }
 }
 

@@ -75,12 +75,7 @@ use crate::{
 
 mod hashes;
 
-pub(crate) use hashes::Hashes;
-#[cfg_attr(
-    not(test),
-    expect(unused_imports, reason = "the prompt is part of the host's interface")
-)]
-pub(crate) use hashes::Prompt;
+pub(crate) use hashes::{Hashes, Prompt};
 
 /// The gateway of this process, as the controller's store names it: the
 /// crate's own name for the one gateway that decides in its own process.
@@ -436,6 +431,13 @@ impl Host {
             door: Arc::new(Door::new(store)),
             workers: Workers::Held(objects),
         }
+    }
+
+    /// An attempt's prompt hashes for `model`, under the generation in force.
+    /// The stage holding the tokens calls this once before the first ask.
+    /// Each ask borrows the same result through [`Ask::hashes`].
+    pub(crate) fn hashes(&self, model: &str, prompt: &Prompt<'_>) -> Hashes {
+        Hashes::of(self.door.store(), model, prompt)
     }
 
     /// The host of a bed that registers its workers by hand in `registry`.

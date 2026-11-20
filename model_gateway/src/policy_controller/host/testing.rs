@@ -88,7 +88,7 @@ pub(crate) fn cache_bed() -> (Host, Arc<MemoryStore>, WorkerId) {
 
 /// [`bed`] over `store` and `registry`: a row publishes cache events where
 /// the store's generation reads them.
-fn bed_with<'a>(
+pub(crate) fn bed_with<'a>(
     store: Arc<MemoryStore>,
     registry: Arc<WorkerRegistry>,
     urls_and_models: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
