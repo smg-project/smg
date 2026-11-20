@@ -1693,6 +1693,9 @@ impl<G> Drop for WorkerMonitor<G> {
         if let Some(handle) = self.eviction_flush_task.get_mut().take() {
             handle.abort();
         }
+        if let Some(handle) = self.pushed_flush_task.get_mut().take() {
+            handle.abort();
+        }
         if let Some(handle) = self.liveness_sweep_task.get_mut().take() {
             handle.abort();
         }
