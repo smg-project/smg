@@ -1599,8 +1599,12 @@ fn a_pin_past_its_own_end_leaves_where_another_rule_keeps_its_keys_for_ever() {
     assert!(sessions.lookup(2).is_some());
 }
 
+/// A removed worker's pins of record stand through its absence, and the
+/// worker it was takes them back where its key is registered again, under
+/// the id the registration makes. A new life of the same worker in place
+/// keeps its own. Another worker under the key takes none.
 #[test]
-fn a_removed_workers_pins_of_record_leave_with_its_row() {
+fn a_key_registered_again_as_the_worker_it_was_takes_its_pins_of_record() {
     let store = MemoryStore::new();
     let (a, b) = (
         ready(&store, "http://a:8000"),
@@ -1611,17 +1615,89 @@ fn a_removed_workers_pins_of_record_leave_with_its_row() {
     sessions.pin(11, a, now, None);
     sessions.pin(12, b, now, None);
     sessions.pin(13, a, now, None);
+    let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
     let revision = WorkersStore::get(&store, a).expect("the row").revision;
     store.remove(a, revision).expect("removed");
-    // The removal's own write drops them: no sweep ran, and no rule
-    // stands.
-    assert!(sessions.lookup(11).is_none() && sessions.lookup(13).is_none());
-    assert_eq!(sessions.lookup(12).map(|pin| pin.worker), Some(b));
+    // The removal drops none: the key may be registered again.
+    assert_eq!((of(11), of(13)), (Some(a), Some(a)));
+    let again = store.upsert(facts("http://a:8000", 2)).id();
+    assert_ne!(again, a);
+    assert_eq!((of(11), of(13)), (Some(again), Some(again)));
+    assert_eq!(of(12), Some(b));
+    let life = store.upsert(facts("http://b:8000", 2)).id();
+    assert_ne!(life, b);
+    assert_eq!(of(12), Some(life), "a new life of the same worker");
+    // Removed again, then registered in another role: another worker.
+    let revision = WorkersStore::get(&store, again).expect("the row").revision;
+    store.remove(again, revision).expect("removed");
+    store.upsert(WorkerFacts {
+        role: Role::Decode,
+        ..facts("http://a:8000", 3)
+    });
+    assert_eq!((of(11), of(13)), (None, None));
     assert_eq!(sessions.len(), 1);
-    // A replaced incarnation's row is gone as well, and so is its pin.
-    let replaced = store.upsert(facts("http://b:8000", 2)).id();
-    assert_ne!(replaced, b);
-    assert!(sessions.is_empty(), "the old incarnation's pin");
+    // A new life in another role, in place: another worker too.
+    store.upsert(WorkerFacts {
+        role: Role::Prefill,
+        ..facts("http://b:8000", 3)
+    });
+    assert!(sessions.is_empty(), "the old worker's pin");
+}
+
+/// Two registrations of one key rename its pins of record in their order.
+/// The second lands where the first has let the workers lock go, and the
+/// pin names the last life: in place, and for a key that left.
+#[test]
+fn registrations_of_one_key_rename_its_pins_of_record_in_their_order() {
+    use std::{cell::Cell, rc::Rc};
+
+    use super::memory::seam;
+
+    let store = Rc::new(MemoryStore::new());
+    let sessions: &dyn SessionsStore = &*store;
+    let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
+    let now = Instant::now();
+    // The third life of `key`, registered behind the next registration.
+    let third_behind = |key: &'static str| {
+        let third = Rc::new(Cell::new(None));
+        let (behind, seen) = (Rc::clone(&store), Rc::clone(&third));
+        seam::on_release(move || seen.set(Some(behind.upsert(facts(key, 3)).id())));
+        third
+    };
+    // In place: the key's second life is replaced by its third at once.
+    let a = ready(&store, "http://a:8000");
+    sessions.pin(11, a, now, None);
+    let third = third_behind("http://a:8000");
+    store.upsert(facts("http://a:8000", 2));
+    assert!(third.get().is_some(), "the hook ran");
+    assert_eq!(of(11), third.get());
+    // A key that left: registered again, and that life replaced at once.
+    let b = ready(&store, "http://b:8000");
+    sessions.pin(12, b, now, None);
+    let revision = WorkersStore::get(&*store, b).expect("the row").revision;
+    store.remove(b, revision).expect("removed");
+    let third = third_behind("http://b:8000");
+    store.upsert(facts("http://b:8000", 2));
+    assert!(third.get().is_some(), "the hook ran");
+    assert_eq!(of(12), third.get());
+}
+
+/// A key that stays away longer than the absence's time takes no pin
+/// back: the time is the longest TTL among the document's session rules.
+#[test]
+fn a_key_registered_again_past_the_absences_time_takes_no_pin() {
+    let store = MemoryStore::new();
+    let ruled = manual_ruled(1, 1, 1);
+    store.apply(ruled).expect("above the unbound start");
+    let a = ready(&store, "http://a:8000");
+    let sessions: &dyn SessionsStore = &store;
+    sessions.pin(11, a, Instant::now(), None);
+    let revision = WorkersStore::get(&store, a).expect("the row").revision;
+    store.remove(a, revision).expect("removed");
+    assert!(sessions.lookup(11).is_some(), "inside its time");
+    std::thread::sleep(Duration::from_millis(1_100));
+    store.upsert(facts("http://a:8000", 2));
+    assert_eq!(sessions.lookup(11), None);
 }
 
 /// The door of a writer that knows a key's rule by its lease alone: the
