@@ -293,7 +293,7 @@ enum Outcome {
     Skip,
     /// The error text for the step's state and events, and whether another
     /// attempt is allowed: the executor's word for its own errors, always
-    /// for a timeout, never for a plain `Failure` result.
+    /// for a timeout, never for a plain `Failure` result or a panic.
     Failed {
         error: String,
         retryable: bool,
@@ -326,6 +326,24 @@ fn panic_words(panic: &(dyn Any + Send)) -> &str {
         .copied()
         .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("no message")
+}
+
+/// Logs how a step's hook ended when it failed or panicked. Neither changes
+/// what the step came to.
+fn log_hook_end<E: std::fmt::Debug>(
+    step_id: &StepId,
+    hook: &'static str,
+    end: Result<Result<(), E>, Box<dyn Any + Send>>,
+) {
+    match end {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(step_id = %step_id, error = ?error, "{hook} hook failed"),
+        Err(panic) => tracing::warn!(
+            step_id = %step_id,
+            panic = panic_words(panic.as_ref()),
+            "{hook} hook panicked"
+        ),
+    }
 }
 
 /// Fixed backoff that returns the same delay every time
@@ -901,14 +919,20 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             return Gate::Run;
         };
         match self.state_store.get_context(instance_id).await {
-            Ok(ctx) if condition(&ctx) => Gate::Run,
-            Ok(_) => {
-                tracing::debug!(
-                    step_id = %step.id,
-                    "Step skipped due to run_if condition"
-                );
-                Gate::Skip
-            }
+            // The condition is the step author's code: its panic fails the step.
+            Ok(ctx) => match catch_unwind(AssertUnwindSafe(|| condition(&ctx))) {
+                Ok(true) => Gate::Run,
+                Ok(false) => {
+                    tracing::debug!(
+                        step_id = %step.id,
+                        "Step skipped due to run_if condition"
+                    );
+                    Gate::Skip
+                }
+                Err(panic) => {
+                    Gate::Fail(format!("run_if panicked: {}", panic_words(panic.as_ref())))
+                }
+            },
             Err(e) => {
                 tracing::error!(
                     step_id = %step.id,
@@ -1217,7 +1241,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             },
             Ok(Ok(Err(e))) => Outcome::Failed {
                 error: format!("{e}"),
-                retryable: step.executor.is_retryable(&e),
+                // The executor's word, and no further attempt when it panics.
+                retryable: catch_unwind(AssertUnwindSafe(|| step.executor.is_retryable(&e)))
+                    .unwrap_or(false),
             },
             // A panic fails the attempt, and no further attempt is made.
             Ok(Err(panic)) => Outcome::Failed {
@@ -1272,9 +1298,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             })
             .await;
 
-        if let Err(e) = step.executor.on_success(context).await {
-            tracing::warn!(step_id = %step.id, error = ?e, "on_success hook failed");
-        }
+        let end = CatchPanic(step.executor.on_success(context)).await;
+        log_hook_end(&step.id, "on_success", end);
         Ok(())
     }
 
@@ -1367,9 +1392,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             step_id: step.id.clone(),
             message: error,
         };
-        if let Err(hook_err) = step.executor.on_failure(context, &hook_error).await {
-            tracing::warn!(step_id = %step.id, error = ?hook_err, "on_failure hook failed");
-        }
+        let end = CatchPanic(step.executor.on_failure(context, &hook_error)).await;
+        log_hook_end(&step.id, "on_failure", end);
     }
 
     fn create_backoff(strategy: &BackoffStrategy) -> BackoffImpl {
