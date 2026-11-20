@@ -342,7 +342,9 @@ mod tests {
 
             // A queued removal can name a URL that a whole read saw again.
             let mut told = HashSet::from([FIRST.to_owned()]);
-            f.feed.removed(FIRST, &mut told).await;
+            let mut removals = JoinSet::new();
+            f.feed.removed(FIRST, &mut told, &mut removals);
+            while removals.join_next().await.is_some() {}
             assert!(told.contains(FIRST));
             assert!(f.feed.collector().slot_ids(FIRST).await.0.is_some());
         })
@@ -369,6 +371,73 @@ mod tests {
             assert_eq!(f.feed.collector().slot_ids(url).await, (None, None));
             assert!(f.feed.collector().task_ended(url).await);
         }
+    }
+
+    /// Every removal permit of the process. Held, they hold a leaving task
+    /// at its last word to the sink, so its removal does not end.
+    async fn removals_held() -> tokio::sync::SemaphorePermit<'static> {
+        smg_worker::kv_events::SINK_REMOVAL_PERMITS
+            .acquire_many(smg_worker::kv_events::MAX_CONCURRENT_SINK_REMOVALS as u32)
+            .await
+            .expect("the removal semaphore is open")
+    }
+
+    /// A removal that does not end holds no add behind it: the next
+    /// worker's add is told and its slot opens while the removal waits.
+    #[tokio::test]
+    async fn a_slow_removal_holds_no_add_behind_it() {
+        let f = Fixture::new();
+        let row = f.lay(facts(FIRST, WireModes::GRPC, true));
+        f.check(async {
+            let leaving = f.new_slot(FIRST, None).await;
+            let permits = removals_held().await;
+            assert!(f.remove(row));
+            f.lay(facts(SECOND, WireModes::GRPC, true));
+            f.new_slot(SECOND, None).await;
+            // The removal is under way and does not end: its reservation
+            // stands beside the second worker's stream.
+            while f.feed.collector().slot_ids(FIRST).await != (None, Some(leaving)) {
+                sleep(POLL).await;
+            }
+            assert!(f.feed.collector().slot_ids(SECOND).await.0.is_some());
+            drop(permits);
+        })
+        .await
+        .expect("the add behind a slow removal takes its slot");
+        assert_eq!(f.feed.collector().slot_ids(FIRST).await, (None, None));
+    }
+
+    /// A removal and a later add of one address keep their order while the
+    /// removal is slow: the new worker's stream starts behind the old
+    /// task's end, and the removal leaves it standing.
+    #[tokio::test]
+    async fn a_removal_and_a_later_add_of_one_address_keep_their_order() {
+        let f = Fixture::new();
+        let row = f.lay(facts(FIRST, WireModes::GRPC, true));
+        f.check(async {
+            let old = f.new_slot(FIRST, None).await;
+            let permits = removals_held().await;
+            assert!(f.remove(row));
+            f.lay(facts(FIRST, WireModes::GRPC, true));
+            // The old task does not end: the address holds its reservation,
+            // and the new worker has no stream.
+            while f.feed.collector().slot_ids(FIRST).await != (None, Some(old)) {
+                sleep(POLL).await;
+            }
+            for _ in 0..20 {
+                sleep(POLL).await;
+                assert_eq!(f.feed.collector().slot_ids(FIRST).await, (None, Some(old)));
+            }
+            drop(permits);
+            let new = f.new_slot(FIRST, Some(old)).await;
+            // The removal's task ends and leaves the new stream standing.
+            for _ in 0..20 {
+                sleep(POLL).await;
+                assert_eq!(f.feed.collector().slot_ids(FIRST).await, (Some(new), None));
+            }
+        })
+        .await
+        .expect("the later add takes the address's slot behind the old task");
     }
 
     #[tokio::test]
