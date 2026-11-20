@@ -1347,13 +1347,18 @@ async fn a_worker_over_the_cap_takes_updates_that_add_no_key() {
 /// ranks refuses the merge, the first keeps its labels too.
 #[tokio::test]
 async fn a_refused_rank_leaves_no_partial_update_behind() {
+    // Each rank is built as a registration builds it: its address beside
+    // the base it is built from.
     let first: Arc<dyn Worker> = Arc::new(
-        BasicWorkerBuilder::new("http://rank:8000@0")
+        BasicWorkerBuilder::new("http://rank:8000")
+            .dp_config(0, 2)
             .status(WorkerStatus::Ready)
             .label("k0", "v")
             .build(),
     );
-    let mut builder = BasicWorkerBuilder::new("http://rank:8000@1").status(WorkerStatus::Ready);
+    let mut builder = BasicWorkerBuilder::new("http://rank:8000")
+        .dp_config(1, 2)
+        .status(WorkerStatus::Ready);
     for i in 0..MAX_WORKER_LABELS {
         builder = builder.label(format!("k{i}"), "v");
     }

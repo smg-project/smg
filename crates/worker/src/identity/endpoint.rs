@@ -192,9 +192,11 @@ impl Endpoint {
     /// Parse an endpoint that may carry the workflow's `@rank` suffix.
     ///
     /// A suffix counts as a rank only when every character after the final `@`
-    /// is a digit, so an IPC path is left intact and an authority's own `@`
-    /// stays put — it is split off as userinfo further down, not treated as a
-    /// rank marker.
+    /// is a digit. An `@` followed by anything else stays put: in an authority
+    /// it is split off as userinfo further down, and in an IPC path it is part
+    /// of the path. An `@` and digits at the end are always split off, even
+    /// where they are a userinfo before a host of digits or the end of a socket
+    /// path: an address that carries no rank goes through `parse_unranked`.
     pub fn parse_with_rank(input: &str) -> Result<(Self, Option<usize>), EndpointError> {
         let (body, rank) = split_rank(input.trim());
         Ok((Self::parse_body(body)?, rank))
