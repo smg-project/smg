@@ -2766,9 +2766,14 @@ async fn follows(
 /// engine that registers behind the snapshot and a dead engine's status. A
 /// stream opened after the last place taken is told the tail alone. At one
 /// place, the watcher holds what one that started from a later snapshot
-/// holds.
+/// holds. The later snapshot keeps a lease already on file in its store.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
+    use smg_policy_controller::{
+        lease::{Lease, LeaseId},
+        store::{GatewayId, LeaseRecord, LeaseState, LeasesStore, Picked},
+    };
+
     let case = async {
         let mut harness = Harness::start().await.expect("the harness starts");
         let engines = harness
@@ -2836,11 +2841,34 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
         // A watcher that starts now takes a snapshot. Both are then told
         // one more death, and at its place the first holds what the second
         // holds.
-        let mut fresh = Watcher::new(Arc::new(MemoryStore::new()));
+        let store = Arc::new(MemoryStore::new());
+        let leases: &dyn LeasesStore = &*store;
+        let gateway = GatewayId(1);
+        let now = Instant::now();
+        leases
+            .issue(LeaseRecord {
+                lease: Lease {
+                    id: LeaseId(1),
+                    ..Lease::default()
+                },
+                gateway,
+                request: 1,
+                target: late,
+                picked: Picked::default(),
+                decode: None,
+                term: 0,
+                issued_at: now,
+                dispatch_deadline: now + ROOM,
+                state: LeaseState::ISSUED,
+            })
+            .expect("filed");
+        assert_eq!(leases.live(gateway), 1);
+        let mut fresh = Watcher::new(Arc::clone(&store));
         let opened = fresh.open(harness.client()).await;
         let mut snapshot = opened.expect("a second watch opens");
         let told = follows(&mut snapshot, |held| held.at().is_some()).await;
         told.expect("a snapshot is told");
+        assert_eq!(leases.live(gateway), 1);
         harness.kill(engines[2]).await.expect("a third engine dies");
         let told = follows(&mut stream, |held| dead(held, ids[2])).await;
         told.expect("the third death is told on the tail");

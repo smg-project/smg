@@ -11,17 +11,18 @@ use super::{
     identity, identity_of,
     leases::{Counts, Slot},
     Ask, AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeSide, Dispatch,
-    GatewayId, Hand, HealthSink, Journal, Kinds, KvEvent, KvEventSink, LeaseRecord, LeaseRefused,
-    LeaseState, LeasesStore, LoadSample, LoadSink, LoadSource, MembershipChange, MembershipTail,
-    MemoryStore, Picked, Pin, PollMode, Position, Reachability, ReservationKind, ReservationStore,
-    ResyncReason, Said, SequenceHash, SessionsStore, Sides, Signals, SnapshotChunk, StoredBlock,
-    VetoWrite, ViewBuffers, Watch, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
-    World,
+    GatewayId, Hand, HealthSink, HealthWrite, Journal, Kinds, KvEvent, KvEventSink, LeaseRecord,
+    LeaseRefused, LeaseState, LeasesStore, LoadSample, LoadSink, LoadSource, MembershipChange,
+    MembershipTail, MemoryStore, Picked, Pin, PollMode, Position, Reachability, ReservationKind,
+    ReservationStore, ResyncReason, Said, SequenceHash, SessionsStore, Sides, Signals,
+    SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, Watch, WorkerFacts, WorkerPatch, WorkerRow,
+    WorkerStatus, WorkersStore, World,
 };
 use crate::{
     decider::Decider,
     decision::{Target, Targets},
     lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
+    replication::Log,
     sessions::SessionVerdict,
     view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
 };
@@ -2486,6 +2487,292 @@ fn a_restore_tells_each_end_under_the_decider_whose_file_holds_its_lease() {
     let mut issued = [(named.0, Some(Decider::new(3))), (unnamed.0, first)];
     issued.sort_unstable();
     assert_eq!(ended, issued);
+}
+
+#[test]
+fn a_watch_snapshot_keeps_a_members_local_tables() {
+    let store = MemoryStore::new();
+    let id = ready(&store, "http://a:1");
+    assert_eq!(publisher(&store, "http://a:1", 0), id);
+    store.publish_now();
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let lease = booking(gateway, 1, id, now);
+    let leases: &dyn LeasesStore = &store;
+    leases.set_term(1);
+    leases.issue(lease).expect("filed");
+    let slot = store.world().booked_of(id).expect("the member's slot");
+    let sessions: &dyn SessionsStore = &store;
+    sessions.pin(1, id, now, None);
+    store.gateway_veto(gateway, id, Some(now + Duration::from_secs(60)));
+    HealthSink::completed(&store, gateway, id, TransportClass::Ok, now);
+    LoadSink::record(&store, id, 0, row(0), now, LoadSource::Stream);
+    let local_load = LoadSink::load(&store, id, 0).expect("the local report");
+    assert_eq!(
+        store.admit(id, 0, batch(1), &one_block(1)),
+        BatchOutcome::Applied
+    );
+    store.probed(id, 2, 0, 0);
+
+    let mut cut = store.cut(Kinds::All);
+    cut.epoch += 1;
+    cut.at.term = 7;
+    cut.rows[0].admitted_at += Duration::from_secs(1);
+    cut.rows[0].revision += 1;
+    cut.rows[0].facts.priority = 8;
+    cut.loads[0].2.row.running = 9;
+    let mut expected = cut.rows[0].clone();
+    expected.admitted_at = WorkersStore::get(&store, id).expect("the row").admitted_at;
+    let revision = expected.revision;
+    assert!(store.watch_from(cut));
+
+    assert_eq!(leases.live(gateway), 1);
+    assert_eq!(leases.get(gateway, lease.lease.id), Some(lease));
+    assert_eq!(leases.term(), 1);
+    assert_eq!(store.world().booked_of(id), Some(slot));
+    assert_eq!(in_flight(&store), [(id, 1)]);
+    assert_eq!(
+        sessions.lookup(1),
+        Some(Pin {
+            worker: id,
+            last_used: now,
+            ends: None
+        })
+    );
+    assert!(store.vetoed(gateway, id, now));
+    assert!(store.completed_ok_since(gateway, id, now));
+    let ask = Ask {
+        gateway,
+        now,
+        pinned: None,
+        affinity: false,
+    };
+    let mut out = ViewBuffers::default();
+    store
+        .build_view("m", Role::Single, &ask, &mut out)
+        .expect("the pool");
+    let health = out.candidates[0].health;
+    assert!(
+        health.stalled && health.breaker_open,
+        "the decision reads the veto"
+    );
+    assert_eq!(LoadSink::load(&store, id, 0), Some(local_load));
+    assert_eq!(store.kv().held_blocks("m"), 1);
+    assert_eq!(WorkersStore::get(&store, id), Some(expected));
+    assert_eq!(
+        store.probe_outcome(id, false, revision),
+        HealthWrite::Moved {
+            from: WorkerStatus::Ready,
+            to: WorkerStatus::NotReady
+        }
+    );
+}
+
+/// The count in a one-member world held across a snapshot. Its slot still
+/// reads the live count after the worker leaves the current world.
+fn held_count(world: &World, gateway: GatewayId, now: Instant) -> u32 {
+    let ask = Ask {
+        gateway,
+        now,
+        pinned: None,
+        affinity: false,
+    };
+    let mut out = ViewBuffers::default();
+    let view = world
+        .view("m", Role::Single, &ask, false, &mut out)
+        .expect("the old pool");
+    view.in_flight.expect("the old slot is lent").at(0)
+}
+
+#[test]
+fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_ends_on_its_own_count() {
+    let store = MemoryStore::new();
+    let left = publisher(&store, "http://a:1", 0);
+    store.publish_now();
+    let before = store.world();
+    let slot = before.booked_of(left).expect("the leaver's slot");
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let lease = booking(gateway, 1, left, now);
+    let leases: &dyn LeasesStore = &store;
+    leases.set_term(1);
+    leases.issue(lease).expect("filed");
+    store.gateway_veto(gateway, left, Some(now + Duration::from_secs(60)));
+    HealthSink::completed(&store, gateway, left, TransportClass::Ok, now);
+    SessionsStore::pin(&store, 1, left, now, None);
+    LoadSink::record(&store, left, 0, row(0), now, LoadSource::Stream);
+    assert_eq!(
+        store.admit(left, 0, batch(1), &one_block(1)),
+        BatchOutcome::Applied
+    );
+
+    let source = MemoryStore::new();
+    let joined = ready(&source, "http://b:1");
+    LoadSink::record(&source, joined, 0, row(0), now, LoadSource::Stream);
+    assert!(store.watch_from(source.cut(Kinds::All)));
+    assert_eq!(leases.get(gateway, lease.lease.id), Some(lease));
+    assert_eq!(held_count(&before, gateway, now), 1);
+    assert_ne!(store.world().booked_of(joined), Some(slot));
+    assert_eq!(in_flight(&store), [(joined, 0)]);
+    assert!(WorkersStore::by_key(&store, "http://a:1").is_none());
+    assert!(!store.vetoed(gateway, left, now));
+    assert!(!store.completed_ok_since(gateway, left, now));
+    assert!(LoadSink::load(&store, left, 0).is_none());
+    assert!(
+        LoadSink::load(&store, joined, 0).is_none(),
+        "the cut's load is ignored"
+    );
+    assert_eq!(store.kv().held_blocks("m"), 0);
+    assert_eq!(
+        SessionsStore::lookup(&store, 1).map(|pin| pin.worker),
+        Some(left)
+    );
+    assert!(leases.released(gateway, lease.lease.id, None, ReleaseReason::ClientGone));
+    assert_eq!(held_count(&before, gateway, now), 0);
+    assert_eq!(in_flight(&store), [(joined, 0)]);
+    LoadSink::record(&store, joined, 0, row(0), now, LoadSource::Stream);
+    assert!(LoadSink::load(&store, joined, 0).is_some());
+}
+
+#[test]
+fn a_watch_snapshot_gives_a_new_incarnation_its_own_count() {
+    let store = MemoryStore::new();
+    let key = "http://a:1";
+    let old = ready(&store, key);
+    let before = store.world();
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let lease = booking(gateway, 1, old, now);
+    let leases: &dyn LeasesStore = &store;
+    leases.set_term(1);
+    leases.issue(lease).expect("filed");
+
+    let source = MemoryStore::new();
+    assert_eq!(ready(&source, key), old);
+    let new = source.upsert(facts(key, 2)).id();
+    assert!(store.watch_from(source.cut(Kinds::Watched)));
+    assert_eq!(store.by_key(key).map(|row| row.id), Some(new));
+    assert!(WorkersStore::get(&store, old).is_none());
+    assert_eq!(in_flight(&store), [(new, 0)]);
+    assert_eq!(held_count(&before, gateway, now), 1);
+    assert!(leases.released(gateway, lease.lease.id, None, ReleaseReason::ClientGone));
+    assert_eq!(held_count(&before, gateway, now), 0);
+    assert_eq!(in_flight(&store), [(new, 0)]);
+}
+
+#[test]
+fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
+    use crate::{
+        view::{Candidate, RequestFacts},
+        AppliedSpec, Catalog, Lifecycle, PolicySpec, Scorer, TieBand,
+    };
+
+    #[derive(Debug)]
+    struct Heard(Arc<Mutex<Vec<String>>>);
+
+    impl Lifecycle for Heard {
+        fn on_membership(&self, change: &Membership<'_>) {
+            self.0
+                .lock()
+                .expect("the stage heard")
+                .push(format!("{change:?}"));
+        }
+    }
+
+    impl Scorer for Heard {
+        fn name(&self) -> &'static str {
+            "heard"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+    }
+
+    let store = MemoryStore::new();
+    let id = ready(&store, "http://a:1");
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let mut catalog = Catalog::builtin();
+    let events = Arc::clone(&heard);
+    catalog
+        .scorer("heard", move || Box::new(Heard(Arc::clone(&events))))
+        .expect("a free name");
+    let document: PolicySpec = serde_json::from_str(
+        r#"{"apiVersion":"smg.policy/v1","generation":1,"view":{"labels":["zone=b"]},"profiles":{"p":{"score":["heard"],"pick":"best"}}}"#,
+    ).expect("a policy document");
+    let spec =
+        AppliedSpec::validate_digested(&document, document.digest().expect("the digest"), &catalog)
+            .expect("a generation");
+    store.apply(spec).expect("the generation is applied");
+
+    let mut cut = store.cut(Kinds::Watched);
+    let earlier = cut.epoch;
+    // The same revision can name other facts in another history.
+    cut.rows[0]
+        .facts
+        .labels
+        .insert("zone".to_owned(), "b".to_owned());
+    cut.rows[0].status = WorkerStatus::Draining;
+    cut.epoch += 2;
+    let epoch = cut.epoch;
+    store.upsert(facts("http://owed:1", 1));
+    assert!(store.publish_due().is_some(), "a build is owed");
+    heard.lock().expect("the stage heard").clear();
+    assert!(store.watch_from(cut));
+    assert_eq!(store.world().epoch(), epoch);
+    assert_eq!(store.epoch(), epoch);
+    assert_eq!(store.history(), 1);
+    assert_eq!(
+        store.changes_since(earlier),
+        MembershipTail::SnapshotRequired
+    );
+    assert_eq!(store.publish_due(), None);
+    assert_eq!(store.filed_members(), 0);
+    let ask = Ask {
+        gateway: GatewayId(1),
+        now: Instant::now(),
+        pinned: None,
+        affinity: false,
+    };
+    let mut out = ViewBuffers::default();
+    store
+        .build_view("m", Role::Single, &ask, &mut out)
+        .expect("the pool");
+    assert_eq!(out.candidates.len(), 1);
+    assert_eq!(out.candidates[0].id, id);
+    assert_eq!(out.candidates[0].labels, 1, "the cut's labels");
+    assert!(out.candidates[0].health.draining, "the cut's status");
+    let snapshot = Membership::Snapshot(&[id]);
+    assert_eq!(
+        *heard.lock().expect("the stage heard"),
+        [format!("{snapshot:?}")]
+    );
+}
+
+#[test]
+fn a_watch_snapshot_the_journal_refuses_changes_nothing() {
+    let store = MemoryStore::journaled(Arc::new(Log::new(8, 8)));
+    let id = ready(&store, "http://a:1");
+    store.set_term(3);
+    let before = store.cut(Kinds::Watched);
+    let world = store.world();
+    let source = MemoryStore::new();
+    ready(&source, "http://b:1");
+    let mut cut = source.cut(Kinds::Watched);
+    cut.at = Position { seq: 1, term: 2 };
+    assert!(!store.watch_from(cut));
+    let after = store.cut(Kinds::Watched);
+    assert_eq!(
+        (after.at, after.epoch, after.rows),
+        (before.at, before.epoch, before.rows)
+    );
+    assert_eq!(store.history(), 0);
+    assert!(Arc::ptr_eq(&store.world(), &world));
+    assert_eq!(in_flight(&store), [(id, 0)]);
 }
 
 /// A journal that takes every place, and whose restart waits inside the

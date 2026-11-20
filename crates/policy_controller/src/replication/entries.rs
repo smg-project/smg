@@ -38,7 +38,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("WorkersStore", "epoch", Fate::Read),
     ("WorkersStore", "snapshot", Fate::Read),
     ("WorkersStore", "changes_since", Fate::Read),
-    // A replica's own count of the restores it took: nothing of it crosses.
+    // Each replica counts the snapshots it takes.
     ("WorkersStore", "history", Fate::Read),
     // The status a verdict moves is journaled as the status write it makes.
     // The streak between two moves is the prober's own count: a promoted
@@ -129,6 +129,11 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
         "MemoryStore",
         "restore_from",
         Fate::Rebuilt("the journal starts again: a reader re-syncs from this store's own snapshot"),
+    ),
+    (
+        "MemoryStore",
+        "watch_from",
+        Fate::Rebuilt("a follower takes the worker rows from a watch snapshot"),
     ),
     // The three doors for a followed write, one a kind of the leader's
     // events: each is the standby's side of a journaled write.
