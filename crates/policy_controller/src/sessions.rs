@@ -99,8 +99,10 @@ impl Claim {
     /// or its own `target` where no pin came in: the pins moved, a claim
     /// was withdrawn, or a worker left. That last answer is the
     /// decision's own pick, and no pin for another decision to follow.
+    /// The pins are read in place: a claim that is taken loads no pin it
+    /// does not test.
     #[inline(always)]
-    pub(crate) fn standing(held: Pins, seen: Pins, target: WorkerId) -> Option<WorkerId> {
+    pub(crate) fn standing(held: &Pins, seen: &Pins, target: WorkerId) -> Option<WorkerId> {
         if held == seen {
             return None;
         }
@@ -251,8 +253,7 @@ impl SessionTable {
         }
         let mut shard = self.shard(key).lock();
         let entry = shard.entry(key).or_default();
-        let held = entry.pins;
-        let Some(owner) = Claim::standing(held, seen, target) else {
+        let Some(owner) = Claim::standing(&entry.pins, &seen, target) else {
             match entry.recovery {
                 Recovery::Latest => entry.front(target),
                 Recovery::Original => entry.append(target),
@@ -260,7 +261,7 @@ impl SessionTable {
             entry.claim = target;
             return Claim::Made(target);
         };
-        Claim::Standing(owner, held)
+        Claim::Standing(owner, entry.pins)
     }
 
     /// A pin of record read for a key the table held no pin of (a key it
@@ -711,8 +712,11 @@ mod tests {
             Claim::Standing(WorkerId(7), held)
         );
         assert_eq!(table.pins(s(3)), Some(held), "nothing is recorded");
-        assert_eq!(Claim::standing(held, seen, WorkerId(8)), Some(WorkerId(8)));
-        assert_eq!(Claim::standing(seen, seen, WorkerId(8)), None);
+        assert_eq!(
+            Claim::standing(&held, &seen, WorkerId(8)),
+            Some(WorkerId(8))
+        );
+        assert_eq!(Claim::standing(&seen, &seen, WorkerId(8)), None);
     }
 
     /// The owner is down, the decision claims B, the commit refuses B and

@@ -4643,7 +4643,7 @@ impl Engine {
                     // pins and its own pick, as the table does. Where no
                     // pin came in, the table's answer was the live pick:
                     // that is no pin, and the shadow keeps its own.
-                    match Claim::standing(found.standing, pins, first) {
+                    match Claim::standing(&found.standing, &pins, first) {
                         Some(owner) => Claim::Standing(owner, found.standing),
                         None => return decision,
                     }
