@@ -236,6 +236,63 @@ fn a_watcher_tails_the_changes_after_its_epoch_and_snapshots_again_past_the_log(
 }
 
 #[test]
+fn snapshot_sort_does_not_hold_the_workers_lock() {
+    let store = Arc::new(MemoryStore::new());
+    let id = store.upsert(facts("http://c:8000", 1)).id();
+    store.upsert(facts("http://a:8000", 1));
+    store.upsert(facts("http://b:8000", 1));
+    let revision = WorkersStore::get(store.as_ref(), id)
+        .expect("the row")
+        .revision;
+    let epoch = store.epoch();
+    let (cloned, resume) = store.pause_snapshot_after_clone();
+
+    let snapshot_store = Arc::clone(&store);
+    let snapshot = std::thread::spawn(move || WorkersStore::snapshot(snapshot_store.as_ref()));
+    cloned
+        .recv_timeout(PATIENCE)
+        .expect("snapshot reached the sort");
+
+    let writer_store = Arc::clone(&store);
+    let (written_tx, written_rx) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let change = writer_store.set_status(id, WorkerStatus::Ready, revision);
+        written_tx
+            .send(change)
+            .expect("the test receives the write");
+    });
+    let written_while_paused = written_rx.recv_timeout(PATIENCE);
+
+    resume.send(()).expect("resume the snapshot");
+    let (snapshot_epoch, rows) = snapshot.join().expect("snapshot thread");
+    writer.join().expect("writer thread");
+    assert_eq!(snapshot_epoch, epoch, "epoch was read with the rows");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.facts.key.as_str())
+            .collect::<Vec<_>>(),
+        ["http://a:8000", "http://b:8000", "http://c:8000"],
+        "snapshot rows are ordered by key"
+    );
+    assert_eq!(
+        rows.iter().find(|row| row.id == id).map(|row| row.status),
+        Some(WorkerStatus::Pending),
+        "the snapshot keeps the row copied before the status write"
+    );
+    assert!(
+        matches!(
+            written_while_paused,
+            Ok(Some(MembershipChange::StatusChanged {
+                id: changed,
+                from: WorkerStatus::Pending,
+                to: WorkerStatus::Ready,
+            })) if changed == id
+        ),
+        "status write waited for snapshot sorting"
+    );
+}
+
+#[test]
 fn probe_outcomes_follow_the_rows_thresholds_and_a_stale_outcome_is_dropped() {
     let store = MemoryStore::new();
     let health: &dyn HealthSink = &store;
