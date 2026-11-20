@@ -762,6 +762,8 @@ impl GrammarStart {
 
 // ── Core identity ────────────────────────────────────────────────────
 
+const REDACTED_API_KEY: &str = "<redacted>";
+
 /// Core worker identity and configuration.
 ///
 /// The single canonical representation of "what is a worker". Used as the
@@ -771,7 +773,7 @@ impl GrammarStart {
 /// Fields use `#[serde(default)]` so the same struct works for both input
 /// (partial config from user) and output (fully resolved state).
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkerSpec {
     /// Worker URL.
     pub url: String,
@@ -914,6 +916,77 @@ pub struct WorkerSpec {
     /// protection for this worker even when the gateway leaves it off.
     #[serde(default, skip_serializing_if = "OverloadUpdate::is_empty")]
     pub overload: OverloadUpdate,
+}
+
+impl std::fmt::Debug for WorkerSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // List every field so new fields require a formatting decision.
+        let Self {
+            url,
+            models,
+            worker_type,
+            connection_mode,
+            runtime_type,
+            provider,
+            labels,
+            priority,
+            cost,
+            api_key,
+            bootstrap_port,
+            bootstrap_host,
+            dp_base_url,
+            dp_rank,
+            dp_size,
+            kv_connector,
+            kv_role,
+            kv_engine_id,
+            kv_block_size,
+            pairing_protocol,
+            constrained_decoding,
+            health,
+            http_pool,
+            resilience,
+            max_connection_attempts,
+            load_monitor_interval_secs,
+            multimodal_tensor_transport,
+            multimodal_shm_min_bytes,
+            zmq_handshake_address,
+            overload,
+        } = self;
+
+        f.debug_struct("WorkerSpec")
+            .field("url", url)
+            .field("models", models)
+            .field("worker_type", worker_type)
+            .field("connection_mode", connection_mode)
+            .field("runtime_type", runtime_type)
+            .field("provider", provider)
+            .field("labels", labels)
+            .field("priority", priority)
+            .field("cost", cost)
+            .field("api_key", &api_key.is_some().then_some(REDACTED_API_KEY))
+            .field("bootstrap_port", bootstrap_port)
+            .field("bootstrap_host", bootstrap_host)
+            .field("dp_base_url", dp_base_url)
+            .field("dp_rank", dp_rank)
+            .field("dp_size", dp_size)
+            .field("kv_connector", kv_connector)
+            .field("kv_role", kv_role)
+            .field("kv_engine_id", kv_engine_id)
+            .field("kv_block_size", kv_block_size)
+            .field("pairing_protocol", pairing_protocol)
+            .field("constrained_decoding", constrained_decoding)
+            .field("health", health)
+            .field("http_pool", http_pool)
+            .field("resilience", resilience)
+            .field("max_connection_attempts", max_connection_attempts)
+            .field("load_monitor_interval_secs", load_monitor_interval_secs)
+            .field("multimodal_tensor_transport", multimodal_tensor_transport)
+            .field("multimodal_shm_min_bytes", multimodal_shm_min_bytes)
+            .field("zmq_handshake_address", zmq_handshake_address)
+            .field("overload", overload)
+            .finish()
+    }
 }
 
 impl WorkerSpec {
@@ -1424,7 +1497,7 @@ impl ResilienceUpdate {
 
 /// Worker update request
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkerUpdateRequest {
     /// Update priority
     pub priority: Option<u32>,
@@ -1440,6 +1513,26 @@ pub struct WorkerUpdateRequest {
 
     /// Update health check configuration (partial — only specified fields change)
     pub health: Option<HealthCheckUpdate>,
+}
+
+impl std::fmt::Debug for WorkerUpdateRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            priority,
+            cost,
+            labels,
+            api_key,
+            health,
+        } = self;
+
+        f.debug_struct("WorkerUpdateRequest")
+            .field("priority", priority)
+            .field("cost", cost)
+            .field("labels", labels)
+            .field("api_key", &api_key.is_some().then_some(REDACTED_API_KEY))
+            .field("health", health)
+            .finish()
+    }
 }
 
 // ── Request types ───────────────────────────────────────────────────
@@ -2545,5 +2638,73 @@ mod constrained_decoding_tests {
             r#"{"url":"http://w:8000","constrained_decoding":"sometimes"}"#
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::{WorkerSpec, WorkerUpdateRequest};
+
+    #[test]
+    fn a_spec_prints_no_api_key() {
+        let marker = "pebble";
+        let mut spec = WorkerSpec::new("http://worker:8000");
+        spec.api_key = Some(marker.to_string());
+
+        let compact = format!("{spec:?}");
+        let pretty = format!("{spec:#?}");
+        assert!(!compact.contains(marker));
+        assert!(!pretty.contains(marker));
+        assert!(compact.contains(r#"api_key: Some("<redacted>")"#));
+        assert!(pretty.contains("api_key: Some(\n        \"<redacted>\",\n    )"));
+
+        spec.api_key = None;
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(text.contains("api_key: None"));
+        }
+    }
+
+    #[test]
+    fn a_key_rotation_request_prints_no_api_key() {
+        let marker = "cedar";
+        let mut request = WorkerUpdateRequest {
+            priority: Some(73),
+            cost: None,
+            labels: None,
+            api_key: Some(marker.to_string()),
+            health: None,
+        };
+
+        let compact = format!("{request:?}");
+        let pretty = format!("{request:#?}");
+        assert!(!compact.contains(marker));
+        assert!(!pretty.contains(marker));
+        assert!(compact.contains(r#"api_key: Some("<redacted>")"#));
+        assert!(pretty.contains("api_key: Some(\n        \"<redacted>\",\n    )"));
+
+        request.api_key = None;
+        let expected = "WorkerUpdateRequest { priority: Some(73), cost: None, labels: None, api_key: None, health: None }";
+        assert!(format!("{request:?}") == expected);
+        assert!(format!("{request:#?}").contains("api_key: None"));
+    }
+
+    #[test]
+    fn a_spec_still_prints_its_other_fields() {
+        let spec = WorkerSpec {
+            priority: 73,
+            ..WorkerSpec::new("http://worker:8000")
+        };
+
+        let text = format!("{spec:?}");
+        assert!(text.starts_with(r#"WorkerSpec { url: "http://worker:8000","#));
+        assert!(text.contains("priority: 73"));
+
+        let pretty = format!("{spec:#?}");
+        let field_count = pretty
+            .lines()
+            .filter_map(|line| line.strip_prefix("    "))
+            .filter(|line| line.starts_with(|c: char| c.is_ascii_lowercase()))
+            .count();
+        assert_eq!(field_count, 30);
     }
 }
