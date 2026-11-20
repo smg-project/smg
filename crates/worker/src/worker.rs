@@ -1818,10 +1818,13 @@ pub struct SchedulerLoadSnapshot {
                        states."
     )]
     pub values: Vec<NamedValue>,
-    /// The parts of this entry that its own record did not carry: the load
-    /// monitor kept them from an older record of the rank. Empty for a
-    /// polled answer and for a rank's first record. Never serialized: an
-    /// answer on the wire states its figures and no mark.
+    /// The parts of this entry that its own source did not state, written
+    /// by [`Self::mark_stated`] alone. A pushed record's are the parts it
+    /// left out: the load monitor kept them from an older record of the
+    /// rank, or the rank has none of them yet. A rank that reports no
+    /// token capacity states neither fixed token count, whatever its
+    /// source. Empty where the source stated every part. Never
+    /// serialized: an answer on the wire states its figures and no mark.
     #[serde(skip)]
     #[schemars(skip)]
     pub kept: LoadTelemetry,
@@ -1836,20 +1839,51 @@ impl SchedulerLoadSnapshot {
     /// states: the first of a name stands. The kept entries keep their
     /// order.
     ///
+    /// A polled answer has no key that says which figures it stated, so
+    /// the snapshot is marked as one whose source carried every part
+    /// ([`Self::mark_stated`]): the capacity rule alone marks it.
+    ///
     /// The load monitor passes every polled answer through this and counts
     /// what it answers. A pushed record's snapshot is built under the same
-    /// bounds. A host that takes an answer by a way of its own calls this
+    /// bounds and marked by the same routine, under what the record
+    /// carried. A host that takes an answer by a way of its own calls this
     /// before it reads the list.
     pub fn bound_values(&mut self) -> usize {
+        self.mark_stated(LoadTelemetry::all());
         value_bounds::bound(&mut self.values)
     }
 
+    /// Marks the parts this snapshot's source did not state
+    /// ([`Self::kept`]). `carried` is the source's own word on what it
+    /// stated: a pushed record's telemetry, or every part for a polled
+    /// answer. The one place the mark is written, so one rule holds for
+    /// every source.
+    ///
+    /// A rank that reports no token capacity states neither fixed token
+    /// count, carried or not. An engine that reports its counts reports
+    /// its capacity ([`WorkerLoadResponse::has_absolute_token_data`]), so
+    /// such a rank's zero is no statement: an engine that keeps no such
+    /// size fills both counts with zero on every record.
+    ///
+    /// Called where a snapshot is made: by a pushed record
+    /// ([`LoadRecord::snapshot`]) and by [`Self::bound_values`]. A mark is
+    /// only added: an entry that passes through this again keeps the mark
+    /// it bears.
+    pub fn mark_stated(&mut self, carried: LoadTelemetry) {
+        self.kept |= LoadTelemetry::all().difference(carried);
+        if self.max_total_num_tokens <= 0 {
+            self.kept |= LoadTelemetry::USED_TOKENS | LoadTelemetry::TOTAL_TOKENS;
+        }
+    }
+
     /// Values the engine reports by name, followed by the two fixed token
-    /// counts, each where it is nonzero, its name is absent from the list
-    /// and this snapshot's own record carried it. A count the entry kept
-    /// from an older record ([`Self::kept`]) is not offered: what a
-    /// snapshot offers by name is its own record's. Missing fixed counts
-    /// are stored as zero.
+    /// counts, each where this snapshot's own record stated it and its
+    /// name is absent from the list. A stated count is offered at zero
+    /// too: an engine that goes idle states zero tokens held, and a reader
+    /// that keeps the last value it read must hear it. A count the record
+    /// did not state ([`Self::kept`]) is not offered: what a snapshot
+    /// offers by name is its own record's. Such a count is stored as zero,
+    /// or as the last record's.
     pub fn named_values(&self) -> impl Iterator<Item = NamedValue> + '_ {
         let [used, capacity, tokens] = &*FIXED_COUNT_NAMES;
         let fixed = [
@@ -1861,10 +1895,8 @@ impl SchedulerLoadSnapshot {
             ),
         ]
         .into_iter()
-        .filter(|&(name, count, part)| {
-            count != 0
-                && !self.kept.contains(part)
-                && !self.values.iter().any(|value| value.name == *name)
+        .filter(|&(name, _, part)| {
+            !self.kept.contains(part) && !self.values.iter().any(|value| value.name == *name)
         })
         .map(move |(name, count, _)| NamedValue {
             name: Arc::clone(name),
@@ -1912,7 +1944,9 @@ pub trait LoadRecord {
     fn telemetry(&self) -> LoadTelemetry;
 
     /// The rank's entry from the record, with omitted telemetry at the
-    /// type's default. The rank is the caller's to set.
+    /// type's default, marked with what the record did not state
+    /// ([`SchedulerLoadSnapshot::mark_stated`] under [`Self::telemetry`]).
+    /// The rank is the caller's to set.
     fn snapshot(&self) -> SchedulerLoadSnapshot;
 
     /// How many values the record names, ahead of the bounds its snapshot
@@ -2470,10 +2504,15 @@ mod load_snapshot_tests {
 
     #[test]
     fn named_values_offer_the_fixed_token_counts_independently() {
-        let mut snapshot = SchedulerLoadSnapshot::default();
+        // A record that stated neither count.
+        let mut snapshot = SchedulerLoadSnapshot {
+            kept: LoadTelemetry::USED_TOKENS | LoadTelemetry::TOTAL_TOKENS,
+            ..Default::default()
+        };
         assert!(snapshot.named_values().next().is_none());
 
         snapshot.num_used_tokens = 211;
+        snapshot.kept = LoadTelemetry::TOTAL_TOKENS;
         let used = NamedValue {
             name: "kv_tokens_used".into(),
             unit: "tokens".into(),
@@ -2486,6 +2525,7 @@ mod load_snapshot_tests {
         );
 
         snapshot.max_total_num_tokens = 1_373;
+        snapshot.kept = LoadTelemetry::empty();
         let capacity = NamedValue {
             name: "kv_tokens_capacity".into(),
             unit: "tokens".into(),
@@ -2502,8 +2542,99 @@ mod load_snapshot_tests {
         }));
         assert!(Arc::ptr_eq(&values[0].unit, &values[1].unit));
 
+        // A stated count is offered at zero: an idle engine holds none.
         snapshot.num_used_tokens = 0;
-        assert_eq!(snapshot.named_values().collect::<Vec<_>>(), [capacity]);
+        let idle = NamedValue {
+            value: 0.0,
+            ..values[0].clone()
+        };
+        assert_eq!(
+            snapshot.named_values().collect::<Vec<_>>(),
+            [idle, capacity]
+        );
+        // The mark alone rules the offer: a capacity it does not name is
+        // offered at zero too.
+        snapshot.max_total_num_tokens = 0;
+        let offered: Vec<_> = snapshot.named_values().map(|value| value.value).collect();
+        assert_eq!(offered, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn one_routine_marks_a_snapshot_for_every_source() {
+        let counts = LoadTelemetry::USED_TOKENS | LoadTelemetry::TOTAL_TOKENS;
+        let marked = |capacity: i32, carried: LoadTelemetry| {
+            let mut snapshot = SchedulerLoadSnapshot {
+                num_used_tokens: 211,
+                max_total_num_tokens: capacity,
+                ..Default::default()
+            };
+            snapshot.mark_stated(carried);
+            snapshot.kept
+        };
+        // A capacity: the mark is what the source did not carry.
+        assert_eq!(marked(1_373, LoadTelemetry::all()), LoadTelemetry::empty());
+        assert_eq!(
+            marked(
+                1_373,
+                LoadTelemetry::all().difference(LoadTelemetry::USED_TOKENS)
+            ),
+            LoadTelemetry::USED_TOKENS
+        );
+        assert_eq!(
+            marked(1_373, counts),
+            LoadTelemetry::all().difference(counts)
+        );
+        // No capacity, zero or negative: neither count is stated, carried
+        // or not.
+        for capacity in [0, -1] {
+            assert_eq!(marked(capacity, LoadTelemetry::all()), counts);
+            assert_eq!(marked(capacity, counts), LoadTelemetry::all());
+        }
+        // A mark is only added: an entry that is bounded again keeps the
+        // mark it bears.
+        let mut entry = SchedulerLoadSnapshot {
+            max_total_num_tokens: 1_373,
+            kept: LoadTelemetry::USED_TOKENS | LoadTelemetry::MEMORY,
+            ..Default::default()
+        };
+        assert_eq!(entry.bound_values(), 0);
+        assert_eq!(
+            entry.kept,
+            LoadTelemetry::USED_TOKENS | LoadTelemetry::MEMORY
+        );
+    }
+
+    #[test]
+    fn a_polled_rank_with_no_token_capacity_states_neither_fixed_count() {
+        let names = |snapshot: &SchedulerLoadSnapshot| -> Vec<(String, f64)> {
+            snapshot
+                .named_values()
+                .map(|value| (value.name.to_string(), value.value))
+                .collect()
+        };
+        // No capacity: the answer's zero, or a count beside it, is no
+        // statement.
+        for used in [0, 211] {
+            let mut polled = SchedulerLoadSnapshot {
+                num_used_tokens: used,
+                ..Default::default()
+            };
+            assert_eq!(polled.bound_values(), 0);
+            assert!(names(&polled).is_empty(), "{used} used");
+        }
+        // A capacity: both counts are the engine's, the zero too.
+        let mut polled = SchedulerLoadSnapshot {
+            max_total_num_tokens: 1_373,
+            ..Default::default()
+        };
+        assert_eq!(polled.bound_values(), 0);
+        assert_eq!(
+            names(&polled),
+            [
+                (KV_TOKENS_USED.to_owned(), 0.0),
+                (KV_TOKENS_CAPACITY.to_owned(), 1_373.0)
+            ]
+        );
     }
 
     #[test]

@@ -506,9 +506,10 @@ type EngineAnswer = Vec<(Arc<dyn Worker>, Option<WorkerLoadResponse>)>;
 /// the engine's figures between heartbeats. Absent is absent: a section the
 /// engine never reports stays unset. `previous` is the rank's entry the
 /// record replaces; what it keeps moves out of it. `carried` is the
-/// record's own word on what it carries. The entry is marked with the
-/// parts it kept (`SchedulerLoadSnapshot::kept`), so what it offers by
-/// name is its own record's.
+/// record's own word on what it carries. The mark of what the record did
+/// not state (`SchedulerLoadSnapshot::kept`) is the fresh snapshot's own,
+/// written at its making: what the entry offers by name is its own
+/// record's, and nothing here sets the mark.
 fn keep_telemetry(
     fresh: &mut SchedulerLoadSnapshot,
     previous: SchedulerLoadSnapshot,
@@ -536,7 +537,6 @@ fn keep_telemetry(
         fresh.decode_queue_reqs = previous.decode_queue_reqs;
         fresh.disagg_mode = previous.disagg_mode;
     }
-    fresh.kept = LoadTelemetry::all().difference(carried);
 }
 
 /// A pushed record is sampled this much before its receipt on top of its own
