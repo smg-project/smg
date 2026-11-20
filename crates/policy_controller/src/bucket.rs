@@ -64,6 +64,8 @@
 //! decision whose size no listed survivor owns a range for: the picker's
 //! draw places those.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc, time::Instant};
 
 use arc_swap::ArcSwap;
@@ -123,6 +125,8 @@ pub struct Bucket {
     /// One writer of `listed` at a time. It is taken under a partition's
     /// guard and takes none itself.
     relisting: Mutex<()>,
+    #[cfg(test)]
+    membership_partition_locks: AtomicUsize,
     /// The workers the lifecycle pruned a moment ago, fenced against a
     /// listing from a view older than the pruning. One fence serves the
     /// stage: the feed names an id and not its pool, and a partition made
@@ -227,6 +231,8 @@ impl Bucket {
             partitions: ArcSwap::from_pointee(FxHashMap::default()),
             listed: ArcSwap::from_pointee(FxHashMap::default()),
             relisting: Mutex::new(()),
+            #[cfg(test)]
+            membership_partition_locks: AtomicUsize::new(0),
             fence: Mutex::new(Fence::default()),
         }
     }
@@ -800,7 +806,13 @@ impl Lifecycle for Bucket {
             _ => FxHashSet::default(),
         };
         match *change {
-            Membership::Added(id) => self.fence.lock().admit(id),
+            // A worker joins from a view of its pool. An add, relabel or
+            // resize changes no listing, so none needs a partition's guard.
+            Membership::Added(id) => {
+                self.fence.lock().admit(id);
+                return;
+            }
+            Membership::Relabelled(_) | Membership::Resized(_) => return,
             Membership::Removed(id) => self.fence.lock().retire(id, now),
             Membership::Replaced { old, new } => {
                 let mut fence = self.fence.lock();
@@ -831,12 +843,14 @@ impl Lifecycle for Bucket {
                     fence.retire(id, now);
                 }
             }
-            // A relabel and a resize prune nobody. Nor does a worker that
-            // left a model: it serves on, and the fence names no model, so
+            // A worker that left a model serves on. The fence names no model, so
             // a view older than the word may list it under that model again.
-            Membership::Relabelled(_) | Membership::Resized(_) | Membership::Left { .. } => {}
+            Membership::Left { .. } => {}
         }
         for (model, partition) in self.partitions.load().iter() {
+            #[cfg(test)]
+            self.membership_partition_locks
+                .fetch_add(1, AtomicOrdering::Relaxed);
             let mut pool = partition.lock();
             let listed = pool.members.len();
             let renamed = match *change {
@@ -871,8 +885,7 @@ impl Lifecycle for Bucket {
                     }
                     false
                 }
-                // A worker joins from a view of its pool: the feed names an
-                // id and not the pool it serves.
+                // These events return before the partition walk.
                 Membership::Added(_) | Membership::Relabelled(_) | Membership::Resized(_) => false,
             };
             // The index follows a listing that changed, under its guard.
@@ -1612,6 +1625,19 @@ mod tests {
         }
         assert_eq!(led(&scorer, &pool, 3_000, 17 * SECOND), Some(2));
         assert_eq!(loads(&scorer), (vec![0, 0, 0], 0));
+    }
+
+    #[test]
+    fn membership_changes_that_do_not_change_listings_lock_no_partitions() {
+        let (scorer, pool) = booked(NEVER, 1.5, &[0]);
+        let id = pool[0].id;
+        scorer.on_membership(&Membership::Added(id));
+        scorer.on_membership(&Membership::Relabelled(id));
+        scorer.on_membership(&Membership::Resized(id));
+        let locks = scorer
+            .membership_partition_locks
+            .load(AtomicOrdering::Relaxed);
+        assert_eq!(locks, 0);
     }
 
     /// A worker a registration took off a model is unlisted under that
