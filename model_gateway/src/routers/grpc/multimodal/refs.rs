@@ -16,8 +16,8 @@ use llm_multimodal::{
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
 use smg_worker::{
-    identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
-    labels::SUPPORTS_VISION_LABEL,
+    identity::basic::{RuntimeType, Worker, WorkerType},
+    labels::{self, SUPPORTS_VISION_LABEL},
 };
 
 use super::{
@@ -41,7 +41,9 @@ use crate::{
 };
 
 /// Worker label carrying the advertised backend (`GetServerInfo.mm_processor`).
-pub(crate) const MM_PROCESSOR_LABEL: &str = "mm_processor";
+/// The worker crate reads it; the cases here name it.
+#[cfg(test)]
+pub(crate) const MM_PROCESSOR_LABEL: &str = labels::MM_PROCESSOR_LABEL;
 /// Worker label carrying accepted URL schemes (`GetServerInfo.mm_media_ref_schemes`).
 pub(crate) const MM_MEDIA_REF_SCHEMES_LABEL: &str = "mm_media_ref_schemes";
 /// The `mm_processor` value of a worker that runs the gateway's own media
@@ -49,7 +51,7 @@ pub(crate) const MM_MEDIA_REF_SCHEMES_LABEL: &str = "mm_media_ref_schemes";
 /// exactly as the gateway would, so a spec's opt-in for the engine's prompt
 /// updates (`worker_expandable`) does not bind it; it takes image and video
 /// references, never audio.
-pub(crate) const GATEWAY_PIPELINE_PROCESSOR: &str = "smg";
+pub(crate) const GATEWAY_PIPELINE_PROCESSOR: &str = labels::HOST_PIPELINE_PROCESSOR;
 
 /// Where one request's media is fetched and preprocessed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,20 +241,10 @@ impl std::fmt::Display for MmRefsError {
     }
 }
 
-/// Whether `worker` can fetch and process media references itself.
+/// Whether `worker` can fetch and process media references itself, by the
+/// worker crate's reading: a registration states the same fact.
 pub(crate) fn worker_accepts_media_refs(worker: &dyn Worker) -> bool {
-    let spec = &worker.metadata().spec;
-    *worker.connection_mode() == ConnectionMode::Grpc
-        && spec
-            .labels
-            .get(MM_PROCESSOR_LABEL)
-            .is_some_and(|value| match spec.runtime_type {
-                RuntimeType::Vllm => !value.is_empty(),
-                RuntimeType::Sglang => value
-                    .trim()
-                    .eq_ignore_ascii_case(GATEWAY_PIPELINE_PROCESSOR),
-                _ => false,
-            })
+    labels::media::accepts_media_refs(worker)
 }
 
 pub(crate) fn worker_supports_ec_transfer(worker: &dyn Worker) -> bool {
@@ -267,17 +259,7 @@ pub(crate) fn worker_supports_ec_transfer(worker: &dyn Worker) -> bool {
 /// Whether `worker` processes media references with the gateway's own
 /// pipeline ([`GATEWAY_PIPELINE_PROCESSOR`]) rather than the engine's.
 pub(crate) fn worker_runs_gateway_pipeline(worker: &dyn Worker) -> bool {
-    worker_accepts_media_refs(worker)
-        && worker
-            .metadata()
-            .spec
-            .labels
-            .get(MM_PROCESSOR_LABEL)
-            .is_some_and(|value| {
-                value
-                    .trim()
-                    .eq_ignore_ascii_case(GATEWAY_PIPELINE_PROCESSOR)
-            })
+    labels::media::runs_host_pipeline(worker)
 }
 
 /// Whether the plan carries a modality whose anchor only the gateway's own
@@ -971,7 +953,10 @@ mod tests {
     use std::sync::Arc;
 
     use openai_protocol::model_card::ModelCard;
-    use smg_worker::{identity::basic::WorkerType, test_support::no_health_check};
+    use smg_worker::{
+        identity::basic::{ConnectionMode, WorkerType},
+        test_support::no_health_check,
+    };
 
     use super::*;
     #[cfg(all(

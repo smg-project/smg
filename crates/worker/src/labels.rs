@@ -1,7 +1,11 @@
 //! Labels of a worker's spec: the names the worker's own code and its hosts
-//! read, and the flat map an engine's answer becomes.
+//! read, and the flat map an engine's answer becomes. With `runtime`,
+//! `media` reads what a worker's media labels say of it.
 
 use std::collections::HashMap;
+
+#[cfg(feature = "runtime")]
+pub mod media;
 
 /// Which discovery provider owns the worker: `kubernetes`, `file`, `slurm` or
 /// `consul`. A provider's registration carries it, and the health checker
@@ -22,6 +26,15 @@ pub const DISCOVERY_PROVIDER_LABEL: &str = "smg.ai/discovery-provider";
 /// engine says so in its server info instead, and that deliberate `false` is
 /// kept. An absent label reads as unknown, never as a refusal.
 pub const SUPPORTS_VISION_LABEL: &str = "supports_vision";
+
+/// The label that carries the media processor a worker's server info
+/// reports. A worker that states one its runtime serves references with
+/// fetches and processes media references itself.
+pub const MM_PROCESSOR_LABEL: &str = "mm_processor";
+
+/// The media processor of a worker that runs its host's own media pipeline
+/// in place of its engine's processor.
+pub const HOST_PIPELINE_PROCESSOR: &str = "smg";
 
 /// Whether text contains a Unicode control character.
 pub fn has_control_character(text: &str) -> bool {

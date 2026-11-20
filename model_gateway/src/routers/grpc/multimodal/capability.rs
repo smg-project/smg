@@ -15,10 +15,9 @@
 use anyhow::Result;
 use axum::response::Response;
 use llm_multimodal::{EncoderInputFormat, Modality};
-use smg_worker::{
-    identity::basic::{RuntimeType, Worker},
-    labels::SUPPORTS_VISION_LABEL,
-};
+use smg_worker::identity::basic::{RuntimeType, Worker};
+#[cfg(test)]
+use smg_worker::labels::SUPPORTS_VISION_LABEL;
 
 use super::{plan::MediaPlan, refs::worker_accepts_media_refs, MultimodalIntermediate};
 use crate::routers::{common::snapshot::WorkerRegistry, error};
@@ -28,16 +27,11 @@ use crate::routers::{common::snapshot::WorkerRegistry, error};
 /// label (non-vLLM runtimes, older servicers) reads as vision-capable so
 /// behavior stays as today.
 pub(crate) fn worker_language_model_only(worker: &dyn Worker) -> bool {
-    worker
-        .metadata()
-        .spec
-        .labels
-        .get(SUPPORTS_VISION_LABEL)
-        .is_some_and(|value| value == "false")
+    smg_worker::labels::media::language_model_only(worker)
 }
 
 /// Whether every worker registered for `model_id` runs without a vision
-/// encoder (`supports_vision=false`, see [`SUPPORTS_VISION_LABEL`]). Such a
+/// encoder (`supports_vision=false`, the worker crate's vision label). Such a
 /// pool takes no pixel payload at all: a vLLM engine admits the request and
 /// never schedules it (encoder-cache budget 0), so a request carrying images
 /// or video must be refused before any of it is decoded, preprocessed or
