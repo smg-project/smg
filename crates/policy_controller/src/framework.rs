@@ -15,6 +15,7 @@ use crate::{
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
     sent::SentCredit,
     sessions::{Assignment, Claim, Forgets, SessionRule, SessionTable, SessionVerdict},
+    signals::SignalCells,
     spec::Needs,
     view::{
         mean_in_flight, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PoolFacts,
@@ -2986,7 +2987,8 @@ struct AssignmentStages {
 /// The two pools of a pair decision: the open prefills and the decodes, each
 /// row carrying its pair class; the pair table, which says which classes
 /// pair; and beside each pool its affinity column, by the candidate's index,
-/// empty for a side nothing reads it on.
+/// empty for a side nothing reads it on, and its signal cells, none for a
+/// side whose stages read no signal.
 #[derive(Clone, Copy, Default)]
 pub struct PairPools<'a> {
     pub prefills: &'a [Candidate],
@@ -2996,6 +2998,11 @@ pub struct PairPools<'a> {
     pub prefill_affinity: &'a [AffinityFacts],
     /// The decodes' affinity facts, the same for the decode side's stages.
     pub decode_affinity: &'a [AffinityFacts],
+    /// The prefills' signal cells: what the prefill side's stages find in
+    /// [`RequestFacts::signal_cells`].
+    pub prefill_signal_cells: Option<&'a SignalCells>,
+    /// The decodes' signal cells, the same for the decode side's stages.
+    pub decode_signal_cells: Option<&'a SignalCells>,
     /// The decode classes each prefill class pairs with. Left at its
     /// default, classes pair by their number.
     pub table: PairTable<'a>,
@@ -3229,20 +3236,21 @@ enum PairSide {
 impl<'a> PairPools<'a> {
     /// One side of the pair as its stages read it: the side's pool, and the
     /// request's facts with the side's phase, its draw sequence and its own
-    /// pool's affinity column, and with no rows named: those index neither
-    /// pool. `None` when that column was not filled for that pool
-    /// ([`column_fits`]). The one place a pair's column meets its pool, so
-    /// no call site hands one side's column with the other side's
-    /// candidates.
+    /// pool's affinity column and signal cells, and with no rows named:
+    /// those index neither pool. `None` when that column was not filled
+    /// for that pool ([`column_fits`]). The one place a pair's column and
+    /// cells meet their pool, so no call site hands one side's with the
+    /// other side's candidates.
     fn side(
         self,
         side: PairSide,
         facts: &RequestFacts<'a>,
     ) -> Option<(&'a [Candidate], RequestFacts<'a>)> {
-        let (pool, affinity, phase, seed) = match side {
+        let (pool, affinity, signal_cells, phase, seed) = match side {
             PairSide::Prefill => (
                 self.prefills,
                 self.prefill_affinity,
+                self.prefill_signal_cells,
                 Phase::Prefill,
                 facts.seed,
             ),
@@ -3255,11 +3263,13 @@ impl<'a> PairPools<'a> {
             PairSide::Decode => (
                 self.decodes,
                 self.decode_affinity,
+                self.decode_signal_cells,
                 Phase::Decode,
                 Draw::new(facts.seed).next_u64(),
             ),
         };
         debug_assert_indexed(pool);
+        debug_assert_cells(signal_cells, pool);
         column_fits(affinity, pool).then(|| {
             let facts = RequestFacts {
                 phase,
@@ -3270,6 +3280,9 @@ impl<'a> PairPools<'a> {
                 // side takes them.
                 pinned_at: 0,
                 lent_in_flight: None,
+                // The side's own cells: the request's would be read by
+                // another pool's positions.
+                signal_cells,
                 ..*facts
             };
             (pool, facts)
@@ -3372,6 +3385,17 @@ fn debug_assert_indexed(pool: &[Candidate]) {
             .zip(0u32..)
             .all(|(row, index)| row.position == index),
         "a row's position is its index in the pool the decision was given"
+    );
+}
+
+/// A debug build's check of the signal cells a decision was handed: the
+/// cells of the pool's rows, the document's signals a row. A release build
+/// tests nothing before the stages run, so a decision that reads no signal
+/// pays nothing for the cells: a read outside them answers no value.
+fn debug_assert_cells(cells: Option<&SignalCells>, pool: &[Candidate]) {
+    debug_assert!(
+        cells.is_none_or(|cells| cells.fits(pool.len())),
+        "the signal cells are those of the rows the decision was given"
     );
 }
 
@@ -3981,6 +4005,7 @@ impl Engine {
             ..Trace::default()
         };
         debug_assert_indexed(candidates);
+        debug_assert_cells(facts.signal_cells, candidates);
         debug_assert_named(facts, candidates);
         debug_assert_keyed(facts, candidates);
         if !column_fits(facts.affinity, candidates) {
@@ -4205,6 +4230,7 @@ impl Engine {
         let profile = &self.profiles[usize::from(index)];
         let marks = self.marks[usize::from(index)];
         debug_assert_indexed(candidates);
+        debug_assert_cells(facts.signal_cells, candidates);
         debug_assert_named(facts, candidates);
         debug_assert_keyed(facts, candidates);
         if !column_fits(facts.affinity, candidates) {
@@ -7202,7 +7228,7 @@ mod tests {
                 decodes,
                 prefill_affinity,
                 decode_affinity,
-                table: PairTable::default(),
+                ..PairPools::default()
             },
             &Constraints::default(),
             &Constraints::default(),

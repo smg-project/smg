@@ -1727,6 +1727,11 @@ impl Asked for Request<'_> {
             // is the one source of its count.
             lent_session_in_flight: None,
             session_counted: false,
+            // Cells a caller handed are by its own list's positions too:
+            // read by the store's, an in-range read would answer another
+            // row's value. The door reads its own view's cells, and its
+            // view hands none yet.
+            signal_cells: None,
             ..self.facts
         };
         let constraints = Constraints {
@@ -5212,6 +5217,84 @@ pub(crate) mod tests {
         store.keyed(keyed(b"r-0", 7, 0).facts.session(), &mut carried);
         let booked: u32 = carried.iter().map(|&(_, count)| count).sum();
         assert_eq!(booked, 2, "{carried:?}");
+    }
+
+    /// Reads one signal of every row it scores and keeps what it read.
+    #[derive(Debug)]
+    struct ReadsHeld {
+        held: crate::SignalColumn,
+        read: Arc<Mutex<Vec<Option<f64>>>>,
+    }
+
+    impl Lifecycle for ReadsHeld {}
+
+    impl crate::Scorer for ReadsHeld {
+        fn name(&self) -> &'static str {
+            "reads-held"
+        }
+
+        fn score(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            let rows = kept.iter().map(|&row| &candidates[row as usize]);
+            let read = rows.map(|row| self.held.read(facts, row));
+            self.read.lock().extend(read);
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+
+        fn needs(&self) -> Needs {
+            Needs {
+                signal_cells: true,
+                ..Needs::default()
+            }
+        }
+    }
+
+    /// The door reads its own view's cells, never the request's: cells a
+    /// caller hands on the request's facts are by its own list's positions,
+    /// and the store's view hands none yet. Here the caller's cells hold a
+    /// value at every position the store's pool has, and every read
+    /// through the door is no value.
+    #[test]
+    fn the_door_reads_none_of_the_cells_a_caller_hands_on_the_request() {
+        let store = fleet(1);
+        let read = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&read);
+        let mut catalog = Catalog::builtin();
+        let added = catalog.scorer_with("reads-held", move |build| {
+            Ok(Box::new(ReadsHeld {
+                held: build.signal_column("held")?,
+                read: Arc::clone(&kept),
+            }))
+        });
+        added.expect("a free name");
+        let document: PolicySpec = serde_json::from_str(
+            r#"{"apiVersion":"smg.policy/v1","generation":2,
+                "signals":{"held":{"unit":"tokens"}},
+                "profiles":{"p":{"score":["reads-held"],"pick":"best"}}}"#,
+        )
+        .expect("a well-formed document");
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+        let applied = store.apply(spec.expect("the catalog holds the stage"));
+        applied.expect("a later generation");
+        let door = Door::new(Arc::clone(&store));
+        let cells = [crate::SignalCell {
+            value: 7.0,
+            sampled_at_micros: 0,
+        }; 8];
+        let cells = crate::SignalCells::new(cells.to_vec(), 1);
+        let mut hosted = request(b"r-1", 1);
+        hosted.facts.signal_cells = Some(&cells);
+        placed(&door, &hosted);
+        let read = read.lock();
+        assert!(!read.is_empty(), "the stage was asked");
+        assert!(read.iter().all(Option::is_none), "{read:?}");
     }
 
     /// One read of a key's shard names the rows that carry the key's

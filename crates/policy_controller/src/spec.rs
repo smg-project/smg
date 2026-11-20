@@ -52,6 +52,7 @@ use crate::{
     routing_key::KeySources,
     sent::SentCredit,
     sessions::SessionRule,
+    signals::SignalColumn,
     terms::Term,
     view::{threshold_permille, HashKind, Phase, MAX_REPORT_AGE_MS},
 };
@@ -237,6 +238,14 @@ pub struct Needs {
     /// summary holds the largest sample of every profile, and a decode
     /// worker's needs the larger of its two profiles'.
     pub sample: u32,
+    /// The signal cells beside the rows
+    /// ([`RequestFacts::signal_cells`](crate::RequestFacts::signal_cells)).
+    /// A stage that keeps a signal's column declares this, and no other
+    /// stage does: the validator holds every stage it builds under a
+    /// build context to both
+    /// ([`StageBuild::signal_column`](crate::StageBuild::signal_column)).
+    /// A host hands the cells where this is declared and none elsewhere.
+    pub signal_cells: bool,
 }
 
 impl Needs {
@@ -262,6 +271,7 @@ impl Needs {
             session_in_flight: self.session_in_flight || other.session_in_flight,
             affinity: self.affinity || other.affinity,
             sample: self.sample.max(other.sample),
+            signal_cells: self.signal_cells || other.signal_cells,
         }
     }
 }
@@ -1940,10 +1950,49 @@ pub struct ExplainSpec {
     pub sample: u32,
 }
 
+/// One declared signal: a named value of a worker's report that the
+/// document's stages read beside the rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SignalSpec {
+    /// The unit a source states for its value to be taken: 1 to 31 ASCII
+    /// characters with no space. It is compared byte for byte with the
+    /// unit a report states.
+    #[schemars(length(min = 1, max = 31))]
+    #[schemars(extend("pattern" = SIGNAL_UNIT_PATTERN))]
+    pub unit: String,
+    /// A value older than this reads as no value: 1 to 3,599,999, the
+    /// bound of the view's `max_report_age_ms`. A store's clock keeps one
+    /// hour, and a sample older than that stands at the clock's origin:
+    /// under a longer limit it would read as fresh. Absent: a value does
+    /// not end by its age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = MAX_REPORT_AGE_MS))]
+    pub max_age_ms: Option<u32>,
+}
+
+/// The most signals one document declares.
+pub const MAX_SIGNALS: usize = 64;
+
+/// The most bytes a signal's name takes.
+const MAX_SIGNAL_NAME: usize = 63;
+
+/// A signal's name as the schema states it: what [`check_signals`] takes.
+const SIGNAL_NAME_PATTERN: &str = "^[a-z][a-z0-9_]{0,62}$";
+
+/// The most bytes a signal's unit takes.
+const MAX_SIGNAL_UNIT: usize = 31;
+
+/// A unit's characters as the schema states them: visible ASCII, so no
+/// space. One at either end of a unit would not be seen in a document and
+/// would match no report. A unit's bytes are then its characters, so the
+/// schema's length is the one [`check_signals`] takes.
+const SIGNAL_UNIT_PATTERN: &str = "^[!-~]*$";
+
 /// The policy specification, version `smg.policy/v1`: what the host builds
-/// into the view, the per-model index settings, the profiles with their
-/// stages, the plans' rules and the ordered bindings. An unknown field at
-/// any level is refused by name.
+/// into the view, the per-model index settings, the signals its stages
+/// read, the profiles with their stages, the plans' rules and the ordered
+/// bindings. An unknown field at any level is refused by name.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PolicySpec {
@@ -1974,6 +2023,20 @@ pub struct PolicySpec {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub index: BTreeMap<String, IndexSpec>,
+    /// The signals the document's stages read, by name: a lower-case
+    /// letter, then lower-case letters, digits and underscores, at most 63
+    /// bytes. At most 64. A signal's column is its place among the names,
+    /// in name order.
+    #[serde(
+        default,
+        deserialize_with = "keyed_once",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    #[schemars(extend(
+        "maxProperties" = MAX_SIGNALS,
+        "propertyNames" = { "pattern": SIGNAL_NAME_PATTERN }
+    ))]
+    pub signals: BTreeMap<String, SignalSpec>,
     /// The profiles by name.
     #[serde(deserialize_with = "keyed_once")]
     pub profiles: BTreeMap<String, ProfileSpec>,
@@ -2395,6 +2458,62 @@ fn check_index(index: &BTreeMap<String, IndexSpec>, view: &ViewSpec) -> Result<(
         }),
         None => Ok(()),
     }
+}
+
+/// The `signals` section's checks, each refused by its path: at most
+/// [`MAX_SIGNALS`] names, each a lower-case identifier of at most 63
+/// bytes, a unit of 1 to 31 ASCII characters with no space, and a maximum
+/// age of 1 to 3,599,999 where one is written. A signal no stage reads is allowed: a host's own
+/// stage may read it.
+fn check_signals(signals: &BTreeMap<String, SignalSpec>) -> Result<(), SpecError> {
+    if signals.len() > MAX_SIGNALS {
+        return Err(SpecError::TooManyListed {
+            path: "signals",
+            count: signals.len(),
+            max: MAX_SIGNALS,
+        });
+    }
+    for (name, spec) in signals {
+        let mut bytes = name.bytes();
+        let named = name.len() <= MAX_SIGNAL_NAME
+            && bytes.next().is_some_and(|first| first.is_ascii_lowercase())
+            && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        if !named {
+            return Err(SpecError::BadField {
+                path: "signals".to_owned(),
+                value: name.clone(),
+                reason: "a lower-case name of letters, digits and underscores, at most 63 bytes",
+            });
+        }
+        // The key's path is built at a refusal alone.
+        let at = || At::new(format!("signals.{name}"));
+        let visible = spec.unit.bytes().all(|b| b.is_ascii_graphic());
+        if spec.unit.is_empty() || spec.unit.len() > MAX_SIGNAL_UNIT || !visible {
+            return Err(at().bad(
+                "unit",
+                format!("{:?}", spec.unit),
+                "a unit of 1 to 31 ASCII characters with no space",
+            ));
+        }
+        match spec.max_age_ms {
+            Some(0) => return Err(at().bad("max_age_ms", 0, "above zero")),
+            Some(ms) if ms > MAX_REPORT_AGE_MS => {
+                return Err(at().bad("max_age_ms", ms, "a whole number from 1 to 3599999"));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The document's signals, resolved once: one column a name, in name
+/// order, so a name's place in the list is its column's number.
+fn resolve_signals(signals: &BTreeMap<String, SignalSpec>) -> Arc<[SignalColumn]> {
+    signals
+        .iter()
+        .zip(0u16..)
+        .map(|((name, spec), column)| SignalColumn::new(name, &spec.unit, column, spec.max_age_ms))
+        .collect()
 }
 
 /// The first two keys that overlap, in the keys' order: the first key with
@@ -2825,12 +2944,13 @@ fn picker_of(
 }
 
 /// What a document's stages are built from: the catalog that makes them,
-/// and the view's reading of a report, which a factory's build context
-/// hands out.
+/// the view's reading of a report, which a factory's build context hands
+/// out, and the document's signals, resolved, which it answers from.
 #[derive(Clone, Copy)]
 struct StageInputs<'a> {
     catalog: &'a Catalog,
     reports: Reports,
+    signals: &'a [SignalColumn],
 }
 
 /// The filter the entry at `index` of a profile's list stands for. The
@@ -2876,8 +2996,17 @@ fn filtered(
             params
                 .values_mut()
                 .for_each(serde_json::Value::sort_all_objects);
-            let mut context = StageBuild::new(&params, profile, sent_ttl_ms, sent, from.reports);
-            let filter = build(&mut context).map_err(|error| error.at(&path()))?;
+            let filter = StageBuild::built(
+                &params,
+                profile,
+                sent_ttl_ms,
+                sent,
+                from.reports,
+                from.signals,
+                build,
+                Filter::needs,
+            )
+            .map_err(|error| error.at(&path()))?;
             let answers = filter.name();
             if answers != name {
                 return Err(SpecError::BadStage {
@@ -2964,8 +3093,17 @@ fn scored(
             params
                 .values_mut()
                 .for_each(serde_json::Value::sort_all_objects);
-            let mut context = StageBuild::new(&params, profile, sent_ttl_ms, sent, from.reports);
-            let scorer = build(&mut context).map_err(|error| error.at(&at.0))?;
+            let scorer = StageBuild::built(
+                &params,
+                profile,
+                sent_ttl_ms,
+                sent,
+                from.reports,
+                from.signals,
+                build,
+                Scorer::needs,
+            )
+            .map_err(|error| error.at(&at.0))?;
             let answers = scorer.name();
             if answers != name {
                 return Err(SpecError::BadStage {
@@ -3078,23 +3216,18 @@ fn check_profile(
     name: &str,
     p: &ProfileSpec,
     view: &ViewSpec,
-    catalog: &Catalog,
+    from: StageInputs<'_>,
     deferred: &mut Deferred,
     depth: &mut HashDepth,
     sent_credits: &mut Vec<Arc<SentCredit>>,
 ) -> Result<Option<(Profile, bool)>, SpecError> {
+    let catalog = from.catalog;
     let gates = gates_of(p, view);
     let at = At::new(format!("profiles.{name}"));
     at.nonzero("sent_ttl_ms", p.sent_ttl_ms)?;
     // The profile's count of sends, made where a stage's factory first
     // asks for it: a filter's may, ahead of any scorer's.
     let mut sent = None;
-    // A registered stage reads a report through the view's reading: the
-    // limit the built-in scorers are wrapped with below.
-    let from = StageInputs {
-        catalog,
-        reports: Reports::new(view.max_report_age_ms),
-    };
     let mut filters = Vec::with_capacity(p.filter.len());
     for (index, entry) in p.filter.iter().enumerate() {
         let filter = filtered(entry, name, &at, index, from, p.sent_ttl_ms, &mut sent)?;
@@ -3997,6 +4130,7 @@ impl PolicySpec {
             kind: None,
             view,
             index: BTreeMap::new(),
+            signals: BTreeMap::new(),
             profiles,
             plans: PlansSpec::default(),
             bindings: vec![BindingSpec {
@@ -4082,17 +4216,18 @@ impl PolicySpec {
         catalog: &Catalog,
         denied_headers: &[&str],
     ) -> Result<Engine, SpecError> {
-        let (engine, _) = self.built(catalog, denied_headers)?;
+        let (engine, _, _) = self.built(catalog, denied_headers)?;
         Ok(engine)
     }
 
     /// [`PolicySpec::validate_in`], and beside the engine how deep its
-    /// stages read a request's block hashes.
+    /// stages read a request's block hashes and the document's signals,
+    /// resolved.
     fn built(
         &self,
         catalog: &Catalog,
         denied_headers: &[&str],
-    ) -> Result<(Engine, HashDepth), SpecError> {
+    ) -> Result<(Engine, HashDepth, Arc<[SignalColumn]>), SpecError> {
         if let Some(kind) = &self.kind {
             return Err(SpecError::Kind(kind.clone()));
         }
@@ -4115,6 +4250,8 @@ impl PolicySpec {
         }
         check_view(&self.view, denied_headers)?;
         check_index(&self.index, &self.view)?;
+        check_signals(&self.signals)?;
+        let signal_columns = resolve_signals(&self.signals);
         let mut deferred = Deferred::default();
         let mut depth = HashDepth::default();
         // What no stage declares: the sessions rules' counts and the view's
@@ -4130,12 +4267,20 @@ impl PolicySpec {
         // The built profiles the plain ring alone places by a request's
         // session key, by their place in `profiles`.
         let mut keyed = Vec::new();
+        // A registered stage reads a report through the view's reading:
+        // the limit the built-in scorers are wrapped with. It resolves a
+        // signal's column from the document's, resolved once.
+        let from = StageInputs {
+            catalog,
+            reports: Reports::new(self.view.max_report_age_ms),
+            signals: &signal_columns,
+        };
         for (name, profile) in &self.profiles {
             let built = check_profile(
                 name,
                 profile,
                 &self.view,
-                catalog,
+                from,
                 &mut deferred,
                 &mut depth,
                 &mut sent_credits,
@@ -4240,7 +4385,7 @@ impl PolicySpec {
         for at in keyed {
             engine.places_by_key(at);
         }
-        Ok((engine, depth))
+        Ok((engine, depth, signal_columns))
     }
 
     /// A document of this version with the given profiles and nothing else
@@ -4253,6 +4398,7 @@ impl PolicySpec {
             kind: None,
             view: ViewSpec::default(),
             index: BTreeMap::new(),
+            signals: BTreeMap::new(),
             profiles,
             plans: PlansSpec::default(),
             bindings: Vec::new(),
@@ -4307,6 +4453,7 @@ impl PolicySpec {
             kind: _,
             view,
             index,
+            signals,
             profiles,
             plans,
             bindings,
@@ -4317,6 +4464,7 @@ impl PolicySpec {
             generation: 0,
             view,
             index,
+            signals,
             profiles,
             plans,
             bindings,
@@ -4338,6 +4486,8 @@ struct Lineless<'a> {
     view: &'a ViewSpec,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     index: &'a BTreeMap<String, IndexSpec>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    signals: &'a BTreeMap<String, SignalSpec>,
     profiles: &'a BTreeMap<String, ProfileSpec>,
     #[serde(skip_serializing_if = "is_default::<PlansSpec>")]
     plans: &'a PlansSpec,
@@ -4429,6 +4579,9 @@ pub struct AppliedSpec {
     /// document; none where a binding names none
     /// ([`AppliedSpec::key_sources_for`]).
     key_sources: Box<[Option<KeySources>]>,
+    /// The document's signals, resolved, in column order
+    /// ([`AppliedSpec::signal_columns`]).
+    signal_columns: Arc<[SignalColumn]>,
     /// A start's document waits for the first lead of this store's
     /// replica ([`AppliedSpec::mark_document_awaited`]): set on the unbound start
     /// alone, and gone with it at the first publication.
@@ -4483,11 +4636,16 @@ impl AppliedSpec {
 
     /// The generation of `document` under its `digest`: the engine it
     /// validated into, with the depth of that engine's stages.
-    fn of(document: &PolicySpec, digest: Digest, (engine, depth): (Engine, HashDepth)) -> Self {
+    fn of(
+        document: &PolicySpec,
+        digest: Digest,
+        (engine, depth, signal_columns): (Engine, HashDepth, Arc<[SignalColumn]>),
+    ) -> Self {
         Self {
             engine,
             digest: Some(digest),
             depth,
+            signal_columns,
             max_block_hashes: document.view.max_block_hashes,
             block_size: Gates::of(None, None, document.view.block_size).block_size,
             pairing: document.plans.pd_pair.pairing,
@@ -4512,6 +4670,7 @@ impl AppliedSpec {
             engine: Engine::new(Vec::new(), Vec::new(), 0, Needs::default()),
             digest: None,
             depth: HashDepth::Unread,
+            signal_columns: Arc::default(),
             max_block_hashes: ViewSpec::default().max_block_hashes,
             block_size: Gates::default().block_size,
             pairing: Pairing::default(),
@@ -4520,6 +4679,15 @@ impl AppliedSpec {
             #[cfg(feature = "controller")]
             awaited: AtomicBool::new(false),
         }
+    }
+
+    /// The document's signals, resolved, in column order: a signal's place
+    /// here is its column's number. What a stage's build answered from
+    /// ([`StageBuild::signal_column`](crate::StageBuild::signal_column)),
+    /// and the one reading of the names for a store that keeps the cells.
+    /// Empty for a document that declares none and for the unbound start.
+    pub fn signal_columns(&self) -> &[SignalColumn] {
+        &self.signal_columns
     }
 
     /// Marks the unbound start of a replica whose start's document waits
@@ -4988,7 +5156,7 @@ mod tests {
             let document = doc(&format!(
                 r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{profile}}}}}"#
             ));
-            let (_, depth) = document
+            let (_, depth, _) = document
                 .built(&catalog, &[])
                 .expect("the document validates");
             depth
@@ -6546,14 +6714,16 @@ mod tests {
         );
         let catalog = Catalog::builtin();
         let entry = &spec.profiles["p"].score[0];
+        let from = StageInputs {
+            catalog: &catalog,
+            reports: Reports::new(None),
+            signals: &[],
+        };
         let Scored::Typed(stage) = scored(
             entry,
             "p",
             &At::new("profiles.p.score[0]"),
-            StageInputs {
-                catalog: &catalog,
-                reports: Reports::new(None),
-            },
+            from,
             None,
             &mut None,
         )
@@ -8090,6 +8260,11 @@ mod tests {
         bindings.push(BindingSpec::default());
         let mut index = base.index.clone();
         index.insert("another*".to_owned(), IndexSpec::default());
+        let held = SignalSpec {
+            unit: "tokens".to_owned(),
+            max_age_ms: None,
+        };
+        let signals = BTreeMap::from([("held".to_owned(), held)]);
         let mut profiles = base.profiles.clone();
         let profile = profiles.values().next().expect("a profile").clone();
         profiles.insert("another".to_owned(), profile);
@@ -8153,6 +8328,13 @@ mod tests {
                 },
             ),
             (
+                "signals",
+                PolicySpec {
+                    signals,
+                    ..base.clone()
+                },
+            ),
+            (
                 "view",
                 PolicySpec {
                     view,
@@ -8192,6 +8374,13 @@ mod tests {
                 ..base.view.clone()
             },
             index: BTreeMap::from([("another*".to_owned(), IndexSpec::default())]),
+            signals: BTreeMap::from([(
+                "held".to_owned(),
+                SignalSpec {
+                    unit: "tokens".to_owned(),
+                    max_age_ms: Some(4_000),
+                },
+            )]),
             plans: PlansSpec {
                 pd_pair: PdPairPlanSpec {
                     pairing: Pairing::Off,

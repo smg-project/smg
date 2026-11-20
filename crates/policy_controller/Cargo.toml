@@ -479,5 +479,9 @@ harness = false
 name = "sent"
 harness = false
 
+[[bench]]
+name = "signals"
+harness = false
+
 [lints]
 workspace = true

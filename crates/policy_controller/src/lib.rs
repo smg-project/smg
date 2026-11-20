@@ -13,7 +13,9 @@
 //! - 4.1, the view ([`view`]): [`RequestFacts`], [`Candidate`] rows with their
 //!   [`LoadRow`], the [`AffinityFacts`] column beside the rows, [`Constraints`]
 //!   and [`PoolFacts`]. Built once per decision by the host into a reused
-//!   buffer; no handle, no callback into the host.
+//!   buffer; no handle, no callback into the host. The values a report
+//!   states under a name the document declares stand beside the rows too
+//!   ([`signals`]): a stage reads one by its [`SignalColumn`].
 //! - 4.2, the decision ([`decision`]): an ordered [`Pick`] of up to
 //!   [`MAX_TARGETS`] targets, a [`Shed`] with its reason and the stage that
 //!   emptied the pool, or a [`Queue`] ticket (specified in v1; no built-in
@@ -159,6 +161,7 @@ pub mod ring;
 pub mod routing_key;
 pub mod sent;
 pub mod sessions;
+pub mod signals;
 pub mod spec;
 pub mod store;
 mod terms;
@@ -195,6 +198,7 @@ pub use sent::{Sent, SentCredit};
 pub use sessions::{
     Assignment, Forgets, Pins, Recovery, SessionRule, SessionTable, SessionVerdict,
 };
+pub use signals::{SignalCell, SignalCells, SignalColumn};
 pub use spec::{
     AppliedSpec, Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION, PRESETS,
 };

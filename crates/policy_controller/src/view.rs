@@ -973,6 +973,16 @@ pub struct RequestFacts<'a> {
     /// that hands a decision its facts from the host's own store makes
     /// them so. In-process only: the wire carries the name.
     pub model_fingerprint: ModelFingerprint,
+    /// The signal cells beside the rows of this decision, by the row's
+    /// position: handed by a host for a profile whose stages read a signal
+    /// ([`Needs::signal_cells`](crate::Needs::signal_cells)), and for no
+    /// other. `None` reads as no value for every row. A pair decision takes
+    /// each side's cells from its pool ([`PairPools`](crate::PairPools)),
+    /// and an encode pair its encoders' from theirs: cells here are not
+    /// read there. One word for every signal the document declares: a
+    /// second signal adds none. In-process only: the contract's facts gain
+    /// nothing.
+    pub signal_cells: Option<&'a crate::signals::SignalCells>,
 }
 
 /// The multiplier that spreads a session's model and phase over its key.
@@ -1391,6 +1401,16 @@ mod tests {
         println!("Candidate size {size} bytes, alignment {alignment} bytes");
         assert_eq!((size, alignment), (128, 64));
         assert_eq!(size_of::<AffinityFacts>(), 20);
+    }
+
+    /// A request's facts are copied where a decision narrows or resumes
+    /// them, so their size is a cost of those decisions: the pin is exact.
+    /// The signal cells are the last word, one for every signal: a field
+    /// the facts gain moves this number and carries the decision bench's
+    /// cells that copy the facts (`benches/decision.rs`).
+    #[test]
+    fn a_requests_facts_take_the_pinned_bytes() {
+        assert_eq!(size_of::<RequestFacts<'_>>(), 288);
     }
 
     #[test]
