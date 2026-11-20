@@ -145,12 +145,12 @@ commands_of() {
     local shard=$1
     case "$shard" in
         gateway-unit)
-            # The lib's unit tests and the smg binary's. The alias binary amg is the same
-            # source (its manifest entry says test = false); an explicit --bins would build
-            # and run its harness anyway, so the binary is named.
+            # The lib's unit tests. The command line's cases run with the library, and
+            # neither executable builds a test harness (their manifest entries say
+            # test = false).
             # One invocation for both packages: on its own, the harness's `-p` would unify the gateway
             # down to the harness's feature set and build the gateway lib a second time.
-            echo "-p smg -p smg-test-harness --lib --bin smg"
+            echo "-p smg -p smg-test-harness --lib"
             echo "-p smg --doc" ;;
         gateway-[0-9]*)
             local index=${shard#gateway-} selectors
