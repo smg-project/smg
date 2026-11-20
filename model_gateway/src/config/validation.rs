@@ -1945,7 +1945,7 @@ impl ConfigValidator {
             return Ok(());
         };
         if !config.policy_controller {
-            return refuse("--policy-controller-address requires the policy_controller setting (--policy-controller)");
+            return refuse("--policy-controller-address requires the policy_controller setting (--policy-controller on)");
         }
         // The follower dials through the controller crate's client, which
         // the gateway's manifest takes on these two targets alone.
@@ -1981,6 +1981,18 @@ impl ConfigValidator {
     }
 
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        if let Some(path) = config
+            .policy_spec_path
+            .as_deref()
+            .filter(|_| !config.policy_controller)
+        {
+            return Err(ConfigError::invalid_value(
+                "policy_spec",
+                path,
+                "a policy document is run by the policy controller: set --policy-controller on",
+            ));
+        }
+
         let has_service_discovery = config.discovery.is_some();
         let invalid_decode_policy = match &config.mode {
             RoutingMode::PrefillDecode { decode_policy, .. } if !config.enable_igw => {

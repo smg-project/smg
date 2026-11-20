@@ -67,7 +67,8 @@ use undecided::Undecided;
 /// Why the controller's store did not start.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StartError {
-    /// The routing configuration holds a setting no policy document says.
+    /// The routing configuration holds a setting no policy document says, or
+    /// one that disagrees with the document a user gave.
     #[error(transparent)]
     Document(#[from] PolicyDocumentError),
     /// The gateway's check of a document it hosts refuses this one: this
@@ -81,25 +82,25 @@ pub(crate) enum StartError {
 }
 
 /// [`start_with`] as the stock gateway starts: no stages of a host, and the
-/// document the routing configuration means. The cases start their stores
-/// through it.
+/// document in force. The cases start their stores through it.
 #[cfg(test)]
 pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, StartError> {
-    start_with(config, None, RouterConfig::policy_document)
+    start_with(config, None, RouterConfig::policy_document_in_force)
 }
 
-/// The controller's store for this process, holding the policy document the
-/// routing configuration means as its one generation. `None` where the
+/// The controller's store for this process, holding the policy document
+/// `document` gives as its one generation: a gateway hands the document in
+/// force ([`RouterConfig::policy_document_in_force`]). `None` where the
 /// classic policies decide: nothing is constructed then, and `document` is
 /// not called.
 ///
 /// `stages` is the catalog of a host's own stages. The stock gateway hands
 /// none, and the document is then checked over the stock stages alone.
 ///
-/// A configuration the document cannot say, and a document the gateway's
-/// check of a hosted document refuses ([`RouterConfig::hosted_policy`]),
-/// stop the start by name. Neither is served by the classic policies in
-/// silence.
+/// A configuration the document cannot say, a routing setting that disagrees
+/// with a given document, and a document the gateway's check of a hosted
+/// document refuses ([`RouterConfig::hosted_policy`]), stop the start by
+/// name. None of them is served by the classic policies in silence.
 pub(crate) fn start_with(
     config: &RouterConfig,
     stages: Option<Catalog>,
