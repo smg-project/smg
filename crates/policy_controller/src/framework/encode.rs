@@ -428,9 +428,10 @@ impl Engine {
     /// reads no encoder and places none.
     ///
     /// What this side cannot read truly is declined. A request with items
-    /// under an encode profile that shows its rows to a plugin names
-    /// `encode-scope`: no scope is opened over the encoders offered to a
-    /// key. A pair column of another length than its pool names
+    /// names `encode-column` when an encode column is not as long as its
+    /// pool, and `encode-scope` under an encode profile that shows its rows
+    /// to a plugin: no scope is opened over the encoders offered to a key.
+    /// A pair column of another length than its pool names
     /// `affinity-column` before a cut, as the pair entry names it. So does
     /// a column on the request, or rows named on it, before a stage of the
     /// encode side is asked. The encode side's stages are handed no pin
@@ -462,11 +463,39 @@ impl Engine {
         placed: &mut EncodePlaced,
     ) -> Decision {
         placed.clear();
+        let bare = Trace {
+            seed: facts.seed,
+            generation: pool.generation,
+            ..Trace::default()
+        };
+        let declined = |stage| turned_away(ShedReason::PolicyDeclined, stage, bare);
+        // The prefill's lookup names the plan: a binding of another plan
+        // declines, as a pair decision under a single binding is declined.
+        let epd = self
+            .binding(facts.model, Phase::Prefill)
+            .and_then(|binding| match binding.plan {
+                Plan::Epd { encode } => Some(encode),
+                Plan::Single | Plan::PdPair => None,
+            });
+        let Some(index) = epd else {
+            return declined("binding");
+        };
+        let Some(profile) = self.profiles.get(usize::from(index)) else {
+            return declined("binding");
+        };
+        // A request with no item that asks no images of its decode is the
+        // pair's alone: the pair entry answers it over the pools as handed,
+        // and no pass or scratch of the encode side is laid for it.
+        let images = facts.media.images != 0;
+        if items.keys.is_empty() && !items.decode_images && !(items.references && images) {
+            return self.decide_pair(facts, pool, pools, cx, decode_cx, scratch);
+        }
         // The encode side's buffers leave the scratch for the decision: the
         // pair entry takes the scratch whole while they hold its pools.
         let mut side = scratch.encode.take().unwrap_or_default();
         let decision = self.encode_pair(
-            facts, pool, pools, encode, items, cx, decode_cx, encode_cx, scratch, &mut side, placed,
+            profile, index, facts, pool, pools, encode, items, cx, decode_cx, encode_cx, scratch,
+            &mut side, placed,
         );
         scratch.encode = Some(side);
         if decision.pick().is_none() {
@@ -481,6 +510,8 @@ impl Engine {
     )]
     fn encode_pair(
         &self,
+        profile: &Profile,
+        index: u16,
         facts: &RequestFacts<'_>,
         pool: &PoolFacts<'_>,
         pools: PairPools<'_>,
@@ -498,20 +529,6 @@ impl Engine {
             generation: pool.generation,
             ..Trace::default()
         };
-        // The prefill's lookup names the plan: a binding of another plan
-        // declines, as a pair decision under a single binding is declined.
-        let epd = self
-            .binding(facts.model, Phase::Prefill)
-            .and_then(|binding| match binding.plan {
-                Plan::Epd { encode } => Some(encode),
-                Plan::Single | Plan::PdPair => None,
-            });
-        let Some(index) = epd else {
-            return turned_away(ShedReason::PolicyDeclined, "binding", unbound);
-        };
-        let Some(profile) = self.profiles.get(usize::from(index)) else {
-            return turned_away(ShedReason::PolicyDeclined, "binding", unbound);
-        };
         // The encode profile is resolved: a shed of the encode side below
         // is made under it, and its trace says so. A column of the pair's
         // or of the request's is refused as the other two entries refuse
@@ -522,9 +539,11 @@ impl Engine {
         };
         let declined = |stage| turned_away(ShedReason::PolicyDeclined, stage, bare);
         let gap = |stage| turned_away(ShedReason::NoEndpoints, stage, bare);
-        if encode.facts.len() != encode.encoders.len()
-            || encode.prefill_classes.len() != pools.prefills.len()
-            || !column_fits(encode.affinity, encode.encoders)
+        let needs = !items.keys.is_empty();
+        if needs
+            && (encode.facts.len() != encode.encoders.len()
+                || encode.prefill_classes.len() != pools.prefills.len()
+                || !column_fits(encode.affinity, encode.encoders))
         {
             return declined(ENCODE_COLUMN);
         }
@@ -548,7 +567,6 @@ impl Engine {
         // a short set, so past this line nothing says a host's wrong shape.
         debug_assert_cells(pools.prefill_signal_cells, pools.prefills);
         debug_assert_cells(pools.decode_signal_cells, pools.decodes);
-        let needs = !items.keys.is_empty();
         // A profile that shows its rows to a plugin answers inside a scope
         // opened over the rows of one decision. None is opened over the
         // encoders offered to a key, so no stage of such a profile is asked.
@@ -556,12 +574,6 @@ impl Engine {
             return declined(ENCODE_SCOPE);
         }
         let images = facts.media.images != 0;
-        // A request with no item that asks no images of its decode is the
-        // pair's alone: the pair entry answers it over the pools as handed,
-        // and no pass of the encode side is laid for it.
-        if !needs && !items.decode_images && !(items.references && images) {
-            return self.decide_pair(facts, pool, pools, cx, decode_cx, scratch);
-        }
         let encode_facts = RequestFacts {
             phase: Phase::Encode,
             affinity: encode.affinity,
