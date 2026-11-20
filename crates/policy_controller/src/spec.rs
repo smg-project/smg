@@ -1136,8 +1136,7 @@ impl FilterStage {
 /// The filter stays soft: where no worker has room, every worker stands.
 /// Written bare, `has-room` reads the bit its host sets. A null under the
 /// name, the slip of a bare name written with a colon, is refused with
-/// both forms named. A reader that takes a null for an empty map refuses
-/// it by the part it lacks.
+/// both forms named, whichever reader takes the document.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[serde(expecting = "a rule with `used` and `capacity`, or the bare name `has-room`")]
@@ -1536,6 +1535,52 @@ impl<'de> Deserialize<'de> for Written {
     }
 }
 
+/// What a document wrote under `has-room`: the rule. A null there is the
+/// slip of a bare name written with a colon, and it is refused here with
+/// both forms named, ahead of the rule's own read: a reader that takes a
+/// null for an empty map would name the part the rule lacks. The refusal
+/// is made inside the value's read, so each reader places it at the
+/// rule's path.
+struct RoomRule(HasRoomParams);
+
+impl<'de> Deserialize<'de> for RoomRule {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct RuleVisitor;
+
+        impl<'de> Visitor<'de> for RuleVisitor {
+            type Value = RoomRule;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a rule with `used` and `capacity`, or the bare name `has-room`")
+            }
+
+            // A null, in the words of a reader that hands the rule one.
+            fn visit_unit<E: de::Error>(self) -> Result<RoomRule, E> {
+                let expected: &dyn de::Expected = &self;
+                Err(E::custom(format_args!(
+                    "invalid type: null, expected {expected}"
+                )))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, rule: A) -> Result<RoomRule, A::Error> {
+                HasRoomParams::deserialize(de::value::MapAccessDeserializer::new(rule))
+                    .map(RoomRule)
+            }
+
+            // The rule's own read takes its parts as a list too.
+            fn visit_seq<A: SeqAccess<'de>>(self, rule: A) -> Result<RoomRule, A::Error> {
+                HasRoomParams::deserialize(de::value::SeqAccessDeserializer::new(rule))
+                    .map(RoomRule)
+            }
+        }
+
+        // Asked by what stands there: a reader places a refusal made in
+        // this read at the rule's own path, and one made behind an
+        // option's read at the entry's.
+        deserializer.deserialize_any(RuleVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for FilterSpec {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct FilterVisitor;
@@ -1560,7 +1605,8 @@ impl<'de> Deserialize<'de> for FilterSpec {
                     return Err(de::Error::custom("a filter entry names one filter"));
                 };
                 let entry = if name == HasRoomRule::NAME {
-                    FilterSpec::Params(FilterStage::HasRoom(map.next_value()?))
+                    let RoomRule(rule) = map.next_value()?;
+                    FilterSpec::Params(FilterStage::HasRoom(rule))
                 } else {
                     let Written(written) = map.next_value()?;
                     FilterSpec::Added { name, written }
@@ -3522,6 +3568,14 @@ fn filtered<'a>(
         Ok(Filtered::Built(filter))
     };
     match (from.catalog.find_filter(name), entry) {
+        // Only a document built in code: the parser reads the built-in's
+        // key into its parameter struct. The catalog holds the name for
+        // its bare form, and that arm's refusal would name the bare form.
+        (_, FilterSpec::Added { .. }) if name == HasRoomRule::NAME => Err(SpecError::BadField {
+            path: format!("{}.filter[{index}]", at.0),
+            value: name.to_string(),
+            reason: "a filter added in code: a built-in's parameters are typed",
+        }),
         // A built-in's parameters are the validator's to check, under a
         // name the catalog holds.
         (Some(Found::Built(_) | Found::With(_)), FilterSpec::Params(stage)) => {

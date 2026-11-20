@@ -458,8 +458,8 @@ fn each_part_of_the_rule_is_refused_at_its_path() {
 
 /// An empty map is no rule: only the bare name is the host's bit. A null
 /// under the name is the slip of a bare name written with a colon, and its
-/// author is told both forms. YAML's own typed read takes that null for an
-/// empty map and refuses it by the part it lacks, at the rule's path.
+/// author is told both forms at the rule's path. YAML's own typed read
+/// would take that null for an empty map: the entry catches it first.
 #[test]
 fn a_rule_that_leaves_a_part_out_is_refused_at_the_parse() {
     let slip = "expected a rule with `used` and `capacity`, or the bare name `has-room`";
@@ -470,7 +470,7 @@ fn a_rule_that_leaves_a_part_out_is_refused_at_the_parse() {
         .expect_err("an empty rule")
         .to_string();
     assert!(
-        slipped.contains("profiles.p.filter[0].has-room: missing field `used`"),
+        slipped.starts_with("profiles.p.filter[0].has-room: ") && slipped.contains(slip),
         "{slipped}"
     );
     for (rule, message) in [

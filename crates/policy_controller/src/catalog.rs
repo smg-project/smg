@@ -1892,6 +1892,29 @@ bindings: [{{ profile: before }}]
         );
     }
 
+    /// A built-in's parameters are its struct's. An entry that carries
+    /// `has-room` as a filter added in code, which only a document built in
+    /// code can, is refused at the entry by what it is. The catalog holds
+    /// the name for its bare form, and the refusal names no bare form.
+    #[test]
+    fn a_built_in_rules_name_under_an_added_entry_is_refused_by_what_it_is() {
+        let mut built_in_code = filter_document("[healthy]");
+        for profile in built_in_code.profiles.values_mut() {
+            profile.filter.push(crate::spec::FilterSpec::Added {
+                name: "has-room".into(),
+                written: serde_json::json!({ "used": { "load.running": 1 }, "capacity": 10 }),
+            });
+        }
+        assert_eq!(
+            built_in_code.validate_in(&catalog(), &[]).map(|_| ()),
+            Err(SpecError::BadField {
+                path: "profiles.default.filter[1]".into(),
+                value: "has-room".into(),
+                reason: "a filter added in code: a built-in's parameters are typed",
+            })
+        );
+    }
+
     #[test]
     fn a_filters_factory_refuses_a_value_at_its_field() {
         let catalog = free_catalog();
