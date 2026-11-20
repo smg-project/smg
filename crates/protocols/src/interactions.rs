@@ -49,7 +49,10 @@ pub struct InteractionsRequest {
     #[serde(alias = "responseFormat")]
     pub response_format: Option<Value>,
 
-    /// MIME type for the response (required if response_format is set)
+    /// MIME type for the response, which the gateway requires beside the
+    /// legacy `response_format` (a raw JSON schema). A typed format (`text`,
+    /// `image`, `audio`, `video`, or a list of them) does not need it, and
+    /// may name its own `mime_type`.
     #[serde(alias = "responseMimeType")]
     pub response_mime_type: Option<String>,
 
@@ -1149,6 +1152,25 @@ pub enum ResponseModality {
     Audio,
 }
 
+/// Whether a `response_format` is read as the legacy form, a raw JSON
+/// schema: anything but a typed format (an object whose `type` is `text`,
+/// `image`, `audio` or `video`) or a list holding only typed formats. So an
+/// object with another `type` or none, a boolean schema, and a list that
+/// holds one of those or is empty all keep the rule every `response_format`
+/// had before the typed ones.
+fn is_legacy_response_format(format: &Value) -> bool {
+    fn is_typed(format: &Value) -> bool {
+        matches!(
+            format.get("type").and_then(Value::as_str),
+            Some("text" | "image" | "audio" | "video")
+        )
+    }
+    match format {
+        Value::Array(formats) => formats.is_empty() || !formats.iter().all(is_typed),
+        format => !is_typed(format),
+    }
+}
+
 fn is_option_blank(v: Option<&String>) -> bool {
     v.map(|s| s.trim().is_empty()).unwrap_or(true)
 }
@@ -1165,8 +1187,15 @@ fn validate_interactions_request(req: &InteractionsRequest) -> Result<(), Valida
         ));
     }
 
-    // response_mime_type is required when response_format is set
-    if req.response_format.is_some() && is_option_blank(req.response_mime_type.as_ref()) {
+    // The legacy response_format, a raw JSON schema, needs a response_mime_type.
+    // A typed format, or a list of them, does not: it may name its own
+    // mime_type, which is not checked here.
+    if req
+        .response_format
+        .as_ref()
+        .is_some_and(is_legacy_response_format)
+        && is_option_blank(req.response_mime_type.as_ref())
+    {
         return Err(ValidationError::new("response_mime_type_required"));
     }
 
@@ -1316,6 +1345,67 @@ fn validate_stop_sequences(seqs: &[String]) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A typed `response_format`, with or without its own `mime_type`, needs
+    /// no `response_mime_type`, nor does a list of them, as the public API's
+    /// polymorphic field takes them. The legacy form, a raw JSON schema,
+    /// still does, wherever it sits in a list.
+    #[test]
+    fn a_typed_response_format_needs_no_response_mime_type() {
+        let request = |response_format: Value| InteractionsRequest {
+            model: Some("m".to_string()),
+            store: false,
+            response_format: Some(response_format),
+            ..Default::default()
+        };
+        let text = serde_json::json!({
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+        });
+        assert!(validate_interactions_request(&request(text.clone())).is_ok());
+        let formats =
+            serde_json::json!([text.clone(), {"type": "image", "mime_type": "image/png"}]);
+        assert!(validate_interactions_request(&request(formats)).is_ok());
+        let without_mime = serde_json::json!({"type": "audio"});
+        assert!(validate_interactions_request(&request(without_mime)).is_ok());
+
+        let schema = serde_json::json!({"type": "object", "properties": {}});
+        let (code, _) = refusal(validate_interactions_request(&request(schema.clone())));
+        assert_eq!(code, "response_mime_type_required");
+        for legacy in [
+            serde_json::json!([schema.clone()]),
+            serde_json::json!([text.clone(), schema.clone()]),
+            serde_json::json!({"properties": {"city": {"type": "string"}}}),
+            // the boolean schema, and a list of no format
+            serde_json::json!(true),
+            serde_json::json!([]),
+        ] {
+            let (code, _) = refusal(validate_interactions_request(&request(legacy)));
+            assert_eq!(code, "response_mime_type_required");
+        }
+        let with_mime = InteractionsRequest {
+            response_mime_type: Some("application/json".to_string()),
+            ..request(schema)
+        };
+        assert!(validate_interactions_request(&with_mime).is_ok());
+
+        // Through the public path: a request with a typed format reads,
+        // validates, and is written back with the format as sent and no
+        // `response_mime_type`.
+        let image = serde_json::json!({"type": "image", "mime_type": "image/jpeg"});
+        let typed: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "Draw a city.",
+            "store": false,
+            "response_format": image
+        }))
+        .unwrap();
+        assert!(typed.validate().is_ok(), "{:?}", typed.validate());
+        let written = crate::common::to_value_exact(&typed).unwrap();
+        assert_eq!(written["response_format"], image);
+        assert!(written.get("response_mime_type").is_none());
+    }
 
     /// The tools the public API declares beside the ones the gateway knew
     /// read, validate and are written back as sent: computer use, Google

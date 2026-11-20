@@ -1997,6 +1997,20 @@ mod tests {
             );
         }
 
+        // An Interactions request whose response_format is a raw JSON schema, beside a blank
+        // response_mime_type: the refusal reaches the client under its own code. The same
+        // request with a typed format, and no response_mime_type at all, is taken.
+        let body = r#"{"model":"m","input":"hi","store":false,"response_format":{"type":"object"},"response_mime_type":"  "}"#;
+        let (status, json) = rejected::<InteractionsRequest>(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(
+            json["error"]["code"], "response_mime_type_required",
+            "{json}"
+        );
+        let body = r#"{"model":"m","input":"hi","store":false,"response_format":{"type":"text","mime_type":"application/json"}}"#;
+        let (status, json) = rejected::<InteractionsRequest>(body).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+
         // A namespace member whose parameters are no object, on Responses: the refusal is the
         // `tools` field's, and its message says which member.
         let body = r#"{"model":"m","input":"hi","tools":[{"type":"namespace","name":"ns","description":"d","tools":[{"type":"function","name":"f","parameters":[]}]}]}"#;
