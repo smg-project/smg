@@ -121,6 +121,13 @@ pub(crate) fn ranges(facts: &proto::RequestFacts) -> Result<(Phase, HashKind, u6
     };
     let hash_kind = match proto::HashKind::try_from(facts.hash_kind) {
         Ok(proto::HashKind::Unspecified | proto::HashKind::Token) => HashKind::Token,
+        // A text request states its window: the window is its host's
+        // choice, and the view's block size is in tokens. One that carries
+        // hashes and states none cannot be priced. One with no hash prices
+        // nothing and is taken.
+        Ok(proto::HashKind::Text) if facts.block_size == 0 && !facts.block_hashes.is_empty() => {
+            return Err(Refusal::OutOfRange("facts.block_size"));
+        }
         Ok(proto::HashKind::Text) => HashKind::Text,
         Err(_) => return Err(Refusal::OutOfRange("facts.hash_kind")),
     };
@@ -1361,6 +1368,44 @@ mod tests {
             refused(with(|facts| facts.phase = 5)).to_string(),
             "facts.phase is out of its range in this protocol version"
         );
+    }
+
+    /// A text request states its window, in bytes. One that carries
+    /// hashes and states none is refused by its field: the view's block
+    /// size is in tokens, and read as a window it would count the
+    /// request's blocks at another size than its host hashed them. A text
+    /// request with no hash prices nothing and is taken, and a token
+    /// request that states none reads the view's.
+    #[test]
+    fn a_text_request_that_states_no_window_is_refused_by_its_field() {
+        let refused = |frame| Checked::new(frame).expect_err("refused");
+        assert_eq!(
+            refused(with(|facts| facts.block_size = 0)),
+            Refusal::OutOfRange("facts.block_size")
+        );
+        let bare = with(|facts| {
+            facts.block_size = 0;
+            facts.block_hashes.clear();
+        });
+        let read = reading(bare, &mut Lists::default(), |facts, _| {
+            (facts.hash_kind, facts.block_size, facts.block_hashes.len())
+        });
+        assert_eq!(read, (HashKind::Text, 0, 0), "no hash to price");
+        for kind in [proto::HashKind::Token, proto::HashKind::Unspecified] {
+            let frame = with(|facts| {
+                facts.hash_kind = kind.into();
+                facts.block_size = 0;
+            });
+            let read = reading(frame, &mut Lists::default(), |facts, _| {
+                (facts.hash_kind, facts.block_size)
+            });
+            assert_eq!(read, (HashKind::Token, 0), "{kind:?}");
+        }
+        let stated = with(|facts| facts.block_size = 64);
+        let read = reading(stated, &mut Lists::default(), |facts, _| {
+            (facts.hash_kind, facts.block_size)
+        });
+        assert_eq!(read, (HashKind::Text, 64));
     }
 
     #[test]

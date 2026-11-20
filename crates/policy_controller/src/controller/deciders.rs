@@ -6064,7 +6064,8 @@ pub(crate) mod tests {
         let first = |count: u64| (1..=count).collect::<Vec<u64>>();
         // A prefix key 256 tokens deep reads 16 blocks of 16 tokens. The
         // blocks are the request's own: 32 of a request counted by 8, 4 of
-        // one counted by 64, and of a text 64 blocks of 16 characters.
+        // one counted by 64, and of a text 64 windows of 16 bytes, which a
+        // text request states.
         let sized = |id, hashes, block_size| {
             let mut frame = hashed(id, hashes);
             frame
@@ -6074,7 +6075,7 @@ pub(crate) mod tests {
                 .block_size = block_size;
             frame
         };
-        let mut text = hashed(6, 80);
+        let mut text = sized(6, 80, 16);
         text.facts
             .as_mut()
             .expect("the case's frame has facts")
