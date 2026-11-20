@@ -154,7 +154,8 @@ pub trait KvEventSink: Send + Sync {
     /// inside the lane's turn, behind whatever emptying the cursor asked. A
     /// batch the cursor skips or answers with a gap runs no body. The body
     /// is the host's own apply rules over the lane's writer: it writes what
-    /// the batch's events leave.
+    /// the batch's events leave. The writer's writes are this crate's own
+    /// ([`LaneWriter`]): the crate's worker host is the body that writes.
     ///
     /// The cursor reads `facts` alone, since it holds no batch to look
     /// into: a batch that carries the engine's own clear says so in

@@ -1549,8 +1549,9 @@ impl MemoryStore {
         self.kv.indexed_blocks(id, rank)
     }
 
-    /// What the lane of `id` at `rank` counted beside its blocks; `None`
-    /// for a row the store does not index.
+    /// What the lane of `id` at `rank` counted beside its blocks, over its
+    /// typed batches; `None` for a row the store does not index. A batch
+    /// lent to a body moves none of them.
     pub fn lane_counts(&self, id: WorkerId, rank: u16) -> Option<LaneCounts> {
         self.kv.counts(id, rank)
     }

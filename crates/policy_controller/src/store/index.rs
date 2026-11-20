@@ -114,7 +114,10 @@ pub enum KvEvent {
     Cleared,
 }
 
-/// What a lane counted since it was made, beside its blocks.
+/// What a lane counted since it was made, beside its blocks, over its
+/// typed batches. A batch lent to a body
+/// ([`KvEventSink::admit_through`](super::KvEventSink::admit_through))
+/// moves none of them: the body's rules count for themselves.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LaneCounts {
     /// Stores whose parent the worker did not hold (evicted, or lost with a
@@ -202,7 +205,9 @@ fn emptying() -> u64 {
 /// by it. A body whose apply rules hold the map as their own state takes
 /// it for the batch and puts it back before it returns. That call stays
 /// inside the crate: the store empties a rank by the map with no caller's
-/// help, and that rule is no host's contract.
+/// help, and that rule is no host's contract. The writes stay inside the
+/// crate with it, since each writes through that map: a write through any
+/// other would leave blocks that no emptying finds.
 ///
 /// The body runs under the lane's lock. It calls nothing of the sink for
 /// its own row. A body that unwinds leaves its rank half written, so the
@@ -241,7 +246,8 @@ impl LaneWriter<'_> {
 
     /// Store `blocks` after `parent`, or from the root when it is absent,
     /// with `map` the row's reverse map.
-    pub fn stored(
+    #[cfg(any(test, feature = "worker-host"))]
+    pub(crate) fn stored(
         &self,
         blocks: &[StoredBlock],
         parent: Option<SequenceHash>,
@@ -258,7 +264,8 @@ impl LaneWriter<'_> {
     }
 
     /// Forget the named blocks of the row.
-    pub fn removed(&self, hashes: &[SequenceHash], map: &mut ChainBlockMap) {
+    #[cfg(feature = "worker-host")]
+    pub(crate) fn removed(&self, hashes: &[SequenceHash], map: &mut ChainBlockMap) {
         self.wrote.set(true);
         self.held
             .index
@@ -267,7 +274,8 @@ impl LaneWriter<'_> {
     }
 
     /// Forget every block of the row.
-    pub fn cleared(&self, map: &mut ChainBlockMap) {
+    #[cfg(feature = "worker-host")]
+    pub(crate) fn cleared(&self, map: &mut ChainBlockMap) {
         self.wrote.set(true);
         self.held.index.chain.apply_cleared(self.held.worker, map);
     }
