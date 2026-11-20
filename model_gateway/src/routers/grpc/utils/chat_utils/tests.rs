@@ -100,7 +100,8 @@ fn a_refusal_part_outside_an_assistant_turn_is_refused() {
 /// system, developer, assistant or root message it is refused at the door in
 /// this door's own sentence (with the role's article), before any fetch, not
 /// after the pipeline ran it and the rendered prompt's anchors did not match
-/// it (none for the first three, one too many for an assistant part).
+/// it (none for a system, developer or root part, one too many for an
+/// assistant part).
 #[test]
 fn a_media_part_in_a_text_only_role_message_is_refused_at_the_door() {
     let parts = [
