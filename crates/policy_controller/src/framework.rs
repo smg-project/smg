@@ -4077,6 +4077,27 @@ impl Engine {
         self.bindings.get(at as usize).map(|entry| &entry.binding)
     }
 
+    /// The binding a request of `phase` for `model` resolves to, where
+    /// its shadow is asked ([`Self::shadow`]): its position in this
+    /// generation, and whether the rows a host names for its live profile
+    /// ([`Self::named_for`]) are the rows its shadow profile would be
+    /// named. They are where that profile names by the same cap, and
+    /// where its stages read no column.
+    pub(crate) fn shadow_for(&self, model: &str, phase: Phase) -> Option<(u32, bool)> {
+        let at = self
+            .bindings
+            .iter()
+            .position(|entry| entry.binding.matches(model, phase))?;
+        // The placing stands where the build found the shadow profile
+        // free to run beside the live one.
+        self.shadow_placing.get(at).copied().flatten()?;
+        let binding = &self.bindings[at].binding;
+        let shadow = usize::from(binding.shadow?);
+        let live = self.named[usize::from(binding.profile)];
+        let shares = !self.profile_needs[shadow].affinity || self.named[shadow] == live;
+        Some((u32::try_from(at).ok()?, shares))
+    }
+
     /// The profile a request resolves to for its phase; `None` when no
     /// binding matches or the binding's plan has no side for the phase.
     pub fn profile_for(&self, model: &str, phase: Phase) -> Option<(u16, &Profile)> {

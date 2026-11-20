@@ -119,7 +119,11 @@
 //! members (`rate_over_one`, `cpu_over_one`).
 //!
 //! `DECIDE_STREAM_EXPLAIN_SAMPLE` sets the document's sampling rate for
-//! each row, with zero as the default.
+//! each row, with zero as the default. `DECIDE_STREAM_SHADOW` gives a
+//! one-side row's binding a twin of its profile as its shadow, so a door's
+//! cell counts a decision with its shadow. Set to `other`, a binding of
+//! another model names that shadow: the cell then counts a decision with
+//! no shadow under a document that shadows.
 //!
 //! A measured run pins a cell's busy threads to a core each, over the
 //! cores the process was given, in their order: the deciders, the
@@ -242,6 +246,7 @@ use smg_policy_controller::{
         ControllerFrame, DecideRequest, Decision, Dispatched, GatewayFrame, Hello,
         Phase as WirePhase, RequestFacts as WireFacts, Side,
     },
+    spec::ShadowSpec,
     store::{
         Ask, BatchFacts, BatchOutcome, GatewayId, Hand, KvEvent, KvEventSink, LeaseRecord,
         LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore, Picked, Said, Signals,
@@ -1116,6 +1121,19 @@ fn fill(store: &MemoryStore, shape: Shape) {
     document.generation = 1;
     if let Ok(sample) = env::var("DECIDE_STREAM_EXPLAIN_SAMPLE") {
         document.explain.sample = sample.parse().expect("an unsigned sampling rate");
+    }
+    if let (false, Ok(shadow)) = (shape.pair, env::var("DECIDE_STREAM_SHADOW")) {
+        let twin = document.profiles[PRESET].clone();
+        document.profiles.insert("twin".to_owned(), twin);
+        let named = Some(ShadowSpec::Profile("twin".to_owned()));
+        if shadow == "other" {
+            let mut other = document.bindings[0].clone();
+            "another-model".clone_into(&mut other.matcher.model);
+            other.shadow = named;
+            document.bindings.insert(0, other);
+        } else {
+            document.bindings[0].shadow = named;
+        }
     }
     let spec = AppliedSpec::validate(&document).expect("the document validates");
     store.apply(spec).expect("above the unbound start");

@@ -29,7 +29,7 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -40,11 +40,11 @@ pub(crate) use crate::store::world::narrow;
 use crate::{
     counts::Slot,
     decider::Decider,
-    decision::{Decision, Pair, Pick, Shed, ShedReason, Target, Targets, Trace},
+    decision::{Decision, Pair, Pick, ShadowKind, Shed, ShedReason, Target, Targets, Trace},
     demands::{DemandFacts, Demands},
     framework::{
         release, EncodeItems, EncodePlaced, Engine, Plan, Scratch, KEEPS_DECIDERS,
-        SAMPLES_DECISIONS,
+        SAMPLES_DECISIONS, SHADOWS,
     },
     lease::{Lease, LeaseId, LeaseKind, Lifecycle, Outcome, Side},
     sessions::{Forgets, SessionVerdict},
@@ -117,6 +117,14 @@ pub(crate) fn unnamed(_: &RequestFacts<'_>, _: &Constraints<'_>) -> Option<Named
     None
 }
 
+/// How many of a generation's bindings count their shadows in a row of
+/// their own ([`Part::shadowed`]). The bindings behind them count in the
+/// last row.
+pub(crate) const SHADOW_ROWS: usize = 16;
+
+/// The kinds a shadow is counted by ([`ShadowKind`]).
+const SHADOW_KINDS: usize = ShadowKind::Skipped as usize + 1;
+
 /// One decider's part of the counts that every decision can move, on cache
 /// lines of its own. Where a fleet's gateways speak fewer wires than its
 /// members, each decision counts the candidates it lost; where a host
@@ -131,6 +139,39 @@ pub(crate) struct Part {
     /// Requests that carried more block hashes than their generation
     /// reads of them.
     pub(crate) hashes_cut: AtomicU64,
+    /// The shadows of this decider's decisions ([`Part::shadowed`]),
+    /// laid at its first: the part of a decider that shadows nothing
+    /// stays its one pair of lines.
+    shadowed: OnceLock<Box<ShadowCounts>>,
+}
+
+/// One decider's counts of its shadows, on lines of their own: a row a
+/// binding by its position in its generation, a count a kind.
+#[derive(Debug, Default)]
+#[repr(align(128))]
+struct ShadowCounts([[AtomicU64; SHADOW_KINDS]; SHADOW_ROWS]);
+
+impl ShadowCounts {
+    fn of(&self, binding: u32, kind: ShadowKind) -> &AtomicU64 {
+        let row = (binding as usize).min(SHADOW_ROWS - 1);
+        &self.0[row][kind as usize]
+    }
+}
+
+impl Part {
+    /// The count of the shadows that said `kind` beside a decision of
+    /// the binding at position `binding`, for the decider that counts
+    /// one: its counts are laid here at its first.
+    pub(crate) fn shadowed(&self, binding: u32, kind: ShadowKind) -> &AtomicU64 {
+        self.shadowed.get_or_init(Box::default).of(binding, kind)
+    }
+
+    /// That count as it stands, for a reader: none where the decider
+    /// has counted no shadow.
+    pub(crate) fn shadowed_so_far(&self, binding: u32, kind: ShadowKind) -> u64 {
+        let counts = self.shadowed.get();
+        counts.map_or(0, |counts| counts.of(binding, kind).load(Ordering::Relaxed))
+    }
 }
 
 /// One of the parts' counts, summed over `parts`.
@@ -404,9 +445,12 @@ fn entry_and_plan<A: Asked>(world: &World, taken: &Taken<'_, A>) -> (Entry, Plan
 /// lease takes of its request. Over rows the store named it is made at the
 /// entry that states what the pick's first target holds of them
 /// ([`Engine::decide_stated`]), and over any other view at the plain entry.
-struct ByEngine<'a>(&'a Engine);
+/// Under `KEEPS` each is the entry's keeping form, which keeps what the
+/// decision read of its session key for the request's shadow
+/// ([`Engine::decide_keeping`]).
+struct ByEngine<'a, const KEEPS: bool>(&'a Engine);
 
-impl ByEngine<'_> {
+impl<const KEEPS: bool> ByEngine<'_, KEEPS> {
     // Forced into each form's one call: out of line the plain form would
     // pay a call the closure it stands for never made.
     #[inline(always)]
@@ -436,10 +480,13 @@ impl ByEngine<'_> {
             );
             return (none, None);
         }
-        let decision = if STATED {
-            engine.decide_stated(facts, pool, candidates, constraints, scratch)
-        } else {
-            engine.decide(facts, pool, candidates, constraints, scratch)
+        let decision = match (STATED, KEEPS) {
+            (false, false) => engine.decide(facts, pool, candidates, constraints, scratch),
+            (true, false) => engine.decide_stated(facts, pool, candidates, constraints, scratch),
+            (false, true) => engine.decide_keeping(facts, pool, candidates, constraints, scratch),
+            (true, true) => {
+                engine.decide_stated_keeping(facts, pool, candidates, constraints, scratch)
+            }
         };
         // What a pick's lease takes of its request, read where the
         // request stands as the engine read it.
@@ -468,7 +515,7 @@ impl ByEngine<'_> {
     }
 }
 
-impl Decides<(Decision, Option<Booking>)> for ByEngine<'_> {
+impl Decides<(Decision, Option<Booking>)> for ByEngine<'_, false> {
     fn over(
         self,
         facts: &RequestFacts<'_>,
@@ -508,11 +555,174 @@ pub(crate) fn decide_in<A: Asked>(
     if taken.request.hashes() > taken.request.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
     }
-    let ((decision, booking), built) = hand(world, taken, buffers, &own.undialed, ByEngine(engine));
+    let plain = ByEngine::<false>(engine);
+    let ((decision, booking), built) = hand(world, taken, buffers, &own.undialed, plain);
     (
         decision,
         booking.map(|booking| Booking { built, ..booking }),
     )
+}
+
+/// What a request's budget must still hold at the end of its live
+/// decision for its shadow to be asked. A shadow asked with less could
+/// take a served answer past its budget, where the decider's last read
+/// refuses it.
+pub(crate) const SHADOW_FLOOR: Duration = Duration::from_millis(1);
+
+/// What a decision's shadow said beside it, where one was due.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Shadowed {
+    /// The position of the request's binding in its generation.
+    pub(crate) binding: u32,
+    /// The shadow's decision beside the live one, and
+    /// [`ShadowKind::Skipped`] where the shadow was due and not asked.
+    pub(crate) kind: ShadowKind,
+    /// The first target of the shadow's pick.
+    pub(crate) first: Option<WorkerId>,
+}
+
+/// What became of a decision's shadow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Shadow {
+    /// None was due: the request's binding asks none, or the door made
+    /// the decision itself over a view its gateway left no row.
+    NotDue,
+    /// One was due: what it said, or that it was not asked.
+    Said(Shadowed),
+    /// The shadow panicked, and the panic was held where it was asked.
+    Faulted,
+}
+
+/// [`ByEngine`] under a generation that shadows. The live decision is
+/// made at the engine's keeping entries and taken with its booking as
+/// values. Then the binding's shadow is asked over the same view
+/// ([`Engine::shadow`]), ahead of the commit: the rows and the counts are
+/// those the live decision read, and no stage has heard of its lease.
+/// The shadow writes the scratch and its own stages, and nothing the
+/// commit reads.
+///
+/// A shadow that is due is not asked in two places, and is said as
+/// skipped. A request with less than [`SHADOW_FLOOR`] of its budget left
+/// keeps that for its answer. And rows named for the live profile are
+/// not the shadow profile's where that profile would be named others
+/// ([`Engine::shadow_for`]).
+///
+/// A shadow that panics is held here, inside the catch its host keeps
+/// round the decision: the live decision stands as decided.
+struct Shadowing<'a, L> {
+    engine: &'a Engine,
+    /// What the request's budget still holds at the end of the live
+    /// decision: asked there, and only where a shadow is due.
+    left: L,
+}
+
+impl<L: FnOnce() -> Duration> Shadowing<'_, L> {
+    // Forced into each form's one call, as the plain decider's is.
+    #[inline(always)]
+    fn decided<const STATED: bool>(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> ((Decision, Option<Booking>), Shadow) {
+        let engine = self.engine;
+        let keeping = ByEngine::<true>(engine);
+        let live = keeping.decided::<STATED>(facts, pool, candidates, constraints, scratch);
+        // The door's own shed over a view with no row: no profile
+        // decided it, so none is set beside it.
+        if candidates.is_empty() && pool.pool_size > 0 {
+            return (live, Shadow::NotDue);
+        }
+        let Some((binding, shares)) = engine.shadow_for(facts.model, facts.phase) else {
+            return (live, Shadow::NotDue);
+        };
+        let said = |kind, first| {
+            Shadow::Said(Shadowed {
+                binding,
+                kind,
+                first,
+            })
+        };
+        // Rows named for the live profile's own cap, where the shadow
+        // profile would be named others.
+        let apart = STATED && !shares;
+        if apart || (self.left)() < SHADOW_FLOOR {
+            return (live, said(ShadowKind::Skipped, None));
+        }
+        #[cfg(test)]
+        if let Some(asking) = ON_SHADOW.take() {
+            asking();
+        }
+        let asked = catch_unwind(AssertUnwindSafe(|| {
+            engine.shadow(facts, pool, candidates, constraints, scratch)
+        }));
+        let shadow = match asked {
+            Ok(Some(shadow)) => {
+                let first = shadow.pick().and_then(|pick| pick.targets.first());
+                said(
+                    ShadowKind::of(&live.0, &shadow),
+                    first.map(|target| target.id),
+                )
+            }
+            Ok(None) => Shadow::NotDue,
+            Err(payload) => {
+                // A payload's own drop can panic: the engine's helper
+                // frees it under a catch of its own.
+                release(payload);
+                Shadow::Faulted
+            }
+        };
+        (live, shadow)
+    }
+}
+
+impl<L: FnOnce() -> Duration> Decides<((Decision, Option<Booking>), Shadow)> for Shadowing<'_, L> {
+    fn over(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> ((Decision, Option<Booking>), Shadow) {
+        self.decided::<false>(facts, pool, candidates, constraints, scratch)
+    }
+
+    fn over_named(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> ((Decision, Option<Booking>), Shadow) {
+        self.decided::<true>(facts, pool, candidates, constraints, scratch)
+    }
+}
+
+/// [`decide_in`] under a generation that shadows: the live decision with
+/// its booking, and what became of its binding's shadow ([`Shadowing`]).
+/// `left` says what the request's budget still holds at the end of the
+/// live decision, by its host's own clock.
+pub(crate) fn decide_shadowed_in<A: Asked>(
+    world: &World,
+    taken: &Taken<'_, A>,
+    buffers: &mut Buffers<A::Lists>,
+    own: &Part,
+    left: impl FnOnce() -> Duration,
+) -> ((Decision, Option<Booking>), Shadow) {
+    let spec = world.spec();
+    let engine = spec.engine();
+    if taken.request.hashes() > taken.request.hashes_read(spec) {
+        own.hashes_cut.fetch_add(1, Ordering::Relaxed);
+    }
+    let shadowing = Shadowing { engine, left };
+    let (((decision, booking), shadow), built) =
+        hand(world, taken, buffers, &own.undialed, shadowing);
+    let booking = booking.map(|booking| Booking { built, ..booking });
+    ((decision, booking), shadow)
 }
 
 /// The engine's pair decision over the world of one load, for the request
@@ -873,17 +1083,36 @@ pub(crate) fn issue<A: Asked>(
     booking: Booking,
     named: &Named,
 ) -> Result<Lease, LeaseRefused> {
+    let engine = world.spec().engine();
+    issue_told(store, world, taken, term, booking, named, |lease: &Lease| {
+        engine.on_decision_issued(lease, decision);
+    })
+}
+
+/// [`issue`] with the telling its caller hands, which tells the engine
+/// that decided of the lease. The store builds its issue for each
+/// telling, so a caller with a telling of its own leaves every other
+/// caller's issue as it was built.
+///
+/// # Errors
+///
+/// Those of [`issue`].
+pub(crate) fn issue_told<A: Asked>(
+    store: &MemoryStore,
+    world: &World,
+    taken: &Taken<'_, A>,
+    term: u64,
+    booking: Booking,
+    named: &Named,
+    told: impl Fn(&Lease),
+) -> Result<Lease, LeaseRefused> {
     let record = record_of(taken, term, &booking, Side::Single);
     let booked = booked_in(world, &booking);
     // Under one hold of the turn the store applies what is handed, files
     // the lease, tells the engine that decided of it, and ends and tells
-    // the leases it finds past their dispatch deadline.
-    let engine = world.spec().engine();
-    let told = |lease: &Lease| {
-        engine.on_decision_issued(lease, decision);
-    };
-    // A decision that read its key's count files a lease that books the
-    // key, whatever it did with the pin: the next read holds this request.
+    // the leases it finds past their dispatch deadline. A decision that
+    // read its key's count files a lease that books the key, whatever it
+    // did with the pin: the next read holds this request.
     let lease = if booking.counted {
         store.issue_keyed(record, booked, told)
     } else {
@@ -2216,6 +2445,8 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     static ON_SAMPLE_READ: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+    /// Called once between a live decision and its shadow.
+    static ON_SHADOW: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
 }
 
 /// The threads that have called a door so far.
@@ -2293,6 +2524,19 @@ impl Door {
         summed(&self.parts, |part| &part.hashes_cut)
     }
 
+    /// How many decisions made here had a shadow that said `kind`
+    /// beside them ([`ShadowKind`]), for the binding at position
+    /// `binding` of its generation. A shadow is counted behind its
+    /// decision's commit, and a decision the door refused counts none.
+    /// The count is a position's: a later generation's binding at the
+    /// same position counts on, and a binding past the sixteenth
+    /// counts with the sixteenth.
+    #[must_use]
+    pub fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64 {
+        let parts = self.parts.iter();
+        parts.map(|part| part.shadowed_so_far(binding, kind)).sum()
+    }
+
     /// One decision for `gateway`'s `request` at `now`, on the calling
     /// thread: one load of the published rows, the engine's decision and,
     /// for a pick, its lease, filed at the issue with the engine told.
@@ -2306,10 +2550,7 @@ impl Door {
         request: &Request<'_>,
         now: Instant,
     ) -> Result<Decided, Refused> {
-        self.deciding(gateway, request, now, |world, at, term, taken, buffers| {
-            let entry = entry(world, taken);
-            self.order(world, at, term, taken, buffers, entry)
-        })
+        self.deciding(gateway, request, now, Whole(self))
     }
 
     /// [`Door::decide`] for a request its host makes from the world the
@@ -2345,11 +2586,11 @@ impl Door {
     ) -> Result<(Decided, bool), Refused> {
         let made = Made(maker);
         let mut later = false;
-        let decided = self.deciding(gateway, &made, now, |world, at, term, taken, buffers| {
-            later = taken.request.decode_later();
-            let entry = entry(world, taken);
-            self.order(world, at, term, taken, buffers, entry)
-        })?;
+        let order = WholeStated {
+            door: self,
+            later: &mut later,
+        };
+        let decided = self.deciding(gateway, &made, now, order)?;
         Ok((decided, later))
     }
 
@@ -2369,17 +2610,12 @@ impl Door {
         placed: &mut EncodePlaced,
         now: Instant,
     ) -> Result<Decided, Refused> {
-        let decided = self.deciding(gateway, request, now, |world, at, term, taken, buffers| {
-            let (entry, plan) = entry_and_plan(world, taken);
-            if matches!((entry, plan), (Entry::Pair, Plan::Epd { .. })) {
-                let (decision, booking) =
-                    encode_pair_in(world, taken, items, placed, buffers, &self.parts[at]);
-                self.file_pair(world, term, taken, decision, booking)
-            } else {
-                placed.clear();
-                self.order(world, at, term, taken, buffers, entry)
-            }
-        });
+        let order = WithEncode {
+            door: self,
+            items,
+            placed: &mut *placed,
+        };
+        let decided = self.deciding(gateway, request, now, order);
         if decided.is_err() {
             placed.clear();
         }
@@ -2416,13 +2652,7 @@ impl Door {
         // The call mints no id: it spends no term and raises none.
         let term = self.term.load(Ordering::Relaxed);
         let called = Called(request, self.store.file_of(lease));
-        self.at_a_seat(
-            term,
-            gateway,
-            &called,
-            now,
-            |world, at, _, taken, buffers| self.decode(world, at, taken, buffers, lease),
-        )
+        self.at_a_seat(term, gateway, &called, now, DecodeCall(self, lease))
     }
 
     /// Finds a sampled decision by gateway and request id. A read holds
@@ -2513,13 +2743,7 @@ impl Door {
         gateway: GatewayId,
         request: &impl Stated,
         now: Instant,
-        mut order: impl FnMut(
-            &World,
-            usize,
-            u64,
-            &Taken<'_, Request<'_>>,
-            &mut Buffers<()>,
-        ) -> Result<Decided, Refused>,
+        mut order: impl Orders,
     ) -> Result<Decided, Refused> {
         match self.once(gateway, request, now, &mut order) {
             Err(Refused::Unleased) => self.once(gateway, request, now, order),
@@ -2536,13 +2760,7 @@ impl Door {
         gateway: GatewayId,
         request: &impl Stated,
         now: Instant,
-        order: impl FnOnce(
-            &World,
-            usize,
-            u64,
-            &Taken<'_, Request<'_>>,
-            &mut Buffers<()>,
-        ) -> Result<Decided, Refused>,
+        order: impl Orders,
     ) -> Result<Decided, Refused> {
         let term = self.term.load(Ordering::Relaxed);
         let outcome = self.at_a_seat(term, gateway, request, now, order);
@@ -2562,22 +2780,16 @@ impl Door {
     /// Takes the seat the last generation called for and checks it
     /// against the world loaded there. If an apply changed which seat
     /// the request belongs at, it takes that seat and loads again. The
-    /// same world governs the decision and its sampling. A call that names
-    /// its lease's seat and decides at its model's applies what waits at
-    /// the lease's file first ([`Door::stand_at`]).
+    /// same world governs the decision, its shadow and its sampling. A call
+    /// that names its lease's seat and decides at its model's applies what
+    /// waits at the lease's file first ([`Door::stand_at`]).
     fn at_a_seat(
         &self,
         term: u64,
         gateway: GatewayId,
         request: &impl Stated,
         now: Instant,
-        order: impl FnOnce(
-            &World,
-            usize,
-            u64,
-            &Taken<'_, Request<'_>>,
-            &mut Buffers<()>,
-        ) -> Result<Decided, Refused>,
+        mut order: impl Orders,
     ) -> Result<Decided, Refused> {
         let store = &*self.store;
         let mut seen = self.seat_flags.load(Ordering::Relaxed);
@@ -2646,16 +2858,24 @@ impl Door {
                     // decider's at work is.
                     place: None,
                 };
-                let decided = order(&world, at, term, &taken, buffers);
-                if flags & SAMPLES_DECISIONS != 0 {
-                    if let Ok(answer) = &decided {
-                        if sample_count.keeps(0, engine, &answer.decision) {
-                            let samples = &self.seats[at].samples;
-                            samples.lock().push(0, engine, &taken, &answer.decision);
-                        }
+                // One test for a generation that neither shadows nor
+                // samples: its order is the plain one, which stands last.
+                if flags & (SAMPLES_DECISIONS | SHADOWS) != 0 {
+                    // Each order's answer is built in its own place:
+                    // two that met in one would cost a copy of it.
+                    if flags & SHADOWS == 0 {
+                        let decided = order.plain(&world, at, term, &taken, buffers);
+                        self.sampled(at, engine, &taken, &decided, None, sample_count);
+                        return decided;
                     }
+                    let mut said = None;
+                    let decided = order.shadowed(&world, at, term, &taken, buffers, &mut said);
+                    if flags & SAMPLES_DECISIONS != 0 {
+                        self.sampled(at, engine, &taken, &decided, said, sample_count);
+                    }
+                    return decided;
                 }
-                decided
+                order.plain(&world, at, term, &taken, buffers)
             };
             let decided = catch_unwind(AssertUnwindSafe(|| request.under(&world, taken_up)));
             // The load ends with the decision.
@@ -2696,6 +2916,27 @@ impl Door {
         let at_file = slot.at_file.get_or_insert_with(|| self.store.at_work());
         at_file.work();
         self.leave(at, at_file);
+    }
+
+    /// Keeps a made decision in the seat's samples where its turn to be
+    /// sampled came, with what its shadow said.
+    // Forced into each order's tail: the sampling stands in line there,
+    // as it did where one order ran.
+    #[inline(always)]
+    fn sampled(
+        &self,
+        at: usize,
+        engine: &Engine,
+        taken: &Taken<'_, Request<'_>>,
+        decided: &Result<Decided, Refused>,
+        said: Option<Shadowed>,
+        count: &mut SampleCount,
+    ) {
+        let Ok(answer) = decided else { return };
+        if count.keeps(0, engine, &answer.decision) {
+            let mut samples = self.seats[at].samples.lock();
+            samples.push(0, engine, taken, &answer.decision, said);
+        }
     }
 
     /// Takes the seat of `model`'s decider and waits for it: a model's
@@ -2837,6 +3078,67 @@ impl Door {
             Entry::Pair => self.pair(world, at, term, taken, buffers),
             Entry::Side => Err(Refused::PairSide),
         }
+    }
+
+    /// [`Self::order`] under a generation that shadows. A single's
+    /// decision is made at the engine's keeping entries, and its
+    /// binding's shadow is asked over the same view ahead of the
+    /// commit ([`decide_shadowed_in`]). What the shadow said comes back
+    /// counted, behind a commit that held: a decision whose lease the
+    /// store refused counts none. A shadow that panicked is counted
+    /// with the door's faults and the scratch it left is dropped, both
+    /// behind the commit: the live decision is issued as decided. The
+    /// budget is the one its host stated at the decision's instant: in
+    /// process the door reads no clock. A pair is ordered as
+    /// [`Self::order`] orders it, and no shadow is asked for it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the order's own, and the place its shadow's word is left"
+    )]
+    fn order_shadowed(
+        &self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        entry: Entry,
+        said: &mut Option<Shadowed>,
+    ) -> Result<Decided, Refused> {
+        if entry != Entry::Single {
+            return self.order(world, at, term, taken, buffers, entry);
+        }
+        let own = &self.parts[at];
+        let ((decision, booking), shadow) =
+            decide_shadowed_in(world, taken, buffers, own, || taken.left);
+        let engine = world.spec().engine();
+        // This order's own telling ([`issue_told`]): the plain order's
+        // issue stays as it was built.
+        let told = |lease: &Lease| {
+            engine.on_decision_issued(lease, &decision);
+        };
+        let named = &buffers.named;
+        let lease = booking
+            .map(|booking| issue_told(&self.store, world, taken, term, booking, named, told))
+            .transpose();
+        if shadow == Shadow::Faulted {
+            // The next decision reads nothing the shadow left.
+            buffers.scratch = Scratch::default();
+            self.faults.fetch_add(1, Ordering::Relaxed);
+        }
+        let Ok(lease) = lease else {
+            return Err(Refused::Unleased);
+        };
+        if let Shadow::Said(shadow) = shadow {
+            let count = own.shadowed(shadow.binding, shadow.kind);
+            count.fetch_add(1, Ordering::Relaxed);
+            *said = Some(shadow);
+        }
+        let lease = lease.map(|lease| Leased {
+            lease,
+            due: taken.due(),
+        });
+        Ok(Decided { decision, lease })
     }
 
     /// A pair's order: decided for both sides and, for a pick, issued a
@@ -2983,6 +3285,233 @@ impl Door {
     }
 }
 
+/// The order of one decision at its seat, in the two forms a seat runs
+/// it in. A generation that neither shadows nor samples runs the plain
+/// form and no part of the other.
+trait Orders {
+    /// Decides the request and, for a pick, issues its lease.
+    fn plain(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+    ) -> Result<Decided, Refused>;
+
+    /// [`Self::plain`] under a generation that shadows
+    /// ([`Door::order_shadowed`]). What the decision's shadow said is
+    /// left in `said`: the answer is built where it is returned, and
+    /// is not carried beside a second value.
+    fn shadowed(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        said: &mut Option<Shadowed>,
+    ) -> Result<Decided, Refused>;
+}
+
+/// An order lent to a run. A decision whose lease the store refused runs
+/// its order twice: the first run borrows it and the second takes it, so
+/// each run is an instance of its own, as each closure's was.
+impl<O: Orders> Orders for &mut O {
+    #[inline(always)]
+    fn plain(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+    ) -> Result<Decided, Refused> {
+        (**self).plain(world, at, term, taken, buffers)
+    }
+
+    #[inline(always)]
+    fn shadowed(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        said: &mut Option<Shadowed>,
+    ) -> Result<Decided, Refused> {
+        (**self).shadowed(world, at, term, taken, buffers, said)
+    }
+}
+
+/// The order of [`Door::decide`] and [`Door::decide_under`]: the request
+/// takes the path its plan gives it ([`entry`]).
+struct Whole<'d>(&'d Door);
+
+impl Orders for Whole<'_> {
+    // Forced into the seat's call: out of line the plain order would pay
+    // a call the closure it stands for never made.
+    #[inline(always)]
+    fn plain(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+    ) -> Result<Decided, Refused> {
+        let entry = entry(world, taken);
+        self.0.order(world, at, term, taken, buffers, entry)
+    }
+
+    fn shadowed(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        said: &mut Option<Shadowed>,
+    ) -> Result<Decided, Refused> {
+        let entry = entry(world, taken);
+        self.0
+            .order_shadowed(world, at, term, taken, buffers, entry, said)
+    }
+}
+
+/// [`Whole`] for [`Door::decide_under_stated`]: each run of the order
+/// notes what the made request said of its decode
+/// ([`Asked::decode_later`]).
+struct WholeStated<'d, 'l> {
+    door: &'d Door,
+    later: &'l mut bool,
+}
+
+impl Orders for WholeStated<'_, '_> {
+    #[inline(always)]
+    fn plain(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+    ) -> Result<Decided, Refused> {
+        *self.later = taken.request.decode_later();
+        Whole(self.door).plain(world, at, term, taken, buffers)
+    }
+
+    fn shadowed(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        said: &mut Option<Shadowed>,
+    ) -> Result<Decided, Refused> {
+        *self.later = taken.request.decode_later();
+        Whole(self.door).shadowed(world, at, term, taken, buffers, said)
+    }
+}
+
+/// The order of [`Door::decide_decode`]: the decode side of the pair's
+/// lease on file ([`Door::decode`]). A pair's side is asked no shadow.
+struct DecodeCall<'d>(&'d Door, LeaseId);
+
+impl Orders for DecodeCall<'_> {
+    #[inline(always)]
+    fn plain(
+        &mut self,
+        world: &World,
+        at: usize,
+        _: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+    ) -> Result<Decided, Refused> {
+        self.0.decode(world, at, taken, buffers, self.1)
+    }
+
+    fn shadowed(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        _: &mut Option<Shadowed>,
+    ) -> Result<Decided, Refused> {
+        self.plain(world, at, term, taken, buffers)
+    }
+}
+
+/// The order of [`Door::decide_encode_pair`]: the request that enters an
+/// `epd` plan is decided as a pair with its encode items placed, and any
+/// other as [`Whole`] orders it, with `placed` cleared.
+struct WithEncode<'d, 'i, 'p> {
+    door: &'d Door,
+    items: EncodeItems<'i>,
+    placed: &'p mut EncodePlaced,
+}
+
+impl WithEncode<'_, '_, '_> {
+    /// The pair's order, for the request that enters an `epd` plan.
+    /// `Err` is the path of any other request, with `placed` cleared.
+    #[inline(always)]
+    fn pair(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+    ) -> Result<Result<Decided, Refused>, Entry> {
+        let (entry, plan) = entry_and_plan(world, taken);
+        if !matches!((entry, plan), (Entry::Pair, Plan::Epd { .. })) {
+            self.placed.clear();
+            return Err(entry);
+        }
+        let own = &self.door.parts[at];
+        let (decision, booking) =
+            encode_pair_in(world, taken, self.items, self.placed, buffers, own);
+        Ok(self.door.file_pair(world, term, taken, decision, booking))
+    }
+}
+
+impl Orders for WithEncode<'_, '_, '_> {
+    #[inline(always)]
+    fn plain(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+    ) -> Result<Decided, Refused> {
+        match self.pair(world, at, term, taken, buffers) {
+            Ok(decided) => decided,
+            Err(entry) => self.door.order(world, at, term, taken, buffers, entry),
+        }
+    }
+
+    fn shadowed(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        said: &mut Option<Shadowed>,
+    ) -> Result<Decided, Refused> {
+        match self.pair(world, at, term, taken, buffers) {
+            Ok(decided) => decided,
+            Err(entry) => self
+                .door
+                .order_shadowed(world, at, term, taken, buffers, entry, said),
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     pub(crate) mod sent_prefixes;
@@ -3027,6 +3556,8 @@ pub(crate) mod tests {
         },
         DecisionRecord,
     };
+
+    mod shadow;
 
     pub(crate) const MODEL: &str = "model-a";
     pub(crate) const GATEWAY: GatewayId = GatewayId(11);
