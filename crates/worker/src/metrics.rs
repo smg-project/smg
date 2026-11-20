@@ -93,8 +93,8 @@ impl BoundedLabels {
     }
 
     /// Whether the set admits no value more: `admitted` is at its cap, or
-    /// a test reads the set as full on its own thread. Asked for a value
-    /// the set does not hold alone, never for one it holds.
+    /// a test reads the set as full on its own thread. Asked only for a
+    /// value the set does not hold.
     fn is_full(&self, admitted: usize) -> bool {
         #[cfg(test)]
         if labels_full::on_this_thread() {
@@ -107,20 +107,6 @@ impl BoundedLabels {
 /// Intern a client-supplied model label, bounded by `MAX_MODEL_LABELS`.
 pub fn intern_model_label(model_id: &str) -> Arc<str> {
     MODEL_LABELS.intern(model_id)
-}
-
-/// The label a model's series carry, read without admitting the model: its
-/// own text where the set of model labels holds it or has room for it, the
-/// sentinel where the set is full and never took it.
-#[cfg(feature = "runtime")]
-pub(crate) fn model_label(model_id: &str) -> &str {
-    let labels = &*MODEL_LABELS;
-    if labels.map.contains_key(model_id) || !labels.is_full(labels.admitted.load(Ordering::Relaxed))
-    {
-        model_id
-    } else {
-        BOUNDED_LABEL_SENTINEL
-    }
 }
 
 /// For this crate's tests: a thread's say that the bounded label sets are
@@ -451,24 +437,5 @@ mod tests {
         }
         let met = intern_model_label("a-model-met-while-full");
         assert_eq!(&*met, "a-model-met-while-full");
-    }
-
-    #[cfg(feature = "runtime")]
-    #[test]
-    fn a_models_label_is_read_without_admitting_it() {
-        let admitted = intern_model_label("a-model-whose-label-is-read");
-        assert_eq!(model_label("a-model-whose-label-is-read"), &*admitted);
-        // The set has room: a model it never met would carry its own text.
-        assert_eq!(
-            model_label("a-model-never-admitted"),
-            "a-model-never-admitted"
-        );
-        // Read as full, the set shows that the read above admitted nothing.
-        let _full = labels_full::hold_on_this_thread();
-        assert_eq!(model_label("a-model-whose-label-is-read"), &*admitted);
-        assert_eq!(
-            model_label("a-model-never-admitted"),
-            BOUNDED_LABEL_SENTINEL
-        );
     }
 }

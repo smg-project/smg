@@ -88,7 +88,7 @@ use crate::{
         state::{LoadReceiver, LoadSnapshot, LoadState},
     },
     metrics::{
-        model_label,
+        intern_model_label,
         writers::{LoadTest, Metrics},
     },
     registry::{event::WorkerEvent, worker_model_ids, Generation, WorkerRegistry},
@@ -1550,16 +1550,24 @@ impl<G: Generation> WorkerMonitor<G> {
             .load_state
             .another_live_workers_row(worker)
             .map(|(source, load)| (worker_model_ids(&source), load));
-        // Each live writer's labels are read once, and the read admits no
-        // model to the label set: the guard compares texts alone.
+        // Each live writer's labels are read once, and the guard compares
+        // texts alone. The read is the intern the writers use, so it gives
+        // the label a writer's series carry, and it admits at most the
+        // label that writer's own first write admits. A second kind of
+        // read of the label map would stop the compiler inlining the
+        // map's lookup into the intern, a cost to every record that
+        // builds its own keys.
         let row = row.as_ref().map(|(models, load)| {
-            let labels: Vec<&str> = models.iter().map(|model| model_label(model)).collect();
+            let labels: Vec<Arc<str>> = models
+                .iter()
+                .map(|model| intern_model_label(model))
+                .collect();
             (labels, load)
         });
         let other = reports
             .get(worker.url())
             .filter(|other| !Arc::ptr_eq(&other.pusher, worker) && !other.series_held)
-            .map(|other| (model_label(other.pusher.model_id()), other));
+            .map(|other| (intern_model_label(other.pusher.model_id()), other));
         write_sentinel(worker, ended, |label, rank, carries| {
             let holds = |loads: &[SchedulerLoadSnapshot]| {
                 loads
@@ -1567,9 +1575,10 @@ impl<G: Generation> WorkerMonitor<G> {
                     .any(|load| load.dp_rank == rank && carries(load))
             };
             row.as_ref().is_some_and(|(labels, load)| {
-                label.is_none_or(|label| labels.contains(&label)) && holds(&load.loads)
+                label.is_none_or(|label| labels.iter().any(|own| **own == *label))
+                    && holds(&load.loads)
             }) || other.as_ref().is_some_and(|(own, other)| {
-                label.is_none_or(|label| *own == label) && holds(&other.report.loads)
+                label.is_none_or(|label| **own == *label) && holds(&other.report.loads)
             })
         });
     }
