@@ -92,6 +92,7 @@ pub mod runtime;
 pub mod settings;
 #[cfg(all(feature = "runtime", any(test, feature = "test-util")))]
 pub mod test_support;
+mod value_bounds;
 pub mod worker;
 #[cfg(feature = "workflow")]
 pub mod workflow;
