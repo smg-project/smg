@@ -123,6 +123,17 @@ mod tests {
             }
         }
 
+        /// Wait within `check` for `url`'s stream: its slot, then its task's
+        /// open of the feed. The task opens the feed in its first turn, so
+        /// one turn of the runtime's other tasks carries it there. A worker
+        /// removed ahead of that turn gets no feed: its ticket opens
+        /// nothing, its task ends by itself, and no removal waits for it.
+        async fn streaming(&self, url: &str) -> u64 {
+            let id = self.new_slot(url, None).await;
+            tokio::task::yield_now().await;
+            id
+        }
+
         /// Wait within `check` for `url`'s slot to stand empty. A removal
         /// runs on a task of its own, so its end is not ordered with the
         /// events behind it.
@@ -398,7 +409,7 @@ mod tests {
         let f = Fixture::new();
         let row = f.lay(facts(FIRST, WireModes::GRPC, true));
         f.check(async {
-            let leaving = f.new_slot(FIRST, None).await;
+            let leaving = f.streaming(FIRST).await;
             let permits = removals_held().await;
             assert!(f.remove(row));
             f.lay(facts(SECOND, WireModes::GRPC, true));
@@ -424,7 +435,7 @@ mod tests {
         let f = Fixture::new();
         let row = f.lay(facts(FIRST, WireModes::GRPC, true));
         f.check(async {
-            let old = f.new_slot(FIRST, None).await;
+            let old = f.streaming(FIRST).await;
             let permits = removals_held().await;
             assert!(f.remove(row));
             f.lay(facts(FIRST, WireModes::GRPC, true));
