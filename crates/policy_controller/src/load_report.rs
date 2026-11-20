@@ -112,8 +112,9 @@ fn narrow(count: i64) -> u32 {
 /// `sampled_at` is the sample instant of the report's row: a record's
 /// own, a polled answer's stamp, else the poll's start. A value is
 /// sampled then, less its own age where the report states one: the age
-/// is the engine's, as of the report it made. A polled value is so never
-/// dated after its poll began, as its row is not.
+/// is the engine's, as of the report it made. A polled value with no
+/// stamp is so never dated after its poll began, as its row is not. A
+/// stamped one is dated no later than its answer's receipt.
 pub fn signal_values(
     report: &WorkerLoadResponse,
     columns: &[SignalColumn],

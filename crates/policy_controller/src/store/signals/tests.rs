@@ -652,6 +652,70 @@ fn a_new_document_keeps_a_name_it_declares_again_and_starts_a_changed_unit_empty
 }
 
 #[test]
+fn a_new_document_that_changes_a_signals_reduction_starts_the_name_empty() {
+    let stages = stages();
+    let store = Arc::new(MemoryStore::new());
+    let a = join(&store, facts("first", Role::Single));
+    let score = json!({ "by-value": { "signal": "heat" } });
+    let before = json!({ "depth": { "unit": "items" }, "heat": { "unit": "celsius" } });
+    stages.apply(&store, &document(4, before, score.clone()));
+    let at = Instant::now();
+    let write = |name, unit, value| store.signal_value(a, 0, name, unit, value, at);
+    assert_eq!(write("depth", "items", 3.0), Taken::Written);
+    assert_eq!(write("heat", "celsius", 71.0), Taken::Written);
+
+    // The same names under the same units: one signal's ranks are made
+    // one another way.
+    let after = json!({
+        "depth": { "unit": "items", "across_ranks": "max" },
+        "heat": { "unit": "celsius" }
+    });
+    stages.apply(&store, &document(5, after, score));
+    // The value on file was made the way that stood, so the name starts
+    // empty. The other name keeps its value.
+    let held = lent(&store, Role::Single);
+    let cells = &held.iter().find(|(row, _)| *row == a).expect("the row").1;
+    assert_eq!(**cells, [None, Some((71.0, store.micros(at)))]);
+    // The next report states the name again.
+    assert_eq!(write("depth", "items", 4.0), Taken::Written);
+    let held = lent(&store, Role::Single);
+    let cells = &held.iter().find(|(row, _)| *row == a).expect("the row").1;
+    assert_eq!(cells[0], Some((4.0, store.micros(at))));
+}
+
+/// A write reads its column with no lock held, so a document can be
+/// applied between that read and the write. The value was made under the
+/// column the write read.
+#[test]
+fn a_write_read_under_the_generation_before_lands_only_where_its_column_is_continued() {
+    let stages = stages();
+    let store = Arc::new(MemoryStore::new());
+    let a = join(&store, facts("first", Role::Single));
+    let score = json!({ "by-value": { "signal": "heat" } });
+    let before = json!({ "depth": { "unit": "items" }, "heat": { "unit": "celsius" } });
+    stages.apply(&store, &document(4, before, score.clone()));
+    let at = Instant::now();
+    let depth = store.signal_read("depth", "items");
+    let heat = store.signal_read("heat", "celsius");
+
+    // A name before both moves the columns, and one reduction changes.
+    let after = json!({
+        "age": { "unit": "ms" },
+        "depth": { "unit": "items", "across_ranks": "max" },
+        "heat": { "unit": "celsius" }
+    });
+    stages.apply(&store, &document(5, after, score));
+    let write = |names, value, read| store.signal_write(a, 0, names, value, at, read);
+    // Made as a sum, under a column that is now a maximum: not taken.
+    assert_eq!(write(("depth", "items"), 3.0, depth), Taken::Undeclared);
+    // Continued: taken, at the column's new place.
+    assert_eq!(write(("heat", "celsius"), 71.0, heat), Taken::Written);
+    let held = lent(&store, Role::Single);
+    let cells = &held.iter().find(|(row, _)| *row == a).expect("the row").1;
+    assert_eq!(**cells, [None, None, Some((71.0, store.micros(at)))]);
+}
+
+#[test]
 fn a_refused_document_moves_no_value() {
     let stages = stages();
     let (store, [a, b, c]) = fleet(&stages);

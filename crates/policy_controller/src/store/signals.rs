@@ -67,7 +67,9 @@ pub trait SignalSink: Send + Sync {
 pub enum Taken {
     /// The value is on file and is shown with the next publication.
     Written,
-    /// The document in force declares no signal of the name.
+    /// The document in force declares no signal of the name. Or one
+    /// applied under the write declares the name with another reduction
+    /// across ranks than the one the value was made under.
     Undeclared,
     /// The stated unit is not the one the document declares.
     WrongUnit,
