@@ -26,7 +26,7 @@ use crate::{
         TieBand, Unit, DRAW_BOUND,
     },
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
-    sent::{Sent, SentCredit, SentReads},
+    sent::{Sent, SentCounts, SentCredit, SentReads},
     spec::{CostMargin, Needs, Unreported},
     terms::{Coefficients, Term},
     view::{
@@ -278,7 +278,7 @@ impl HasRoomRule {
         facts: &RequestFacts<'_>,
         row: &Candidate,
         load: Option<&LoadRow>,
-        sent: impl FnOnce() -> (u64, u64),
+        sent: impl FnOnce() -> SentCounts,
     ) -> bool {
         let mut used = 0.0;
         if self.in_flight {
@@ -297,9 +297,9 @@ impl HasRoomRule {
         }
         used += asked;
         if self.sent.is_some() {
-            let (tokens, requests) = sent();
-            used += requests as f64 * self.terms.sent_requests;
-            used += tokens as f64 * self.terms.sent_tokens;
+            let sent = sent();
+            used += f64::from(sent.requests) * self.terms.sent_requests;
+            used += sent.tokens as f64 * self.terms.sent_tokens;
         }
         used <= self.bound
     }
@@ -309,7 +309,7 @@ impl HasRoomRule {
         let sent = || {
             self.sent
                 .as_ref()
-                .map_or((0, 0), |sent| sent.reads(facts).counts(row))
+                .map_or_else(SentCounts::default, |sent| sent.reads(facts).counts(row))
         };
         by_names!(self, fits(self.asked(facts), facts, row, load, sent))
     }
@@ -332,7 +332,11 @@ impl HasRoomRule {
         for at in 0..kept.len() {
             let i = kept[at];
             let row = &candidates[i as usize];
-            let sent = || sends.as_ref().map_or((0, 0), |sends| sends.counts(row));
+            let sent = || {
+                sends
+                    .as_ref()
+                    .map_or_else(SentCounts::default, |sends| sends.counts(row))
+            };
             let fits =
                 self.fits::<RESIDENT, WAITING, KV_OR_RUNNING>(asked, facts, row, load(row), sent);
             kept[held] = i;
@@ -1238,11 +1242,13 @@ impl SinceReport {
     /// before `through_micros` are released: a report sampled then
     /// reflects them, or a time limit ends them. An instant that reaches
     /// none of them reads the word alone. Inlined into a reader's row
-    /// loop: two loads and a compare a row, the release behind a call.
+    /// loop: two loads and a compare a row, the release behind a call
+    /// that hands the held word back, so the loop keeps nothing of the
+    /// row across it.
     #[inline(always)]
     pub(crate) fn credit_through(&self, through_micros: u64) -> (u64, u64) {
         if self.reaches(through_micros) {
-            self.release_through(through_micros);
+            return Self::credit_of(self.release_through(through_micros));
         }
         self.held_credit()
     }
@@ -1276,19 +1282,26 @@ impl SinceReport {
     /// The held token-work and requests, as the word stands.
     #[inline(always)]
     fn held_credit(&self) -> (u64, u64) {
-        let held = self.held.load(Ordering::Relaxed);
+        Self::credit_of(self.held.load(Ordering::Relaxed))
+    }
+
+    /// The token-work and requests a held word says.
+    #[inline(always)]
+    const fn credit_of(held: u64) -> (u64, u64) {
         (held >> REQUEST_BITS, held & REQUEST_MASK)
     }
 
     /// Releases every lane's dispatches made at or before the sample and
     /// recomputes the row's oldest, under every lane's lock in lane order,
-    /// so no dispatch lands between the lanes' reads and the store. Out of
-    /// line: a decision reads a row far more often than a report releases
-    /// from it, and with this body inlined the read was too large to stay
-    /// in a second scorer's row loop.
+    /// so no dispatch lands between the lanes' reads and the store. Hands
+    /// back the held word as it stands once the locks are free: a read of
+    /// two numbers takes them from it and keeps nothing of the row across
+    /// the call. Out of line: a decision reads a row far more often than
+    /// a report releases from it, and with this body inlined the read was
+    /// too large to stay in a second scorer's row loop.
     #[cold]
     #[inline(never)]
-    fn release_through(&self, sampled_at_micros: u64) {
+    fn release_through(&self, sampled_at_micros: u64) -> u64 {
         let mut held_lanes = self.lock_lanes();
         // No dispatch lands under every lane's lock, so the count of the
         // held dispatches of no tokens stands still here: a row that
@@ -1314,6 +1327,10 @@ impl SinceReport {
             .min()
             .unwrap_or(u64::MAX);
         self.oldest_micros.store(oldest, Ordering::Release);
+        // Loaded behind the locks, as a reader's own load is: under them
+        // the value would be carried across the unlocking.
+        drop(held_lanes);
+        self.held.load(Ordering::Relaxed)
     }
 
     /// The release of a row that holds a dispatch of no tokens: each one
@@ -2393,7 +2410,7 @@ impl ResidentWork {
             // number stale, so the test rides that release: a row that
             // holds none at or before its sample reads the word alone.
             if since.reaches(row.load_sampled_at_micros) {
-                self.release(since, row);
+                return self.release(since, row);
             }
             since.held_credit()
         });
@@ -2408,15 +2425,19 @@ impl ResidentWork {
     /// Releases the dispatches `row`'s report reflects, as a stage told
     /// nothing does, and sends back a number kept of an earlier report:
     /// the release may have taken dispatches that number counts
-    /// ([`ResidentWork::settle`]). Cold and out of line: a decision reads
-    /// a row far more often than a report releases from it.
+    /// ([`ResidentWork::settle`]). Hands back the held token-work and
+    /// requests behind the release, which settling does not write, so
+    /// the pass keeps nothing of the row across this call. Cold and out
+    /// of line: a decision reads a row far more often than a report
+    /// releases from it.
     #[cold]
     #[inline(never)]
-    fn release(&self, since: &SinceReport, row: &Candidate) {
-        since.release_through(row.load_sampled_at_micros);
+    fn release(&self, since: &SinceReport, row: &Candidate) -> (u64, u64) {
+        let held = since.release_through(row.load_sampled_at_micros);
         if since.keeps_before(row.load_sampled_at_micros) {
             self.settle(None, since, row, Slot::NONE);
         }
+        SinceReport::credit_of(held)
     }
 }
 
@@ -2972,9 +2993,9 @@ impl ReadsLoad for LeastCostSent {
             let mut bounds = CostBounds::EMPTY;
             for (&row, cost) in kept.iter().zip(costs.iter_mut()) {
                 if let RowCost::Sum(sum) = cost {
-                    let (tokens, requests) = sends.counts(&candidates[row as usize]);
-                    *sum += requests as f64 * terms.sent_requests;
-                    *sum += tokens as f64 * terms.sent_tokens;
+                    let sent = sends.counts(&candidates[row as usize]);
+                    *sum += f64::from(sent.requests) * terms.sent_requests;
+                    *sum += sent.tokens as f64 * terms.sent_tokens;
                     bounds.include(*sum);
                 }
             }

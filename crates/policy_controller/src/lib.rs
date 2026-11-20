@@ -195,7 +195,7 @@ pub use lease::{
 pub use reports::{ReportReads, Reports};
 pub use ring::{ConsistentHash, Ring};
 pub use routing_key::{DerivedKey, KeySource, KeySources};
-pub use sent::{Sent, SentCredit};
+pub use sent::{Sent, SentCounts, SentCredit};
 pub use sessions::{
     Assignment, Forgets, Pins, Recovery, SessionRule, SessionTable, SessionVerdict,
 };
