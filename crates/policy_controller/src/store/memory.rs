@@ -426,6 +426,11 @@ impl MemoryStore {
     ///
     /// Loads in the cut are ignored. Returns `false` with the store as it
     /// was if the journal refuses the snapshot's place.
+    ///
+    /// A follower's store has no journal. On a journaled store the journal
+    /// takes the cut's place: it follows the cut's term and leads no
+    /// longer, as at a restore, and the lease files keep their own term.
+    /// The two terms are in step after a restore and not after this door.
     pub fn watch_from(&self, cut: Cut) -> bool {
         let _released = self.released();
         self.lay_snapshot(cut, true)

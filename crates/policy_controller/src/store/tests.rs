@@ -2704,9 +2704,9 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
     let document: PolicySpec = serde_json::from_str(
         r#"{"apiVersion":"smg.policy/v1","generation":1,"view":{"labels":["zone=b"]},"profiles":{"p":{"score":["heard"],"pick":"best"}}}"#,
     ).expect("a policy document");
+    let digest = document.digest().expect("the digest");
     let spec =
-        AppliedSpec::validate_digested(&document, document.digest().expect("the digest"), &catalog)
-            .expect("a generation");
+        AppliedSpec::validate_digested(&document, digest, &catalog, &[]).expect("a generation");
     store.apply(spec).expect("the generation is applied");
 
     let mut cut = store.cut(Kinds::Watched);
