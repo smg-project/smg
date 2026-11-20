@@ -27,6 +27,26 @@ pub(crate) const FILTER: u32 = proto::Stage::Filter as u32;
 pub(crate) const SCORE: u32 = proto::Stage::Score as u32;
 pub(crate) const PICK: u32 = proto::Stage::Pick as u32;
 
+#[cfg(test)]
+std::thread_local! {
+    static SCORE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn score_visit() {
+    SCORE_VISITS.with(|visits| visits.set(visits.get() + 1));
+}
+
+#[cfg(test)]
+fn reset_score_visits() {
+    SCORE_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+fn score_visits() -> usize {
+    SCORE_VISITS.with(std::cell::Cell::get)
+}
+
 fn health_bits(h: Health) -> u32 {
     // The same numbering as the WIT's `health` flags and the packed row.
     let mut bits = 0;
@@ -641,18 +661,23 @@ pub(crate) fn read(
             }
             answer.declined |= SCORE;
         } else {
-            if d.scores.len() != count as usize || d.scores.iter().any(|s| !s.is_finite()) {
+            if d.scores.len() != count as usize {
                 return Err(Invalid::Scores);
+            }
+            answer.scores = d.scores;
+            for s in &mut answer.scores {
+                #[cfg(test)]
+                score_visit();
+                if !s.is_finite() {
+                    return Err(Invalid::Scores);
+                }
+                *s = s.clamp(0.0, 1.0);
             }
             if let Some(band) = d.tie_band {
                 if !(0.0..=1.0).contains(&band) {
                     return Err(Invalid::Band);
                 }
                 answer.band = Some(band);
-            }
-            answer.scores = d.scores;
-            for s in &mut answer.scores {
-                *s = s.clamp(0.0, 1.0);
             }
         }
     }
@@ -761,6 +786,30 @@ mod tests {
     }
 
     #[test]
+    fn finite_scores_are_validated_and_clamped_in_one_visit_each() {
+        for count in [8, 72, 512] {
+            let scores: Vec<f32> = (0..count)
+                .map(|position| match position % 3 {
+                    0 => -0.25,
+                    1 => 0.5,
+                    _ => 1.25,
+                })
+                .collect();
+            let clamped: Vec<f32> = scores.iter().map(|score| score.clamp(0.0, 1.0)).collect();
+
+            super::reset_score_visits();
+            let answer = read(decision(None, scores, None, None), SCORE, count).unwrap();
+
+            assert_eq!(answer.scores, clamped);
+            assert_eq!(
+                super::score_visits(),
+                count as usize,
+                "one validation and normalization visit per score"
+            );
+        }
+    }
+
+    #[test]
     fn a_decline_names_its_stages_and_a_budget_decline_is_busy() {
         let a = read(
             decision(
@@ -813,15 +862,17 @@ mod tests {
             read(decision(None, vec![0.1], None, None), SCORE, 3).unwrap_err(),
             Invalid::Scores
         );
-        assert_eq!(
-            read(
-                decision(None, vec![0.1, f32::NAN, 0.3], None, None),
-                SCORE,
-                3
-            )
-            .unwrap_err(),
-            Invalid::Scores
-        );
+        for not_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                read(
+                    decision(None, vec![0.1, not_finite, 0.3], None, None),
+                    SCORE,
+                    3
+                )
+                .unwrap_err(),
+                Invalid::Scores
+            );
+        }
         assert_eq!(
             read(
                 decision(Some(vec![0]), Vec::new(), Some(1), None),
