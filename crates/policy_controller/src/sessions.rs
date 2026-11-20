@@ -121,6 +121,8 @@ struct Entry {
     /// The instant the key's pins expire on the decision clock; `u64::MAX`
     /// under a rule without a TTL, and `0` until a decision reads the key.
     expires_at_micros: u64,
+    /// The newest decision instant that set the expiry and recovery rule.
+    touched_at_micros: u64,
     recovery: Recovery,
     /// The pin a decision's claim wrote before its commit; `WorkerId(0)`
     /// when none stands. Any dispatch to it confirms it (the key was served
@@ -132,9 +134,13 @@ struct Entry {
 
 impl Entry {
     fn touch(&mut self, now_micros: u64, rule: &SessionRule) {
+        if now_micros < self.touched_at_micros {
+            return;
+        }
         self.expires_at_micros = rule
             .ttl_micros
             .map_or(u64::MAX, |ttl| now_micros.saturating_add(ttl));
+        self.touched_at_micros = now_micros;
         self.recovery = rule.recovery;
     }
 
@@ -212,10 +218,10 @@ impl SessionTable {
     }
 
     /// The pins of `key` at a decision taken at `now_micros` under `rule`,
-    /// the key touched (its TTL renewed, its recovery rule recorded) and the
-    /// table swept when a sweep is due. A key never seen, or one whose TTL
-    /// passed, has empty pins: expiry is the key's own compare, the sweep
-    /// only reclaims.
+    /// the key touched when its decision instant is not older (its TTL
+    /// renewed, its recovery rule recorded) and the table swept when a sweep
+    /// is due. A key never seen, or one whose TTL passed, has empty pins:
+    /// expiry is the key's own compare, the sweep only reclaims.
     /// Always inlined: the keyed decision has two forms, and a second caller
     /// would otherwise move this out of line under the first.
     #[inline(always)]
@@ -563,6 +569,26 @@ mod tests {
         rarely.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
         assert_eq!(rarely.lookup(s(1), 500, &RULE), [WorkerId(1), WorkerId(0)]);
         assert_eq!(rarely.lookup(s(1), 2_000, &RULE), [WorkerId(0); 2]);
+    }
+
+    #[test]
+    fn an_older_lookup_cannot_shorten_a_newer_touch() {
+        let table = SessionTable::new(RULE.sweep_micros);
+        table.lookup(s(7), 500, &RULE);
+        table.dispatched(s(7), SessionVerdict::Pinned, WorkerId(1));
+
+        table.lookup(s(7), 1_000, &RULE);
+        table.lookup(s(7), 600, &ORIGINAL);
+
+        assert_eq!(
+            table.held(s(7)),
+            Some(([WorkerId(1), WorkerId(0)], Forgets::At(2_000)))
+        );
+        assert_eq!(
+            table.claim(s(7), [WorkerId(1), WorkerId(0)], WorkerId(2)),
+            Claim::Made(WorkerId(2))
+        );
+        assert_eq!(table.lookup(s(7), 1_600, &RULE), [WorkerId(2), WorkerId(1)]);
     }
 
     /// A retry's claim survives the commit of an older request on the owner:
