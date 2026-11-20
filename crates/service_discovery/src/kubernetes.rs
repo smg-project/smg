@@ -2,9 +2,8 @@
 //!
 //! A reflector keeps a store of the Pods in view consistent with the API
 //! server (initial list, watch, re-list on desync, reconnect with backoff);
-//! every watch event and a periodic tick run one level-triggered pass that
-//! turns the store into the published workers and hands them to the shared
-//! reconciler. What a Pod publishes:
+//! store changes rebuild the published workers, and a periodic tick reconciles
+//! the last build again. What a Pod publishes:
 //!
 //! - It is in view when its labels match the worker selector, or in
 //!   disaggregated routing any of the role selectors; its role is the first
@@ -54,6 +53,13 @@ use super::{
     provider::{DiscoveredWorker, DiscoveryKind},
     reconciler::{self, DesiredState},
 };
+
+#[cfg(test)]
+std::thread_local! {
+    /// The `compute_desired_state` calls on this thread, isolated because the
+    /// test harness runs each unit test on its own thread.
+    static PROJECTION_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Labels Kubernetes discovery has always stamped on the workers it registers,
 /// kept for existing selectors and dashboards. Ownership no longer depends on
@@ -560,8 +566,8 @@ fn run_service_discovery(
 
         // Level-triggered reconcile: the reflector keeps `store` consistent
         // with the API server (initial LIST → watch, re-LIST on desync,
-        // reconnect with internal backoff). Every watch event and a periodic
-        // tick trigger one pass diffing desired workers against the registry.
+        // reconnect with internal backoff). Visible store changes rebuild the
+        // desired workers; periodic ticks reconcile that last build again.
         let (store, writer) = reflector::store::<Pod>();
         let notify = Notify::new();
 
@@ -583,15 +589,25 @@ fn run_service_discovery(
     handle
 }
 
-/// Wake the reconcile loop on every watch event. A watcher error is logged;
-/// the stream itself retries with its own backoff.
+/// Wake the reconcile loop when the store changes. The initial list wakes the
+/// store's readiness waiter; later complete re-lists wake this loop too. A
+/// watcher error is logged, and the stream retries with its own backoff.
 async fn drive_watch(
     mut stream: impl Stream<Item = watcher::Result<watcher::Event<Pod>>> + Unpin,
     notify: &Notify,
 ) {
+    let mut initial_sync = true;
     while let Some(item) = stream.next().await {
         match item {
-            Ok(_) => notify.notify_one(),
+            Ok(watcher::Event::Apply(_) | watcher::Event::Delete(_)) => notify.notify_one(),
+            Ok(watcher::Event::InitDone) => {
+                if initial_sync {
+                    initial_sync = false;
+                } else {
+                    notify.notify_one();
+                }
+            }
+            Ok(watcher::Event::Init | watcher::Event::InitApply(_)) => {}
             Err(e) => {
                 error!("K8s worker watcher error (auto-retrying with backoff): {e}");
             }
@@ -600,7 +616,7 @@ async fn drive_watch(
     error!("K8s worker watcher stream ended; discovery no longer receives updates");
 }
 
-/// One reconcile pass on every notification, coalesced, and on every tick,
+/// Rebuild after a store change and reconcile the last build on every tick,
 /// once the store holds the initial list.
 async fn reconcile_on_change(
     store: &Store<Pod>,
@@ -618,19 +634,33 @@ async fn reconcile_on_change(
     );
     let mut interval = time::interval(config.check_interval);
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    interval.tick().await;
+
+    let started_at = time::Instant::now();
+    let mut desired = compute_desired_state(&store.state(), config);
+    reconciler::reconcile(&desired, DiscoveryKind::Kubernetes, host, started_at).await;
+
     loop {
-        tokio::select! {
+        let changed = tokio::select! {
             () = notify.notified() => {
                 // Coalesce event bursts (relists, rollouts) into one pass.
                 time::sleep(Duration::from_secs(1)).await;
+                true
             }
-            _ = interval.tick() => {}
+            _ = interval.tick() => false
+        };
+        let started_at = time::Instant::now();
+        if changed {
+            desired = compute_desired_state(&store.state(), config);
         }
-        reconcile_once(store, config, host).await;
+        reconciler::reconcile(&desired, DiscoveryKind::Kubernetes, host, started_at).await;
     }
 }
 
 fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> DesiredState {
+    #[cfg(test)]
+    PROJECTION_PASSES.set(PROJECTION_PASSES.get() + 1);
+
     let mut workers = Vec::new();
     for pod in pods {
         if !PodInfo::should_include(pod, config) {
@@ -687,18 +717,6 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
         }
     }
     DesiredState::from_workers(workers)
-}
-
-/// Convert the current reflector store snapshot into desired workers and hand
-/// it to the shared reconciler. Kubernetes-specific conversion stops here.
-async fn reconcile_once(
-    store: &Store<Pod>,
-    config: &ServiceDiscoveryConfig,
-    host: &dyn DiscoveryHost,
-) {
-    let started_at = time::Instant::now();
-    let desired = compute_desired_state(&store.state(), config);
-    reconciler::reconcile(&desired, DiscoveryKind::Kubernetes, host, started_at).await;
 }
 
 #[cfg(test)]
