@@ -35,7 +35,7 @@ use parking_lot::Mutex;
 use smg_policy_controller::{
     store::{LoadSink as StoreLoadSink, Maker, MemoryStore, WorkerFacts},
     worker_host::{
-        Expect, HealthAdapter, KvFeed, LoadAdapter, Membership, Objects, Refused, Remover,
+        Expect, HealthAdapter, KvFeed, LoadAdapter, Membership, Objects, Over, Refused, Remover,
         SoleLead, Standing, StoreDoor, Wrote,
     },
 };
@@ -420,11 +420,12 @@ impl Membership for FeedDoor {
         maker: &Maker,
         expect: Expect,
         built: &Arc<dyn Worker>,
-        over: Option<&Arc<dyn Worker>>,
+        over: Option<Over<'_>>,
     ) -> Result<Wrote, Refused> {
         self.write(|door| {
-            self.objects.handing(self.store.as_ref(), built, over, || {
-                door.found_built(maker, expect, built, None)
+            let seen = over.map(Over::object);
+            self.objects.handing(self.store.as_ref(), built, seen, || {
+                door.found_built(maker, expect, built, over)
             })
         })
     }

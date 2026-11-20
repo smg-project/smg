@@ -15,7 +15,7 @@ use openai_protocol::worker::WorkerStatus;
 use smg_policy_controller::{
     store::{Maker, WorkerFacts},
     view::WorkerId,
-    worker_host::{Expect, Membership, Objects, Refused, Remover, Standing, Wrote},
+    worker_host::{Expect, Membership, Objects, Over, Refused, Remover, Standing, Wrote},
 };
 use smg_worker::identity::basic::Worker;
 
@@ -71,7 +71,7 @@ impl Membership for DrainingDoor {
         maker: &Maker,
         expect: Expect,
         built: &Arc<dyn Worker>,
-        over: Option<&Arc<dyn Worker>>,
+        over: Option<Over<'_>>,
     ) -> Result<Wrote, Refused> {
         self.door.found_built(maker, expect, built, over)
     }

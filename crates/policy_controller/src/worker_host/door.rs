@@ -5,7 +5,11 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use smg_worker::{identity::basic::Worker, settings::UnhealthyRemovalScope};
 
-use super::{found::facts, kv_feed::asks_events, Standing};
+use super::{
+    found::{facts, stated},
+    kv_feed::asks_events,
+    Standing,
+};
 use crate::{
     store::{
         membership::{self, NotMaker, Past},
@@ -90,6 +94,32 @@ pub enum Expect {
     Anything,
 }
 
+/// The object a guarded write replaces, named by the write's verb: the
+/// object its asker read and built from.
+///
+/// A kept object can change while its row's revision stands, so a door
+/// that hands the built worker in refuses the write as moved where another
+/// object stands for the row by then. A door that keeps no object has
+/// nothing to hold it against, and still reads the verb.
+#[derive(Clone, Copy)]
+pub enum Over<'a> {
+    /// A replacement by id. It is its maker's whole statement of what a
+    /// registration can state: a threshold it leaves out is cleared.
+    Replaced(&'a Arc<dyn Worker>),
+    /// An update in place. It moves what it names: a threshold the built
+    /// worker does not state stays the row's.
+    Updated(&'a Arc<dyn Worker>),
+}
+
+impl<'a> Over<'a> {
+    /// The object the write replaces.
+    pub fn object(self) -> &'a Arc<dyn Worker> {
+        match self {
+            Self::Replaced(object) | Self::Updated(object) => object,
+        }
+    }
+}
+
 /// The membership door a host hands its registration and removal steps.
 pub trait Membership: Send + Sync + 'static {
     /// Lay a registration's facts under `url`, over what it expects to
@@ -108,7 +138,7 @@ pub trait Membership: Send + Sync + 'static {
 
     /// Lay the registration of a worker its asker built, under the
     /// worker's URL. The facts are the ones `built` states over the
-    /// standing row ([`facts`]).
+    /// standing row ([`facts`](super::facts)).
     ///
     /// Each door says what it does with the object. A door whose host
     /// keeps built objects hands `built` to the holder in the write's turn
@@ -116,17 +146,17 @@ pub trait Membership: Send + Sync + 'static {
     /// passes the call on. Any other door writes the facts alone, and its
     /// host's holder builds the object from the row.
     ///
-    /// `over` is the object a guarded write replaces: the one its asker
-    /// read and built from. A kept object can change while its row's
-    /// revision stands, so a door that hands `built` in refuses the write
-    /// as moved where another object stands for the row by then. A door
-    /// that keeps no object has nothing to hold it against.
+    /// `over` names the object a guarded write replaces, by the write's
+    /// verb ([`Over`]). A door that hands `built` in holds the write
+    /// against that object. Every door reads the verb: a replacement by id
+    /// states its thresholds whole, and any other write keeps the standing
+    /// row's where `built` states none.
     fn found_built(
         &self,
         maker: &Maker,
         expect: Expect,
         built: &Arc<dyn Worker>,
-        over: Option<&Arc<dyn Worker>>,
+        over: Option<Over<'_>>,
     ) -> Result<Wrote, Refused>;
 
     /// Mark the row the asker saw as draining. Its revision stays the same.
@@ -445,16 +475,17 @@ impl Membership for StoreDoor {
         self.call(|| lay(self, maker, expect, url, state))
     }
 
-    // This door has no holder. The row takes the facts alone.
+    // This door has no holder. The row takes the facts alone, by the
+    // write's verb.
     fn found_built(
         &self,
         maker: &Maker,
         expect: Expect,
         built: &Arc<dyn Worker>,
-        _: Option<&Arc<dyn Worker>>,
+        over: Option<Over<'_>>,
     ) -> Result<Wrote, Refused> {
         self.found(maker, expect, built.url(), &|standing| {
-            facts(built.as_ref(), standing)
+            stated(built.as_ref(), standing, over)
         })
     }
 

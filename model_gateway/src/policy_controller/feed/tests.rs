@@ -22,7 +22,9 @@ use smg_policy_controller::{
         PUBLISH_WINDOW,
     },
     view::{Role, WireModes, WorkerId},
-    worker_host::{Expect, Membership, Objects, Refused, Remover, Standing, StoreDoor, Wrote},
+    worker_host::{
+        Expect, Membership, Objects, Over, Refused, Remover, Standing, StoreDoor, Wrote,
+    },
 };
 use smg_worker::{
     connection::engine::EngineConnector,
@@ -465,8 +467,12 @@ fn a_built_worker_is_the_rows_object_when_its_write_returns() {
     // a write over it is refused as moved though the row never moved.
     let third = built();
     let guarded = |over| {
-        feed.door
-            .found_built(&Maker::Control, Expect::Anything, &third, Some(over))
+        feed.door.found_built(
+            &Maker::Control,
+            Expect::Anything,
+            &third,
+            Some(Over::Updated(over)),
+        )
     };
     assert_eq!(guarded(&first), Err(Refused::Moved));
     assert!(held(&second));

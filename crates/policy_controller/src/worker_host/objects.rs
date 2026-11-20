@@ -969,8 +969,8 @@ mod tests {
             WorkerStatus,
         },
         worker_host::{
-            facts as stated, object, Expect, HealthAdapter, KeptCredential, Membership, SoleLead,
-            StoreDoor,
+            facts as stated, object, Expect, HealthAdapter, KeptCredential, Membership, Over,
+            SoleLead, StoreDoor,
         },
     };
 
@@ -1410,7 +1410,12 @@ mod tests {
         let guarded = |built: &Arc<dyn Worker>, over: &Arc<dyn Worker>| {
             let store = replica.store.as_ref();
             replica.objects.handing(store, built, Some(over), || {
-                door.found_built(&Maker::Control, Expect::Anything, built, Some(over))
+                door.found_built(
+                    &Maker::Control,
+                    Expect::Anything,
+                    built,
+                    Some(Over::Updated(over)),
+                )
             })
         };
         let stale = built(A, KEY_C);

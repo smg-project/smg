@@ -2233,6 +2233,65 @@ mod tests {
         assert_eq!(laid.status(), WorkerStatus::Ready);
     }
 
+    /// Under the policy controller a PUT is the operator's whole statement
+    /// of a worker: an overload threshold it leaves out is cleared, on the
+    /// row and on the row's object. A PATCH of another field keeps it.
+    #[tokio::test]
+    async fn under_the_policy_controller_a_put_clears_a_threshold_it_leaves_out() {
+        use smg_policy_controller::store::{Overload, WorkersStore};
+
+        let (hosted, url, _, mut next_job) = a_hosted_gateway_with_a_row().await;
+        let store = hosted.policy_store.as_ref().expect("the store");
+        let registry = &hosted.worker_registry;
+        let service = &hosted.worker_service;
+        let id = registry.get_id_by_url(&url).expect("the worker's id");
+        let marks = DashSet::new();
+        let limited = |waiting| {
+            let mut spec = WorkerSpec::new(&url);
+            spec.overload.waiting_requests = waiting;
+            spec
+        };
+        let pair = || store.by_key(&url).expect("the worker's row").facts.overload;
+        let listed = || {
+            let object = registry.get(&id).expect("the row's object");
+            object.metadata().spec.overload.waiting_requests
+        };
+
+        // A PUT that states a threshold: the row and its object hold it.
+        service
+            .replace_worker(id.as_str(), limited(Some(8)))
+            .await
+            .expect("the 202");
+        let done = execute_job(&next_job(), &hosted, &marks, None).await;
+        assert!(done.is_ok(), "{done:?}");
+        assert_eq!(pair().waiting_requests, Some(8));
+        assert_eq!(listed(), Some(8));
+
+        // A PATCH of a label keeps it.
+        let patch = Job::UpdateWorker {
+            url: url.clone(),
+            update: Box::new(
+                serde_json::from_value(serde_json::json!({"labels": {"tier": "a"}}))
+                    .expect("an update"),
+            ),
+            asker: WorkerJobAsker::Api,
+        };
+        let done = execute_job(&patch, &hosted, &marks, None).await;
+        assert!(done.is_ok(), "{done:?}");
+        assert_eq!(pair().waiting_requests, Some(8));
+        assert_eq!(listed(), Some(8));
+
+        // A PUT that leaves it out clears it.
+        service
+            .replace_worker(id.as_str(), limited(None))
+            .await
+            .expect("the 202");
+        let done = execute_job(&next_job(), &hosted, &marks, None).await;
+        assert!(done.is_ok(), "{done:?}");
+        assert_eq!(pair(), Overload::default());
+        assert_eq!(listed(), None);
+    }
+
     /// The door is the judge of an update. A job that reaches a row another
     /// maker made fails by the store's sentence, word for word, and the row
     /// keeps its labels. A provider's worker has no row, and the same line

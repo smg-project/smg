@@ -2,10 +2,10 @@
 
 use smg_worker::{
     identity::basic::Worker,
-    worker::{ConnectionMode, HealthCheckConfig},
+    worker::{ConnectionMode, HealthCheckConfig, WorkerSpec},
 };
 
-use super::object::role;
+use super::{door::Over, object::role};
 use crate::{
     store::{HealthPolicy, Overload, WorkerFacts},
     view::{threshold_permille, WireModes},
@@ -15,7 +15,10 @@ use crate::{
 /// row as the module's table describes. Facts the object does not carry
 /// come from the standing row, or from the store's defaults. The models are
 /// the ones the object serves now, and a threshold of its own registration
-/// is stated over the standing row's.
+/// is stated over the standing row's. A threshold it leaves out stays the
+/// standing row's: this reading keeps it under every verb. A door that
+/// writes a replacement by id ([`Over::Replaced`]) clears it past this
+/// reading.
 pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts {
     let defaults = WorkerFacts::default();
     let standing = standing.unwrap_or(&defaults);
@@ -65,17 +68,14 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
             timeout_ms: milliseconds(checks.timeout_secs),
             probes: !checks.disable_health_check,
         },
-        overload: Overload {
-            kv_usage_permille: spec
-                .overload
-                .token_usage
-                .map(threshold_permille)
-                .or(standing.overload.kv_usage_permille),
-            waiting_requests: spec
-                .overload
-                .waiting_requests
-                .map(|waiting| u32::try_from(waiting).unwrap_or(u32::MAX))
-                .or(standing.overload.waiting_requests),
+        overload: {
+            let own = thresholds(spec);
+            Overload {
+                kv_usage_permille: own
+                    .kv_usage_permille
+                    .or(standing.overload.kv_usage_permille),
+                waiting_requests: own.waiting_requests.or(standing.overload.waiting_requests),
+            }
         },
         // A window the object's registration left at the default is not a
         // fact of the row: the object built from the row takes the default.
@@ -83,6 +83,37 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
             != HealthCheckConfig::default().drain_settle_secs)
             .then(|| u32::try_from(checks.drain_settle_secs).unwrap_or(u32::MAX)),
         demand_facts: standing.demand_facts,
+    }
+}
+
+/// The thresholds a worker's own registration states.
+fn thresholds(spec: &WorkerSpec) -> Overload {
+    Overload {
+        kv_usage_permille: spec.overload.token_usage.map(threshold_permille),
+        waiting_requests: spec
+            .overload
+            .waiting_requests
+            .map(|waiting| u32::try_from(waiting).unwrap_or(u32::MAX)),
+    }
+}
+
+/// The facts `built` states at a write that names `over`: [`facts`], and at
+/// a replacement by id the thresholds as its own registration states them.
+/// A replacement is its maker's whole statement of what a registration can
+/// state, so a threshold it leaves out is cleared. An add finds no row to
+/// keep one from. An upsert and an update keep the standing row's.
+pub(crate) fn stated(
+    built: &dyn Worker,
+    standing: Option<&WorkerFacts>,
+    over: Option<Over<'_>>,
+) -> WorkerFacts {
+    let facts = facts(built, standing);
+    match over {
+        Some(Over::Replaced(_)) => WorkerFacts {
+            overload: thresholds(&built.metadata().spec),
+            ..facts
+        },
+        Some(Over::Updated(_)) | None => facts,
     }
 }
 

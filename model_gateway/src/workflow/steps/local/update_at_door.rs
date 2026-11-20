@@ -8,17 +8,18 @@
 //! provider's worker stays outside the store, and the step writes it in
 //! the registry as the classic line does.
 //!
-//! A row holds no credential, no priority and no cost. The rebuilt worker
-//! holds them, so an update that states one moves the object the holder
-//! keeps, though it moves no fact of the row. A label refresh leaves a
-//! row's worker as it is: the door takes the engine's labels from no
-//! writer yet.
+//! A row holds no credential and no cost, and its priority is a fact of
+//! the store's own, not the worker's. The rebuilt worker holds a key, a
+//! priority and a cost, so an update that states one moves the object the
+//! holder keeps, though it moves no fact of the row. A label refresh
+//! leaves a row's worker as it is: the door takes the engine's labels from
+//! no writer yet.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use smg_policy_controller::worker_host::{
-    maker_of, Expect, Membership, Objects, Refused, Standing,
+    maker_of, Expect, Membership, Objects, Over, Refused, Standing,
 };
 use smg_worker::{identity::basic::Worker, jobs::WorkerJobAsker, registry::WorkerId};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
@@ -81,7 +82,12 @@ impl UpdateAtDoorStep {
     ) -> WorkflowResult<()> {
         let maker = maker_of(asker, updated.url()).map_err(|why| step_failed(why.to_string()))?;
         self.door
-            .found_built(&maker, Expect::Seen(standing), updated, Some(found))
+            .found_built(
+                &maker,
+                Expect::Seen(standing),
+                updated,
+                Some(Over::Updated(found)),
+            )
             .map(drop)
             .map_err(|refusal| step_failed(dropped(updated.as_ref(), refusal)))
     }

@@ -74,8 +74,8 @@ use crate::{
 use crate::{
     store::{membership::Past, WorkerFacts},
     worker_host::{
-        drain, facts, lay, refresh, take, Expect, Membership, Refused as HostRefused, Remover,
-        Standing, Turn, Wrote,
+        drain, lay, refresh, stated, take, Expect, Membership, Over, Refused as HostRefused,
+        Remover, Standing, Turn, Wrote,
     },
 };
 
@@ -595,10 +595,10 @@ impl Membership for Hosted {
         maker: &Maker,
         expect: Expect,
         built: &Arc<dyn Worker>,
-        _: Option<&Arc<dyn Worker>>,
+        over: Option<Over<'_>>,
     ) -> Result<Wrote, HostRefused> {
         self.found(maker, expect, built.url(), &|standing| {
-            facts(built.as_ref(), standing)
+            stated(built.as_ref(), standing, over)
         })
     }
 

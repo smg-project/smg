@@ -22,8 +22,8 @@ use wfaas::{
 };
 
 use super::{
-    facts, Credentials, Expect, KeptCredential, Membership, Objects, Refused, Remover, Standing,
-    Wrote,
+    facts, Credentials, Expect, KeptCredential, Membership, Objects, Over, Refused, Remover,
+    Standing, Wrote,
 };
 use crate::{
     store::{Maker, Unmade, WorkersStore},
@@ -375,7 +375,7 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
             }
         };
         for worker in workers {
-            self.write_at_door(&maker, expect, worker, over.as_ref())?;
+            self.write_at_door(&maker, expect, worker, over.as_ref().map(Over::Replaced))?;
         }
         data.workers = Some(WorkerList::from_workers(workers));
         Ok(StepResult::Success)
@@ -405,7 +405,7 @@ impl<G: Generation> WriteWorkersAtDoor<G> {
         maker: &Maker,
         expect: Expect,
         worker: &Arc<dyn Worker>,
-        over: Option<&Arc<dyn Worker>>,
+        over: Option<Over<'_>>,
     ) -> WorkflowResult<Wrote> {
         let url = worker.url();
         let write = || -> WorkflowResult<Wrote> {
@@ -420,7 +420,7 @@ impl<G: Generation> WriteWorkersAtDoor<G> {
             return write();
         }
         self.objects
-            .keeping(url, over, write)
+            .keeping(url, over.map(Over::object), write)
             .map_err(|refusal| registration_refusal(url, refusal))?
     }
 
@@ -747,10 +747,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        store::{Maker, MemoryStore, Unmade, WorkerFacts, WorkerStatus, WorkersStore},
+        store::{Maker, MemoryStore, Overload, Unmade, WorkerFacts, WorkerStatus, WorkersStore},
         worker_host::{
-            facts, Expect, Members, Membership, Objects, Refused, Remover, Standing, StoreDoor,
-            Wrote,
+            facts, Expect, Members, Membership, Objects, Over, Refused, Remover, Standing,
+            StoreDoor, Wrote,
         },
     };
 
@@ -1235,7 +1235,7 @@ mod tests {
             _: &Maker,
             _: Expect,
             _: &Arc<dyn Worker>,
-            _: Option<&Arc<dyn Worker>>,
+            _: Option<Over<'_>>,
         ) -> Result<Wrote, Refused> {
             Err(self.0.clone())
         }
@@ -1440,7 +1440,7 @@ mod tests {
             maker: &Maker,
             _: Expect,
             built: &Arc<dyn Worker>,
-            _: Option<&Arc<dyn Worker>>,
+            _: Option<Over<'_>>,
         ) -> Result<Wrote, Refused> {
             self.door
                 .found(maker, Expect::Anything, built.url(), &|standing| {
@@ -1568,7 +1568,12 @@ mod tests {
         assert_eq!((row.id, row.revision), (seen.row, seen.revision));
 
         let error = write
-            .write_at_door(&Maker::Control, Expect::Seen(seen), &stale[0], Some(&over))
+            .write_at_door(
+                &Maker::Control,
+                Expect::Seen(seen),
+                &stale[0],
+                Some(Over::Replaced(&over)),
+            )
             .expect_err("another object stands under the URL");
         assert!(StepExecutor::<Registration>::is_retryable(&write, &error));
         assert_eq!(f.store.epoch(), epoch, "the door was not asked");
@@ -1742,6 +1747,74 @@ mod tests {
             "Step failed: write_workers_at_door - Worker http://worker:8000 is draining, \
              so the replacement was dropped"
         );
+    }
+
+    /// A replacement by id is its maker's whole statement of what a
+    /// registration can state: a threshold it leaves out is cleared. An add
+    /// states its own. An upsert and an update in place keep the standing
+    /// row's.
+    #[tokio::test]
+    async fn a_replacement_by_id_clears_a_threshold_it_leaves_out_and_the_other_verbs_keep_it() {
+        let f = Fixture::new();
+        let limited = |waiting| -> Arc<dyn Worker> {
+            let mut spec = WorkerSpec {
+                models: vec![ModelCard::new("model")].into(),
+                ..WorkerSpec::new(URL.to_owned())
+            };
+            spec.overload.waiting_requests = waiting;
+            Arc::new(<BasicWorkerBuilder>::from_spec(spec).build())
+        };
+        let pair = || f.store.by_key(URL).expect("the row").facts.overload;
+        let eight = Overload {
+            waiting_requests: Some(8),
+            ..Overload::default()
+        };
+        let standing = || {
+            f.objects.follow(&*f.store);
+            let id = f.host.registry.get_id_by_url(URL).expect("the worker's id");
+            let live = f.host.registry.get(&id).expect("the worker");
+            (id, live)
+        };
+        let write = f.write();
+
+        // An add states its own pair.
+        let mut cx = f.registration(WorkerJobAsker::Api, vec![limited(Some(8))]);
+        cx.data.registration_mode = WorkerRegistrationMode::CreateOnly;
+        write.execute(&mut cx).await.expect("added");
+        assert_eq!(pair(), eight);
+
+        // An upsert that leaves the threshold out keeps the row's.
+        let mut cx = f.registration(WorkerJobAsker::Api, vec![limited(None)]);
+        cx.data.registration_mode = WorkerRegistrationMode::Upsert;
+        write.execute(&mut cx).await.expect("upserted");
+        assert_eq!(pair(), eight);
+
+        // So does an update in place.
+        let (id, live) = standing();
+        let seen = f.objects.standing_of(&id, &live).expect("its row");
+        let over = Some(Over::Updated(&live));
+        f.door
+            .found_built(&Maker::Control, Expect::Seen(seen), &limited(None), over)
+            .expect("updated");
+        assert_eq!(pair(), eight);
+
+        // A replacement by id that leaves it out clears it.
+        let (id, live) = standing();
+        let by_id = |live: &Arc<dyn Worker>| WorkerRegistrationMode::ReplaceById {
+            worker_id: id.as_str().to_owned(),
+            expected_revision: live.revision(),
+        };
+        let mut cx = f.registration(WorkerJobAsker::Api, vec![limited(None)]);
+        cx.data.registration_mode = by_id(&live);
+        write.execute(&mut cx).await.expect("replaced");
+        assert_eq!(pair(), Overload::default());
+        let (_, live) = standing();
+
+        // One that states a threshold sets it.
+        let mut cx = f.registration(WorkerJobAsker::Api, vec![limited(Some(3))]);
+        cx.data.registration_mode = by_id(&live);
+        write.execute(&mut cx).await.expect("replaced again");
+        assert_eq!(pair().waiting_requests, Some(3));
     }
 
     /// At a step's second read a worker registered anew under the URL is
