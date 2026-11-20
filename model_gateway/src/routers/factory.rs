@@ -192,13 +192,18 @@ impl RouterFactory {
     }
 
     /// Register the prefill/decode policies (HTTP PD, gRPC PD and gRPC EPD),
-    /// each from its own config or, when unset, the main policy.
+    /// each from its own config or, when unset, the main policy. Under the
+    /// policy controller none is registered: no classic policy decides for a
+    /// pair there, and one built anyway would start its own tasks.
     fn set_pd_policies(
         prefill_policy_config: Option<&PolicyConfig>,
         decode_policy_config: Option<&PolicyConfig>,
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) {
+        if ctx.policy_host.is_some() {
+            return;
+        }
         let prefill_policy =
             PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
         let decode_policy =
@@ -210,7 +215,8 @@ impl RouterFactory {
 
     /// Register the encode/prefill/decode policies for a gRPC EPD deployment.
     /// Encode defaults to consistent hashing over each item's content hash;
-    /// prefill/decode default to the main policy when unset.
+    /// prefill/decode default to the main policy when unset. Under the policy
+    /// controller none is registered, as in [`Self::set_pd_policies`].
     fn set_epd_policies(
         encode_policy_config: Option<&PolicyConfig>,
         prefill_policy_config: Option<&PolicyConfig>,
@@ -218,6 +224,9 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) {
+        if ctx.policy_host.is_some() {
+            return;
+        }
         let default_encode_policy = PolicyConfig::ConsistentHashing;
         let encode_policy = PolicyFactory::create_from_config(
             encode_policy_config.unwrap_or(&default_encode_policy),

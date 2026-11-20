@@ -423,12 +423,19 @@ fn quiet() -> RouterConfig {
 }
 
 async fn build_gateway(config: RouterConfig) -> Result<Arc<Gateway>, String> {
+    Ok(Box::pin(build(config)).await?.1)
+}
+
+/// The context a start makes for `config`, and the gateway over it.
+async fn build(config: RouterConfig) -> Result<(Arc<AppContext>, Arc<Gateway>), String> {
     let context = Box::pin(AppContext::from_config(config.clone(), 30, None, None)).await?;
-    Box::pin(Gateway::from_config(
+    let context = Arc::new(context);
+    let gateway = Box::pin(Gateway::from_config(
         &ServerConfig::minimal(config),
-        &Arc::new(context),
+        &context,
     ))
-    .await
+    .await?;
+    Ok((context, gateway))
 }
 
 /// With an empty registry, typed requests reach a model miss and routes
@@ -697,12 +704,42 @@ async fn the_pair_and_the_provider_routers_refuse_by_name() -> Case {
     };
     let mut grpc_pair = pair.clone();
     grpc_pair.connection_mode = ConnectionMode::Grpc;
-    for (family, config) in [("HTTP pair", pair), ("gRPC pair", grpc_pair)] {
-        let gateway = build_gateway(config).await?;
+    let mut encode_pair = grpc_pair.clone();
+    encode_pair.mode = RoutingMode::EncodePrefillDecode {
+        encode_urls: vec![],
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        encode_policy: None,
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    for (family, config) in [
+        ("HTTP pair", pair),
+        ("gRPC pair", grpc_pair),
+        ("gRPC encode pair", encode_pair),
+    ] {
+        let (context, gateway) = build(config).await?;
         let router = gateway
             .select_router_for_request(None)
             .ok_or("the router is missing")?;
         assert_refusing_router(router.as_ref(), family).await?;
+        // No classic pair policy was built for the refused family.
+        let policies = &context.policy_registry;
+        let unset = policies.get_default_policy();
+        assert!(
+            Arc::ptr_eq(&policies.get_prefill_policy(), &unset),
+            "{family}"
+        );
+        assert!(
+            Arc::ptr_eq(&policies.get_decode_policy(), &unset),
+            "{family}"
+        );
+        // An encode policy nobody registered is made anew at each read. A
+        // registered one is one object.
+        assert!(
+            !Arc::ptr_eq(&policies.get_encode_policy(), &policies.get_encode_policy()),
+            "{family}"
+        );
     }
 
     #[cfg(feature = "provider-openai")]
