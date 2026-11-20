@@ -78,7 +78,15 @@
 //!   decision), `door` (a decision asked at a host's door on this thread and
 //!   its lease reported released at once, `Door::decide` and `Door::report`),
 //!   `handle` (a request served through a handle on this thread, from
-//!   `Handle::decide` to `Handle::completed`), `stream` (the decision asked
+//!   `Handle::decide` to `Handle::completed`), `named` (a `door` decision
+//!   under the `cache_aware` preset of a request whose leading blocks three
+//!   members in four hold: the door names its sixteen deepest holders and
+//!   asks the pass's test up to the first that passes), `retry` (the same
+//!   once the deepest holder was tried: another passes and the naming
+//!   stands), `blocked` (the same with the sixteen deepest holders not
+//!   ready, a cap full: the naming looks again once), `refused` (the same
+//!   with the eighty deepest not ready: the naming looks again as often as
+//!   its bound lets it), `stream` (the decision asked
 //!   over one stream, one at a time so every decision wakes the same threads
 //!   whatever its fleet, the client's own calls included) or `pair` (the
 //!   `stream` cell under a pair plan, over that many prefills and as many
@@ -222,6 +230,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use kv_index::{request_prefix_hashes, ContentHash};
 use smg_policy_controller::{
     controller::{Config, Controller, Election, Listener, Scope, State},
     door::{self, Door},
@@ -234,11 +243,12 @@ use smg_policy_controller::{
         Phase as WirePhase, RequestFacts as WireFacts, Side,
     },
     store::{
-        Ask, GatewayId, Hand, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource,
-        MemoryStore, Picked, Said, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+        Ask, BatchFacts, BatchOutcome, GatewayId, Hand, KvEvent, KvEventSink, LeaseRecord,
+        LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore, Picked, Said, Signals,
+        StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
     },
     AppliedSpec, Constraints, Lease, LeaseId, LoadRow, PolicySpec, PoolFacts, ReleaseReason,
-    RequestFacts, Role, Scratch,
+    RequestFacts, Role, Scratch, WorkerId,
 };
 use tokio::{
     runtime,
@@ -2230,6 +2240,126 @@ fn door_over(members: u32, files: usize, told: bool) -> Door {
     Door::new(Arc::new(store))
 }
 
+/// The deepest holders a naming can refuse before its bound: the cap of
+/// sixteen at its first lookup and at each of the four it makes again.
+const REFUSED: usize = 80;
+
+/// A cap full of holders: the sixteen the first lookup of a naming reads.
+const BLOCKED: usize = 16;
+
+/// A host's door over a fleet under the `cache_aware` preset whose members
+/// publish their blocks, for a count of decisions that name their rows: the
+/// door, the request's block hashes and the holders, the deepest first.
+/// Three members in four hold a leading part of the one request, at most
+/// ninety-six of them and each to a depth of its own, so a naming under the
+/// preset's cap names the sixteen deepest. The `refused` deepest are not
+/// ready: the pass refuses them.
+fn named_fleet(members: u32, refused: usize) -> (Door, Vec<u64>, Vec<WorkerId>) {
+    let store = MemoryStore::new().with_deciders(1);
+    let document = PolicySpec::preset("cache_aware").expect("a preset of this build");
+    let spec = AppliedSpec::validate(&document).expect("a preset validates");
+    store.apply(spec).expect("above the unbound start");
+    let status = |id: WorkerId, status: WorkerStatus| {
+        let revision = WorkersStore::get(&store, id).expect("the row").revision;
+        store.set_status(id, status, revision).expect("the status");
+    };
+    let ids: Vec<WorkerId> = (0..members)
+        .map(|index| {
+            let key = format!("http://worker-{index}.fleet:8000");
+            let facts = WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                models: vec![model(0)],
+                dp_size: 1,
+                signals: Signals {
+                    events: true,
+                    ..Signals::default()
+                },
+                ..WorkerFacts::default()
+            };
+            let id = store.upsert(facts).id();
+            status(id, WorkerStatus::Ready);
+            id
+        })
+        .collect();
+    store.publish_now();
+    let holders = (ids.len() - ids.len() / 4).min(96);
+    let depth = u64::try_from(holders).expect("a count that fits");
+    let contents: Vec<ContentHash> = (1..=depth).map(ContentHash).collect();
+    let chain: Vec<StoredBlock> = contents
+        .iter()
+        .zip(request_prefix_hashes(&contents))
+        .map(|(&content_hash, seq_hash)| StoredBlock {
+            seq_hash,
+            content_hash,
+        })
+        .collect();
+    for (at, &id) in ids.iter().take(holders).enumerate() {
+        let blocks = chain.get(..holders - at).unwrap_or_default().to_vec();
+        let parent = None;
+        let stored = [KvEvent::Stored { parent, blocks }];
+        let facts = BatchFacts {
+            sequence: 1,
+            ..BatchFacts::default()
+        };
+        assert_eq!(store.admit(id, 0, facts, &stored), BatchOutcome::Applied);
+    }
+    for &id in ids.iter().take(refused.min(holders)) {
+        status(id, WorkerStatus::NotReady);
+    }
+    store.publish_now();
+    let hashes = contents.iter().map(|content| content.0).collect();
+    let holders = ids.get(..holders).unwrap_or_default().to_vec();
+    (Door::new(Arc::new(store)), hashes, holders)
+}
+
+/// How many decisions of a named count's request are asked at `door` under
+/// `mode`, and the allocator's calls they made: `named` (no holder
+/// refused), `retry` (the deepest holder tried), `blocked` (the deepest
+/// holders not ready, a cap full) or `refused` (as many of them as the
+/// naming's bound can refuse). Each is decided at one instant and released
+/// at once, as a door row's.
+fn named(members: u32, mode: &str, decisions: u64) -> u64 {
+    let refused = match mode {
+        "refused" => REFUSED,
+        "blocked" => BLOCKED,
+        _ => 0,
+    };
+    let (door, hashes, holders) = named_fleet(members, refused);
+    let tried = holders.get(..1).filter(|_| mode == "retry");
+    let tried = tried.unwrap_or_default();
+    let name = model(0);
+    let now = Instant::now();
+    let ask = |seed: u64| {
+        let id = seed.to_le_bytes();
+        let request = door::Request {
+            id: &id,
+            facts: RequestFacts {
+                model: &name,
+                seed,
+                budget_micros: BUDGET_MICROS,
+                block_hashes: &hashes,
+                tried,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints::default(),
+        };
+        let decided = door.decide(HOST, &request, now).expect("the door decides");
+        let leased = decided
+            .lease
+            .expect("a pick over the fleet, with its lease");
+        let gone = Said::Released(None, ReleaseReason::ClientGone);
+        door.report(HOST, leased.lease.id, gone);
+        black_box(&decided.decision);
+    };
+    (0..2_000).for_each(&ask);
+    counting();
+    (2_000..2_000 + decisions).for_each(&ask);
+    COUNTING.store(false, Ordering::Relaxed);
+    CALLS.load(Ordering::Relaxed)
+}
+
 /// Whether one row alone stands in the least band of a fleet of `members`
 /// ([`bands`]): under 128 members. A kind of rows that tells its
 /// dispatches needs it so: the rows of one band tie, and the dispatches
@@ -2619,6 +2749,7 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
             at_door(&door_over(shape.members, 1, true), ask_handle, decisions),
             0,
         ),
+        "named" | "retry" | "blocked" | "refused" => (named(shape.members, mode, decisions), 0),
         "stream" | "pair" => {
             let row = wire(shape);
             (row.calls, row.busy)
@@ -2626,7 +2757,7 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
         _ => {
             return writeln!(
                 out,
-                "a count row's mode is in_process, commit, door, handle, stream or pair"
+                "a count row's mode is in_process, commit, door, handle, named, retry, blocked, refused, stream or pair"
             )
         }
     };

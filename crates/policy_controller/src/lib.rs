@@ -232,7 +232,11 @@ pub use view::{
 ///   decision's rows and cuts a list at the profile's sample, the holders'
 ///   draw and the warming rows' draw;
 /// - the first value of the holders' stream, and of each stream so seeded:
-///   the seed of each lookup a naming makes again, a stream a round.
+///   the seed of each lookup a naming makes again, a stream a round;
+/// - the first value of the seed under the store's mask for refused
+///   holders, and of each stream so seeded: the seed of each lookup a
+///   naming makes again past a cap of holders the pass refused, a stream a
+///   round.
 #[derive(Clone, Copy, Debug)]
 pub struct Draw(u64);
 

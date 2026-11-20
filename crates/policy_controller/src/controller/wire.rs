@@ -64,7 +64,7 @@ use crate::{
     spec::{AppliedSpec, MAX_HEADERS},
     view::{
         fingerprint, key_of_session, Constraints, HashKind, Header, Identity, MediaCounts,
-        ModelFingerprint, Phase, RequestFacts, Session, WireModes, WorkerId,
+        ModelFingerprint, NamedAffinity, Phase, RequestFacts, Session, WireModes, WorkerId,
     },
 };
 
@@ -286,10 +286,13 @@ impl Checked {
     /// Hands `decide` the request as the engine reads it, with what the
     /// decision's `view` adds to the frame, and returns its answer. The
     /// request borrows the frame and `lists`, for the time of `decide`.
-    pub(crate) fn read<R>(
+    /// `name` is asked first, over that request with no row named: what it
+    /// answers stands as the request's named rows for `decide`.
+    pub(crate) fn read<'n, R>(
         &self,
         lists: &mut Lists,
         view: Viewed<'_>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R {
         let (facts, constraints) = (&self.facts, &self.constraints);
@@ -317,8 +320,10 @@ impl Checked {
                 bytes: media.bytes,
             })
             .unwrap_or_default();
-        let answer = decide(
-            &RequestFacts {
+        // The request and the constraints in the engine's form, built once:
+        // the naming's answer is written into the request below.
+        let (mut request, cx) = (
+            RequestFacts {
                 model: &facts.model,
                 namespace_seed: facts.namespace_seed,
                 tenant: identity(facts.tenant.as_ref()),
@@ -347,8 +352,9 @@ impl Checked {
                 block_size: facts.block_size,
                 now_micros: view.now_micros,
                 affinity: view.affinity,
-                // In-process only: the rows the deciding host named.
-                named: view.named,
+                // In-process only: the rows the deciding host names,
+                // written below by the naming's answer.
+                named: None,
                 // The wire carries the name: each read of the request's
                 // session fingerprints it.
                 model_fingerprint: ModelFingerprint::NONE,
@@ -365,7 +371,7 @@ impl Checked {
                 // the rows of the host that decides.
                 signal_cells: None,
             },
-            &Constraints {
+            Constraints {
                 excluded: &lists.excluded,
                 wire_modes: self.wires().unwrap_or_default(),
                 overload_lifted: constraints.overload_lifted,
@@ -379,6 +385,8 @@ impl Checked {
                 pins: view.pins,
             },
         );
+        request.named = name(&request, &cx);
+        let answer = decide(&request, &cx);
         lists.headers = emptied(headers);
         answer
     }
@@ -437,13 +445,14 @@ impl Asked for Checked {
         Self::seed(self)
     }
 
-    fn read<R>(
+    fn read<'n, R>(
         &self,
         lists: &mut Lists,
         viewed: Viewed<'_>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R {
-        Self::read(self, lists, viewed, decide)
+        Self::read(self, lists, viewed, name, decide)
     }
 }
 
@@ -830,6 +839,7 @@ mod tests {
             Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
             Trace,
         },
+        door::unnamed,
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
         spec::MAX_BLOCK_HASHES,
         view::{
@@ -1207,10 +1217,9 @@ mod tests {
             held: &[],
             in_flight: None,
             max_block_hashes: 256,
-            named: None,
             pins: None,
         };
-        checked.read(lists, view, check)
+        checked.read(lists, view, unnamed, check)
     }
 
     #[test]
@@ -1553,10 +1562,9 @@ mod tests {
                 held: &[],
                 in_flight: None,
                 max_block_hashes,
-                named: None,
                 pins: None,
             };
-            checked.read(&mut Lists::default(), view, |facts, _| {
+            checked.read(&mut Lists::default(), view, unnamed, |facts, _| {
                 facts.block_hashes.to_vec()
             })
         };

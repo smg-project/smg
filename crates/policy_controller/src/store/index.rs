@@ -35,7 +35,8 @@
 //! published before that: the index counts its takes and keeps the count
 //! each id was last taken at (`Index`), and a row is named a holder only
 //! where its id was not taken since the tables the decision holds were
-//! known whole.
+//! known whole. Two cases alone make the lookup again: a row it kept had
+//! its id taken since, or its cap is full of holders the pass refuses.
 //!
 //! A pool whose profile reads sent prefixes can also hold its model's
 //! record of sends. Naming adds holders without lanes to the room left
@@ -269,6 +270,11 @@ const WIRE_BITS: usize = u8::BITS as usize;
 const HOLDERS_STREAM: u64 = 0x3c6e_f372_fe94_f82b;
 const WARMING_STREAM: u64 = 0xa54f_f53a_5f1d_36f1;
 
+/// The stream the lookups a naming makes again past a cap of holders the
+/// pass refused are seeded from, a stream a round ([`Tables::passing`]):
+/// none another site reads.
+const REFUSED_STREAM: u64 = 0x510e_527f_ade6_82d1;
+
 /// A value under `under` from `draw`, by a multiply: no division.
 fn below(draw: &mut Draw, under: u32) -> u32 {
     ((u128::from(draw.next_u64()) * u128::from(under)) >> 64) as u32
@@ -286,6 +292,9 @@ pub struct Named {
     /// The warming rows are the thin.
     pub thin: bool,
     kept: Vec<(u32, u32)>,
+    /// The naming's first read, while its lookup is made again under the
+    /// pass's test.
+    first: Vec<(u32, u32)>,
     picked: Vec<u32>,
     live: Vec<(u32, u64)>,
     // One key per block read and one id per worker at the deepest block.
@@ -533,8 +542,11 @@ impl Tables {
         mask
     }
 
-    /// How many times a naming makes its lookup again before it names no
-    /// holder: each round more needs a take under a row it kept.
+    /// How many rounds a lookup is made again. For a read that kept an id
+    /// taken since ([`Self::again`]) each round more needs a take under a
+    /// row it kept, and past them the naming names no holder. For a cap
+    /// full of refused holders ([`Self::passing`]) each round reads a cap
+    /// more of them, and past them the first naming stands.
     const ROUNDS: usize = 4;
 
     /// What stands of the read in `kept`, kept within `within`, for a
@@ -598,6 +610,75 @@ impl Tables {
             }
         }
         kept.clear();
+    }
+
+    /// What stands of the read in `named` under the pass's own test, for a
+    /// naming every holder of which the test refused: `passes` says whether
+    /// the pass keeps the row of an index id. The ids of such a read leave
+    /// the ids the lookup is kept within, and the lookup is made again
+    /// ([`Index::deepest_again`]) by a draw of the round's own, so the rows
+    /// it then reads are the next deepest. Behind each such lookup the
+    /// check of an id taken again runs as behind the naming's own
+    /// ([`Self::look_again`]).
+    ///
+    /// The rounds end at a read that holds a holder the pass keeps, at one
+    /// that holds none at all, and at [`Self::ROUNDS`] rounds. Each reads
+    /// under `room`, the cap less the record's holders. The holders of the
+    /// last read that pass stand, fewer than the room where it held a
+    /// refused one, and the answer is `true`. Where none stands the first
+    /// read does, as the naming made it, and the answer is `false`: the
+    /// pass drops its rows itself, or reads them where a soft filter of it
+    /// steps aside. Out of line: a naming one of whose holders passes pays
+    /// its asks and nothing of this.
+    #[cold]
+    #[inline(never)]
+    fn passing(
+        &self,
+        naming: &Naming<'_>,
+        within: &[u64],
+        room: usize,
+        passes: &dyn Fn(u32) -> bool,
+        named: &mut Named,
+    ) -> bool {
+        let Some(index) = self.index.as_deref() else {
+            return false;
+        };
+        let Named { kept, first, .. } = named;
+        first.clear();
+        first.extend_from_slice(kept);
+        let words = within.len().min(MASK_WORDS);
+        let mut mask = [0u64; MASK_WORDS];
+        mask[..words].copy_from_slice(&within[..words]);
+        // A round's stream is seeded by the first value of the one before
+        // it, the first round's by the refused holders' stream.
+        let mut seed = naming.seed ^ REFUSED_STREAM;
+        for _ in 0..Self::ROUNDS {
+            // No holder of the read in hand passes: each leaves the ids
+            // the next lookup is kept within.
+            for &(id, _) in kept.iter() {
+                if let Some(word) = mask.get_mut((id / 64) as usize) {
+                    *word &= !(1u64 << (id % 64));
+                }
+            }
+            seed = Draw::new(seed).next_u64();
+            // As in the naming: the count the tables are whole at before
+            // the lookup, the lookup before the fence, the asks after.
+            let whole_at = self.taken.load(Ordering::Acquire);
+            index.deepest_again(naming, &mask[..words], room, seed, kept);
+            fence(Ordering::Acquire);
+            if index.taken() != whole_at {
+                self.look_again(naming, &mask[..words], room, whole_at, kept);
+            }
+            if kept.is_empty() || kept.iter().any(|&(id, _)| passes(id)) {
+                break;
+            }
+        }
+        kept.retain(|&(id, _)| passes(id));
+        if kept.is_empty() {
+            kept.extend_from_slice(first);
+            return false;
+        }
+        true
     }
 }
 
@@ -1018,6 +1099,90 @@ impl PoolIndex {
         named.warming.sort_unstable();
     }
 
+    /// The holders of a naming just made over `view` ([`Self::name`] or
+    /// [`Self::name_cut`]), named again under the pass's own test of a
+    /// row: `named` holds that naming, and `keeps` refused every one of its
+    /// holders. What stands of the index's read is what [`Tables::passing`]
+    /// leaves, kept within the rows the view holds, and its holders are
+    /// named from it by their place in the view.
+    ///
+    /// The index is read again under the cap less the record's holders,
+    /// whichever were named first ([`Predict::ahead`]): the naming holds no
+    /// holder past its cap, whatever the index learned since its first
+    /// read. Under no room it reads nothing. The record's holders and the
+    /// warming rows stand as named, and where no read holds a holder the
+    /// pass keeps the naming stands whole. Out of line, with the test by
+    /// reference: no naming pays for it until every holder it named is
+    /// refused.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn name_again(
+        &self,
+        naming: &Naming<'_>,
+        pool: &[Candidate],
+        view: &[Candidate],
+        keeps: &dyn Fn(&Candidate) -> bool,
+        named: &mut Named,
+    ) {
+        let tables = &*self.tables;
+        let whole = view.len() == pool.len();
+        let cap = match naming.cap {
+            0 => usize::MAX,
+            cap => cap as usize,
+        };
+        // A holder the record of sent prefixes named, not the index.
+        let recorded = |holder: &NamedHolder| holder.predicted_blocks != 0;
+        // The index's room: the cap less the record's holders. Named
+        // ahead, they left the index that room. Named behind, they took
+        // what its read left, and a read made again takes no more.
+        let taken = named.holders.iter().filter(|&holder| recorded(holder));
+        let room = cap.saturating_sub(taken.count());
+        // Where the row of an index id stands in the view, as the naming
+        // places it: at its own index where the view is the pool whole,
+        // else by its worker's id.
+        let at = |id: u32| -> Option<u32> {
+            let row = tables.row_of.get(id as usize).copied()?;
+            if row == NONE {
+                return None;
+            }
+            if whole {
+                return Some(row);
+            }
+            let id = pool.get(row as usize)?.id;
+            let at = view.binary_search_by_key(&id, |candidate| candidate.id);
+            at.ok().map(|at| at as u32)
+        };
+        // An id whose row the view does not hold passes nothing: no row is
+        // named for it.
+        let passes = |id: u32| {
+            let row = at(id).and_then(|at| view.get(at as usize));
+            row.is_some_and(keeps)
+        };
+        // The rows the lookup is kept within: the pool's members where
+        // the view is the pool whole, else the view's own rows, by one walk
+        // of them.
+        let mut mask = [0u64; MASK_WORDS];
+        let within = if whole {
+            &tables.members[..]
+        } else {
+            tables.within_view(pool, view, &mut mask)
+        };
+        if !tables.passing(naming, within, room, &passes, named) {
+            return;
+        }
+        named.holders.retain(recorded);
+        for &(id, blocks) in &named.kept {
+            if let Some(at) = at(id) {
+                named.holders.push(NamedHolder {
+                    row: at,
+                    overlap_blocks: blocks,
+                    predicted_blocks: 0,
+                });
+            }
+        }
+        named.holders.sort_unstable_by_key(|holder| holder.row);
+    }
+
     /// Writes the naming's keys for the leased worker, if it has no lane.
     pub(super) fn sent(&self, rows: &[Candidate], named: &Named, target: WorkerId) {
         let Some(predicted) = &self.tables.predicted else {
@@ -1184,14 +1349,15 @@ impl Index {
         self.taken.load(Ordering::Acquire)
     }
 
-    /// The naming's lookup made again ([`Tables::again`]): the request's
-    /// deepest holders within `within` under `cap`, into `kept` by index
-    /// id, the depth the cap cuts by a draw from `seed`, the round's own. A
-    /// round runs only where the lookup before it kept an id taken since,
-    /// so the stream that lookup cut by would cut by the same values again,
-    /// and favour the rows it reaches first. A lookup of its own beside the
-    /// naming's: with one instantiation for both, every decision would pay
-    /// a call for the lookup it makes once.
+    /// The naming's lookup made again ([`Tables::again`],
+    /// [`Tables::passing`]): the request's deepest holders within `within`
+    /// under `cap`, into `kept` by index id, the depth the cap cuts by a
+    /// draw from `seed`, the round's own. A round runs only where the
+    /// lookup before it kept an id taken since, or a cap full of holders
+    /// the pass refuses: the stream that lookup cut by would cut by the
+    /// same values again, and favour the rows it reaches first. A lookup of
+    /// its own beside the naming's: with one instantiation for both, every
+    /// decision would pay a call for the lookup it makes once.
     fn deepest_again(
         &self,
         naming: &Naming<'_>,

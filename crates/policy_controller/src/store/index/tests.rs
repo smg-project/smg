@@ -36,7 +36,7 @@ mod sent_prefixes {
             index::Predicted, Ask, GatewayId, Kinds, Named, Naming, Position, Reachability,
             ViewBuffers,
         },
-        view::{Role, WireModes},
+        view::{Candidate, Role, WireModes},
     };
 
     type Case = Result<(), Box<dyn std::error::Error>>;
@@ -126,6 +126,170 @@ mod sent_prefixes {
         });
         let ids = view.candidates.iter().map(|row| row.id).collect();
         (named, ids)
+    }
+
+    /// The naming of [`named`] under `cap` and seed 0, held to `keeps` as
+    /// the door holds a naming to the pass's test of a row.
+    fn tested(
+        store: &MemoryStore,
+        cap: u32,
+        keeps: impl Fn(&Candidate) -> bool,
+    ) -> (Named, Vec<WorkerId>) {
+        let mut named = Named::default();
+        let mut view = ViewBuffers::default();
+        store.deciding(|world| {
+            let ask = Ask {
+                gateway: GatewayId::LOCAL,
+                now: Instant::now(),
+                pinned: None,
+                affinity: false,
+            };
+            world.build(MODEL, Role::Single, &ask, &mut view);
+            let naming = Naming {
+                gateway: GatewayId::LOCAL,
+                block_hashes: &HASHES,
+                namespace_seed: 0,
+                seed: 0,
+                cap,
+                wires: None,
+                now_micros: 0,
+            };
+            let rows = &view.candidates;
+            world.name(MODEL, Role::Single, &naming, rows, &mut named);
+            world.name_kept(MODEL, Role::Single, &naming, rows, &mut named, || {
+                Some(&keeps)
+            });
+        });
+        let ids = view.candidates.iter().map(|row| row.id).collect();
+        (named, ids)
+    }
+
+    /// Each holder named: its worker, its blocks by the index and by the
+    /// record.
+    fn holders(named: &Named, rows: &[WorkerId]) -> Vec<(WorkerId, u32, u32)> {
+        let worker = |holder: &crate::NamedHolder| rows[holder.row as usize];
+        let each = named.holders.iter();
+        each.map(|holder| {
+            (
+                worker(holder),
+                holder.overlap_blocks,
+                holder.predicted_blocks,
+            )
+        })
+        .collect()
+    }
+
+    /// Where the record's holders are named ahead, the index is read again
+    /// under the room they leave, and they stand as named.
+    #[test]
+    fn a_lookup_made_again_reads_under_the_room_the_record_leaves() -> Case {
+        let store = MemoryStore::new();
+        let deep = admitted(&store, "deep");
+        let shallow = admitted(&store, "shallow");
+        let sent = plain(&store, "plain", WireModes::GRPC, Reachability::Any);
+        let mut document = merged(1)?;
+        use_sent_prefixes(&mut document, AffinitySource::Predictor);
+        store.apply(applied(&document)?)?;
+        publish(&store, deep);
+        let two = stored(None, &chain(&HASHES[..2]));
+        assert_eq!(
+            store.admit(shallow, 0, batch(1), &two),
+            BatchOutcome::Applied
+        );
+        predicted(&store, sent).ok_or("a record with a placement")?;
+        // The record's holder is named first and the index's room is one:
+        // the deeper holder takes it.
+        let (first, rows) = tested(&store, 2, |_| true);
+        let first = holders(&first, &rows);
+        assert_eq!(first.len(), 2, "{first:?}");
+        assert!(first.contains(&(sent, 0, 4)), "{first:?}");
+        assert!(first.contains(&(deep, 4, 0)), "{first:?}");
+        // Refused with the record's holder, the deeper one gives its place
+        // to the next: the record's stands as named and the cap holds.
+        let (again, rows) = tested(&store, 2, |row| row.id == shallow);
+        let again = holders(&again, &rows);
+        assert_eq!(again.len(), 2, "{again:?}");
+        assert!(again.contains(&(sent, 0, 4)), "{again:?}");
+        assert!(again.contains(&(shallow, 2, 0)), "{again:?}");
+        // Where the pass refuses every row the index is read to its end,
+        // and the naming stands whole.
+        let (whole, rows) = tested(&store, 2, |_| false);
+        assert_eq!(holders(&whole, &rows), first);
+        Ok(())
+    }
+
+    /// Holders the index learns of inside one naming take no place past
+    /// the cap. In the default order the record's holder took the place
+    /// the index's first read left: the lookup made again reads under the
+    /// cap less that holder, and names one of the two rows that reported
+    /// the request behind the first read.
+    #[test]
+    fn a_lookup_made_again_names_no_holder_past_the_cap() -> Case {
+        use crate::store::index::seam;
+
+        let store = Arc::new(MemoryStore::new());
+        let event = admitted(&store, "event");
+        let late = ["a", "b"].map(|key| admitted(&store, key));
+        let sent = plain(&store, "plain", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        publish(&store, event);
+        predicted(&store, sent).ok_or("a record with a placement")?;
+        let behind = Arc::clone(&store);
+        seam::set(seam::Point::Looked, move || {
+            for id in late {
+                publish(&behind, id);
+            }
+        });
+        let (named, rows) = tested(&store, 2, |row| row.id != event && row.id != sent);
+        assert!(!seam::pending(), "the step ran inside the naming");
+        let named = holders(&named, &rows);
+        assert_eq!(named.len(), 2, "the cap holds: {named:?}");
+        assert!(named.contains(&(sent, 0, 4)), "{named:?}");
+        assert!(
+            named.iter().any(|&(id, ..)| late.contains(&id)),
+            "{named:?}"
+        );
+        Ok(())
+    }
+
+    /// Where the record's holders fill the cap the index was not read, and
+    /// it is not read past them: the pass refuses the record's holder and
+    /// keeps the index's, and the naming stands as made.
+    #[test]
+    fn a_cap_the_records_holders_fill_is_not_read_past() -> Case {
+        let store = MemoryStore::new();
+        let event = admitted(&store, "event");
+        let sent = plain(&store, "plain", WireModes::GRPC, Reachability::Any);
+        let mut document = merged(1)?;
+        use_sent_prefixes(&mut document, AffinitySource::Predictor);
+        store.apply(applied(&document)?)?;
+        publish(&store, event);
+        predicted(&store, sent).ok_or("a record with a placement")?;
+        let (named, rows) = tested(&store, 1, |row| row.id == event);
+        assert_eq!(holders(&named, &rows), [(sent, 0, 4)]);
+        Ok(())
+    }
+
+    /// In the default order the index's one holder and the record's fill a
+    /// cap of two. The index holds no holder more: where the pass refuses
+    /// both, the lookups made again read nothing and the naming stands
+    /// whole.
+    #[test]
+    fn a_naming_the_record_fills_stands_whole_where_every_holder_is_refused() -> Case {
+        let store = MemoryStore::new();
+        let event = admitted(&store, "event");
+        let sent = plain(&store, "plain", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        publish(&store, event);
+        predicted(&store, sent).ok_or("a record with a placement")?;
+        let (first, rows) = tested(&store, 2, |_| true);
+        let first = holders(&first, &rows);
+        assert_eq!(first.len(), 2, "{first:?}");
+        assert!(first.contains(&(event, 4, 0)), "{first:?}");
+        assert!(first.contains(&(sent, 0, 4)), "{first:?}");
+        let (again, rows) = tested(&store, 2, |_| false);
+        assert_eq!(holders(&again, &rows), first);
+        Ok(())
     }
 
     #[test]
@@ -1951,6 +2115,20 @@ mod named {
         seeds: &[u64],
         then: impl FnOnce(),
     ) -> (Vec<Vec<(WorkerId, u32)>>, Vec<WorkerId>) {
+        named_under_a_kept_world_less(store, request, cap, seeds, None, then)
+    }
+
+    /// [`named_under_a_kept_world_each`], each naming then held to a test
+    /// that refuses the rows of `refused` where it names some
+    /// ([`World::name_kept`](crate::store::World::name_kept)).
+    fn named_under_a_kept_world_less(
+        store: &MemoryStore,
+        request: &[u64],
+        cap: u32,
+        seeds: &[u64],
+        refused: Option<&[WorkerId]>,
+        then: impl FnOnce(),
+    ) -> (Vec<Vec<(WorkerId, u32)>>, Vec<WorkerId>) {
         let mut view = ViewBuffers::default();
         let mut named = Named::default();
         let mut each = Vec::with_capacity(seeds.len());
@@ -1977,6 +2155,12 @@ mod named {
                     now_micros: built.now_micros,
                 };
                 world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+                if let Some(refused) = refused {
+                    let keeps = |row: &Candidate| !refused.contains(&row.id);
+                    let rows = &view.candidates;
+                    let made = || Some(keeps);
+                    world.name_kept(MODEL, Role::Single, &naming, rows, &mut named, made);
+                }
                 let holders = named.holders.iter();
                 each.push(
                     holders
@@ -2113,6 +2297,165 @@ mod named {
         });
         assert_eq!(holders.len(), 2, "{holders:?}");
         assert!(holders.contains(&(deep, 2)) && holders.contains(&(shallow, 1)));
+    }
+
+    /// Seven rows that hold a request of seven blocks to seven depths, the
+    /// row at `n` its first `7 - n`, beside one that holds nothing: no
+    /// block is the whole pool's.
+    fn layered() -> (MemoryStore, [u64; 7], Vec<WorkerId>) {
+        let store = MemoryStore::new();
+        store.apply(sampled(1)).expect("above the unbound start");
+        let request = [1, 2, 3, 4, 5, 6, 7];
+        let rows: Vec<WorkerId> = (0..7)
+            .map(|n| {
+                let id = admitted(&store, &format!("holds-{}", 7 - n));
+                holds(&store, id, &request[..7 - n]);
+                id
+            })
+            .collect();
+        admitted(&store, "idle");
+        (store, request, rows)
+    }
+
+    /// What a decision is named for `request` under a cap of `cap` once
+    /// its naming is held to a test that refuses the rows of `refused`: the
+    /// holders by their workers, the deepest first.
+    fn named_less(
+        store: &MemoryStore,
+        request: &[u64],
+        cap: u32,
+        refused: &[WorkerId],
+    ) -> Vec<(WorkerId, u32)> {
+        let refused = Some(refused);
+        let (mut each, _) =
+            named_under_a_kept_world_less(store, request, cap, &[7], refused, || {});
+        let mut holders = each.pop().expect("one seed");
+        holders.sort_unstable_by_key(|&(_, blocks)| std::cmp::Reverse(blocks));
+        holders
+    }
+
+    /// A cap full of holders the pass refuses is read past: their ids leave
+    /// the rows the lookup is kept within, the lookup is made again, and
+    /// the next deepest holders are named in their place. A naming one of
+    /// whose holders passes stands as it was made, the refused one beside
+    /// it: no holder outside it is deeper than the one that passes.
+    #[test]
+    fn a_cap_full_of_refused_holders_is_read_past() {
+        let (store, request, rows) = layered();
+        let deepest = [(rows[0], 7), (rows[1], 6)];
+        assert_eq!(named_less(&store, &request, 2, &[]), deepest);
+        // A refused row the naming did not name moves nothing.
+        assert_eq!(named_less(&store, &request, 2, &rows[2..3]), deepest);
+        // One of the two passes, the deeper or the shallower.
+        assert_eq!(named_less(&store, &request, 2, &rows[1..2]), deepest);
+        assert_eq!(named_less(&store, &request, 2, &rows[..1]), deepest);
+        assert_eq!(named_less(&store, &request, 1, &rows[..1]), [(rows[1], 6)]);
+        let both = named_less(&store, &request, 2, &rows[..2]);
+        assert_eq!(both, [(rows[2], 5), (rows[3], 4)]);
+    }
+
+    /// Whether a naming of `request` under a cap of `cap`, held to a test
+    /// that refuses the rows of `refused`, made its lookup again: the first
+    /// read is set aside then, and at no other time.
+    fn looks_again(store: &MemoryStore, request: &[u64], cap: u32, refused: &[WorkerId]) -> bool {
+        let mut view = ViewBuffers::default();
+        let mut named = Named::default();
+        store.deciding(|world| {
+            let ask = Ask {
+                gateway: GatewayId::LOCAL,
+                now: Instant::now(),
+                pinned: None,
+                affinity: false,
+            };
+            let built = world.build(MODEL, Role::Single, &ask, &mut view);
+            let naming = Naming {
+                gateway: GatewayId::LOCAL,
+                block_hashes: request,
+                namespace_seed: 0,
+                seed: 7,
+                cap,
+                wires: None,
+                now_micros: built.expect("the pool").now_micros,
+            };
+            let rows = &view.candidates;
+            world.name(MODEL, Role::Single, &naming, rows, &mut named);
+            let keeps = |row: &Candidate| !refused.contains(&row.id);
+            world.name_kept(MODEL, Role::Single, &naming, rows, &mut named, || {
+                Some(keeps)
+            });
+        });
+        !named.first.is_empty()
+    }
+
+    /// A naming shorter than its cap holds every holder there is: where
+    /// the pass refuses them all no lookup is made again, and the naming
+    /// stands as it was made. One that fills its cap is read past, and one
+    /// that names no holder asks nothing.
+    #[test]
+    fn a_naming_shorter_than_its_cap_is_not_looked_up_again() {
+        let (store, request, rows) = layered();
+        // Seven holders under a cap of eight, every one refused.
+        assert!(!looks_again(&store, &request, 8, &rows));
+        assert_eq!(named_less(&store, &request, 8, &rows).len(), 7);
+        // The same seven fill a cap of seven.
+        assert!(looks_again(&store, &request, 7, &rows));
+        assert!(!looks_again(&store, &[99], 2, &rows), "no holder named");
+    }
+
+    /// The lookup is made again at most four times, each within the rows
+    /// no read before it named. Behind four refused layers under a cap of
+    /// one the fourth lookup more reads the row that passes. A read one
+    /// holder of which passes ends the lookups, and the refused holder
+    /// beside it is not named.
+    #[test]
+    fn the_lookup_is_made_again_at_most_the_bound() {
+        let (store, request, rows) = layered();
+        assert_eq!(named_less(&store, &request, 1, &rows[..4]), [(rows[4], 3)]);
+        let third = named_less(&store, &request, 2, &rows[..3]);
+        assert_eq!(third, [(rows[3], 4)]);
+    }
+
+    /// Where no holder passes within the bound the first read stands, as a
+    /// naming under no test makes it: the pass rules on its rows itself.
+    #[test]
+    fn where_no_holder_passes_the_first_read_of_a_naming_stands() {
+        let (store, request, rows) = layered();
+        let first = [(rows[0], 7), (rows[1], 6)];
+        assert_eq!(named_less(&store, &request, 2, &rows), first);
+        // Five refused layers under a cap of one: no lookup reads the sixth.
+        assert_eq!(named_less(&store, &request, 1, &rows[..5]), [(rows[0], 7)]);
+    }
+
+    /// An id taken again takes no place of the cap in a lookup made again
+    /// past refused holders either: the check runs behind that lookup as
+    /// behind the naming's own. The taker and a refused row hold the
+    /// request whole under a cap of two and the next holder is refused
+    /// beside them, so the row behind the three is named alone.
+    #[test]
+    fn an_index_id_taken_again_takes_no_place_of_the_cap_past_refused_holders() {
+        let store = MemoryStore::new();
+        store.apply(sampled(1)).expect("above the unbound start");
+        let left = admitted(&store, "left");
+        let (shallow, deep) = (admitted(&store, "shallow"), admitted(&store, "deep"));
+        let hot = admitted(&store, "hot");
+        admitted(&store, "idle");
+        let request = [1, 2, 3];
+        let refused = [hot, deep];
+        let then = || {
+            let freed = index_id(&store, left);
+            let revision = WorkersStore::get(&store, left).expect("the row").revision;
+            store.remove(left, revision).expect("removed");
+            let taker = admitted(&store, "taker");
+            assert_eq!(index_id(&store, taker), freed, "the id is taken again");
+            holds(&store, taker, &request);
+            holds(&store, hot, &request);
+            holds(&store, deep, &[1, 2]);
+            holds(&store, shallow, &[1]);
+        };
+        let (each, before) =
+            named_under_a_kept_world_less(&store, &request, 2, &[7], Some(&refused), then);
+        assert!(before.contains(&left), "the world of before holds the row");
+        assert_eq!(each[0], [(shallow, 1)]);
     }
 
     /// The lookup made again cuts by a draw of its own. Three rows hold one
