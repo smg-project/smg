@@ -50,7 +50,7 @@ use crate::{
     sent::SentCredit,
     sessions::SessionRule,
     terms::Term,
-    view::{permille, HashKind, Phase, MAX_REPORT_AGE_MS},
+    view::{threshold_permille, HashKind, Phase, MAX_REPORT_AGE_MS},
 };
 
 pub const API_VERSION: &str = "smg.policy/v1";
@@ -3096,18 +3096,17 @@ fn check_matcher(
 
 /// The thresholds a binding hands its pools: its block's values, each else
 /// the default, and none when the block is switched off. A binding with no
-/// block has the default block. The usage goes to permille by the rounding
-/// a report's usage takes ([`permille`]), so one rank's usage at or above
-/// the threshold in the document's unit is never read as under it. A usage
-/// that would round to no permille is held as one: at none, every engine
-/// with a row on file would read over it.
+/// block has the default block. The usage goes to permille by the one
+/// conversion of a threshold ([`threshold_permille`]): the rounding a
+/// report's usage takes, so one rank's usage at or above the threshold in
+/// the document's unit is never read as under it, and a floor of one.
 fn overload_thresholds(block: Option<&OverloadSpec>) -> Option<OverloadThresholds> {
     let (enabled, waiting, usage) = block.map_or((true, None, None), |block| {
         (block.enabled, block.waiting_requests, block.token_usage)
     });
     enabled.then(|| OverloadThresholds {
         waiting_requests: waiting.unwrap_or(OVERLOAD_WAITING_REQUESTS),
-        kv_usage_permille: permille(f64::from(usage.unwrap_or(OVERLOAD_TOKEN_USAGE))).max(1),
+        kv_usage_permille: threshold_permille(f64::from(usage.unwrap_or(OVERLOAD_TOKEN_USAGE))),
     })
 }
 

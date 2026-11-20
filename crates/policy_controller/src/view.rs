@@ -176,6 +176,15 @@ pub fn permille(ratio: f64) -> u16 {
     (ratio * 1000.0).round().clamp(0.0, 1000.0) as u16
 }
 
+/// A usage threshold as a permille field: [`permille`]'s rounding with a
+/// floor of one, the one conversion every threshold stated as a ratio
+/// takes. At no permille the store reads every engine with a rank on file
+/// as over the threshold, an idle one too, so a valid threshold that would
+/// round to none is held as one.
+pub(crate) fn threshold_permille(usage: f64) -> u16 {
+    permille(usage).max(1)
+}
+
 /// One load row as the view carries it: the engine load record's routing
 /// core, in the record's own names, rounded to narrow fields by the host.
 /// Permille fields are the record's ratios times 1000.
