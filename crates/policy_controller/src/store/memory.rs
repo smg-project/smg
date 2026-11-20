@@ -26,8 +26,8 @@ use crate::{
         journal::{Journal, Kinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{
-            Counts, DecodeMark, DecodeSide, Dispatch, LeaseRecord, LeaseRefused, LeaseState,
-            LeasesStore, Said, Sides, Slot,
+            Counts, DecodeMark, DecodeRefused, DecodeSide, Dispatch, LeaseRecord, LeaseRefused,
+            LeaseState, LeasesStore, Said, Sides, Slot, DISPATCH_TTL,
         },
         loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
         reservations::{ReservationKind, ReservationStore},
@@ -2986,14 +2986,21 @@ struct Held {
 struct HeldDecode {
     side: DecodeSide,
     booked: Option<Slot>,
+    /// Whether the side started as chosen, kept after issue or dispatch.
+    filed_chosen: bool,
 }
 
 impl HeldDecode {
     /// `side` as a door files it with `booked`, the slot of its worker's
-    /// count: a side filed as ended books none.
+    /// count. Only a live side books a count at filing.
     fn laid(side: DecodeSide, booked: Option<Slot>) -> Self {
         let booked = booked.filter(|_| side.state.is_live());
-        Self { side, booked }
+        let filed_chosen = side.state.is_chosen();
+        Self {
+            side,
+            booked,
+            filed_chosen,
+        }
     }
 }
 
@@ -3069,10 +3076,17 @@ fn waits(found: &Sides, side: Side) -> bool {
 /// left it: released as abandoned where it waited. A pair's record is its
 /// prefill part, which stands as it was where a dispatch had named it.
 fn left(mut record: LeaseRecord) -> LeaseRecord {
-    if record.state.is_issued() {
-        record.state = LeaseState::Released(ReleaseReason::Abandoned);
-    }
+    record.state = state_after_deadline(record.state);
     record
+}
+
+/// The state of a side after the deadline sweep. Only issued sides end.
+fn state_after_deadline(state: LeaseState) -> LeaseState {
+    if state.is_issued() {
+        LeaseState::Released(ReleaseReason::Abandoned)
+    } else {
+        state
+    }
 }
 
 /// Moves a side's booking to the slot `to`: the count it booked is free
@@ -3176,6 +3190,45 @@ impl Leases {
         if decode.side.state.is_issued() && !record.state.is_issued() {
             self.queue(record.dispatch_deadline, key);
         }
+    }
+
+    /// Replaces a chosen decode side in its place while the prefill is held.
+    fn issue_decode(
+        &mut self,
+        key: Key,
+        mut decode: DecodeSide,
+        booked: Option<Slot>,
+        now: Instant,
+    ) -> Result<crate::Lease, DecodeRefused> {
+        let held = self.records.get_mut(&key).ok_or(DecodeRefused::NoLease)?;
+        let found = held
+            .record
+            .decode
+            .and_then(|_| self.decodes.get_mut(held.decode, &key))
+            .ok_or(DecodeRefused::NotChosen)?;
+        if !found.side.state.is_chosen() {
+            return Err(if found.filed_chosen {
+                DecodeRefused::DecodeStands
+            } else {
+                DecodeRefused::NotChosen
+            });
+        }
+        if !matches!(held.record.state, LeaseState::Dispatched { .. }) {
+            return Err(DecodeRefused::PrefillNotHeld);
+        }
+
+        decode.state = LeaseState::issued(decode.state.session_ttl_micros());
+        decode.target_index = 0;
+        let laid = HeldDecode {
+            side: decode,
+            booked,
+            ..*found
+        };
+        *found = laid;
+        held.record.dispatch_deadline = now + DISPATCH_TTL;
+        let (record, keyed) = (held.record, held.keyed);
+        self.decode_laid(key, &record, &laid, keyed);
+        Ok(decode.lease(&record.lease))
     }
 
     /// The keys of `gateway`'s leases on file.
@@ -3345,12 +3398,9 @@ impl Leases {
         true
     }
 
-    /// A dispatch of one side of the pair's lease under `key`: the side
-    /// its frame names, where that side waits. Every target of a pair's
-    /// pick names the one prefill, so that side's dispatch moves no
-    /// booking; the decode's on another target of the pick moves the
-    /// decode's booking alone. A side the lease does not hold changes
-    /// nothing.
+    /// Dispatches the named side if it is issued or chosen. Every target
+    /// of a pair's pick names the same prefill, so only the decode's
+    /// booking can move. A chosen decode books its target at dispatch.
     fn dispatched_side(
         &mut self,
         slots: Slots<'_>,
@@ -3382,6 +3432,21 @@ impl Leases {
                         side.target = target;
                     }
                     side.target_index = dispatch.target_index;
+                }
+            }
+            Side::Decode if decode.side.state.is_chosen() => {
+                let side = &mut decode.side;
+                if let Some((target, _)) = side.target_at(dispatch.target_index) {
+                    side.target = target;
+                    side.target_index = dispatch.target_index;
+                }
+                side.state = LeaseState::Dispatched { at };
+                decode.booked = slots.of(side.target);
+                if let Some(booked) = decode.booked {
+                    self.counts.book(booked);
+                }
+                if let Some((session, worker)) = keyed_decode(held.keyed, side) {
+                    self.sessions.book(session, worker);
                 }
             }
             _ => {}
@@ -3684,6 +3749,23 @@ impl MemoryStore {
         issued: impl Fn(&crate::Lease),
     ) -> Result<crate::Lease, LeaseRefused> {
         self.issue_minted(record, booked, Some((side, decode)), false, issued)
+    }
+
+    /// [`LeasesStore::issue_decode`] with the slot from the decision's world.
+    /// The `issued` callback hears the decode lease under the file's turn.
+    pub(crate) fn issue_decided_decode(
+        &self,
+        gateway: GatewayId,
+        lease: LeaseId,
+        decode: DecodeSide,
+        booked: Option<Slot>,
+        now: Instant,
+        issued: impl FnOnce(&crate::Lease),
+    ) -> Result<crate::Lease, DecodeRefused> {
+        let mut leases = self.turn_of(self.file_of(lease));
+        let lease = leases.issue_decode((gateway, lease), decode, booked, now)?;
+        issued(&lease);
+        Ok(lease)
     }
 
     /// The one issue behind the doors: a single's lease with no `pair`,
@@ -3999,12 +4081,9 @@ impl MemoryStore {
     /// too where `settled` says no, asked under the file's turn behind
     /// everything handed to it: a host that keeps what was said of a
     /// file's leases beside its ring says no until it has handed that
-    /// on, so no lease is ended ahead of a dispatch said of it.
-    pub(crate) fn expire_where(
-        &self,
-        now: Instant,
-        settled: impl Fn(usize) -> bool,
-    ) -> Vec<LeaseRecord> {
+    /// on, so no lease is ended ahead of a dispatch said of it. Returns
+    /// both parts of each lease as the sweep left them.
+    pub(crate) fn expire_where(&self, now: Instant, settled: impl Fn(usize) -> bool) -> Vec<Sides> {
         let mut ended = Vec::new();
         for at in 0..self.files.len() {
             // A file whose decider works is passed with no wait for its
@@ -4021,7 +4100,14 @@ impl MemoryStore {
             let (mut steps, mut one) = (usize::MAX, turn::OneLoad::default());
             while let Some(found) = leases.end_due(now, &mut steps) {
                 self.tell_abandoned(at, one.world(self), &found);
-                ended.push(left(found.record));
+                let decode = found.decode.map(|decode| DecodeSide {
+                    state: state_after_deadline(decode.state),
+                    ..decode
+                });
+                ended.push(Sides {
+                    record: left(found.record),
+                    decode,
+                });
             }
         }
         ended
@@ -4113,6 +4199,18 @@ impl LeasesStore for MemoryStore {
         self.issue_filed(record, booked, Some(pair))
     }
 
+    fn issue_decode(
+        &self,
+        gateway: GatewayId,
+        lease: LeaseId,
+        decode: DecodeSide,
+        now: Instant,
+    ) -> Result<(), DecodeRefused> {
+        let booked = self.slots().of(decode.target);
+        self.issue_decided_decode(gateway, lease, decode, booked, now, |_| ())
+            .map(|_| ())
+    }
+
     fn dispatched(
         &self,
         gateway: GatewayId,
@@ -4158,7 +4256,7 @@ impl LeasesStore for MemoryStore {
     }
 
     /// The store's pass over its files, none held back by a host.
-    fn expire(&self, now: Instant) -> Vec<LeaseRecord> {
+    fn expire(&self, now: Instant) -> Vec<Sides> {
         self.expire_where(now, |_| true)
     }
 
