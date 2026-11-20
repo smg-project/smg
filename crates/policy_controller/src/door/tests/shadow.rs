@@ -10,12 +10,14 @@ use std::{
         mpsc, Arc,
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
+
+use kv_index::chain_prefix_hash;
 
 use super::{
     counted, dispatched, fleet, items, keyed, pair_fleet, pair_request, place_one, placed,
-    push_fleet, release, report, request, seated, GATEWAY,
+    push_fleet, release, report, request, seated, GATEWAY, MODEL,
 };
 use crate::{
     builtins::target_of,
@@ -29,8 +31,12 @@ use crate::{
         AffinitySource, AppliedSpec, BestParams, PickStage, PolicySpec, PrefixAffinityParams,
         ProfileSpec, ScoreStage, ShadowSpec, WarmupSliceParams,
     },
-    store::{Dispatch, LeasesStore, MemoryStore, Said},
-    view::{Candidate, RequestFacts, WorkerId},
+    store::{
+        BatchFacts, BatchOutcome, ContentHash, Dispatch, KvEvent, KvEventSink, LeasesStore,
+        LoadSink, LoadSource, MemoryStore, Said, SequenceHash, Signals, StoredBlock, WorkerFacts,
+        WorkerStatus, WorkersStore,
+    },
+    view::{Candidate, LoadRow, RequestFacts, Role, WorkerId},
     Assignment,
 };
 
@@ -408,13 +414,13 @@ fn a_decision_made_again_is_shadowed_from_its_own_reading() {
     assert_eq!(kinds(&door), [2, 0, 0, 0]);
 }
 
-/// Rows are named for the live profile alone, by its sample, its
-/// warm-up ruling and the record of sent prefixes. A shadow profile that
-/// would be named other rows is not asked, and is counted as skipped: one
-/// of another sample, one of another ruling, one that reads the record
-/// where the live profile reads the index, and one that reads cached
-/// blocks behind a live profile that is named no row. A shadow of the
-/// live profile's own sample and ruling is asked over the same rows.
+/// A pool keeps one ruling of its warming rows and one record of sent
+/// prefixes: the live profile's. A shadow profile of another ruling, or
+/// one that reads the record where the live profile reads the index, is
+/// not asked, and is counted as skipped. A shadow of another sample, and
+/// one that reads cached blocks behind a live profile that is named no
+/// row, are asked over rows named for them alone. A shadow of the live
+/// profile's own sample and ruling is asked over the same rows.
 #[test]
 fn a_shadow_that_would_be_named_other_rows_is_skipped() {
     let shadowed = |live: &str, turn: &dyn Fn(&mut ProfileSpec)| {
@@ -452,12 +458,173 @@ fn a_shadow_that_would_be_named_other_rows_is_skipped() {
         };
         twin.score[1] = ScoreStage::PrefixAffinity(prefix).into();
     };
-    assert_eq!(shadowed("cache_aware", &sample(8)), [0, 0, 0, 1]);
     assert_eq!(shadowed("cache_aware", &ruling), [0, 0, 0, 1]);
     assert_eq!(shadowed("cache_aware", &record), [0, 0, 0, 1]);
-    assert_eq!(shadowed("random", &|_| {}), [0, 0, 0, 1]);
-    let same = shadowed("cache_aware", &sample(16));
-    assert_eq!((same.iter().sum::<u64>(), same[3]), (1, 0), "{same:?}");
+    let asked = [
+        shadowed("cache_aware", &sample(8)),
+        shadowed("random", &|_| {}),
+        shadowed("cache_aware", &sample(16)),
+    ];
+    for kinds in asked {
+        assert_eq!((kinds.iter().sum::<u64>(), kinds[3]), (1, 0), "{kinds:?}");
+    }
+}
+
+/// A store of one decider under `document` whose members publish their
+/// cache events. `holders` of them hold the chain of blocks 1 to 1,100,
+/// and `bare` hold none: under a ruling those are the pool's warming rows
+/// at the next window. The members' ids, the holders first.
+fn cached(document: &PolicySpec, holders: usize, bare: usize) -> (Arc<MemoryStore>, Vec<WorkerId>) {
+    let store = MemoryStore::new().with_deciders(1);
+    let spec = AppliedSpec::validate(document).expect("the document validates");
+    store.apply(spec).expect("above the unbound start");
+    let filled: Vec<u64> = (1..=1_100).collect();
+    let mut ids = Vec::new();
+    for at in 0..holders + bare {
+        let key = format!("http://c{at}:8000");
+        let facts = WorkerFacts {
+            key: key.clone(),
+            engine: key,
+            incarnation: 1,
+            role: Role::Single,
+            models: vec![MODEL.to_owned()],
+            dp_size: 1,
+            max_running: Some(4_096),
+            signals: Signals {
+                events: true,
+                ..Signals::default()
+            },
+            ..WorkerFacts::default()
+        };
+        let id = store.upsert(facts).id();
+        let row = WorkersStore::get(&store, id).expect("the row");
+        if row.status != WorkerStatus::Ready {
+            let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
+            ready.expect("the row stands");
+        }
+        store.publish_now();
+        if at < holders {
+            let mut blocks: Vec<StoredBlock> = Vec::with_capacity(filled.len());
+            for &content in &filled {
+                let seq_hash = match blocks.last() {
+                    Some(parent) => chain_prefix_hash(parent.seq_hash, ContentHash(content)),
+                    None => SequenceHash(content),
+                };
+                blocks.push(StoredBlock {
+                    seq_hash,
+                    content_hash: ContentHash(content),
+                });
+            }
+            let events = [KvEvent::Stored {
+                parent: None,
+                blocks,
+            }];
+            let batch = BatchFacts {
+                sequence: 1,
+                ..BatchFacts::default()
+            };
+            assert_eq!(store.admit(id, 0, batch, &events), BatchOutcome::Applied);
+        }
+        ids.push(id);
+    }
+    let window = Instant::now() + Duration::from_secs(1);
+    store.record(ids[0], 0, LoadRow::default(), window, LoadSource::Stream);
+    (Arc::new(store), ids)
+}
+
+/// The `least_load` preset with its decisions sampled and, where
+/// `shadowed`, the `cache_aware` preset's profile as its binding's
+/// shadow: a live profile that is named no row, and a shadow that is
+/// named rows of its own.
+fn own_rows(shadowed: bool) -> PolicySpec {
+    let mut document = PolicySpec::preset("least_load").expect("a preset of this build");
+    document.explain.sample = 1;
+    if shadowed {
+        let aware = PolicySpec::preset("cache_aware").expect("a preset of this build");
+        let twin = aware.profiles.into_values().next();
+        let twin = twin.expect("the preset's profile");
+        document.profiles.insert("twin".into(), twin);
+        document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+    }
+    document
+}
+
+/// A shadow profile that reads cached blocks, behind a live profile that
+/// is named no row, is asked over rows the door names for it alone: the
+/// request's holder, and the pool's warming rows by the shadow profile's
+/// own ruling. It takes the worker the same profile takes live over the
+/// same state. The live answer is the one given with no shadow.
+#[test]
+fn a_shadow_named_rows_of_its_own_is_asked_over_them() {
+    let hashes = [1_u64];
+    let mut asked = request(b"own", 7);
+    asked.facts.block_hashes = &hashes;
+    let place = |ids: &[WorkerId], id: WorkerId| ids.iter().position(|&at| at == id);
+
+    let aware = PolicySpec::preset("cache_aware").expect("a preset of this build");
+    let (store, ids) = cached(&aware, 1, 2);
+    let as_live = place(&ids, placed(&Door::new(store), &asked).1);
+    let (store, ids) = cached(&own_rows(false), 1, 2);
+    let unshadowed = place(&ids, placed(&Door::new(store), &asked).1);
+
+    let (store, ids) = cached(&own_rows(true), 1, 2);
+    let door = Door::new(store);
+    let (_, live, _) = placed(&door, &asked);
+    assert_eq!(place(&ids, live), unshadowed);
+    assert_eq!(kinds(&door)[3], 0, "the shadow is asked");
+    let record = door.explain(GATEWAY, b"own");
+    let record = record.expect("the sampled decision");
+    assert_eq!(record.shadow_target.and_then(|id| place(&ids, id)), as_live);
+    let slot = door.seats[0].slot.lock();
+    let named = &slot.buffers.shadow_named;
+    assert_eq!((named.holders.len(), named.warming.len()), (1, 2));
+}
+
+/// A shadow of another sample than the live profile's is named by its own
+/// cap: of twelve holders the live profile is named every one under its
+/// sixteen, and the shadow eight.
+#[test]
+fn a_shadow_of_another_sample_is_named_by_its_own_cap() {
+    let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
+    let live = document.profiles.values().next();
+    let mut twin = live.expect("the preset's profile").clone();
+    twin.pick = PickStage::Best(BestParams { sample: 8 }).into();
+    document.profiles.insert("twin".into(), twin);
+    document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+    let (store, _) = cached(&document, 12, 0);
+    let door = Door::new(store);
+    let hashes = [1_u64];
+    let mut asked = request(b"cap", 7);
+    asked.facts.block_hashes = &hashes;
+    placed(&door, &asked);
+    assert_eq!(kinds(&door)[3], 0, "the shadow is asked");
+    let slot = door.seats[0].slot.lock();
+    let named = (
+        slot.buffers.named.holders.len(),
+        slot.buffers.shadow_named.holders.len(),
+    );
+    assert_eq!(named, (12, 8));
+}
+
+/// The floor is asked ahead of the shadow's own rows: a request under it
+/// names none and skips its shadow, and one at it is named its holder.
+#[test]
+fn a_budget_under_the_floor_names_no_rows_for_the_shadow() {
+    let (store, _) = cached(&own_rows(true), 1, 2);
+    let door = Door::new(store);
+    let floor = u32::try_from(SHADOW_FLOOR.as_micros()).expect("a floor in microseconds");
+    let hashes = [1_u64];
+    let budgeted = |id: &'static [u8], micros: u32| {
+        let mut stated = request(id, 7);
+        stated.facts.block_hashes = &hashes;
+        stated.facts.budget_micros = micros;
+        stated
+    };
+    let named = |door: &Door| door.seats[0].slot.lock().buffers.shadow_named.holders.len();
+    placed(&door, &budgeted(b"short", floor - 1));
+    assert_eq!((kinds(&door), named(&door)), ([0, 0, 0, 1], 0));
+    placed(&door, &budgeted(b"held", floor));
+    assert_eq!((kinds(&door)[3], named(&door)), (1, 1));
 }
 
 /// A profile that reads no column is named no row when it decides live.

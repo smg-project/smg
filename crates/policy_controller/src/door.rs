@@ -205,6 +205,10 @@ pub(crate) struct Buffers<L> {
     pub(crate) scratch: Scratch,
     pub(crate) lists: L,
     pub(crate) named: Named,
+    /// The rows named again for a decision's shadow, where its profile
+    /// is named rows of its own ([`ShadowRows::Own`]): they grow at the
+    /// thread's first such shadow.
+    pub(crate) shadow_named: Named,
     /// What a keyed decision reads of its key in the store, where its
     /// rule has an in-flight cap.
     pub(crate) keyed: Keyed,
@@ -604,7 +608,9 @@ pub(crate) enum Shadow {
 /// are not the shadow profile's where that profile would be handed
 /// others ([`ShadowRows::Apart`]). A shadow profile that reads no column
 /// is asked without the rows named for the live one
-/// ([`ShadowRows::Unnamed`]).
+/// ([`ShadowRows::Unnamed`]). One that is named rows of its own is asked
+/// over rows the door names again for it ([`ShadowRows::Own`],
+/// [`OwnRows`]), behind the live decision and the floor.
 ///
 /// A shadow that panics is held here, inside the catch its host keeps
 /// round the decision: the live decision stands as decided.
@@ -617,6 +623,58 @@ struct Shadowing<'a, L> {
     /// What the request's budget still holds at the end of the live
     /// decision: asked there, and only where a shadow is due.
     left: L,
+    /// What a naming of the shadow's own rows reads beside the request.
+    naming: OwnRows<'a>,
+}
+
+/// What the door names a shadow's own rows by ([`ShadowRows::Own`]),
+/// beside the request: the world of the decision's one load, the gateway
+/// and the wires its view was built and narrowed for, whether a demand
+/// may have taken a row of it, and the buffer the rows are written on.
+struct OwnRows<'a> {
+    world: &'a World,
+    gateway: GatewayId,
+    wires: Option<WireModes>,
+    cut: bool,
+    named: &'a mut Named,
+}
+
+impl<'a> OwnRows<'a> {
+    /// The rows of `candidates` named for the shadow of `facts`' request
+    /// under `cap`, as [`hand`] names a live profile's: by the request's
+    /// block hashes as the engine reads them, on the decision's seed, at
+    /// the instant its view was built.
+    fn name(self, cap: u32, facts: &RequestFacts<'_>, candidates: &[Candidate]) -> &'a Named {
+        let Self {
+            world,
+            gateway,
+            wires,
+            cut,
+            named,
+        } = self;
+        let role = match facts.phase {
+            Phase::Single => Role::Single,
+            Phase::Prefill => Role::Prefill,
+            Phase::Decode => Role::Decode,
+            Phase::Encode => Role::Encode,
+        };
+        let naming = Naming {
+            gateway,
+            block_hashes: facts.block_hashes,
+            namespace_seed: facts.namespace_seed,
+            seed: facts.seed,
+            cap,
+            wires,
+            now_micros: facts.now_micros,
+        };
+        let (model, kind) = (facts.model, facts.hash_kind);
+        if cut {
+            world.name_in::<true>(model, role, &naming, candidates, kind, named);
+        } else {
+            world.name_in::<false>(model, role, &naming, candidates, kind, named);
+        }
+        named
+    }
 }
 
 impl<L: FnOnce() -> Duration> Shadowing<'_, L> {
@@ -654,6 +712,7 @@ impl<L: FnOnce() -> Duration> Shadowing<'_, L> {
         if let Some(asking) = ON_SHADOW.take() {
             asking();
         }
+        let naming = self.naming;
         let asked = catch_unwind(AssertUnwindSafe(|| match rows {
             // A profile that reads no column is named no row, live or
             // as a shadow: the names would turn its pick to a draw.
@@ -663,6 +722,17 @@ impl<L: FnOnce() -> Duration> Shadowing<'_, L> {
                     ..*facts
                 };
                 engine.shadow(&unnamed, pool, candidates, constraints, scratch)
+            }
+            // A profile that is named rows of its own reads them in the
+            // column's place, as it does live.
+            ShadowRows::Own(cap) => {
+                let named = naming.name(cap, facts, candidates);
+                let own = RequestFacts {
+                    named: Some(named.affinity()),
+                    affinity: &[],
+                    ..*facts
+                };
+                engine.shadow(&own, pool, candidates, constraints, scratch)
             }
             _ => engine.shadow(facts, pool, candidates, constraints, scratch),
         }));
@@ -729,9 +799,24 @@ pub(crate) fn decide_shadowed_in<A: Asked>(
     if taken.request.hashes() > taken.request.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
     }
-    let shadowing = Shadowing { engine, due, left };
+    // The buffer of the shadow's own rows is lent for the decision: the
+    // hand holds the thread's other buffers while the shadow is named.
+    let mut named = std::mem::take(&mut buffers.shadow_named);
+    let shadowing = Shadowing {
+        engine,
+        due,
+        left,
+        naming: OwnRows {
+            world,
+            gateway: taken.gateway,
+            wires: taken.request.wires(),
+            cut: !taken.request.demands().is_none(),
+            named: &mut named,
+        },
+    };
     let (((decision, booking), shadow), built) =
         hand(world, taken, buffers, &own.undialed, shadowing);
+    buffers.shadow_named = named;
     let booking = booking.map(|booking| Booking { built, ..booking });
     ((decision, booking), shadow)
 }
@@ -2900,23 +2985,26 @@ impl Door {
                     };
                     // Each order's answer is built in its own place:
                     // two that met in one would cost a copy of it.
-                    let Some((binding, rows)) = due else {
-                        let decided = order.plain(&world, at, term, &taken, buffers);
+                    if let Some((binding, rows)) = due {
+                        let mut due = Due {
+                            binding,
+                            rows,
+                            said: None,
+                        };
+                        let decided = order.shadowed(&world, at, term, &taken, buffers, &mut due);
                         if flags & SAMPLES_DECISIONS != 0 {
-                            self.sampled(at, engine, &taken, &decided, None, sample_count);
+                            self.sampled(at, engine, &taken, &decided, due.said, sample_count);
                         }
                         return decided;
-                    };
-                    let mut due = Due {
-                        binding,
-                        rows,
-                        said: None,
-                    };
-                    let decided = order.shadowed(&world, at, term, &taken, buffers, &mut due);
-                    if flags & SAMPLES_DECISIONS != 0 {
-                        self.sampled(at, engine, &taken, &decided, due.said, sample_count);
                     }
-                    return decided;
+                    if flags & SAMPLES_DECISIONS != 0 {
+                        let decided = order.plain(&world, at, term, &taken, buffers);
+                        self.sampled(at, engine, &taken, &decided, None, sample_count);
+                        return decided;
+                    }
+                    // No shadow is due and nothing is sampled: the request
+                    // is ordered below, by the line a generation that
+                    // shadows nowhere runs.
                 }
                 order.plain(&world, at, term, &taken, buffers)
             };

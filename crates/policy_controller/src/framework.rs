@@ -2609,8 +2609,15 @@ pub(crate) enum ShadowRows {
     /// Less the rows named for the live profile: the shadow profile reads
     /// no column, and would be named none.
     Unnamed,
-    /// Not at all: the shadow profile would be named other rows, or
-    /// handed a column the live decision was not.
+    /// By rows the host names again for it, under this cap: the shadow
+    /// profile names by another cap than the live one, or the live one
+    /// is named no row. A pool keeps one ruling of its warming rows and
+    /// one record of sent prefixes, and both are the shadow profile's
+    /// own there ([`Engine::pool_rule_for`]).
+    Own(u32),
+    /// Not at all: the shadow profile would be named rows of another
+    /// warm-up ruling or another record than the pool keeps, or handed a
+    /// column the live decision was not.
     Apart,
 }
 
@@ -2633,9 +2640,23 @@ impl ShadowRows {
             // The live profile alone is named rows. A shadow that reads
             // no column decides without them, as it would live.
             (_, 0) if !column => Self::Unnamed,
+            (_, 0) => Self::Apart,
             // One value names the same rows.
             _ if live == by => Self::Same,
-            _ => Self::Apart,
+            // The shadow profile is named rows of its own. The pool's
+            // warming rows are of one ruling and its record of one
+            // profile: the live one's, and the ruling is left to the
+            // shadow where the live profile is named no row and rules by
+            // none.
+            (live_cap, cap) => {
+                let ruled = live.rule == by.rule || (live_cap == 0 && live.rule.is_none());
+                let recorded = (live.sent, live.sent_alone) == (by.sent, by.sent_alone);
+                if ruled && recorded {
+                    Self::Own(cap)
+                } else {
+                    Self::Apart
+                }
+            }
         }
     }
 }
@@ -4198,6 +4219,24 @@ impl Engine {
     pub fn warm_rule_for(&self, model: &str, phase: Phase) -> Option<WarmRule> {
         let (_, index, _) = self.resolve(model, phase)?;
         self.named_by[usize::from(index)].rule
+    }
+
+    /// The ruling a host reads a pool's warming rows by, for the decisions
+    /// of `phase` for `model`: the live profile's
+    /// ([`Self::warm_rule_for`]) and, where that profile rules by none and
+    /// its binding's shadow is named rows of its own
+    /// ([`ShadowRows::Own`]), the shadow profile's. A live profile that
+    /// rules by none reads no warming row, so the rows it is handed do
+    /// not move.
+    pub fn pool_rule_for(&self, model: &str, phase: Phase) -> Option<WarmRule> {
+        self.warm_rule_for(model, phase).or_else(|| {
+            let (at, rows) = self.shadow_for(model, phase)?;
+            let ShadowRows::Own(_) = rows else {
+                return None;
+            };
+            let shadow = self.bindings.get(at as usize)?.binding.shadow?;
+            self.named_by.get(usize::from(shadow))?.rule
+        })
     }
 
     /// Whether the profile a decision resolves to reads sent prefixes: a
@@ -7601,13 +7640,15 @@ mod tests {
             };
             profile.score[1] = ScoreStage::PrefixAffinity(prefix).into();
         };
-        let cases: [(&str, &str, Turn<'_>, ShadowRows); 7] = [
+        let cases: [(&str, &str, Turn<'_>, ShadowRows); 9] = [
             ("cache_aware", "cache_aware", &as_it_is, ShadowRows::Same),
             ("cache_aware", "cache_aware", &record, ShadowRows::Apart),
             ("least_load", "random", &as_it_is, ShadowRows::Same),
-            ("cache_aware", "cache_aware", &sample, ShadowRows::Apart),
+            ("cache_aware", "cache_aware", &sample, ShadowRows::Own(8)),
             ("cache_aware", "cache_aware", &ruling, ShadowRows::Apart),
-            ("least_load", "cache_aware", &as_it_is, ShadowRows::Apart),
+            ("least_load", "cache_aware", &as_it_is, ShadowRows::Own(16)),
+            ("least_load", "cache_aware", &ruling, ShadowRows::Own(16)),
+            ("least_load", "cache_aware", &record, ShadowRows::Apart),
             ("cache_aware", "least_load", &as_it_is, ShadowRows::Unnamed),
         ];
         for (live, shadow, turn, wanted) in cases {
@@ -7617,6 +7658,29 @@ mod tests {
                 "{shadow} behind {live}"
             );
         }
+    }
+
+    /// A pool has one ruling of its warming rows: the live profile's, and
+    /// where that profile rules by none and its shadow is named rows of
+    /// its own, the shadow profile's.
+    #[test]
+    fn a_pool_is_ruled_for_its_shadow_where_the_live_profile_rules_by_none() {
+        let aware = PolicySpec::preset("cache_aware").expect("a preset");
+        let second = aware.profiles.values().next();
+        let second = second.expect("the preset's profile").clone();
+        let aware = aware.validate().expect("the preset validates");
+        let rule = aware.warm_rule_for("m", Phase::Single);
+        assert!(rule.is_some());
+        assert_eq!(aware.pool_rule_for("m", Phase::Single), rule);
+
+        let mut document = PolicySpec::preset("least_load").expect("a preset");
+        let alone = document.validate().expect("the preset validates");
+        assert_eq!(alone.pool_rule_for("m", Phase::Single), None);
+        document.profiles.insert("second".into(), second);
+        document.bindings[0].shadow = Some(crate::spec::ShadowSpec::Profile("second".into()));
+        let engine = document.validate().expect("a binding with a shadow");
+        assert_eq!(engine.warm_rule_for("m", Phase::Single), None);
+        assert_eq!(engine.pool_rule_for("m", Phase::Single), rule);
     }
 
     #[test]

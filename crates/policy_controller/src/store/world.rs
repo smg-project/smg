@@ -4917,7 +4917,7 @@ fn put_read(
 /// numbers: it is named no rows.
 fn ruling_of(spec: &AppliedSpec, model: &str, rows: &[Candidate]) -> Option<WarmRule> {
     let role = rows.first()?.role;
-    spec.engine().warm_rule_for(model, phase_of(role))
+    spec.engine().pool_rule_for(model, phase_of(role))
 }
 
 /// The tree's placement bound for a pool whose profile reads sent prefixes.
