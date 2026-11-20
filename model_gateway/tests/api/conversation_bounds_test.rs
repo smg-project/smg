@@ -254,3 +254,27 @@ async fn message_items_outside_the_public_sets_are_refused_and_not_stored() {
 
     ctx.shutdown().await;
 }
+
+#[tokio::test]
+async fn conversation_item_list_refuses_limit_and_order_outside_the_public_bounds() {
+    let (ctx, app) = app_over_no_workers().await;
+    let (status, created) = call(&app, Method::POST, "/v1/conversations", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["id"].as_str().unwrap_or_default();
+
+    for (query, param) in [
+        ("limit=0", "limit"),
+        ("limit=101", "limit"),
+        ("order=sideways", "order"),
+    ] {
+        let uri = format!("/v1/conversations/{id}/items?{query}");
+        let (status, body) = call(&app, Method::GET, &uri, Value::Null).await;
+        assert_eq!(
+            refusal(status, &body),
+            ("invalid_value".to_owned(), json!(param)),
+            "{query}"
+        );
+    }
+
+    ctx.shutdown().await;
+}

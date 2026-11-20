@@ -26,9 +26,12 @@ use smg_data_connector::{
 };
 use tracing::{info, warn};
 
-use crate::routers::{
-    common::{openai_bridge, persistence_utils::item_to_json},
-    error as route_error,
+use crate::{
+    endpoints::responses::InputItemsQuery,
+    routers::{
+        common::{openai_bridge, persistence_utils::item_to_json},
+        error as route_error,
+    },
 };
 
 // ============================================================================
@@ -421,6 +424,29 @@ pub async fn list_conversation_items(
     order: Option<&str>,
     after: Option<&str>,
 ) -> Response {
+    let limit = limit.unwrap_or(100);
+    if !(1..=InputItemsQuery::MAX_LIMIT).contains(&limit) {
+        return refused(
+            Some("limit"),
+            "invalid_value",
+            &format!(
+                "limit: Input should be an integer from 1 to {}, got {limit}",
+                InputItemsQuery::MAX_LIMIT
+            ),
+        );
+    }
+    let order = match order {
+        Some("asc") => SortOrder::Asc,
+        Some("desc") | None => SortOrder::Desc,
+        Some(other) => {
+            return refused(
+                Some("order"),
+                "invalid_value",
+                &format!("order: Input should be 'asc' or 'desc', got {other:?}"),
+            )
+        }
+    };
+
     let conversation_id = ConversationId::from(conv_id);
 
     if let Err(response) =
@@ -428,12 +454,6 @@ pub async fn list_conversation_items(
     {
         return response;
     }
-
-    let limit = limit.unwrap_or(100);
-    let order = match order {
-        Some("asc") => SortOrder::Asc,
-        _ => SortOrder::Desc,
-    };
 
     let params = ListParams {
         limit,
