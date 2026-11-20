@@ -1882,6 +1882,40 @@ pub(crate) mod tests {
         assert_eq!(filed.session.get(), session);
     }
 
+    /// A frame's client key places its request on the ring: one client's
+    /// requests take one worker whatever their seeds, and clients spread
+    /// over the workers.
+    #[tokio::test]
+    async fn a_frames_client_key_places_its_request_on_the_ring() {
+        let mut bed = bed(Some(preset("consistent_hashing", 1)), true, (2, 8), []);
+        let from = |id: u8, client: u64| {
+            let mut frame = frame(id, u64::from(id));
+            frame
+                .facts
+                .as_mut()
+                .expect("the frame has facts")
+                .client_key = client;
+            frame
+        };
+        let mut of_one = Vec::new();
+        for id in 1..=12u8 {
+            of_one.push(picked(&bed.ask(from(id, 0x9e37_79b9_7f4a_7c15)).await));
+        }
+        assert!(
+            of_one.windows(2).all(|pair| pair[0] == pair[1]),
+            "{of_one:?}"
+        );
+        let mut of_many = Vec::new();
+        for id in 13..=28u8 {
+            let client = u64::from(id).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            of_many.push(picked(&bed.ask(from(id, client)).await));
+        }
+        assert!(
+            of_many.windows(2).any(|pair| pair[0] != pair[1]),
+            "{of_many:?}"
+        );
+    }
+
     /// Requests that state no prompt size spread over the members: each
     /// dispatch is its worker's credit at the load stage's mean until that
     /// worker's next report, and each lease states no size.
