@@ -205,11 +205,6 @@ pub(crate) struct Buffers<L> {
     pub(crate) scratch: Scratch,
     pub(crate) lists: L,
     pub(crate) named: Named,
-    /// The rows named again for a decision's shadow, where its profile
-    /// is named rows of its own ([`ShadowRows::Own`]). They are lent to
-    /// that shadow's asking for the one decision ([`decide_own_in`]),
-    /// and grow at the thread's first such shadow.
-    pub(crate) shadow_named: Named,
     /// What a keyed decision reads of its key in the store, where its
     /// rule has an in-flight cap.
     pub(crate) keyed: Keyed,
@@ -680,6 +675,13 @@ impl ShadowAsk for LiveRows {
         constraints: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Option<Decision> {
+        // Rows of the shadow's own have an asking of their own
+        // ([`OwnRows`]): a caller that hands them here would have the
+        // shadow asked over the live profile's rows.
+        debug_assert!(
+            rows != ShadowRows::Own,
+            "a shadow named rows of its own is asked by its own order"
+        );
         match rows {
             // A profile that reads no column is named no row, live or
             // as a shadow: the names would turn its pick to a draw.
@@ -896,33 +898,31 @@ pub(crate) fn decide_shadowed_in<A: Asked>(
 /// skipped ([`OwnRows`]). No column is filled for such a shadow's sake:
 /// the live decision's is filled where its own profile reads it.
 ///
-/// The buffer the shadow's rows are named on is lent out of `buffers`
-/// for the decision, since the hand holds the rest. It comes back with
-/// no record to write where no shadow was named: a naming an earlier
-/// decision left is no word of this one's issue.
+/// `named` is the buffer the shadow's rows are named on. Its host keeps
+/// it beside `buffers`, which the hand holds while the shadow is named.
+/// It is left with no record to write where no shadow was named: a
+/// naming an earlier decision left is no word of this one's issue.
 pub(crate) fn decide_own_in<A: Asked>(
     world: &World,
     taken: &Taken<'_, A>,
     buffers: &mut Buffers<A::Lists>,
     own: &Part,
     due: (u32, ShadowRows),
+    named: &mut Named,
     left: impl FnOnce() -> Duration,
 ) -> ((Decision, Option<Booking>), Shadow) {
     let engine = world.spec().engine();
-    let mut named = mem::take(&mut buffers.shadow_named);
     named.clear_sent();
     let ask = OwnRows {
         world,
         gateway: taken.gateway,
         wires: taken.request.wires(),
         cut: !taken.request.demands().is_none(),
-        named: &mut named,
+        named,
         column: engine.live_column_at(due.0, taken.request.phase()),
         binding: due.0,
     };
-    let decided = shadowed_by(world, taken, buffers, own, due, left, ask);
-    buffers.shadow_named = named;
-    decided
+    shadowed_by(world, taken, buffers, own, due, left, ask)
 }
 
 /// The hand of a shadowed decision by one way of asking its shadow
@@ -2646,6 +2646,21 @@ pub struct Door {
     faults: AtomicU64,
     /// What the reports left beside a full ring, a list a file.
     kept: Box<[Kept]>,
+    /// The rows named again for a decision's shadow, a buffer a seat
+    /// ([`OwnNamed`]).
+    own_named: Box<[OwnNamed]>,
+}
+
+/// The buffer a seat's holder names a shadow's own rows on, where the
+/// shadow profile is named rows of its own ([`ShadowRows::Own`]). It
+/// stands beside its seat, on lines of its own, and not in it: a seat
+/// keeps its size, and no decision reaches the buffer but one whose
+/// shadow is named such rows. Its holder is the seat's, so its lock is
+/// never waited for. It grows at the seat's first such shadow.
+#[derive(Default)]
+#[repr(align(128))]
+struct OwnNamed {
+    named: Mutex<Named>,
 }
 
 /// What the door keeps for one file while its ring is full
@@ -2752,6 +2767,7 @@ impl Door {
             seat_flags: AtomicU8::new(0),
             parts: (0..deciders).map(|_| Part::default()).collect(),
             kept: (0..deciders).map(|_| Kept::default()).collect(),
+            own_named: (0..deciders).map(|_| OwnNamed::default()).collect(),
             store,
             term,
             faults: AtomicU64::new(0),
@@ -3458,12 +3474,18 @@ impl Door {
     ) -> Result<Decided, Refused> {
         let own = &self.parts[at];
         let word = (due.binding, due.rows);
-        let ((decision, booking), shadow) = match ORDER {
-            OWN_ROWS => decide_own_in(world, taken, buffers, own, word, || taken.left),
-            _ => decide_shadowed_in(world, taken, buffers, own, word, || taken.left),
+        // The order of a shadow's own rows holds its seat's buffer for
+        // them through the commit: the issue may write from it.
+        let mut lent = match ORDER {
+            OWN_ROWS => Some(self.own_named[at].named.lock()),
+            _ => None,
         };
-        let named = match ORDER {
-            OWN_ROWS if buffers.named.sent_pool().is_none() => &buffers.shadow_named,
+        let ((decision, booking), shadow) = match lent.as_deref_mut() {
+            Some(named) => decide_own_in(world, taken, buffers, own, word, named, || taken.left),
+            None => decide_shadowed_in(world, taken, buffers, own, word, || taken.left),
+        };
+        let named = match lent.as_deref() {
+            Some(own_named) if buffers.named.sent_pool().is_none() => own_named,
             _ => &buffers.named,
         };
         let filed = self.file::<ORDER>(world, term, taken, named, &decision, booking);

@@ -576,8 +576,7 @@ fn a_shadow_named_rows_of_its_own_is_asked_over_them() {
     let record = door.explain(GATEWAY, b"own");
     let record = record.expect("the sampled decision");
     assert_eq!(record.shadow_target.and_then(|id| place(&ids, id)), as_live);
-    let slot = door.seats[0].slot.lock();
-    let named = &slot.buffers.shadow_named;
+    let named = door.own_named[0].named.lock();
     assert_eq!((named.holders.len(), named.warming.len()), (1, 2));
 }
 
@@ -599,10 +598,9 @@ fn a_shadow_of_another_sample_is_named_by_its_own_cap() {
     asked.facts.block_hashes = &hashes;
     placed(&door, &asked);
     assert_eq!(kinds(&door)[3], 0, "the shadow is asked");
-    let slot = door.seats[0].slot.lock();
     let named = (
-        slot.buffers.named.holders.len(),
-        slot.buffers.shadow_named.holders.len(),
+        door.seats[0].slot.lock().buffers.named.holders.len(),
+        door.own_named[0].named.lock().holders.len(),
     );
     assert_eq!(named, (12, 8));
 }
@@ -621,7 +619,7 @@ fn a_budget_under_the_floor_names_no_rows_for_the_shadow() {
         stated.facts.budget_micros = micros;
         stated
     };
-    let named = |door: &Door| door.seats[0].slot.lock().buffers.shadow_named.holders.len();
+    let named = |door: &Door| door.own_named[0].named.lock().holders.len();
     placed(&door, &budgeted(b"short", floor - 1));
     assert_eq!((kinds(&door), named(&door)), ([0, 0, 0, 1], 0));
     placed(&door, &budgeted(b"held", floor));
