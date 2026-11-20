@@ -3487,6 +3487,34 @@ async fn an_eviction_leaves_every_series_of_a_rank_its_successors_row_names_twic
     assert!(capacity.ends_with(" 1000"), "{rendered}");
 }
 
+/// A rollup's row names a rank once for each downstream worker that holds
+/// it. The sentinel walks a rank once, however often the ended row names
+/// it: a rank past the width is asked about as often as the width's own.
+#[test]
+fn the_sentinel_walks_a_rank_once_however_often_the_ended_row_names_it() {
+    let worker = ready_worker("http://w:1", "m");
+    let ended = WorkerLoadResponse {
+        loads: [0, 1, 2, 2, 1, 2]
+            .into_iter()
+            .map(|dp_rank| SchedulerLoadSnapshot {
+                dp_rank,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let asked = std::cell::RefCell::new(Vec::new());
+    write_sentinel(&worker, Some(&ended), |_, rank, _| {
+        asked.borrow_mut().push(rank);
+        true
+    });
+    let asked = asked.into_inner();
+    let asks = |rank: i32| asked.iter().filter(|&&seen| seen == rank).count();
+    assert!(asks(0) > 0, "the width's own rank is asked about");
+    assert_eq!(asks(1), asks(0), "rank 1, named twice: {asked:?}");
+    assert_eq!(asks(2), asks(0), "rank 2, named three times: {asked:?}");
+}
+
 /// A poll's series and its rows go out under one hold of the lock of the
 /// reports, where a record and the sentinel write theirs: nothing runs
 /// between a tick's series and its row.

@@ -378,10 +378,12 @@ impl PushedFile {
     }
 }
 
-/// The ranks `report` holds at or past `width`, its worker's own width: a
-/// report taken off the file, or the load of a row the batch removed. The
-/// sentinel of the worker's series covers the width and each of these,
-/// and no rank between: a far rank costs one sentinel.
+/// The rank of each entry `report` holds at or past `width`, its worker's
+/// own width: a report taken off the file, or the load of a row the batch
+/// removed. A rollup's row names a rank once for each downstream worker
+/// that holds it, so a rank can come more than once. The sentinel of the
+/// worker's series covers the width and each of these ranks once, and no
+/// rank between.
 fn ranks_past(report: &WorkerLoadResponse, width: usize) -> impl Iterator<Item = i32> + '_ {
     report
         .loads
@@ -407,13 +409,17 @@ fn write_sentinel(
 ) {
     let url = worker.url();
     let width = worker.dp_size().unwrap_or(1).max(1);
-    let ranks = (0..width)
+    let mut ranks: Vec<i32> = (0..width)
         .filter_map(|rank| i32::try_from(rank).ok())
         .chain(
             ended
                 .into_iter()
                 .flat_map(|report| ranks_past(report, width)),
-        );
+        )
+        .collect();
+    // An ended row can name a far rank more than once: one pass a rank.
+    ranks.sort_unstable();
+    ranks.dedup();
     // A worker can serve multiple models (one load group per model),
     // so sentinel every model's series — not just the primary.
     let models = worker_model_ids(worker);
