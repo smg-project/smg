@@ -2859,7 +2859,8 @@ pub(super) struct Writer {
     /// lie and still be judged, in microseconds; none until a report
     /// period is told.
     sample_bound: Option<u64>,
-    /// An engine has a threshold.
+    /// A load write is judged: an engine has a threshold, or a rank stands
+    /// unnamed.
     judging: bool,
     /// How many engines' last word was that no report came.
     silenced: u32,
@@ -4706,8 +4707,8 @@ impl Writer {
         self.unnamed.len()
     }
 
-    /// Whether a load write is judged ([`Self::recorded`]).
-    #[cfg(test)]
+    /// Whether a load write is judged ([`Self::recorded`]): an engine has a
+    /// threshold, or a rank stands unnamed.
     pub(super) fn judges_writes(&self) -> bool {
         self.judging
     }

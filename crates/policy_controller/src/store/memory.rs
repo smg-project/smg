@@ -3016,6 +3016,12 @@ impl LoadSink for MemoryStore {
         stands
     }
 
+    fn wants_loads(&self) -> bool {
+        let loads = self.loads.lock();
+        let needs = loads.writer.spec().needs();
+        needs.loads || needs.signal_cells || loads.writer.judges_writes()
+    }
+
     fn poll_mode(&self, id: WorkerId, now: Instant, interval: Duration) -> PollMode {
         let loads = self.loads.lock();
         let Some(ranks) = loads.ranks.get(&id) else {

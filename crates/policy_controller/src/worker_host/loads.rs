@@ -164,6 +164,9 @@ impl KeptMember {
 /// reset, and behind a document that declared no signal, each rank counts
 /// at its next report. A polled answer is one sample of every rank it
 /// lists, and states them all, though its row is passed over.
+///
+/// Asked whether a reader wants loads, the adapter gives the store's answer
+/// ([`StoreLoadSink::wants_loads`]), whether it leads or follows.
 pub struct LoadAdapter<G, S: ?Sized> {
     objects: Arc<Objects<G>>,
     store: Arc<S>,
@@ -531,6 +534,10 @@ where
             self.store.evict_unready();
         }
     }
+
+    fn needs_loads(&self) -> bool {
+        self.store.wants_loads()
+    }
 }
 
 #[cfg(test)]
@@ -626,6 +633,10 @@ mod tests {
 
         fn evict_unready(&self) {
             self.memory.evict_unready();
+        }
+
+        fn wants_loads(&self) -> bool {
+            self.memory.wants_loads()
         }
     }
 
@@ -1330,13 +1341,34 @@ mod tests {
         assert!(adapter.members.read().is_empty());
         adapter.reset();
         assert!(adapter.members.read().is_empty());
-        assert!(adapter.needs_loads());
+        // The question is the store's, and writes nothing there.
+        assert_eq!(adapter.needs_loads(), replica.store.memory.wants_loads());
         adapter.tick(&GroupTick {
             workers: slice::from_ref(&worker),
             reports: &[],
         });
         assert_eq!(*replica.store.calls.lock(), before);
         assert_eq!(replica.store.load(id, 0), saved);
+    }
+
+    #[test]
+    fn whether_a_reader_wants_loads_is_the_stores_answer() {
+        let replica = Replica::new();
+        replica.add(facts(URL));
+        let adapter = replica.lead();
+        let follower = replica.adapter(Arc::new(TestLead(Mutex::new(None))), 1);
+        // No stage of the standing document reads a load, and no threshold
+        // stands.
+        assert!(!adapter.needs_loads());
+        assert!(!follower.needs_loads());
+        let mut document = PolicySpec::preset("least_load").expect("a preset of this build");
+        document.generation = 2;
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        let applied = replica.store.memory.apply(spec);
+        applied.expect("a newer generation");
+        assert!(adapter.needs_loads());
+        // A follower asks its own store too.
+        assert!(follower.needs_loads());
     }
 
     #[test]

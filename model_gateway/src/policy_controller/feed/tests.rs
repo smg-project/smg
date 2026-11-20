@@ -906,6 +906,54 @@ fn a_worker_with_no_row_writes_no_load() {
     assert!(Arc::ptr_eq(&shown, &loads.store.world()));
 }
 
+/// Whether the monitor of a gateway started under `config`, with the
+/// controller picked and loads fetched on demand alone, wants the loads of
+/// its one worker: a row under [`stated`], which names no threshold.
+fn loads_wanted(config: RouterConfig) -> Result<bool, Box<dyn Error>> {
+    use crate::routers::common::snapshot::WorkerMonitor;
+
+    let config = RouterConfig {
+        policy_controller: true,
+        disable_load_monitoring: true,
+        ..config
+    };
+    let store = start(&config)?.ok_or("the controller was picked and no store started")?;
+    let (registry, feed) = bed(&store);
+    register(&*feed.door)?;
+    let worker = registry
+        .get_by_url(URL)
+        .ok_or("the registry holds no worker of the row")?;
+    let monitor = WorkerMonitor::with_sink(
+        registry,
+        feed.load_sink(PERIOD),
+        PERIOD.as_secs(),
+        config.engine_metrics,
+        config.disable_load_monitoring,
+    );
+    Ok(monitor.loads_wanted(&[worker]))
+}
+
+#[tokio::test]
+async fn loads_on_demand_are_fetched_only_where_the_store_reads_them() {
+    // A plain start protects against overload: its document hands the pool
+    // thresholds, and the store judges each report.
+    assert!(loads_wanted(RouterConfig::default()).expect("the bed stands"));
+    // With the protection off the default policy reads no load.
+    let unprotected = || RouterConfig {
+        worker_overload_protection: false,
+        ..RouterConfig::default()
+    };
+    assert!(!loads_wanted(unprotected()).expect("the bed stands"));
+    // A policy that reads loads is fed.
+    let load_aware = RouterConfig {
+        policy: crate::config::PolicyConfig::PowerOfTwo {
+            load_metric: Default::default(),
+        },
+        ..unprotected()
+    };
+    assert!(loads_wanted(load_aware).expect("the bed stands"));
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_loop_shows_a_waiting_write_at_its_due_instant() {
     let loads = Loads::new().expect("the bed stands");

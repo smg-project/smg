@@ -42,6 +42,7 @@ mod owed;
 mod pool_binding;
 mod repeated_models;
 mod unnamed_rank;
+mod wants_loads;
 mod written;
 
 mod sent_prefixes {

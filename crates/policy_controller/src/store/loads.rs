@@ -166,6 +166,22 @@ pub trait LoadSink: Send + Sync {
     /// changes nothing and answers `false`.
     fn heard_every(&self, period: Duration) -> bool;
 
+    /// Whether a reader wants loads at all, asked by a host whose collector
+    /// fetches them on demand alone. A sink that knows nothing of its
+    /// readers keeps this answer.
+    ///
+    /// The crate's store answers by what stands. A stage of the standing
+    /// generation reads a load ([`Needs::loads`](crate::Needs::loads)), or
+    /// keeps a signal's column
+    /// ([`Needs::signal_cells`](crate::Needs::signal_cells)): the reports
+    /// state a signal's values. Or a load write is judged: an engine has
+    /// an overload threshold, or a rank stands unnamed. A threshold counts
+    /// from the build its membership write owes. The answer takes the
+    /// loads lock once and writes nothing.
+    fn wants_loads(&self) -> bool {
+        true
+    }
+
     /// The row of one rank, when one is on file.
     fn load(&self, id: WorkerId, rank: u16) -> Option<LoadSample>;
 

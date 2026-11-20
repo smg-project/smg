@@ -77,6 +77,9 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
         "heard_every",
         Fate::Rebuilt("each replica's load driver tells its own report period"),
     ),
+    // The answer is read off what a replica holds itself: the needs of its
+    // standing generation and the writes it judges.
+    ("LoadSink", "wants_loads", Fate::Read),
     ("LoadSink", "load", Fate::Read),
     ("LoadSink", "ranks", Fate::Read),
     // The load adapter of a host with no standby is the one caller.

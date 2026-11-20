@@ -886,6 +886,27 @@ fn a_profile_that_reads_no_signal_is_handed_no_cells() {
 }
 
 #[test]
+fn a_stage_that_keeps_a_signals_column_wants_the_loads_that_state_it() {
+    let stages = stages();
+    let store = MemoryStore::new();
+    join(&store, facts("first", Role::Single));
+    // Each document switches its overload block off: no threshold stands.
+    let unprotected = |generation, score| {
+        let declared = json!({ QUEUE: { "unit": REQUESTS } });
+        let mut document = document(generation, declared, score);
+        document["bindings"] = json!([{ "profile": "work", "overload": { "enabled": false } }]);
+        document
+    };
+    // The reports state a signal's values, so its reader reads the loads.
+    let read = unprotected(1, json!({ "by-value": { "signal": QUEUE } }));
+    stages.apply(&store, &read);
+    assert!(store.wants_loads());
+    // The next document declares the signal and no stage keeps its column.
+    stages.apply(&store, &unprotected(2, json!("sees-cells")));
+    assert!(!store.wants_loads());
+}
+
+#[test]
 fn a_document_with_no_signal_publishes_no_block_and_drops_a_value_with_no_lock_taken() {
     let stages = stages();
     let store = Arc::new(MemoryStore::new());
