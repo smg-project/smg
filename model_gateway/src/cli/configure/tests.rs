@@ -540,12 +540,7 @@ const ROUTING_FLAGS: &[Row] = &[
     lands("pd-pairing-mode", PAIR, &["strict"]),
     lands("routing-key-headers", MANUAL, &["x-session-id"]),
     refused("grouped-dp-sticky", &["hash"], "grouped_dp_sticky"),
-    kept(
-        "enable-igw",
-        &[],
-        &[],
-        "which models a gateway serves is its deployment, not the document's",
-    ),
+    lands("enable-igw", &[], &[]),
     refused(
         "dp-minimum-tokens-scheduler",
         &[],

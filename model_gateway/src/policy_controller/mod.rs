@@ -249,8 +249,9 @@ pub(crate) fn undecided(context: &AppContext) -> Option<Box<dyn RouterTrait>> {
 /// its `plan`. A request of it is then decided under another plan, and none
 /// of its targets commits as the family's: a pair asked under a single's
 /// plan answers that no target holds. A gateway of many routers mounts
-/// every family over its one document, so a family reaches this where the
-/// gateway's own mode is another's.
+/// every family over its one document, so a family reaches this where that
+/// document binds no plan of it: a document a user supplies, or the routing
+/// settings' own where it plans one family.
 ///
 /// Nor is it decided where the gateway follows a controller. Such a request
 /// is the controller's to decide, and no ask reaches it for these families
