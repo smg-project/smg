@@ -1118,29 +1118,6 @@ impl Router {
             PolicyConfig as ConfigPolicyConfig, RoutingMode,
         };
 
-        // A policy document replaces the routing settings, and the launcher
-        // refuses each that is set beside one. A policy name left at none
-        // was not set, so this constructor refuses the four names itself.
-        if self.policy_spec.is_some() {
-            let named: Vec<&str> = [
-                ("policy", self.policy.is_some()),
-                ("prefill_policy", self.prefill_policy.is_some()),
-                ("decode_policy", self.decode_policy.is_some()),
-                ("encode_policy", self.encode_policy.is_some()),
-            ]
-            .into_iter()
-            .filter_map(|(name, set)| set.then_some(name))
-            .collect();
-            if !named.is_empty() {
-                return Err(config::ConfigError::ValidationFailed {
-                    reason: format!(
-                        "a policy document replaces the routing settings, and these are set beside it: {}",
-                        named.join(", ")
-                    ),
-                });
-            }
-        }
-
         // Validate the transport mode up front. The CLI (value_parser) and the
         // argparse path (choices) already reject bad values; this covers direct
         // programmatic `RouterArgs` use, matching the CLI/Rust parsing contract.
@@ -2415,12 +2392,11 @@ impl Router {
             })?;
         }
 
-        // A policy document replaces the routing settings. The four policy
-        // names are refused where one is given (`to_router_config`). Every
-        // other setting has a default, so a keyword does not say whether it
-        // was given: one that is not at the constructor's own default is
-        // refused by name here, as the launcher refuses it. The configuration
-        // would drop most of them in silence.
+        // A policy document replaces the routing settings, and the
+        // configuration would drop most of them in silence. Each one that is
+        // not at the constructor's own default is refused by name, in one
+        // list, as the launcher refuses it. A policy name has no default, so
+        // one that was given is in the list whatever it names.
         if self.policy_spec.is_some() {
             let plain: Self = py
                 .get_type::<Self>()
@@ -2431,9 +2407,10 @@ impl Router {
                     [$((stringify!($setting), self.$setting != plain.$setting)),*]
                 };
             }
-            // The launcher's list of the settings a document replaces, less
-            // the four policy names.
+            // The launcher's list of the settings a document replaces, in its
+            // order.
             let moved: Vec<&str> = moved![
+                policy,
                 cache_threshold,
                 balance_abs_threshold,
                 balance_rel_threshold,
@@ -2474,6 +2451,9 @@ impl Router {
                 worker_warmup_blocks,
                 worker_warmup_thin_ratio,
                 worker_warmup_divert_every,
+                prefill_policy,
+                decode_policy,
+                encode_policy,
             ]
             .into_iter()
             .filter_map(|(name, moved)| moved.then_some(name))

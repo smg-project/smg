@@ -1981,14 +1981,18 @@ impl ConfigValidator {
     }
 
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
-        if let Some(path) = config
-            .policy_spec_path
-            .as_deref()
-            .filter(|_| !config.policy_controller)
+        // A launcher gives the document's path, and a host may hand the
+        // document itself. Either one, with the switch off, would be dropped
+        // and the classic policies would serve.
+        if !config.policy_controller
+            && (config.policy_spec_path.is_some() || config.policy_spec.is_some())
         {
             return Err(ConfigError::invalid_value(
                 "policy_spec",
-                path,
+                config
+                    .policy_spec_path
+                    .as_deref()
+                    .unwrap_or("the given document"),
                 "a policy document is run by the policy controller: set --policy-controller on",
             ));
         }

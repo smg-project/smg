@@ -693,14 +693,17 @@ class TestPolicyDocument:
             f"A policy document replaces the routing settings, and these are set beside it: {named}"
         )
 
-    def test_a_policy_name_beside_a_document_is_refused_by_the_constructor(self, tmp_path):
-        with pytest.raises(ValueError, match="these are set beside it: policy, prefill_policy"):
+    def test_the_constructor_names_every_setting_in_one_refusal(self, tmp_path):
+        # A policy name and a tuning value together: one list, in the launcher's order.
+        named = "these are set beside it: policy, cache_threshold, prefill_policy$"
+        with pytest.raises(ValueError, match=named):
             _Router(
                 worker_urls=[],
                 policy_controller="on",
                 policy_spec=str(tmp_path / "routing.yaml"),
                 policy=PolicyType.Random,
                 prefill_policy=PolicyType.Random,
+                cache_threshold=0.5,
             ).start()
 
     @staticmethod

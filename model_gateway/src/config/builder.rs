@@ -1166,6 +1166,23 @@ mod tests {
     }
 
     #[test]
+    fn a_document_given_without_its_path_needs_the_switch_too() {
+        // A host hands the document itself, and no launcher stands before it.
+        let document = PolicySpec::preset("random").expect("the preset");
+        let config = RouterConfig {
+            enable_igw: true,
+            policy_spec: Some(document),
+            ..RouterConfig::default()
+        };
+        assert!(matches!(
+            config.validate().expect_err("the document needs the controller"),
+            ConfigError::InvalidValue { field, value, reason }
+                if field == "policy_spec" && value == "the given document"
+                    && reason == "a policy document is run by the policy controller: set --policy-controller on"
+        ));
+    }
+
+    #[test]
     fn a_path_with_no_loaded_document_is_refused() {
         let config = RouterConfig {
             enable_igw: true,
