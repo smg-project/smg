@@ -295,12 +295,33 @@ async fn a_body_keeps_its_head_and_reports_what_its_frames_show() {
                 .expect("the error frame")
                 .expect_err("body failure");
             assert_eq!(error.to_string(), "body failed");
+            // A server drops a failed body here, so its lease ends here.
+            assert_eq!(live(&store, 0), 0);
+        } else {
+            assert_eq!(LeasesStore::live(&*store, GATEWAY), 1);
         }
-        assert_eq!(LeasesStore::live(&*store, GATEWAY), 1);
         assert!(body.next().await.is_none());
         assert_eq!(live(&store, 0), 0);
         assert_eq!(store.completed_ok_since(GATEWAY, row, sent), !failed);
     }
+}
+
+#[tokio::test]
+async fn a_body_the_relay_marked_cut_ends_as_a_failure() {
+    let (host, store, _) = bed(&["http://w0:8000"]);
+    let sent = Instant::now();
+    let mut placed = host.place(&first(b"r1"), sent).await.expect("a worker");
+    let row = placed.id();
+    placed.dispatched(sent);
+    // The relay ends a cut body cleanly and writes the cut on the mark.
+    placed.cut_mark().store(502, Ordering::Relaxed);
+
+    let response = placed.held_to_the_end_of(Response::new(Body::from("data: a\n\n")));
+    to_bytes(response.into_body(), 64)
+        .await
+        .expect("a clean end");
+    assert_eq!(live(&store, 0), 0);
+    assert!(!store.completed_ok_since(GATEWAY, row, sent));
 }
 
 #[tokio::test]

@@ -1022,15 +1022,19 @@ impl Router {
                 if let Some(adapter) = decision_adapter.as_mut() {
                     adapter.release_request();
                 }
+                let mut source = RelaySource::new(attempt.model_id, route, Arc::clone(worker));
                 if let Some(placed) = placed {
                     placed.dispatched(Instant::now());
+                    if attempt.is_stream {
+                        source = source.marking(placed.cut_mark());
+                    }
                 }
                 self.send_serialized_request(
                     headers,
                     body,
                     upstream_route,
                     mode,
-                    RelaySource::new(attempt.model_id, route, Arc::clone(worker)),
+                    source,
                     load_guard,
                 )
                 .await

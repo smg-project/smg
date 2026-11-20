@@ -410,7 +410,7 @@ async fn a_stream_dropped_before_its_end_is_cancelled() -> Case {
 }
 
 #[tokio::test]
-async fn a_stream_whose_body_fails_reads_what_the_body_showed() -> Case {
+async fn a_stream_the_worker_cuts_ends_its_lease_as_a_failure() -> Case {
     const BODY: &str = "data: a\n\ndata: b\n\ndata: [DONE]\n\n";
     let url = spawn_sized_sse_worker_cut_after(BODY, FIRST_FRAME.len()).await;
     let registry = Arc::new(WorkerRegistry::new());
@@ -427,7 +427,8 @@ async fn a_stream_whose_body_fails_reads_what_the_body_showed() -> Case {
     assert!(bytes.ends_with(b"data: [DONE]\n\n"));
     assert!(std::str::from_utf8(&bytes)?.contains("\"type\":\"stream_error\""));
     assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
-    assert!(store.completed_ok_since(GATEWAY, row, start));
+    // The relay ends the body cleanly; the lease still hears of the cut.
+    assert!(!store.completed_ok_since(GATEWAY, row, start));
     Ok(())
 }
 

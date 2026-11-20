@@ -28,7 +28,7 @@
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU16, AtomicU64, Ordering},
         Arc,
     },
     time::Instant,
@@ -567,6 +567,7 @@ impl Host {
                     target: *target,
                     handle,
                     sent: None,
+                    cut: None,
                 });
             }
         }
@@ -663,6 +664,8 @@ pub(crate) struct Placed {
     handle: Handle<Arc<Door>>,
     /// The instant of the send, `None` before one.
     sent: Option<Instant>,
+    /// The mark the relay of a streamed answer writes at a cut.
+    cut: Option<Arc<AtomicU16>>,
 }
 
 impl Placed {
@@ -686,6 +689,17 @@ impl Placed {
     pub(crate) fn dispatched(&mut self, now: Instant) {
         self.sent = Some(now);
         self.handle.dispatched(now);
+    }
+
+    /// The mark for the relay of this placement's streamed answer: the relay
+    /// writes the status of a cut's class on it, and the body's end reads it.
+    pub(crate) fn cut_mark(&mut self) -> Arc<AtomicU16> {
+        Arc::clone(self.cut.get_or_insert_with(Arc::default))
+    }
+
+    /// The status of the cut's class, where the relay marked one.
+    fn cut(&self) -> Option<StatusCode> {
+        StatusCode::from_u16(self.cut.as_ref()?.load(Ordering::Relaxed)).ok()
     }
 
     /// The request ended with a whole answer of `status` at `now`.

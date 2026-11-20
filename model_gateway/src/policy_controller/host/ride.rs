@@ -18,8 +18,8 @@ use super::{transport_class, End, Placed};
 
 impl Placed {
     /// `response` with this placement held to the end of its body. The
-    /// stream reports at EOF, using the time of the first data frame.
-    /// A body dropped before EOF is cancelled.
+    /// stream reports at EOF, using the time of the first data frame, or at
+    /// the body's error frame. A body dropped before either is cancelled.
     pub(crate) fn held_to_the_end_of(self, response: Response) -> Response {
         let (parts, body) = response.into_parts();
         let body = Body::from_stream(Ride {
@@ -27,7 +27,6 @@ impl Placed {
             inner: body.into_data_stream(),
             status: parts.status,
             first: None,
-            failed: false,
         });
         Response::from_parts(parts, body)
     }
@@ -38,15 +37,28 @@ impl Placed {
 /// placement and the load guard together as [`Held`](super::Held).
 ///
 /// The placement drops before the body and its guard. A dispatched
-/// placement reports once at EOF. On an early drop the handle reports
-/// the cancellation.
+/// placement reports once: at EOF, by the head's status or by the cut the
+/// relay marked, or at an error frame, where a server drops the body and
+/// polls no further. On an early drop the handle reports the cancellation.
 /// The stream reads the frame results without reading their bytes.
 struct Ride {
     placed: Option<Placed>,
     inner: BodyDataStream,
     status: StatusCode,
     first: Option<Instant>,
-    failed: bool,
+}
+
+impl Ride {
+    /// Say the placement's end, once, where it was sent.
+    fn end(&mut self, class: TransportClass) {
+        let Some(mut placed) = self.placed.take() else {
+            return;
+        };
+        if let Some(sent) = placed.sent {
+            let now = Instant::now();
+            placed.completed(End::http(self.status, class, sent, self.first, now), now);
+        }
+    }
 }
 
 impl Stream for Ride {
@@ -57,21 +69,10 @@ impl Stream for Ride {
         let next = Pin::new(&mut this.inner).poll_next(cx);
         match &next {
             Poll::Ready(Some(Ok(_))) if this.first.is_none() => this.first = Some(Instant::now()),
-            Poll::Ready(Some(Err(_))) => this.failed = true,
+            Poll::Ready(Some(Err(_))) => this.end(TransportClass::ServerError),
             Poll::Ready(None) => {
-                let Some(mut placed) = this.placed.take() else {
-                    return next;
-                };
-                let Some(sent) = placed.sent else {
-                    return next;
-                };
-                let class = if this.failed {
-                    TransportClass::ServerError
-                } else {
-                    transport_class(this.status, true)
-                };
-                let now = Instant::now();
-                placed.completed(End::http(this.status, class, sent, this.first, now), now);
+                let cut = this.placed.as_ref().and_then(Placed::cut);
+                this.end(transport_class(cut.unwrap_or(this.status), true));
             }
             _ => {}
         }
@@ -100,7 +101,6 @@ mod tests {
             inner: Body::from_stream(stream::iter(frames)).into_data_stream(),
             status: StatusCode::OK,
             first: None,
-            failed: false,
         };
         assert!(matches!(ride.next().await, Some(Err(_))));
         assert_eq!(ride.first, None);
