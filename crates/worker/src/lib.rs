@@ -40,13 +40,15 @@
 //! its pairing descriptor (`pd`), the registry with its events (`registry`),
 //! the metric writers with their series store (`metrics`), and `connection`:
 //! the engine handle a host implements, the HTTP client factory and the cache
-//! of worker-directed clients. Beside them stand the errors a worker
-//! operation reports (`identity::error`), `periodic_task`, a task on a thread
+//! of worker-directed clients. The `jobs` module holds a queue that runs the
+//! jobs its host supplies and takes requests through the worker jobs port.
+//! Beside them stand the errors a worker operation reports
+//! (`identity::error`), `periodic_task`, a task on a thread
 //! of its own, and the merge of the metrics scraped from the workers. The
 //! gateway re-exports each module at the path it had there. `test-util` adds
 //! `test_support`, what a test builds its workers with, and opens the test
 //! readers and hooks the registry, the series store, the label interner and
-//! the KV event collector keep for their own cases.
+//! the KV event collector and job queue keep for their own cases.
 //!
 //! The `workflow` feature adds `workflow`, the worker side of the workflows
 //! a host runs over its workers on the workflow engine: the steps of a

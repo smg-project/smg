@@ -198,7 +198,7 @@ rsa = { version = "0.9", features = ["sha2"] }
 rustls-pemfile = "2.2"
 jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
 validator = "0.20.0"
-tracing-test = "0.2"
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 tokio = { workspace = true, features = ["test-util"] }
 kv-index.workspace = true
 # The bellwether render-parity test reads the fixture manifests (TOML).
