@@ -174,7 +174,7 @@ use std::{
 use arc_swap::Guard;
 use parking_lot::{Mutex, MutexGuard};
 
-use super::{waits, Key, Leases, MemoryStore};
+use super::{takes_dispatch, Key, Leases, MemoryStore};
 use crate::{
     decider::Decider,
     lease::LeaseId,
@@ -1068,9 +1068,9 @@ impl MemoryStore {
             Said::Dispatched(dispatch, when) => {
                 let found = leases.found(&key);
                 leases.dispatched(self.slots(), &key, dispatch, when);
-                // The side the frame names is told where it waited for
-                // this dispatch.
-                found.filter(|found| waits(found, dispatch.side))
+                // The side the frame names is told where this dispatch
+                // moved it.
+                found.filter(|found| takes_dispatch(found, dispatch.side))
             }
             Said::Completed(outcome) => {
                 let found = leases.found(&key);

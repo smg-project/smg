@@ -160,7 +160,7 @@ fn assert_the_lease_is_named_by_none_of(store: &MemoryStore, ids: &[&str]) {
     let leases = store.expire(Instant::now() + Duration::from_secs(60));
     assert_eq!(leases.len(), 1);
     for id in ids {
-        assert_ne!(leases[0].request, fingerprint(id.as_bytes()), "{id}");
+        assert_ne!(leases[0].record.request, fingerprint(id.as_bytes()), "{id}");
     }
 }
 
@@ -293,7 +293,7 @@ async fn each_ask_carries_a_mark_of_its_own() {
     stage.execute(&mut second).await.expect("a placed worker");
     let leases = store.expire(Instant::now() + Duration::from_secs(60));
     assert_eq!(leases.len(), 2);
-    assert_ne!(leases[0].request, leases[1].request);
+    assert_ne!(leases[0].record.request, leases[1].record.request);
 }
 
 #[tokio::test]

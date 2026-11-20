@@ -369,6 +369,7 @@ impl Checked {
                 excluded: &lists.excluded,
                 wire_modes: self.wires().unwrap_or_default(),
                 overload_lifted: constraints.overload_lifted,
+                decode_later: self.decode_later(),
                 subset_hint: constraints.subset_hint,
                 demands: Demands::default(),
                 // The asking gateway's standing vetoes beside lent rows,
@@ -410,6 +411,10 @@ impl Asked for Checked {
     /// yet.
     fn demands(&self) -> Demands {
         Demands::default()
+    }
+
+    fn decode_later(&self) -> bool {
+        false
     }
 
     fn hashes(&self) -> usize {
@@ -1270,6 +1275,7 @@ mod tests {
                 WireModes::GRPC.union(WireModes::ZMQ)
             );
             assert!(constraints.overload_lifted);
+            assert!(!constraints.decode_later);
             assert_eq!(constraints.subset_hint, Some(0));
         });
     }

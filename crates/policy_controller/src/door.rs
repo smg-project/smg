@@ -48,9 +48,10 @@ use crate::{
     sessions::{Forgets, SessionVerdict},
     spec::AppliedSpec,
     store::{
-        leases::DISPATCH_TTL, Ask, AtWork, Built, DecodeSide, EncodePairBuffers, GatewayId, Hand,
-        HealthSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, MemoryStore, Named, Naming,
-        PairBuffers, Picked, Pin, Said, SessionsStore, Sides, ViewBuffers, World,
+        leases::DISPATCH_TTL, Ask, AtWork, Built, DecodeRefused, DecodeSide, EncodePairBuffers,
+        GatewayId, Hand, HealthSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore,
+        MemoryStore, Named, Naming, PairBuffers, Picked, Pin, Said, SessionsStore, Sides,
+        ViewBuffers, World,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, KeyedRow, NamedAffinity, Phase,
@@ -82,6 +83,9 @@ pub(crate) trait Asked {
     fn subset(&self) -> Option<u32>;
     /// What the request demands of the worker that takes it.
     fn demands(&self) -> Demands;
+    /// Whether the asker sends a pair's decode after its prefill has run:
+    /// the pair's first decision then files the decode side chosen.
+    fn decode_later(&self) -> bool;
     /// How many block hashes the request carries.
     fn hashes(&self) -> usize;
     /// How many of them the generation of `spec` reads.
@@ -526,6 +530,7 @@ pub(crate) fn pair_in<A: Asked>(
         lists,
         ..
     } = buffers;
+    let later = taken.request.decode_later();
     pair_with(
         world,
         taken,
@@ -537,9 +542,14 @@ pub(crate) fn pair_in<A: Asked>(
             world.count_pair_in_flight(&built, &ask, pair);
             Some((built, pair.narrow(wires, subset, &built)))
         },
-        |engine, pair, facts, pool, cx, scratch| {
-            engine.decide_pair(facts, pool, pair.pools(), cx, cx, scratch)
-        },
+        (
+            |engine, pair, facts, pool, cx, scratch| {
+                engine.decide_pair(facts, pool, pair.pools(), cx, cx, scratch)
+            },
+            |facts, decision, built, scratch| {
+                pair_booking(world, facts, decision, built, scratch, later)
+            },
+        ),
     )
 }
 
@@ -559,6 +569,7 @@ pub(crate) fn encode_pair_in<A: Asked>(
         ..
     } = buffers;
     let rows: &mut EncodePairBuffers = encode.get_or_insert_with(Box::default);
+    let later = taken.request.decode_later();
     let answer = pair_with(
         world,
         taken,
@@ -582,12 +593,17 @@ pub(crate) fn encode_pair_in<A: Asked>(
             };
             Some((built, narrowed))
         },
-        |engine, rows, facts, pool, cx, scratch| {
-            let (pools, encode) = rows.pools();
-            engine.decide_encode_pair(
-                facts, pool, pools, encode, items, cx, cx, cx, scratch, placed,
-            )
-        },
+        (
+            |engine, rows, facts, pool, cx, scratch| {
+                let (pools, encode) = rows.pools();
+                engine.decide_encode_pair(
+                    facts, pool, pools, encode, items, cx, cx, cx, scratch, placed,
+                )
+            },
+            |facts, decision, built, scratch| {
+                pair_booking(world, facts, decision, built, scratch, later)
+            },
+        ),
     );
     // A subset or wire cut can shed before the engine's entry clears what
     // an earlier decision placed.
@@ -597,8 +613,9 @@ pub(crate) fn encode_pair_in<A: Asked>(
     answer
 }
 
-/// Reads a built pair and turns its decision into a booking.
-fn pair_with<A: Asked, R>(
+/// Reads a built pair, decides over it, and takes what `book` files of the
+/// decision.
+fn pair_with<A: Asked, R, B>(
     world: &World,
     taken: &Taken<'_, A>,
     own: &Part,
@@ -612,15 +629,18 @@ fn pair_with<A: Asked, R>(
         Option<WireModes>,
         Option<u32>,
     ) -> Option<((Built, Built), (u64, bool))>,
-    decide: impl FnOnce(
-        &Engine,
-        &R,
-        &RequestFacts<'_>,
-        &PoolFacts<'_>,
-        &Constraints<'_>,
-        &mut Scratch,
-    ) -> Decision,
-) -> (Decision, Option<PairBooking>) {
+    (decide, book): (
+        impl FnOnce(
+            &Engine,
+            &R,
+            &RequestFacts<'_>,
+            &PoolFacts<'_>,
+            &Constraints<'_>,
+            &mut Scratch,
+        ) -> Decision,
+        impl FnOnce(&RequestFacts<'_>, &Decision, Option<(Built, Built)>, &Scratch) -> Option<B>,
+    ),
+) -> (Decision, Option<B>) {
     let Taken {
         request,
         gateway,
@@ -711,19 +731,22 @@ fn pair_with<A: Asked, R>(
             return (none, None);
         }
         let decision = decide(engine, rows, facts, &pool, constraints, scratch);
-        let booking = pair_booking(world, facts, &decision, built, scratch);
+        let booking = book(facts, &decision, built, scratch);
         (decision, booking)
     })
 }
 
 /// What each side's lease takes of the pair's pick. The decode's session
-/// is the request's under the decode phase.
+/// is the request's under the decode phase. Where the gateway sends the
+/// decode `later`, its side is filed chosen: it holds the pick's decode
+/// targets and books nothing.
 fn pair_booking(
     world: &World,
     facts: &RequestFacts<'_>,
     decision: &Decision,
     built: Option<(Built, Built)>,
     scratch: &Scratch,
+    later: bool,
 ) -> Option<PairBooking> {
     let (pick, built) = decision.pick().zip(built)?;
     let first = pick.targets.first()?;
@@ -733,6 +756,14 @@ fn pair_booking(
     } else {
         scratch.session_ttl_micros()
     };
+    let (state, slot) = if later {
+        (LeaseState::Chosen, None)
+    } else {
+        (
+            LeaseState::issued(ttl_micros),
+            world.booked(&built.1, chosen.decode_id),
+        )
+    };
     let decode = DecodeSide {
         target: chosen.decode_id,
         picked: Picked::of_decodes(&pick.targets),
@@ -741,7 +772,7 @@ fn pair_booking(
             ..*facts
         }
         .session(),
-        state: LeaseState::issued(ttl_micros),
+        state,
         tokens: facts.prompt_tokens,
         target_index: 0,
     };
@@ -761,7 +792,7 @@ fn pair_booking(
             built: Some(built.0),
         },
         decode,
-        slot: world.booked(&built.1, chosen.decode_id),
+        slot,
     })
 }
 
@@ -1463,10 +1494,20 @@ pub(crate) fn told(
     store.call_faulted()
 }
 
+/// The engine that hears a lease's words under `spec`: the one of the
+/// generation the lease was issued under, where that generation still
+/// stands. A later generation's engine heard no issue of the lease and
+/// hears nothing of it: no dispatch, no end, and no issue of a side a call
+/// decides later.
+#[inline]
+fn issuing<'a>(spec: &'a AppliedSpec, lease: &Lease) -> Option<&'a Engine> {
+    (spec.generation() == lease.generation).then(|| spec.engine())
+}
+
 /// What [`told`] tells, under its catch.
 fn tell(store: &MemoryStore, world: &World, found: &Sides, said: Said) {
     let spec = world.spec();
-    let issuing = || (spec.generation() == found.record.lease.generation).then(|| spec.engine());
+    let issuing = || issuing(spec, &found.record.lease);
     match said {
         Said::Dispatched(dispatch, at) => {
             // The side the frame names: its lease, and its worker at
@@ -1693,6 +1734,10 @@ impl Asked for Request<'_> {
         self.constraints.demands
     }
 
+    fn decode_later(&self) -> bool {
+        self.constraints.decode_later
+    }
+
     fn hashes(&self) -> usize {
         self.facts.block_hashes.len()
     }
@@ -1770,6 +1815,13 @@ trait Stated {
     /// The model the request is for. The door takes its seat by it, ahead
     /// of the load.
     fn model(&self) -> &str;
+    /// The seat the request decides at, where it names one
+    /// ([`Called`]). `None` for a request that decides at its caller's
+    /// own seat: every request but a decode call.
+    #[inline(always)]
+    fn own_seat(&self) -> Option<usize> {
+        None
+    }
     /// Hands `order` the request as it stands under `world`.
     fn under<R>(&self, world: &World, order: impl FnOnce(&Request<'_>) -> R) -> R;
 }
@@ -1784,6 +1836,29 @@ impl Stated for Request<'_> {
     #[inline(always)]
     fn under<R>(&self, _: &World, order: impl FnOnce(&Request<'_>) -> R) -> R {
         order(self)
+    }
+}
+
+/// A decode call's request with the seat of its lease's file. The call
+/// decides at that seat, behind the decision that stands there: a caller
+/// that takes up a seat's work applies what was handed to its file, so a
+/// prefill's dispatch that waits there is applied ahead of the call's read.
+/// From another seat the call would read a file that applies nothing while
+/// its own caller decides, and a sent prefill would read as not sent.
+struct Called<'r, 'q>(&'r Request<'q>, usize);
+
+impl Stated for Called<'_, '_> {
+    fn model(&self) -> &str {
+        self.0.facts.model
+    }
+
+    fn own_seat(&self) -> Option<usize> {
+        Some(self.1)
+    }
+
+    #[inline(always)]
+    fn under<R>(&self, _: &World, order: impl FnOnce(&Request<'_>) -> R) -> R {
+        order(self.0)
     }
 }
 
@@ -1855,6 +1930,9 @@ pub enum Refused {
     /// The decision panicked. It cost this request alone: the next one
     /// decides on new buffers.
     Faulted,
+    /// The store takes no decode side under the lease a decode call
+    /// named, for the reason it carries.
+    Decode(DecodeRefused),
 }
 
 /// A host's door to a decision in process: the order of a decision's
@@ -2116,11 +2194,27 @@ impl Door {
         maker: &impl Maker,
         now: Instant,
     ) -> Result<Decided, Refused> {
+        let (decided, _) = self.decide_under_stated(gateway, maker, now)?;
+        Ok(decided)
+    }
+
+    /// [`Door::decide_under`], with what the made request said of its
+    /// decode: whether a pair's decode side was filed chosen
+    /// ([`Asked::decode_later`]). The handle holds the side by it.
+    pub(crate) fn decide_under_stated(
+        &self,
+        gateway: GatewayId,
+        maker: &impl Maker,
+        now: Instant,
+    ) -> Result<(Decided, bool), Refused> {
         let made = Made(maker);
-        self.deciding(gateway, &made, now, |world, at, term, taken, buffers| {
+        let mut later = false;
+        let decided = self.deciding(gateway, &made, now, |world, at, term, taken, buffers| {
+            later = taken.request.decode_later();
             let entry = entry(world, taken);
             self.order(world, at, term, taken, buffers, entry)
-        })
+        })?;
+        Ok((decided, later))
     }
 
     /// Decides an `epd` request's pair and places its encode items in
@@ -2154,6 +2248,45 @@ impl Door {
             placed.clear();
         }
         decided
+    }
+
+    /// Decides the decode side of the pair's lease `lease`, for the gateway
+    /// it was issued to, while its prefill is dispatched and held and its
+    /// decode side is chosen. The decode profile runs over the decodes that
+    /// pair with that prefill in the rows of this instant. A pick is issued
+    /// under the same lease id, and the answer's lease is the decode side's.
+    /// A shed files nothing: the side stays chosen, and the host keeps the
+    /// decode the first pick named.
+    ///
+    /// The call decides at the seat of its lease's file, behind the
+    /// decision that stands there: a prefill's dispatch handed to that file
+    /// is applied ahead of the call's read. Under an engine that keeps its
+    /// deciders the call decides at its model's seat, which is the lease's
+    /// unless a reload turned the keeping on between the two decisions.
+    /// Behind such a reload the call first stands at its lease's seat for
+    /// no decision, so what waits at that file is applied all the same.
+    ///
+    /// # Errors
+    ///
+    /// [`Refused::Decode`] says why the lease takes no decode side, and
+    /// [`Refused::Faulted`] that the decision panicked. Either files nothing.
+    pub fn decide_decode(
+        &self,
+        gateway: GatewayId,
+        request: &Request<'_>,
+        lease: LeaseId,
+        now: Instant,
+    ) -> Result<Decided, Refused> {
+        // The call mints no id: it spends no term and raises none.
+        let term = self.term.load(Ordering::Relaxed);
+        let called = Called(request, self.store.file_of(lease));
+        self.at_a_seat(
+            term,
+            gateway,
+            &called,
+            now,
+            |world, at, _, taken, buffers| self.decode(world, at, taken, buffers, lease),
+        )
     }
 
     /// Finds a sampled decision by gateway and request id. A read holds
@@ -2293,7 +2426,9 @@ impl Door {
     /// Takes the seat the last generation called for and checks it
     /// against the world loaded there. If an apply changed which seat
     /// the request belongs at, it takes that seat and loads again. The
-    /// same world governs the decision and its sampling.
+    /// same world governs the decision and its sampling. A call that names
+    /// its lease's seat and decides at its model's applies what waits at
+    /// the lease's file first ([`Door::stand_at`]).
     fn at_a_seat(
         &self,
         term: u64,
@@ -2312,7 +2447,17 @@ impl Door {
         let mut seen = self.seat_flags.load(Ordering::Relaxed);
         loop {
             let (at, mut slot) = if seen & KEEPS_DECIDERS != 0 {
+                // A decode call's lease stands at another seat's file
+                // where a reload turned the keeping on between the pair's
+                // two decisions: the call reads that file from its
+                // model's seat, behind what was handed there.
+                let away = |own: &usize| *own != decider_of(request.model(), self.seats.len());
+                if let Some(own) = request.own_seat().filter(away) {
+                    self.stand_at(own);
+                }
                 self.home(request.model())
+            } else if let Some(at) = request.own_seat() {
+                (at, self.seats[at].slot.lock())
             } else {
                 self.seat()
             };
@@ -2400,6 +2545,21 @@ impl Door {
         if self.kept[at].waits.load(Ordering::SeqCst) != 0 {
             self.hand_kept(at);
         }
+    }
+
+    /// Stands at seat `at` for no decision, behind the decision that
+    /// stands there: the thread takes up the work at the seat's file, which
+    /// applies what was handed to it, and leaves. For a call that reads a
+    /// lease on file there and decides at another seat.
+    #[cold]
+    fn stand_at(&self, at: usize) {
+        let mut slot = self.seats[at].slot.lock();
+        // The store lays at most one file for each byte-sized name.
+        debug_assert!(at < Decider::COUNT);
+        let _acting = Decider::new(at as u8).enter();
+        let at_file = slot.at_file.get_or_insert_with(|| self.store.at_work());
+        at_file.work();
+        self.leave(at, at_file);
     }
 
     /// Takes the seat of `model`'s decider and waits for it: a model's
@@ -2579,6 +2739,105 @@ impl Door {
             }),
         })
     }
+
+    /// A decode call's order. The store's own test of the lease comes
+    /// first, so a call it refuses runs no stage. Then the pair's rows of
+    /// this instant, the engine's decode entry over the held prefill's
+    /// partners and, for a pick, the side's issue under the lease's id.
+    #[inline(never)]
+    fn decode(
+        &self,
+        world: &World,
+        at: usize,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        lease: LeaseId,
+    ) -> Result<Decided, Refused> {
+        let store = &*self.store;
+        let prefill = store
+            .held_prefill(taken.gateway, lease)
+            .map_err(Refused::Decode)?;
+        let Buffers {
+            pair,
+            scratch,
+            lists,
+            ..
+        } = buffers;
+        let (decision, side) = pair_with(
+            world,
+            taken,
+            &self.parts[at],
+            pair,
+            (lists, scratch),
+            |pair, _, model, ask, wires, subset| {
+                let built = world.build_pair(model, &ask, pair)?;
+                world.count_pair_in_flight(&built, &ask, pair);
+                Some((built, pair.narrow(wires, subset, &built)))
+            },
+            (
+                |engine, pair, facts, pool, cx, scratch| {
+                    let facts = RequestFacts {
+                        phase: Phase::Decode,
+                        ..*facts
+                    };
+                    engine.decide_decode(&facts, pool, pair.pools(), prefill, cx, scratch)
+                },
+                |facts, decision, built, _| {
+                    let (pick, (_, decodes)) = decision.pick().zip(built)?;
+                    let first = pick.targets.first()?.pair?;
+                    let side = DecodeSide {
+                        target: first.decode_id,
+                        picked: Picked::of_decodes(&pick.targets),
+                        session: RequestFacts {
+                            phase: Phase::Decode,
+                            ..*facts
+                        }
+                        .session(),
+                        state: LeaseState::ISSUED,
+                        tokens: facts.prompt_tokens,
+                        target_index: 0,
+                    };
+                    Some((side, world.booked(&decodes, side.target)))
+                },
+            ),
+        );
+        let Some((side, slot)) = side else {
+            return Ok(Decided {
+                decision,
+                lease: None,
+            });
+        };
+        let spec = world.spec();
+        let lease = store
+            .issue_decided_decode(taken.gateway, lease, side, slot, taken.now, |lease| {
+                // The lease keeps the generation of its first decision, and
+                // the engine of that generation alone hears its words
+                // ([`issuing`]). Behind a reload the engine of this instant
+                // decided the side and hears nothing of the lease.
+                let Some(engine) = issuing(spec, lease) else {
+                    return;
+                };
+                // The side is on file by now. A stage that panics while it
+                // hears of the issue is held and counted, as under a
+                // report: the host still gets the pick the file holds.
+                let heard = || engine.on_decision_issued(lease, &decision);
+                match catch_unwind(AssertUnwindSafe(heard)) {
+                    Ok(()) => store.call_returned(),
+                    Err(payload) => {
+                        release(payload);
+                        store.call_faulted();
+                    }
+                }
+            })
+            .map_err(Refused::Decode)?;
+        Ok(Decided {
+            decision,
+            lease: Some(Leased {
+                lease,
+                due: taken.due(),
+            }),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2602,7 +2861,7 @@ pub(crate) mod tests {
         ON_SAMPLE_READ, SEAT, TERM_MARK,
     };
     use crate::{
-        builtins::Random,
+        builtins::{Best, Random},
         catalog::Catalog,
         decider::Decider,
         decision::{Decision, ShedReason, Target, Targets},
@@ -2612,13 +2871,14 @@ pub(crate) mod tests {
         sessions::SessionVerdict,
         spec::{AppliedSpec, Needs, PolicySpec},
         store::{
-            Ask, DecodeMark, Dispatch, EncodeHandoff, EncodeOffer, GatewayId, HealthSink,
-            LeaseRecord, LeaseState, LeasesStore, MemoryStore, Picked, Said, SessionsStore,
-            VetoWrite, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+            Ask, DecodeMark, DecodeRefused, Dispatch, EncodeHandoff, EncodeOffer, GatewayId,
+            HealthSink, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore,
+            Picked, Said, SessionsStore, VetoWrite, ViewBuffers, WorkerFacts, WorkerStatus,
+            WorkersStore,
         },
         view::{
-            Candidate, Constraints, Identity, KeyedRow, Phase, PoolFacts, RequestFacts, Role,
-            Session, WireModes, WorkerId,
+            Candidate, Constraints, Identity, KeyedRow, LoadRow, Phase, PoolFacts, RequestFacts,
+            Role, Session, WireModes, WorkerId,
         },
         DecisionRecord,
     };
@@ -2684,7 +2944,15 @@ pub(crate) mod tests {
         prefills: usize,
         decodes: usize,
     ) -> Result<Arc<MemoryStore>, Box<dyn Error>> {
-        let store = MemoryStore::new();
+        pair_fleet_over(MemoryStore::new(), prefills, decodes)
+    }
+
+    /// [`pair_fleet`] over `store`.
+    fn pair_fleet_over(
+        store: MemoryStore,
+        prefills: usize,
+        decodes: usize,
+    ) -> Result<Arc<MemoryStore>, Box<dyn Error>> {
         for n in 0..prefills {
             member(&store, &format!("p{n}"), Role::Prefill);
         }
@@ -2843,6 +3111,36 @@ pub(crate) mod tests {
             },
             constraints: Constraints::default(),
         }
+    }
+
+    pub(crate) fn later_request(id: &[u8]) -> Request<'_> {
+        let mut asked = request(id, 7);
+        asked.facts.phase = Phase::Prefill;
+        asked.constraints.decode_later = true;
+        asked
+    }
+
+    pub(crate) fn load_decodes(
+        store: &MemoryStore,
+        [busy, idle]: [WorkerId; 2],
+        at: Instant,
+    ) -> Instant {
+        for (worker, queued) in [(busy, 80), (idle, 0)] {
+            store.record(
+                worker,
+                0,
+                LoadRow {
+                    queued,
+                    live_rate: 2_000,
+                    ..LoadRow::default()
+                },
+                at,
+                LoadSource::Stream,
+            );
+        }
+        let now = store.publish_due().map_or(at, |due| due.max(at));
+        store.publish(now);
+        now
     }
 
     /// What the leases on file book on each member, as a decision reads it.
@@ -3395,6 +3693,571 @@ pub(crate) mod tests {
             assert_eq!(filed.record.dispatch_deadline, leased.due);
             assert_eq!(pair_counts(&store, [target.id, pair.decode_id]), [1, 1]);
         }
+    }
+
+    #[test]
+    fn a_pair_asked_with_its_decode_later_books_the_prefill_alone() {
+        const PICK_FAULT: u32 = 1;
+        const ISSUE_FAULT: u32 = 2;
+
+        #[derive(Debug)]
+        struct Hears(Arc<Mutex<Vec<Side>>>);
+
+        impl Lifecycle for Hears {
+            fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
+                self.0.lock().push(lease.side);
+                assert_ne!(lease.tokens, ISSUE_FAULT, "issue hook fault");
+            }
+        }
+
+        impl Picker for Hears {
+            fn name(&self) -> &'static str {
+                "hears-pair"
+            }
+
+            fn pick(
+                &self,
+                facts: &RequestFacts<'_>,
+                rows: &[Candidate],
+                kept: &[u32],
+                scores: &[f32],
+                band: TieBand,
+                out: &mut Targets,
+            ) {
+                assert_ne!(facts.prompt_tokens, PICK_FAULT, "picker fault");
+                Best.pick(facts, rows, kept, scores, band, out);
+            }
+        }
+
+        let store = pair_fleet(1, 1).expect("a pair fleet");
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&heard);
+        let mut catalog = Catalog::builtin();
+        catalog
+            .picker("hears-pair", move || Box::new(Hears(Arc::clone(&kept))))
+            .expect("a free picker name");
+        let mut document = PolicySpec::pair_presets("least_load", "least_load").expect("a spec");
+        document.generation = 2;
+        for profile in document.profiles.values_mut() {
+            profile.filter.clear();
+        }
+        document
+            .profiles
+            .get_mut("decode")
+            .expect("decode profile")
+            .pick = "hears-pair".into();
+        let digest = document.digest().expect("a digest");
+        let spec =
+            AppliedSpec::validate_digested(&document, digest, &catalog, &[]).expect("a valid spec");
+        store.apply(spec).expect("a new generation");
+        let door = Door::new(Arc::clone(&store));
+        let now = Instant::now();
+        let mut asked = later_request(b"pair");
+        for (later, state, count) in [
+            (true, LeaseState::Chosen, 0),
+            (false, LeaseState::ISSUED, 1),
+        ] {
+            asked.constraints.decode_later = later;
+            let answer = door.decide(GATEWAY, &asked, now).expect("a pair");
+            let lease = answer.lease.expect("a lease").lease.id;
+            let target = answer
+                .decision
+                .pick()
+                .expect("the first pick")
+                .targets
+                .first()
+                .expect("a target");
+            let decode = target.pair.expect("a decode in the pick").decode_id;
+            let filed = store.sides(GATEWAY, lease).expect("both sides on file");
+            assert_eq!(filed.record.state, LeaseState::ISSUED);
+            assert_eq!(
+                filed.decode.map(|side| (side.state, side.target)),
+                Some((state, decode))
+            );
+            assert_eq!(pair_counts(&store, [target.id, decode]), [1, count]);
+            let issued = if later {
+                &[Side::Prefill][..]
+            } else {
+                &[Side::Prefill, Side::Decode][..]
+            };
+            assert_eq!(heard.lock().as_slice(), issued);
+            heard.lock().clear();
+            if later {
+                door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+                let before = store.sides(GATEWAY, lease);
+                let mut call = asked;
+                call.facts.prompt_tokens = PICK_FAULT;
+                assert_eq!(
+                    door.decide_decode(GATEWAY, &call, lease, now).err(),
+                    Some(Refused::Faulted)
+                );
+                assert_eq!(store.sides(GATEWAY, lease), before);
+                assert_eq!(door.faults(), 1);
+                assert!(heard.lock().is_empty());
+
+                call.facts.prompt_tokens = ISSUE_FAULT;
+                let answer = door
+                    .decide_decode(GATEWAY, &call, lease, now)
+                    .expect("the issued decode still has an answer");
+                assert_eq!(
+                    answer.lease.map(|leased| leased.lease.side),
+                    Some(Side::Decode)
+                );
+                assert_eq!(pair_counts(&store, [target.id, decode]), [1, 1]);
+                assert_eq!(heard.lock().as_slice(), [Side::Decode]);
+                assert_eq!(store.lifecycle_faults(), 1);
+                heard.lock().clear();
+            }
+            door.report(
+                GATEWAY,
+                lease,
+                Said::Released(None, ReleaseReason::ClientGone),
+            );
+        }
+        assert!(!Constraints::default().decode_later);
+    }
+
+    #[test]
+    fn the_call_issues_the_decode_on_the_loads_of_its_instant() {
+        let store = pair_fleet(1, 2).expect("a pair fleet");
+        let door = Door::new(Arc::clone(&store));
+        let now = Instant::now();
+        let mut asked = later_request(b"pair");
+        let answer = door.decide(GATEWAY, &asked, now).expect("the pair");
+        let lease = answer.lease.expect("a lease").lease.id;
+        let pick = answer.decision.pick().expect("the initial pick");
+        let [first, other] = pick.targets.as_slice() else {
+            panic!("the pair has two decode targets");
+        };
+        let first_decode = first.pair.expect("the first decode").decode_id;
+        let other_decode = other.pair.expect("the alternate decode").decode_id;
+        let workers = [first.id, first_decode, other_decode];
+        let sent = now + Duration::from_millis(1);
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, sent));
+        let call = load_decodes(
+            &store,
+            [first_decode, other_decode],
+            now + Duration::from_secs(8),
+        );
+        asked.constraints.decode_later = false;
+        asked.facts.session_key = Identity::plain("decode-key");
+        asked.facts.prompt_tokens = 321;
+        let before = store.sides(GATEWAY, lease).expect("the held prefill");
+        let answer = door
+            .decide_decode(GATEWAY, &asked, lease, call)
+            .expect("a decode decision");
+        let leased = answer.lease.expect("the decode lease");
+        assert_eq!(
+            (leased.lease.id, leased.lease.side, leased.lease.booked),
+            (lease, Side::Decode, other_decode)
+        );
+        assert_eq!(leased.due, call + Duration::from_secs(5));
+        let after = store.sides(GATEWAY, lease).expect("both sides on file");
+        assert_eq!(after.record.state, before.record.state);
+        assert_eq!(after.record.target, first.id);
+        assert_eq!(after.record.dispatch_deadline, leased.due);
+        let decode = after.decode.expect("the issued decode");
+        let expected_session = RequestFacts {
+            phase: Phase::Decode,
+            ..asked.facts
+        }
+        .session();
+        assert_eq!(
+            (decode.state, decode.session, decode.tokens),
+            (LeaseState::ISSUED, expected_session, 321)
+        );
+        assert_eq!(
+            (leased.lease.session, leased.lease.tokens),
+            (expected_session, 321)
+        );
+        assert_eq!(decode.target_at(0).map(|(id, _)| id), Some(other_decode));
+        assert_eq!(decode.target_at(1).map(|(id, _)| id), Some(first_decode));
+        assert_eq!(pair_counts(&store, workers), [1, 0, 1]);
+        assert_eq!(
+            answer
+                .decision
+                .pick()
+                .and_then(|pick| pick.targets.first())
+                .and_then(|target| target.pair)
+                .map(|pair| pair.decode_id),
+            Some(other_decode)
+        );
+    }
+
+    fn pair_dispatch(side: Side, at: Instant) -> Said {
+        Said::Dispatched(
+            Dispatch {
+                side,
+                target_index: 0,
+                since_decision_micros: 0,
+            },
+            at,
+        )
+    }
+
+    #[test]
+    fn the_call_is_refused_by_name_and_moves_nothing() {
+        let store = pair_fleet(1, 1).expect("a pair fleet");
+        let door = Door::new(Arc::clone(&store));
+        let now = Instant::now();
+        let asked = later_request(b"pair");
+        let answer = door.decide(GATEWAY, &asked, now).expect("a pair");
+        let lease = answer.lease.expect("a lease").lease.id;
+        let filed = store.sides(GATEWAY, lease).expect("both sides");
+        let decode = filed.decode.expect("the chosen side");
+        let workers = [filed.record.target, decode.target];
+        let refused = |gateway, id, expected| {
+            let (sides, counts) = (store.sides(GATEWAY, id), pair_counts(&store, workers));
+            for subset_hint in [None, Some(0)] {
+                let mut request = asked;
+                request.constraints.subset_hint = subset_hint;
+                assert_eq!(
+                    door.decide_decode(gateway, &request, id, now).err(),
+                    Some(Refused::Decode(expected))
+                );
+            }
+            assert_eq!(store.sides(GATEWAY, id), sides);
+            assert_eq!(pair_counts(&store, workers), counts);
+        };
+        refused(GATEWAY, LeaseId(0), DecodeRefused::NoLease);
+        refused(GatewayId(GATEWAY.0 + 1), lease, DecodeRefused::NoLease);
+        refused(GATEWAY, lease, DecodeRefused::PrefillNotHeld);
+
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+        let _ = door
+            .decide_decode(GATEWAY, &asked, lease, now)
+            .expect("a decode");
+        refused(GATEWAY, lease, DecodeRefused::DecodeStands);
+        door.report(GATEWAY, lease, pair_dispatch(Side::Decode, now));
+        refused(GATEWAY, lease, DecodeRefused::DecodeStands);
+
+        let fallback = door
+            .decide(GATEWAY, &asked, now)
+            .expect("another pair")
+            .lease
+            .expect("a lease")
+            .lease
+            .id;
+        door.report(GATEWAY, fallback, pair_dispatch(Side::Prefill, now));
+        door.report(GATEWAY, fallback, pair_dispatch(Side::Decode, now));
+        refused(GATEWAY, fallback, DecodeRefused::DecodeStands);
+
+        let mut ordinary = asked;
+        ordinary.constraints.decode_later = false;
+        let ordinary = door
+            .decide(GATEWAY, &ordinary, now)
+            .expect("an ordinary pair")
+            .lease
+            .expect("a lease")
+            .lease
+            .id;
+        door.report(GATEWAY, ordinary, pair_dispatch(Side::Prefill, now));
+        refused(GATEWAY, ordinary, DecodeRefused::NotChosen);
+
+        let ending = door
+            .decide(GATEWAY, &asked, now)
+            .expect("a pair")
+            .lease
+            .expect("a lease")
+            .lease
+            .id;
+        let ending_record = LeasesStore::get(&*store, GATEWAY, ending).expect("a prefill on file");
+        door.report(GATEWAY, ending, pair_dispatch(Side::Prefill, now));
+        door.report(
+            GATEWAY,
+            ending,
+            Said::Completed(Outcome {
+                side: Side::Prefill,
+                served: filed.record.target,
+                status: 200,
+                class: TransportClass::Ok,
+                ttft_micros: 0,
+                tokens_in: 0,
+                tokens_out: 0,
+                duration_micros: 0,
+            }),
+        );
+        refused(GATEWAY, ending, DecodeRefused::NoLease);
+        let ended = LeaseRecord {
+            state: LeaseState::Completed,
+            ..ending_record
+        };
+        LeasesStore::issue_pair(&*store, ended, decode).expect("an ended prefill still on file");
+        refused(GATEWAY, ending, DecodeRefused::PrefillNotHeld);
+    }
+
+    #[test]
+    fn a_shed_at_the_call_leaves_the_side_chosen() {
+        let store = pair_fleet(1, 1).expect("a pair fleet");
+        let door = Door::new(Arc::clone(&store));
+        let now = Instant::now();
+        let mut asked = later_request(b"pair");
+        let first = door.decide(GATEWAY, &asked, now).expect("the pair");
+        let lease = first.lease.expect("a lease").lease.id;
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+        let before = store.sides(GATEWAY, lease).expect("both sides");
+        let decode = before.decode.expect("the chosen decode");
+        let workers = [before.record.target, decode.target];
+        asked.constraints.subset_hint = Some(0);
+        let shed = door
+            .decide_decode(GATEWAY, &asked, lease, now)
+            .expect("a shed decision");
+        let Decision::Shed(reason) = shed.decision else {
+            panic!("the subset left no rows: {shed:?}");
+        };
+        assert_eq!(
+            (reason.reason, reason.emptied_by),
+            (ShedReason::NoEndpoints, "subset-hint")
+        );
+        assert!(shed.lease.is_none());
+        assert_eq!(store.sides(GATEWAY, lease), Some(before));
+        assert_eq!(decode.state, LeaseState::Chosen);
+        assert_eq!(pair_counts(&store, workers), [1, 0]);
+        door.report(GATEWAY, lease, pair_dispatch(Side::Decode, now));
+        let decode = store
+            .sides(GATEWAY, lease)
+            .and_then(|sides| sides.decode)
+            .expect("the dispatched decode");
+        assert_eq!(
+            (decode.state, decode.target),
+            (LeaseState::Dispatched { at: now }, workers[1])
+        );
+        assert_eq!(pair_counts(&store, workers), [1, 1]);
+    }
+
+    /// Applies the pair presets to `store` as `generation`, the decode side
+    /// picking through a stage that keeps every word it hears of leases in
+    /// `heard`: a stage hears the words of both sides.
+    fn hearing_pair(store: &MemoryStore, generation: u64, heard: &Arc<Mutex<Vec<&'static str>>>) {
+        #[derive(Debug)]
+        struct Hears(Arc<Mutex<Vec<&'static str>>>);
+
+        impl Lifecycle for Hears {
+            fn on_decision_issued(&self, _: &Lease, _: &Decision) {
+                self.0.lock().push("issued");
+            }
+
+            fn on_dispatched(&self, _: &Lease, _: &Target, _: Side, _: u32) {
+                self.0.lock().push("dispatched");
+            }
+
+            fn on_completed(&self, _: &Lease, _: &Outcome) {
+                self.0.lock().push("completed");
+            }
+
+            fn on_released(&self, _: &Lease, _: ReleaseReason) {
+                self.0.lock().push("released");
+            }
+        }
+
+        impl Picker for Hears {
+            fn name(&self) -> &'static str {
+                "hears-all"
+            }
+
+            fn pick(
+                &self,
+                facts: &RequestFacts<'_>,
+                rows: &[Candidate],
+                kept: &[u32],
+                scores: &[f32],
+                band: TieBand,
+                out: &mut Targets,
+            ) {
+                Best.pick(facts, rows, kept, scores, band, out);
+            }
+        }
+
+        let kept = Arc::clone(heard);
+        let mut catalog = Catalog::builtin();
+        let added = catalog.picker("hears-all", move || Box::new(Hears(Arc::clone(&kept))));
+        added.expect("a free picker name");
+        let mut document = PolicySpec::pair_presets("least_load", "least_load").expect("a spec");
+        document.generation = generation;
+        for profile in document.profiles.values_mut() {
+            profile.filter.clear();
+        }
+        let decode = document.profiles.get_mut("decode");
+        decode.expect("the decode profile").pick = "hears-all".into();
+        let digest = document.digest().expect("a digest");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+        let applied = store.apply(spec.expect("a valid spec"));
+        applied.expect("a later generation");
+    }
+
+    /// A reload between a pair's two decisions. The generation of the
+    /// call's instant decides the side, and its engine hears nothing of
+    /// the lease: an older engine heard the lease's issue. One rule says
+    /// which engine hears a lease's word, at the call as in the telling.
+    #[test]
+    fn a_decode_called_behind_a_reload_is_told_to_no_engine() {
+        let store = pair_fleet(1, 1).expect("a pair fleet");
+        let first = Arc::new(Mutex::new(Vec::new()));
+        hearing_pair(&store, 2, &first);
+        let door = Door::new(Arc::clone(&store));
+        let now = Instant::now();
+        let asked = later_request(b"pair");
+        let answer = door.decide(GATEWAY, &asked, now).expect("the pair");
+        let lease = answer.lease.expect("a lease").lease.id;
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+        assert_eq!(*first.lock(), ["issued", "dispatched"]);
+        let reloaded = Arc::new(Mutex::new(Vec::new()));
+        hearing_pair(&store, 3, &reloaded);
+        let answer = door.decide_decode(GATEWAY, &asked, lease, now);
+        let leased = answer.expect("a decode decision").lease;
+        assert_eq!(leased.map(|leased| leased.lease.side), Some(Side::Decode));
+        door.report(GATEWAY, lease, pair_dispatch(Side::Decode, now));
+        let gone = Said::Released(None, ReleaseReason::ClientGone);
+        door.report(GATEWAY, lease, gone);
+        assert!(store.sides(GATEWAY, lease).is_none());
+        assert_eq!(*reloaded.lock(), [""; 0]);
+        assert_eq!(*first.lock(), ["issued", "dispatched"]);
+    }
+
+    /// A caller that stands at its seat until the case sends it on: it
+    /// says when it stands there, with its seat's file at work.
+    struct Stands {
+        stood: mpsc::Sender<()>,
+        go: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl Maker for Stands {
+        fn model(&self) -> &str {
+            MODEL
+        }
+
+        fn make<'w>(&'w self, _: &'w World) -> Request<'w> {
+            self.stood.send(()).expect("the case waits for the seat");
+            let word = self.go.lock().recv_timeout(PATIENCE);
+            word.expect("the case sends the caller on");
+            request(b"held", 7)
+        }
+    }
+
+    /// A decode call decides at the seat of its lease's file, behind the
+    /// decision that stands there. A prefill's dispatch handed while
+    /// another caller decided at that file waits for that caller, and the
+    /// call reads it as sent: from a free seat of its own it would read
+    /// the file as it stood and be refused.
+    #[test]
+    fn a_decode_call_decides_behind_what_waits_at_its_leases_file() {
+        let files = MemoryStore::new().with_deciders(2);
+        let store = pair_fleet_over(files, 1, 1).expect("a pair fleet of two files");
+        let door = Arc::new(Door::new(Arc::clone(&store)));
+        let now = Instant::now();
+        seated(0);
+        let answer = door.decide(GATEWAY, &later_request(b"pair"), now);
+        let lease = answer.expect("the pair").lease.expect("a lease").lease.id;
+        assert_eq!(store.file_of(lease), 0);
+        // Another caller decides at the lease's file and stands there.
+        let (stood, at_seat) = mpsc::channel();
+        let (word, go) = mpsc::channel();
+        let other = Arc::clone(&door);
+        let other = thread::spawn(move || {
+            seated(0);
+            let go = Mutex::new(go);
+            let held = other.decide_under(GATEWAY, &Stands { stood, go }, Instant::now());
+            held.is_ok()
+        });
+        at_seat.recv_timeout(PATIENCE).expect("the other caller");
+        // The prefill's dispatch is handed meanwhile and waits at the file.
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+        let prefill =
+            |store: &MemoryStore| store.sides(GATEWAY, lease).map(|sides| sides.record.state);
+        assert_eq!(prefill(&store), Some(LeaseState::ISSUED));
+        // The call comes from a thread whose own seat is free.
+        let (answered, answer) = mpsc::channel();
+        let caller = Arc::clone(&door);
+        let caller = thread::spawn(move || {
+            seated(1);
+            let decided = caller.decide_decode(GATEWAY, &later_request(b"pair"), lease, now);
+            let side = decided.map(|decided| decided.lease.map(|leased| leased.lease.side));
+            answered.send(side).ok();
+        });
+        let early = answer.recv_timeout(Duration::from_millis(100));
+        assert_eq!(early, Err(mpsc::RecvTimeoutError::Timeout));
+        word.send(()).expect("the other caller waits");
+        assert_eq!(answer.recv_timeout(PATIENCE), Ok(Ok(Some(Side::Decode))));
+        assert_eq!(other.join().ok(), Some(true));
+        assert!(caller.join().is_ok());
+    }
+
+    /// A reload turns the keeping of deciders on between a pair's two
+    /// decisions, so the call decides at its model's seat while its lease
+    /// stands at the file of the seat its first decision took. A prefill's
+    /// dispatch handed while another caller decided at that file waits for
+    /// that caller. The call stands behind that caller first and reads the
+    /// dispatch as sent: straight from its model's seat it would read the
+    /// file as it stood and be refused.
+    #[test]
+    fn a_decode_call_under_kept_deciders_first_applies_what_waits_at_its_leases_file() {
+        // A count of files under which the model's seat is not the first,
+        // where the pair's first decision is made.
+        let files = (2..=8).find(|&files| decider_of(MODEL, files) != 0);
+        let files = files.expect("the model names a later file under some count");
+        let home = decider_of(MODEL, files);
+        let store = MemoryStore::new().with_deciders(files);
+        let store = pair_fleet_over(store, 1, 1).expect("a pair fleet");
+        let door = Arc::new(Door::new(Arc::clone(&store)));
+        let now = Instant::now();
+        seated(0);
+        let answer = door.decide(GATEWAY, &later_request(b"pair"), now);
+        let lease = answer.expect("the pair").lease.expect("a lease").lease.id;
+        assert_eq!(store.file_of(lease), 0, "no stage keeps state a decider");
+        // Another caller decides at the lease's file and stands there.
+        let (stood, at_seat) = mpsc::channel();
+        let (word, go) = mpsc::channel();
+        let other = Arc::clone(&door);
+        let other = thread::spawn(move || {
+            seated(0);
+            let go = Mutex::new(go);
+            let held = other.decide_under(GATEWAY, &Stands { stood, go }, Instant::now());
+            held.is_ok()
+        });
+        at_seat.recv_timeout(PATIENCE).expect("the other caller");
+        // The reload: the decode profile picks through a stage that keeps
+        // state a decider. The next decision finds the stage and leaves
+        // the door's word that requests decide at their model's seat.
+        let mut catalog = Catalog::builtin();
+        let added = catalog.picker("scoped", || Box::new(Scoped));
+        added.expect("a free picker name");
+        let mut document = PolicySpec::pair_presets("least_load", "least_load").expect("a spec");
+        document.generation = 3;
+        for profile in document.profiles.values_mut() {
+            profile.filter.clear();
+        }
+        let decode = document.profiles.get_mut("decode");
+        decode.expect("the decode profile").pick = "scoped".into();
+        let digest = document.digest().expect("a digest");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+        let applied = store.apply(spec.expect("a valid spec"));
+        applied.expect("a later generation");
+        let kept = door.decide(GATEWAY, &later_request(b"kept"), now);
+        let kept = kept
+            .expect("a pair under the reload")
+            .lease
+            .expect("a lease");
+        assert_eq!(store.file_of(kept.lease.id), home, "the model's seat");
+        // The prefill's dispatch is handed meanwhile and waits at the file.
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+        let prefill =
+            |store: &MemoryStore| store.sides(GATEWAY, lease).map(|sides| sides.record.state);
+        assert_eq!(prefill(&store), Some(LeaseState::ISSUED));
+        // The call's own seat is its model's, and that seat is free.
+        let (answered, answer) = mpsc::channel();
+        let caller = Arc::clone(&door);
+        let caller = thread::spawn(move || {
+            seated(1);
+            let decided = caller.decide_decode(GATEWAY, &later_request(b"pair"), lease, now);
+            let side = decided.map(|decided| decided.lease.map(|leased| leased.lease.side));
+            answered.send(side).ok();
+        });
+        let early = answer.recv_timeout(Duration::from_millis(100));
+        assert_eq!(early, Err(mpsc::RecvTimeoutError::Timeout));
+        word.send(()).expect("the other caller waits");
+        assert_eq!(answer.recv_timeout(PATIENCE), Ok(Ok(Some(Side::Decode))));
+        assert_eq!(other.join().ok(), Some(true));
+        assert!(caller.join().is_ok());
     }
 
     #[test]

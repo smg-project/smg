@@ -1170,6 +1170,8 @@ pub struct Constraints<'a> {
     /// ([`RequestFacts::session_counted`]). An engine built by hand does
     /// not: its host says so here.
     pub overload_lifted: bool,
+    /// This pair's decode is sent after its prefill has run. Default: false.
+    pub decode_later: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
     /// What the request demands of the worker that takes it

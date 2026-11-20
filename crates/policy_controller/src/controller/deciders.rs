@@ -5465,6 +5465,51 @@ pub(crate) mod tests {
         decision.leases.iter().map(side).collect()
     }
 
+    #[tokio::test]
+    async fn a_pair_s_reply_names_the_decode_side_s_own_session() {
+        use crate::view::{Identity, Phase};
+
+        let document: PolicySpec = serde_json::from_str(
+            r#"{
+              "apiVersion": "smg.policy/v1",
+              "generation": 1,
+              "profiles": { "p": { "pick": "random" } },
+              "bindings": [
+                { "plan": "pd-pair", "profiles": { "prefill": "p", "decode": "p" } }
+              ]
+            }"#,
+        )
+        .expect("a document of this build");
+        let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
+        let key = 17;
+        let session = |phase| {
+            RequestFacts {
+                model: MODEL,
+                phase,
+                session_key: Identity::hashed(key),
+                ..RequestFacts::default()
+            }
+            .session()
+            .get()
+        };
+        let frame = keyed(session(Phase::Prefill), 77);
+        let answer = bed.ask(phased(frame, proto::Phase::Prefill)).await;
+        let Some(Answer::Decision(decision)) = answer.answer else {
+            panic!("a decision: {answer:?}");
+        };
+        let leases = decision
+            .leases
+            .iter()
+            .map(|lease| (lease.side(), lease.session_key));
+        assert_eq!(
+            leases.collect::<Vec<_>>(),
+            [
+                (proto::Side::Prefill, session(Phase::Prefill)),
+                (proto::Side::Decode, session(Phase::Decode)),
+            ]
+        );
+    }
+
     /// A pair's ask reads what both sides' profiles read. The prefill
     /// lookup answers for the prefill's profile alone, so a column the
     /// decode profile alone declares is written by the decode lookup's
