@@ -52,6 +52,7 @@ pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
         signals: _,
         health,
         overload: _,
+        demand_facts: _,
     } = &row.facts;
     let mut spec = WorkerSpec::new(key.clone());
     spec.models = models.iter().map(ModelCard::new).collect::<Vec<_>>().into();

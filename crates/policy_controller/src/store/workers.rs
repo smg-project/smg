@@ -5,6 +5,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use crate::{
+    demands::DemandFacts,
     lease::Membership,
     store::{encoding::EncodeOffer, pairing::PairingDescriptor, GatewayId},
     view::{fingerprint, Role, WireModes, WorkerId},
@@ -162,6 +163,10 @@ pub struct WorkerFacts {
     pub signals: Signals,
     pub health: HealthPolicy,
     pub overload: Overload,
+    /// What the worker states for a request's hard demands
+    /// ([`DemandFacts`]), in its registering host's own numbers. A host
+    /// that states none registers a worker that meets no demand.
+    pub demand_facts: DemandFacts,
 }
 
 impl WorkerFacts {

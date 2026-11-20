@@ -34,7 +34,7 @@
 //! | `bootstrap_port` | `bootstrap_port` |
 //! | `health` | the health checks: the two thresholds, the interval and the timeout in whole seconds, the checks off where the policy's probes are |
 //! | `signals`, `reachable_from` | not carried: the object has no field for them, and a collector reads them of the row by the id the holder keeps |
-//! | `zone`, `pairing`, `encode`, `vision`, `max_running`, `priority`, `overload` | not carried: a decision's facts, read of the store's rows and never of an object |
+//! | `zone`, `pairing`, `encode`, `vision`, `max_running`, `priority`, `overload`, `demand_facts` | not carried: a decision's facts, read of the store's rows and never of an object |
 //!
 //! Of the row's own columns, the status is the object's first status and is
 //! not followed after: the store's status is the truth, and what drives it

@@ -56,6 +56,7 @@ use std::{
 pub(crate) use crate::door::Viewed;
 use crate::{
     decision::{Decision, ShedReason, Target, Trace},
+    demands::Demands,
     door::Asked,
     lease::{Lease, Side},
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
@@ -365,6 +366,7 @@ impl Checked {
                 wire_modes: self.wires().unwrap_or_default(),
                 overload_lifted: constraints.overload_lifted,
                 subset_hint: constraints.subset_hint,
+                demands: Demands::default(),
                 // The asking gateway's standing vetoes beside lent rows,
                 // and nothing where each row carries its own bit.
                 stalled: view.stalled,
@@ -398,6 +400,12 @@ impl Asked for Checked {
 
     fn subset(&self) -> Option<u32> {
         Self::subset(self)
+    }
+
+    /// A frame states no demand: the contract's constraints carry none
+    /// yet.
+    fn demands(&self) -> Demands {
+        Demands::default()
     }
 
     fn hashes(&self) -> usize {

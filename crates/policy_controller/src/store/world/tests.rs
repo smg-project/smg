@@ -354,6 +354,56 @@ fn another_gateways_host_local_row_is_not_written_and_the_slice_is_its_own_index
     assert!(rows.iter().all(|row| !row.session_hit));
 }
 
+/// What each row states for a request's hard demands is read beside the
+/// rows a build writes for the asking gateway, one entry a row in the rows'
+/// order: another gateway's host-local row has no entry there.
+#[test]
+fn the_demand_facts_stand_beside_the_rows_written_for_the_asking_gateway() {
+    use crate::demands::DemandFacts;
+
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let stating = |key: &str, runtime: u32, reachable_from: Reachability| {
+        admit(
+            &store,
+            WorkerFacts {
+                reachable_from,
+                demand_facts: DemandFacts { runtime },
+                ..facts(key, Role::Single, &[MODEL])
+            },
+        )
+    };
+    let open = stating("http://a:8000", 7, Reachability::Any);
+    let theirs = stating("unix:///b", 8, Reachability::Gateway(GatewayId(2)));
+    let ours = stating("unix:///c", 9, Reachability::Gateway(GatewayId(1)));
+    let last = stating("http://d:8000", 0, Reachability::Any);
+    let stated_to = |gateway: u64| {
+        let ask = Ask {
+            gateway: GatewayId(gateway),
+            ..ask(now)
+        };
+        let (mut out, mut stated) = (ViewBuffers::default(), Vec::new());
+        store.with_world(|world| {
+            let built = world.build(MODEL, Role::Single, &ask, &mut out);
+            world.demand_facts(&built.expect("the pool"), &ask, &mut stated);
+        });
+        assert_eq!(stated.len(), out.candidates.len());
+        let rows = out.candidates.iter().zip(&stated);
+        rows.map(|(row, facts)| (row.id, facts.runtime))
+            .collect::<Vec<_>>()
+    };
+    let sorted = |mut rows: Vec<(WorkerId, u32)>| {
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(stated_to(1), sorted(vec![(open, 7), (ours, 9), (last, 0)]));
+    assert_eq!(
+        stated_to(2),
+        sorted(vec![(open, 7), (theirs, 8), (last, 0)])
+    );
+    assert_eq!(stated_to(3), sorted(vec![(open, 7), (last, 0)]));
+}
+
 #[test]
 fn a_build_names_the_asking_gateways_list_where_the_pool_holds_a_host_local_row() {
     let store = MemoryStore::new();

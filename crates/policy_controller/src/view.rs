@@ -1129,6 +1129,14 @@ pub struct Constraints<'a> {
     pub overload_lifted: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
+    /// What the request demands of the worker that takes it
+    /// ([`Demands`](crate::Demands)). A door keeps the demands before any
+    /// stage runs, where it keeps its gateway's wires, and no stage reads
+    /// them: an engine handed rows by a host of its own is handed rows
+    /// that meet them. A pair's sides keep none yet: a door sheds a
+    /// pair's request that states a demand, under the stage `wires`,
+    /// whatever its sides state. In-process only.
+    pub demands: crate::Demands,
     /// The rows a standing veto of this host masks, by position, in order,
     /// where the host did not write them into the rows: a view of a
     /// publication's own rows hands them here, and a reader of a row's
