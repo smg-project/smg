@@ -245,6 +245,20 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
             .map_err(|why| failed(WRITE_WORKERS_AT_DOOR_STEP, why.to_string()))?;
         let expect = match &data.registration_mode {
             WorkerRegistrationMode::Upsert => Expect::Anything,
+            // The door takes one row a call. An add refused at a later rank
+            // would leave the earlier ones, and its retry would be refused at
+            // the rank it wrote: no rank is written until the door lays a
+            // worker's ranks in one turn.
+            WorkerRegistrationMode::CreateOnly if workers.len() > 1 => {
+                return Err(failed(
+                    WRITE_WORKERS_AT_DOOR_STEP,
+                    format!(
+                        "Adding a worker of {} ranks needs them written in one turn, \
+                         which this door does not take yet",
+                        workers.len()
+                    ),
+                ));
+            }
             WorkerRegistrationMode::CreateOnly => Expect::Nothing,
             WorkerRegistrationMode::ReplaceById {
                 worker_id,
@@ -946,6 +960,18 @@ mod tests {
             "Step failed: write_workers_at_door - Worker http://worker:8000 already exists"
         );
         assert!(!StepExecutor::<Registration>::is_retryable(&write, &error));
+        assert_eq!(f.store.epoch(), epoch);
+
+        // Two ranks, the second standing: one door call a rank would write
+        // the first, and the add's retry would be refused there. None is.
+        let ranks =
+            ["http://worker:8000@0", "http://worker:8000@1"].map(|url| worker(url, "model"));
+        cx.data.actual_workers = Some(vec![Arc::clone(&ranks[1])]);
+        write.execute(&mut cx).await.expect("the second rank");
+        let epoch = f.store.epoch();
+        cx.data.actual_workers = Some(ranks.to_vec());
+        let error = write.execute(&mut cx).await.expect_err("two ranks");
+        assert!(error.to_string().contains("2 ranks"), "{error}");
         assert_eq!(f.store.epoch(), epoch);
     }
 

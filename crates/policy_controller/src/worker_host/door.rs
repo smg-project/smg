@@ -64,9 +64,10 @@ pub enum Remover<'a> {
     Health(UnhealthyRemovalScope),
 }
 
-/// What a registration expects to stand under its URL. Its facts are laid
-/// by one rule whatever it expects: an absent URL is registered, and a
-/// standing row is left, changed in place or replaced as its facts say.
+/// What a registration expects to stand under its URL. Once that holds, its
+/// facts are laid by one rule whatever it expects: an absent URL is
+/// registered, and a standing row is left, changed in place or replaced as
+/// its facts say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Expect {
     /// Nothing: an add. A standing row refuses it ([`Refused::Stands`]),
