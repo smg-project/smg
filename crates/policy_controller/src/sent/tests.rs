@@ -1074,3 +1074,81 @@ fn a_registered_filter_reads_the_sends_of_its_profile() {
         }
     );
 }
+
+/// Picks the kept row its profile sent the fewest requests, the first of
+/// them at a tie.
+#[derive(Debug)]
+struct LeastSent {
+    sent: Arc<SentCredit>,
+}
+
+impl Lifecycle for LeastSent {}
+
+impl crate::framework::Picker for LeastSent {
+    fn name(&self) -> &'static str {
+        "least-sent"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        _: &[f32],
+        _: TieBand,
+        out: &mut crate::decision::Targets,
+    ) {
+        let sent = |row: &&u32| self.sent.read(facts, &candidates[**row as usize]).requests;
+        if let Some(&row) = kept.iter().min_by_key(sent) {
+            out.push(crate::builtins::target_of(&candidates[row as usize]));
+        }
+    }
+}
+
+/// A registered picker holds its profile's count of sends, as a registered
+/// filter does. A profile whose only reader of sends is its picker keeps
+/// its limit: the picker is built ahead of the limit's check. The count its
+/// factory was handed is the profile's own, the one the engine feeds.
+#[test]
+fn a_registered_picker_reads_the_sends_of_its_profile() {
+    let readers = Readers::default();
+    let kept = Arc::clone(&readers);
+    let mut catalog = Catalog::builtin();
+    catalog
+        .picker_with("least-sent", move |build| {
+            let sent = build.sent();
+            kept.lock().push(Arc::clone(&sent));
+            Ok(Box::new(LeastSent { sent }))
+        })
+        .expect("a free name");
+    let document: PolicySpec = serde_json::from_value(json!({
+        "apiVersion": API_VERSION,
+        "generation": 4,
+        "profiles": {
+            "work": {
+                "sent_ttl_ms": 24_001,
+                "filter": ["healthy"],
+                "score": ["least-requests"],
+                "pick": "least-sent"
+            }
+        }
+    }))
+    .expect("a document");
+    let engine = document
+        .validate_in(&catalog, &[])
+        .expect("the picker reads the sends the limit ages");
+    assert_eq!(engine.sent_credits.len(), 1);
+
+    let a = row(127, 3);
+    let facts = clock(START + 700);
+    send(&engine, &a, START, TOKENS);
+    send(&engine, &a, START, TOKENS);
+    assert_eq!(
+        readers.lock()[0].read(&facts, &a),
+        Sent {
+            requests: 2,
+            tokens: 2 * u64::from(TOKENS),
+            ..Sent::default()
+        }
+    );
+}
