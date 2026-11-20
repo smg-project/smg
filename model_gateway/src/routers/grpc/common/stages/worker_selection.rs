@@ -805,7 +805,6 @@ impl WorkerSelectionStage {
         // (the helpers derive them too), the routing snapshot the pixel-media
         // fact.
         let wire = Some(ctx.wire);
-        let media_refs = ctx.wire.requires_media_refs;
         let media = retry_media(ctx);
         // A retry skips the workers that already answered this request
         // definitively (see `routers::common::attempt_ledger`), and stays on
@@ -860,18 +859,7 @@ impl WorkerSelectionStage {
                         ctx.sticky_key.as_deref(),
                         wire,
                         media,
-                        PairDemands::new(
-                            self.prefill_side_needs_vision(ctx.routing.needs_vision),
-                            // Under a push handoff the decode side still reads
-                            // the identity's grids; a rendezvous embedding
-                            // reaches it without a vision encoder.
-                            ctx.routing.decode_needs_vision
-                                && (self.mode != WorkerSelectionMode::EncodePrefillDecode
-                                    || PdProtocol::encode_handoff(ctx.wire.runtime)
-                                        == Some(EncodeHandoff::Push)),
-                        )
-                        .with_media_refs(media_refs, ctx.wire.pipeline)
-                        .with_context(context_requirements),
+                        self.retry_pair_demands(ctx),
                         Attempt::Retry(ctx),
                     )
                     .await?;
@@ -2024,6 +2012,35 @@ impl WorkerSelectionStage {
         retry_under_rule.then_some(Shape::RetryUnderRule)
     }
 
+    /// The demands a retry of `ctx` puts on its pair, from what the retained
+    /// snapshot and wire carry.
+    fn retry_pair_demands(&self, ctx: &DispatchContext) -> PairDemands {
+        PairDemands::new(
+            self.prefill_side_needs_vision(ctx.routing.needs_vision),
+            // Under a push handoff the decode side still reads the
+            // identity's grids; a rendezvous embedding reaches it without a
+            // vision encoder.
+            ctx.routing.decode_needs_vision
+                && (self.mode != WorkerSelectionMode::EncodePrefillDecode
+                    || PdProtocol::encode_handoff(ctx.wire.runtime) == Some(EncodeHandoff::Push)),
+        )
+        .with_media_refs(ctx.wire.requires_media_refs, ctx.wire.pipeline)
+        .with_context(ctx.routing.context_requirements)
+    }
+
+    /// Whether a pair attempt under `media` and `demand` carries a media
+    /// input, a shape the controller's pair does not place yet. In the
+    /// encode mode the request's pixels went to its encoders and the pair
+    /// takes none: a retry there is the pair alone, as the classic's is.
+    fn pair_media_input(&self, media: MediaDemands, demand: PairDemands) -> bool {
+        let pixels = media.vision && self.mode != WorkerSelectionMode::EncodePrefillDecode;
+        let media = MediaDemands {
+            vision: pixels,
+            ..media
+        };
+        media != MediaDemands::NONE || demand.prefill || demand.decode || demand.refs
+    }
+
     /// Whether a retry of `ctx` can be placed at all. Under the controller's
     /// host a retry of a shape the stage refuses by name has no next
     /// attempt: the refusal must not stand where a worker's failure does.
@@ -2032,13 +2049,17 @@ impl WorkerSelectionStage {
         if self.host.is_none() {
             return true;
         }
-        let media = retry_media(ctx) != MediaDemands::NONE;
+        let media = retry_media(ctx);
         let (prefill_pool, decode_pool) = PdWire::Grpc.pools();
         let (pools, media): (&[RoutingPool], bool) = match self.mode {
-            WorkerSelectionMode::Regular => (&[RoutingPool::GrpcPipelineRegular], media),
+            WorkerSelectionMode::Regular => (
+                &[RoutingPool::GrpcPipelineRegular],
+                media != MediaDemands::NONE,
+            ),
+            // The pair's media input, as the retry's selection reads it.
             WorkerSelectionMode::PrefillDecode | WorkerSelectionMode::EncodePrefillDecode => (
                 &[prefill_pool, decode_pool],
-                media || ctx.routing.decode_needs_vision,
+                self.pair_media_input(media, self.retry_pair_demands(ctx)),
             ),
         };
         self.undecided(
@@ -2181,8 +2202,7 @@ impl WorkerSelectionStage {
         let (prefill_pool, decode_pool) = PdWire::Grpc.pools();
         let under_rule =
             matches!(attempt, Attempt::Retry(ctx) if ctx.constraint_decided_on.is_some());
-        let media_input =
-            media != MediaDemands::NONE || demand.prefill || demand.decode || demand.refs;
+        let media_input = self.pair_media_input(media, demand);
         let pools = [prefill_pool, decode_pool];
         let shape = self.undecided(
             model_id,

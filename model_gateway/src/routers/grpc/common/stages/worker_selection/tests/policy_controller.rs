@@ -1963,3 +1963,91 @@ async fn the_classic_encode_stage_is_unmoved_without_a_host() -> anyhow::Result<
     assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
     Ok(())
 }
+
+/// The encode mode's pixels went to its encoders, so a retry of a request
+/// with images is its pair alone: the controller places it, as the classic
+/// selection does. Under a class that pushes the stage cannot replay the
+/// handoff, and the retry reads the classic's own answer. References stay
+/// a shape the pair does not place.
+#[tokio::test]
+async fn a_retry_of_a_request_with_images_under_the_encode_plan_is_its_pair() -> anyhow::Result<()>
+{
+    use smg_grpc_client::vllm_proto as vllm;
+
+    /// The answer `stage` gives a retry of `plan` with images, under the
+    /// class that pushes. A next attempt follows the failure, and reads it.
+    async fn replayed(
+        stage: &WorkerSelectionStage,
+        plan: &ExecutionPlan,
+    ) -> anyhow::Result<(StatusCode, Value)> {
+        let mut ctx = dispatch_ctx(MODEL, grpc_wire(PUSH));
+        ctx.routing.needs_vision = true;
+        assert!(stage.places_retry(&ctx));
+        let refused = stage
+            .reselect(&mut ctx, plan)
+            .await
+            .expect_err("a handoff that cannot be replayed");
+        status_and_body(refused).await
+    }
+
+    let (stage, store) = encode_stage(&fleet_of(MEET))?;
+    // References are a media input of the pair: no next attempt follows,
+    // and the retry is refused by name when asked all the same.
+    let mut with_refs = dispatch_ctx(MODEL, grpc_wire(MEET));
+    with_refs.wire.requires_media_refs = true;
+    assert!(!stage.places_retry(&with_refs));
+    let refused = stage
+        .reselect(&mut with_refs, &retained_plan(&[1]))
+        .await
+        .expect_err("references");
+    assert_named_refusal(refused, "media input", &store).await?;
+
+    // Images alone: the pair again, with no encoder and no assignment. A
+    // decode behind a rendezvous reads no image itself.
+    let mut ctx = dispatch_ctx(MODEL, grpc_wire(MEET));
+    ctx.routing.needs_vision = true;
+    ctx.routing.decode_needs_vision = true;
+    assert!(stage.places_retry(&ctx));
+    stage
+        .reselect(&mut ctx, &retained_plan(&[1]))
+        .await
+        .expect("the pair again");
+    let placed = ctx.placed.as_ref().context("the placement")?;
+    assert!(placed.decode().is_some() && placed.encoders().is_empty());
+    assert!(ctx.pd_prefill_guard.is_some());
+    assert!(matches!(
+        &ctx.workers,
+        Some(WorkerSelection::Disaggregated { encode_assignments: None, prefill, decode, .. })
+            if prefill.url() == PREFILL && decode.url() == DECODE
+    ));
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
+
+    // In the pair mode the prefill takes the pixels itself: refused still.
+    let (pair, _) = one_pair_stage(WorkerSelectionMode::PrefillDecode);
+    let mut pixels = dispatch_ctx(MODEL, grpc_wire(PUSH));
+    pixels.routing.needs_vision = true;
+    assert!(!pair.places_retry(&pixels));
+
+    // Under a class that pushes, the retry of a plan with media reads the
+    // answer the classic stage gives it.
+    let (hosted, _) = encode_stage(&fleet_of(PUSH))?;
+    let classic = WorkerSelectionStage::new(
+        Arc::clone(&hosted.worker_registry),
+        Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+        WorkerSelectionMode::EncodePrefillDecode,
+        None,
+    );
+    let request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+        mm_inputs: Some(vllm::MultimodalInputs {
+            pixel_values: Some(vllm::TensorData::default()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }));
+    let plan = ExecutionPlan::EncodePrefillDecode { request };
+    let answer = replayed(&hosted, &plan).await?;
+    assert_eq!(answer, replayed(&classic, &plan).await?);
+    assert_eq!(answer.0, StatusCode::BAD_GATEWAY);
+    assert_eq!(answer.1["error"]["code"], "ec_retry_unsupported");
+    Ok(())
+}
