@@ -5,13 +5,15 @@ use std::{error::Error, time::Duration};
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::json;
 use smg_policy_controller::{
+    spec::DecodePick,
     store::{
-        GatewayId, HealthSink, LeasesStore, MemoryStore, PairingDescriptor, WorkerFacts,
-        WorkerStatus as RowStatus, WorkersStore,
+        GatewayId, HealthSink, LeasesStore, LoadSink, LoadSource, MemoryStore, PairingDescriptor,
+        WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
     },
-    view::{Role, WireModes},
+    view::{LoadRow, Role, WireModes},
+    AppliedSpec, PolicySpec,
 };
-use smg_worker::identity::basic::ConnectionMode;
+use smg_worker::identity::basic::{ConnectionMode, MORIIO_CONNECTOR};
 
 use super::{
     tests::{
@@ -22,7 +24,10 @@ use super::{
 };
 use crate::{
     config::{RouterConfig, RoutingMode},
-    policy_controller::{host::testing::MODEL, start},
+    policy_controller::{
+        host::testing::{pair_in_flight, MODEL},
+        start,
+    },
     routers::grpc::backend_client::BasicWorkerBuilder,
     tenant::TenantKey,
 };
@@ -386,6 +391,169 @@ async fn a_decode_that_waits_on_its_prefill_outlives_the_dispatch_deadline() -> 
     Ok(())
 }
 
+/// The engines report the decode at `busy` deep in its queue and the one at
+/// `idle` empty, and the store publishes the two loads.
+fn report(store: &MemoryStore, busy: &str, idle: &str) -> Case {
+    let at = Instant::now();
+    for (url, queued) in [(busy, 80), (idle, 0)] {
+        let row = store.by_key(url).ok_or("the decode's row")?;
+        let load = LoadRow {
+            queued,
+            live_rate: 2_000,
+            ..LoadRow::default()
+        };
+        store.record(row.id, 0, load, at, LoadSource::Stream);
+    }
+    // A publication shows what waits once it is due.
+    store.publish(store.publish_due().map_or(at, |due| due.max(at)));
+    Ok(())
+}
+
+/// One chat request through a sequential pair of one held prefill and two
+/// decodes, under the stock least-load pair presets with the document's
+/// word for when the decode is picked. The second decode reports a deep
+/// queue, so the first decision names the first. While the prefill holds
+/// its answer the loads turn over: the first decode fills and the second
+/// goes free. The arrivals at the two decodes come back.
+async fn decode_arrivals_behind_moved_loads(picked: DecodePick) -> Case<[usize; 2]> {
+    decode_arrivals_over(picked, None).await
+}
+
+/// [`decode_arrivals_behind_moved_loads`] where the second decode's engine
+/// runs the connector `second_connector` names, and each other worker its
+/// runtime's own.
+async fn decode_arrivals_over(
+    picked: DecodePick,
+    second_connector: Option<&str>,
+) -> Case<[usize; 2]> {
+    let hold = Duration::from_millis(400);
+    let (prefill, prefill_seen) = spawn_delayed_stub(StatusCode::OK, json!({}), hold).await;
+    let (first, first_seen) = spawn_recording_stub(r#"{"object":"chat.completion"}"#).await;
+    let (second, second_seen) = spawn_recording_stub(r#"{"object":"chat.completion"}"#).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let shaped = |url: &str, worker: BasicWorkerBuilder| {
+        let worker = worker.runtime_type(RuntimeType::Vllm);
+        match second_connector.filter(|_| url == second) {
+            Some(connector) => worker.kv_connector(connector),
+            None => worker,
+        }
+    };
+    let bed = pair_bed_of(
+        shaped,
+        Arc::clone(&registry),
+        &[&prefill],
+        &[&first, &second],
+    );
+    let (host, store, _) = bed;
+    let mut document = PolicySpec::pair_presets("least_load", "least_load")?;
+    document.plans.pd_pair.decode = picked;
+    document.generation = store.with_world(|world| world.spec().generation()) + 1;
+    store
+        .apply(AppliedSpec::validate(&document)?)
+        .map_err(|stale| format!("{stale:?}"))?;
+    let router = router(registry, host);
+
+    report(&store, &second, &first)?;
+    let turn = async {
+        // The prefill holds its answer: its request is in, the decode's is not.
+        for _ in 0..200 {
+            if prefill_seen.lock().is_ok_and(|seen| !seen.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        report(&store, &first, &second)
+    };
+    let (response, turned) = tokio::join!(chat(&router), turn);
+    turned?;
+
+    assert_eq!(response?.status(), StatusCode::OK);
+    assert_eq!(live(&store, 0).await, 0, "a lease outlived its request");
+    Ok([&first_seen, &second_seen].map(|seen| seen.lock().map_or(0, |seen| seen.len())))
+}
+
+/// Under a document that picks the decode after the prefill, the sequential
+/// dispatch asks the decode again when its prefill has answered. The loads
+/// moved while the prefill ran, so the decode goes to the worker that is
+/// free at that instant, not to the one the first decision named.
+#[tokio::test]
+async fn a_decode_picked_after_its_prefill_goes_where_the_loads_stand_at_its_answer() -> Case {
+    let arrivals = decode_arrivals_behind_moved_loads(DecodePick::AfterPrefill).await?;
+    assert_eq!(arrivals, [0, 1], "the decode did not follow the loads");
+    Ok(())
+}
+
+/// The connector's mode is settled by the pair the first decision named.
+/// A decode of the MoRI-IO connector takes that connector's checked path
+/// alone, so a second ask whose loads favour one passes it over: the decode
+/// stays on the worker the mode was settled for.
+#[tokio::test]
+async fn a_second_ask_passes_over_a_decode_of_another_connectors_path() -> Case {
+    let arrivals = decode_arrivals_over(DecodePick::AfterPrefill, Some(MORIIO_CONNECTOR)).await?;
+    assert_eq!(arrivals, [1, 0], "the decode moved to another connector");
+    Ok(())
+}
+
+/// A MoRI-IO prefill is told its decode at its own send, so the sequential
+/// dispatch asks that decode no second time. Under a document that picks
+/// the decode after the prefill it is booked at the prefill's send all the
+/// same, as a decode decided with its prefill is: a decision made while the
+/// prefill runs counts the request on it.
+#[tokio::test]
+async fn a_decode_its_prefill_was_told_is_booked_at_the_prefills_send() -> Case {
+    let hold = Duration::from_millis(400);
+    let (prefill, prefill_seen) = spawn_delayed_stub(StatusCode::OK, json!({}), hold).await;
+    let (decode, decode_seen) = spawn_recording_stub(r#"{"object":"chat.completion"}"#).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let read = |_: &str, worker: BasicWorkerBuilder| {
+        let worker = worker.runtime_type(RuntimeType::Vllm);
+        worker
+            .kv_connector(MORIIO_CONNECTOR)
+            .label("moriio_mode", "read")
+    };
+    let bed = pair_bed_of(read, Arc::clone(&registry), &[&prefill], &[&decode]);
+    let (host, store, _) = bed;
+    let mut document = PolicySpec::pair_presets("least_load", "least_load")?;
+    document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+    document.generation = store.with_world(|world| world.spec().generation()) + 1;
+    store
+        .apply(AppliedSpec::validate(&document)?)
+        .map_err(|stale| format!("{stale:?}"))?;
+    let router = router(registry, host);
+    let row = store.by_key(&decode).ok_or("the decode's row")?.id;
+
+    let booked = async {
+        // The prefill holds its answer: its request is in, the decode's is not.
+        for _ in 0..200 {
+            if prefill_seen.lock().is_ok_and(|seen| !seen.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let waits = decode_seen.lock().is_ok_and(|seen| seen.is_empty());
+        (waits, pair_in_flight(&store, row))
+    };
+    let (response, (waits, booked)) = tokio::join!(chat(&router), booked);
+
+    assert!(waits, "the decode went out ahead of its prefill's answer");
+    assert_eq!(booked, 1, "the decode stood unbooked while its prefill ran");
+    // The stub's prefill hands no KV over: the request fails, and no
+    // decode is sent.
+    assert!(response?.status().is_server_error());
+    assert_eq!(decode_seen.lock().map_err(|e| e.to_string())?.len(), 0);
+    assert_eq!(live(&store, 0).await, 0, "a lease outlived its request");
+    Ok(())
+}
+
+/// The document's default picks the decode with the prefill: the same
+/// loads move, and the decode goes where the one decision named it.
+#[tokio::test]
+async fn a_decode_picked_with_its_prefill_stays_where_its_one_decision_named_it() -> Case {
+    let arrivals = decode_arrivals_behind_moved_loads(DecodePick::WithPrefill).await?;
+    assert_eq!(arrivals, [1, 0], "the decode left its first pick");
+    Ok(())
+}
+
 /// A retry is not placed on a worker that answered the request
 /// definitively. The pair's commit asks the request's ledger of both
 /// workers, so a pick that names the closed decode is passed over for the
@@ -423,7 +591,7 @@ async fn a_retry_is_not_placed_on_a_worker_the_ledger_closed() -> Case {
             let placed = router
                 .place_pair_attempt(host, &context, 0, None, &tried, &ledger)
                 .await;
-            let (sent, (_, decode), _guards) =
+            let (sent, (_, decode), _guards, _asked) =
                 placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
             assert_eq!(decode.url(), decodes[1 - closed].url(), "closed {closed}");
             drop(sent);
@@ -717,7 +885,7 @@ async fn a_pair_of_another_wire_is_passed_over_at_its_commit() -> Case {
             let placed = router
                 .place_pair_attempt(host, &context, 0, None, &tried, &ledger)
                 .await;
-            let (sent, (_, decode), _guards) =
+            let (sent, (_, decode), _guards, _asked) =
                 placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
             assert_eq!(
                 decode.url(),

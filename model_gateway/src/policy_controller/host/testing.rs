@@ -2,21 +2,22 @@
 //! URL, a registry with one worker a URL, and the host over both. A router's
 //! cases build their rows this way, so one fixture stands.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use kv_index::{chain_prefix_hash, ContentHash, SequenceHash, StoredBlock};
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus, UNKNOWN_MODEL_ID};
 use smg_policy_controller::{
+    spec::DecodePick,
     store::{
-        BatchFacts, BatchOutcome, KvEvent, KvEventSink, MemoryStore, Signals, WorkerFacts,
-        WorkerStatus as RowStatus, WorkersStore,
+        Ask as StoreAsk, BatchFacts, BatchOutcome, KvEvent, KvEventSink, MemoryStore, PairBuffers,
+        Signals, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
     },
     view::{Role, WorkerId},
     AppliedSpec, LeaseId, PolicySpec, WireModes,
 };
 use smg_worker::identity::basic::{Worker, WorkerType};
 
-use super::{Host, Placed};
+use super::{Host, Placed, GATEWAY};
 use crate::{
     config::{PolicyConfig, RouterConfig, RoutingMode},
     policy_controller::start,
@@ -199,6 +200,45 @@ pub(crate) fn pair_bed(prefills: &[&str], decodes: &[&str]) -> Bed {
     let applied = AppliedSpec::validate(&document).expect("the presets validate");
     store.apply(applied).expect("the store takes the presets");
     pair_rows(store, MODEL, prefills, decodes)
+}
+
+/// [`pair_bed`] under a document that says when a pair's decode is picked
+/// (`plans.pd-pair.decode`).
+pub(crate) fn pair_bed_picking(decode: DecodePick, prefills: &[&str], decodes: &[&str]) -> Bed {
+    let store = Arc::new(MemoryStore::new());
+    let mut document =
+        PolicySpec::pair_presets("least_load", "least_load").expect("the pair presets");
+    document.plans.pd_pair.decode = decode;
+    let applied = AppliedSpec::validate(&document).expect("the presets validate");
+    store.apply(applied).expect("the store takes the presets");
+    pair_rows(store, MODEL, prefills, decodes)
+}
+
+/// The requests the store counts in flight on `row`, a row of [`MODEL`]'s
+/// pair pools.
+pub(crate) fn pair_in_flight(store: &MemoryStore, row: WorkerId) -> u32 {
+    store.with_world(|world| {
+        let ask = StoreAsk {
+            gateway: GATEWAY,
+            now: Instant::now(),
+            pinned: None,
+            affinity: false,
+            signal_cells: false,
+        };
+        let mut rows = PairBuffers::default();
+        let built = world
+            .build_pair(MODEL, &ask, &mut rows)
+            .expect("a pair's pools");
+        world.count_pair_in_flight(&built, &ask, &mut rows);
+        let pools = rows.pools();
+        let row = pools
+            .prefills
+            .iter()
+            .chain(pools.decodes)
+            .find(|listed| listed.id == row)
+            .expect("the row is listed");
+        row.in_flight
+    })
 }
 
 /// The store a pair gateway starts, with one ready row a URL as

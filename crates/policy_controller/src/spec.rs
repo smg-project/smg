@@ -441,11 +441,30 @@ pub enum Pairing {
     Strict,
 }
 
+/// When a pair's decode side is picked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum DecodePick {
+    /// With the prefill, in the pair's one decision.
+    #[default]
+    WithPrefill,
+    /// After the prefill has run, on a route that sends the decode then.
+    /// The pair's first decision books the prefill alone and names the
+    /// decode's targets. The host asks the decode again when the prefill
+    /// has answered, and that decision reads the rows of its own instant.
+    /// A route that sends both sides at once keeps the first decision's
+    /// decode.
+    AfterPrefill,
+}
+
 /// The `pd-pair` plan's rules.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct PdPairPlanSpec {
     pub pairing: Pairing,
+    /// When a pair's decode side is picked: `with-prefill` (the default)
+    /// or `after-prefill`.
+    pub decode: DecodePick,
 }
 
 /// The plans' rules, by plan name.
@@ -5258,7 +5277,8 @@ fn index_matching<'a>(
 /// and one load reads the pair.
 ///
 /// It also holds what a store derives under, beside the engine: the
-/// document's pairing mode ([`AppliedSpec::pairing`]). And it says how deep
+/// document's pairing mode ([`AppliedSpec::pairing`]). It says when a host
+/// asks a pair's decode ([`AppliedSpec::decode_pick`]). And it says how deep
 /// a host hashes a request for it ([`AppliedSpec::block_hashes_read`]).
 #[derive(Debug)]
 pub struct AppliedSpec {
@@ -5275,6 +5295,8 @@ pub struct AppliedSpec {
     /// The index settings a model takes at a membership write or apply.
     index: BTreeMap<String, IndexSpec>,
     pairing: Pairing,
+    /// The document's `plans.pd-pair.decode`.
+    decode_pick: DecodePick,
     lists: ViewLists,
     /// Each binding's routing key sources, by the binding's place in the
     /// document; none where a binding names none
@@ -5351,6 +5373,7 @@ impl AppliedSpec {
             block_size: Gates::of(None, None, document.view.block_size).block_size,
             index: document.index.clone(),
             pairing: document.plans.pd_pair.pairing,
+            decode_pick: document.plans.pd_pair.decode,
             lists: ViewLists::of(&document.view),
             key_sources: document
                 .bindings
@@ -5365,7 +5388,7 @@ impl AppliedSpec {
     /// The generation a store holds before any document is applied: number
     /// 0, an engine with no profile and no binding, which declines every
     /// decision by name as an engine declines a model no binding covers,
-    /// and the pairing mode a document that names none has.
+    /// and the pair plan's rules a document that names none has.
     #[must_use]
     pub fn unbound() -> Self {
         Self {
@@ -5377,6 +5400,7 @@ impl AppliedSpec {
             block_size: Gates::default().block_size,
             index: BTreeMap::new(),
             pairing: Pairing::default(),
+            decode_pick: DecodePick::default(),
             lists: ViewLists::default(),
             key_sources: Box::default(),
             #[cfg(feature = "controller")]
@@ -5523,6 +5547,17 @@ impl AppliedSpec {
     #[must_use]
     pub fn pairing(&self) -> Pairing {
         self.pairing
+    }
+
+    /// When a pair's decode side is picked while this generation stands:
+    /// the document's `plans.pd-pair.decode`. A host whose route sends a
+    /// pair's decode behind its prefill states
+    /// [`Constraints::decode_later`](crate::view::Constraints::decode_later)
+    /// under [`DecodePick::AfterPrefill`], and asks the decode again when
+    /// the prefill has answered.
+    #[must_use]
+    pub fn decode_pick(&self) -> DecodePick {
+        self.decode_pick
     }
 
     /// The lists this generation declares, as a store reads them when it
@@ -8381,6 +8416,51 @@ mod tests {
     }
 
     #[test]
+    fn the_plans_section_says_when_a_pairs_decode_is_picked() {
+        let document = |plans: &str| {
+            doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1"{plans},"profiles":{{"p":{{"pick":"best"}}}}}}"#
+            ))
+        };
+        let applied =
+            |spec: &PolicySpec| AppliedSpec::validate(spec).map(|applied| applied.decode_pick());
+        // A document that names no rule, and one that names the other rule
+        // of the plan alone, pick the decode with the prefill.
+        for plans in ["", r#","plans":{"pd-pair":{"pairing":"strict"}}"#] {
+            let spec = document(plans);
+            assert_eq!(
+                spec.plans.pd_pair.decode,
+                DecodePick::WithPrefill,
+                "{plans}"
+            );
+            assert_eq!(
+                applied(&spec).ok(),
+                Some(DecodePick::WithPrefill),
+                "{plans}"
+            );
+        }
+        let spec = document(r#","plans":{"pd-pair":{"decode":"with-prefill"}}"#);
+        assert_eq!(applied(&spec).ok(), Some(DecodePick::WithPrefill));
+        let spec = document(r#","plans":{"pd-pair":{"decode":"after-prefill"}}"#);
+        assert_eq!(spec.plans.pd_pair.decode, DecodePick::AfterPrefill);
+        assert_eq!(spec.plans.pd_pair.pairing, Pairing::default());
+        assert_eq!(applied(&spec).ok(), Some(DecodePick::AfterPrefill));
+        // The document written back names the rule, and reads back the same.
+        let written = serde_json::to_string(&spec).expect("the document writes");
+        assert!(written.contains(r#""decode":"after-prefill""#), "{written}");
+        assert_eq!(doc(&written), spec);
+        // A start with no document picks with the prefill.
+        assert_eq!(
+            AppliedSpec::unbound().decode_pick(),
+            DecodePick::WithPrefill
+        );
+        let err = parse_error(
+            r#"{"apiVersion":"smg.policy/v1","plans":{"pd-pair":{"decode":"later"}},"profiles":{"p":{"pick":"best"}}}"#,
+        );
+        assert!(err.contains("unknown variant `later`"), "{err}");
+    }
+
+    #[test]
     fn the_plans_section_carries_the_pairing_mode() {
         let spec = doc(
             r#"{"apiVersion":"smg.policy/v1","plans":{"pd-pair":{"pairing":"strict"}},"profiles":{"p":{"pick":"best"}}}"#,
@@ -9100,6 +9180,7 @@ mod tests {
         let plans = PlansSpec {
             pd_pair: PdPairPlanSpec {
                 pairing: Pairing::Off,
+                ..PdPairPlanSpec::default()
             },
         };
         let view = ViewSpec {
@@ -9214,6 +9295,7 @@ mod tests {
             plans: PlansSpec {
                 pd_pair: PdPairPlanSpec {
                     pairing: Pairing::Off,
+                    ..PdPairPlanSpec::default()
                 },
             },
             bindings: vec![BindingSpec::default()],
