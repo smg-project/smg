@@ -979,10 +979,10 @@ impl AppContextBuilder {
         self
     }
 
-    /// Start the policy store with its operators' door, its membership feed
-    /// and host and, under a controller's address, the follower of that
-    /// controller's workers. A start the door refuses stops this one, by
-    /// name.
+    /// Start the policy store with its operators' door, its membership feed,
+    /// its host with the host's timer and, under a controller's address, the
+    /// follower of that controller's workers. A start the door refuses stops
+    /// this one, by name.
     fn with_policy_controller(
         mut self,
         config: &RouterConfig,
@@ -1001,9 +1001,12 @@ impl AppContextBuilder {
             let connector = Arc::clone(&self.engine_connector);
             let (feed, follower) =
                 policy_controller::feeds(&store, registry, connector, controller);
-            let host = Host::new(Arc::clone(&store), Arc::clone(&feed.objects));
+            let host = Arc::new(Host::new(Arc::clone(&store), Arc::clone(&feed.objects)));
+            // The door's clock runs from here on. The timer ends behind
+            // the host, so its handle detaches.
+            let _timer = policy_controller::upkeep::start(&host);
             self.policy_feed = Some(feed);
-            self.policy_host = Some(Arc::new(host));
+            self.policy_host = Some(host);
             self.policy_follower = follower.map(|follower| Arc::new(Mutex::new(Some(follower))));
             self.policy_operators = Some(Arc::new(Operators::new(Arc::clone(&store), door)));
             self.policy_store = Some(store);

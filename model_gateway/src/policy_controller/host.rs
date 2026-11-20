@@ -41,8 +41,8 @@ use axum::{
 use parking_lot::Mutex;
 use rand::RngExt;
 use smg_policy_controller::{
-    decision::{Decision, Lifted, Pair, ShedReason, Targets, Trace, MAX_TARGETS},
-    door::{Door, Maker, Refused, Request},
+    decision::{Decision, Lifted, Pair, ShadowKind, ShedReason, Targets, Trace, MAX_TARGETS},
+    door::{Door, Maker, Refused, Request, Swept},
     handle::Handle,
     lease::{Outcome, ReleaseReason, Side, TransportClass},
     spec::DecodePick,
@@ -497,6 +497,25 @@ impl Host {
             door: Arc::new(Door::new(store)),
             workers: Workers::Held(objects),
         }
+    }
+
+    /// One pass of the door's clock at `now`: the call of the host's timer
+    /// ([`upkeep`](super::upkeep)), about once a second.
+    pub(crate) fn sweep(&self, now: Instant) -> Swept {
+        self.door.sweep(now)
+    }
+
+    /// How many shadows said `kind` beside a single decision of the
+    /// binding at position `binding`: the door's count, which the timer
+    /// shows as a series.
+    pub(crate) fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64 {
+        self.door.shadowed(binding, kind)
+    }
+
+    /// How many decisions panicked, the shadows that did beside a live
+    /// decision that stood among them: the door's count, shown the same way.
+    pub(crate) fn faults(&self) -> u64 {
+        self.door.faults()
     }
 
     /// An attempt's prompt hashes for `model`, under the generation in force.

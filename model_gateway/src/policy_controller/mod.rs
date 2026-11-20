@@ -8,7 +8,9 @@
 //!
 //! The setting starts the store with the policy document for the routing
 //! configuration. The context holds the membership feed over that store and
-//! a host over the feed's holder. A regular HTTP router with that host asks
+//! a host over the feed's holder, and starts the host's timer, which runs
+//! the door's clock and shows its counts as series, on no request's path
+//! ([`upkeep`]). A regular HTTP router with that host asks
 //! it to place typed requests: for the model a request names, or for the one
 //! primary model the router's workers serve where it names none. A regular
 //! gRPC router and a gRPC pair router ask it in their selection stage. An
@@ -82,6 +84,7 @@ pub(crate) mod feed;
 pub(crate) mod host;
 pub(crate) mod operators;
 mod undecided;
+pub(crate) mod upkeep;
 
 use feed::Feed;
 use follower::{Follower, Settings};
