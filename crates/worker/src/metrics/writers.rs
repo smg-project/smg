@@ -51,6 +51,22 @@ pub fn intern_string(s: &str) -> Arc<str> {
         .clone()
 }
 
+/// The ranks whose label [`rank_label`] keeps in its table.
+const TABLED_RANKS: usize = 16;
+
+/// The `dp_rank` label of a data-parallel rank, the same text for every
+/// writer of a rank's series. The first ranks come from a table built
+/// once: a record that builds its own keys formats nothing and interns
+/// nothing for its rank. A rank past the table is formatted and interned.
+fn rank_label(dp_rank: i32) -> Arc<str> {
+    static FIRST: Lazy<[Arc<str>; TABLED_RANKS]> =
+        Lazy::new(|| std::array::from_fn(|rank| Arc::from(rank.to_string())));
+    usize::try_from(dp_rank)
+        .ok()
+        .and_then(|rank| FIRST.get(rank))
+        .map_or_else(|| intern_string(&dp_rank.to_string()), Arc::clone)
+}
+
 #[cfg(any(test, feature = "test-util"))]
 pub fn interner_size() -> usize {
     STRING_INTERNER.len()
@@ -85,7 +101,7 @@ mod handles {
     use metrics::{Counter, Gauge, Histogram};
     use rustc_hash::FxHashMap;
 
-    use super::{intern_model_label, intern_string};
+    use super::{intern_model_label, intern_string, rank_label};
     #[cfg(test)]
     pub(super) use crate::metrics::handles::force_on_this_thread;
     pub(super) use crate::metrics::handles::{
@@ -139,7 +155,7 @@ mod handles {
             Self {
                 worker: intern_string(worker_url),
                 model: intern_model_label(model_id),
-                dp_rank: intern_string(&dp_rank.to_string()),
+                dp_rank: rank_label(dp_rank),
             }
         }
     }
@@ -1551,7 +1567,7 @@ impl Metrics {
         live: impl Fn(Option<&str>) -> LiveLoads<'l>,
     ) {
         let worker = intern_string(worker_url);
-        let dp_rank = intern_string(&dp_rank.to_string());
+        let dp_rank = rank_label(dp_rank);
         for model_id in models {
             let held = live(Some(model_id.as_str()));
             let core = held.iter().any(Option::is_some);
