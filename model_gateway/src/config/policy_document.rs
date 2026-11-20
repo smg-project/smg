@@ -58,10 +58,10 @@
 //! rooms. The pin of a sticky key to one engine of a grouped worker is the
 //! dispatch's as well: it runs behind the decision, on the worker the
 //! decision names. Its key is the gateway's own, read from the routing-key
-//! headers: a supplied document that keys its requests on another header
-//! leaves the pin without a key. The copy of the cache boundaries at the
-//! top of the configuration decides nothing either: each policy reads its
-//! own.
+//! headers. A supplied document names its own key sources, which need not
+//! be that key, so the pin is refused beside one. The copy of the cache
+//! boundaries at the top of the configuration decides nothing either: each
+//! policy reads its own.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -83,8 +83,8 @@ use smg_policy_controller::{
 };
 
 use super::{
-    CacheIndexKind, ManualAssignmentMode, PdPairingMode, PolicyConfig, PowerOfTwoLoadMetric,
-    RouterConfig, RoutingMode,
+    CacheIndexKind, GroupedDpSticky, ManualAssignmentMode, PdPairingMode, PolicyConfig,
+    PowerOfTwoLoadMetric, RouterConfig, RoutingMode,
 };
 use crate::policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY;
 
@@ -187,6 +187,16 @@ impl RouterConfig {
         let Some(given) = &self.policy_spec else {
             return Ok(said);
         };
+        // The dispatch pins a sticky key by the gateway's own key. A supplied
+        // document names its own key sources: where they are not that key,
+        // the pin would split a conversation the document keeps together.
+        if self.grouped_dp_sticky != GroupedDpSticky::Off {
+            return Err(unsaid(
+                "grouped_dp_sticky",
+                self.grouped_dp_sticky.as_str(),
+                "beside a supplied document the pin would read the gateway's own key, which that document's key sources need not be",
+            ));
+        }
         let mut given = given.clone();
         if given.generation == 0 {
             given.generation = 1;
@@ -1166,7 +1176,6 @@ mod tests {
     use smg_policy_controller::PRESETS;
 
     use super::*;
-    use crate::config::GroupedDpSticky;
 
     fn config(policy: PolicyConfig) -> RouterConfig {
         RouterConfig {
@@ -2101,13 +2110,21 @@ mod tests {
             ..config(PolicyConfig::RoundRobin)
         };
         assert_eq!(pinned.policy_document(), Ok(preset("round_robin")));
-        // A supplied document stands beside the pin as beside no setting.
+        assert_eq!(pinned.policy_document_in_force(), Ok(preset("round_robin")));
+        // The pin reads the gateway's own key, and a supplied document names
+        // its own key sources: beside one the pin is refused by its name.
         let given = RouterConfig {
             grouped_dp_sticky: GroupedDpSticky::Hash,
             policy_spec: Some(preset("least_load")),
             ..RouterConfig::default()
         };
-        assert_eq!(given.policy_document_in_force(), Ok(preset("least_load")));
+        assert!(matches!(
+            given.policy_document_in_force(),
+            Err(PolicyDocumentError::Unsaid {
+                setting: "grouped_dp_sticky",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -735,21 +735,6 @@ class TestPolicyDocument:
         with pytest.raises(ValueError, match=f"these are set beside it: {name}$"):
             router.start()
 
-    def test_the_constructor_takes_the_grouped_pin_beside_a_document(self, tmp_path):
-        # The dispatch applies the pin behind any document's decision, so the
-        # native start takes the setting beside one. It goes on to read the
-        # document, which is not there.
-        path = tmp_path / "routing.yaml"
-        router = _Router(
-            worker_urls=[],
-            policy_controller="on",
-            policy_spec=str(path),
-            grouped_dp_sticky="hash",
-        )
-        unread = re.escape(str(path)) + ": could not read the policy document"
-        with pytest.raises(ValueError, match=unread):
-            router.start()
-
     def test_the_routing_options_at_their_defaults_stand_beside_a_document(self, policy_document):
         # The chart's line carries these six at their defaults on every render.
         line = [

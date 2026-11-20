@@ -85,6 +85,7 @@ DOCUMENT_REPLACES = (
     "power_of_two_load_metric",
     "routing_key_override",
     "pd_pairing_mode",
+    "grouped_dp_sticky",
     "dp_minimum_tokens_scheduler",
     "worker_warmup_secs",
     "worker_warmup_share",
