@@ -4190,6 +4190,13 @@ impl Leases {
         Sides { record, decode }
     }
 
+    /// Both parts of the lease under `key` as the file holds them.
+    #[cfg(feature = "controller")]
+    fn found(&self, key: &Key) -> Option<Sides> {
+        let held = self.records.get(key)?;
+        Some(self.sides(key, held))
+    }
+
     /// Whether a side of the lease `held` under `key` waits for its
     /// dispatch.
     fn waits(&self, key: &Key, held: &Held) -> bool {
