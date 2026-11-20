@@ -8345,6 +8345,7 @@ dependencies = [
  "dashmap",
  "futures",
  "http",
+ "kv-index",
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-util",

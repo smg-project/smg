@@ -1,5 +1,6 @@
 //! The worker's KV port over the store's index. The adapter decodes one
-//! batch at a time into the store's events, in the batch's order.
+//! batch at a time into the store's events. It reads the groups a batch
+//! shows first and decodes stores of groups other than main attention last.
 //!
 //! # What the adapter keeps
 //!
@@ -10,14 +11,8 @@
 //! which groups are the main signal of a worker that has shown no main
 //! group. The adapter keeps those three a row until the worker leaves.
 //!
-//! They are the admission rule of the gateway's index, word for word and
-//! under its names, with the order it applies a batch in: what the batch's
-//! stores show is read first, and the stores of groups other than main
-//! attention are decoded last. This is a second body of that rule, and the
-//! ingestion is to move below both hosts, not to be copied: the change that
-//! moves the gateway's body deletes this one, and the gateway's cases of
-//! the rule stand here under their names until then. No other rule with a
-//! state is copied.
+//! A row opened without group facts loses any cached blocks and cursor
+//! before its feed starts.
 //!
 //! # Limits
 //!
@@ -39,14 +34,13 @@ use std::{
     },
 };
 
-use kv_index::salt::{content_hash_with_seed, namespace_seed};
+use kv_index::salt::namespace_seed;
 use parking_lot::Mutex;
 use smg_worker::{
-    common_proto::{
-        kv_cache_event::Data, KvBlock, KvBlocksStored, KvCacheLocality, KvCacheTier, KvEventBatch,
-    },
+    common_proto::{kv_cache_event::Data, KvEventBatch},
     identity::basic::Worker,
     kv_events::{
+        apply::{convert_kv_block, indexed_tier, stored_tier, tokenful, Admission, GroupsShown},
         port::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         KvEventFeed, KvEventHost,
     },
@@ -55,7 +49,7 @@ use smg_worker::{
 
 use super::Objects;
 use crate::{
-    store::{self, KvEvent, SequenceHash, StoredBlock},
+    store::{self, KvEvent, SequenceHash},
     view::WorkerId,
 };
 
@@ -186,135 +180,6 @@ where
     }
 }
 
-/// What a row's stream showed of its cache groups: the three facts the
-/// gateway's index keeps a worker to say where an event goes, under the
-/// gateway's names, and no more of its state.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct GroupsShown {
-    /// The groups a store named with a kind other than main attention.
-    non_main_groups: Vec<u32>,
-    /// Whether a store named a main attention kind, or a plain store came.
-    main_shown: bool,
-    /// The groups whose stores with tokens are the worker's main signal: a
-    /// worker that has shown no main group.
-    main_signal_groups: Vec<u32>,
-}
-
-/// Where an event goes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Admission {
-    /// The prefix index's: a main attention store, a plain worker's event,
-    /// or the main signal of a worker without a main group.
-    Main,
-    /// A group's of another kind: the index holds no view of it here.
-    Group,
-    /// A removal of a group that is the worker's main signal and is known
-    /// as another kind too: the index lets go.
-    MainAndGroup,
-    /// Not applied.
-    Skip,
-}
-
-impl GroupsShown {
-    /// Where an event with these attributes goes. A store names its group's
-    /// kind; later events for that group may omit it, so the groups shown
-    /// decide for them, and an unlearned group without a kind is the main
-    /// group (an engine with one group names nothing). A store of a group
-    /// other than main attention that carries tokens, on a worker that has
-    /// shown no main group, is the worker's main signal: the index's, and
-    /// its group's kind-less removals follow it there.
-    fn admit(
-        &mut self,
-        kind: Option<&str>,
-        group_idx: Option<u32>,
-        tokenful: bool,
-        locality: Option<i32>,
-        ownership: Option<&str>,
-    ) -> Admission {
-        if foreign_owner(ownership) || remote(locality) {
-            return Admission::Skip;
-        }
-        match (kind, group_idx) {
-            (Some(kind), group) if MAIN_ATTENTION_KINDS.contains(&kind) => {
-                self.main_shown = true;
-                if let Some(group) = group {
-                    self.non_main_groups.retain(|&known| known != group);
-                }
-                Admission::Main
-            }
-            (Some(_), Some(group)) if tokenful && !self.main_shown => {
-                self.main_signal(group);
-                Admission::Main
-            }
-            (Some(_), Some(group)) => {
-                self.show_group(group);
-                Admission::Group
-            }
-            (Some(_), None) => Admission::Skip,
-            (None, Some(group)) => match (self.is_main_signal(group), self.knows_group(group)) {
-                (true, true) => Admission::MainAndGroup,
-                (false, true) => Admission::Group,
-                _ => Admission::Main,
-            },
-            (None, None) => Admission::Main,
-        }
-    }
-
-    /// Whether the worker has shown `group` as other than main attention.
-    fn knows_group(&self, group: u32) -> bool {
-        self.non_main_groups.contains(&group)
-    }
-
-    /// A store named `group` with a kind other than main attention.
-    fn show_group(&mut self, group: u32) {
-        if !self.non_main_groups.contains(&group) {
-            self.non_main_groups.push(group);
-        }
-    }
-
-    /// Whether tokenful stores of `group` were the worker's main signal.
-    fn is_main_signal(&self, group: u32) -> bool {
-        self.main_signal_groups.contains(&group)
-    }
-
-    /// A tokenful store of `group` on a worker that has shown no main group.
-    fn main_signal(&mut self, group: u32) {
-        if !self.main_signal_groups.contains(&group) {
-            self.main_signal_groups.push(group);
-        }
-    }
-
-    /// Whether a store belongs to a cache group other than main attention
-    /// ([`Self::admit`] without a write): the stores a batch decodes last.
-    fn is_group_store(&self, stored: &KvBlocksStored) -> bool {
-        match (stored.kv_cache_spec_kind.as_deref(), stored.group_idx) {
-            (Some(kind), Some(_)) => {
-                !MAIN_ATTENTION_KINDS.contains(&kind) && (self.main_shown || !tokenful(stored))
-            }
-            (None, Some(group)) => self.knows_group(group) && !self.is_main_signal(group),
-            _ => false,
-        }
-    }
-
-    /// A main group shows. The first on a worker whose main signal was a
-    /// window group restarts it: `true`, and the index lets the signal's
-    /// blocks go, the main group's stores rebuild it, and the signal's
-    /// groups are groups of another kind from here.
-    fn main_group_shown(&mut self) -> bool {
-        if self.main_shown {
-            return false;
-        }
-        self.main_shown = true;
-        if self.main_signal_groups.is_empty() {
-            return false;
-        }
-        for group in std::mem::take(&mut self.main_signal_groups) {
-            self.show_group(group);
-        }
-        true
-    }
-}
-
 /// Decode the events the store can index against what the row's stream
 /// showed of its groups, as the gateway's index applies a batch: what the
 /// batch's stores show is read ahead of its events, and the stores of groups
@@ -322,42 +187,7 @@ impl GroupsShown {
 /// batch restarts the worker: the index is to let the main signal's blocks
 /// go ahead of them.
 fn events(batch: &KvEventBatch, groups: &mut GroupsShown) -> (bool, Vec<KvEvent>) {
-    let stores = || {
-        batch
-            .events
-            .iter()
-            .filter_map(|event| match event.data.as_ref()? {
-                // A store the index skips shows no group here either.
-                Data::Stored(stored) if !foreign(stored) => Some(stored),
-                Data::Stored(_) | Data::Removed(_) | Data::Cleared(_) => None,
-            })
-    };
-    // The main group first, so a window group's store ahead of it in the
-    // batch reads as a group's, not as the worker's main signal.
-    let mut restarted = false;
-    for stored in stores() {
-        let main = match (stored.kv_cache_spec_kind.as_deref(), stored.group_idx) {
-            (Some(kind), _) => MAIN_ATTENTION_KINDS.contains(&kind),
-            (None, None) => true,
-            (None, Some(_)) => false,
-        };
-        if main && groups.main_group_shown() {
-            restarted = true;
-        }
-    }
-    for stored in stores() {
-        if let (Some(kind), Some(group)) = (stored.kv_cache_spec_kind.as_deref(), stored.group_idx)
-        {
-            if MAIN_ATTENTION_KINDS.contains(&kind) {
-                continue;
-            }
-            if groups.main_shown || !tokenful(stored) {
-                groups.show_group(group);
-            } else {
-                groups.main_signal(group);
-            }
-        }
-    }
+    let (restarted, _) = groups.show_batch(&batch.events);
     let mut events = Vec::with_capacity(batch.events.len() + 1);
     let mut deferred = Vec::new();
     for data in batch.events.iter().filter_map(|event| event.data.as_ref()) {
@@ -374,7 +204,7 @@ fn events(batch: &KvEventBatch, groups: &mut GroupsShown) -> (bool, Vec<KvEvent>
             events.push(event);
         }
     }
-    (restarted, events)
+    (restarted.is_some(), events)
 }
 
 /// One wire event as the store's, `None` for one that is not the index's.
@@ -391,8 +221,11 @@ fn decode(data: &Data, groups: &mut GroupsShown) -> Option<KvEvent> {
             );
             // A kind-less store of a group that is the main signal is the
             // index's, as its tokenful stores are.
-            let indexed = matches!(admission, Admission::Main | Admission::MainAndGroup);
-            if !(indexed && tokens && stored_tier(stored)) {
+            let indexed = matches!(
+                admission,
+                Admission::Main | Admission::MainSignal | Admission::MainAndGroup(_)
+            );
+            if !(indexed && tokens && stored_tier(stored).is_some()) {
                 return None;
             }
             let seed = namespace_seed(stored.lora_name.as_deref(), stored.cache_salt.as_deref());
@@ -413,8 +246,8 @@ fn decode(data: &Data, groups: &mut GroupsShown) -> Option<KvEvent> {
                 removed.locality,
                 removed.ownership.as_deref(),
             );
-            let indexed = matches!(admission, Admission::Main | Admission::MainAndGroup);
-            if !(indexed && indexed_tier(removed.tier, removed.cache_level)) {
+            let indexed = matches!(admission, Admission::Main | Admission::MainAndGroup(_));
+            if !(indexed && indexed_tier(removed.tier, removed.cache_level).is_some()) {
                 return None;
             }
             Some(KvEvent::Removed(
@@ -430,58 +263,6 @@ fn decode(data: &Data, groups: &mut GroupsShown) -> Option<KvEvent> {
             let admission = groups.admit(None, None, false, None, cleared.ownership.as_deref());
             (admission == Admission::Main).then_some(KvEvent::Cleared)
         }
-    }
-}
-
-/// Whether a residency agent owns the blocks.
-fn foreign_owner(ownership: Option<&str>) -> bool {
-    ownership.is_some_and(|owner| owner.eq_ignore_ascii_case("kvcr"))
-}
-
-/// Whether the blocks live on a remote tier.
-fn remote(locality: Option<i32>) -> bool {
-    locality == Some(KvCacheLocality::Remote as i32)
-}
-
-/// Whether the admission skips a store before it reads the store's group:
-/// the batch's first passes skip it too, so a foreign store shows neither a
-/// main group nor a window group.
-fn foreign(stored: &KvBlocksStored) -> bool {
-    foreign_owner(stored.ownership.as_deref()) || remote(stored.locality)
-}
-
-/// Whether the named tier is indexed, falling back to the older cache level.
-fn indexed_tier(tier: Option<i32>, cache_level: Option<i32>) -> bool {
-    match tier.and_then(|tier| KvCacheTier::try_from(tier).ok()) {
-        Some(KvCacheTier::Device | KvCacheTier::Host) => true,
-        Some(KvCacheTier::Disk | KvCacheTier::External) => false,
-        Some(KvCacheTier::Unspecified) | None => matches!(cache_level, None | Some(0 | 1)),
-    }
-}
-
-/// Whether the store's tier is indexed, using its first block for the cache level.
-fn stored_tier(stored: &KvBlocksStored) -> bool {
-    let first_level = stored.blocks.first().and_then(|block| block.cache_level);
-    indexed_tier(stored.tier, first_level)
-}
-
-/// The kinds whose blocks feed the main attention index.
-const MAIN_ATTENTION_KINDS: [&str; 3] = ["full_attention", "mla_attention", "sink_full_attention"];
-
-/// Whether the store has blocks and carries the tokens of every block.
-fn tokenful(stored: &KvBlocksStored) -> bool {
-    !stored.blocks.is_empty()
-        && stored
-            .blocks
-            .iter()
-            .all(|block| !block.token_ids.is_empty())
-}
-
-/// Keep the block's sequence hash and hash its tokens under the namespace seed.
-fn convert_kv_block(block: &KvBlock, seed: u64) -> StoredBlock {
-    StoredBlock {
-        seq_hash: SequenceHash::from(block.block_hash),
-        content_hash: content_hash_with_seed(&block.token_ids, seed),
     }
 }
 
@@ -579,7 +360,20 @@ where
         _model: &str,
     ) -> Option<KvEventFeed<Self::Sink>> {
         match ticket {
-            Ok(row) => Some((Arc::clone(&self.sink), row)),
+            Ok(row) => {
+                // A row the adapter holds no facts for begins from nothing:
+                // what the store kept of its stream was decided by facts
+                // that are gone. The store is called outside the facts'
+                // lock, which every row's batch takes.
+                let known = self.sink.rows.lock().contains_key(&row);
+                if !known {
+                    if self.sink.store.cursor(row, 0).is_some() {
+                        self.sink.store.removed(row);
+                    }
+                    self.sink.rows.lock().entry(row).or_default();
+                }
+                Some((Arc::clone(&self.sink), row))
+            }
             Err(NoFeed::NoRow) => {
                 self.no_row.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
@@ -608,8 +402,12 @@ where
 mod tests {
     use std::time::Instant;
 
+    use kv_index::salt::content_hash_with_seed;
     use smg_worker::{
-        common_proto::{KvBlocksRemoved, KvCacheCleared, KvCacheEvent},
+        common_proto::{
+            KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheCleared, KvCacheEvent,
+            KvCacheLocality, KvCacheTier,
+        },
         identity::builder::BasicWorkerBuilder,
         kv_events::port::SnapshotChunk,
         registry::WorkerRegistry,
@@ -968,10 +766,6 @@ mod tests {
         assert_eq!(f.blocks(), 1);
     }
 
-    // The gateway's cases of the admission rule, under their names: what
-    // each says of the prefix index. They hold both bodies of the rule
-    // until the gateway's moves below both hosts.
-
     /// A removal that names a group without its kind is the group's where
     /// the group was shown, even ahead of the group's first store in the
     /// batch, and even for a group no view could place: the main block of
@@ -1325,6 +1119,24 @@ mod tests {
         assert_eq!(f.blocks(), 0);
     }
 
+    /// A main group shown in a batch 0 behind a resync: the adapter's own
+    /// clear is read as late there, and the resync emptied the rank already.
+    #[test]
+    fn a_first_batch_behind_a_resync_that_shows_a_main_group_stands() {
+        let f = Fixture::new();
+        f.applied(4, &batch([Data::Stored(window_store(&[1], 0, true))]));
+        f.sink.resync(f.row, None, ResyncReason::DataLoss);
+        f.applied(0, &batch([Data::Stored(main_store(7, 1))]));
+        assert_eq!(f.blocks(), 1);
+        // The window group is a group of another kind now: its store is not
+        // the index's.
+        f.applied(1, &batch([Data::Stored(window_store(&[2], 0, true))]));
+        assert_eq!(f.blocks(), 1);
+        // The block that stands is the main group's.
+        f.applied(2, &batch([Data::Removed(group_removal(&[7], 1))]));
+        assert_eq!(f.blocks(), 0);
+    }
+
     #[test]
     fn a_batch_the_store_does_not_take_shows_nothing() {
         let f = Fixture::new();
@@ -1634,6 +1446,54 @@ mod tests {
         assert_eq!(row, f.row);
         assert!(Arc::ptr_eq(&sink, &host.sink));
         assert_eq!(host.unfed(), Unfed::default());
+    }
+
+    #[test]
+    fn a_row_the_adapter_never_fed_begins_from_nothing() {
+        let f = Fixture::single(Some(BLOCK_SIZE));
+        let stores = batch([
+            Data::Stored(main_store(1, 0)),
+            Data::Stored(window_store(&[1], 2, false)),
+        ]);
+        assert_eq!(
+            f.sink.admit(f.row, 0, facts(7), &stores),
+            BatchOutcome::Applied
+        );
+        assert_eq!(
+            f.store.cursor(f.row, 0).map(|cursor| cursor.applied),
+            Some(7)
+        );
+        assert_eq!(f.store.indexed_blocks(f.row, 0), 1);
+
+        let host = f.host();
+        let worker = host
+            .objects
+            .registry()
+            .get_by_url(URL)
+            .expect("the worker's object");
+        let (sink, row) = host
+            .open(host.enroll(&worker, MODEL), &worker, MODEL)
+            .expect("the row's feed");
+        assert_eq!(sink.cursor(row, 0), None);
+        assert_eq!(f.store.indexed_blocks(row, 0), 0);
+        assert_eq!(sink.rows.lock().get(&row), Some(&GroupsShown::default()));
+
+        assert_eq!(sink.admit(row, 0, facts(9), &stores), BatchOutcome::Applied);
+        let (sink, row) = host
+            .open(host.enroll(&worker, MODEL), &worker, MODEL)
+            .expect("the row's feed");
+        assert_eq!(sink.cursor(row, 0).map(|cursor| cursor.applied), Some(9));
+        assert_eq!(f.store.indexed_blocks(row, 0), 1);
+        assert_eq!(
+            sink.admit(
+                row,
+                0,
+                facts(10),
+                &batch([Data::Removed(group_removal(&[1], 2))])
+            ),
+            BatchOutcome::Applied
+        );
+        assert_eq!(f.store.indexed_blocks(row, 0), 1);
     }
 
     #[test]
