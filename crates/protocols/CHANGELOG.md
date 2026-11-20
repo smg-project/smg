@@ -342,6 +342,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses
   `text.format` description into the Chat request it builds, but a gRPC engine still gets only the
   format's schema, as before. Breaking: `JsonSchemaFormat` gains `description: Option<String>`.
+- A Messages `mcp_toolset` keeps its pinned tool listing (`tools`), and a thinking config its
+  `block_binding` under `enabled` and `adaptive`, as the beta takes them. Both were dropped, so the
+  provider asked the MCP server for its tools again, and answered a failed thinking-block check
+  with its default instead of the behavior the client chose. Breaking: `McpToolset` gains `tools`,
+  and `ThinkingConfig::Enabled` and `ThinkingConfig::Adaptive` gain `block_binding`.
 - A Responses request's reasoning config keeps `mode`, `context` and the deprecated
   `generate_summary`, as the public API's `Reasoning` takes them, when the request is written back
   for an upstream, and a Response's `reasoning` echoes the ones the request set. The crate dropped
