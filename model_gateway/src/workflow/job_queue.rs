@@ -467,12 +467,17 @@ fn removal_wait() -> Duration {
 }
 
 /// The longest a run of `workflow` spends in its steps: each step's bound
-/// times its attempts, added up. The backoff between attempts is not counted.
+/// times its attempts, added up. A step counts at least once: the engine
+/// runs it once even under a policy of no attempts. The backoff between
+/// attempts is not counted.
 fn run_bound<D: WorkflowData>(workflow: &WorkflowDefinition<D>) -> Duration {
     workflow
         .steps
         .iter()
-        .map(|step| workflow.get_timeout(step) * workflow.get_retry_policy(step).max_attempts)
+        .map(|step| {
+            let attempts = workflow.get_retry_policy(step).max_attempts.max(1);
+            workflow.get_timeout(step) * attempts
+        })
         .sum()
 }
 
@@ -3815,18 +3820,40 @@ mod tests {
     fn a_runs_bound_counts_every_attempt_of_a_step() {
         use wfaas::{BackoffStrategy, RetryPolicy, StepId};
 
-        let mut workflow = create_worker_removal_workflow();
-        let once = run_bound(&workflow);
-        let cleanup = workflow
-            .steps
-            .iter_mut()
-            .find(|step| step.id == StepId::new("remove_from_policy_registry"))
-            .expect("the policy cleanup step");
-        cleanup.retry_policy = Some(RetryPolicy {
-            max_attempts: 2,
-            backoff: BackoffStrategy::Fixed(Duration::ZERO),
-        });
+        let once = run_bound(&create_worker_removal_workflow());
+        // The cleanup step's attempts, and its bounds past the first. The
+        // engine runs a step once even under a policy of no attempts.
+        for (attempts, more) in [(2, 1), (1, 0), (0, 0)] {
+            let mut workflow = create_worker_removal_workflow();
+            let cleanup = workflow
+                .steps
+                .iter_mut()
+                .find(|step| step.id == StepId::new("remove_from_policy_registry"))
+                .expect("the policy cleanup step");
+            cleanup.retry_policy = Some(RetryPolicy {
+                max_attempts: attempts,
+                backoff: BackoffStrategy::Fixed(Duration::ZERO),
+            });
 
-        assert_eq!(run_bound(&workflow), once + Duration::from_secs(300));
+            assert_eq!(
+                run_bound(&workflow),
+                once + Duration::from_secs(300) * more,
+                "{attempts} attempts"
+            );
+        }
+    }
+
+    /// The wait adds up bounds, and a step that retries without end has none.
+    #[test]
+    fn no_removal_step_retries_without_end() {
+        use wfaas::FailureAction;
+
+        for step in &create_worker_removal_workflow().steps {
+            assert!(
+                step.on_failure != FailureAction::RetryIndefinitely,
+                "{} retries without end",
+                step.name
+            );
+        }
     }
 }
