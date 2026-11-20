@@ -31,28 +31,52 @@ thread_local! {
 
 macro_rules! pool_impl {
     ($take_cap:ident, $give:ident, $held:ident, $ty:ty, $local:ident) => {
-        /// Take an empty `Vec` with at least `cap` capacity, reusing pooled storage.
+        /// Take an empty `Vec` with at least `cap` capacity: the smallest kept
+        /// buffer that holds it, or new storage when none does, so the kept
+        /// buffers stay for the takes they hold.
         pub fn $take_cap(cap: usize) -> Vec<$ty> {
-            let mut v = $local
-                .with(|p| p.borrow_mut().get_or_insert_with(Vec::new).pop())
-                .unwrap_or_default();
-            v.clear();
-            v.reserve(cap);
-            v
+            let kept = $local.with(|p| {
+                let mut p = p.borrow_mut();
+                let kept = p.get_or_insert_with(Vec::new);
+                let fit = kept
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| v.capacity() >= cap)
+                    .min_by_key(|(_, v)| v.capacity())
+                    .map(|(at, _)| at);
+                fit.map(|at| kept.swap_remove(at))
+            });
+            match kept {
+                Some(mut v) => {
+                    v.clear();
+                    v
+                }
+                None => Vec::with_capacity(cap),
+            }
         }
 
         /// Return a buffer for reuse by a later same-thread take. Kept only on
         /// a thread that has taken from the pool (one of its producers); on
         /// any other thread the buffer is dropped, since nothing there would
-        /// ever take it.
+        /// ever take it. A full pool gives up its smallest buffer for a
+        /// larger one.
         pub fn $give(v: Vec<$ty>) {
             if v.capacity() == 0 {
                 return;
             }
             $local.with(|p| {
                 let mut p = p.borrow_mut();
-                if let Some(kept) = p.as_mut().filter(|kept| kept.len() < MAX_THREAD_POOLED) {
+                let Some(kept) = p.as_mut() else {
+                    return;
+                };
+                if kept.len() < MAX_THREAD_POOLED {
                     kept.push(v);
+                } else if let Some(smallest) =
+                    kept.iter_mut().min_by_key(|buffer| buffer.capacity())
+                {
+                    if smallest.capacity() < v.capacity() {
+                        *smallest = v;
+                    }
                 }
             });
         }
@@ -103,6 +127,57 @@ mod tests {
             let _ = take_f32(16);
             give_f32(vec![0.0; 16]);
             assert_eq!(held_f32(), 1, "after its first take the thread keeps");
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_take_no_kept_buffer_holds_leaves_the_kept_buffers_kept() {
+        std::thread::spawn(|| {
+            let mut kept = take_f32_cap(1_000);
+            kept.push(1.0);
+            give_f32(kept);
+            let large = take_f32_cap(2_000);
+            assert!(large.capacity() >= 2_000);
+            assert_eq!(held_f32(), 1, "the kept buffer waits for a take it holds");
+            let small = take_f32_cap(1_000);
+            assert_eq!(held_f32(), 0, "and serves it");
+            assert!(small.is_empty() && small.capacity() >= 1_000);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_take_gets_the_smallest_kept_buffer_that_holds_it() {
+        std::thread::spawn(|| {
+            for (first, second) in [(1_000, 3_000), (3_000, 1_000)] {
+                let (first, second) = (take_f32_cap(first), take_f32_cap(second));
+                give_f32(first);
+                give_f32(second);
+                let small = take_f32_cap(500);
+                assert!(small.capacity() < 3_000, "the large buffer is left");
+                let _large = take_f32_cap(2_000);
+                assert_eq!(held_f32(), 0, "for the large take, which it serves");
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_full_pool_gives_up_its_smallest_buffer_for_a_larger_one() {
+        std::thread::spawn(|| {
+            let buffers = [1_000, 2_000, 3_000, 500].map(take_f32_cap);
+            for buffer in buffers {
+                give_f32(buffer);
+            }
+            assert_eq!(held_f32(), MAX_THREAD_POOLED);
+            let _large = take_f32_cap(3_000);
+            assert_eq!(held_f32(), 1, "the largest buffer given back was kept");
+            let _middle = take_f32_cap(2_000);
+            assert_eq!(held_f32(), 0, "beside the next largest");
         })
         .join()
         .unwrap();
