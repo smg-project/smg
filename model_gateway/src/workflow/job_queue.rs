@@ -825,9 +825,13 @@ impl JobHost for AppContext {
                     };
                     let mut spec = WorkerSpec::new(url);
                     spec.worker_type = proto_worker_type;
-                    spec.api_key.clone_from(&api_key);
                     spec.bootstrap_port = bootstrap_port;
                     apply_startup_worker_config(&mut spec, router_config);
+                    // The runtime is stated by now. A worker that becomes a row
+                    // of the policy controller's store takes no key.
+                    if !context.registers_at_door(&spec) {
+                        spec.api_key.clone_from(&api_key);
+                    }
                     let config = spec;
 
                     let job = Job::AddWorker {
@@ -1686,6 +1690,72 @@ mod tests {
                  of five; the lines with a credential: {credentialed:#?}"
             ))
         });
+    }
+
+    /// A gateway that holds an API key and decides by the policy controller
+    /// still registers its start-up workers. Its start-up list states the
+    /// key on a provider's worker alone: a self-hosted worker becomes a row
+    /// of the store, and a row holds no credential yet. The start says so,
+    /// and the keyless registration ends with the worker's row ready. Under
+    /// the classic policies the list states the key on both.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn under_the_policy_controller_a_keyed_gateways_startup_worker_becomes_a_row() {
+        use smg_policy_controller::store::{WorkerStatus as RowStatus, WorkersStore};
+
+        let url = format!("http://{}", a_registering_engine().await);
+        let provider = "https://api.openai.com/v1".to_string();
+        let mut config = RouterConfig::builder()
+            .mode(RoutingMode::Regular {
+                worker_urls: vec![url.clone(), provider.clone()],
+            })
+            .api_key("gateway-key")
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+        let startup = |config: &RouterConfig| Job::InitializeWorkersFromConfig {
+            router_config: Box::new(config.clone()),
+        };
+        let stated = |job: &Job| match job {
+            Job::AddWorker { config, .. } => Some((config.url.clone(), config.api_key.clone())),
+            _ => None,
+        };
+        let key = Some("gateway-key".to_string());
+        let marks = DashSet::new();
+
+        let classic = create_test_app_context();
+        let (queue, mut next_job) = recording_for_tests(&classic);
+        classic.worker_job_queue.set(queue).unwrap();
+        execute_job(&startup(&config), &classic, &marks, None)
+            .await
+            .expect("the classic start-up list");
+        assert_eq!(stated(&next_job()), Some((url.clone(), key.clone())));
+        assert_eq!(stated(&next_job()), Some((provider.clone(), key.clone())));
+        assert!(!logs_contain("holds no worker credential yet"));
+
+        config.policy_controller = true;
+        let hosted = AppContext::from_config(config.clone(), 30, None, None)
+            .await
+            .expect("the context");
+        let hosted = Arc::new(hosted);
+        assert!(logs_contain("holds no worker credential yet"));
+        let (queue, mut next_job) = recording_for_tests(&hosted);
+        hosted.worker_job_queue.set(queue).unwrap();
+        execute_job(&startup(&config), &hosted, &marks, None)
+            .await
+            .expect("the start-up list");
+        let registration = next_job();
+        assert_eq!(stated(&registration), Some((url.clone(), None)));
+        assert_eq!(stated(&next_job()), Some((provider, key)));
+
+        let engines = WorkflowEngines::with_feed(&config, hosted.policy_feed.as_ref());
+        assert!(hosted.workflow_engines.set(engines).is_ok());
+        let done = execute_job(&registration, &hosted, &marks, None).await;
+        assert!(done.is_ok(), "{done:?}");
+        let store = hosted.policy_store.as_ref().expect("the store");
+        let row = store.by_key(&url).expect("the worker's row");
+        assert_eq!(row.status, RowStatus::Ready);
     }
 
     /// The registration workflows the store holds that have not ended.

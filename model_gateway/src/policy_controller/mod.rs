@@ -15,10 +15,9 @@
 //! refusing router under its usual id ([`undecided()`]) whenever the store
 //! started, with or without a controller's address. The routes that pick a
 //! worker by no routing policy serve as under the classic policies: a
-//! provider's router, a realtime session and a proxied GET. The gateway's
-//! workflows leave the feed's door unused, so without an address nothing
-//! feeds the store yet. With the setting off, the context holds neither the
-//! store, its feed nor its host.
+//! provider's router, a realtime session and a proxied GET. A local worker's
+//! registration writes its row at the feed's door. With the setting off, the
+//! context holds neither the store, its feed nor its host.
 //!
 //! One site reads the setting, [`start_with`]. Every other site asks what
 //! the start left in the context.

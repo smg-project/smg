@@ -2,6 +2,7 @@ mod check_local_worker;
 mod ensure_harmony_encoding;
 mod find_worker_to_update;
 mod rediscover_labels;
+mod refuse_worker_key;
 mod release_tokenizer;
 mod remove_from_policy_registry;
 mod submit_tokenizer_job;
@@ -19,6 +20,9 @@ pub use ensure_harmony_encoding::EnsureHarmonyEncodingStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;
 use openai_protocol::worker::WorkerUpdateRequest;
 pub use rediscover_labels::RediscoverLabelsStep;
+pub(crate) use refuse_worker_key::{
+    RefuseWorkerKeyStep, REFUSE_WORKER_KEY_STEP, WORKER_KEY_UNSUPPORTED,
+};
 pub use release_tokenizer::ReleaseTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
 use smg_worker::{

@@ -10,12 +10,13 @@ use wfaas::{EventSubscriber, InMemoryStore, WorkflowEngine};
 use super::{
     create_mcp_registration_workflow, create_tokenizer_registration_workflow,
     create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
-    create_worker_registration_workflow, create_worker_removal_workflow,
-    create_worker_update_workflow, McpWorkflowData, TokenizerWorkflowData,
-    WasmRegistrationWorkflowData, WasmRemovalWorkflowData, WorkerRemovalWorkflowData,
-    WorkerUpdateWorkflowData,
+    create_worker_removal_workflow, create_worker_update_workflow, steps::worker_registration_line,
+    McpWorkflowData, TokenizerWorkflowData, WasmRegistrationWorkflowData, WasmRemovalWorkflowData,
+    WorkerRemovalWorkflowData, WorkerUpdateWorkflowData,
 };
-use crate::{config::RouterConfig, workflow::data::WorkerWorkflowData};
+use crate::{
+    config::RouterConfig, policy_controller::feed::Feed, workflow::data::WorkerWorkflowData,
+};
 
 /// Retention for terminal workflow state after its last update. Waiters poll
 /// at sub-second cadence and observe a terminal state within seconds, so this
@@ -79,15 +80,22 @@ impl WorkflowEngines {
     /// Create and initialize all workflow engines with their workflow definitions.
     ///
     /// Must be called within a Tokio runtime: it spawns the periodic state sweepers.
+    pub fn new(router_config: &RouterConfig) -> Self {
+        Self::with_feed(router_config, None)
+    }
+
+    /// [`Self::new`], with the worker registration writing at the door of
+    /// `feed` where one stands: a local worker of such a gateway is a row
+    /// of the policy controller's store. Every other engine is the same.
     #[expect(
         clippy::expect_used,
         reason = "Workflow registration uses compile-time-known step/transition definitions that cannot fail at runtime — a failure here indicates a programming error in workflow construction"
     )]
-    pub fn new(router_config: &RouterConfig) -> Self {
+    pub(crate) fn with_feed(router_config: &RouterConfig, feed: Option<&Feed>) -> Self {
         // Create unified worker registration engine
         let worker_registration = WorkflowEngine::new();
         worker_registration
-            .register_workflow(create_worker_registration_workflow(router_config))
+            .register_workflow(worker_registration_line(router_config, feed))
             .expect("worker_registration workflow should be valid");
 
         // Create worker removal engine
