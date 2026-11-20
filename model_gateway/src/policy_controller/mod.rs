@@ -153,7 +153,9 @@ pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, S
 ///
 /// In a gateway of many routers the settings' own document may plan one
 /// family alone. One warning then names the family it leaves out and the
-/// setting that leaves it so ([`RouterConfig::family_left_out`]).
+/// setting that leaves it so ([`RouterConfig::family_left_out`]). A supplied
+/// document stands beside such settings where it is their own document, and
+/// the warning is as true there.
 pub(crate) fn start_with(
     config: &RouterConfig,
     stages: Option<Catalog>,
@@ -187,14 +189,9 @@ pub(crate) fn start_with(
     let written = serde_yaml::to_string(&document)?;
     let started = hosted(config, Some(stages), &written)?;
     info!("The policy controller is picked for this gateway");
-    // The settings' own document may plan one family of a gateway of many
-    // routers. No later refusal names the setting that left the other out.
-    let left_out = config
-        .policy_spec
-        .is_none()
-        .then(|| config.family_left_out())
-        .flatten();
-    if let Some((family, why)) = left_out {
+    // The routing settings may leave one family of a gateway of many
+    // routers without a plan. No later refusal names the setting.
+    if let Some((family, why)) = config.family_left_out() {
         warn!(
             "The policy document plans no {family}, so the policy controller places none of their requests: {why}"
         );

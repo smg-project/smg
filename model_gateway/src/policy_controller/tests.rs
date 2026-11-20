@@ -165,6 +165,22 @@ fn the_start_names_a_family_the_settings_document_leaves_out() -> Case {
     Ok(())
 }
 
+/// A supplied document that is the settings' own leaves the same family
+/// out, and the start says so beside it too.
+#[traced_test]
+#[test]
+fn the_start_names_the_family_beside_a_supplied_document_of_the_same_settings() -> Case {
+    let mut config = picked(RouterConfig::default());
+    config.enable_igw = true;
+    config.routing_key_override.enabled = true;
+    config.policy_spec = Some(config.policy_document()?);
+    start(&config)?.ok_or("the controller was not picked")?;
+    assert!(logs_contain(
+        "The policy document plans no prefill and decode pairs, so the policy controller places none of their requests: routing_key_override.enabled = true: "
+    ));
+    Ok(())
+}
+
 #[test]
 fn a_document_this_build_does_not_run_stops_the_start_by_its_name() -> Case {
     let mut policy = PolicyConfig::cache_aware(0.3, 64, 1.5, 120, 1 << 20);
