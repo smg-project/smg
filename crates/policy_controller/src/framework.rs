@@ -5574,8 +5574,12 @@ impl Engine {
         since_decision_micros: u32,
         present: impl Fn() -> bool,
     ) {
-        if !self.sent_credits.is_empty() {
-            self.credit_dispatch(lease, target, side, since_decision_micros, present);
+        match self.sent_credits.as_slice() {
+            [] => {}
+            // One count is the common document: its record runs in line
+            // behind the caller's telling.
+            [one] => one.dispatched(lease, target, side, since_decision_micros, present),
+            _ => self.credit_dispatch(lease, target, side, since_decision_micros, present),
         }
     }
 
