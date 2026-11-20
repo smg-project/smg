@@ -17,13 +17,15 @@
 //! # The block size
 //!
 //! A batch the store takes names the model's block size: the widest block
-//! its stores carry. The first stored block replaces a size a registration
-//! named, since the stream shows the engine's own block. After it a block
-//! only raises the size: an engine also publishes prefix entries narrower
-//! than its block, and a request hashed at their width would match no
-//! whole block. So a worker that states no size needs no other word. The
-//! adapter keeps the model each open row streams for and the size a stored
-//! block last named a model. The store keeps the size of record.
+//! of the stores the index takes from it. A store the index passes over
+//! says nothing of the block. The engine's word only rises: an engine also
+//! publishes prefix entries narrower than its block, and a request hashed
+//! at their width would match no whole block. The size of record is put to
+//! the engine's word wherever the two differ. So the first stored block
+//! replaces a size a registration named, and the next one puts back a size
+//! a registration raised behind it. A worker that states no size needs no
+//! other word. The adapter keeps the model each open row streams for and
+//! the engine's word for each model. The store keeps the size of record.
 //!
 //! # Limits
 //!
@@ -79,8 +81,8 @@ pub struct KvAdapter<S: ?Sized> {
 struct Sizes {
     /// The model each open row streams for.
     models: HashMap<WorkerId, Arc<str>>,
-    /// The size a stored block last named a model. While it is the size of
-    /// record, the record is the engine's own word and only rises.
+    /// The widest block a model's stored blocks named: the engine's word,
+    /// which only rises.
     named: HashMap<Arc<str>, u32>,
 }
 
@@ -99,9 +101,9 @@ impl<S> KvAdapter<S>
 where
     S: store::KvEventSink<Batch = [KvEvent]> + ?Sized,
 {
-    /// A stored block of `id`'s stream is `size` tokens wide: the block size
-    /// of record of the model the row streams for, by the module's rule. A
-    /// row no feed was opened for names no model.
+    /// A store the index took from `id`'s stream is `size` tokens wide: what
+    /// it says of the block size of the model the row streams for, by the
+    /// module's rule. A row no feed was opened for names no model.
     fn learn(&self, id: WorkerId, size: u32) {
         // Held through the store's calls: two rows of one model learn in turn.
         let mut sizes = self.sizes.lock();
@@ -109,27 +111,27 @@ where
         let Some(model) = models.get(&id) else {
             return;
         };
+        let last = named.get(model).copied();
+        let word = last.map_or(size, |last| last.max(size));
         let of_record = self.store.block_size(model);
-        let engines_own = of_record.is_some() && named.get(model).copied() == of_record;
-        if engines_own && of_record.is_some_and(|of_record| size <= of_record) {
-            return;
-        }
-        // The store's setter only raises, so a wider size that no stored
-        // block named goes first. A request hashed between the two calls
-        // reads no size and states no hash.
-        if of_record.is_some_and(|of_record| of_record > size) {
-            self.store.forget_block_size(model);
-        }
-        self.store.set_block_size(model, size);
-        if of_record != Some(size) {
+        if of_record != Some(word) {
+            // The store's setter only raises, so a wider size that no stored
+            // block named goes first. A request hashed between the two calls
+            // reads no size and states no hash.
+            if of_record.is_some_and(|of_record| of_record > word) {
+                self.store.forget_block_size(model);
+            }
+            self.store.set_block_size(model, word);
             tracing::info!(
                 model = %model,
-                block_size = size,
+                block_size = word,
                 previous = ?of_record,
                 "learned a model's block size from a stored block"
             );
         }
-        named.insert(Arc::clone(model), size);
+        if last != Some(word) {
+            named.insert(Arc::clone(model), word);
+        }
     }
 }
 
@@ -152,7 +154,7 @@ where
         // shows nothing.
         let shown = self.rows.lock().get(&id).cloned().unwrap_or_default();
         let mut groups = shown.clone();
-        let (restarted, mut events) = events(batch, &mut groups);
+        let (restarted, mut events, width) = events(batch, &mut groups);
         // The store reads a clear among a batch's events as the header's
         // fact: the engine's own clear, which makes a batch at or under the
         // row's cursor a restarted publisher. The header counts an unowned
@@ -196,7 +198,7 @@ where
                 if groups != shown {
                     self.rows.lock().insert(id, groups);
                 }
-                if let Some(width) = widest_store(batch) {
+                if let Some(width) = width {
                     self.learn(id, width);
                 }
                 BatchOutcome::Applied
@@ -247,28 +249,17 @@ where
     }
 }
 
-/// The widest block a batch's stores name, when one names any: what the
-/// batch says of the model's block size.
-fn widest_store(batch: &KvEventBatch) -> Option<u32> {
-    batch
-        .events
-        .iter()
-        .filter_map(|event| match &event.data {
-            Some(Data::Stored(stored)) => store_width(stored),
-            _ => None,
-        })
-        .max()
-}
-
 /// Decode the events the store can index against what the row's stream
 /// showed of its groups, as the gateway's index applies a batch: what the
 /// batch's stores show is read ahead of its events, and the stores of groups
 /// other than main attention come last. `true` with the events when the
 /// batch restarts the worker: the index is to let the main signal's blocks
-/// go ahead of them.
-fn events(batch: &KvEventBatch, groups: &mut GroupsShown) -> (bool, Vec<KvEvent>) {
+/// go ahead of them. Last, the widest block the stores among the events
+/// name: what the batch says of the model's block size.
+fn events(batch: &KvEventBatch, groups: &mut GroupsShown) -> (bool, Vec<KvEvent>, Option<u32>) {
     let (restarted, _) = groups.show_batch(&batch.events);
     let mut events = Vec::with_capacity(batch.events.len() + 1);
+    let mut width = None;
     let mut deferred = Vec::new();
     for data in batch.events.iter().filter_map(|event| event.data.as_ref()) {
         if matches!(data, Data::Stored(stored) if groups.is_group_store(stored)) {
@@ -276,15 +267,25 @@ fn events(batch: &KvEventBatch, groups: &mut GroupsShown) -> (bool, Vec<KvEvent>
             continue;
         }
         if let Some(event) = decode(data, groups) {
+            width = width.max(width_of(data));
             events.push(event);
         }
     }
     for data in deferred {
         if let Some(event) = decode(data, groups) {
+            width = width.max(width_of(data));
             events.push(event);
         }
     }
-    (restarted.is_some(), events)
+    (restarted.is_some(), events, width)
+}
+
+/// The width a wire store names, and none for any other event.
+fn width_of(data: &Data) -> Option<u32> {
+    match data {
+        Data::Stored(stored) => store_width(stored),
+        Data::Removed(_) | Data::Cleared(_) => None,
+    }
 }
 
 /// One wire event as the store's, `None` for one that is not the index's.
@@ -1520,15 +1521,20 @@ mod tests {
         (host, sink)
     }
 
-    /// One store of one block `block_size` tokens wide, alone in its batch.
-    fn wide(hash: i64, block_size: i32) -> KvEventBatch {
-        batch([Data::Stored(KvBlocksStored {
+    /// One store of one block `block_size` tokens wide.
+    fn wide_store(hash: i64, block_size: i32) -> KvBlocksStored {
+        KvBlocksStored {
             blocks: vec![KvBlock {
                 block_size,
                 ..block(hash, &tokens_of(hash))
             }],
             ..KvBlocksStored::default()
-        })])
+        }
+    }
+
+    /// One store of one block `block_size` tokens wide, alone in its batch.
+    fn wide(hash: i64, block_size: i32) -> KvEventBatch {
+        batch([Data::Stored(wide_store(hash, block_size))])
     }
 
     /// A batch the store takes names the model's block size, whatever the
@@ -1563,9 +1569,25 @@ mod tests {
         }
     }
 
+    /// A store the index passes over names no size. One on a tier the index
+    /// does not track is wider than the engine's block here, and the size of
+    /// record stays the indexed store's.
+    #[test]
+    fn a_store_the_index_passes_over_names_no_block_size() {
+        let f = Fixture::single(None);
+        let (_host, sink) = opened(&f);
+        let passed_over = KvBlocksStored {
+            tier: Some(KvCacheTier::Disk as i32),
+            ..wide_store(2, 64)
+        };
+        let both = batch([Data::Stored(wide_store(1, 16)), Data::Stored(passed_over)]);
+        assert_eq!(sink.admit(f.row, 0, facts(1), &both), BatchOutcome::Applied);
+        assert_eq!(f.store.block_size(MODEL), Some(16));
+    }
+
     /// A registration that names a wider size behind a stored block is put
-    /// right by the next stored block, and a model that left learns its size
-    /// anew.
+    /// right by the next stored block, a prefix entry too: the engine's word
+    /// only rises. A model that left learns its size anew.
     #[test]
     fn a_stored_block_keeps_the_size_of_record_the_engines_own() {
         let f = Fixture::single(None);
@@ -1592,6 +1614,10 @@ mod tests {
         assert_eq!(stored(16), Some(16));
         // A wider block raises it.
         assert_eq!(stored(32), Some(32));
+        // A prefix entry behind a wider registration puts the engine's block
+        // back, not its own width.
+        f.store.set_block_size(MODEL, 64);
+        assert_eq!(stored(8), Some(32));
     }
 
     #[test]
