@@ -30,6 +30,7 @@ use smg_worker::{
     identity::basic::Worker,
     load::port::{LoadSink, PollMode, PolledMember},
     registry::event::WorkerEvent,
+    runtime::StallReason,
     worker::{SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus},
 };
 use tokio::{task::yield_now, time::sleep_until};
@@ -291,6 +292,42 @@ fn a_rows_object_takes_no_step_of_the_registrys_own() {
             new: WorkerStatus::Ready
         }
     );
+}
+
+/// Whether the next decision reads the pool's worker as stalled.
+fn stalled(store: &MemoryStore) -> bool {
+    let ask = ViewAsk {
+        gateway: GatewayId::LOCAL,
+        now: Instant::now(),
+        pinned: None,
+        affinity: false,
+    };
+    store.deciding(|world| {
+        let mut view = ViewBuffers::default();
+        let built = world.build(MODEL, Role::Single, &ask, &mut view).is_some();
+        built && view.candidates.iter().any(|row| row.health.stalled)
+    })
+}
+
+/// The health loop tells the feed's sink each move of a worker's liveness
+/// veto. The adapter writes it as the row's stalled bit, and the next
+/// decision reads it there.
+#[test]
+fn a_move_of_a_rows_liveness_veto_is_written_on_the_row() {
+    let store = start_store().expect("the store starts");
+    let (registry, feed) = bed(&store);
+    let row = register(&*feed.door).expect("the worker registers");
+    let object = feed.objects.object(row).expect("the row has an object");
+    let worker = registry.get(&object).expect("the worker stands");
+    let sink = feed.health_sink();
+    assert!(!stalled(&store));
+
+    assert!(worker.set_stall(Some(StallReason::Unreachable)));
+    sink.liveness_moved(&object, worker.revision());
+    assert!(stalled(&store));
+    assert!(worker.set_stall(None));
+    sink.liveness_moved(&object, worker.revision());
+    assert!(!stalled(&store));
 }
 
 #[test]

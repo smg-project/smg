@@ -220,6 +220,7 @@ impl LoadSink for FeedLoads {
 }
 
 /// The adapter writes a row's health and mirrors its status on the worker.
+/// It writes a move of the worker's liveness veto as the row's stalled bit.
 /// The registry writes the health of workers without a row.
 /// The adapter answers stale for those workers, so it cannot promote them.
 struct FeedHealth {
@@ -256,6 +257,10 @@ impl HealthSink for FeedHealth {
         revision: u64,
     ) -> Option<(WorkerStatus, WorkerStatus)> {
         self.sink(worker_id).connected(worker_id, revision)
+    }
+
+    fn liveness_moved(&self, worker_id: &WorkerId, revision: u64) {
+        self.sink(worker_id).liveness_moved(worker_id, revision);
     }
 }
 

@@ -2881,7 +2881,7 @@ pub(crate) mod tests {
         builtins::{Best, Random},
         catalog::Catalog,
         decider::Decider,
-        decision::{Decision, ShedReason, Target, Targets},
+        decision::{Decision, Lifted, ShedReason, Target, Targets},
         demands::{DemandFacts, Demands},
         framework::{DecisionScope, EncodeItems, EncodePlaced, Picker, TieBand},
         lease::{Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
@@ -2889,9 +2889,9 @@ pub(crate) mod tests {
         spec::{AppliedSpec, Needs, PolicySpec},
         store::{
             Ask, DecodeMark, DecodeRefused, Dispatch, EncodeHandoff, EncodeOffer, GatewayId,
-            HealthSink, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore,
-            Picked, Said, SessionsStore, VetoWrite, ViewBuffers, WorkerFacts, WorkerStatus,
-            WorkersStore,
+            HealthSink, HealthWrite, LeaderBits, LeaseRecord, LeaseState, LeasesStore, LoadSink,
+            LoadSource, MemoryStore, Picked, Said, SessionsStore, VetoWrite, ViewBuffers,
+            WorkerFacts, WorkerStatus, WorkersStore,
         },
         view::{
             Candidate, Constraints, Identity, KeyedRow, LoadRow, Phase, PoolFacts, RequestFacts,
@@ -5241,6 +5241,59 @@ pub(crate) mod tests {
         facts.truncate(1);
         narrow_demanded(&mut view, &mut facts, None, None, Demands { runtime: 7 });
         assert_eq!(read(&view, &facts), (vec![(10, 0)], vec![100], vec![7]));
+    }
+
+    /// The leader's doubt of a worker reaches the door's decision as a
+    /// gateway's own doubt does, for every gateway of the store. A doubted
+    /// member beside sound ones is passed over. A pool doubted on every
+    /// member is steered with the doubt lifted, and the trace says so: a
+    /// doubt is not an outage.
+    #[test]
+    fn the_leaders_doubt_of_a_worker_reaches_the_doors_decision() {
+        let store = fleet(1);
+        let door = Door::new(Arc::clone(&store));
+        let now = Instant::now();
+        let members: Vec<WorkerId> = booked(&store, Role::Single)
+            .iter()
+            .map(|&(id, _)| id)
+            .collect();
+        let doubt = |member: WorkerId, stalled: bool| {
+            let row = WorkersStore::get(&*store, member).expect("the member's row");
+            let bits = LeaderBits { stalled };
+            let written = store.leader_bits(member, row.revision, bits, &|| true);
+            assert!(matches!(written, HealthWrite::Stood(_)), "{written:?}");
+        };
+        let decide = |id: &[u8], seed: u64| {
+            let decided = door.decide(GATEWAY, &request(id, seed), now);
+            decided.expect("a decision").decision
+        };
+
+        // One doubted member beside two sound ones: no seed picks it, and
+        // no veto is lifted.
+        doubt(members[0], true);
+        for seed in 0..32_u64 {
+            let decision = decide(&seed.to_be_bytes(), seed);
+            let pick = decision.pick().expect("two sound members stand");
+            let first = pick.targets.first().map(|target| target.id);
+            assert_ne!(first, Some(members[0]));
+            assert_eq!(pick.trace.lifted, Lifted::None);
+        }
+
+        // The pool doubted whole: steered, with the doubt lifted.
+        doubt(members[1], true);
+        doubt(members[2], true);
+        let decision = decide(b"whole", 7);
+        let pick = decision.pick().expect("a doubt is not an outage");
+        assert_eq!(pick.trace.lifted, Lifted::Liveness);
+
+        // The doubt cleared on one member: it takes the request, and no
+        // veto is lifted.
+        doubt(members[1], false);
+        let decision = decide(b"cleared", 7);
+        let pick = decision.pick().expect("a sound member stands");
+        let first = pick.targets.first().map(|target| target.id);
+        assert_eq!(first, Some(members[1]));
+        assert_eq!(pick.trace.lifted, Lifted::None);
     }
 
     /// In process no election hands a term over: the door starts a store

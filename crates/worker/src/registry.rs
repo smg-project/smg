@@ -33,7 +33,7 @@ use crate::{
     metrics::writers::Metrics,
     metrics_labels,
     model_card::ModelCard,
-    registry::event::{WorkerConnected, WorkerEvent},
+    registry::event::{WorkerEvent, WorkerSignal},
     settings::RetryConfig,
     worker::WorkerStatus,
     UNKNOWN_MODEL_ID,
@@ -266,10 +266,11 @@ pub struct WorkerRegistry<G> {
     event_tx: broadcast::Sender<WorkerEvent>,
 
     /// Sender handed to workers so a completed backend connection can wake
-    /// the manager for immediate promotion (see [`WorkerConnected`]). Lives
-    /// on the registry because workers are built before the manager starts,
-    /// and dynamically-registered workers need it long after.
-    connect_signal_tx: mpsc::UnboundedSender<WorkerConnected>,
+    /// the manager for immediate promotion, and a move of the liveness veto
+    /// reaches the health sink (see [`WorkerSignal`]). Lives on the registry
+    /// because workers are built before the manager starts, and
+    /// dynamically-registered workers need it long after.
+    connect_signal_tx: mpsc::UnboundedSender<WorkerSignal>,
 
     /// Receiver drained by the manager's health loop. One loop holds it at
     /// a time: [`Self::take_connect_signal_receiver`] hands it out, and the
@@ -277,7 +278,7 @@ pub struct WorkerRegistry<G> {
     /// ([`Self::return_connect_signal_receiver`]). It waits here while no
     /// loop runs: health checks globally disabled, or between two loops of
     /// a host that starts one for each term of its lead.
-    connect_signal_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<WorkerConnected>>>,
+    connect_signal_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<WorkerSignal>>>,
 
     /// Wakes a loop that started while another held the receiver: told each
     /// time the receiver comes back.
@@ -398,17 +399,22 @@ impl<G: Generation> WorkerRegistry<G> {
         self.event_tx.subscribe()
     }
 
-    /// Clone the connect-signal sender for a worker to fire once its backend
-    /// connection completes. See [`WorkerConnected`]. Holds no locks.
-    pub fn connect_signal_sender(&self) -> mpsc::UnboundedSender<WorkerConnected> {
+    /// Clone the signal sender for a worker. It says there that its backend
+    /// connection completed, and that its liveness veto moved. See
+    /// [`WorkerSignal`]. Holds no locks.
+    pub fn connect_signal_sender(&self) -> mpsc::UnboundedSender<WorkerSignal> {
         self.connect_signal_tx.clone()
     }
 
     /// Take the connect-signal receiver: `Some` for the one loop that holds
-    /// it, `None` while another does. A loop hands it back at its end, and
-    /// the next take gets it with every signal sent meanwhile. Holds the
-    /// receiver lock briefly.
-    pub fn take_connect_signal_receiver(&self) -> Option<mpsc::UnboundedReceiver<WorkerConnected>> {
+    /// it, `None` while another does. A loop hands it back at its end
+    /// ([`Self::return_connect_signal_receiver`]), and the next take gets it
+    /// with every signal sent meanwhile. The take is the crate's, as the
+    /// hand-back is: a taker that could not hand it back would leave every
+    /// later loop without signals. Holds the receiver lock briefly.
+    pub(crate) fn take_connect_signal_receiver(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<WorkerSignal>> {
         self.connect_signal_rx.lock().take()
     }
 
@@ -418,7 +424,7 @@ impl<G: Generation> WorkerRegistry<G> {
     /// briefly.
     pub(crate) fn return_connect_signal_receiver(
         &self,
-        receiver: mpsc::UnboundedReceiver<WorkerConnected>,
+        receiver: mpsc::UnboundedReceiver<WorkerSignal>,
     ) {
         *self.connect_signal_rx.lock() = Some(receiver);
         self.connect_signal_home.notify_one();
@@ -434,7 +440,7 @@ impl<G: Generation> WorkerRegistry<G> {
 
     /// True if any registered worker is Pending and depends on the connect
     /// signal (rather than health polling) to reach Ready. Such a worker is
-    /// promoted only by the manager consuming [`WorkerConnected`], so the
+    /// promoted only by the manager consuming [`WorkerSignal::Connected`], so the
     /// manager must run even when health checks are otherwise disabled.
     pub fn has_workers_awaiting_connect_signal(&self) -> bool {
         self.get_by_connection(ConnectionMode::Zmq)
