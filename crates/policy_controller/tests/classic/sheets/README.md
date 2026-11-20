@@ -31,6 +31,13 @@ Two sheets record a rank of one worker and no worker: `minimum_tokens.json` hold
 minimum-tokens policy gives each request after each thing its rank cache is handed about the worker, and
 `sticky_rank.json` holds the rank the gateway pins each request of one grouped worker to by its sticky key.
 
+Five sheets record no policy: each holds one of the gateway's hard demands, what a request must have of the worker
+that takes it, kept before any policy runs. `retry_wire.json` holds the runtime and the transport a retry stays on,
+`media_refs.json` where a request's forwarded media references and its pixel media may go, `context_window.json`
+the two bounds a worker's context window puts on a request, `constraint_decider.json` the workers a retry may take
+once the request's constraint was decided on its first worker, and `rank_pin.json` the workers a route that pins no
+data-parallel rank leaves out. Each also holds the gateway's refusal where a demand leaves the pool nobody.
+
 ```
 crates/policy_controller/tests/classic/sheets/
   power_of_two.json        one sheet per policy: its recorded rows
@@ -46,6 +53,11 @@ crates/policy_controller/tests/classic/sheets/
   sticky_rank.json
   cache_aware.json
   sticky_override.json
+  retry_wire.json          one sheet per hard demand of a request
+  media_refs.json
+  context_window.json
+  constraint_decider.json
+  rank_pin.json
 model_gateway/src/         the gateway's recorders, each a test module beside the code it runs
   policies/classic_rows.rs                                                  power_of_two.json
   policies/classic_manual_rows.rs                                           manual.json
@@ -246,6 +258,23 @@ pool, which is the pool's order and no rule of the policy.
   `key-0` upward: a pairs row (`pairs` true) asks each twice and counts the keys whose two requests took one rank,
   then the others, and a spread row counts what each rank took, the largest count first. Nothing in a row draws:
   a key's rank is its hash, and the recorder runs each row twice and stops if the two runs differ.
+- **demand row of the five demand sheets:** a pool of regular workers under `round_robin`, whether a pool over on
+  every worker is shed (`shed`), and a list of requests. A worker has its `state` (`free`, `over` or `down`) and, on
+  the four sheets of the gRPC pipeline, its `runtime` and its `transport` (`grpc` or `zmq`). Each sheet adds the
+  registration's own words for its demand and, beside them, what the gateway reads of those words. On
+  `media_refs.json`: the `mm_processor` label and a `supports_vision` label of `false`, then
+  `processes_references`, `gateway_pipeline` and `vision`. On `context_window.json`: the `window` the model card
+  states, absent where it states none. On `constraint_decider.json`: the three decoding labels, then `policy`,
+  `whole_turn` and `vocabulary`. On `rank_pin.json`: the `dp_rank` and `dp_size` of a registration that names a
+  rank, then `rank_registered`. A request states its demands, each absent where it has none: the `wire` of a
+  retry (a runtime and a transport), `references` with the pipeline pin of its plan (`any`, `only` the gateway's
+  own pipeline, `never` it), `pixels`, `input_tokens` with `scoring_position` and `output_tokens`, and
+  `decided_on`, the place of the worker the first attempt's constraint was decided on. A row of `rank_pin.json`
+  lists no request: its one answer is a transcription's. The recorder places a request sixteen times the pool's size,
+  so the rotation walks every worker the demands leave it. An answer is `placed`, the places of those workers in
+  the row's list, or `refused`: the response's `status`, its `code`, whether it carries `retry_after`, and its
+  `message`. Nothing draws: the recorder runs each row twenty times, each time from a fresh pool and a fresh
+  policy, and stops if two runs differ.
 
 The rows of `sticky_override.json` are sequence rows and four drawn rows in the manual sheet's shape, taken through
 the routing-key override: the policy registry's own selection with the override on. A row names the policy under
@@ -331,7 +360,10 @@ the window are the policy's private state, and a module beside the policy's coul
 The minimum-tokens sheet's recorder is a child of the load monitor too: each step reaches the rank cache by the
 recorder's own repeat of the hand-over the monitor's poll loop makes, and each request asks the cache's select,
 which the policy forwards to. The sticky rank sheet's recorder is a child of the stage that sends a request to its
-worker, and calls the stage's own pin.
+worker, and calls the stage's own pin. The four demand sheets of the gRPC pipeline share one recorder, a child of the
+worker selection stage: it calls the two functions a first attempt and a retry both call for a single worker, the
+selection and the refusal where it names nobody, and writes one sheet a demand. The rank sheet's recorder is a
+child of the HTTP router and calls the transcription route's own selection.
 
 A sheet is never edited by hand. A new recording replaces the whole sheet and its row in the table above, in one
 pull request that names the commit and says which rows moved: a sequence row moves only when the policy's
@@ -413,3 +445,12 @@ fails once the reason no longer holds.
   here is not its rank there: a row of steps replays when the requests of one key share one rank and a request
   with no rank there has none here. The other four rows replay so, the pairs row count for count and the spread
   row share for share.
+- `retry_wire.json`: every row replays. A worker states its runtime as a number of its registering host's, and
+  a retry demands the number of its plan's runtime, so the replay numbers a row's runtimes itself, one a
+  spelling. A refusal replays by its `status` and its `code`. The crate sheds under a reason and a stage's
+  name, and the replay keeps the gateway's words for each: a model no worker serves and a wire no worker is on
+  are no model, a pool over its thresholds on every worker of the wire is overloaded where shedding is on, and
+  any other pool left nobody is unavailable. The `message` and `retry_after` are no part of a decision.
+- `media_refs.json`, `context_window.json`, `constraint_decider.json`, `rank_pin.json`: owed whole. Of a
+  request's hard demands the crate keeps the wire of a retry alone yet, so no module replays these sheets, and
+  the replay names each as owed until the change that keeps its demand brings its module.
