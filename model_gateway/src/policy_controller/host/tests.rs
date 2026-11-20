@@ -508,32 +508,25 @@ bindings:
 
 #[test]
 fn only_a_shed_ahead_of_every_profile_names_no_profile() {
-    let shed = |reason, emptied_by| {
+    let shed = |profile, emptied_by| {
         Decision::Shed(Shed {
-            reason,
+            reason: ShedReason::PolicyDeclined,
             emptied_by,
             retry_after_secs: 1,
             wait_allowed: false,
             trace: Trace {
-                profile: 3,
+                profile,
                 ..Trace::default()
             },
         })
     };
-    for (reason, stage) in [
-        (ShedReason::PolicyDeclined, "binding"),
-        (ShedReason::PolicyDeclined, "affinity-column"),
-        (ShedReason::PolicyDeclined, "written-rows"),
-        (ShedReason::NoEndpoints, "wires"),
-        (ShedReason::NoEndpoints, "subset-hint"),
-    ] {
-        assert_eq!(profile_of(&shed(reason, stage)), None, "{stage}");
+    // The trace's mark decides, and a stage's word decides nothing: rows
+    // not written decline under their profile, and so does a plugin stage
+    // that carries the word of a shed the engine makes ahead of a profile.
+    for stage in ["written-rows", "binding", "random"] {
+        assert_eq!(profile_of(&shed(3, stage)), Some(3), "{stage}");
+        assert_eq!(profile_of(&shed(Trace::NO_PROFILE, stage)), None, "{stage}");
     }
-    // A profile's own stage that declines, and a pool a filter emptied.
-    let by_a_picker = shed(ShedReason::PolicyDeclined, "random");
-    assert_eq!(profile_of(&by_a_picker), Some(3));
-    let emptied = shed(ShedReason::NoEndpoints, "healthy");
-    assert_eq!(profile_of(&emptied), Some(3));
 }
 
 #[test]
