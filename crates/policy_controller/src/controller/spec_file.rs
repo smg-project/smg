@@ -33,11 +33,11 @@
 //! followed, and a take runs the file only where it holds the newer word.
 //!
 //! A file is read whole or not at all, at the start and under the watch: its
-//! identity is looked at before and after the read, and what a read gave
-//! while the file moved, bytes or an error, is no state of the file: a
-//! mount's rotation takes a version's directory from under an open. The
-//! start reads such a file again, and the watch reads it once it stood
-//! still.
+//! identity is looked at before and after the read, and the opened file's
+//! identity is checked before and after its bytes. What a read gave while
+//! the file moved, bytes or an error, is no state of the file: a mount's
+//! rotation takes a version's directory from under an open. The start reads
+//! such a file again, and the watch reads it once it stood still.
 //!
 //! Limit. An identity is the file system's word: an edit in place that keeps
 //! the file's size, made within the timestamp grain of the last look, is
@@ -107,25 +107,31 @@ fn look(path: &Path) -> Seen {
 fn identity(path: &Path) -> io::Result<Identity> {
     let resolved = fs::canonicalize(path)?;
     let metadata = fs::metadata(&resolved)?;
-    // A pipe, a device or a directory is refused here, unopened. The read
-    // asks the opened file again: the name may turn between the two.
-    if !metadata.is_file() {
-        return Err(io::Error::other(NOT_A_FILE));
+    Identity::from_metadata(resolved, &metadata)
+}
+
+impl Identity {
+    fn from_metadata(resolved: PathBuf, metadata: &fs::Metadata) -> io::Result<Self> {
+        // A pipe, a device or a directory is no regular-file identity. This
+        // is checked both for a path look and for an opened descriptor.
+        if !metadata.is_file() {
+            return Err(io::Error::other(NOT_A_FILE));
+        }
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            inode: {
+                use std::os::unix::fs::MetadataExt;
+                Inode {
+                    device: metadata.dev(),
+                    number: metadata.ino(),
+                    changed: (metadata.ctime(), metadata.ctime_nsec()),
+                }
+            },
+            resolved,
+        })
     }
-    Ok(Identity {
-        len: metadata.len(),
-        modified: metadata.modified().ok(),
-        #[cfg(unix)]
-        inode: {
-            use std::os::unix::fs::MetadataExt;
-            Inode {
-                device: metadata.dev(),
-                number: metadata.ino(),
-                changed: (metadata.ctime(), metadata.ctime_nsec()),
-            }
-        },
-        resolved,
-    })
 }
 
 /// Opens the file without waiting, and never as the process's controlling
@@ -140,38 +146,67 @@ fn open(path: &Path) -> io::Result<fs::File> {
     Ok(opened.into())
 }
 
-/// Opens a regular file for a read without waiting ([`open`]) and refuses
-/// what is none by its kind, unread: a read of a pipe or of a terminal's
-/// device waits on a writer. The opened file states the kind, not its path.
-pub(super) fn open_regular(path: &Path) -> io::Result<fs::File> {
-    let file = open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::other(NOT_A_FILE));
-    }
-    Ok(file)
+/// The file's bytes, whole, when its opened descriptor was the looked file
+/// and kept that identity through the read, and `None` where it was not: a
+/// file that moved. A file over the bound is refused by its size, unread. A
+/// descriptor that is no regular file is no looked file, so it is `None`,
+/// unread: a read of a pipe or of a terminal's device waits on a writer.
+fn read(identity: &Identity) -> Option<Result<Vec<u8>, SpecRejected>> {
+    read_with(identity, fs::File::metadata, read_to_bound)
 }
 
-/// The file's bytes, whole. A file over the bound is refused by its size,
-/// unread, and one that is no regular file by its kind, unread: a read of a
-/// pipe or of a terminal's device waits on a writer.
-fn read(identity: &Identity) -> Result<Vec<u8>, SpecRejected> {
+/// [`read`] with descriptor operations as arguments, so cases can observe a
+/// byte read and make descriptor metadata fail.
+fn read_with(
+    identity: &Identity,
+    mut metadata: impl FnMut(&fs::File) -> io::Result<fs::Metadata>,
+    read_bytes: impl FnOnce(&fs::File, &mut Vec<u8>) -> io::Result<usize>,
+) -> Option<Result<Vec<u8>, SpecRejected>> {
     if identity.len > MAX_DOCUMENT_BYTES {
-        return Err(SpecRejected::TooLarge(identity.len));
+        return Some(Err(SpecRejected::TooLarge(identity.len)));
     }
     let unreadable = |error: io::Error| SpecRejected::Unreadable(error.to_string());
     // The opened file has the word, not the path a look found: the name may
     // have turned between the two.
-    let file = open_regular(&identity.resolved).map_err(unreadable)?;
+    let file = match open(&identity.resolved) {
+        Ok(file) => file,
+        Err(error) => {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) {
+                return None;
+            }
+            return Some(Err(unreadable(error)));
+        }
+    };
+    let before = match metadata(&file) {
+        Ok(metadata) => metadata,
+        Err(error) => return Some(Err(unreadable(error))),
+    };
+    let opened = Identity::from_metadata(identity.resolved.clone(), &before).ok()?;
+    if opened != *identity {
+        return None;
+    }
     let mut bytes = Vec::with_capacity(usize::try_from(identity.len).unwrap_or(0));
     // One byte past the bound and no more. A file that grew since the look
     // is another file at the look after the read. A file whose size a look
     // cannot read (one the kernel writes as it is read) and that streams
     // past the bound hands the door one byte over it and is refused by its
     // size, never cut to a prefix that may parse.
-    file.take(MAX_DOCUMENT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(unreadable)?;
-    Ok(bytes)
+    let document = read_bytes(&file, &mut bytes)
+        .map(|_| bytes)
+        .map_err(unreadable);
+    let after = match metadata(&file) {
+        Ok(metadata) => metadata,
+        Err(error) => return Some(Err(unreadable(error))),
+    };
+    let after = Identity::from_metadata(identity.resolved.clone(), &after).ok()?;
+    (after == opened).then_some(document)
+}
+
+fn read_to_bound(file: &fs::File, bytes: &mut Vec<u8>) -> io::Result<usize> {
+    file.take(MAX_DOCUMENT_BYTES + 1).read_to_end(bytes)
 }
 
 /// What one look of the watch did.
@@ -251,7 +286,7 @@ impl SpecFile {
         path: PathBuf,
         generations: Arc<Generations>,
     ) -> Result<Self, SpecRejected> {
-        Self::start_by(path, generations, look, Generations::defer)
+        Self::start_by(path, generations, look, read, Generations::defer)
     }
 
     /// [`SpecFile::start`] with the look as its argument: the identity is
@@ -262,8 +297,18 @@ impl SpecFile {
         generations: Arc<Generations>,
         look: impl FnMut(&Path) -> Seen,
     ) -> Result<Self, SpecRejected> {
+        Self::start_reading(path, generations, look, read)
+    }
+
+    /// [`SpecFile::start_looking`] with the descriptor read as its argument.
+    fn start_reading(
+        path: PathBuf,
+        generations: Arc<Generations>,
+        look: impl FnMut(&Path) -> Seen,
+        read: impl FnMut(&Identity) -> Option<Result<Vec<u8>, SpecRejected>>,
+    ) -> Result<Self, SpecRejected> {
         let apply = |door: &Generations, document, format| door.apply(document, format).map(drop);
-        Self::start_by(path, generations, look, apply)
+        Self::start_by(path, generations, look, read, apply)
     }
 
     /// The start's read, and the document handed to the door by `hand`: an
@@ -272,6 +317,7 @@ impl SpecFile {
         path: PathBuf,
         generations: Arc<Generations>,
         mut look: impl FnMut(&Path) -> Seen,
+        mut read: impl FnMut(&Identity) -> Option<Result<Vec<u8>, SpecRejected>>,
         hand: impl FnOnce(&Generations, Vec<u8>, Format) -> Result<(), SpecRejected>,
     ) -> Result<Self, SpecRejected> {
         let format = Format::of(&path);
@@ -283,7 +329,10 @@ impl SpecFile {
             let found = look(&path);
             let document = match &found {
                 Seen::File(identity) => read(identity),
-                Seen::Unreadable(error) => Err(SpecRejected::Unreadable(error.clone())),
+                Seen::Unreadable(error) => Some(Err(SpecRejected::Unreadable(error.clone()))),
+            };
+            let Some(document) = document else {
+                continue;
             };
             if look(&path) == found {
                 hand(&generations, document?, format)?;
@@ -318,6 +367,15 @@ impl SpecFile {
     /// case hands in a file that moves under its read. No clock is read:
     /// "stood still for one poll" is two looks in a row that agree.
     fn poll_looking(&mut self, mut look: impl FnMut(&Path) -> Seen) -> Look {
+        self.poll_reading(&mut look, read)
+    }
+
+    /// [`SpecFile::poll_looking`] with the descriptor read as its argument.
+    fn poll_reading(
+        &mut self,
+        mut look: impl FnMut(&Path) -> Seen,
+        mut read: impl FnMut(&Identity) -> Option<Result<Vec<u8>, SpecRejected>>,
+    ) -> Look {
         // The lead this look's bytes are read under: the door applies them
         // while its fence shows that term, and under no other. The start's
         // document, where it still waits for the replica's first lead, goes
@@ -345,7 +403,9 @@ impl SpecFile {
         let document = match &now {
             Seen::Unreadable(error) => Err(SpecRejected::Unreadable(error.clone())),
             Seen::File(identity) => {
-                let document = read(identity);
+                let Some(document) = read(identity) else {
+                    return self.settling(lead.is_some());
+                };
                 let after = look(&self.path);
                 if after != now {
                     // It moved under the read: what the read gave, bytes or
@@ -594,6 +654,23 @@ pub(crate) mod tests {
         }
     }
 
+    /// Reads through the descriptor seam and counts attempts to take bytes
+    /// from a descriptor other than the looked file.
+    fn read_counting_unexpected(
+        identity: &Identity,
+        unexpected_reads: &AtomicUsize,
+    ) -> Option<Result<Vec<u8>, SpecRejected>> {
+        read_with(identity, fs::File::metadata, |file, bytes| {
+            let opened = file.metadata().ok().and_then(|metadata| {
+                Identity::from_metadata(identity.resolved.clone(), &metadata).ok()
+            });
+            if opened.as_ref() != Some(identity) {
+                unexpected_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            read_to_bound(file, bytes)
+        })
+    }
+
     /// The start reads the file as it stands: a document with no line is
     /// generation 1 and a written line is the number, in the form the
     /// file's name says. A file of exactly the bound starts: the bound is
@@ -724,27 +801,30 @@ pub(crate) mod tests {
         refused_as_no_file(bed, pipe);
     }
 
-    /// A name that turns to a pipe between a look and its read is refused by
-    /// the opened file's kind: the read opens without waiting and reads no
-    /// byte of what is no regular file. The read runs on a thread of its
-    /// own, waited five seconds, so an open that waits fails the case.
+    /// A name that turns to a pipe between a look and its read is no state of
+    /// the looked file: the read opens without waiting and reads no byte of
+    /// what is no regular file. The read runs on a thread of its own, waited
+    /// five seconds, so an open that waits fails the case.
     #[cfg(unix)]
     #[test]
-    fn a_name_turned_to_a_pipe_under_a_read_is_refused_unread() {
+    fn a_name_turned_to_a_pipe_under_a_read_is_not_read() {
         let bed = bed(LEAST_LOAD.as_bytes());
         let looked = identity(&bed.path).expect("the file");
         let pipe = bed.dir.path().join("pipe.yaml");
         pipe_at(&pipe);
         fs::rename(&pipe, &bed.path).expect("the rename");
 
+        let unexpected_reads = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&unexpected_reads);
         let (answer, answered) = mpsc::channel();
         thread::spawn(move || {
-            let _ = answer.send(read(&looked));
+            let _ = answer.send(read_counting_unexpected(&looked, &counted));
         });
         let read = answered
             .recv_timeout(Duration::from_secs(5))
             .expect("the read answers: its open does not wait");
-        assert_eq!(read, Err(SpecRejected::Unreadable(NOT_A_FILE.to_owned())));
+        assert_eq!(read, None);
+        assert_eq!(unexpected_reads.load(Ordering::Relaxed), 0);
     }
 
     /// A device is refused as a pipe is, behind a link: a terminal's own
@@ -861,15 +941,30 @@ pub(crate) mod tests {
         assert_ne!(after.inode.changed, before.inode.changed);
     }
 
-    /// A read stops one byte past the bound, whatever the file grew to since
-    /// its look: the byte over tells the door a document over the bound.
+    /// A file that grew since its look is not read through a descriptor that
+    /// no longer has the looked identity.
     #[test]
-    fn a_read_stops_one_byte_past_the_bound() {
+    fn a_file_that_grew_since_its_look_is_not_read() {
         let bed = bed(LEAST_LOAD.as_bytes());
         let looked = identity(&bed.path).expect("the file");
         let bound = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits");
         fs::write(&bed.path, vec![b'#'; bound + 5]).expect("the file grows");
-        assert_eq!(read(&looked).map(|bytes| bytes.len()), Ok(bound + 1));
+        let unexpected_reads = AtomicUsize::new(0);
+        assert_eq!(read_counting_unexpected(&looked, &unexpected_reads), None);
+        assert_eq!(unexpected_reads.load(Ordering::Relaxed), 0);
+    }
+
+    /// A read stops one byte past the bound, whatever the file holds: the
+    /// byte over tells the door a document over the bound.
+    #[test]
+    fn a_read_stops_one_byte_past_the_bound() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let bound = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits");
+        fs::write(&bed.path, vec![b'#'; bound + 5]).expect("the file grows");
+        let file = fs::File::open(&bed.path).expect("the file");
+        let mut bytes = Vec::new();
+        read_to_bound(&file, &mut bytes).expect("the read");
+        assert_eq!(bytes.len(), bound + 1);
     }
 
     /// The identity reads where the path leads: a link turned to another
@@ -916,7 +1011,8 @@ pub(crate) mod tests {
     /// the path leads next. The same for a look that could not read the
     /// path between two versions. An error is the file's own where the file
     /// stood still: one read between two looks that agree, and the start is
-    /// refused by the error's text, not as a file that moved.
+    /// refused by the error's text, not as a file that moved. An open that
+    /// says the looked file disappeared contradicts that look and is retried.
     #[test]
     fn a_file_gone_at_its_read_is_read_where_the_path_leads_next() {
         let rotated = bed(LEAST_LOAD.as_bytes());
@@ -934,7 +1030,7 @@ pub(crate) mod tests {
             },
         );
         assert!(file.is_ok(), "the second read stood still");
-        assert_eq!(looks, 4, "the read that failed and the one that stood");
+        assert_eq!(looks, 3, "the missing open and the read that stood");
         assert_eq!(rotated.answered().2, LEAST_LOAD.as_bytes());
 
         let between = bed(RANDOM.as_bytes());
@@ -962,52 +1058,110 @@ pub(crate) mod tests {
                 looks += 1;
                 before_the_rotation(still.dir.path(), path)
             });
-        match refused.err() {
-            Some(SpecRejected::Unreadable(error)) => {
-                assert!(error.contains("No such file"), "{error}");
-            }
-            other => panic!("started as {other:?}"),
-        }
-        assert_eq!(looks, 2, "one read between two looks");
+        assert_eq!(
+            refused.err(),
+            Some(SpecRejected::Unreadable(
+                "the file moved under each of 3 reads".to_owned()
+            ))
+        );
+        assert_eq!(looks, 3, "each missing open is retried");
         assert!(!still.generations.bound());
     }
 
     /// Under the watch a read that fails while the file moves is no state
     /// of the file: nothing is rejected and nothing counted, and the file
-    /// is read once it stood still. An error of a file that stood still is
-    /// a rejected state.
+    /// is read once it stood still. A missing open also contradicts looks
+    /// that claim the file stands there.
     #[test]
     fn a_read_that_fails_under_a_moving_file_is_no_rejected_state() {
         let bed = bed(LEAST_LOAD.as_bytes());
         let mut file = bed.start();
         replace(&bed.path, RANDOM.as_bytes());
-        // Two looks from before a rotation: the version they lead to is gone
-        // at the open, and the look after the read finds the next one.
+        // An injected look names a version already gone at the open. The
+        // missing open contradicts the look, so no second look is made.
         let dir = bed.dir.path();
         let gone = |path: &Path| before_the_rotation(dir, path);
         assert_eq!(file.poll_looking(gone), Look::Settling);
         let mut looks = 0;
         let failed = file.poll_looking(|path| {
             looks += 1;
-            if looks == 1 {
-                gone(path)
-            } else {
-                look(path)
+            gone(path)
+        });
+        assert_eq!(looks, 1, "the missing open ends this read");
+        assert_eq!(failed, Look::Settling, "the missing open is retried");
+        assert_eq!((bed.rejected(), bed.generation()), (0, 1));
+        assert_eq!(settle(&mut file), Ok(Applied::Generation(2)));
+
+        // The same impossible lost version at every look: its missing open
+        // still contradicts the injected look.
+        assert_eq!(file.poll_looking(gone), Look::Settling);
+        assert_eq!(file.poll_looking(gone), Look::Settling);
+        assert_eq!((bed.rejected(), bed.generation()), (0, 2));
+    }
+
+    /// A missing open between two looks of the same standing file is no
+    /// state of that file: the start retries it after the name comes back.
+    #[test]
+    fn a_missing_open_between_matching_start_looks_is_retried() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let standing = look(&bed.path);
+        let saved = bed.dir.path().join("standing.yaml");
+        let mut looks = 0;
+
+        let started =
+            SpecFile::start_looking(bed.path.clone(), Arc::clone(&bed.generations), |path| {
+                looks += 1;
+                match looks {
+                    1 => {
+                        fs::rename(path, &saved).expect("the file leaves before the open");
+                        standing.clone()
+                    }
+                    2 => {
+                        fs::rename(&saved, path).expect("the file returns before the next look");
+                        standing.clone()
+                    }
+                    _ => look(path),
+                }
+            });
+
+        assert!(started.is_ok(), "the missing open is retried");
+        assert_eq!(bed.answered().2, LEAST_LOAD.as_bytes());
+    }
+
+    /// A missing open between two looks of the same settled file is no state
+    /// of that file: the watch retries it without rejecting the standing file.
+    #[test]
+    fn a_missing_open_between_matching_watch_looks_is_retried() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let mut file = bed.start();
+        replace(&bed.path, RANDOM.as_bytes());
+        assert_eq!(file.poll(), Look::Settling);
+        let standing = look(&bed.path);
+        let saved = bed.dir.path().join("standing.yaml");
+        let mut looks = 0;
+
+        let missing = file.poll_looking(|path| {
+            looks += 1;
+            match looks {
+                1 => {
+                    fs::rename(path, &saved).expect("the file leaves before the open");
+                    standing.clone()
+                }
+                2 => {
+                    fs::rename(&saved, path).expect("the file returns before the next look");
+                    standing.clone()
+                }
+                _ => look(path),
             }
         });
-        assert_eq!(failed, Look::Settling, "the read's error while it moved");
-        assert_eq!((bed.rejected(), bed.generation()), (0, 1));
-        assert_eq!(file.poll(), Look::Read(Ok(Applied::Generation(2))));
 
-        // The same lost version at every look: the file stood still.
-        assert_eq!(file.poll_looking(gone), Look::Settling);
-        match file.poll_looking(gone) {
-            Look::Read(Err(SpecRejected::Unreadable(error))) => {
-                assert!(error.contains("No such file"), "{error}");
-            }
-            other => panic!("the look was {other:?}"),
+        assert_eq!(missing, Look::Settling, "the missing open is retried");
+        assert_eq!((bed.rejected(), bed.generation()), (0, 1));
+        if saved.exists() {
+            fs::rename(&saved, &bed.path).expect("the file returns after the missing open");
         }
-        assert_eq!((bed.rejected(), bed.generation()), (1, 2));
+        assert_eq!(settle(&mut file), Ok(Applied::Generation(2)));
+        assert_eq!(bed.answered().2, RANDOM.as_bytes());
     }
 
     /// A file is read whole or not at all. At the start one that moved
@@ -1068,6 +1222,136 @@ pub(crate) mod tests {
         assert_eq!(moving, Look::Settling, "the bytes read while it moved");
         assert_eq!(watched.generation(), 1);
         assert_eq!(file.poll(), Look::Read(Ok(Applied::Generation(9))));
+    }
+
+    /// A start does not accept bytes from a replacement that appears only
+    /// between two looks of the standing file.
+    #[test]
+    fn an_aba_replacement_during_start_is_not_accepted() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let standing = look(&bed.path);
+        let saved = bed.dir.path().join("standing.yaml");
+        fs::rename(&bed.path, &saved).expect("the standing file is saved");
+        fs::write(&bed.path, RANDOM).expect("the transient replacement");
+        let mut looks = 0;
+        let unexpected_reads = AtomicUsize::new(0);
+
+        let started = SpecFile::start_reading(
+            bed.path.clone(),
+            Arc::clone(&bed.generations),
+            |path| {
+                looks += 1;
+                match looks {
+                    1 => standing.clone(),
+                    2 => {
+                        fs::rename(&saved, path).expect("the standing file is restored");
+                        standing.clone()
+                    }
+                    _ => look(path),
+                }
+            },
+            |identity| read_counting_unexpected(identity, &unexpected_reads),
+        );
+
+        assert!(started.is_ok(), "the standing file starts after the retry");
+        assert!(looks >= 4, "the transient read is retried");
+        assert_eq!(unexpected_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(bed.answered().2, LEAST_LOAD.as_bytes());
+    }
+
+    /// A watch does not accept bytes from a replacement that appears only
+    /// between two looks of the settled file.
+    #[test]
+    fn an_aba_replacement_during_watch_is_not_accepted() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let mut file = bed.start();
+        replace(&bed.path, RANDOM.as_bytes());
+        assert_eq!(file.poll(), Look::Settling);
+
+        let settled = look(&bed.path);
+        let saved = bed.dir.path().join("settled.yaml");
+        fs::rename(&bed.path, &saved).expect("the settled file is saved");
+        fs::write(&bed.path, with_line(LEAST_LOAD, 3)).expect("the transient replacement");
+        let mut looks = 0;
+        let unexpected_reads = AtomicUsize::new(0);
+        let read = file.poll_reading(
+            |path| {
+                looks += 1;
+                match looks {
+                    1 => settled.clone(),
+                    2 => {
+                        fs::rename(&saved, path).expect("the settled file is restored");
+                        settled.clone()
+                    }
+                    _ => look(path),
+                }
+            },
+            |identity| read_counting_unexpected(identity, &unexpected_reads),
+        );
+
+        assert_eq!(read, Look::Settling, "the transient read is retried");
+        assert_eq!(unexpected_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(bed.answered().2, LEAST_LOAD.as_bytes());
+        if saved.exists() {
+            fs::rename(&saved, &bed.path).expect("the settled file is restored");
+        }
+        assert_eq!(settle(&mut file), Ok(Applied::Generation(2)));
+        assert_eq!(bed.answered().2, RANDOM.as_bytes());
+    }
+
+    /// An error reading the opened descriptor's metadata is the standing
+    /// file's error at the start, not evidence that the file moved.
+    #[test]
+    fn a_descriptor_metadata_error_during_start_is_reported() {
+        const ERROR: &str = "descriptor metadata failed";
+
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let started = SpecFile::start_reading(
+            bed.path.clone(),
+            Arc::clone(&bed.generations),
+            look,
+            |identity| read_with(identity, |_| Err(io::Error::other(ERROR)), read_to_bound),
+        );
+
+        assert_eq!(
+            started.err(),
+            Some(SpecRejected::Unreadable(ERROR.to_owned()))
+        );
+        assert!(!bed.generations.bound());
+    }
+
+    /// An error reading descriptor metadata after its bytes is the standing
+    /// file's error under the watch, not evidence that the file moved.
+    #[test]
+    fn a_descriptor_metadata_error_after_a_watch_read_is_reported() {
+        const ERROR: &str = "descriptor metadata failed after the read";
+
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let mut file = bed.start();
+        replace(&bed.path, RANDOM.as_bytes());
+        assert_eq!(file.poll(), Look::Settling);
+        let metadata_calls = Cell::new(0);
+
+        let failed = file.poll_reading(look, |identity| {
+            read_with(
+                identity,
+                |file| {
+                    metadata_calls.set(metadata_calls.get() + 1);
+                    if metadata_calls.get() == 2 {
+                        Err(io::Error::other(ERROR))
+                    } else {
+                        file.metadata()
+                    }
+                },
+                read_to_bound,
+            )
+        });
+
+        assert_eq!(
+            failed,
+            Look::Read(Err(SpecRejected::Unreadable(ERROR.to_owned())))
+        );
+        assert_eq!((bed.rejected(), bed.generation()), (1, 1));
     }
 
     /// A changed file is read once it stood still for one poll, never at the
