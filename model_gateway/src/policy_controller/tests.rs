@@ -34,7 +34,7 @@ use smg_worker::{
 use super::{refused, start, start_with, undecided::ROUTER_TYPE, StartError};
 use crate::{
     app_context::AppContext,
-    config::{ManualAssignmentMode, PolicyConfig, PolicyDocumentError, RouterConfig},
+    config::{ManualAssignmentMode, PolicyConfig, PolicyDocumentError, RouterConfig, RoutingMode},
     middleware::{RouteRequestMeta, TenantKey},
     routers::{
         common::snapshot::WorkerRegistry,
@@ -435,6 +435,62 @@ async fn adapter_asks(router: &dyn RouterTrait) -> Vec<(&'static str, Response)>
                 .await,
         ),
     ]
+}
+
+/// The three provider modes, each over one provider's worker.
+fn provider_modes() -> [RoutingMode; 3] {
+    let worker_urls = vec!["https://provider.example".to_owned()];
+    [
+        RoutingMode::OpenAI {
+            worker_urls: worker_urls.clone(),
+        },
+        RoutingMode::Anthropic {
+            worker_urls: worker_urls.clone(),
+        },
+        RoutingMode::Gemini { worker_urls },
+    ]
+}
+
+#[test]
+fn a_provider_mode_starts_no_store_under_the_setting() -> Case {
+    // A provider mode places its requests by no routing policy: the setting
+    // moves nothing, and the gateway starts as the classic line does.
+    for mode in provider_modes() {
+        let config = picked(RouterConfig {
+            mode,
+            ..RouterConfig::default()
+        });
+        assert!(
+            start(&config)?.is_none(),
+            "the {} mode started a store",
+            config.mode_type()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_document_beside_a_provider_mode_is_refused_by_name() -> Case {
+    for mode in provider_modes() {
+        let config = running(
+            RouterConfig {
+                mode,
+                ..RouterConfig::default()
+            },
+            PolicySpec::preset("random")?,
+        );
+        let refusal = start(&config)
+            .err()
+            .ok_or("a document ran beside a provider mode")?;
+        assert!(matches!(refusal, StartError::Document(_)), "{refusal}");
+        assert!(
+            refusal
+                .to_string()
+                .contains("a provider mode places its requests by no routing policy"),
+            "{refusal}"
+        );
+    }
+    Ok(())
 }
 
 /// A configuration with no health probe behind its cases.

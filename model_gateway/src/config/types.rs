@@ -2171,6 +2171,20 @@ impl RouterConfig {
         }
     }
 
+    /// The provider mode's name, where the gateway runs one. A provider mode
+    /// holds one provider's worker and places its requests by no routing
+    /// policy.
+    pub(crate) fn provider_mode(&self) -> Option<&'static str> {
+        match self.mode {
+            RoutingMode::OpenAI { .. } => Some("openai"),
+            RoutingMode::Anthropic { .. } => Some("anthropic"),
+            RoutingMode::Gemini { .. } => Some("gemini"),
+            RoutingMode::Regular { .. }
+            | RoutingMode::PrefillDecode { .. }
+            | RoutingMode::EncodePrefillDecode { .. } => None,
+        }
+    }
+
     /// Check if service discovery is enabled
     pub fn has_service_discovery(&self) -> bool {
         self.discovery.is_some()
