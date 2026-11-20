@@ -272,7 +272,7 @@ impl Trace {
     /// it was made ahead of every profile. A shed made once a profile is
     /// resolved names it, though no stage of it ran.
     #[must_use]
-    pub const fn profile_ran(&self) -> Option<u16> {
+    pub const fn made_under(&self) -> Option<u16> {
         if self.profile == Self::NO_PROFILE {
             None
         } else {
@@ -293,7 +293,7 @@ impl Trace {
     /// The trace on the wire. Ahead of every profile the position stays zero.
     #[cfg(feature = "controller")]
     pub(crate) fn wire(&self) -> proto::Trace {
-        let profile = self.profile_ran();
+        let profile = self.made_under();
         proto::Trace {
             profile: u32::from(profile.unwrap_or_default()),
             no_profile: profile.is_none(),
@@ -581,12 +581,12 @@ mod tests {
                 lifted: Lifted::None,
             }
         );
-        assert_eq!(trace.profile_ran(), None);
+        assert_eq!(trace.made_under(), None);
         let last = Trace {
             profile: u16::MAX - 1,
             ..trace
         };
-        assert_eq!(last.profile_ran(), Some(u16::MAX - 1));
+        assert_eq!(last.made_under(), Some(u16::MAX - 1));
     }
 
     /// The mark of a lifted veto costs the trace no byte: it sits in one the

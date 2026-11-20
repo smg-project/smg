@@ -780,7 +780,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "affinity_source",
                 // The record reads it from its count ([`Trace::drew_first`]).
                 "drew_first",
-                // The record marks this in `profile` ([`Trace::profile_ran`]).
+                // The record marks this in `profile` ([`Trace::made_under`]).
                 "no_profile",
             ],
             wire: &[

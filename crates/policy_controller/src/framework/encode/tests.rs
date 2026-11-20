@@ -402,8 +402,8 @@ fn encoders_the_veto_left_none_of_shed_as_saturation() {
     let shed = bed.decide().0;
     assert_eq!(shed_of(&shed), saturated);
     // The veto is a stage of the encode profile, and the trace says so.
-    assert_eq!(shed.trace().profile_ran(), encode_profile(&stock));
-    assert!(shed.trace().profile_ran().is_some());
+    assert_eq!(shed.trace().made_under(), encode_profile(&stock));
+    assert!(shed.trace().made_under().is_some());
     // A pair's side says the same of its own rows.
     let mut side = Bed::new();
     side.decodes = vec![overloaded(row(0, Role::Decode, 1, 0))];
@@ -479,7 +479,7 @@ fn a_column_of_another_length_and_a_binding_of_another_plan_decline() {
     // A shed made once the encode profile is resolved says that profile.
     // One made where no binding gives a profile says none.
     let declined = |bed: &Bed, engine: &Engine| match bed.decide_with(engine).0 {
-        Decision::Shed(shed) => (shed.reason, shed.emptied_by, shed.trace.profile_ran()),
+        Decision::Shed(shed) => (shed.reason, shed.emptied_by, shed.trace.made_under()),
         other => panic!("a shed, not {other:?}"),
     };
     let encode = encode_profile(&engine());
@@ -1137,7 +1137,7 @@ fn a_pair_column_of_another_length_declines_before_a_cut() {
             shed_of(&decision),
             (ShedReason::PolicyDeclined, "affinity-column")
         );
-        assert_eq!(decision.trace().profile_ran(), None, "as the pair entry");
+        assert_eq!(decision.trace().made_under(), None, "as the pair entry");
     }
 }
 
@@ -1191,7 +1191,7 @@ fn a_request_with_a_column_or_named_rows_declines_before_a_stage_is_asked() {
             shed_of(&decision),
             (ShedReason::PolicyDeclined, "affinity-column")
         );
-        assert_eq!(decision.trace().profile_ran(), None, "as the pair entry");
+        assert_eq!(decision.trace().made_under(), None, "as the pair entry");
         assert!(placed.encoders().is_empty());
         assert_eq!(asked.load(Ordering::Relaxed), 0, "no stage is asked");
     }

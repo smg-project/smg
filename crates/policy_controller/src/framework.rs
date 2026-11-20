@@ -6027,7 +6027,7 @@ mod tests {
             Decision::Shed(shed) => {
                 assert_eq!(shed.reason, ShedReason::NoEndpoints);
                 assert_eq!(shed.emptied_by, "healthy");
-                assert_eq!(shed.trace.profile_ran(), Some(0));
+                assert_eq!(shed.trace.made_under(), Some(0));
             }
             other => panic!("an unhealthy pool answered {other:?}"),
         }
@@ -6302,7 +6302,7 @@ mod tests {
                 "a column of {} for three candidates answered {decision:?}",
                 column.len()
             );
-            assert_eq!(decision.trace().profile_ran(), None);
+            assert_eq!(decision.trace().made_under(), None);
         }
         // A decision's inputs are checked before anything is resolved from
         // them: a model no binding covers is refused for its column when the
@@ -6818,7 +6818,7 @@ mod tests {
                 (ShedReason::PolicyDeclined, WRITTEN_ROWS),
                 "{beside}"
             );
-            assert_eq!(shed.trace.profile_ran(), Some(0), "{beside}");
+            assert_eq!(shed.trace.made_under(), Some(0), "{beside}");
         }
         // A profile that shows nothing reads both.
         assert!(lead(&plain.decide(
@@ -6939,7 +6939,7 @@ mod tests {
         // A mask beside the decode side's rows: declined, and no scope opens.
         let decision = decide(&engine, &decodes, [&written, &masked]);
         assert!(declined(&decision), "{decision:?}");
-        assert_eq!(decision.trace().profile_ran(), Some(1));
+        assert_eq!(decision.trace().made_under(), Some(1));
         assert_eq!(read(), (1, 0), "no scope opens for a declined decision");
         // A mask beside the prefill side, which shows nothing: its filters
         // read it, and the masked prefill is passed over.
@@ -7447,7 +7447,7 @@ mod tests {
                 assert_eq!(shed.reason, ShedReason::PolicyDeclined);
                 assert_eq!(shed.emptied_by, "binding");
                 assert_eq!(shed.trace.survivors.get(), Some(0), "no pool was read");
-                assert_eq!(shed.trace.profile_ran(), None);
+                assert_eq!(shed.trace.made_under(), None);
             }
             other => panic!("a single binding answered a pair with {other:?}"),
         }
@@ -7604,7 +7604,7 @@ mod tests {
             "the tried worker is dropped while another remains"
         );
         assert_eq!(pick.trace.survivors.get(), Some(1));
-        assert_eq!(pick.trace.profile_ran(), Some(0));
+        assert_eq!(pick.trace.made_under(), Some(0));
     }
 
     #[test]
@@ -7641,7 +7641,7 @@ mod tests {
                 assert_eq!(shed.reason, ShedReason::PolicyDeclined);
                 assert_eq!(shed.emptied_by, "binding");
                 assert_eq!(shed.trace.survivors.get(), Some(0), "no pool was read");
-                assert_eq!(shed.trace.profile_ran(), None);
+                assert_eq!(shed.trace.made_under(), None);
             }
             other => panic!("an unbound model answered {other:?}"),
         }

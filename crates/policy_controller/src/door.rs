@@ -2932,7 +2932,7 @@ pub(crate) mod tests {
                 ..crate::Names::default()
             }),
         );
-        assert_eq!(shed.trace.profile_ran(), None);
+        assert_eq!(shed.trace.made_under(), None);
     }
 
     #[test]
@@ -3669,7 +3669,7 @@ pub(crate) mod tests {
             panic!("the gateway can dial no member");
         };
         assert_eq!(shed.emptied_by, super::WIRES);
-        assert_eq!(shed.trace.profile_ran(), None);
+        assert_eq!(shed.trace.made_under(), None);
         assert!(decided.lease.is_none());
         assert_eq!((door.undialed(), door.hashes_cut()), (3, 0));
     }

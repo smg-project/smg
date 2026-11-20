@@ -72,7 +72,7 @@ impl DecisionRecord {
             plan: plan.name(),
             ..Names::default()
         };
-        let Some(at) = trace.profile_ran() else {
+        let Some(at) = trace.made_under() else {
             return Some(names);
         };
         let bound = at == binding.profile
