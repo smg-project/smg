@@ -1,0 +1,393 @@
+{
+  "recorded_from": "a4935a5acd15151641b1988e234016a95fd172da",
+  "policy": "constraint-decider",
+  "rows": [
+    {
+      "name": "a-retry-stays-on-the-workers-that-decide-the-constraint-alike",
+      "shed": false,
+      "workers": [
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "free",
+          "constrained_decoding": "always",
+          "constrained_decoding_start": "first_token",
+          "policy": "always",
+          "whole_turn": true,
+          "vocabulary": "current"
+        },
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "free",
+          "policy": "requested",
+          "whole_turn": false,
+          "vocabulary": "current"
+        },
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "free",
+          "constrained_decoding": "always",
+          "constrained_decoding_start": "after_reasoning",
+          "policy": "always",
+          "whole_turn": false,
+          "vocabulary": "current"
+        },
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "free",
+          "constrained_decoding": "always",
+          "constrained_decoding_start": "first_token",
+          "policy": "always",
+          "whole_turn": true,
+          "vocabulary": "current"
+        },
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "free",
+          "constrained_decoding": "always",
+          "constrained_decoding_start": "first_token",
+          "structural_tag_vocabulary": "older",
+          "policy": "always",
+          "whole_turn": true,
+          "vocabulary": "older"
+        },
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "free",
+          "constrained_decoding": "always",
+          "policy": "always",
+          "whole_turn": false,
+          "vocabulary": "current"
+        },
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "free",
+          "constrained_decoding": "always",
+          "constrained_decoding_start": "after_reasoning",
+          "structural_tag_vocabulary": "older",
+          "policy": "always",
+          "whole_turn": false,
+          "vocabulary": "older"
+        },
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "free",
+          "constrained_decoding": "always",
+          "constrained_decoding_start": "first_token",
+          "structural_tag_vocabulary": "older",
+          "policy": "always",
+          "whole_turn": true,
+          "vocabulary": "older"
+        }
+      ],
+      "requests": [
+        {},
+        {
+          "decided_on": 0
+        },
+        {
+          "decided_on": 1
+        },
+        {
+          "decided_on": 2
+        },
+        {
+          "decided_on": 4
+        },
+        {
+          "decided_on": 5
+        },
+        {
+          "decided_on": 6
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7
+          ]
+        },
+        {
+          "placed": [
+            0,
+            3
+          ]
+        },
+        {
+          "placed": [
+            1
+          ]
+        },
+        {
+          "placed": [
+            2,
+            5,
+            6
+          ]
+        },
+        {
+          "placed": [
+            4,
+            7
+          ]
+        },
+        {
+          "placed": [
+            2,
+            5,
+            6
+          ]
+        },
+        {
+          "placed": [
+            2,
+            5,
+            6
+          ]
+        }
+      ]
+    },
+    {
+      "name": "the-one-worker-that-decides-alike-is-down",
+      "shed": false,
+      "workers": [
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "down",
+          "constrained_decoding": "always",
+          "constrained_decoding_start": "first_token",
+          "policy": "always",
+          "whole_turn": true,
+          "vocabulary": "current"
+        },
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "free",
+          "policy": "requested",
+          "whole_turn": false,
+          "vocabulary": "current"
+        },
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "free",
+          "constrained_decoding": "always",
+          "constrained_decoding_start": "after_reasoning",
+          "policy": "always",
+          "whole_turn": false,
+          "vocabulary": "current"
+        }
+      ],
+      "requests": [
+        {
+          "decided_on": 0
+        },
+        {
+          "decided_on": 1
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 503,
+            "code": "no_available_workers",
+            "retry_after": true,
+            "message": "All workers for model 'm' are unavailable (unhealthy or circuit breaker open)"
+          }
+        },
+        {
+          "placed": [
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "name": "the-workers-that-decide-alike-are-over-their-thresholds",
+      "shed": false,
+      "workers": [
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "over",
+          "constrained_decoding": "always",
+          "constrained_decoding_start": "first_token",
+          "policy": "always",
+          "whole_turn": true,
+          "vocabulary": "current"
+        },
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "over",
+          "constrained_decoding": "always",
+          "constrained_decoding_start": "first_token",
+          "policy": "always",
+          "whole_turn": true,
+          "vocabulary": "current"
+        },
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "free",
+          "policy": "requested",
+          "whole_turn": false,
+          "vocabulary": "current"
+        }
+      ],
+      "requests": [
+        {
+          "decided_on": 0
+        },
+        {
+          "decided_on": 2
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            0,
+            1
+          ]
+        },
+        {
+          "placed": [
+            2
+          ]
+        }
+      ]
+    },
+    {
+      "name": "the-workers-that-decide-alike-are-over-and-shedding-is-on",
+      "shed": true,
+      "workers": [
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "over",
+          "constrained_decoding": "always",
+          "constrained_decoding_start": "first_token",
+          "policy": "always",
+          "whole_turn": true,
+          "vocabulary": "current"
+        },
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "over",
+          "constrained_decoding": "always",
+          "constrained_decoding_start": "first_token",
+          "policy": "always",
+          "whole_turn": true,
+          "vocabulary": "current"
+        },
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "free",
+          "policy": "requested",
+          "whole_turn": false,
+          "vocabulary": "current"
+        }
+      ],
+      "requests": [
+        {
+          "decided_on": 0
+        },
+        {
+          "decided_on": 2
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 503,
+            "code": "no_available_workers",
+            "retry_after": true,
+            "message": "All workers for model 'm' are unavailable (unhealthy or circuit breaker open)"
+          }
+        },
+        {
+          "placed": [
+            2
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a-pool-over-on-every-worker-is-shed-whoever-decides-alike",
+      "shed": true,
+      "workers": [
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "over",
+          "constrained_decoding": "always",
+          "constrained_decoding_start": "first_token",
+          "policy": "always",
+          "whole_turn": true,
+          "vocabulary": "current"
+        },
+        {
+          "runtime": "tokenspeed",
+          "transport": "grpc",
+          "state": "over",
+          "policy": "requested",
+          "whole_turn": false,
+          "vocabulary": "current"
+        }
+      ],
+      "requests": [
+        {
+          "decided_on": 0
+        },
+        {
+          "decided_on": 1
+        },
+        {}
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 503,
+            "code": "worker_overload_protection_shed",
+            "retry_after": true,
+            "message": "All workers for model 'm' are overloaded"
+          }
+        },
+        {
+          "refused": {
+            "status": 503,
+            "code": "worker_overload_protection_shed",
+            "retry_after": true,
+            "message": "All workers for model 'm' are overloaded"
+          }
+        },
+        {
+          "refused": {
+            "status": 503,
+            "code": "worker_overload_protection_shed",
+            "retry_after": true,
+            "message": "All workers for model 'm' are overloaded"
+          }
+        }
+      ]
+    }
+  ]
+}
