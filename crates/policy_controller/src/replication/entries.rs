@@ -45,6 +45,13 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     // standby's prober starts it again.
     ("HealthSink", "probe_outcome", Fate::Journaled),
     ("HealthSink", "connected", Fate::Journaled),
+    // What the leader's own worker object knows is that replica's alone: a
+    // standby holds none of it.
+    (
+        "HealthSink",
+        "leader_bits",
+        Fate::Rebuilt("a new leader writes what its own worker objects know"),
+    ),
     ("HealthSink", "gateway_veto", Fate::Rebuilt(HELLO)),
     ("HealthSink", "gateway_veto_noted", Fate::Rebuilt(HELLO)),
     ("HealthSink", "vetoed", Fate::Read),

@@ -52,7 +52,11 @@
 //!
 //! [`HealthAdapter`] writes probe outcomes and connect signals to the store
 //! and sets the object's status to the status that stands there. The host
-//! supplies the [`Lead`] and the term the adapter writes under.
+//! supplies the [`Lead`] and the term the adapter writes under. Its
+//! projection ([`HealthAdapter::project`]) writes what the object knows of
+//! its worker onto the row: the object's liveness veto is the row's stalled
+//! bit, for every gateway. The host calls it at each change of that veto,
+//! and for an object it lays over another.
 //!
 //! [`LoadAdapter`] writes load records and poll answers to the store. The
 //! store decides when the collector polls and keeps the overload verdict.

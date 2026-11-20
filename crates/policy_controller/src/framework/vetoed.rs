@@ -363,8 +363,11 @@ pub(super) fn emptied(
     // A doubt is a row's own bit or the host's mask beside the rows, and
     // the tier opens for a row the doubt alone refuses. A doubt on a row a
     // harder veto refuses too gains nobody when it is lifted. Nor does a
-    // row a hold of the host stands on: it stays masked.
-    let own = candidates.iter().any(|row| doubted_alone(row.health));
+    // row a hold of the host stands on, whichever doubt it carries: it
+    // stays masked, and both tests pass it by.
+    let own = candidates
+        .iter()
+        .any(|row| doubted_alone(row.health) && cx.held.binary_search(&row.position).is_err());
     // The two lengths answer for the rows only where every held row is a
     // row of the mask, named once: the store's view keeps that, and a host
     // that fills the constraints by hand owes it.
@@ -3726,6 +3729,45 @@ mod tests {
         assert_eq!(passes, pool.len());
         let (one, passes) = ask(&[0, 1, 3]);
         assert_eq!(order(&one), vec![2]);
+        assert_eq!(passes, 2 * pool.len());
+    }
+
+    /// A held row that carries a doubt of its own gains nobody either: the
+    /// hold stands through the tier, on a lent row with its leader's bit
+    /// as on any other. A pool held on every row costs its one pass
+    /// whether or not a row carries the bit. A row that carries it with no
+    /// hold on it still opens the tier and takes the request.
+    #[test]
+    fn a_held_row_that_carries_its_own_doubt_costs_no_further_pass() {
+        let mut pool = [free(0, 0), free(1, 1), free(2, 9)];
+        pool[0].health.stalled = true;
+        pool[1].health.stalled = true;
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counts: Box<dyn Filter> = Box::new(Counts(Arc::clone(&asked)));
+        let (engine, _) = counted_among(|_| vec![counts, Box::new(Healthy)]);
+        let ask = |stalled: &[u32], held: &[u32]| {
+            let masked = Constraints {
+                stalled,
+                held,
+                ..Constraints::default()
+            };
+            let mut scratch = Scratch::new();
+            let decision = engine.decide(
+                &facts(1),
+                &PoolFacts::default(),
+                &pool,
+                &masked,
+                &mut scratch,
+            );
+            (decision, asked.swap(0, Ordering::Relaxed))
+        };
+        let (whole, passes) = ask(&[0, 1, 2], &[0, 1, 2]);
+        assert_eq!(shed_of(&whole), (ShedReason::NoEndpoints, "healthy"));
+        assert_eq!(passes, pool.len());
+        // Row 1 carries the bit and no hold: the tier opens for it alone.
+        let (one, passes) = ask(&[0, 2], &[0, 2]);
+        assert_eq!(order(&one), vec![1]);
+        assert_eq!(one.trace().lifted, Lifted::Liveness);
         assert_eq!(passes, 2 * pool.len());
     }
 
