@@ -17,8 +17,9 @@ use std::{
 use kv_index::chain_prefix_hash;
 
 use super::{
-    counted, dispatched, encode_document, fleet, items, keyed, pair_counts, pair_fleet,
-    pair_request, place_one, placed, push_fleet, release, report, request, seated, GATEWAY, MODEL,
+    booked, counted, dispatched, encode_document, fleet, items, keyed, later_request, pair_counts,
+    pair_dispatch, pair_fleet, pair_request, place_one, placed, push_fleet, release, report,
+    request, seated, GATEWAY, MODEL,
 };
 use crate::{
     builtins::target_of,
@@ -37,7 +38,7 @@ use crate::{
         LoadSink, LoadSource, MemoryStore, Said, SequenceHash, Signals, StoredBlock, WorkerFacts,
         WorkerStatus, WorkersStore,
     },
-    view::{Candidate, LoadRow, RequestFacts, Role, WorkerId},
+    view::{Candidate, LoadRow, Phase, RequestFacts, Role, WorkerId},
     Assignment,
 };
 
@@ -1088,4 +1089,168 @@ fn a_pair_sides_shadow_of_another_column_is_skipped_and_counted() {
     paired(&door, b"pair", Instant::now());
     assert_eq!(both_kinds(&door), [[0, 1, 0, 0], [0, 0, 0, 1]]);
     assert_eq!(asks(&asked), [1, 0]);
+}
+
+/// The door's counts of the shadows of the first binding's decodes that
+/// were decided after their prefill: agreed, another target, another
+/// outcome, skipped.
+fn later_kinds(door: &Door) -> [u64; 4] {
+    use ShadowKind::{Agreed, OtherOutcome, OtherTarget, Skipped};
+    [Agreed, OtherTarget, OtherOutcome, Skipped].map(|kind| door.shadowed_later(0, kind))
+}
+
+/// A door over one prefill and two decodes whose decode side is decided
+/// by the first row kept and shadowed under `next`, with a pair decided
+/// for a later decode and its prefill dispatched: the door, the pair's
+/// lease and the counts of the decisions that asked each side's shadow.
+fn held_pair(next: Rule) -> (Door, LeaseId, [Arc<AtomicUsize>; 2]) {
+    let store = pair_fleet(1, 2).expect("one prefill and two decodes");
+    let next = [None, Some(next)];
+    let asked = pair_shadowing(&store, 2, [Rule::Place(0); 2], next, |document| {
+        document.explain.sample = 1;
+    });
+    let door = Door::new(store);
+    let now = Instant::now();
+    let first = door.decide(GATEWAY, &later_request(b"pair"), now);
+    let lease = first.expect("a pair").lease.expect("a lease").lease.id;
+    door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+    (door, lease, asked)
+}
+
+/// A decode decided after its prefill asks its side's shadow at that
+/// second decision, over the partners of the held prefill, and compares
+/// it with the decode the call picked. The count is its own: the pair's
+/// first decision counted its decode side beside the decode it named
+/// first, and that count stands.
+#[test]
+fn a_decode_decided_later_asks_its_shadow_at_its_own_call() {
+    let (door, lease, asked) = held_pair(Rule::Place(1));
+    assert_eq!(side_kinds(&door, PairSide::Decode), [0, 1, 0, 0]);
+    assert_eq!(later_kinds(&door), [0; 4]);
+    let call = later_request(b"pair");
+    let decided = door.decide_decode(GATEWAY, &call, lease, Instant::now());
+    let decided = decided.expect("a decode");
+    let first = decided
+        .decision
+        .pick()
+        .and_then(|pick| pick.targets.first());
+    let decode = first
+        .and_then(|target| target.pair)
+        .map(|pair| pair.decode_id);
+    assert_eq!(later_kinds(&door), [0, 1, 0, 0]);
+    assert_eq!(side_kinds(&door, PairSide::Decode), [0, 1, 0, 0]);
+    assert_eq!(kinds(&door), [0; 4]);
+    assert_eq!(asks(&asked), [0, 2]);
+    let record = door.explain(GATEWAY, b"pair");
+    let record = record.expect("the sampled call");
+    assert_eq!(record.decode_shadow, Some(ShadowKind::OtherTarget));
+    assert!(record.decode_shadow_target.is_some() && record.decode_shadow_target != decode);
+}
+
+/// A later decode's shadow costs its call nothing. Under the floor of
+/// its budget the shadow is not asked and is counted as skipped. One
+/// that panics is counted with the door's faults, and the call answers
+/// with its lease.
+#[test]
+fn a_later_decodes_shadow_under_the_floor_or_in_a_panic_leaves_the_call() {
+    let (door, lease, asked) = held_pair(Rule::Place(1));
+    let floor = u32::try_from(SHADOW_FLOOR.as_micros()).expect("a floor in microseconds");
+    let mut short = later_request(b"pair");
+    short.facts.budget_micros = floor - 1;
+    let decided = door.decide_decode(GATEWAY, &short, lease, Instant::now());
+    assert!(decided.expect("a decode").lease.is_some());
+    assert_eq!(later_kinds(&door), [0, 0, 0, 1]);
+    assert_eq!(asks(&asked), [0, 1], "the first decision's ask alone");
+
+    let (door, lease, _) = held_pair(Rule::Panics);
+    assert_eq!(door.faults(), 1, "the first decision's shadow");
+    let call = later_request(b"pair");
+    let decided = door.decide_decode(GATEWAY, &call, lease, Instant::now());
+    let side = decided
+        .expect("a decode")
+        .lease
+        .map(|leased| leased.lease.side);
+    assert_eq!(side, Some(Side::Decode));
+    assert_eq!(door.faults(), 2);
+    assert_eq!(later_kinds(&door), [0; 4]);
+}
+
+/// A later decode's shadow books nothing: the store's counts behind the
+/// call are those of the same call under a document that names no
+/// shadow, the call's decode alone on its side.
+#[test]
+fn a_later_decodes_shadow_books_nothing() {
+    let counts = |shadowed: bool| {
+        let store = pair_fleet(1, 2).expect("one prefill and two decodes");
+        let next = [None, shadowed.then_some(Rule::Place(1))];
+        pair_shadowing(&store, 2, [Rule::Place(0); 2], next, |_| {});
+        let door = Door::new(Arc::clone(&store));
+        let now = Instant::now();
+        let first = door.decide(GATEWAY, &later_request(b"pair"), now);
+        let lease = first.expect("a pair").lease.expect("a lease").lease.id;
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+        let call = later_request(b"pair");
+        let decided = door.decide_decode(GATEWAY, &call, lease, now);
+        assert!(decided.expect("a decode").lease.is_some());
+        (booked(&store, Role::Prefill), booked(&store, Role::Decode))
+    };
+    let plain = counts(false);
+    assert_eq!(counts(true), plain);
+    let decodes: u32 = plain.1.iter().map(|&(_, count)| count).sum();
+    assert_eq!(decodes, 1, "the call's decode alone");
+}
+
+/// A decode call's shadow and its sampled record are found by the pair
+/// binding the call decides under, whatever phase the call states. A
+/// binding of the decode phase stands ahead of the pair's here and names
+/// no shadow: it decides a decode asked alone, and no pair's. A call
+/// that states the decode phase still asks the pair's decode shadow, and
+/// counts it under the pair binding's position. Its record names that
+/// binding, shadowed or not, so the record's names are the pair's.
+#[test]
+fn a_decode_call_finds_its_shadow_by_the_pair_binding_it_decides_under() {
+    use crate::spec::{BindingSpec, Match};
+
+    for shadowed in [true, false] {
+        let store = pair_fleet(1, 2).expect("one prefill and two decodes");
+        let next = [None, shadowed.then_some(Rule::Place(1))];
+        pair_shadowing(&store, 2, [Rule::Place(0); 2], next, |document| {
+            let alone = document.profiles.get("decode").cloned();
+            let alone = alone.expect("the decode side's profile");
+            document.profiles.insert("alone".into(), alone);
+            let decode_first = BindingSpec {
+                matcher: Match {
+                    phase: vec![Phase::Decode],
+                    ..Match::default()
+                },
+                profile: Some("alone".into()),
+                ..BindingSpec::default()
+            };
+            document.bindings.insert(0, decode_first);
+            document.explain.sample = 1;
+        });
+        let door = Door::new(store);
+        let now = Instant::now();
+        let first = door.decide(GATEWAY, &later_request(b"pair"), now);
+        let lease = first.expect("a pair").lease.expect("a lease").lease.id;
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+        let mut call = later_request(b"pair");
+        call.facts.phase = Phase::Decode;
+        let decided = door.decide_decode(GATEWAY, &call, lease, now);
+        let decided = decided.expect("a decode");
+        assert!(decided.lease.is_some());
+        // The pair's binding is the document's second.
+        let counted = u64::from(shadowed);
+        assert_eq!(door.shadowed_later(1, ShadowKind::OtherTarget), counted);
+        assert_eq!(door.shadowed_later(0, ShadowKind::OtherTarget), 0);
+        let explained = door.explained(GATEWAY, b"pair");
+        let explained = explained.expect("the sampled call");
+        let record = explained.record;
+        assert_eq!(record.decision, decided.decision, "the call's own record");
+        assert_eq!(record.binding, Some(1));
+        let said = shadowed.then_some(ShadowKind::OtherTarget);
+        assert_eq!(record.decode_shadow, said);
+        let names = explained.names.expect("the generation that decided");
+        assert_eq!((names.plan, names.profile.as_str()), ("pd-pair", "decode"));
+    }
 }
