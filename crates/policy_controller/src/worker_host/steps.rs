@@ -9,9 +9,9 @@ use smg_worker::{
     settings::{RegistrationSettings, UnhealthyRemovalScope},
     workflow::{
         pin, require_host, single_attempt, worker_registration_workflow, worker_removal_workflow,
-        Pin, RegistrationGates, RemovalOrder, WorkerList, WorkerRegistrationWorkflowData,
-        WorkerRemovalWorkflowData, WorkflowHost, CREATE_LOCAL_WORKER_STEP,
-        FIND_WORKERS_TO_REMOVE_STEP, SETTLE_DRAINED_WORKERS_STEP,
+        Pin, RegistrationGates, RemovalOrder, WorkerKind, WorkerList,
+        WorkerRegistrationWorkflowData, WorkerRemovalWorkflowData, WorkflowHost,
+        CREATE_LOCAL_WORKER_STEP, FIND_WORKERS_TO_REMOVE_STEP, SETTLE_DRAINED_WORKERS_STEP,
     },
 };
 use tracing::{debug, warn};
@@ -87,6 +87,9 @@ pub struct RemoveWorkersAtDoor<G> {
 ///
 /// The write is the only next step after a step in `behind`. A step writes
 /// back the run's data whole, so parallel steps can overwrite each other.
+///
+/// The write is a step of the local kind, as the creation is: it skips a
+/// registration of another kind, whose workers the host's own steps write.
 pub fn registration_at_door<H: WorkflowHost>(
     settings: &RegistrationSettings,
     gates: RegistrationGates,
@@ -183,6 +186,9 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for WriteW
         context: &mut WorkflowContext<WorkerRegistrationWorkflowData<H>>,
     ) -> WorkflowResult<StepResult> {
         let data = &mut context.data;
+        if data.worker_kind != Some(WorkerKind::Local) {
+            return Ok(StepResult::Skip);
+        }
         let workers = data
             .actual_workers
             .as_ref()
@@ -518,6 +524,7 @@ mod tests {
                 Arc::clone(&self.host),
                 asker,
             );
+            data.worker_kind = Some(WorkerKind::Local);
             data.actual_workers = Some(workers);
             WorkflowContext::new(WorkflowInstanceId::new(), data)
         }
@@ -647,6 +654,27 @@ mod tests {
         }
         assert_eq!(f.store.epoch(), 2);
         assert_eq!(cx.data.workers.expect("the written URLs").worker_urls, urls);
+    }
+
+    #[tokio::test]
+    async fn a_registration_that_is_not_local_is_skipped_and_writes_no_row() {
+        let f = Fixture::new();
+        for kind in [None, Some(WorkerKind::External)] {
+            let mut cx = f.registration(WorkerJobAsker::Api, vec![worker(URL, "model")]);
+            cx.data.worker_kind = kind;
+            assert_eq!(
+                f.write().execute(&mut cx).await.expect("skipped"),
+                StepResult::Skip
+            );
+            assert!(cx.data.workers.is_none());
+            // A run the host's steps have built nothing for yet is skipped as well.
+            cx.data.actual_workers = None;
+            assert_eq!(
+                f.write().execute(&mut cx).await.expect("skipped"),
+                StepResult::Skip
+            );
+        }
+        assert_eq!(f.store.epoch(), 0);
     }
 
     #[tokio::test]
