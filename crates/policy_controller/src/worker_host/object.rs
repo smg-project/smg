@@ -52,6 +52,7 @@ pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
         signals: _,
         health,
         overload: _,
+        drain_settle_secs,
     } = &row.facts;
     let mut spec = WorkerSpec::new(key.clone());
     spec.models = models.iter().map(ModelCard::new).collect::<Vec<_>>().into();
@@ -80,7 +81,7 @@ pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
         spec.dp_size = Some(usize::from(*dp_size));
     }
     <BasicWorkerBuilder>::from_spec(spec)
-        .health_config(checks(health))
+        .health_config(checks(health, *drain_settle_secs))
         .status(status(row.status))
 }
 
@@ -97,16 +98,17 @@ fn wire(modes: WireModes) -> ConnectionMode {
     }
 }
 
-/// The object's health checks under the row's policy. Every other setting of
-/// the checks is the object's default.
-fn checks(policy: &HealthPolicy) -> HealthCheckConfig {
+/// The object's health checks under the row's policy, with the row's drain
+/// window where it states one: else the window is the object's default.
+fn checks(policy: &HealthPolicy, drain_settle_secs: Option<u32>) -> HealthCheckConfig {
+    let default = HealthCheckConfig::default();
     HealthCheckConfig {
         timeout_secs: seconds(policy.timeout_ms),
         check_interval_secs: seconds(policy.check_interval_ms),
         success_threshold: policy.success_threshold,
         failure_threshold: policy.failure_threshold,
         disable_health_check: !policy.probes,
-        ..HealthCheckConfig::default()
+        drain_settle_secs: drain_settle_secs.map_or(default.drain_settle_secs, u64::from),
     }
 }
 
