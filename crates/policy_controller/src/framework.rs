@@ -884,6 +884,8 @@ struct SessionsFound {
     key: u64,
     now_micros: u64,
     seed: u64,
+    /// The key's pins as the table held them. Where the write back of the
+    /// host's pin lost to another request's pin, the pins that stood then.
     pins: [WorkerId; 2],
     /// `WorkerId(0)` where the host was not asked, or told none.
     record: WorkerId,
@@ -4433,6 +4435,10 @@ impl Engine {
         let mut left_out = None;
         // The pin of record the host told this decision, for its reading.
         let mut told = WorkerId(0);
+        // The pins that stood where the write back of that pin lost to
+        // another request's pin: the decision follows them, and so does
+        // its shadow.
+        let mut stood = None;
         let owner = owner.or_else(|| {
             if pins[0] != WorkerId(0) {
                 return None;
@@ -4457,6 +4463,9 @@ impl Engine {
                 return None;
             }
             let pins = restore(stored);
+            if KEEPS && pins[0] != stored {
+                stood = Some(pins);
+            }
             pins.iter()
                 .filter(|p| **p != WorkerId(0))
                 .find_map(|p| buf.kept.iter().find(|&&i| candidates[i as usize].id == *p))
@@ -4464,12 +4473,13 @@ impl Engine {
         });
         if WRITE_SESSIONS && KEEPS {
             // What the table and the host gave, apart from any pin this
-            // decision writes: its shadow starts from it.
+            // decision writes: its shadow starts from it. Where the write
+            // back lost, the pins that stood.
             scratch.sessions_found = SessionsFound {
                 key: key.get(),
                 now_micros: facts.now_micros,
                 seed: facts.seed,
-                pins,
+                pins: stood.unwrap_or(pins),
                 record: told,
             };
         }
@@ -6239,6 +6249,35 @@ mod tests {
             .expect("a shadow decision");
         assert_eq!(first_of(&shadow), Some(rows[0].id));
         assert_eq!(pins.asked().len(), 1);
+    }
+
+    /// The reading holds the pins that stood where the write back of the
+    /// host's pin lost to another first request of the key. The live
+    /// decision follows the pin that request wrote, not the record, and
+    /// so does its twin: nothing moved the pins between the two.
+    #[test]
+    fn shadow_follows_the_pins_that_stood_where_a_write_back_lost() {
+        let engine = with_shadow(least_requests_profile(), Some(SESSIONS));
+        let rows = [candidate(0, 13), candidate(1, 3), candidate(2, 1)];
+        let facts = keyed_at(61, 71);
+        let pool = PoolFacts::default();
+        let racing = Racing {
+            engine: &engine,
+            rule: SESSIONS,
+            stored: rows[0].id,
+            other: rows[1].id,
+        };
+        let cx = Constraints {
+            pins: Some(&racing),
+            ..Constraints::default()
+        };
+        let mut scratch = Scratch::new();
+        let live = engine.decide_keeping(&facts, &pool, &rows, &cx, &mut scratch);
+        assert_eq!(first_of(&live), Some(rows[1].id));
+        let shadow = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("a shadow decision");
+        assert_eq!(first_of(&shadow), Some(rows[1].id));
     }
 
     /// The shadow's entry takes its inputs as the live one does: a debug
