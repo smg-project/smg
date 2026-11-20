@@ -2571,6 +2571,47 @@ impl Binding {
         };
         model_ok && (self.phases.is_empty() || self.phases.contains(&phase))
     }
+
+    /// Whether the binding's phase list covers `phase`: an empty list
+    /// covers each.
+    fn covers(&self, phase: Phase) -> bool {
+        self.phases.is_empty() || self.phases.contains(&phase)
+    }
+
+    /// The model pattern, read as [`Self::matches`] reads it.
+    fn pattern(&self) -> Pattern<'_> {
+        match (self.model.strip_prefix('*'), self.model.strip_suffix('*')) {
+            _ if self.model == "*" => Pattern::Any,
+            (Some(suffix), _) => Pattern::Suffix(suffix),
+            (_, Some(prefix)) => Pattern::Prefix(prefix),
+            _ => Pattern::Exact(&self.model),
+        }
+    }
+
+    /// Whether one model id matches this binding's pattern and `other`'s:
+    /// each of the two can be the first to match a pool of that model.
+    fn shares_a_model(&self, other: &Self) -> bool {
+        use Pattern::{Any, Exact, Prefix, Suffix};
+        match (self.pattern(), other.pattern()) {
+            // Every id, and the id that starts with the one's prefix and
+            // ends with the other's suffix.
+            (Any, _) | (_, Any) | (Prefix(_), Suffix(_)) | (Suffix(_), Prefix(_)) => true,
+            (Prefix(a), Prefix(b)) => a.starts_with(b) || b.starts_with(a),
+            (Suffix(a), Suffix(b)) => a.ends_with(b) || b.ends_with(a),
+            (Exact(a), Exact(b)) => a == b,
+            (Exact(id), Prefix(prefix)) | (Prefix(prefix), Exact(id)) => id.starts_with(prefix),
+            (Exact(id), Suffix(suffix)) | (Suffix(suffix), Exact(id)) => id.ends_with(suffix),
+        }
+    }
+}
+
+/// A binding's model pattern: every id, the ids that end with a suffix,
+/// the ids that start with a prefix, or one id.
+enum Pattern<'a> {
+    Any,
+    Suffix(&'a str),
+    Prefix(&'a str),
+    Exact(&'a str),
 }
 
 /// What a host names a profile's rows by, where it names them in the
@@ -2622,15 +2663,26 @@ pub(crate) enum ShadowRows {
     Own,
     /// Not at all: the shadow profile would be named rows of another
     /// warm-up ruling or another record than the pool keeps, or handed a
-    /// column the live decision was not.
+    /// column the live decision was not. So too where the pool would
+    /// keep the record for the shadow alone while a live profile reads
+    /// the record of the same model ([`live_reader_beside`]): a model
+    /// keeps one record under one bound.
     Apart,
 }
 
 impl ShadowRows {
     /// How the shadow of `binding` reads its live decision's rows, by what
     /// each of the two profiles is named by and whether the shadow's reads
-    /// the column at all.
-    fn of(binding: &Binding, named_by: &[NamedBy], needs: &[Needs]) -> Self {
+    /// the column at all. `beside` says whether a live profile reads the
+    /// record of sent prefixes for a model the binding decides
+    /// ([`live_reader_beside`]). It is asked where the pool would keep
+    /// the record for the shadow alone.
+    fn of(
+        binding: &Binding,
+        named_by: &[NamedBy],
+        needs: &[Needs],
+        beside: impl FnOnce() -> bool,
+    ) -> Self {
         let Some(shadow) = binding.single_shadow().map(usize::from) else {
             return Self::Apart;
         };
@@ -2653,11 +2705,18 @@ impl ShadowRows {
             // profile: the live one's. A live profile that is named no
             // row reads no record, so the record is left to the shadow
             // there, and the ruling too where that profile rules by
-            // none.
+            // none. The record is the model's, though, under one bound:
+            // entries kept for a shadow never stand under the bound a
+            // live profile's stand under, where they would move which
+            // of those the record keeps.
             (live_cap, _) => {
                 let left = live_cap == 0;
                 let ruled = live.rule == by.rule || (left && live.rule.is_none());
-                let recorded = left || (live.sent, live.sent_alone) == (by.sent, by.sent_alone);
+                let recorded = if left {
+                    !(by.sent && beside())
+                } else {
+                    (live.sent, live.sent_alone) == (by.sent, by.sent_alone)
+                };
                 if ruled && recorded {
                     Self::Own
                 } else {
@@ -2666,6 +2725,51 @@ impl ShadowRows {
             }
         }
     }
+}
+
+/// Whether a live profile reads the record of sent prefixes for a model
+/// the binding at `at` decides a pool of, by another binding of
+/// `bindings`. A model keeps one record under one bound, and each of its
+/// pools that keeps the record writes there
+/// ([`Engine::pool_record_for`]): a pool that kept it for a shadow alone
+/// would write under the bound that live profile's entries stand under.
+///
+/// The answer is of the document, by the bindings' patterns, phase lists
+/// and order: no membership is asked. It is one word for the binding, so
+/// it says yes for each of its models where it is so for one. It reads
+/// two bindings at a time, so it says yes too where a third takes the
+/// pools those two would share. A profile counts as a reader where its
+/// pool keeps the record for it ([`Engine::reads_sent_for`]).
+fn live_reader_beside(bindings: &[Binding], at: usize, named_by: &[NamedBy]) -> bool {
+    let Some(own) = bindings.get(at) else {
+        return false;
+    };
+    let reads = |other: &Binding, phase: Phase| {
+        other.covers(phase)
+            && profile_index(other, phase)
+                .and_then(|index| named_by.get(usize::from(index)))
+                .is_some_and(|by| by.sent)
+    };
+    bindings.iter().enumerate().any(|(other_at, other)| {
+        if other_at == at || !own.shares_a_model(other) {
+            return false;
+        }
+        if other_at < at {
+            // The other binding is found first. Where it covers each
+            // phase this one covers, it takes every pool of a model the
+            // two share, and this one decides none of that model.
+            let takes = PHASES
+                .iter()
+                .all(|&phase| !own.covers(phase) || other.covers(phase));
+            !takes && PHASES.iter().any(|&phase| reads(other, phase))
+        } else {
+            // This binding is found first: the other decides a pool of
+            // a model of its own only in a phase this one leaves.
+            PHASES
+                .iter()
+                .any(|&phase| !own.covers(phase) && reads(other, phase))
+        }
+    })
 }
 
 /// The engine: validated profiles and the ordered bindings over them, and the
@@ -3783,7 +3887,6 @@ impl Engine {
         let mut live = Vec::new();
         if shadows {
             shadow_placing.reserve_exact(bindings.len());
-            shadow_rows.reserve_exact(bindings.len());
             live.resize(profiles.len(), false);
             for binding in &bindings {
                 for phase in PHASES {
@@ -3794,6 +3897,13 @@ impl Engine {
                     }
                 }
             }
+            // A binding's word is of the whole list: whether a live
+            // profile reads the record beside it.
+            let rows = bindings.iter().enumerate().map(|(at, binding)| {
+                let beside = || live_reader_beside(&bindings, at, &named_by);
+                ShadowRows::of(binding, &named_by, &profile_needs, beside)
+            });
+            shadow_rows = rows.collect();
         }
         // A picker that leaves the placement to its rule has no stages to
         // delegate to: the assignment that places is written beside each
@@ -3819,7 +3929,6 @@ impl Engine {
                             .then(|| placed_by(declared, marks.by_assignment()))
                     });
                     shadow_placing.push(placing);
-                    shadow_rows.push(ShadowRows::of(&binding, &named_by, &profile_needs));
                 }
                 Entry {
                     placing: placed_by(declared, by_assignment),
@@ -4306,7 +4415,10 @@ impl Engine {
     /// no row and its binding's shadow is named rows of its own, the
     /// shadow profile's. A live profile that is named no row reads no
     /// holder, so the record its pool keeps moves nothing it is handed.
-    /// A document that names no such shadow keeps none there.
+    /// A document that names no such shadow keeps none there. A shadow
+    /// is named no such rows where a live profile reads the record of
+    /// the same model ([`live_reader_beside`]): the entries kept for a
+    /// shadow share a bound with no live reader's.
     pub(crate) fn pool_record_for(&self, model: &str, phase: Phase) -> Option<bool> {
         if self.reads_sent_for(model, phase) {
             return Some(self.reads_sent_alone_for(model, phase));
@@ -7793,6 +7905,117 @@ mod tests {
         document.profiles.insert("second".into(), by_record);
         let engine = document.validate().expect("a binding with a shadow");
         assert_eq!(engine.pool_record_for("m", Phase::Single), Some(true));
+    }
+
+    /// A model keeps one record of sent prefixes under one bound. A
+    /// shadow named rows of its own behind a live profile that is named
+    /// none would have its pool keep the record for it, and write under
+    /// the bound of every live reader of that model. So it is not asked
+    /// where another binding's live profile reads the record for a model
+    /// its binding decides, and its pool keeps none. It is asked where
+    /// that profile reads the index alone, where the two bindings share
+    /// no model, and where one of them takes every pool of the models
+    /// they share.
+    #[test]
+    fn a_shadow_is_not_asked_where_a_live_profile_reads_its_models_record() {
+        use crate::spec::{AffinitySource, PrefixAffinityParams, ScoreStage, ShadowSpec};
+        type Side<'a> = (&'a str, &'a [Phase]);
+        let word = |own: Side<'_>, other: Side<'_>, first: bool, index: bool, model: &str| {
+            let aware = PolicySpec::preset("cache_aware").expect("a preset");
+            let aware = aware.profiles.into_values().next();
+            let aware = aware.expect("the preset's profile");
+            let mut live = aware.clone();
+            if index {
+                // The live profile's prefix stage reads the index alone.
+                let prefix = PrefixAffinityParams {
+                    weight: 4.0,
+                    source: Some(AffinitySource::Index),
+                    ..PrefixAffinityParams::default()
+                };
+                live.score[1] = ScoreStage::PrefixAffinity(prefix).into();
+            }
+            let mut document = PolicySpec::preset("least_load").expect("a preset");
+            document.profiles.insert("second".into(), aware);
+            document.profiles.insert("live".into(), live);
+            let mut reader = document.bindings[0].clone();
+            reader.matcher.model = other.0.into();
+            reader.matcher.phase = other.1.to_vec();
+            reader.profile = Some("live".into());
+            let shadowed = &mut document.bindings[0];
+            shadowed.matcher.model = own.0.into();
+            shadowed.matcher.phase = own.1.to_vec();
+            shadowed.shadow = Some(ShadowSpec::Profile("second".into()));
+            document.bindings.insert(usize::from(first), reader);
+            let engine = document.validate().expect("two bindings");
+            let rows = engine.shadow_for(model, Phase::Single);
+            let record = engine.pool_record_for(model, Phase::Single);
+            (rows.map(|(_, rows)| rows), record)
+        };
+        let (single, prefill) = (&[Phase::Single][..], &[Phase::Prefill][..]);
+        let each: &[Phase] = &[];
+        let (own, apart) = (ShadowRows::Own, ShadowRows::Apart);
+        // The shadowed binding, the other one, whether the shadowed one
+        // is listed first, whether the other reads the index alone, the
+        // model asked of, and the word.
+        let cases: [(Side<'_>, Side<'_>, bool, bool, &str, ShadowRows); 8] = [
+            // Another pool of the model is a live reader's.
+            (("*", single), ("*", prefill), true, false, "m", apart),
+            (("*", single), ("*", prefill), false, false, "m", apart),
+            (("m*", single), ("*x", prefill), true, false, "m", apart),
+            // One word a binding: another of its models is skipped too.
+            (("*", each), ("m", prefill), false, false, "n", apart),
+            // No record is read live beside it.
+            (("*", single), ("*", prefill), true, true, "m", own),
+            (("m", single), ("n", prefill), true, false, "m", own),
+            // One binding takes every pool of the models they share.
+            (("m", each), ("*", each), true, false, "m", own),
+            (("*", each), ("m", each), false, false, "n", own),
+        ];
+        for (shadowed, other, first, index, model, wanted) in cases {
+            let record = (wanted == own).then_some(false);
+            assert_eq!(
+                word(shadowed, other, first, index, model),
+                (Some(wanted), record),
+                "{shadowed:?} beside {other:?}"
+            );
+        }
+    }
+
+    /// Two bindings share a model where one id matches both patterns, as
+    /// [`Binding::matches`] reads each: by every id of one to four
+    /// letters.
+    #[test]
+    fn two_bindings_share_a_model_where_one_id_matches_both() {
+        let binding = |model: &str| Binding {
+            model: model.into(),
+            phases: vec![],
+            ..single_binding()
+        };
+        let ids: Vec<String> = (1..=4u32)
+            .flat_map(|len| (0..1u32 << len).map(move |bits| (len, bits)))
+            .map(|(len, bits)| {
+                let letter = |at| if bits >> at & 1 == 0 { 'a' } else { 'b' };
+                (0..len).map(letter).collect()
+            })
+            .collect();
+        let patterns = [
+            "*", "a*", "ab*", "b*", "*a", "*ba", "*b", "a", "ab", "ba", "b",
+        ];
+        for one in patterns {
+            for other in patterns {
+                let (one, other) = (binding(one), binding(other));
+                let both = |id: &String| {
+                    one.matches(id, Phase::Single) && other.matches(id, Phase::Single)
+                };
+                assert_eq!(
+                    one.shares_a_model(&other),
+                    ids.iter().any(both),
+                    "{} and {}",
+                    one.model,
+                    other.model
+                );
+            }
+        }
     }
 
     #[test]

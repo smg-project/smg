@@ -447,6 +447,90 @@ fn a_decision_whose_shadow_is_not_asked_writes_no_record() -> Case {
     Ok(())
 }
 
+/// What two leases of one prompt in each of a model's two pools left.
+#[derive(Debug, PartialEq)]
+struct Beside {
+    /// Whether each lease of the reader's pool took its first worker.
+    returned: [bool; 2],
+    /// The record's slices as each pool reads them: the shadowed
+    /// binding's pool, then the reader's.
+    record: [Option<usize>; 2],
+    /// The shadows that were not asked.
+    skipped: u64,
+}
+
+/// A model keeps one record of sent prefixes under one bound, and each
+/// of its pools that keeps the record writes there. A shadow that would
+/// be named rows of its own is not asked where another pool of its model
+/// reads the record live: the entries its pool kept for it would stand
+/// under the bound the live reader's stand under. That pool's leases and
+/// the record's entries are the same with the shadow and without, and
+/// each such decision counts its shadow as skipped.
+#[test]
+fn a_shadow_is_skipped_where_another_pool_of_its_model_reads_the_record() -> Case {
+    let landing = |shadowed: bool| -> Case<Beside> {
+        let store = fleet();
+        let a = worker(&store, "a", Role::Single, &[MODEL], false)?;
+        let b = worker(&store, "b", Role::Single, &[MODEL], false)?;
+        let c = worker(&store, "c", Role::Prefill, &[MODEL], false)?;
+        let d = worker(&store, "d", Role::Prefill, &[MODEL], false)?;
+        // Least load decides the single pool, with the shadow or with
+        // none. A live cache-aware profile decides the prefill pool.
+        let mut document = least_load(1, shadowed)?;
+        let aware = merged(1)?.profiles.into_values().next();
+        let aware = aware.ok_or("the preset's profile")?;
+        document.profiles.insert("aware".into(), aware);
+        let mut reader = document.bindings[0].clone();
+        reader.matcher.phase = vec![Phase::Prefill];
+        reader.profile = Some("aware".into());
+        reader.shadow = None;
+        document.bindings[0].matcher.phase = vec![Phase::Single];
+        document.bindings.push(reader);
+        store.apply(applied(&document)?)?;
+        let door = Door::new(store.clone());
+        let placed = |phase: Phase, now: Instant| -> Case<WorkerId> {
+            let mut asked = token_request(&HASHES[..8]);
+            asked.facts.phase = phase;
+            let decided = door.decide(GATEWAY, &asked, now);
+            let decided = decided.map_err(|word| format!("{word:?}"))?;
+            let lease = decided.lease.ok_or("a pick's lease")?.lease;
+            door.report(GATEWAY, lease.id, gone());
+            Ok(lease.booked)
+        };
+        let now = Instant::now() + Duration::from_secs(120);
+        for (id, running) in [(a, 0), (b, 1), (c, 0), (d, 1)] {
+            load(&store, id, running, now);
+        }
+        placed(Phase::Single, now)?;
+        let cold = placed(Phase::Prefill, now)? == c;
+        let later = now + Duration::from_millis(20);
+        for (id, running) in [(a, 2), (b, 0), (c, 2), (d, 0)] {
+            load(&store, id, running, later);
+        }
+        placed(Phase::Single, later)?;
+        let back = placed(Phase::Prefill, later)? == c;
+        Ok(Beside {
+            returned: [cold, back],
+            record: [Role::Single, Role::Prefill].map(|role| slices(&store, role)),
+            skipped: door.shadowed(0, ShadowKind::Skipped),
+        })
+    };
+    let plain = landing(false)?;
+    assert_eq!(plain.returned, [true, true], "the prefix returns");
+    // The reader's first lease writes its slice. The prompt's return to
+    // the same worker is a fresh hit and writes none.
+    assert_eq!(plain.record, [None, Some(1)], "the reader's one slice");
+    assert_eq!(plain.skipped, 0, "no shadow is named");
+    let shadowed = landing(true)?;
+    assert_eq!(
+        (shadowed.returned, shadowed.record),
+        (plain.returned, plain.record),
+        "the reader's leases and the record stand as with no shadow"
+    );
+    assert_eq!(shadowed.skipped, 2, "the pairing is skipped each time");
+    Ok(())
+}
+
 #[test]
 fn a_prefix_grown_by_a_turn_follows_its_worker() -> Case {
     let store = fleet();
