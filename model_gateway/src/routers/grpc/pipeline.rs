@@ -120,6 +120,10 @@ pub(crate) struct PipelineDeps {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     host: Option<Arc<Host>>,
+    /// Whether the pair's policy settings keep a request to the worker it
+    /// names (`placement::pair_keeps_target`). No role policy is built under
+    /// the policy controller, so the selection stage is told.
+    pair_keeps_target: bool,
     prefill_admission: Option<Arc<PrefillAdmission>>,
     tool_parser_factory: ToolParserFactory,
     reasoning_parser_factory: ReasoningParserFactory,
@@ -162,6 +166,7 @@ impl PipelineDeps {
             worker_registry,
             policy_registry,
             host: None,
+            pair_keeps_target: false,
             prefill_admission,
             tool_parser_factory,
             reasoning_parser_factory,
@@ -187,6 +192,7 @@ impl PipelineDeps {
             worker_registry,
             policy_registry,
             host: None,
+            pair_keeps_target: false,
             prefill_admission,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
@@ -221,6 +227,14 @@ impl PipelineDeps {
     #[must_use]
     pub(crate) fn with_host(mut self, host: Option<Arc<Host>>) -> Self {
         self.host = host;
+        self
+    }
+
+    /// Tell the selection stage whether the pair's policy settings keep a
+    /// request to the worker it names (`placement::pair_keeps_target`).
+    #[must_use]
+    pub(crate) fn with_pair_keeps_target(mut self, keeps: bool) -> Self {
+        self.pair_keeps_target = keeps;
         self
     }
 
@@ -285,6 +299,7 @@ impl PipelineDeps {
             worker_registry: Arc::new(WorkerRegistry::new()),
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             host: None,
+            pair_keeps_target: false,
             prefill_admission: None,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
@@ -366,6 +381,7 @@ impl RequestPipeline {
             deps.prefill_admission.clone(),
         )
         .with_host(deps.host.clone())
+        .with_pair_keeps_target(deps.pair_keeps_target)
         .with_queue_timeout(deps.queue_timeout);
         let plan_settings = mode.plan_settings();
         let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);

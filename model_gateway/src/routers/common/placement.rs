@@ -28,6 +28,7 @@ use smg_worker::{
 use tracing::{debug, warn};
 
 use crate::{
+    config::{PolicyConfig, RoutingMode},
     middleware::ReportedRefusal,
     observability::{
         log_throttle::KeyedLogThrottle,
@@ -101,6 +102,16 @@ impl WireConstraint {
 pub(crate) fn strict_target(policy: &dyn LoadBalancingPolicy, headers: Option<&HeaderMap>) -> bool {
     as_consistent_hashing(policy).is_some()
         && header_utils::extract_target_worker(headers).is_some()
+}
+
+/// The policy half of [`strict_target`] read off a pair's settings: the
+/// prefill or the decode policy, each the `main` one where unset, is
+/// consistent hashing. Under the policy controller no role policy is built,
+/// so a pair's route asks its settings what the classic would keep.
+pub(crate) fn pair_keeps_target(mode: &RoutingMode, main: &PolicyConfig) -> bool {
+    [mode.get_prefill_policy(main), mode.get_decode_policy(main)]
+        .into_iter()
+        .any(|policy| matches!(policy, PolicyConfig::ConsistentHashing))
 }
 
 /// Whether an admission pre-filter may drop full workers from a role's

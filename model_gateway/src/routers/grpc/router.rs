@@ -55,7 +55,7 @@ use crate::{
     observability::metrics::metrics_labels,
     routers::{
         common::{
-            json_response,
+            json_response, placement,
             snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
         },
         error,
@@ -174,6 +174,10 @@ impl GrpcRouter {
                 Mode::EncodePrefillDecode => {}
             }
         }
+        // No role policy is built under the policy controller, so the
+        // selection stage is told what the pair's settings keep.
+        let settings = &ctx.router_config;
+        let pair_keeps_target = placement::pair_keeps_target(&settings.mode, &settings.policy);
         // Deps for the parser-consuming endpoints (chat/messages/harmony).
         let configured_deps = PipelineDeps::new(
             worker_registry.clone(),
@@ -188,7 +192,8 @@ impl GrpcRouter {
         )
         .with_request_timeout(request_timeout)
         .with_grouped_dp_sticky(grouped_dp_sticky)
-        .with_host(ctx.policy_host.clone());
+        .with_host(ctx.policy_host.clone())
+        .with_pair_keeps_target(pair_keeps_target);
         // Deps for the parser-free endpoints (completion/embeddings/classify/
         // decisions/transcription).
         let pair_deps = PipelineDeps::pair(
@@ -200,7 +205,8 @@ impl GrpcRouter {
         )
         .with_request_timeout(request_timeout)
         .with_grouped_dp_sticky(grouped_dp_sticky)
-        .with_host(ctx.policy_host.clone());
+        .with_host(ctx.policy_host.clone())
+        .with_pair_keeps_target(pair_keeps_target);
 
         // Present in every mode: chat/generate, messages, completion.
         let pipeline = RequestPipeline::build(Endpoint::Chat, mode, &configured_deps)
