@@ -9,39 +9,29 @@ use std::{sync::Arc, time::Duration};
 
 use crate::{
     common_proto as common,
+    value_bounds::{stands, MAX_VALUES},
     worker::{
         EngineMemoryMetricsSnapshot, EngineQueueMetricsSnapshot, LoadRecord, LoadTelemetry,
         NamedValue, SchedulerLoadSnapshot,
     },
 };
 
-const MAX_VALUES: usize = 64;
-const MAX_NAME_BYTES: usize = 63;
-const MAX_UNIT_BYTES: usize = 31;
-
-/// The record's named values under the snapshot's bounds: the first
-/// `MAX_VALUES` entries, less those with an empty name, a name or a unit
-/// over its bound, a value that is not finite, or a name an entry kept
-/// ahead of it states. The first of a name stands. What is left out here
-/// is counted where the record is taken: the record's list less this one
+/// The record's named values under the report's bounds: of the record's
+/// first `MAX_VALUES` entries, those that stand by the test every list is
+/// held to, in a list sized for them once. What is left out here is
+/// counted where the record is taken: the record's list less this one
 /// ([`LoadRecord::values_sent`]).
 fn read_values(values: &[common::NamedValue]) -> Vec<NamedValue> {
-    let mut named: Vec<NamedValue> = Vec::new();
+    let mut named: Vec<NamedValue> = Vec::with_capacity(values.len().min(MAX_VALUES));
     for sample in values.iter().take(MAX_VALUES) {
-        if sample.name.is_empty()
-            || sample.name.len() > MAX_NAME_BYTES
-            || sample.unit.len() > MAX_UNIT_BYTES
-            || !sample.value.is_finite()
-            || named.iter().any(|kept| *kept.name == *sample.name)
-        {
-            continue;
+        if stands(&sample.name, &sample.unit, sample.value, &named) {
+            named.push(NamedValue {
+                name: Arc::from(sample.name.as_str()),
+                unit: Arc::from(sample.unit.as_str()),
+                value: sample.value,
+                age_ms: sample.age_ms,
+            });
         }
-        named.push(NamedValue {
-            name: Arc::from(sample.name.as_str()),
-            unit: Arc::from(sample.unit.as_str()),
-            value: sample.value,
-            age_ms: sample.age_ms,
-        });
     }
     named
 }
@@ -311,5 +301,36 @@ mod tests {
         ];
         let kept = read_values(&values);
         assert_eq!((kept.len(), kept[0].value), (1, 5.0));
+    }
+
+    /// A polled answer's list and a pushed record's are held to one test:
+    /// of the same entries the same ones stand, in the same order, and as
+    /// many leave.
+    #[test]
+    fn a_polled_list_keeps_what_a_pushed_record_of_its_entries_keeps() {
+        let mut values: Vec<_> = (0..70)
+            .map(|index| sample(&format!("ready_{index}"), "items", f64::from(index)))
+            .collect();
+        values[3] = sample("", "items", 1.0);
+        values[5] = sample("ready_4", "items", 2.0);
+        values[7] = sample("ready_7", "items", f64::INFINITY);
+        values[9] = sample(&"n".repeat(64), "items", 3.0);
+        values[11] = sample("ready_11", &"u".repeat(32), 4.0);
+        let pushed = read_values(&values);
+        assert_eq!(pushed.len(), 59);
+        let mut polled = SchedulerLoadSnapshot {
+            values: values
+                .iter()
+                .map(|value| NamedValue {
+                    name: value.name.as_str().into(),
+                    unit: value.unit.as_str().into(),
+                    value: value.value,
+                    age_ms: value.age_ms,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(polled.bound_values(), values.len() - pushed.len());
+        assert_eq!(polled.values, pushed);
     }
 }

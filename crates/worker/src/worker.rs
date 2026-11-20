@@ -23,7 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(feature = "axum")]
 use serde_json::json;
 
-use super::{identity::endpoint::Endpoint, model_card::ModelCard};
+use super::{identity::endpoint::Endpoint, model_card::ModelCard, value_bounds};
 
 // ── Default value constants ──────────────────────────────────────────
 
@@ -1770,7 +1770,26 @@ pub struct SchedulerLoadSnapshot {
     /// in its snapshot, and that says nothing about the value. A reader
     /// that wants a value across records keeps the last one it read; the
     /// load sink hears every record.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// A report holds a list to bounds ([`Self::bound_values`]). A pushed
+    /// record's snapshot is built under them, and the load monitor puts a
+    /// polled answer's list under them before a sink or a reader sees it.
+    /// Off the wire the key fails no answer: an entry that is no named
+    /// value is read with no name, and a key that is no list as no list.
+    #[serde(
+        default,
+        deserialize_with = "value_bounds::stated",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    #[schemars(
+        description = "Values the engine reports by name, as the one record or answer this \
+                       snapshot was read from states them. A list takes the place of the \
+                       rank's last: a name it leaves out is not in the snapshot, and that says \
+                       nothing about the value. A report keeps the first 64 entries of a list, \
+                       less each one with an empty name, a name over 63 bytes, a unit over 31 \
+                       bytes, a value that is not finite, or a name an entry kept ahead of it \
+                       states."
+    )]
     pub values: Vec<NamedValue>,
     /// The parts of this entry that its own record did not carry: the load
     /// monitor kept them from an older record of the rank. Empty for a
@@ -1782,6 +1801,22 @@ pub struct SchedulerLoadSnapshot {
 }
 
 impl SchedulerLoadSnapshot {
+    /// Puts [`Self::values`] under the bounds a report holds named values
+    /// to, in place, and answers how many entries left the list. A report
+    /// considers a list's first 64 entries. Of those it drops each one
+    /// with an empty name, a name over 63 bytes, a unit over 31 bytes, a
+    /// value that is not finite, or a name an entry kept ahead of it
+    /// states: the first of a name stands. The kept entries keep their
+    /// order.
+    ///
+    /// The load monitor passes every polled answer through this and counts
+    /// what it answers. A pushed record's snapshot is built under the same
+    /// bounds. A host that takes an answer by a way of its own calls this
+    /// before it reads the list.
+    pub fn bound_values(&mut self) -> usize {
+        value_bounds::bound(&mut self.values)
+    }
+
     /// Values the engine reports by name, followed by the two fixed token
     /// counts, each where it is nonzero, its name is absent from the list
     /// and this snapshot's own record carried it. A count the entry kept
