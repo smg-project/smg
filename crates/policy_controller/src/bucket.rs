@@ -3,10 +3,10 @@
 //! For each model the scorer keeps a partition of the request sizes among
 //! the pool's workers. Each listed worker owns a range of sizes, in the
 //! order the workers were listed, and the last range is open-ended. A
-//! prefill decision scores the owner of its prompt's size first, so
-//! requests of like size meet on one worker. When the owner is no survivor
-//! of the decision, the nearest listed survivor below it in the partition
-//! takes the request, else the nearest above.
+//! prefill decision scores every row of the worker that owns its prompt's
+//! size first, so requests of like size meet on one worker. When the owner
+//! is no survivor of the decision, the nearest listed survivor below it in
+//! the partition takes the request, else the nearest above.
 //!
 //! The partition is learned from a window of bookings. Every issued
 //! decision books its tokens on the worker it names
@@ -84,8 +84,7 @@ use crate::{
 /// replaces the split with ranges learned from the sizes seen.
 pub const SPAN: u32 = 4096;
 
-/// No member and no survivor: a booking whose worker left the listing, a
-/// member that is no survivor of the decision in progress.
+/// No member: a booking whose worker left the listing.
 const NONE: u32 = u32::MAX;
 
 /// The most bookings a window holds. The host's clock bounds the window; a
@@ -161,9 +160,9 @@ struct Pool {
     /// entry a decision made and listed nobody in: the decision that still
     /// holds it takes the model's next one.
     left: bool,
-    /// Per member, the place among the kept of the candidate it is in the
-    /// decision in progress, or [`NONE`]. Reused from decision to decision.
-    seats: Vec<u32>,
+    /// Whether each member has a surviving row in the decision in progress.
+    /// Reused from decision to decision.
+    seated: Vec<bool>,
     /// The rows of the view in the decision in progress that the partition
     /// does not list and the fence names, each by its place in the view and
     /// its worker's id, in the view's order. Written where the decision
@@ -206,8 +205,8 @@ enum Clock {
     Dispatch,
 }
 
-/// The booked tokens of a decision's survivors: the most, the least, and
-/// the first survivor that holds the least, by its place among the kept.
+/// The booked tokens of a decision's surviving members: the most, the least,
+/// and the first member that holds the least, by its place in the listing.
 #[derive(Clone, Copy, Debug)]
 struct Loads {
     most: u64,
@@ -297,7 +296,7 @@ impl Pool {
             next_cut_micros: 0,
             by_id: FxHashMap::default(),
             left: false,
-            seats: Vec::new(),
+            seated: Vec::new(),
             fenced: Vec::new(),
             sizes: Vec::new(),
         }
@@ -335,12 +334,12 @@ impl Pool {
         candidates: &[Candidate],
         kept: &[u32],
     ) -> Option<Loads> {
-        self.seats.clear();
-        self.seats.resize(self.members.len(), NONE);
+        self.seated.clear();
+        self.seated.resize(self.members.len(), false);
         let mut loads: Option<Loads> = None;
         // How many of the view's fenced rows stand before the row at hand.
         let mut behind = 0;
-        for (place, &row) in kept.iter().enumerate() {
+        for &row in kept {
             let id = candidates[row as usize].id;
             if LISTED {
                 while self.fenced.get(behind).is_some_and(|&(at, _)| at < row) {
@@ -354,19 +353,22 @@ impl Pool {
                 return None;
             };
             let member = member as usize;
-            self.seats[member] = place as u32;
+            if self.seated[member] {
+                continue;
+            }
+            self.seated[member] = true;
             let load = self.members[member].load;
             loads = Some(match loads {
                 None => Loads {
                     most: load,
                     least: load,
-                    lightest: place,
+                    lightest: member,
                 },
                 Some(so_far) => Loads {
                     most: so_far.most.max(load),
                     least: so_far.least.min(load),
                     lightest: if load < so_far.least {
-                        place
+                        member
                     } else {
                         so_far.lightest
                     },
@@ -675,9 +677,9 @@ impl Pool {
         }
     }
 
-    /// The survivor a size goes to among the seated: the owner of the
-    /// size's range, else the nearest seated owner below it in the
-    /// partition, else the nearest above; by its place among the kept.
+    /// The member a size goes to among the seated: the owner of the size's
+    /// range, else the nearest seated owner below it in the partition, else
+    /// the nearest above; by its place in the listing.
     fn owner(&self, tokens: u32) -> Option<usize> {
         let at = self
             .ranges
@@ -694,9 +696,8 @@ impl Pool {
         (0..=at)
             .rev()
             .chain(at + 1..self.ranges.len())
-            .map(|at| self.seats[self.ranges[at].member as usize])
-            .find(|&seat| seat != NONE)
-            .map(|seat| seat as usize)
+            .map(|at| self.ranges[at].member as usize)
+            .find(|&member| self.seated[member])
     }
 }
 
@@ -974,8 +975,14 @@ impl Scorer for Bucket {
             } else {
                 pool.owner(facts.prompt_tokens)
             };
-            if let Some(score) = leads.and_then(|place| out.get_mut(place)) {
-                *score = 1.0;
+            if let Some(id) =
+                leads.and_then(|member| pool.members.get(member).map(|member| member.id))
+            {
+                for (&row, score) in kept.iter().zip(out) {
+                    if candidates[row as usize].id == id {
+                        *score = 1.0;
+                    }
+                }
             }
             return TieBand::NORMALIZED;
         }
@@ -1034,9 +1041,9 @@ mod tests {
         }
     }
 
-    /// The row the scorer leads with among `kept`; `None` when every
-    /// survivor scores equal. One survivor at most leads, at the top of the
-    /// scale, and every other stands at zero.
+    /// The first row of the worker the scorer leads with among `kept`; `None`
+    /// when every survivor scores equal. Every row of one worker at most
+    /// leads, at the top of the scale, and every other stands at zero.
     fn led_by(
         scorer: &Bucket,
         facts: &RequestFacts<'_>,
@@ -1054,7 +1061,14 @@ mod tests {
             .filter(|&(_, &score)| score > 0.5)
             .map(|(&row, _)| row)
             .collect();
-        assert!(leads.len() <= 1, "{out:?}");
+        if let Some(&first) = leads.first() {
+            assert!(
+                leads
+                    .iter()
+                    .all(|&row| pool[row as usize].id == pool[first as usize].id),
+                "{out:?}"
+            );
+        }
         assert!(
             out.iter().all(
                 |&score| score.to_bits() == 0f32.to_bits() || score.to_bits() == 1f32.to_bits()
@@ -1752,6 +1766,90 @@ mod tests {
         ];
         led(&scorer, &twice, 0, SECOND);
         assert_eq!(loads(&scorer), (vec![0, 0], 0));
+    }
+
+    #[test]
+    fn all_rows_of_the_bucket_owner_score_alike() {
+        let pool = pool(2);
+        let mut candidates = [
+            pool[0],
+            Candidate {
+                position: 1,
+                dp_rank: 1,
+                ..pool[0]
+            },
+            Candidate {
+                position: 2,
+                ..pool[1]
+            },
+        ];
+        let scores = |candidates: &[Candidate]| {
+            let scorer = scorer(NEVER, 1.5, 5);
+            let mut out = vec![0.5; candidates.len()];
+            assert_eq!(
+                scorer.score(
+                    &prefill("m", 0, SECOND),
+                    candidates,
+                    &all(candidates),
+                    &mut out,
+                ),
+                TieBand::NORMALIZED
+            );
+            let score = |id, rank| {
+                candidates
+                    .iter()
+                    .zip(&out)
+                    .find(|(candidate, _)| candidate.id == id && candidate.dp_rank == rank)
+                    .map(|(_, &score)| score)
+            };
+            [
+                score(pool[0].id, 0),
+                score(pool[0].id, 1),
+                score(pool[1].id, 0),
+            ]
+        };
+        assert_eq!(scores(&candidates), [Some(1.0), Some(1.0), Some(0.0)]);
+        candidates.swap(0, 1);
+        for (position, candidate) in candidates.iter_mut().enumerate() {
+            candidate.position = position as u32;
+        }
+        assert_eq!(scores(&candidates), [Some(1.0), Some(1.0), Some(0.0)]);
+    }
+
+    #[test]
+    fn the_balance_rule_spills_to_every_row_of_the_least_booked_worker() {
+        let pool = pool(2);
+        let candidates = [
+            pool[0],
+            Candidate {
+                position: 1,
+                dp_rank: 1,
+                ..pool[0]
+            },
+            Candidate {
+                position: 2,
+                ..pool[1]
+            },
+        ];
+        let scorer = scorer(32, 1.5, 5);
+        let mut out = vec![0.5; candidates.len()];
+        scorer.score(
+            &prefill("m", 0, SECOND),
+            &candidates,
+            &all(&candidates),
+            &mut out,
+        );
+        book(&scorer, &candidates, 2, 100, SECOND);
+
+        // 3,000 is worker 101's size in the even split of two: worker 100's
+        // rows lead only because 100 booked against 0 spills.
+        scorer.score(
+            &prefill("m", 3_000, SECOND),
+            &candidates,
+            &all(&candidates),
+            &mut out,
+        );
+        assert_eq!(out, [1.0, 1.0, 0.0]);
     }
 
     #[test]
