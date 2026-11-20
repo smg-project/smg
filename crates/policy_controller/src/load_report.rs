@@ -2,6 +2,7 @@
 //! worker host's load adapter.
 
 use std::{
+    fmt,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -162,7 +163,7 @@ pub fn signal_values(
                 &mut made[at],
                 nth,
                 across,
-                stated.unit,
+                &stated.unit,
                 stated.value,
                 sampled,
             );
@@ -225,7 +226,7 @@ impl Made {
         slot: &mut Option<Self>,
         nth: u32,
         across: AcrossRanks,
-        unit: Arc<str>,
+        unit: &Arc<str>,
         value: f64,
         sampled: Instant,
     ) {
@@ -233,7 +234,7 @@ impl Made {
             None if nth == 0 => {
                 *slot = Some(Self {
                     ranks: 1,
-                    unit,
+                    unit: Arc::clone(unit),
                     value,
                     oldest: sampled,
                 });
@@ -244,7 +245,7 @@ impl Made {
             // filled at the first rank alone, so no later statement
             // is read.
             Some(row) if row.ranks == nth => {
-                if row.unit == unit {
+                if row.unit == *unit {
                     row.ranks += 1;
                     row.value = joined(across, row.value, value);
                     row.oldest = row.oldest.min(sampled);
@@ -290,7 +291,9 @@ fn joined(across: AcrossRanks, so_far: f64, next: f64) -> f64 {
 /// cell holds that worker's last value. It ends no statement either: a
 /// worker's first records list one rank until the others report. What
 /// such a record stated is read from its rank's entry at the first record
-/// of another rank ([`ReportOf::OneRank`]).
+/// of another rank, as old as the source read it ([`Self::behind`]). From
+/// then on the keeper is told every report of its worker, of one rank or
+/// of several, and holds each rank's own instant.
 ///
 /// What is kept is bounded by the declared signals times the report's
 /// ranks. A rank that a report of several ranks lists no more takes its
@@ -317,6 +320,10 @@ pub struct RankValues {
 #[derive(Debug)]
 struct RankStated {
     rank: i32,
+    /// When the report's entry of the rank was last written, as this
+    /// keeper was told: at the rank's last record, or at the last answer
+    /// that listed the rank.
+    heard: Option<Instant>,
     stated: Vec<Stated>,
 }
 
@@ -330,23 +337,36 @@ struct Stated {
     sampled: Instant,
 }
 
-/// Whose sample a report of several ranks is: what says which of its
-/// entries a keeper reads, and under which sample instant.
+/// Whose sample a report is: what says which of its entries a keeper
+/// reads, and under which sample instant.
 #[derive(Clone, Copy)]
 pub enum ReportOf<'a> {
-    /// A polled answer's: one sample of every rank, each entry its own.
+    /// A polled answer's: one sample of every rank it lists, each entry
+    /// its own.
     EveryRank,
     /// A pushed record's: its own rank's. Every other entry is what its
-    /// rank's last record left.
+    /// rank's last record left, or the last answer that listed the rank.
     OneRank {
         /// The rank the record came from.
         rank: i32,
         /// When another rank's last record was sampled, by its rank:
         /// `None` where the source holds no record of it. A poll's row in
-        /// a rank's place is no record of the rank. A keeper asks it where
-        /// that rank's entry states a name it holds no statement of.
+        /// a rank's place is no record of the rank. A keeper asks it for a
+        /// rank whose entry it was not told of itself.
         heard: &'a dyn Fn(i32) -> Option<Instant>,
     },
+}
+
+impl fmt::Debug for ReportOf<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EveryRank => f.write_str("EveryRank"),
+            Self::OneRank { rank, .. } => f
+                .debug_struct("OneRank")
+                .field("rank", rank)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 impl ReportOf<'_> {
@@ -397,22 +417,33 @@ fn lists_each_rank_once(report: &WorkerLoadResponse) -> bool {
 }
 
 impl RankValues {
-    /// Whether a keeper keeps `report`: one of several ranks of one
-    /// engine, each listed once, under a document that declares a signal.
-    /// Any other report is one sample, and [`signal_values`] makes its
-    /// values with nothing kept. A gateway's rollup of its own workers is
-    /// one: its entries are workers, and they repeat a rank, so one
-    /// worker's statement would be kept in the place of another's.
-    pub fn keeps(report: &WorkerLoadResponse, columns: &[SignalColumn]) -> bool {
-        Self::order_of(report, columns).is_some()
+    /// A keeper made behind a report its source read alone: `alone` is
+    /// that report's one rank and its sample instant, where the source
+    /// read one. The rank's entry is as old when a later record lists it
+    /// beside another rank.
+    pub fn behind(alone: Option<(i32, Instant)>) -> Self {
+        let mut keeper = Self::default();
+        if let Some((rank, at)) = alone {
+            keeper.hear(rank, at);
+        }
+        keeper
     }
 
-    /// Whether a keeper keeps `report` ([`Self::keeps`]), and then whether
-    /// the report lists its ranks in rank order: one pass says both of a
-    /// pushed record's report, and an answer out of order is read pair by
-    /// pair.
-    fn order_of(report: &WorkerLoadResponse, columns: &[SignalColumn]) -> Option<bool> {
-        if columns.is_empty() || report.loads.len() < 2 || !report.ranks_are_dp_ranks() {
+    /// Whether a keeper makes the values of `report`: one of several ranks
+    /// of one engine, each listed once, under a document that declares a
+    /// signal. Any other report is one sample, and [`signal_values`] makes
+    /// its values. A gateway's rollup of its own workers is one: its
+    /// entries are workers, and they repeat a rank, so one worker's
+    /// statement would be kept in the place of another's.
+    pub fn keeps(report: &WorkerLoadResponse, columns: &[SignalColumn]) -> bool {
+        !columns.is_empty() && report.loads.len() > 1 && Self::order_of(report).is_some()
+    }
+
+    /// Whether `report` lists ranks of one engine, each once, and then
+    /// whether it lists them in rank order: one pass says both of a pushed
+    /// record's report, and an answer out of order is read pair by pair.
+    fn order_of(report: &WorkerLoadResponse) -> Option<bool> {
+        if report.loads.is_empty() || !report.ranks_are_dp_ranks() {
             return None;
         }
         if in_rank_order(report) {
@@ -452,30 +483,39 @@ impl RankValues {
                 let (Some(slot), Some(column)) = (slot, columns.get(stated.column)) else {
                     continue;
                 };
-                let unit = Arc::clone(&stated.unit);
                 let across = column.across_ranks();
-                Made::join(slot, nth, across, unit, stated.value, stated.sampled);
+                Made::join(
+                    slot,
+                    nth,
+                    across,
+                    &stated.unit,
+                    stated.value,
+                    stated.sampled,
+                );
             }
         }
         let ranks = report.loads.len() as u32;
         hand(columns, self.made.drain(..), ranks, each);
     }
 
-    /// Keeps what a report of several ranks states, and says whether
-    /// `report` is one ([`Self::keeps`]): nothing is kept of any other.
+    /// Keeps what a report states, and says whether the row's values are
+    /// made through the keeper ([`Self::keeps`]). A report of one rank is
+    /// kept too: its statements and its instant stand for a later report
+    /// of several ranks, and its values are its own. Nothing is kept of a
+    /// report that lists no ranks of one engine, or under a document that
+    /// declares no signal.
     ///
     /// `of` says whose sample the report is. A polled answer is one sample
-    /// of every rank, at `sampled_at`. A pushed record is its own rank's,
-    /// at `sampled_at`, and every other entry is what its rank's last
-    /// record left. Such an entry is read once, at the first record behind
-    /// the keeper's start, behind each new list of columns and behind a
-    /// report that dropped a rank, for the names the keeper holds no
-    /// statement of. A worker's first records list one rank, a keeper can
-    /// be younger than its report, and an answer can leave out a rank the
-    /// pushed report still lists. The entry is dated by its own rank's
-    /// last record, as the source holds it, and is not read where the
-    /// source holds none. It moves at its own rank's record alone, so no
-    /// later record reads it.
+    /// of every rank it lists, at `sampled_at`. It ends no statement of a
+    /// rank it leaves out: the worker's pushed report keeps that rank. A
+    /// pushed record is its own rank's, at `sampled_at`, and every other
+    /// entry is what its rank's last record or answer left. Such an entry
+    /// is read once, at the first record behind the keeper's start, behind
+    /// each new list of columns and behind a report that dropped a rank,
+    /// for the names the keeper holds no statement of. It is dated by the
+    /// instant the keeper was told the entry was written, else by its
+    /// rank's last record as the source holds it, and is not read where
+    /// neither is known.
     ///
     /// A rank's statement takes the place of its last one of that name,
     /// unless that one was sampled later: a later report of an older
@@ -489,42 +529,54 @@ impl RankValues {
         columns: &Arc<[SignalColumn]>,
         sampled_at: Instant,
     ) -> bool {
-        let Some(in_order) = Self::order_of(report, columns) else {
+        let Some(in_order) = Self::order_of(report) else {
             return false;
         };
+        if columns.is_empty() {
+            return false;
+        }
         self.read_under(columns);
-        let kept = self.ranks.len();
-        if in_order {
-            // Both lists stand in rank order: one walk drops the ranks the
-            // report lists no more.
-            let mut listed = report.loads.iter().map(|rank| rank.dp_rank).peekable();
-            self.ranks.retain(|kept| {
-                while listed.next_if(|&rank| rank < kept.rank).is_some() {}
-                listed.peek() == Some(&kept.rank)
-            });
-        } else {
-            let listed =
-                |kept: &RankStated| report.loads.iter().any(|rank| rank.dp_rank == kept.rank);
-            self.ranks.retain(listed);
+        let several = report.loads.len() > 1;
+        let record = matches!(of, ReportOf::OneRank { .. });
+        if record {
+            // A pushed report lists the worker's ranks: one it lists no
+            // more takes its statements. An answer can leave out a rank
+            // the pushed report keeps, and ends nothing.
+            let kept = self.ranks.len();
+            if in_order {
+                // Both lists stand in rank order: one walk.
+                let mut listed = report.loads.iter().map(|rank| rank.dp_rank).peekable();
+                self.ranks.retain(|kept| {
+                    while listed.next_if(|&rank| rank < kept.rank).is_some() {}
+                    listed.peek() == Some(&kept.rank)
+                });
+            } else {
+                let listed =
+                    |kept: &RankStated| report.loads.iter().any(|rank| rank.dp_rank == kept.rank);
+                self.ranks.retain(listed);
+            }
+            if self.ranks.len() < kept {
+                self.settled = false;
+            }
         }
-        // An answer can leave out a rank the pushed report still lists:
-        // the next record reads that rank's entry again.
-        if self.ranks.len() < kept {
-            self.settled = false;
-        }
-        // Another rank's entry moves at that rank's own record alone, so
-        // one read of the others tells all they can of the ranks kept.
-        let others = !self.settled;
-        self.settled |= matches!(of, ReportOf::OneRank { .. });
+        // Another rank's entry moves at that rank's own record or answer,
+        // which the keeper is told: one read of the others tells all they
+        // can of what it was not told.
+        let others = record && several && !self.settled;
+        self.settled |= others;
         for rank in &report.loads {
             let own = of.is_of(rank.dp_rank);
             if !own && !others {
                 continue;
             }
             // The entry's instant: the report's for its own entry. Another
-            // rank's is asked once, at the first name the keeper holds no
-            // statement of.
-            let mut entry_at = own.then_some(Some(sampled_at));
+            // rank's is looked up once, at the first name the keeper holds
+            // no statement of.
+            let mut entry_at = None;
+            if own {
+                self.hear(rank.dp_rank, sampled_at);
+                entry_at = Some(Some(sampled_at));
+            }
             // Each declared name has a bit, set at the name's first
             // statement. A document declares no more names than the bits.
             let mut read = 0u64;
@@ -538,15 +590,23 @@ impl RankValues {
                     continue;
                 }
                 read |= bit;
-                let asked = || of.heard(rank.dp_rank);
-                let Some(at) = *entry_at.get_or_insert_with(asked) else {
+                let at = match entry_at {
+                    Some(at) => at,
+                    None => {
+                        let told = of_rank(&self.ranks, rank.dp_rank).and_then(|kept| kept.heard);
+                        let at = told.or_else(|| of.heard(rank.dp_rank));
+                        entry_at = Some(at);
+                        at
+                    }
+                };
+                let Some(at) = at else {
                     break;
                 };
                 let sampled = sampled(&stated, at);
                 self.state(rank.dp_rank, column, stated, sampled);
             }
         }
-        true
+        several
     }
 
     /// The statements under `columns`, the list of the document in force.
@@ -559,7 +619,10 @@ impl RankValues {
         if self.columns.as_ref().is_some_and(same) {
             return;
         }
-        self.ranks.clear();
+        // The instants stay: they are the entries', whatever is declared.
+        for rank in &mut self.ranks {
+            rank.stated.clear();
+        }
         self.settled = false;
         self.columns = Some(Arc::clone(columns));
     }
@@ -570,19 +633,35 @@ impl RankValues {
         kept.is_some_and(|kept| kept.stated.iter().any(|stated| stated.column == column))
     }
 
+    /// What is kept of `rank`, started where nothing is.
+    fn rank_mut(&mut self, rank: i32) -> Option<&mut RankStated> {
+        let at = match self.ranks.binary_search_by_key(&rank, |kept| kept.rank) {
+            Ok(at) => at,
+            Err(at) => {
+                let fresh = RankStated {
+                    rank,
+                    heard: None,
+                    stated: Vec::new(),
+                };
+                self.ranks.insert(at, fresh);
+                at
+            }
+        };
+        self.ranks.get_mut(at)
+    }
+
+    /// The report's entry of `rank` was written at `at`.
+    fn hear(&mut self, rank: i32, at: Instant) {
+        if let Some(kept) = self.rank_mut(rank) {
+            kept.heard = Some(at);
+        }
+    }
+
     /// `rank`'s statement of the name at `column`, sampled at `sampled`,
     /// in the place of the rank's last one of that name unless that one
     /// was sampled later.
     fn state(&mut self, rank: i32, column: usize, stated: NamedValue, sampled: Instant) {
-        let at = match self.ranks.binary_search_by_key(&rank, |kept| kept.rank) {
-            Ok(at) => at,
-            Err(at) => {
-                let stated = Vec::new();
-                self.ranks.insert(at, RankStated { rank, stated });
-                at
-            }
-        };
-        let Some(kept) = self.ranks.get_mut(at) else {
+        let Some(kept) = self.rank_mut(rank) else {
             return;
         };
         let NamedValue { unit, value, .. } = stated;
@@ -1185,8 +1264,9 @@ mod tests {
 
     /// A statement stands for the column it was read under. Another list
     /// of columns ends them all, though it declares the same signal, and
-    /// the next record reads each rank's entry again: a rank's latest
-    /// record under its own instant, where the source holds it.
+    /// the next record reads each rank's entry again, as old as the keeper
+    /// was told that entry is. A name an entry leaves out is gone with the
+    /// list its statement was read under.
     #[test]
     fn another_list_of_columns_ends_the_statements_and_the_entries_are_read_again() {
         let start = Instant::now();
@@ -1197,29 +1277,21 @@ mod tests {
         let both = report(vec![ranked(0, depth(1.0)), ranked(1, depth(2.0))]);
         kept(&mut keeper, &both, Some(1), &first, (at(0), now));
         kept(&mut keeper, &both, Some(0), &first, (at(0), now));
-        // The source holds no record of rank 1: rank 0's record alone
-        // makes no value under the new list.
+        // Rank 0 states 4 under another list: rank 1's entry is read
+        // again, as old as rank 1's own record.
         let again = depth_alone();
-        let ended = kept(&mut keeper, &both, Some(0), &again, (at(40), now));
-        assert!(ended.is_empty());
-        let restated = kept(&mut keeper, &both, Some(1), &again, (at(50), now));
-        assert_eq!(restated, [value("depth", "items", 3.0, 960)]);
-        // The source heard rank 1 at the start: under another list its
-        // entry is read again, as old as its record.
-        let third = depth_alone();
-        let heard = |rank: i32| (rank == 1).then(|| at(0));
-        let record = ReportOf::OneRank {
-            rank: 0,
-            heard: &heard,
-        };
         let moved = report(vec![ranked(0, depth(4.0)), ranked(1, depth(2.0))]);
-        let read = kept_of(&mut keeper, &moved, record, &third, (at(60), now));
+        let read = kept(&mut keeper, &moved, Some(0), &again, (at(40), now));
         assert_eq!(read, [value("depth", "items", 6.0, 1_000)]);
-        // A name the entry leaves out is not read: what rank 1 stated
-        // under the last list is gone with that list.
-        let fourth = depth_alone();
+        // Rank 1's next record leaves the depth out, and its statement
+        // stands under the same list.
         let bare = report(vec![ranked(0, depth(4.0)), ranked(1, Vec::new())]);
-        let gone = kept_of(&mut keeper, &bare, record, &fourth, (at(70), now));
+        let stands = kept(&mut keeper, &bare, Some(1), &again, (at(50), now));
+        assert_eq!(stands, [value("depth", "items", 6.0, 1_000)]);
+        // Under a third list the entry states no depth: what rank 1
+        // stated is gone with the list it was read under.
+        let third = depth_alone();
+        let gone = kept(&mut keeper, &bare, Some(0), &third, (at(70), now));
         assert!(gone.is_empty());
     }
 
@@ -1258,10 +1330,17 @@ mod tests {
         let other = report(vec![ranked(0, depth(1.0)), ranked(1, depth(7.0))]);
         let stands = kept_of(&mut keeper, &other, record, &columns, (at(9_900), now));
         assert_eq!(stands, [value("depth", "items", 101.0, 10_000)]);
+        // A keeper made behind a report of rank 1 alone was told that
+        // entry's instant, and asks its source nothing.
+        let mut behind = RankValues::behind(Some((1, at(0))));
+        let told = kept(&mut behind, &file, Some(0), &columns, (at(9_000), now));
+        assert_eq!(told, [value("depth", "items", 101.0, 10_000)]);
     }
 
     /// A polled answer may list its ranks out of rank order: it is kept
-    /// all the same, and a rank it lists no more takes its statements.
+    /// all the same. An answer that leaves a rank out makes its value over
+    /// the ranks it lists and ends nothing: the worker's pushed report
+    /// keeps that rank.
     #[test]
     fn an_answer_out_of_rank_order_is_kept_as_one_in_order() {
         let start = Instant::now();
@@ -1277,36 +1356,48 @@ mod tests {
         assert!(RankValues::keeps(&answer, &columns));
         let whole = kept(&mut keeper, &answer, None, &columns, (at(0), now));
         assert_eq!(whole, [value("depth", "items", 7.0, 1_000)]);
-        // Rank 1 is listed no more: its statement goes, and the two that
-        // stay make the row's value.
+        // The answer leaves rank 1 out: the two it lists make its value,
+        // and rank 1's statement stands for the next record.
         let fewer = report(vec![ranked(2, depth(4.0)), ranked(0, depth(3.0))]);
         let two = kept(&mut keeper, &fewer, None, &columns, (at(10), now));
         assert_eq!(two, [value("depth", "items", 7.0, 990)]);
-        assert_eq!(keeper.ranks.len(), 2);
+        assert_eq!(keeper.ranks.len(), 3);
+        let pushed = kept(&mut keeper, &answer, Some(0), &columns, (at(20), now));
+        assert_eq!(pushed, [value("depth", "items", 7.0, 1_000)]);
     }
 
-    /// A worker of one rank has its last value in the store's cell: its
-    /// report is handed as it is, and the keeper takes no room.
+    /// A report of one rank is one sample: it is handed as it is, by a
+    /// record and by an answer. A keeper that is told one keeps its
+    /// statement and its instant for a later report of several ranks. A
+    /// document that declares no signal keeps nothing and takes no room.
     #[test]
-    fn a_report_of_one_rank_keeps_nothing_and_takes_no_room() {
-        let now = Instant::now();
+    fn a_report_of_one_rank_is_handed_as_it_is_and_kept_for_a_later_one() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let now = at(1_000);
         let columns = depth_alone();
-        let mut keeper = RankValues::default();
-        let one = report(vec![ranked(3, depth(2.0))]);
-        assert!(!RankValues::keeps(&one, &columns));
-        for record_of in [Some(3), None] {
-            let handed = kept(&mut keeper, &one, record_of, &columns, (now, now));
-            assert_eq!(handed, [value("depth", "items", 2.0, 0)]);
-        }
-        // Several ranks under a document that declares no signal keep
-        // nothing either.
+        // Under no declared signal nothing is read, of one rank or of two.
         let none: Arc<[SignalColumn]> = Vec::new().into();
         let two = report(vec![ranked(0, depth(1.0)), ranked(1, depth(2.0))]);
+        let mut idle = RankValues::default();
         assert!(!RankValues::keeps(&two, &none));
-        assert!(kept(&mut keeper, &two, Some(0), &none, (now, now)).is_empty());
-        assert!(keeper.columns.is_none());
-        assert_eq!((keeper.ranks.capacity(), keeper.made.capacity()), (0, 0));
+        assert!(kept(&mut idle, &two, Some(0), &none, (now, now)).is_empty());
+        assert!(idle.columns.is_none());
+        assert_eq!((idle.ranks.capacity(), idle.made.capacity()), (0, 0));
         assert!(RankValues::keeps(&two, &columns));
+        // Rank 1 alone, by a record and then by an answer.
+        let mut keeper = RankValues::default();
+        let one = report(vec![ranked(1, depth(2.0))]);
+        assert!(!RankValues::keeps(&one, &columns));
+        for (record_of, ms) in [(Some(1), 0), (None, 10)] {
+            let handed = kept(&mut keeper, &one, record_of, &columns, (at(ms), now));
+            let age = 1_000 - u128::from(ms);
+            assert_eq!(handed, [value("depth", "items", 2.0, age)]);
+        }
+        // Rank 0's first record counts what rank 1 stated alone, under the
+        // instant the keeper was told.
+        let both = kept(&mut keeper, &two, Some(0), &columns, (at(500), now));
+        assert_eq!(both, [value("depth", "items", 3.0, 990)]);
     }
 
     /// A gateway's rollup lists its workers, and they repeat a rank: kept
