@@ -39,7 +39,6 @@ use crate::{
             attempt_ledger::{
                 is_definitive_failure, mark_failed_side, mark_upstream_answer, AttemptLedger,
             },
-            pd_admission,
             pd_failure::{PdSide, SidePhase},
             prefill_admission::PrefillLoadGuard,
             retry::mark_non_retryable,
@@ -276,15 +275,10 @@ pub(crate) async fn execute_plan(
     // encode jobs' SHM unclaimed for the duration: under the burst this gate
     // targets, holding it would queue a second scarce resource behind the
     // decode window and throw the finished encode work away on a shed. The
-    // gate abstains when the engine reports no window.
-    let admission = match ctx
-        .workers
-        .as_ref()
-        .and_then(WorkerSelection::decode_worker)
-    {
-        Some(decode) => pd_admission::admit_decode(decode, &ctx.model_id, sub_requests).await?,
-        None => None,
-    };
+    // gate abstains when the engine reports no window. A pair the policy
+    // controller placed is committed ahead of the wait, so its bookings
+    // outlast it.
+    let admission = ctx.admit(sub_requests).await?;
 
     // `None` for non-EPD, text-only EPD, or an EPD retry (the first dispatch
     // consumed it). Taking it transfers a rendezvous plan's encode jobs and
@@ -314,8 +308,8 @@ pub(crate) async fn execute_plan(
         Instant::now(),
     );
     ctx.load_guards = Some(LoadGuards::admitted(admission, guards));
-    // A pair the controller placed says each side's dispatch at that side's
-    // send: the dispatch reads the placement its guards hold.
+    // A sequential pair the controller placed ends its prefill's side at
+    // the phase's end: the dispatch reads the placement its guards hold.
     let placement = ctx.load_guards.as_ref().and_then(LoadGuards::placement);
     // A sticky request to a grouped data-parallel worker goes to its key's
     // engine.
@@ -564,11 +558,11 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
 /// request's samples take too.
 /// `encode` is the watch on an EPD request's encode dispatch (see
 /// [`launch_encode_dispatch`]), `None` for every other request.
-/// `placement` is the placement of a pair the policy controller placed. A
-/// parallel dispatch says each side on it at its own send
-/// ([`Placement::sent`]). A sequential one commits both sides at the
-/// prefill's send and ends the prefill's side at its last drain
-/// ([`Placement::committed`], [`Placement::prefill_ended`]).
+/// `placement` is the placement of a pair the policy controller placed,
+/// committed ahead of the admission gate. A sequential dispatch ends the
+/// prefill's side on it at its last drain ([`Placement::prefill_ended`]).
+/// A parallel dispatch says no prefill end yet: both sides end with the
+/// response.
 #[expect(clippy::too_many_arguments)]
 async fn execute_pd_dispatch(
     proto_request: ProtoGenerateRequest,
@@ -630,7 +624,6 @@ async fn execute_pd_dispatch(
                     ledger,
                     room_residue,
                     encode,
-                    placement,
                 )
                 .await
             }
@@ -642,7 +635,6 @@ async fn execute_pd_dispatch(
                     prefill_guard,
                     ledger,
                     encode,
-                    placement,
                 )
                 .await
             }
@@ -712,7 +704,6 @@ async fn execute_fanout_pd(
     ledger: &AttemptLedger,
     room_residue: Option<RoomResidue>,
     encode: Option<EncodeWatch>,
-    placement: Option<&Placement>,
 ) -> Result<ExecutionResult, Response> {
     let subs = pd_fanout_requests(&proto_request, n, workers, room_residue);
     debug!(
@@ -726,9 +717,7 @@ async fn execute_fanout_pd(
     let dispatches = subs.into_iter().zip(guards).map(|(sub, guard)| {
         let mut clients = clients.clone();
         let encode = encode.clone();
-        async move {
-            execute_parallel_pd(sub, &mut clients, workers, guard, ledger, encode, placement).await
-        }
+        async move { execute_parallel_pd(sub, &mut clients, workers, guard, ledger, encode).await }
     });
     let results = try_join_all(dispatches).await?;
 
@@ -1499,9 +1488,7 @@ const SGLANG_MEDIA_IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Execute a parallel PD dispatch: both sides are sent together and rendezvous
 /// on the bootstrap info the request carries; the first failure answers, and
 /// the pair that answered is handed to the response with the decode's abort
-/// deferred until its first item proves the handoff finished. A pair the
-/// policy controller placed says each side's dispatch on `placement` where
-/// that side's call goes out.
+/// deferred until its first item proves the handoff finished.
 async fn execute_parallel_pd(
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
@@ -1509,7 +1496,6 @@ async fn execute_parallel_pd(
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
     encode: Option<EncodeWatch>,
-    placement: Option<&Placement>,
 ) -> Result<ExecutionResult, Response> {
     let streaming = proto_request.stream();
     let runtime = workers
@@ -1566,18 +1552,12 @@ async fn execute_parallel_pd(
     // read before the booking, so the side's own prompt is not counted twice.
     let prefill_ticket =
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
-    // Each side owns a hold on a placed pair's placement, as it owns its
-    // client, and gives it up once its send is said.
-    let (prefill_placement, decode_placement) = (placement.cloned(), placement.cloned());
     let prefill_dispatch: SideDispatch = Box::pin(dispatch_prefill_within(
         PrefillWait {
             bound: bound.clone(),
             encode: encode.clone(),
         },
         Box::pin(async move {
-            if let Some(placement) = prefill_placement {
-                placement.sent(PdSide::Prefill, Instant::now());
-            }
             let mut stream = prefill_client.generate(prefill_request).await?;
             if await_identity {
                 // This is a preprocessing control item, not a token or proof
@@ -1620,9 +1600,6 @@ async fn execute_parallel_pd(
                     }
                 }
             }
-        }
-        if let Some(placement) = decode_placement {
-            placement.sent(PdSide::Decode, Instant::now());
         }
         decode_client.generate(decode_request).await
     });

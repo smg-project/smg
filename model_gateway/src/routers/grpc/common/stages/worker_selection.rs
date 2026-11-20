@@ -1989,9 +1989,15 @@ impl WorkerSelectionStage {
             return Err(policy_controller::refused(shape));
         }
 
+        // Named a fact at a time over the default, so a prompt that learns
+        // another fact still builds here with that fact unstated.
         let prompt = host::Prompt {
             tokens: inputs.tokens,
+            ..host::Prompt::default()
+        };
+        let prompt = host::Prompt {
             namespace: inputs.cache_namespace,
+            ..prompt
         };
         let hashes = host.hashes(model_id, &prompt);
         let id = host::mark();

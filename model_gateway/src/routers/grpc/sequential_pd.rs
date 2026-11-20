@@ -722,13 +722,6 @@ async fn sequential_prefill_side(
     // above was read before the booking.
     let prefill_ticket =
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
-    // A pair the policy controller placed is committed here, at the
-    // prefill's send: both sides say their dispatch. The decode goes out
-    // once the prefill has run, and a side that waited that long would end
-    // at its dispatch deadline.
-    if let Some(placement) = placement {
-        placement.committed(prefill_start);
-    }
     let prefill_stream = dispatch_prefill_within(
         PrefillWait {
             bound: bound.clone(),

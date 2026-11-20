@@ -11,9 +11,10 @@
 //! a host over the feed's holder. A regular HTTP router with that host asks
 //! it to place typed requests: for the model a request names, or for the one
 //! primary model the router's workers serve where it names none. A regular
-//! gRPC router asks it in its selection stage. A pair router mounts a
-//! refusing router under its usual id ([`undecided()`]) whenever the store
-//! started, with or without a controller's address. The routes that pick a
+//! gRPC router and a gRPC pair router ask it in their selection stage. An
+//! HTTP pair router and a gRPC encode pair router mount a refusing router
+//! under their usual id ([`undecided()`]) whenever the store started, with
+//! or without a controller's address. The routes that pick a
 //! worker by no routing policy serve as under the classic policies: a
 //! provider's router, a realtime session and a proxied GET. The gateway's
 //! workflows leave the feed's door unused, so without an address nothing
@@ -149,9 +150,9 @@ pub(crate) fn feeds(
 }
 
 /// The refusing router for a family the controller does not decide yet:
-/// the pair routers, which need pair placement. It mounts under the
-/// family's usual id so the gateway can select it. Returns `None` under the
-/// classic policies.
+/// the HTTP pair router and the gRPC encode pair router. It mounts under
+/// the family's usual id so the gateway can select it. Returns `None` under
+/// the classic policies.
 pub(crate) fn undecided(context: &AppContext) -> Option<Box<dyn RouterTrait>> {
     context
         .policy_host

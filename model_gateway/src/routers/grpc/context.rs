@@ -67,8 +67,11 @@ use crate::{
     policy_controller::host::{End, Held, Placed},
     routers::{
         common::{
-            attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard, pd_failure::PdSide,
-            prefill_admission::PrefillLoadGuard, snapshot::WorkerRegistry, sse::SseSender,
+            attempt_ledger::AttemptLedger,
+            pd_admission::{self, PdAdmissionGuard},
+            prefill_admission::PrefillLoadGuard,
+            snapshot::WorkerRegistry,
+            sse::SseSender,
         },
         error::internal_error,
         grpc::regular::symphony::{template::Templates, PreparedConstraint},
@@ -515,14 +518,58 @@ impl DispatchContext {
         self.load_guards.as_ref().and_then(LoadGuards::placement)
     }
 
+    /// The dispatch's claim at the decode's admission gate, for
+    /// `sub_requests` rooms. The gate abstains for a worker that reports no
+    /// window, and a dispatch with no decode side has no gate.
+    ///
+    /// A pair the policy controller placed is committed first: both sides
+    /// say their dispatch. The gate may hold the request longer than a
+    /// booking waits for its dispatch, and a decode may follow a whole
+    /// prefill. A side left waiting would end at its dispatch deadline, and
+    /// the request would then run with no booking. A single says its send
+    /// where its guards are made.
+    ///
+    /// Both workers stay booked through the gate's wait, as the prefill's
+    /// admission slot does. A shed at the gate drops the placement: each
+    /// side ends as cancelled, on a worker that was sent nothing. A span the
+    /// router states runs from the send, which the guards read after the
+    /// gate. A cancelled side's span is the lease's own, and it runs from
+    /// this commit.
+    pub(crate) async fn admit(
+        &mut self,
+        sub_requests: usize,
+    ) -> Result<Option<PdAdmissionGuard>, axum::response::Response> {
+        self.commit_pair(Instant::now());
+        match self
+            .workers
+            .as_ref()
+            .and_then(WorkerSelection::decode_worker)
+        {
+            Some(decode) => pd_admission::admit_decode(decode, &self.model_id, sub_requests).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Both sides of a placed pair say their dispatch at `now`.
+    fn commit_pair(&mut self, now: Instant) {
+        let Some(placed) = self.placed.as_mut() else {
+            return;
+        };
+        if placed.decode().is_some() {
+            placed.dispatched(now);
+            placed.decode_dispatched(now);
+        }
+    }
+
     /// A failed attempt says its end, lets its workers go and names its
     /// rows as tried: the worker's, and a pair's decode beside it. After a
     /// send the guards hold the placement: it is told the failure's status
     /// and class at `now`, with no tokens, and the rows are its own. Ahead
     /// of a send the placement is still on the context: it goes unsent and
-    /// reports itself as abandoned, and its rows are named all the same.
-    /// The guards go, and with them the worker's load and any admission
-    /// claim.
+    /// reports itself as abandoned, and its rows are named all the same. A
+    /// pair shed at the admission gate was committed there, so each of its
+    /// sides ends as cancelled. The guards go, and with them the worker's
+    /// load and any admission claim.
     pub(crate) fn release_attempt(&mut self, failure: &axum::response::Response, now: Instant) {
         let rows = self
             .placement()
@@ -1151,29 +1198,6 @@ impl Placement {
         self.cell.lock().placed().decode_id()
     }
 
-    /// A placed pair's `side` goes out at `now`: that side says its
-    /// dispatch, and the other says none. A single said its send where its
-    /// guards were made, so a word of its one side says nothing more.
-    pub(crate) fn sent(&self, side: PdSide, now: Instant) {
-        let mut held = self.cell.lock();
-        match side {
-            PdSide::Prefill => held.placed().dispatched(now),
-            PdSide::Decode => held.placed().decode_dispatched(now),
-        }
-    }
-
-    /// A placed pair whose decode follows its prefill goes out at `now`:
-    /// both sides say their dispatch. The decode worker is committed from
-    /// the prefill's send. A decode side left waiting through the prefill
-    /// would end at its dispatch deadline, and the decode would then run
-    /// with no booking.
-    pub(crate) fn committed(&self, now: Instant) {
-        let mut held = self.cell.lock();
-        let placed = held.placed();
-        placed.dispatched(now);
-        placed.decode_dispatched(now);
-    }
-
     /// One prefill phase of a placed pair ended whole at `now`, having read
     /// `tokens_in` of the prompt. A dispatch runs one phase a sub-request,
     /// all on the one prefill worker, and the prefill's side ends with the
@@ -1397,11 +1421,10 @@ impl LoadGuards {
     }
 
     /// The guards of a dispatch at its send, at `now`. A placement of the
-    /// controller rides them. A single is told the send here. A pair's
-    /// sides go out apart, so its dispatch tells them: each at its own send
-    /// ([`Placement::sent`]), or both at the prefill's where the decode
-    /// follows the prefill ([`Placement::committed`]). With no placement
-    /// they are the classic guards of [`Self::scaled`].
+    /// controller rides them. A single is told the send here. A pair was
+    /// committed where its dispatch began, ahead of the admission gate
+    /// ([`DispatchContext::admit`]). With no placement they are the classic
+    /// guards of [`Self::scaled`].
     pub fn at_dispatch(
         selection: &WorkerSelection,
         routing_key: Option<&str>,
@@ -2517,36 +2540,17 @@ mod tests {
         assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
     }
 
-    /// What stands of a placed pair's one lease once the sides of `sent`
-    /// said their send and the dispatch deadline of the rest passed:
-    /// whether a side still waited for its dispatch, and how many leases
-    /// stand.
-    async fn after_the_sends_of(sent: &[PdSide]) -> (bool, usize) {
-        let (placed, _admission, store) = place_pair().await;
+    /// The guards of a placed pair for `count` sub-requests, as a dispatch
+    /// makes them: the pair committed at its claim on the gate, which
+    /// abstains here, and its guards made at `sent`.
+    async fn dispatched_pair(placed: Placed, count: usize, sent: Instant) -> LoadGuards {
         let selection = pair_selection(&placed);
-        let now = Instant::now();
-        let guards = LoadGuards::at_dispatch(&selection, None, 1, Some(placed), now);
-        let placement = guards.placement().expect("the pair's placement");
-        for side in sent {
-            placement.sent(*side, now);
-        }
-        let late = now + std::time::Duration::from_secs(60);
-        let waited = !store.expire(late).is_empty();
-        (waited, LeasesStore::live(&*store, GatewayId::LOCAL))
-    }
-
-    #[tokio::test]
-    async fn each_side_of_a_placed_pair_says_its_dispatch_at_its_send() {
-        // The guards' build says neither side's dispatch: a lease no
-        // dispatch names ends whole at its deadline.
-        assert_eq!(after_the_sends_of(&[]).await, (true, 0));
-        // Each send says its own side alone: the other still waits, and
-        // ends alone.
-        assert_eq!(after_the_sends_of(&[PdSide::Prefill]).await, (true, 1));
-        assert_eq!(after_the_sends_of(&[PdSide::Decode]).await, (true, 1));
-        // With both said, no side waits.
-        let both = [PdSide::Prefill, PdSide::Decode];
-        assert_eq!(after_the_sends_of(&both).await, (false, 1));
+        let mut ctx = dispatch_context(placed);
+        ctx.workers = Some(selection);
+        let admission = ctx.admit(count).await.expect("no shed");
+        assert!(admission.is_none(), "no window is reported");
+        let selection = ctx.workers.as_ref().expect("the pair");
+        LoadGuards::at_dispatch(selection, None, count, ctx.placed.take(), sent)
     }
 
     /// Whether each side of a pair's lease still stands live in the store,
@@ -2562,32 +2566,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_committed_pair_keeps_its_decode_booked_through_a_slow_prefill() {
-        let (placed, _admission, store) = place_pair().await;
+    async fn a_placed_pair_keeps_both_bookings_through_a_wait_at_the_admission_gate() {
+        let (placed, _slot, store) = place_pair().await;
         let lease = testing::lease_of(&placed);
-        let selection = pair_selection(&placed);
-        let now = Instant::now();
-        let guards = LoadGuards::at_dispatch(&selection, None, 1, Some(placed), now);
-        let placement = guards.placement().expect("the pair's placement");
-        // A sequential dispatch sends the prefill alone and commits the pair
-        // there. The prefill then runs past the dispatch deadline, and no
-        // decode has gone out.
-        placement.committed(now);
-        let late = now + std::time::Duration::from_secs(60);
+        let mut selection = pair_selection(&placed);
+        let WorkerSelection::Disaggregated { decode, .. } = &mut selection else {
+            panic!("a pair");
+        };
+        // The decode's window is one request wide, and another request
+        // holds it.
+        let gated: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://gated:9000")
+                .label("max_running_requests", "1")
+                .build(),
+        );
+        *decode = Arc::clone(&gated);
+        let holder = admit_decode(&gated, testing::MODEL, 1)
+            .await
+            .expect("no shed")
+            .expect("a claim");
+        let mut ctx = dispatch_context(placed);
+        ctx.workers = Some(selection);
+        let mut waiting = Box::pin(ctx.admit(1));
+        assert!(
+            futures::poll!(waiting.as_mut()).is_pending(),
+            "the window is full"
+        );
+        // The wait outlasts the dispatch deadline, and no side is lost.
+        let late = Instant::now() + std::time::Duration::from_secs(60);
         assert!(store.expire(late).is_empty(), "no side waited");
+        drop(holder);
+        let admission = waiting.await.expect("no shed");
+        assert!(admission.is_some(), "the freed room is claimed");
         assert_eq!(live_sides(&store, lease), (true, true));
         assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_commits_a_placed_pair_and_leaves_a_single_to_its_guards() {
+        // A decode follows a whole prefill. The pair is committed where its
+        // dispatch begins, so the prefill can run past the dispatch deadline
+        // with no decode sent.
+        let (placed, _slot, store) = place_pair().await;
+        let lease = testing::lease_of(&placed);
+        let guards = dispatched_pair(placed, 1, Instant::now()).await;
+        let late = Instant::now() + std::time::Duration::from_secs(60);
+        assert!(store.expire(late).is_empty(), "no side waited");
+        assert_eq!(live_sides(&store, lease), (true, true));
+        drop(guards);
+
+        // A single says its send where its guards are made: the claim says
+        // nothing of it, and its lease still waits for a dispatch.
+        let (placed, store) = place_worker().await;
+        let mut ctx = dispatch_context(placed);
+        assert!(ctx.admit(1).await.expect("no shed").is_none());
+        assert!(!store.expire(late).is_empty(), "the single still waited");
     }
 
     #[tokio::test]
     async fn a_placed_pairs_prefill_ends_at_its_phase_boundary() {
         let (placed, admission, store) = place_pair().await;
         let lease = testing::lease_of(&placed);
-        let selection = pair_selection(&placed);
         let sent = Instant::now();
-        let guards = LoadGuards::at_dispatch(&selection, None, 1, Some(placed), sent);
+        let guards = dispatched_pair(placed, 1, sent).await;
         let placement = guards.placement().expect("the pair's placement");
-        placement.committed(sent);
         assert_eq!(live_sides(&store, lease), (true, true));
         // The prefill is drained: its admission guard goes, and its side
         // ends with it. The decode's side stands for the response.
@@ -2613,11 +2655,9 @@ mod tests {
         // pair's one prefill worker, under one lease.
         let (placed, _admission, store) = place_pair().await;
         let lease = testing::lease_of(&placed);
-        let selection = pair_selection(&placed);
         let sent = Instant::now();
-        let guards = LoadGuards::at_dispatch(&selection, None, 3, Some(placed), sent);
+        let guards = dispatched_pair(placed, 3, sent).await;
         let placement = guards.placement().expect("the pair's placement");
-        placement.committed(sent);
         // The first two to drain leave the worker busy with the third.
         placement.prefill_ended(5, sent);
         placement.prefill_ended(7, sent);
@@ -2634,12 +2674,9 @@ mod tests {
             (503, TransportClass::ServerError),
         ] {
             let (placed, _admission, store) = place_pair().await;
-            let selection = pair_selection(&placed);
             let sent = Instant::now();
-            let guards = LoadGuards::at_dispatch(&selection, None, 1, Some(placed), sent);
+            let guards = dispatched_pair(placed, 1, sent).await;
             let placement = guards.placement().expect("the pair's placement");
-            placement.sent(PdSide::Prefill, sent);
-            placement.sent(PdSide::Decode, sent);
             assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
             // The guards still stand: their drop has nothing left to say.
             placement.ended(status, class, 17, 5, sent);

@@ -179,9 +179,10 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
         mode: Mode,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // The regular router's selection stage asks the controller's host.
-        // A pair mode places no request through it yet.
-        if mode != Mode::Regular {
+        // The regular router and the pair router ask the controller's host
+        // in their selection stage. The encode mode places no request
+        // through it yet.
+        if mode == Mode::EncodePrefillDecode {
             if let Some(router) = policy_controller::undecided(ctx) {
                 return Ok(router);
             }
