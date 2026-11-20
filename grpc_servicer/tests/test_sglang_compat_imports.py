@@ -146,3 +146,68 @@ def test_media_normalization_does_not_hide_a_real_splitter_failure(monkeypatch):
     with pytest.raises(ValueError) as raised:
         compat.normalize_multimodal_processor_output(output)
     assert raised.value is failure
+
+
+@pytest.mark.parametrize("returned", ["split", "kept"])
+def test_media_normalization_splits_a_bundled_image_without_mutating_the_caller(
+    monkeypatch, returned
+):
+    """A controlled splitter exercises the real helper's copy and identity branches."""
+    item = SimpleNamespace(
+        is_image=lambda: True,
+        offsets=[(1, 2), (4, 5)],
+        hash=123,
+        pad_value=None,
+    )
+    parts = [SimpleNamespace(offsets=[offset]) for offset in item.offsets]
+    calls = []
+
+    def split(items):
+        calls.append(items)
+        return parts if returned == "split" else items
+
+    module = ModuleType("sglang.srt.managers.mm_utils")
+    module.get_new_expanded_mm_items = split
+    monkeypatch.setattr(compat.importlib, "import_module", lambda _: module)
+    marker = object()
+    items = [item]
+    output = SimpleNamespace(mm_items=items, padded_input_ids=None, metadata=marker)
+    result = compat.normalize_multimodal_processor_output(output)
+    assert calls == [[item]]
+    assert output.mm_items is items and output.mm_items == [item]
+    assert (item.offsets, item.hash, item.pad_value) == ([(1, 2), (4, 5)], 123, None)
+    assert output.padded_input_ids is None and output.metadata is marker
+    if returned == "split":
+        assert result is not output and result.mm_items == parts
+        assert result.metadata is marker and result.padded_input_ids is None
+    else:
+        assert result is output
+
+
+@pytest.mark.parametrize("fault", ["pad_value", "padded_input_ids", "count"])
+def test_media_normalization_rejects_padded_or_lossy_splits(monkeypatch, fault):
+    """Reject pre-padded bundles before the splitter and reject offset loss afterwards."""
+    item = SimpleNamespace(
+        is_image=lambda: True,
+        offsets=[(1, 2), (4, 5)],
+        hash=123,
+        pad_value=7 if fault == "pad_value" else None,
+    )
+    calls = []
+
+    def split(items):
+        calls.append(items)
+        assert fault == "count", "padded inputs must fail before calling the splitter"
+        return [SimpleNamespace(), SimpleNamespace(), SimpleNamespace()]
+
+    module = ModuleType("sglang.srt.managers.mm_utils")
+    module.get_new_expanded_mm_items = split
+    monkeypatch.setattr(compat.importlib, "import_module", lambda _: module)
+    ids = [1] if fault == "padded_input_ids" else None
+    output = SimpleNamespace(mm_items=[item], padded_input_ids=ids)
+    message = "every image offset" if fault == "count" else "before padding"
+    with pytest.raises(ValueError, match=message):
+        compat.normalize_multimodal_processor_output(output)
+    assert calls == ([[item]] if fault == "count" else [])
+    assert output.mm_items == [item] and output.padded_input_ids is ids
+    assert item.hash == 123

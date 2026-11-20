@@ -177,10 +177,11 @@ unsafe impl BufMut for DigestBuffer<'_> {
 /// Limit reuse to tokenized, single-choice PD requests with immutable media references.
 pub fn reusable_request(req: &GenerateRequest) -> bool {
     has_media_refs(req)
-        && req
-            .mm_inputs
-            .as_ref()
-            .is_some_and(|mm| mm.image_urls.is_empty() || mm.video_urls.is_empty())
+        && req.mm_inputs.as_ref().is_some_and(|mm| {
+            (mm.image_urls.is_empty() || mm.video_urls.is_empty())
+                    // v1 cannot reuse the per-image identities of a known image bundle.
+                    && mm.image_urls.len() <= 1
+        })
         && req
             .tokenized
             .as_ref()
@@ -361,9 +362,28 @@ mod tests {
             .collect::<Vec<_>>()
             .into();
         let original = req.clone();
-        assert!(reusable_request(&req));
+        assert!(!reusable_request(&req));
         assert!(!validate(&identity, &req, "key"));
         assert_eq!(req, original, "both workers retain the ordered references");
+
+        // A single image may expand to several processor ranges. It remains
+        // eligible before processing, so validation must still reject its bundle.
+        let mut single_image = req.clone();
+        single_image
+            .mm_inputs
+            .as_mut()
+            .unwrap()
+            .image_urls
+            .truncate(1);
+        let single_original = single_image.clone();
+        let mut expanded_identity = identity.clone();
+        expanded_identity.request_digest = request_digest(&single_image);
+        assert!(reusable_request(&single_image));
+        assert!(!validate(&expanded_identity, &single_image, "key"));
+        assert_eq!(
+            single_image, single_original,
+            "fallback retains the single reference"
+        );
 
         // Video keeps its existing bundle representation at the SGLang ingress.
         let refs = req.mm_inputs.as_mut().unwrap();
