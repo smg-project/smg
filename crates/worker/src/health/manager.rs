@@ -227,6 +227,26 @@ impl WorkerManager {
         health_checks_enabled: bool,
         zmq_transport_enabled: bool,
     ) -> Option<Self> {
+        let sink: Arc<dyn HealthSink> = registry.clone();
+        Self::maybe_start_with_sink(
+            registry,
+            sink,
+            config,
+            job_queue,
+            health_checks_enabled,
+            zmq_transport_enabled,
+        )
+    }
+
+    /// [`Self::maybe_start`] over the sink a host hands.
+    pub fn maybe_start_with_sink<G: Generation>(
+        registry: Arc<WorkerRegistry<G>>,
+        sink: Arc<dyn HealthSink>,
+        config: WorkerManagerConfig,
+        job_queue: Option<Arc<dyn WorkerJobs>>,
+        health_checks_enabled: bool,
+        zmq_transport_enabled: bool,
+    ) -> Option<Self> {
         if !health_checks_enabled
             && !zmq_transport_enabled
             && !registry.has_workers_awaiting_connect_signal()
@@ -238,7 +258,7 @@ impl WorkerManager {
             return None;
         }
         let default_check_interval_secs = config.default_check_interval_secs;
-        let manager = Self::start(registry, config, job_queue);
+        let manager = Self::start_with_sink(registry, sink, config, job_queue);
         debug!("Started WorkerManager loop with {default_check_interval_secs}s default interval");
         Some(manager)
     }
