@@ -473,13 +473,6 @@ impl Hosted {
             Remover::Provider(name) => name,
             Remover::Health(_) => "health",
         });
-        // A removal is out of scope by its row's maker. The one other call
-        // that answers so is a refresh, which names no remover.
-        let out_of_scope = if remover.is_some() {
-            HostRefused::OUT_OF_SCOPE
-        } else {
-            HostRefused::NOT_LABELS_ALONE
-        };
         let turn = self.door.turn.lock();
         let term = match (self.leading)() {
             Ok(term) => term,
@@ -526,7 +519,10 @@ impl Hosted {
                         (Code::AlreadyExists, "a worker is registered under the URL")
                     }
                     HostRefused::Draining => (Code::FailedPrecondition, DRAINING),
-                    HostRefused::OutOfScope => (Code::PermissionDenied, out_of_scope),
+                    HostRefused::OutOfScope => (Code::PermissionDenied, HostRefused::OUT_OF_SCOPE),
+                    HostRefused::NotLabelsAlone => {
+                        (Code::PermissionDenied, HostRefused::NOT_LABELS_ALONE)
+                    }
                 };
                 audit_refusal(call, &self.by, code, why, asker);
                 Err(refusal)
@@ -2550,7 +2546,7 @@ pub(crate) mod tests {
         let row = store.by_key(HTTP).expect("the registered row");
         let seen = standing(&row);
         let stray = door.refreshed(seen, &built("other", "gold"), &first);
-        assert_eq!(stray, Err(Refused::OutOfScope));
+        assert_eq!(stray, Err(Refused::NotLabelsAlone));
         let wrote = door.refreshed(seen, &built("m", "silver"), &first);
         assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
 

@@ -47,15 +47,15 @@ pub enum Refused {
     /// The row a replacement or a refresh names is draining: its removal
     /// takes the worker.
     Draining,
-    /// Outside what the health loop writes: a removal of a row whose maker
-    /// is outside the health removal scope, or a refresh whose worker
-    /// states another fact than the labels.
+    /// The row's maker is outside the health removal scope.
     OutOfScope,
+    /// A refresh's worker states another fact than the row's labels. A
+    /// refresh writes the labels alone.
+    NotLabelsAlone,
 }
 
 impl Refused {
     pub(crate) const OUT_OF_SCOPE: &str = "the row's maker is outside the health removal scope";
-    /// What [`Self::OutOfScope`] says of a refresh.
     pub(crate) const NOT_LABELS_ALONE: &str =
         "a refresh writes a row's labels and states no other fact";
 }
@@ -143,7 +143,7 @@ pub trait Membership: Send + Sync + 'static {
     ///
     /// The facts `built` states over the standing row ([`facts`]) may
     /// differ from the row's in the labels alone. Any other difference is
-    /// refused ([`Refused::OutOfScope`]), so a refresh starts no life. No
+    /// refused ([`Refused::NotLabelsAlone`]), so a refresh starts no life. No
     /// row, another row or revision, and a draining row refuse it too. The
     /// labels' room is tested as a registration's is. Equal labels write
     /// nothing and answer [`Wrote::Unmoved`].
@@ -361,7 +361,7 @@ pub(crate) fn refresh(
     let mut stated = facts(built, Some(&row.facts));
     let labels = std::mem::replace(&mut stated.labels, row.facts.labels.clone());
     if stated != row.facts {
-        return Err(Refused::OutOfScope);
+        return Err(Refused::NotLabelsAlone);
     }
     if labels == row.facts.labels {
         return Ok(Wrote::Unmoved(row.id));
@@ -898,9 +898,9 @@ pub(super) mod tests {
     /// A refresh writes the labels its rebuilt worker states over the row
     /// its asker saw, whoever made the row. The row keeps its maker and
     /// every other fact, and equal labels write no revision. A worker that
-    /// states another fact is out of scope, a label past its bound is
-    /// refused, and a row that moved, drains or left takes no refresh. A
-    /// refused refresh writes nothing.
+    /// states another fact is refused in the refresh's own variant, a label
+    /// past its bound is refused, and a row that moved, drains or left
+    /// takes no refresh. A refused refresh writes nothing.
     pub(crate) fn check_refresh(
         open: impl Fn() -> (Arc<MemoryStore>, Box<dyn Membership>),
     ) -> Result<(), &'static str> {
@@ -931,7 +931,7 @@ pub(super) mod tests {
             ];
             for stray in strays {
                 let refused = door.refreshed(seen, &worker(stray), &first);
-                assert_eq!(refused, Err(Refused::OutOfScope));
+                assert_eq!(refused, Err(Refused::NotLabelsAlone));
             }
             let wide = "x".repeat(WorkerFacts::LABEL_VALUE_BYTES + 1);
             let refused = door.refreshed(seen, &worker(built(&wide)), &first);
