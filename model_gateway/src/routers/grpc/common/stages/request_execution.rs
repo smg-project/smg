@@ -1246,10 +1246,12 @@ pub(crate) fn start_failure_response(
     // The request's media failed, not the worker (see `TonicStatusExt::media_fault`):
     // the answer is for the media, under the code the worker names (see
     // `TonicStatusExt::media_code`), and another worker fetching the same URL
-    // would meet the same host, so the request is not replayed.
+    // would meet the same host, so the request is not replayed. The client
+    // reads the gateway's sentence for a fetch that failed (see
+    // `TonicStatusExt::media_message`); the worker's own words are on this line.
     if let Some(fault) = e.media_fault() {
         warn!(function = function, error = %e, ?fault, "{}: the request's media failed", description);
-        let mut response = e.to_http_error(e.media_code().as_str(), e.message().to_string());
+        let mut response = e.to_http_error(e.media_code().as_str(), e.media_message(fault));
         mark_non_retryable(&mut response);
         return response;
     }

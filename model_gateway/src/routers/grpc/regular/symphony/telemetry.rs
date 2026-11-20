@@ -137,8 +137,11 @@ pub(crate) const MALFORMED: &str = "smg_symphony_malformed_total";
 pub(crate) const MALFORMED_BYTES: &str = "smg_symphony_malformed_bytes";
 /// Calls after the first dropped under `parallel_tool_calls: false`, by `table`.
 pub(crate) const CALLS_SUPPRESSED: &str = "smg_symphony_calls_suppressed_total";
-/// Calls the model wrote under `tool_choice: none`, read whole and dropped, by `table`: the
-/// request forbade them, as the engine's own server reads and withholds such a call.
+/// Calls the request's `tool_choice` forbade that the model wrote anyway, read whole and dropped,
+/// by `table`: every call under `none`, as the engine's own server reads and withholds such a
+/// call, and a call outside the callable tools under a named function, an allowed list or
+/// `required`. The list may be the gateway's own: the final turn of a Responses tool loop allows
+/// the request's own tools alone, so a server tool's call written on it counts here too.
 pub(crate) const CALLS_FORBIDDEN: &str = "smg_symphony_calls_forbidden_total";
 /// Requests Symphony was configured for that the legacy parsers read, by `reason`, under the
 /// table `none` ([`record_fallback`]).
@@ -384,8 +387,8 @@ pub(crate) struct Tally {
     /// shows it; allocated only for an output with one.
     undeclared: Option<Undeclared>,
     suppressed_calls: u32,
-    /// The calls the request forbade (`tool_choice: none`) that the model wrote anyway, each
-    /// read whole and dropped ([`Self::see_forbidden`]).
+    /// The calls the request's `tool_choice` forbade that the model wrote anyway, each read
+    /// whole and dropped ([`Self::see_forbidden`]).
     forbidden_calls: u32,
     tool_calls: u32,
     /// The bytes the client was shown: content, reasoning, malformed text kept as content, and
@@ -531,12 +534,13 @@ impl Tally {
         self.at += bytes_of(event);
     }
 
-    /// Accounts for `event` of an output whose calls the request forbade (`tool_choice: none`):
-    /// the reader drops every call after this tally sees it (`event::forbidden_calls`), so a
-    /// call's bytes count as dropped, not shown, it begins no call the client sees and names no
-    /// undeclared function to it (the `UnknownTool` event announcing its name goes with it), each
-    /// is counted as forbidden, none as suppressed; the finish counts no call, and one the engine
-    /// gave as `tool_calls` is the `stop` the client gets.
+    /// Accounts for `event` of a call the request's `tool_choice` forbade, or for the finish of
+    /// an output with no call kept: the reader drops the call after
+    /// this tally sees it (`event::forbidden_calls`), so a call's bytes count as dropped, not
+    /// shown, it begins no call the client sees and names no undeclared function to it (the
+    /// `UnknownTool` event announcing its name goes with it), each is counted as forbidden, none
+    /// as suppressed; the finish of an output with no call kept counts no call, and one the
+    /// engine gave as `tool_calls` is the `stop` the client gets.
     pub(crate) fn see_forbidden(&mut self, event: &Event) {
         match event {
             Event::ToolCallStart { source, .. } => {

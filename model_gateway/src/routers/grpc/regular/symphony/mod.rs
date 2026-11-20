@@ -39,7 +39,10 @@
 //! its thought ([`assign_for`]). A `tool_choice` of `none` over declared tools keeps the table's
 //! calls: the prompt declares the tools as under `auto`, as the engine's own server renders it,
 //! and the reader drops every call the model writes anyway, counted per table
-//! (`smg_symphony_calls_forbidden_total`), so none is delivered as a call or as content.
+//! (`smg_symphony_calls_forbidden_total`), so none is delivered as a call or as content. Under a
+//! named function, an allowed list or `required` the reader drops the same way, and counts in
+//! the same counter, a call to a function outside the tools the choice leaves callable; the
+//! calls beside it go out, numbered from zero.
 //!
 //! Request building assigns Symphony to a request ([`assign_for`]) and stores
 //! the [`Assignment`] in the response spec: the table, and the part of the rendered prompt the
@@ -136,6 +139,8 @@ pub(crate) fn choice(
     })
 }
 
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) use self::constraint::Forbids;
 #[cfg(test)]
 pub(crate) use self::{constraint::constraint, reader::assign};
 pub(crate) use self::{
