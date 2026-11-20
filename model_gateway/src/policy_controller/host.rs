@@ -95,37 +95,11 @@ fn outcome(decision: &Decision) -> &'static str {
     }
 }
 
-/// The controller's sheds made ahead of every profile, each by its reason
-/// and the stage it names: a request no binding matches, an affinity column
-/// that does not fit the rows, rows not written for a profile's scope, a
-/// gateway that shares a wire with no row of the pool, and a subset hint of
-/// none.
-///
-/// A copy of the policy crate's own words, kept until a decision says which
-/// profile made it. It mirrors the sheds `Engine::decide` and
-/// `Engine::decide_pair` make on the bare trace, and the two the door makes
-/// in their place. A shed the crate adds ahead of a profile is counted under
-/// the first profile until it joins this table. So is a shed of the encode
-/// entry, which this host does not ask. A plugin stage registered under one
-/// of these words is read as no profile.
-const AHEAD_OF_A_PROFILE: [(ShedReason, &str); 5] = [
-    (ShedReason::PolicyDeclined, "binding"),
-    (ShedReason::PolicyDeclined, "affinity-column"),
-    (ShedReason::PolicyDeclined, "written-rows"),
-    (ShedReason::NoEndpoints, "wires"),
-    (ShedReason::NoEndpoints, "subset-hint"),
-];
-
-/// The profile that made `decision`, `None` where none did. A shed made
-/// ahead of every profile carries the default trace, whose profile index is
-/// the first profile's: it is counted and traced under none.
+/// The profile `decision` was made under, `None` where it was made ahead of
+/// every profile: its trace says so itself, and it is counted and traced
+/// under none.
 fn profile_of(decision: &Decision) -> Option<u16> {
-    match decision {
-        Decision::Shed(shed) if AHEAD_OF_A_PROFILE.contains(&(shed.reason, shed.emptied_by)) => {
-            None
-        }
-        _ => Some(decision.trace().profile),
-    }
+    decision.trace().made_under()
 }
 
 /// The next ask's process-local number, in eight bytes. The gateway assigns
