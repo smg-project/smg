@@ -517,7 +517,9 @@ static JEMALLOC_IS_GLOBAL: AtomicBool = AtomicBool::new(false);
 /// Call this from a binary or extension that declares jemalloc with
 /// `#[global_allocator]`, including binaries using [`crate::stock_allocator!`].
 /// Register before [`crate::main_from_args`] to skip its warning and before
-/// [`start_prometheus`] to publish statistics for this allocator.
+/// [`start_prometheus`] to publish statistics for this allocator. A binary
+/// on another allocator must not call this: it would publish the statistics
+/// of a linked jemalloc that serves nothing.
 pub fn register_jemalloc_as_global_allocator() {
     #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
     JEMALLOC_IS_GLOBAL.store(true, Ordering::Release);

@@ -54,6 +54,9 @@ pub use tikv_jemallocator::Jemalloc as __StockAllocator;
 /// Write this once at the binary's root. The allocator uses prefixed symbols
 /// so native libraries can keep their own allocator. On MSVC and musl the
 /// macro expands to nothing. See [`main_from_args`] for registration.
+///
+/// The expansion exports the options under an unsafe attribute, so a crate
+/// that forbids unsafe code cannot take the macro.
 #[macro_export]
 macro_rules! stock_allocator {
     () => {
@@ -87,8 +90,10 @@ macro_rules! stock_allocator {
 /// }
 /// ```
 ///
-/// Where no allocator was registered the call says so once on stderr: the
-/// process then runs on the system allocator, and the stock build does not.
+/// The macro alone gives the allocator and its options. The registration
+/// turns the allocator's statistics on, and where it was not called this
+/// call says so once on stderr. A binary that declares no allocator runs
+/// on Rust's default, the system allocator, and the stock build does not.
 ///
 /// The call builds its own runtime and blocks its thread until the server
 /// stops, so it must not be made from async code. A call that served has
@@ -112,7 +117,7 @@ pub fn main_with(
         WARN.call_once(|| {
             let _ = writeln!(
                 std::io::stderr(),
-                "warning: the stock allocator was not registered. Rust uses the system allocator by default. See smg::main_from_args for setup."
+                "warning: jemalloc was not registered as the global allocator, so allocator statistics are off. A binary on the stock allocator declares smg::stock_allocator!() and calls smg::observability::metrics::register_jemalloc_as_global_allocator() before this call. See smg::main_from_args."
             );
         });
     }
