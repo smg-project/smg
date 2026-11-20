@@ -195,13 +195,8 @@ async fn a_retry_names_the_row_of_its_failed_attempt() -> Case {
     let a_row = store.by_key(&a).ok_or("worker A has no row")?.id;
     let b_row = store.by_key(&b).ok_or("worker B has no row")?.id;
     let other = Ask {
-        id: b"other request",
-        model: MODEL,
-        streaming: false,
-        headers: None,
-        rid: None,
         tried: &[a_row],
-        hashes: None,
+        ..Ask::of(b"other request", MODEL)
     };
     let mut booking = host
         .place(&other, Instant::now())
