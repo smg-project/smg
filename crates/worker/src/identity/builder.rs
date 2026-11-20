@@ -483,6 +483,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
             metadata,
             engine_connection,
             engine_connector: self.engine_connector.or_else(D::default_connector),
+            load_source: Arc::new(OnceCell::new()),
             zmq_connect_started: Arc::new(AtomicBool::new(false)),
             zmq_connect_abort: Arc::new(ArcSwapOption::empty()),
             superseded: AtomicBool::new(false),

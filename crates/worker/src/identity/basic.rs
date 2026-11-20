@@ -24,7 +24,8 @@ pub use crate::worker::ConnectionMode;
 use crate::{
     connection::{
         engine::{
-            EngineConnection, EngineConnectionCache, EngineConnector, ZmqLink, NO_ENGINE_CONNECTOR,
+            EngineConnection, EngineConnectionCache, EngineConnector, LoadSource, ZmqLink,
+            NO_ENGINE_CONNECTOR,
         },
         engine_admin::{
             admin_backend_client, admin_grpc_result, admin_http_post, failed, FLUSH_HTTP_TIMEOUT,
@@ -842,6 +843,15 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Returns None for HTTP workers, Some(connection) for gRPC and ZMQ workers
     async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>>;
 
+    /// The host's load source of this worker, where it is an HTTP worker
+    /// whose connector keeps one ([`EngineConnector::http_load_source`]):
+    /// asked at the first call and kept once the connector has answered.
+    /// `None` for every other worker, which the load monitor polls over its
+    /// own wire.
+    async fn load_source(&self) -> Option<Arc<dyn LoadSource>> {
+        None
+    }
+
     /// Release background work owned by this worker instance.
     ///
     /// Called by the registry when the worker leaves it (removal) or is
@@ -993,6 +1003,10 @@ pub struct BasicWorker {
     /// What makes the engine connection: the host's connector, as the
     /// builder resolved it. Without one a gRPC or ZMQ connect is refused.
     pub engine_connector: Option<Arc<dyn EngineConnector>>,
+    /// The host's load source of an HTTP worker, as its connector answered
+    /// at the worker's first load poll: kept once the connector answers,
+    /// `None` inside where the connector keeps none. Clones share the slot.
+    pub load_source: Arc<OnceCell<Option<Arc<dyn LoadSource>>>>,
     /// Guards the one-shot background ZMQ handshake driver so the health probe
     /// never cancels a long (model-load) handshake. Clears at completion to
     /// allow a retry. Unused for HTTP/gRPC.
@@ -1046,6 +1060,7 @@ impl Clone for BasicWorker {
             circuit_breaker: ArcSwap::from(self.circuit_breaker.load_full()),
             engine_connection: Arc::clone(&self.engine_connection),
             engine_connector: self.engine_connector.clone(),
+            load_source: Arc::clone(&self.load_source),
             zmq_connect_started: Arc::clone(&self.zmq_connect_started),
             zmq_connect_abort: Arc::clone(&self.zmq_connect_abort),
             connect_signal_tx: self.connect_signal_tx.clone(),
@@ -1904,6 +1919,20 @@ impl Worker for BasicWorker {
         );
         self.models_override
             .store(Arc::new(WorkerModels::from(models)));
+    }
+
+    async fn load_source(&self) -> Option<Arc<dyn LoadSource>> {
+        if self.metadata.spec.connection_mode != ConnectionMode::Http {
+            return None;
+        }
+        let connector = self.engine_connector.as_ref()?;
+        self.load_source
+            .get_or_init(|| {
+                connector
+                    .http_load_source(self.metadata.base_url(), self.metadata.spec.runtime_type)
+            })
+            .await
+            .clone()
     }
 
     async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>> {

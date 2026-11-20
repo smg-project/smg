@@ -1191,6 +1191,11 @@ impl Extensions {
     /// If the connection supplies load reports, let the worker runtime be
     /// the only poller of that engine's load.
     ///
+    /// An HTTP worker connects no engine, and its load is polled over HTTP.
+    /// A connector that keeps such a worker's load on a service of its own
+    /// answers [`EngineConnector::http_load_source`]: the worker runtime
+    /// then polls that source alone and sends the worker no load request.
+    ///
     /// [`BackendConnector::shared`]: crate::routers::grpc::backend_client::BackendConnector::shared
     /// [`BackendClient`]: crate::routers::grpc::backend_client::BackendClient
     #[must_use]
@@ -3803,6 +3808,7 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
 #[cfg(test)]
 mod tests {
     mod connector;
+    mod load_source;
 
     use std::convert::Infallible;
 
