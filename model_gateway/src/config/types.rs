@@ -360,7 +360,8 @@ pub struct RouterConfig {
     /// places by its routing key, placing it by its policy). Off by
     /// default: a fleet that is uniformly over the thresholds is still a
     /// fleet, and the dispatch-time re-check that sheds a worker flagged
-    /// between selection and dispatch is part of the same opt-in.
+    /// between selection and dispatch is part of the same opt-in. A request
+    /// the policy controller placed is not re-checked.
     #[serde(default)]
     pub worker_overload_shed: bool,
     /// Force `GetLoads` polling for `smg_engine_*` gauges even when no
