@@ -118,6 +118,24 @@ fn every_routing_default_means_the_plain_document_but_the_policy() {
     }
 }
 
+#[test]
+fn the_banner_names_the_document_where_one_decides() {
+    for (flags, line) in [
+        (
+            &["--policy-spec", "routing.yaml"][..],
+            "Policy: document routing.yaml",
+        ),
+        (&[][..], "Policy: cache_aware"),
+    ] {
+        let argv: Vec<String> = std::iter::once("smg")
+            .chain(flags.iter().copied())
+            .map(str::to_owned)
+            .collect();
+        let (args, ..) = parsed(&argv).expect("the binary takes the line");
+        assert_eq!(args.policy_line(), line, "{flags:?}");
+    }
+}
+
 /// Holds the routing part of a command line to the document its whole
 /// configuration means. A field the document reads and the routing part
 /// does not carry fails here.

@@ -2815,17 +2815,6 @@ class TestPolicyController:
         [
             ([], "passthrough"),
             (["--router-policy-controller", "on", "--router-policy-spec", "routing.yaml"], None),
-            (
-                [
-                    "--router-policy-controller",
-                    "on",
-                    "--router-policy-spec",
-                    "routing.yaml",
-                    "--router-policy",
-                    "cache_aware",
-                ],
-                "cache_aware",
-            ),
         ],
     )
     def test_single_worker_serve_preserves_the_policy_when_given_a_document(self, flags, policy):

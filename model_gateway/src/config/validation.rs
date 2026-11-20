@@ -2269,6 +2269,16 @@ impl ConfigValidator {
                 "a policy document is run by the policy controller: set --policy-controller on",
             ));
         }
+        // The path is written with the configuration and the document is
+        // not. A configuration that was not built by its builder holds the
+        // path alone, and would run the routing settings' document.
+        if let (Some(path), None) = (&config.policy_spec_path, &config.policy_spec) {
+            return Err(ConfigError::invalid_value(
+                "policy_spec",
+                path,
+                "the policy document of this path is not loaded: the builder reads it, or set policy_spec",
+            ));
+        }
 
         let has_service_discovery = config.discovery.is_some();
         let invalid_decode_policy = match &config.mode {

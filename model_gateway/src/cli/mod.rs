@@ -175,6 +175,58 @@ struct CliArgs {
     integrations: IntegrationArgs,
 }
 
+/// The routing flags a policy document replaces. `--policy-spec` conflicts
+/// with each of them, and the parser knows where a value came from: a flag
+/// typed beside a document is refused by both names, at its default value
+/// too. A flag the gateway still reads under a document is not listed.
+const DOCUMENT_REPLACES: [&str; 45] = [
+    "policy",
+    "cache_threshold",
+    "balance_abs_threshold",
+    "balance_rel_threshold",
+    "balance_prefix_margin_tokens",
+    "balance_uncached_credit",
+    "bucket_adjust_interval_secs",
+    "balance_token_usage_threshold",
+    "overload_token_usage_threshold",
+    "worker_overload_protection",
+    "disable_worker_overload_protection",
+    "worker_overload_waiting_requests",
+    "worker_overload_token_usage",
+    "worker_overload_shed",
+    "overlap_decay",
+    "selection_temperature",
+    "selection_policy",
+    "selection_accounting_ttl_ms",
+    "eviction_interval",
+    "max_tree_size",
+    "block_size",
+    "cache_boundaries",
+    "cache_index",
+    "cache_ttl_secs",
+    "max_idle_secs",
+    "assignment_mode",
+    "prefix_token_count",
+    "prefix_hash_load_factor",
+    "prefix_hash_balance_abs_threshold",
+    "least_load_kv_pressure_weight",
+    "least_load_default_throughput",
+    "least_load_mean_prefill_tokens",
+    "power_of_two_load_metric",
+    "routing_key_override",
+    "pd_pairing_mode",
+    "grouped_dp_sticky",
+    "dp_minimum_tokens_scheduler",
+    "worker_warmup_secs",
+    "worker_warmup_share",
+    "worker_warmup_blocks",
+    "worker_warmup_thin_ratio",
+    "worker_warmup_divert_every",
+    "prefill_policy",
+    "decode_policy",
+    "encode_policy",
+];
+
 #[derive(clap::Args, Debug)]
 #[group(skip)]
 struct RoutingArgs {
@@ -308,8 +360,8 @@ struct RoutingArgs {
     worker_startup_check_interval: u64,
 
     // ==================== Routing Policy ====================
-    /// Load balancing policy to use. Defaults to cache_aware. With a policy
-    /// document and no --policy, the document decides.
+    /// Load balancing policy to use. Defaults to cache_aware. A policy
+    /// document replaces the routing flags, and --policy is refused beside one.
     #[arg(long, value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
     policy: Option<String>,
 
@@ -674,13 +726,15 @@ struct RoutingArgs {
     policy_controller: String,
 
     /// Run this policy document in place of the one the routing flags mean.
-    /// Settings that change the default routing document must agree with the
-    /// file. Omit --policy to use the file's policy
+    /// The document replaces those flags. A policy name, a policy's own
+    /// setting and the overload, warm-up and pairing settings are each
+    /// refused beside it by name
     #[arg(
         long,
         value_name = "FILE",
         help_heading = "Routing Policy",
-        conflicts_with = "print_policy_spec"
+        conflicts_with = "print_policy_spec",
+        conflicts_with_all = DOCUMENT_REPLACES
     )]
     policy_spec: Option<String>,
 
@@ -2268,49 +2322,74 @@ mod tests {
         assert_eq!(config.policy_document_in_force(), Ok(document));
     }
 
-    #[test]
-    fn a_set_flag_that_disagrees_is_refused_by_name() {
-        use crate::config::PolicyDocumentError;
+    /// The flags under the routing policy heading a document does not
+    /// replace: the controller's own, and what the gateway reads itself.
+    const BESIDE_A_DOCUMENT: [&str; 6] = [
+        "policy_controller",
+        "policy_spec",
+        "print_policy_spec",
+        "dp_aware",
+        "routing_key_headers",
+        "enable_igw",
+    ];
 
-        let (file, _) = policy_file("least_load").expect("a policy document file");
-        let path = file.path().to_str().expect("a UTF-8 path");
-        for policy in ["round_robin", "cache_aware"] {
-            let config = cli_args_from(&[
-                "--policy-controller",
-                "on",
-                "--policy-spec",
-                path,
-                "--policy",
-                policy,
-            ])
-            .to_router_config(vec![], vec![])
-            .expect("the routing configuration");
-            let refusal = config
-                .policy_document_in_force()
-                .expect_err("the policies disagree");
-            assert!(
-                matches!(&refusal, PolicyDocumentError::Disagree { at, .. } if at == &format!("profiles.{policy}")),
-                "{refusal}"
+    #[test]
+    fn every_routing_flag_is_replaced_by_a_document_or_stays_beside_it() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        for arg in command.get_arguments() {
+            if arg.get_help_heading() != Some("Routing Policy") {
+                continue;
+            }
+            let id = arg.get_id().as_str();
+            assert_ne!(
+                DOCUMENT_REPLACES.contains(&id),
+                BESIDE_A_DOCUMENT.contains(&id),
+                "{id}: a routing flag stands in exactly one of the two lists"
             );
         }
     }
 
     #[test]
-    fn a_set_flag_that_agrees_takes_the_document() {
-        let (file, document) = policy_file("round_robin").expect("a policy document file");
-        let path = file.path().to_str().expect("a UTF-8 path");
-        let config = cli_args_from(&[
-            "--policy-controller",
-            "on",
-            "--policy-spec",
-            path,
-            "--policy",
-            "round_robin",
-        ])
-        .to_router_config(vec![], vec![])
-        .expect("the routing configuration");
-        assert!(matches!(config.policy, PolicyConfig::RoundRobin));
-        assert_eq!(config.policy_document_in_force(), Ok(document));
+    fn a_routing_flag_typed_beside_a_document_is_refused_by_both_names() {
+        use clap::{error::ErrorKind, CommandFactory};
+
+        let command = Cli::command();
+        for id in DOCUMENT_REPLACES {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap_or_else(|| panic!("{id} is no flag of the command line"));
+            let flag = format!("--{}", arg.get_long().expect("a long flag"));
+            let mut line = vec!["smg", "--policy-spec", "routing.yaml", flag.as_str()];
+            // The flag's own default where it has one: the parser refuses
+            // by where the value came from, never by the value.
+            let default = arg
+                .get_default_values()
+                .first()
+                .map(|value| value.to_string_lossy().into_owned());
+            let choice = arg
+                .get_possible_values()
+                .first()
+                .map(|value| value.get_name().to_owned());
+            let value = default.or(choice).unwrap_or_else(|| "1".to_owned());
+            if arg.get_action().takes_values() {
+                line.push(&value);
+            }
+            let refusal =
+                Cli::try_parse_from(&line).expect_err("the flag is typed beside a document");
+            assert_eq!(
+                refusal.kind(),
+                ErrorKind::ArgumentConflict,
+                "{flag}: {refusal}"
+            );
+            let message = refusal.to_string();
+            assert!(
+                message.contains("--policy-spec") && message.contains(&flag),
+                "{message}"
+            );
+        }
     }
 
     #[test]

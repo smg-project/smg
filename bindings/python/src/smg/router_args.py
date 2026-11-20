@@ -46,6 +46,56 @@ PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 # Worker discovery providers --discovery-provider accepts.
 DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file", "slurm", "consul"]
+# The routing options a policy document replaces: the command line's
+# DOCUMENT_REPLACES (model_gateway/src/cli/mod.rs) under this launcher's
+# names. Beside a document, one that is not at its default is refused by its
+# name.
+DOCUMENT_REPLACES = (
+    "policy",
+    "cache_threshold",
+    "balance_abs_threshold",
+    "balance_rel_threshold",
+    "balance_prefix_margin_tokens",
+    "balance_uncached_credit",
+    "bucket_adjust_interval_secs",
+    "balance_token_usage_threshold",
+    "overload_token_usage_threshold",
+    "worker_overload_protection",
+    "worker_overload_waiting_requests",
+    "worker_overload_token_usage",
+    "worker_overload_shed",
+    "overlap_decay",
+    "selection_temperature",
+    "selection_policy",
+    "selection_accounting_ttl_ms",
+    "eviction_interval_secs",
+    "max_tree_size",
+    "block_size",
+    "cache_boundaries",
+    "cache_index",
+    "cache_ttl_secs",
+    "max_idle_secs",
+    "assignment_mode",
+    "prefix_token_count",
+    "prefix_hash_load_factor",
+    "prefix_hash_balance_abs_threshold",
+    "least_load_kv_pressure_weight",
+    "least_load_default_throughput",
+    "least_load_mean_prefill_tokens",
+    "power_of_two_load_metric",
+    "routing_key_override",
+    "pd_pairing_mode",
+    "grouped_dp_sticky",
+    "dp_minimum_tokens_scheduler",
+    "worker_warmup_secs",
+    "worker_warmup_share",
+    "worker_warmup_blocks",
+    "worker_warmup_thin_ratio",
+    "worker_warmup_divert_every",
+    "prefill_policy",
+    "decode_policy",
+    "encode_policy",
+)
 
 
 def _policy_name(policy: str | None) -> str:
@@ -964,7 +1014,7 @@ class RouterArgs:
             help=(
                 "Load balancing policy to use. In PD mode, this is used for both prefill and decode"
                 " unless overridden. Defaults to cache_aware."
-                " With a policy document and no --policy, the document decides."
+                " A policy document replaces the routing flags, and --policy is refused beside one."
             ),
         )
         routing_group.add_argument(
@@ -982,8 +1032,8 @@ class RouterArgs:
             default=RouterArgs.policy_spec,
             help=(
                 "Run a policy document with the policy controller."
-                " Settings that change the default routing document must agree with the"
-                " file. Omit --policy to use the file's policy."
+                " The document replaces the routing options: one that is not at its"
+                " default is refused beside it by name."
             ),
         )
         routing_group.add_argument(
@@ -3476,6 +3526,17 @@ class RouterArgs:
                 )
             return self.discovery_provider
         return "kubernetes" if self.service_discovery else None
+
+    def options_a_document_replaces(self) -> list[str]:
+        """Name the routing options set beside a policy document.
+
+        argparse does not say whether an option was typed, so an option at
+        its default stands.
+        """
+        if self.policy_spec is None:
+            return []
+        plain = RouterArgs()
+        return [name for name in DOCUMENT_REPLACES if getattr(self, name) != getattr(plain, name)]
 
     def _validate_router_args(self):
         # Validate configuration based on mode
