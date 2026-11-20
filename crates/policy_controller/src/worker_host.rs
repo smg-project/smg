@@ -37,10 +37,12 @@
 //! | `signals`, `reachable_from` | not carried: the object has no field for them, and a collector reads them of the row by the id the holder keeps |
 //! | `zone`, `pairing`, `encode`, `vision`, `max_running`, `priority`, `overload` | not carried: a decision's facts, read of the store's rows and never of an object |
 //!
-//! Of the row's own columns, the status is the object's first status and is
-//! not followed after: the store's status is the truth, and what drives it
-//! writes the store. An object built in the place of a standing one takes
-//! that one's running state, its status with it, and not its row's status.
+//! A new object starts at its row's status. A replacement takes the
+//! standing object's running state, including its status. A host that gets
+//! health from the rows can use [`Objects::with_status_followed`] to copy
+//! their status on tail changes and snapshots, for objects kept or laid
+//! again. The holder checks the row's revision and writes under the
+//! object's mutation lock. The host's breaker and vetoes still apply.
 //! The id and the revision stand beside the object in the
 //! holder ([`Standing`]). No credential and no connector is a row's fact. A
 //! host hands the holder its connector ([`Objects::with_connector`]); a
