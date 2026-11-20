@@ -746,7 +746,8 @@ class TestPolicyDocument:
             policy_spec=str(path),
             grouped_dp_sticky="hash",
         )
-        with pytest.raises(ValueError, match=r"policy_spec.*" + re.escape(str(path))):
+        unread = re.escape(str(path)) + ": could not read the policy document"
+        with pytest.raises(ValueError, match=unread):
             router.start()
 
     def test_the_routing_options_at_their_defaults_stand_beside_a_document(self, policy_document):
