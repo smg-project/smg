@@ -27,14 +27,17 @@ use smg_worker::{
     jobs::WorkerJobAsker,
     labels::has_control_character,
     registry::WorkerId,
-    workflow::find_workers_by_url,
+    workflow::{find_workers_by_url, WorkerKind},
 };
 use tracing::warn;
 
 use crate::{
     config::{unused_credentials_warning, validate_worker_url, RouterConfig},
     routers::{common::snapshot::WorkerRegistry, provider_support},
-    workflow::{Job, JobQueue, WorkerRegistrationMode},
+    workflow::{
+        steps::{stated_kind, WORKER_KEY_UNSUPPORTED},
+        Job, JobQueue, WorkerRegistrationMode,
+    },
 };
 
 /// Validate the URL of an incoming worker-management request, translating a
@@ -341,6 +344,10 @@ pub enum WorkerServiceError {
         family: &'static str,
         feature: &'static str,
     },
+    /// The spec states an API key for a local worker, on a gateway whose
+    /// local workers are rows of the policy controller's store (a POST or
+    /// a PUT)
+    KeyUnsupported { url: String },
     /// Job queue not initialized
     QueueNotInitialized,
     /// Failed to submit job to queue
@@ -360,6 +367,7 @@ impl WorkerServiceError {
             Self::CreateInProgress { .. } => "WORKER_CREATE_IN_PROGRESS",
             Self::DiscoveryOwned { .. } => "WORKER_DISCOVERY_OWNED",
             Self::ProviderNotCompiled { .. } => "PROVIDER_NOT_COMPILED",
+            Self::KeyUnsupported { .. } => WORKER_KEY_UNSUPPORTED,
             Self::QueueNotInitialized => "INTERNAL_SERVER_ERROR",
             Self::QueueSubmitFailed { .. } => "INTERNAL_SERVER_ERROR",
         }
@@ -375,6 +383,7 @@ impl WorkerServiceError {
             Self::CreateInProgress { .. } => StatusCode::CONFLICT,
             Self::DiscoveryOwned { .. } => StatusCode::CONFLICT,
             Self::ProviderNotCompiled { .. } => StatusCode::BAD_REQUEST,
+            Self::KeyUnsupported { .. } => StatusCode::BAD_REQUEST,
             Self::QueueNotInitialized => StatusCode::INTERNAL_SERVER_ERROR,
             Self::QueueSubmitFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -446,6 +455,11 @@ impl std::fmt::Display for WorkerServiceError {
                 f,
                 "Worker '{url}' targets the {family} provider, but this build carries no \
                  {family} router; rebuild with the `{feature}` Cargo feature to admit it."
+            ),
+            Self::KeyUnsupported { url } => write!(
+                f,
+                "Worker '{url}' states an API key, and a worker of the policy controller's \
+                 store holds none yet: register it without a key."
             ),
             Self::QueueNotInitialized => write!(f, "Job queue not initialized"),
             Self::QueueSubmitFailed { message } => write!(f, "{message}"),
@@ -607,6 +621,9 @@ pub struct WorkerService {
     worker_registry: Arc<WorkerRegistry>,
     job_queue: Arc<std::sync::OnceLock<Arc<JobQueue>>>,
     router_config: RouterConfig,
+    /// Whether a local worker is a row of the policy controller's store,
+    /// which keeps no credential.
+    refuses_worker_keys: bool,
 }
 
 impl WorkerService {
@@ -620,7 +637,30 @@ impl WorkerService {
             worker_registry,
             job_queue,
             router_config,
+            refuses_worker_keys: false,
         }
+    }
+
+    /// Refuse a local worker that states an API key, for a gateway whose
+    /// local workers are rows of the policy controller's store.
+    #[must_use]
+    pub(crate) fn refusing_worker_keys(mut self) -> Self {
+        self.refuses_worker_keys = true;
+        self
+    }
+
+    /// A row keeps no credential, so a local worker would be asked without
+    /// the key its spec states. Refuse here rather than after the 202,
+    /// inside the background workflow, which refuses it too. A provider's
+    /// worker stays outside the store and keeps its key.
+    fn refuse_worker_key(&self, config: &WorkerSpec) -> Result<(), WorkerServiceError> {
+        let local = stated_kind(config) != Some(WorkerKind::External);
+        if self.refuses_worker_keys && local && config.api_key.is_some() {
+            return Err(WorkerServiceError::KeyUnsupported {
+                url: config.url.clone(),
+            });
+        }
+        Ok(())
     }
 
     /// Parse and validate a worker ID string
@@ -647,6 +687,7 @@ impl WorkerService {
         validate_spec(&config)?;
         validate_worker_url_request(&config.url)?;
         Self::require_provider_router(&config)?;
+        self.refuse_worker_key(&config)?;
 
         if self.router_config.api_key.is_some() && config.api_key.is_none() {
             warn!(
@@ -766,6 +807,7 @@ impl WorkerService {
         let url = existing.url().to_string();
         validate_spec(&config)?;
         Self::require_provider_router(&config)?;
+        self.refuse_worker_key(&config)?;
 
         // A data-parallel router expands one spec into one worker per rank,
         // each registered under a rank-suffixed URL. Re-running registration
@@ -1188,6 +1230,53 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A gateway whose local workers are rows refuses a local worker's API
+    /// key at the POST and at the PUT, by name and with a 400, and nothing
+    /// is reserved for it. A provider's worker keeps its key.
+    #[tokio::test]
+    async fn a_local_workers_key_is_refused_by_name_where_a_local_worker_is_a_row() {
+        let keyed = |url: &str, runtime: &str| -> WorkerSpec {
+            let spec = json!({"url": url, "api_key": "secret-key", "runtime": runtime});
+            serde_json::from_value(spec).expect("worker spec")
+        };
+        let registry = Arc::new(WorkerRegistry::new());
+        let replaced = "http://replace:8000";
+        register_worker(&registry, replaced, Some("served"));
+        let id = registry.get_id_by_url(replaced).unwrap();
+        let service = make_service(Arc::clone(&registry)).refusing_worker_keys();
+
+        let created = "http://create:8000";
+        for refused in [
+            service
+                .create_worker(keyed(created, "sglang"))
+                .await
+                .map(drop),
+            service
+                .replace_worker(id.as_str(), keyed(replaced, "sglang"))
+                .await
+                .map(drop),
+        ] {
+            let (status, body, _) = answer(refused.unwrap_err()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["code"], "policy_controller_worker_key_unsupported");
+            let sentence = body["error"].as_str().unwrap();
+            assert!(!sentence.contains("secret-key"), "{sentence}");
+        }
+        assert!(registry.get_id_by_url_or_reservation(created).is_none());
+
+        // A provider's worker and a service with no rows behind it pass this
+        // check: each ends at the next one.
+        for passed in [
+            service.create_worker(keyed(created, "external")).await,
+            make_service(registry)
+                .create_worker(keyed(created, "sglang"))
+                .await,
+        ] {
+            let refusal = passed.err().map(|error| error.error_code());
+            assert_ne!(refusal, Some("policy_controller_worker_key_unsupported"));
+        }
     }
 
     #[tokio::test]

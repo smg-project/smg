@@ -7,11 +7,11 @@
 //! default.
 //!
 //! The setting starts the store with the routing configuration's policy
-//! document. The gateway holds the membership feed, and its workflows
-//! leave that door unused. Without a controller's address nothing feeds the
-//! store yet. The server answers with one refusing router in the gateway
-//! object's place ([`router`]). With the setting off the classic policies
-//! decide and the gateway constructs neither the store nor its feed.
+//! document. The gateway holds the membership feed, and a local worker's
+//! registration writes its row at that door. The server answers with one
+//! refusing router in the gateway object's place ([`router`]). With the
+//! setting off the classic policies decide and the gateway constructs
+//! neither the store nor its feed.
 //!
 //! One site reads the setting, [`start`]. Every other site asks what the
 //! start left in the context.

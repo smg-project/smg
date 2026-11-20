@@ -7,11 +7,13 @@ pub(crate) mod util;
 
 use std::{sync::Arc, time::Duration};
 
+pub(crate) use classify::stated_kind;
 pub use classify::ClassifyWorkerTypeStep;
 pub use external::{
     group_models_into_cards, infer_model_type_from_id, CreateExternalWorkersStep,
     DiscoverModelsStep, ModelInfo, ModelsResponse,
 };
+pub(crate) use local::WORKER_KEY_UNSUPPORTED;
 pub use local::{
     create_worker_removal_workflow, create_worker_removal_workflow_data,
     create_worker_update_workflow, create_worker_update_workflow_data, FindWorkerToUpdateStep,
@@ -19,15 +21,16 @@ pub use local::{
     UpdateRemainingPoliciesStep, UpdateWorkerPropertiesStep,
 };
 use local::{
-    CheckLocalWorkerStep, DiscoverZmqLabelsStep, EnsureHarmonyEncodingStep, SubmitTokenizerJobStep,
-    CHECK_LOCAL_WORKER_STEP, ZMQ_LABELS_STEP,
+    CheckLocalWorkerStep, DiscoverZmqLabelsStep, EnsureHarmonyEncodingStep, RefuseWorkerKeyStep,
+    SubmitTokenizerJobStep, CHECK_LOCAL_WORKER_STEP, REFUSE_WORKER_KEY_STEP, ZMQ_LABELS_STEP,
 };
 use openai_protocol::worker::WorkerSpec;
-use shared::REGISTER_WORKERS_STEP;
 pub use shared::{
     registered_entries, registered_in, ActivateWorkersStep, RegisterWorkersStep,
     UpdatePoliciesStep, WorkerList,
 };
+use shared::{RegisterBesideRowsStep, REGISTER_WORKERS_STEP};
+use smg_policy_controller::worker_host::{registration_at_door, WRITE_WORKERS_AT_DOOR_STEP};
 use smg_worker::{
     jobs::WorkerJobAsker,
     workflow::{
@@ -40,6 +43,7 @@ use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, Workflo
 use crate::{
     app_context::AppContext,
     config::RouterConfig,
+    policy_controller::feed::Feed,
     workflow::data::{WorkerRegistrationMode, WorkerWorkflowData},
 };
 
@@ -81,6 +85,47 @@ use crate::{
 pub fn create_worker_registration_workflow(
     router_config: &RouterConfig,
 ) -> WorkflowDefinition<WorkerWorkflowData> {
+    worker_registration_line(router_config, None)
+}
+
+/// The registration line. With no feed it is
+/// [`create_worker_registration_workflow`]'s.
+///
+/// With a feed the gateway's local workers are rows of the policy
+/// controller's store, and the line differs in four things:
+/// ```text
+///            classify_worker_type
+///                    |
+///       +------------+------------------+
+///       |  (LOCAL branch)               |  (EXTERNAL branch)
+///       v                               v
+///  refuse_worker_key              discover_models
+///       |                               |
+///  (the local steps above)              |
+///       |                               |
+///  ensure_harmony_encoding       create_external_workers
+///       |                               |
+///  write_workers_at_door                |
+///       +---------------+---------------+
+///                        |
+///                 register_workers
+///                        |
+///                 +------+------+
+///                 |             |
+///            submit_tok   activate_workers
+/// ```
+/// - A local registration that states an API key is refused by name ahead
+///   of every probe: a row holds no credential.
+/// - The store crate's write at the feed's door stands behind the encoding
+///   step, and no other step waits on that step. It writes a local worker's
+///   row, and the holder lays the row's object in the registry.
+/// - The register step waits on that write and on the external branch. It
+///   writes a provider's workers alone ([`RegisterBesideRowsStep`]).
+/// - No step writes the classic policies: they decide nothing there.
+pub(crate) fn worker_registration_line(
+    router_config: &RouterConfig,
+    feed: Option<&Feed>,
+) -> WorkflowDefinition<WorkerWorkflowData> {
     let settings = router_config.registration_settings();
     let startup_delay = Duration::from_secs(settings.startup_delay_secs);
     // The steps that poll a starting engine share one attempt budget, which
@@ -116,13 +161,56 @@ pub fn create_worker_registration_workflow(
     .with_failure_action(FailureAction::FailWorkflow)
     .depends_on(&[CREATE_LOCAL_WORKER_STEP]);
 
-    worker_registration_workflow::<AppContext>(
-        &settings,
-        RegistrationGates {
-            detection: Some("classify_worker_type"),
-            creation: Some(ZMQ_LABELS_STEP),
-        },
-    )
+    // Step 4: Register workers, where both branches converge. Under a feed
+    // the local branch's last step is the write at the door.
+    let register_workers = match feed {
+        None => StepDefinition::new(
+            REGISTER_WORKERS_STEP,
+            "Register Workers",
+            Arc::new(RegisterWorkersStep),
+        )
+        .depends_on(&[
+            CHECK_LOCAL_WORKER_STEP,
+            "ensure_harmony_encoding",
+            "create_external_workers",
+        ]),
+        Some(feed) => StepDefinition::new(
+            REGISTER_WORKERS_STEP,
+            "Register Workers",
+            Arc::new(RegisterBesideRowsStep::new(Arc::clone(&feed.objects))),
+        )
+        .depends_on(&[WRITE_WORKERS_AT_DOOR_STEP, "create_external_workers"]),
+    }
+    .with_timeout(Duration::from_secs(5))
+    .with_failure_action(FailureAction::FailWorkflow);
+
+    // The crate's line. Under a feed its detection waits on the key's
+    // refusal, and it ends with the write at the feed's door.
+    let gates = |detection| RegistrationGates {
+        detection: Some(detection),
+        creation: Some(ZMQ_LABELS_STEP),
+    };
+    let workflow = match feed {
+        None => {
+            worker_registration_workflow::<AppContext>(&settings, gates("classify_worker_type"))
+        }
+        Some(feed) => registration_at_door::<AppContext>(
+            &settings,
+            gates(REFUSE_WORKER_KEY_STEP),
+            Arc::clone(&feed.door),
+            &["ensure_harmony_encoding"],
+        )
+        .add_step(
+            StepDefinition::new(
+                REFUSE_WORKER_KEY_STEP,
+                "Refuse Worker Key",
+                Arc::new(RefuseWorkerKeyStep),
+            )
+            .with_timeout(Duration::from_secs(5))
+            .with_failure_action(FailureAction::FailWorkflow)
+            .depends_on(&["classify_worker_type"]),
+        ),
+    }
     // Step 0: Classify worker type (Local vs External)
     .add_step(classify_worker_type)
     // === LOCAL BRANCH ===
@@ -197,20 +285,7 @@ pub fn create_worker_registration_workflow(
     )
     // === SHARED (both branches converge) ===
     // Step 4: Register workers
-    .add_step(
-        StepDefinition::new(
-            REGISTER_WORKERS_STEP,
-            "Register Workers",
-            Arc::new(RegisterWorkersStep),
-        )
-        .with_timeout(Duration::from_secs(5))
-        .with_failure_action(FailureAction::FailWorkflow)
-        .depends_on(&[
-            CHECK_LOCAL_WORKER_STEP,
-            "ensure_harmony_encoding",
-            "create_external_workers",
-        ]),
-    )
+    .add_step(register_workers)
     // Step 5a: Submit tokenizer job (local only)
     .add_step(
         StepDefinition::new(
@@ -221,20 +296,24 @@ pub fn create_worker_registration_workflow(
         .with_timeout(Duration::from_secs(5))
         .with_failure_action(FailureAction::ContinueNextStep)
         .depends_on(&[REGISTER_WORKERS_STEP]),
-    )
-    // Step 5b: Update policies
-    .add_step(
-        StepDefinition::new(
-            "update_policies",
-            "Update Policies",
-            Arc::new(UpdatePoliciesStep),
+    );
+    // Step 5b: Update policies, where the classic policies decide
+    let workflow = if feed.is_some() {
+        workflow
+    } else {
+        workflow.add_step(
+            StepDefinition::new(
+                "update_policies",
+                "Update Policies",
+                Arc::new(UpdatePoliciesStep),
+            )
+            .with_timeout(Duration::from_secs(5))
+            .with_failure_action(FailureAction::ContinueNextStep)
+            .depends_on(&[REGISTER_WORKERS_STEP]),
         )
-        .with_timeout(Duration::from_secs(5))
-        .with_failure_action(FailureAction::ContinueNextStep)
-        .depends_on(&[REGISTER_WORKERS_STEP]),
-    )
+    };
     // Step 5c: Activate workers
-    .add_step(
+    workflow.add_step(
         StepDefinition::new(
             "activate_workers",
             "Activate Workers",
@@ -261,12 +340,30 @@ mod policy_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
+    use http::StatusCode;
+    use openai_protocol::worker::{ConnectionMode, RuntimeType, WorkerStatus};
+    use serde_json::json;
+    use smg_policy_controller::store::{
+        Maker, MemoryStore, WorkerStatus as RowStatus, WorkersStore,
+    };
     use smg_worker::workflow::{
         DETECT_CONNECTION_MODE_STEP, DETECT_RUNTIME_STEP, DISCOVER_METADATA_STEP,
+        WORKER_REGISTRATION_WORKFLOW,
     };
-    use wfaas::StepId;
+    use wfaas::{StepId, StepStatus, WorkflowEngine, WorkflowId, WorkflowState, WorkflowStatus};
 
-    use super::*;
+    use super::{local::test_support::serve_json_routes, *};
+    use crate::{
+        app_context::testing::app_context_for_tests,
+        policy_controller::{
+            feed::feed,
+            host::{Ask, Host},
+            start,
+        },
+        routers::common::snapshot::WorkerRegistry,
+    };
 
     fn config_with(timeout_secs: u64, check_interval_secs: u64) -> RouterConfig {
         RouterConfig::builder()
@@ -507,5 +604,274 @@ mod tests {
                  unknown tool-call parser 'no-such-parser'"
             )
         );
+    }
+
+    /// A line's steps and the steps each waits on, in the line's order.
+    fn edges(workflow: &WorkflowDefinition<WorkerWorkflowData>) -> Vec<(String, Vec<String>)> {
+        workflow
+            .steps
+            .iter()
+            .map(|step| {
+                assert!(step.depends_on_any.is_empty(), "{}", step.id);
+                let waits_on = step.depends_on.iter().map(ToString::to_string).collect();
+                (step.id.to_string(), waits_on)
+            })
+            .collect()
+    }
+
+    fn written(table: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
+        table
+            .iter()
+            .map(|(id, waits_on)| {
+                let waits_on = waits_on.iter().map(ToString::to_string).collect();
+                ((*id).to_string(), waits_on)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn with_no_feed_the_registration_line_is_todays() {
+        let config = config_with(1800, 30);
+        let todays = written(&[
+            ("detect_connection_mode", &["classify_worker_type"]),
+            ("detect_backend", &["detect_connection_mode"]),
+            ("discover_metadata", &["detect_backend"]),
+            ("discover_dp_info", &["discover_metadata"]),
+            ("create_local_worker", &["discover_zmq_labels"]),
+            ("classify_worker_type", &[]),
+            ("discover_zmq_labels", &["discover_dp_info"]),
+            ("check_local_worker", &["create_local_worker"]),
+            ("ensure_harmony_encoding", &["check_local_worker"]),
+            ("discover_models", &["classify_worker_type"]),
+            ("create_external_workers", &["discover_models"]),
+            (
+                "register_workers",
+                &[
+                    "check_local_worker",
+                    "ensure_harmony_encoding",
+                    "create_external_workers",
+                ],
+            ),
+            ("submit_tokenizer_job", &["register_workers"]),
+            ("update_policies", &["register_workers"]),
+            ("activate_workers", &["register_workers"]),
+        ]);
+        assert_eq!(edges(&create_worker_registration_workflow(&config)), todays);
+        assert_eq!(edges(&worker_registration_line(&config, None)), todays);
+    }
+
+    /// The feed of a gateway that started under `config`, over a registry of
+    /// its own: the store, the registry and the feed. `None` where no store
+    /// started.
+    fn started(config: &RouterConfig) -> Option<(Arc<MemoryStore>, Arc<WorkerRegistry>, Feed)> {
+        let store = start(config).ok()??;
+        let registry = Arc::new(WorkerRegistry::new());
+        let feed = feed(&store, &registry);
+        Some((store, registry, feed))
+    }
+
+    fn picked(mut config: RouterConfig) -> RouterConfig {
+        config.policy_controller = true;
+        config.health_check.disable_health_check = true;
+        config
+    }
+
+    /// Under the feed a local worker's branch ends with the write at the
+    /// door, behind the encoding step alone and ahead of the register step.
+    /// The key's refusal stands ahead of the detection. No step writes the
+    /// classic policies.
+    #[test]
+    fn under_the_feed_the_local_line_writes_at_the_door() {
+        let config = picked(config_with(1800, 30));
+        let (_, _, feed) = started(&config).expect("the store starts");
+        let line = written(&[
+            ("detect_connection_mode", &["refuse_worker_key"]),
+            ("detect_backend", &["detect_connection_mode"]),
+            ("discover_metadata", &["detect_backend"]),
+            ("discover_dp_info", &["discover_metadata"]),
+            ("create_local_worker", &["discover_zmq_labels"]),
+            ("write_workers_at_door", &["ensure_harmony_encoding"]),
+            ("refuse_worker_key", &["classify_worker_type"]),
+            ("classify_worker_type", &[]),
+            ("discover_zmq_labels", &["discover_dp_info"]),
+            ("check_local_worker", &["create_local_worker"]),
+            ("ensure_harmony_encoding", &["check_local_worker"]),
+            ("discover_models", &["classify_worker_type"]),
+            ("create_external_workers", &["discover_models"]),
+            (
+                "register_workers",
+                &["write_workers_at_door", "create_external_workers"],
+            ),
+            ("submit_tokenizer_job", &["register_workers"]),
+            ("activate_workers", &["register_workers"]),
+        ]);
+        assert_eq!(edges(&worker_registration_line(&config, Some(&feed))), line);
+    }
+
+    /// Two steps behind one step each write the run's data back whole, and
+    /// one drops what the other wrote. Under the feed two steps stand
+    /// behind one step in two places alone: at the classification, where
+    /// one branch of the two skips, and behind the register step, as with
+    /// no feed. One step alone waits on two: the register step.
+    #[test]
+    fn under_the_feed_every_step_waits_on_one_step_alone_but_the_join() {
+        use std::collections::BTreeMap;
+
+        let config = picked(config_with(1800, 30));
+        let (_, _, feed) = started(&config).expect("the store starts");
+        let mut followers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut joins = Vec::new();
+        for (id, waits_on) in edges(&worker_registration_line(&config, Some(&feed))) {
+            if waits_on.len() > 1 {
+                joins.push(id.clone());
+            }
+            for step in waits_on {
+                followers.entry(step).or_default().push(id.clone());
+            }
+        }
+        followers.retain(|_, steps| steps.len() > 1);
+        assert_eq!(joins, ["register_workers"]);
+        assert_eq!(
+            followers.into_iter().collect::<Vec<_>>(),
+            [
+                (
+                    "classify_worker_type".to_string(),
+                    vec![
+                        "refuse_worker_key".to_string(),
+                        "discover_models".to_string()
+                    ]
+                ),
+                (
+                    "register_workers".to_string(),
+                    vec![
+                        "submit_tokenizer_job".to_string(),
+                        "activate_workers".to_string()
+                    ]
+                ),
+            ]
+        );
+    }
+
+    /// A registration under the feed, run through the engine to its end.
+    async fn registered_under_the_feed(
+        config: &RouterConfig,
+        registry: &Arc<WorkerRegistry>,
+        feed: &Feed,
+        spec: WorkerSpec,
+    ) -> Result<WorkflowState<WorkerWorkflowData>, String> {
+        let host = app_context_for_tests(config.clone(), Arc::clone(registry), None);
+        let engine = WorkflowEngine::new();
+        engine
+            .register_workflow(worker_registration_line(config, Some(feed)))
+            .map_err(|invalid| invalid.to_string())?;
+        let url = spec.url.clone();
+        let id = engine
+            .start_workflow(
+                WorkflowId::new(WORKER_REGISTRATION_WORKFLOW),
+                create_worker_workflow_data(
+                    spec,
+                    WorkerRegistrationMode::Upsert,
+                    host,
+                    WorkerJobAsker::Startup,
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        engine
+            .wait_for_terminal_state(id, &url, Duration::from_secs(20))
+            .await
+    }
+
+    /// A start-up job for a plain HTTP worker, with the health checks off:
+    /// the store holds one Ready row at the worker's URL, the registry holds
+    /// the object the holder laid from it and not the one the job built, and
+    /// the host's next decision picks the row.
+    #[tokio::test]
+    async fn a_local_workers_job_ends_as_a_ready_row_and_the_holders_object() {
+        let url = serve_json_routes(vec![
+            ("/health", StatusCode::OK, json!({"status": "ok"})),
+            (
+                "/model_info",
+                StatusCode::OK,
+                json!({"model_path": "m", "is_generation": true}),
+            ),
+            ("/server_info", StatusCode::OK, json!({"version": "test"})),
+        ])
+        .await;
+        let config = picked(config_with(5, 1));
+        let (store, registry, feed) = started(&config).expect("the store starts");
+
+        let state = registered_under_the_feed(&config, &registry, &feed, WorkerSpec::new(&url))
+            .await
+            .expect("the run ends");
+        let errors: Vec<_> = state
+            .step_states
+            .iter()
+            .filter_map(|(id, step)| Some((id.to_string(), step.last_error.clone()?)))
+            .collect();
+        assert_eq!(state.status, WorkflowStatus::Completed, "{errors:?}");
+        assert!(registered_in(&state));
+
+        let row = store.by_key(&url).expect("the worker's row");
+        assert_eq!(row.status, RowStatus::Ready);
+        assert_eq!(row.maker, Maker::Control);
+
+        let object = registry.get_by_url(&url).expect("the row's object");
+        assert_eq!(feed.objects.object(row.id), registry.get_id_by_url(&url));
+        assert_eq!(object.status(), WorkerStatus::Ready);
+        let data = &state.context.data;
+        let built = data.actual_workers.as_deref().expect("the built workers");
+        assert!(built.iter().all(|built| !Arc::ptr_eq(built, &object)));
+        let written = data.workers.as_ref().expect("the written workers");
+        assert_eq!(written.worker_urls, [url]);
+
+        let model = object.model_id().to_string();
+        let placed = Host::new(Arc::clone(&store), Arc::clone(&registry))
+            .place(
+                &Ask {
+                    id: b"first",
+                    model: &model,
+                    streaming: false,
+                    headers: None,
+                    rid: None,
+                    tried: &[],
+                    hashes: None,
+                },
+                Instant::now(),
+            )
+            .await
+            .expect("the next decision picks the worker");
+        assert_eq!(placed.id(), row.id);
+    }
+
+    /// A local worker that states an API key fails its job by name ahead of
+    /// every probe, and no row is written: a row keeps no credential.
+    #[tokio::test]
+    async fn a_keyed_local_workers_job_fails_by_name_and_writes_no_row() {
+        let config = picked(config_with(1, 1));
+        let (store, registry, feed) = started(&config).expect("the store starts");
+        let url = "ipc:///tmp/worker-keyed.ipc";
+        let mut spec = WorkerSpec::new(url);
+        spec.connection_mode = ConnectionMode::Zmq;
+        spec.runtime_type = RuntimeType::Vllm;
+        spec.labels.insert("model_id".into(), "m".into());
+        spec.api_key = Some("secret-key".into());
+
+        let state = registered_under_the_feed(&config, &registry, &feed, spec)
+            .await
+            .expect("the run ends");
+        assert_eq!(state.status, WorkflowStatus::Failed);
+        let refusal = &state.step_states[&StepId::new(REFUSE_WORKER_KEY_STEP)];
+        assert_eq!(refusal.status, StepStatus::Failed);
+        let error = refusal.last_error.as_deref().unwrap_or_default();
+        assert!(error.contains(WORKER_KEY_UNSUPPORTED), "{error}");
+        assert!(!error.contains("secret-key"), "{error}");
+        let probed = state
+            .step_states
+            .get(&StepId::new(DETECT_CONNECTION_MODE_STEP))
+            .is_some_and(|detection| detection.status == StepStatus::Succeeded);
+        assert!(!probed, "the worker was probed");
+        assert!(store.by_key(url).is_none());
+        assert!(registry.is_empty());
     }
 }
