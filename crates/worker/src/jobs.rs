@@ -1,12 +1,20 @@
-//! The jobs the worker stack asks of its host. One port, [`WorkerJobs`], that
-//! the host's job queue implements: the health manager, a discovery source
-//! and the registration steps each ask through it, and none names a job of
-//! the host.
+//! The jobs the worker stack asks of its host. The health manager, a discovery
+//! source and the registration steps ask through [`WorkerJobs`]. The queue
+//! takes those requests for any host whose jobs can carry a [`WorkerJob`].
+
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{registry::WorkerId, worker::WorkerSpec};
+use self::queue::{JobHost, JobQueue, QueueJob};
+use crate::{
+    identity::endpoint::Endpoint,
+    registry::WorkerId,
+    worker::{WorkerSpec, WorkerUpdateRequest},
+};
+
+pub mod queue;
 
 /// Who asked for a worker job. The caller states it when it asks. The host
 /// carries it on the job, and a host's step reads it from the workflow data.
@@ -23,8 +31,9 @@ pub enum WorkerJobAsker {
     Api,
     /// An address the host was started with.
     Startup,
-    /// A discovery source. It names no source today. It carries the
-    /// source's name the day a host runs two.
+    /// A discovery source. It names no source today. The day a host runs
+    /// two it carries the source's name: the provider word the reconciler
+    /// writes on the worker's label.
     Discovery,
     /// The health manager.
     Health,
@@ -108,18 +117,176 @@ pub trait WorkerJobs: Send + Sync {
     ) -> Result<bool, String>;
 
     /// Whether the host's record of the address `url`, as written, shows a
-    /// job in flight. A host may write a job's record ahead of its queue
-    /// slot (a registration's and a label re-read's, at the claim) or once
-    /// the slot is held (a removal's), and may keep one record an address,
-    /// which a job that ends clears. So the answer is one to plan by, not a
-    /// claim: `false` reserves nothing, and [`Self::add_worker`] is the
-    /// claim. A job is recorded under the address it was asked with, so a
-    /// caller reads in that form: a registration's as its spec writes the
-    /// address, a removal's as the removal was asked. A discovery source
-    /// registers an address [as published] and asks its removal at the
-    /// address's [lookup form].
+    /// job in flight. The queue keeps one record per address. It writes the
+    /// record for a registration or a label re-read at the claim and a plain
+    /// submission's once a slot is held. Success clears the job's record.
+    /// Failure leaves a terminal record. [`Self::add_worker`] claims the
+    /// address when it admits a registration. A discovery source registers
+    /// an address [as published] and asks its removal at the address's
+    /// [lookup form].
     ///
     /// [as published]: crate::identity::endpoint::Endpoint::render
     /// [lookup form]: crate::identity::endpoint::Endpoint::lookup_form
     fn job_in_flight(&self, url: &str) -> bool;
+}
+
+/// A job the worker stack asks of a host's queue.
+#[derive(Debug, Clone)]
+pub enum WorkerJob {
+    Add {
+        spec: Box<WorkerSpec>,
+        mode: WorkerRegistrationMode,
+        asker: WorkerJobAsker,
+    },
+    Update {
+        url: String,
+        update: Box<WorkerUpdateRequest>,
+        asker: WorkerJobAsker,
+    },
+    RefreshLabels {
+        url: String,
+        asker: WorkerJobAsker,
+    },
+    Remove {
+        url: String,
+        /// Revisions by worker id. A pin with no revision accepts any
+        /// revision of that id. A removal with no pins takes the whole address.
+        expected_revisions: Option<HashMap<String, Option<u64>>>,
+        asker: WorkerJobAsker,
+    },
+}
+
+impl QueueJob for WorkerJob {
+    const REGISTRATION_TYPE: &'static str = "AddWorker";
+
+    fn job_type(&self) -> &'static str {
+        match self {
+            Self::Add { .. } => Self::REGISTRATION_TYPE,
+            Self::Update { .. } => "UpdateWorker",
+            Self::RefreshLabels { .. } => "RefreshWorkerLabels",
+            Self::Remove { .. } => "RemoveWorker",
+        }
+    }
+
+    fn key(&self) -> &str {
+        match self {
+            Self::Add { spec, .. } => &spec.url,
+            Self::Update { url, .. }
+            | Self::RefreshLabels { url, .. }
+            | Self::Remove { url, .. } => url,
+        }
+    }
+
+    fn shown_key(_job_type: &str, key: &str) -> String {
+        Endpoint::redacted_str(key)
+    }
+
+    fn is_removal(&self) -> bool {
+        matches!(self, Self::Remove { .. })
+    }
+
+    fn merge_removals(mut held: Self, mut newer: Self) -> Result<Self, (Self, Self)> {
+        match (&mut held, &mut newer) {
+            (
+                Self::Remove {
+                    expected_revisions: pins,
+                    asker,
+                    ..
+                },
+                Self::Remove {
+                    expected_revisions: newer_pins,
+                    asker: newer_asker,
+                    ..
+                },
+            ) if asker == newer_asker => {
+                *pins = merge_pins(pins.take(), newer_pins.take());
+                Ok(held)
+            }
+            _ => Err((held, newer)),
+        }
+    }
+
+    fn asker(&self) -> Option<&WorkerJobAsker> {
+        match self {
+            Self::Add { asker, .. }
+            | Self::Update { asker, .. }
+            | Self::RefreshLabels { asker, .. }
+            | Self::Remove { asker, .. } => Some(asker),
+        }
+    }
+}
+
+/// Merged removals take the union of their pins. A pin that accepts any
+/// revision takes precedence. An unguarded removal takes the whole address.
+fn merge_pins(
+    held: Option<HashMap<String, Option<u64>>>,
+    newer: Option<HashMap<String, Option<u64>>>,
+) -> Option<HashMap<String, Option<u64>>> {
+    let (Some(mut pins), Some(newer)) = (held, newer) else {
+        return None;
+    };
+    for (id, revision) in newer {
+        let pin = pins.entry(id).or_insert(revision);
+        if revision.is_none() {
+            *pin = None;
+        }
+    }
+    Some(pins)
+}
+
+#[async_trait]
+impl<H: JobHost> WorkerJobs for JobQueue<H>
+where
+    H::Job: From<WorkerJob>,
+{
+    async fn refresh_worker_labels(
+        &self,
+        url: String,
+        asker: WorkerJobAsker,
+    ) -> Result<bool, String> {
+        self.submit_or_defer(WorkerJob::RefreshLabels { url, asker }.into())
+            .await
+    }
+
+    async fn add_worker(
+        &self,
+        spec: WorkerSpec,
+        mode: WorkerRegistrationMode,
+        asker: WorkerJobAsker,
+    ) -> Result<bool, String> {
+        let job = WorkerJob::Add {
+            spec: Box::new(spec),
+            mode,
+            asker,
+        };
+        self.submit_unless_registering(job.into()).await
+    }
+
+    async fn remove_workers_at(
+        &self,
+        url: String,
+        guards: Vec<(WorkerId, u64)>,
+        asker: WorkerJobAsker,
+    ) -> Result<(), String> {
+        // Each pin names one worker. Workers sharing a base address can
+        // have the same revision, so the revision alone cannot name one.
+        let expected_revisions = guards
+            .into_iter()
+            .map(|(id, revision)| (id.as_str().to_string(), Some(revision)))
+            .collect();
+        self.submit(
+            WorkerJob::Remove {
+                url,
+                expected_revisions: Some(expected_revisions),
+                asker,
+            }
+            .into(),
+        )
+        .await
+    }
+
+    fn job_in_flight(&self, url: &str) -> bool {
+        self.get_status(url)
+            .is_some_and(|status| status.status == "pending" || status.status == "processing")
+    }
 }

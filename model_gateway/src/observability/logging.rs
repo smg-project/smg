@@ -1490,8 +1490,10 @@ mod filter_tests {
     fn the_default_filter_gives_the_worker_crate_the_configured_level() {
         let debug = targets(&build_workspace_filter("debug"));
         assert!(debug.would_enable("smg_worker::periodic_task", &Level::DEBUG));
+        assert!(debug.would_enable("smg_worker::jobs::queue", &Level::DEBUG));
         let error = targets(&build_workspace_filter("error"));
         assert!(!error.would_enable("smg_worker::load::metrics_aggregator", &Level::WARN));
+        assert!(!error.would_enable("smg_worker::jobs::queue", &Level::WARN));
     }
 
     /// The discovery crate's lines take the configured level by the crate's

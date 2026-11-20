@@ -1,31 +1,24 @@
-//! Async job queue for control plane operations
-//!
-//! Provides non-blocking worker management by queuing operations and processing
-//! them asynchronously in background worker tasks.
+//! Jobs the gateway runs through its control plane. The application context
+//! runs the workflows and handles their reservations and cancel marks.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Weak,
-    },
-    time::{Duration, SystemTime},
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use dashmap::{mapref::entry::Entry, DashMap, DashSet};
+use dashmap::DashSet;
 use openai_protocol::worker::{
-    ConnectionMode, JobStatus, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
+    ConnectionMode, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
 };
+pub use queue::{JobOutcomeError, JobQueueConfig};
 use smg_mcp::McpConfig;
 use smg_worker::{
     identity::endpoint::Endpoint,
-    jobs::{WorkerJobAsker, WorkerJobs},
+    jobs::{
+        queue::{self, JobHost, JobRun, QueueJob},
+        WorkerJob, WorkerJobAsker,
+    },
     registry::WorkerId,
-    workflow::SETTLE_STEP_TIMEOUT,
 };
-use tokio::sync::{mpsc, oneshot, Semaphore};
-use tracing::{debug, error, field, info, warn};
+use tracing::{debug, info};
 use wfaas::{StateStore, WorkflowData, WorkflowEngine, WorkflowError, WorkflowId, WorkflowStatus};
 
 use crate::{
@@ -35,15 +28,18 @@ use crate::{
     workflow::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
-        create_worker_removal_workflow_data, create_worker_update_workflow_data,
-        create_worker_workflow_data, note_tokenizer_load_outcome, note_tokenizer_removed,
-        registered_entries, registered_in, McpServerConfigRequest, TokenizerConfigRequest,
-        TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
-        WorkerRegistrationMode, WorkflowEngines,
+        create_worker_removal_workflow, create_worker_removal_workflow_data,
+        create_worker_update_workflow_data, create_worker_workflow_data,
+        note_tokenizer_load_outcome, note_tokenizer_removed, registered_entries, registered_in,
+        McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
+        WasmModuleConfigRequest, WasmModuleRemovalRequest, WorkerRegistrationMode, WorkflowEngines,
     },
 };
 
-/// Job types for control plane operations
+/// The control plane's queue, with the application context as its host.
+pub type JobQueue = queue::JobQueue<AppContext>;
+
+/// A job the gateway runs through the control plane.
 #[derive(Debug, Clone)]
 pub enum Job {
     AddWorker {
@@ -102,7 +98,7 @@ impl Job {
     /// Get job type as string for logging
     pub fn job_type(&self) -> &'static str {
         match self {
-            Job::AddWorker { .. } => "AddWorker",
+            Job::AddWorker { .. } => Self::REGISTRATION_TYPE,
             Job::UpdateWorker { .. } => "UpdateWorker",
             Job::RefreshWorkerLabels { .. } => "RefreshWorkerLabels",
             Job::RemoveWorker { .. } => "RemoveWorker",
@@ -130,7 +126,7 @@ impl Job {
             | "RemoveWasmModule"
             | "AddTokenizer"
             | "RemoveTokenizer" => worker_url.to_string(),
-            _ => Endpoint::redacted_str(worker_url),
+            _ => WorkerJob::shown_key(job_type, worker_url),
         }
     }
 
@@ -161,6 +157,60 @@ impl Job {
             Job::RemoveTokenizer { request } => &request.id,
         }
     }
+}
+
+impl QueueJob for Job {
+    const REGISTRATION_TYPE: &'static str = WorkerJob::REGISTRATION_TYPE;
+
+    fn job_type(&self) -> &'static str {
+        self.job_type()
+    }
+
+    fn key(&self) -> &str {
+        self.worker_url()
+    }
+
+    fn shown_key(job_type: &str, key: &str) -> String {
+        Self::shown_worker(job_type, key)
+    }
+
+    fn is_removal(&self) -> bool {
+        matches!(self, Self::RemoveWorker { .. })
+    }
+
+    fn merge_removals(held: Self, newer: Self) -> Result<Self, (Self, Self)> {
+        let jobs = (held, newer);
+        let (
+            Self::RemoveWorker {
+                url,
+                expected_revisions,
+                asker,
+            },
+            Self::RemoveWorker {
+                url: newer_url,
+                expected_revisions: newer_revisions,
+                asker: newer_asker,
+            },
+        ) = jobs
+        else {
+            return Err(jobs);
+        };
+
+        WorkerJob::merge_removals(
+            WorkerJob::Remove {
+                url,
+                expected_revisions,
+                asker,
+            },
+            WorkerJob::Remove {
+                url: newer_url,
+                expected_revisions: newer_revisions,
+                asker: newer_asker,
+            },
+        )
+        .map(Self::from)
+        .map_err(|(held, newer)| (held.into(), newer.into()))
+    }
 
     fn asker(&self) -> Option<&WorkerJobAsker> {
         match self {
@@ -179,191 +229,26 @@ impl Job {
     }
 }
 
-/// Job queue configuration
-#[derive(Clone, Debug)]
-pub struct JobQueueConfig {
-    /// Maximum pending jobs in queue
-    pub queue_capacity: usize,
-    /// Maximum number of jobs executing concurrently
-    pub max_concurrent_jobs: usize,
-}
-
-impl Default for JobQueueConfig {
-    fn default() -> Self {
-        Self {
-            queue_capacity: 1000,
-            max_concurrent_jobs: 200,
+impl From<WorkerJob> for Job {
+    fn from(job: WorkerJob) -> Self {
+        match job {
+            WorkerJob::Add { spec, mode, asker } => Self::AddWorker {
+                config: spec,
+                registration_mode: mode,
+                asker,
+            },
+            WorkerJob::Update { url, update, asker } => Self::UpdateWorker { url, update, asker },
+            WorkerJob::RefreshLabels { url, asker } => Self::RefreshWorkerLabels { url, asker },
+            WorkerJob::Remove {
+                url,
+                expected_revisions,
+                asker,
+            } => Self::RemoveWorker {
+                url,
+                expected_revisions,
+                asker,
+            },
         }
-    }
-}
-
-/// Job queue manager for worker validation and removal operations
-pub struct JobQueue {
-    /// Channel for submitting jobs, each with the id of the waiter for its
-    /// outcome when a caller waits on it
-    tx: mpsc::Sender<Queued>,
-    /// Weak reference to AppContext to avoid circular dependencies
-    context: Weak<AppContext>,
-    /// Job status tracking by worker URL
-    status_map: Arc<DashMap<String, JobStatus>>,
-    /// Semaphore to limit concurrent job execution
-    concurrency_limit: Arc<Semaphore>,
-    /// The waiters of [`Self::submit_and_wait`], by job key: a job's outcome
-    /// is handed to its waiter when the job ends.
-    outcomes: Outcomes,
-    /// The next waiter's id: what tells a caller's waiter from a later one
-    /// under the same key.
-    next_waiter_id: AtomicU64,
-    /// The jobs kept per URL while another job holds it (`submit_or_defer`).
-    /// That job's completion runs them in turn (`run_kept`).
-    kept: Arc<DashMap<String, Kept>>,
-    /// The ids (the ones their `POST /workers` reserved) whose registration a
-    /// `DELETE` ended before the job had saved a workflow state
-    /// (`cancel_registration`): the `POST`'s job reads its own id here before
-    /// and right after it starts the workflow, and clears it when it ends;
-    /// no other kind of registration job owns a mark (`own_mark_id`), so a
-    /// `PUT`'s or a discovery job of the same URL neither takes nor erases it.
-    cancelled_before_start: Arc<DashSet<WorkerId>>,
-}
-
-/// A job handed to the dispatcher with the id of the waiter for its outcome,
-/// when a caller waits on it: the outcome goes to that waiter alone, never to
-/// a later caller's under the same key.
-struct Queued {
-    job: Job,
-    waiter: Option<u64>,
-}
-
-/// The caller waiting on a job's outcome under the job's key, one per key
-/// at a time; `id` is the caller's own, so a caller leaving takes its own
-/// entry alone.
-struct Waiter {
-    id: u64,
-    sender: oneshot::Sender<Result<String, String>>,
-}
-
-/// The waiters for a job's outcome, by job key.
-type Outcomes = Arc<DashMap<String, Waiter>>;
-
-/// Removes the caller's waiter when the caller leaves
-/// [`JobQueue::submit_and_wait`] by any path: a submit refused, a wait
-/// cancelled while the queue is full, a timeout, or the outcome delivered
-/// (which removed it already). The entry goes only while it is still this
-/// caller's, so a later waiter under the same key stays.
-struct WaiterSlot {
-    outcomes: Outcomes,
-    key: String,
-    id: u64,
-}
-
-impl Drop for WaiterSlot {
-    fn drop(&mut self) {
-        self.outcomes
-            .remove_if(&self.key, |_, waiter| waiter.id == self.id);
-    }
-}
-
-/// Why [`JobQueue::submit_and_wait`] returned no success message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JobOutcomeError {
-    /// The queue took no job: full, or shutting down.
-    NotQueued(String),
-    /// The job ran and failed, with its reason.
-    Failed(String),
-    /// The job did not end within the wait; it keeps running.
-    TimedOut(Duration),
-    /// A caller is waiting on a job under this key already: the job runs
-    /// once and its outcome goes to that caller. The key is written as a
-    /// log line writes it, a worker's address with its userinfo masked.
-    InFlight(String),
-}
-
-impl std::fmt::Display for JobOutcomeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotQueued(reason) => write!(f, "Failed to submit job: {reason}"),
-            Self::Failed(reason) => f.write_str(reason),
-            Self::TimedOut(wait) => write!(f, "Job timeout after {}s", wait.as_secs()),
-            Self::InFlight(key) => write!(f, "A job for {key} is in flight; wait for its outcome"),
-        }
-    }
-}
-
-impl std::error::Error for JobOutcomeError {}
-
-impl std::fmt::Debug for JobQueue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JobQueue")
-            .field("status_count", &self.status_map.len())
-            .finish()
-    }
-}
-
-/// The jobs kept for one URL while another job holds it
-/// ([`JobQueue::submit_or_defer`]). A host's step acts for one asker per job,
-/// so only removals from the same asker merge. At most four removals are kept,
-/// one per asker. They run in the order first kept, before the latest job of
-/// any other kind. A refresh then runs on any worker the removals leave.
-#[derive(Default)]
-struct Kept {
-    removals: VecDeque<Job>,
-    other: Option<Job>,
-}
-
-impl Kept {
-    fn is_empty(&self) -> bool {
-        self.removals.is_empty() && self.other.is_none()
-    }
-
-    /// The next job to run, taking removals first.
-    fn take_next(&mut self) -> Option<Job> {
-        self.removals.pop_front().or_else(|| self.other.take())
-    }
-
-    /// Keeps a job or puts one with a refused claim back at the front.
-    /// Merged removals take the union of their pins. A pin that accepts any
-    /// revision takes precedence. An unguarded removal takes the whole URL.
-    fn place(&mut self, mut job: Job, newer_wins: bool) {
-        if let Job::RemoveWorker {
-            expected_revisions,
-            asker,
-            ..
-        } = &mut job
-        {
-            let pins = self.removals.iter_mut().find_map(|held| match held {
-                Job::RemoveWorker {
-                    expected_revisions: pins,
-                    asker: held_asker,
-                    ..
-                } if held_asker == asker => Some(pins),
-                _ => None,
-            });
-            if let Some(pins) = pins {
-                *pins = Self::merge_pins(pins.take(), expected_revisions.take());
-            } else if newer_wins {
-                self.removals.push_back(job);
-            } else {
-                self.removals.push_front(job);
-            }
-        } else if newer_wins || self.other.is_none() {
-            self.other = Some(job);
-        }
-    }
-
-    fn merge_pins(
-        held: Option<HashMap<String, Option<u64>>>,
-        other: Option<HashMap<String, Option<u64>>>,
-    ) -> Option<HashMap<String, Option<u64>>> {
-        let (Some(mut pins), Some(other)) = (held, other) else {
-            return None;
-        };
-        for (id, revision) in other {
-            let pin = pins.entry(id).or_insert(revision);
-            if revision.is_none() {
-                *pin = None;
-            }
-        }
-        Some(pins)
     }
 }
 
@@ -376,822 +261,264 @@ enum CleanupRemoval {
     Behind,
 }
 
-/// A claimed submission's hold on its own status entry while it waits for a
-/// slot: dropped with its caller before the slot is held (a cancelled request
-/// on a full queue) or ended by a refused submission, it takes the claim back
-/// out, so no pending entry outlives the submission it was made for.
-struct Claim<'a> {
-    status_map: &'a DashMap<String, JobStatus>,
-    url: &'a str,
-    job_type: &'static str,
-    held: bool,
+/// Cancels the `POST /workers` registration in flight for `worker_url`,
+/// the one `worker_id` was reserved for, and says how many a `DELETE`
+/// ends. A workflow the store holds is cancelled (one an earlier `DELETE`
+/// cancelled, its job not ended yet, counts without a second cancel, so a
+/// repeated `DELETE` queues no removal); a job that has not saved its
+/// state yet is marked under `worker_id` and ends when it reads the mark.
+/// The cancelled job's end releases the URL's reservation and records its
+/// status as for any failed registration. A startup or discovery
+/// registration of the same URL (`Upsert`) is not the API's
+/// to end and runs on: none is cancelled, and no mark is set while one
+/// runs (a `DELETE` then goes to the removal job as before).
+pub(crate) async fn cancel_registration(
+    queue: &JobQueue,
+    worker_url: &str,
+    worker_id: &WorkerId,
+) -> Result<usize, String> {
+    let Some(context) = queue.host() else {
+        return Err(format!(
+            "Job queue shutting down: {} dropped",
+            AppContext::NAME
+        ));
+    };
+    let (cancelled, upsert_running) = cancel_registration_states(&context, worker_url).await?;
+    if cancelled > 0 || upsert_running || !add_worker_in_flight(queue, worker_url) {
+        return Ok(cancelled);
+    }
+    // The job is queued, or started and has not saved its state yet. It
+    // may have saved it since the listing above: a second listing catches
+    // that, and the job's own read after its save catches the rest. A job
+    // that ended meanwhile, or an id that no longer names the URL (its
+    // registration over, a new one admitted), takes the mark back.
+    queue.set_cancel_mark(worker_id);
+    let (cancelled, upsert_running) = match cancel_registration_states(&context, worker_url).await {
+        Ok(found) => found,
+        Err(message) => {
+            queue.clear_cancel_mark(worker_id);
+            return Err(message);
+        }
+    };
+    if cancelled > 0
+        || upsert_running
+        || !add_worker_in_flight(queue, worker_url)
+        || context.worker_registry.get_url_by_id(worker_id).as_deref() != Some(worker_url)
+    {
+        queue.clear_cancel_mark(worker_id);
+        return Ok(cancelled);
+    }
+    Ok(1)
 }
 
-impl Drop for Claim<'_> {
-    fn drop(&mut self) {
-        if !self.held {
-            JobQueue::record_own_status(self.status_map, self.url, self.job_type, None);
-        }
-    }
+/// Whether the status entry under `url` is a registration job that has
+/// not ended: queued, or running (the type name of [`Job::job_type`]).
+fn add_worker_in_flight(queue: &JobQueue, url: &str) -> bool {
+    queue.get_status(url).is_some_and(|status| {
+        status.job_type == Job::REGISTRATION_TYPE
+            && matches!(status.status.as_str(), "pending" | "processing")
+    })
 }
 
-impl JobQueue {
-    /// Create a new job queue with semaphore-based concurrency control
-    ///
-    /// Takes a Weak reference to AppContext to avoid circular strong references.
-    /// Spawns a single dispatcher task that spawns individual job tasks with semaphore control.
-    pub fn new(config: JobQueueConfig, context: Weak<AppContext>) -> Arc<Self> {
-        let (tx, mut rx) = mpsc::channel(config.queue_capacity);
+/// The workflow engines, or the refusal a job answers while they are not
+/// built yet.
+fn workflow_engines(context: &AppContext) -> Result<&WorkflowEngines, String> {
+    context
+        .workflow_engines
+        .get()
+        .ok_or_else(|| "Workflow engines not initialized".to_string())
+}
 
-        debug!(
-            "Initializing job queue: capacity={}, max_concurrent={}",
-            config.queue_capacity, config.max_concurrent_jobs
-        );
-
-        let status_map = Arc::new(DashMap::new());
-        let concurrency_limit = Arc::new(Semaphore::new(config.max_concurrent_jobs));
-        let outcomes: Outcomes = Arc::new(DashMap::new());
-        let kept: Arc<DashMap<String, Kept>> = Arc::new(DashMap::new());
-        let cancelled_before_start = Arc::new(DashSet::new());
-
-        let queue = Arc::new(Self {
-            tx,
-            context: context.clone(),
-            status_map: status_map.clone(),
-            concurrency_limit: concurrency_limit.clone(),
-            outcomes: outcomes.clone(),
-            next_waiter_id: AtomicU64::new(1),
-            kept: kept.clone(),
-            cancelled_before_start: cancelled_before_start.clone(),
-        });
-
-        // Single dispatcher task
-        let ctx = context.clone();
-        let status = status_map.clone();
-        let sem = concurrency_limit.clone();
-        let waiters = outcomes.clone();
-        let marks = cancelled_before_start.clone();
-
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "Core job dispatcher loop: runs for the lifetime of the gateway and drains cleanly when the channel sender is dropped on shutdown"
-        )]
-        tokio::spawn(async move {
-            while let Some(queued) = rx.recv().await {
-                // Acquire permit (blocks if at concurrency limit)
-                let Ok(permit) = sem.clone().acquire_owned().await else {
-                    error!("Semaphore closed, stopping dispatcher");
-                    break;
-                };
-
-                let ctx_clone = ctx.clone();
-                let status_clone = status.clone();
-                let waiters_clone = waiters.clone();
-                let kept_clone = kept.clone();
-                let marks_clone = marks.clone();
-
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "Job processing task: bounded by the semaphore permit which is dropped when the task completes"
-                )]
-                tokio::spawn(async move {
-                    Self::process_job(
-                        queued,
-                        ctx_clone,
-                        status_clone,
-                        waiters_clone,
-                        kept_clone,
-                        marks_clone,
-                        permit,
-                    )
-                    .await;
-                });
-            }
-
-            debug!("Job dispatcher stopped");
-        });
-
-        // Spawn cleanup task for old job statuses (TTL 5 minutes)
-        let cleanup_status_map = status_map.clone();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "Background cleanup loop: runs periodically to evict expired job statuses, bounded by the DashMap's own TTL logic"
-        )]
-        tokio::spawn(async move {
-            Self::cleanup_old_statuses(cleanup_status_map).await;
-        });
-
-        queue
-    }
-
-    /// Get current queue and concurrency status
-    pub fn get_load_info(&self) -> (usize, usize) {
-        let queue_depth = self.tx.max_capacity() - self.tx.capacity();
-        let available_permits = self.concurrency_limit.available_permits();
-        (queue_depth, available_permits)
-    }
-
-    /// Claim the URL of `job` for it, unless a job of its type is already
-    /// pending or processing there, in which case `false`. The status-map
-    /// entry is taken atomically, so of concurrent callers exactly one holds
-    /// the claim and enqueues, with [`Self::submit_claimed`] (#1533); what
-    /// that caller does between the two (a `POST` reserves the worker id its
-    /// 202 names) is behind the claim, so a caller refused here does none of
-    /// it.
-    pub fn claim_if_idle(&self, job: &Job) -> bool {
-        Self::claim(&self.status_map, job.worker_url(), job.job_type())
-    }
-
-    /// Submit a job whose URL the caller claimed with [`Self::claim_if_idle`].
-    /// A submission refused or dropped before it holds a slot owns no job, so
-    /// its claim goes with it (`submit_inner`'s hold on the entry).
-    pub async fn submit_claimed(&self, job: Job) -> Result<(), String> {
-        self.submit_inner(job, true, None).await
-    }
-
-    /// Only an in-flight job of the same type counts: the status map is keyed
-    /// by name across job types, so an MCP server or WASM module named like a
-    /// worker URL must not block that worker's AddWorker.
-    fn claim(status_map: &DashMap<String, JobStatus>, url: &str, job_type: &'static str) -> bool {
-        match status_map.entry(url.to_string()) {
-            Entry::Occupied(e)
-                if e.get().job_type == job_type
-                    && matches!(e.get().status.as_str(), "pending" | "processing") =>
-            {
-                false
-            }
-            entry => {
-                entry.insert(JobStatus::pending(job_type, url));
-                true
-            }
+/// Cancels the `POST /workers` registration workflows the store holds for
+/// `worker_url`: the active ones are cancelled, a cancelled one counts, one
+/// that ended between the listing and the cancel is skipped. Says how many
+/// it ended and whether a startup or discovery registration (`Upsert`) of
+/// the URL is running, which is not the API's to end.
+async fn cancel_registration_states(
+    context: &AppContext,
+    worker_url: &str,
+) -> Result<(usize, bool), String> {
+    let engine = &workflow_engines(context)?.worker_registration;
+    let states = engine
+        .state_store()
+        .list_all()
+        .await
+        .map_err(|e| format!("Failed to list registration workflows: {e:?}"))?;
+    let mut cancelled = 0;
+    let mut upsert_running = false;
+    for state in states {
+        if state.context.data.config.url != worker_url {
+            continue;
         }
-    }
-
-    /// Submit unless a job of any type is pending or processing for this URL.
-    /// For a best-effort submission that must not take an in-flight job's
-    /// status under the key: a label refresh while the worker's registration
-    /// is still processing would take that job's entry (and let the in-flight
-    /// guard admit a second registration). Returns `Ok(false)` when one is in
-    /// flight; the caller's next occasion submits again. A job of another type
-    /// submitted after the claim keeps its entry too: the pending status
-    /// written once a slot is held, the claim's return on a refused or dropped
-    /// submission and a job's later status writes touch only this job's own
-    /// entry (`record_own_status`).
-    pub async fn submit_unless_in_flight(&self, job: Job) -> Result<bool, String> {
-        let worker_url = job.worker_url().to_string();
-        let job_type = job.job_type();
-        if !Self::claim_unless_in_flight(&self.status_map, &worker_url, job_type) {
-            return Ok(false);
-        }
-        self.submit_inner(job, true, None).await.map(|()| true)
-    }
-
-    /// Submit `job` unless a registration (`AddWorker`) is pending or
-    /// processing under its URL: the check and the job's claim are one entry
-    /// operation, and the job's pending status is then written over its own
-    /// entry only, once it holds a slot, so a registration that claims the URL
-    /// during the wait keeps its entry. `Ok(false)` when a registration holds
-    /// the URL; any other entry (another type's, or an ended job's) is taken.
-    pub(crate) async fn submit_unless_registering(&self, job: Job) -> Result<bool, String> {
-        let worker_url = job.worker_url().to_string();
-        let job_type = job.job_type();
-        match self.status_map.entry(worker_url.clone()) {
-            Entry::Occupied(e)
-                if e.get().job_type == "AddWorker"
-                    && matches!(e.get().status.as_str(), "pending" | "processing") =>
-            {
-                return Ok(false);
-            }
-            entry => {
-                entry.insert(JobStatus::pending(job_type, &worker_url));
-            }
-        }
-        self.submit_inner(job, true, None).await.map(|()| true)
-    }
-
-    /// Keeps a job that finds the URL held. The holder's completion runs the
-    /// kept jobs in order. If the holder ended before the job was kept, this
-    /// call tries to submit the next kept job. Returns `Ok(true)` when this
-    /// call submits its own job, including a removal merged with one from
-    /// the same asker.
-    pub async fn submit_or_defer(&self, job: Job) -> Result<bool, String> {
-        let worker_url = job.worker_url().to_string();
-        if Self::claim_unless_in_flight(&self.status_map, &worker_url, job.job_type()) {
-            return self.submit_inner(job, true, None).await.map(|()| true);
-        }
-        let removal_asker = match &job {
-            Job::RemoveWorker { asker, .. } => Some(asker.clone()),
-            _ => None,
-        };
-        Self::keep(&self.kept, &worker_url, job);
-        let Some(next) = Self::take_next(&self.kept, &worker_url, |next| {
-            Self::claim_unless_in_flight(&self.status_map, &worker_url, next.job_type())
-        }) else {
-            return Ok(false);
-        };
-        let own = match &next {
-            Job::RemoveWorker { asker, .. } => removal_asker.as_ref() == Some(asker),
-            _ => removal_asker.is_none(),
-        };
-        self.submit_inner(next, true, None).await.map(|()| own)
-    }
-
-    /// Keeps `job` for `url` under the rules of [`Kept`].
-    fn keep(kept: &DashMap<String, Kept>, url: &str, job: Job) {
-        kept.entry(url.to_string()).or_default().place(job, true);
-    }
-
-    /// Takes the next kept job and claims the URL under the same lock, so
-    /// two runners cannot take jobs out of order. A refused job goes back
-    /// in place. The entry goes when it has no jobs left.
-    fn take_next(
-        kept: &DashMap<String, Kept>,
-        url: &str,
-        claim: impl FnOnce(&Job) -> bool,
-    ) -> Option<Job> {
-        let mut entry = kept.get_mut(url)?;
-        let job = entry.take_next()?;
-        if !claim(&job) {
-            entry.place(job, false);
-            return None;
-        }
-        let emptied = entry.is_empty();
-        drop(entry);
-        if emptied {
-            kept.remove_if(url, |_, slots| slots.is_empty());
-        }
-        Some(job)
-    }
-
-    #[cfg(test)]
-    fn put_back(kept: &DashMap<String, Kept>, url: &str, job: Job) {
-        kept.entry(url.to_string()).or_default().place(job, false);
-    }
-
-    /// Runs the kept jobs in order, each under its own status. If another
-    /// job has taken the URL, its completion runs the jobs still kept.
-    async fn run_kept(
-        worker_url: &str,
-        context: &Arc<AppContext>,
-        status_map: &Arc<DashMap<String, JobStatus>>,
-        kept: &DashMap<String, Kept>,
-        cancelled_before_start: &DashSet<WorkerId>,
-    ) {
-        while let Some(job) = Self::take_next(kept, worker_url, |next| {
-            Self::claim_unless_in_flight(status_map, worker_url, next.job_type())
-        }) {
-            let job_type = job.job_type();
-            debug!(
-                asker = job.asker().map(field::debug),
-                "Running the {} job kept for worker={} while another job held the URL",
-                job_type,
-                Job::shown_worker(job_type, worker_url)
-            );
-            Self::record_own_status(
-                status_map,
-                worker_url,
-                job_type,
-                Some(JobStatus::processing(job_type, worker_url)),
-            );
-            let start = std::time::Instant::now();
-            // A kept registration's cancel mark and reservation go as on the
-            // dispatcher's path (`process_job`): the job reads and clears its
-            // own mark, and a failed `POST`'s job releases its reservation
-            // before its status turns terminal.
-            let own_id = Self::own_mark_id(&job, &context.worker_registry);
-            let result =
-                Self::execute_job(&job, context, cancelled_before_start, own_id.as_ref()).await;
-            if result.is_err()
-                && matches!(
-                    job,
-                    Job::AddWorker {
-                        registration_mode: WorkerRegistrationMode::CreateOnly,
-                        ..
-                    }
-                )
-            {
-                context.worker_registry.release_reservation(worker_url);
-            }
-            Self::record_job_completion(job_type, worker_url, start.elapsed(), &result, status_map);
-            if let Some(id) = own_id {
-                cancelled_before_start.remove(&id);
-            }
-        }
-    }
-
-    /// A job of `job_type` written as processing under `url`, standing in for
-    /// one the dispatcher is running.
-    #[cfg(test)]
-    pub(crate) fn hold_url_for_tests(&self, url: &str, job_type: &'static str) {
-        self.status_map
-            .insert(url.to_string(), JobStatus::processing(job_type, url));
-    }
-
-    /// Whether a job is kept for `url` (`submit_or_defer`).
-    #[cfg(test)]
-    pub(crate) fn kept_for(&self, url: &str) -> bool {
-        self.kept.get(url).is_some_and(|slots| !slots.is_empty())
-    }
-
-    /// Accepts submissions without dispatching them. The reader takes the
-    /// next queued job.
-    #[cfg(test)]
-    pub(crate) fn recording_for_tests(
-        context: &Arc<AppContext>,
-    ) -> (Arc<Self>, impl FnMut() -> Job) {
-        let config = JobQueueConfig::default();
-        let (tx, mut rx) = mpsc::channel::<Queued>(config.queue_capacity);
-        let queue = Arc::new(Self {
-            tx,
-            context: Arc::downgrade(context),
-            status_map: Arc::default(),
-            concurrency_limit: Arc::new(Semaphore::new(config.max_concurrent_jobs)),
-            outcomes: Arc::default(),
-            next_waiter_id: AtomicU64::new(1),
-            kept: Arc::default(),
-            cancelled_before_start: Arc::default(),
-        });
-        (queue, move || rx.try_recv().expect("a queued job").job)
-    }
-
-    /// Any in-flight job under the key blocks the claim, whatever its type.
-    fn claim_unless_in_flight(
-        status_map: &DashMap<String, JobStatus>,
-        url: &str,
-        job_type: &'static str,
-    ) -> bool {
-        match status_map.entry(url.to_string()) {
-            Entry::Occupied(e) if matches!(e.get().status.as_str(), "pending" | "processing") => {
-                false
-            }
-            entry => {
-                entry.insert(JobStatus::pending(job_type, url));
-                true
-            }
-        }
-    }
-
-    /// Submit a job with detailed queue status
-    pub async fn submit(&self, job: Job) -> Result<(), String> {
-        self.submit_inner(job, false, None).await
-    }
-
-    /// `submit`, with the pending status written over this job's own claim
-    /// alone when `claimed` ([`Self::submit_claimed`],
-    /// [`Self::submit_unless_in_flight`]): a job of another type that took the
-    /// URL during the wait for a slot keeps its entry, where a plain submission
-    /// writes its own over whatever is there. `waiter` is the id of the caller
-    /// waiting on the outcome, [`Self::submit_and_wait`]'s own; none otherwise.
-    async fn submit_inner(
-        &self,
-        job: Job,
-        claimed: bool,
-        waiter: Option<u64>,
-    ) -> Result<(), String> {
-        // Extract values before moving job
-        let job_type = job.job_type();
-        let worker_url = job.worker_url().to_string();
-        // A claimed submission holds its entry only as long as it lives:
-        // ended or dropped before a slot is held, the claim goes with it. A
-        // plain one builds no guard (built eagerly, a guard would drop at once
-        // and take another job's same-type entry with it).
-        let mut claim = claimed.then(|| Claim {
-            status_map: &self.status_map,
-            url: &worker_url,
-            job_type,
-            held: false,
-        });
-        // Check if context is still alive before accepting jobs
-        let Some(context) = self.context.upgrade() else {
-            return Err("Job queue shutting down: AppContext dropped".to_string());
-        };
-        let tokenizer_load = match &job {
-            Job::AddTokenizer { config } => Some(config.name.clone()),
-            _ => None,
-        };
-
-        // A slot in the queue first: the wait for one (a full queue) can be
-        // cancelled with the caller and must leave nothing behind, so nothing
-        // is recorded before a slot is held; from the slot on, the hand-over
-        // is synchronous and cannot fail.
-        let Ok(permit) = self.tx.reserve().await else {
-            let (queue_depth, _) = self.get_load_info();
-            return Err(format!(
-                "Job queue full: {} jobs pending (capacity: {})",
-                queue_depth,
-                self.tx.max_capacity()
-            ));
-        };
-
-        if let Some(claim) = claim.as_mut() {
-            claim.held = true;
-        }
-        // Record pending status
-        Self::write_pending(&self.status_map, &worker_url, job_type, claimed);
-        // A tokenizer load counts as in flight for its model from here (the
-        // model is pending until the job ends, whatever was recorded): with
-        // the slot held, the job is handed over right after the count, so a
-        // job that ends at once finds its count to release.
-        if let Some(model) = &tokenizer_load {
-            context.tokenizer_load_failures.load_started(model);
-        }
-        permit.send(Queued { job, waiter });
-
-        let (queue_depth, available_permits) = self.get_load_info();
-        debug!(
-            "Job submitted: type={}, worker={}, queue_depth={}, available_slots={}",
-            job_type,
-            Job::shown_worker(job_type, &worker_url),
-            queue_depth,
-            available_permits
-        );
-        Ok(())
-    }
-
-    /// Submit `job` and wait for its outcome: the job's own success message
-    /// or its failure, as the status map records them, without a poll.
-    /// `timeout` bounds the wait; a job that outlives it keeps running and
-    /// its outcome is dropped.
-    pub async fn submit_and_wait(
-        &self,
-        job: Job,
-        timeout: Duration,
-    ) -> Result<String, JobOutcomeError> {
-        let key = job.worker_url().to_string();
-        let (tx, rx) = oneshot::channel();
-        let id = self.next_waiter_id.fetch_add(1, Ordering::Relaxed);
-        // One waiter per key: a second caller for a job in flight is refused,
-        // not handed the first caller's outcome (and the first its loss).
-        match self.outcomes.entry(key.clone()) {
-            Entry::Occupied(_) => {
-                let shown = Job::shown_worker(job.job_type(), &key);
-                return Err(JobOutcomeError::InFlight(shown));
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(Waiter { id, sender: tx });
-            }
-        }
-        // The waiter leaves with the caller, whichever way the caller leaves.
-        let _slot = WaiterSlot {
-            outcomes: Arc::clone(&self.outcomes),
-            key,
-            id,
-        };
-        if let Err(reason) = self.submit_inner(job, false, Some(id)).await {
-            return Err(JobOutcomeError::NotQueued(reason));
-        }
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(Ok(message))) => Ok(message),
-            Ok(Ok(Err(reason))) => Err(JobOutcomeError::Failed(reason)),
-            Ok(Err(_)) => Err(JobOutcomeError::Failed(
-                "the job ended without an outcome".to_string(),
-            )),
-            Err(_) => Err(JobOutcomeError::TimedOut(timeout)),
-        }
-    }
-
-    /// Hands a finished job's outcome to the waiter the job was queued for,
-    /// while that waiter is still under the key. A job queued without a
-    /// waiter, or whose waiter left and a later caller took the key, delivers
-    /// nothing; a waiter that gave up (its receiver dropped) is a no-op.
-    fn deliver_outcome(
-        outcomes: &Outcomes,
-        key: &str,
-        waiter: Option<u64>,
-        outcome: Result<String, String>,
-    ) {
-        let Some(id) = waiter else { return };
-        if let Some((_, waiter)) = outcomes.remove_if(key, |_, waiter| waiter.id == id) {
-            let _ = waiter.sender.send(outcome);
-        }
-    }
-
-    /// Get job status by worker URL
-    pub fn get_status(&self, worker_url: &str) -> Option<JobStatus> {
-        self.status_map.get(worker_url).map(|entry| entry.clone())
-    }
-
-    /// Remove the status entry for `worker_url`.
-    pub fn remove_status(&self, worker_url: &str) {
-        self.status_map.remove(worker_url);
-    }
-
-    /// Cancels the `POST /workers` registration in flight for `worker_url`,
-    /// the one `worker_id` was reserved for, and says how many a `DELETE`
-    /// ends. A workflow the store holds is cancelled (one an earlier `DELETE`
-    /// cancelled, its job not ended yet, counts without a second cancel, so a
-    /// repeated `DELETE` queues no removal); a job that has not saved its
-    /// state yet is marked under `worker_id`, and ends when it reads the mark
-    /// (`execute_job`).
-    /// The cancelled job's end releases the URL's reservation and records its
-    /// status as for any registration that failed (`process_job`). A startup
-    /// or discovery registration of the same URL (`Upsert`) is not the API's
-    /// to end and runs on: none is cancelled, and no mark is set while one
-    /// runs (a `DELETE` then goes to the removal job as before).
-    pub async fn cancel_registration(
-        &self,
-        worker_url: &str,
-        worker_id: &WorkerId,
-    ) -> Result<usize, String> {
-        let Some(context) = self.context.upgrade() else {
-            return Err("Job queue shutting down: AppContext dropped".to_string());
-        };
-        let (cancelled, upsert_running) =
-            Self::cancel_registration_states(&context, worker_url).await?;
-        if cancelled > 0 || upsert_running || !self.add_worker_in_flight(worker_url) {
-            return Ok(cancelled);
-        }
-        // The job is queued, or started and has not saved its state yet. It
-        // may have saved it since the listing above: a second listing catches
-        // that, and the job's own read after its save catches the rest. A job
-        // that ended meanwhile, or an id that no longer names the URL (its
-        // registration over, a new one admitted), takes the mark back.
-        self.cancelled_before_start.insert(worker_id.clone());
-        let (cancelled, upsert_running) =
-            match Self::cancel_registration_states(&context, worker_url).await {
-                Ok(found) => found,
-                Err(message) => {
-                    self.cancelled_before_start.remove(worker_id);
-                    return Err(message);
-                }
-            };
-        if cancelled > 0
-            || upsert_running
-            || !self.add_worker_in_flight(worker_url)
-            || context.worker_registry.get_url_by_id(worker_id).as_deref() != Some(worker_url)
-        {
-            self.cancelled_before_start.remove(worker_id);
-            return Ok(cancelled);
-        }
-        Ok(1)
-    }
-
-    /// Whether the status entry under `url` is a registration job that has
-    /// not ended: queued, or running (the type name of [`Job::job_type`]).
-    fn add_worker_in_flight(&self, url: &str) -> bool {
-        self.status_map.get(url).is_some_and(|status| {
-            status.job_type == "AddWorker"
-                && matches!(status.status.as_str(), "pending" | "processing")
-        })
-    }
-
-    /// The workflow engines, or the refusal a job answers while they are not
-    /// built yet.
-    fn workflow_engines(context: &AppContext) -> Result<&WorkflowEngines, String> {
-        context
-            .workflow_engines
-            .get()
-            .ok_or_else(|| "Workflow engines not initialized".to_string())
-    }
-
-    /// Cancels the `POST /workers` registration workflows the store holds for
-    /// `worker_url`: the active ones are cancelled, a cancelled one counts, one
-    /// that ended between the listing and the cancel is skipped. Says how many
-    /// it ended and whether a startup or discovery registration (`Upsert`) of
-    /// the URL is running, which is not the API's to end.
-    async fn cancel_registration_states(
-        context: &AppContext,
-        worker_url: &str,
-    ) -> Result<(usize, bool), String> {
-        let engine = &Self::workflow_engines(context)?.worker_registration;
-        let states = engine
-            .state_store()
-            .list_all()
-            .await
-            .map_err(|e| format!("Failed to list registration workflows: {e:?}"))?;
-        let mut cancelled = 0;
-        let mut upsert_running = false;
-        for state in states {
-            if state.context.data.config.url != worker_url {
-                continue;
-            }
-            if !matches!(
+        if !matches!(
+            state.context.data.registration_mode,
+            WorkerRegistrationMode::CreateOnly
+        ) {
+            // A `PUT`'s registration (`ReplaceById`) owns no id without a
+            // worker behind it, so it blocks no mark.
+            upsert_running |= matches!(
                 state.context.data.registration_mode,
-                WorkerRegistrationMode::CreateOnly
-            ) {
-                // A `PUT`'s registration (`ReplaceById`) owns no id without a
-                // worker behind it, so it blocks no mark.
-                upsert_running |= matches!(
-                    state.context.data.registration_mode,
-                    WorkerRegistrationMode::Upsert
-                ) && matches!(
-                    state.status,
-                    WorkflowStatus::Pending | WorkflowStatus::Running
-                );
-                continue;
-            }
-            match state.status {
-                WorkflowStatus::Pending | WorkflowStatus::Running => {
-                    match engine.cancel_workflow(state.instance_id).await {
-                        Ok(()) => cancelled += 1,
-                        // Ended between the listing and the cancel: its job's
-                        // end path runs as for any registration that ended.
-                        Err(WorkflowError::NotFound(_)) => {}
-                        Err(e) => {
-                            return Err(format!(
-                                "Failed to cancel registration workflow {}: {e:?}",
-                                state.instance_id
-                            ));
-                        }
+                WorkerRegistrationMode::Upsert
+            ) && matches!(
+                state.status,
+                WorkflowStatus::Pending | WorkflowStatus::Running
+            );
+            continue;
+        }
+        match state.status {
+            WorkflowStatus::Pending | WorkflowStatus::Running => {
+                match engine.cancel_workflow(state.instance_id).await {
+                    Ok(()) => cancelled += 1,
+                    // Ended between the listing and the cancel: its job's
+                    // end path runs as for any registration that ended.
+                    Err(WorkflowError::NotFound(_)) => {}
+                    Err(e) => {
+                        return Err(format!(
+                            "Failed to cancel registration workflow {}: {e:?}",
+                            state.instance_id
+                        ));
                     }
                 }
-                // Cancelled by an earlier DELETE; its job has not ended yet.
-                WorkflowStatus::Cancelled => cancelled += 1,
-                WorkflowStatus::Paused | WorkflowStatus::Completed | WorkflowStatus::Failed => {}
             }
-        }
-        Ok((cancelled, upsert_running))
-    }
-
-    /// Process a single job with status tracking and error handling
-    async fn process_job(
-        queued: Queued,
-        context: Weak<AppContext>,
-        status_map: Arc<DashMap<String, JobStatus>>,
-        outcomes: Outcomes,
-        kept: Arc<DashMap<String, Kept>>,
-        cancelled_before_start: Arc<DashSet<WorkerId>>,
-        permit: tokio::sync::OwnedSemaphorePermit,
-    ) {
-        let Queued { job, waiter } = queued;
-        let job_type = job.job_type();
-        let worker_url = job.worker_url().to_string();
-        let start = std::time::Instant::now();
-
-        // Update to processing: this job's entry only (a job of another type
-        // submitted for the URL since this one was queued keeps its status).
-        Self::record_own_status(
-            &status_map,
-            &worker_url,
-            job_type,
-            Some(JobStatus::processing(job_type, &worker_url)),
-        );
-
-        debug!(
-            asker = job.asker().map(field::debug),
-            "Processing job: type={}, worker={}",
-            job_type,
-            Job::shown_worker(job_type, &worker_url)
-        );
-
-        // Release concurrency slot immediately. The semaphore bounds how many
-        // jobs can be dequeued concurrently (preventing thundering herd), but
-        // long-running waits (e.g. 30-min worker health checks) must not hold
-        // a slot or they starve the queue for all other job types.
-        drop(permit);
-
-        // Execute job
-        match context.upgrade() {
-            Some(ctx) => {
-                // The id whose cancel mark this job owns (`own_mark_id`), read
-                // before the end path can release the reservation: the mark
-                // the job reads and clears is its own alone.
-                let own_id = Self::own_mark_id(&job, &ctx.worker_registry);
-                let result =
-                    Self::execute_job(&job, &ctx, &cancelled_before_start, own_id.as_ref()).await;
-                let duration = start.elapsed();
-                // Only `POST /workers` (CreateOnly) reserves an id for its 202; a failed
-                // upsert from discovery or startup owns no reservation to drop. Release
-                // before the status turns terminal, so a retry cannot reserve the same
-                // mapping in between and have it deleted from under it (#1533).
-                if result.is_err()
-                    && matches!(
-                        job,
-                        Job::AddWorker {
-                            registration_mode: WorkerRegistrationMode::CreateOnly,
-                            ..
-                        }
-                    )
-                {
-                    ctx.worker_registry.release_reservation(&worker_url);
-                }
-                Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
-                // A mark set for this job after its reads is over with it.
-                if let Some(id) = own_id {
-                    cancelled_before_start.remove(&id);
-                }
-                Self::deliver_outcome(&outcomes, &worker_url, waiter, result);
-                Self::run_kept(
-                    &worker_url,
-                    &ctx,
-                    &status_map,
-                    &kept,
-                    &cancelled_before_start,
-                )
-                .await;
-            }
-            None => {
-                let error_msg = "AppContext dropped".to_string();
-                status_map.insert(
-                    worker_url.clone(),
-                    JobStatus::failed(job_type, &worker_url, error_msg.clone()),
-                );
-                Self::deliver_outcome(&outcomes, &worker_url, waiter, Err(error_msg));
-                error!(
-                    "AppContext dropped, cannot process job: type={}, worker={}",
-                    job_type,
-                    Job::shown_worker(job_type, &worker_url)
-                );
-            }
+            // Cancelled by an earlier DELETE; its job has not ended yet.
+            WorkflowStatus::Cancelled => cancelled += 1,
+            WorkflowStatus::Paused | WorkflowStatus::Completed | WorkflowStatus::Failed => {}
         }
     }
+    Ok((cancelled, upsert_running))
+}
 
-    /// The id whose cancel mark a registration job owns: a `POST`'s job
-    /// (`CreateOnly`) owns the id its `POST` reserved, read from the URL's
-    /// mapping itself since the reservation has no worker behind it yet. A
-    /// `PUT`'s job and a startup or discovery registration own none: the mark
-    /// is a `DELETE` of a `POST`'s registration, and a job of another kind
-    /// started under that reservation (a `PUT` queued before the `POST`, a
-    /// discovery pass over the same URL) leaves it for the `POST`'s job.
-    fn own_mark_id(job: &Job, registry: &WorkerRegistry) -> Option<WorkerId> {
-        match job {
-            Job::AddWorker {
-                config,
-                registration_mode: WorkerRegistrationMode::CreateOnly,
-                ..
-            } => registry.get_id_by_url_or_reservation(&config.url),
-            _ => None,
-        }
+/// The id whose cancel mark a registration job owns: a `POST`'s job
+/// (`CreateOnly`) owns the id its `POST` reserved, read from the URL's
+/// mapping itself since the reservation has no worker behind it yet. A
+/// `PUT`'s job and a startup or discovery registration own none: the mark
+/// is a `DELETE` of a `POST`'s registration, and a job of another kind
+/// started under that reservation (a `PUT` queued before the `POST`, a
+/// discovery pass over the same URL) leaves it for the `POST`'s job.
+fn own_mark_id(job: &Job, registry: &WorkerRegistry) -> Option<WorkerId> {
+    match job {
+        Job::AddWorker {
+            config,
+            registration_mode: WorkerRegistrationMode::CreateOnly,
+            ..
+        } => registry.get_id_by_url_or_reservation(&config.url),
+        _ => None,
     }
+}
 
-    /// Queues the removal of a registration's workers under `url`, pinned to
-    /// `entries` (their ids and revisions as the registry holds them now, so
-    /// a worker registered or replaced since is left alone): the job a
-    /// `DELETE` of a live worker queues, drain and bookkeeping included.
-    /// Behind a removal in flight at the URL (a `DELETE`'s, an earlier end's)
-    /// it runs on that one's heels, as a `DELETE`'s does: that one takes the
-    /// workers it was queued for and leaves these standing when they are
-    /// not among its pins, so a second is needed, and finds nothing left
-    /// when they were. A kept removal merges only with one from the same
-    /// asker ([`Kept`]).
-    async fn queue_removal(
-        context: &Arc<AppContext>,
-        url: &str,
-        entries: HashMap<String, u64>,
-        asker: WorkerJobAsker,
-    ) -> Result<CleanupRemoval, String> {
-        let queue = context
-            .worker_job_queue
-            .get()
-            .ok_or_else(|| "Worker job queue not initialized".to_string())?;
-        let job = Job::RemoveWorker {
-            url: url.to_string(),
-            expected_revisions: Some(
-                entries
-                    .into_iter()
-                    .map(|(id, revision)| (id, Some(revision)))
-                    .collect(),
-            ),
-            asker,
-        };
-        if queue.claim_if_idle(&job) {
-            return queue
-                .submit_claimed(job)
-                .await
-                .map(|()| CleanupRemoval::Queued);
-        }
-        let submitted = queue.submit_or_defer(job).await?;
-        Ok(if submitted {
-            CleanupRemoval::Queued
-        } else {
-            CleanupRemoval::Behind
-        })
-    }
-
-    /// Takes the mark under `own_id`, if there is one: true when a `DELETE`
-    /// ended this registration before its job had saved a workflow state.
-    fn take_mark(marks: &DashSet<WorkerId>, own_id: Option<&WorkerId>) -> bool {
-        own_id.is_some_and(|id| marks.remove(id).is_some())
-    }
-
-    /// Start the `workflow` definition on `engine` with `data`, log the
-    /// instance under `label`, and wait for it to end within `timeout`.
-    /// `what` names the workflow in the start failure and in the log line.
-    async fn run_workflow<D: WorkflowData, S: StateStore<D> + 'static>(
-        engine: &WorkflowEngine<D, S>,
-        workflow: &'static str,
-        what: &str,
-        label: &str,
-        data: D,
-        timeout: Duration,
-    ) -> Result<String, String> {
-        let instance_id = engine
-            .start_workflow(WorkflowId::new(workflow), data)
+/// Queues the removal of a registration's workers under `url`, pinned to
+/// `entries` (their ids and revisions as the registry holds them now, so
+/// a worker registered or replaced since is left alone): the job a
+/// `DELETE` of a live worker queues, drain and bookkeeping included.
+/// Behind a removal in flight at the URL (a `DELETE`'s, an earlier end's)
+/// it runs on that one's heels, as a `DELETE`'s does: that one takes the
+/// workers it was queued for and leaves these standing when they are
+/// not among its pins, so a second is needed, and finds nothing left
+/// when they were. A kept removal merges only with one from the same
+/// asker.
+async fn queue_removal(
+    context: &Arc<AppContext>,
+    url: &str,
+    entries: HashMap<String, u64>,
+    asker: WorkerJobAsker,
+) -> Result<CleanupRemoval, String> {
+    let queue = context
+        .worker_job_queue
+        .get()
+        .ok_or_else(|| "Worker job queue not initialized".to_string())?;
+    let job = Job::RemoveWorker {
+        url: url.to_string(),
+        expected_revisions: Some(
+            entries
+                .into_iter()
+                .map(|(id, revision)| (id, Some(revision)))
+                .collect(),
+        ),
+        asker,
+    };
+    if queue.claim_if_idle(&job) {
+        return queue
+            .submit_claimed(job)
             .await
-            .map_err(|e| format!("Failed to start {what} workflow: {e:?}"))?;
-        debug!("Started {what} workflow for {label} (instance: {instance_id})");
-        engine
-            .wait_for_completion(instance_id, label, timeout)
-            .await
+            .map(|()| CleanupRemoval::Queued);
+    }
+    let submitted = queue.submit_or_defer(job).await?;
+    Ok(if submitted {
+        CleanupRemoval::Queued
+    } else {
+        CleanupRemoval::Behind
+    })
+}
+
+/// Takes the mark under `own_id`, if there is one: true when a `DELETE`
+/// ended this registration before its job had saved a workflow state.
+fn take_mark(marks: &DashSet<WorkerId>, own_id: Option<&WorkerId>) -> bool {
+    own_id.is_some_and(|id| marks.remove(id).is_some())
+}
+
+/// How long a removal job waits for its run: the bounds of the removal's
+/// steps, added up. Each step has one attempt, so the run ends within the
+/// sum. A job that gave up earlier would report a failure and free the URL
+/// while its run went on to remove the worker.
+fn removal_wait() -> Duration {
+    let workflow = create_worker_removal_workflow();
+    workflow
+        .steps
+        .iter()
+        .map(|step| workflow.get_timeout(step))
+        .sum()
+}
+
+/// Start the `workflow` definition on `engine` with `data`, log the
+/// instance under `label`, and wait for it to end within `timeout`.
+/// `what` names the workflow in the start failure and in the log line.
+async fn run_workflow<D: WorkflowData, S: StateStore<D> + 'static>(
+    engine: &WorkflowEngine<D, S>,
+    workflow: &'static str,
+    what: &str,
+    label: &str,
+    data: D,
+    timeout: Duration,
+) -> Result<String, String> {
+    let instance_id = engine
+        .start_workflow(WorkflowId::new(workflow), data)
+        .await
+        .map_err(|e| format!("Failed to start {what} workflow: {e:?}"))?;
+    debug!("Started {what} workflow for {label} (instance: {instance_id})");
+    engine
+        .wait_for_completion(instance_id, label, timeout)
+        .await
+}
+
+#[async_trait]
+impl JobHost for AppContext {
+    type Job = Job;
+    const NAME: &'static str = "AppContext";
+
+    fn mark_id(&self, job: &Job) -> Option<WorkerId> {
+        own_mark_id(job, &self.worker_registry)
     }
 
-    /// Execute a specific job
-    async fn execute_job(
-        job: &Job,
-        context: &Arc<AppContext>,
-        cancelled_before_start: &DashSet<WorkerId>,
-        own_id: Option<&WorkerId>,
-    ) -> Result<String, String> {
+    fn accepted(&self, job: &Job) {
+        if let Job::AddTokenizer { config } = job {
+            self.tokenizer_load_failures.load_started(&config.name);
+        }
+    }
+
+    fn failed(&self, job: &Job) {
+        if let Job::AddWorker {
+            config,
+            registration_mode: WorkerRegistrationMode::CreateOnly,
+            ..
+        } = job
+        {
+            // Release before the failed status lets a retry reserve the address.
+            self.worker_registry.release_reservation(&config.url);
+        }
+    }
+
+    async fn execute(self: &Arc<Self>, job: &Job, run: &JobRun<'_>) -> Result<String, String> {
+        let context = self;
         match job {
             Job::AddWorker {
                 config,
@@ -1204,10 +531,10 @@ impl JobQueue {
                 // job owns a mark (`own_mark_id`): a PUT's job and a startup
                 // or discovery registration of the same URL read none, so no
                 // other kind can consume a mark meant for the POST's job.
-                if Self::take_mark(cancelled_before_start, own_id) {
+                if take_mark(run.cancelled_before_start, run.own_id) {
                     return Err("Registration cancelled before it started".to_string());
                 }
-                let engines = Self::workflow_engines(context)?;
+                let engines = workflow_engines(context)?;
 
                 let timeout_duration =
                     Duration::from_secs(context.router_config.worker_startup_timeout_secs + 30);
@@ -1226,7 +553,7 @@ impl JobQueue {
                 // A DELETE between the read above and the state's save found
                 // no state to cancel and left its mark: the workflow just
                 // started is cancelled here, and the wait below ends with it.
-                if Self::take_mark(cancelled_before_start, own_id) {
+                if take_mark(run.cancelled_before_start, run.own_id) {
                     engines
                         .worker_registration
                         .cancel_workflow(instance_id)
@@ -1281,7 +608,7 @@ impl JobQueue {
                             } else {
                                 asker.clone()
                             };
-                            match Self::queue_removal(context, &config.url, entries, asker).await {
+                            match queue_removal(context, &config.url, entries, asker).await {
                                 Ok(CleanupRemoval::Queued) => format!(
                                     "{failure}; its workers were registered and leave through \
                                     a queued removal"
@@ -1301,7 +628,7 @@ impl JobQueue {
                 }
             }
             Job::UpdateWorker { url, update, asker } => {
-                let engines = Self::workflow_engines(context)?;
+                let engines = workflow_engines(context)?;
 
                 let workflow_data = create_worker_update_workflow_data(
                     url.to_string(),
@@ -1310,7 +637,7 @@ impl JobQueue {
                     asker.clone(),
                 );
 
-                Self::run_workflow(
+                run_workflow(
                     &engines.worker_update,
                     "worker_update",
                     "worker update",
@@ -1321,7 +648,7 @@ impl JobQueue {
                 .await
             }
             Job::RefreshWorkerLabels { url, asker } => {
-                let engines = Self::workflow_engines(context)?;
+                let engines = workflow_engines(context)?;
 
                 let mut workflow_data = create_worker_update_workflow_data(
                     url.to_string(),
@@ -1337,7 +664,7 @@ impl JobQueue {
                 );
                 workflow_data.refresh_discovered_labels = true;
 
-                Self::run_workflow(
+                run_workflow(
                     &engines.worker_update,
                     "worker_update",
                     "worker label refresh",
@@ -1352,7 +679,7 @@ impl JobQueue {
                 expected_revisions,
                 asker,
             } => {
-                let engines = Self::workflow_engines(context)?;
+                let engines = workflow_engines(context)?;
 
                 let workflow_data = create_worker_removal_workflow_data(
                     url.to_string(),
@@ -1373,27 +700,20 @@ impl JobQueue {
                     instance_id
                 );
 
-                // The job waits as long as its run can last. The drain step
-                // waits each worker's own window under `SETTLE_STEP_TIMEOUT`.
-                // A job that gave up earlier would report a failure and free
-                // the URL while its run went on to remove the worker. 30s on
-                // top covers the other removal steps.
-                let timeout_duration = SETTLE_STEP_TIMEOUT + Duration::from_secs(30);
-
                 // Completion releases the claim after the worker leaves.
                 // Another kept job can take the URL as soon as it is released.
                 engines
                     .worker_removal
-                    .wait_for_completion(instance_id, &Job::workflow_label(url), timeout_duration)
+                    .wait_for_completion(instance_id, &Job::workflow_label(url), removal_wait())
                     .await
             }
             Job::AddWasmModule { config } => {
-                let engines = Self::workflow_engines(context)?;
+                let engines = workflow_engines(context)?;
 
                 let workflow_data =
                     create_wasm_registration_workflow_data(*config.clone(), Arc::clone(context));
 
-                Self::run_workflow(
+                run_workflow(
                     &engines.wasm_registration,
                     "wasm_module_registration",
                     "WASM module registration",
@@ -1404,12 +724,12 @@ impl JobQueue {
                 .await
             }
             Job::RemoveWasmModule { request } => {
-                let engines = Self::workflow_engines(context)?;
+                let engines = workflow_engines(context)?;
 
                 let workflow_data =
                     create_wasm_removal_workflow_data(*request.clone(), Arc::clone(context));
 
-                Self::run_workflow(
+                run_workflow(
                     &engines.wasm_removal,
                     "wasm_module_removal",
                     "WASM module removal",
@@ -1554,12 +874,12 @@ impl JobQueue {
                 Ok(format!("Submitted {server_count} RegisterMcpServer jobs"))
             }
             Job::RegisterMcpServer { config } => {
-                let engines = Self::workflow_engines(context)?;
+                let engines = workflow_engines(context)?;
 
                 let workflow_data =
                     create_mcp_workflow_data((**config).clone(), Arc::clone(context));
 
-                Self::run_workflow(
+                run_workflow(
                     &engines.mcp,
                     "mcp_registration",
                     "MCP registration",
@@ -1574,7 +894,7 @@ impl JobQueue {
                 // noted for the model (a failure of the model's last load
                 // answers its requests 503 tokenizer_load_failed).
                 let result = async {
-                    let engines = Self::workflow_engines(context)?;
+                    let engines = workflow_engines(context)?;
 
                     let workflow_data =
                         create_tokenizer_workflow_data(*config.clone(), Arc::clone(context));
@@ -1630,184 +950,6 @@ impl JobQueue {
                 }
             }
         }
-    }
-
-    /// Update job status on completion
-    fn record_job_completion(
-        job_type: &'static str,
-        worker_url: &str,
-        _duration: Duration,
-        result: &Result<String, String>,
-        status_map: &Arc<DashMap<String, JobStatus>>,
-    ) {
-        match result {
-            Ok(message) => {
-                Self::record_own_status(status_map, worker_url, job_type, None);
-                debug!(
-                    "Completed job: type={}, worker={}, result={}",
-                    job_type,
-                    Job::shown_worker(job_type, worker_url),
-                    message
-                );
-            }
-            Err(error) => {
-                Self::record_own_status(
-                    status_map,
-                    worker_url,
-                    job_type,
-                    Some(JobStatus::failed(job_type, worker_url, error.clone())),
-                );
-                warn!(
-                    "Failed job: type={}, worker={}, error={}",
-                    job_type,
-                    Job::shown_worker(job_type, worker_url),
-                    error
-                );
-            }
-        }
-    }
-
-    /// The pending status under `url` once a slot is held: written over
-    /// whatever is there, or, for a claimed submission (`own_only`), over this
-    /// job's own claim alone (`record_own_status`), so a job of another type
-    /// that took the URL during the wait keeps its entry and the in-flight
-    /// guard that reads it.
-    fn write_pending(
-        status_map: &DashMap<String, JobStatus>,
-        url: &str,
-        job_type: &'static str,
-        own_only: bool,
-    ) {
-        if own_only {
-            Self::record_own_status(
-                status_map,
-                url,
-                job_type,
-                Some(JobStatus::pending(job_type, url)),
-            );
-        } else {
-            status_map.insert(url.to_string(), JobStatus::pending(job_type, url));
-        }
-    }
-
-    /// Writes a job's status under its URL (`None` removes it) unless the
-    /// entry there is another job's: a job of another type submitted for the
-    /// URL after this one was queued keeps its status for its lifetime, since
-    /// the in-flight guards (the reconciler's, `submit_unless_in_flight`) read
-    /// that entry. A vacant entry is written as before.
-    fn record_own_status(
-        status_map: &DashMap<String, JobStatus>,
-        url: &str,
-        job_type: &'static str,
-        status: Option<JobStatus>,
-    ) {
-        match status_map.entry(url.to_string()) {
-            Entry::Occupied(entry) if entry.get().job_type != job_type => {
-                debug!(
-                    "Job status of type={} for worker={} left to the {} job under the key",
-                    job_type,
-                    Job::shown_worker(job_type, url),
-                    entry.get().job_type
-                );
-            }
-            Entry::Occupied(mut entry) => match status {
-                Some(status) => {
-                    entry.insert(status);
-                }
-                None => {
-                    entry.remove();
-                }
-            },
-            Entry::Vacant(entry) => {
-                if let Some(status) = status {
-                    entry.insert(status);
-                }
-            }
-        }
-    }
-
-    /// A status is reclaimed only once terminal and older than the TTL.
-    /// Pending/processing entries are the reconciler's in-flight guard: a
-    /// long registration wave holds jobs in those states well past any
-    /// fixed TTL, and purging them makes every discovery pass resubmit
-    /// duplicate jobs for workers already mid-registration.
-    fn status_expired(status: &JobStatus, now: u64, ttl: u64) -> bool {
-        !matches!(status.status.as_str(), "pending" | "processing")
-            && now.saturating_sub(status.timestamp) >= ttl
-    }
-
-    /// Cleanup old terminal job statuses (TTL 5 minutes)
-    async fn cleanup_old_statuses(status_map: Arc<DashMap<String, JobStatus>>) {
-        const CLEANUP_INTERVAL: Duration = Duration::from_secs(60); // Run every minute
-        const STATUS_TTL: u64 = 300; // 5 minutes in seconds
-
-        loop {
-            tokio::time::sleep(CLEANUP_INTERVAL).await;
-
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            status_map.retain(|_key, value| !Self::status_expired(value, now, STATUS_TTL));
-
-            debug!(
-                "Cleaned up old job statuses, remaining: {}",
-                status_map.len()
-            );
-        }
-    }
-}
-
-#[async_trait]
-impl WorkerJobs for JobQueue {
-    async fn refresh_worker_labels(
-        &self,
-        url: String,
-        asker: WorkerJobAsker,
-    ) -> Result<bool, String> {
-        self.submit_or_defer(Job::RefreshWorkerLabels { url, asker })
-            .await
-    }
-
-    async fn add_worker(
-        &self,
-        spec: WorkerSpec,
-        mode: WorkerRegistrationMode,
-        asker: WorkerJobAsker,
-    ) -> Result<bool, String> {
-        self.submit_unless_registering(Job::AddWorker {
-            config: Box::new(spec),
-            registration_mode: mode,
-            asker,
-        })
-        .await
-    }
-
-    async fn remove_workers_at(
-        &self,
-        url: String,
-        guards: Vec<(WorkerId, u64)>,
-        asker: WorkerJobAsker,
-    ) -> Result<(), String> {
-        // Each guard names a worker by its own id. The url may be a DP base, so
-        // the removal step matches the whole rank group; a bare revision would
-        // take out every sibling that happens to sit at the same revision.
-        let expected_revisions = guards
-            .into_iter()
-            .map(|(id, revision)| (id.as_str().to_string(), Some(revision)))
-            .collect();
-        self.submit(Job::RemoveWorker {
-            url,
-            expected_revisions: Some(expected_revisions),
-            asker,
-        })
-        .await
-    }
-
-    fn job_in_flight(&self, url: &str) -> bool {
-        self.get_status(url)
-            .is_some_and(|status| status.status == "pending" || status.status == "processing")
     }
 }
 
@@ -1900,8 +1042,29 @@ fn build_external_worker_config(
 }
 
 #[cfg(test)]
+pub(crate) fn recording_for_tests(
+    context: &Arc<AppContext>,
+) -> (Arc<JobQueue>, impl FnMut() -> Job) {
+    use queue::testing::QueueTest;
+
+    let (queue, mut next_job) = QueueTest::recording(context);
+    (queue, move || next_job().expect("a queued job"))
+}
+
+#[cfg(test)]
 mod tests {
-    use smg_worker::identity::basic::Worker;
+    use std::sync::Weak;
+
+    use dashmap::DashMap;
+    use openai_protocol::worker::JobStatus;
+    use smg_worker::{
+        identity::basic::Worker,
+        jobs::{
+            queue::testing::{Kept, Outcomes, Waiter, WaiterSlot},
+            WorkerJobs,
+        },
+    };
+    use tokio::sync::{mpsc, oneshot};
 
     use super::*;
     use crate::{
@@ -1909,10 +1072,92 @@ mod tests {
         wasm::{WasmModuleDescriptor, WasmModuleType},
     };
 
+    type QueueTest<'a> = queue::testing::QueueTest<'a, AppContext>;
+
+    async fn execute_job(
+        job: &Job,
+        context: &Arc<AppContext>,
+        cancelled_before_start: &DashSet<WorkerId>,
+        own_id: Option<&WorkerId>,
+    ) -> Result<String, String> {
+        context
+            .execute(
+                job,
+                &JobRun {
+                    cancelled_before_start,
+                    own_id,
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_tokenizer_job_notes_its_load_when_it_is_accepted() {
+        use crate::workflow::TokenizerLoadFailure;
+
+        let context = create_test_app_context();
+        let (queue, mut next_job) = QueueTest::recording(&context);
+        let failures = &context.tokenizer_load_failures;
+        let name = "model";
+        let job = Job::AddTokenizer {
+            config: Box::new(TokenizerConfigRequest {
+                id: "tokenizer-id".to_string(),
+                name: name.to_string(),
+                source: "tokenizer.json".to_string(),
+                chat_template_path: None,
+                cache_config: None,
+                fail_on_duplicate: false,
+                for_worker: false,
+            }),
+        };
+
+        assert!(failures.record(name, TokenizerLoadFailure::NoSource));
+        queue.submit(job.clone()).await.unwrap();
+        assert!(matches!(next_job(), Some(Job::AddTokenizer { .. })));
+        assert!(failures.get(name).is_none());
+        assert!(!failures.record(name, TokenizerLoadFailure::NoSource));
+        assert!(failures.load_ended(name), "one load was counted");
+
+        drop(next_job);
+        assert!(failures.record(name, TokenizerLoadFailure::NoSource));
+        assert_eq!(
+            queue.submit(job).await,
+            Err("Job queue closed: its dispatcher stopped".to_string()),
+            "the receiver was closed"
+        );
+        assert_eq!(failures.get(name), Some(TokenizerLoadFailure::NoSource));
+    }
+
+    #[tokio::test]
+    async fn a_failed_create_releases_its_reservation_before_answering_its_waiter() {
+        let context = create_test_app_context();
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        let url = "http://worker:8000";
+        let id = context.worker_registry.reserve_id_for_url(url);
+        let outcome = queue
+            .submit_and_wait(
+                Job::AddWorker {
+                    config: Box::new(WorkerSpec::new(url)),
+                    registration_mode: WorkerRegistrationMode::CreateOnly,
+                    asker: WorkerJobAsker::Api,
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            Err(JobOutcomeError::Failed(
+                "Workflow engines not initialized".to_string()
+            ))
+        );
+        assert!(context.worker_registry.get_url_by_id(&id).is_none());
+        assert_eq!(queue.get_status(url).unwrap().status, "failed");
+    }
+
     #[tokio::test]
     async fn the_port_carries_the_callers_asker_into_the_job() {
         let context = create_test_app_context();
-        let (queue, mut next_job) = JobQueue::recording_for_tests(&context);
+        let (queue, mut next_job) = recording_for_tests(&context);
         let jobs: &dyn WorkerJobs = &*queue;
         let asker = WorkerJobAsker::Discovery;
         let id = WorkerId::from_string("worker-id".to_string());
@@ -1965,7 +1210,7 @@ mod tests {
     #[tokio::test]
     async fn the_startup_list_asks_as_startup() {
         let context = create_test_app_context();
-        let (queue, mut next_job) = JobQueue::recording_for_tests(&context);
+        let (queue, mut next_job) = recording_for_tests(&context);
         context.worker_job_queue.set(queue).unwrap();
         let marks = DashSet::new();
         let url = "http://worker:8000";
@@ -1983,9 +1228,7 @@ mod tests {
                     ..RouterConfig::default()
                 }),
             };
-            JobQueue::execute_job(&job, &context, &marks, None)
-                .await
-                .unwrap();
+            execute_job(&job, &context, &marks, None).await.unwrap();
             assert!(matches!(
                 next_job(),
                 Job::AddWorker {
@@ -2008,7 +1251,7 @@ mod tests {
             expected_revisions: Some(pins(&[(id, Some(revision))])),
             asker,
         };
-        JobQueue::keep(
+        QueueTest::keep(
             &kept,
             url,
             Job::RefreshWorkerLabels {
@@ -2016,11 +1259,11 @@ mod tests {
                 asker: WorkerJobAsker::Health,
             },
         );
-        JobQueue::keep(&kept, url, removal(WorkerJobAsker::Health, "first", 1));
-        JobQueue::keep(&kept, url, removal(WorkerJobAsker::Api, "second", 2));
-        JobQueue::keep(&kept, url, removal(WorkerJobAsker::Health, "third", 3));
+        QueueTest::keep(&kept, url, removal(WorkerJobAsker::Health, "first", 1));
+        QueueTest::keep(&kept, url, removal(WorkerJobAsker::Api, "second", 2));
+        QueueTest::keep(&kept, url, removal(WorkerJobAsker::Health, "third", 3));
 
-        assert!(JobQueue::take_next(&kept, url, |_| false).is_none());
+        assert!(QueueTest::take_next(&kept, url, |_| false).is_none());
         {
             let slots = kept.get(url).unwrap();
             assert_eq!(slots.removals.len(), 2);
@@ -2036,7 +1279,7 @@ mod tests {
             ));
         }
 
-        JobQueue::run_kept(url, &context, &status, &kept, &DashSet::new()).await;
+        QueueTest::run_kept(url, &context, &status, &kept, &DashSet::new()).await;
         assert!(kept.is_empty());
         logs_assert(|lines| {
             let starts: Vec<_> = lines
@@ -2087,7 +1330,7 @@ mod tests {
         }
 
         let context = create_test_app_context();
-        let (queue, _next_job) = JobQueue::recording_for_tests(&context);
+        let (queue, _next_job) = recording_for_tests(&context);
         context.worker_job_queue.set(Arc::clone(&queue)).unwrap();
         let engines = WorkflowEngines::new(&context.router_config);
         let mut registrations = record_asker(&engines.worker_registration, |data| &data.asker);
@@ -2131,11 +1374,9 @@ mod tests {
         let marks = DashSet::new();
         for (job, expected) in jobs {
             if matches!(job, Job::RemoveWorker { .. }) {
-                queue.hold_url_for_tests(url, "RemoveWorker");
+                QueueTest::hold_url_for_tests(&queue, url, "RemoveWorker");
             }
-            JobQueue::execute_job(&job, &context, &marks, None)
-                .await
-                .unwrap();
+            execute_job(&job, &context, &marks, None).await.unwrap();
             let read = match job {
                 Job::AddWorker { .. } => registrations.try_recv(),
                 Job::RemoveWorker { .. } => {
@@ -2161,7 +1402,7 @@ mod tests {
         };
 
         let context = create_test_app_context();
-        let (queue, mut next_job) = JobQueue::recording_for_tests(&context);
+        let (queue, mut next_job) = recording_for_tests(&context);
         context.worker_job_queue.set(queue).unwrap();
         let engines = WorkflowEngines::new(&context.router_config);
         let engine = Arc::clone(&engines.worker_registration);
@@ -2219,10 +1460,8 @@ mod tests {
                 }
                 release.notify_one();
             };
-            let (result, ()) = tokio::join!(
-                JobQueue::execute_job(&job, &context, &marks, Some(&id)),
-                finish_write,
-            );
+            let (result, ()) =
+                tokio::join!(execute_job(&job, &context, &marks, Some(&id)), finish_write,);
             assert!(result
                 .unwrap_err()
                 .contains("leave through a queued removal"));
@@ -2289,9 +1528,9 @@ mod tests {
             let job = Job::InitializeWorkersFromConfig {
                 router_config: Box::new(RouterConfig::builder().mode(mode).build_unchecked()),
             };
-            let result = JobQueue::execute_job(&job, &context, &marks, None).await;
+            let result = execute_job(&job, &context, &marks, None).await;
             assert!(result.is_err(), "the queue took the submission: {result:?}");
-            JobQueue::record_job_completion(
+            QueueTest::record_job_completion(
                 job.job_type(),
                 job.worker_url(),
                 Duration::ZERO,
@@ -2394,9 +1633,9 @@ mod tests {
                     "both registered, each under its own address"
                 );
             }
-            let result = JobQueue::execute_job(job, &context, &marks, None).await;
+            let result = execute_job(job, &context, &marks, None).await;
             assert_eq!(result.as_deref(), Ok(done.as_str()), "{}", job.job_type());
-            JobQueue::record_job_completion(
+            QueueTest::record_job_completion(
                 job.job_type(),
                 job.worker_url(),
                 Duration::ZERO,
@@ -2493,20 +1732,20 @@ mod tests {
             })
             .await
             .expect("two registrations running within the bound");
-            let ended = JobQueue::cancel_registration_states(&context, &first).await;
+            let ended = cancel_registration_states(&context, &first).await;
             assert_eq!(ended, Ok((1, false)), "the first address ends its own");
             assert_eq!(
                 registrations_running(&context).await,
                 1,
                 "the second, apart by its userinfo alone, still runs"
             );
-            let ended = JobQueue::cancel_registration_states(&context, &second).await;
+            let ended = cancel_registration_states(&context, &second).await;
             assert_eq!(ended, Ok((1, false)), "the second address ends its own");
         };
         let [job_a, job_b] = &jobs;
         let (result_a, result_b, ()) = tokio::join!(
-            JobQueue::execute_job(job_a, &context, &marks, None),
-            JobQueue::execute_job(job_b, &context, &marks, None),
+            execute_job(job_a, &context, &marks, None),
+            execute_job(job_b, &context, &marks, None),
             cancel_one_then_the_other,
         );
 
@@ -2514,7 +1753,7 @@ mod tests {
         let statuses = Arc::new(DashMap::new());
         for (job, result) in [(job_a, &result_a), (job_b, &result_b)] {
             assert_eq!(result.as_ref().err(), Some(&cancelled));
-            JobQueue::record_job_completion(
+            QueueTest::record_job_completion(
                 job.job_type(),
                 job.worker_url(),
                 Duration::ZERO,
@@ -2625,7 +1864,7 @@ mod tests {
         let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
         let key = "http://user:secret@127.0.0.1:8000".to_string();
         let (first, first_rx) = oneshot::channel();
-        queue.outcomes.insert(
+        QueueTest::state(&queue).outcomes.insert(
             key.clone(),
             Waiter {
                 id: 1,
@@ -2644,8 +1883,19 @@ mod tests {
         let shown = Job::shown_worker("RefreshWorkerLabels", &key);
         assert!(!shown.contains("secret"), "{shown}");
         assert_eq!(second, Err(JobOutcomeError::InFlight(shown)));
-        assert_eq!(queue.outcomes.get(&key).map(|waiter| waiter.id), Some(1));
-        JobQueue::deliver_outcome(&queue.outcomes, &key, Some(1), Ok("done".to_string()));
+        assert_eq!(
+            QueueTest::state(&queue)
+                .outcomes
+                .get(&key)
+                .map(|waiter| waiter.id),
+            Some(1)
+        );
+        QueueTest::deliver_outcome(
+            QueueTest::state(&queue).outcomes,
+            &key,
+            Some(1),
+            Ok("done".to_string()),
+        );
         assert!(matches!(first_rx.await, Ok(Ok(ref message)) if message == "done"));
     }
 
@@ -2675,7 +1925,7 @@ mod tests {
             asker: WorkerJobAsker::Api,
             url: url.to_string(),
         };
-        let held = Arc::clone(&queue.concurrency_limit)
+        let held = Arc::clone(QueueTest::state(&queue).concurrency_limit)
             .acquire_owned()
             .await
             .expect("the dispatcher's permit");
@@ -2690,7 +1940,7 @@ mod tests {
             "{first:?}"
         );
         assert!(
-            queue.outcomes.is_empty(),
+            QueueTest::state(&queue).outcomes.is_empty(),
             "the first caller's waiter left with it"
         );
 
@@ -2701,7 +1951,10 @@ mod tests {
         let release = async {
             tokio::time::sleep(Duration::from_millis(20)).await;
             assert_eq!(
-                queue.outcomes.get(&key).map(|waiter| waiter.id),
+                QueueTest::state(&queue)
+                    .outcomes
+                    .get(&key)
+                    .map(|waiter| waiter.id),
                 Some(2),
                 "the second wait holds the key with the next id"
             );
@@ -2712,7 +1965,7 @@ mod tests {
             matches!(second, Err(JobOutcomeError::Failed(ref reason)) if reason.contains("not initialized")),
             "{second:?}"
         );
-        assert!(queue.outcomes.is_empty());
+        assert!(QueueTest::state(&queue).outcomes.is_empty());
     }
 
     /// A finished job's outcome reaches the waiter under its key once, and
@@ -2722,8 +1975,8 @@ mod tests {
         let outcomes: Outcomes = Arc::new(DashMap::new());
         let (tx, rx) = oneshot::channel();
         outcomes.insert("job-1".to_string(), Waiter { id: 1, sender: tx });
-        JobQueue::deliver_outcome(&outcomes, "job-2", Some(1), Ok("stray".to_string()));
-        JobQueue::deliver_outcome(&outcomes, "job-1", Some(1), Ok("done".to_string()));
+        QueueTest::deliver_outcome(&outcomes, "job-2", Some(1), Ok("stray".to_string()));
+        QueueTest::deliver_outcome(&outcomes, "job-1", Some(1), Ok("done".to_string()));
         assert!(matches!(rx.await, Ok(Ok(ref message)) if message == "done"));
         assert!(outcomes.is_empty());
     }
@@ -2736,19 +1989,19 @@ mod tests {
         let outcomes: Outcomes = Arc::new(DashMap::new());
         let (tx, mut rx) = oneshot::channel();
         outcomes.insert("job-1".to_string(), Waiter { id: 2, sender: tx });
-        JobQueue::deliver_outcome(
+        QueueTest::deliver_outcome(
             &outcomes,
             "job-1",
             Some(1),
             Ok("the first job's".to_string()),
         );
-        JobQueue::deliver_outcome(&outcomes, "job-1", None, Ok("a plain submit's".to_string()));
+        QueueTest::deliver_outcome(&outcomes, "job-1", None, Ok("a plain submit's".to_string()));
         assert_eq!(outcomes.get("job-1").map(|waiter| waiter.id), Some(2));
         assert!(matches!(
             rx.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
         ));
-        JobQueue::deliver_outcome(&outcomes, "job-1", Some(2), Ok("its own".to_string()));
+        QueueTest::deliver_outcome(&outcomes, "job-1", Some(2), Ok("its own".to_string()));
         assert!(matches!(rx.await, Ok(Ok(ref message)) if message == "its own"));
         assert!(outcomes.is_empty());
     }
@@ -2765,7 +2018,7 @@ mod tests {
             matches!(outcome, Err(JobOutcomeError::NotQueued(ref reason)) if reason.contains("shutting down")),
             "{outcome:?}"
         );
-        assert!(queue.outcomes.is_empty());
+        assert!(QueueTest::state(&queue).outcomes.is_empty());
     }
 
     /// A caller leaving while its submit is parked on a slot (the queue full)
@@ -2790,7 +2043,9 @@ mod tests {
             Arc::downgrade(&context),
         );
         // The queue's one slot, held for the whole test: every submit parks.
-        let slot = queue.tx.reserve().await.expect("the queue is open");
+        let slot = QueueTest::reserve_slot(&queue)
+            .await
+            .expect("the queue is open");
         let key = "http://127.0.0.1:8000".to_string();
 
         let mut wait = Box::pin(queue.submit_and_wait(
@@ -2807,12 +2062,12 @@ mod tests {
             "the submit parks on the held slot"
         );
         assert!(
-            queue.outcomes.contains_key(&key),
+            QueueTest::state(&queue).outcomes.contains_key(&key),
             "the waiter is under the key while the submit waits"
         );
         drop(wait);
         assert!(
-            queue.outcomes.is_empty(),
+            QueueTest::state(&queue).outcomes.is_empty(),
             "the caller leaving took its waiter"
         );
 
@@ -2830,7 +2085,7 @@ mod tests {
             "the later submit parks too"
         );
         assert!(
-            queue.outcomes.contains_key(&key),
+            QueueTest::state(&queue).outcomes.contains_key(&key),
             "a later caller takes the key"
         );
         drop(later);
@@ -2904,8 +2159,8 @@ mod tests {
         let processing = JobStatus::processing("AddWorker", "http://w:8000");
         let far_future = pending.timestamp + 100_000;
 
-        assert!(!JobQueue::status_expired(&pending, far_future, 300));
-        assert!(!JobQueue::status_expired(&processing, far_future, 300));
+        assert!(!QueueTest::status_expired(&pending, far_future, 300));
+        assert!(!QueueTest::status_expired(&processing, far_future, 300));
     }
 
     /// Terminal statuses still age out so a failed worker retries on a later
@@ -2914,12 +2169,12 @@ mod tests {
     fn cleanup_expires_terminal_statuses_after_the_ttl() {
         let failed = JobStatus::failed("AddWorker", "http://w:8000", "boom".to_string());
 
-        assert!(!JobQueue::status_expired(
+        assert!(!QueueTest::status_expired(
             &failed,
             failed.timestamp + 299,
             300
         ));
-        assert!(JobQueue::status_expired(
+        assert!(QueueTest::status_expired(
             &failed,
             failed.timestamp + 300,
             300
@@ -2934,7 +2189,7 @@ mod tests {
         let won: Vec<bool> = (0..16)
             .map(|_| {
                 let map = Arc::clone(&map);
-                std::thread::spawn(move || JobQueue::claim(&map, "http://w:8000", "AddWorker"))
+                std::thread::spawn(move || QueueTest::claim(&map, "http://w:8000", "AddWorker"))
             })
             .collect::<Vec<_>>()
             .into_iter()
@@ -2946,14 +2201,14 @@ mod tests {
             "http://w:8000".to_string(),
             JobStatus::failed("AddWorker", "http://w:8000", "boom".to_string()),
         );
-        assert!(JobQueue::claim(&map, "http://w:8000", "AddWorker"));
+        assert!(QueueTest::claim(&map, "http://w:8000", "AddWorker"));
 
         // A different job type under the same key is not a competing claim.
         map.insert(
             "http://w:8000".to_string(),
             JobStatus::pending("RegisterMcpServer", "http://w:8000"),
         );
-        assert!(JobQueue::claim(&map, "http://w:8000", "AddWorker"));
+        assert!(QueueTest::claim(&map, "http://w:8000", "AddWorker"));
     }
 
     /// A claim that yields to any in-flight job never replaces that job's
@@ -2965,7 +2220,7 @@ mod tests {
             "http://w:8000".to_string(),
             JobStatus::processing("AddWorker", "http://w:8000"),
         );
-        assert!(!JobQueue::claim_unless_in_flight(
+        assert!(!QueueTest::claim_unless_in_flight(
             &map,
             "http://w:8000",
             "RefreshWorkerLabels"
@@ -2976,7 +2231,7 @@ mod tests {
             "http://w:8000".to_string(),
             JobStatus::failed("AddWorker", "http://w:8000", "boom".to_string()),
         );
-        assert!(JobQueue::claim_unless_in_flight(
+        assert!(QueueTest::claim_unless_in_flight(
             &map,
             "http://w:8000",
             "RefreshWorkerLabels"
@@ -3004,7 +2259,7 @@ mod tests {
             )),
             None,
         ] {
-            JobQueue::record_own_status(&map, url, "RefreshWorkerLabels", status);
+            QueueTest::record_own_status(&map, url, "RefreshWorkerLabels", status);
             let entry = map.get(url).expect("the other job's entry stays");
             assert_eq!(entry.job_type, "RemoveWorker");
             assert_eq!(entry.status, "processing");
@@ -3015,16 +2270,16 @@ mod tests {
             url.to_string(),
             JobStatus::pending("RefreshWorkerLabels", url),
         );
-        JobQueue::record_own_status(
+        QueueTest::record_own_status(
             &map,
             url,
             "RefreshWorkerLabels",
             Some(JobStatus::processing("RefreshWorkerLabels", url)),
         );
         assert_eq!(map.get(url).unwrap().status, "processing");
-        JobQueue::record_own_status(&map, url, "RefreshWorkerLabels", None);
+        QueueTest::record_own_status(&map, url, "RefreshWorkerLabels", None);
         assert!(map.get(url).is_none());
-        JobQueue::record_own_status(
+        QueueTest::record_own_status(
             &map,
             url,
             "RefreshWorkerLabels",
@@ -3046,12 +2301,12 @@ mod tests {
         let map: DashMap<String, JobStatus> = DashMap::new();
         let url = "http://w:8000";
         map.insert(url.to_string(), JobStatus::pending("AddWorker", url));
-        JobQueue::write_pending(&map, url, "RefreshWorkerLabels", true);
+        QueueTest::write_pending(&map, url, "RefreshWorkerLabels", true);
         assert_eq!(map.get(url).unwrap().job_type, "AddWorker");
-        JobQueue::write_pending(&map, url, "RefreshWorkerLabels", false);
+        QueueTest::write_pending(&map, url, "RefreshWorkerLabels", false);
         assert_eq!(map.get(url).unwrap().job_type, "RefreshWorkerLabels");
         map.remove(url);
-        JobQueue::write_pending(&map, url, "RefreshWorkerLabels", true);
+        QueueTest::write_pending(&map, url, "RefreshWorkerLabels", true);
         let entry = map.get(url).expect("a vacant entry is written");
         assert_eq!(entry.job_type, "RefreshWorkerLabels");
         assert_eq!(entry.status, "pending");
@@ -3069,7 +2324,7 @@ mod tests {
             url: url.to_string(),
         };
         assert!(queue.submit_unless_in_flight(job()).await.is_err());
-        assert!(queue.status_map.get(url).is_none());
+        assert!(QueueTest::state(&queue).status_map.get(url).is_none());
         assert!(queue.submit_unless_in_flight(job()).await.is_err());
     }
 
@@ -3087,7 +2342,7 @@ mod tests {
         let context = create_test_app_context();
         let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
         let url = "http://w:8000";
-        queue.hold_url_for_tests(url, "AddWorker");
+        QueueTest::hold_url_for_tests(&queue, url, "AddWorker");
 
         let removal = Job::RemoveWorker {
             asker: WorkerJobAsker::Api,
@@ -3095,29 +2350,32 @@ mod tests {
             expected_revisions: None,
         };
         assert_eq!(queue.submit_or_defer(removal).await, Ok(false));
-        assert!(queue.kept_for(url), "the job is kept, not dropped");
+        assert!(
+            QueueTest::kept_for(&queue, url),
+            "the job is kept, not dropped"
+        );
         assert_eq!(
             queue.get_status(url).expect("the holder's status").job_type,
             "AddWorker",
             "the holder's status is left to it"
         );
 
-        JobQueue::record_job_completion(
+        QueueTest::record_job_completion(
             "AddWorker",
             url,
             Duration::ZERO,
             &Ok("done".to_string()),
-            &queue.status_map,
+            QueueTest::state(&queue).status_map,
         );
-        JobQueue::run_kept(
+        QueueTest::run_kept(
             url,
             &context,
-            &queue.status_map,
-            &queue.kept,
-            &queue.cancelled_before_start,
+            QueueTest::state(&queue).status_map,
+            QueueTest::state(&queue).kept,
+            QueueTest::state(&queue).cancelled_before_start,
         )
         .await;
-        assert!(!queue.kept_for(url));
+        assert!(!QueueTest::kept_for(&queue, url));
         let status = queue.get_status(url).expect("the kept job's own status");
         assert_eq!(status.job_type, "RemoveWorker");
         assert_eq!(
@@ -3153,13 +2411,16 @@ mod tests {
         );
 
         let held = "http://held:8000";
-        queue.hold_url_for_tests(held, "AddWorker");
+        QueueTest::hold_url_for_tests(&queue, held, "AddWorker");
         assert_eq!(
             jobs.refresh_worker_labels(held.to_string(), WorkerJobAsker::Health)
                 .await,
             Ok(false)
         );
-        assert!(queue.kept_for(held), "kept behind the job that holds it");
+        assert!(
+            QueueTest::kept_for(&queue, held),
+            "kept behind the job that holds it"
+        );
         assert_eq!(
             queue
                 .get_status(held)
@@ -3168,22 +2429,22 @@ mod tests {
             "AddWorker",
             "the holder's status is left to it"
         );
-        JobQueue::record_job_completion(
+        QueueTest::record_job_completion(
             "AddWorker",
             held,
             Duration::ZERO,
             &Ok("done".to_string()),
-            &queue.status_map,
+            QueueTest::state(&queue).status_map,
         );
-        JobQueue::run_kept(
+        QueueTest::run_kept(
             held,
             &context,
-            &queue.status_map,
-            &queue.kept,
-            &queue.cancelled_before_start,
+            QueueTest::state(&queue).status_map,
+            QueueTest::state(&queue).kept,
+            QueueTest::state(&queue).cancelled_before_start,
         )
         .await;
-        assert!(!queue.kept_for(held));
+        assert!(!QueueTest::kept_for(&queue, held));
         assert_eq!(
             queue
                 .get_status(held)
@@ -3210,13 +2471,19 @@ mod tests {
         let ends: [Result<String, String>; 2] =
             [Ok("done".to_string()), Err("refused".to_string())];
         for (job_type, end) in ["AddWorker", "RemoveWorker"].into_iter().zip(ends) {
-            queue.hold_url_for_tests(url, job_type);
+            QueueTest::hold_url_for_tests(&queue, url, job_type);
             assert!(jobs.job_in_flight(url), "{job_type} is processing");
-            JobQueue::record_job_completion(job_type, url, Duration::ZERO, &end, &queue.status_map);
+            QueueTest::record_job_completion(
+                job_type,
+                url,
+                Duration::ZERO,
+                &end,
+                QueueTest::state(&queue).status_map,
+            );
             assert!(!jobs.job_in_flight(url), "{job_type} ended: {end:?}");
         }
 
-        queue
+        QueueTest::state(&queue)
             .status_map
             .insert(url.to_string(), JobStatus::pending("AddWorker", url));
         assert!(jobs.job_in_flight(url), "a pending job is in flight");
@@ -3236,14 +2503,14 @@ mod tests {
         let context = create_test_app_context();
         let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
         let url = "http://w:8001";
-        queue.hold_url_for_tests(url, "AddWorker");
+        QueueTest::hold_url_for_tests(&queue, url, "AddWorker");
         let kept = Job::RemoveWorker {
             asker: WorkerJobAsker::Api,
             url: url.to_string(),
             expected_revisions: None,
         };
         assert_eq!(queue.submit_or_defer(kept).await, Ok(false));
-        assert!(queue.kept_for(url));
+        assert!(QueueTest::kept_for(&queue, url));
 
         queue
             .submit(Job::RefreshWorkerLabels {
@@ -3257,7 +2524,7 @@ mod tests {
             let last = queue
                 .get_status(url)
                 .map(|status| (status.job_type.to_string(), status.status.to_string()));
-            if !queue.kept_for(url)
+            if !QueueTest::kept_for(&queue, url)
                 && last == Some(("RemoveWorker".to_string(), "failed".to_string()))
             {
                 break;
@@ -3265,7 +2532,7 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the kept job did not run at the holder's completion: kept={} last={last:?}",
-                queue.kept_for(url)
+                QueueTest::kept_for(&queue, url)
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -3298,7 +2565,7 @@ mod tests {
         let context = create_test_app_context();
         let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
         let url = "http://w:8002";
-        queue.hold_url_for_tests(url, "AddWorker");
+        QueueTest::hold_url_for_tests(&queue, url, "AddWorker");
         let removal = Job::RemoveWorker {
             asker: WorkerJobAsker::Api,
             url: url.to_string(),
@@ -3314,24 +2581,24 @@ mod tests {
             Ok(false),
             "the refresh is kept, neither submitted nor dropped"
         );
-        assert!(queue.kept_for(url));
+        assert!(QueueTest::kept_for(&queue, url));
 
-        JobQueue::record_job_completion(
+        QueueTest::record_job_completion(
             "AddWorker",
             url,
             Duration::ZERO,
             &Ok("done".to_string()),
-            &queue.status_map,
+            QueueTest::state(&queue).status_map,
         );
-        JobQueue::run_kept(
+        QueueTest::run_kept(
             url,
             &context,
-            &queue.status_map,
-            &queue.kept,
-            &queue.cancelled_before_start,
+            QueueTest::state(&queue).status_map,
+            QueueTest::state(&queue).kept,
+            QueueTest::state(&queue).cancelled_before_start,
         )
         .await;
-        assert!(!queue.kept_for(url), "both kept jobs ran");
+        assert!(!QueueTest::kept_for(&queue, url), "both kept jobs ran");
         assert_eq!(
             queue
                 .get_status(url)
@@ -3352,7 +2619,7 @@ mod tests {
         let context = create_test_app_context();
         let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
         let url = "http://w:8003";
-        queue.hold_url_for_tests(url, "AddWorker");
+        QueueTest::hold_url_for_tests(&queue, url, "AddWorker");
         let refresh = Job::RefreshWorkerLabels {
             asker: WorkerJobAsker::Health,
             url: url.to_string(),
@@ -3364,38 +2631,41 @@ mod tests {
             expected_revisions: None,
         };
         assert_eq!(queue.submit_or_defer(removal).await, Ok(false));
-        assert!(queue.kept_for(url));
+        assert!(QueueTest::kept_for(&queue, url));
         // The run order, read off the slots and put back as it was.
-        let first = JobQueue::take_next(&queue.kept, url, |_| true).expect("the removal is next");
-        let second = JobQueue::take_next(&queue.kept, url, |_| true).expect("the refresh follows");
+        let first = QueueTest::take_next(QueueTest::state(&queue).kept, url, |_| true)
+            .expect("the removal is next");
+        let second = QueueTest::take_next(QueueTest::state(&queue).kept, url, |_| true)
+            .expect("the refresh follows");
         assert_eq!(
             (first.job_type(), second.job_type()),
             ("RemoveWorker", "RefreshWorkerLabels"),
             "the removal runs first, the refresh after it"
         );
         assert!(
-            JobQueue::take_next(&queue.kept, url, |_| true).is_none() && !queue.kept_for(url),
+            QueueTest::take_next(QueueTest::state(&queue).kept, url, |_| true).is_none()
+                && !QueueTest::kept_for(&queue, url),
             "two slots, nothing else"
         );
-        JobQueue::put_back(&queue.kept, url, second);
-        JobQueue::put_back(&queue.kept, url, first);
+        QueueTest::put_back(QueueTest::state(&queue).kept, url, second);
+        QueueTest::put_back(QueueTest::state(&queue).kept, url, first);
 
-        JobQueue::record_job_completion(
+        QueueTest::record_job_completion(
             "AddWorker",
             url,
             Duration::ZERO,
             &Ok("done".to_string()),
-            &queue.status_map,
+            QueueTest::state(&queue).status_map,
         );
-        JobQueue::run_kept(
+        QueueTest::run_kept(
             url,
             &context,
-            &queue.status_map,
-            &queue.kept,
-            &queue.cancelled_before_start,
+            QueueTest::state(&queue).status_map,
+            QueueTest::state(&queue).kept,
+            QueueTest::state(&queue).cancelled_before_start,
         )
         .await;
-        assert!(!queue.kept_for(url), "both kept jobs ran");
+        assert!(!QueueTest::kept_for(&queue, url), "both kept jobs ran");
         assert_eq!(
             queue
                 .get_status(url)
@@ -3419,7 +2689,7 @@ mod tests {
         let context = create_test_app_context();
         let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
         let url = "http://w:8005";
-        queue.hold_url_for_tests(url, "UpdateWorker");
+        QueueTest::hold_url_for_tests(&queue, url, "UpdateWorker");
         let old_id_removal = Job::RemoveWorker {
             asker: WorkerJobAsker::Api,
             url: url.to_string(),
@@ -3435,7 +2705,8 @@ mod tests {
             Ok(false),
             "the refresh is kept beside the removal, not dropped for it"
         );
-        let next = JobQueue::take_next(&queue.kept, url, |_| true).expect("the removal is next");
+        let next = QueueTest::take_next(QueueTest::state(&queue).kept, url, |_| true)
+            .expect("the removal is next");
         assert!(
             matches!(
                 next,
@@ -3446,24 +2717,27 @@ mod tests {
             ),
             "the old-id removal runs first"
         );
-        JobQueue::put_back(&queue.kept, url, next);
+        QueueTest::put_back(QueueTest::state(&queue).kept, url, next);
 
-        JobQueue::record_job_completion(
+        QueueTest::record_job_completion(
             "UpdateWorker",
             url,
             Duration::ZERO,
             &Ok("done".to_string()),
-            &queue.status_map,
+            QueueTest::state(&queue).status_map,
         );
-        JobQueue::run_kept(
+        QueueTest::run_kept(
             url,
             &context,
-            &queue.status_map,
-            &queue.kept,
-            &queue.cancelled_before_start,
+            QueueTest::state(&queue).status_map,
+            QueueTest::state(&queue).kept,
+            QueueTest::state(&queue).cancelled_before_start,
         )
         .await;
-        assert!(!queue.kept_for(url), "the removal and the refresh both ran");
+        assert!(
+            !QueueTest::kept_for(&queue, url),
+            "the removal and the refresh both ran"
+        );
         assert_eq!(
             queue
                 .get_status(url)
@@ -3490,7 +2764,7 @@ mod tests {
             asker: WorkerJobAsker::Api,
             url: url.to_string(),
         };
-        let kinds = |kept: &DashMap<String, Kept>| {
+        let kinds = |kept: &DashMap<String, Kept<Job>>| {
             kept.get(url).map_or((None, None), |slots| {
                 (
                     slots.removals.front().map(Job::job_type),
@@ -3499,15 +2773,15 @@ mod tests {
             })
         };
 
-        let kept: DashMap<String, Kept> = DashMap::new();
-        JobQueue::put_back(&kept, url, refresh());
+        let kept: DashMap<String, Kept<Job>> = DashMap::new();
+        QueueTest::put_back(&kept, url, refresh());
         assert_eq!(
             kinds(&kept),
             (None, Some("RefreshWorkerLabels")),
             "an empty slot takes the job back"
         );
 
-        JobQueue::put_back(
+        QueueTest::put_back(
             &kept,
             url,
             Job::RemoveWorker {
@@ -3522,7 +2796,7 @@ mod tests {
             "a removal put back beside a kept refresh keeps both"
         );
 
-        JobQueue::keep(
+        QueueTest::keep(
             &kept,
             url,
             Job::RemoveWorker {
@@ -3531,7 +2805,7 @@ mod tests {
                 expected_revisions: Some(HashMap::new()),
             },
         );
-        JobQueue::put_back(&kept, url, removal());
+        QueueTest::put_back(&kept, url, removal());
         assert!(
             kept.get(url).is_some_and(|slots| matches!(
                 slots.removals.front(),
@@ -3549,17 +2823,17 @@ mod tests {
         );
 
         assert_eq!(
-            JobQueue::take_next(&kept, url, |_| true).map(|job| job.job_type()),
+            QueueTest::take_next(&kept, url, |_| true).map(|job| job.job_type()),
             Some("RemoveWorker"),
             "the removal is taken first"
         );
         assert_eq!(
-            JobQueue::take_next(&kept, url, |_| true).map(|job| job.job_type()),
+            QueueTest::take_next(&kept, url, |_| true).map(|job| job.job_type()),
             Some("RefreshWorkerLabels"),
             "the refresh follows"
         );
         assert!(
-            JobQueue::take_next(&kept, url, |_| true).is_none() && !kept.contains_key(url),
+            QueueTest::take_next(&kept, url, |_| true).is_none() && !kept.contains_key(url),
             "the URL's entry goes with its last job"
         );
     }
@@ -3595,12 +2869,12 @@ mod tests {
                 WorkerJobAsker::Discovery,
             ),
         ] {
-            let own = JobQueue::own_mark_id(&job(mode, asker), &registry);
+            let own = own_mark_id(&job(mode, asker), &registry);
             assert_eq!(own, None, "{kind} job owns no mark");
-            assert!(!JobQueue::take_mark(&marks, own.as_ref()));
+            assert!(!take_mark(&marks, own.as_ref()));
             assert!(marks.contains(&reserved), "{kind} job took the POST's mark");
         }
-        let own = JobQueue::own_mark_id(
+        let own = own_mark_id(
             &job(WorkerRegistrationMode::CreateOnly, WorkerJobAsker::Api),
             &registry,
         );
@@ -3609,7 +2883,7 @@ mod tests {
             Some(&reserved),
             "the POST's job owns its reserved id"
         );
-        assert!(JobQueue::take_mark(&marks, own.as_ref()));
+        assert!(take_mark(&marks, own.as_ref()));
         assert!(marks.is_empty());
     }
 
@@ -3636,11 +2910,11 @@ mod tests {
         let url = "http://w:8000";
         let entries = || HashMap::from([("worker-id".to_string(), 1u64)]);
         assert_eq!(
-            JobQueue::queue_removal(&context, url, entries(), WorkerJobAsker::Api).await,
+            queue_removal(&context, url, entries(), WorkerJobAsker::Api).await,
             Ok(CleanupRemoval::Queued)
         );
         assert_eq!(
-            JobQueue::queue_removal(&context, url, entries(), WorkerJobAsker::Api).await,
+            queue_removal(&context, url, entries(), WorkerJobAsker::Api).await,
             Ok(CleanupRemoval::Behind),
             "a removal in flight owns the URL; the second runs on its heels"
         );
@@ -3652,7 +2926,7 @@ mod tests {
         assert_eq!(status.job_type, "RemoveWorker");
         assert_eq!(status.status, "pending");
         let queue = context.worker_job_queue.get().expect("the queue");
-        let slots = queue
+        let slots = QueueTest::state(queue)
             .kept
             .get(url)
             .expect("a removal kept behind the one in flight");
@@ -3692,21 +2966,21 @@ mod tests {
         let url = "http://w:8000";
         let one = |id: &str, revision: u64| HashMap::from([(id.to_string(), revision)]);
         assert_eq!(
-            JobQueue::queue_removal(&context, url, one("old", 1), WorkerJobAsker::Api).await,
+            queue_removal(&context, url, one("old", 1), WorkerJobAsker::Api).await,
             Ok(CleanupRemoval::Queued)
         );
         assert_eq!(
-            JobQueue::queue_removal(&context, url, one("new", 3), WorkerJobAsker::Api).await,
+            queue_removal(&context, url, one("new", 3), WorkerJobAsker::Api).await,
             Ok(CleanupRemoval::Behind),
             "a removal of other workers in flight: the cleanup runs on its heels"
         );
         assert_eq!(
-            JobQueue::queue_removal(&context, url, one("third", 5), WorkerJobAsker::Api).await,
+            queue_removal(&context, url, one("third", 5), WorkerJobAsker::Api).await,
             Ok(CleanupRemoval::Behind),
             "a later cleanup joins the kept removal"
         );
         let queue = context.worker_job_queue.get().expect("the queue");
-        let slots = queue
+        let slots = QueueTest::state(queue)
             .kept
             .get(url)
             .expect("a removal kept behind the one in flight");
@@ -3759,7 +3033,7 @@ mod tests {
             context,
         );
 
-        assert_eq!(queue.tx.max_capacity(), 7);
+        assert_eq!(QueueTest::capacity(&queue), 7);
         let (queue_depth, available_permits) = queue.get_load_info();
         assert_eq!(queue_depth, 0);
         assert_eq!(available_permits, 3);
@@ -3824,19 +3098,19 @@ mod tests {
                 health: None,
             }),
         };
-        queue.hold_url_for_tests(url, "AddWorker");
+        QueueTest::hold_url_for_tests(&queue, url, "AddWorker");
         assert_eq!(queue.submit_unless_registering(update()).await, Ok(false));
         let entry = queue.get_status(url).expect("the registration's entry");
         assert_eq!(
             (entry.job_type.as_str(), entry.status.as_str()),
             ("AddWorker", "processing")
         );
-        JobQueue::record_job_completion(
+        QueueTest::record_job_completion(
             "AddWorker",
             url,
             Duration::ZERO,
             &Ok("done".to_string()),
-            &queue.status_map,
+            QueueTest::state(&queue).status_map,
         );
         assert_eq!(queue.submit_unless_registering(update()).await, Ok(true));
         let entry = queue.get_status(url).expect("the update's entry");
@@ -3853,12 +3127,12 @@ mod tests {
             queue.claim_if_idle(&registration),
             "the registration takes the entry"
         );
-        JobQueue::record_job_completion(
+        QueueTest::record_job_completion(
             "UpdateWorker",
             url,
             Duration::ZERO,
             &Ok("done".to_string()),
-            &queue.status_map,
+            QueueTest::state(&queue).status_map,
         );
         let entry = queue.get_status(url).expect("the registration's entry");
         assert_eq!(
@@ -3898,17 +3172,21 @@ mod tests {
             .await
             .expect("the first job");
         for _ in 0..1000 {
-            if queue.tx.capacity() == 1 {
+            if queue.get_load_info().0 == 0 {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        assert_eq!(queue.tx.capacity(), 1, "the dispatcher took the first job");
+        assert_eq!(
+            queue.get_load_info().0,
+            0,
+            "the dispatcher took the first job"
+        );
         queue
             .submit(an_update("http://w:8007"))
             .await
             .expect("the slot");
-        assert_eq!(queue.tx.capacity(), 0, "the queue is full");
+        assert_eq!(queue.get_load_info().0, 1, "the queue is full");
         queue
     }
 
@@ -3961,7 +3239,7 @@ mod tests {
         let context = create_test_app_context();
         let queue = a_full_one_slot_queue(&context).await;
         let url = "http://w:8009";
-        queue.hold_url_for_tests(url, "UpdateWorker");
+        QueueTest::hold_url_for_tests(&queue, url, "UpdateWorker");
         let dropped =
             tokio::time::timeout(Duration::from_millis(50), queue.submit(an_update(url))).await;
         assert!(dropped.is_err(), "the plain submission waits for a slot");
@@ -4163,32 +3441,32 @@ mod tests {
     async fn a_kept_delete_removal_removes_the_worker_the_delete_saw() {
         let url = "http://10.0.0.9:8000";
         let (context, queue, registry, _worker, id) = a_delete_setting(url);
-        queue.hold_url_for_tests(url, "RemoveWorker");
+        QueueTest::hold_url_for_tests(&queue, url, "RemoveWorker");
         context
             .worker_service
             .delete_worker(id.as_str())
             .await
             .expect("the DELETE is admitted");
         assert!(
-            queue.kept_for(url),
+            QueueTest::kept_for(&queue, url),
             "the DELETE's removal waits for the holder"
         );
-        JobQueue::record_job_completion(
+        QueueTest::record_job_completion(
             "RemoveWorker",
             url,
             Duration::ZERO,
             &Ok("done".to_string()),
-            &queue.status_map,
+            QueueTest::state(&queue).status_map,
         );
-        JobQueue::run_kept(
+        QueueTest::run_kept(
             url,
             &context,
-            &queue.status_map,
-            &queue.kept,
-            &queue.cancelled_before_start,
+            QueueTest::state(&queue).status_map,
+            QueueTest::state(&queue).kept,
+            QueueTest::state(&queue).cancelled_before_start,
         )
         .await;
-        assert!(!queue.kept_for(url), "the kept removal ran");
+        assert!(!QueueTest::kept_for(&queue, url), "the kept removal ran");
         assert!(
             registry.get_by_url(url).is_none(),
             "the DELETE's removal removed the worker it saw"
@@ -4208,14 +3486,14 @@ mod tests {
         use crate::routers::grpc::backend_client::BasicWorkerBuilder;
         let url = "http://10.0.0.10:8000";
         let (context, queue, registry, first, id) = a_delete_setting(url);
-        queue.hold_url_for_tests(url, "UpdateWorker");
+        QueueTest::hold_url_for_tests(&queue, url, "UpdateWorker");
         context
             .worker_service
             .delete_worker(id.as_str())
             .await
             .expect("the DELETE is admitted");
         assert!(
-            queue.kept_for(url),
+            QueueTest::kept_for(&queue, url),
             "the DELETE's removal waits for the holder"
         );
         // The update rebuilds the worker under its id before the kept removal
@@ -4234,22 +3512,22 @@ mod tests {
             registry.replace_claiming_local(&id, Arc::clone(&rebuilt), first.revision()),
             "the update replaces the worker"
         );
-        JobQueue::record_job_completion(
+        QueueTest::record_job_completion(
             "UpdateWorker",
             url,
             Duration::ZERO,
             &Ok("done".to_string()),
-            &queue.status_map,
+            QueueTest::state(&queue).status_map,
         );
-        JobQueue::run_kept(
+        QueueTest::run_kept(
             url,
             &context,
-            &queue.status_map,
-            &queue.kept,
-            &queue.cancelled_before_start,
+            QueueTest::state(&queue).status_map,
+            QueueTest::state(&queue).kept,
+            QueueTest::state(&queue).cancelled_before_start,
         )
         .await;
-        assert!(!queue.kept_for(url), "the kept removal ran");
+        assert!(!QueueTest::kept_for(&queue, url), "the kept removal ran");
         assert!(
             registry.get_by_url(url).is_none(),
             "the DELETE's removal removed the worker rebuilt under the id it named"
@@ -4268,14 +3546,14 @@ mod tests {
         use crate::routers::grpc::backend_client::BasicWorkerBuilder;
         let url = "http://10.0.0.11:8000";
         let (context, queue, registry, _first, id) = a_delete_setting(url);
-        queue.hold_url_for_tests(url, "RemoveWorker");
+        QueueTest::hold_url_for_tests(&queue, url, "RemoveWorker");
         context
             .worker_service
             .delete_worker(id.as_str())
             .await
             .expect("the DELETE is admitted");
         assert!(
-            queue.kept_for(url),
+            QueueTest::kept_for(&queue, url),
             "the DELETE's removal waits for the holder"
         );
         // The holder takes the worker out, and a registration lands under the
@@ -4302,22 +3580,22 @@ mod tests {
             id.as_str(),
             "the registration has a fresh id"
         );
-        JobQueue::record_job_completion(
+        QueueTest::record_job_completion(
             "RemoveWorker",
             url,
             Duration::ZERO,
             &Ok("done".to_string()),
-            &queue.status_map,
+            QueueTest::state(&queue).status_map,
         );
-        JobQueue::run_kept(
+        QueueTest::run_kept(
             url,
             &context,
-            &queue.status_map,
-            &queue.kept,
-            &queue.cancelled_before_start,
+            QueueTest::state(&queue).status_map,
+            QueueTest::state(&queue).kept,
+            QueueTest::state(&queue).cancelled_before_start,
         )
         .await;
-        assert!(!queue.kept_for(url), "the kept removal ran");
+        assert!(!QueueTest::kept_for(&queue, url), "the kept removal ran");
         let standing = registry
             .get_by_url(url)
             .expect("the fresh worker stays under the URL");
@@ -4346,7 +3624,7 @@ mod tests {
     }
 
     fn kept_removal_pins(
-        kept: &DashMap<String, Kept>,
+        kept: &DashMap<String, Kept<Job>>,
         url: &str,
     ) -> Option<HashMap<String, Option<u64>>> {
         let slots = kept.get(url).expect("an entry kept for the URL");
@@ -4363,12 +3641,12 @@ mod tests {
     fn a_removal_kept_over_a_kept_removal_merges_the_pins_the_wider_pin_staying() {
         let kept = DashMap::new();
         let url = "http://w:8000";
-        JobQueue::keep(
+        QueueTest::keep(
             &kept,
             url,
             removal(url, Some(&[("a", Some(1)), ("b", None)])),
         );
-        JobQueue::keep(
+        QueueTest::keep(
             &kept,
             url,
             removal(url, Some(&[("b", Some(2)), ("c", Some(3))])),
@@ -4378,7 +3656,7 @@ mod tests {
             Some(pins(&[("a", Some(1)), ("b", None), ("c", Some(3))]))
         );
         // A `None` pin on the newer side widens the held one.
-        JobQueue::keep(&kept, url, removal(url, Some(&[("a", None)])));
+        QueueTest::keep(&kept, url, removal(url, Some(&[("a", None)])));
         assert_eq!(
             kept_removal_pins(&kept, url),
             Some(pins(&[("a", None), ("b", None), ("c", Some(3))]))
@@ -4390,13 +3668,13 @@ mod tests {
         let url = "http://w:8000";
         // The `DELETE`'s unguarded removal first, the cleanup's pins over it.
         let kept = DashMap::new();
-        JobQueue::keep(&kept, url, removal(url, None));
-        JobQueue::keep(&kept, url, removal(url, Some(&[("a", Some(1))])));
+        QueueTest::keep(&kept, url, removal(url, None));
+        QueueTest::keep(&kept, url, removal(url, Some(&[("a", Some(1))])));
         assert_eq!(kept_removal_pins(&kept, url), None);
         // The cleanup's pins first, the `DELETE`'s unguarded removal over them.
         let kept = DashMap::new();
-        JobQueue::keep(&kept, url, removal(url, Some(&[("a", Some(1))])));
-        JobQueue::keep(&kept, url, removal(url, None));
+        QueueTest::keep(&kept, url, removal(url, Some(&[("a", Some(1))])));
+        QueueTest::keep(&kept, url, removal(url, None));
         assert_eq!(kept_removal_pins(&kept, url), None);
     }
 
@@ -4404,8 +3682,8 @@ mod tests {
     fn a_removal_put_back_merges_with_the_removal_kept_since() {
         let kept = DashMap::new();
         let url = "http://w:8000";
-        JobQueue::keep(&kept, url, removal(url, Some(&[("b", Some(2))])));
-        JobQueue::put_back(&kept, url, removal(url, Some(&[("a", Some(1))])));
+        QueueTest::keep(&kept, url, removal(url, Some(&[("b", Some(2))])));
+        QueueTest::put_back(&kept, url, removal(url, Some(&[("a", Some(1))])));
         assert_eq!(
             kept_removal_pins(&kept, url),
             Some(pins(&[("a", Some(1)), ("b", Some(2))]))
@@ -4417,8 +3695,6 @@ mod tests {
     /// registered, and it goes once it is named at its own.
     #[tokio::test]
     async fn a_health_removal_runs_under_the_revisions_it_names() {
-        use smg_worker::identity::basic::Worker;
-
         use crate::{
             app_context::testing::live_app_context,
             routers::grpc::backend_client::BasicWorkerBuilder,
@@ -4508,6 +3784,19 @@ mod tests {
         assert!(
             registry.get_by_url(url).is_none(),
             "the removal took the worker"
+        );
+    }
+
+    /// The wait counts every step: the selection and the registry removal,
+    /// 10 seconds each, the settle bound, then the policy cleanup under the
+    /// workflow's default of 300 seconds and a 10 second tokenizer release.
+    #[test]
+    fn a_removal_job_waits_for_the_bound_of_every_step() {
+        use smg_worker::workflow::SETTLE_STEP_TIMEOUT;
+
+        assert_eq!(
+            removal_wait(),
+            SETTLE_STEP_TIMEOUT + Duration::from_secs(330)
         );
     }
 }
