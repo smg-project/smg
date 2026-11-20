@@ -137,6 +137,19 @@ impl Held {
             self.ranks.remove(address);
         }
     }
+
+    /// Take the row `id` out of every table of the entry: its place among
+    /// its engine's ranks, its facts, its object's id, and that object's
+    /// own entry. A row that leaves goes through here, at its object's end
+    /// and where its next life takes its object's place.
+    fn leave(&mut self, id: WorkerId) {
+        // The rank first: it is found by the row's facts.
+        self.unrank(id);
+        self.facts.remove(&id);
+        if let Some(object) = self.objects.remove(&id) {
+            self.rows.remove(&object);
+        }
+    }
 }
 
 /// A replica's worker objects: for every row of the membership store that
@@ -146,7 +159,8 @@ impl Held {
 /// what the store's membership did since its last read. It builds the
 /// object of a row that arrived, drops the object of a row that went, and
 /// replaces the object of a row whose facts changed under the same id in
-/// the registry. A new incarnation of a key gets a new object and id.
+/// the registry. A new incarnation of a key gets a new object and id,
+/// unless a registration hands its object in.
 ///
 /// By default a status change reads no row and leaves the object alone.
 /// With [`Self::with_status_followed`], the holder copies the row's status
@@ -184,6 +198,11 @@ impl Held {
 /// row that moves with no hand-in keeps it, and its entry alone moves to
 /// the row. Such an object holds its own credential, so that holder needs
 /// no keeper.
+///
+/// A registration whose write makes the row another life keeps the
+/// worker's id in the registry: the object it hands in takes the place of
+/// the old life's object. The id is the worker's handle for its operator,
+/// and the row's id is the life.
 ///
 /// With a keeper ([`Self::with_credentials`]), each read has the keeper
 /// forget the rows that left, whoever wrote the removal, and an entry goes
@@ -401,6 +420,11 @@ impl<G: Generation> Objects<G> {
     /// stands: a write that moved no fact still laid another. So the call
     /// refuses the write as moved, ahead of it, where another object
     /// stands under the URL by then.
+    ///
+    /// A write that makes the row another life keeps the worker's id:
+    /// the read lays `built` in the place of the old life's object. With
+    /// no object on offer, it drops that object and lays the new life's
+    /// under another id.
     ///
     /// A holder built without [`Self::with_built_kept`] runs `write` alone.
     pub fn handing<S: WorkersStore + ?Sized>(
@@ -636,9 +660,13 @@ impl<G: Generation> Objects<G> {
             MembershipChange::StatusChanged { id, .. } => self.follow_status(store, id),
             // The old incarnation first: its object leaves the URL the new
             // one's is built under. It leaves whatever stands under its id
-            // now: an incarnation a key takes again is another life.
+            // now: an incarnation a key takes again is another life. An
+            // object on offer for the new one takes the old one's place
+            // instead, and the worker keeps its id.
             MembershipChange::Replaced { old, new } => {
-                self.end(old);
+                if !self.succeed(store, old, new) {
+                    self.end(old);
+                }
                 self.settle(store, old);
                 self.settle(store, new);
             }
@@ -755,11 +783,7 @@ impl<G: Generation> Objects<G> {
         };
         // The registry first: the entry stands while its event is sent.
         self.registry.remove(&held);
-        let mut entries = self.held.write();
-        entries.objects.remove(&id);
-        entries.rows.remove(&held);
-        entries.unrank(id);
-        entries.facts.remove(&id);
+        self.held.write().leave(id);
     }
 
     /// Lay `row`'s object: the one on offer for it, else one built from
@@ -769,7 +793,7 @@ impl<G: Generation> Objects<G> {
     /// the row's revision and facts alone.
     fn lay<S: WorkersStore + ?Sized>(&self, store: &S, row: &WorkerRow) {
         if let Some(built) = self.take_offered(row) {
-            return self.lay_handed(store, row, built);
+            return self.lay_handed(store, row, built, None);
         }
         if self.kept(row.id).is_some() {
             self.missed(row, "the object that stands is kept");
@@ -780,7 +804,7 @@ impl<G: Generation> Objects<G> {
         if self.built_kept {
             self.missed(row, "its object is built from the row");
         }
-        self.put(store, row, self.build(row), false);
+        self.put(store, row, self.build(row), false, None);
     }
 
     /// Take the object on offer where it is `row`'s: under the row's URL,
@@ -833,11 +857,14 @@ impl<G: Generation> Objects<G> {
     /// row's status ahead of the registry's write and again behind it: a
     /// replacement takes the standing object's running state, its status
     /// with it. A row's worker neither leads its row nor trails it.
+    /// `succeeds` is the life `row` took the place of: the object takes the
+    /// place of that life's object.
     fn lay_handed<S: WorkersStore + ?Sized>(
         &self,
         store: &S,
         row: &WorkerRow,
         built: Arc<dyn Worker>,
+        succeeds: Option<WorkerId>,
     ) {
         // A write's second attempt hands in the object that stands: a
         // replacement by itself would end its own background tasks.
@@ -853,7 +880,24 @@ impl<G: Generation> Objects<G> {
         if built.status() != at {
             built.set_status(at);
         }
-        self.put(store, row, built, true);
+        self.put(store, row, built, true, succeeds);
+    }
+
+    /// Lay `new`, the life a write made of the row `old`, with the object
+    /// on offer for it, in the place of the old life's object: under its
+    /// id in the registry and with its running state. The old row leaves
+    /// every table of the entry. Return whether an object was laid: with
+    /// none on offer that states the new row as it stands, the read drops
+    /// the old life's object and lays the new life under a new id.
+    fn succeed<S: WorkersStore + ?Sized>(&self, store: &S, old: WorkerId, new: WorkerId) -> bool {
+        let offered = store
+            .get(new)
+            .and_then(|row| Some((self.take_offered(&row)?, row)));
+        let Some((built, row)) = offered else {
+            return false;
+        };
+        self.lay_handed(store, &row, built, Some(old));
+        true
     }
 
     /// Lay the row a write left unmoved with the object still on offer.
@@ -861,7 +905,7 @@ impl<G: Generation> Objects<G> {
     /// stands states it.
     fn lay_unmoved<S: WorkersStore + ?Sized>(&self, store: &S, row: &WorkerRow) {
         match self.take_offered(row) {
-            Some(built) => self.lay_handed(store, row, built),
+            Some(built) => self.lay_handed(store, row, built, None),
             None => self.missed(row, "the object that stands is kept"),
         }
     }
@@ -897,25 +941,34 @@ impl<G: Generation> Objects<G> {
     /// where the row's URL holds no object, else in the place of the one
     /// that stands there, under its id and with its running state. An
     /// object another row holds under the URL is dropped first: a row takes
-    /// the place of its own object alone.
+    /// the place of its own object, or of the object of `succeeds`, the
+    /// life it took the place of. Where the registry holds nothing under
+    /// the URL by then, the object is registered under a new id.
     fn put<S: WorkersStore + ?Sized>(
         &self,
         store: &S,
         row: &WorkerRow,
         object: Arc<dyn Worker>,
         handed: bool,
+        succeeds: Option<WorkerId>,
     ) {
         // The id first, then the entry, then the registry's write: its
         // event finds the entry.
         let mut id = self.registry.reserve_id_for_url(&row.facts.key);
         // A store restored inside a read can show a key's new incarnation
         // before any change says the old one left.
-        if let Some(other) = self.standing(&id).filter(|other| other.row != row.id) {
+        let others = |other: &Standing| other.row != row.id && Some(other.row) != succeeds;
+        if let Some(other) = self.standing(&id).filter(others) {
             self.end(other.row);
             id = self.registry.reserve_id_for_url(&row.facts.key);
         }
         {
             let mut entries = self.held.write();
+            // The old life leaves the entry in the turn the new one enters
+            // it: a reader finds the object under one of the two rows.
+            if let Some(old) = succeeds {
+                entries.leave(old);
+            }
             entries.objects.insert(row.id, id.clone());
             entries.state(row);
             entries.rows.insert(
@@ -958,7 +1011,7 @@ mod tests {
         model_card::ModelCard,
         registry::event::WorkerEvent,
         runtime::StallReason,
-        worker::{HealthCheckConfig, WorkerStatus as ObjectStatus},
+        worker::{HealthCheckConfig, WorkerStatus as ObjectStatus, WorkerType},
     };
     use tokio::sync::broadcast::Receiver;
 
@@ -1426,6 +1479,115 @@ mod tests {
         assert!(matches!(wrote, Ok(Wrote::Unmoved(_))), "{wrote:?}");
         assert!(Arc::ptr_eq(&replica.at(A), &fresh));
         assert_eq!(replica.told(), [("replaced", replica.id(A))]);
+    }
+
+    /// A registration whose write makes the row another life keeps the
+    /// worker's id: the built object takes the old life's place in the
+    /// registry, which tells a replacement and no removal. Nothing of the
+    /// old row is left in the holder, the one lay took the object handed
+    /// in, and the object reads its new row's status: Pending where the
+    /// row is probed, Ready where its checks are off. A guarded write and
+    /// an upsert are laid alike.
+    #[test]
+    fn a_registration_that_starts_another_life_keeps_its_workers_id() {
+        let (mut replica, door) = handing();
+        let first = built(A, KEY_A);
+        registered(&replica, &door, &first, Expect::Anything).expect("the first write");
+        let id = replica.id(A);
+        replica.told();
+
+        // Another model is another life. A guarded write names its object.
+        let old = replica.row(A);
+        let renamed = <BasicWorkerBuilder>::new(A).model(ModelCard::new("n"));
+        let second: Arc<dyn Worker> = Arc::new(renamed.api_key(KEY_B).build());
+        let seen = replica.objects.standing_of(&id, &first).expect("its row");
+        let wrote = replica
+            .objects
+            .handing(replica.store.as_ref(), &second, Some(&first), || {
+                door.found_built(
+                    &Maker::Control,
+                    Expect::Seen(seen),
+                    &second,
+                    Some(Over::Replaced(&first)),
+                )
+            });
+        let new = replica.row(A);
+        let another = Wrote::Another {
+            old: old.id,
+            new: new.id,
+        };
+        assert_eq!(wrote, Ok(another));
+        assert!(replica.store.get(old.id).is_none());
+        assert_eq!(replica.id(A), id);
+        assert!(Arc::ptr_eq(&replica.at(A), &second));
+        assert!(entry_stands(&replica, A));
+        assert_eq!(replica.objects.object(old.id), None);
+        assert_eq!(replica.objects.len(), 1);
+        assert_eq!(new.status, WorkerStatus::Pending);
+        assert_eq!(second.status(), ObjectStatus::Pending);
+        assert_eq!(replica.told(), [("replaced", id.clone())]);
+
+        // Another role is another life, here by an upsert with checks off.
+        let old = new;
+        let unchecked = HealthCheckConfig {
+            disable_health_check: true,
+            ..HealthCheckConfig::default()
+        };
+        let prefill = <BasicWorkerBuilder>::new(A)
+            .model(ModelCard::new("n"))
+            .worker_type(WorkerType::Prefill)
+            .health_config(unchecked);
+        let third: Arc<dyn Worker> = Arc::new(prefill.build());
+        let wrote = registered(&replica, &door, &third, Expect::Anything);
+        let new = replica.row(A);
+        let another = Wrote::Another {
+            old: old.id,
+            new: new.id,
+        };
+        assert_eq!(wrote, Ok(another));
+        assert_eq!(replica.id(A), id);
+        assert!(Arc::ptr_eq(&replica.at(A), &third));
+        assert!(entry_stands(&replica, A));
+        assert_eq!(replica.objects.object(old.id), None);
+        assert_eq!(replica.objects.len(), 1);
+        assert_eq!(new.status, WorkerStatus::Ready);
+        assert_eq!(third.status(), ObjectStatus::Ready);
+        let told = replica.told();
+        assert!(told.contains(&("replaced", id.clone())), "{told:?}");
+        assert!(
+            told.iter()
+                .all(|(what, _)| *what != "removed" && *what != "registered"),
+            "{told:?}"
+        );
+        assert_eq!(replica.objects.unhanded(), 0);
+    }
+
+    /// The way out of that replacement: where the registry holds nothing
+    /// under the URL by then, the new life's object is registered anew and
+    /// the entry holds the id it got. Nothing of the old row is left.
+    #[test]
+    fn a_new_life_whose_old_object_left_the_registry_is_registered_anew() {
+        let (mut replica, door) = handing();
+        let first = built(A, KEY_A);
+        registered(&replica, &door, &first, Expect::Anything).expect("the first write");
+        let id = replica.id(A);
+        let old = replica.row(A);
+        replica.objects.registry().remove(&id);
+        replica.told();
+
+        let renamed = <BasicWorkerBuilder>::new(A).model(ModelCard::new("n"));
+        let second: Arc<dyn Worker> = Arc::new(renamed.build());
+        let wrote = registered(&replica, &door, &second, Expect::Anything);
+        assert!(matches!(wrote, Ok(Wrote::Another { .. })), "{wrote:?}");
+        let anew = replica.id(A);
+        assert_ne!(anew, id);
+        assert!(Arc::ptr_eq(&replica.at(A), &second));
+        assert!(entry_stands(&replica, A));
+        assert_eq!(replica.objects.standing(&id), None);
+        assert_eq!(replica.objects.object(old.id), None);
+        assert_eq!(replica.objects.len(), 1);
+        assert_eq!(replica.objects.unhanded(), 0);
+        assert_eq!(replica.told(), [("registered", anew)]);
     }
 
     /// A replacement takes the standing object's status, so a handed
