@@ -1125,6 +1125,12 @@ impl MockScheduler {
                 ));
             }
             let records = load_records_only(sources, self.cfg.loads_like, self.cfg.step_reports);
+            // The cut hook of any rank's engine ends this stream as it ends
+            // the event streams.
+            let records = self
+                .ranks
+                .iter()
+                .fold(records, |records, rank| rank.engine.until_cut(records));
             let mut stopped = self.stopped.clone();
             let stop = async move {
                 let _ = stopped.wait_for(|stop| *stop).await;
@@ -3010,6 +3016,38 @@ mod tests {
             let record = source.record(LoadsLike::Mock, false, 0);
             assert_eq!(record.num_resident_tokens, wanted);
         }
+    }
+
+    /// The cut hook ends a `loads_only` subscription as it ends the event
+    /// streams, whichever rank's engine it cuts: `UNAVAILABLE`, then nothing.
+    #[tokio::test]
+    async fn the_cut_hook_ends_a_loads_only_subscription() {
+        let (service, _stop) = scheduler_with_ranks(2, 65_116);
+        let mut records = service
+            .subscribe_kv_events(Request::new(common::SubscribeKvEventsRequest {
+                loads_only: true,
+                ..Default::default()
+            }))
+            .await
+            .expect("subscribed")
+            .into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(2), records.next())
+            .await
+            .expect("a record at the first tick")
+            .expect("an item")
+            .expect("a batch");
+        assert!(first.load.is_some_and(|load| load.load_only));
+
+        service.ranks[1].engine.fault_cut_streams();
+        let cut = tokio::time::timeout(Duration::from_secs(2), records.next())
+            .await
+            .expect("the cut reaches the stream")
+            .expect("as an item")
+            .expect_err("that is a status");
+        assert_eq!(cut.code(), Code::Unavailable);
+        assert!(records.next().await.is_none(), "nothing follows the status");
+        assert_eq!(service.ranks[1].engine.fault_status().stream_cuts, 1);
+        assert_eq!(service.ranks[0].engine.fault_status().stream_cuts, 0);
     }
 
     /// A `loads_only` subscription carries every rank's record and never an
