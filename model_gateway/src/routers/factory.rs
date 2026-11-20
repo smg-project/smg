@@ -146,7 +146,12 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        if let Some(router) = policy_controller::undecided(ctx) {
+        // The pair router asks the controller's host where this gateway
+        // decides pairs in its own process. Its family refuses by name
+        // elsewhere.
+        if let Some(router) =
+            policy_controller::undecided_without(ctx, policy_controller::PlanName::PdPair)
+        {
             return Ok(router);
         }
         Self::set_pd_policies(
@@ -179,12 +184,20 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
         mode: Mode,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // The regular router's selection stage asks the controller's host.
-        // A pair mode places no request through it yet.
-        if mode != Mode::Regular {
-            if let Some(router) = policy_controller::undecided(ctx) {
-                return Ok(router);
+        // The regular router and the pair router ask the controller's host
+        // in their selection stage. The pair router serves where the
+        // document in force plans pairs, and its family refuses by name
+        // elsewhere. The encode mode places no request through the host
+        // yet.
+        let refusing = match mode {
+            Mode::Regular => None,
+            Mode::PrefillDecode => {
+                policy_controller::undecided_without(ctx, policy_controller::PlanName::PdPair)
             }
+            Mode::EncodePrefillDecode => policy_controller::undecided(ctx),
+        };
+        if let Some(router) = refusing {
+            return Ok(router);
         }
         let router = GrpcRouter::new(ctx, mode)?;
 

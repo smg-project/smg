@@ -24,7 +24,7 @@ use super::{
     },
     sse_bytes::assert_recorded_bytes,
 };
-use crate::routers::grpc::regular::symphony::Assignment;
+use crate::routers::grpc::regular::symphony::{Assignment, Forbids};
 
 struct MessagesScenario {
     name: &'static str,
@@ -141,7 +141,7 @@ async fn stream_bytes(scenario: &MessagesScenario) -> Vec<u8> {
         symphony: scenario.symphony.then(|| Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: "<|im_start|>assistant\n".to_string(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,

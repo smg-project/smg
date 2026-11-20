@@ -1,7 +1,5 @@
 #[cfg(test)]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 
 use llm_tokenizer::{
@@ -509,25 +507,40 @@ fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
 pub const SERVER_MALLOC_CONF: &[u8; 100] =
     b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432\0";
 
-#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
-static JEMALLOC_IS_GLOBAL: AtomicBool = AtomicBool::new(false);
+/// The bytes of the one allocation that tells which allocator serves the
+/// process.
+#[cfg(all(
+    feature = "jemalloc-stats",
+    not(target_env = "msvc"),
+    not(target_env = "musl")
+))]
+const ALLOCATOR_PROBE_BYTES: usize = 4096;
 
-/// Marks jemalloc as the final artifact's Rust global allocator.
+/// Whether this process's Rust allocations go through the library's
+/// jemalloc.
 ///
-/// Call this from a binary or extension that declares jemalloc with
-/// `#[global_allocator]`, including binaries using [`crate::stock_allocator!`].
-/// Register before [`crate::main_from_args`] to skip its warning and before
-/// [`start_prometheus`] to publish statistics for this allocator. A binary
-/// on another allocator must not call this: it would publish the statistics
-/// of a linked jemalloc that serves nothing.
-pub fn register_jemalloc_as_global_allocator() {
-    #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
-    JEMALLOC_IS_GLOBAL.store(true, Ordering::Release);
-}
-
-#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+/// The gateway finds out and is not told: it makes one allocation and reads
+/// the allocator's own count of this thread's bytes before and after. A
+/// count that did not move means another allocator serves the process, and
+/// the statistics of the linked jemalloc are then not published. The answer
+/// is found once and kept.
+#[cfg(all(
+    feature = "jemalloc-stats",
+    not(target_env = "msvc"),
+    not(target_env = "musl")
+))]
 pub(crate) fn jemalloc_is_global() -> bool {
-    JEMALLOC_IS_GLOBAL.load(Ordering::Acquire)
+    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        let Ok(allocated) = tikv_jemalloc_ctl::thread::allocatedp::read() else {
+            return false;
+        };
+        let before = allocated.get();
+        let probe = std::hint::black_box(Vec::<u8>::with_capacity(ALLOCATOR_PROBE_BYTES));
+        let after = allocated.get();
+        drop(probe);
+        after > before
+    })
 }
 
 pub(crate) fn init_metrics() {
@@ -551,7 +564,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         symphony_telemetry::CALLS_FORBIDDEN,
-        "Tool calls a Symphony table read under tool_choice: none and the gateway dropped, by table"
+        "Tool calls a Symphony table read and the gateway dropped under a tool_choice that forbids them (every call under none; a call outside the callable tools under a named function, an allowed list or required), by table"
     );
     describe_counter!(
         symphony_telemetry::FALLBACK,
@@ -1313,8 +1326,8 @@ pub(crate) mod allocator_stats {
         }
     }
 
-    /// Registration at the final-artifact boundary keeps these gauges tied to
-    /// Rust's actual global allocator.
+    /// The gauges are published where this jemalloc serves the process's Rust
+    /// allocations, and nowhere else.
     pub(crate) fn start_reporting() {
         if !jemalloc_is_global() {
             return;
@@ -1331,6 +1344,13 @@ pub(crate) mod allocator_stats {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn the_allocator_of_the_lib_tests_is_found() {
+            // The lib's tests declare jemalloc as their allocator (lib.rs),
+            // so the one allocation moves its count.
+            assert!(super::jemalloc_is_global());
+        }
+
         #[test]
         fn jemalloc_stats_interface_readable() {
             use tikv_jemalloc_ctl::{epoch, stats};

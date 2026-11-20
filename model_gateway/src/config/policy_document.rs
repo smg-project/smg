@@ -13,13 +13,18 @@
 //!
 //! - A policy name lands on the controller's preset of that name. A
 //!   prefill-decode mode lands on the pair plan, with one profile a side.
+//! - A gateway of many routers serves pairs and single workers over its
+//!   one document, so the document binds both: pairs first, over the
+//!   prefill and decode phases, and single workers behind. The sides of a
+//!   pair run under the mode's side policies and single workers under the
+//!   main policy, as on the classic line.
 //! - A policy's own setting lands in the stage of the preset that reads it,
 //!   and only where it differs from the number that stage runs at when its
 //!   document names none. The controller names those numbers and this
 //!   module reads them, so a configuration at them is the preset itself.
-//! - The overload thresholds land on the binding, the pairing mode on the
-//!   pair plan, the index settings under every model, and the block size
-//!   and the cache boundaries in the view.
+//! - The overload thresholds land on every binding, the pairing mode on
+//!   the pair plan, the index settings under every model, and the block
+//!   size and the cache boundaries in the view.
 //! - The manual policy's settings land in the binding's session rule.
 //! - A keyed policy's key sources land on the binding. The two rings name
 //!   them under `routing_key`. The manual policy names them in its session
@@ -31,6 +36,15 @@
 //! A setting that decides a placement and has no place in the document is
 //! refused by its name ([`PolicyDocumentError::Unsaid`]). It is never left
 //! out in silence.
+//!
+//! # What is left out
+//!
+//! The document of many routers plans one family where the other has no
+//! document. Pairs are left out under the manual policy, whose session rule
+//! runs under the single plan alone, and beside the encode mode. Single
+//! workers are left out of a pair configuration whose main policy reads a
+//! setting no document says. A request of the family left out is refused,
+//! as it was.
 //!
 //! # What is not read
 //!
@@ -50,13 +64,13 @@ use smg_policy_controller::{
     bucket,
     builtins::{DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT},
     spec::{
-        BestWithTemperatureParams, BoundedLoadParams, BucketParams, ConsistentHashParams,
-        IndexKind, IndexSpec, KeySourceSpec, KvPressureParams, LeastLoadParams, OverloadSpec,
-        Pairing, PickStage, PrefixAffinityParams, ProfileSpec, RoutingKeySpec, ScoreSpec,
-        ScoreStage, SpillParams, WarmupSliceParams, MANUAL_SESSION_HEADER, MAX_KEY_SOURCES,
-        OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS,
+        BestWithTemperatureParams, BindingSpec, BoundedLoadParams, BucketParams,
+        ConsistentHashParams, IndexKind, IndexSpec, KeySourceSpec, KvPressureParams,
+        LeastLoadParams, OverloadSpec, Pairing, PickStage, PrefixAffinityParams, ProfileSpec,
+        RoutingKeySpec, ScoreSpec, ScoreStage, SpillParams, WarmupSliceParams,
+        MANUAL_SESSION_HEADER, MAX_KEY_SOURCES, OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS,
     },
-    AppliedSpec, Assignment, Catalog, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError,
+    AppliedSpec, Assignment, Phase, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError,
 };
 
 use super::{
@@ -135,36 +149,16 @@ impl RouterConfig {
     /// names there a stage its build does not run yet.
     pub fn policy_document(&self) -> Result<PolicySpec, PolicyDocumentError> {
         refuse_unsaid(self)?;
-        let (mut document, sides) = presets(self)?;
-        let mut shared = Shared::default();
-        for &(side, policy) in &sides {
-            let profile =
-                document
-                    .profiles
-                    .get_mut(side)
-                    .ok_or_else(|| PolicyDocumentError::NoPart {
-                        policy: policy.name(),
-                        part: "profile",
-                    })?;
-            write_policy(policy, self, profile, &mut shared)?;
-            // The encode side places an item by the item's content: it reads
-            // no key, and the override never places it.
-            if side != ENCODE_SIDE {
-                if let Some(sources) = key_sources(policy, self)? {
-                    shared.keys.push((policy.name(), sources));
-                }
+        if let Some(both) = both_families(self)? {
+            match written(self, both) {
+                // A setting the other family's policy reads and no document
+                // says leaves that family out. The document then plans the
+                // configuration's own family alone.
+                Err(PolicyDocumentError::Unsaid { .. }) => {}
+                said => return said,
             }
         }
-        shared.write(self, sides.len(), &mut document)?;
-        let binding = document
-            .bindings
-            .first_mut()
-            .ok_or_else(|| PolicyDocumentError::NoPart {
-                policy: self.policy.name(),
-                part: "binding",
-            })?;
-        binding.overload = overload(self)?;
-        Ok(document)
+        written(self, presets(self)?)
     }
 
     /// The document this gateway runs. Without a supplied document, it is
@@ -188,8 +182,11 @@ impl RouterConfig {
         if given.generation == 0 {
             given.generation = 1;
         }
+        // The default configuration of this gateway's kind: a provider mode
+        // has a document under the multi-router setting alone.
         let plain = RouterConfig {
             mode: self.mode.with_defaults(),
+            enable_igw: self.enable_igw,
             ..RouterConfig::default()
         }
         .policy_document()?;
@@ -222,21 +219,18 @@ impl RouterConfig {
     }
 
     /// Validates the document over the stock stages, with the gateway's
-    /// tenant header denied to the view.
+    /// own headers denied to the view: the typed half of the check a hosted
+    /// document passes. The start and `--print-policy-spec` hand the
+    /// document's YAML to the operators' door, which bounds its size and
+    /// reads it back before it validates it this way.
     pub fn hosted_policy(&self, document: &PolicySpec) -> Result<AppliedSpec, SpecError> {
-        self.hosted_policy_in(document, None)
+        AppliedSpec::validate_with(document, &self.denied_view_headers())
     }
 
-    pub(crate) fn hosted_policy_in(
-        &self,
-        document: &PolicySpec,
-        stages: Option<&Catalog>,
-    ) -> Result<AppliedSpec, SpecError> {
-        let denied_headers = [self.tenant_resolution.tenant_header_name.as_str()];
-        match stages {
-            Some(stages) => AppliedSpec::validate_in(document, stages, &denied_headers),
-            None => AppliedSpec::validate_with(document, &denied_headers),
-        }
+    /// The header names this gateway denies the view of a document it
+    /// hosts: its tenant header, which it keeps to itself.
+    pub(crate) fn denied_view_headers(&self) -> [&str; 1] {
+        [self.tenant_resolution.tenant_header_name.as_str()]
     }
 }
 
@@ -342,17 +336,23 @@ fn refuse_unsaid(config: &RouterConfig) -> Result<(), PolicyDocumentError> {
 /// A profile of the document and the policy that decides it.
 type Side<'a> = (&'static str, &'a PolicyConfig);
 
-/// The presets the mode's policies name, as one document, with its
-/// profiles: one named for the policy under the regular mode, one a side
-/// under the pair and the encode modes. The pools of a mode are the
-/// gateway's and are not read.
-fn presets(config: &RouterConfig) -> Result<(PolicySpec, Vec<Side<'_>>), PolicyDocumentError> {
+/// A document and, binding by binding, the sides its plan runs.
+type Planned<'a> = (PolicySpec, Vec<Vec<Side<'a>>>);
+
+/// The presets the mode's policies name, as a document of one binding, with
+/// its profiles: one named for the policy under the regular mode, one a side
+/// under the pair and the encode modes. A provider mode of a multi-router
+/// gateway reads as the regular mode: the document says the policy of its
+/// self-hosted workers. The pools of a mode are the gateway's and are not
+/// read.
+fn presets(config: &RouterConfig) -> Result<Planned<'_>, PolicyDocumentError> {
     let (mode, main) = (&config.mode, &config.policy);
     let (prefill, decode) = (mode.get_prefill_policy(main), mode.get_decode_policy(main));
-    let (mut document, sides) = match mode {
-        RoutingMode::Regular { worker_urls: _ } => {
-            (PolicySpec::preset(main.name())?, vec![(main.name(), main)])
-        }
+    let regular = || -> Result<_, PolicyDocumentError> {
+        Ok((PolicySpec::preset(main.name())?, vec![(main.name(), main)]))
+    };
+    let (document, sides) = match mode {
+        RoutingMode::Regular { worker_urls: _ } => regular()?,
         RoutingMode::PrefillDecode {
             prefill_urls: _,
             decode_urls: _,
@@ -380,19 +380,123 @@ fn presets(config: &RouterConfig) -> Result<(PolicySpec, Vec<Side<'_>>), PolicyD
                 ],
             )
         }
-        RoutingMode::OpenAI { worker_urls: _ } => return Err(provider_mode("openai")),
-        RoutingMode::Anthropic { worker_urls: _ } => return Err(provider_mode("anthropic")),
-        RoutingMode::Gemini { worker_urls: _ } => return Err(provider_mode("gemini")),
+        RoutingMode::OpenAI { worker_urls: _ }
+        | RoutingMode::Anthropic { worker_urls: _ }
+        | RoutingMode::Gemini { worker_urls: _ } => match config.provider_alone() {
+            Some(provider) => return Err(provider_mode(provider)),
+            None => regular()?,
+        },
     };
-    // A document of several sides runs the pair: the pairing mode is its rule.
-    if sides.len() > 1 {
+    Ok((document, vec![sides]))
+}
+
+/// The document of a gateway of many routers, which serves pairs and single
+/// workers side by side: the pair binding first, over the prefill and decode
+/// phases, and the single binding behind it for every other request. Each
+/// family runs under the policies the classic line gives it. The sides of a
+/// pair run under the mode's side policies, which are the main policy in a
+/// regular configuration. Single workers run under the main policy.
+///
+/// `None` where the document plans one family: a gateway of one router, the
+/// encode mode, and a regular configuration whose main policy runs on no
+/// side of a pair. The manual policy is that one: its picker leaves the
+/// placement to the binding's session rule, and a rule runs under the single
+/// plan alone.
+fn both_families(config: &RouterConfig) -> Result<Option<Planned<'_>>, PolicyDocumentError> {
+    let (mode, main) = (&config.mode, &config.policy);
+    let pairs = match mode {
+        RoutingMode::Regular { worker_urls: _ }
+        | RoutingMode::OpenAI { worker_urls: _ }
+        | RoutingMode::Anthropic { worker_urls: _ }
+        | RoutingMode::Gemini { worker_urls: _ } => !matches!(main, PolicyConfig::Manual { .. }),
+        RoutingMode::PrefillDecode {
+            prefill_urls: _,
+            decode_urls: _,
+            prefill_policy: _,
+            decode_policy: _,
+        } => true,
+        RoutingMode::EncodePrefillDecode {
+            encode_urls: _,
+            prefill_urls: _,
+            decode_urls: _,
+            encode_policy: _,
+            prefill_policy: _,
+            decode_policy: _,
+        } => false,
+    };
+    if !(config.enable_igw && pairs) {
+        return Ok(None);
+    }
+    let (prefill, decode) = (mode.get_prefill_policy(main), mode.get_decode_policy(main));
+    let mut document = PolicySpec::pair_presets(prefill.name(), decode.name())?;
+    for binding in &mut document.bindings {
+        binding.matcher.phase = vec![Phase::Prefill, Phase::Decode];
+    }
+    let single = PolicySpec::preset(main.name())?;
+    document.profiles.extend(single.profiles);
+    document.bindings.extend(single.bindings);
+    let sides = vec![
+        vec![("prefill", prefill), ("decode", decode)],
+        vec![(main.name(), main)],
+    ];
+    Ok(Some((document, sides)))
+}
+
+/// Writes the configuration's settings over a planned document: each side's
+/// policy into its profile, what the sides of a binding share into that
+/// binding, and what every side shares into the places the document holds
+/// once. The overload block lands on every binding, so one set of thresholds
+/// judges the pools of each family.
+fn written<'a>(
+    config: &'a RouterConfig,
+    (mut document, bindings): Planned<'a>,
+) -> Result<PolicySpec, PolicyDocumentError> {
+    // A plan of several sides runs the pair: the pairing mode is its rule.
+    if bindings.iter().any(|sides| sides.len() > 1) {
         document.plans.pd_pair.pairing = match config.pd_pairing_mode {
             PdPairingMode::Off => Pairing::Off,
             PdPairingMode::Lenient => Pairing::Lenient,
             PdPairingMode::Strict => Pairing::Strict,
         };
     }
-    Ok((document, sides))
+    let mut shared = Shared::default();
+    let mut bound = Vec::with_capacity(bindings.len());
+    for sides in &bindings {
+        for &(side, policy) in sides {
+            let profile =
+                document
+                    .profiles
+                    .get_mut(side)
+                    .ok_or_else(|| PolicyDocumentError::NoPart {
+                        policy: policy.name(),
+                        part: "profile",
+                    })?;
+            write_policy(policy, config, profile, &mut shared)?;
+            // The encode side places an item by the item's content: it reads
+            // no key, and the override never places it.
+            if side != ENCODE_SIDE {
+                if let Some(sources) = key_sources(policy, config)? {
+                    shared.bound.keys.push((policy.name(), sources));
+                }
+            }
+        }
+        bound.push((sides.len(), std::mem::take(&mut shared.bound)));
+    }
+    shared.write(&mut document)?;
+    if document.bindings.is_empty() || document.bindings.len() != bound.len() {
+        return Err(PolicyDocumentError::NoPart {
+            policy: config.policy.name(),
+            part: "binding",
+        });
+    }
+    for (binding, (sides, bound)) in document.bindings.iter_mut().zip(bound) {
+        bound.write(config, sides, binding, &mut document.view.headers)?;
+    }
+    let overload = overload(config)?;
+    for binding in &mut document.bindings {
+        binding.overload.clone_from(&overload);
+    }
+    Ok(document)
 }
 
 fn provider_mode(mode: &'static str) -> PolicyDocumentError {
@@ -489,9 +593,9 @@ fn write_policy<'a>(
         } => {
             // The manual preset places by the binding's session rule, which
             // every side shares: its settings land there.
-            shared.manual_sides += 1;
+            shared.bound.manual_sides += 1;
             share(
-                &mut shared.manual,
+                &mut shared.bound.manual,
                 (*eviction_interval_secs, *max_idle_secs, *assignment_mode),
                 "eviction_interval_secs, max_idle_secs, assignment_mode",
             )
@@ -704,6 +808,13 @@ struct Shared<'a> {
     boundaries: Option<&'a [usize]>,
     /// The index's kind, entry lifetime, size and sweep interval.
     index: Option<(CacheIndexKind, u32, u64, u32)>,
+    /// What the sides of the binding being written share.
+    bound: Bound,
+}
+
+/// What the sides of one binding share. The binding holds each once.
+#[derive(Default)]
+struct Bound {
     /// The manual policy's sweep interval, idle time and assignment.
     manual: Option<(u64, u64, ManualAssignmentMode)>,
     manual_sides: usize,
@@ -736,13 +847,8 @@ fn share<T: PartialEq + Serialize>(
 }
 
 impl Shared<'_> {
-    /// Writes what the sides named into a document of `sides` profiles.
-    fn write(
-        self,
-        config: &RouterConfig,
-        sides: usize,
-        document: &mut PolicySpec,
-    ) -> Result<(), PolicyDocumentError> {
+    /// Writes what the sides named into the places the document holds once.
+    fn write(self, document: &mut PolicySpec) -> Result<(), PolicyDocumentError> {
         if let Some(block_size) = self.block_size {
             document.view.block_size = unless(
                 narrow("block_size", block_size)?,
@@ -769,6 +875,20 @@ impl Shared<'_> {
         if let Some(index) = index.and_then(|index| unless(index, IndexSpec::default())) {
             document.index.insert("*".to_string(), index);
         }
+        Ok(())
+    }
+}
+
+impl Bound {
+    /// Writes what the sides named into their binding, a plan of `sides`
+    /// profiles. The headers the manual policy reads are the view's too.
+    fn write(
+        self,
+        config: &RouterConfig,
+        sides: usize,
+        binding: &mut BindingSpec,
+        view_headers: &mut Vec<String>,
+    ) -> Result<(), PolicyDocumentError> {
         let Some((eviction_interval_secs, max_idle_secs, assignment_mode)) = self.manual else {
             // A binding names its key's sources once: what its keyed sides
             // read, or nothing, over whatever its presets wrote.
@@ -776,9 +896,7 @@ impl Shared<'_> {
             if let Some(key) = &key {
                 within_a_block(key, config)?;
             }
-            if let Some(binding) = document.bindings.first_mut() {
-                binding.routing_key = key;
-            }
+            binding.routing_key = key;
             return Ok(());
         };
         if self.manual_sides != sides {
@@ -824,14 +942,7 @@ impl Shared<'_> {
                 seconds("eviction_interval_secs", eviction_interval_secs)?,
             )
         };
-        document.view.headers.clone_from(&headers);
-        let binding = document
-            .bindings
-            .first_mut()
-            .ok_or(PolicyDocumentError::NoPart {
-                policy: "manual",
-                part: "binding",
-            })?;
+        view_headers.clone_from(&headers);
         // A pair of presets names no rule: the manual preset's own is the
         // one the settings are written into.
         let preset = match binding.sessions.take() {
@@ -1973,5 +2084,204 @@ mod tests {
             },
         });
         assert_eq!(refusal(&wide).0, "load_metric.request_tokens");
+    }
+
+    /// `config` as a gateway of many routers runs it.
+    fn many_routers(config: RouterConfig) -> RouterConfig {
+        RouterConfig {
+            enable_igw: true,
+            ..config
+        }
+    }
+
+    fn pair_mode(prefill: Option<PolicyConfig>, decode: Option<PolicyConfig>) -> RoutingMode {
+        RoutingMode::PrefillDecode {
+            prefill_urls: Vec::new(),
+            decode_urls: Vec::new(),
+            prefill_policy: prefill,
+            decode_policy: decode,
+        }
+    }
+
+    #[test]
+    fn the_default_document_of_many_routers_binds_pairs_ahead_of_single_workers() {
+        let document = many_routers(RouterConfig::default())
+            .policy_document()
+            .expect("the default document");
+        assert_eq!(
+            serde_json::to_value(&document.bindings).expect("a written form"),
+            json!([
+                {
+                    "match": { "model": "*", "phase": ["prefill", "decode"] },
+                    "plan": "pd-pair",
+                    "profiles": { "decode": "decode", "prefill": "prefill" },
+                },
+                { "match": { "model": "*", "phase": [] }, "profile": "random" },
+            ]),
+        );
+        assert_eq!(
+            document.profiles.keys().collect::<Vec<_>>(),
+            ["decode", "prefill", "random"]
+        );
+    }
+
+    #[test]
+    fn many_routers_say_each_family_as_its_own_configuration_does() {
+        for name in PRESETS.iter().copied().filter(|name| *name != "manual") {
+            let regular = config(at_flag_defaults(name));
+            let pair = RouterConfig {
+                mode: pair_mode(None, None),
+                ..regular.clone()
+            };
+            let single = regular.policy_document().expect("the regular document");
+            let paired = pair.policy_document().expect("the pair document");
+            let both = many_routers(regular.clone())
+                .policy_document()
+                .expect("the document of many routers");
+
+            // The pair binding leads over its two phases. The single binding
+            // stands behind it as the regular configuration writes it.
+            let mut bindings = paired.bindings.clone();
+            for binding in &mut bindings {
+                binding.matcher.phase = vec![Phase::Prefill, Phase::Decode];
+            }
+            bindings.extend(single.bindings.clone());
+            assert_eq!(both.bindings, bindings, "{name}");
+            let mut profiles = paired.profiles.clone();
+            profiles.extend(single.profiles.clone());
+            assert_eq!(both.profiles, profiles, "{name}");
+            assert_eq!(
+                (&both.view, &both.index),
+                (&single.view, &single.index),
+                "{name}"
+            );
+
+            // A pair configuration with no side policy of its own says the
+            // same document, and the controller takes it.
+            assert_eq!(
+                many_routers(pair).policy_document().as_ref(),
+                Ok(&both),
+                "{name}"
+            );
+            assert_eq!(regular.hosted_policy(&both).err(), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_setting_of_the_binding_lands_on_both_bindings_of_many_routers() {
+        let mut keyed = RouterConfig {
+            worker_overload_waiting_requests: Some(32),
+            worker_overload_token_usage: Some(0.9),
+            worker_overload_shed: true,
+            pd_pairing_mode: PdPairingMode::Strict,
+            ..config(PolicyConfig::ConsistentHashing)
+        };
+        keyed.routing_key_override.headers = vec!["x-user".to_string()];
+        let single = keyed.policy_document().expect("the regular document");
+        let (overload, key) = single
+            .bindings
+            .first()
+            .map(|binding| (binding.overload.clone(), binding.routing_key.clone()))
+            .expect("the regular binding");
+        assert!(overload.is_some() && key.is_some());
+
+        let both = many_routers(keyed)
+            .policy_document()
+            .expect("the document of many routers");
+        assert_eq!(both.bindings.len(), 2);
+        for binding in &both.bindings {
+            // One set of thresholds judges the pools of each family, and
+            // each family reads a request's key from the same sources.
+            assert_eq!(binding.overload, overload);
+            assert_eq!(binding.routing_key, key);
+        }
+        // The pairing mode is the pair plan's under a regular configuration too.
+        assert_eq!(both.plans.pd_pair.pairing, Pairing::Strict);
+    }
+
+    #[test]
+    fn a_given_document_is_compared_with_the_document_of_many_routers() {
+        let given = preset("round_robin");
+        for mode in [RouterConfig::default().mode, pair_mode(None, None)] {
+            // No routing setting is set: the given document is in force.
+            let unset = many_routers(RouterConfig {
+                mode: mode.clone(),
+                policy_spec: Some(given.clone()),
+                ..RouterConfig::default()
+            });
+            assert_eq!(unset.policy_document_in_force(), Ok(given.clone()));
+
+            // A setting that says another document is refused, and one that
+            // says the given document is not.
+            let set = many_routers(RouterConfig {
+                mode,
+                ..config(PolicyConfig::RoundRobin)
+            });
+            let said = set.policy_document().expect("the flags' document");
+            let other = RouterConfig {
+                policy_spec: Some(given.clone()),
+                ..set.clone()
+            };
+            assert!(matches!(
+                other.policy_document_in_force(),
+                Err(PolicyDocumentError::Disagree { .. })
+            ));
+            let same = RouterConfig {
+                policy_spec: Some(said.clone()),
+                ..set
+            };
+            assert_eq!(same.policy_document_in_force(), Ok(said));
+        }
+    }
+
+    #[test]
+    fn many_routers_plan_one_family_where_the_other_has_no_document() {
+        // The manual policy runs on no side of a pair.
+        let manual = config(at_flag_defaults("manual"));
+        assert!(manual.policy_document().is_ok());
+        assert_eq!(
+            many_routers(manual.clone()).policy_document(),
+            manual.policy_document()
+        );
+
+        // The encode mode's document is its own.
+        let encode = RouterConfig {
+            mode: RoutingMode::EncodePrefillDecode {
+                encode_urls: Vec::new(),
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..config(PolicyConfig::RoundRobin)
+        };
+        assert!(encode.policy_document().is_ok());
+        assert_eq!(
+            many_routers(encode.clone()).policy_document(),
+            encode.policy_document()
+        );
+
+        // Under the override the main policy's keyed requests have no
+        // document yet, while the hash ring on both sides of the pair has
+        // one. The pair configuration's document then plans pairs alone.
+        let mut keyed = RouterConfig {
+            mode: pair_mode(
+                Some(PolicyConfig::ConsistentHashing),
+                Some(PolicyConfig::ConsistentHashing),
+            ),
+            ..config(PolicyConfig::RoundRobin)
+        };
+        keyed.routing_key_override.enabled = true;
+        keyed.routing_key_override.headers = vec![MANUAL_SESSION_HEADER.to_string()];
+        let pairs_alone = keyed.policy_document();
+        assert!(pairs_alone.is_ok(), "{pairs_alone:?}");
+        assert_eq!(many_routers(keyed.clone()).policy_document(), pairs_alone);
+        // The same main policy alone is refused by the setting's name.
+        keyed.mode = RouterConfig::default().mode;
+        assert_eq!(
+            refusal(&many_routers(keyed)),
+            ("routing_key_override.enabled", "true".to_string())
+        );
     }
 }

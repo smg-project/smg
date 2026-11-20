@@ -7,6 +7,11 @@
 //! mixing is fixed (seed = 1337 + xxh3(lora_name, 0) + xxh3(cache_salt, 1),
 //! wrapping), so a corpus hashed elsewhere by the same rule stays comparable. Empty strings count as absent, as a client
 //! sending `lora_name = ""` means the base model.
+//!
+//! A host with no token ids hashes fixed windows of a request's text
+//! ([`request_text_hashes_with_seed`]). Their seed adds xxh3("text", 2) to
+//! the namespace's, so a window of text and a block of token ids over the
+//! same bytes never share a hash.
 
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
@@ -72,6 +77,27 @@ pub fn request_content_hashes_with_seed(
     token_ids
         .chunks_exact(block_size)
         .map(|block| content_hash_with_seed(block, seed))
+        .collect()
+}
+
+/// The seed a namespace's text windows hash under: the namespace's own
+/// with the text kind folded in, as [`namespace_seed`] folds its parts.
+fn text_seed(seed: u64) -> u64 {
+    seed.wrapping_add(xxh3_64_with_seed(b"text", 2))
+}
+
+/// The text form of [`request_content_hashes_with_seed`], for a host with
+/// no token ids: one hash per full window of `window` bytes of the text,
+/// the partial tail ignored. A window is of the text's bytes as the request
+/// carries them, so it may end inside a character. `seed` is the
+/// namespace's (see [`namespace_seed`]).
+pub fn request_text_hashes_with_seed(text: &[u8], window: usize, seed: u64) -> Vec<ContentHash> {
+    if window == 0 {
+        return Vec::new();
+    }
+    let seed = text_seed(seed);
+    text.chunks_exact(window)
+        .map(|bytes| ContentHash(xxh3_64_with_seed(bytes, seed)))
         .collect()
 }
 
@@ -153,6 +179,48 @@ mod tests {
             namespaced_content_hash(&TOKENS[..4], Some("adapter"), None)
         );
         assert!(namespaced_request_content_hashes(&TOKENS, 0, None, None).is_empty());
+    }
+
+    #[test]
+    fn text_windows_follow_the_byte_grid_under_the_documented_seed() {
+        let seed = namespace_seed(Some("adapter"), None);
+        let window = |bytes: &[u8]| {
+            ContentHash(xxh3_64_with_seed(
+                bytes,
+                seed.wrapping_add(xxh3_64_with_seed(b"text", 2)),
+            ))
+        };
+        // Ten bytes are two windows of four: the tail of two is not hashed.
+        assert_eq!(
+            request_text_hashes_with_seed(b"abcdefghij", 4, seed),
+            [window(b"abcd"), window(b"efgh")]
+        );
+        // A window ends where its bytes end, inside a character or not.
+        let text = "abc\u{e9}";
+        assert_eq!(text.len(), 5);
+        assert_eq!(
+            request_text_hashes_with_seed(text.as_bytes(), 4, seed),
+            [window(&text.as_bytes()[..4])]
+        );
+        assert!(request_text_hashes_with_seed(b"abc", 4, seed).is_empty());
+        assert!(request_text_hashes_with_seed(b"abcd", 0, seed).is_empty());
+    }
+
+    #[test]
+    fn a_text_window_keeps_to_its_kind_and_its_namespace() {
+        // One id whose little-endian bytes are the window's own.
+        let id = u32::from_le_bytes(*b"abcd");
+        let text = |seed| request_text_hashes_with_seed(b"abcd", 4, seed);
+        assert_ne!(
+            text(XXH3_SEED),
+            [content_hash_with_seed(&[id], XXH3_SEED)],
+            "a token block over the same bytes"
+        );
+        assert_ne!(
+            text(XXH3_SEED),
+            text(namespace_seed(None, Some("tenant"))),
+            "another namespace"
+        );
     }
 
     /// The streaming hasher's digest of the same ids: the rule a corpus

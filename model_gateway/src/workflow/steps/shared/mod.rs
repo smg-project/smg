@@ -12,7 +12,7 @@ use std::sync::Arc;
 pub use activate::ActivateWorkersStep;
 #[cfg(test)]
 pub(crate) use register::registration_hold;
-pub(crate) use register::REGISTER_WORKERS_STEP;
+pub(crate) use register::{pool_groups_touched, RegisterBesideRowsStep, REGISTER_WORKERS_STEP};
 pub use register::{registered_entries, registered_in, RegisterWorkersStep};
 use smg_worker::identity::basic::Worker;
 pub(crate) use update_policies::start_kv_stream;

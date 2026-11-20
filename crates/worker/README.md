@@ -7,8 +7,8 @@ what a worker is on the wire, and the runtime a process needs to host
 workers. The wire types are the default layer: a crate that only reads or
 writes them links six crates and nothing else. The runtime sits behind the
 `runtime` feature: the worker itself, the registry, the connection to its
-engine, health, load monitoring, the KV event collector and metrics. The
-gateway hosts the runtime; the other crates of the workspace take only the
+engine, health, load monitoring, the KV event collector, the job queue and
+metrics. The gateway hosts the runtime. Other crates of the workspace take the
 layer they need.
 
 What it holds:
@@ -25,6 +25,9 @@ What it holds:
   that collects each worker's load report.
 - **KV cache events.** The collector of the KV cache events an engine pushes,
   and the port to the host's sink that applies them.
+- **Jobs.** The worker jobs port that the health manager, discovery and
+  registration ask through, and the queue that dispatches and tracks a host's
+  jobs.
 - **Metrics.** The worker's metric writers, and the store that drops a
   worker's series when the worker leaves.
 - **The wire types and the proto.** A worker's spec, info, status and load
@@ -64,8 +67,8 @@ The default feature set is empty, so every other layer is asked for by name.
 | `axum` | The HTTP responses of the admin types. | | `axum` | A crate that answers the admin API. |
 | `metrics` | What the worker's metric writers share with a host's: the bounded label set, the one set of model labels and the handles a record keeps. | | `dashmap`, `rustc-hash` | A crate with metric writers of its own. `smg-external-router` is one. |
 | `proto` | `common_proto`: the Rust types of `proto/common.proto`. The build then runs `protoc`. | | `prost`, `prost-build` | A crate that speaks gRPC to an engine. `smg-grpc-client` is one. |
-| `runtime` | The worker runtime: the worker and its builder, the registry, health, the load monitor, the metric writers, the engine handle and the collector of the KV cache events. | `metrics`, `proto` | `anyhow`, `arc-swap`, `async-trait`, `chrono`, `futures`, `kv-index`, `metrics`, `metrics-exporter-prometheus`, `metrics-util`, `once_cell`, `openmetrics-parser`, `parking_lot`, `quanta`, `reqwest`, `rustls`, `thiserror`, `tokio`, `tonic`, `tracing`, `uuid` | The process that hosts the workers. The gateway is one. |
-| `test-util` | `test_support`: what a test builds its workers with, a scripted engine among it. It also opens the test readers and hooks of the registry, the series store, the label interner and the KV event collector. | `runtime` | `tonic-prost` | The tests of a crate that hosts the runtime. |
+| `runtime` | The worker runtime: the worker and its builder, the registry, health, the load monitor, the metric writers, the engine handle, the collector and apply rules for KV cache events, and the job queue. | `metrics`, `proto` | `anyhow`, `arc-swap`, `async-trait`, `chrono`, `futures`, `kv-index`, `metrics`, `metrics-exporter-prometheus`, `metrics-util`, `once_cell`, `openmetrics-parser`, `parking_lot`, `quanta`, `reqwest`, `rustls`, `thiserror`, `tokio`, `tonic`, `tracing`, `uuid` | The process that hosts the workers. The gateway is one. |
+| `test-util` | `test_support`: what a test builds its workers with, a scripted engine among it. It also opens the test readers and hooks of the registry, the series store, the label interner, the KV event collector and the job queue. | `runtime` | `tonic-prost` | The tests of a crate that hosts the runtime. |
 | `workflow` | `workflow`: the worker side of the workflows a host runs over its workers. A removal in registry order selects and drains workers, then removes them from the registry. In door order it selects workers and waits for them to settle between the host's drain and removal. It also holds a local worker's detection and creation at registration (connection and runtime detection, metadata and data-parallel reads, then the worker objects), the data the steps pass along, and the host trait they read. | `runtime` | `wfaas` | A host that registers or removes workers by a workflow. The gateway is one. |
 
 "Turns on" names other features of this crate. "Pulls in" names the crates a
@@ -211,7 +214,10 @@ What the block shows:
   its check is due. A `Pending` worker becomes `Ready` after enough probes
   pass in a row, two by default. A `Ready` worker becomes `NotReady` after
   enough fail in a row, three by default. Keep the returned `WorkerManager`:
-  dropping it stops the checks.
+  dropping it stops the checks. A host that keeps a worker's status elsewhere
+  hands its sink to `WorkerManager::start_with_sink`, or to
+  `WorkerManager::maybe_start_with_sink`, which starts the loop only where
+  `WorkerManager::maybe_start` would.
 - **`None` leaves the `WorkerJobs` port empty.** The manager then asks nobody
   to remove a failed worker or to read a worker's labels again.
   `UnhealthyRemovalScope::Disabled` says the same of removal: a failed worker
@@ -247,9 +253,10 @@ worker: the admin API takes it as input and returns it as output, so only
 report in it (`SchedulerLoadSnapshot`) holds fixed figures and the values an
 engine reports by name (`NamedValue`). The named values are those of the
 rank's newest record: a pushed record's list takes the place of the last.
-What a pushed record names past the list's bounds is dropped and counted by
-worker in `smg_engine_load_values_dropped_total`. They live in the `worker`
-module, and the model card in `model_card`.
+What a pushed record or a polled answer names past the list's bounds is
+dropped and counted by worker in `smg_engine_load_values_dropped_total`. A
+`values` key of another shape fails no answer: it reads as no list. These
+types live in the `worker` module, and the model card in `model_card`.
 
 The proto is one file, `proto/common.proto`, package `smg.grpc.common`. It
 declares the messages every engine's gRPC service shares: the tokenizer's
@@ -296,10 +303,11 @@ A port is a trait this crate calls and a host implements.
 | `EngineConnector` | `connection::engine` | How to connect a gRPC or ZMQ worker to its engine, and how to dial a gRPC address once. | Its gRPC and ZMQ connector. |
 | `EngineConnection` | `connection::engine` | The calls the runtime makes on a connected engine: liveness, the health and load reads, the labels the engine reports of its model and of itself, the admin calls and the two pushed streams. | Its client of an engine. |
 | `ConnectorDefault` | `connection::engine` | The connector a builder uses when it is handed none. | The same connector. |
-| `WorkerJobs` | `jobs` | How to remove workers at an address, how to read a worker's labels again, how to register a worker, and whether a job of an address is in flight. | Its job queue. |
-| `LoadSink` | `load::port` | What a pushed record or a poll's answer means for routing: the receipts and the poll decision, the overload verdict, what its readers cache. | Nothing to write for the crate's own sink: `WorkerMonitor::new` builds it over the registry and the routing side. A host with a load store of its own writes this trait and hands it to `WorkerMonitor::with_sink`. |
+| `WorkerJobs` | `jobs` | How to remove workers at an address, how to read a worker's labels again, how to register a worker, and whether a job of an address is in flight. | Nothing to write: the crate's `JobQueue` implements it over the host's `JobHost`, for a job type that accepts a `WorkerJob`. |
+| `JobHost` | `jobs::queue` | What jobs the queue takes and how they run. | Its application context. |
+| `LoadSink` | `load::port` | What a pushed record or a poll's answer means for routing: the receipts and the poll decision, the overload verdict, what its readers cache. | Under the classic policies nothing to write: `WorkerMonitor::new` builds the crate's own sink over the registry and the routing side. Where the gateway decides under the policy controller in its own process, the sink of the gateway's feed: the controller crate's load adapter, which writes the store's rows, and a loop of the feed that publishes what waits for the store's window. Under a controller's address the gateway runs no load collector. A host with a load store of its own writes this trait and hands it to `WorkerMonitor::with_sink`. |
 | `LoadConsumer` | `load::monitor` | Whether a reader wants loads, and how to trim what readers booked on a worker. | Its policy registry. |
-| `HealthSink` | `health::port` | What a probe's outcome or a connect signal does to a worker's status. | Nothing to write: the crate's registry is the sink, and `WorkerManager::start` hands it. |
+| `HealthSink` | `health::port` | What a probe's outcome or a connect signal does to a worker's status, and that a worker's liveness veto moved. | Under the classic policies nothing to write: the crate's registry is the sink, and `WorkerManager::start` hands it. Where the gateway decides under the policy controller in its own process, the sink of the gateway's feed: the store keeps the health of a worker that has a row, and the registry keeps the rest. Under a controller's address the gateway runs no health checks. The collector calls `liveness_moved` when a worker's liveness veto may have moved. A host that keeps the veto outside the worker object implements it, and the default does nothing. |
 | `RequestCompletionSink` | `identity::basic` | What to do when a request on a worker ends. | The sink its policy registry installs. |
 | `KvEventSink` | `kv_events::port` | What to do with the KV cache events a worker's stream brings: keep each rank's cursor, apply what it admits, and drop a worker's blocks when it leaves. | The sink over its KV indexes. |
 | `KvEventHost` | `kv_events` | What a worker's events subscription feeds: the sink its task opens, and what goes when a model's last events subscription is gone. | Its index side: the models' KV indexes. |
@@ -346,7 +354,7 @@ is always there.
 |---|---|---|
 | `health` | | The overload thresholds. With `runtime`: the health manager, liveness, the circuit breaker, the resilience settings and the probe of a bootstrap port. |
 | `identity` | | A worker's address, parsed once and keyed, and the sampling defaults a worker reports. With `runtime`: the `Worker` trait, `BasicWorker`, its builder, its metadata, the worker errors and the door a worker's address passes. |
-| `kv_events` | | The port between the collector of the KV cache events an engine pushes and a host's sink. With `runtime`: the collector, which keeps one task a worker, and the port of its host. |
+| `kv_events` | | The port between the collector of the KV cache events an engine pushes and a host's sink. With `runtime`, the collector keeps one task a worker, the host supplies the sink, and `apply` puts events into an index. |
 | `labels` | | The labels of a worker's spec that the worker's own code and its hosts read, and `flat_labels`, which turns an engine's answer into a flat map of labels. |
 | `metrics_labels` | | The metric label values the worker's writers share with a host's. |
 | `model_card` | | The model card a worker serves. |
@@ -357,7 +365,7 @@ is always there.
 | `metrics` | `metrics` | The label mechanism shared with a host's writers. With `runtime`: the worker's metric writers and their series store. |
 | `common_proto` | `proto` | The Rust types of `proto/common.proto`. |
 | `connection` | `runtime` | The engine handle a host implements, the HTTP client factory and the cache of worker-directed clients. |
-| `jobs` | `runtime` | The port to a host's job queue, and how a registration writes its address. |
+| `jobs` | `runtime` | The worker jobs port, the jobs it submits, and the queue that dispatches and tracks a host's jobs. |
 | `load` | `runtime` | A worker's requests in flight, the load monitor, the snapshots it publishes, the fleet's capacity and the merge of scraped metrics. |
 | `pd` | `runtime` | What a prefill or decode worker says of its side of a pair. |
 | `periodic_task` | `runtime` | A task on a thread of its own. |

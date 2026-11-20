@@ -514,6 +514,11 @@ What the table says beyond the others:
   as under `auto`, and nothing of the call reaches the client as a call or as content, which is
   what the engine's own server delivers for it. A request with no tools anywhere still reads with
   the variant without calls, whatever its `tool_choice`.
+- **A choice that narrows the tools returns only the calls it leaves callable.** Under a named
+  function, an allowed list or `required`, the gateway's reader drops a call to any other
+  function the same way, one the request did not declare among them, and counts it in the same
+  counter; the calls beside it go out, numbered from zero, and with none left a `tool_calls`
+  finish is `stop` again. Under `auto` every call goes out as before.
 
 - **A JSON answer's quoted spellings are the answer's text under the engine's JSON-answer
   option.** A model held to a JSON answer may spell a marker in a key or a value, and the

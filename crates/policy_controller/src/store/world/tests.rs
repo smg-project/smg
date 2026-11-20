@@ -193,6 +193,7 @@ fn ask(now: Instant) -> Ask {
         now,
         pinned: None,
         affinity: false,
+        signal_cells: false,
     }
 }
 
@@ -456,7 +457,10 @@ fn the_demand_facts_stand_beside_the_rows_written_for_the_asking_gateway() {
             &store,
             WorkerFacts {
                 reachable_from,
-                demand_facts: DemandFacts { runtime },
+                demand_facts: DemandFacts {
+                    runtime,
+                    ..DemandFacts::default()
+                },
                 ..facts(key, Role::Single, &[MODEL])
             },
         )
@@ -1812,7 +1816,9 @@ fn a_row_carries_its_registrations_fixed_facts_and_reads_its_own_rank() {
         (row.in_flight, row.session_in_flight, row.active_sessions),
         (0, 0, 0)
     );
-    assert!(!row.has_capacity && !row.has_room && !row.health.overloaded);
+    assert!(!row.health.overloaded);
+    // No admission window is the store's to know: both bits read open.
+    assert!(row.has_capacity && row.has_room);
     assert_eq!(row.connector, 0);
     // Under a generation that declares no list the listed fields read 0.
     assert_eq!((row.zone, row.labels, row.engine_kind), (0, 0, 0));
@@ -3857,6 +3863,105 @@ fn a_store_with_no_threshold_writes_no_verdict() {
     store.record(a, 0, pressure(1_000, 1_000), t0, LoadSource::Stream);
     assert_eq!(overloaded(&store, t0), []);
     assert_eq!(store.overload_flips(), 0, "no write moved a verdict");
+}
+
+/// The workers the standing world publishes under an overload verdict, and
+/// the epoch of its verdicts.
+fn shown(store: &MemoryStore) -> (Vec<WorkerId>, u64) {
+    store.with_world(|world| {
+        let over = world.overloaded().map(|row| row.id).collect();
+        (over, world.overload_epoch())
+    })
+}
+
+#[test]
+fn the_published_world_hands_the_rows_under_an_overload_verdict() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    store
+        .apply(generation_with(1, block(2, 0.9)))
+        .expect("applied");
+    let a = member(&store, "http://a:8000");
+    let b = member(&store, "http://b:8000");
+    store.record(a, 0, pressure(3, 0), t0, LoadSource::Stream);
+    store.record(b, 0, pressure(1, 0), t0, LoadSource::Stream);
+    assert_eq!(shown(&store).0, [a]);
+    // The queue drains, and the next publication hands no row.
+    store.record(a, 0, pressure(0, 0), t0, LoadSource::Stream);
+    assert_eq!(shown(&store).0, []);
+    // A worker's row is handed by its id with the figures it carries, and
+    // none for a worker no pool lists.
+    let queued = |id| {
+        store.with_world(|world| {
+            let load = world.first_row_of(id).and_then(|row| row.load);
+            load.map(|load| load.queued)
+        })
+    };
+    assert_eq!((queued(a), queued(b)), (Some(0), Some(1)));
+    assert_eq!(queued(WorkerId(u64::MAX)), None);
+}
+
+#[test]
+fn a_worlds_overload_epoch_moves_in_the_world_that_shows_the_verdict() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    store
+        .apply(generation_with(1, block(2, 0.9)))
+        .expect("applied");
+    let a = member(&store, "http://a:8000");
+    // The first record after a quiet window is shown at once. Under the
+    // threshold it moves no verdict and no epoch.
+    let (_, quiet) = shown(&store);
+    store.record(a, 0, pressure(1, 0), t0, LoadSource::Stream);
+    assert_eq!(shown(&store), (vec![], quiet));
+    // A record over the threshold lands inside the window. The store has
+    // counted its flip, and the standing world shows neither the verdict
+    // nor another epoch.
+    let late = t0 + Duration::from_millis(5);
+    store.record(a, 0, pressure(3, 0), late, LoadSource::Stream);
+    assert_eq!(store.overload_flips(), 1);
+    assert_eq!(shown(&store), (vec![], quiet));
+    // A call ahead of the window's end shows nothing and moves neither.
+    store.publish(t0 + PUBLISH_WINDOW - Duration::from_millis(1));
+    assert_eq!(shown(&store), (vec![], quiet));
+    // The window's end shows the verdict and its epoch in one world.
+    let end = t0 + PUBLISH_WINDOW;
+    store.publish(end);
+    let (over, vetoed) = shown(&store);
+    assert_eq!(over, [a]);
+    assert_ne!(vetoed, quiet);
+    // A record that moves no verdict leaves the epoch where it stands.
+    store.record(a, 0, pressure(4, 0), end, LoadSource::Stream);
+    store.publish(end + PUBLISH_WINDOW);
+    assert_eq!(shown(&store), (vec![a], vetoed));
+}
+
+#[test]
+fn a_membership_build_moves_the_overload_epoch_whatever_it_judges() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    // One worker names a count of its own, under no pool's pair.
+    let naming = |overload| WorkerFacts {
+        overload,
+        ..facts("http://a:8000", Role::Single, &[MODEL])
+    };
+    let count = Overload {
+        waiting_requests: Some(2),
+        kv_usage_permille: None,
+    };
+    let a = admit(&store, naming(count));
+    store.record(a, 0, pressure(3, 0), t0, LoadSource::Stream);
+    let (over, vetoed) = shown(&store);
+    assert_eq!(over, [a]);
+    // Its registration is written again and names no count. The build's
+    // rows start with no bit and no threshold has the engine judged: the
+    // verdict goes with no judgment to move it, and no write is counted.
+    let flips = store.overload_flips();
+    admit(&store, naming(Overload::default()));
+    let (over, built) = shown(&store);
+    assert_eq!(over, []);
+    assert_ne!(built, vetoed);
+    assert_eq!(store.overload_flips(), flips);
 }
 
 #[test]

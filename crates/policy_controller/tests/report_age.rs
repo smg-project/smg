@@ -465,6 +465,7 @@ fn check_view_limit(limit_ms: u64) {
             now: at,
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         store.with_world(|world| {
             let mut buffers = ViewBuffers::default();

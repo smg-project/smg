@@ -26,8 +26,8 @@ use smg_worker::{
 
 use super::{object::role, Lead, Objects};
 use crate::{
-    load_report::load_row,
-    store::{LoadSink as StoreLoadSink, LoadSource, PollMode as StorePollMode},
+    load_report::{load_row, signal_values},
+    store::{LoadSink as StoreLoadSink, LoadSource, PollMode as StorePollMode, SignalSink},
     view::{Role, SignalSource, WorkerId},
 };
 
@@ -64,6 +64,12 @@ struct KeptMember {
 /// A reset drops the loads of every row that is not `Ready`, by the row's
 /// own status.
 /// The host publishes the store's pending writes.
+///
+/// Behind each row go the values its report states of the signals the
+/// document in force declares ([`signal_values`]), written to the store's
+/// signal sink at the row's rank. A polled row the store passed over
+/// takes its values with it. Under a document that declares no signal a
+/// record reads one empty list more.
 pub struct LoadAdapter<G, S: ?Sized> {
     objects: Arc<Objects<G>>,
     store: Arc<S>,
@@ -75,7 +81,7 @@ pub struct LoadAdapter<G, S: ?Sized> {
     period_taken: bool,
 }
 
-impl<G: Generation, S: StoreLoadSink + ?Sized> LoadAdapter<G, S> {
+impl<G: Generation, S: StoreLoadSink + SignalSink + ?Sized> LoadAdapter<G, S> {
     /// For the lead under `term`. Tells the store once how often the
     /// collector hears each ready rank, by its stream or a poll. The store
     /// keeps the first period it is told: [`Self::period_taken`] says
@@ -167,6 +173,10 @@ impl<G: Generation, S: StoreLoadSink + ?Sized> LoadAdapter<G, S> {
             ConnectionMode::Grpc => LoadSource::Poll,
             ConnectionMode::Http | ConnectionMode::Zmq => LoadSource::Scrape,
         };
+        let columns = self.store.signal_columns();
+        // Each row's report, kept past its row where the document declares
+        // a signal.
+        let mut stated = Vec::new();
         let rows: Vec<_> = answer
             .filter_map(|(worker, report)| {
                 // A member whose status left `Ready` while its poll was out
@@ -175,11 +185,13 @@ impl<G: Generation, S: StoreLoadSink + ?Sized> LoadAdapter<G, S> {
                     return None;
                 }
                 let member = self.member(worker)?;
-                let row = report
-                    .filter(|report| !report.loads.is_empty())
-                    .map(|report| {
-                        load_row(report, member.role, received_at, received_at, source.into())
-                    });
+                let report = report.filter(|report| !report.loads.is_empty());
+                let row = report.map(|report| {
+                    load_row(report, member.role, received_at, received_at, source.into())
+                });
+                if !columns.is_empty() {
+                    stated.push(report);
+                }
                 Some((member.row, member.rank, row))
             })
             .collect();
@@ -187,8 +199,23 @@ impl<G: Generation, S: StoreLoadSink + ?Sized> LoadAdapter<G, S> {
         {
             return Vec::new();
         }
-        self.store
-            .report(&rows, polled_at, source)
+        let passed = self.store.report(&rows, polled_at, source);
+        // The rows first, then their values, each dated as its row is: at
+        // the poll's start. The positions the store passed over stand in
+        // the answer's order.
+        let mut skipped = passed.iter().copied().peekable();
+        for (position, (&(row, rank, _), report)) in rows.iter().zip(stated).enumerate() {
+            if skipped.next_if_eq(&position).is_some() {
+                continue;
+            }
+            let Some(report) = report else {
+                continue;
+            };
+            signal_values(report, &columns, polled_at, |column, unit, value, at| {
+                self.store.signal_value(row, rank, column, unit, value, at);
+            });
+        }
+        passed
             .into_iter()
             .filter_map(|position| rows.get(position))
             .map(|&(_, rank, _)| i32::from(rank))
@@ -196,7 +223,11 @@ impl<G: Generation, S: StoreLoadSink + ?Sized> LoadAdapter<G, S> {
     }
 }
 
-impl<G: Generation, S: StoreLoadSink + ?Sized + 'static> LoadSink for LoadAdapter<G, S> {
+impl<G, S> LoadSink for LoadAdapter<G, S>
+where
+    G: Generation,
+    S: StoreLoadSink + SignalSink + ?Sized + 'static,
+{
     fn record(
         &self,
         worker: &Arc<dyn Worker>,
@@ -229,6 +260,12 @@ impl<G: Generation, S: StoreLoadSink + ?Sized + 'static> LoadSink for LoadAdapte
         );
         self.store
             .record(member.row, rank, row, received_at, LoadSource::Stream);
+        // The row first, then its values.
+        let columns = self.store.signal_columns();
+        signal_values(report, &columns, sampled_at, |column, unit, value, at| {
+            self.store
+                .signal_value(member.row, rank, column, unit, value, at);
+        });
     }
 
     fn poll_mode(&self, worker: &Arc<dyn Worker>, now: Instant, interval: Duration) -> PollMode {
@@ -327,14 +364,15 @@ mod tests {
     use smg_worker::{
         load::port::GroupTick,
         registry::WorkerRegistry,
-        worker::{SchedulerLoadSnapshot, WorkerStatus as ObjectStatus},
+        worker::{LoadTelemetry, NamedValue, SchedulerLoadSnapshot, WorkerStatus as ObjectStatus},
     };
 
     use super::*;
     use crate::{
+        spec::{AcrossRanks, AppliedSpec, PolicySpec, SignalSpec},
         store::{
             Ask, GatewayId, LoadSample, LoadSource, MemoryStore, Overload,
-            PollMode as StorePollMode, ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus,
+            PollMode as StorePollMode, Taken, ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus,
             WorkersStore,
         },
         view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
@@ -414,6 +452,25 @@ mod tests {
         }
     }
 
+    impl SignalSink for Store {
+        fn signal_columns(&self) -> Arc<[crate::SignalColumn]> {
+            self.memory.signal_columns()
+        }
+
+        fn signal_value(
+            &self,
+            id: WorkerId,
+            rank: u16,
+            column: &crate::SignalColumn,
+            unit: &str,
+            value: f64,
+            sampled_at: Instant,
+        ) -> Taken {
+            self.memory
+                .signal_value(id, rank, column, unit, value, sampled_at)
+        }
+    }
+
     struct Replica {
         objects: Arc<Objects<Members>>,
         store: Arc<Store>,
@@ -430,11 +487,7 @@ mod tests {
             }
         }
 
-        fn adapter(
-            &self,
-            lead: Arc<dyn Lead>,
-            term: u64,
-        ) -> LoadAdapter<Members, dyn StoreLoadSink> {
+        fn adapter(&self, lead: Arc<dyn Lead>, term: u64) -> LoadAdapter<Members, Store> {
             LoadAdapter::new(
                 Arc::clone(&self.objects),
                 self.store.clone(),
@@ -444,7 +497,7 @@ mod tests {
             )
         }
 
-        fn lead(&self) -> LoadAdapter<Members, dyn StoreLoadSink> {
+        fn lead(&self) -> LoadAdapter<Members, Store> {
             self.adapter(Arc::new(SoleLead), SoleLead::TERM)
         }
 
@@ -496,6 +549,7 @@ mod tests {
                 now,
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             self.store
                 .memory
@@ -540,6 +594,8 @@ mod tests {
                 num_waiting_reqs: running,
                 gen_throughput: 30.0,
                 prefill_throughput: Some(900.0),
+                // A rank's core: it states neither fixed token count.
+                kept: LoadTelemetry::USED_TOKENS | LoadTelemetry::TOTAL_TOKENS,
                 ..Default::default()
             }],
             ..Default::default()
@@ -1185,5 +1241,162 @@ mod tests {
         adapter.forget(&worker);
         adapter.reset();
         assert_eq!(replica.store.calls.lock().periods, 1);
+    }
+
+    /// One row's cells as a publication holds them: each cell's value and
+    /// its sample instant, or none.
+    type Held = Vec<Option<(f64, u64)>>;
+
+    /// The `random` preset as the next generation, declaring the depth in
+    /// items and the fixed count of used tokens, applied to the store.
+    fn declare(replica: &Replica) {
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        document.generation = 2;
+        for (name, unit) in [("depth", "items"), ("kv_tokens_used", "tokens")] {
+            let spec = SignalSpec {
+                unit: unit.to_owned(),
+                max_age_ms: None,
+                across_ranks: AcrossRanks::default(),
+            };
+            document.signals.insert(name.to_owned(), spec);
+        }
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        let applied = replica.store.memory.apply(spec);
+        applied.expect("a newer generation");
+    }
+
+    /// Each row's signal cells once the store's writes are shown, by
+    /// worker, in the declared names' order: the depth, then the tokens.
+    fn cells(replica: &Replica) -> FxHashMap<WorkerId, Held> {
+        replica.publish();
+        replica.store.memory.deciding(|world| {
+            let ask = Ask {
+                gateway: GatewayId(1),
+                now: Instant::now(),
+                pinned: None,
+                affinity: false,
+                signal_cells: true,
+            };
+            let mut out = ViewBuffers::default();
+            let view = world
+                .view(MODEL, Role::Single, &ask, false, &mut out)
+                .expect("the pool");
+            let block = view.signal_cells.expect("the publication's block");
+            let held = |cell: &crate::SignalCell| {
+                (!cell.is_none()).then_some((cell.value, cell.sampled_at_micros))
+            };
+            let cells = block.cells().chunks(block.signals());
+            let ids = view.candidates.iter().map(|row| row.id);
+            ids.zip(cells.map(|cells| cells.iter().map(held).collect()))
+                .collect()
+        })
+    }
+
+    /// One rank's report: its depth by name, a name no document declares,
+    /// and the fixed count of used tokens.
+    fn stating(rank: i32, depth: f64, age_ms: Option<u32>) -> WorkerLoadResponse {
+        let stated = |name: &str, value| NamedValue {
+            name: name.into(),
+            unit: "items".into(),
+            value,
+            age_ms,
+        };
+        WorkerLoadResponse {
+            dp_rank_count: 1,
+            loads: vec![SchedulerLoadSnapshot {
+                dp_rank: rank,
+                num_running_reqs: 1,
+                num_used_tokens: 1_024 + rank,
+                max_total_num_tokens: 8_192,
+                values: vec![stated("depth", depth), stated("other", 1.0)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_records_declared_values_follow_its_row_into_the_store() {
+        let replica = Replica::new();
+        // The second rank of two: a value written at another rank reaches
+        // no row.
+        let (id, worker) = replica.add(WorkerFacts {
+            dp_rank: 1,
+            dp_size: 2,
+            ..facts(URL)
+        });
+        declare(&replica);
+        let adapter = replica.lead();
+        let sampled = Instant::now() + Duration::from_secs(1);
+        let received = sampled + Duration::from_millis(37);
+        adapter.record(&worker, 1, &stating(1, 3.0, Some(20)), received, sampled);
+        // A value is as old as it says before its record's sample, and one
+        // that states no age is as old as its record.
+        let store = &replica.store.memory;
+        let aged = store.micros(sampled - Duration::from_millis(20));
+        let held = [Some((3.0, aged)), Some((1_025.0, store.micros(sampled)))];
+        assert_eq!(cells(&replica)[&id], held);
+        // The name no document declares was never offered: no write
+        // counts it.
+        assert_eq!(store.counts().signal_writes, [2, 0, 0, 0, 0, 0]);
+        // A record that leaves the names out leaves their cells.
+        let later = received + PERIOD;
+        adapter.record(&worker, 1, &report(1, 4), later, later);
+        let row = replica.store.load(id, 1).expect("the later row");
+        assert_eq!(row.row.running, 4);
+        assert_eq!(cells(&replica)[&id], held);
+        assert_eq!(store.counts().signal_writes, [2, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_polled_answers_values_follow_the_rows_the_store_took() {
+        let replica = Replica::new();
+        let [(zero, first), (one, second)] = replica.two_ranks(None);
+        declare(&replica);
+        let adapter = replica.lead();
+        let asked = Instant::now();
+        // Rank 0's own record lands while the poll is out: its polled row
+        // is passed over, and takes its values with it.
+        let pushed = asked + Duration::from_millis(1);
+        adapter.record(&first, 0, &report(0, 7), pushed, pushed);
+        let answers = [stating(0, 3.0, None), stating(1, 5.0, None)];
+        let ranks = adapter.report(
+            &[
+                polled(&first, Some(&answers[0])),
+                polled(&second, Some(&answers[1])),
+            ],
+            asked,
+        );
+        assert_eq!(ranks.newer, [0]);
+        // A polled value is dated as its row is: at the poll's start.
+        let store = &replica.store.memory;
+        let at = store.micros(asked);
+        let held = cells(&replica);
+        assert_eq!(held[&zero], [None, None]);
+        assert_eq!(held[&one], [Some((5.0, at)), Some((1_025.0, at))]);
+        assert_eq!(store.counts().signal_writes, [2, 0, 0, 0, 0, 0]);
+        // A failed fetch and an answer with no row write no value.
+        let empty = WorkerLoadResponse::default();
+        adapter.report(&[polled(&first, Some(&empty))], asked + PERIOD);
+        adapter.fetch_failed(slice::from_ref(&first), asked + PERIOD);
+        assert_eq!(store.counts().signal_writes, [2, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_record_that_lays_no_row_writes_no_value() {
+        let replica = Replica::new();
+        let (id, worker) = replica.add(facts(URL));
+        declare(&replica);
+        let now = Instant::now();
+        // An adapter whose term ended, then a worker that is not ready.
+        let lead = Arc::new(TestLead(Mutex::new(Some(2))));
+        let ended = replica.adapter(lead, 1);
+        ended.record(&worker, 0, &stating(0, 3.0, None), now, now);
+        worker.set_status(ObjectStatus::NotReady);
+        let adapter = replica.lead();
+        adapter.record(&worker, 0, &stating(0, 3.0, None), now, now);
+        assert_eq!(replica.store.ranks(id), 0);
+        let counts = replica.store.memory.counts();
+        assert_eq!(counts.signal_writes, [0; 6]);
     }
 }

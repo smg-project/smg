@@ -70,7 +70,7 @@ use crate::{
         otel_trace::{inject_trace_context_http, with_trace_context_http},
     },
     policies::{CacheNamespace, PolicyRegistry},
-    policy_controller::host::{self, Ask, BehindAnswer, Host, Placed, Sent},
+    policy_controller::host::{self, Ask, BehindAnswer, Host, Placed, Prompt, Sent},
     rate_limit::RateLimitManager,
     routers::{
         common::{
@@ -537,7 +537,7 @@ impl Router {
             // The state the attempts share; `TypedAttempt` names each piece.
             let tried = parking_lot::Mutex::new(Vec::new());
             let tried_rows = parking_lot::Mutex::new(Vec::new());
-            let ledger = AttemptLedger::default();
+            let ledger = AttemptLedger::of(self.host.is_some());
             let attempt = TypedAttempt {
                 headers,
                 lease: &lease,
@@ -813,6 +813,22 @@ impl Router {
         models.all(|other| other == model).then(|| model.to_owned())
     }
 
+    /// The refusal of a request that names its worker, where the model's
+    /// classic policy holds it to that worker ([`placement::strict_target`]).
+    /// The host reads no explicit target yet and would place the request on
+    /// another worker, so the shape is refused by name.
+    fn explicit_target_refusal(
+        &self,
+        model_id: &str,
+        headers: Option<&HeaderMap>,
+    ) -> Option<Response> {
+        // A request that names no worker pays the header's probe alone.
+        header_utils::extract_target_worker(headers)?;
+        let policy = self.policy_registry.get_policy_or_default(model_id);
+        placement::strict_target(policy.as_ref(), headers)
+            .then(|| crate::policy_controller::refused("an explicit target worker"))
+    }
+
     /// The attempt's placement by the policy controller, or the answer of a
     /// request it did not place. The commit keeps to this router's own pool
     /// ([`RoutingPool::HttpRegular`]): the router sends plain HTTP to a
@@ -849,13 +865,26 @@ impl Router {
                 error::model_not_found(&model),
             ));
         }
+        if let Some(refusal) = self.explicit_target_refusal(&model, attempt.headers) {
+            return Err(refusal);
+        }
         let id = host::mark();
         let tried = attempt.tried_rows.lock().clone();
+        // The prompt the classic arm routes by: the request's token ids
+        // where it has them, else its text.
+        let hashes = attempt.lease.with_view(|view| {
+            let prompt = Prompt {
+                text: view.text,
+                ..Prompt::of(view.tokens, view.cache_namespace)
+            };
+            host.hashes(&model, &prompt)
+        });
         let ask = Ask {
             streaming: attempt.is_stream,
             headers: attempt.headers,
             rid: attempt.rid,
             tried: &tried,
+            hashes: Some(&hashes),
             ..Ask::of(&id, &model)
         };
         let ledger = attempt.ledger;
@@ -1410,6 +1439,9 @@ impl Router {
         }
         if pool.iter().all(|worker| worker.is_dp_aware()) {
             return Err(Self::transcription_dp_not_supported());
+        }
+        if let Some(refusal) = self.explicit_target_refusal(model_id, headers) {
+            return Err(refusal);
         }
 
         let id = host::mark();

@@ -397,8 +397,8 @@ impl<D: Deref<Target = Door>> Handle<D> {
             },
             #[cfg(feature = "client")]
             Arm::Link(link) => {
-                // A full queue ends the link. Session cleanup covers the leases.
-                let _ = link.report(wire::frame(lease, side, said));
+                // With no session standing the report waits in the link's line.
+                link.report(wire::frame(lease, side, said));
             }
         }
     }
@@ -2123,6 +2123,46 @@ mod tests {
             .await;
         }
 
+        /// A request can outlast the session its decision came over. Its
+        /// handle holds the gateway's link, so what it reports then waits
+        /// for the next session and rides it.
+        #[tokio::test(start_paused = true)]
+        async fn a_request_that_outlasts_its_session_reports_on_the_next_one() {
+            let mut peer = Peer::patient(1);
+            let now = Instant::now();
+            let mut handle = answered(&mut peer, picked(), now)
+                .await
+                .expect("the pick is held");
+            let target = handle.take(1).expect("the pick's second target");
+            assert_eq!(target.id, WorkerId(19));
+            peer.end_session().await;
+            handle.dispatched(now + Duration::from_micros(250));
+
+            drop(peer.redial(1));
+            peer.read_hello().await;
+            let complete = outcome(WorkerId(28), TransportClass::Ok);
+            handle.completed(&complete, now + Duration::from_millis(5));
+            drop(handle);
+            reports(
+                &mut peer,
+                [
+                    dispatch(1, 250),
+                    Frame::Completed(proto::Completed {
+                        lease_id: 73,
+                        side: proto::Side::Single.into(),
+                        served: 28,
+                        status: 200,
+                        class: Class::Ok.into(),
+                        ttft_micros: 1_000,
+                        tokens_in: 12,
+                        tokens_out: 34,
+                        duration_micros: 5_000,
+                    }),
+                ],
+            )
+            .await;
+        }
+
         #[tokio::test(start_paused = true)]
         async fn a_link_reports_when_every_commit_is_refused_or_a_client_leaves() {
             let now = Instant::now();
@@ -2532,7 +2572,10 @@ mod tests {
             let mut peer = Peer::new(1);
             let mut ask = request(&[1], 7);
             ask.facts.budget_micros = 200_000;
-            ask.constraints.demands = Demands { runtime: 7 };
+            ask.constraints.demands = Demands {
+                runtime: 7,
+                ..Demands::default()
+            };
             let before = tokio::time::Instant::now();
             let answer = timeout(
                 PATIENCE,

@@ -12,13 +12,13 @@ use smg_policy_controller::{
         WorkerStatus as RowStatus, WorkersStore,
     },
     view::{Role, WorkerId},
-    AppliedSpec, PolicySpec,
+    AppliedSpec, LeaseId, PolicySpec, WireModes,
 };
-use smg_worker::identity::basic::Worker;
+use smg_worker::identity::basic::{Worker, WorkerType};
 
-use super::Host;
+use super::{Host, Placed};
 use crate::{
-    config::{PolicyConfig, RouterConfig},
+    config::{PolicyConfig, RouterConfig, RoutingMode},
     policy_controller::start,
     routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
 };
@@ -28,6 +28,12 @@ pub(crate) const MODEL: &str = "model-a";
 
 /// A host, its store, and the registry's workers in the URLs' order.
 type Bed = (Host, Arc<MemoryStore>, Vec<Arc<dyn Worker>>);
+
+/// The id of the lease `placed` holds: a router's case reads the lease's
+/// sides in the store by it.
+pub(crate) fn lease_of(placed: &Placed) -> LeaseId {
+    placed.handle.lease().expect("a lease").lease.id
+}
 
 /// The store a start makes under the controller with one ready row a URL,
 /// a registry with one worker a URL, and the host over the two.
@@ -80,17 +86,41 @@ fn started<'a>(
     bed_with(store, registry, urls_and_models, ranked_url)
 }
 
-/// Three ready rows under the cache-aware preset, with the second row's id.
-pub(crate) fn cache_bed() -> (Host, Arc<MemoryStore>, WorkerId) {
+/// The URLs of a preset bed's three rows.
+const URLS: [&str; 3] = ["http://w0:8000", "http://w1:8000", "http://w2:8000"];
+
+/// One ready row a URL under the cache-aware preset, over workers
+/// registered in `registry`, each publishing cache events or none.
+fn preset_bed(registry: Arc<WorkerRegistry>, urls: &[&str], events: bool) -> Bed {
     let store = Arc::new(MemoryStore::new());
     let document = PolicySpec::preset("cache_aware").expect("the preset");
     let applied = AppliedSpec::validate(&document).expect("the preset validates");
     store.apply(applied).expect("the store takes the preset");
-    let urls = ["http://w0:8000", "http://w1:8000", "http://w2:8000"];
     let rows = urls.iter().map(|&url| (url, Some(MODEL)));
-    let (host, store, _) = bed_with(store, Arc::new(WorkerRegistry::new()), rows, None);
-    let holder = store.by_key(urls[1]).expect("the second worker's row").id;
+    bed_publishing(store, registry, rows, None, events)
+}
+
+/// [`preset_bed`] of three rows that publish cache events, with the second
+/// row's id.
+pub(crate) fn cache_bed() -> (Host, Arc<MemoryStore>, WorkerId) {
+    let (host, store, _) = preset_bed(Arc::new(WorkerRegistry::new()), &URLS, true);
+    let holder = store.by_key(URLS[1]).expect("the second worker's row").id;
     (host, store, holder)
+}
+
+/// [`preset_bed`] of three rows that publish none: the preset's prefix
+/// stage reads the record of sent prefixes for them.
+pub(crate) fn record_bed() -> (Host, Arc<MemoryStore>) {
+    record_bed_over(Arc::new(WorkerRegistry::new()), &URLS)
+}
+
+/// [`record_bed`] with one row a URL, over workers registered in `registry`.
+pub(crate) fn record_bed_over(
+    registry: Arc<WorkerRegistry>,
+    urls: &[&str],
+) -> (Host, Arc<MemoryStore>) {
+    let (host, store, _) = preset_bed(registry, urls, false);
+    (host, store)
 }
 
 /// [`bed`] over `store` and `registry`: a row publishes cache events where
@@ -102,6 +132,17 @@ pub(crate) fn bed_with<'a>(
     ranked_url: Option<&str>,
 ) -> Bed {
     let events = store.deciding(|world| world.spec().needs().events);
+    bed_publishing(store, registry, urls_and_models, ranked_url, events)
+}
+
+/// [`bed_with`], each row publishing cache events or none.
+fn bed_publishing<'a>(
+    store: Arc<MemoryStore>,
+    registry: Arc<WorkerRegistry>,
+    urls_and_models: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    ranked_url: Option<&str>,
+    events: bool,
+) -> Bed {
     let mut workers = Vec::new();
     for (url, model) in urls_and_models {
         let builder = BasicWorkerBuilder::new(url).status(WorkerStatus::Ready);
@@ -125,6 +166,7 @@ pub(crate) fn bed_with<'a>(
             models: vec![model.unwrap_or(UNKNOWN_MODEL_ID).to_string()],
             dp_size,
             max_running: Some(64),
+            wire_modes: wire_of(url),
             signals: Signals {
                 events,
                 ..Signals::default()
@@ -143,6 +185,97 @@ pub(crate) fn bed_with<'a>(
             .register(Arc::clone(&worker))
             .expect("the worker registers");
         workers.push(worker);
+    }
+    store.publish_now();
+    (Host::at_keys(Arc::clone(&store), registry), store, workers)
+}
+
+/// A store under the stock pair presets with one ready row a URL, the
+/// prefills' then the decodes', a registry with one worker a row, and the
+/// host over the two. The workers come back in the rows' order.
+pub(crate) fn pair_bed(prefills: &[&str], decodes: &[&str]) -> Bed {
+    let store = Arc::new(MemoryStore::new());
+    let document = PolicySpec::pair_presets("least_load", "least_load").expect("the pair presets");
+    let applied = AppliedSpec::validate(&document).expect("the presets validate");
+    store.apply(applied).expect("the store takes the presets");
+    pair_rows(store, MODEL, prefills, decodes)
+}
+
+/// The store a pair gateway starts, with one ready row a URL as
+/// [`pair_bed`] writes them, each serving `model`. The document is the one
+/// the gateway's configuration makes, with every filter it names, and each
+/// row is as the store builds it: no case sets a filter or a row's bit.
+pub(crate) fn pair_bed_started(model: &str, prefills: &[&str], decodes: &[&str]) -> Bed {
+    let config = RouterConfig {
+        policy_controller: true,
+        mode: RoutingMode::PrefillDecode {
+            prefill_urls: Vec::new(),
+            decode_urls: Vec::new(),
+            prefill_policy: None,
+            decode_policy: None,
+        },
+        ..RouterConfig::default()
+    };
+    let store = start(&config)
+        .expect("the start takes the pair routing")
+        .expect("the controller was picked");
+    pair_rows(store, model, prefills, decodes)
+}
+
+/// The wire a bed's row at `url` states, as a store's writer states it for
+/// a worker: gRPC under its scheme, else HTTP. A case that types its worker
+/// otherwise writes the row's wire itself.
+fn wire_of(url: &str) -> WireModes {
+    if url.starts_with("grpc://") {
+        WireModes::GRPC
+    } else {
+        WireModes::HTTP
+    }
+}
+
+/// One ready row a URL in `store`, the prefills' then the decodes', each
+/// serving `model`, a registry with one worker a row, and the host over the
+/// two.
+fn pair_rows(store: Arc<MemoryStore>, model: &str, prefills: &[&str], decodes: &[&str]) -> Bed {
+    let registry = Arc::new(WorkerRegistry::new());
+    let mut workers = Vec::new();
+    let sides = [
+        (prefills, Role::Prefill, WorkerType::Prefill),
+        (decodes, Role::Decode, WorkerType::Decode),
+    ];
+    for (urls, role, worker_type) in sides {
+        for &url in urls {
+            let facts = WorkerFacts {
+                key: url.to_string(),
+                engine: url.to_string(),
+                incarnation: 1,
+                role,
+                models: vec![model.to_string()],
+                dp_size: 1,
+                max_running: Some(64),
+                wire_modes: wire_of(url),
+                ..WorkerFacts::default()
+            };
+            let id = store.upsert(facts).id();
+            store.publish_now();
+            let row = WorkersStore::get(&*store, id).expect("the row");
+            if row.status != RowStatus::Ready {
+                store
+                    .set_status(id, RowStatus::Ready, row.revision)
+                    .expect("the row stands");
+            }
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new(model))
+                    .worker_type(worker_type)
+                    .status(WorkerStatus::Ready)
+                    .build(),
+            );
+            registry
+                .register(Arc::clone(&worker))
+                .expect("the worker registers");
+            workers.push(worker);
+        }
     }
     store.publish_now();
     (Host::at_keys(Arc::clone(&store), registry), store, workers)

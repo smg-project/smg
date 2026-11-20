@@ -145,6 +145,7 @@ fn ask_at(opened: Instant, pinned: Option<WorkerId>, affinity: bool) -> Ask {
         now: opened + Duration::from_secs(1),
         pinned,
         affinity,
+        signal_cells: false,
     }
 }
 

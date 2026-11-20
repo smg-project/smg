@@ -40,7 +40,7 @@ use crate::{
     metrics::writers::Metrics,
     model_card::ModelCard,
     pd::pairing::PdPairing,
-    registry::event::WorkerConnected,
+    registry::event::{WorkerConnected, WorkerSignal},
     runtime::{
         routing_state_series, AVAILABLE_CODE, CIRCUIT_OPEN_CODE, ROUTING_STATE_SERIES, STALE_BIT,
     },
@@ -467,8 +467,10 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Whether the absolute overload guard currently vetoes this worker.
     ///
-    /// Written only by the load monitor, once per ingested load report, and
-    /// always `false` while overload protection is unconfigured.
+    /// Written through the registry, by whoever judges the worker's load:
+    /// the load monitor, once per ingested load report, or a host that
+    /// judges load in a store of its own and mirrors each verdict. Always
+    /// `false` while overload protection is unconfigured.
     fn is_overloaded(&self) -> bool {
         false
     }
@@ -489,7 +491,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Set or clear the liveness veto, returning `true` when it changed.
     /// Route writes through the `liveness` module, which logs and counts the
-    /// transition.
+    /// transition. A worker that holds its registry's signal sender says
+    /// each change to the manager's loop, which tells the health sink
+    /// ([`HealthSink::liveness_moved`](crate::health::port::HealthSink::liveness_moved)).
     fn set_stall(&self, _reason: Option<StallReason>) -> bool {
         false
     }
@@ -1007,11 +1011,12 @@ pub struct BasicWorker {
     /// (a trip of a shared breaker behind a request in flight, a stall) marks
     /// the code stale, and the replacement's next read publishes it again.
     pub superseded: AtomicBool,
-    /// Wakes the manager the instant the ZMQ handshake completes so it can
-    /// promote the worker without waiting for the next health poll. Set only
-    /// for ZMQ workers built through the registration path; `None` elsewhere
-    /// (HTTP/gRPC, tests), where promotion stays poll-driven.
-    pub connect_signal_tx: Option<mpsc::UnboundedSender<WorkerConnected>>,
+    /// The registry's signal sender ([`WorkerSignal`]). It wakes the
+    /// manager the instant the ZMQ handshake completes or a demoted worker
+    /// is heard from again, and it says each move of the liveness veto. Set
+    /// for a worker built for a registry; `None` elsewhere (tests), where
+    /// promotion stays poll-driven and no sink is told of the veto.
+    pub connect_signal_tx: Option<mpsc::UnboundedSender<WorkerSignal>>,
     /// Runtime-mutable models override (for lazy discovery).
     /// When not `Wildcard`, overrides metadata.models for routing decisions.
     /// Uses `ArcSwap` for lock-free reads on the hot path (`supports_model`).
@@ -1153,7 +1158,7 @@ impl BasicWorker {
                     // manager, or receiver gone) is harmless — polling
                     // still promotes on the success threshold.
                     if let Some(tx) = &signal_tx {
-                        let _ = tx.send(WorkerConnected { url, revision });
+                        let _ = tx.send(WorkerConnected { url, revision }.into());
                     }
                 }
                 Err(e) => {
@@ -1301,6 +1306,23 @@ impl BasicWorker {
     /// veto, the circuit breaker).
     fn publish_state(&self) {
         self.publish_state_under(&self.runtime.load(), false);
+    }
+
+    /// Say to the manager's loop that the liveness veto moved
+    /// ([`WorkerSignal::LivenessMoved`]), where the worker holds its
+    /// registry's signal sender. The running state is marked at the send,
+    /// and the loop takes the mark before it tells the health sink. So at
+    /// most one such signal of a worker waits in the channel, however often
+    /// the veto moves and whether or not a loop reads.
+    fn signal_liveness(&self) {
+        let Some(tx) = &self.connect_signal_tx else {
+            return;
+        };
+        if self.runtime.load().mark_liveness_signalled() {
+            let _ = tx.send(WorkerSignal::LivenessMoved {
+                url: self.url().to_string(),
+            });
+        }
     }
 
     async fn grpc_health_check(&self) -> WorkerResult<bool> {
@@ -1657,6 +1679,7 @@ impl Worker for BasicWorker {
         let changed = self.runtime.load().set_stall(reason);
         if changed {
             self.publish_state();
+            self.signal_liveness();
         }
         changed
     }
@@ -1667,10 +1690,10 @@ impl Worker for BasicWorker {
 
     fn signal_connected(&self) {
         if let Some(tx) = &self.connect_signal_tx {
-            let _ = tx.send(WorkerConnected {
+            let _ = tx.send(WorkerSignal::Connected(WorkerConnected {
                 url: self.url().to_string(),
                 revision: self.revision(),
-            });
+            }));
         }
     }
 

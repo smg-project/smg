@@ -46,9 +46,9 @@ use smg_policy_controller::{
     handle::Handle,
     lease::{Outcome, ReleaseReason, Side, TransportClass},
     store::{GatewayId, MemoryStore, World},
-    view::{Constraints, HashKind, Identity, Phase, RequestFacts, WorkerId},
+    view::{Constraints, Identity, Phase, RequestFacts, WorkerId},
     worker_host::Objects,
-    AppliedSpec, DerivedKey, KeySource,
+    AppliedSpec, DerivedKey, KeySource, MediaCounts, WireModes,
 };
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard, WorkerType};
 
@@ -138,8 +138,19 @@ pub(crate) struct Ask<'a> {
     pub phase: Phase,
     /// The size of the prompt in tokens. Zero uses the count from hashing if available.
     pub prompt_tokens: u32,
+    /// The media the request carries, by count. Zero where it carries
+    /// none. A stage that places by media reads it.
+    pub media: MediaCounts,
+    /// The wires the route dials. A route that dials one states it, and
+    /// the controller places among the rows that serve it. None stated
+    /// leaves every row in.
+    pub wires: WireModes,
     /// The rows of the workers the request's failed attempts were sent to.
     pub tried: &'a [WorkerId],
+    /// The retry number, `0` for the first attempt. `None` counts the rows
+    /// of `tried`, one a failed attempt. A stage whose failed attempt names
+    /// more rows than one states the number: a pair names two.
+    pub attempt: Option<u8>,
     /// The attempt's prompt hashes, where it has them. The stage that holds
     /// the tokens fills this once per attempt, before its first ask.
     pub hashes: Option<&'a Hashes>,
@@ -148,7 +159,8 @@ pub(crate) struct Ask<'a> {
 impl<'a> Ask<'a> {
     /// An ask for `model` under the request's `id` that states no other
     /// fact: a single request of no stated prompt size, not streamed, no
-    /// input of a routing key, nothing tried, no hashes.
+    /// input of a routing key, no media, no stated wire, nothing tried, no
+    /// stated attempt, no hashes.
     pub(crate) const fn of(id: &'a [u8], model: &'a str) -> Self {
         Self {
             id,
@@ -158,7 +170,10 @@ impl<'a> Ask<'a> {
             rid: None,
             phase: Phase::Single,
             prompt_tokens: 0,
+            media: MediaCounts::NONE,
+            wires: WireModes::NONE,
             tried: &[],
+            attempt: None,
             hashes: None,
         }
     }
@@ -213,15 +228,18 @@ impl<'a> Ask<'a> {
             session_key: key,
             phase: self.phase,
             prompt_tokens: self.prompt_tokens,
+            media: self.media,
             client_key,
-            attempt: u8::try_from(self.tried.len()).unwrap_or(u8::MAX),
+            attempt: self
+                .attempt
+                .unwrap_or_else(|| u8::try_from(self.tried.len()).unwrap_or(u8::MAX)),
             tried: self.tried,
             seed: rand::rng().random(),
             ..RequestFacts::default()
         };
         if let Some(hashes) = self.hashes {
             facts.block_hashes = &hashes.blocks;
-            facts.hash_kind = HashKind::Token;
+            facts.hash_kind = hashes.kind;
             facts.block_size = hashes.block_size;
             facts.namespace_seed = hashes.namespace_seed;
             if facts.prompt_tokens == 0 {
@@ -233,6 +251,7 @@ impl<'a> Ask<'a> {
             facts,
             constraints: Constraints {
                 excluded: missed,
+                wire_modes: self.wires,
                 ..Constraints::default()
             },
         }
@@ -703,10 +722,25 @@ impl Host {
 
     /// Takes the first sendable pair whose prefill has room. The admission
     /// lock can be held here, so every lookup happens in the ask.
-    #[expect(clippy::unused_self, reason = "the commit uses workers from the ask")]
     pub(crate) fn commit_pair(
         &self,
         asked: Asked,
+        room: Option<&PrefillSelectionContext<'_>>,
+        missed: &mut Vec<WorkerId>,
+        now: Instant,
+    ) -> Result<Placed, Unplaced> {
+        self.commit_pair_where(asked, |_| true, room, missed, now)
+    }
+
+    /// The pair's commit on a route with a rule of its own: as
+    /// [`Host::commit_pair`], and a target either of whose workers `holds`
+    /// refuses is passed over like one the gateway cannot send to. The
+    /// rule is the route's, as [`Host::commit_where`] says of a regular one.
+    #[expect(clippy::unused_self, reason = "the commit uses workers from the ask")]
+    pub(crate) fn commit_pair_where(
+        &self,
+        asked: Asked,
+        holds: impl Fn(&dyn Worker) -> bool,
         room: Option<&PrefillSelectionContext<'_>>,
         missed: &mut Vec<WorkerId>,
         now: Instant,
@@ -722,8 +756,11 @@ impl Host {
             let Some(pair) = target.pair else {
                 continue;
             };
-            let prefill = prefill.filter(|worker| routable_but_for_veto(worker.as_ref()));
-            let decode = decode.filter(|worker| routable_but_for_veto(worker.as_ref()));
+            let sendable = |worker: &Arc<dyn Worker>| {
+                routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref())
+            };
+            let prefill = prefill.filter(sendable);
+            let decode = decode.filter(sendable);
             let (Some(worker), Some(decode)) = (&prefill, decode.as_ref()) else {
                 failed[index] = [
                     prefill.is_none().then_some(target.id),
@@ -769,6 +806,23 @@ impl Host {
         admission: Option<&PrefillAdmission>,
         routing_key: Option<&str>,
     ) -> Result<(Placed, PrefillLoadGuard), Unplaced> {
+        self.place_pair_where(ask, |_| true, admission, routing_key)
+            .await
+    }
+
+    /// Places a pair on a route with a rule of its own: as
+    /// [`Host::place_pair`], over [`Host::commit_pair_where`]. The pass
+    /// that reads which prefills are full and the probe of a request
+    /// behind a waiter count a worker the rule refuses as one the gateway
+    /// cannot send to.
+    pub(crate) async fn place_pair_where(
+        &self,
+        ask: &Ask<'_>,
+        holds: impl Fn(&dyn Worker) -> bool + Send + Sync,
+        admission: Option<&PrefillAdmission>,
+        routing_key: Option<&str>,
+    ) -> Result<(Placed, PrefillLoadGuard), Unplaced> {
+        let holds = &holds;
         let missed = Mutex::new(Vec::new());
         // The attempt's first ask, whichever half makes it: each wake's
         // decision starts from the attempt's list, which stays empty
@@ -778,9 +832,11 @@ impl Host {
             admission,
             routing_key,
             Placed::worker,
-            || self.probe_pair(ask, &missed, &first),
-            || self.decide_pair(ask, admission, missed.lock().clone(), &first),
-            |asked, room| self.commit_pair(asked, room, &mut missed.lock(), Instant::now()),
+            || self.probe_pair(ask, holds, &missed, &first),
+            || self.decide_pair(ask, holds, admission, missed.lock().clone(), &first),
+            |asked, room| {
+                self.commit_pair_where(asked, holds, room, &mut missed.lock(), Instant::now())
+            },
         )
         .await
         .map_err(|error| match error {
@@ -795,6 +851,7 @@ impl Host {
     async fn decide_pair(
         &self,
         ask: &Ask<'_>,
+        holds: &(impl Fn(&dyn Worker) -> bool + Sync),
         admission: Option<&PrefillAdmission>,
         mut missed: Vec<WorkerId>,
         first: &AtomicBool,
@@ -810,8 +867,10 @@ impl Host {
                 let (Some(prefill), Some(decode)) = (prefill, decode) else {
                     continue;
                 };
-                if routable_but_for_veto(prefill.as_ref()) && routable_but_for_veto(decode.as_ref())
-                {
+                let sendable = |worker: &Arc<dyn Worker>| {
+                    routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref())
+                };
+                if sendable(prefill) && sendable(decode) {
                     if !admission.reads_full(prefill) {
                         return Ok(asked);
                     }
@@ -833,6 +892,7 @@ impl Host {
     async fn probe_pair(
         &self,
         ask: &Ask<'_>,
+        holds: &(impl Fn(&dyn Worker) -> bool + Sync),
         missed: &Mutex<Vec<WorkerId>>,
         first: &AtomicBool,
     ) -> Option<Unplaced> {
@@ -844,7 +904,7 @@ impl Host {
                 WorkerType::Decode => &mut decode,
                 WorkerType::Regular | WorkerType::Encode => continue,
             };
-            *found = *found || routable_but_for_veto(worker.as_ref());
+            *found = *found || (routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref()));
             if prefill && decode {
                 return None;
             }
@@ -1098,20 +1158,26 @@ impl fmt::Debug for Placed {
 pub(crate) struct Held {
     /// Dropped first: a report still owed is said while the load stands.
     placed: Placed,
-    /// The load of the placement's worker, given back at the drop.
+    /// The load of the worker the response is read from, given back at the
+    /// drop.
     #[expect(dead_code, reason = "held for its drop alone")]
     guard: WorkerLoadGuard,
 }
 
 impl Held {
-    /// The placement beside the load guard `guard` makes of its worker. The
-    /// guard is asked of the placement's own worker, so the two do not name
-    /// two workers, and neither is dropped ahead of its turn.
+    /// The placement beside the load guard `guard` makes of the worker its
+    /// response is read from: a single's worker, a pair's decode. The guard
+    /// is asked of the placement's own worker, so the two do not name two
+    /// workers, and neither is dropped ahead of its turn.
+    ///
+    /// A pair's prefill holds its load by the admission guard
+    /// [`Host::place_pair`] hands back apart. Its router gives that one up
+    /// when the prefill phase ends, ahead of the response.
     pub(crate) fn new(
         placed: Placed,
         guard: impl FnOnce(&Arc<dyn Worker>) -> WorkerLoadGuard,
     ) -> Self {
-        let guard = guard(placed.worker());
+        let guard = guard(placed.decode().unwrap_or_else(|| placed.worker()));
         Self { placed, guard }
     }
 

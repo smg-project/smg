@@ -43,7 +43,8 @@ use smg_policy_controller::{
         WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
     },
     view::{
-        fingerprint, Candidate, Identity, LoadRow, Phase, RequestFacts, Role, WireModes, WorkerId,
+        fingerprint, Candidate, Identity, LoadRow, MediaCounts, Phase, RequestFacts, Role,
+        WireModes, WorkerId,
     },
     AppliedSpec, Catalog, DerivedKey, KeySource, Lease, LeaseId, Lifecycle, Membership, Outcome,
     Picker, PolicySpec, ReleaseReason, Side, Target, Targets, TieBand, TransportClass,
@@ -55,7 +56,7 @@ use smg_worker::{
 
 use super::{
     elapsed_micros, left_no_worker, mark, profile_of,
-    testing::{bed, bed_under, cache_bed, store_blocks, MODEL},
+    testing::{bed, bed_under, cache_bed, record_bed, store_blocks, MODEL},
     transport_class, Ask, End, Hashes, Held, Host, Placed, Prompt, Sent, Unplaced, GATEWAY,
     NO_STAGE,
 };
@@ -772,7 +773,7 @@ async fn a_returning_prefix_lands_on_the_worker_that_holds_it() {
             MODEL,
             &Prompt {
                 tokens: Some(&tokens),
-                namespace: None,
+                ..Prompt::default()
             },
         );
         let now = Instant::now();
@@ -816,6 +817,58 @@ async fn a_returning_prefix_lands_on_the_worker_that_holds_it() {
             returning.request(Identity::NONE, 0, &[]).facts.block_size,
             block_size
         );
+    }
+}
+
+#[tokio::test]
+async fn a_returning_prompt_lands_on_the_worker_it_was_sent_to() {
+    // No size of record: a block is the document's 16 tokens, and a window
+    // those tokens at four bytes.
+    let text: String = ('a'..='z').cycle().take(256).collect();
+    let tokens: Vec<u32> = (1..=64).collect();
+    let as_text = Prompt {
+        text: Some(&text),
+        ..Prompt::default()
+    };
+    let as_tokens = Prompt {
+        tokens: Some(&tokens),
+        ..Prompt::default()
+    };
+    for prompt in [as_text, as_tokens] {
+        let (host, store) = record_bed();
+        let hashes = Hashes::of(&store, MODEL, &prompt);
+        assert!(!hashes.blocks.is_empty());
+        let now = Instant::now();
+        let cold = Ask {
+            hashes: Some(&hashes),
+            ..first(b"cold")
+        };
+        let sent = host.place(&cold, now).await.expect("a worker").id();
+        // Every other row reports less load: the record alone brings it back.
+        for row in store.snapshot().1 {
+            let running = u32::from(row.id == sent);
+            let load = LoadRow {
+                running,
+                ..LoadRow::default()
+            };
+            store.record(row.id, 0, load, now, LoadSource::Stream);
+        }
+        let now = now + PUBLISH_WINDOW;
+        store.publish(now);
+        let mut plain_matches = 0;
+        for turn in 0..32u8 {
+            let id = [turn];
+            let plain = first(&id);
+            let returning = Ask {
+                hashes: Some(&hashes),
+                ..plain
+            };
+            let placed = host.place(&returning, now).await.expect("a worker");
+            assert_eq!(placed.id(), sent, "request {turn}");
+            let placed = host.place(&plain, now).await.expect("a worker");
+            plain_matches += usize::from(placed.id() == sent);
+        }
+        assert!(plain_matches < 32);
     }
 }
 
@@ -1169,6 +1222,25 @@ async fn an_ask_with_no_routing_key_states_its_clients_key() {
     headers.insert(KEY_HEADER, HeaderValue::from_static("conv-1"));
     assert_eq!(keys_of(&headers), (false, 0));
     assert_eq!(keys_of(&HeaderMap::new()), (true, 0));
+}
+
+/// An ask states its request's media, and the request carries the counts
+/// as stated. An ask that states none carries zero.
+#[test]
+fn an_ask_states_its_requests_media() {
+    let media = MediaCounts {
+        images: 2,
+        audio: 1,
+        bytes: 4_096,
+        ..MediaCounts::NONE
+    };
+    let ask = Ask {
+        media,
+        ..first(b"media")
+    };
+    assert_eq!(ask.request(Identity::NONE, 0, &[]).facts.media, media);
+    let bare = first(b"bare").request(Identity::NONE, 0, &[]);
+    assert_eq!(bare.facts.media, MediaCounts::NONE);
 }
 
 #[tokio::test]
@@ -1664,6 +1736,7 @@ impl PairBed {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let mut rows = PairBuffers::default();
             let built = world.build_pair(MODEL, &ask, &mut rows)?;
@@ -1728,6 +1801,23 @@ fn an_asks_own_token_count_wins_over_its_hashes_count() {
         ..pair_ask()
     };
     assert_eq!(ask.request(Identity::NONE, 0, &[]).facts.prompt_tokens, 37);
+}
+
+#[test]
+fn an_asks_stated_attempt_wins_over_the_count_of_its_rows() {
+    // A failed pair names its prefill and its decode: two rows, one attempt.
+    let rows = [WorkerId(3), WorkerId(4)];
+    let counted = Ask {
+        tried: &rows,
+        ..pair_ask()
+    };
+    assert_eq!(counted.request(Identity::NONE, 0, &[]).facts.attempt, 2);
+    let stated = Ask {
+        attempt: Some(1),
+        ..counted
+    };
+    let request = stated.request(Identity::NONE, 0, &[]);
+    assert_eq!((request.facts.attempt, request.facts.tried), (1, &rows[..]));
 }
 
 #[tokio::test]
@@ -2154,6 +2244,114 @@ async fn each_side_of_a_placed_pair_reports_its_own_dispatch_and_end() {
     );
 }
 
+/// A route's rule at the pair's commit: a target whose decode the rule
+/// refuses is passed over like one the gateway cannot send to. With every
+/// target refused the pick is released and the refused rows are missed.
+#[tokio::test]
+async fn the_routes_rule_passes_over_a_pair_at_its_commit() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 2, 2).expect("a pair fleet");
+    let now = Instant::now();
+    let url_of = |row: WorkerId| {
+        let decode = bed.decodes.iter().find(|(id, _)| *id == row);
+        decode.expect("a decode of the bed").1.url().to_owned()
+    };
+    let asked = bed.host.ask(&pair_ask(), &[], now).await.expect("a pair");
+    let rows: Vec<_> = asked
+        .targets
+        .iter()
+        .filter_map(|target| target.pair)
+        .collect();
+    let (first, second) = (rows[0].decode_id, rows[1].decode_id);
+    let refused = url_of(first);
+    let mut missed = Vec::new();
+    let placed = bed
+        .host
+        .commit_pair_where(
+            asked,
+            |worker| worker.url() != refused,
+            None,
+            &mut missed,
+            now,
+        )
+        .expect("the target behind the first");
+    assert_eq!(placed.decode_id(), Some(second));
+    assert!(missed.is_empty());
+    drop(placed);
+
+    let asked = bed.host.ask(&pair_ask(), &[], now).await.expect("a pair");
+    let rows = asked.targets.iter().filter_map(|target| target.pair);
+    let rows: Vec<_> = rows.map(|pair| pair.decode_id).collect();
+    let refused = [url_of(first), url_of(second)];
+    let none = bed.host.commit_pair_where(
+        asked,
+        |worker| !refused.iter().any(|url| url == worker.url()),
+        None,
+        &mut missed,
+        now,
+    );
+    assert_eq!(none.err(), Some(Unplaced::NoTargetHolds));
+    assert_eq!(missed, rows);
+    assert_eq!(live(&bed.store, 0), 0);
+}
+
+/// A pair's router says the prefill's end where the prefill is done with,
+/// ahead of the answer its decode writes. The answer's end then ends the
+/// decode alone, so the prefill hears one completion.
+#[tokio::test]
+async fn a_sent_pairs_prefill_ends_ahead_of_its_answer() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
+    let placed = bed.commit().await.expect("a placement");
+    let lease = placed.handle.lease().expect("a lease").lease.id;
+    let mut sent = Sent::from(placed);
+    let now = Instant::now();
+    bed.calls.lock().clear();
+    sent.dispatched(now);
+    sent.decode_dispatched(now);
+    sent.prefill_ended(StatusCode::OK, now + Duration::from_micros(5));
+    let sides = bed
+        .store
+        .sides(GATEWAY, lease)
+        .expect("the decode still holds the lease");
+    assert_eq!(sides.record.state, LeaseState::Completed);
+    let decode = sides.decode.expect("the decode side").state;
+    assert_eq!(decode, LeaseState::Dispatched { at: now });
+    sent.ended(StatusCode::OK, true, now + Duration::from_micros(9));
+    assert_eq!(live(&bed.store, 0), 0);
+    let ended = |call: &PairCall| match call {
+        PairCall::Completed(outcome) => Some(outcome.side),
+        _ => None,
+    };
+    let ends: Vec<_> = bed.calls.lock().iter().filter_map(ended).collect();
+    assert_eq!(ends, [Side::Prefill, Side::Decode]);
+}
+
+/// A pair's router that sends its decode alone says no dispatch of the
+/// prefill. The answer's end then ends the decode, and the placement's drop
+/// releases the prefill: its row hears no dispatch and no completion for a
+/// request it never saw.
+#[tokio::test]
+async fn a_prefill_that_was_not_sent_hears_no_dispatch_and_no_end() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
+    let placed = bed.commit().await.expect("a placement");
+    let lease = placed.handle.lease().expect("a lease").lease.id;
+    let decode = bed.decodes[0].0;
+    let mut sent = Sent::from(placed);
+    let now = Instant::now();
+    bed.calls.lock().clear();
+    sent.decode_dispatched(now);
+    sent.prefill_ended(StatusCode::OK, now + Duration::from_micros(5));
+    sent.ended(StatusCode::OK, true, now + Duration::from_micros(9));
+    assert_eq!(live(&bed.store, 0), 0);
+    let calls = bed.calls.lock();
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert!(matches!(calls[0], PairCall::Dispatched(Side::Decode, id, _) if id == decode));
+    assert!(matches!(calls[1], PairCall::Completed(outcome) if outcome.side == Side::Decode));
+    assert_eq!(
+        calls[2],
+        PairCall::Released(lease, Side::Prefill, ReleaseReason::Abandoned)
+    );
+}
+
 #[tokio::test]
 async fn releasing_the_decode_leaves_the_prefill_on_file() {
     let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
@@ -2226,6 +2424,39 @@ async fn a_pair_without_admission_is_one_ask_and_one_commit() {
     assert_eq!(placed.id(), bed.prefills[0].0);
     drop(guard);
     assert_eq!((prefill.load(), prefill.routing_key_load()), (1, 0));
+}
+
+/// A route states the wire it dials, and the controller places among the
+/// rows that serve it. No row of this fleet serves the other wire.
+#[tokio::test]
+async fn an_ask_that_states_its_wire_is_placed_among_the_rows_that_serve_it() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
+    let ask = |wires| Ask {
+        wires,
+        ..pair_ask()
+    };
+    let now = Instant::now();
+    let unplaced = bed.host.ask(&ask(WireModes::GRPC), &[], now).await.err();
+    assert!(
+        matches!(
+            unplaced,
+            Some(Unplaced::Shed {
+                reason: ShedReason::NoEndpoints,
+                emptied_by: "wires",
+                ..
+            })
+        ),
+        "{unplaced:?}"
+    );
+    assert_eq!(live(&bed.store, 0), 0);
+
+    let asked = bed.host.ask(&ask(WireModes::HTTP), &[], now).await;
+    let asked = asked.expect("the rows serve the wire");
+    let placed = bed
+        .host
+        .commit_pair(asked, None, &mut Vec::new(), now)
+        .expect("a placement");
+    assert_eq!(placed.id(), bed.prefills[0].0);
 }
 
 #[tokio::test]

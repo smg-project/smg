@@ -154,8 +154,10 @@
 //! loads', in that order. No path takes one of those and then a turn. A
 //! lifecycle call of a served controller therefore runs under a turn, or
 //! after it where a decision gives its own lease up: it is bounded and
-//! calls no door of the leases. A debug build marks the thread that holds
-//! a turn and refuses a second take of it by that thread.
+//! calls no door of the leases. A registration that takes its key's pins
+//! along holds the workers lock over the store's pins, each shard a leaf
+//! under it. A debug build marks the thread that holds a turn and refuses
+//! a second take of it by that thread.
 
 use std::{
     fmt,
@@ -315,7 +317,8 @@ pub(super) struct Behind {
 pub(super) struct File {
     /// The turn: its holder writes the file.
     turn: Mutex<Behind>,
-    /// The next deadline written with the queue under `turn`.
+    /// When a sweep next asks the file, written under `turn`
+    /// ([`super::NextDue`]).
     next_due: Arc<super::NextDue>,
     /// What a hand reads at each frame.
     shown: Shown,

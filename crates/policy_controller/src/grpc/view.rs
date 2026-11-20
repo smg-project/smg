@@ -245,6 +245,9 @@ fn request(facts: &RequestFacts<'_>, exposure: &Exposure, needs: Needs) -> proto
         seed: facts.seed,
         prompt_text: Vec::new(),
         block_size: facts.block_size,
+        // The client's key is the host's and the controller's: no exposure
+        // shows it.
+        client_key: 0,
     }
 }
 
@@ -1070,6 +1073,36 @@ mod tests {
         );
         let read: Vec<u32> = frame.candidates.iter().map(|c| c.in_flight).collect();
         assert_eq!(read, [4, 0, 9]);
+    }
+
+    /// A plugin's frame carries no client key, whatever the plugin is shown
+    /// of the tenant and the session.
+    #[test]
+    fn the_frame_carries_no_client_key() {
+        use crate::{
+            plugins::config::{Exposure, Reveal},
+            spec::Needs,
+            view::{PoolFacts, RequestFacts},
+        };
+
+        let facts = RequestFacts {
+            client_key: 29,
+            ..RequestFacts::default()
+        };
+        let exposure = Exposure {
+            tenant: Reveal::Plain,
+            session_key: Reveal::Plain,
+            ..Exposure::default()
+        };
+        let frame = super::decide(
+            1,
+            &facts,
+            &[],
+            &PoolFacts::default(),
+            &exposure,
+            Needs::default(),
+        );
+        assert_eq!(frame.request.expect("the frame's request").client_key, 0);
     }
 
     /// The frame carries each candidate's count of the request's session

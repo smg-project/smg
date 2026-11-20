@@ -11,6 +11,10 @@ use smg_policy_controller::{
     Catalog, PolicySpec,
 };
 
+/// A signal's name as a sum writes it: `signal.` before a name of the
+/// signal names' own pattern.
+const SIGNAL_TERM: &str = r"^signal\.[a-z][a-z0-9_]{0,62}$";
+
 fn schema_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("policyspec.schema.json")
 }
@@ -53,18 +57,23 @@ fn the_committed_schema_admits_least_cost_with_terms_and_a_margin() {
     let params = &defs["LeastCostParams"];
     assert_eq!(params["required"], serde_json::json!(["terms"]));
     let terms = &params["properties"]["terms"];
+    // A name is one of the closed list, or a declared signal's behind the
+    // family's name.
     assert_eq!(
-        terms["propertyNames"]["enum"],
+        terms["propertyNames"]["anyOf"],
         serde_json::json!([
-            "candidate.in_flight",
-            "load.active_kv_permille",
-            "load.kv_usage_permille",
-            "load.queued",
-            "load.resident_tokens",
-            "load.running",
-            "load.waiting_uncached_tokens",
-            "sent.requests",
-            "sent.tokens",
+            { "enum": [
+                "candidate.in_flight",
+                "load.active_kv_permille",
+                "load.kv_usage_permille",
+                "load.queued",
+                "load.resident_tokens",
+                "load.running",
+                "load.waiting_uncached_tokens",
+                "sent.requests",
+                "sent.tokens",
+            ] },
+            { "pattern": SIGNAL_TERM }
         ])
     );
     let coefficient = &terms["additionalProperties"];
@@ -72,7 +81,10 @@ fn the_committed_schema_admits_least_cost_with_terms_and_a_margin() {
     assert_eq!(coefficient["minimum"], -1e15);
     assert_eq!(coefficient["maximum"], 1e15);
     assert_eq!(coefficient["not"]["const"], 0);
-    assert_eq!(params["properties"]["margin"]["$ref"], "#/$defs/CostMargin");
+    let margin = &params["properties"]["margin"]["anyOf"];
+    assert_eq!(margin[0]["type"], "number");
+    assert_eq!(margin[0]["minimum"], 0);
+    assert_eq!(margin[1]["$ref"], "#/$defs/CostMargin");
     assert_eq!(defs["CostMargin"]["properties"]["absolute"]["default"], 0.0);
     assert_eq!(defs["CostMargin"]["properties"]["relative"]["default"], 0.0);
     assert_eq!(
@@ -84,10 +96,55 @@ fn the_committed_schema_admits_least_cost_with_terms_and_a_margin() {
     let over_least = &unreported[0]["properties"]["over-least"];
     assert_eq!(over_least["required"], serde_json::json!(["request_cost"]));
     assert_eq!(over_least["properties"]["request_cost"]["type"], "number");
-    let bare = defs["ScoreSpec"]["anyOf"][0]["enum"]
-        .as_array()
-        .expect("the bare names");
-    assert!(!bare.iter().any(|name| name == "least-cost"));
+    // Its parameters have no default: the stock scorers a document names
+    // bare, listed in the entry's description, leave it out.
+    let listed = defs["ScoreSpec"]["description"]
+        .as_str()
+        .expect("a description");
+    let (_, bare) = listed
+        .rsplit_once(" names bare: ")
+        .expect("the stock names");
+    assert!(!bare.contains("least-cost"), "{bare}");
+}
+
+/// A stage's name is open in both forms for a scorer and a picker, as for
+/// a filter: the schema cannot know a host's catalog, and the validator
+/// refuses an unknown name by its path. A map is a stock stage with its
+/// typed parameters, or one key that is no stock typed name's.
+#[test]
+fn the_committed_schema_admits_a_scorer_and_a_picker_by_any_name() {
+    let committed = fs::read_to_string(schema_path()).expect("the committed schema");
+    let schema: Value = serde_json::from_str(&committed).expect("a JSON schema");
+    let defs = &schema["$defs"];
+    let scorers: Vec<&str> = Catalog::builtin().scorers().collect();
+    assert_eq!(
+        defs["ScoreSpec"]["anyOf"],
+        serde_json::json!([
+            { "type": "string" },
+            { "$ref": "#/$defs/ScoreStage" },
+            {
+                "type": "object",
+                "minProperties": 1,
+                "maxProperties": 1,
+                "propertyNames": { "not": { "enum": scorers } },
+                "additionalProperties": { "type": "object" }
+            }
+        ])
+    );
+    assert_eq!(
+        defs["PickSpec"]["anyOf"],
+        serde_json::json!([
+            { "type": "string" },
+            { "$ref": "#/$defs/PickStage" },
+            {
+                "type": "object",
+                "minProperties": 1,
+                "maxProperties": 1,
+                "propertyNames": { "not": { "enum": ["best", "best-with-temperature"] } },
+                "additionalProperties": { "type": "object" }
+            }
+        ])
+    );
 }
 
 #[test]
@@ -121,7 +178,8 @@ fn the_committed_schema_admits_a_filter_by_its_name_and_by_its_name_with_paramet
     let rule = &defs["HasRoomParams"];
     assert_eq!(rule["required"], serde_json::json!(["used", "capacity"]));
     assert_eq!(rule["additionalProperties"], false);
-    let names = rule["properties"]["used"]["propertyNames"]["enum"]
+    let names = &rule["properties"]["used"]["propertyNames"]["anyOf"];
+    let listed = names[0]["enum"]
         .as_array()
         .expect("the names the rule may sum");
     for name in [
@@ -129,8 +187,11 @@ fn the_committed_schema_admits_a_filter_by_its_name_and_by_its_name_with_paramet
         "request.prompt_tokens",
         "sent.tokens",
     ] {
-        assert!(names.iter().any(|listed| listed == name), "{name}");
+        assert!(listed.iter().any(|listed| listed == name), "{name}");
     }
+    // A signal's name is summed too, and a signal may hold the capacity.
+    assert_eq!(names[1]["pattern"], SIGNAL_TERM);
+    assert_eq!(defs["Capacity"]["anyOf"][1]["pattern"], SIGNAL_TERM);
 }
 
 /// Every object schema under `root` either lists its properties and refuses
@@ -216,14 +277,17 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
         defs["SessionsSpec"]["properties"]["ttl_s"]["default"],
         14_400
     );
-    // The bare names are the catalog minus the stages whose parameters have
-    // no default, so a document written against the schema validates.
+    // The stock names a document writes bare stand in each entry's
+    // description: the catalog minus the stages whose parameters have no
+    // default.
     let bare = |def: &str| -> Vec<String> {
-        defs[def]["anyOf"][0]["enum"]
-            .as_array()
-            .expect("the bare names")
-            .iter()
-            .filter_map(Value::as_str)
+        let description = defs[def]["description"].as_str().expect("a description");
+        let (_, names) = description
+            .rsplit_once(" names bare: ")
+            .expect("the stock names");
+        names
+            .trim_end_matches('.')
+            .split(", ")
             .map(str::to_string)
             .collect()
     };

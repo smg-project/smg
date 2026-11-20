@@ -16,7 +16,9 @@ mod tests {
         tokenspeed_proto::{GenerateRequest, SamplingParams, TokenizedInput},
         TokenSpeedSchedulerClient as SchedulerClient,
     };
-    use smg_worker::kv_events::SubscriptionKind;
+    use smg_worker::{
+        kv_events::SubscriptionKind, load::monitor::WorkerMonitor, test_support::LoadReaders,
+    };
     use tokio::{
         net::TcpListener,
         sync::{broadcast::error::TryRecvError, oneshot, watch},
@@ -32,8 +34,8 @@ mod tests {
             Controller,
         },
         store::{
-            Ask, GatewayId, Maker, MemoryStore, Named, Naming, Signals, ViewBuffers, WorkerFacts,
-            WorkerStatus, WorkersStore,
+            Ask, GatewayId, KvEventSink as _, Maker, MemoryStore, Named, Naming, Signals,
+            ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
         },
         view::{Role, WireModes, WorkerId as RowId},
         worker_host::{Expect, KvFeed, Members, Membership as _, Objects, StoreDoor},
@@ -120,6 +122,26 @@ mod tests {
                 sleep(POLL).await;
             }
         }
+
+        /// Wait within `check` for `url`'s stream: its slot, then its task's
+        /// open of the feed. The task opens the feed in its first turn, so
+        /// one turn of the runtime's other tasks carries it there. A worker
+        /// removed ahead of that turn gets no feed: its ticket opens
+        /// nothing, its task ends by itself, and no removal waits for it.
+        async fn streaming(&self, url: &str) -> u64 {
+            let id = self.new_slot(url, None).await;
+            tokio::task::yield_now().await;
+            id
+        }
+
+        /// Wait within `check` for `url`'s slot to stand empty. A removal
+        /// runs on a task of its own, so its end is not ordered with the
+        /// events behind it.
+        async fn freed(&self, url: &str) {
+            while self.feed.collector().slot_ids(url).await != (None, None) {
+                sleep(POLL).await;
+            }
+        }
     }
 
     #[tokio::test]
@@ -162,7 +184,7 @@ mod tests {
             assert!(f.remove(row));
             f.lay(facts(SECOND, WireModes::GRPC, true));
             f.new_slot(SECOND, None).await;
-            assert_eq!(f.feed.collector().slot_ids(FIRST).await, (None, None));
+            f.freed(FIRST).await;
             assert!(f.feed.collector().task_ended(FIRST).await);
         })
         .await
@@ -223,6 +245,74 @@ mod tests {
         .expect("the feed processes the worker whose row asks for events");
     }
 
+    /// A gRPC row that is not indexed streams its load records alone once
+    /// the host hands a monitor that wants its loads, and has no stream
+    /// under a monitor that wants none.
+    #[tokio::test]
+    async fn a_row_that_is_not_indexed_streams_its_loads_where_the_monitor_wants_them() {
+        // Whether the monitor polls by need alone, and whether the row streams:
+        // a monitor with no reader of loads wants none of a worker's.
+        for (by_need, streams) in [(false, true), (true, false)] {
+            let f = Fixture::new();
+            let monitor = Arc::new(WorkerMonitor::new(
+                Arc::clone(f.objects.registry()),
+                Arc::new(LoadReaders::Blind),
+                1,
+                false,
+                by_need,
+            ));
+            f.feed.set_load_sink(&monitor);
+            f.check(async {
+                f.lay(facts(FIRST, WireModes::GRPC, false));
+                f.lay(facts(SECOND, WireModes::GRPC, true));
+                f.new_slot(SECOND, None).await;
+                let (slot, _) = f.feed.collector().slot_ids(FIRST).await;
+                assert_eq!(slot.is_some(), streams, "by need: {by_need}");
+            })
+            .await
+            .expect("the feed processes the indexed worker behind the other");
+        }
+    }
+
+    /// The kind of stream each rank of an indexed data-parallel worker
+    /// gets. Rank 0 streams its cache events. A rank above it opens no
+    /// events feed, so it streams its load records alone where a monitor
+    /// wants them, and has no stream without one.
+    #[tokio::test]
+    async fn an_upper_rank_of_an_indexed_worker_streams_its_loads_alone() {
+        const UPPER: &str = "grpc://127.0.0.1:1#1";
+        let f = Fixture::new();
+        let lower = WorkerFacts {
+            dp_size: 2,
+            ..facts(FIRST, WireModes::GRPC, true)
+        };
+        f.lay(WorkerFacts {
+            key: UPPER.to_owned(),
+            dp_rank: 1,
+            ..lower.clone()
+        });
+        f.lay(lower);
+        let stream = |url: &str| {
+            let registry = f.objects.registry();
+            let id = registry.get_id_by_url(url).expect("the row has an object");
+            let worker = registry.get_by_url(url).expect("the row has an object");
+            f.feed.stream_of(&id, &worker)
+        };
+        assert_eq!(stream(FIRST), Some(SubscriptionKind::Events));
+        assert_eq!(stream(UPPER), None, "no monitor wants its loads");
+
+        let monitor = Arc::new(WorkerMonitor::new(
+            Arc::clone(f.objects.registry()),
+            Arc::new(LoadReaders::Blind),
+            1,
+            false,
+            false,
+        ));
+        f.feed.set_load_sink(&monitor);
+        assert_eq!(stream(FIRST), Some(SubscriptionKind::Events));
+        assert_eq!(stream(UPPER), Some(SubscriptionKind::Loads));
+    }
+
     #[tokio::test]
     async fn a_worker_replaced_in_place_is_told_again_for_its_new_object() {
         let f = Fixture::new();
@@ -265,14 +355,16 @@ mod tests {
                 // A later replacement takes its slot after the whole read ends.
                 f.lay(facts(LAST, WireModes::GRPC, true));
                 last = Some(f.new_slot(LAST, Some(slot)).await);
-                assert_eq!(f.feed.collector().slot_ids(gone).await, (None, None));
+                f.freed(gone).await;
                 assert!(f.feed.collector().slot_ids(joined).await.0.is_some());
                 assert_eq!(f.feed.collector().slot_ids(FLOOD).await, (None, None));
             }
 
             // A queued removal can name a URL that a whole read saw again.
             let mut told = HashSet::from([FIRST.to_owned()]);
-            f.feed.removed(FIRST, &mut told).await;
+            let mut removals = JoinSet::new();
+            f.feed.removed(FIRST, &mut told, &mut removals);
+            while removals.join_next().await.is_some() {}
             assert!(told.contains(FIRST));
             assert!(f.feed.collector().slot_ids(FIRST).await.0.is_some());
         })
@@ -301,6 +393,73 @@ mod tests {
         }
     }
 
+    /// Every removal permit of the process. Held, they hold a leaving task
+    /// at its last word to the sink, so its removal does not end.
+    async fn removals_held() -> tokio::sync::SemaphorePermit<'static> {
+        smg_worker::kv_events::SINK_REMOVAL_PERMITS
+            .acquire_many(smg_worker::kv_events::MAX_CONCURRENT_SINK_REMOVALS as u32)
+            .await
+            .expect("the removal semaphore is open")
+    }
+
+    /// A removal that does not end holds no add behind it: the next
+    /// worker's add is told and its slot opens while the removal waits.
+    #[tokio::test]
+    async fn a_slow_removal_holds_no_add_behind_it() {
+        let f = Fixture::new();
+        let row = f.lay(facts(FIRST, WireModes::GRPC, true));
+        f.check(async {
+            let leaving = f.streaming(FIRST).await;
+            let permits = removals_held().await;
+            assert!(f.remove(row));
+            f.lay(facts(SECOND, WireModes::GRPC, true));
+            f.new_slot(SECOND, None).await;
+            // The removal is under way and does not end: its reservation
+            // stands beside the second worker's stream.
+            while f.feed.collector().slot_ids(FIRST).await != (None, Some(leaving)) {
+                sleep(POLL).await;
+            }
+            assert!(f.feed.collector().slot_ids(SECOND).await.0.is_some());
+            drop(permits);
+        })
+        .await
+        .expect("the add behind a slow removal takes its slot");
+        assert_eq!(f.feed.collector().slot_ids(FIRST).await, (None, None));
+    }
+
+    /// A removal and a later add of one address keep their order while the
+    /// removal is slow: the new worker's stream starts behind the old
+    /// task's end, and the removal leaves it standing.
+    #[tokio::test]
+    async fn a_removal_and_a_later_add_of_one_address_keep_their_order() {
+        let f = Fixture::new();
+        let row = f.lay(facts(FIRST, WireModes::GRPC, true));
+        f.check(async {
+            let old = f.streaming(FIRST).await;
+            let permits = removals_held().await;
+            assert!(f.remove(row));
+            f.lay(facts(FIRST, WireModes::GRPC, true));
+            // The old task does not end: the address holds its reservation,
+            // and the new worker has no stream.
+            while f.feed.collector().slot_ids(FIRST).await != (None, Some(old)) {
+                sleep(POLL).await;
+            }
+            for _ in 0..5 {
+                sleep(POLL).await;
+                assert_eq!(f.feed.collector().slot_ids(FIRST).await, (None, Some(old)));
+            }
+            drop(permits);
+            let new = f.new_slot(FIRST, Some(old)).await;
+            // The removal's task ends and leaves the new stream standing.
+            for _ in 0..5 {
+                sleep(POLL).await;
+                assert_eq!(f.feed.collector().slot_ids(FIRST).await, (Some(new), None));
+            }
+        })
+        .await
+        .expect("the later add takes the address's slot behind the old task");
+    }
+
     #[tokio::test]
     async fn a_block_a_mock_engine_stores_is_named_for_a_request() {
         let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -320,9 +479,9 @@ mod tests {
             },
             ..MockConfig::default()
         };
+        // The row states no block size: the stream is the store's one word of it.
         let row = WorkerFacts {
             engine_kind: mock.grpc_wire.as_str().to_owned(),
-            kv_block_size: Some(block_size),
             ..facts(&url, WireModes::GRPC, true)
         };
         let (stop_mock, mock_stopped) = oneshot::channel();
@@ -381,6 +540,7 @@ mod tests {
                         now: Instant::now(),
                         pinned: None,
                         affinity: false,
+                        signal_cells: false,
                     };
                     let mut view = ViewBuffers::default();
                     let built = world
@@ -435,6 +595,8 @@ mod tests {
                 }
                 sleep(POLL).await;
             }
+            // The store learned the model's size from the engine's stored block.
+            assert_eq!(store.block_size(MODEL), Some(block_size));
             stop.send(()).expect("the controller is still serving");
         };
         let (result, ()) = timeout(Duration::from_secs(15), async { tokio::join!(serve, case) })

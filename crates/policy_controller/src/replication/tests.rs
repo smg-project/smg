@@ -979,6 +979,7 @@ fn pool(store: &MemoryStore, at: Instant) -> Vec<(WorkerId, u16, Health, Option<
         now: at,
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let mut out = ViewBuffers::default();
     if store
@@ -1746,6 +1747,7 @@ fn pair_rows(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
         now: Instant::now(),
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let mut out = ViewBuffers::default();
     let mut rows = Vec::new();

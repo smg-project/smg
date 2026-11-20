@@ -655,7 +655,6 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "named",
                 "model_fingerprint",
                 "signal_cells",
-                "client_key",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -678,6 +677,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("seed", Type::Fixed64),
                 ("prompt_text", Type::Bytes),
                 ("block_size", Type::Uint32),
+                ("client_key", Type::Fixed64),
             ],
             repeated: &["block_hashes", "tried", "headers"],
             optional: &[],
@@ -1107,7 +1107,14 @@ const ONEOFS: &[(&str, &str, &str, &[&str])] = &[
             "relabelled",
             "needs",
             "snapshot_required",
+            "ranks",
         ],
+    ),
+    (
+        CONTROLLER_PROTO,
+        "RankRow",
+        "made",
+        &["registered", "replaced", "removed", "relabelled"],
     ),
     (
         CONTROLLER_PROTO,

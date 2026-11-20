@@ -41,6 +41,11 @@ fn read_values(values: &[common::NamedValue]) -> Vec<NamedValue> {
 /// is KV usage, and the request total is the sum of running and waiting
 /// requests. The caller sets the rank and can merge fixed telemetry the
 /// record omitted with the last figures it received.
+///
+/// The fields alone: a part the record left out is at the type's default
+/// and bears no mark, so the named values of this shape offer a count the
+/// record did not state. A reader of named values takes the record's entry
+/// from [`LoadRecord::snapshot`], which marks it.
 impl From<&common::EngineLoad> for SchedulerLoadSnapshot {
     /// Read input capacity directly, including absence after the samples expire.
     fn from(record: &common::EngineLoad) -> Self {
@@ -130,7 +135,7 @@ impl LoadRecord for common::EngineLoad {
     }
 
     #[inline]
-    fn snapshot(&self) -> SchedulerLoadSnapshot {
+    fn fields(&self) -> SchedulerLoadSnapshot {
         SchedulerLoadSnapshot::from(self)
     }
 
@@ -209,6 +214,49 @@ mod tests {
         assert_eq!(serde_json::to_string(&snapshot).unwrap(), legacy);
         let decoded: SchedulerLoadSnapshot = serde_json::from_str(legacy).unwrap();
         assert!(decoded.values.is_empty());
+    }
+
+    /// The record's own entry bears the mark of what the record did not
+    /// state: a count it left out is not offered as a zero, and neither
+    /// count is where the record states no capacity.
+    #[test]
+    fn a_records_snapshot_is_marked_with_what_the_record_did_not_state() {
+        let offered = |snapshot: &SchedulerLoadSnapshot| -> Vec<(String, f64)> {
+            snapshot
+                .named_values()
+                .map(|value| (value.name.to_string(), value.value))
+                .collect()
+        };
+        let record = |held: Option<i32>, capacity: Option<i32>| common::EngineLoad {
+            running_requests: 2,
+            num_used_tokens: held,
+            max_total_num_tokens: capacity,
+            ..Default::default()
+        };
+        let capacity = ("kv_tokens_capacity".to_owned(), 8_192.0);
+        // Both stated beside a capacity: both offered, the zero held too.
+        let idle = record(Some(0), Some(8_192)).snapshot();
+        assert_eq!(
+            offered(&idle),
+            [("kv_tokens_used".to_owned(), 0.0), capacity.clone()]
+        );
+        // The sections the record left out are marked with the counts.
+        assert!(idle
+            .kept
+            .contains(LoadTelemetry::MEMORY | LoadTelemetry::QUEUES));
+        // The held count left out: the capacity alone.
+        let core = record(None, Some(8_192)).snapshot();
+        assert_eq!(offered(&core), [capacity]);
+        // No capacity: neither, stated as zeros or beside a held count.
+        for (held, capacity) in [
+            (Some(0), Some(0)),
+            (Some(211), Some(-1)),
+            (Some(211), None),
+            (None, None),
+        ] {
+            let snapshot = record(held, capacity).snapshot();
+            assert!(offered(&snapshot).is_empty(), "{held:?} {capacity:?}");
+        }
     }
 
     fn sample(name: &str, unit: &str, value: f64) -> common::NamedValue {

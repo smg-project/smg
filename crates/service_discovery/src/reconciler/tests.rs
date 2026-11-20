@@ -1,6 +1,6 @@
 use std::{slice, sync::Arc};
 
-use openai_protocol::worker::WorkerType;
+use openai_protocol::worker::{WorkerStatus, WorkerType};
 use smg_worker::{
     identity::endpoint::endpoint_key,
     test_support::{assert_metric, render_with_recorder},
@@ -289,6 +289,36 @@ fn owned_workers_read_back_the_spec_hash() {
     let owned = owned_workers(&*host, DiscoveryKind::Kubernetes);
     assert_eq!(owned[0].spec_hash, Some(worker.fingerprint()));
 
+    let actions = compute_actions(&desired_state_of(&[worker]), &owned);
+    assert!(actions.add.is_empty());
+    assert!(actions.remove.is_empty());
+}
+
+/// Today's behaviour, held here so that a change of it is a choice and not
+/// an accident: a pass reads no worker state. A worker that left the
+/// published list and is listed again while its removal still drains it
+/// counts as registered, so the pass queues nothing for it. The removal
+/// goes on and removes it, and the first pass after that registers it again.
+#[test]
+fn a_worker_listed_again_while_it_drains_counts_as_registered() {
+    let host = TestHost::without_a_queue();
+    let worker = published("10.0.0.1:8080", "f-1");
+    register_with_labels(
+        &host,
+        "http://10.0.0.1:8080",
+        &[
+            (DISCOVERY_PROVIDER_LABEL, "file"),
+            (DISCOVERY_ID_LABEL, "f-1"),
+            (DISCOVERY_SPEC_HASH_LABEL, &worker.fingerprint()),
+        ],
+    );
+    // What the removal's drain step writes while its window runs.
+    for registered in host.registry.get_all() {
+        registered.set_status(WorkerStatus::Draining);
+    }
+
+    let owned = owned_workers(&*host, DiscoveryKind::File);
+    assert_eq!(owned.len(), 1);
     let actions = compute_actions(&desired_state_of(&[worker]), &owned);
     assert!(actions.add.is_empty());
     assert!(actions.remove.is_empty());

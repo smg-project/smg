@@ -30,7 +30,7 @@ use tokio::{
 use tonic::codegen::{http::Uri, Bytes};
 use tracing::{debug, info, warn};
 
-use super::BoxError;
+use super::{keep_alive_timeout_status, BoxError};
 
 /// HTTP/2 keepalive: a ping every 30 seconds, answered within 10. The
 /// interval is bounded from below by the engines' gRPC servers, not by how
@@ -123,7 +123,7 @@ impl End {
             return Box::new(error);
         }
         if self.keep_alive_timed_out.load(Ordering::Acquire) {
-            return Box::new(tonic::Status::unavailable("keep-alive timed out"));
+            return Box::new(keep_alive_timeout_status());
         }
         Box::new(TransportError(error))
     }
@@ -144,6 +144,21 @@ impl std::error::Error for TransportError {
         Some(&self.0)
     }
 }
+
+/// The keep-alive timeout of a connection this side dropped: the peer
+/// answered no ping. It is the source of the status each call on that
+/// connection ends with, which tells that status from an `UNAVAILABLE` the
+/// worker answered ([`super::is_keep_alive_timeout`]).
+#[derive(Debug)]
+pub(super) struct KeepAliveTimeout;
+
+impl fmt::Display for KeepAliveTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("keep-alive timed out")
+    }
+}
+
+impl std::error::Error for KeepAliveTimeout {}
 
 /// A dial's failure with the peer it came from. Its text names the peer: the
 /// log line of a failed call on a gateway with many workers says which one

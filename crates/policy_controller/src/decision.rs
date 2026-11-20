@@ -40,13 +40,35 @@ pub struct Pair {
 /// The ordered targets of a pick: the best first. For a pair the list reads
 /// "pairs before the prefill went out, decodes of the chosen prefill after",
 /// so an alternate taken after the prefill dispatched changes the decode only.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default)]
 pub struct Targets {
     items: [Target; MAX_TARGETS],
     len: u8,
     /// What the profile's prefix stage says of the first target
     /// ([`Pick::overlap`]), in the bytes the count left spare.
     overlap: Overlap,
+}
+
+/// Two lists are equal where their targets and what they state of the first
+/// are. The entries past a count are no part of a list:
+/// [`Targets::clear`] leaves them as they stood.
+impl PartialEq for Targets {
+    fn eq(&self, other: &Self) -> bool {
+        self.overlap == other.overlap && self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for Targets {}
+
+/// A list prints what its equality reads: its targets and what it states
+/// of the first.
+impl fmt::Debug for Targets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Targets")
+            .field("items", &self.as_slice())
+            .field("overlap", &self.overlap)
+            .finish()
+    }
 }
 
 impl Targets {
@@ -77,6 +99,27 @@ impl Targets {
         }
     }
 
+    /// Turns a decode side's targets into a pair's where they stand: each
+    /// names `prefill` with the decode it held, in the order they had.
+    /// Nothing is stated of a pair's first target ([`Pick::overlap`]). The
+    /// entries past the count are not rewritten, as [`Self::clear`] leaves
+    /// them. No accessor goes past the count.
+    pub(crate) fn pair_under(&mut self, prefill: &Target) {
+        for target in &mut self.items[..usize::from(self.len)] {
+            *target = Target {
+                position: prefill.position,
+                id: prefill.id,
+                dp_rank: prefill.dp_rank,
+                pair: Some(Pair {
+                    decode_position: target.position,
+                    decode_id: target.id,
+                    decode_dp_rank: target.dp_rank,
+                }),
+            };
+        }
+        self.overlap = Overlap::NONE;
+    }
+
     /// Empties the list. What was stated of its first target goes with it
     /// ([`Pick::overlap`]).
     pub fn clear(&mut self) {
@@ -91,7 +134,7 @@ impl Targets {
         let mut led = Self::new();
         led.push(target);
         for t in self.as_slice() {
-            if t.id != target.id {
+            if *t != target {
                 led.push(*t);
             }
         }
@@ -475,6 +518,21 @@ impl ShadowKind {
         }
     }
 
+    /// How many kinds there are: the width of a count by kind.
+    pub(crate) const COUNT: usize = 4;
+
+    /// The kind's place in a count by kind, under [`Self::COUNT`]. Every
+    /// kind is named here: one added to the enum does not build until it
+    /// takes a place.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Agreed => 0,
+            Self::OtherTarget => 1,
+            Self::OtherOutcome => 2,
+            Self::Skipped => 3,
+        }
+    }
+
     /// The comparison's label.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -489,6 +547,14 @@ impl ShadowKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_shadow_kind_takes_a_place_of_its_own_under_the_count() {
+        use ShadowKind::{Agreed, OtherOutcome, OtherTarget, Skipped};
+        let places = [Agreed, OtherTarget, OtherOutcome, Skipped].map(ShadowKind::index);
+        assert_eq!(places, [0, 1, 2, 3]);
+        assert_eq!(places.len(), ShadowKind::COUNT);
+    }
 
     #[test]
     fn shadow_kind_compares_the_outcome_and_first_target() {
@@ -690,6 +756,40 @@ mod tests {
     }
 
     #[test]
+    fn a_list_cleared_and_filled_again_equals_a_new_one() {
+        let target = |position: u32| Target {
+            position,
+            id: WorkerId(u64::from(position) + 1),
+            dp_rank: 0,
+            pair: None,
+        };
+        let mut used = Targets::new();
+        used.push(target(0));
+        used.push(target(1));
+        used.clear();
+        used.push(target(2));
+        let mut new = Targets::new();
+        new.push(target(2));
+        assert_eq!(used, new);
+        // A count and what a list states of its first target are parts
+        // of it still.
+        let mut longer = new;
+        longer.push(target(1));
+        assert_ne!(used, longer);
+        let mut stated = new;
+        stated.state(Overlap {
+            blocks: 1,
+            of: 2,
+            source: OverlapSource::Index,
+            margin_held: false,
+        });
+        assert_ne!(used, stated);
+        // A list prints what its equality reads.
+        assert_eq!(format!("{used:?}"), format!("{new:?}"));
+        assert_ne!(format!("{used:?}"), format!("{longer:?}"));
+    }
+
+    #[test]
     fn lead_puts_a_target_first_and_drops_its_copy_or_the_last_one() {
         let target = |id: u64| Target {
             position: id as u32,
@@ -716,6 +816,85 @@ mod tests {
             MAX_TARGETS as u64 - 1,
             "the last one left"
         );
+    }
+
+    #[test]
+    fn lead_removes_only_the_equal_target_not_another_rank() {
+        let x_rank_0 = Target {
+            position: 0,
+            id: WorkerId(1),
+            dp_rank: 0,
+            pair: None,
+        };
+        let w_rank_1 = Target {
+            position: 1,
+            id: WorkerId(2),
+            dp_rank: 1,
+            pair: None,
+        };
+        let w_rank_0 = Target {
+            position: 2,
+            dp_rank: 0,
+            ..w_rank_1
+        };
+        let mut targets = Targets::new();
+        for target in [x_rank_0, w_rank_1, w_rank_0] {
+            targets.push(target);
+        }
+
+        targets.lead(w_rank_0);
+
+        assert_eq!(targets.as_slice(), [w_rank_0, x_rank_0, w_rank_1]);
+    }
+
+    /// A decode side's targets turn into a pair's where they stand. Each
+    /// names the prefill with the decode it held, in the order they had.
+    /// The list equals the one a new list takes push by push, and nothing
+    /// is stated of its first target.
+    #[test]
+    fn a_decodes_targets_turn_into_a_pairs_where_they_stand() {
+        let prefill = Target {
+            position: 7,
+            id: WorkerId(70),
+            dp_rank: 3,
+            pair: None,
+        };
+        let decode = |position: u32| Target {
+            position,
+            id: WorkerId(u64::from(position) + 1),
+            dp_rank: position as u16 + 5,
+            pair: None,
+        };
+        let mut turned = Targets::new();
+        let mut pushed = Targets::new();
+        for position in 0..2u32 {
+            turned.push(decode(position));
+            pushed.push(Target {
+                pair: Some(Pair {
+                    decode_position: position,
+                    decode_id: decode(position).id,
+                    decode_dp_rank: decode(position).dp_rank,
+                }),
+                ..prefill
+            });
+        }
+        turned.state(Overlap {
+            blocks: 3,
+            of: 4,
+            source: OverlapSource::Index,
+            margin_held: false,
+        });
+        turned.pair_under(&prefill);
+        assert_eq!(turned, pushed);
+        let pick = Pick {
+            targets: turned,
+            ..Pick::default()
+        };
+        assert_eq!(pick.overlap(), Overlap::NONE);
+        // An empty list stays empty.
+        let mut none = Targets::new();
+        none.pair_under(&prefill);
+        assert_eq!(none, Targets::new());
     }
 
     /// The count and its absence are one word: a trace is the size it was

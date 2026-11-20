@@ -536,9 +536,37 @@ message WorkerEvent {
     // retains: the stream ends and the watcher reconnects with resume_seq 0.
     // The event carries no position of its own: seq and term are 0.
     SnapshotRequired snapshot_required = 10;
+    // The answer of a RegisterWorker that states more than one rank
+    // (WorkerSpec.dp_size): what the call made of each rank. No watch tells
+    // it: a watcher is told each row's own event, and a reader that meets
+    // this case on a watch lets the stream go.
+    RankRows ranks = 12;
   }
   // The term `seq` was written under; a watcher hands both back on resume.
   uint64 term = 11;
+}
+
+// What a registration that states more than one rank made of each rank, in
+// rank order, then one entry for each row of the engine that left with it:
+// a rank a narrower worker no longer has, or the plain row of a worker that
+// comes back ranked. Each entry is the event a watcher is told of that row,
+// with no position of its own: the answer's seq, epoch and term are read
+// after the call's last write, so a watcher past them holds every rank as
+// answered or later. A call that wrote nothing answers each rank
+// `relabelled`, the row unmoved. At most 64 ranks (WorkerSpec.dp_size): a
+// replacement tells two rows, and the answer stays within half of a 4 MiB
+// frame.
+message RankRows {
+  repeated RankRow rows = 1;
+}
+
+message RankRow {
+  oneof made {
+    WorkerRow registered = 1;
+    Replaced replaced = 2;
+    Removed removed = 3;
+    WorkerRow relabelled = 4;
+  }
 }
 
 // Paged at 128 rows or at 2 MiB of rows, whichever comes first, every page at
@@ -876,8 +904,24 @@ message WorkerSpec {
   // removing the worker and registering it again.
   PairingDescriptor pairing = 10;
   // 0: the data-parallel width is discovered where a handshake runs (always
-  // on) and is one rank where none does. Above 1: INVALID_ARGUMENT where no
-  // call answers a row a rank.
+  // on) and is one rank where none does. Above 1: one row a rank, rank r
+  // under the URL `url@r`, and the call answers a row a rank
+  // (WorkerEvent.ranks). Every rule holds before the first write: a
+  // refusal of a rank or of the group writes nothing. A lead lost between
+  // two ranks is UNAVAILABLE and leaves the ranks written before it: a
+  // MODE_UPSERT lays the rest, and a MODE_ADD meets them as ALREADY_EXISTS.
+  // At most 64: INVALID_ARGUMENT above, and above 1 where the controller's
+  // build lays no ranks.
+  //
+  // The modes hold for the engine. MODE_ADD: ALREADY_EXISTS where a row
+  // stands under a rank's URL or the engine stands in another form (its
+  // plain row, or ranks the registration does not state). MODE_REPLACE:
+  // NOT_FOUND unless every stated rank stands; each is its next
+  // incarnation. MODE_UPSERT lays each rank over what stands. Under REPLACE
+  // and UPSERT the engine's rows that the registration does not state leave
+  // with it. A registration of one rank (0 or 1) for an engine that stands
+  // as ranks is FAILED_PRECONDITION: it states its width, or its ranks are
+  // removed first (DeregisterWorker, a rank at a time).
   uint32 dp_size = 11;
   Signals signals = 12;
   repeated string topology = 13;

@@ -1,5 +1,5 @@
-//! A placement as the regular HTTP router holds it, to the end of its
-//! response's body.
+//! A placement as an HTTP router holds it, to the end of its response's
+//! body.
 
 use std::{
     ops::Deref,
@@ -15,7 +15,8 @@ use std::{
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use http_body::{Body as _, Frame, SizeHint};
-use smg_policy_controller::lease::TransportClass;
+use parking_lot::Mutex;
+use smg_policy_controller::{lease::TransportClass, ReleaseReason};
 
 use super::{transport_class, End, Placed};
 use crate::{middleware::metrics::BodyProgress, routers::common::attempt_ledger::UpstreamAnswer};
@@ -33,13 +34,67 @@ fn answered(response: &Response) -> bool {
     marks.get::<UpstreamAnswer>().is_some() || marks.get::<BehindAnswer>().is_some()
 }
 
-/// A placement with what the regular HTTP router alone knows of its send:
+/// The end of the drain of a pair's prefill, which the drain shares with
+/// the placement. The drain outlives the attempt that sent it, and it can
+/// outlive the answer's body. A placement whose answer ended first is left
+/// here, and the drain says the prefill's end on it.
+#[derive(Default)]
+pub(crate) struct DrainEnd {
+    /// The status the drain ended with. Zero while it runs.
+    status: AtomicU16,
+    /// The placement of an answer that ended ahead of the drain.
+    left: Mutex<Option<Sent>>,
+}
+
+impl DrainEnd {
+    /// The drain ended with `status`. A placement left here hears its
+    /// prefill's end now. One whose answer still runs reads the status at
+    /// its next frame, or at its end.
+    pub(crate) fn tell(&self, status: StatusCode) {
+        let left = {
+            let mut left = self.left.lock();
+            self.status.store(status.as_u16(), Ordering::Relaxed);
+            left.take()
+        };
+        if let Some(mut sent) = left {
+            sent.prefill_ended(status, Instant::now());
+        }
+    }
+
+    /// The status the drain ended with, where it has ended.
+    fn told(&self) -> Option<StatusCode> {
+        StatusCode::from_u16(self.status.load(Ordering::Relaxed)).ok()
+    }
+
+    /// Takes `sent`, whose answer ended. A drain that has ended is told on
+    /// it here. One that still runs keeps it and tells its own end. The
+    /// status is read under the lock the drain writes it under, so exactly
+    /// one of the two says the prefill's end.
+    fn leave(&self, mut sent: Sent) {
+        let mut left = self.left.lock();
+        match self.told() {
+            Some(status) => {
+                drop(left);
+                sent.prefill_ended(status, Instant::now());
+            }
+            None => *left = Some(sent),
+        }
+    }
+}
+
+/// A placement with what an HTTP router alone knows of its send:
 /// the instant, and the mark its streamed answer's relay writes at a cut.
 /// The host's [`Placed`] keeps neither, so a route that needs none carries
 /// none.
 pub(crate) struct Sent {
     placed: Placed,
     at: Option<Instant>,
+    /// Whether [`Self::dispatched`] was said: the request's own dispatch, or
+    /// a pair's prefill's. A pair's prefill that was not sent is said no
+    /// end, and the placement's drop releases its side.
+    own_sent: bool,
+    /// The end of the drain of a pair's prefill, while the drain owes it.
+    drained: Option<Arc<DrainEnd>>,
     cut: Option<Arc<AtomicU16>>,
 }
 
@@ -48,6 +103,8 @@ impl From<Placed> for Sent {
         Self {
             placed,
             at: None,
+            own_sent: false,
+            drained: None,
             cut: None,
         }
     }
@@ -65,7 +122,55 @@ impl Sent {
     /// The request was sent to the worker at `now`. Said once.
     pub(crate) fn dispatched(&mut self, now: Instant) {
         self.at = Some(now);
+        self.own_sent = true;
         self.placed.dispatched(now);
+    }
+
+    /// A pair's decode request was sent at `now`. Said once. Where the
+    /// prefill was not sent, the placement's time counts from here.
+    pub(crate) fn decode_dispatched(&mut self, now: Instant) {
+        if self.at.is_none() {
+            self.at = Some(now);
+        }
+        self.placed.decode_dispatched(now);
+    }
+
+    /// A pair's prefill answered `status` at `now`, ahead of the end of the
+    /// answer its decode writes. Said once, and of a prefill that was sent.
+    pub(crate) fn prefill_ended(&mut self, status: StatusCode, now: Instant) {
+        if let (true, Some(at)) = (self.own_sent, self.at) {
+            let class = transport_class(status, true);
+            self.placed
+                .completed(End::http(status, class, at, None, now), now);
+        }
+    }
+
+    /// The end of the drain of this pair's prefill, for the drain to tell
+    /// ([`DrainEnd::tell`]). The answer's body reads it at each frame, and
+    /// an answer that ends ahead of the drain leaves the placement to it.
+    pub(crate) fn drain_end(&mut self) -> Arc<DrainEnd> {
+        Arc::clone(self.drained.get_or_insert_with(Arc::default))
+    }
+
+    /// Say the prefill's end where its drain has told one. Said once: the
+    /// drain's end is given up with it. The clock is read only for a told
+    /// end.
+    fn tell_drained(&mut self) {
+        if let Some(status) = self.drained.as_deref().and_then(DrainEnd::told) {
+            self.drained = None;
+            self.prefill_ended(status, Instant::now());
+        }
+    }
+
+    /// The answer's body was dropped ahead of its end, at `now`: its client
+    /// left. Where the prefill's drain still owes its end, the decode is
+    /// given up here and the placement is left to the drain. Elsewhere the
+    /// placement's drop gives up what it owes.
+    fn body_dropped(mut self, now: Instant) {
+        if let Some(drain) = self.drained.take() {
+            self.placed.decode_released(ReleaseReason::Abandoned, now);
+            drain.leave(self);
+        }
     }
 
     /// The mark for the relay of this placement's streamed answer: the relay
@@ -93,7 +198,12 @@ impl Sent {
         self.ended(response.status(), answered(response), now);
     }
 
-    /// Say the placement's end where it was sent.
+    /// Say the placement's end where it was sent. A pair's answer is its
+    /// decode's: the decode ends with it, and so does a prefill whose router
+    /// said no end ahead of it ([`Self::prefill_ended`]). A drained prefill
+    /// ends with its drain: the placement goes to the drain's end, which
+    /// tells it at once or when the drain ends ([`DrainEnd::leave`]). A
+    /// prefill that was not sent hears no end: the drop releases its side.
     fn end(
         mut self,
         status: StatusCode,
@@ -101,9 +211,21 @@ impl Sent {
         first: Option<Instant>,
         now: Instant,
     ) {
-        if let Some(at) = self.at {
-            self.placed
-                .completed(End::http(status, class, at, first, now), now);
+        let Some(at) = self.at else {
+            return;
+        };
+        let end = End::http(status, class, at, first, now);
+        match self.drained.take() {
+            Some(drain) => {
+                self.placed.decode_completed(end, now);
+                drain.leave(self);
+            }
+            None => {
+                if self.own_sent {
+                    self.placed.completed(end, now);
+                }
+                self.placed.decode_completed(end, now);
+            }
         }
     }
 
@@ -160,9 +282,10 @@ fn class_at_the_end(failed: bool, cut: Option<StatusCode>, status: StatusCode) -
 /// has gone out in full by the edge body's rule ([`BodyProgress`]): at its
 /// last frame, or once its data adds up to the length the response
 /// declared, since an HTTP/1.1 server asks for no frame after that. On an
-/// early drop the handle reports the cancellation. The body reads each
-/// frame's length and none of its bytes. A response with nothing to send
-/// gets no such body: its lease ended at its head.
+/// early drop the handle reports the cancellation, and a prefill whose
+/// drain still runs is left to the drain ([`Sent::body_dropped`]). The body
+/// reads each frame's length and none of its bytes. A response with nothing
+/// to send gets no such body: its lease ended at its head.
 struct Ride {
     sent: Option<Sent>,
     inner: Body,
@@ -188,6 +311,9 @@ impl http_body::Body for Ride {
                     this.first.get_or_insert_with(Instant::now);
                 }
                 if !this.progress.frame_out(frame, this.inner.is_end_stream()) {
+                    if let Some(sent) = &mut this.sent {
+                        sent.tell_drained();
+                    }
                     return next;
                 }
                 false
@@ -208,6 +334,16 @@ impl http_body::Body for Ride {
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+impl Drop for Ride {
+    /// A body dropped with its placement still in hand never reached its
+    /// end: the placement hears that.
+    fn drop(&mut self) {
+        if let Some(sent) = self.sent.take() {
+            sent.body_dropped(Instant::now());
+        }
     }
 }
 

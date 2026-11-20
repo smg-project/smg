@@ -17,9 +17,13 @@ use super::{
 };
 use crate::{
     catalog::Catalog,
-    door::{decide_in, entry, Buffers, Decided, Taken},
+    decision::ShadowKind,
+    door::{decide_in, entry, Buffers, Decided, Taken, SHADOW_FLOOR},
     framework::Scorer,
-    spec::{AffinitySource, AppliedSpec, BindingSpec, Match, PolicySpec, ScoreSpec, ScoreStage},
+    spec::{
+        AffinitySource, AppliedSpec, BindingSpec, Match, PolicySpec, ScoreSpec, ScoreStage,
+        ShadowSpec,
+    },
     store::{
         BatchFacts, BatchOutcome, KvEvent, KvEventSink, LeasesStore, LoadSink, LoadSource,
         MemoryStore, Signals, StoredBlock, WorkerFacts, WorkerStatus, WorkersStore,
@@ -31,10 +35,11 @@ type Case<T = ()> = Result<T, Box<dyn Error>>;
 
 const HASHES: [u64; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 
+/// The `cache_aware` preset as it stands: its affinity stage names no
+/// source, so it reads `merged`.
 pub(crate) fn merged(generation: u64) -> Result<PolicySpec, crate::spec::SpecError> {
     let mut document = PolicySpec::preset("cache_aware")?;
     document.generation = generation;
-    use_sent_prefixes(&mut document, AffinitySource::Merged);
     Ok(document)
 }
 
@@ -162,6 +167,24 @@ fn slices(store: &MemoryStore, role: Role) -> Option<usize> {
     store.deciding(|world| world.sent_slices(MODEL, role))
 }
 
+/// A batch through the worker's lane with one stored block no request of
+/// these cases holds: the store has heard the worker's cache events.
+fn hear(store: &MemoryStore, id: WorkerId) -> BatchOutcome {
+    let other = StoredBlock {
+        seq_hash: kv_index::SequenceHash(999),
+        content_hash: kv_index::ContentHash(999),
+    };
+    let event = KvEvent::Stored {
+        parent: None,
+        blocks: vec![other],
+    };
+    let facts = BatchFacts {
+        sequence: 1,
+        ..BatchFacts::default()
+    };
+    store.admit(id, 0, facts, &[event])
+}
+
 #[test]
 fn a_worker_with_no_events_is_named_by_what_it_was_sent() -> Case {
     let store = fleet();
@@ -181,6 +204,330 @@ fn a_worker_with_no_events_is_named_by_what_it_was_sent() -> Case {
     load(&store, b, 0, later);
     assert_eq!(issued(&door, &asked, later, &mut buffers)?, a);
     assert_eq!(depths(&buffers), vec![(u32::from(a > b), 8)]);
+    Ok(())
+}
+
+/// A worker can ask for cache events and never publish one. Its lane is
+/// never heard, so the record speaks for it as for a worker with no lane.
+#[test]
+fn a_worker_that_asks_for_events_and_publishes_none_keeps_its_prompt() -> Case {
+    let store = fleet();
+    let a = worker(&store, "a", Role::Single, &[MODEL], true)?;
+    let b = worker(&store, "b", Role::Single, &[MODEL], true)?;
+    let c = worker(&store, "c", Role::Single, &[MODEL], true)?;
+    store.apply(applied(&merged(1)?)?)?;
+    let door = Door::new(store.clone());
+    let mut buffers = Buffers::default();
+    let start = Instant::now() + Duration::from_secs(120);
+    for id in [a, b, c] {
+        load(&store, id, u32::from(id != a), start);
+    }
+    let asked = token_request(&HASHES[..8]);
+    assert_eq!(issued(&door, &asked, start, &mut buffers)?, a);
+    // From here its worker is the heaviest row: load alone would move the
+    // prompt at every turn.
+    for turn in 1..40 {
+        let now = start + Duration::from_millis(20 * turn);
+        load(&store, a, 2, now);
+        load(&store, b, 0, now);
+        load(&store, c, 0, now);
+        assert_eq!(issued(&door, &asked, now, &mut buffers)?, a, "turn {turn}");
+    }
+    Ok(())
+}
+
+/// A lane's first batch hands its row to the index, with no publication
+/// between. Its worker reported gone hands the row back to the record,
+/// which still holds what the row was sent before.
+#[test]
+fn a_heard_lane_hands_its_row_to_the_index_and_a_worker_gone_hands_it_back() -> Case {
+    let store = fleet();
+    let a = worker(&store, "a", Role::Single, &[MODEL], true)?;
+    let b = worker(&store, "b", Role::Single, &[MODEL], true)?;
+    store.apply(applied(&merged(1)?)?)?;
+    let door = Door::new(store.clone());
+    let mut buffers = Buffers::default();
+    let now = Instant::now() + Duration::from_secs(120);
+    load(&store, a, 0, now);
+    load(&store, b, 1, now);
+    let asked = token_request(&HASHES[..8]);
+    assert_eq!(issued(&door, &asked, now, &mut buffers)?, a);
+    let row = u32::from(a > b);
+    let later = now + Duration::from_millis(20);
+    decide_only(&door, &asked, later, &mut buffers);
+    assert_eq!(depths(&buffers), vec![(row, 8)]);
+
+    assert_eq!(hear(&store, a), BatchOutcome::Applied);
+    decide_only(&door, &asked, later, &mut buffers);
+    assert!(buffers.named.holders.is_empty(), "the index speaks for it");
+    // A lease on the heard worker writes nothing.
+    let written = slices(&store, Role::Single);
+    load(&store, a, 0, later);
+    load(&store, b, 1, later);
+    let other = token_request(&HASHES[..4]);
+    assert_eq!(issued(&door, &other, later, &mut buffers)?, a);
+    assert_eq!(slices(&store, Role::Single), written);
+
+    KvEventSink::removed(&*store, a);
+    decide_only(&door, &asked, later, &mut buffers);
+    assert_eq!(depths(&buffers), vec![(row, 8)]);
+    Ok(())
+}
+
+/// Where a request's binding names a shadow, its order writes the record
+/// of sent prefixes as the plain order does. A prefix sent to a worker
+/// with no events returns to it past a lighter one under both documents,
+/// and the pool keeps the same slices.
+#[test]
+fn a_shadowed_order_records_the_prefixes_it_sent_as_the_plain_one() -> Case {
+    let returning = |shadowed: bool| -> Case<([bool; 2], Option<usize>, u64)> {
+        let store = fleet();
+        let a = worker(&store, "a", Role::Single, &[MODEL], false)?;
+        let b = worker(&store, "b", Role::Single, &[MODEL], false)?;
+        let mut document = merged(1)?;
+        if shadowed {
+            let live = document.profiles.values().next();
+            let twin = live.ok_or("the preset's profile")?.clone();
+            document.profiles.insert("twin".into(), twin);
+            document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+        }
+        store.apply(applied(&document)?)?;
+        let door = Door::new(store.clone());
+        let asked = token_request(&HASHES[..8]);
+        let placed = |now: Instant| -> Case<WorkerId> {
+            let decided = door.decide(GATEWAY, &asked, now);
+            let decided = decided.map_err(|word| format!("{word:?}"))?;
+            let lease = decided.lease.ok_or("a pick's lease")?.lease;
+            door.report(GATEWAY, lease.id, gone());
+            Ok(lease.booked)
+        };
+        let now = Instant::now() + Duration::from_secs(120);
+        load(&store, a, 0, now);
+        load(&store, b, 1, now);
+        let cold = placed(now)? == a;
+        let later = now + Duration::from_millis(20);
+        load(&store, a, 2, later);
+        load(&store, b, 0, later);
+        let back = placed(later)? == a;
+        let agreed = door.shadowed(0, ShadowKind::Agreed);
+        Ok(([cold, back], slices(&store, Role::Single), agreed))
+    };
+    let plain = returning(false)?;
+    assert_eq!(plain.0, [true, true], "the prefix returns to its worker");
+    assert_eq!(plain.2, 0, "no shadow is named");
+    let shadowed = returning(true)?;
+    assert_eq!((shadowed.0, shadowed.1), (plain.0, plain.1));
+    assert_eq!(shadowed.2, 2, "the twin is asked beside both decisions");
+    Ok(())
+}
+
+/// The `least_load` preset and, where `shadowed`, the `cache_aware`
+/// preset's profile as its binding's shadow: a live profile that is named
+/// no row, and a shadow that reads sent prefixes and is named rows of its
+/// own.
+fn least_load(generation: u64, shadowed: bool) -> Case<PolicySpec> {
+    let mut document = PolicySpec::preset("least_load")?;
+    document.generation = generation;
+    if shadowed {
+        let twin = merged(generation)?.profiles.into_values().next();
+        let twin = twin.ok_or("the preset's profile")?;
+        document.profiles.insert("twin".into(), twin);
+        document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+    }
+    Ok(document)
+}
+
+/// What two leases of one prompt left under a document.
+#[derive(Debug, PartialEq)]
+struct Landed {
+    /// Whether each lease took the lighter worker.
+    lighter: [bool; 2],
+    /// The shadows that agreed, and those that took another worker.
+    kinds: [u64; 2],
+    /// The record's slices under the document, and behind the next one,
+    /// which names no shadow.
+    record: [Option<usize>; 2],
+}
+
+/// Behind a live profile that is named no row, a pool keeps the record of
+/// sent prefixes for a shadow that is named rows of its own. Each lease
+/// writes the live decision's worker under the prefixes that shadow's
+/// naming folded, so the shadow reads where the requests went: it keeps a
+/// returning prompt on the worker least load sent it to, past a lighter
+/// one. The live decisions land as they land with no shadow, and a
+/// document that names none keeps no record.
+#[test]
+fn a_shadow_of_its_own_rows_reads_where_the_live_decisions_went() -> Case {
+    let landing = |shadowed: bool| -> Case<Landed> {
+        let store = fleet();
+        let a = worker(&store, "a", Role::Single, &[MODEL], false)?;
+        let b = worker(&store, "b", Role::Single, &[MODEL], false)?;
+        store.apply(applied(&least_load(1, shadowed)?)?)?;
+        let door = Door::new(store.clone());
+        let asked = token_request(&HASHES[..8]);
+        let placed = |now: Instant| -> Case<WorkerId> {
+            let decided = door.decide(GATEWAY, &asked, now);
+            let decided = decided.map_err(|word| format!("{word:?}"))?;
+            let lease = decided.lease.ok_or("a pick's lease")?.lease;
+            door.report(GATEWAY, lease.id, gone());
+            Ok(lease.booked)
+        };
+        let now = Instant::now() + Duration::from_secs(120);
+        load(&store, a, 0, now);
+        load(&store, b, 1, now);
+        let first = placed(now)? == a;
+        let later = now + Duration::from_millis(20);
+        load(&store, a, 2, later);
+        load(&store, b, 0, later);
+        let second = placed(later)? == b;
+        let kinds = [ShadowKind::Agreed, ShadowKind::OtherTarget];
+        let kinds = kinds.map(|kind| door.shadowed(0, kind));
+        let kept = slices(&store, Role::Single);
+        // The document in force names no shadow again.
+        store.apply(applied(&least_load(2, false)?)?)?;
+        Ok(Landed {
+            lighter: [first, second],
+            kinds,
+            record: [kept, slices(&store, Role::Single)],
+        })
+    };
+    let plain = landing(false)?;
+    assert_eq!(plain.lighter, [true, true], "least load takes the lighter");
+    assert_eq!((plain.kinds, plain.record), ([0, 0], [None, None]));
+    let shadowed = landing(true)?;
+    assert_eq!(
+        shadowed.lighter, plain.lighter,
+        "the live decisions land the same"
+    );
+    assert_eq!(
+        shadowed.kinds,
+        [1, 1],
+        "the shadow returns to the first worker"
+    );
+    assert_eq!(
+        shadowed.record,
+        [Some(2), None],
+        "a slice a lease, then none"
+    );
+    Ok(())
+}
+
+/// A request whose shadow is not asked leaves no entry. Under the floor
+/// no row is named for the shadow, so the lease writes nothing: not the
+/// request's prefixes, and nothing of the naming the request before left
+/// on the thread's buffers.
+#[test]
+fn a_decision_whose_shadow_is_not_asked_writes_no_record() -> Case {
+    let store = fleet();
+    let a = worker(&store, "a", Role::Single, &[MODEL], false)?;
+    let b = worker(&store, "b", Role::Single, &[MODEL], false)?;
+    store.apply(applied(&least_load(1, true)?)?)?;
+    let door = Door::new(store.clone());
+    let floor = u32::try_from(SHADOW_FLOOR.as_micros())?;
+    let placed = |budget_micros: u32, now: Instant| -> Case<WorkerId> {
+        let mut asked = token_request(&HASHES[..8]);
+        asked.facts.budget_micros = budget_micros;
+        let decided = door.decide(GATEWAY, &asked, now);
+        let decided = decided.map_err(|word| format!("{word:?}"))?;
+        let lease = decided.lease.ok_or("a pick's lease")?.lease;
+        door.report(GATEWAY, lease.id, gone());
+        Ok(lease.booked)
+    };
+    let now = Instant::now() + Duration::from_secs(120);
+    load(&store, a, 0, now);
+    load(&store, b, 1, now);
+    assert_eq!(placed(floor, now)?, a);
+    assert_eq!(slices(&store, Role::Single), Some(1));
+    let later = now + Duration::from_millis(20);
+    load(&store, a, 2, later);
+    load(&store, b, 0, later);
+    assert_eq!(placed(floor - 1, later)?, b);
+    assert_eq!(door.shadowed(0, ShadowKind::Skipped), 1);
+    assert_eq!(slices(&store, Role::Single), Some(1), "no entry for it");
+    Ok(())
+}
+
+/// What two leases of one prompt in each of a model's two pools left.
+#[derive(Debug, PartialEq)]
+struct Beside {
+    /// Whether each lease of the reader's pool took its first worker.
+    returned: [bool; 2],
+    /// The record's slices as each pool reads them: the shadowed
+    /// binding's pool, then the reader's.
+    record: [Option<usize>; 2],
+    /// The shadows that were not asked.
+    skipped: u64,
+}
+
+/// A model keeps one record of sent prefixes under one bound, and each
+/// of its pools that keeps the record writes there. A shadow that would
+/// be named rows of its own is not asked where another pool of its model
+/// reads the record live: the entries its pool kept for it would stand
+/// under the bound the live reader's stand under. That pool's leases and
+/// the record's entries are the same with the shadow and without, and
+/// each such decision counts its shadow as skipped.
+#[test]
+fn a_shadow_is_skipped_where_another_pool_of_its_model_reads_the_record() -> Case {
+    let landing = |shadowed: bool| -> Case<Beside> {
+        let store = fleet();
+        let a = worker(&store, "a", Role::Single, &[MODEL], false)?;
+        let b = worker(&store, "b", Role::Single, &[MODEL], false)?;
+        let c = worker(&store, "c", Role::Prefill, &[MODEL], false)?;
+        let d = worker(&store, "d", Role::Prefill, &[MODEL], false)?;
+        // Least load decides the single pool, with the shadow or with
+        // none. A live cache-aware profile decides the prefill pool.
+        let mut document = least_load(1, shadowed)?;
+        let aware = merged(1)?.profiles.into_values().next();
+        let aware = aware.ok_or("the preset's profile")?;
+        document.profiles.insert("aware".into(), aware);
+        let mut reader = document.bindings[0].clone();
+        reader.matcher.phase = vec![Phase::Prefill];
+        reader.profile = Some("aware".into());
+        reader.shadow = None;
+        document.bindings[0].matcher.phase = vec![Phase::Single];
+        document.bindings.push(reader);
+        store.apply(applied(&document)?)?;
+        let door = Door::new(store.clone());
+        let placed = |phase: Phase, now: Instant| -> Case<WorkerId> {
+            let mut asked = token_request(&HASHES[..8]);
+            asked.facts.phase = phase;
+            let decided = door.decide(GATEWAY, &asked, now);
+            let decided = decided.map_err(|word| format!("{word:?}"))?;
+            let lease = decided.lease.ok_or("a pick's lease")?.lease;
+            door.report(GATEWAY, lease.id, gone());
+            Ok(lease.booked)
+        };
+        let now = Instant::now() + Duration::from_secs(120);
+        for (id, running) in [(a, 0), (b, 1), (c, 0), (d, 1)] {
+            load(&store, id, running, now);
+        }
+        placed(Phase::Single, now)?;
+        let cold = placed(Phase::Prefill, now)? == c;
+        let later = now + Duration::from_millis(20);
+        for (id, running) in [(a, 2), (b, 0), (c, 2), (d, 0)] {
+            load(&store, id, running, later);
+        }
+        placed(Phase::Single, later)?;
+        let back = placed(Phase::Prefill, later)? == c;
+        Ok(Beside {
+            returned: [cold, back],
+            record: [Role::Single, Role::Prefill].map(|role| slices(&store, role)),
+            skipped: door.shadowed(0, ShadowKind::Skipped),
+        })
+    };
+    let plain = landing(false)?;
+    assert_eq!(plain.returned, [true, true], "the prefix returns");
+    // The reader's first lease writes its slice. The prompt's return to
+    // the same worker is a fresh hit and writes none.
+    assert_eq!(plain.record, [None, Some(1)], "the reader's one slice");
+    assert_eq!(plain.skipped, 0, "no shadow is named");
+    let shadowed = landing(true)?;
+    assert_eq!(
+        (shadowed.returned, shadowed.record),
+        (plain.returned, plain.record),
+        "the reader's leases and the record stand as with no shadow"
+    );
+    assert_eq!(shadowed.skipped, 2, "the pairing is skipped each time");
     Ok(())
 }
 
@@ -269,12 +616,13 @@ fn a_long_request_is_written_in_slices_of_sixteen() -> Case {
 }
 
 #[test]
-fn a_worker_with_events_is_neither_written_nor_listed() -> Case {
+fn a_worker_whose_events_are_heard_is_neither_written_nor_listed() -> Case {
     let store = fleet();
     let event = worker(&store, "event", Role::Single, &[MODEL], true)?;
     let plain = worker(&store, "plain", Role::Single, &[MODEL], false)?;
     let other = worker(&store, "other", Role::Single, &[MODEL], false)?;
     store.apply(applied(&merged(1)?)?)?;
+    assert_eq!(hear(&store, event), BatchOutcome::Applied);
     let door = Door::new(store.clone());
     let mut buffers = Buffers::default();
     let now = Instant::now() + Duration::from_secs(120);
@@ -318,6 +666,11 @@ fn a_worker_with_events_is_neither_written_nor_listed() -> Case {
     assert_eq!(buffers.named.holders.len(), 1);
     let holder = buffers.named.holders[0];
     assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (1, 0));
+    // The same numbers as windows of a text ask no cache events.
+    let mut text = asked;
+    text.facts.hash_kind = HashKind::Text;
+    decide_only(&door, &text, later, &mut buffers);
+    assert!(buffers.named.holders.is_empty());
     Ok(())
 }
 
@@ -340,18 +693,21 @@ fn a_namespace_keeps_its_prefixes_apart() -> Case {
 }
 
 #[test]
-fn text_windows_and_absent_hashes_write_no_prefix() -> Case {
+fn a_text_request_is_recorded_and_absent_hashes_are_not() -> Case {
     let store = fleet();
     worker(&store, "a", Role::Single, &[MODEL], false)?;
     store.apply(applied(&merged(1)?)?)?;
     let door = Door::new(store.clone());
     let now = Instant::now();
     let mut buffers = Buffers::default();
+    issued(&door, &token_request(&[]), now, &mut buffers)?;
+    assert_eq!(slices(&store, Role::Single), Some(0));
     let mut asked = token_request(&HASHES);
     asked.facts.hash_kind = HashKind::Text;
     issued(&door, &asked, now, &mut buffers)?;
-    issued(&door, &token_request(&[]), now, &mut buffers)?;
-    assert_eq!(slices(&store, Role::Single), Some(0));
+    assert_eq!(slices(&store, Role::Single), Some(1));
+    decide_only(&door, &asked, now, &mut buffers);
+    assert_eq!(depths(&buffers), vec![(0, 12)]);
     Ok(())
 }
 
@@ -542,7 +898,10 @@ fn a_profile_that_reads_sent_prefixes_keeps_no_decider() -> Case {
         assert!(!spec.engine().reads_sent_for("unbound", Phase::Single));
         assert!(!spec.engine().keeps_deciders());
     }
-    let index = PolicySpec::preset("cache_aware")?;
+    // The preset names no source and reads them too. `index` does not.
+    assert!(applied(&merged(1)?)?.needs().sent_prefixes);
+    let mut index = merged(1)?;
+    use_sent_prefixes(&mut index, AffinitySource::Index);
     assert!(!applied(&index)?.needs().sent_prefixes);
     let mut old = serde_json::to_value(Needs::default())?;
     old.as_object_mut()

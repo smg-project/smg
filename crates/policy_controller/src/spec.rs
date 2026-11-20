@@ -39,11 +39,12 @@ use crate::{
     affinity::{blocks_within, Gates, KvPressure, PrefixAffinity, WarmupSlice},
     bucket::Bucket,
     builtins::{
-        has_room_rule, with_report_age, FewestSessions, HasRoomRule, LeastCost, LeastCostSent,
-        LeastLoad, LeastRequests, ResidentWork, SampledBest, SessionAffinity,
-        DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
+        has_room_rule, with_report_age, FewestSessions, HasRoomRule, HasRoomSignals, LeastCost,
+        LeastCostSent, LeastCostSignals, LeastLoad, LeastRequests, ResidentWork, SampledBest,
+        SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS,
+        DEFAULT_THROUGHPUT,
     },
-    catalog::{profile_sent, Catalog, FilterFactory, Found, StageBuild},
+    catalog::{profile_sent, Catalog, FilterFactory, Found, PickerFactory, StageBuild},
     framework::{
         Binding, Engine, Filter, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted,
     },
@@ -52,8 +53,8 @@ use crate::{
     routing_key::KeySources,
     sent::SentCredit,
     sessions::SessionRule,
-    signals::SignalColumn,
-    terms::Term,
+    signals::{column_named, SignalColumn},
+    terms::{signal_named, Term, SIGNAL_FAMILY},
     view::{threshold_permille, HashKind, Phase, MAX_REPORT_AGE_MS},
 };
 
@@ -182,8 +183,10 @@ const SIDES: [&str; 4] = ["single", "prefill", "decode", "encode"];
 /// deployment. Read at apply, never per request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Needs {
-    /// The request text in the view (a text-window hash form, for a host
-    /// without a tokenizer).
+    /// The request's text itself, for a controller that hashes it into
+    /// windows for a foreign host. No stage of this build declares it: a
+    /// host that holds the text hashes its windows itself
+    /// ([`Self::text_hashes`]).
     pub text: bool,
     /// The request's prefix block hashes over its token ids. A decision is
     /// handed the hashes as deep as the stages that declare them read
@@ -192,13 +195,18 @@ pub struct Needs {
     /// does, it is handed none. A plugin is shown the list where its own
     /// row declares one of the two, and none of it otherwise.
     pub token_hashes: bool,
-    /// The request's prefix block hashes over windows of its text, which a
-    /// host without a tokenizer feeds in their place. A stage that reads a
-    /// prefix by either kind sets this beside `text`.
+    /// The request's prefix block hashes over fixed windows of its text's
+    /// bytes, which a host with no token ids feeds in the token hashes'
+    /// place. A stage that reads a prefix by either kind sets this beside
+    /// `token_hashes`.
     pub text_hashes: bool,
     /// Load reports per worker.
     pub loads: bool,
-    /// KV events into an index.
+    /// KV events into an index. A stage that declares this beside
+    /// `token_hashes` reads the request's holders from the index, and a
+    /// host names the index's holders ahead of the record's for its
+    /// profile. A stage that reads the events for another fact of a row,
+    /// as a warm-up does, declares no hashes beside it.
     pub events: bool,
     /// The stage reads the prefixes sent to each worker.
     #[serde(default)]
@@ -248,9 +256,11 @@ pub struct Needs {
     /// The signal cells beside the rows
     /// ([`RequestFacts::signal_cells`](crate::RequestFacts::signal_cells)).
     /// A stage that keeps a signal's column declares this, and no other
-    /// stage does: the validator holds every stage it builds under a
-    /// build context to both
+    /// stage does: the validator holds every stage a catalog adds to both.
+    /// One a factory builds under a build context resolves its column
+    /// there
     /// ([`StageBuild::signal_column`](crate::StageBuild::signal_column)).
+    /// One built with no context resolves none, so it declares none.
     /// A host hands the cells where this is declared and none elsewhere.
     pub signal_cells: bool,
 }
@@ -392,7 +402,11 @@ pub struct IndexSpec {
     #[schemars(range(min = 1))]
     pub ttl_s: u32,
     /// The size bound of a tree index: characters on a text host, tokens
-    /// otherwise.
+    /// otherwise. The crate's own store reads it for a pool whose profile
+    /// reads sent prefixes: the model's record is bound to `max_size` over
+    /// the block size placements, never under one, one a block a worker
+    /// was sent. A lowered bound is met by sweeps at the record's next
+    /// writes, and a pool whose lanes are all heard writes none.
     #[schemars(range(min = 1))]
     pub max_size: u64,
     /// The index's sweep cadence, in seconds.
@@ -503,13 +517,13 @@ impl Default for LeastLoadParams {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AffinitySource {
-    /// The event-fed prefix index.
-    #[default]
+    /// The index of cache events alone.
     Index,
-    /// The side index of prefixes sent, for workers without an event
-    /// subscription.
+    /// The record of the prefixes sent alone.
     Predictor,
-    /// Both, merged by per-worker maximum.
+    /// Each worker by what it has: its cache events where it publishes
+    /// them, and the prefixes sent to it where it does not.
+    #[default]
     Merged,
 }
 
@@ -552,7 +566,7 @@ pub struct PrefixAffinityParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0.0))]
     pub decay: Option<f32>,
-    /// Where placements come from (default `index`).
+    /// Where placements come from (default `merged`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<AffinitySource>,
     /// How long an optimistic dispatch booking lives before the engine
@@ -733,9 +747,9 @@ pub struct ConsistentHashParams {
     /// request carries. Under the view's `boundaries` a request that reaches
     /// one is keyed there instead, at the deepest it reaches. The depth is
     /// checked in the view's token blocks and read in the blocks a request
-    /// was hashed by. A text request's windows are `block_size` characters,
-    /// a quarter of a token block, so it carries a quarter of the checked
-    /// depth and a deeper depth keys at its last window. Under a block size
+    /// was hashed by. A host that hashes a text request by windows of the
+    /// block size times four bytes gives it the checked depth in windows,
+    /// as a token request has it in blocks. Under a block size
     /// an engine published above the depth a request has no key. Absent, a
     /// request with no routing key has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -770,7 +784,9 @@ pub struct ResidentWorkParams {
     pub request_tokens: u32,
 }
 
-const COST_PARAMETER_LIMIT: f64 = 1e15;
+/// The largest magnitude of a cost rule's parameter. The signal sink holds
+/// a value it takes to the same bound.
+pub(crate) const COST_PARAMETER_LIMIT: f64 = 1e15;
 const RELATIVE_MARGIN_LIMIT: f64 = 1e6;
 
 /// The least-cost scorer: a sum of a row's fields times their coefficients,
@@ -783,10 +799,16 @@ pub struct LeastCostParams {
     #[schemars(extend("exclusiveMinimum" = 0, "maximum" = COST_PARAMETER_LIMIT))]
     pub weight: f32,
     /// Field names and their coefficients. At least one field is required.
+    /// A name written `signal.<name>` reads a signal the document declares.
     #[serde(deserialize_with = "keyed_once")]
     #[schemars(extend(
         "minProperties" = 1,
-        "propertyNames" = { "enum": Term::NAMES.map(|(name, _)| name) },
+        "propertyNames" = {
+            "anyOf": [
+                { "enum": Term::NAMES.map(|(name, _)| name) },
+                { "pattern": signal_pattern() }
+            ]
+        },
         "additionalProperties" = {
             "type": "number",
             "format": "double",
@@ -796,11 +818,13 @@ pub struct LeastCostParams {
         }
     ))]
     pub terms: BTreeMap<String, f64>,
-    /// How far above the least cost a row still ties for the top score.
-    #[serde(default)]
+    /// How far above the least cost a row still ties for the top score: the
+    /// map of its two parts, or a bare number, the absolute margin.
+    #[serde(default, deserialize_with = "absolute_or_parts")]
+    #[schemars(with = "AbsoluteOrParts")]
     pub margin: CostMargin,
     /// What a row costs when a named value is missing. Required for terms
-    /// that read a report.
+    /// that read a report or a signal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unreported: Option<Unreported>,
 }
@@ -876,6 +900,69 @@ pub struct CostMargin {
     /// A share of the magnitude of the least cost.
     #[schemars(extend("minimum" = 0, "maximum" = RELATIVE_MARGIN_LIMIT))]
     pub relative: f64,
+}
+
+/// Reads a margin as a document writes it. A bare number is the absolute
+/// margin, and a map is read part by part.
+fn absolute_or_parts<'de, D: Deserializer<'de>>(deserializer: D) -> Result<CostMargin, D::Error> {
+    struct MarginVisitor;
+
+    impl<'de> Visitor<'de> for MarginVisitor {
+        type Value = CostMargin;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a number, the absolute margin, or a map of `absolute` and `relative`")
+        }
+
+        fn visit_f64<E: de::Error>(self, absolute: f64) -> Result<CostMargin, E> {
+            Ok(CostMargin {
+                absolute,
+                ..CostMargin::default()
+            })
+        }
+
+        fn visit_i64<E: de::Error>(self, absolute: i64) -> Result<CostMargin, E> {
+            self.visit_f64(absolute as f64)
+        }
+
+        fn visit_u64<E: de::Error>(self, absolute: u64) -> Result<CostMargin, E> {
+            self.visit_f64(absolute as f64)
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<CostMargin, A::Error> {
+            CostMargin::deserialize(de::value::MapAccessDeserializer::new(map))
+        }
+    }
+
+    deserializer.deserialize_any(MarginVisitor)
+}
+
+/// The schema of a margin's two forms in a document. It holds no value.
+enum AbsoluteOrParts {}
+
+impl JsonSchema for AbsoluteOrParts {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        "AbsoluteOrParts".into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "anyOf": [
+                {
+                    "description": "The absolute margin, in cost units.",
+                    "type": "number",
+                    "format": "double",
+                    "minimum": 0,
+                    "maximum": COST_PARAMETER_LIMIT
+                },
+                generator.subschema_for::<CostMargin>()
+            ]
+        })
+    }
 }
 
 /// The `best` picker's parameters.
@@ -1028,17 +1115,29 @@ impl FilterStage {
 /// `has-room` by a rule: a worker has room where what it holds is at most
 /// its capacity less the headroom, `used <= (1 - headroom) * capacity`.
 /// The filter stays soft: where no worker has room, every worker stands.
-/// Written bare, `has-room` reads the bit its host sets.
+/// Written bare, `has-room` reads the bit its host sets. A null under the
+/// name, the slip of a bare name written with a colon, is refused with
+/// both forms named. A reader that takes a null for an empty map refuses
+/// it by the part it lacks.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[serde(expecting = "a rule with `used` and `capacity`, or the bare name `has-room`")]
 pub struct HasRoomParams {
     /// What a worker holds: field names and their coefficients, summed. At
-    /// least one field is required. A worker that lacks a named value has
-    /// no room.
+    /// least one is required. A name written `signal.<name>` reads a signal
+    /// the document declares. Under a capacity that is a number, a field
+    /// or a signal of the worker is required: the request's size alone
+    /// reads nothing of a worker there. A worker that lacks a named value
+    /// has no room.
     #[serde(deserialize_with = "keyed_once")]
     #[schemars(extend(
         "minProperties" = 1,
-        "propertyNames" = { "enum": room_fields() },
+        "propertyNames" = {
+            "anyOf": [
+                { "enum": room_fields() },
+                { "pattern": signal_pattern() }
+            ]
+        },
         "additionalProperties" = {
             "type": "number",
             "format": "double",
@@ -1048,12 +1147,25 @@ pub struct HasRoomParams {
         }
     ))]
     pub used: BTreeMap<String, f64>,
-    /// What a worker can hold, in the units of `used`.
+    /// What a worker can hold, in the units of `used`: a number, or a
+    /// signal the document declares. A worker whose capacity reads zero or
+    /// less has no room.
     pub capacity: Capacity,
     /// The share of the capacity kept free: from 0 to under 1.
     #[serde(default)]
     #[schemars(extend("minimum" = 0, "exclusiveMaximum" = 1))]
     pub headroom: f64,
+}
+
+/// The schema's pattern of a signal's name as a sum writes it: the
+/// family's name before the signal names' own pattern
+/// ([`SIGNAL_NAME_PATTERN`]), which is written once.
+fn signal_pattern() -> String {
+    format!(
+        "^{}{}",
+        SIGNAL_FAMILY.replace('.', r"\."),
+        SIGNAL_NAME_PATTERN.trim_start_matches('^')
+    )
 }
 
 /// The names `has-room` may sum: every term's, and the request's size.
@@ -1065,12 +1177,13 @@ fn room_fields() -> Vec<&'static str> {
 }
 
 /// What a worker can hold: a number above zero in the units of `used`, or
-/// the name of a field that holds one. No field of this build holds a
-/// capacity, so a name is read and refused.
+/// the name of a signal that holds one, written `signal.<name>`. No field
+/// of this build holds a capacity, so any other name is read and refused.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Capacity {
     Fixed(f64),
+    /// A name as the document writes it: a declared signal's.
     Field(String),
 }
 
@@ -1091,7 +1204,7 @@ impl<'de> Deserialize<'de> for Capacity {
             type Value = Capacity;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a number, or the name of a field that holds one")
+                f.write_str("a number, or a declared signal written signal.<name>")
             }
 
             fn visit_f64<E: de::Error>(self, capacity: f64) -> Result<Capacity, E> {
@@ -1122,10 +1235,10 @@ impl JsonSchema for Capacity {
 
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
         json_schema!({
-            "description": "What a worker can hold: a number above zero in the units of `used`, or the name of a field that holds one. No field of this build holds a capacity.",
+            "description": "What a worker can hold: a number above zero in the units of `used`, or a signal the document declares, written `signal.<name>`.",
             "anyOf": [
                 { "type": "number", "format": "double", "exclusiveMinimum": 0 },
-                { "type": "string" }
+                { "type": "string", "pattern": signal_pattern() }
             ]
         })
     }
@@ -1501,18 +1614,32 @@ impl JsonSchema for ScoreSpec {
     }
 
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-        // The bare form stands for the stage at its defaults, so a scorer
-        // whose parameters have none is written in the parameter form only.
+        // The schema cannot know a host's catalog, so a name is open in
+        // both forms: the validator refuses an unknown one by its path. The
+        // bare form stands for a stock scorer at its defaults, so one whose
+        // parameters have none is written in the parameter form only: the
+        // description lists the stock scorers that stand bare.
         let names: Vec<&str> = SCORERS
             .iter()
             .copied()
             .filter(|name| ScoreStage::by_name(name).is_some())
             .collect();
+        let description = format!(
+            "A scorer: its bare name (a stock scorer at its defaults, or a scorer the host adds at weight one), a stock scorer mapped to its weight and parameters, or the name of a scorer the host adds mapped to its weight and parameters. The stock scorers a document names bare: {}.",
+            names.join(", ")
+        );
         json_schema!({
-            "description": "A scorer: its bare name (the stage at its defaults), or the name mapped to its weight and parameters.",
+            "description": description,
             "anyOf": [
-                { "type": "string", "enum": names },
-                generator.subschema_for::<ScoreStage>()
+                { "type": "string" },
+                generator.subschema_for::<ScoreStage>(),
+                {
+                    "type": "object",
+                    "minProperties": 1,
+                    "maxProperties": 1,
+                    "propertyNames": { "not": { "enum": SCORERS } },
+                    "additionalProperties": { "type": "object" }
+                }
             ]
         })
     }
@@ -1536,19 +1663,29 @@ impl PickStage {
     }
 }
 
-/// A picker reference: a bare name, or the name mapped to its parameters
-/// ([`PickStage`]).
+/// A picker reference: a bare name, a built-in mapped to its parameters
+/// ([`PickStage`]), or a name the catalog adds mapped to the parameters
+/// its factory reads.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum PickSpec {
     Name(String),
     Params(PickStage),
+    /// A name that is no built-in's with parameters, mapped to what the
+    /// document wrote under it. The map is kept as read so the validator
+    /// can ask the catalog for the name first. Parsing refuses a repeated
+    /// key.
+    Added {
+        name: String,
+        written: serde_json::Value,
+    },
 }
 
 impl PickSpec {
     /// The picker's name as written.
     pub fn name(&self) -> &str {
         match self {
-            Self::Name(name) => name,
+            Self::Name(name) | Self::Added { name, .. } => name,
             Self::Params(stage) => stage.name(),
         }
     }
@@ -1586,27 +1723,43 @@ impl Serialize for PickSpec {
                 map.serialize_entry("best-with-temperature", p)?;
                 map.end()
             }
+            Self::Added { name, written } => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry(name, &Ordered(written))?;
+                map.end()
+            }
         }
     }
 }
 
-/// The one picker of a pick entry's map, read by its key.
-fn picker_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<PickStage, A::Error> {
-    const WITH_PARAMETERS: [&str; 2] = ["best", "best-with-temperature"];
+/// The built-in pickers a document writes with parameters: the keys the
+/// reader reads into [`PickStage`].
+const TYPED_PICKERS: [&str; 2] = ["best", "best-with-temperature"];
+
+/// The one picker of a pick entry's map, read by its key. A built-in's
+/// key chooses its parameter struct, so the struct's own message names an
+/// unknown or mistyped parameter. What stands under any other name is
+/// kept as read: only the validator knows the names a catalog adds.
+fn picker_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<PickSpec, A::Error> {
     let Some(key) = map.next_key::<String>()? else {
         return Err(de::Error::custom("a pick entry names one picker"));
     };
-    let stage = match key.as_str() {
-        "best" => PickStage::Best(map.next_value()?),
-        "best-with-temperature" => PickStage::BestWithTemperature(map.next_value()?),
-        other => return Err(de::Error::unknown_variant(other, &WITH_PARAMETERS)),
+    let entry = match key.as_str() {
+        "best" => PickSpec::Params(PickStage::Best(map.next_value()?)),
+        "best-with-temperature" => {
+            PickSpec::Params(PickStage::BestWithTemperature(map.next_value()?))
+        }
+        _ => {
+            let Written(written) = map.next_value()?;
+            PickSpec::Added { name: key, written }
+        }
     };
     if map.next_key::<de::IgnoredAny>()?.is_some() {
         return Err(de::Error::custom(
             "a pick entry maps a single key to its parameters",
         ));
     }
-    Ok(stage)
+    Ok(entry)
 }
 
 impl<'de> Deserialize<'de> for PickSpec {
@@ -1625,7 +1778,7 @@ impl<'de> Deserialize<'de> for PickSpec {
             }
 
             fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<PickSpec, A::Error> {
-                picker_entry(map).map(PickSpec::Params)
+                picker_entry(map)
             }
         }
 
@@ -1644,11 +1797,25 @@ impl JsonSchema for PickSpec {
             .copied()
             .filter(|name| *name != "best-with-temperature")
             .collect();
+        // A name is open in both forms, as a scorer's is: the description
+        // lists the stock pickers a document names bare.
+        let description = format!(
+            "{} The stock pickers a document names bare: {}.",
+            "A picker: its bare name, a built-in mapped to its parameters, or the name of a picker the host adds mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool.",
+            names.join(", ")
+        );
         json_schema!({
-            "description": "A picker: its bare name, or the name mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool.",
+            "description": description,
             "anyOf": [
-                { "type": "string", "enum": names },
-                generator.subschema_for::<PickStage>()
+                { "type": "string" },
+                generator.subschema_for::<PickStage>(),
+                {
+                    "type": "object",
+                    "minProperties": 1,
+                    "maxProperties": 1,
+                    "propertyNames": { "not": { "enum": TYPED_PICKERS } },
+                    "additionalProperties": { "type": "object" }
+                }
             ]
         })
     }
@@ -1668,7 +1835,8 @@ pub struct ProfileSpec {
     /// The scorers, each a name or a name with its weight and parameters.
     #[serde(default)]
     pub score: Vec<ScoreSpec>,
-    /// The picker.
+    /// The picker: a name, a built-in mapped to its parameters, or the name
+    /// of a picker the catalog adds mapped to its parameters.
     pub pick: PickSpec,
     /// The number of milliseconds a send counts for. An unset limit keeps
     /// sends from expiring by age. A profile whose stages do not read its
@@ -2146,6 +2314,28 @@ pub struct SignalSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = MAX_REPORT_AGE_MS))]
     pub max_age_ms: Option<u32>,
+    /// How one row's value is made where its report holds several ranks.
+    /// Absent: the sum.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub across_ranks: AcrossRanks,
+}
+
+/// How one row's value is made where its report holds several ranks: a
+/// worker of several data-parallel ranks that stands as one row. Where
+/// each rank is a row of its own, nothing is reduced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AcrossRanks {
+    /// The ranks' values added: an amount each rank holds a part of.
+    #[default]
+    Sum,
+    /// The largest of the ranks' values.
+    Max,
+    /// The smallest of the ranks' values.
+    Min,
+    /// The mean of the ranks' values.
+    Mean,
 }
 
 /// The most signals one document declares.
@@ -2689,8 +2879,37 @@ fn resolve_signals(signals: &BTreeMap<String, SignalSpec>) -> Arc<[SignalColumn]
     signals
         .iter()
         .zip(0u16..)
-        .map(|((name, spec), column)| SignalColumn::new(name, &spec.unit, column, spec.max_age_ms))
+        .map(|((name, spec), column)| {
+            SignalColumn::new(name, &spec.unit, column, spec.max_age_ms).across(spec.across_ranks)
+        })
         .collect()
+}
+
+/// What a term's written name reads: a field of this build, or a signal
+/// the document declares.
+enum Named {
+    Field(Term),
+    Signal(SignalColumn),
+}
+
+/// The term `name` in the map `terms` of the stage at `at`. A name of the
+/// signal family (`signal.<name>`) reads a signal the document declares,
+/// and any other name a field of this build. A name that reads neither is
+/// refused at the map, by the name as written.
+fn named_term(
+    signals: &[SignalColumn],
+    at: &At,
+    terms: &str,
+    name: &str,
+) -> Result<Named, SpecError> {
+    match signal_named(name) {
+        Some(signal) => column_named(signals, signal)
+            .map(|column| Named::Signal(column.clone()))
+            .ok_or_else(|| at.bad(terms, name, "a signal the document declares")),
+        None => Term::named(name)
+            .map(Named::Field)
+            .ok_or_else(|| at.bad(terms, name, "a field this build reads")),
+    }
 }
 
 /// The first two keys that overlap, in the keys' order: the first key with
@@ -2843,9 +3062,11 @@ fn check_stage(stage: &ScoreStage, at: &At) -> Result<(), SpecError> {
     }
 }
 
-/// Check the cost parameters while resolving the field names into readers.
+/// Check the cost parameters while resolving the field names into readers
+/// and the signals' names into their columns.
 fn least_cost_of(
     p: &LeastCostParams,
+    signals: &[SignalColumn],
     sent: impl FnOnce() -> Arc<SentCredit>,
     max_age_ms: Option<u64>,
     at: &At,
@@ -2862,9 +3083,9 @@ fn least_cost_of(
         return Err(at.bad("terms", "{}", "at least one field with its coefficient"));
     }
     let mut terms = Vec::new();
+    let mut signal_terms = Vec::new();
     for (name, &coefficient) in &p.terms {
-        let term =
-            Term::named(name).ok_or_else(|| at.bad("terms", name, "a field this build reads"))?;
+        let term = named_term(signals, at, "terms", name)?;
         if coefficient == 0.0
             || !(-COST_PARAMETER_LIMIT..=COST_PARAMETER_LIMIT).contains(&coefficient)
         {
@@ -2874,7 +3095,10 @@ fn least_cost_of(
                 "a finite number other than zero, of magnitude at most 1e15",
             ));
         }
-        terms.push((term, coefficient));
+        match term {
+            Named::Field(term) => terms.push((term, coefficient)),
+            Named::Signal(signal) => signal_terms.push((signal, coefficient)),
+        }
     }
     if !(0.0..=COST_PARAMETER_LIMIT).contains(&p.margin.absolute) {
         return Err(at
@@ -2899,15 +3123,25 @@ fn least_cost_of(
     }
     let reads_sent = terms.iter().any(|&(term, _)| term.reads_sent());
     let scorer = LeastCost::new(terms.into_boxed_slice(), p.margin, p.unreported);
-    if scorer.needs().loads && p.unreported.is_none() {
+    // A row with no fresh value for a named signal is unreported for the
+    // scorer, as a row with no report is: the document says what such a
+    // row costs.
+    if (scorer.needs().loads || !signal_terms.is_empty()) && p.unreported.is_none() {
         return Err(at.bad(
             "unreported", "null",
-            "what a row with no report costs, which a term that reads a report needs: over-least or missing-as-zero",
+            "what a row with no report, or with no fresh value of a signal, costs, which a term that reads a report or a signal needs: over-least or missing-as-zero",
         ));
     }
-    // Only a term that reads sends makes the profile's count, and the
-    // scorer that adds it.
-    Ok(if reads_sent {
+    // Only a term that reads sends makes the profile's count, and only a
+    // term that reads a signal the scorer that adds one.
+    Ok(if !signal_terms.is_empty() {
+        let scorer = LeastCostSignals::new(
+            scorer,
+            reads_sent.then(sent),
+            signal_terms.into_boxed_slice(),
+        );
+        with_report_age(scorer, max_age_ms)
+    } else if reads_sent {
         with_report_age(LeastCostSent::new(scorer, sent()), max_age_ms)
     } else {
         with_report_age(scorer, max_age_ms)
@@ -3021,6 +3255,7 @@ fn scorer_of(
     stage: &ScoreStage,
     gates: Gates,
     view: &ViewSpec,
+    signals: &[SignalColumn],
     sent: impl FnOnce() -> Arc<SentCredit>,
     at: &At,
 ) -> Result<Resolved<Box<dyn Scorer>>, SpecError> {
@@ -3070,33 +3305,75 @@ fn scorer_of(
             ResidentWork::new(p.request_tokens),
             max_age,
         )),
-        ScoreStage::LeastCost(p) => Resolved::Built(least_cost_of(p, sent, max_age, at)?),
+        ScoreStage::LeastCost(p) => Resolved::Built(least_cost_of(p, signals, sent, max_age, at)?),
     })
 }
 
+/// The profile's picker. The catalog is asked for a name first, as it is
+/// for a filter: a picker it builds from the document's map is handed what
+/// stands under the name, a picker registered with no parameter is written
+/// by its name alone, and a name it does not hold is refused as unknown
+/// whatever is written under it. `sent` hands a factory that asks for it
+/// the profile's count of sends.
 fn picker_of(
     pick: &PickSpec,
     profile: &str,
     at: &At,
-    catalog: &Catalog,
+    from: StageInputs<'_>,
+    sent_ttl_ms: Option<u32>,
+    sent: &mut Option<Arc<SentCredit>>,
 ) -> Result<Resolved<Box<dyn Picker>>, SpecError> {
-    Ok(match pick {
-        PickSpec::Name(name) => match catalog.find_picker(name) {
-            Some(Found::Built(picker)) => Resolved::Built(picker),
+    let named = pick.name();
+    let path = || format!("{}.pick.{named}", at.0);
+    // The catalog's factory builds its picker from the document's map. A
+    // picker has no weight: the map is the factory's whole.
+    let made = |build: &PickerFactory,
+                mut params: serde_json::Map<String, serde_json::Value>,
+                sent: &mut Option<Arc<SentCredit>>| {
+        in_key_order(&mut params);
+        let picker = StageBuild::built(
+            &params,
+            profile,
+            sent_ttl_ms,
+            sent,
+            from.reports,
+            from.signals,
+            build,
+            Picker::needs,
+        )
+        .map_err(|error| error.at(&path()))?;
+        let answers = picker.name();
+        if answers != named {
+            return Err(SpecError::BadStage {
+                path: path(),
+                reason: format!("picker registered as {named:?} answers the name {answers:?}"),
+            });
+        }
+        Ok(Resolved::Built(picker))
+    };
+    let unknown = || SpecError::UnknownPicker {
+        profile: profile.to_string(),
+        name: named.to_string(),
+    };
+    match pick {
+        PickSpec::Name(name) => match from.catalog.find_picker(name) {
+            Some(Found::Built(picker)) => {
+                // A picker the catalog built with no context.
+                no_cells_without_a_context(
+                    picker.needs(),
+                    "register it by picker_with to resolve one, or leave the need unset",
+                    path,
+                )?;
+                Ok(Resolved::Built(picker))
+            }
+            Some(Found::With(build)) => made(build, serde_json::Map::new(), sent),
             // The one picker with parameters, named without them.
-            Some(Found::Typed) => {
-                return Err(at.bad(
-                    "pick",
-                    name,
-                    "a picker with its temperature: { best-with-temperature: { temperature } }",
-                ))
-            }
-            None => {
-                return Err(SpecError::UnknownPicker {
-                    profile: profile.to_string(),
-                    name: name.clone(),
-                })
-            }
+            Some(Found::Typed) => Err(at.bad(
+                "pick",
+                name,
+                "a picker with its temperature: { best-with-temperature: { temperature } }",
+            )),
+            None => Err(unknown()),
         },
         PickSpec::Params(PickStage::Best(p)) => {
             if !(1..=MAX_SAMPLE).contains(&p.sample) {
@@ -3106,7 +3383,7 @@ fn picker_of(
                     "a whole number from 1 to 64",
                 ));
             }
-            Resolved::Built(Box::new(SampledBest::new(p.sample)))
+            Ok(Resolved::Built(Box::new(SampledBest::new(p.sample))))
         }
         PickSpec::Params(PickStage::BestWithTemperature(p)) => {
             if !at_or_above_zero(p.temperature) {
@@ -3116,9 +3393,49 @@ fn picker_of(
                     "a finite number at or above zero",
                 ));
             }
-            Resolved::NotInBuild("the best-with-temperature picker")
+            Ok(Resolved::NotInBuild("the best-with-temperature picker"))
         }
-    })
+        PickSpec::Added { name, written } => match from.catalog.find_picker(name) {
+            // Only a document built in code: the reader reads a typed
+            // built-in's key into its parameter struct.
+            _ if TYPED_PICKERS.contains(&name.as_str()) => Err(SpecError::BadField {
+                path: path(),
+                value: name.clone(),
+                reason: "a picker added in code: a built-in's parameters are typed",
+            }),
+            Some(Found::With(build)) => {
+                let params = written.as_object().ok_or_else(|| SpecError::BadField {
+                    path: path(),
+                    value: written.to_string(),
+                    reason: "a map of the picker's parameters",
+                })?;
+                made(build, params.clone(), sent)
+            }
+            // A picker registered with no parameter is written by its name
+            // alone: whatever stands under it is refused.
+            Some(Found::Built(_)) => Err(SpecError::BadField {
+                path: path(),
+                value: written.to_string(),
+                reason: "left out: this picker takes no parameter, write its bare name",
+            }),
+            // The catalog holds no picker by its type alone under a name the
+            // reader kept as read.
+            None | Some(Found::Typed) => Err(unknown()),
+        },
+    }
+}
+
+/// Holds a stage the catalog built with no context to the signal cells,
+/// as [`StageBuild::built`] holds one a factory built under a context. It
+/// resolved no signal, so its needs declare no cells: a host would hand
+/// cells nothing reads. `remedy` is what the stage's author can do, and
+/// `path` is the stage's own, made where a refusal names it.
+fn no_cells_without_a_context(
+    needs: Needs,
+    remedy: &'static str,
+    path: impl FnOnce() -> String,
+) -> Result<(), SpecError> {
+    StageBuild::held_to_cells(false, needs, remedy).map_err(|error| error.at(&path()))
 }
 
 /// What a document's stages are built from: the catalog that makes them,
@@ -3187,7 +3504,14 @@ fn filtered<'a>(
         (Some(Found::Built(_) | Found::With(_)), FilterSpec::Params(stage)) => {
             Ok(Filtered::Typed(stage))
         }
-        (Some(Found::Built(filter)), FilterSpec::Name(_)) => Ok(Filtered::Built(filter)),
+        (Some(Found::Built(filter)), FilterSpec::Name(_)) => {
+            no_cells_without_a_context(
+                filter.needs(),
+                "register it by filter_with to resolve one, or leave the need unset",
+                path,
+            )?;
+            Ok(Filtered::Built(filter))
+        }
         // A filter registered with no parameter is written by its name
         // alone: whatever stands under it is refused.
         (Some(Found::Built(_)), FilterSpec::Added { written, .. }) => Err(SpecError::BadField {
@@ -3219,18 +3543,21 @@ fn filtered<'a>(
 fn filter_of(
     stage: &FilterStage,
     view: &ViewSpec,
+    signals: &[SignalColumn],
     sent: impl FnOnce() -> Arc<SentCredit>,
     at: &At,
 ) -> Result<Box<dyn Filter>, SpecError> {
     match stage {
-        FilterStage::HasRoom(p) => has_room_of(p, sent, view.max_report_age_ms, at),
+        FilterStage::HasRoom(p) => has_room_of(p, signals, sent, view.max_report_age_ms, at),
     }
 }
 
 /// Check the rule's parameters while resolving the field names into
-/// readers. Only a term that reads sends makes the profile's count.
+/// readers and the signals' names into their columns. Only a term that
+/// reads sends makes the profile's count.
 fn has_room_of(
     p: &HasRoomParams,
+    signals: &[SignalColumn],
     sent: impl FnOnce() -> Arc<SentCredit>,
     max_age_ms: Option<u64>,
     at: &At,
@@ -3239,13 +3566,13 @@ fn has_room_of(
         return Err(at.bad("used", "{}", "at least one field with its coefficient"));
     }
     let mut terms = Vec::new();
+    let mut signal_terms = Vec::new();
     let mut request_tokens = 0.0;
     for (name, &coefficient) in &p.used {
         let term = if name == HasRoomRule::REQUEST_TOKENS {
             None
         } else {
-            let named = Term::named(name);
-            Some(named.ok_or_else(|| at.bad("used", name, "a field this build reads"))?)
+            Some(named_term(signals, at, "used", name)?)
         };
         if coefficient == 0.0
             || !(-COST_PARAMETER_LIMIT..=COST_PARAMETER_LIMIT).contains(&coefficient)
@@ -3257,20 +3584,43 @@ fn has_room_of(
             ));
         }
         match term {
-            Some(term) => terms.push((term, coefficient)),
+            Some(Named::Field(term)) => terms.push((term, coefficient)),
+            Some(Named::Signal(signal)) => signal_terms.push((signal, coefficient)),
             None => request_tokens = coefficient,
         }
     }
-    let capacity = match &p.capacity {
-        Capacity::Fixed(capacity) if capacity.is_finite() && *capacity > 0.0 => *capacity,
+    // Under a signal's capacity the rule's own bound is that of a capacity
+    // of one: a row's value scales it.
+    let (capacity, capacity_signal) = match &p.capacity {
+        Capacity::Fixed(capacity) if capacity.is_finite() && *capacity > 0.0 => (*capacity, None),
         Capacity::Fixed(capacity) => {
             return Err(at.bad("capacity", capacity, "a finite number above zero"));
         }
-        // No field of this build holds a capacity.
-        Capacity::Field(name) => {
-            return Err(at.bad("capacity", name, "a field this build reads"));
-        }
+        // A name is a declared signal's: no field of this build holds a
+        // capacity.
+        Capacity::Field(name) => match signal_named(name) {
+            Some(signal) => {
+                let column = column_named(signals, signal)
+                    .ok_or_else(|| at.bad("capacity", name, "a signal the document declares"))?;
+                (1.0, Some(column.clone()))
+            }
+            None => {
+                return Err(at.bad("capacity", name, "a declared signal, written signal.<name>"))
+            }
+        },
     };
+    // Under a capacity that is a number, the request's size alone is one
+    // answer for every row: such a rule reads nothing of a worker, and it
+    // keeps every row or steps aside. A signal in the sum reads a worker,
+    // and so does a capacity read of each worker, so both are settled
+    // first.
+    if terms.is_empty() && signal_terms.is_empty() && capacity_signal.is_none() {
+        return Err(at.bad(
+            "used",
+            HasRoomRule::REQUEST_TOKENS,
+            "at least one field or signal of the worker beside the request's size",
+        ));
+    }
     if !(0.0..1.0).contains(&p.headroom) {
         return Err(at.bad("headroom", p.headroom, "a number from 0 to under 1"));
     }
@@ -3282,7 +3632,18 @@ fn has_room_of(
         p.headroom,
         reads_sent.then(sent),
     );
-    Ok(has_room_rule(rule, max_age_ms))
+    // The signal form is a type of its own: a rule that names no signal
+    // is built as it is with no signal declared.
+    Ok(if signal_terms.is_empty() && capacity_signal.is_none() {
+        has_room_rule(rule, max_age_ms)
+    } else {
+        Box::new(HasRoomSignals::new(
+            rule,
+            signal_terms.into_boxed_slice(),
+            capacity_signal,
+            max_age_ms,
+        ))
+    })
 }
 
 /// What a score entry stands for.
@@ -3312,6 +3673,14 @@ fn scored(
             name: name.to_string(),
         });
     };
+    // A scorer the catalog built with no context, bare or under a weight.
+    if let Found::Built(scorer) = &found {
+        no_cells_without_a_context(
+            scorer.needs(),
+            "register it by scorer_with to resolve one, or leave the need unset",
+            || at.field(name),
+        )?;
+    }
     match (entry, found) {
         (ScoreSpec::Params(stage), _) => Ok(Scored::Typed(stage.clone())),
         (ScoreSpec::Name(_), Found::Typed) => match ScoreStage::by_name(name) {
@@ -3500,7 +3869,7 @@ fn check_profile(
             Filtered::Typed(stage) => {
                 let stage_at = At::new(format!("{}.filter[{index}].{}", at.0, stage.name()));
                 let count = || profile_sent(&mut sent, name, p.sent_ttl_ms);
-                filter_of(stage, view, count, &stage_at)?
+                filter_of(stage, view, from.signals, count, &stage_at)?
             }
         };
         filters.push(filter);
@@ -3521,24 +3890,8 @@ fn check_profile(
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
         check_prefix_depth(&stage, gates, view, &stage_at)?;
-        // A host that records no prefix it sent holds no source that reads
-        // them: where no worker publishes its blocks, the stage would score
-        // every worker as holding nothing.
-        let reads_sent = matches!(
-            &stage,
-            ScoreStage::PrefixAffinity(p)
-                if matches!(p.source, Some(AffinitySource::Predictor | AffinitySource::Merged))
-        );
-        if reads_sent && !catalog.records_sent_prefixes() {
-            complete = false;
-            deferred.note(
-                stage_at.field("source"),
-                "the record of sent prefixes this source reads",
-            );
-            continue;
-        }
         let count = || profile_sent(&mut sent, name, p.sent_ttl_ms);
-        match scorer_of(&stage, gates, view, count, &stage_at)? {
+        match scorer_of(&stage, gates, view, from.signals, count, &stage_at)? {
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
                 depth.deepen(read);
@@ -3558,7 +3911,7 @@ fn check_profile(
             }
         }
     }
-    let picker = match picker_of(&p.pick, name, &at, catalog)? {
+    let picker = match picker_of(&p.pick, name, &at, from, p.sent_ttl_ms, &mut sent)? {
         Resolved::Built(picker) => Some(picker),
         Resolved::NotInBuild(what) => {
             deferred.note(at.field("pick"), what);
@@ -5040,6 +5393,12 @@ impl AppliedSpec {
         &self.signal_columns
     }
 
+    /// [`Self::signal_columns`] as the list is shared: what the store's
+    /// signal sink hands a report's conversion.
+    pub(crate) fn shared_signal_columns(&self) -> Arc<[SignalColumn]> {
+        Arc::clone(&self.signal_columns)
+    }
+
     /// Marks the unbound start of a replica whose start's document waits
     /// for its first lead. Under the mark a request is no decision, and
     /// its answer is `Busy` with no reason: the unbound start of a store
@@ -5081,7 +5440,8 @@ impl AppliedSpec {
 
     /// The document's block size, in tokens: the size a request's blocks
     /// are counted by where neither the request nor a record says one.
-    pub(crate) fn block_size(&self) -> u32 {
+    #[must_use]
+    pub fn block_size(&self) -> u32 {
         self.block_size
     }
 
@@ -5108,11 +5468,21 @@ impl AppliedSpec {
     /// and the blocks are the request's own, counted as the key counts
     /// them. A stage that declares the request's hashes and names no depth
     /// reads to the cap ([`Self::max_block_hashes`]), which no depth is
-    /// past, and a generation with no such stage reads none. A host hashes
-    /// that many blocks of a request and no more, and hands the engine the
-    /// first that many of a longer list.
+    /// past, and a generation with no such stage reads none. A kind no
+    /// stage of the generation declares is read by none
+    /// ([`Needs::token_hashes`], [`Needs::text_hashes`]): `0`, whatever the
+    /// other kind's depth. A host hashes that many blocks of a request and
+    /// no more, and hands the engine the first that many of a longer list.
     #[must_use]
     pub fn block_hashes_read(&self, kind: HashKind, block_size: u32) -> usize {
+        let needs = self.needs();
+        let declared = match kind {
+            HashKind::Token => needs.token_hashes,
+            HashKind::Text => needs.text_hashes,
+        };
+        if !declared {
+            return 0;
+        }
         let blocks = match self.depth {
             HashDepth::Unread => 0,
             HashDepth::Tokens(tokens) => {
@@ -5367,6 +5737,8 @@ mod tests {
     #[test]
     fn an_applied_generation_reads_block_hashes_as_deep_as_its_stages_do() {
         use HashKind::{Text, Token};
+
+        use crate::door::tests::sent_prefixes::use_sent_prefixes;
         let preset = |name: &str| {
             let mut document = PolicySpec::preset(name).expect("a preset of this build");
             document.generation = 1;
@@ -5415,6 +5787,13 @@ mod tests {
         let mut held = preset("cache_aware");
         assert_eq!(applied(&held).block_hashes_read(Token, 0), 256);
         held.view.max_block_hashes = 128;
+        // A kind no stage declares is read by none. The prefix stage
+        // declares text hashes where its source reads the record of sent
+        // prefixes, and none where it reads cache events alone.
+        use_sent_prefixes(&mut held, AffinitySource::Index);
+        assert_eq!(applied(&held).block_hashes_read(Token, 0), 128);
+        assert_eq!(applied(&held).block_hashes_read(Text, 4), 0);
+        use_sent_prefixes(&mut held, AffinitySource::Merged);
         assert_eq!(applied(&held).block_hashes_read(Text, 4), 128);
         // A generation reads as deep as the deepest of its profiles.
         let two = doc(
@@ -5925,7 +6304,16 @@ mod tests {
             // affinity stage and the ring's prefix form.
             let hashes = ["cache_aware", "prefix_hash"].contains(&name);
             assert_eq!(engine.needs().token_hashes, hashes, "{name}");
+            assert_eq!(engine.needs().text_hashes, hashes, "{name}");
+            assert!(!engine.needs().text, "{name}");
+            // The affinity stage's source is left out: it reads each worker
+            // by what it has, its cache events or the prefixes sent to it.
             assert_eq!(engine.needs().events, name == "cache_aware", "{name}");
+            assert_eq!(
+                engine.needs().sent_prefixes,
+                name == "cache_aware",
+                "{name}"
+            );
             // The affinity column is fed where an affinity stage reads it
             // and nowhere else: a preset without one declares no column.
             assert_eq!(engine.needs().affinity, name == "cache_aware", "{name}");
@@ -7037,37 +7425,19 @@ mod tests {
             .expect("the tokens alone");
     }
 
-    /// A prefix-affinity source that reads the prefixes sent is refused by
-    /// its field where the host records none: `predictor` and `merged`
-    /// would place as with no affinity where no worker publishes its
-    /// blocks. A host that records them validates both. The event-fed
-    /// index validates on either host, named or left out.
+    /// A document that names no source reads each worker by what it has:
+    /// its stage asks a host for cache events and for the prefixes sent.
     #[test]
-    fn a_source_of_sent_prefixes_is_refused_where_the_host_records_none() {
-        let records_none = Catalog::builtin().without_sent_prefixes();
-        for source in ["predictor", "merged"] {
-            let score = format!(r#"{{"prefix-affinity":{{"source":"{source}"}}}}"#);
-            let spec = spec_with_score(&score);
-            let refused = spec
-                .validate_in(&records_none, &[])
-                .expect_err("a source this host cannot feed");
-            assert_eq!(
-                refused.to_string(),
-                "profiles.p.score[0].prefix-affinity.source: the record of sent prefixes this source reads is not in this build",
-                "{source}"
-            );
-            assert!(
-                spec.validate().is_ok(),
-                "{source}: a host that records them"
-            );
-        }
-        for score in [
-            r#"{"prefix-affinity":{"source":"index"}}"#,
-            r#"{"prefix-affinity":{}}"#,
-        ] {
-            let spec = spec_with_score(score);
-            assert!(spec.validate_in(&records_none, &[]).is_ok(), "{score}");
-        }
+    fn a_source_left_out_reads_cache_events_and_sent_prefixes() {
+        let needs = |score: &str| spec_with_score(score).validate().expect(score).needs();
+        let left_out = needs(r#"{"prefix-affinity":{}}"#);
+        assert_eq!(
+            left_out,
+            needs(r#"{"prefix-affinity":{"source":"merged"}}"#)
+        );
+        assert!(left_out.events && left_out.sent_prefixes);
+        let index = needs(r#"{"prefix-affinity":{"source":"index"}}"#);
+        assert!(index.events && !index.sent_prefixes);
     }
 
     #[test]
@@ -7097,6 +7467,7 @@ mod tests {
             &stage,
             Gates::of(None, None, None),
             &spec.view,
+            &[],
             || panic!("no term reads sends"),
             &At::new("profiles.p.score[0].least-cost"),
         )
@@ -8720,6 +9091,7 @@ mod tests {
         let held = SignalSpec {
             unit: "tokens".to_owned(),
             max_age_ms: None,
+            across_ranks: AcrossRanks::default(),
         };
         let signals = BTreeMap::from([("held".to_owned(), held)]);
         let mut profiles = base.profiles.clone();
@@ -8836,6 +9208,7 @@ mod tests {
                 SignalSpec {
                     unit: "tokens".to_owned(),
                     max_age_ms: Some(4_000),
+                    across_ranks: AcrossRanks::Max,
                 },
             )]),
             plans: PlansSpec {

@@ -1,6 +1,6 @@
 //! Fields a policy can use in a sum, in the units of the row that holds them.
 
-use crate::view::LoadRow;
+use crate::{sent::SentCounts, view::LoadRow};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Term {
@@ -55,6 +55,16 @@ impl Term {
             Self::SentRequests | Self::SentTokens => Some(0.0),
         }
     }
+}
+
+/// The family of names that read a signal the document declares:
+/// `signal.<name>`. A stage resolves the name where it is built.
+pub(crate) const SIGNAL_FAMILY: &str = "signal.";
+
+/// The signal a written name reads: what stands behind `signal.`, where
+/// the name is of that family.
+pub(crate) fn signal_named(written: &str) -> Option<&str> {
+    written.strip_prefix(SIGNAL_FAMILY)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -130,6 +140,16 @@ impl Coefficients {
 
     pub(crate) fn names_kv_or_running(&self) -> bool {
         self.active_kv != 0.0 || self.kv_usage != 0.0 || self.running != 0.0
+    }
+
+    /// Adds the sends' two terms to `sum` in name order: the requests,
+    /// then the tokens they stated. The one routine a pass that prices a
+    /// profile's count of sends closes a row's sum by. A pass reads the
+    /// count first, so it holds no sum across that read.
+    #[inline(always)]
+    pub(crate) fn add_sent(&self, sum: &mut f64, sent: SentCounts) {
+        *sum += f64::from(sent.requests) * self.sent_requests;
+        *sum += sent.tokens as f64 * self.sent_tokens;
     }
 
     /// Adds the report's terms in name order. A missing named value ends

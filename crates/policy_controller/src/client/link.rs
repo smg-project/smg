@@ -2,12 +2,12 @@
 //! one decide stream carries the host's concurrent asks. A watch opens on
 //! the same channel in a stream of its own.
 
-use std::{pin::pin, sync::Arc, time::Duration};
+use std::{collections::VecDeque, mem, pin::pin, sync::Arc, time::Duration};
 
 use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::FxHashMap;
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{mpsc, oneshot, watch, Mutex as AsyncMutex},
     task::JoinHandle,
     time::{timeout_at, Instant},
 };
@@ -34,15 +34,25 @@ use crate::{
 /// About six seconds at ten thousand reports a second.
 const REPORT_QUEUE: usize = 65_536;
 
+/// The reports that wait for a session at most: half of what a session's
+/// queue holds, so the next session takes the line whole and keeps room
+/// for the reports made while it sends it.
+const LINE: usize = REPORT_QUEUE / 2;
+
 /// A stream's clean end, as the message of the `OK` status the link keeps
 /// of it ([`Link::ended`]).
 const SESSION_ENDED: &str = "the session ended";
 const DECIDE_ENDED: &str = "the decide stream ended";
 
 /// A host's session and one decide stream, shared by its requests.
+///
+/// A link is dialed again in place ([`Link::redial`]): its next session
+/// opens in the state its clones share. A request in flight holds a clone,
+/// so what it reports rides the session that stands when it reports,
+/// whichever session its decision came over. A report made while no
+/// session stands waits for the next one ([`Link::report`]).
 #[derive(Clone, Debug)]
 pub struct Link {
-    welcome: Arc<Welcome>,
     shared: Arc<Shared>,
 }
 
@@ -56,21 +66,18 @@ pub enum Unanswered {
     /// wait it names.
     Busy(Busy),
     /// No answer inside the budget. The link releases a decision that arrives
-    /// later.
+    /// later, and the ask's id stays taken until then.
     Late,
-    /// An ask under this id is in flight already. Nothing was sent.
+    /// An ask under this id is in flight already, or one that left has its
+    /// answer still due. Nothing was sent.
     InFlight,
-    /// The link ended or the request queue closed. [`Link::ended`] tells
-    /// the cause once the link has ended.
+    /// No session stands, or the request queue closed. [`Link::ended`]
+    /// tells why the last session ended.
     Ended,
     /// The request could not be sent, or a handle could not read the
     /// decision it got back. An unread decision's leases are released as late.
     Unsent(Error),
 }
-
-/// The report queue was full or closed.
-#[derive(Debug)]
-pub struct Full;
 
 impl Link {
     /// Dials the endpoint, asks who leads, opens the session and one decide
@@ -79,9 +86,46 @@ impl Link {
     /// The link sets its own keepalive on the endpoint, over any the caller
     /// set: a ping every [`KEEPALIVE`], idle or not, and [`ANSWER_WAIT`]
     /// for its answer. The link's readers wait with no bound of their own,
-    /// as a watch does, so the keepalive is what ends a link whose
+    /// as a watch does, so the keepalive is what ends a session whose
     /// controller went silent.
     pub async fn connect(endpoint: Endpoint, gateway_id: &str) -> Result<Self, Error> {
+        let link = Self {
+            shared: Shared::new(),
+        };
+        link.redial(endpoint, gateway_id).await?;
+        Ok(link)
+    }
+
+    /// Opens the link's next session at `endpoint`, as [`Self::connect`]
+    /// opened its first, in the state the link's clones share. The reports
+    /// that waited for a session are sent first, in their order
+    /// ([`Self::report`]).
+    ///
+    /// A controller keeps a gateway's leases while it holds the gateway
+    /// present: through its sessions, and one grace period past the last
+    /// one's end as the controller read it. The gateway's next session
+    /// works on them. So a request that outlasts its session still reports
+    /// its dispatch and its end where the controller reads them.
+    ///
+    /// A session that still stands is let go once the dial and its `Leader`
+    /// ask have answered, ahead of the next session's welcome
+    /// ([`Error::Redialed`]): the controller lets it go at the next
+    /// session's hello. Two dials at once open their sessions one after
+    /// the other, so the session the controller keeps is the one the link
+    /// keeps. A dial dropped ahead of its session's start lets that
+    /// session go.
+    ///
+    /// # Errors
+    ///
+    /// What the dial, the `Leader` ask, the session's open or the decide
+    /// stream's open failed with. The link holds no new session then, and
+    /// the reports that waited still wait.
+    pub async fn redial(&self, endpoint: Endpoint, gateway_id: &str) -> Result<(), Error> {
+        let shared = &self.shared;
+        // One open at a time: a later dial's hello leaves after an earlier
+        // one's welcome, so the controller and the link keep the same
+        // session.
+        let _turn = shared.dialing.lock().await;
         let endpoint = endpoint
             .http2_keep_alive_interval(KEEPALIVE)
             .keep_alive_timeout(ANSWER_WAIT)
@@ -89,52 +133,66 @@ impl Link {
         let (mut stub, floor) = dial_leader(endpoint.connect(), gateway_id, ANSWER_WAIT).await?;
         let (report, reports) = mpsc::channel(REPORT_QUEUE);
         let (request, requests) = mpsc::unbounded_channel();
-        let shared = Shared::new(stub.clone(), floor, report, request);
-        let frames = shared.session_frames(hello(gateway_id, floor), reports);
+        // Dropped ahead of the session's start, by an open that failed or
+        // by a caller that left, the seat lets its session go.
+        let (seat, floor) = shared.seat(stub.clone(), floor, report, request);
+        let session = seat.session;
+        let frames = shared.session_frames(session, hello(gateway_id, floor), reports);
         let (controller, welcome, term) =
             Session::welcomed(&mut stub, frames, floor, ANSWER_WAIT).await?;
-        let decisions =
-            Decide::opened(&mut stub, shared.decide_requests(requests), ANSWER_WAIT).await?;
-        let (link, _) = shared.start(welcome, term, controller, decisions);
-        Ok(link)
+        let requests = shared.decide_requests(session, requests);
+        let decisions = Decide::opened(&mut stub, requests, ANSWER_WAIT).await?;
+        match shared.start(session, welcome, term, controller, decisions) {
+            Some(_) => Ok(()),
+            None => Err(Error::Redialed),
+        }
     }
 
-    /// The welcome that answered the session's hello.
-    pub fn welcome(&self) -> &Welcome {
-        &self.welcome
+    /// The welcome of the session that stands, or of the last one.
+    pub fn welcome(&self) -> Arc<Welcome> {
+        Arc::clone(&self.shared.state.lock().welcome)
     }
 
-    /// Whether the session and decide stream still stand.
+    /// Whether a session and its decide stream stand.
     pub fn stands(&self) -> bool {
         self.shared.stands()
     }
 
-    /// Why the link ended, and none while it stands. The first cause is
-    /// kept, including the whole status of the session or decide stream.
-    /// A clean end reads as an `OK` status that names the stream. A frame
-    /// below the term floor, a replica that stopped leading, an empty
-    /// answer or a full report queue can also end the link.
+    /// Why the last session ended, and none while one stands. The first
+    /// cause is kept, including the whole status of the session or decide
+    /// stream. A clean end reads as an `OK` status that names the stream.
+    /// A frame below the term floor, a replica that stopped leading, an
+    /// empty answer or a full report queue can also end a session.
     pub fn ended(&self) -> Option<Arc<Error>> {
         self.shared.state.lock().ended.clone()
     }
 
-    /// Waits for the link to end, returning at once if it already has.
+    /// Waits for the end of the session that stands, or of one whose
+    /// welcome has not come. Returns at once where there is neither.
     pub async fn closed(&self) {
-        let _ = self.shared.stopped.clone().changed().await;
+        let mut stopped = self.shared.state.lock().stopped.clone();
+        let _ = stopped.changed().await;
+    }
+
+    /// The reports the line dropped at its bound, each the oldest of a
+    /// full line ([`Self::report`]).
+    pub fn reports_dropped(&self) -> usize {
+        self.shared.state.lock().dropped
     }
 
     /// Opens a watch of the controller's workers on the link's channel,
     /// within [`ANSWER_WAIT`]. The watch has its own stream, so the session
     /// and asks can proceed while it waits.
     ///
-    /// The watch can outlive the link. Wait for [`Self::closed`] alongside
-    /// [`Watch::next`] to stop following it when the link ends.
+    /// The watch can outlive the session. Wait for [`Self::closed`]
+    /// alongside [`Watch::next`] to stop following it when the session
+    /// ends.
     ///
     /// # Errors
     ///
-    /// [`Error::LinkEnded`] where the link had ended: it lets its channel
-    /// go at its end, and nothing is dialed. Otherwise what the open
-    /// answers.
+    /// [`Error::LinkEnded`] where no session stands: a session lets its
+    /// channel go at its end, and nothing is dialed. Otherwise what the
+    /// open answers.
     pub async fn watch_workers(&self, request: WatchWorkersRequest) -> Result<Watch, Error> {
         let stub = self
             .shared
@@ -163,8 +221,11 @@ impl Link {
 
     /// Sends one ask if the stream holds credit and waits up to `budget`
     /// for its answer. A budget past the clock's range waits with no bound.
-    /// Use a distinct id for each request that may still have an answer on
-    /// the wire.
+    ///
+    /// An id stays taken until its ask's answer arrives, also where the
+    /// asker left or its budget ended. An ask under it in that time is
+    /// [`Unanswered::InFlight`], so no ask takes an answer made for an
+    /// earlier one.
     ///
     /// A request the controller's check refuses is refused here, by the
     /// same check, and nothing is sent: a frame out of its ranges ends the
@@ -208,10 +269,27 @@ impl Link {
         }
     }
 
-    /// Queues a report for the session without waiting for room. A full
-    /// queue ends the link.
-    pub fn report(&self, frame: gateway_frame::Frame) -> Result<(), Full> {
-        self.shared.report(frame)
+    /// Queues a report for the session that stands, without waiting for
+    /// room. With no session to take it the report waits in the link's
+    /// line, and the next session sends the line first, in its order.
+    ///
+    /// The line is bounded by its length alone: half of what a session's
+    /// queue holds. Past that it drops its oldest report for a new one
+    /// and counts it ([`Self::reports_dropped`]). The link drops no report
+    /// by its age. Whether the controller still holds a lease is the
+    /// controller's to know, and a report of a lease it let go is no error
+    /// there.
+    ///
+    /// A completion that waited past the grace period the last welcome
+    /// told is said as a release with the reason `EXPIRED`. Its lease
+    /// ends, and its outcome is not said: the controller would read it as
+    /// one of the instant it arrives.
+    ///
+    /// A full queue ends the session: it took no report for as long as its
+    /// queue covers. The report that met it waits for the next session,
+    /// and the reports the queue held are lost with it.
+    pub fn report(&self, frame: gateway_frame::Frame) {
+        self.shared.report(frame);
     }
 
     /// Gives back the leases of a decision its host could not read.
@@ -235,17 +313,37 @@ fn in_range(request: &DecideRequest) -> Result<(), Error> {
 #[derive(Debug)]
 struct Shared {
     state: Mutex<State>,
-    stopped: watch::Receiver<()>,
+    // Held over a session's open: one dial at a time.
+    dialing: AsyncMutex<()>,
 }
 
 #[derive(Debug)]
 struct State {
     floor: u64,
+    // The session that stands: its welcome came, and neither of its
+    // streams has ended.
     open: Option<Open>,
-    // Why the link ended: the first cause, written as the queues are taken.
+    // The session whose open has not ended. A report waits in the line
+    // until it has, so an open that fails takes no report with it.
+    seated: Option<Open>,
+    // Why the last session ended: the first cause, written as the queues
+    // are taken. None while a session stands.
     ended: Option<Arc<Error>>,
     // The block hashes cut from the asks the link queued.
     cut: usize,
+    // The number of the session seated last. A stream, a reader, an end and
+    // a waiting ask act on their own session alone: what an ended session
+    // left behind reaches nothing of the next.
+    session: u64,
+    // The welcome of the session that stands, or of the last one.
+    welcome: Arc<Welcome>,
+    // Closed at the end of the session seated last, for who waits on it.
+    stopped: watch::Receiver<()>,
+    // The reports made with no session to take them, in their order, each
+    // with the instant it was made.
+    line: VecDeque<(Instant, gateway_frame::Frame)>,
+    // The reports the line dropped at its bound.
+    dropped: usize,
 }
 
 impl State {
@@ -257,12 +355,37 @@ impl State {
         self.floor = term;
         Some(open)
     }
+
+    /// Whether the session `session` is seated or stands.
+    fn holds(&self, session: u64) -> bool {
+        self.session == session && (self.open.is_some() || self.seated.is_some())
+    }
+
+    /// Takes the queues and waiters of the session that stands, and writes
+    /// why it ended. The caller drops them outside the lock.
+    fn close(&mut self, why: Error) -> Option<Open> {
+        let open = self.open.take()?;
+        self.ended = Some(Arc::new(why));
+        Some(open)
+    }
+
+    /// A report with no session to take it joins the line for the next
+    /// one. A line at its bound drops its oldest report for it. No report
+    /// is dropped by its age: only the controller knows whether it still
+    /// holds the report's lease.
+    fn wait(&mut self, frame: gateway_frame::Frame) {
+        if self.line.len() == LINE {
+            self.line.pop_front();
+            self.dropped += 1;
+        }
+        self.line.push_back((Instant::now(), frame));
+    }
 }
 
 #[derive(Debug)]
 struct Open {
-    // The link's channel, kept for a watch opened on it. It leaves with
-    // the queues, so an ended link holds no connection open.
+    // The session's channel, kept for a watch opened on it. It leaves with
+    // the queues, so an ended session holds no connection open.
     stub: Stub,
     reports: mpsc::Sender<gateway_frame::Frame>,
     // Every queued request has spent credit. A grant can exceed the
@@ -274,50 +397,138 @@ struct Open {
     _stop: watch::Sender<()>,
 }
 
+/// A session's seat until its start. Dropped ahead of that, by an open
+/// that failed or by a caller that left, it lets the session go.
+#[derive(Debug)]
+struct Seat<'a> {
+    shared: &'a Shared,
+    session: u64,
+}
+
+impl Drop for Seat<'_> {
+    fn drop(&mut self) {
+        self.shared.unseat(self.session);
+    }
+}
+
+/// A report as its session says it after a wait in the line. A completion
+/// that waited past the grace period goes as an expired release: its lease
+/// ends, and the controller reads no outcome as one of the instant it
+/// arrives. Every other report goes as it was made.
+fn waited(frame: gateway_frame::Frame, late: bool) -> gateway_frame::Frame {
+    match frame {
+        gateway_frame::Frame::Completed(completed) if late => {
+            gateway_frame::Frame::Released(Released {
+                what: Some(released::What::LeaseId(completed.lease_id)),
+                reason: released::Reason::Expired.into(),
+                side: completed.side,
+            })
+        }
+        frame => frame,
+    }
+}
+
 #[derive(Debug)]
 struct Waiting {
     deadline: Option<Instant>,
-    // The id stays in the table until its caller takes the answer or leaves.
+    // `None` once the asker took the answer, or left ahead of it.
     answer: Option<oneshot::Sender<Answer>>,
+    // Whether the answer arrived. The id stays in the table until it has
+    // and the asker left: an asker that leaves first keeps the id taken,
+    // so no later ask under it takes the answer still due.
+    answered: bool,
 }
 
 impl Waiting {
+    /// The asker's end for the answer that arrived, where the asker
+    /// still waits inside its budget.
     fn take(&mut self) -> Option<oneshot::Sender<Answer>> {
+        self.answered = true;
         if self.deadline.is_some_and(|at| Instant::now() >= at) {
             return None;
         }
         self.answer.take()
     }
+
+    /// Whether the asker left ahead of its answer.
+    fn left(&self) -> bool {
+        !self.answered && self.answer.is_none()
+    }
 }
 
 impl Shared {
-    fn new(
+    /// A link's state ahead of its first session.
+    fn new() -> Arc<Self> {
+        // No session is seated: who waits for one's end returns at once.
+        let (_, stopped) = watch::channel(());
+        Arc::new(Self {
+            state: Mutex::new(State {
+                floor: 0,
+                open: None,
+                seated: None,
+                ended: None,
+                cut: 0,
+                session: 0,
+                welcome: Arc::default(),
+                stopped,
+                line: VecDeque::new(),
+                dropped: 0,
+            }),
+            dialing: AsyncMutex::new(()),
+        })
+    }
+
+    /// Seats the link's next session and lets go the one before it. Answers
+    /// the session's seat, and the floor its hello states: the link's
+    /// floor never falls. The session stands once its welcome comes
+    /// ([`Self::start`]).
+    fn seat(
+        &self,
         stub: Stub,
         floor: u64,
         reports: mpsc::Sender<gateway_frame::Frame>,
         requests: mpsc::UnboundedSender<DecideRequest>,
-    ) -> Arc<Self> {
+    ) -> (Seat<'_>, u64) {
         let (stop, stopped) = watch::channel(());
-        Arc::new(Self {
-            state: Mutex::new(State {
-                floor,
-                open: Some(Open {
-                    stub,
-                    reports,
-                    requests,
-                    credit: 0,
-                    pending: FxHashMap::default(),
-                    _stop: stop,
-                }),
-                ended: None,
-                cut: 0,
-            }),
-            stopped,
-        })
+        let mut state = self.state.lock();
+        let before = (state.close(Error::Redialed), state.seated.take());
+        state.floor = state.floor.max(floor);
+        state.session += 1;
+        state.stopped = stopped;
+        state.seated = Some(Open {
+            stub,
+            reports,
+            requests,
+            credit: 0,
+            pending: FxHashMap::default(),
+            _stop: stop,
+        });
+        let (session, floor) = (state.session, state.floor);
+        drop(state);
+        drop(before);
+        let seat = Seat {
+            shared: self,
+            session,
+        };
+        (seat, floor)
+    }
+
+    /// Lets go the session `session` where it has not started. The line
+    /// stands as it was.
+    fn unseat(&self, session: u64) {
+        let mut state = self.state.lock();
+        let seated = if state.session == session {
+            state.seated.take()
+        } else {
+            None
+        };
+        drop(state);
+        drop(seated);
     }
 
     fn session_frames(
         self: &Arc<Self>,
+        session: u64,
         first: GatewayFrame,
         queued: mpsc::Receiver<gateway_frame::Frame>,
     ) -> impl Stream<Item = GatewayFrame> + use<> {
@@ -326,7 +537,7 @@ impl Shared {
         once(first).chain(ReceiverStream::new(queued).map_while(move |frame| {
             let shared = shared.upgrade()?;
             let state = shared.state.lock();
-            state.open.as_ref()?;
+            state.holds(session).then_some(())?;
             seq += 1;
             Some(numbered(seq, state.floor, frame))
         }))
@@ -334,64 +545,111 @@ impl Shared {
 
     fn decide_requests(
         self: &Arc<Self>,
+        session: u64,
         queued: mpsc::UnboundedReceiver<DecideRequest>,
     ) -> impl Stream<Item = DecideRequest> + use<> {
         let shared = Arc::downgrade(self);
-        UnboundedReceiverStream::new(queued)
-            .map_while(move |request| shared.upgrade()?.stands().then_some(request))
+        UnboundedReceiverStream::new(queued).map_while(move |request| {
+            let held = shared.upgrade()?.state.lock().holds(session);
+            held.then_some(request)
+        })
     }
 
+    /// The welcome of the session `session` came: the session stands from
+    /// here with its credit, and its two readers start. The reports that
+    /// waited are queued first, in their order. A queue whose stream is
+    /// gone takes none of them: they keep their place for the session
+    /// after. None where the session was let go meanwhile.
     fn start(
-        self: Arc<Self>,
+        self: &Arc<Self>,
+        session: u64,
         welcome: Welcome,
         term: u64,
         controller: impl Stream<Item = Result<ControllerFrame, Status>> + Send + 'static,
         decisions: impl Stream<Item = Result<DecideAnswer, Status>> + Send + 'static,
-    ) -> (Link, [JoinHandle<()>; 2]) {
-        {
+    ) -> Option<[JoinHandle<()>; 2]> {
+        let (stopped, line) = {
             let mut state = self.state.lock();
-            if let Some(open) = state.observe(term) {
+            if state.session != session {
+                return None;
+            }
+            let mut open = state.seated.take()?;
+            // The grace period the waiting reports' leases lived under.
+            let grace = Duration::from_millis(u64::from(state.welcome.grace_period_ms));
+            let mut line = mem::take(&mut state.line);
+            while let Some((made, frame)) = line.pop_front() {
+                let late = made.elapsed() >= grace;
+                // The line is no longer than half the session's queue, so
+                // only a queue whose stream is gone refuses. What it
+                // refuses waits for the next session with the rest, as a
+                // report made on this one does.
+                if let Err(refused) = open.reports.try_send(waited(frame, late)) {
+                    line.push_front((made, refused.into_inner()));
+                    state.line = mem::take(&mut line);
+                    break;
+                }
+            }
+            if term >= state.floor {
+                state.floor = term;
                 open.credit = welcome.decide_window;
             }
-        }
-        let readers = [
-            self.reader(controller, Self::read_session, SESSION_ENDED),
-            self.reader(decisions, Self::read_decide, DECIDE_ENDED),
-        ];
-        let link = Link {
-            welcome: Arc::new(welcome),
-            shared: self,
+            state.welcome = Arc::new(welcome);
+            state.open = Some(open);
+            state.ended = None;
+            (state.stopped.clone(), line)
         };
-        (link, readers)
+        // The line's buffer is freed outside the lock.
+        drop(line);
+        Some([
+            self.reader(
+                session,
+                stopped.clone(),
+                controller,
+                Self::read_session,
+                SESSION_ENDED,
+            ),
+            self.reader(session, stopped, decisions, Self::read_decide, DECIDE_ENDED),
+        ])
     }
 
     fn stands(&self) -> bool {
         self.state.lock().open.is_some()
     }
 
-    /// Takes the queues and waiters together, then drops them outside the
-    /// lock. Neither stream can send new frames past this point. The end
-    /// that takes them writes why: a later end finds none, and its cause
-    /// is dropped.
-    fn end(mut state: MutexGuard<'_, State>, why: Error) {
-        let open = state.open.take();
-        if open.is_some() {
-            state.ended = Some(Arc::new(why));
-        }
+    /// Takes the queues and waiters of the session `session` together,
+    /// then drops them outside the lock. Neither stream can send new
+    /// frames past this point. The end that takes them writes why: a later
+    /// end finds none, and its cause is dropped. So is the end of a
+    /// session that is not the one seated last.
+    fn end(mut state: MutexGuard<'_, State>, session: u64, why: Error) {
+        let open = if state.session == session {
+            state.close(why)
+        } else {
+            None
+        };
         drop(state);
         drop(open);
     }
 
-    fn report(&self, frame: gateway_frame::Frame) -> Result<(), Full> {
-        let state = self.state.lock();
-        let open = state.open.as_ref().ok_or(Full)?;
+    fn report(&self, frame: gateway_frame::Frame) {
+        let mut state = self.state.lock();
+        let Some(open) = state.open.as_ref() else {
+            state.wait(frame);
+            return;
+        };
         match open.reports.try_send(frame) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                Self::end(state, Error::ReportsFull);
-                Err(Full)
+            Ok(()) => {}
+            // The session took no report for as long as its queue covers:
+            // it ends, and this report waits for the next one.
+            Err(mpsc::error::TrySendError::Full(frame)) => {
+                let full = state.close(Error::ReportsFull);
+                state.wait(frame);
+                drop(state);
+                drop(full);
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(Full),
+            // The session's stream is gone, and its reader has yet to say
+            // so.
+            Err(mpsc::error::TrySendError::Closed(frame)) => state.wait(frame),
         }
     }
 
@@ -421,12 +679,14 @@ impl Shared {
             Waiting {
                 deadline,
                 answer: Some(sender),
+                answered: false,
             },
         );
         // The cut of an ask is counted once the ask is queued.
         state.cut += cut;
         Ok(Pending {
             shared: self,
+            session: state.session,
             id,
             answer,
         })
@@ -438,8 +698,10 @@ impl Shared {
     )]
     fn reader<T>(
         self: &Arc<Self>,
+        session: u64,
+        mut stopped: watch::Receiver<()>,
         frames: impl Stream<Item = Result<T, Status>> + Send + 'static,
-        read: fn(&Self, T),
+        read: fn(&Self, u64, T),
         clean_end: &'static str,
     ) -> JoinHandle<()>
     where
@@ -448,7 +710,6 @@ impl Shared {
         // The readers hold the link only while handling a frame. Dropping
         // the last handle drops the queues and wakes both readers.
         let shared = Arc::downgrade(self);
-        let mut stopped = self.stopped.clone();
         tokio::spawn(async move {
             let mut frames = pin!(frames);
             loop {
@@ -462,33 +723,42 @@ impl Shared {
                 };
                 let status = match next {
                     Some(Ok(frame)) => {
-                        read(&shared, frame);
+                        read(&shared, session, frame);
                         continue;
                     }
                     Some(Err(status)) => status,
                     None => Status::ok(clean_end),
                 };
-                Self::end(shared.state.lock(), status.into());
+                Self::end(shared.state.lock(), session, status.into());
                 break;
             }
         })
     }
 
-    fn read_session(&self, frame: ControllerFrame) {
+    fn read_session(&self, session: u64, frame: ControllerFrame) {
         let mut state = self.state.lock();
+        // A frame its reader held across its session's end.
+        if state.session != session {
+            return;
+        }
         let (term, floor) = (frame.term, state.floor);
         if state.observe(term).is_none() {
-            Self::end(state, Error::BelowFloor { term, floor });
+            Self::end(state, session, Error::BelowFloor { term, floor });
         } else if let Some(controller_frame::Frame::NotLeader(told)) = frame.frame {
-            Self::end(state, Error::NotLeader(told.leader_address));
+            Self::end(state, session, Error::NotLeader(told.leader_address));
         }
     }
 
-    fn read_decide(&self, frame: DecideAnswer) {
+    fn read_decide(&self, session: u64, frame: DecideAnswer) {
         let mut state = self.state.lock();
+        // A frame its reader held across its session's end. The next
+        // session's credit and asks are none of its.
+        if state.session != session {
+            return;
+        }
         let (term, floor) = (frame.term, state.floor);
         let Some(open) = state.observe(term) else {
-            Self::end(state, Error::BelowFloor { term, floor });
+            Self::end(state, session, Error::BelowFloor { term, floor });
             return;
         };
         let answer = match frame.answer {
@@ -501,20 +771,26 @@ impl Shared {
                 Answer::Busy(busy)
             }
             Some(decide_answer::Answer::Busy(_)) => {
-                Self::end(state, Error::NotLeader(String::new()));
+                Self::end(state, session, Error::NotLeader(String::new()));
                 return;
             }
             None => {
                 let nothing = "an answer of the decide stream carries nothing";
-                Self::end(state, Error::NoDecision(nothing.to_owned()));
+                Self::end(state, session, Error::NoDecision(nothing.to_owned()));
                 return;
             }
         };
-        let waiting = open.pending.get_mut(frame.request_id.as_slice());
+        let id = frame.request_id.as_slice();
+        let waiting = open.pending.get_mut(id);
+        // An asker that left ahead of this answer kept its id for it.
+        let left = waiting.as_ref().is_some_and(|waiting| waiting.left());
         let undelivered = match waiting.and_then(Waiting::take) {
             Some(sender) => sender.send(answer).err(),
             None => Some(answer),
         };
+        if left {
+            open.pending.remove(id);
+        }
         drop(state);
         if let Some(Answer::Decision(decision)) = undelivered {
             self.release(decision);
@@ -539,16 +815,15 @@ impl Shared {
                 // An unknown side gives back the whole lease.
                 side: side.into(),
             });
-            if self.report(frame).is_err() {
-                // The controller's session grace covers leases still on file.
-                break;
-            }
+            self.report(frame);
         }
     }
 }
 
 struct Pending<'a> {
     shared: &'a Shared,
+    // The session the ask went out on.
+    session: u64,
     id: Arc<[u8]>,
     answer: oneshot::Receiver<Answer>,
 }
@@ -556,9 +831,21 @@ struct Pending<'a> {
 impl Drop for Pending<'_> {
     fn drop(&mut self) {
         self.answer.close();
-        if let Some(open) = self.shared.state.lock().open.as_mut() {
-            open.pending.remove(self.id.as_ref());
+        let mut state = self.shared.state.lock();
+        // A later session's table holds nothing of this ask.
+        let own = state.session == self.session;
+        if let Some(open) = state.open.as_mut().filter(|_| own) {
+            match open.pending.get_mut(self.id.as_ref()) {
+                // The asker leaves ahead of its answer. The id stays taken
+                // until that answer arrives: an ask under it in between
+                // would take an answer made for this one.
+                Some(waiting) if !waiting.answered => waiting.answer = None,
+                _ => {
+                    open.pending.remove(self.id.as_ref());
+                }
+            }
         }
+        drop(state);
         // A send that won the race with close may still be in the channel.
         if let Ok(Answer::Decision(decision)) = self.answer.try_recv() {
             self.shared.release(decision);
@@ -580,8 +867,8 @@ pub(super) mod tests {
     use crate::{
         client::{PolicyControllerClient, Principal},
         proto::{
-            busy, controller_frame, decide_answer, released, Credit, Header, Lease, NotLeader,
-            Released, RequestFacts, Side,
+            busy, controller_frame, decide_answer, released, Completed, Credit, Header, Lease,
+            NotLeader, Released, RequestFacts, Side,
         },
         spec::MAX_HEADERS,
     };
@@ -590,6 +877,11 @@ pub(super) mod tests {
     const LEADER_TERM: u64 = 3;
     const WELCOME_TERM: u64 = 4;
     const ASKS: u8 = 64;
+    /// The grace period a patient peer's welcome tells.
+    const GRACE: Duration = Duration::from_secs(10);
+    const GATEWAY: &str = "gateway";
+    /// An address no test dials.
+    const NOWHERE: &str = "http://127.0.0.1:1";
 
     /// One change of a request's facts.
     type Edit = fn(&mut RequestFacts);
@@ -601,34 +893,52 @@ pub(super) mod tests {
         controller: Option<mpsc::UnboundedSender<Result<ControllerFrame, Status>>>,
         decide: Option<mpsc::UnboundedSender<Result<DecideAnswer, Status>>>,
         readers: [JoinHandle<()>; 2],
+        // The floor the session's hello states.
+        floor: u64,
     }
 
     impl Peer {
         pub(crate) fn new(window: u32) -> Self {
-            Self::over(window, Endpoint::from_static("http://127.0.0.1:1"))
+            Self::over(window, Endpoint::from_static(NOWHERE))
+        }
+
+        /// A peer whose welcome tells a grace period.
+        pub(crate) fn patient(window: u32) -> Self {
+            let link = Link {
+                shared: Shared::new(),
+            };
+            Self::session(link, Endpoint::from_static(NOWHERE), welcome(window, GRACE))
         }
 
         fn over(window: u32, endpoint: Endpoint) -> Self {
-            const GATEWAY: &str = "gateway";
-            let principal = Principal::of(GATEWAY).expect("a gateway id");
-            let stub = PolicyControllerClient::with_interceptor(endpoint.connect_lazy(), principal);
+            let link = Link {
+                shared: Shared::new(),
+            };
+            Self::session(link, endpoint, welcome(window, Duration::ZERO))
+        }
+
+        /// Opens the next session of `link` as a redial does past its
+        /// dial, and holds the controller's ends of it.
+        fn session(link: Link, endpoint: Endpoint, told: Welcome) -> Self {
             let (report, reports) = mpsc::channel(REPORT_QUEUE);
             let (request, requests) = mpsc::unbounded_channel();
             let (controller, session) = mpsc::unbounded_channel();
             let (decide, decisions) = mpsc::unbounded_channel();
-            let shared = Shared::new(stub, LEADER_TERM, report, request);
-            let reports = Box::pin(shared.session_frames(hello(GATEWAY, LEADER_TERM), reports));
-            let requests = Box::pin(shared.decide_requests(requests));
-            let welcome = Welcome {
-                decide_window: window,
-                ..Welcome::default()
-            };
-            let (link, readers) = shared.start(
-                welcome,
-                WELCOME_TERM,
-                UnboundedReceiverStream::new(session),
-                UnboundedReceiverStream::new(decisions),
-            );
+            let shared = &link.shared;
+            let (seat, floor) = shared.seat(stub(endpoint), LEADER_TERM, report, request);
+            let number = seat.session;
+            let reports = Box::pin(shared.session_frames(number, hello(GATEWAY, floor), reports));
+            let requests = Box::pin(shared.decide_requests(number, requests));
+            let readers = shared
+                .start(
+                    number,
+                    told,
+                    WELCOME_TERM.max(floor),
+                    UnboundedReceiverStream::new(session),
+                    UnboundedReceiverStream::new(decisions),
+                )
+                .expect("the seated session starts");
+            drop(seat);
             Self {
                 link,
                 reports,
@@ -636,7 +946,23 @@ pub(super) mod tests {
                 controller: Some(controller),
                 decide: Some(decide),
                 readers,
+                floor,
             }
+        }
+
+        /// The link's next session, under a patient welcome. Answers the
+        /// peer of the session before it.
+        pub(crate) fn redial(&mut self, window: u32) -> Self {
+            let link = self.link.clone();
+            let next = Self::session(link, Endpoint::from_static(NOWHERE), welcome(window, GRACE));
+            mem::replace(self, next)
+        }
+
+        /// Ends the session by its stream's clean end, and waits for the
+        /// link to read it.
+        pub(crate) async fn end_session(&mut self) {
+            let link = self.link.clone();
+            closes(&link, || drop(self.controller.take())).await;
         }
 
         pub(crate) fn controller(&self, term: u64, frame: Option<controller_frame::Frame>) {
@@ -679,7 +1005,7 @@ pub(super) mod tests {
 
         pub(crate) async fn read_hello(&mut self) {
             let first = within(self.reports.next()).await.expect("the hello");
-            assert_eq!((first.seq, first.term_floor), (1, LEADER_TERM));
+            assert_eq!((first.seq, first.term_floor), (1, self.floor));
             assert!(matches!(first.frame, Some(gateway_frame::Frame::Hello(_))));
         }
 
@@ -703,6 +1029,43 @@ pub(super) mod tests {
         assert!(poll(closed.as_mut()).is_pending());
         tokio::join!(biased; within(closed), async { end() });
         assert!(poll(pin!(link.closed())).is_ready());
+    }
+
+    /// A welcome that grants `window` asks and tells `grace` as its grace
+    /// period.
+    fn welcome(window: u32, grace: Duration) -> Welcome {
+        Welcome {
+            decide_window: window,
+            grace_period_ms: u32::try_from(grace.as_millis()).expect("a grace period in range"),
+            ..Welcome::default()
+        }
+    }
+
+    fn stub(endpoint: Endpoint) -> Stub {
+        let principal = Principal::of(GATEWAY).expect("a gateway id");
+        PolicyControllerClient::with_interceptor(endpoint.connect_lazy(), principal)
+    }
+
+    /// Seats a session on `link` whose welcome has not come.
+    fn seated(link: &Link) -> Seat<'_> {
+        let (report, _) = mpsc::channel(REPORT_QUEUE);
+        let (request, _) = mpsc::unbounded_channel();
+        let endpoint = Endpoint::from_static(NOWHERE);
+        let shared = &link.shared;
+        let (seat, _) = shared.seat(stub(endpoint), LEADER_TERM, report, request);
+        seat
+    }
+
+    fn gone(lease: u64) -> gateway_frame::Frame {
+        release(lease, Side::Single, released::Reason::ClientGone)
+    }
+
+    fn completed(lease: u64) -> gateway_frame::Frame {
+        gateway_frame::Frame::Completed(Completed {
+            lease_id: lease,
+            side: Side::Single.into(),
+            ..Completed::default()
+        })
     }
 
     fn request(id: u8) -> DecideRequest {
@@ -742,11 +1105,10 @@ pub(super) mod tests {
         for id in [7, 3] {
             let link = peer.link.clone();
             std::thread::spawn(move || {
-                link.report(release(id, Side::Single, released::Reason::ClientGone))
+                link.report(release(id, Side::Single, released::Reason::ClientGone));
             })
             .join()
-            .expect("the caller returns")
-            .expect("the link takes the report");
+            .expect("the caller returns");
         }
 
         peer.controller(5, None);
@@ -771,18 +1133,18 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_report_queue_ends_the_link() {
+    async fn a_full_report_queue_ends_the_session() {
         let mut peer = Peer::new(1);
         peer.read_hello().await;
         let mut asked = Box::pin(peer.link.ask(request(1), WAIT));
         assert!(poll(asked.as_mut()).is_pending());
         let report = release(7, Side::Single, released::Reason::ClientGone);
         for _ in 0..65_536 {
-            assert!(peer.link.report(report.clone()).is_ok());
+            peer.link.report(report.clone());
         }
         assert!(peer.link.stands());
         closes(&peer.link, || {
-            assert!(matches!(peer.link.report(report.clone()), Err(Full)));
+            peer.link.report(report);
             assert!(!peer.link.stands());
             assert!(matches!(
                 peer.link.ended().as_deref(),
@@ -790,7 +1152,6 @@ pub(super) mod tests {
             ));
         })
         .await;
-        assert!(matches!(peer.link.report(report), Err(Full)));
         assert!(matches!(within(asked).await, Err(Unanswered::Ended)));
         assert_eq!(within(peer.reports.next()).await, None);
         assert_eq!(within(peer.requests.next()).await, None);
@@ -946,7 +1307,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_budget_ends_the_wait_and_frees_the_id() {
+    async fn the_budget_ends_the_wait_and_the_id_stays_taken_until_its_answer() {
         let mut peer = Peer::new(3);
         peer.read_hello().await;
         let budget = Duration::from_secs(1);
@@ -959,16 +1320,26 @@ pub(super) mod tests {
         advance(2 * step).await;
         assert!(matches!(within(first).await, Err(Unanswered::Late)));
 
-        let mut again = Box::pin(peer.link.ask(request(1), budget));
-        assert!(poll(again.as_mut()).is_pending());
-        assert_eq!(within(peer.requests.next()).await, Some(request(1)));
-        advance(budget).await;
+        // The first ask's answer is still due. A second ask under its id
+        // would take that answer for its own: it is refused, unsent.
+        assert!(matches!(
+            poll(Box::pin(peer.link.ask(request(1), budget)).as_mut()),
+            Poll::Ready(Err(Unanswered::InFlight))
+        ));
+        assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
         peer.answer(1, 5, decision(7, &[Side::Single]));
         assert_eq!(
             within(peer.reports.next()).await.expect("a release").frame,
             Some(release(7, Side::Single, released::Reason::LateDecision))
         );
-        assert!(matches!(within(again).await, Err(Unanswered::Late)));
+        // The answer freed the id: the next ask under it goes out, and
+        // the answer it gets is its own.
+        let mut again = Box::pin(peer.link.ask(request(1), budget));
+        assert!(poll(again.as_mut()).is_pending());
+        assert_eq!(within(peer.requests.next()).await, Some(request(1)));
+        peer.answer(1, 5, decision(8, &[Side::Single]));
+        let again = within(again).await.expect("the second ask's own answer");
+        assert_eq!(again.leases[0].id, 8);
 
         assert!(matches!(
             poll(Box::pin(peer.link.ask(request(2), Duration::ZERO)).as_mut()),
@@ -1002,6 +1373,11 @@ pub(super) mod tests {
         assert!(poll(dropped.as_mut()).is_pending());
         drop(dropped);
         assert_eq!(within(peer.requests.next()).await, Some(request(2)));
+        // The dropped ask's answer is still due: its id stays taken.
+        assert!(matches!(
+            poll(Box::pin(peer.link.ask(request(2), WAIT)).as_mut()),
+            Poll::Ready(Err(Unanswered::InFlight))
+        ));
         peer.answer(2, 4, decision(8, &[Side::Single]));
 
         let mut closed = peer
@@ -1076,8 +1452,8 @@ pub(super) mod tests {
             assert!(poll(asked.as_mut()).is_pending());
             if session {
                 drop(peer.reports);
-                let report = release(7, Side::Single, released::Reason::ClientGone);
-                assert!(matches!(peer.link.report(report), Err(Full)));
+                // The report waits for the link's next session.
+                peer.link.report(gone(7));
             } else {
                 drop(peer.requests);
                 for _ in 0..2 {
@@ -1186,11 +1562,9 @@ pub(super) mod tests {
             peer.link.ask(DecideRequest::default(), WAIT).await,
             Err(Unanswered::Ended)
         ));
-        assert!(matches!(
-            peer.link
-                .report(release(7, Side::Single, released::Reason::ClientGone)),
-            Err(Full)
-        ));
+        // A report made now waits for the link's next session.
+        peer.link.report(gone(7));
+        assert_eq!(peer.link.reports_dropped(), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1265,9 +1639,7 @@ pub(super) mod tests {
         let link = peer.link.clone();
         drop(peer.link);
         assert!(link.stands());
-        assert!(link
-            .report(release(7, Side::Single, released::Reason::ClientGone))
-            .is_ok());
+        link.report(gone(7));
         assert!(matches!(
             link.ask(request(1), Duration::ZERO).await,
             Err(Unanswered::Late)
@@ -1277,5 +1649,282 @@ pub(super) mod tests {
         assert_eq!(within(peer.reports.next()).await, None);
         assert_eq!(within(peer.requests.next()).await, None);
         Peer::readers_end(peer.readers).await;
+    }
+
+    /// A request in flight holds a clone of the link. What it reports
+    /// while no session stands waits, and rides the next session ahead of
+    /// what is reported after.
+    #[tokio::test]
+    async fn reports_made_with_no_session_ride_the_next_one_in_their_order() {
+        let mut peer = Peer::patient(1);
+        peer.read_hello().await;
+        let held = peer.link.clone();
+        peer.end_session().await;
+        assert!(!held.stands());
+        held.report(gone(7));
+        held.report(gone(3));
+
+        drop(peer.redial(1));
+        assert!(held.stands() && held.ended().is_none());
+        peer.read_hello().await;
+        held.report(gone(9));
+        for (seq, lease) in [(2, 7), (3, 3), (4, 9)] {
+            let said = within(peer.reports.next()).await.expect("a report");
+            assert_eq!((said.seq, said.frame), (seq, Some(gone(lease))));
+        }
+        assert_eq!(held.reports_dropped(), 0);
+    }
+
+    /// The link drops no report by its age: a line that waited well past
+    /// the grace period is sent whole. The controller would read a
+    /// completion as an outcome of the instant it arrives, so one that
+    /// waited past the grace period goes as an expired release.
+    #[tokio::test(start_paused = true)]
+    async fn a_completion_that_waited_past_the_grace_period_is_said_as_an_expired_release() {
+        let step = Duration::from_millis(1);
+        let mut peer = Peer::patient(1);
+        peer.read_hello().await;
+        let link = peer.link.clone();
+        peer.end_session().await;
+        link.report(completed(1));
+        link.report(gone(2));
+        advance(step).await;
+        link.report(completed(3));
+        advance(GRACE - step).await;
+
+        drop(peer.redial(1));
+        peer.read_hello().await;
+        let expired = release(1, Side::Single, released::Reason::Expired);
+        for said in [expired, gone(2), completed(3)] {
+            let report = within(peer.reports.next()).await.expect("a report");
+            assert_eq!(report.frame, Some(said));
+        }
+        assert_eq!(link.reports_dropped(), 0);
+    }
+
+    /// A line holds half of a session's queue. Past that it drops its
+    /// oldest report, and the session that takes a full line has room for
+    /// the reports made while it sends it.
+    #[tokio::test]
+    async fn a_line_past_its_bound_drops_its_oldest_and_counts_it() {
+        let mut peer = Peer::patient(1);
+        peer.read_hello().await;
+        let link = peer.link.clone();
+        peer.end_session().await;
+        let bound = u64::try_from(LINE).expect("the bound fits");
+        for lease in 0..=bound {
+            link.report(gone(lease));
+        }
+        assert_eq!(link.reports_dropped(), 1);
+
+        drop(peer.redial(1));
+        // No frame is read yet: the session's queue holds the whole line.
+        link.report(gone(bound + 1));
+        assert!(link.stands());
+        peer.read_hello().await;
+        let oldest = within(peer.reports.next()).await.expect("a report");
+        assert_eq!(oldest.frame, Some(gone(1)));
+        assert_eq!(link.reports_dropped(), 1);
+    }
+
+    /// A full queue ends the session, and the report that met it is the
+    /// next session's first.
+    #[tokio::test]
+    async fn a_report_that_meets_a_full_queue_waits_for_the_next_session() {
+        let mut peer = Peer::patient(1);
+        peer.read_hello().await;
+        let link = peer.link.clone();
+        for _ in 0..REPORT_QUEUE {
+            link.report(gone(7));
+        }
+        closes(&link, || link.report(gone(8))).await;
+        assert!(matches!(link.ended().as_deref(), Some(Error::ReportsFull)));
+
+        drop(peer.redial(1));
+        peer.read_hello().await;
+        let first = within(peer.reports.next()).await.expect("a report");
+        assert_eq!(first.frame, Some(gone(8)));
+        assert_eq!(link.reports_dropped(), 0);
+    }
+
+    /// A session whose open fails, or whose dial is dropped, takes no
+    /// report with it and holds no wait: the line stands for the session
+    /// after.
+    #[tokio::test]
+    async fn a_session_that_fails_to_open_takes_no_report_from_the_line() {
+        let mut peer = Peer::patient(1);
+        peer.read_hello().await;
+        let link = peer.link.clone();
+        peer.end_session().await;
+        link.report(gone(7));
+
+        // The dial reached a leader, and it is dropped ahead of a welcome.
+        let failed = seated(&link);
+        assert!(!link.stands());
+        assert!(poll(pin!(link.closed())).is_pending());
+        link.report(gone(3));
+        drop(failed);
+        assert!(poll(pin!(link.closed())).is_ready());
+        link.report(gone(9));
+
+        drop(peer.redial(1));
+        peer.read_hello().await;
+        for lease in [7, 3, 9] {
+            let said = within(peer.reports.next()).await.expect("a report");
+            assert_eq!(said.frame, Some(gone(lease)));
+        }
+        assert_eq!(link.reports_dropped(), 0);
+    }
+
+    /// A session can start with its frame stream gone: the call was reset
+    /// behind its welcome. Its queue refuses the waiting reports, and they
+    /// keep their place in the line for the session after.
+    #[tokio::test]
+    async fn a_session_whose_stream_is_gone_at_its_start_leaves_the_line_standing() {
+        let mut peer = Peer::patient(1);
+        peer.read_hello().await;
+        let link = peer.link.clone();
+        peer.end_session().await;
+        link.report(gone(7));
+        link.report(gone(3));
+
+        // The welcome comes for a session whose report queue has no reader.
+        let seat = seated(&link);
+        let (controller, session) = mpsc::unbounded_channel();
+        let (decide, decisions) = mpsc::unbounded_channel();
+        let readers = link
+            .shared
+            .start(
+                seat.session,
+                welcome(1, GRACE),
+                WELCOME_TERM,
+                UnboundedReceiverStream::new(session),
+                UnboundedReceiverStream::new(decisions),
+            )
+            .expect("the seated session starts");
+        drop(seat);
+        assert!(link.stands());
+        // A report made on that session waits behind them.
+        link.report(gone(9));
+
+        drop(peer.redial(1));
+        Peer::readers_end(readers).await;
+        drop((controller, decide));
+        peer.read_hello().await;
+        for lease in [7, 3, 9] {
+            let said = within(peer.reports.next()).await.expect("a report");
+            assert_eq!(said.frame, Some(gone(lease)));
+        }
+        assert_eq!(link.reports_dropped(), 0);
+    }
+
+    /// A redial over a session that stands lets it go, as the controller
+    /// does at the next hello: its waiters end, and its streams send no
+    /// more.
+    #[tokio::test]
+    async fn a_session_that_stands_is_let_go_by_the_next_one() {
+        let mut peer = Peer::patient(1);
+        peer.read_hello().await;
+        let link = peer.link.clone();
+        let mut asked = Box::pin(link.ask(request(1), WAIT));
+        assert!(poll(asked.as_mut()).is_pending());
+        link.report(gone(7));
+
+        let mut closed = pin!(link.closed());
+        assert!(poll(closed.as_mut()).is_pending());
+        let mut first = peer.redial(1);
+        within(closed).await;
+        assert!(matches!(within(asked).await, Err(Unanswered::Ended)));
+        assert!(link.stands() && link.ended().is_none());
+        // The ask and the report sat in the first session's queues: its
+        // streams end ahead of them.
+        assert_eq!(within(first.reports.next()).await, None);
+        assert_eq!(within(first.requests.next()).await, None);
+        Peer::readers_end(first.readers).await;
+        peer.read_hello().await;
+        link.report(gone(9));
+        let said = within(peer.reports.next()).await.expect("a report");
+        assert_eq!((said.seq, said.frame), (2, Some(gone(9))));
+
+        // Until the next welcome the link says why the session ended, and
+        // its floor does not fall to the dialed leader's.
+        let next = seated(&link);
+        assert!(matches!(link.ended().as_deref(), Some(Error::Redialed)));
+        assert_eq!(link.term_floor(), WELCOME_TERM);
+        drop(next);
+        assert!(!link.stands());
+    }
+
+    /// An asker and a reader of a session can outlast it. What they do
+    /// then reaches nothing of the session after: not an ask under the
+    /// same id, not its credit, not its floor, not its end.
+    #[tokio::test]
+    async fn what_an_ended_session_left_behind_reaches_nothing_of_the_next() {
+        let mut peer = Peer::patient(1);
+        let link = peer.link.clone();
+        let mut stale = Box::pin(link.ask(request(1), WAIT));
+        assert!(poll(stale.as_mut()).is_pending());
+        let first = link.shared.state.lock().session;
+        peer.end_session().await;
+
+        drop(peer.redial(1));
+        let mut asked = Box::pin(link.ask(request(1), WAIT));
+        assert!(poll(asked.as_mut()).is_pending());
+        assert_eq!(within(peer.requests.next()).await, Some(request(1)));
+
+        // The first session's asker leaves, and its readers read on.
+        drop(stale);
+        let late = |answer| DecideAnswer {
+            request_id: vec![1],
+            term: WELCOME_TERM,
+            answer: Some(answer),
+        };
+        let shared = &link.shared;
+        shared.read_decide(first, late(decision(7, &[Side::Single])));
+        let credit = decide_answer::Answer::Credit(Credit { window: 8 });
+        shared.read_decide(first, late(credit));
+        let above = ControllerFrame {
+            term: WELCOME_TERM + 1,
+            ..ControllerFrame::default()
+        };
+        shared.read_session(first, above);
+        Shared::end(shared.state.lock(), first, Error::LinkEnded);
+        assert!(link.stands() && link.ended().is_none());
+        assert_eq!(link.term_floor(), WELCOME_TERM);
+        assert!(poll(asked.as_mut()).is_pending());
+        assert!(matches!(
+            poll(Box::pin(link.ask(request(2), WAIT)).as_mut()),
+            Poll::Ready(Err(Unanswered::NoCredit))
+        ));
+
+        peer.answer(1, WELCOME_TERM, decision(8, &[Side::Single]));
+        let own = within(asked).await.expect("the ask's own answer");
+        assert_eq!(own.leases[0].id, 8);
+    }
+
+    /// Two dials at once open their sessions one after the other. A later
+    /// dial's hello then leaves after the earlier one's welcome, and the
+    /// controller keeps the session the link keeps.
+    #[tokio::test(start_paused = true)]
+    async fn two_dials_at_once_take_their_turns() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a listener that answers nothing");
+        let address = listener.local_addr().expect("the listener's address");
+        let endpoint = Endpoint::from_shared(format!("http://{address}")).expect("a URI");
+        let peer = Peer::new(1);
+        let link = peer.link.clone();
+        let started = Instant::now();
+        let (first, second) = tokio::join!(
+            link.redial(endpoint.clone(), GATEWAY),
+            link.redial(endpoint, GATEWAY)
+        );
+        // Each dial waits out its own answer bound: side by side they
+        // would end together.
+        assert!(matches!(first, Err(Error::NoAnswer { .. })), "{first:?}");
+        assert!(matches!(second, Err(Error::NoAnswer { .. })), "{second:?}");
+        assert_eq!(started.elapsed(), 2 * ANSWER_WAIT);
+        // A dial that reached no leader let no session go.
+        assert!(link.stands());
     }
 }

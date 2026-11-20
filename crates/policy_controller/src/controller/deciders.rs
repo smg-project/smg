@@ -358,7 +358,8 @@ impl Shared {
             let seats = self
                 .samples
                 .get_or_init(|| (0..deciders).map(|_| Mutex::default()).collect());
-            seats[index].lock().push(answer.0, engine, taken, &answer.1);
+            let mut samples = seats[index].lock();
+            samples.push(answer.0, engine, taken, &answer.1, None);
         }
         Ok(answer)
     }
@@ -937,8 +938,14 @@ impl Deciding {
             let (decision, filed) = match entry(world, &taken) {
                 Entry::Single => {
                     let (decision, booking) = decide_in(world, &taken, buffers, own);
+                    let named = &buffers.named;
+                    let engine = world.spec().engine();
                     let filed = booking
-                        .map(|booking| issue(store, world, &taken, term, &decision, booking))
+                        .map(|booking| {
+                            issue(store, world, &taken, term, booking, named, |lease| {
+                                engine.on_decision_issued(lease, &decision);
+                            })
+                        })
                         .transpose();
                     (decision, filed)
                 }
@@ -1577,6 +1584,7 @@ pub(crate) mod tests {
                     now: self.script.taken,
                     pinned: None,
                     affinity: false,
+                    signal_cells: false,
                 };
                 let mut view = ViewBuffers::default();
                 let built = world.build(&wire.model, Role::Single, &ask, &mut view);
@@ -1720,6 +1728,65 @@ pub(crate) mod tests {
             assert_eq!(first_on_file(&bed.store, lease), booked, "request {id}");
             assert_eq!(booked, made.first().copied(), "request {id}");
         }
+    }
+
+    /// A served decision writes the record of sent prefixes at its lease's
+    /// issue, as the door does in process: on workers that publish no cache
+    /// events a request lands where its prefix was sent.
+    #[tokio::test]
+    async fn a_served_request_lands_where_its_prefix_was_sent() {
+        let mut bed = bed(Some(preset("cache_aware", 1)), true, (1, 8), []);
+        let asked = |id: u8, seed: u64| {
+            let mut frame = frame(id, seed);
+            let facts = frame.facts.as_mut().expect("the case's frame has facts");
+            facts.block_hashes = (1..=8).collect();
+            facts.prompt_tokens = 8 * 16;
+            frame
+        };
+        let sent = picked(&bed.ask(asked(1, 100)).await);
+        // Each lease on file books its worker: load alone would send the
+        // next request to another.
+        for (id, seed) in (2..=4).zip(101..) {
+            let returned = picked(&bed.ask(asked(id, seed)).await);
+            assert_eq!(returned, sent, "request {id}");
+        }
+    }
+
+    /// An entry of the record of sent prefixes is a prediction made at the
+    /// decision. A served decision whose last read of the clock finds its
+    /// budget gone leaves as `Busy` and gives its lease up. Its entry
+    /// stays, and the next request with that prefix follows it.
+    #[tokio::test]
+    async fn a_decision_that_leaves_as_busy_keeps_its_prefix_for_the_next_request() {
+        let asked = |id: u8, seed: u64| {
+            let mut frame = frame(id, seed);
+            let facts = frame.facts.as_mut().expect("the case's frame has facts");
+            facts.block_hashes = (1..=8).collect();
+            facts.prompt_tokens = 8 * 16;
+            frame
+        };
+        let fresh = |steps: Vec<Step>| bed(Some(preset("cache_aware", 1)), true, (1, 8), steps);
+        // Where the late request lands, and a second request that lands
+        // elsewhere as the first of its prefix, each on a bed of its own.
+        let late = picked(&fresh(Vec::new()).ask(asked(1, 100)).await);
+        let mut elsewhere = None;
+        for seed in 101..=132 {
+            if picked(&fresh(Vec::new()).ask(asked(2, seed)).await) != late {
+                elsewhere = Some(seed);
+                break;
+            }
+        }
+        let seed = elsewhere.expect("a seed that lands on another worker");
+        // The same two requests on one bed. The first decision's last read
+        // of the clock shows its budget gone, and the second is taken at
+        // the first's instant again.
+        let steps = [Duration::ZERO, BUDGET, Duration::ZERO].map(Step::At);
+        let mut bed = fresh(steps.into());
+        let answer = bed.ask(asked(1, 100)).await;
+        assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
+        assert_eq!(bed.store.live(GATEWAY), 0);
+        let next = picked(&bed.ask(asked(2, seed)).await);
+        assert_eq!(next, late, "the late decision's entry is followed");
     }
 
     /// A decision waits in its stream's queue as it was made, with the
@@ -1880,6 +1947,40 @@ pub(crate) mod tests {
         let filed = filed.expect("the lease is on file").lease;
         assert_ne!(session, 0);
         assert_eq!(filed.session.get(), session);
+    }
+
+    /// A frame's client key places its request on the ring: one client's
+    /// requests take one worker whatever their seeds, and clients spread
+    /// over the workers.
+    #[tokio::test]
+    async fn a_frames_client_key_places_its_request_on_the_ring() {
+        let mut bed = bed(Some(preset("consistent_hashing", 1)), true, (2, 8), []);
+        let from = |id: u8, client: u64| {
+            let mut frame = frame(id, u64::from(id));
+            frame
+                .facts
+                .as_mut()
+                .expect("the frame has facts")
+                .client_key = client;
+            frame
+        };
+        let mut of_one = Vec::new();
+        for id in 1..=12u8 {
+            of_one.push(picked(&bed.ask(from(id, 0x9e37_79b9_7f4a_7c15)).await));
+        }
+        assert!(
+            of_one.windows(2).all(|pair| pair[0] == pair[1]),
+            "{of_one:?}"
+        );
+        let mut of_many = Vec::new();
+        for id in 13..=28u8 {
+            let client = u64::from(id).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            of_many.push(picked(&bed.ask(from(id, client)).await));
+        }
+        assert!(
+            of_many.windows(2).any(|pair| pair[0] != pair[1]),
+            "{of_many:?}"
+        );
     }
 
     /// Requests that state no prompt size spread over the members: each
@@ -4820,7 +4921,7 @@ pub(crate) mod tests {
             let mut frame = frame(1, 7);
             let facts = frame.facts.as_mut().expect("the case's frame has facts");
             facts.block_hashes = vec![1];
-            facts.hash_kind = proto::HashKind::Text.into();
+            facts.hash_kind = proto::HashKind::Token.into();
             let request = checked(frame);
             let now = Instant::now() + Duration::from_secs(3);
             let taken = Taken::at(&request, gateway, now, now).expect("budget is left");
@@ -4912,7 +5013,7 @@ pub(crate) mod tests {
             let mut frame = frame(1, seed);
             let facts = frame.facts.as_mut().expect("the case's frame has facts");
             facts.block_hashes = vec![1, 2, 3];
-            facts.hash_kind = proto::HashKind::Text.into();
+            facts.hash_kind = proto::HashKind::Token.into();
             let frame = constrained(frame, u32::from(WireModes::GRPC.bits()), None);
             let request = checked(frame);
             let taken = Taken::at(&request, GATEWAY, at, at).expect("budget is left");
@@ -4940,6 +5041,7 @@ pub(crate) mod tests {
                     now: at,
                     pinned: None,
                     affinity: false,
+                    signal_cells: false,
                 };
                 let built = world
                     .build(MODEL, Role::Single, &ask, &mut view)
@@ -5035,7 +5137,7 @@ pub(crate) mod tests {
             let mut frame = phased(frame(1, 7), proto::Phase::Decode);
             let facts = frame.facts.as_mut().expect("the case's frame has facts");
             facts.block_hashes = vec![1];
-            facts.hash_kind = proto::HashKind::Text.into();
+            facts.hash_kind = proto::HashKind::Token.into();
             let request = checked(frame);
             let now = Instant::now() + Duration::from_secs(3);
             let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
@@ -5119,7 +5221,7 @@ pub(crate) mod tests {
             let mut frame = frame(1, seed);
             let facts = frame.facts.as_mut().expect("the case's frame has facts");
             facts.block_hashes = vec![block];
-            facts.hash_kind = proto::HashKind::Text.into();
+            facts.hash_kind = proto::HashKind::Token.into();
             decided(&store, frame, now, &[]).1
         };
         let held = (1..=32).filter(|&seed| asked(1, seed) == Some(members[5]));
@@ -5176,7 +5278,7 @@ pub(crate) mod tests {
             let mut frame = frame(1, 7);
             let facts = frame.facts.as_mut().expect("the case's frame has facts");
             facts.block_hashes = vec![block];
-            facts.hash_kind = proto::HashKind::Text.into();
+            facts.hash_kind = proto::HashKind::Token.into();
             let request = checked(frame);
             let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
             let mut buffers = Buffers::default();
@@ -5268,7 +5370,7 @@ pub(crate) mod tests {
             let mut frame = frame(1, seed);
             let facts = frame.facts.as_mut().expect("the case's frame has facts");
             facts.block_hashes = vec![1, 2];
-            facts.hash_kind = proto::HashKind::Text.into();
+            facts.hash_kind = proto::HashKind::Token.into();
             let request = checked(frame);
             let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
             let mut buffers = Buffers::default();
@@ -5600,6 +5702,7 @@ pub(crate) mod tests {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let built = world
                 .build_pair(MODEL, &ask, &mut rows)
@@ -5964,7 +6067,8 @@ pub(crate) mod tests {
         let first = |count: u64| (1..=count).collect::<Vec<u64>>();
         // A prefix key 256 tokens deep reads 16 blocks of 16 tokens. The
         // blocks are the request's own: 32 of a request counted by 8, 4 of
-        // one counted by 64, and of a text 64 blocks of 16 characters.
+        // one counted by 64, and of a text 64 windows of 16 bytes, which a
+        // text request states.
         let sized = |id, hashes, block_size| {
             let mut frame = hashed(id, hashes);
             frame
@@ -5974,7 +6078,7 @@ pub(crate) mod tests {
                 .block_size = block_size;
             frame
         };
-        let mut text = hashed(6, 80);
+        let mut text = sized(6, 80, 16);
         text.facts
             .as_mut()
             .expect("the case's frame has facts")

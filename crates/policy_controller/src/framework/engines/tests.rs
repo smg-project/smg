@@ -766,6 +766,83 @@ fn a_clients_key_is_walked_as_a_sessions_key_is() {
     assert!(walked >= 48, "{walked} of 64 keys by the walk alone");
 }
 
+/// A shadow takes the walk where its live decision does: under a session's
+/// key and under a client's, the two decisions of one request hand the same
+/// rows, and the walk alone decides for both or for neither.
+#[test]
+fn a_shadow_is_walked_as_its_live_decision_is() {
+    let ring = |name: &str| Profile {
+        name: name.into(),
+        filters: vec![Box::new(Asked)],
+        scorers: vec![Weighted {
+            scorer: Box::new(ConsistentHash::new(None)),
+            weight: 1.0,
+        }],
+        picker: Box::new(Best),
+    };
+    let binding = Binding {
+        model: "*".into(),
+        phases: vec![],
+        plan: Plan::Single,
+        profile: 0,
+        decode_profile: None,
+        shadow: Some(1),
+        decode_shadow: None,
+        sessions: None,
+        overload: None,
+    };
+    let engine = Engine::new(
+        vec![ring("ring"), ring("next")],
+        vec![binding],
+        1,
+        Needs::default(),
+    );
+    let (rows, listed, ends) = fleet(&[8; 8], 1);
+    let pool = PoolFacts {
+        pool_size: rows.len() as u32,
+        generation: 1,
+        membership_epoch: 1,
+        engines: Engines::new(0, &listed, &ends),
+        ..PoolFacts::default()
+    };
+    let cx = Constraints::default();
+    let handed = |decision: Option<Decision>| {
+        let pick = decision.as_ref().and_then(Decision::pick)?;
+        Some((
+            positions(&pick.targets),
+            pick.trace.survivors.get().is_none(),
+        ))
+    };
+    let mut walked = [0, 0];
+    for i in 0..64 {
+        let key = format!("conv-{i}");
+        let by_session = RequestFacts {
+            model: "m",
+            session_key: Identity::plain(&key),
+            seed: 1,
+            ..RequestFacts::default()
+        };
+        let by_client = RequestFacts {
+            model: "m",
+            client_key: fingerprint(key.as_bytes()),
+            seed: 1,
+            ..RequestFacts::default()
+        };
+        let requests = [("a session's", by_session), ("a client's", by_client)];
+        for (walked, (whose, facts)) in walked.iter_mut().zip(requests) {
+            let live = engine.decide(&facts, &pool, &rows, &cx, &mut Scratch::new());
+            let live = handed(Some(live));
+            let shadow = handed(engine.shadow(&facts, &pool, &rows, &cx, &mut Scratch::new()));
+            assert_eq!(shadow, live, "{key} as {whose} key");
+            *walked += u32::from(live.is_some_and(|(_, by_walk)| by_walk));
+        }
+    }
+    assert!(
+        walked.iter().all(|&walked| walked >= 48),
+        "{walked:?} of 64 keys by the walk alone"
+    );
+}
+
 #[test]
 fn a_walk_that_meets_refused_rows_to_its_bound_leaves_the_pool_to_the_whole_pass() {
     // Three rows kept of 64: most walks meet eight refused rows first.

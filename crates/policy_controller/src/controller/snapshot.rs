@@ -57,7 +57,7 @@ use std::time::Instant;
 use prost::encoding::message;
 use tonic::Status;
 
-use super::{generations::Generations, watch_workers, wire, worker_wire};
+use super::{generations::Generations, watch_workers, wire};
 use crate::{
     operator::{
         snapshot::{self, Asked as RowsAsked, Rows},
@@ -190,15 +190,9 @@ pub(crate) fn asked(request: proto::SnapshotRequest) -> Result<Asked, Status> {
             names(served)
         )));
     }
-    if request.models.len() > worker_wire::MODELS {
-        return Err(Status::invalid_argument(format!(
-            "models: a snapshot names at most {} model ids",
-            worker_wire::MODELS
-        )));
+    if let Some(why) = RowsAsked::refused(&request.models) {
+        return Err(Status::invalid_argument(format!("models: {why}")));
     }
-    worker_wire::watched(&request.models).map_err(|refused| {
-        Status::invalid_argument(format!("{}: {}", refused.path, refused.why))
-    })?;
     if request.plain_identifiers {
         return Err(Status::unimplemented(PLAIN));
     }

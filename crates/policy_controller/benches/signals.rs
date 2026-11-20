@@ -8,51 +8,21 @@
     reason = "the benchmark requires a valid policy to measure a decision"
 )]
 
+#[path = "common/reads_two.rs"]
+mod reads_two;
+
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
-    Candidate, Catalog, Constraints, Engine, Lifecycle, Needs, PolicySpec, PoolFacts, RequestFacts,
-    Scorer, Scratch, SignalCell, SignalCells, SignalColumn, TieBand, WorkerId, API_VERSION,
+    Candidate, Catalog, Constraints, Engine, PolicySpec, PoolFacts, RequestFacts, Scratch,
+    SignalCell, SignalCells, WorkerId, API_VERSION,
 };
+
+use crate::reads_two::ReadsTwo;
 
 /// The decisions' instant on the host's clock.
 const NOW: u64 = 1_000_000;
-
-/// Scores a row by the two values it reads: the less of both, the better.
-#[derive(Debug)]
-struct ReadsTwo(SignalColumn, SignalColumn);
-
-impl Lifecycle for ReadsTwo {}
-
-impl Scorer for ReadsTwo {
-    fn name(&self) -> &'static str {
-        "reads-two"
-    }
-
-    fn score(
-        &self,
-        facts: &RequestFacts<'_>,
-        candidates: &[Candidate],
-        kept: &[u32],
-        out: &mut [f32],
-    ) -> TieBand {
-        for (&index, score) in kept.iter().zip(out) {
-            let row = &candidates[index as usize];
-            let used = self.0.read(facts, row).unwrap_or(0.0);
-            let pending = self.1.read(facts, row).unwrap_or(0.0);
-            *score = 1.0 / (1.0 + (used + pending) as f32);
-        }
-        TieBand::NORMALIZED
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            signal_cells: true,
-            ..Needs::default()
-        }
-    }
-}
 
 fn engine() -> Engine {
     let mut catalog = Catalog::builtin();

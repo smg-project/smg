@@ -23,13 +23,18 @@ use crate::{
     identity::basic::Worker,
     model_card::ModelCard,
     pd::pairing::PdPairing,
-    registry::event::WorkerConnected,
+    registry::event::WorkerSignal,
     settings::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     worker::{
         ConstrainedDecoding, HealthCheckConfig, OverloadUpdate, WorkerModels, WorkerSpec,
         WorkerStatus,
     },
 };
+
+/// The URL of the rank `rank` of the engine at `base`.
+pub fn rank_url(base: &str, rank: usize) -> String {
+    format!("{base}@{rank}")
+}
 
 /// Builder for creating BasicWorker instances with fluent API.
 ///
@@ -73,8 +78,9 @@ pub struct BasicWorkerBuilder<D = NoConnector> {
     /// Callers replacing an existing worker (e.g. metadata updates) should
     /// pass the old worker's status to avoid kicking it back to Pending.
     initial_status: Option<WorkerStatus>,
-    /// Connect-readiness signal sender (ZMQ registration path only).
-    connect_signal_tx: Option<mpsc::UnboundedSender<WorkerConnected>>,
+    /// The registry's signal sender: the worker's connect signal and the
+    /// moves of its liveness veto ride it to the manager's loop.
+    connect_signal_tx: Option<mpsc::UnboundedSender<WorkerSignal>>,
     /// Gateway-level overload thresholds the spec's `overload` block resolves
     /// against. Default empty: a spec block alone still enables protection
     /// for this worker.
@@ -284,10 +290,12 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
         self
     }
 
-    /// Wire the connect-readiness signal sender (from the registry) so a ZMQ
-    /// worker can wake the manager the instant its handshake completes. Only
-    /// meaningful for ZMQ workers; HTTP/gRPC promotion stays poll-driven.
-    pub fn connect_signal_tx(mut self, tx: mpsc::UnboundedSender<WorkerConnected>) -> Self {
+    /// Wire the signal sender (from the registry). The worker says two
+    /// things on it to the manager's loop. Its connection completed: a ZMQ
+    /// worker is promoted the instant its handshake lands, and a demoted
+    /// worker is probed at its first contact. And its liveness veto moved,
+    /// which the loop tells the health sink.
+    pub fn connect_signal_tx(mut self, tx: mpsc::UnboundedSender<WorkerSignal>) -> Self {
         self.connect_signal_tx = Some(tx);
         self
     }
@@ -379,7 +387,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
     /// Captures the current URL as the base URL, then formats it as `{base}@{rank}`.
     pub fn dp_config(mut self, rank: usize, size: usize) -> Self {
         let base_url = self.spec.url.clone();
-        self.spec.url = format!("{base_url}@{rank}");
+        self.spec.url = rank_url(&base_url, rank);
         self.spec.dp_base_url = Some(base_url);
         self.spec.dp_rank = Some(rank);
         self.spec.dp_size = Some(size);
@@ -613,6 +621,23 @@ mod tests {
         spec.dp_base_url = Some("ipc:///tmp/g".to_string());
         let ranked = BasicWorkerBuilder::from_spec(spec).build();
         assert_eq!(ranked.redacted_url(), "ipc:///tmp/g@1");
+    }
+
+    #[test]
+    fn a_ranks_url_is_formed_in_one_place() {
+        let base = "http://worker:8000";
+        for (rank, url) in [
+            "http://worker:8000@0",
+            "http://worker:8000@1",
+            "http://worker:8000@2",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let worker = BasicWorkerBuilder::new(base).dp_config(rank, 3).build();
+            assert_eq!(rank_url(base, rank), url);
+            assert_eq!(worker.url(), url);
+        }
     }
 
     #[test]

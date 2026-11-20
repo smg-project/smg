@@ -300,6 +300,7 @@ mod tests {
                 now: self.window + Duration::from_secs(1),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             }
         }
 

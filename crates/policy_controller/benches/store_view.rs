@@ -188,6 +188,7 @@ fn ask_at(opened: Instant, affinity: bool) -> Ask {
         now: opened + Duration::from_secs(1),
         pinned: None,
         affinity,
+        signal_cells: false,
     }
 }
 

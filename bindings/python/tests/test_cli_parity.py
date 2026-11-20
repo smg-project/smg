@@ -30,19 +30,18 @@ def cli_source() -> str:
     return "\n".join(p.read_text() for p in sorted(CLI_DIR.glob("*.rs")))
 
 
-def test_the_executable_registers_its_allocator_before_running_the_command_line():
+def test_the_executable_takes_the_stock_allocator_in_one_line():
     if not GATEWAY_SRC.is_dir():
         pytest.skip("the Rust CLI's source is not in this checkout")
     executable = (GATEWAY_SRC / "main.rs").read_text()
     library = (GATEWAY_SRC / "lib.rs").read_text()
     cli = cli_source()
     registration = "register_jemalloc_as_global_allocator();"
-    call = "smg::main_from_args()"
 
     assert "smg::stock_allocator!();" in executable
-    assert registration in executable
-    assert call in executable
-    assert executable.index(registration) < executable.index(call)
+    assert "smg::main_from_args()" in executable
+    # No call registers the allocator: the library finds out which one serves.
+    assert registration not in executable
     assert "pub fn main_from_args()" in library
     assert registration not in re.sub(r"(?m)^\s*//.*$", "", library)
     assert registration not in cli
