@@ -67,7 +67,7 @@ use crate::{
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, error_reason_from_status, metrics_labels, Metrics},
-        otel_trace::inject_trace_context_http,
+        otel_trace::{inject_trace_context_http, with_trace_context_http},
     },
     policies::{CacheNamespace, PolicyRegistry},
     policy_controller::{
@@ -1003,9 +1003,8 @@ impl Router {
         }
         .emit();
         let raw_body_len = header_utils::content_length(headers);
-        let mut headers_with_trace = headers.cloned().unwrap_or_default();
-        inject_trace_context_http(&mut headers_with_trace);
-        let headers = Some(&headers_with_trace);
+        let headers_with_trace = with_trace_context_http(headers);
+        let headers = Some(&*headers_with_trace);
 
         let mode = Self::relay_mode_for_attempt(attempt);
         match Self::serialize_attempt_body(
