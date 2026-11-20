@@ -541,8 +541,8 @@ impl std::fmt::Display for WorkerServiceError {
             ),
             Self::FieldUnsupported { url, field } => write!(
                 f,
-                "Worker '{url}' states a {field}, and a worker of the policy controller's \
-                 store holds none yet. Leave the {field} out of the request."
+                "Worker '{url}' states a {field}, and the worker API sets none on a worker \
+                 of the policy controller's store yet. Leave the {field} out of the request."
             ),
             Self::QueueNotInitialized => write!(f, "Job queue not initialized"),
             Self::QueueSubmitFailed { message } => write!(f, "{message}"),
@@ -921,11 +921,11 @@ impl WorkerService {
         refuse_discovery_owned(existing.as_ref())?;
         validate_spec(&config)?;
         Self::require_provider_router(&config)?;
-        self.refuse_what_no_row_holds(&config)?;
         // A PUT keeps a worker on its side of the store. A row's worker
         // restated as a provider's would be accepted and then fail at the
         // row that holds its URL, and a provider's worker restated as
-        // self-hosted would find no row to replace.
+        // self-hosted would find no row to replace. The side is asked ahead
+        // of the fields, so the first answer names what stands in the way.
         let stays_row = stated_kind(&config) != Some(WorkerKind::External);
         if self.local_workers_are_rows && is_row != stays_row {
             return Err(WorkerServiceError::BadRequest {
@@ -936,6 +936,7 @@ impl WorkerService {
                 ),
             });
         }
+        self.refuse_what_no_row_holds(&config)?;
 
         // A data-parallel router expands one spec into one worker per rank,
         // each registered under a rank-suffixed URL. Re-running registration
@@ -1437,6 +1438,23 @@ mod tests {
         let restated = service
             .replace_worker(id.as_str(), spec(replaced, "external", json!({})))
             .await;
+        let (answered, body, _) = answer(restated.map(drop).unwrap_err()).await;
+        assert_eq!(answered, StatusCode::BAD_REQUEST);
+        let sentence = body["error"].as_str().unwrap();
+        assert!(sentence.contains("Use DELETE + POST instead"), "{sentence}");
+
+        // The side is asked first. A provider's worker restated with no
+        // runtime is told of its side, not to drop a field it may keep.
+        let private = "http://litellm:4000";
+        let hosted = BasicWorkerBuilder::new(private)
+            .runtime_type(RuntimeType::External)
+            .model(ModelCard::new("hosted"))
+            .build();
+        registry.register(Arc::new(hosted)).unwrap();
+        let hosted_id = registry.get_id_by_url(private).unwrap();
+        let unstated: WorkerSpec =
+            serde_json::from_value(json!({"url": private, "priority": 7})).expect("worker spec");
+        let restated = service.replace_worker(hosted_id.as_str(), unstated).await;
         let (answered, body, _) = answer(restated.map(drop).unwrap_err()).await;
         assert_eq!(answered, StatusCode::BAD_REQUEST);
         let sentence = body["error"].as_str().unwrap();

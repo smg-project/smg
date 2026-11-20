@@ -1925,6 +1925,107 @@ mod tests {
         );
     }
 
+    /// Under the policy controller a POST that fails behind its row's write
+    /// leaves no row. The job reads its rows from the holder where the state
+    /// records the door's write, and sends them out through the removal job.
+    /// A POST the door refused wrote no row, and the row that stood under its
+    /// URL is not its to remove.
+    #[tokio::test]
+    async fn under_the_policy_controller_a_post_that_fails_behind_its_row_takes_the_row_out() {
+        use smg_policy_controller::{
+            store::{Maker, WorkersStore},
+            worker_host::{facts, Expect, WRITE_WORKERS_AT_DOOR_STEP},
+        };
+        use smg_worker::workflow::single_attempt;
+        use wfaas::{
+            FunctionStep, StepDefinition, StepResult, WorkflowContext, WorkflowDefinition,
+        };
+
+        use crate::{
+            routers::grpc::backend_client::BasicWorkerBuilder, workflow::WorkerWorkflowData,
+        };
+
+        let (hosted, standing, _, mut next_job) = a_hosted_gateway_with_a_row().await;
+        let store = hosted.policy_store.as_ref().expect("the store");
+        let registry = &hosted.worker_registry;
+        let door = Arc::clone(&hosted.door_feed().expect("the feed").door);
+        // The door's write under its step's name, then a step that fails.
+        let write = FunctionStep::new(move |run: &mut WorkflowContext<WorkerWorkflowData>| {
+            let url = run.data.config.url.clone();
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(&url).build());
+            let wrote = door
+                .found(&Maker::Control, Expect::Nothing, &url, &|row| {
+                    facts(worker.as_ref(), row)
+                })
+                .is_ok();
+            run.data.actual_workers = Some(vec![worker]);
+            Box::pin(async move {
+                Ok(if wrote {
+                    StepResult::Success
+                } else {
+                    StepResult::Failure
+                })
+            })
+        });
+        let fail = FunctionStep::new(|_: &mut WorkflowContext<WorkerWorkflowData>| {
+            Box::pin(async { Ok(StepResult::Failure) })
+        });
+        hosted
+            .workflow_engines
+            .get()
+            .expect("the engines")
+            .worker_registration
+            .register_workflow(
+                WorkflowDefinition::new("worker_registration", "Write the row, then fail")
+                    .add_step(
+                        StepDefinition::new(
+                            WRITE_WORKERS_AT_DOOR_STEP,
+                            "Write the row",
+                            Arc::new(write),
+                        )
+                        .with_retry(single_attempt()),
+                    )
+                    .add_step(
+                        StepDefinition::new("fail_behind", "Fail", Arc::new(fail))
+                            .with_retry(single_attempt()),
+                    ),
+            )
+            .unwrap();
+
+        for (url, written) in [("http://fresh:8000", true), (standing.as_str(), false)] {
+            let id = registry.reserve_id_for_url(url);
+            let job = Job::AddWorker {
+                config: Box::new(WorkerSpec::new(url)),
+                registration_mode: WorkerRegistrationMode::CreateOnly,
+                asker: WorkerJobAsker::Api,
+            };
+            let failure = execute_job(&job, &hosted, &DashSet::new(), Some(&id))
+                .await
+                .expect_err("the registration fails");
+            assert_eq!(
+                failure.contains("leave through a queued removal"),
+                written,
+                "{url}: {failure}"
+            );
+            assert!(store.by_key(url).is_some(), "{url}");
+            if written {
+                let laid = registry.get(&id).expect("the row's object");
+                let rows = HashMap::from([(id.as_str().to_string(), Some(laid.revision()))]);
+                assert!(
+                    matches!(
+                        next_job(),
+                        Job::RemoveWorker {
+                            asker: WorkerJobAsker::Api,
+                            expected_revisions: Some(entries),
+                            ..
+                        } if entries == rows
+                    ),
+                    "{url}"
+                );
+            }
+        }
+    }
+
     /// Under the policy controller a PUT replaces a row in place. The
     /// registration job lays the new spec over the row behind the worker
     /// the PUT named, and the holder lays the row's object under the same
@@ -2005,6 +2106,53 @@ mod tests {
         );
         assert_eq!(metadata.health_config.failure_threshold, 7);
         assert_eq!(metadata.health_config.drain_settle_secs, 9);
+    }
+
+    /// Under the policy controller a PATCH that turns a row's health checks
+    /// off leaves its worker in service. The door promotes the row, and no
+    /// probe will promote the registry's object, so the update promotes it
+    /// as the classic line does.
+    #[tokio::test]
+    async fn under_the_policy_controller_a_patch_that_turns_checks_off_promotes_a_rows_worker() {
+        use openai_protocol::worker::WorkerStatus;
+        use smg_policy_controller::store::{WorkerStatus as RowStatus, WorkersStore};
+
+        let (hosted, url, _, mut next_job) = a_hosted_gateway_with_a_row().await;
+        let store = hosted.policy_store.as_ref().expect("the store");
+        let registry = &hosted.worker_registry;
+        let service = &hosted.worker_service;
+        let id = registry.get_id_by_url(&url).expect("the worker's id");
+        let marks = DashSet::new();
+        let checks_off = |off: bool| -> WorkerUpdateRequest {
+            serde_json::from_value(serde_json::json!({"health": {"disable_health_check": off}}))
+                .expect("an update")
+        };
+
+        // Checks on, then the worker out of service, as behind failed probes.
+        service
+            .update_worker(id.as_str(), checks_off(false))
+            .await
+            .expect("the 202");
+        let done = execute_job(&next_job(), &hosted, &marks, None).await;
+        assert!(done.is_ok(), "{done:?}");
+        let checked = store.by_key(&url).expect("the worker's row");
+        assert!(checked.facts.health.probes);
+        let _ = registry.transition_status(&id, WorkerStatus::NotReady);
+        let out = registry.get(&id).expect("the row's object");
+        assert_eq!(out.status(), WorkerStatus::NotReady);
+
+        service
+            .update_worker(id.as_str(), checks_off(true))
+            .await
+            .expect("the 202");
+        let done = execute_job(&next_job(), &hosted, &marks, None).await;
+        assert!(done.is_ok(), "{done:?}");
+
+        let row = store.by_key(&url).expect("the worker's row");
+        assert!(!row.facts.health.probes);
+        assert_eq!(row.status, RowStatus::Ready);
+        let laid = registry.get(&id).expect("the row's object");
+        assert_eq!(laid.status(), WorkerStatus::Ready);
     }
 
     /// The door is the judge of an update. A job that reaches a row another

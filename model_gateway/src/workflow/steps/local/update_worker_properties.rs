@@ -12,7 +12,7 @@ use smg_worker::{
         validate_constrained_decoding_label, DP_WIDTH_LABELS,
     },
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::{
@@ -246,11 +246,21 @@ impl UpdateWorkerPropertiesStep {
                 continue;
             }
             if !card_fields.is_empty() {
-                info!(
-                    worker_url = %worker.redacted_url(),
-                    fields = ?card_fields,
-                    "The worker's model card follows its labels"
-                );
+                if row.is_some() {
+                    // The holder builds a row's object with a card of its id
+                    // alone: the labels are written, and the card stays.
+                    warn!(
+                        worker_url = %worker.redacted_url(),
+                        fields = ?card_fields,
+                        "A row's model card holds its id alone and does not follow these labels yet"
+                    );
+                } else {
+                    info!(
+                        worker_url = %worker.redacted_url(),
+                        fields = ?card_fields,
+                        "The worker's model card follows its labels"
+                    );
+                }
             }
             // A key an update sets is the operator's from then on, whatever
             // value it carries: it leaves the discovered set, so a later
@@ -360,7 +370,16 @@ impl UpdateWorkerPropertiesStep {
             // lays its object over the one that stands, under its id.
             if let Some((door, standing)) = row {
                 door.lay(&context.data.asker, standing, new_worker.as_ref())?;
-                updated_workers.extend(app_context.worker_registry.get_by_url(worker.url()));
+                let registry = &app_context.worker_registry;
+                // The door promotes a row whose checks the update turned
+                // off, and no probe will promote the registry's object. It
+                // follows here, as on the classic way out below.
+                let captured = snapshot.as_ref().and_then(|entries| entries.get(index));
+                let off = updated_health_config.disable_health_check;
+                if let Some((id, _)) = captured.filter(|_| off) {
+                    let _ = registry.transition_status(id, WorkerStatus::Ready);
+                }
+                updated_workers.extend(registry.get_by_url(worker.url()));
                 continue;
             }
 

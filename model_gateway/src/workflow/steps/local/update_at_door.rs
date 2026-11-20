@@ -89,8 +89,8 @@ impl UpdateAtDoorStep {
             return Ok(());
         };
         Err(step_failed(format!(
-            "{name}: the update of worker {} states {stated}, and a worker of the policy \
-             controller's store holds none yet",
+            "{name}: the update of worker {} states {stated}, and the worker API sets none \
+             on a worker of the policy controller's store yet",
             worker.redacted_url()
         )))
     }

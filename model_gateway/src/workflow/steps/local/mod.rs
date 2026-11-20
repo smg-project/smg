@@ -52,7 +52,7 @@ pub(crate) use update_at_door::WORKER_FIELD_UNSUPPORTED;
 pub use update_policies_for_worker::UpdatePoliciesForWorkerStep;
 pub use update_remaining_policies::UpdateRemainingPoliciesStep;
 pub use update_worker_properties::UpdateWorkerPropertiesStep;
-use wfaas::{BackoffStrategy, RetryPolicy, StepDefinition, WorkflowDefinition};
+use wfaas::{BackoffStrategy, RetryPolicy, StepDefinition, StepExecutor, WorkflowDefinition};
 pub(crate) use zmq_labels::{DiscoverZmqLabelsStep, ZMQ_LABELS_STEP};
 
 use crate::{
@@ -216,40 +216,11 @@ fn release_tokenizer_step(behind: &str) -> StepDefinition<WorkerRemovalWorkflowD
 /// ```
 pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflowData> {
     WorkflowDefinition::new("worker_update", "Update worker properties")
-        .add_step(
-            StepDefinition::new(
-                "find_worker_to_update",
-                "Find worker to update",
-                Arc::new(FindWorkerToUpdateStep),
-            )
-            .with_timeout(Duration::from_secs(10))
-            .with_retry(single_attempt()),
-        )
-        .add_step(
-            StepDefinition::new(
-                "rediscover_labels",
-                "Re-read the worker's labels from its engine (label refresh only)",
-                Arc::new(RediscoverLabelsStep),
-            )
-            .with_timeout(Duration::from_secs(10))
-            // An engine that just came back may still be warming up: one more
-            // try before the refresh is left to the next transition.
-            .with_retry(RetryPolicy {
-                max_attempts: 2,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(3)),
-            })
-            .depends_on(&["find_worker_to_update"]),
-        )
-        .add_step(
-            StepDefinition::new(
-                "update_worker_properties",
-                "Update worker properties",
-                Arc::new(UpdateWorkerPropertiesStep),
-            )
-            .with_timeout(Duration::from_secs(10))
-            .with_retry(single_attempt())
-            .depends_on(&["rediscover_labels"]),
-        )
+        .add_step(find_worker_to_update_step())
+        .add_step(rediscover_labels_step())
+        .add_step(update_worker_properties_step(Arc::new(
+            UpdateWorkerPropertiesStep,
+        )))
         .add_step(
             StepDefinition::new(
                 "update_policies_for_worker",
@@ -260,6 +231,48 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
             .with_retry(single_attempt())
             .depends_on(&["update_worker_properties"]),
         )
+}
+
+/// The update line's first step: the workers an update names.
+fn find_worker_to_update_step() -> StepDefinition<WorkerUpdateWorkflowData> {
+    StepDefinition::new(
+        "find_worker_to_update",
+        "Find worker to update",
+        Arc::new(FindWorkerToUpdateStep),
+    )
+    .with_timeout(Duration::from_secs(10))
+    .with_retry(single_attempt())
+}
+
+/// The label refresh's read of the engine, behind the find step.
+fn rediscover_labels_step() -> StepDefinition<WorkerUpdateWorkflowData> {
+    StepDefinition::new(
+        "rediscover_labels",
+        "Re-read the worker's labels from its engine (label refresh only)",
+        Arc::new(RediscoverLabelsStep),
+    )
+    .with_timeout(Duration::from_secs(10))
+    // An engine that just came back may still be warming up: one more
+    // try before the refresh is left to the next transition.
+    .with_retry(RetryPolicy {
+        max_attempts: 2,
+        backoff: BackoffStrategy::Fixed(Duration::from_secs(3)),
+    })
+    .depends_on(&["find_worker_to_update"])
+}
+
+/// The update step of either line, by the executor that writes the worker.
+fn update_worker_properties_step(
+    executor: Arc<dyn StepExecutor<WorkerUpdateWorkflowData>>,
+) -> StepDefinition<WorkerUpdateWorkflowData> {
+    StepDefinition::new(
+        "update_worker_properties",
+        "Update worker properties",
+        executor,
+    )
+    .with_timeout(Duration::from_secs(10))
+    .with_retry(single_attempt())
+    .depends_on(&["rediscover_labels"])
 }
 
 /// The update line. With no feed it is [`create_worker_update_workflow`]'s.
@@ -276,44 +289,11 @@ pub(crate) fn worker_update_line(
     let Some(feed) = feed else {
         return create_worker_update_workflow();
     };
+    let at_door = UpdateAtDoorStep::new(Arc::clone(&feed.door), Arc::clone(&feed.objects));
     WorkflowDefinition::new("worker_update", "Update worker properties")
-        .add_step(
-            StepDefinition::new(
-                "find_worker_to_update",
-                "Find worker to update",
-                Arc::new(FindWorkerToUpdateStep),
-            )
-            .with_timeout(Duration::from_secs(10))
-            .with_retry(single_attempt()),
-        )
-        .add_step(
-            StepDefinition::new(
-                "rediscover_labels",
-                "Re-read the worker's labels from its engine (label refresh only)",
-                Arc::new(RediscoverLabelsStep),
-            )
-            .with_timeout(Duration::from_secs(10))
-            // As in the classic line: one more try for an engine that is
-            // still warming up.
-            .with_retry(RetryPolicy {
-                max_attempts: 2,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(3)),
-            })
-            .depends_on(&["find_worker_to_update"]),
-        )
-        .add_step(
-            StepDefinition::new(
-                "update_worker_properties",
-                "Update worker properties",
-                Arc::new(UpdateAtDoorStep::new(
-                    Arc::clone(&feed.door),
-                    Arc::clone(&feed.objects),
-                )),
-            )
-            .with_timeout(Duration::from_secs(10))
-            .with_retry(single_attempt())
-            .depends_on(&["rediscover_labels"]),
-        )
+        .add_step(find_worker_to_update_step())
+        .add_step(rediscover_labels_step())
+        .add_step(update_worker_properties_step(Arc::new(at_door)))
 }
 
 /// Helper to create initial workflow data for worker removal

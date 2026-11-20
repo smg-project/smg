@@ -72,8 +72,9 @@ where
         // door's. Hand it the rowless workers alone, then lay the door's
         // lists back in front of what it left. The engine writes a failed
         // step's data back as well, so the lists are whole where the step
-        // ends, well or not. A step its timeout cuts short leaves them as
-        // it took them: its run fails, and nothing reads them behind it.
+        // ends, well or not. A step its timeout or a panic cuts short
+        // leaves them as it took them: its run fails, and nothing reads
+        // them behind it.
         let data = &mut context.data;
         let drained = mem::take(&mut data.drained_workers);
         let removed = mem::take(&mut data.removed_workers);
