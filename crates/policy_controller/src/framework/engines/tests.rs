@@ -12,7 +12,10 @@ use crate::{
     lease::{Lifecycle, Membership},
     ring::ConsistentHash,
     spec::{BoundedLoadParams, Needs},
-    view::{Candidate, Constraints, Engines, Health, Identity, PoolFacts, RequestFacts, WorkerId},
+    view::{
+        fingerprint, Candidate, Constraints, Engines, Health, Identity, PoolFacts, RequestFacts,
+        WorkerId,
+    },
     Draw, Scratch, DRAW_BOUND,
 };
 
@@ -656,6 +659,17 @@ fn placed(
         seed: 1,
         ..RequestFacts::default()
     };
+    placed_as(engine, &facts, rows, engines, epoch)
+}
+
+/// [`placed`] for a request of any facts.
+fn placed_as(
+    engine: &Engine,
+    facts: &RequestFacts<'_>,
+    rows: &[Candidate],
+    engines: Engines<'_>,
+    epoch: u64,
+) -> Option<(Vec<u32>, Lifted, bool)> {
     let pool = PoolFacts {
         pool_size: rows.len() as u32,
         generation: 1,
@@ -664,7 +678,7 @@ fn placed(
         ..PoolFacts::default()
     };
     let cx = Constraints::default();
-    let decision = engine.decide(&facts, &pool, rows, &cx, &mut Scratch::new());
+    let decision = engine.decide(facts, &pool, rows, &cx, &mut Scratch::new());
     let pick = decision.pick()?;
     Some((
         positions(&pick.targets),
@@ -723,6 +737,33 @@ fn a_keyed_request_by_the_rings_walk_is_the_whole_passes_answer_row_for_row() {
             assert!(walked >= 48, "{walked} of 64 keys by the walk alone");
         }
     }
+}
+
+/// A client's key is walked as a session's key is: the same rows, and
+/// where the walk alone decides for the one it decides for the other.
+#[test]
+fn a_clients_key_is_walked_as_a_sessions_key_is() {
+    let ring = ring_engine();
+    let (rows, listed, ends) = fleet(&[8; 8], 1);
+    let engines = Engines::new(0, &listed, &ends);
+    let mut walked = 0;
+    for i in 0..64 {
+        let key = format!("conv-{i}");
+        let by_session = placed(&ring, &key, &rows, engines, 1);
+        let client = RequestFacts {
+            model: "m",
+            client_key: fingerprint(key.as_bytes()),
+            seed: 1,
+            ..RequestFacts::default()
+        };
+        assert_eq!(
+            placed_as(&ring, &client, &rows, engines, 1),
+            by_session,
+            "{key}"
+        );
+        walked += u32::from(by_session.is_some_and(|(_, _, by_walk)| by_walk));
+    }
+    assert!(walked >= 48, "{walked} of 64 keys by the walk alone");
 }
 
 #[test]

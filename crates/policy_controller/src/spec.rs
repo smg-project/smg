@@ -96,8 +96,12 @@ pub const KEY_BYTES: u32 = 128;
 /// The most bytes an entry's `max_bytes` may ask for.
 pub const MAX_KEY_BYTES: u32 = 8192;
 
-/// The most sources one `routing_key` block lists.
+/// The most sources one `routing_key` block lists, its client sources not
+/// counted.
 pub const MAX_KEY_SOURCES: usize = 8;
+
+/// The most client sources one `routing_key` block lists.
+pub const MAX_CLIENT_SOURCES: usize = 4;
 
 /// The highest `view.max_block_hashes`: the hashes a `DecideRequest` at
 /// the contract's bound of 64 KiB carries beside an id of one byte, at
@@ -1739,8 +1743,9 @@ fn default_inflight_cap() -> u16 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingKeySpec {
-    /// The sources, read in order: one to eight, each named once.
-    #[schemars(length(min = 1, max = 8))]
+    /// The sources, read in order: one to eight, each named once, and up
+    /// to four client sources beside them.
+    #[schemars(length(min = 1, max = 12))]
     pub sources: Vec<KeySourceSpec>,
     /// Take the turn and retry suffixes off a key, so every turn of a
     /// conversation shares one (`conv_t2_r1` keys as `conv`); default
@@ -1768,6 +1773,18 @@ pub struct KeySourceSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 8192))]
     pub max_bytes: Option<u32>,
+    /// A source that tells one client from another, not one session: a
+    /// header a proxy or a browser sets. Its key places a request that
+    /// carries no session key on a ring. It lifts no overload veto, pins
+    /// no session and is counted under no key. Of a binding's client
+    /// sources, the first whose header a request carries is the one read,
+    /// and a value it cannot hand ends the read. The value is read whole
+    /// and leaves as its fingerprint alone, so `rid` and `max_bytes` are
+    /// refused beside it. A header may be named both ways: capped as a
+    /// session's source, and whole as a client's where that read handed no
+    /// key. Default false.
+    #[serde(skip_serializing_if = "is_default")]
+    pub client: bool,
 }
 
 /// A second profile deciding a share of the binding's requests, the
@@ -3569,20 +3586,30 @@ fn check_session_headers(
     Ok(())
 }
 
-/// A binding's routing key sources: one to eight entries, each a header
-/// outside the credential names or the request's own id, each named once,
-/// with a byte cap inside the schema's.
+/// A binding's routing key sources: one to eight entries and up to four
+/// client entries beside them, never client entries alone, each a header
+/// outside the credential names or the request's own id, each named once
+/// as a session's source and once as a client's, with a byte cap inside the
+/// schema's.
 fn check_routing_key(
     block: &RoutingKeySpec,
     cx: &BindingContext<'_>,
     at: &At,
 ) -> Result<(), SpecError> {
-    let listed = block.sources.len();
-    if listed == 0 || listed > MAX_KEY_SOURCES {
+    let clients = block.sources.iter().filter(|source| source.client).count();
+    let listed = block.sources.len() - clients;
+    if block.sources.is_empty() || listed > MAX_KEY_SOURCES {
         return Err(at.bad(
             "sources",
             format_args!("{listed} entries"),
             "a list of one to eight sources",
+        ));
+    }
+    if clients > MAX_CLIENT_SOURCES {
+        return Err(at.bad(
+            "sources",
+            format_args!("{clients} client entries"),
+            "a list of four client sources at most",
         ));
     }
     let mut seen = BTreeSet::new();
@@ -3602,7 +3629,14 @@ fn check_routing_key(
                 });
             }
         };
-        if !seen.insert((source.rid, name)) {
+        if source.client && (source.rid || source.max_bytes.is_some()) {
+            return Err(SpecError::BadField {
+                path: at.field("client"),
+                value: "true".to_string(),
+                reason: "a header read whole, with no rid and no max_bytes beside it",
+            });
+        }
+        if !seen.insert((source.rid, source.client, name)) {
             return Err(SpecError::Duplicate {
                 path: at.0,
                 name: name.to_string(),
@@ -3614,6 +3648,13 @@ fn check_routing_key(
             |bytes| (1..=MAX_KEY_BYTES).contains(&bytes),
             "between 1 and 8192",
         )?;
+    }
+    if listed == 0 {
+        return Err(at.bad(
+            "sources",
+            "client entries alone",
+            "a list of one to eight sources",
+        ));
     }
     Ok(())
 }
@@ -3944,16 +3985,27 @@ pub const MANUAL_SESSION_HEADER: &str = "x-smg-routing-key";
 
 /// The routing key sources of a preset whose ring places by the key, as
 /// the gateway's policy of that name reads them at its defaults: the
-/// routing key header. `None` for every other preset: `manual` names its
-/// one header in its sessions rule, and no other preset's stage reads a
-/// key.
+/// routing key header, and for the hash ring, behind it, the two headers
+/// that tell one client from another, as client sources. `None` for every
+/// other preset: `manual` names its one header in its sessions rule, and no
+/// other preset's stage reads a key.
 fn preset_routing_key(name: &str) -> Option<RoutingKeySpec> {
-    matches!(name, "prefix_hash" | "consistent_hashing").then(|| RoutingKeySpec {
-        sources: vec![KeySourceSpec {
-            header: Some(MANUAL_SESSION_HEADER.to_string()),
-            rid: false,
-            max_bytes: None,
-        }],
+    let header = |name: &str, client| KeySourceSpec {
+        header: Some(name.to_string()),
+        client,
+        ..KeySourceSpec::default()
+    };
+    let sources = match name {
+        "prefix_hash" => vec![header(MANUAL_SESSION_HEADER, false)],
+        "consistent_hashing" => vec![
+            header(MANUAL_SESSION_HEADER, false),
+            header("x-forwarded-for", true),
+            header("cookie", true),
+        ],
+        _ => return None,
+    };
+    Some(RoutingKeySpec {
+        sources,
         strip_lineage: false,
     })
 }
@@ -4044,7 +4096,8 @@ impl PolicySpec {
             },
             // The ring owner of the decision's key (an encode item's content
             // hash, a request's routing key), the ring's next members as the
-            // alternates; a keyless decision is the picker's draw.
+            // alternates; a request with no session key is placed by its
+            // client's key, and one with neither is the picker's draw.
             "consistent_hashing" => ProfileSpec {
                 filter: standard_filters(),
                 score: vec!["consistent-hash".into()],
@@ -4189,9 +4242,12 @@ impl PolicySpec {
         spec.bindings = vec![BindingSpec {
             plan: Some(PlanName::PdPair),
             profiles,
-            // One request, one key: the prefill side's sources where its
-            // preset reads a key, else the decode side's.
-            routing_key: preset_routing_key(prefill).or_else(|| preset_routing_key(decode)),
+            // One request, one key: the sides' session sources are the one
+            // header, and the hash ring's side adds its client sources.
+            routing_key: [prefill, decode]
+                .into_iter()
+                .filter_map(preset_routing_key)
+                .max_by_key(|key| key.sources.len()),
             ..BindingSpec::default()
         }];
         Ok(spec)
@@ -5299,7 +5355,7 @@ mod tests {
             ),
             (
                 "consistent_hashing",
-                "sha256:47f482157ac66931f8e0551a945183f3e8fd5b686d633411f6c3358e9ba6676b",
+                "sha256:f7f4be1857e6241e4e910252f2cdfc8b8c36a2516e822ec9607f683f5db7fb63",
             ),
             (
                 "prefix_hash",
@@ -7468,6 +7524,16 @@ mod tests {
         let refused = |text: &str| block(text).expect_err(text).to_string();
         let nine: Vec<String> = (0..9).map(|i| format!(r#"{{"header":"x-{i}"}}"#)).collect();
         let nine = format!(r#"{{"sources":[{}]}}"#, nine.join(","));
+        // Client sources are counted apart: four stand beside eight.
+        let beside_eight = |clients: usize| {
+            let listed: Vec<String> = (0..8)
+                .map(|i| format!(r#"{{"header":"x-{i}"}}"#))
+                .chain((0..clients).map(|i| format!(r#"{{"header":"x-c{i}","client":true}}"#)))
+                .collect();
+            format!(r#"{{"sources":[{}]}}"#, listed.join(","))
+        };
+        assert!(block(&beside_eight(4)).is_ok());
+        let five = beside_eight(5);
         for (text, message) in [
             (
                 r#"{"sources":[]}"#,
@@ -7476,6 +7542,10 @@ mod tests {
             (
                 nine.as_str(),
                 "bindings[0].routing_key.sources = 9 entries is not a list of one to eight sources",
+            ),
+            (
+                five.as_str(),
+                "bindings[0].routing_key.sources = 5 client entries is not a list of four client sources at most",
             ),
             (
                 r#"{"sources":[{}]}"#,
@@ -7525,6 +7595,48 @@ mod tests {
                 name: "x-tenant-id".to_string(),
             })
         );
+        // A client source is a header read whole.
+        let client = |source: &str| {
+            spec_with_binding(&format!(
+                r#"{{"profile":"p","routing_key":{{"sources":[{source}]}}}}"#
+            ))
+            .validate()
+            .err()
+        };
+        assert_eq!(
+            client(r#"{"header":"x-a"},{"header":"cookie","client":true}"#),
+            None
+        );
+        // Client sources alone are no block: a sessions rule beside the
+        // block would have no source of a session's key.
+        assert_eq!(
+            client(r#"{"header":"cookie","client":true}"#).map(|refused| refused.to_string()),
+            Some(
+                "bindings[0].routing_key.sources = client entries alone is not a list of one to eight sources"
+                    .to_string()
+            )
+        );
+        // A header is named once each way.
+        assert_eq!(
+            client(r#"{"header":"x-forwarded-for"},{"header":"x-forwarded-for","client":true}"#),
+            None
+        );
+        assert!(matches!(
+            client(r#"{"header":"cookie","client":true},{"header":"cookie","client":true}"#),
+            Some(SpecError::Duplicate { .. })
+        ));
+        for refused in [
+            r#"{"rid":true,"client":true}"#,
+            r#"{"header":"cookie","max_bytes":64,"client":true}"#,
+        ] {
+            assert!(
+                matches!(
+                    client(refused),
+                    Some(SpecError::BadField { path, .. }) if path.ends_with("sources[0].client")
+                ),
+                "{refused}"
+            );
+        }
         // One spelling or the other beside a sessions rule.
         let beside = |sessions: &str| {
             spec_with_binding(&format!(

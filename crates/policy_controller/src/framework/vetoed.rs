@@ -2234,6 +2234,37 @@ mod tests {
         assert_ne!(order(&decide(&engine, &other, &pool))[0], owner);
     }
 
+    /// A client's key places like a session's and keeps nothing: the request
+    /// goes to the ring's worker for the key, and off it where that worker
+    /// is over its thresholds, which a session's key stays on.
+    #[test]
+    fn a_client_key_places_on_the_ring_and_lifts_no_veto() {
+        let engine = PolicySpec::preset("consistent_hashing")
+            .expect("the preset's form")
+            .validate()
+            .expect("the document builds");
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let as_client = |session: &RequestFacts<'static>| RequestFacts {
+            session_key: Identity::NONE,
+            client_key: session.session_key.hash,
+            ..*session
+        };
+        // Eight keys: one key alone passes a tie's draw one time in four.
+        for key in ["k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8"] {
+            let session = keyed(key);
+            let owner = ring_order(&engine, &session, &pool)[0];
+            let placed = order(&decide(&engine, &as_client(&session), &pool))[0];
+            assert_eq!(placed, owner, "{key}");
+        }
+        let session = keyed("k1");
+        let client = as_client(&session);
+        let owner = ring_order(&engine, &session, &pool)[0];
+        pool[owner as usize].health.overloaded = true;
+        pool[owner as usize].in_flight = 1;
+        assert_eq!(order(&decide(&engine, &session, &pool))[0], owner);
+        assert_ne!(order(&decide(&engine, &client, &pool))[0], owner);
+    }
+
     /// The ring's preset with its one profile's scorers and picker replaced,
     /// under the prefix hash preset's view, which admits the prefix form.
     fn ring_shaped(score: serde_json::Value, pick: serde_json::Value) -> Engine {

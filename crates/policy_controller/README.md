@@ -833,6 +833,10 @@ bindings:
     routing_key:
       sources:
         - header: x-smg-routing-key
+        - header: x-forwarded-for
+          client: true
+        - header: cookie
+          client: true
 ```
 
 ### `prefix_hash`

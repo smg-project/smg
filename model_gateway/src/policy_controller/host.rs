@@ -163,34 +163,47 @@ impl<'a> Ask<'a> {
         }
     }
 
-    /// The request's routing key by the sources its binding names in `spec`:
-    /// the first that holds a value, with the source it came from
-    /// ([`KeySources::derive`](smg_policy_controller::KeySources::derive)).
+    /// The request's two keys by the sources its binding names in `spec`.
+    /// Its routing key is the first session source that holds a value, with
+    /// the source it came from
+    /// ([`KeySources::derive`](smg_policy_controller::KeySources::derive)):
     /// `None` where the binding names no source, or none of them holds a
-    /// value.
+    /// value. Its client's key is read where it has no routing key
+    /// ([`KeySources::derive_client`](smg_policy_controller::KeySources::derive_client)),
+    /// and is `0` where it carries none.
     ///
-    /// The key borrows the document. The door hands the ask the world it
-    /// decides under, and the key is derived there
+    /// The routing key borrows the document. The door hands the ask the
+    /// world it decides under, and the keys are derived there
     /// ([`Handle::decide_under`]).
-    fn key<'s>(&self, spec: &'s AppliedSpec) -> Option<DerivedKey<'s>>
+    fn keys<'s>(&self, spec: &'s AppliedSpec) -> (Option<DerivedKey<'s>>, u64)
     where
         'a: 's,
     {
-        let sources = spec.key_sources_for(self.model, self.phase)?;
+        let Some(sources) = spec.key_sources_for(self.model, self.phase) else {
+            return (None, 0);
+        };
         let headers = self.headers;
         let header = |name: &str| headers?.get(name).map(HeaderValue::as_bytes);
-        sources.derive(header, self.rid)
+        let derived = sources.derive(header, self.rid);
+        // A client's key places where no session's does: it is read for
+        // such a request alone.
+        let client_key = match derived {
+            Some(_) => 0,
+            None => sources.derive_client(header),
+        };
+        (derived, client_key)
     }
 
-    /// The request as the controller reads it, with its routing `key` and
-    /// the targets the gateway `missed` at this attempt's earlier asks or
-    /// commits. The one place a fact of a request is stated: a later step
-    /// adds its fact here. Each ask borrows the attempt's hashes.
+    /// The request as the controller reads it, with its routing `key`, its
+    /// client's key and the targets the gateway `missed` at this attempt's
+    /// earlier asks or commits. The one place a fact of a request is
+    /// stated: a later step adds its fact here. Each ask borrows the
+    /// attempt's hashes.
     ///
     /// Each call draws the decision's seed anew. The seed is the one
     /// randomness a stage gets: under a constant seed a policy that draws
     /// picks the same worker of an unchanged pool every time.
-    fn request<'s>(&self, key: Identity<'s>, missed: &'s [WorkerId]) -> Request<'s>
+    fn request<'s>(&self, key: Identity<'s>, client_key: u64, missed: &'s [WorkerId]) -> Request<'s>
     where
         'a: 's,
     {
@@ -200,6 +213,7 @@ impl<'a> Ask<'a> {
             session_key: key,
             phase: self.phase,
             prompt_tokens: self.prompt_tokens,
+            client_key,
             attempt: u8::try_from(self.tried.len()).unwrap_or(u8::MAX),
             tried: self.tried,
             seed: rand::rng().random(),
@@ -226,7 +240,7 @@ impl<'a> Ask<'a> {
 }
 
 /// One ask of an attempt, as the door takes it up: its request is made from
-/// the world the decision is made under, so its key is derived by the
+/// the world the decision is made under, so its keys are derived by the
 /// sources of the document that decides.
 struct Made<'r, 'a> {
     ask: &'r Ask<'a>,
@@ -244,13 +258,13 @@ impl Maker for Made<'_, '_> {
     }
 
     fn make<'w>(&'w self, world: &'w World) -> Request<'w> {
-        let derived = self.ask.key(world.spec());
+        let (derived, client_key) = self.ask.keys(world.spec());
         self.source.set(derived.map(|derived| match derived.source {
             KeySource::Header(_) => "header",
             KeySource::Rid => "rid",
         }));
         let key = derived.map_or(Identity::NONE, |derived| derived.key);
-        self.ask.request(key, self.missed)
+        self.ask.request(key, client_key, self.missed)
     }
 }
 

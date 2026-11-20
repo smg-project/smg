@@ -364,6 +364,9 @@ impl Checked {
                 // The frame carries no signal cells: they stand beside
                 // the rows of the host that decides.
                 signal_cells: None,
+                // The wire carries no client key yet: a request with no
+                // session key is placed as one with no key.
+                client_key: 0,
             },
             &Constraints {
                 excluded: &lists.excluded,

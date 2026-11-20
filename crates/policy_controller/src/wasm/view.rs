@@ -1525,6 +1525,7 @@ mod tests {
             affinity: &[],
             named: None,
             signal_cells: None,
+            client_key: 0,
         };
         let exposure = Exposure {
             tenant: Reveal::Plain,
