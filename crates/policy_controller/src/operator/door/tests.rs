@@ -233,8 +233,8 @@ fn a_document_that_only_changed_its_form_is_no_change() {
 }
 
 /// The apply counter by result: a new generation counts as applied, a
-/// refusal a running source hands back counts as rejected, once, and the
-/// standing document again counts as neither.
+/// refusal counts as rejected, once, and the standing document again
+/// counts as neither.
 #[test]
 fn the_counts_follow_the_outcomes() {
     let (_store, generations) = generations();
@@ -244,8 +244,7 @@ fn the_counts_follow_the_outcomes() {
     assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Unchanged(1)));
     assert_eq!(generations.counts(), counts(1, 0));
 
-    let refused =
-        yaml(&generations, with_line(RANDOM, 1)).map_err(|rejected| generations.reject(rejected));
+    let refused = yaml(&generations, with_line(RANDOM, 1));
     assert!(matches!(
         refused,
         Err(SpecRejected::ChangedUnderItsLine { .. })
@@ -842,14 +841,18 @@ fn a_dry_run_refuses_what_an_apply_would_by_the_same_name() {
         (vec![b'#'; over], ""),
     ];
     for (document, path) in rows {
+        let before = generations.counts();
         let refused = generations
             .dry_run("", &document, Format::Yaml)
             .expect("no guard")
             .would_run
             .expect_err("refused");
         assert_eq!(refused.field_path(), path, "{refused}");
+        assert_eq!(generations.counts(), before, "a dry run counts nothing");
         assert_eq!(yaml(&generations, document), Err(refused));
+        assert_eq!(generations.counts(), applied(1, before.rejected + 1));
     }
+    let before = generations.counts();
     let lower = generations
         .dry_run("", &with_line(RANDOM, 3), Format::Yaml)
         .expect("no guard");
@@ -859,13 +862,7 @@ fn a_dry_run_refuses_what_an_apply_would_by_the_same_name() {
     };
     assert_eq!(lower.would_run, Err(SpecRejected::Stale(stale)));
     assert!(lower.needs.is_none(), "a refused document carries no diff");
-    assert_eq!(
-        generations.counts(),
-        Counts {
-            applied: 1,
-            rejected: 0
-        }
-    );
+    assert_eq!(generations.counts(), before, "a dry run counts nothing");
 }
 
 /// The bound fails fast: a document one byte over it is refused by its

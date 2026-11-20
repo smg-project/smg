@@ -144,8 +144,9 @@ ingest = [
     "tokio/time",
 ]
 # Reading and applying a policy document in process. The turn uses only
-# Tokio's sync primitives. It builds on Linux and macOS: the spec store's
-# file calls come of `rustix`, a dependency on those two alone.
+# Tokio's sync primitives. It builds on every target. The spec store's file
+# calls come of `rustix`, a dependency on Linux and macOS alone: on another
+# target a door has no spec store to bind.
 operator = [
     "dep:rustix",
     "dep:serde_path_to_error",

@@ -731,11 +731,8 @@ fn verdict(
 /// end or a file that was not read as internal.
 fn unanswered(unanswered: Unanswered) -> Status {
     match unanswered {
-        Unanswered::Door(DoorUnanswered::Guarded(standing, digest)) => {
-            let digest = digest.map(|digest| digest.to_string()).unwrap_or_default();
-            Status::failed_precondition(format!(
-                "expected_digest: generation {standing} stands with digest {digest}"
-            ))
+        Unanswered::Door(door @ DoorUnanswered::Guarded(..)) => {
+            Status::failed_precondition(door.to_string())
         }
         Unanswered::Full => Status::resource_exhausted(format!(
             "{DRY_RUNS_WAITING} dry runs wait their turn: ask again later"

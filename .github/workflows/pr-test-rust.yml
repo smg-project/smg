@@ -441,6 +441,11 @@ jobs:
           # build.sh adds a missing target by one attempt; added here first,
           # behind the retry helper, it is not missing.
           bash scripts/ci_retry.sh 5 10 timeout 180 rustup target add wasm32-unknown-unknown
+          # The policy crate's `operator` feature builds for a target that has
+          # no spec store: the store's file calls are Linux's and macOS's, and a
+          # host's door elsewhere has no store to bind. This target stands for
+          # every such one, since it is installed here already.
+          cargo check --locked -p smg-policy-controller --no-default-features --features operator --target wasm32-unknown-unknown
           bash examples/wasm/wasm-guest-policy/build.sh
           cd examples/wasm/wasm-guest-policy
           bash "$GITHUB_WORKSPACE/scripts/ci_retry.sh" 5 10 timeout 180 rustup toolchain install nightly --profile minimal --component rustfmt

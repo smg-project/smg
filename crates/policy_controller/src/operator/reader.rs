@@ -12,11 +12,11 @@ use crate::spec::PolicySpec;
 /// The largest document a source hands over, in bytes: 128 KiB. What sets
 /// the bound is what an apply may hold beside the document, 64 MiB: the
 /// budget of one apply in a controller whose container is a few hundred
-/// mebibytes. By run a YAML document of this size holds under 56 MiB
-/// ([`read_yaml`]). An apply runs one at a time, and a dry run one at a time
+/// mebibytes. By run a YAML document of this size holds under 56 MiB.
+/// An apply runs one at a time, and a dry run one at a time
 /// beside it when the host takes its turns. A fleet's document is far under the bound: 143 names
 /// with a binding each write 11,523 bytes.
-pub(crate) const MAX_DOCUMENT_BYTES: u64 = 128 << 10;
+pub const MAX_DOCUMENT_BYTES: u64 = 128 << 10;
 
 /// How many bytes a YAML document may build for each byte of the size bound
 /// ([`MAX_DOCUMENT_BYTES`]), as the values it is read into. A value weighs
@@ -74,7 +74,7 @@ impl Format {
     }
 
     /// The name of this form.
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Yaml => "yaml",
             Self::Json => "json",
@@ -83,8 +83,7 @@ impl Format {
 
     /// The form a contract's `format` field names, as [`Format::as_str`]
     /// writes one; none for any other name.
-    #[cfg(any(test, feature = "controller"))]
-    pub(crate) fn named(name: &str) -> Option<Self> {
+    pub fn named(name: &str) -> Option<Self> {
         [Self::Yaml, Self::Json]
             .into_iter()
             .find(|format| format.as_str() == name)

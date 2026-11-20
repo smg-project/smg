@@ -93,24 +93,24 @@ pub enum SpecRejected {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NotHeld {
     /// The generation asked for: the standing one where the call names none.
-    pub(crate) asked: u64,
+    pub asked: u64,
     /// The generation of the document the source applied, when it applied
     /// one.
-    pub(crate) held: Option<u64>,
+    pub held: Option<u64>,
     /// The generation the store runs.
-    pub(crate) standing: u64,
-    /// Under a spec store, the generations on file. `None` under a file,
-    /// which retains the standing generation's document alone.
-    pub(crate) on_file: Option<OnFile>,
+    pub standing: u64,
+    /// Under a spec store, the generations on file. `None` where none is
+    /// bound: the standing generation's document alone is retained.
+    pub on_file: Option<OnFile>,
 }
 
 /// The generations on file under a spec store, as a refusal names them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct OnFile {
+pub struct OnFile {
     /// How many are listed.
-    pub(crate) count: usize,
+    pub count: usize,
     /// The oldest one's number and the newest one's: zero where none is.
-    pub(crate) span: (u64, u64),
+    pub span: (u64, u64),
 }
 
 impl fmt::Display for NotHeld {
@@ -138,12 +138,15 @@ impl fmt::Display for NotHeld {
     }
 }
 
+impl std::error::Error for NotHeld {}
+
 /// The apply counter by result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Counts {
     /// Documents applied as a new generation.
     pub applied: u64,
-    /// Documents a running source handed back as rejected.
+    /// Documents refused: by an apply or a write, or handed back by a
+    /// source that keeps running. A dry run counts nothing.
     pub rejected: u64,
 }
 
@@ -259,6 +262,21 @@ pub enum Unanswered {
     /// The caller's guard names another digest than the standing one's.
     /// The refusal names the standing number and digest.
     Guarded(u64, Option<Digest>),
-    /// No document is held for the generation a rollback names.
+    /// No document is held for the generation the call names.
     NotHeld(NotHeld),
 }
+
+impl fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Guarded(standing, Some(digest)) => write!(
+                f,
+                "expected_digest: generation {standing} stands with digest {digest}"
+            ),
+            Self::Guarded(..) => f.write_str("expected_digest: no generation stands"),
+            Self::NotHeld(not_held) => not_held.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for Unanswered {}

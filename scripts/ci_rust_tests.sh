@@ -192,6 +192,9 @@ commands_of() {
             # that feature, so nothing else would run the cases behind it. The line above stays as it
             # is: it runs the case of a build without the feature.
             echo "-p smg-policy-controller --lib --features smg-policy-controller/discovery"
+            # The policy crate's case for a host that builds the `operator` feature alone. The shard's
+            # first line turns the controller on, so that case would never run as such a host builds it.
+            echo "-p smg-policy-controller --no-default-features --features operator --test operator_door"
             # The radix tree without its fuzz binary (the radix-fuzz shard); --doc cannot share an invocation with --test.
             selectors=$(test_selectors_except smg-radix-tree fuzz_differential)
             echo "-p smg-radix-tree --lib$selectors"
@@ -275,6 +278,9 @@ lint() {
             for features in $(discovery_feature_sets) test-util; do
                 (set -x; cargo clippy -p smg-service-discovery --features "$features" --all-targets -- -D warnings)
             done
+            # The policy crate's `operator` feature is what a host calls in its own process. It
+            # builds with no controller behind it, and nothing of it is left unused there.
+            (set -x; cargo clippy -p smg-policy-controller --no-default-features --features operator --all-targets -- -D warnings)
             (set -x; cargo check --manifest-path bindings/python/Cargo.toml)
             (set -x; cargo check --manifest-path bindings/golang/Cargo.toml) ;;
         *) echo "ci_rust_tests.sh: unknown lint leg '$1' (all-features, self-hosted, anthropic-only, default-build)" >&2; exit 2 ;;
