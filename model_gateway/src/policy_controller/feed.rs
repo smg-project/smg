@@ -455,4 +455,6 @@ impl Membership for FeedDoor {
 #[cfg(test)]
 mod cache_events_tests;
 #[cfg(test)]
+pub(crate) mod signal_tests;
+#[cfg(test)]
 mod tests;

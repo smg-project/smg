@@ -7,6 +7,11 @@ use std::{
 };
 
 use async_trait::async_trait;
+use smg_policy_controller::{
+    store::{HealthPolicy, LoadSink, Maker, WorkerFacts},
+    view::{Role, WireModes},
+    worker_host::{Expect, Membership, Wrote},
+};
 use smg_worker::{
     common_proto::KvEventBatch,
     connection::engine::{AdminAnswer, EngineConnection, EngineConnector, HealthAnswer, ZmqLink},
@@ -19,8 +24,8 @@ use smg_worker::{
     registry::RemoteWorkerState,
     test_support::NoEngine,
     worker::{
-        ProfileOptions, RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey, WorkerLoadResponse,
-        WorkerSpec, WorkerUpdateRequest,
+        NamedValue, ProfileOptions, RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey,
+        WorkerLoadResponse, WorkerSpec, WorkerUpdateRequest,
     },
     workflow::{
         CreateLocalWorkerStep, DetectConnectionModeStep, DetectRuntimeStep, DiscoverMetadataStep,
@@ -33,6 +38,10 @@ use super::super::{build_app_context, Extensions, ServerConfig};
 use crate::{
     app_context::AppContext,
     config::RouterConfig,
+    policy_controller::{
+        feed::signal_tests::{stages, SINGLE, SLOTS},
+        host::Ask,
+    },
     routers::grpc::backend_client::{get_backend_client, BackendConnector, BasicWorkerBuilder},
     workflow::{
         data::{WorkerRegistrationMode, WorkerUpdateWorkflowData, WorkerWorkflowData},
@@ -47,8 +56,12 @@ use crate::{
 const HOST_URL: &str = "grpc://worker.invalid:53177";
 const MODEL_ID: &str = "sample-model";
 
-#[derive(Debug)]
-struct HostConnection;
+/// A host's connection to one engine. Its load answer states the
+/// engine's free slots by name where the host knows the count.
+#[derive(Debug, Default)]
+struct HostConnection {
+    free_slots: Option<f64>,
+}
 
 #[async_trait]
 impl EngineConnection for HostConnection {
@@ -79,9 +92,16 @@ impl EngineConnection for HostConnection {
     }
 
     async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
+        let stated = self.free_slots.map(|free| NamedValue {
+            name: SLOTS.into(),
+            unit: "slots".into(),
+            value: free,
+            age_ms: None,
+        });
         let rank = SchedulerLoadSnapshot {
             num_running_reqs: 37,
             num_waiting_reqs: 29,
+            values: stated.into_iter().collect(),
             ..Default::default()
         };
         Ok(WorkerLoadResponse {
@@ -129,7 +149,7 @@ impl EngineConnector for HostConnector {
         runtime: RuntimeType,
     ) -> Result<Arc<dyn EngineConnection>, String> {
         if url == HOST_URL {
-            return Ok(Arc::new(HostConnection));
+            return Ok(Arc::new(HostConnection::default()));
         }
         BackendConnector::shared().connect_grpc(url, runtime).await
     }
@@ -143,6 +163,40 @@ impl EngineConnector for HostConnector {
             return Ok(());
         }
         BackendConnector::shared().dial_grpc(url, timeout).await
+    }
+}
+
+/// The host's engines that state their free slots, each at its address.
+const STATING: [(&str, f64); 3] = [
+    ("grpc://first.invalid:53177", 10.0),
+    ("grpc://second.invalid:53177", 70.0),
+    ("grpc://third.invalid:53177", 40.0),
+];
+
+/// The host owns the [`STATING`] addresses, with no listener at any.
+#[derive(Debug)]
+struct StatingConnector;
+
+#[async_trait]
+impl EngineConnector for StatingConnector {
+    async fn connect_grpc(
+        &self,
+        url: &str,
+        _: RuntimeType,
+    ) -> Result<Arc<dyn EngineConnection>, String> {
+        let engine = STATING.iter().find(|(address, _)| *address == url);
+        let &(_, free) = engine.ok_or_else(|| format!("the host has no engine at {url}"))?;
+        Ok(Arc::new(HostConnection {
+            free_slots: Some(free),
+        }))
+    }
+
+    async fn connect_zmq(&self, link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
+        BackendConnector::shared().connect_zmq(link).await
+    }
+
+    async fn dial_grpc(&self, _: &str, _: Duration) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -356,4 +410,69 @@ async fn the_load_port_publishes_the_host_connections_report() {
     assert_eq!(report.loads.len(), 1);
     assert_eq!(report.loads[0].num_running_reqs, 37);
     assert_eq!(report.loads[0].num_waiting_reqs, 29);
+}
+
+/// Under a document that declares a signal, the values a host's connections
+/// state in their polled load answers decide a placement. The gateway's
+/// context is built with the host's connector and the host's stage. The
+/// load monitor polls each engine through its connection, the feed's sink
+/// hands the store the named values, and the host places by them.
+#[tokio::test]
+async fn a_placement_follows_the_values_a_host_connections_polled_answer_states() {
+    let router = RouterConfig {
+        policy_controller: true,
+        policy_spec: Some(serde_yaml::from_str(SINGLE).unwrap()),
+        ..RouterConfig::default()
+    };
+    let extensions = Extensions::new()
+        .connector(Arc::new(StatingConnector))
+        .stages(stages().unwrap());
+    let app = build_app_context(&ServerConfig::minimal(router), extensions)
+        .await
+        .unwrap();
+    let door: &dyn Membership = &*app.policy_feed.as_ref().unwrap().door;
+    for (url, _) in STATING {
+        let facts = WorkerFacts {
+            key: url.to_owned(),
+            engine: url.to_owned(),
+            role: Role::Single,
+            wire_modes: WireModes::GRPC,
+            engine_kind: "generic".to_owned(),
+            models: vec![MODEL_ID.to_owned()],
+            dp_size: 1,
+            max_running: Some(64),
+            health: HealthPolicy {
+                probes: false,
+                ..HealthPolicy::default()
+            },
+            ..WorkerFacts::default()
+        };
+        let wrote = door.found(&Maker::Control, Expect::Nothing, url, &|_| facts.clone());
+        assert!(matches!(wrote, Ok(Wrote::Registered(_))), "{wrote:?}");
+    }
+    let (second, _) = STATING[1];
+    let worker = app.worker_registry.get_by_url(second).unwrap();
+    assert_host_connection(worker.as_ref()).await;
+    let key = WorkerGroupKey {
+        model_id: worker.model_id().into(),
+        worker_type: *worker.worker_type(),
+        connection_mode: *worker.connection_mode(),
+    };
+    assert_eq!(key.connection_mode, ConnectionMode::Grpc);
+
+    let monitor = app.worker_monitor.as_ref().unwrap();
+    let now = Instant::now();
+    poll_group_once_for_test(monitor, &key, Duration::from_secs(11), now).await;
+    let store = app.policy_store.as_ref().unwrap();
+    // The case runs no publication loop: it shows what waits at its instant.
+    if let Some(due) = store.publish_due() {
+        store.publish(due);
+    }
+    // One value an engine was taken, and none dropped.
+    assert_eq!(store.counts().signal_writes, [3, 0, 0, 0, 0, 0]);
+
+    let host = app.policy_host.as_ref().unwrap();
+    let ask = Ask::of(b"polled", MODEL_ID);
+    let placed = host.place(&ask, now + Duration::from_millis(10)).await;
+    assert_eq!(placed.unwrap().worker().url(), second);
 }
