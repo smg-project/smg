@@ -70,6 +70,17 @@
 //! other word. The adapter keeps the model each open row streams for and
 //! the engine's word for each model. The store keeps the size of record.
 //!
+//! # The series
+//!
+//! A batch the store takes is applied and accounted for by the worker
+//! crate's one routine, under the URL of the stream's worker: its blocks
+//! by operation, the stores the index did not take as they came, its age
+//! and the batch itself. The adapter adds what its own answers say: a
+//! live batch's pace, the worker's index blocks, a batch behind its
+//! lane's cursor, a gap that asks a replay, and each reset by its reason.
+//! The series are the worker crate's, written to the recorder in scope as
+//! the collector's are.
+//!
 //! # Limits
 //!
 //! - A store on an indexed tier raises the row's block of record whether or
@@ -82,6 +93,13 @@
 //!   every row it wrote.
 //! - What a row's old stream had in flight as the row moved, a batch or a
 //!   reset, can land behind the new stream's clear.
+//! - What the store's cursor decides by itself is in no series: a gap kept
+//!   or cleared, the batches missed, the degraded ranks, and the reason it
+//!   emptied a rank ahead of a batch.
+//! - The index-blocks gauge moves at a batch: a rank the store emptied
+//!   shows at its row's next batch.
+//! - A batch the adapter passes over by itself is counted nowhere: one of
+//!   a rank with no row laid, or one on a stream that is ending.
 
 use std::{
     collections::HashMap,
@@ -97,10 +115,11 @@ use smg_worker::{
     common_proto::{kv_cache_event::Data, KvEventBatch},
     identity::basic::Worker,
     kv_events::{
-        apply::{apply_events, BlockIndex, HeldBlocks, WorkerIndexState},
+        apply::{apply_counted, apply_events, BlockIndex, HeldBlocks, WorkerIndexState},
         port::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         KvEventFeed, KvEventHost,
     },
+    metrics::writers::Metrics,
     registry::Generation,
 };
 
@@ -120,6 +139,9 @@ pub struct KvAdapter<S: ?Sized> {
     rows: Mutex<Rows>,
     /// What the streams said of their models' block sizes.
     sizes: Mutex<Sizes>,
+    /// The URL each open feed's worker is named by in the cache-event
+    /// series, by the feed's own row.
+    urls: Mutex<HashMap<WorkerId, Arc<str>>>,
     /// Where the ranks of an engine stand, where a host handed its holder.
     ranks: Option<Arc<dyn Ranks>>,
     store: Arc<S>,
@@ -196,6 +218,8 @@ struct Applied {
     /// batch that reads another resets the state first: the store emptied
     /// the rank in between.
     emptied: Option<u64>,
+    /// The blocks the row's map held behind its last batch.
+    blocks: usize,
 }
 
 /// The row's reverse map inside the rules' state. The map is the lane's,
@@ -325,6 +349,7 @@ impl<S: ?Sized> KvAdapter<S> {
         Self {
             rows: Mutex::new(Rows::default()),
             sizes: Mutex::new(Sizes::default()),
+            urls: Mutex::new(HashMap::new()),
             ranks,
             store,
         }
@@ -356,6 +381,23 @@ impl<S: ?Sized> KvAdapter<S> {
         self.ranks
             .as_ref()
             .is_some_and(|ranks| ranks.row_of(row, 0).is_some())
+    }
+
+    /// The blocks the rows `id`'s stream writes held behind their last
+    /// batches: what its worker's index-blocks gauge says.
+    fn held(&self, id: WorkerId) -> usize {
+        let states: Vec<_> = {
+            let rows = self.rows.lock();
+            let own = rows.written.get(&id).filter(|own| own.stream == id);
+            let fed = rows.fed.get(&id).into_iter().flatten();
+            let fed = fed.filter_map(|row| rows.written.get(row));
+            own.into_iter()
+                .chain(fed)
+                .map(|written| Arc::clone(&written.applied))
+                .collect()
+        };
+        // Each row's state by itself, outside the table's lock.
+        states.iter().map(|state| state.lock().blocks).sum()
     }
 }
 
@@ -518,6 +560,9 @@ where
         let Some((applied, kept)) = self.applied(id, row) else {
             return BatchOutcome::Skipped;
         };
+        // The stream's worker, as its series name it.
+        let url = self.urls.lock().get(&id).cloned();
+        let snapshot = facts.snapshot.is_some();
         let facts = store::BatchFacts {
             sequence: facts.sequence,
             clears: facts.clears,
@@ -531,11 +576,16 @@ where
             .iter()
             .any(|event| matches!(event.data, Some(Data::Stored(_))));
         let mut record = None;
+        let mut took = None;
         // The cursor reads the header alone. The body runs where it admits
         // the batch: inside the lane's turn, with the table's lock let go.
         let outcome = self.store.admit_through(row, rank, facts, &mut |lane| {
             let mut applied = applied.lock();
-            let Applied { state, emptied } = &mut *applied;
+            let Applied {
+                state,
+                emptied,
+                blocks,
+            } = &mut *applied;
             if *emptied != Some(lane.emptied()) {
                 // The store emptied the rank since the row's last batch, or
                 // the row begins: what the rules kept beside the map goes
@@ -550,7 +600,31 @@ where
             let worker = lane.worker();
             {
                 let lending = Lending::new(lane, state);
-                apply_events(&batch.events, worker, &Lane(lending.lane), lending.state);
+                took = match &url {
+                    // Applied and accounted for under the worker's name.
+                    Some(url) => {
+                        let (op, disposition) = if snapshot {
+                            ("snapshot", "snapshot")
+                        } else {
+                            ("stored", "applied")
+                        };
+                        Some(apply_counted(
+                            batch,
+                            url,
+                            worker,
+                            &Lane(lending.lane),
+                            lending.state,
+                            op,
+                            disposition,
+                        ))
+                    }
+                    // A row no feed was opened for names no series.
+                    None => {
+                        apply_events(&batch.events, worker, &Lane(lending.lane), lending.state);
+                        None
+                    }
+                };
+                *blocks = lending.state.blocks.len();
             }
             *emptied = Some(lane.emptied());
             record = state.block_of_record();
@@ -563,10 +637,30 @@ where
                 if let Some(width) = record.filter(|_| stores) {
                     self.learn(id, width);
                 }
+                if let Some(url) = &url {
+                    // A live batch's duration is the stream's pace. A
+                    // snapshot chunk publishes none.
+                    if let Some(took) = took.filter(|_| !snapshot) {
+                        Metrics::record_kv_event_apply(url, took.as_secs_f64());
+                    }
+                    Metrics::set_kv_index_blocks(url, self.held(id));
+                }
                 BatchOutcome::Applied
             }
-            store::BatchOutcome::Skipped => BatchOutcome::Skipped,
+            store::BatchOutcome::Skipped => {
+                // A batch behind its lane's cursor. A row with no lane
+                // skips every batch and counts none.
+                let behind = || self.store.cursor(row, rank).is_some();
+                if let Some(url) = url.as_ref().filter(|_| behind()) {
+                    Metrics::record_kv_event_batch(url, "stale");
+                }
+                BatchOutcome::Skipped
+            }
             store::BatchOutcome::Gap { expected, received } => {
+                // The collector asks the publisher to replay from here.
+                if let Some(url) = &url {
+                    Metrics::record_kv_event_gap(url, "replay_requested", 0);
+                }
                 BatchOutcome::Gap { expected, received }
             }
         }
@@ -579,6 +673,9 @@ where
     }
 
     fn resync(&self, id: WorkerId, rank: Option<u16>, reason: ResyncReason) {
+        if let Some(url) = self.urls.lock().get(&id) {
+            Metrics::record_kv_event_resync(url, reason.as_str());
+        }
         let reason = match reason {
             ResyncReason::OutOfRange => store::ResyncReason::OutOfRange,
             ResyncReason::DataLoss => store::ResyncReason::DataLoss,
@@ -616,6 +713,7 @@ where
 
     fn removed(&self, id: WorkerId) {
         self.sizes.lock().models.remove(&id);
+        self.urls.lock().remove(&id);
         // What the stream still writes goes with it, since no stream feeds
         // it now: the rows of other ranks, and its own unless another
         // stream took it. Each is marked in the one hold that reads the
@@ -769,6 +867,9 @@ where
             Ok(row) => {
                 // The model the row's stored blocks name a size for.
                 self.sink.sizes.lock().models.insert(row, Arc::from(model));
+                // The name the stream's series go under.
+                let url = Arc::from(worker.url());
+                self.sink.urls.lock().insert(row, url);
                 Some((Arc::clone(&self.sink), row))
             }
             Err(NoFeed::NoRow) => {
@@ -2314,6 +2415,224 @@ mod tests {
                 ..Signals::default()
             },
             ..WorkerFacts::default()
+        }
+    }
+
+    /// The cache-event series of the fixture's worker, read from a recorder
+    /// of the case's own. The recorder's crates come with the controller.
+    #[cfg(feature = "controller")]
+    mod series {
+        use metrics_exporter_prometheus::{
+            PrometheusBuilder, PrometheusHandle, PrometheusRecorder,
+        };
+
+        use super::*;
+
+        struct Series {
+            recorder: PrometheusRecorder,
+            handle: PrometheusHandle,
+        }
+
+        impl Series {
+            fn new() -> Self {
+                let recorder = PrometheusBuilder::new().build_recorder();
+                let handle = recorder.handle();
+                Self { recorder, handle }
+            }
+
+            /// The value of `name` for the fixture's worker under `labels`,
+            /// where the series stands.
+            fn read(&self, name: &str, labels: &[&str]) -> Option<f64> {
+                let worker = format!("worker=\"{URL}\"");
+                let open = format!("{name}{{");
+                self.handle.render().lines().find_map(|line| {
+                    let (series, value) = line.rsplit_once(' ')?;
+                    let named = series.starts_with(&open) && series.contains(&worker);
+                    let all = labels.iter().all(|label| series.contains(label));
+                    (named && all).then(|| value.parse().ok()).flatten()
+                })
+            }
+
+            /// Whether any cache-event series names the fixture's worker.
+            /// The worker's object has series of its own.
+            fn names_the_worker(&self) -> bool {
+                let worker = format!("worker=\"{URL}\"");
+                let rendered = self.handle.render();
+                let mut lines = rendered.lines();
+                lines.any(|line| line.starts_with("smg_kv_") && line.contains(&worker))
+            }
+        }
+
+        /// A batch the store takes counts its blocks by operation and
+        /// itself as applied, publishes its pace and sets the worker's
+        /// index blocks. A removal behind it counts its blocks and moves
+        /// the gauge.
+        #[test]
+        fn an_applied_batch_counts_its_blocks_and_sets_the_workers_gauge() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                let (_host, sink) = opened(&f);
+                let mut first = wide(1, 32);
+                first.events.extend(wide(2, 32).events);
+                assert_eq!(
+                    sink.admit(f.row, 0, facts(1), &first),
+                    BatchOutcome::Applied
+                );
+                let stored = series.read("smg_kv_event_blocks_total", &["op=\"stored\""]);
+                assert_eq!(stored, Some(2.0));
+                let applied = &["disposition=\"applied\""];
+                assert_eq!(
+                    series.read("smg_kv_event_batches_total", applied),
+                    Some(1.0)
+                );
+                assert_eq!(series.read("smg_kv_index_blocks", &[]), Some(2.0));
+                assert_eq!(
+                    series.read("smg_kv_event_apply_seconds_count", &[]),
+                    Some(1.0)
+                );
+
+                let gone = batch([Data::Removed(removed(&[2]))]);
+                assert_eq!(sink.admit(f.row, 0, facts(2), &gone), BatchOutcome::Applied);
+                let removed = series.read("smg_kv_event_blocks_total", &["op=\"removed\""]);
+                assert_eq!(removed, Some(1.0));
+                assert_eq!(
+                    series.read("smg_kv_event_batches_total", applied),
+                    Some(2.0)
+                );
+                assert_eq!(series.read("smg_kv_index_blocks", &[]), Some(1.0));
+            });
+        }
+
+        /// A snapshot chunk counts its blocks and itself under the
+        /// snapshot's own words, and publishes no pace.
+        #[test]
+        fn a_snapshot_chunk_counts_under_its_own_words_and_publishes_no_pace() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                let (_host, sink) = opened(&f);
+                let chunk = BatchFacts {
+                    snapshot: Some(SnapshotChunk {
+                        unknown_before: false,
+                    }),
+                    ..facts(7)
+                };
+                assert_eq!(
+                    sink.admit(f.row, 0, chunk, &wide(1, 32)),
+                    BatchOutcome::Applied
+                );
+                let stored = series.read("smg_kv_event_blocks_total", &["op=\"snapshot\""]);
+                assert_eq!(stored, Some(1.0));
+                let chunks = &["disposition=\"snapshot\""];
+                assert_eq!(series.read("smg_kv_event_batches_total", chunks), Some(1.0));
+                assert_eq!(series.read("smg_kv_index_blocks", &[]), Some(1.0));
+                assert_eq!(series.read("smg_kv_event_apply_seconds_count", &[]), None);
+            });
+        }
+
+        /// A batch behind its lane's cursor counts as stale, and a gap
+        /// counts the replay the collector asks.
+        #[test]
+        fn a_stale_batch_and_a_gap_count_under_their_own_words() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                let (_host, sink) = opened(&f);
+                assert_eq!(
+                    sink.admit(f.row, 0, facts(1), &wide(1, 32)),
+                    BatchOutcome::Applied
+                );
+                assert_eq!(
+                    sink.admit(f.row, 0, facts(1), &wide(1, 32)),
+                    BatchOutcome::Skipped
+                );
+                let stale = &["disposition=\"stale\""];
+                assert_eq!(series.read("smg_kv_event_batches_total", stale), Some(1.0));
+                assert_eq!(
+                    sink.admit(f.row, 0, facts(3), &wide(3, 32)),
+                    BatchOutcome::Gap {
+                        expected: 2,
+                        received: 3
+                    }
+                );
+                let asked = &["outcome=\"replay_requested\""];
+                assert_eq!(series.read("smg_kv_event_gaps_total", asked), Some(1.0));
+                // Neither moved the applied count or the stored blocks.
+                let applied = &["disposition=\"applied\""];
+                assert_eq!(
+                    series.read("smg_kv_event_batches_total", applied),
+                    Some(1.0)
+                );
+                let stored = series.read("smg_kv_event_blocks_total", &["op=\"stored\""]);
+                assert_eq!(stored, Some(1.0));
+            });
+        }
+
+        /// A reset counts under its reason, each reason by itself.
+        #[test]
+        fn a_reset_counts_under_its_reason() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                let (_host, sink) = opened(&f);
+                sink.resync(f.row, None, ResyncReason::DataLoss);
+                sink.resync(f.row, Some(0), ResyncReason::Snapshot);
+                sink.resync(f.row, None, ResyncReason::DataLoss);
+                let lost = &["reason=\"data_loss\""];
+                assert_eq!(series.read("smg_kv_event_resyncs_total", lost), Some(2.0));
+                let snapshot = &["reason=\"snapshot\""];
+                assert_eq!(
+                    series.read("smg_kv_event_resyncs_total", snapshot),
+                    Some(1.0)
+                );
+            });
+        }
+
+        /// A store whose parent the row does not hold is placed as a chain
+        /// of its own and counted for the worker: the rules' own count
+        /// reaches a series.
+        #[test]
+        fn a_parentless_store_is_counted_for_the_worker() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                let (_host, sink) = opened(&f);
+                let orphan = KvBlocksStored {
+                    parent_block_hash: Some(99),
+                    ..wide_store(1, 32)
+                };
+                let orphan = batch([Data::Stored(orphan)]);
+                assert_eq!(
+                    sink.admit(f.row, 0, facts(1), &orphan),
+                    BatchOutcome::Applied
+                );
+                let stores = series.read("smg_kv_event_parentless_stores_total", &[]);
+                assert_eq!(stores, Some(1.0));
+                let blocks = series.read("smg_kv_event_parentless_blocks_total", &[]);
+                assert_eq!(blocks, Some(1.0));
+            });
+        }
+
+        /// A row no feed was opened for names no series: its batch is
+        /// applied by the rules alone. A feed that left names none either.
+        #[test]
+        fn a_row_with_no_open_feed_names_no_series() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                assert_eq!(
+                    f.sink.admit(f.row, 0, facts(1), &wide(1, 32)),
+                    BatchOutcome::Applied
+                );
+                assert_eq!(f.store.indexed_blocks(f.row, 0), 1);
+                assert!(!series.names_the_worker());
+
+                let (_host, sink) = opened(&f);
+                sink.removed(f.row);
+                sink.resync(f.row, None, ResyncReason::DataLoss);
+                assert!(!series.names_the_worker());
+            });
         }
     }
 
