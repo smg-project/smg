@@ -162,6 +162,10 @@ pub struct WorkerFacts {
     pub signals: Signals,
     pub health: HealthPolicy,
     pub overload: Overload,
+    /// The seconds a removal waits behind a drain, where the worker's
+    /// registration states another window than the default. A host that
+    /// builds the worker's object from the row gives the object this window.
+    pub drain_settle_secs: Option<u32>,
 }
 
 impl WorkerFacts {
