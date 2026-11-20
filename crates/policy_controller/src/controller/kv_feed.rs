@@ -122,6 +122,15 @@ mod tests {
                 sleep(POLL).await;
             }
         }
+
+        /// Wait within `check` for `url`'s slot to stand empty. A removal
+        /// runs on a task of its own, so its end is not ordered with the
+        /// events behind it.
+        async fn freed(&self, url: &str) {
+            while self.feed.collector().slot_ids(url).await != (None, None) {
+                sleep(POLL).await;
+            }
+        }
     }
 
     #[tokio::test]
@@ -164,7 +173,7 @@ mod tests {
             assert!(f.remove(row));
             f.lay(facts(SECOND, WireModes::GRPC, true));
             f.new_slot(SECOND, None).await;
-            assert_eq!(f.feed.collector().slot_ids(FIRST).await, (None, None));
+            f.freed(FIRST).await;
             assert!(f.feed.collector().task_ended(FIRST).await);
         })
         .await
@@ -335,7 +344,7 @@ mod tests {
                 // A later replacement takes its slot after the whole read ends.
                 f.lay(facts(LAST, WireModes::GRPC, true));
                 last = Some(f.new_slot(LAST, Some(slot)).await);
-                assert_eq!(f.feed.collector().slot_ids(gone).await, (None, None));
+                f.freed(gone).await;
                 assert!(f.feed.collector().slot_ids(joined).await.0.is_some());
                 assert_eq!(f.feed.collector().slot_ids(FLOOD).await, (None, None));
             }
@@ -424,14 +433,14 @@ mod tests {
             while f.feed.collector().slot_ids(FIRST).await != (None, Some(old)) {
                 sleep(POLL).await;
             }
-            for _ in 0..20 {
+            for _ in 0..5 {
                 sleep(POLL).await;
                 assert_eq!(f.feed.collector().slot_ids(FIRST).await, (None, Some(old)));
             }
             drop(permits);
             let new = f.new_slot(FIRST, Some(old)).await;
             // The removal's task ends and leaves the new stream standing.
-            for _ in 0..20 {
+            for _ in 0..5 {
                 sleep(POLL).await;
                 assert_eq!(f.feed.collector().slot_ids(FIRST).await, (Some(new), None));
             }

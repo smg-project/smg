@@ -94,7 +94,8 @@ impl<G: Generation> KvFeed<G> {
     /// add behind it, and not the stop's word. The removals under way end
     /// before the streams are stopped. An add is told in the loop: one
     /// whose address has a removal under way waits there for the old
-    /// task's end, and holds the events behind it.
+    /// task's end, and holds the events behind it. A removal that panics
+    /// takes the follow down, as a panic in the loop does.
     pub async fn run(&self, mut stop: watch::Receiver<bool>) {
         let mut told = HashSet::new();
         let mut removals = JoinSet::new();
@@ -214,10 +215,11 @@ impl<G: Generation> KvFeed<G> {
     }
 }
 
-/// Say a removal's task that failed: its call ended in a panic.
+/// A removal's task that panicked takes the follow down, as a panic in the
+/// loop does: the panic is raised again where the task is reaped.
 fn reaped(ended: Result<(), JoinError>) {
-    if let Err(error) = ended {
-        tracing::error!(%error, "a worker's cache-event removal failed");
+    if let Some(panic) = ended.err().and_then(|error| error.try_into_panic().ok()) {
+        std::panic::resume_unwind(panic);
     }
 }
 
