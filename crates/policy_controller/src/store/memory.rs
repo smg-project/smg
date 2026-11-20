@@ -3862,14 +3862,17 @@ impl Leases {
     }
 
     /// Returns the decode side under `key` to chosen where a call issued
-    /// it and no dispatch named it ([`Self::put_back`]). The side holds
-    /// the first pick's targets again: that pick's dispatch books it, and
-    /// a later call issues it anew. The lease comes back as the call found
-    /// it, both its parts; `None` where no such side stands, and nothing
-    /// moves.
+    /// it and no dispatch named it ([`Self::put_back`]): under `issue`
+    /// where one is named, under any issue else. The side holds the first
+    /// pick's targets again: that pick's dispatch books it, and a later
+    /// call issues it anew. The lease comes back as the issue left it,
+    /// both its parts; `None` where no such side stands, and nothing moves.
     #[cfg(feature = "controller")]
-    fn end_issued_decode(&mut self, key: &Key) -> Option<Sides> {
-        self.issued_decode(key)?;
+    fn taken_back(&mut self, key: &Key, issue: Option<DecodeIssue>) -> Option<Sides> {
+        let count = self.issued_decode(key)?;
+        if issue.is_some_and(|issue| issue.0 != count) {
+            return None;
+        }
         let found = self.found(key);
         self.put_back(key).then_some(found).flatten()
     }
@@ -4474,26 +4477,34 @@ impl MemoryStore {
         Ok((lease, issue))
     }
 
-    /// Returns the decode side of `gateway`'s lease `lease` to chosen
-    /// where a call issued it and no dispatch named it, for a gateway that
-    /// asks that call again and holds no answer to it: no dispatch will
-    /// name the side the lost answer carried. The lost issue is released
-    /// as abandoned with its engine told, and the side holds the first
-    /// pick's targets again. That pick's dispatch books it whatever the
-    /// repeat answers, and a pick of the repeat issues it anew. `false`
-    /// where no such side stands: one still chosen, one a dispatch named,
-    /// one that ended.
+    /// Takes back an issue of the decode side of `gateway`'s lease `lease`
+    /// where a call issued the side and no dispatch named it: no dispatch
+    /// will name what that issue's answer carried. With `issue` it is that
+    /// issue alone, for an answer of the call that does not leave. With
+    /// none it is the issue that stands, for a gateway that asks the call
+    /// again and holds no answer to it. The issue is released under
+    /// `reason` with its engine told, and the side holds the first pick's
+    /// targets again: that pick's dispatch books it, and a later call
+    /// issues it anew. The lease's prefill keeps its booking. `false`
+    /// where no such issue stands: a side still chosen, one a dispatch
+    /// named, one that ended, one issued anew since.
     #[cfg(feature = "controller")]
     #[cold]
-    pub(crate) fn end_issued_decode(&self, gateway: GatewayId, lease: LeaseId) -> bool {
+    pub(crate) fn take_back_decode(
+        &self,
+        gateway: GatewayId,
+        lease: LeaseId,
+        issue: Option<DecodeIssue>,
+        reason: ReleaseReason,
+    ) -> bool {
         let at = self.file_of(lease);
         let mut leases = self.turn_of(at);
-        let Some(found) = leases.end_issued_decode(&(gateway, lease)) else {
+        let Some(found) = leases.taken_back(&(gateway, lease), issue) else {
             return false;
         };
         let mut one = turn::OneLoad::default();
-        let abandoned = Said::Released(Some(Side::Decode), ReleaseReason::Abandoned);
-        self.tell(at, one.world(self), &found, abandoned);
+        let released = Said::Released(Some(Side::Decode), reason);
+        self.tell(at, one.world(self), &found, released);
         true
     }
 

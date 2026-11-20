@@ -475,9 +475,10 @@ message DecideRequest {
   // request's own, as on its first decision. It is read at the decode phase,
   // whatever its facts' phase says, and its decode_later is not read. The
   // answer's pick names decode targets, each with the lease's prefill, under
-  // the same lease id. A refusal is a Busy with a reason of its own: the
-  // gateway then sends the decode the first pick named. An id of 0 is out of
-  // range.
+  // the same lease id. A refusal is a Busy with a reason of its own, and a
+  // decision that sheds is no refusal of the request, whose prefill runs:
+  // behind either the gateway sends the decode the first pick named, and
+  // that Dispatched books the side. An id of 0 is out of range.
   optional fixed64 decode_of = 6;
 }
 

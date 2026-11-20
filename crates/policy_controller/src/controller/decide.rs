@@ -98,7 +98,7 @@ use super::{
 use crate::{
     lease::ReleaseReason,
     proto::{self, busy::Reason},
-    store::{GatewayId, Hand, MemoryStore, Said},
+    store::{GatewayId, Hand, MemoryStore},
 };
 
 /// The requests a decide stream may have unanswered: its credit at the
@@ -339,10 +339,7 @@ impl<S> Answers<S> {
             return wire::decided(id, term, &decision, lease.as_ref());
         };
         if let Some(leased) = lease {
-            // Handed as a `Released` frame's word is: whoever holds the
-            // file's turn next ends the lease and tells its engine.
-            let store: &MemoryStore = &self.shared.store;
-            store.hand(&self.hand, leased.lease.id, Said::Released(None, release));
+            leased.given_up(&self.shared.store, &self.hand, self.gateway, release);
         }
         deciders.busy(id, reason)
     }
@@ -431,7 +428,7 @@ impl<S> Drop for Answers<S> {
     /// the stream handed here, and at each send it stopped.
     fn drop(&mut self) {
         self.decided.close();
-        let abandoned = Said::Released(None, ReleaseReason::Abandoned);
+        let abandoned = ReleaseReason::Abandoned;
         let mut dropped = 0;
         while let Ok(decided) = self.decided.try_recv() {
             dropped += 1;
@@ -440,8 +437,7 @@ impl<S> Drop for Answers<S> {
                 ..
             } = decided
             {
-                let store: &MemoryStore = &self.shared.store;
-                store.hand(&self.hand, leased.lease.id, abandoned);
+                leased.given_up(&self.shared.store, &self.hand, self.gateway, abandoned);
             }
         }
         if dropped != 0 {
@@ -578,8 +574,9 @@ mod tests {
             config::Scope,
             deciders::{
                 tests::{
-                    busy, fleet, frame, frame_for, gone, hearing, lease_of, picked, preset,
-                    settled, Script, Step, BUDGET, PATIENCE,
+                    busy, call, fleet, frame, frame_for, gone, hearing, later_spec, lease_of,
+                    pair_frame, picked, preset, ready, sent, settled, Script, SideCalls, Step,
+                    BUDGET, MODEL, PATIENCE,
                 },
                 Clock, Counts, Deciders, Job, Reads,
             },
@@ -590,13 +587,13 @@ mod tests {
             service::{Service, Shared},
             session::GRACE_PERIOD,
             watch_workers::tests::Woken,
-            wire::{Checked, MAX_FRAME},
+            wire::{Checked, Decided, MAX_FRAME},
         },
         elector::{Elector, Tick},
-        lease::{LeaseId, ReleaseReason},
+        lease::{LeaseId, ReleaseReason, Side},
         proto::{self, busy::Reason, decide_answer::Answer, identity::Form},
         store::{leases::DISPATCH_TTL, HealthSink, LeasesStore},
-        view::WorkerId,
+        view::{Role, WireModes, WorkerId},
     };
 
     const ID: &str = "controller-0";
@@ -1652,6 +1649,97 @@ mod tests {
         assert_eq!(heard.lock()[3..], [abandoned]);
     }
 
+    /// A decode call's answer that does not leave gives its one issue back
+    /// at each sender of its stream: one the fence stops at the send, and
+    /// one the stream's end finds in its queue. The prefill that runs
+    /// under the same lease keeps its booking, and the side stands chosen
+    /// as its first decision filed it, for the first pick's dispatch. A
+    /// release of the whole lease there would end the running prefill's.
+    #[tokio::test]
+    async fn a_decode_calls_answer_that_does_not_leave_gives_its_issue_back_at_each_sender() {
+        let bed = bed_with((1, 8), None, []).await;
+        let store = Arc::clone(&bed.shared.store);
+        let heard = Arc::new(Mutex::new(SideCalls::new()));
+        let later = store.apply(later_spec(2, &heard));
+        later.expect("a later generation");
+        ready(&store, "d1", MODEL, Role::Decode, WireModes::NONE);
+        let _seat = bed.welcomed(NAME, 1);
+        let gateway = told(NAME).gateway();
+        let (_frames, inbound) = mpsc::channel(1);
+        let served = serve(
+            Arc::clone(&bed.shared),
+            &told(NAME),
+            ReceiverStream::new(inbound),
+        );
+        let mut stream = match served {
+            Ok(stream) => stream,
+            Err(status) => panic!("a present gateway's stream opens: {status:?}"),
+        };
+        let leases: &dyn LeasesStore = store.as_ref();
+        let job = |frame: proto::DecideRequest, answers: &mpsc::Sender<Decided>| Job {
+            request: Checked::new(frame).expect("a frame the record holds"),
+            gateway,
+            received: bed.now(),
+            answers: answers.clone(),
+        };
+        // Two pairs asked with their decode later, each prefill sent.
+        let (own, mut answers) = mpsc::channel(1);
+        let mut pairs = Vec::new();
+        for id in [1, 2] {
+            let pair = job(pair_frame(id, true), &own);
+            assert!(bed.shared.deciders.submit(pair).is_none());
+            let answer = timeout(PATIENCE, answers.recv()).await;
+            let answer = answer.ok().flatten().expect("the pair's answer").frame();
+            let lease = LeaseId(lease_of(&answer).id);
+            assert!(leases.dispatched(gateway, lease, sent(Side::Prefill), bed.now()));
+            pairs.push((lease, store.sides(gateway, lease)));
+        }
+        // Each pair's decode call is decided into the stream's queue, and
+        // the stream sends nothing meanwhile: one decider decides a
+        // model's requests in order, and it is past both at the third.
+        for (id, (lease, _)) in [1, 2].into_iter().zip(&pairs) {
+            let call = job(call(id, lease.0), &stream.sender);
+            assert!(bed.shared.deciders.submit(call).is_none());
+            // The stream counts what it handed over: the case hands this.
+            stream.deciding += 1;
+        }
+        assert!(bed.shared.deciders.submit(job(frame(3, 3), &own)).is_none());
+        let other = timeout(PATIENCE, answers.recv()).await;
+        assert!(matches!(other, Ok(Some(_))), "{other:?}");
+        for (lease, filed) in &pairs {
+            assert_ne!(
+                store.sides(gateway, *lease),
+                *filed,
+                "a call issued the side"
+            );
+        }
+        // The clock passes the renew deadline: the fence shows no term, and
+        // the first call's answer is stopped at the send.
+        bed.at(PATIENT.renew_deadline + Duration::from_secs(1));
+        let stopped = match timeout(PATIENCE, stream.next()).await {
+            Ok(Some(Ok(answer))) => answer,
+            other => panic!("an answer within the case's patience: {other:?}"),
+        };
+        assert_eq!(busy(&stopped), Reason::NotLeader);
+        let (first, filed) = &pairs[0];
+        assert_eq!(store.sides(gateway, *first), *filed);
+        // The stream ends with the second call's answer in its queue.
+        let (second, filed) = &pairs[1];
+        assert_ne!(store.sides(gateway, *second), *filed);
+        drop(stream);
+        assert_eq!(store.sides(gateway, *second), *filed);
+        // The engine heard each issue's release, and no prefill's.
+        let abandoned = Some(ReleaseReason::Abandoned);
+        let released = |side| {
+            let heard = heard.lock();
+            let told = heard
+                .iter()
+                .filter(|told| (told.0, told.2) == (side, abandoned));
+            told.count()
+        };
+        assert_eq!([released(Side::Decode), released(Side::Prefill)], [2, 0]);
+    }
+
     /// The word is for a request whose stream ended (the contract's field).
     /// Said while the earlier answer waits in an open stream's queue, it
     /// ends the lease all the same, and nothing holds that answer back: it
@@ -1684,10 +1772,7 @@ mod tests {
         };
         assert!(bed.shared.deciders.submit(job).is_none());
         let anew = timeout(PATIENCE, answers.recv()).await;
-        let leased = matches!(
-            anew,
-            Ok(Some(super::wire::Decided::Decision { lease: Some(_), .. }))
-        );
+        let leased = matches!(anew, Ok(Some(Decided::Decision { lease: Some(_), .. })));
         assert!(leased, "{anew:?}");
         // The word ended the first ask's lease, its engine told ahead of
         // the repeat's own lease: one lease of the request is on file.

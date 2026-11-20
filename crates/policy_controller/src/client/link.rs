@@ -224,14 +224,15 @@ impl Link {
     }
 }
 
-/// The ranges the controller's check reads in a request's facts, by that
-/// check's own function.
+/// The ranges the controller's check reads in a request, by that check's
+/// own functions: the lease a decode call names, then the facts.
 fn in_range(request: &DecideRequest) -> Result<(), Error> {
-    let Some(facts) = &request.facts else {
-        return Ok(());
-    };
-    match wire::ranges(facts) {
-        Ok(_) => Ok(()),
+    let checked = wire::asked_decode(request.decode_of).and_then(|_| match &request.facts {
+        Some(facts) => wire::ranges(facts).map(|_| ()),
+        None => Ok(()),
+    });
+    match checked {
+        Ok(()) => Ok(()),
         Err(Refusal::OutOfRange(field)) => Err(Error::OutOfRange(field)),
     }
 }
@@ -924,6 +925,19 @@ pub(super) mod tests {
                 "{field}: {refused:?}"
             );
         }
+        // A decode call that names lease 0 is refused here too, by its field.
+        let wrong = DecideRequest {
+            decode_of: Some(0),
+            ..request(1)
+        };
+        let refused = peer.link.ask(wrong, WAIT).await;
+        assert!(
+            matches!(
+                refused,
+                Err(Unanswered::Unsent(Error::OutOfRange("decode_of")))
+            ),
+            "{refused:?}"
+        );
         assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
         assert!(peer.link.stands() && peer.link.ended().is_none());
         // The window of one is whole: the next ask is sent.

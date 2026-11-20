@@ -58,10 +58,11 @@ use crate::{
     decision::{Decision, ShedReason, Target},
     demands::Demands,
     door::Asked,
-    lease::{Lease, LeaseId, Side},
+    lease::{Lease, LeaseId, ReleaseReason, Side},
     operator::{Document, NeedsRow, Status},
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
     spec::{AppliedSpec, MAX_HEADERS},
+    store::{DecodeIssue, GatewayId, Hand, MemoryStore, Said},
     view::{
         fingerprint, key_of_session, Constraints, HashKind, Header, Identity, MediaCounts,
         ModelFingerprint, NamedAffinity, Phase, RequestFacts, Session, WireModes, WorkerId,
@@ -110,6 +111,18 @@ const DECODE_LATER: u8 = 1 << 2;
 /// The bit for a frame that asks the decode side of a lease
 /// (`DecideRequest.decode_of`).
 const DECODE_OF: u8 = 1 << 3;
+
+/// The lease a frame asks the decode side of (`DecideRequest.decode_of`),
+/// `0` where it asks none. An id of 0 is no lease's and out of the field's
+/// range. The check of a frame received reads the field here, and so does
+/// a sender whose callers share one stream, as both read [`ranges`].
+#[inline(always)]
+pub(crate) fn asked_decode(decode_of: Option<u64>) -> Result<u64, Refusal> {
+    match decode_of {
+        Some(0) => Err(Refusal::OutOfRange("decode_of")),
+        asked => Ok(asked.unwrap_or(0)),
+    }
+}
 
 /// What the ranges of a frame's facts read as: its phase, the kind of its
 /// block hashes and its session key's fingerprint (`0` for a key carried
@@ -205,10 +218,7 @@ impl Checked {
         // The prompt as text is said and not kept: no step reads it yet.
         let text = !mem::take(&mut facts.prompt_text).is_empty();
         let (phase, hash_kind, session_key) = ranges(&facts)?;
-        let decode_of = match request.decode_of {
-            Some(0) => return Err(Refusal::OutOfRange("decode_of")),
-            asked => asked.unwrap_or(0),
-        };
+        let decode_of = asked_decode(request.decode_of)?;
         // A frame that asks a lease's decode side is read at the decode
         // phase, whatever its facts say, and is no pair's first request:
         // its `decode_later` is not read.
@@ -546,6 +556,22 @@ fn narrowed(count: u32) -> u16 {
     u16::try_from(count).unwrap_or(u16::MAX)
 }
 
+/// What a pick's lease is handed over with, beside the lease. One word of
+/// the three: the queue's entry stays the size it was.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Beside {
+    /// A single's lease: nothing.
+    Alone,
+    /// The session key of the decode side's lease of a pair's pick. That
+    /// lease is the prefill side's under this key: one id, one record, and
+    /// at the answer one index and one count of tokens.
+    Decode(Session),
+    /// The issue of a decode call's pick. Where the answer does not leave,
+    /// its sender takes this one issue back: the prefill that runs under
+    /// the same lease keeps its booking ([`Leased::given_up`]).
+    Issue(DecodeIssue),
+}
+
 /// A pick's lease as its decider hands it over: the lease the store filed,
 /// what its decision left of the lease's dispatch span, and when that span
 /// ends.
@@ -553,11 +579,8 @@ fn narrowed(count: u32) -> u16 {
 pub(crate) struct Leased {
     /// The lease as the store filed it.
     pub(crate) lease: Lease,
-    /// The session key of the decode side's lease of a pair's pick; none
-    /// for a single's. That lease is the prefill side's under this key:
-    /// one id, one record, and at the answer one index and one count of
-    /// tokens. The key alone keeps the queue's entry small.
-    pub(crate) decode: Option<Session>,
+    /// What the lease is handed over with.
+    pub(crate) beside: Beside,
     /// What is left of its dispatch span: at the decision's last read as
     /// its decider hands it over, at the send as its stream sends it.
     pub(crate) left: Duration,
@@ -576,6 +599,30 @@ impl Leased {
         Self {
             left: self.due.saturating_duration_since(now),
             ..self
+        }
+    }
+
+    /// Gives the lease up for an answer that does not leave, under
+    /// `reason`. A decode call's answer takes its one issue back, with its
+    /// engine told, and the side stands chosen for the first pick's
+    /// dispatch ([`MemoryStore::take_back_decode`]). Any other lease is
+    /// released whole by a word handed to its file through `hand`, as a
+    /// `Released` frame's word is: whoever holds the file's turn next ends
+    /// the lease and tells its engine.
+    pub(crate) fn given_up(
+        &self,
+        store: &MemoryStore,
+        hand: &Hand,
+        gateway: GatewayId,
+        reason: ReleaseReason,
+    ) {
+        match self.beside {
+            Beside::Issue(issue) => {
+                store.take_back_decode(gateway, self.lease.id, Some(issue), reason);
+            }
+            Beside::Alone | Beside::Decode(_) => {
+                store.hand(hand, self.lease.id, Said::Released(None, reason));
+            }
         }
     }
 
@@ -634,15 +681,19 @@ pub(crate) fn decided(
 ) -> proto::DecideAnswer {
     let mut decision = self::decision(decision);
     if let Some(leased) = lease {
-        let mut leases = Vec::with_capacity(1 + usize::from(leased.decode.is_some()));
-        leases.push(self::lease(&leased.lease, term, leased.left));
-        if let Some(session) = leased.decode {
+        let decode = match leased.beside {
+            Beside::Decode(session) => Some(session),
+            Beside::Alone | Beside::Issue(_) => None,
+        };
+        let mut leases = Vec::with_capacity(1 + usize::from(decode.is_some()));
+        leases.push(self::lease(&leased.lease, leased.left));
+        if let Some(session) = decode {
             let decode = Lease {
                 side: Side::Decode,
                 session,
                 ..leased.lease
             };
-            leases.push(self::lease(&decode, term, leased.left));
+            leases.push(self::lease(&decode, leased.left));
         }
         decision.leases = leases;
     }
@@ -659,12 +710,18 @@ pub(super) fn millis(duration: Duration) -> u32 {
     u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
 }
 
+/// Where a controller's lease id holds the term that minted it: the bits
+/// from this one up, over the term's counter.
+const MINTED_UNDER: u32 = 32;
+
 /// A lease this controller minted, as the wire carries it under the term
 /// that minted it, with `left`: what is left, where it is sent, of the time
-/// its gateway has to name the dispatch. The decide call issues one kind of
+/// its gateway has to name the dispatch. The term is the one in the id's
+/// own bits ([`MINTED_UNDER`]): a decode call answered under a later term
+/// names a lease an earlier one minted. The decide call issues one kind of
 /// lease, a credit: on a single request's target, or on each side of a
 /// pair under one id.
-fn lease(lease: &Lease, term: u64, left: Duration) -> proto::Lease {
+fn lease(lease: &Lease, left: Duration) -> proto::Lease {
     let side = match lease.side {
         Side::Single => proto::Side::Single,
         Side::Prefill => proto::Side::Prefill,
@@ -679,7 +736,7 @@ fn lease(lease: &Lease, term: u64, left: Duration) -> proto::Lease {
         generation: lease.generation,
         session_key: lease.session.get(),
         tokens: lease.tokens,
-        term,
+        term: lease.id.0 >> MINTED_UNDER,
         dispatch_ttl_ms: millis(left),
         origin: proto::LeaseOrigin::Controller.into(),
     }
