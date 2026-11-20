@@ -17,17 +17,17 @@ grpc::grpc_context_routing_test::unknown_window_remains_eligible
 # A retry under a decoding rule has no next attempt under the controller.
 grpc::response_template_test::a_retry_takes_the_auto_tag_in_the_shape_its_own_workers_start_needs
 
-# No worker's pairing descriptor reaches the store, so the pair rule refuses no pair,
-# and a pair of two runtimes is refused under another code.
+# No worker's pairing descriptor reaches the store, so the pair rule refuses no pair.
 grpc_pd::grpc_pd_kv_store_connector_test::a_store_worker_never_pairs_with_a_rendezvous_worker_of_the_same_family
-grpc_pd::grpc_pd_pairing_off_runtime_test::pairing_off_refuses_a_pair_across_two_runtimes_by_name
 grpc_pd::grpc_pd_pairing_off_runtime_test::pairing_off_serves_a_pair_on_one_runtime_that_the_lenient_mode_refuses
 
 # A pair the controller places writes no row into the request's decision record.
 grpc_pd::grpc_pd_pair_trace_test::a_traced_pair_names_both_picks
+grpc_pd::grpc_pd_prefill_addition_test::a_prefill_worker_that_joins_during_traffic_takes_its_share_of_the_sizes
+grpc_pd::grpc_pd_prefill_removal_test::a_draining_prefill_workers_size_range_goes_to_its_neighbour_at_once
 
-# Under min_group the count of a worker's keys is not kept, so first keys are not
-# spread evenly.
+# Under min_group the count of a worker's keys is not kept, so first keys are
+# spread evenly in some runs alone.
 routing::manual_routing_test::manual_min_group_tests::test_min_group_concurrent_distribution
 routing::manual_routing_test::manual_min_group_tests::test_min_group_mixed_concurrent_routing
 
@@ -38,26 +38,12 @@ routing::stream_request_body_test::large_chat_body_streams_to_worker_chunked
 routing::stream_request_body_test::large_generate_body_streams_to_worker_chunked
 routing::stream_request_body_test::retries_disabled_streams_a_small_body
 
-# The policy document refuses the largest balance_abs_threshold at the start.
-grpc_pd::grpc_pd_prefill_addition_test::a_prefill_worker_that_joins_during_traffic_takes_its_share_of_the_sizes
-grpc_pd::grpc_pd_prefill_removal_test::a_draining_prefill_workers_size_range_goes_to_its_neighbour_at_once
-grpc_pd::grpc_pd_prefill_removal_test::requests_in_a_removed_prefill_workers_size_range_still_find_a_worker
-
-# The policy document refuses a cache-aware eviction interval of 0 at the start.
-routing::stream_request_body_test::text_needing_policy_stays_buffered_past_the_cap
-
 # The policy document refuses routing_key_override at the start: the sticky
 # sessions' rule has no recorded form yet.
 api::messages_threads_test::test_v1_messages_thread_turns_of_one_lineage_pin_to_one_worker_under_the_override
 routing::stream_request_body_test::routing_key_override_buffers_and_prefers_header_over_fresh_rids
 
-# The policy document refuses grouped_dp_sticky = hash at the start: no rule pins
-# a key to one engine of a grouped worker.
-grpc_pd::grpc_pd_grouped_dp_room_test::a_sticky_keys_pd_rooms_carry_its_prefill_rank
-serial::zmq_backend_test::a_routing_key_keeps_its_engine_of_a_grouped_worker
-serial::zmq_backend_test::a_vllm_group_indexed_from_a_later_rank_serves_its_keys_unpinned
-
-# By design: the controller refuses an explicit target worker by name, 501.
+# The controller refuses an explicit target worker by name, 501.
 routing::header_routing_hints_test::header_routing_hints_tests::test_target_worker_hint_indexes_the_available_workers
 
 # By design: under the controller the worker API changes no discovery provider's worker.
@@ -89,7 +75,21 @@ discovery::file_discovery_test::an_in_place_edit_updates_the_worker_in_place
 discovery::k8s_discovery_test::kv_annotation_edit_on_a_live_pod_updates_its_worker_in_place
 discovery::k8s_discovery_test::ready_pod_becoming_unready_removes_all_workers_and_recovers
 
+# The case registers the ranks of one engine by hand, one registration a rank. The
+# controller's store takes an engine's ranks in one registration and refuses a
+# part of them.
+routing::worker_management_test::dp_removal_tests::api_removes_plain_worker_and_individual_rank_in_mixed_pd_fleet
+routing::worker_management_test::dp_removal_tests::discovery_removal_resolves_plain_and_dp_groups_without_global_dp_setting
+routing::worker_management_test::dp_removal_tests::dp_group_removal_leaves_ranks_absent_from_the_snapshot
+routing::worker_management_test::dp_removal_tests::dp_group_removal_skips_only_the_rank_whose_revision_moved
+
 # By design: the controller's store tells a provider's worker by the row's maker,
 # where the classic reads the worker's label. The case registers its leftover worker
 # by hand, which makes a control call's row that no discovery provider removes.
 discovery::k8s_discovery_test::zombie_worker_removed_and_manual_worker_kept
+
+# Under the controller the gateway follows each gRPC worker on a stream of its own,
+# for the worker's load records, and dials the worker again when its engine ends.
+# The case counts one connection an attempt, so it fails in the runs where that
+# dial lands among the attempts. It passes in every run with the follow stopped.
+grpc::grpc_worker_restart_test::a_transport_reset_on_the_last_attempt_is_answered_like_the_attempts_before_it

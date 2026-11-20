@@ -330,12 +330,21 @@ impl AppContext {
     /// stays outside the store, as its registration leaves it, and the
     /// registry takes it. A host that assembles a gateway by hand registers
     /// here where it would write the registry. `None` where the address is
-    /// taken or the door refuses the worker.
+    /// taken, by a row's worker or by one the registry holds alone, or the
+    /// door refuses the worker. The door refuses one rank of an engine of
+    /// several: such an engine states its ranks in one registration, which
+    /// this entry does not make.
     pub fn register_built(&self, worker: Arc<dyn Worker>) -> Option<WorkerId> {
         let feed = self.door_feed().filter(|_| stands_as_row(worker.as_ref()));
         let Some(feed) = feed else {
             return self.worker_registry.register(worker);
         };
+        // An add is create-only across both writers, as a registration's
+        // check is: the store knows its rows alone, and its door would lay
+        // this worker over one the registry holds by itself.
+        if self.worker_registry.get_by_url(worker.url()).is_some() {
+            return None;
+        }
         if let Err(refused) = feed
             .door
             .found_built(&Maker::Control, Expect::Nothing, &worker, None)
@@ -1742,14 +1751,21 @@ mod tests {
         assert!(feed.objects.standing(&id).is_none(), "no row stands for it");
         let second = external(URL);
         assert!(hosted.replace_built(Arc::clone(&second)));
+        // Its address is taken for a row's worker too: an add is
+        // create-only across the registry and the store.
+        assert!(hosted.register_built(local(URL)).is_none());
+        assert!(hosted.register_built(external(URL)).is_none());
         assert!(!hosted.replace_built(local(URL)));
         let stands = registry.get(&id).expect("the object");
         assert!(Arc::ptr_eq(&stands, &second));
+        assert!(feed.objects.standing(&id).is_none(), "and no row was made");
 
         let row = hosted
             .register_built(local(ROW))
             .expect("the door registers the worker");
         let laid = registry.get(&row).expect("the row's object");
+        assert!(hosted.register_built(external(ROW)).is_none());
+        assert!(hosted.register_built(local(ROW)).is_none());
         assert!(!hosted.replace_built(external(ROW)));
         let stands = registry.get(&row).expect("the row's object");
         assert!(Arc::ptr_eq(&stands, &laid));
