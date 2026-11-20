@@ -106,6 +106,9 @@ impl Discovery {
         }
     }
 
+    /// Runs the provider while this replica leads, until the stop. The
+    /// election's own end closes `standing`: the provider ends there, and
+    /// the task still stays until the stop, as the serve's other tasks do.
     pub(crate) async fn run(
         &self,
         standing: watch::Receiver<Standing>,
@@ -139,7 +142,7 @@ impl Discovery {
                     () = &mut stopped => return,
                     open = Self::turned(turn, &mut standing) => {
                         if !open {
-                            return;
+                            break;
                         }
                     }
                 }
@@ -155,7 +158,7 @@ impl Discovery {
                 () = &mut stopped => return,
                 open = &mut left => {
                     if !open {
-                        return;
+                        break;
                     }
                     continue;
                 }
@@ -170,8 +173,8 @@ impl Discovery {
             };
             let open = tokio::select! {
                 biased;
-                () = &mut stopped => false,
-                open = &mut left => open,
+                () = &mut stopped => None,
+                open = &mut left => Some(open),
                 end = &mut task.0 => {
                     // A provider that stops by itself would leave the
                     // workers as they stood: it is said and started again.
@@ -192,10 +195,16 @@ impl Discovery {
             };
             task.0.abort();
             let _ = (&mut task.0).await;
-            if !open {
-                return;
+            match open {
+                None => return,
+                Some(true) => {}
+                Some(false) => break,
             }
         }
+        // The election's watch closed: its thread is gone, and the serve
+        // says so itself. No provider runs here. The task stays until the
+        // stop, so the serve does not read its end as a stopped listener.
+        stopped.await;
     }
 
     fn leader_term(&self) -> Option<u64> {

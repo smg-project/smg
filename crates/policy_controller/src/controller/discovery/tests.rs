@@ -268,6 +268,37 @@ async fn a_lost_lead_ends_the_provider() -> Result<(), Box<dyn Error>> {
     bed.stop().await
 }
 
+/// The election thread's end closes the watch of its words. The provider
+/// ends there, and the runner stays until the stop: the serve reads a task
+/// that ends before the stop as a stopped listener, and the election's end
+/// is the serve's own to say.
+#[tokio::test]
+async fn a_closed_watch_ends_the_provider_and_the_runner_stays_until_the_stop(
+) -> Result<(), Box<dyn Error>> {
+    let mut bed = Bed::new()?;
+    bed.file.publish(&[WORKER])?;
+    assert!(bed.install_queue());
+    bed.take()?;
+    bed.run();
+    assert!(bed.wait_for_job(0).await.is_some());
+    bed.jobs.hold(WORKER);
+
+    // The thread's end drops its sender. The provider's hold on the host
+    // goes; the runner's own stays while it lives.
+    let (gone, _) = watch::channel(Standing::default());
+    drop(std::mem::replace(&mut bed.standing, gone));
+    let ended = until(PASS, || (Arc::strong_count(&bed.host) <= 2).then_some(())).await;
+    assert!(
+        ended.is_some(),
+        "the provider held the host after the watch closed"
+    );
+    assert!(
+        time::timeout(PASS, bed.tasks.join_next()).await.is_err(),
+        "the runner ended before the stop"
+    );
+    bed.stop().await
+}
+
 #[tokio::test]
 async fn a_lead_that_ends_by_the_clock_ends_the_provider_with_no_word_from_the_election(
 ) -> Result<(), Box<dyn Error>> {
