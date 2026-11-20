@@ -2532,7 +2532,10 @@ mod tests {
             let mut peer = Peer::new(1);
             let mut ask = request(&[1], 7);
             ask.facts.budget_micros = 200_000;
-            ask.constraints.demands = Demands { runtime: 7 };
+            ask.constraints.demands = Demands {
+                runtime: 7,
+                ..Demands::default()
+            };
             let before = tokio::time::Instant::now();
             let answer = timeout(
                 PATIENCE,

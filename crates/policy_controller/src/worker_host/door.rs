@@ -1076,7 +1076,10 @@ pub(super) mod tests {
         let maker = Maker::provider("pool", "first").expect("a maker");
         let stating = |runtime| WorkerFacts {
             models: vec![MODEL.to_owned()],
-            demand_facts: DemandFacts { runtime },
+            demand_facts: DemandFacts {
+                runtime,
+                ..DemandFacts::default()
+            },
             ..stated()
         };
         door.found(&maker, Expect::Anything, URL, &|_| stating(7))
@@ -1096,7 +1099,10 @@ pub(super) mod tests {
         let decide = |id: &[u8], runtime: u32| {
             let mut retry = request(id, 7);
             retry.constraints.wire_modes = WireModes::HTTP;
-            retry.constraints.demands = Demands { runtime };
+            retry.constraints.demands = Demands {
+                runtime,
+                ..Demands::default()
+            };
             let decided = policy.decide(GATEWAY, &retry, Instant::now());
             decided.expect("a decision")
         };
@@ -1114,7 +1120,13 @@ pub(super) mod tests {
             })
         );
         assert_eq!(store.get(old.id), None);
-        assert_eq!(row.facts.demand_facts, DemandFacts { runtime: 9 });
+        assert_eq!(
+            row.facts.demand_facts,
+            DemandFacts {
+                runtime: 9,
+                ..DemandFacts::default()
+            }
+        );
         assert_eq!(row.status, WorkerStatus::Ready, "handed on by the store");
 
         let refused = decide(b"after", 7);
@@ -1124,6 +1136,72 @@ pub(super) mod tests {
         );
         let moved = decide(b"moved", 9);
         let target = moved.decision.pick().expect("the worker states runtime 9");
+        assert_eq!(target.targets.first().map(|target| target.id), Some(row.id));
+    }
+
+    /// A refresh that turns a worker's vision off starts another life, as
+    /// one that changes a demand fact does: the door reads the bit as a
+    /// hard demand. The row that took images is gone when the write is
+    /// answered: with no publication awaited, a request that needs vision
+    /// is decided over nobody, and one that needs none is placed on the
+    /// new life, which is handed the old one's status.
+    #[test]
+    fn a_changed_vision_is_another_life_and_the_new_one_takes_no_image() {
+        let (store, door) = door();
+        let maker = Maker::provider("pool", "first").expect("a maker");
+        let seeing = |vision| WorkerFacts {
+            models: vec![MODEL.to_owned()],
+            vision,
+            ..stated()
+        };
+        door.found(&maker, Expect::Anything, URL, &|_| seeing(true))
+            .expect("registered");
+        // Its checks are on: a check's word makes the first life ready.
+        let pending = store.by_key(URL).expect("the registered row");
+        store
+            .set_status(pending.id, WorkerStatus::Ready, pending.revision)
+            .expect("ready");
+        let old = store.by_key(URL).expect("the ready row");
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        document.generation = 1;
+        let applied = AppliedSpec::validate(&document).expect("the document validates");
+        store.apply(applied).expect("above the unbound start");
+        store.publish_now();
+        let policy = Door::new(Arc::clone(&store));
+        let decide = |id: &[u8], vision: bool| {
+            let mut asked = request(id, 7);
+            asked.constraints.wire_modes = WireModes::HTTP;
+            asked.constraints.demands = Demands {
+                vision,
+                ..Demands::default()
+            };
+            let decided = policy.decide(GATEWAY, &asked, Instant::now());
+            decided.expect("a decision")
+        };
+        let placed = decide(b"before", true);
+        let target = placed.decision.pick().expect("the worker takes images");
+        assert_eq!(target.targets.first().map(|target| target.id), Some(old.id));
+
+        let wrote = door.found(&maker, Expect::Anything, URL, &|_| seeing(false));
+        let row = store.by_key(URL).expect("the replaced row");
+        assert_eq!(
+            wrote,
+            Ok(Wrote::Another {
+                old: old.id,
+                new: row.id
+            })
+        );
+        assert_eq!(store.get(old.id), None);
+        assert!(!row.facts.vision);
+        assert_eq!(row.status, WorkerStatus::Ready, "handed on by the store");
+
+        let refused = decide(b"after", true);
+        assert!(
+            refused.decision.pick().is_none() && refused.lease.is_none(),
+            "the worker takes no image: {refused:?}"
+        );
+        let plain = decide(b"plain", false);
+        let target = plain.decision.pick().expect("the request needs no vision");
         assert_eq!(target.targets.first().map(|target| target.id), Some(row.id));
     }
 

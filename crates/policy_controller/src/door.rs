@@ -178,7 +178,8 @@ pub(crate) fn summed(parts: &[Part], count: impl Fn(&Part) -> &AtomicU64) -> u64
 }
 
 /// The stage a decision is shed under when its pool has rows and its
-/// gateway shares a wire with none of them.
+/// gateway shares a wire with none of them, or its request's runtime is
+/// none of theirs ([`Unmet::Runtime`](crate::demands::Unmet::Runtime)).
 pub(crate) const WIRES: &str = "wires";
 
 /// The stage a decision is shed under when its gateway hints a subset of 0
@@ -460,23 +461,6 @@ impl<const KEEPS: bool> ByEngine<'_, KEEPS> {
         scratch: &mut Scratch,
     ) -> (Decision, Option<Booking>) {
         let engine = self.0;
-        if candidates.is_empty() && pool.pool_size > 0 {
-            // What the gateway states of itself left none of a pool
-            // that has rows: said under that constraint's name, where
-            // the engine would name no stage.
-            let emptied_by = if constraints.subset_hint == Some(0) {
-                SUBSET_HINT
-            } else {
-                WIRES
-            };
-            let none = shed(
-                ShedReason::NoEndpoints,
-                emptied_by,
-                facts.seed,
-                pool.generation,
-            );
-            return (none, None);
-        }
         let decision = match (STATED, KEEPS) {
             (false, false) => engine.decide(facts, pool, candidates, constraints, scratch),
             (true, false) => engine.decide_stated(facts, pool, candidates, constraints, scratch),
@@ -533,6 +517,21 @@ impl Decides<(Decision, Option<Booking>)> for ByEngine<'_, false> {
         scratch: &mut Scratch,
     ) -> (Decision, Option<Booking>) {
         self.decided::<true>(facts, pool, candidates, constraints, scratch)
+    }
+
+    /// What the request states of itself left none of a pool that has
+    /// rows: said under that stage's name, where the engine would name no
+    /// stage.
+    fn emptied(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        _: &Constraints<'_>,
+        _: &mut Scratch,
+        stage: &'static str,
+    ) -> (Decision, Option<Booking>) {
+        let none = shed(ShedReason::NoEndpoints, stage, facts.seed, pool.generation);
+        (none, None)
     }
 }
 
@@ -801,11 +800,6 @@ impl<L: FnOnce() -> Duration, R: ShadowAsk> Shadowing<'_, L, R> {
         let engine = self.engine;
         let keeping = ByEngine::<true>(engine);
         let live = keeping.decided::<STATED>(facts, pool, candidates, constraints, scratch);
-        // The door's own shed over a view with no row: no profile
-        // decided it, so none is set beside it.
-        if candidates.is_empty() && pool.pool_size > 0 {
-            return (live, Shadow::NotDue);
-        }
         let (binding, rows) = self.due;
         let said = |kind, first| {
             Shadow::Said(Shadowed {
@@ -869,6 +863,22 @@ impl<L: FnOnce() -> Duration, R: ShadowAsk> Decides<((Decision, Option<Booking>)
         scratch: &mut Scratch,
     ) -> ((Decision, Option<Booking>), Shadow) {
         self.decided::<true>(facts, pool, candidates, constraints, scratch)
+    }
+
+    /// The door's own shed over a view with no row, under the name of
+    /// the stage that took the last of them: no profile decided it, so
+    /// no shadow is set beside it.
+    fn emptied(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+        stage: &'static str,
+    ) -> ((Decision, Option<Booking>), Shadow) {
+        let plain = ByEngine::<false>(self.engine);
+        let none = plain.emptied(facts, pool, constraints, scratch, stage);
+        (none, Shadow::NotDue)
     }
 
     fn reads_column(&self) -> bool {
@@ -1439,13 +1449,15 @@ pub(crate) fn shed(
     })
 }
 
-/// How a decision is made over the view [`hand`] reads, in two forms: over
-/// rows of which no stage of the profile's own reads the holdings, and
-/// over rows the store named for the profile's own affinity stages. A
-/// function of the view decides alike over both. A decider that says more
-/// of a decision over named rows writes the second form, and [`hand`] asks
-/// it at a call of its own, so a decision that names no row meets no test
-/// for it.
+/// How a decision is made over the view [`hand`] reads, in three forms:
+/// over rows of which no stage of the profile's own reads the holdings,
+/// over rows the store named for the profile's own affinity stages, and
+/// over a pool that has rows of which the request's own narrowing left
+/// none. A function of the view decides alike over all three. A decider
+/// that says more of a decision over named rows writes the second form,
+/// and [`hand`] asks it at a call of its own, so a decision that names no
+/// row meets no test for it. A decider that names the stage an emptied
+/// pool is shed under writes the third.
 pub(crate) trait Decides<R> {
     fn over(
         self,
@@ -1468,6 +1480,23 @@ pub(crate) trait Decides<R> {
         Self: Sized,
     {
         self.over(facts, pool, candidates, constraints, scratch)
+    }
+
+    /// The answer for a pool that has rows of which the request's own
+    /// narrowing left none, and the stage that took the last of them:
+    /// asked over no rows unless the decider names the stage itself.
+    fn emptied(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+        _stage: &'static str,
+    ) -> R
+    where
+        Self: Sized,
+    {
+        self.over(facts, pool, &[], constraints, scratch)
     }
 
     /// Whether the affinity column the decision's needs declare has a
@@ -1544,6 +1573,12 @@ type Read<'a> = (
 /// rows it named the decision is asked in the decider's form for them
 /// ([`Decides::over_named`]).
 ///
+/// A pool that has rows of which the request's own narrowing left none is
+/// answered in the decider's form for it ([`Decides::emptied`]), under
+/// the stage that took the last row: the request's hint of 0, the last
+/// demand its rows failed first ([`Unmet`](crate::demands::Unmet)), or its
+/// gateway's wires.
+///
 /// A request whose profile holds a stage that may refuse by a report of
 /// leases ([`Filter::refuses_by_reports`](crate::framework::Filter::refuses_by_reports))
 /// is handed its rows behind an apply of what waits at the files of leases
@@ -1612,7 +1647,7 @@ pub(crate) fn hand<A: Asked, R>(
         keyed,
         ..
     } = buffers;
-    let (wires, demands) = (request.wires(), request.demands());
+    let wires = request.wires();
     // No member serves the model in the role: the engine answers over no
     // candidate, as it answers any host that hands it none.
     let none = || PoolFacts {
@@ -1624,10 +1659,10 @@ pub(crate) fn hand<A: Asked, R>(
     // door writes with the counts on it for a plugin, which is shown a
     // row's bits and ages as the row's own fields. A request that states a
     // hard demand is handed written rows, as one that states wires is.
-    let by_door = wires.is_none() && request.subset() != Some(0) && demands.is_none();
-    // Whether a demand took a row of the build: the rows left are named
-    // within themselves then.
-    let mut cut = false;
+    let by_door = wires.is_none() && request.subset() != Some(0) && request.demands().is_none();
+    // The last demand the rows a demand took failed first, where one took
+    // a row of the build: the rows left are named within themselves then.
+    let mut unmet: Option<crate::demands::Unmet> = None;
     let (pool, now_micros, candidates, masks, affinity, cells, counts, built): Read<'_> = if by_door
     {
         match world.view(model, role, &ask, shown, view) {
@@ -1667,16 +1702,19 @@ pub(crate) fn hand<A: Asked, R>(
                 // narrowing, all but the list's name: the rows the wires
                 // left are another list of the pool.
                 let mut pool: PoolFacts<'_> = built.pool_facts();
+                // The request's demands, read where a row is written: the
+                // path that writes none carries none of them past its test.
+                let demands = request.demands();
                 let took = if demands.is_none() {
                     Took {
                         undialed: narrow(view, wires, request.subset()),
-                        demanded: 0,
+                        ..Took::default()
                     }
                 } else {
                     world.demand_facts(&built, &ask, demanded);
                     narrow_demanded(view, demanded, wires, request.subset(), demands)
                 };
-                cut = took.demanded != 0;
+                unmet = took.unmet;
                 if took.undialed > 0 {
                     undialed.fetch_add(took.undialed, Ordering::Relaxed);
                 }
@@ -1747,7 +1785,7 @@ pub(crate) fn hand<A: Asked, R>(
             // The names borrow the buffer past this call: the closure
             // gives its hold of it up.
             let named = named;
-            if cut {
+            if unmet.is_some() {
                 world.name_in::<true>(model, role, &naming, candidates, hash_kind, named);
             } else {
                 world.name_in::<false>(model, role, &naming, candidates, hash_kind, named);
@@ -1768,6 +1806,10 @@ pub(crate) fn hand<A: Asked, R>(
         // them, at this arm's own call: a decision that names no row
         // meets no test for it.
         let answer = request.read(lists, viewed, name, |facts, constraints| {
+            if candidates.is_empty() && pool.pool_size > 0 {
+                let subset = request.subset();
+                return emptied(decide, facts, &pool, constraints, scratch, subset, unmet);
+            }
             // The engine's ask, written once for the two ways to it: at
             // once, or behind the key's read.
             let ask = |facts: &RequestFacts<'_>, constraints: &Constraints<'_>| {
@@ -1782,6 +1824,10 @@ pub(crate) fn hand<A: Asked, R>(
     }
     named.clear_sent();
     let answer = request.read(lists, viewed, unnamed, |facts, constraints| {
+        if candidates.is_empty() && pool.pool_size > 0 {
+            let subset = request.subset();
+            return emptied(decide, facts, &pool, constraints, scratch, subset, unmet);
+        }
         let ask = |facts: &RequestFacts<'_>, constraints: &Constraints<'_>| {
             decide.over(facts, &pool, candidates, constraints, scratch)
         };
@@ -1791,6 +1837,32 @@ pub(crate) fn hand<A: Asked, R>(
         }
     });
     (answer, built)
+}
+
+/// The answer for a pool that has rows of which the request's own narrowing
+/// left none, in the decider's form for it ([`Decides::emptied`]), under
+/// the stage that took the last of them: the request's hint of 0, the last
+/// demand its rows failed first, or its gateway's wires. A routine of its
+/// own, out of line, asked inside the request's read where the decider is
+/// asked: a pool that keeps a row pays one test for this answer, the test
+/// its decider had, and the door's routine keeps the frame it had.
+#[cold]
+#[inline(never)]
+fn emptied<R>(
+    decide: impl Decides<R>,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    constraints: &Constraints<'_>,
+    scratch: &mut Scratch,
+    subset: Option<u32>,
+    unmet: Option<crate::demands::Unmet>,
+) -> R {
+    let stage = if subset == Some(0) {
+        SUBSET_HINT
+    } else {
+        unmet.map_or(WIRES, crate::demands::Unmet::stage)
+    };
+    decide.emptied(facts, pool, constraints, scratch, stage)
 }
 
 /// The role whose pool decides a request of `phase`: the pool [`hand`]
@@ -1819,15 +1891,20 @@ pub(crate) struct Took {
     /// The name of the rows a demand took, by their places in the build's
     /// list: `0` where no demand took a row.
     pub(crate) demanded: u64,
+    /// The last of the demands those rows failed first, in the order a
+    /// host answers for them ([`Unmet`](crate::demands::Unmet)): the stage
+    /// a pool the demands left nobody is shed under. `None` where no demand
+    /// took a row.
+    pub(crate) unmet: Option<crate::demands::Unmet>,
 }
 
 /// [`narrow`] for a request that states hard demands ([`Demands`]): one
 /// pass keeps the rows that share a wire with the gateway and meet every
-/// demand, each by its entry of `facts`, the build's column
-/// ([`World::demand_facts`]). A row with no entry meets none. The kept rows
-/// keep their order and take their positions, and every column beside them
-/// follows in the same step: the affinity column, the signal cells and the
-/// facts. A hint of 0 keeps none.
+/// demand, each by its own vision bit and its entry of `facts`, the
+/// build's column ([`World::demand_facts`]). A row with no entry states
+/// nothing there. The kept rows keep their order and take their positions,
+/// and every column beside them follows in the same step: the affinity
+/// column, the signal cells and the facts. A hint of 0 keeps none.
 ///
 /// The rows a demand took are named by their places in the build's list
 /// ([`Took::demanded`]), never by what the demand states: two requests
@@ -1860,11 +1937,9 @@ pub(crate) fn narrow_demanded(
             took.undialed += 1;
             continue;
         }
-        let Some(stated) = facts
-            .get(at)
-            .copied()
-            .filter(|stated| demands.met_by(*stated))
-        else {
+        // A row with no entry states nothing.
+        let stated = facts.get(at).copied().unwrap_or_default();
+        if let Some(unmet) = demands.unmet_by(row.vision, stated) {
             // One more than the place: the first row's taking is no zero.
             // Each place turns the fold by a product of the places' own
             // word: the name is of these places in their order, and of
@@ -1872,8 +1947,9 @@ pub(crate) fn narrow_demanded(
             took.demanded = (took.demanded ^ (at as u64 + 1))
                 .wrapping_mul(PLACES)
                 .max(1);
+            took.unmet = took.unmet.max(Some(unmet));
             continue;
-        };
+        }
         view.candidates[kept] = Candidate { position, ..row };
         position += 1;
         if column {
@@ -1882,7 +1958,9 @@ pub(crate) fn narrow_demanded(
         if let Some(cells) = &mut cells {
             cells.keep(at);
         }
-        facts[kept] = stated;
+        if let Some(entry) = facts.get_mut(kept) {
+            *entry = stated;
+        }
         kept += 1;
     }
     view.candidates.truncate(kept);
@@ -3938,7 +4016,7 @@ pub(crate) mod tests {
             Candidate, Constraints, Identity, KeyedRow, LoadRow, Phase, PoolFacts, RequestFacts,
             Role, Session, WireModes, WorkerId,
         },
-        DecisionRecord,
+        DecisionRecord, References, Unmet,
     };
 
     mod shadow;
@@ -6101,9 +6179,15 @@ pub(crate) mod tests {
         assert_eq!(first.map(|target| target.id), Some(members[1]));
     }
 
-    /// A ready member of [`MODEL`] under `role` that states `runtime` for a
-    /// request's hard demands, `0` for none, in `store`.
-    fn states(store: &MemoryStore, name: &str, role: Role, runtime: u32) -> WorkerId {
+    /// A ready member of [`MODEL`] under `role` in `store` that takes images
+    /// where `vision`, and states `stated` beside it for a request's hard
+    /// demands.
+    fn states_facts(
+        store: &MemoryStore,
+        name: &str,
+        role: Role,
+        (vision, stated): (bool, DemandFacts),
+    ) -> WorkerId {
         let key = format!("http://{name}:8000");
         let facts = WorkerFacts {
             key: key.clone(),
@@ -6113,7 +6197,8 @@ pub(crate) mod tests {
             models: vec![MODEL.to_owned()],
             dp_size: 1,
             max_running: Some(4_096),
-            demand_facts: DemandFacts { runtime },
+            vision,
+            demand_facts: stated,
             ..WorkerFacts::default()
         };
         let id = store.upsert(facts).id();
@@ -6125,14 +6210,36 @@ pub(crate) mod tests {
         id
     }
 
-    /// A store under the `random` preset whose ready members of [`MODEL`]
-    /// state the runtimes of `stated`, one a member, in that order.
+    /// [`states_facts`] for a member that states a runtime and no more: `0`
+    /// states none.
+    fn states(store: &MemoryStore, name: &str, role: Role, runtime: u32) -> WorkerId {
+        let stated = DemandFacts {
+            runtime,
+            ..DemandFacts::default()
+        };
+        states_facts(store, name, role, (false, stated))
+    }
+
+    /// [`stating_facts`] for members that state a runtime and no more.
     fn stating(stated: &[u32]) -> (Arc<MemoryStore>, Vec<WorkerId>) {
+        let facts = stated.iter().map(|&runtime| {
+            let stated = DemandFacts {
+                runtime,
+                ..DemandFacts::default()
+            };
+            (false, stated)
+        });
+        stating_facts(&facts.collect::<Vec<_>>())
+    }
+
+    /// A store under the `random` preset whose ready members of [`MODEL`]
+    /// state the facts of `stated`, one a member, in that order: its vision
+    /// bit, then what it states beside it.
+    fn stating_facts(stated: &[(bool, DemandFacts)]) -> (Arc<MemoryStore>, Vec<WorkerId>) {
         let store = MemoryStore::new();
-        let ids = stated
-            .iter()
-            .enumerate()
-            .map(|(place, &runtime)| states(&store, &format!("r{place}"), Role::Single, runtime));
+        let ids = stated.iter().enumerate().map(|(place, &stated)| {
+            states_facts(&store, &format!("r{place}"), Role::Single, stated)
+        });
         let ids: Vec<WorkerId> = ids.collect();
         store.publish_now();
         let applied = store.apply(preset("random", 1));
@@ -6152,7 +6259,10 @@ pub(crate) mod tests {
             for seed in 0..64_u64 {
                 let id = [seed.to_le_bytes(), u64::from(runtime).to_le_bytes()].concat();
                 let mut asked = request(&id, seed);
-                asked.constraints.demands = Demands { runtime };
+                asked.constraints.demands = Demands {
+                    runtime,
+                    ..Demands::default()
+                };
                 let decided = door.decide(GATEWAY, &asked, Instant::now());
                 let decided = decided.expect("a decision");
                 let pick = decided.decision.pick().expect("a member states it");
@@ -6182,7 +6292,10 @@ pub(crate) mod tests {
         let (store, _) = stating(&[7, 0]);
         let door = Door::new(Arc::clone(&store));
         let mut asked = request(b"r-1", 7);
-        asked.constraints.demands = Demands { runtime: 9 };
+        asked.constraints.demands = Demands {
+            runtime: 9,
+            ..Demands::default()
+        };
         let decided = door.decide(GATEWAY, &asked, Instant::now());
         let decided = decided.expect("a decision");
         match decided.decision {
@@ -6215,7 +6328,10 @@ pub(crate) mod tests {
         let decide = |id: &[u8], runtime: u32| {
             let mut asked = request(id, 7);
             asked.facts.phase = Phase::Prefill;
-            asked.constraints.demands = Demands { runtime };
+            asked.constraints.demands = Demands {
+                runtime,
+                ..Demands::default()
+            };
             let decided = door.decide(GATEWAY, &asked, Instant::now());
             decided.expect("a decision")
         };
@@ -6258,9 +6374,13 @@ pub(crate) mod tests {
                     });
                     facts.push(DemandFacts {
                         runtime: if position == place { 9 } else { 7 },
+                        ..DemandFacts::default()
                     });
                 }
-                let demands = Demands { runtime: 7 };
+                let demands = Demands {
+                    runtime: 7,
+                    ..Demands::default()
+                };
                 let took = narrow_demanded(&mut view, &mut facts, None, None, demands);
                 assert_eq!(
                     (took.undialed, view.candidates.len()),
@@ -6283,7 +6403,7 @@ pub(crate) mod tests {
                 // No demand took a row: the wires' name alone, or the build's.
                 let dialed = Took {
                     undialed: 1,
-                    demanded: 0,
+                    ..Took::default()
                 };
                 assert_eq!(cut_name(build, Some(wires), dialed), by_wires);
                 assert_eq!(cut_name(build, Some(wires), Took::default()), build);
@@ -6312,7 +6432,10 @@ pub(crate) mod tests {
                 models: vec![MODEL.to_owned()],
                 dp_size: 1,
                 wire_modes,
-                demand_facts: DemandFacts { runtime },
+                demand_facts: DemandFacts {
+                    runtime,
+                    ..DemandFacts::default()
+                },
                 ..WorkerFacts::default()
             }
         };
@@ -6348,7 +6471,10 @@ pub(crate) mod tests {
             let id = turn.to_le_bytes();
             let mut asked = request(&id, turn);
             asked.constraints.wire_modes = [WireModes::GRPC, WireModes::ZMQ][list];
-            asked.constraints.demands = Demands { runtime: 7 };
+            asked.constraints.demands = Demands {
+                runtime: 7,
+                ..Demands::default()
+            };
             let decided = door.decide(GATEWAY, &asked, Instant::now());
             let decided = decided.expect("a decision");
             let pick = decided.decision.pick().expect("sixteen members state it");
@@ -6396,7 +6522,10 @@ pub(crate) mod tests {
                     events: true,
                     ..Signals::default()
                 },
-                demand_facts: DemandFacts { runtime },
+                demand_facts: DemandFacts {
+                    runtime,
+                    ..DemandFacts::default()
+                },
                 ..WorkerFacts::default()
             };
             let id = store.upsert(facts).id();
@@ -6443,7 +6572,10 @@ pub(crate) mod tests {
         let hashes = [1_u64];
         let mut asked = request(b"named", 7);
         asked.facts.block_hashes = &hashes;
-        asked.constraints.demands = Demands { runtime: 7 };
+        asked.constraints.demands = Demands {
+            runtime: 7,
+            ..Demands::default()
+        };
         let taken = Taken {
             request: &asked,
             gateway: GATEWAY,
@@ -6473,6 +6605,196 @@ pub(crate) mod tests {
         assert_eq!(rows, [full, short].into_iter().collect());
         assert_eq!(holders, [full]);
         assert_eq!(warming, [short]);
+    }
+
+    /// Media is a demand as a runtime is: a request that needs vision or
+    /// carries media by reference is decided over the members that take it.
+    /// Vision is read of a member's own bit, the one a pairing plan reads,
+    /// and the rest of what it states beside it. A pool that holds none is
+    /// shed under the last demand its members failed first, in a host's
+    /// order of answers: under the plan's own word where that is vision, and
+    /// under the wires where its runtime emptied it.
+    #[test]
+    fn a_media_demand_keeps_the_members_that_take_it_and_names_its_shed() {
+        let member = |vision: bool, references: bool, host_pipeline: bool| {
+            let stated = DemandFacts {
+                runtime: 7,
+                references,
+                host_pipeline,
+            };
+            (vision, stated)
+        };
+        let (store, ids) = stating_facts(&[
+            member(true, false, false),
+            member(true, true, true),
+            member(false, true, false),
+        ]);
+        let (plain, host, own) = (ids[0], ids[1], ids[2]);
+        let door = Door::new(Arc::clone(&store));
+        let decide = |tag: u8, demands: Demands| {
+            let mut placed = BTreeSet::new();
+            for seed in 0..48_u64 {
+                let id = [&[tag][..], &seed.to_le_bytes()].concat();
+                let mut asked = request(&id, seed);
+                asked.constraints.demands = demands;
+                let decided = door.decide(GATEWAY, &asked, Instant::now());
+                match decided.expect("a decision").decision {
+                    Decision::Shed(shed) => return Err((shed.reason, shed.emptied_by)),
+                    decision => {
+                        let first = decision.pick().and_then(|pick| pick.targets.first());
+                        placed.insert(first.expect("a target").id);
+                    }
+                }
+            }
+            Ok(placed)
+        };
+        let asks = |vision: bool, references: References| Demands {
+            vision,
+            references,
+            ..Demands::default()
+        };
+        let kept = |members: &[WorkerId]| Ok(members.iter().copied().collect::<BTreeSet<_>>());
+        assert_eq!(
+            decide(1, asks(true, References::None)),
+            kept(&[plain, host])
+        );
+        assert_eq!(decide(2, asks(false, References::Any)), kept(&[host, own]));
+        assert_eq!(decide(3, asks(false, References::Host)), kept(&[host]));
+        assert_eq!(decide(4, asks(false, References::Worker)), kept(&[own]));
+        // One member takes no images, one processes no reference and one
+        // runs the other pipeline: the last of the three is the pipeline.
+        let nobody = |stage: &'static str| Err((ShedReason::NoEndpoints, stage));
+        assert_eq!(
+            decide(5, asks(true, References::Worker)),
+            nobody("pipeline")
+        );
+        // Every member fails at its runtime, the first demand of the order.
+        let elsewhere = Demands {
+            runtime: 9,
+            ..asks(true, References::Host)
+        };
+        assert_eq!(decide(6, elsewhere), nobody(super::WIRES));
+        assert_eq!(door.undialed(), 0);
+        // A pool none of whose members takes images is shed under the word
+        // the pairing plan sheds under.
+        let (blind, _) = stating_facts(&[member(false, true, true), member(false, false, false)]);
+        let blind = Door::new(blind);
+        let mut asked = request(b"blind", 1);
+        asked.constraints.demands = asks(true, References::Any);
+        let decided = blind.decide(GATEWAY, &asked, Instant::now());
+        let shed = match decided.expect("a decision").decision {
+            Decision::Shed(shed) => Ok((shed.reason, shed.emptied_by)),
+            decision => Err(decision.pick().is_some()),
+        };
+        assert_eq!(
+            shed,
+            Ok((ShedReason::NoEndpoints, crate::framework::VISION))
+        );
+    }
+
+    /// A hint of 0 keeps no row whatever the request demands: its pool is
+    /// shed under the hint's stage, and under no demand's.
+    #[test]
+    fn a_hint_of_none_beside_a_demand_is_shed_under_the_hint() {
+        let (store, _) = stating_facts(&[(false, DemandFacts::default())]);
+        let door = Door::new(store);
+        let mut asked = request(b"both", 1);
+        asked.constraints.subset_hint = Some(0);
+        asked.constraints.demands = Demands {
+            vision: true,
+            ..Demands::default()
+        };
+        let decided = door.decide(GATEWAY, &asked, Instant::now());
+        let shed = match decided.expect("a decision").decision {
+            Decision::Shed(shed) => Ok((shed.reason, shed.emptied_by)),
+            decision => Err(decision.pick().is_some()),
+        };
+        assert_eq!(shed, Ok((ShedReason::NoEndpoints, super::SUBSET_HINT)));
+    }
+
+    /// A model no member serves is no pool the request's own narrowing
+    /// emptied: a request for it that states a demand is shed under no
+    /// stage, as one that states none is.
+    #[test]
+    fn a_demand_for_a_model_no_member_serves_is_shed_under_no_stage() {
+        let (store, _) = stating_facts(&[(true, DemandFacts::default())]);
+        let door = Door::new(store);
+        let mut asked = request(b"absent", 1);
+        asked.facts.model = "a-model-nobody-serves";
+        asked.constraints.demands = Demands {
+            vision: true,
+            ..Demands::default()
+        };
+        let decided = door.decide(GATEWAY, &asked, Instant::now());
+        let shed = match decided.expect("a decision").decision {
+            Decision::Shed(shed) => Ok((shed.reason, shed.emptied_by)),
+            decision => Err(decision.pick().is_some()),
+        };
+        assert_eq!(shed, Ok((ShedReason::NoEndpoints, "none")));
+    }
+
+    /// A row a vision demand took is named by nobody, as one a runtime took
+    /// is: the member that holds the request's first block takes no image,
+    /// and the request is decided over the member that does.
+    #[test]
+    fn a_vision_demand_that_took_the_holder_names_the_rows_that_stay() {
+        use crate::store::{
+            BatchFacts, BatchOutcome, ContentHash, KvEvent, KvEventSink, SequenceHash, Signals,
+            StoredBlock,
+        };
+
+        let store = MemoryStore::new();
+        let applied = store.apply(preset("cache_aware", 1));
+        applied.expect("above the unbound start");
+        let member = |name: &str, vision: bool| {
+            let facts = WorkerFacts {
+                key: name.to_owned(),
+                engine: name.to_owned(),
+                incarnation: 1,
+                role: Role::Single,
+                models: vec![MODEL.to_owned()],
+                dp_size: 1,
+                vision,
+                signals: Signals {
+                    events: true,
+                    ..Signals::default()
+                },
+                ..WorkerFacts::default()
+            };
+            let id = store.upsert(facts).id();
+            let row = WorkersStore::get(&store, id).expect("the row");
+            if row.status != WorkerStatus::Ready {
+                let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
+                ready.expect("the row stands");
+            }
+            id
+        };
+        let (blind, sighted) = (member("blind", false), member("sighted", true));
+        store.publish_now();
+        let hashes = [17_u64];
+        let events = [KvEvent::Stored {
+            parent: None,
+            blocks: vec![StoredBlock {
+                seq_hash: SequenceHash(hashes[0]),
+                content_hash: ContentHash(hashes[0]),
+            }],
+        }];
+        let batch = BatchFacts {
+            sequence: 1,
+            ..BatchFacts::default()
+        };
+        assert_eq!(store.admit(blind, 0, batch, &events), BatchOutcome::Applied);
+        let door = Door::new(Arc::new(store));
+        let mut asked = request(b"seen", 1);
+        asked.facts.block_hashes = &hashes;
+        asked.constraints.demands = Demands {
+            vision: true,
+            ..Demands::default()
+        };
+        let decided = door.decide(GATEWAY, &asked, Instant::now());
+        let decision = decided.expect("a decision").decision;
+        let first = decision.pick().and_then(|pick| pick.targets.first());
+        assert_eq!(first.map(|target| target.id), Some(sighted));
     }
 
     /// One pass narrows a built view by its gateway's wires and its
@@ -6508,7 +6830,10 @@ pub(crate) mod tests {
                         ..AffinityFacts::default()
                     });
                 }
-                facts.push(DemandFacts { runtime });
+                facts.push(DemandFacts {
+                    runtime,
+                    ..DemandFacts::default()
+                });
             }
             (view, facts)
         };
@@ -6528,9 +6853,19 @@ pub(crate) mod tests {
         // The wire takes the third row, the demand the second and the
         // fourth, which states no runtime.
         let (mut view, mut facts) = built(true, sevens);
-        let took = narrow_demanded(&mut view, &mut facts, grpc, None, Demands { runtime: 7 });
+        let took = narrow_demanded(
+            &mut view,
+            &mut facts,
+            grpc,
+            None,
+            Demands {
+                runtime: 7,
+                ..Demands::default()
+            },
+        );
         assert_eq!(took.undialed, 1);
         assert_ne!(took.demanded, 0);
+        assert_eq!(took.unmet, Some(Unmet::Runtime));
         assert_eq!(
             read(&view, &facts),
             (kept.clone(), vec![100, 104], vec![7, 7])
@@ -6538,12 +6873,30 @@ pub(crate) mod tests {
         // The same rows taken of a view with no column, under other
         // numbers and a positive hint: one list, one name.
         let (mut view, mut facts) = built(false, [3, 5, 3, 0, 3]);
-        let again = narrow_demanded(&mut view, &mut facts, grpc, Some(2), Demands { runtime: 3 });
+        let again = narrow_demanded(
+            &mut view,
+            &mut facts,
+            grpc,
+            Some(2),
+            Demands {
+                runtime: 3,
+                ..Demands::default()
+            },
+        );
         assert_eq!(again, took);
         assert_eq!(read(&view, &facts), (kept, vec![], vec![3, 3]));
         // Another demand leaves another list, under another name.
         let (mut view, mut facts) = built(true, sevens);
-        let other = narrow_demanded(&mut view, &mut facts, None, None, Demands { runtime: 9 });
+        let other = narrow_demanded(
+            &mut view,
+            &mut facts,
+            None,
+            None,
+            Demands {
+                runtime: 9,
+                ..Demands::default()
+            },
+        );
         assert_eq!(other.undialed, 0);
         assert!(other.demanded != 0 && other.demanded != took.demanded);
         assert_eq!(read(&view, &facts), (vec![(11, 0)], vec![101], vec![9]));
@@ -6555,19 +6908,38 @@ pub(crate) mod tests {
             none,
             Took {
                 undialed: 1,
-                demanded: 0
+                demanded: 0,
+                unmet: None,
             }
         );
         assert_eq!(read(&view, &facts).0, [(10, 0), (11, 1), (13, 2), (14, 3)]);
         // A hint of 0 keeps none.
         let (mut view, mut facts) = built(true, sevens);
-        let hinted = narrow_demanded(&mut view, &mut facts, None, Some(0), Demands { runtime: 7 });
+        let hinted = narrow_demanded(
+            &mut view,
+            &mut facts,
+            None,
+            Some(0),
+            Demands {
+                runtime: 7,
+                ..Demands::default()
+            },
+        );
         assert_eq!(hinted, Took::default());
         assert_eq!(read(&view, &facts), (vec![], vec![], vec![]));
         // A row with no entry of the column meets no demand.
         let (mut view, mut facts) = built(true, sevens);
         facts.truncate(1);
-        narrow_demanded(&mut view, &mut facts, None, None, Demands { runtime: 7 });
+        narrow_demanded(
+            &mut view,
+            &mut facts,
+            None,
+            None,
+            Demands {
+                runtime: 7,
+                ..Demands::default()
+            },
+        );
         assert_eq!(read(&view, &facts), (vec![(10, 0)], vec![100], vec![7]));
     }
 
@@ -7621,7 +7993,10 @@ pub(crate) mod tests {
                     events: true,
                     ..Signals::default()
                 },
-                demand_facts: DemandFacts { runtime },
+                demand_facts: DemandFacts {
+                    runtime,
+                    ..DemandFacts::default()
+                },
                 ..WorkerFacts::default()
             };
             let id = store.upsert(facts).id();
@@ -7922,7 +8297,10 @@ pub(crate) mod tests {
             let mut asked = request(b"cut", 7);
             asked.facts.block_hashes = &BLOCKS;
             asked.facts.tried = &tried;
-            asked.constraints.demands = Demands { runtime: 7 };
+            asked.constraints.demands = Demands {
+                runtime: 7,
+                ..Demands::default()
+            };
             let decided = decided(&store, &asked);
             assert_eq!(decided.holders, [(warm, 1)]);
             assert_eq!(decided.pick, Some((warm, 1)));
@@ -8096,7 +8474,10 @@ pub(crate) mod tests {
             let mut asked = request(b"cut", 7);
             asked.facts.block_hashes = &BLOCKS;
             asked.facts.tried = &tried;
-            asked.constraints.demands = Demands { runtime: 7 };
+            asked.constraints.demands = Demands {
+                runtime: 7,
+                ..Demands::default()
+            };
             let decided = decided(&store, &asked);
             assert_eq!(decided.holders, [(shallow, 1)]);
             assert_eq!(decided.pick, Some((shallow, 1)));
@@ -8658,7 +9039,10 @@ pub(crate) mod tests {
         store.publish_now();
         let door = Door::new(Arc::clone(&store));
         let mut asked = request(b"stays", 7);
-        asked.constraints.demands = Demands { runtime: 7 };
+        asked.constraints.demands = Demands {
+            runtime: 7,
+            ..Demands::default()
+        };
         let decided = door.decide(GATEWAY, &asked, now).expect("a decision");
         assert!(decided.decision.pick().is_some(), "{decided:?}");
         // The demand left the second and the fourth member: each read the

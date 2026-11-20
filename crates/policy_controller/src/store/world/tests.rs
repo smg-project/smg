@@ -457,7 +457,10 @@ fn the_demand_facts_stand_beside_the_rows_written_for_the_asking_gateway() {
             &store,
             WorkerFacts {
                 reachable_from,
-                demand_facts: DemandFacts { runtime },
+                demand_facts: DemandFacts {
+                    runtime,
+                    ..DemandFacts::default()
+                },
                 ..facts(key, Role::Single, &[MODEL])
             },
         )
