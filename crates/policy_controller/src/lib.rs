@@ -175,7 +175,7 @@ pub use decision::{
     Decision, Lifted, Overlap, OverlapSource, Pair, Pick, Queue, Shed, ShedReason, Survivors,
     Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
-pub use door::{Explained, Names};
+pub use door::{DecisionRecord, Explained, Names};
 pub use framework::{
     Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
     Front, Narrowed, PairPools, PairTable, PairTableError, Picker, Plan, Profile, Scorer, Scratch,

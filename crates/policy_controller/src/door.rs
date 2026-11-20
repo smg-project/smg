@@ -2427,8 +2427,8 @@ pub(crate) mod tests {
     use parking_lot::Mutex;
 
     use super::{
-        decider_of, pinned, DecisionRecord, Door, Maker, Refused, Request, Swept, World,
-        DISPATCH_TTL, ON_SAMPLE_READ, SEAT, TERM_MARK,
+        decider_of, pinned, Door, Maker, Refused, Request, Swept, World, DISPATCH_TTL,
+        ON_SAMPLE_READ, SEAT, TERM_MARK,
     };
     use crate::{
         builtins::Random,
@@ -2448,6 +2448,7 @@ pub(crate) mod tests {
             Candidate, Constraints, Identity, KeyedRow, Phase, PoolFacts, RequestFacts, Role,
             Session, WireModes, WorkerId,
         },
+        DecisionRecord,
     };
 
     const MODEL: &str = "model-a";
