@@ -43,6 +43,8 @@ use crate::{
         feed::Feed,
         follower::{Follower, Settings},
         host::Host,
+        operators::Operators,
+        Started,
     },
     rate_limit::RateLimitManager,
     rl_adapter,
@@ -143,6 +145,10 @@ pub struct AppContext {
     /// The policy controller's store, where the controller was picked to
     /// decide for this process; `None` under the classic policies.
     pub policy_store: Option<Arc<MemoryStore>>,
+    /// The operators' door over the policy store: the control plane's
+    /// policy document routes stand on it. `None` under the classic
+    /// policies.
+    pub(crate) policy_operators: Option<Arc<Operators>>,
     /// The worker watch, owned by the context until server teardown.
     pub(crate) policy_follower: Option<Arc<Mutex<Option<Follower>>>>,
     /// The policy controller's host. Routers ask it for placement wherever
@@ -243,6 +249,8 @@ pub struct AppContextBuilder {
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
     policy_store: Option<Arc<MemoryStore>>,
+    /// The operators' door over the store, built with it.
+    policy_operators: Option<Arc<Operators>>,
     /// The membership feed, built with the policy store.
     policy_feed: Option<Feed>,
     /// The host over the feed's holder, built with the feed.
@@ -395,6 +403,7 @@ impl AppContextBuilder {
             wasm_manager: None,
             kv_event_monitor: None,
             policy_store: None,
+            policy_operators: None,
             policy_feed: None,
             policy_host: None,
             policy_follower: None,
@@ -711,6 +720,7 @@ impl AppContextBuilder {
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
             policy_store: self.policy_store,
+            policy_operators: self.policy_operators,
             policy_follower: self.policy_follower,
             policy_host: self.policy_host,
             policy_feed: self.policy_feed,
@@ -943,17 +953,18 @@ impl AppContextBuilder {
         self
     }
 
-    /// Start the policy store with its membership feed and host and, under
-    /// a controller's address, the follower of that controller's workers.
-    /// A start the store refuses stops this one, by name.
+    /// Start the policy store with its operators' door, its membership feed
+    /// and host and, under a controller's address, the follower of that
+    /// controller's workers. A start the door refuses stops this one, by
+    /// name.
     fn with_policy_controller(
         mut self,
         config: &RouterConfig,
         stages: Option<Catalog>,
     ) -> Result<Self, String> {
-        self.policy_store =
+        let started =
             policy_controller::start_with(config, stages).map_err(|refusal| refusal.to_string())?;
-        if let Some(store) = &self.policy_store {
+        if let Some(Started { store, door }) = started {
             let registry = self.worker_registry.as_ref().ok_or_else(|| {
                 "worker_registry must be set before the policy controller".to_string()
             })?;
@@ -962,11 +973,14 @@ impl AppContextBuilder {
                 .as_ref()
                 .map(|address| Settings::new(address.clone(), config));
             let connector = Arc::clone(&self.engine_connector);
-            let (feed, follower) = policy_controller::feeds(store, registry, connector, controller);
-            let host = Host::new(Arc::clone(store), Arc::clone(&feed.objects));
+            let (feed, follower) =
+                policy_controller::feeds(&store, registry, connector, controller);
+            let host = Host::new(Arc::clone(&store), Arc::clone(&feed.objects));
             self.policy_feed = Some(feed);
             self.policy_host = Some(Arc::new(host));
             self.policy_follower = follower.map(|follower| Arc::new(Mutex::new(Some(follower))));
+            self.policy_operators = Some(Arc::new(Operators::new(door)));
+            self.policy_store = Some(store);
         }
         Ok(self)
     }
@@ -1976,6 +1990,7 @@ pub(crate) mod testing {
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
             policy_store: None,
+            policy_operators: None,
             policy_follower: None,
             policy_host: None,
             policy_feed: None,

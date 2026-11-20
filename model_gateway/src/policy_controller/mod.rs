@@ -20,6 +20,13 @@
 //! feeds the store yet. With the setting off, the context holds neither the
 //! store, its feed nor its host.
 //!
+//! The document in force reaches the store through the policy crate's
+//! operators' door as YAML: the bytes `--print-policy-spec` prints where
+//! the routing configuration means it, and the gateway's YAML of it where
+//! it was given. The door stays in the context beside the store. The
+//! control plane reads the document in force through it and checks another
+//! against it ([`operators`]). Nothing is applied after the start.
+//!
 //! One site reads the setting, [`start_with`]. Every other site asks what
 //! the start left in the context.
 //!
@@ -32,8 +39,9 @@
 use std::sync::Arc;
 
 use smg_policy_controller::{
-    store::{MemoryStore, StaleGeneration},
-    Catalog, SpecError,
+    operator::{Format, SpecDoor, SpecRejected},
+    store::MemoryStore,
+    Catalog,
 };
 use smg_worker::connection::engine::EngineConnector;
 use tracing::info;
@@ -66,6 +74,7 @@ pub(crate) mod feed;
     )
 )]
 pub(crate) mod host;
+pub(crate) mod operators;
 mod undecided;
 
 use feed::Feed;
@@ -80,21 +89,28 @@ pub(crate) enum StartError {
     /// one that disagrees with the document a user gave.
     #[error(transparent)]
     Document(#[from] PolicyDocumentError),
-    /// The gateway's check of a document it hosts refuses this one: this
-    /// build does not run a part of it, or its view reads a header the
-    /// gateway keeps to itself.
+    /// The document did not write as the YAML the door reads.
+    #[error("the policy document did not write as YAML: {0}")]
+    Unwritten(#[from] serde_yaml::Error),
+    /// The door refuses the document: this build does not run a part of
+    /// it, or its view reads a header the gateway keeps to itself.
     #[error(transparent)]
-    Spec(#[from] SpecError),
-    /// The store holds a generation that is not below the document's.
-    #[error(transparent)]
-    Stale(#[from] StaleGeneration),
+    Spec(#[from] SpecRejected),
+}
+
+/// What a start leaves the process: the controller's store, and the
+/// operators' door over it, which holds the start's document as written.
+pub(crate) struct Started {
+    pub(crate) store: Arc<MemoryStore>,
+    pub(crate) door: Arc<SpecDoor>,
 }
 
 /// [`start_with`] as the stock gateway starts: no stages of a host. The
 /// cases start their stores through it.
 #[cfg(test)]
 pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, StartError> {
-    start_with(config, None)
+    let started = start_with(config, None)?;
+    Ok(started.map(|started| started.store))
 }
 
 /// The controller's store for this process, holding the policy document in
@@ -103,25 +119,57 @@ pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, S
 /// and no document is read.
 ///
 /// `stages` is the catalog of a host's own stages. The stock gateway hands
-/// none, and the document is then checked over the stock stages alone.
+/// none, and the door then checks over the stock stages alone.
 ///
-/// A configuration the document cannot say, a routing setting that disagrees
-/// with a given document, and a document the gateway's check of a hosted
-/// document refuses ([`RouterConfig::hosted_policy`]), stop the start by
-/// name. None of them is served by the classic policies in silence.
+/// The start returns the store with the door that applied the document
+/// ([`Started`]). The door is handed the document as YAML by the one
+/// function `--print-policy-spec` checks its own through ([`hosted`]), and
+/// it checks a later dry run over the same stages. A configuration the
+/// document cannot say, a routing setting that disagrees with a given
+/// document, and a document that check refuses, stop the start by name.
+/// None of them is served by the classic policies in silence.
 pub(crate) fn start_with(
     config: &RouterConfig,
     stages: Option<Catalog>,
-) -> Result<Option<Arc<MemoryStore>>, StartError> {
+) -> Result<Option<Started>, StartError> {
     if !config.policy_controller {
         return Ok(None);
     }
     let document = config.policy_document_in_force()?;
-    let generation = config.hosted_policy_in(&document, stages.as_ref())?;
-    let store = MemoryStore::new();
-    store.apply(generation)?;
+    let stages = stages.unwrap_or_else(Catalog::builtin);
+    // A given document may hold what its YAML does not say, a `kind` line.
+    // The typed check refuses it by the door's own word before the door
+    // reads the YAML, over the same stages and denied headers.
+    document
+        .validate_in(&stages, &config.denied_view_headers())
+        .map_err(SpecRejected::Invalid)?;
+    let written = serde_yaml::to_string(&document)?;
+    let started = hosted(config, Some(stages), &written)?;
     info!("The policy controller is picked for this gateway");
-    Ok(Some(Arc::new(store)))
+    Ok(Some(started))
+}
+
+/// A new store and the operators' door over it, holding `written` as the
+/// store's one generation: the one check and apply of a document this
+/// gateway hosts. The door bounds the YAML's size, reads it back and
+/// validates it over `stages`, the stock ones where a host hands none, with
+/// the gateway's own headers denied to the view. The start keeps what this
+/// returns. `--print-policy-spec` calls it for its refusal alone, so the
+/// print and the start never part.
+pub(crate) fn hosted(
+    config: &RouterConfig,
+    stages: Option<Catalog>,
+    written: &str,
+) -> Result<Started, SpecRejected> {
+    let store = Arc::new(MemoryStore::new());
+    let denied = config.denied_view_headers().map(str::to_owned);
+    let stages = stages.unwrap_or_else(Catalog::builtin);
+    let door = SpecDoor::new(Arc::clone(&store), Arc::new(stages), denied.into());
+    door.apply(written.as_bytes().to_vec(), Format::Yaml)?;
+    Ok(Started {
+        store,
+        door: Arc::new(door),
+    })
 }
 
 /// The store's membership feed and, under a controller's address, the

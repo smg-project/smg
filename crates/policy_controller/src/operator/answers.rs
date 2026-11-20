@@ -170,8 +170,7 @@ impl SpecRejected {
     /// The document's field the refusal is about, as a `SpecIssue` writes
     /// it ([`SpecError::field_path`]); empty where it is about the document
     /// as a whole.
-    #[cfg(any(test, feature = "controller"))]
-    pub(crate) fn field_path(&self) -> String {
+    pub fn field_path(&self) -> String {
         match self {
             Self::Unreadable(_)
             | Self::TooLarge(_)

@@ -102,7 +102,7 @@ use crate::{
         logging::LoggingConfig, metrics, metrics::PrometheusConfig, metrics_server, otel_trace,
         runtime_metrics,
     },
-    policy_controller::follower::Follower,
+    policy_controller::{follower::Follower, operators},
     routers::{
         common::realtime::ws::RealtimeQueryParams,
         error as route_error,
@@ -845,7 +845,7 @@ async fn inflight_requests(State(state): State<Arc<AppState>>) -> Response {
 /// The control-plane reads the `admin` role alone may make: the gate
 /// refuses the `user` role there before any handler and writes the denial
 /// line, as for a mutation ([`smg_auth::ControlPlaneAuthState::with_admin_only_reads`]).
-pub const ADMIN_ONLY_READS: &[&str] = &["/config", "/rate-limits/tenants"];
+pub const ADMIN_ONLY_READS: &[&str] = &["/config", "/rate-limits/tenants", "/policy/spec"];
 
 /// `GET /config`: the effective configuration with every secret
 /// redacted and the keys in force named by fingerprint. The `admin` role
@@ -897,7 +897,8 @@ async fn reload_secrets(State(state): State<Arc<AppState>>) -> Response {
 
 /// The control-plane routes that exist only behind control-plane
 /// authentication, mounted by `build_apps` when it is configured: the
-/// routes that expose addresses or change the configuration. A route
+/// routes that expose addresses, tell or check a document in force, or
+/// change the configuration. A route
 /// that joins this group is listed in [`GATED_ROUTES`] too, which the
 /// start-up record prints and the role matrix test reads.
 fn gated_control_plane_routes() -> Router<Arc<AppState>> {
@@ -908,6 +909,15 @@ fn gated_control_plane_routes() -> Router<Arc<AppState>> {
             "/rate-limits/tenants",
             get(rate_limit_document::get).put(rate_limit_document::put),
         )
+        .route("/policy/spec", get(operators::spec))
+        // The door's bound at the edge: a body that declares a longer length
+        // is refused unread, and one that declares none is read to the bound.
+        .route(
+            "/policy/spec:validate",
+            post(operators::validate).layer(middleware::RequestBodyLimitLayer::new(
+                operators::document_bytes(),
+            )),
+        )
 }
 
 /// The gated routes by name, in the order of `gated_control_plane_routes`.
@@ -916,6 +926,8 @@ pub const GATED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/secrets/reload"),
     ("GET", "/rate-limits/tenants"),
     ("PUT", "/rate-limits/tenants"),
+    ("GET", "/policy/spec"),
+    ("POST", "/policy/spec:validate"),
 ];
 
 async fn list_workers_rest(

@@ -22,13 +22,16 @@ use serde_json::{json, Value};
 use smg_policy_controller::{
     framework::{Scorer, TieBand},
     lease::Lifecycle,
+    operator::SpecRejected,
     store::{WorkerFacts, WorkerStatus as RowStatus, WorkersStore},
     view::{Candidate, RequestFacts, Role, WireModes},
     AppliedSpec, Catalog, CatalogError, PolicySpec, SpecError,
 };
 use smg_worker::{connection::engine::EngineConnector, identity::basic::ConnectionMode};
 
-use super::{refused, start, start_with, undecided::ROUTER_TYPE, StartError};
+use super::{
+    operators::document_bytes, refused, start, start_with, undecided::ROUTER_TYPE, StartError,
+};
 use crate::{
     app_context::AppContext,
     config::{ManualAssignmentMode, PolicyConfig, PolicyDocumentError, RouterConfig, RoutingMode},
@@ -538,11 +541,58 @@ fn the_store_starts_with_a_registered_scorer() -> Case {
     let digest = document.digest()?;
     let generation = document.generation;
     let config = running(RouterConfig::default(), document);
-    let store = start_with(&config, Some(host_stages()?))?
+    let started = start_with(&config, Some(host_stages()?))?
         .ok_or("the controller was picked and no store started")?;
-    let world = store.world();
+    let world = started.store.world();
     assert_eq!(world.spec().generation(), generation);
     assert_eq!(world.spec().digest(), Some(digest));
+    Ok(())
+}
+
+/// A hosted document passes the door's bound at the start: one whose YAML
+/// is past it stops the start by its size. The print option answers by the
+/// same function.
+#[test]
+fn a_document_past_the_doors_bound_stops_the_start_by_its_size() -> Case {
+    let mut document = RouterConfig::default().policy_document()?;
+    let stock = document.bindings[0].clone();
+    let many = (0..4096).map(|n| {
+        let mut binding = stock.clone();
+        binding.matcher.model = format!("tenant-{n:04}/model");
+        binding
+    });
+    document.bindings.splice(0..0, many);
+    let config = running(RouterConfig::default(), document);
+    let written = serde_yaml::to_string(&config.policy_document_in_force()?)?.len();
+    let bound = document_bytes();
+    assert!(written > bound, "{written}");
+    let refusal = start_with(&config, None)
+        .err()
+        .ok_or("the start took a document past the door's bound")?;
+    assert_eq!(
+        refusal.to_string(),
+        format!("the document is {written} bytes; at most {bound}")
+    );
+    Ok(())
+}
+
+/// A given document's `kind` line is no part of its YAML, so the door never
+/// reads it: the start refuses it by name, by the door's own word.
+#[test]
+fn a_given_documents_kind_line_stops_the_start_by_name() -> Case {
+    let document: PolicySpec = serde_yaml::from_str(
+        "apiVersion: smg.policy/v1\nkind: PolicySpec\nprofiles:\n  preview:\n    score: [least-load]\n    pick: best\n",
+    )?;
+    let refusal = start_with(&running(RouterConfig::default(), document), None)
+        .err()
+        .ok_or("the start took a document with a kind line")?;
+    assert!(
+        matches!(
+            &refusal,
+            StartError::Spec(SpecRejected::Invalid(SpecError::Kind(kind))) if kind == "PolicySpec"
+        ),
+        "{refusal:?}"
+    );
     Ok(())
 }
 
@@ -554,7 +604,7 @@ fn the_stock_store_names_the_unknown_scorer() -> Case {
         .ok_or("the stock start took a scorer it does not hold")?;
     assert!(matches!(
         refusal,
-        StartError::Spec(SpecError::UnknownScorer { .. })
+        StartError::Spec(SpecRejected::Invalid(SpecError::UnknownScorer { .. }))
     ));
     assert_eq!(
         refusal.to_string(),
@@ -571,7 +621,9 @@ fn the_classic_policies_skip_a_document_the_catalog_would_refuse() -> Case {
     );
     assert!(matches!(
         start_with(&config, Some(host_stages()?)),
-        Err(StartError::Spec(SpecError::UnknownScorer { .. }))
+        Err(StartError::Spec(SpecRejected::Invalid(
+            SpecError::UnknownScorer { .. }
+        )))
     ));
 
     config.policy_controller = false;
@@ -594,7 +646,7 @@ fn the_gateways_tenant_header_is_denied_with_a_host_catalog() -> Case {
         .ok_or("the start took a view that reads the tenant header")?;
     assert!(matches!(
         refusal,
-        StartError::Spec(SpecError::DeniedHeader { .. })
+        StartError::Spec(SpecRejected::Invalid(SpecError::DeniedHeader { .. }))
     ));
     assert_eq!(
         refusal.to_string(),

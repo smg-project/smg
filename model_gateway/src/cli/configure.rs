@@ -38,6 +38,7 @@ use crate::{
     mesh::discovery::MeshDiscoveryConfig,
     observability::metrics::PrometheusConfig,
     policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
+    policy_controller,
     secrets::SecretFiles,
     server::{
         posture::{SecretSource, SecretSources},
@@ -1579,10 +1580,10 @@ impl CliArgs {
     }
 
     /// The answer of `--print-policy-spec`: the policy document this command
-    /// line means, as YAML, checked as this gateway checks a document where
-    /// it hosts the controller ([`RouterConfig::hosted_policy`]). The routing
-    /// part of the line is read alone ([`Self::routing_config`]). Nothing is
-    /// bound or spawned.
+    /// line means, as YAML, checked by the function a start hands its own
+    /// document to ([`policy_controller::hosted`]): the operators' door over
+    /// the stock stages. The routing part of the line is read alone
+    /// ([`Self::routing_config`]). Nothing is bound or spawned.
     pub(crate) fn policy_spec_print(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -1602,7 +1603,7 @@ impl CliArgs {
         };
         // A document this gateway's check refuses is still the one the flags
         // mean: it prints, with the check's word for what it refuses.
-        match config.hosted_policy(&document) {
+        match policy_controller::hosted(&config, None, &yaml) {
             Ok(_) => PolicySpecPrint::Document(yaml),
             Err(refusal) => PolicySpecPrint::DocumentRefused {
                 document: yaml,

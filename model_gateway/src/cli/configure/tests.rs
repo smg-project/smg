@@ -775,6 +775,28 @@ fn the_print_checks_its_document_as_the_gateway_checks_one_it_hosts() {
     );
 }
 
+/// The print's check is the start's own: a document past the operators'
+/// door's bound prints with the refusal a start stops by. Twenty thousand
+/// cache boundaries are a line the flags' own checks take.
+#[test]
+fn the_print_refuses_a_document_past_the_doors_bound_as_a_start_does() {
+    let boundaries: Vec<String> = (1..=20_000).map(|at| at.to_string()).collect();
+    let boundaries = boundaries.join(",");
+    let answer = printed(&[
+        "smg",
+        "--policy",
+        "cache_aware",
+        "--cache-boundaries",
+        &boundaries,
+        "--print-policy-spec",
+    ]);
+    let written = answer.document().expect("the document prints").len();
+    assert_eq!(
+        answer.refusal(),
+        Some(format!("the document is {written} bytes; at most 131072").as_str())
+    );
+}
+
 #[test]
 fn the_print_does_not_read_the_stores_flags() {
     // A start refuses this line for its store, which has no address. The
