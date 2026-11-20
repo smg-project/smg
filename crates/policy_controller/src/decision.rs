@@ -40,13 +40,35 @@ pub struct Pair {
 /// The ordered targets of a pick: the best first. For a pair the list reads
 /// "pairs before the prefill went out, decodes of the chosen prefill after",
 /// so an alternate taken after the prefill dispatched changes the decode only.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default)]
 pub struct Targets {
     items: [Target; MAX_TARGETS],
     len: u8,
     /// What the profile's prefix stage says of the first target
     /// ([`Pick::overlap`]), in the bytes the count left spare.
     overlap: Overlap,
+}
+
+/// Two lists are equal where their targets and what they state of the first
+/// are. The entries past a count are no part of a list:
+/// [`Targets::clear`] leaves them as they stood.
+impl PartialEq for Targets {
+    fn eq(&self, other: &Self) -> bool {
+        self.overlap == other.overlap && self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for Targets {}
+
+/// A list prints what its equality reads: its targets and what it states
+/// of the first.
+impl fmt::Debug for Targets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Targets")
+            .field("items", &self.as_slice())
+            .field("overlap", &self.overlap)
+            .finish()
+    }
 }
 
 impl Targets {
@@ -709,6 +731,40 @@ mod tests {
             session_verdict: SessionVerdict::None,
         });
         assert!(pick.pick().is_some());
+    }
+
+    #[test]
+    fn a_list_cleared_and_filled_again_equals_a_new_one() {
+        let target = |position: u32| Target {
+            position,
+            id: WorkerId(u64::from(position) + 1),
+            dp_rank: 0,
+            pair: None,
+        };
+        let mut used = Targets::new();
+        used.push(target(0));
+        used.push(target(1));
+        used.clear();
+        used.push(target(2));
+        let mut new = Targets::new();
+        new.push(target(2));
+        assert_eq!(used, new);
+        // A count and what a list states of its first target are parts
+        // of it still.
+        let mut longer = new;
+        longer.push(target(1));
+        assert_ne!(used, longer);
+        let mut stated = new;
+        stated.state(Overlap {
+            blocks: 1,
+            of: 2,
+            source: OverlapSource::Index,
+            margin_held: false,
+        });
+        assert_ne!(used, stated);
+        // A list prints what its equality reads.
+        assert_eq!(format!("{used:?}"), format!("{new:?}"));
+        assert_ne!(format!("{used:?}"), format!("{longer:?}"));
     }
 
     #[test]
