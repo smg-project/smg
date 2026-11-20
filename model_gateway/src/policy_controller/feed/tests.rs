@@ -475,6 +475,52 @@ fn a_built_worker_is_the_rows_object_when_its_write_returns() {
     assert_eq!(feed.objects.unhanded(), 0);
 }
 
+/// A worker the health loop's refresh rebuilt is the row's object when
+/// its write returns, whether its labels moved the row or not. Equal labels
+/// move no row, and the object is laid all the same. A refresh rebuilt
+/// from an object that stands no more is refused as moved.
+#[test]
+fn a_refreshed_worker_is_the_rows_object_when_its_write_returns() {
+    let store = Arc::new(MemoryStore::default());
+    let (registry, feed) = bed(&store);
+    let built = |tier: &str| -> Arc<dyn Worker> {
+        let worker = BasicWorkerBuilder::new(URL).model(ModelCard::new(MODEL));
+        Arc::new(worker.api_key("key").label("tier", tier).build())
+    };
+    let held = |built: &Arc<dyn Worker>| {
+        let held = registry.get_by_url(URL);
+        held.is_some_and(|held| Arc::ptr_eq(&held, built))
+    };
+    let seen = || {
+        let row = store.by_key(URL).expect("the row");
+        Standing {
+            row: row.id,
+            revision: row.revision,
+        }
+    };
+
+    let first = built("gold");
+    let wrote = feed
+        .door
+        .found_built(&Maker::Control, Expect::Anything, &first, None);
+    assert!(matches!(wrote, Ok(Wrote::Registered(_))), "{wrote:?}");
+
+    let equal = built("gold");
+    let wrote = feed.door.refreshed(seen(), &equal, &first);
+    assert!(matches!(wrote, Ok(Wrote::Unmoved(_))), "{wrote:?}");
+    assert!(held(&equal));
+
+    let late = feed.door.refreshed(seen(), &built("silver"), &first);
+    assert_eq!(late, Err(Refused::Moved));
+    assert!(held(&equal));
+
+    let moved = built("silver");
+    let wrote = feed.door.refreshed(seen(), &moved, &equal);
+    assert!(matches!(wrote, Ok(Wrote::InPlace(_))), "{wrote:?}");
+    assert!(held(&moved));
+    assert_eq!(feed.objects.unhanded(), 0);
+}
+
 #[tokio::test]
 async fn a_drained_row_takes_no_decision_and_a_gone_row_leaves_the_registry() {
     let store = start_store().expect("the store starts");

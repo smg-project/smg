@@ -93,6 +93,10 @@
 //! workers to settle and removes their rows. The steps write the store
 //! through the door. [`Objects`] remains the registry's one writer.
 //!
+//! The health loop's refresh of a worker's engine has an entry of its own
+//! ([`Membership::refreshed`]). It asks no maker, writes the row's labels
+//! and no other fact, and hands the rebuilt worker in with the write.
+//!
 //! # What the module does not hold
 //!
 //! It builds no registry and no engine. The host builds the registry and
@@ -117,10 +121,10 @@ pub use credentials::{Credentials, KeptCredential, RegistrationInFlight};
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use door::tests::{
     check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
-    check_provider,
+    check_provider, check_refresh,
 };
 #[cfg(feature = "controller")]
-pub(crate) use door::{drain, lay, take, Turn};
+pub(crate) use door::{drain, lay, refresh, take, Turn};
 pub use door::{Expect, Membership, Refused, Remover, StoreDoor, Wrote};
 pub use found::facts;
 pub use health::HealthAdapter;

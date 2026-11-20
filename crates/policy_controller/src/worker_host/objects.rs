@@ -1163,6 +1163,68 @@ mod tests {
             })
     }
 
+    /// One refresh of `rebuilt`, a worker rebuilt from `over`, handed to
+    /// the holder through its write.
+    fn refreshed(
+        replica: &Replica,
+        door: &StoreDoor,
+        seen: Standing,
+        rebuilt: &Arc<dyn Worker>,
+        over: &Arc<dyn Worker>,
+    ) -> Result<Wrote, Refused> {
+        replica
+            .objects
+            .handing(replica.store.as_ref(), rebuilt, Some(over), || {
+                door.refreshed(seen, rebuilt, over)
+            })
+    }
+
+    /// A refresh lays the object it rebuilt whatever its write moved: equal
+    /// labels move no row and write no revision, and a label moves the row
+    /// in place. Each object takes the standing one's place, id and running
+    /// state, and no lay finds its hand empty. A refresh rebuilt from the
+    /// object that one replaced is an older rebuild: it is refused as
+    /// moved and lays nothing, though the row's revision may still stand.
+    #[test]
+    fn a_refresh_lays_the_object_it_rebuilt_whether_or_not_a_label_moved() {
+        type Build = fn(&str, &str) -> Arc<dyn Worker>;
+        let rows: [(&str, Build, bool); 2] = [
+            ("equal labels", built, false),
+            ("a label", built_gold, true),
+        ];
+        for (name, build, moved) in rows {
+            let (mut replica, door) = handing();
+            let first = built(A, KEY_A);
+            registered(&replica, &door, &first, Expect::Anything).expect("the first write");
+            first.increment_load();
+            let id = replica.id(A);
+            let seen = replica.objects.standing(&id).expect("the object's row");
+            replica.told();
+
+            let rebuilt = build(A, KEY_A);
+            let wrote = refreshed(&replica, &door, seen, &rebuilt, &first);
+            let row = replica.row(A);
+            let expected = if moved {
+                Wrote::InPlace(row.id)
+            } else {
+                Wrote::Unmoved(row.id)
+            };
+            assert_eq!(wrote, Ok(expected), "{name}");
+            assert_eq!(row.revision != seen.revision, moved, "{name}: the revision");
+            assert!(Arc::ptr_eq(&replica.at(A), &rebuilt), "{name}");
+            assert_eq!(replica.at(A).load(), 1, "{name}: the running state");
+            assert!(entry_stands(&replica, A), "{name}");
+            let seen = replica.objects.standing(&id).expect("the object's row");
+            assert_eq!(replica.told(), [("replaced", id)], "{name}");
+
+            let late = refreshed(&replica, &door, seen, &build(A, KEY_A), &first);
+            assert_eq!(late, Err(Refused::Moved), "{name}");
+            assert!(Arc::ptr_eq(&replica.at(A), &rebuilt), "{name}");
+            assert_eq!(replica.told(), [], "{name}");
+            assert_eq!(replica.objects.unhanded(), 0, "{name}");
+        }
+    }
+
     /// The entry of the object under `url` names the row as it stands.
     fn entry_stands(replica: &Replica, url: &str) -> bool {
         let row = replica.row(url);

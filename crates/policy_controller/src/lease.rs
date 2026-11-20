@@ -283,7 +283,8 @@ impl fmt::Debug for EventSet {
 /// panics at a dispatch, a completion or a release that a frame brings,
 /// or at a dispatch deadline's end, is held there: the lease's
 /// event stands as applied, and so does one that panics at the issue a
-/// dispatch brings. One that panics at a decision's issue, or at the
+/// dispatch or a decode call brings: that call still hands its host the
+/// pick on file. One that panics at another decision's issue, or at the
 /// release of a lease its decision gives up, costs that request its
 /// decision.
 pub trait Lifecycle: Send + Sync {

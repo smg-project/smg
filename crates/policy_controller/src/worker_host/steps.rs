@@ -281,6 +281,7 @@ fn registration_refusal(url: &str, refusal: Refused) -> WorkflowError {
             Endpoint::redacted_str(url)
         ),
         Refused::OutOfScope => Refused::OUT_OF_SCOPE.to_owned(),
+        Refused::NotLabelsAlone => Refused::NOT_LABELS_ALONE.to_owned(),
     };
     failed(WRITE_WORKERS_AT_DOOR_STEP, message)
 }
@@ -530,6 +531,9 @@ fn removal_answer(step: &str, url: &str, answer: Result<Wrote, Refused>) -> Work
         Err(Refused::Stands) => return Err(failed(step, "the door answered a removal as an add")),
         Err(Refused::Draining) => {
             return Err(failed(step, "the door answered a removal as a replacement"))
+        }
+        Err(Refused::NotLabelsAlone) => {
+            return Err(failed(step, "the door answered a removal as a refresh"))
         }
         Err(Refused::Past(past)) => {
             return Err(failed(step, format!("{}: {}", past.fact, past.why)))
@@ -1243,6 +1247,15 @@ mod tests {
         fn gone(&self, _: Remover<'_>, _: &str, _: Standing) -> Result<Wrote, Refused> {
             Err(self.0.clone())
         }
+
+        fn refreshed(
+            &self,
+            _: Standing,
+            _: &Arc<dyn Worker>,
+            _: &Arc<dyn Worker>,
+        ) -> Result<Wrote, Refused> {
+            Err(self.0.clone())
+        }
     }
 
     #[tokio::test]
@@ -1444,6 +1457,15 @@ mod tests {
         }
 
         fn gone(&self, _: Remover<'_>, _: &str, _: Standing) -> Result<Wrote, Refused> {
+            Err(Refused::Moved)
+        }
+
+        fn refreshed(
+            &self,
+            _: Standing,
+            _: &Arc<dyn Worker>,
+            _: &Arc<dyn Worker>,
+        ) -> Result<Wrote, Refused> {
             Err(Refused::Moved)
         }
     }

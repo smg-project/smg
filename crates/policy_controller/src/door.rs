@@ -1879,10 +1879,12 @@ fn tell(store: &MemoryStore, world: &World, found: &Sides, said: Said) {
 /// store's own clock. A side filed in its decision bears that decision's
 /// instant ([`record_of`]). A side filed later is told here under its
 /// lease dated `at`, the instant of that filing as its caller states it.
-/// Behind a served controller that is the decider's read at the call, or
-/// the read of the dispatch's frame. In process it is the instant the
-/// host hands its call, where the door reads no clock. The lease on file
-/// keeps the instant of the pair's first decision for its other words.
+/// In process that is the instant the host hands its call, where the
+/// door reads no clock. No served controller files a side later yet: a
+/// frame asks for no later decode, and a handle over a link refuses the
+/// decode call. On the day one does, it is the decider's read at the
+/// call, or the read of the dispatch's frame. The lease on file keeps
+/// the instant of the pair's first decision for its other words.
 ///
 /// A stage that dates its bookings by its issues reads a date far behind
 /// its newest as a clock that went back, and ends what it passed. So a

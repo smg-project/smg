@@ -89,4 +89,14 @@ impl Membership for DrainingDoor {
     fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
         self.door.gone(by, url, seen)
     }
+
+    // The feed's door hands a rebuilt worker to the holder, as a built one.
+    fn refreshed(
+        &self,
+        seen: Standing,
+        built: &Arc<dyn Worker>,
+        over: &Arc<dyn Worker>,
+    ) -> Result<Wrote, Refused> {
+        self.door.refreshed(seen, built, over)
+    }
 }

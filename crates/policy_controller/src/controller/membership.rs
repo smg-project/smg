@@ -74,8 +74,8 @@ use crate::{
 use crate::{
     store::{membership::Past, WorkerFacts},
     worker_host::{
-        drain, facts, lay, take, Expect, Membership, Refused as HostRefused, Remover, Standing,
-        Turn, Wrote,
+        drain, facts, lay, refresh, take, Expect, Membership, Refused as HostRefused, Remover,
+        Standing, Turn, Wrote,
     },
 };
 
@@ -520,6 +520,9 @@ impl Hosted {
                     }
                     HostRefused::Draining => (Code::FailedPrecondition, DRAINING),
                     HostRefused::OutOfScope => (Code::PermissionDenied, HostRefused::OUT_OF_SCOPE),
+                    HostRefused::NotLabelsAlone => {
+                        (Code::PermissionDenied, HostRefused::NOT_LABELS_ALONE)
+                    }
                 };
                 audit_refusal(call, &self.by, code, why, asker);
                 Err(refusal)
@@ -610,6 +613,25 @@ impl Membership for Hosted {
             take(&self.door.store, by, url, seen)
         })
     }
+
+    // The controller builds each object from its row: the labels alone.
+    fn refreshed(
+        &self,
+        seen: Standing,
+        built: &Arc<dyn Worker>,
+        _: &Arc<dyn Worker>,
+    ) -> Result<Wrote, HostRefused> {
+        self.call("worker label refresh", None, |term| {
+            refresh(
+                &HostedTurn {
+                    door: &self.door,
+                    term,
+                },
+                seen,
+                built.as_ref(),
+            )
+        })
+    }
 }
 
 /// The call's answer at `at`, the log's place after the call, and its audit
@@ -674,7 +696,11 @@ pub(crate) mod tests {
     };
 
     #[cfg(feature = "worker-host")]
-    use smg_worker::settings::UnhealthyRemovalScope;
+    use smg_worker::{
+        identity::{basic::Worker, builder::BasicWorkerBuilder},
+        model_card::ModelCard,
+        settings::UnhealthyRemovalScope,
+    };
     use tonic::{Code, Status};
 
     #[cfg(feature = "worker-host")]
@@ -696,7 +722,8 @@ pub(crate) mod tests {
         view::{Role, WireModes},
         worker_host::{
             check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
-            check_provider, Expect, Membership, Refused, Remover, Standing, StoreDoor, Wrote,
+            check_provider, check_refresh, Expect, Membership, Refused, Remover, Standing,
+            StoreDoor, Wrote,
         },
     };
 
@@ -1662,6 +1689,12 @@ pub(crate) mod tests {
 
     #[cfg(feature = "worker-host")]
     #[test]
+    fn a_refresh_writes_its_workers_labels_and_no_other_fact() {
+        check_refresh(hosted_door).expect("the makers and their rows");
+    }
+
+    #[cfg(feature = "worker-host")]
+    #[test]
     fn the_hosts_own_source_removes_its_rows_under_any_key() {
         check_provider(hosted_door).expect("the makers and their rows");
     }
@@ -2484,6 +2517,52 @@ pub(crate) mod tests {
         assert!(calls[1].contains("made=\"status\""), "{logged}");
         assert!(calls[2].contains("made=\"removed\""), "{logged}");
         assert!(!logged.contains(URL) && !logged.contains(key), "{logged}");
+    }
+
+    /// A refresh leaves one audit line a call, under its own name. One that
+    /// states another fact than the labels is refused in a refresh's
+    /// words, never in a removal's, and no line holds the URL.
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_refresh_leaves_its_audit_line_in_its_own_words() {
+        const HTTP: &str = "http://10.0.0.5:8000";
+        let lines = Logged::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _kept = tracing::subscriber::set_default(subscriber);
+
+        let (store, door) = hosted_door();
+        let built = |model: &str, tier: &str| -> Arc<dyn Worker> {
+            let worker = <BasicWorkerBuilder>::new(HTTP).model(ModelCard::new(model));
+            Arc::new(worker.label("tier", tier).build())
+        };
+        let first = built("m", "gold");
+        door.found_built(&Maker::Control, Expect::Nothing, &first, None)
+            .expect("registered");
+        let row = store.by_key(HTTP).expect("the registered row");
+        let seen = standing(&row);
+        let stray = door.refreshed(seen, &built("other", "gold"), &first);
+        assert_eq!(stray, Err(Refused::NotLabelsAlone));
+        let wrote = door.refreshed(seen, &built("m", "silver"), &first);
+        assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
+
+        let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+        let calls: Vec<_> = logged.lines().skip(1).collect();
+        assert_eq!(calls.len(), 2, "{logged}");
+        assert!(
+            calls
+                .iter()
+                .all(|line| line.contains("worker label refresh")),
+            "{logged}"
+        );
+        assert!(calls[0].contains("code=PermissionDenied"), "{logged}");
+        assert!(calls[0].contains(Refused::NOT_LABELS_ALONE), "{logged}");
+        assert!(calls[1].contains("made=\"relabelled\""), "{logged}");
+        assert!(!logged.contains(HTTP), "{logged}");
     }
 
     #[cfg(feature = "worker-host")]
