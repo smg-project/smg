@@ -83,7 +83,7 @@ with no error: a stage over one ties or keeps every worker.
 
 | A stage reads | Where it comes from | In this controller today |
 |---|---|---|
-| `Candidate::health` | The prober's status of the worker, the pool's circuit breaker and the overload verdict on its engine's load reports. | The prober's status, and a stall where a veto of the asking gateway stands. The breaker bit reads as open where that veto holds, as the gateway's own open breaker does, and as clear everywhere else: the controller keeps no breaker of its own. The overload bit reads as clear unless the store judges the engine's load reports over a threshold. |
+| `Candidate::health` | The prober's status of the worker, the pool's circuit breaker and the overload verdict on its engine's load reports. | The prober's status. A veto of the asking gateway is in the row only where the rows were written for the request: the stalled bit, and the breaker bit beside it where the veto holds, as the gateway's own open breaker does. Beside rows the store lends, both bits read clear and the veto stands in the constraints: the row's position in `Constraints::stalled`, and in `Constraints::held` where the veto holds. So a stage asks `Constraints::masks` beside the stalled bit, as `healthy` does. The controller keeps no breaker of its own. The overload bit reads as clear unless the store judges the engine's load reports over a threshold. |
 | `Candidate::load` (`LoadRow`) | The engine's own load report: requests running and queued, KV-cache usage, the drain rate, the report's age. A stage that reads it declares `Needs::loads`. | Fed. |
 | `Candidate::in_flight` | The requests the deciding host holds on the worker right now. | The leases on file that book the worker, read through `RequestFacts::in_flight`: beside the rows the store lends, in the row where the rows are written for the request. The field itself reads 0 beside lent rows, so a stage asks the request's facts. A decision reads one count a row. |
 | `Candidate::session_hit`, `session_in_flight` | The request's session key: whether it is pinned to this worker, and its requests in flight there. | `session_hit` is set on the worker the ask names as pinned. A key's requests in flight are the leases on file whose decisions read the key's count, read through `RequestFacts::session_in_flight`: the store lends them beside the rows for a keyed request under a rule with an in-flight cap. The field itself reads 0, so a stage asks the request's facts. For any other request none is lent and the read is 0. |
@@ -174,6 +174,7 @@ smg-policy-controller = { git = "https://github.com/smg-project/smg", features =
 ```
 
 - `controller`: the listeners, the command line and `controller::run`.
+- `worker-host`: the cache-event feed. With it a controller reads cache events from each gRPC worker whose row asks for them. The stock image is built with it. Without it a cache-aware document places by warm-up and load.
 - `kubernetes`: the Lease election the Helm chart's replicas use.
 - `client`: the reference client of the protocol. The example's tests ask
   the started controller its decisions through it.

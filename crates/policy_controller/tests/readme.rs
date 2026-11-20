@@ -14,7 +14,7 @@
 //!   the page shows every preset;
 //! - the page names, each in a code span, every flag of the standalone
 //!   binary, every call of the controller's contract and every series the
-//!   controller exports: each list is read off the file that declares it.
+//!   controller exports: each list is read off the files that declare it.
 
 use std::{
     fs,
@@ -37,9 +37,9 @@ const DOCUMENTS: usize = 16;
 const REFUSALS: usize = 2;
 
 /// The flags the standalone binary declares, at the least: a walk that
-/// finds fewer has lost the shape of its source file, and a change that
+/// finds fewer has lost the shape of a source file, and a change that
 /// takes a flag away lowers the count.
-const FLAGS: usize = 29;
+const FLAGS: usize = 56;
 
 /// The calls the controller's contract holds, at the least.
 const CALLS: usize = 17;
@@ -241,14 +241,18 @@ fn field(line: &str) -> Option<&str> {
     (!name.is_empty() && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')).then_some(name)
 }
 
-/// The standalone binary's flags, off the declaration of its command line:
-/// the field under an `arg` attribute is one flag, spelled with dashes.
+/// The standalone binary's flags, off the declaration of its command line
+/// and of the discovery build's flags: the field under an `arg` attribute
+/// is one flag, spelled with dashes.
 fn flags() -> Vec<String> {
-    let mut under_arg = false;
-    include_str!("../src/controller/run.rs")
-        .lines()
-        .map(str::trim)
-        .filter_map(|line| {
+    [
+        include_str!("../src/controller/run.rs"),
+        include_str!("../src/controller/discovery/flags.rs"),
+    ]
+    .into_iter()
+    .flat_map(|declaration| {
+        let mut under_arg = false;
+        declaration.lines().map(str::trim).filter_map(move |line| {
             if line.starts_with("#[arg(") {
                 under_arg = true;
                 return None;
@@ -257,7 +261,8 @@ fn flags() -> Vec<String> {
             under_arg = false;
             Some(format!("--{}", name.replace('_', "-")))
         })
-        .collect()
+    })
+    .collect()
 }
 
 /// The calls of the controller's contract: each `rpc` of its service.

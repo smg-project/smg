@@ -108,7 +108,7 @@ The engine reports a profile's input requirements through `Needs`. The host supp
 | Running, queued and waiting uncached work, KV usage and active KV usage, drain rate, resident tokens, admission window, sample age and source | Host load reports. The standalone leader polls the worker's load RPC and can scrape HTTP metrics for a registered runtime with a supported parser. Fields depend on the reporter. Use `view.max_report_age_ms` to age out reports for the affected scorers and KV gates. Overload is a separate latched verdict. |
 | Host requests in flight and dispatch credit | Lease bookings and lifecycle reports. Read counts through `RequestFacts::in_flight` so a stage also sees counts lent beside rows. The load scorers can account for dispatched work until a report covers it. |
 | Pins, requests in flight for one key, and active-key counts | The host's session facts, or the engine's session rule and the store's pins of record. The standalone controller counts a key's requests in flight by the leases it holds, for a rule with an in-flight cap. Its decision view does not supply active-key counts or a premarked session-hit row. Its session rule keeps pins using the caller's key. |
-| Cache depth, age, growth and size | An embedded host can submit KV events to `MemoryStore` and name prefix holders, or supply an affinity column itself. It can also supply sent-prefix predictions. With regular standalone ingestion, worker age is available and cache events and sent-prefix placements are absent. A controller built with the `worker-host` feature reads cache events from each gRPC worker whose row asks for them. |
+| Cache depth, age, growth and size | An embedded host can submit KV events to `MemoryStore` and name prefix holders, or supply an affinity column itself. It can also supply sent-prefix predictions. With regular standalone ingestion, worker age is available and sent-prefix placements are absent. The stock controller reads cache events from each gRPC worker whose row asks for them. A controller of your own built without the `worker-host` feature reads none. |
 | Role, ranks, wires, stable worker key, zone, engine family and labels | Membership. The document projects labels to bits, and zone and family to positions from 1. An unlisted or absent zone or family is 0. |
 | Capacity, room, pair and encode compatibility, worker vision | The host supplies admission bits and worker facts. `MemoryStore` builds pairing tables and encode classes from membership for its library callers. Its candidate rows leave the admission bits unset. |
 | Pool generation, size and membership, reachability and host constraints | The pool view and `Constraints` carry the pool's facts, exclusions, vetoes, a wire mask and an optional subset hint. A standalone request can narrow by common wires or specify a zero subset to exclude the pool. Hosts can supply further pool facts such as a regime or zone capacity. The standalone view supplies neither. |
@@ -121,14 +121,18 @@ An embedded host can implement or use the store's ingress traits for membership,
 
 Validate a `PolicySpec` to get an `Engine`. Call `Engine::decide` with request facts, rows, constraints and reusable `Scratch`. For a host that needs booking, apply an `AppliedSpec` to `MemoryStore` and call `Door` or `Handle`. The door runs on the caller's thread. It issues the lease for the first target. The host takes a target, reports dispatch and completion or release, and calls `Door::sweep` on its timer. The door decides a pair when asked at its prefill: that one request decides both sides. It returns `PairSide` for a decode or an encode sent on its own, and `Unleased` or `Faulted` if it cannot book or decide a pick. `Door::decide_encode_pair` and `Handle::decide_encode_pair` also place an `epd` request's encode items. A pick can state what its first worker holds of the request's prefix (`Pick::overlap`): the leading blocks held, the request's blocks, where the match came from, and whether the prefix margin kept that worker in front. The profile's first `prefix-affinity` scorer says it. A host that calls the library asks through `Engine::decide_stated`. The controller's `Decide` answer does not carry it yet. [Engine example](src/framework.rs) · [Door API](src/door.rs) · [Handle API](src/handle.rs)
 
-The crate defaults to `wasm`. Use `default-features = false` for the library without that runtime. `ingest` adds load polling and scrape helpers. `controller` adds the service, its protocol, command line and gRPC plugin host, and enables `ingest` and `operator`. `client` enables the reference client and watcher and implies `controller`. `kubernetes` adds the namespaced Lease backend. `operator` adds the operators' door for a host's own process and builds no server. `worker-host` adds an optional registry of worker objects that follows membership. In the controller build those objects use a lazy gRPC connector. The feature also has the cache feed's two parts: `worker_host::KvAdapter` writes a worker's cache events to the index, and `worker_host::KvHost` gives each event subscription its row. A controller built with the feature fills its index itself: every replica opens a cache-event stream to each gRPC worker whose row asks for events. The stock controller is built without it. `test-util` supports the crate's tests and benches. [Cargo features](Cargo.toml)
+The crate defaults to `wasm`. Use `default-features = false` for the library without that runtime. `ingest` adds load polling and scrape helpers. `controller` adds the service, its protocol, command line and gRPC plugin host, and enables `ingest` and `operator`. `client` enables the reference client and watcher and implies `controller`. `kubernetes` adds the namespaced Lease backend. `operator` adds the operators' door for a host's own process. It builds no server, and it builds on every target. `worker-host` adds an optional registry of worker objects that follows membership. In the controller build those objects use a lazy gRPC connector. The feature also has the cache feed's two parts: `worker_host::KvAdapter` writes a worker's cache events to the index, and `worker_host::KvHost` gives each event subscription its row. A controller built with the feature fills its index itself: every replica opens a cache-event stream to each gRPC worker whose row asks for events. The stock controller is built with it: its binary requires `controller` and `worker-host`. `discovery` lets the controller run a worker discovery provider, and enables `controller` and `worker-host`: see [Worker discovery](#worker-discovery). `test-util` supports the crate's tests and benches. [Cargo features](Cargo.toml)
+
+A host built with `worker-host` can keep a worker object for each membership row. If the host gets health from the rows, use `Objects::new(registry).with_status_followed()` and call `follow(&store)` when the store moves. The holder copies each row's status on a status change or a snapshot read. By default, a status change in the store's tail does nothing to the object.
+
+For example, a worker registered `Pending` can take requests once its row turns `Ready` and the host's breaker and vetoes allow it. If a snapshot changes just that row's status to `NotReady`, the same object stops taking requests. The registry tells its subscribers each change, and a promotion puts an open breaker on trial, as a health probe's promotion does.
 
 ### Standalone service
 
-Build from a checkout with `protoc` available. The service feature uses the worker protocol files from the checkout. Save the first policy document above as `policy.yaml`, then run the following from the checkout root.
+Build from a checkout with `protoc` available. The service feature uses the worker protocol files from the checkout. The stock binary requires the `controller` and `worker-host` features. With either one missing, cargo builds no binary and says nothing. Save the first policy document above as `policy.yaml`, then run the following from the checkout root.
 
 ```sh
-cargo build --release --locked -p smg-policy-controller --features controller
+cargo build --release --locked -p smg-policy-controller --features controller,worker-host
 target/release/smg-policy-controller --controller-id controller-0 --spec-file policy.yaml \
   --gateway-listen 127.0.0.1:30100 --control-listen 127.0.0.1:30101 \
   --replication-listen 127.0.0.1:30102 --admin-listen 127.0.0.1:30103 \
@@ -157,6 +161,53 @@ Register workers with `RegisterWorker` on the control listener. Use `Session` an
 | `--log-level`, `--log-json` | `info` by default, also accepts `debug`, `warn`, `error`. `RUST_LOG` can set the filter. Text output by default. `NO_COLOR`, `FORCE_COLOR` and `CLICOLOR_FORCE` control text color, with force taking precedence. |
 
 Startup rejects missing or duplicate scopes, duplicate listener names or addresses, unusable TLS material, and invalid lease addresses or timings. A client CA requires a verified certificate at transport level. This build has no certificate-to-principal mapping. Calls requiring a principal use a listener configured with `--identity-as-told`. A stated subject is a visible ASCII token of at most 253 bytes without commas. The service checks the scope before the principal. [Flags](src/controller/run.rs) · [Listener configuration](src/controller/config.rs)
+
+### Worker discovery
+
+A controller built with the `discovery` feature looks for its workers by itself. The feature is off by default, and the stock image does not build it yet.
+
+```sh
+cargo build --release --locked -p smg-policy-controller --features discovery
+```
+
+The binary then takes the gateway's worker discovery flags, under the same names and with the same defaults. `--discovery-provider` selects one of `kubernetes`, `file`, `slurm` and `consul`. `--service-discovery` still selects Kubernetes.
+
+| Flags | Default and effect |
+|---|---|
+| `--discovery-provider` | One of `kubernetes`, `file`, `slurm` and `consul`. Unset by default: the controller runs no provider. Give this or `--service-discovery`, not both. |
+| `--service-discovery` | The older spelling of `--discovery-provider kubernetes`. |
+| `--discovery-check-interval-secs` | Seconds between periodic passes, 30 when unset. It must be positive. A start that failed is tried again after it. Refused with no provider. |
+| `--api-key`, `--api-key-file` | The key sent to discovered workers, or a file that holds it alone. Refused with no provider. |
+| `--selector` | Kubernetes: the label selector of regular worker pods, as `key=value`. |
+| `--encode-selector`, `--prefill-selector`, `--decode-selector` | Kubernetes: the label selectors of encode, prefill and decode pods. Under any provider, a prefill or decode one selects the prefill and decode pair, and an encode one beside them selects all three roles. |
+| `--service-discovery-port` | Kubernetes: 80. The port of a discovered pod that has no `smg.ai/worker-ports` annotation. |
+| `--service-discovery-namespace` | Kubernetes: the namespace to watch. Every namespace when unset. |
+| `--model-id-from` | Kubernetes: take each worker's model id from pod metadata: `namespace`, `label:<key>` or `annotation:<key>`. |
+| `--kv-connector-annotation`, `--kv-engine-id-annotation` | Kubernetes: `smg.ai/kv-connector` and `smg.ai/kv-engine-id`. The pod annotations that name a worker's KV connector and its engine ids. |
+| `--discovery-file` | File: the JSON manifest that lists the workers. Required with `--discovery-provider file`. It may be created after startup. |
+| `--slurm-job-name`, `--slurm-encode-job-name`, `--slurm-prefill-job-name`, `--slurm-decode-job-name` | Slurm: the job names whose nodes are regular, encode, prefill and decode workers. Each can be given more than once. |
+| `--slurm-port` | Slurm: the inference port on every node of a discovered job. Required with `--discovery-provider slurm`. |
+| `--slurm-bootstrap-port` | Slurm: the bootstrap port of discovered encode and prefill workers. |
+| `--slurm-user`, `--slurm-account`, `--slurm-partition` | Slurm: discover this user's jobs (the user the controller runs as when unset), and only the jobs of this account or partition. |
+| `--consul-service` | Consul: the service whose instances with passing health checks are the workers. Required with `--discovery-provider consul`. |
+| `--consul-address`, `--consul-datacenter` | Consul: the HTTP API address (`CONSUL_HTTP_ADDR`, else 127.0.0.1:8500) and the datacenter (the agent's own when unset). |
+
+```sh
+smg-policy-controller --controller-id controller-0 --spec-file policy.yaml \
+  --discovery-provider file --discovery-file /etc/smg/workers.json
+```
+
+- The replica that leads runs the provider. A standby runs none.
+- The provider stops when the replica loses the lead, when its lease runs out, and at shutdown. The next leader starts its own.
+- A provider that cannot start is logged as an error and tried again after the check interval. So is a provider that ends by itself.
+- A Slurm or Consul flag, or `--discovery-file`, given with another provider or with none, is refused at the start. The Kubernetes flags are not: a selector also sets the roles of another provider.
+- A Slurm job name given for two roles is refused at the start.
+- The key sent to discovered workers comes from `--api-key` or `SMG_API_KEY`, or from a file named by `--api-key-file` or `SMG_API_KEY_FILE`. Each flag beats its own variable. A key and a key file together are refused, from any source. The key never prints.
+- The key is read only when a provider is selected. A key flag with no provider is refused.
+- The controller has no routing mode. A prefill or decode selector or job name selects the prefill and decode pair. An encode one beside them selects all three roles.
+- `--router-selector` and `--model-alias` stay with the gateway.
+
+Two limits stand today. Both are listed under [what is not built yet](#what-is-not-built-yet): discovery registers no worker yet, and the gateway's later checks of the settings do not run here. [Discovery flags](src/controller/discovery/flags.rs)
 
 ### Remote calls from a gateway
 
@@ -204,6 +255,10 @@ let end = loop {
 `None` means the link ended. `Some` gives the watch's own end. `Link::ended()` gives the cause once the link ends. A closed send queue can refuse an ask or a report before its stream reader sees the end. A full report queue ends the link at once.
 
 Drop the stream before opening the watch again. The watcher asks for changes after the last event it took, or for a snapshot if it has no place. When a link ends, the host dials a new one.
+
+When the watch starts from a snapshot, its last page puts the rows into use through `MemoryStore::watch_from`. The watch carries worker rows and their status. The store keeps its own load reports for workers still present.
+
+For example, if the watch starts again while a request is running, its lease stays on file. If its worker is still present, the request still counts toward that worker's in-flight total and the worker keeps its gateway vetoes. If the worker has left, the lease ends when the host reports the request's end. The store keeps its session pins through the snapshot.
 
 ## Extend it
 
@@ -271,6 +326,7 @@ score:
 - Derive `deny_unknown_fields` on the parameters' type. Without it a misspelled key is ignored and its default runs.
 - The keys of a parameter map carry no order. The factory reads them in key order, and two files that differ in that order alone have one digest. A key written twice is refused.
 - A filter and a picker take no parameters yet.
+- A stage is asked what it needs while the document that names it is built, and not at a decision. The engine keeps the answer, so a stage's `needs` must give the same answer every time it is asked.
 - The scorer's `name()` must return the name it is registered under. `scorer`, `filter` and `picker` run the factory once at registration and refuse another name there. `scorer_with` runs no factory then, so validation refuses the name.
 - A `scorer_with` factory can call `build.sent()` for the profile's `SentCredit`: what the host sent each row since that row's last load report. The scorer reads a row's `Sent { requests, tokens }` with `read`. A send is a dispatch the host reports. It stops counting at a report of the row sampled at or after it, at the profile's `sent_ttl_ms`, or at the row's removal. When a send arrives with 8,192 already held on a row, the tally retires the row's oldest batch, at any age.
 
@@ -493,7 +549,7 @@ A source need not be in `view.headers`: its value enters no view. A credential h
 
 A binding names its sources once. With `routing_key`, a sessions rule leaves out `sticky_header` and `headers`. Without it, the rule's own headers are the sources. A binding with neither gives its requests no key.
 
-A host reads a binding's sources with `AppliedSpec::key_sources_for` and derives a request's key with `KeySources::derive`.
+A host reads a binding's sources with `AppliedSpec::key_sources_for` and derives a request's key with `KeySources::derive`. A host in process does both inside the door: it implements `door::Maker` and calls `Door::decide_under` or `Handle::decide_under`. The door hands `Maker::make` the world the decision is made under, and with it the applied document. The key's sources and the rule that pins the key are then of one generation, whatever is applied meanwhile. The maker is asked once for each run of the decision: a second time only where the store refused the first run's lease.
 
 A plain ring under `single` can keep a key on an otherwise usable worker across the overload veto. This requires the sole scorer to be `consistent-hash` without prefix or load bound, bare `best`, and a steering binding. Any session rule must delegate and either have its cap disabled or have the key's counts held. The door and the standalone controller hold them from their leases. A host that decides over its own rows sets `session_counted`. With shedding enabled, a vetoed owner passes the request to a usable pin or ring successor if one exists. With a bounded prefix ring, an owner strictly above both load bounds is passed over. The mean includes the incoming request. Where boundaries supply a shallower key it is tried before the profile's keyless scoring path.
 
@@ -548,9 +604,11 @@ After a stream's end most repeats read `none`: the stream gave the lease up, or 
 
 **Calls.** `ApplyPolicySpec` requires a mode. Use `yaml` or `json` for the document format. `DRY_RUN` on either source checks the candidate under that source's rules. `ENFORCE` writes only under a store. Both can take the current `expected_digest` as a guard. A verdict can include before and after needs, or one issue with a field path when one applies. `AUDIT` is unserved. `GetPolicySpec` returns this replica's standing document, or a generation by number if held. It returns `NOT_FOUND` when none is held. `RollbackPolicySpec` under a store reapplies a named retained generation using a new number. Enforce and rollback under a file return `read_only` before document validation. Each dry-run and write queue has room for up to 32 waiting. Both use the same 128 KiB document cap as the file, with a separate bound on decoded YAML expansion.
 
-**In process.** A host that embeds the store takes the same door with the crate's `operator` feature. `operator::SpecDoor::new(store, catalog, denied_headers)` makes it. `apply` takes the host's document as bytes, YAML or JSON. It checks the document over the host's catalog and denied headers, and runs it. A changed document that leaves `generation` out runs as the next generation. One that states a higher number runs under that number. `dry_run` checks a document and applies nothing. `status`, `document` and `standing` read the generation that runs, and `counts` the applies. `operator::snapshot::told` gives the worker rows an operator reads. An address and a provider's key are told without userinfo. No spec store is bound in process, so `enforce` and `roll_back` refuse. The feature builds on Linux and macOS. The gateway serves no route for these calls yet.
+**In process.** A host that embeds the store takes the same door with the crate's `operator` feature. `operator::SpecDoor::new(store, catalog, denied_headers)` makes it. `apply` takes the host's document as bytes, YAML or JSON. It checks the document over the host's catalog and denied headers, and runs it. A changed document that leaves `generation` out runs as the next generation. One that states a higher number runs under that number. `dry_run` checks a document and applies nothing. A refused apply counts once in `counts`, and a dry run counts nothing. `operator::MAX_DOCUMENT_BYTES` is the 128 KiB bound, and `Format::named` reads `yaml` or `json`. `status`, `document` and `standing` read the generation that runs, and `counts` the applies. `Unanswered` and `NotHeld` are errors a host can print. `NotHeld` says what was asked, what is held, what stands and what a spec store has on file. `operator::snapshot::told` gives the worker rows an operator reads. An address is told without userinfo, and so is a provider's key that is a URL. A provider's key that is no URL and holds an `@` reads as `<unparsable address>`. No spec store is bound in process. `writable` says so, and `enforce` and `roll_back` are refused there with `not persisted: no spec store is bound`. The spec store itself builds on Linux and macOS. The gateway serves no route for these calls yet.
 
 **Shared lease.** A standby follows the leader's document if replication is configured and working. It validates its own file at startup and watches without applying it while following. On promotion it may apply its file after it settles. A file already observed running since the last change is skipped. An unnumbered document the standby never saw run can take effect on promotion even if its file is older. An explicit generation keeps a stale number from taking over. A new leader awaiting its first document can return `Busy`. File lease renewals are durable writes. With the default timings, a slow renewal can stop decisions, close sessions or lose the lease. For slower storage, the lease flags can give more time, for example `--lease-duration-ms 15000 --lease-renew-deadline-ms 10000 --lease-renew-period-ms 2000`.
+
+**Sends.** A profile's tally of sends (`StageBuild::sent`: what the host sent each row since the row's last load report) carries over to the profile of the same name in the next document, when both have a stage that reads it. The two generations share the entries, so a decision still running under the old document reads the same sends. A profile under a new name starts empty. A changed `sent_ttl_ms` applies from the next read. A refused document takes nothing. `MemoryStore::apply` makes the carry before it publishes. A host with a store of its own calls `Engine::succeed` where it swaps engines. A dispatch reported for a worker that the store no longer lists at that rank adds nothing to the tally.
 
 The validator refuses unknown document fields and a non-null `kind`, wrong API version, malformed or duplicate map keys, invalid names or ranges, missing or conflicting bindings, missing plan sides, unsafe headers, unknown stages, unsupported active fields and stage factory errors. The one exception is the parameters of a scorer you register: its own type reads them, and must deny unknown fields to refuse one. A refusal can be about the whole document. The validator messages in these two examples also appear in startup or apply errors.
 
@@ -822,7 +880,7 @@ bindings:
 
 ### `cache_aware`
 
-Blends warm-up, prefix reuse and least-load. The default KV gate is off. With the standalone controller's regular inputs it works from worker age and load. A controller built with the `worker-host` feature reads cache events from each gRPC worker whose row asks for them.
+Blends warm-up, prefix reuse and least-load. The default KV gate is off. The stock controller reads cache events from each gRPC worker whose row asks for them. Where no worker publishes them, the preset works from worker age and load.
 
 <!-- preset: cache_aware -->
 ```yaml
@@ -910,11 +968,13 @@ A host that links the library with the `worker-host` feature writes rows at a me
 - The `best-with-temperature` picker, and three settings of `prefix-affinity`: `decay`, `accounting_ttl_ms` and `spill.uncached_credit`.
 - The `bucket` scorer in the stock controller. The library runs it. The stock controller refuses a document that names it, because it does not yet report every request's end to a stage.
 - `prefix-affinity` with `source` set to `predictor` or `merged` in the stock controller. Both read the prefixes sent to each worker. The library validates them for a host that fills that column. The crate's `Predictor` keeps that record for such a host: it folds a request's keys once (`Predictor::fold_into`), reads by a shared reference, and writes with a tick of the host's clock. The stock controller refuses a document that names either, because it does not yet record the prefixes it sent.
-- Cache events in the stock controller. Its `PushKvEvents` call is not served, and the stock build has nothing else that feeds its cache index. So `prefix-affinity` sees no worker as holding a prefix there. A controller built with the `worker-host` feature fills its index itself: every replica opens a cache-event stream to each gRPC worker whose row asks for events. It keeps those streams while the active document reads no index. The library places by cache for a host that feeds the index. A host built with the `worker-host` feature has the feed's two parts: `worker_host::KvAdapter` writes a worker's cache events to the index, and `worker_host::KvHost` gives each event subscription its row. A row above rank 0 of a data-parallel worker gets no feed there.
+- Cache events from an engine that asks for a key, or from a data-parallel worker's rows above rank 0. The stock controller builds its worker objects without credentials, so an engine that asks for a key gives it no stream. Its `PushKvEvents` call is not served. Every replica of the stock controller opens a cache-event stream to each gRPC worker whose row asks for events, and keeps those streams while the active document reads no index. A host built with the `worker-host` feature has the feed's two parts: `worker_host::KvAdapter` writes a worker's cache events to the index, and `worker_host::KvHost` gives each event subscription its row.
 - One more input in the stock controller. A worker's circuit-breaker bit has one source there: a veto of the asking gateway that holds, as its breaker's open window does. Such a veto takes the worker out of that gateway's decisions, and no rule lifts it. Its row reads as stalled too, as under every veto of that gateway, so a filter that reads the stalled bit refuses it. The controller keeps no breaker of its own.
 - An engine connection over the host-local ZMQ wire. A controller built with the `worker-host` feature hands each worker object a gRPC connector alone, and an object connects to its engine at its first use. A worker that serves only the ZMQ wire gets no connection there, so nothing that controller reads from an engine reaches it for that worker. No field of a registration or of a worker object names a gateway yet, so the controller's doors refuse a worker of that wire.
 - A plugin named in the document. The format has no field for one.
 - Four calls of the contract: `PushLoad`, `PushKvEvents`, `StepDown` and `WatchRegime`. The stock controller answers each as not served.
 - Eight of the ten slices of the snapshot call, `GetSnapshot`. The stock controller serves the worker rows and the spec's status. It refuses a request for any other slice by the slice's name, and a request that names no slice asks for all ten. It also refuses a request for identifiers in clear.
 - The audit mode of the apply call.
+- Registration of the workers that discovery finds. A provider hands each worker to the controller's job queue, and nothing sets that queue yet. Until then a pass finds workers and registers none.
+- The gateway's later checks of discovery settings. The controller accepts a Kubernetes provider with no selector, a port of zero, a comma in a Slurm name and Slurm job names that do not fit the roles. The gateway refuses each.
 - The gateway's use of the controller.
