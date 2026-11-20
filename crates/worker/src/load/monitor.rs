@@ -1839,21 +1839,36 @@ impl<G: Generation> WorkerMonitor<G> {
     /// member asks; the outcome is every member's, as each one's own poll
     /// would have had it: the whole answer (the caller scopes it to each
     /// member's rank), the contact that ends an unreachable veto, a
-    /// transport failure. Returns `None` on no members, a missing client or
-    /// an error.
+    /// transport failure. Returns `None` on no members, a missing client, a
+    /// connect or a call the poll's deadline ended, or an error.
     pub(crate) async fn fetch_backend_load(
         members: &[Arc<dyn Worker>],
     ) -> Option<WorkerLoadResponse> {
         let worker = members.first()?;
-        let backend_client = match worker.engine_connection().await {
-            Ok(Some(client)) => client,
-            Ok(None) => {
+        // A first use connects through the host's connector. The connect
+        // stands under the deadline as the call below does, and for its
+        // reason: a connector that never returns must not stall the group's
+        // poll. A connect the deadline ends is a missing report for this
+        // tick. The next tick connects again, and the worker's health
+        // check, its event stream and its requests drive a slow connect to
+        // its end.
+        let connected = tokio::time::timeout(LOAD_POLL_DEADLINE, worker.engine_connection());
+        let backend_client = match connected.await {
+            Ok(Ok(Some(client))) => client,
+            Ok(Ok(None)) => {
                 debug!("No backend client for worker {}", worker.redacted_url());
                 return None;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 debug!(
                     "Failed to get backend client for {}: {e}",
+                    worker.redacted_url()
+                );
+                return None;
+            }
+            Err(_) => {
+                debug!(
+                    "the connect of {} did not end within {LOAD_POLL_DEADLINE:?}",
                     worker.redacted_url()
                 );
                 return None;
@@ -3241,6 +3256,63 @@ mod native_loads_tests {
         assert_eq!(stub.probes.load(Ordering::Relaxed), 0);
         assert!(memo.is_empty());
         assert_eq!((worker.status(), worker.stall_reason()), before);
+    }
+
+    /// A host's connector whose gRPC connect never returns.
+    #[derive(Debug)]
+    struct SilentConnect;
+
+    #[async_trait::async_trait]
+    impl EngineConnector for SilentConnect {
+        async fn connect_grpc(
+            &self,
+            _base_url: &str,
+            _runtime: RuntimeType,
+        ) -> Result<Arc<dyn EngineConnection>, String> {
+            std::future::pending().await
+        }
+
+        async fn connect_zmq(&self, _link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
+            Err("a gRPC worker runs no handshake".to_string())
+        }
+
+        async fn dial_grpc(&self, _base_url: &str, _timeout: Duration) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A gRPC worker whose connect never returns stalls no poll. Its engine
+    /// has a missing report for the tick and holds no connection, and an
+    /// engine fetched beside it has its report.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_never_returns_is_a_missing_report_and_stalls_no_other_engine() {
+        let silent: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://engine-a.invalid:50051")
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .model(ModelCard::new("a"))
+                .engine_connector(Arc::new(SilentConnect))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let prompt = SourceConnector::keeping(Some(host_answer(1)));
+        let beside = hosted_worker("http://engine-b.invalid:8000", &prompt, None);
+        let memo = DashMap::new();
+
+        let (stalled, answered) = tokio::join!(
+            WorkerMonitor::fetch_engine_loads(
+                vec![Arc::clone(&silent)],
+                ConnectionMode::Grpc,
+                &memo
+            ),
+            engine_fetch(vec![beside], &memo),
+        );
+        assert!(matches!(stalled.as_slice(), [(_, None)]));
+        assert!(matches!(answered.as_slice(), [Some(_)]));
+        assert!(silent.engine_connection_if_initialized().is_none());
     }
 
     /// A connector that does not say in time whether it keeps a source
