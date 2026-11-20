@@ -255,6 +255,37 @@ pub struct LentCounts<'a> {
 }
 
 impl<'a> LentCounts<'a> {
+    /// Books the row at `position` for the decision that picked it, where
+    /// its cell holds no more than the decision read of it: of the
+    /// decisions that read one count of a row, one books it. `Ok` is the
+    /// slot booked: none where the decision read no count of the row.
+    /// `Err`: another booked the row first, and every row reads as unread,
+    /// for a decision made again over the counts as they stand.
+    pub(crate) fn book_as_read(&self, position: u32) -> Result<Option<Slot>, ()> {
+        let (kept, slot) = (&self.kept.cells, self.slots.get(position as usize));
+        let Some((kept, &slot)) = kept.get(position as usize).zip(slot) else {
+            return Ok(None);
+        };
+        let held = kept.load(Ordering::Relaxed);
+        if (held >> 32) as u32 != self.kept.stamp {
+            return Ok(None);
+        }
+        let Some(cell) = self.counts.cell(slot) else {
+            return Ok(None);
+        };
+        let one_more = |now: u32| (now <= held as u32).then(|| now.saturating_add(1));
+        if cell
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, one_more)
+            .is_ok()
+        {
+            return Ok(Some(slot));
+        }
+        for kept in self.kept.cells.iter().take(self.slots.len()) {
+            kept.store(0, Ordering::Relaxed);
+        }
+        Err(())
+    }
+
     /// The count of the row at `position`, one number for the decision:
     /// zero past the rows.
     #[inline]

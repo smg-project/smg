@@ -4583,7 +4583,7 @@ impl MemoryStore {
         booked: Option<Slot>,
         issued: impl Fn(&crate::Lease),
     ) -> Result<crate::Lease, LeaseRefused> {
-        self.issue_minted(record, booked, None, false, issued)
+        self.issue_minted(record, booked, None, false, false, issued)
     }
 
     /// [`Self::issue_decided`] for a decision that read its key's count
@@ -4602,7 +4602,36 @@ impl MemoryStore {
         booked: Option<Slot>,
         issued: impl Fn(&crate::Lease),
     ) -> Result<crate::Lease, LeaseRefused> {
-        self.issue_minted(record, booked, None, true, issued)
+        self.issue_minted(record, booked, None, true, false, issued)
+    }
+
+    /// [`Self::issue_decided`], and under `keyed` [`Self::issue_keyed`],
+    /// for a pick that booked `booked` itself, by a compare against the
+    /// count its decision read (`LentCounts::book_as_read`): the lease
+    /// takes that booking over and its filing adds none. A refusal gives
+    /// the booking back ([`Self::unbook`]).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::issue_decided`].
+    pub(crate) fn issue_booked(
+        &self,
+        record: LeaseRecord,
+        booked: Slot,
+        keyed: bool,
+        issued: impl Fn(&crate::Lease),
+    ) -> Result<crate::Lease, LeaseRefused> {
+        let lease = self.issue_minted(record, Some(booked), None, keyed, true, issued);
+        if lease.is_err() {
+            self.unbook(booked);
+        }
+        lease
+    }
+
+    /// Gives back what a pick booked on `booked` itself where no lease
+    /// takes it over: the count would stand for good.
+    pub(crate) fn unbook(&self, booked: Slot) {
+        self.counts.free(booked);
     }
 
     /// Issues the two leases of one pair's decision under the one id the
@@ -4622,7 +4651,7 @@ impl MemoryStore {
         [booked, decode]: [Option<Slot>; 2],
         issued: impl Fn(&crate::Lease),
     ) -> Result<crate::Lease, LeaseRefused> {
-        self.issue_minted(record, booked, Some((side, decode)), false, issued)
+        self.issue_minted(record, booked, Some((side, decode)), false, false, issued)
     }
 
     /// [`LeasesStore::issue_decode`] with the slot from the decision's world.
@@ -4736,6 +4765,7 @@ impl MemoryStore {
     /// The one issue behind the doors: a single's lease with no `pair`,
     /// which then reads no decode part and takes no branch of one, and
     /// with `keyed` a lease that books its key's requests in flight.
+    /// Under `at_pick` the lease's pick booked its count already.
     /// Inline in each door, so the single's door is the issue it was and
     /// tests no key.
     #[inline(always)]
@@ -4745,6 +4775,7 @@ impl MemoryStore {
         booked: Option<Slot>,
         pair: Paired,
         keyed: bool,
+        at_pick: bool,
         issued: impl Fn(&crate::Lease),
     ) -> Result<crate::Lease, LeaseRefused> {
         use std::collections::hash_map::Entry;
@@ -4784,7 +4815,7 @@ impl MemoryStore {
                 break key;
             }
         };
-        leases.laid(key, &record, booked, keyed);
+        leases.laid(key, &record, booked.filter(|_| !at_pick), keyed);
         if let Some(side) = side {
             leases.decode_laid(key, &record, &side, keyed);
         }

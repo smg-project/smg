@@ -482,6 +482,10 @@ fn entry_and_plan<A: Asked>(world: &World, taken: &Taken<'_, A>) -> (Entry, Plan
 /// ([`Engine::decide_keeping`]).
 struct ByEngine<'a, const KEEPS: bool>(&'a Engine);
 
+/// How many times one request's decision is made again behind a lost
+/// compare of its pick's count (`LentCounts::book_as_read`).
+const BOOK_TRIES: u8 = 3;
+
 impl<const KEEPS: bool> ByEngine<'_, KEEPS> {
     // Forced into each form's one call: out of line the plain form would
     // pay a call the closure it stands for never made.
@@ -495,12 +499,39 @@ impl<const KEEPS: bool> ByEngine<'_, KEEPS> {
         scratch: &mut Scratch,
     ) -> (Decision, Option<Booking>) {
         let engine = self.0;
-        let decision = match (STATED, KEEPS) {
-            (false, false) => engine.decide(facts, pool, candidates, constraints, scratch),
-            (true, false) => engine.decide_stated(facts, pool, candidates, constraints, scratch),
-            (false, true) => engine.decide_keeping(facts, pool, candidates, constraints, scratch),
-            (true, true) => {
-                engine.decide_stated_keeping(facts, pool, candidates, constraints, scratch)
+        // Seats that decide at once read one count of a row: the pick books
+        // it by a compare against that count, and one that lost is made again.
+        let (mut tries, mut lost, mut at_pick) = (BOOK_TRIES, None, None);
+        let decision = loop {
+            let decision = match (STATED, KEEPS) {
+                (false, false) => engine.decide(facts, pool, candidates, constraints, scratch),
+                (true, false) => {
+                    engine.decide_stated(facts, pool, candidates, constraints, scratch)
+                }
+                (false, true) => {
+                    engine.decide_keeping(facts, pool, candidates, constraints, scratch)
+                }
+                (true, true) => {
+                    engine.decide_stated_keeping(facts, pool, candidates, constraints, scratch)
+                }
+            };
+            let Some((pick, lent)) = decision.pick().zip(facts.lent_in_flight) else {
+                break decision;
+            };
+            let Some(first) = pick.targets.first() else {
+                break decision;
+            };
+            // A key claimed for the pick, or one row lost twice running:
+            // the count does not move the pick, and it stands.
+            let claimed = matches!(pick.session_verdict, SessionVerdict::Claimed(_));
+            match lent.book_as_read(first.position) {
+                Err(()) if tries > 0 && !claimed && lost != Some(first.position) => {
+                    (tries, lost) = (tries - 1, Some(first.position));
+                }
+                booked => {
+                    at_pick = booked.ok().flatten();
+                    break decision;
+                }
             }
         };
         // What a pick's lease takes of its request, read where the
@@ -524,6 +555,7 @@ impl<const KEEPS: bool> ByEngine<'_, KEEPS> {
                 tokens: facts.prompt_tokens,
                 now_micros: facts.now_micros,
                 built: None,
+                at_pick,
             })
         });
         (decision, booking)
@@ -1476,6 +1508,7 @@ fn pair_booking(
             tokens: facts.prompt_tokens,
             now_micros: facts.now_micros,
             built: Some(built.0),
+            at_pick: None,
         },
         decode,
         slot,
@@ -1508,6 +1541,10 @@ pub(crate) struct Booking {
     pub(crate) now_micros: u64,
     /// The build the decision read: where its target's count stands.
     pub(crate) built: Option<Built>,
+    /// The slot the pick booked itself, which its lease takes over; none
+    /// where the lease's filing books. A booking that is not issued gives
+    /// the slot back ([`MemoryStore::unbook`]).
+    pub(crate) at_pick: Option<Slot>,
 }
 
 /// What a pair's two leases take of its decision's hand-over: the prefill
@@ -1555,10 +1592,10 @@ pub(crate) fn issue<A: Asked>(
     // the leases it finds past their dispatch deadline. A decision that
     // read its key's count files a lease that books the key, whatever it
     // did with the pin: the next read holds this request.
-    let lease = if booking.counted {
-        store.issue_keyed(record, booked, told)
-    } else {
-        store.issue_decided(record, booked, told)
+    let lease = match booking.at_pick {
+        Some(at_pick) => store.issue_booked(record, at_pick, booking.counted, told),
+        None if booking.counted => store.issue_keyed(record, booked, told),
+        None => store.issue_decided(record, booked, told),
     }?;
     world.sent(named, booking.target);
     Ok(lease)
@@ -3072,6 +3109,10 @@ pub struct Door {
     /// A seat a file of the store: its holder decides as that file's
     /// decider.
     seats: Box<[Seat]>,
+    /// Held across the decision and the filing of a pair and of a decode
+    /// call. Their picks book at the filing alone: two that overlapped at
+    /// two seats would read one count and take one worker.
+    pairs: Mutex<()>,
     /// The last generation's seat flags, checked again against the world
     /// loaded at the seat.
     seat_flags: AtomicU8,
@@ -3202,6 +3243,7 @@ impl Door {
         let term = AtomicU64::new(LeasesStore::term(&*store));
         Self {
             seats: (0..deciders).map(|_| Seat::default()).collect(),
+            pairs: Mutex::new(()),
             seat_flags: AtomicU8::new(0),
             parts: (0..deciders).map(|_| Part::default()).collect(),
             kept: (0..deciders).map(|_| Kept::default()).collect(),
@@ -3986,6 +4028,7 @@ impl Door {
             return self.order(world, at, term, taken, buffers, entry);
         }
         let own = &self.parts[at];
+        let _one = self.pairs.lock();
         let ((decision, booking), sides) =
             pair_shadowed_in(world, taken, buffers, own, due.binding);
         let decided = self.file_pair(world, term, taken, decision, booking);
@@ -4070,6 +4113,7 @@ impl Door {
         taken: &Taken<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
     ) -> Result<Decided, Refused> {
+        let _one = self.pairs.lock();
         let (decision, booking) = pair_in(world, taken, buffers, &self.parts[at]);
         self.file_pair(world, term, taken, decision, booking)
     }
@@ -4111,6 +4155,7 @@ impl Door {
         lease: LeaseId,
     ) -> Result<Decided, Refused> {
         let (store, own) = (&*self.store, &self.parts[at]);
+        let _one = self.pairs.lock();
         let decided = decode_in(world, store, taken, lease, buffers, own);
         self.file_decode(world, taken, lease, decided)
     }
@@ -4138,6 +4183,7 @@ impl Door {
         let (binding, left) = (due.binding, taken.left);
         let mut said = Shadow::NotDue;
         let (store, own) = (&*self.store, &self.parts[at]);
+        let _one = self.pairs.lock();
         let decided = decode_with(world, store, taken, lease, buffers, own, |prefill| {
             let said = &mut said;
             move |engine: &Engine,
@@ -4440,6 +4486,7 @@ impl WithEncode<'_, '_, '_> {
             return Err(entry);
         }
         let own = &self.door.parts[at];
+        let _one = self.door.pairs.lock();
         let (decision, booking) =
             encode_pair_in(world, taken, self.items, self.placed, buffers, own);
         Ok(self.door.file_pair(world, term, taken, decision, booking))
@@ -9403,6 +9450,71 @@ pub(crate) mod tests {
             })
         });
         assert_ne!(seats[0], seats[1]);
+    }
+
+    /// Seats that decide at once read one count of a row, and one of them
+    /// books it: as many decisions as a pool has idle workers leave one
+    /// lease on each, under a single plan and under a pair plan. A round
+    /// is one decision a seat, so a single's decision loses its compare
+    /// once to each other seat at most: `BOOK_TRIES` times.
+    #[test]
+    fn seats_that_decide_at_once_under_least_load_book_each_idle_worker_once() {
+        const ROUNDS: u8 = 64;
+        let seats = usize::from(super::BOOK_TRIES) + 1;
+        let workers = seats * usize::from(ROUNDS);
+        let single = MemoryStore::new().with_deciders(seats);
+        for worker in 0..workers {
+            member(&single, &format!("w{worker}"), Role::Single);
+        }
+        let applied = single.apply(preset("least_load", 1));
+        applied.expect("above the unbound start");
+        let pair = pair_fleet_over(MemoryStore::new().with_deciders(seats), workers, workers);
+        let fleets = [
+            (Arc::new(single), Phase::Single, &[Role::Single][..]),
+            (
+                pair.expect("a pair fleet"),
+                Phase::Prefill,
+                &[Role::Prefill, Role::Decode][..],
+            ),
+        ];
+        let (mut away, mut piled) = (0, Vec::new());
+        for (store, phase, roles) in fleets {
+            let door = Door::new(store);
+            let (round, now) = (Barrier::new(seats), Instant::now());
+            away += thread::scope(|scope| {
+                let callers = (0..=super::BOOK_TRIES).map(|seat| {
+                    let (door, round) = (&door, &round);
+                    scope.spawn(move || {
+                        seated(usize::from(seat));
+                        let at_own_seat = |turn: u8| {
+                            round.wait();
+                            let id = [seat, turn];
+                            let mut asked = request(&id, 7);
+                            asked.facts.phase = phase;
+                            let decided = door.decide(GATEWAY, &asked, now);
+                            let leased = decided.ok().and_then(|decided| decided.lease);
+                            let file = leased.map(|leased| door.store.file_of(leased.lease.id));
+                            file == Some(usize::from(seat))
+                        };
+                        (0..ROUNDS).filter(|&turn| !at_own_seat(turn)).count()
+                    })
+                });
+                let callers: Vec<_> = callers.collect();
+                let away = callers.into_iter().map(|caller| caller.join());
+                away.map(|away| away.expect("a caller")).sum::<usize>()
+            });
+            for &role in roles {
+                let held = booked(&door.store, role);
+                let off = held.iter().filter(|&&(_, count)| count != 1).count();
+                piled.push((role, off));
+            }
+        }
+        assert_eq!(away, 0, "decisions made at another caller's seat");
+        let even = piled.iter().all(|&(_, off)| off == 0);
+        assert!(
+            even,
+            "workers that hold no lease or more than one: {piled:?}"
+        );
     }
 
     /// A thread's seat at a door of fewer seats is its last seat counted

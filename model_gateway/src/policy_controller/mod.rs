@@ -198,7 +198,11 @@ pub(crate) fn hosted(
     stages: Option<Catalog>,
     written: &str,
 ) -> Result<Started, SpecRejected> {
-    let store = Arc::new(MemoryStore::new());
+    // A seat for each thread that can decide at once, the runtime's worker
+    // threads; one seat where no runtime runs.
+    let seats =
+        tokio::runtime::Handle::try_current().map_or(1, |runtime| runtime.metrics().num_workers());
+    let store = Arc::new(MemoryStore::new().with_deciders(seats));
     let denied = config.denied_view_headers().map(str::to_owned);
     let stages = stages.unwrap_or_else(Catalog::builtin);
     let door = SpecDoor::new(Arc::clone(&store), Arc::new(stages), denied.into());

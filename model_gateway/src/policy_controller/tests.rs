@@ -90,6 +90,16 @@ fn the_store_starts_with_the_document_the_routing_configuration_means() -> Case 
     Ok(())
 }
 
+/// One seat would hold every decision of the gateway behind one lock: each
+/// thread that can decide finds a seat of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn the_store_starts_with_a_seat_for_each_worker_thread_of_its_runtime() -> Case {
+    let config = picked(RouterConfig::default());
+    let store = start(&config)?.ok_or("the controller was picked and no store started")?;
+    assert_eq!(store.deciders(), 3, "seats, one a worker thread");
+    Ok(())
+}
+
 #[test]
 fn the_store_starts_on_the_given_document() -> Case {
     // A document that names no generation is the store's first.

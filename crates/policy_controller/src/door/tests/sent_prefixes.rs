@@ -762,7 +762,11 @@ fn a_pairs_lease_writes_nothing() -> Case {
 
 fn decide_only(door: &Door, asked: &Request<'_>, now: Instant, buffers: &mut Buffers<()>) {
     door.store().deciding(|world| {
-        decide_in(world, &taken(asked, now), buffers, &door.parts[0]);
+        let (_, booking) = decide_in(world, &taken(asked, now), buffers, &door.parts[0]);
+        // No lease takes over what the pick booked.
+        if let Some(at_pick) = booking.and_then(|booking| booking.at_pick) {
+            door.store().unbook(at_pick);
+        }
     });
 }
 
