@@ -23,7 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(feature = "axum")]
 use serde_json::json;
 
-use super::model_card::ModelCard;
+use super::{identity::endpoint::Endpoint, model_card::ModelCard};
 
 // ── Default value constants ──────────────────────────────────────────
 
@@ -954,8 +954,24 @@ impl std::fmt::Debug for WorkerSpec {
             overload,
         } = self;
 
+        // An address prints in its redacted form: its userinfo can carry
+        // a credential. A rank is read out of the address alone that a
+        // registration wrote beside its base: in any other, an `@` and
+        // digits at the end are a userinfo and a host, and read as a rank
+        // they would print the userinfo.
+        let unranked = |address: &str| {
+            Endpoint::parse(address).map_or_else(
+                |_| "<unparsable address>".to_string(),
+                |address| address.redacted(),
+            )
+        };
+        let url = if dp_base_url.is_some() {
+            Endpoint::redacted_str(url)
+        } else {
+            unranked(url.as_str())
+        };
         f.debug_struct("WorkerSpec")
-            .field("url", url)
+            .field("url", &url)
             .field("models", models)
             .field("worker_type", worker_type)
             .field("connection_mode", connection_mode)
@@ -967,7 +983,7 @@ impl std::fmt::Debug for WorkerSpec {
             .field("api_key", &api_key.is_some().then_some(REDACTED_API_KEY))
             .field("bootstrap_port", bootstrap_port)
             .field("bootstrap_host", bootstrap_host)
-            .field("dp_base_url", dp_base_url)
+            .field("dp_base_url", &dp_base_url.as_deref().map(unranked))
             .field("dp_rank", dp_rank)
             .field("dp_size", dp_size)
             .field("kv_connector", kv_connector)
@@ -2653,14 +2669,51 @@ mod debug_tests {
 
         let compact = format!("{spec:?}");
         let pretty = format!("{spec:#?}");
-        assert!(!compact.contains(marker));
-        assert!(!pretty.contains(marker));
-        assert!(compact.contains(r#"api_key: Some("<redacted>")"#));
-        assert!(pretty.contains("api_key: Some(\n        \"<redacted>\",\n    )"));
+        assert!(!compact.contains(marker), "{compact}");
+        assert!(!pretty.contains(marker), "{pretty}");
+        assert!(
+            compact.contains(r#"api_key: Some("<redacted>")"#),
+            "{compact}"
+        );
+        assert!(
+            pretty.contains("api_key: Some(\n        \"<redacted>\",\n    )"),
+            "{pretty}"
+        );
 
         spec.api_key = None;
         for text in [format!("{spec:?}"), format!("{spec:#?}")] {
-            assert!(text.contains("api_key: None"));
+            assert!(text.contains("api_key: None"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_spec_prints_no_credential_of_its_addresses() {
+        let mut spec = WorkerSpec::new("http://user:pebble@worker:8000");
+        spec.dp_base_url = Some("http://cedar@worker:8001".to_string());
+
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(!text.contains("pebble"), "{text}");
+            assert!(!text.contains("cedar"), "{text}");
+            assert!(text.contains("***@worker:8000"), "{text}");
+            assert!(text.contains("***@worker:8001"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_spec_reads_a_rank_out_of_the_address_beside_a_base_alone() {
+        // With no base, an `@` and digits at the end are a userinfo and a
+        // host.
+        let mut spec = WorkerSpec::new("http://pebble@2130706433");
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(!text.contains("pebble"), "{text}");
+        }
+
+        // A base carries no rank, and the address written beside it does.
+        spec.url = "http://worker:8000@1".to_string();
+        spec.dp_base_url = Some("http://cedar@8001".to_string());
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(!text.contains("cedar"), "{text}");
+            assert!(text.contains(r#"url: "http://worker:8000@1""#), "{text}");
         }
     }
 
@@ -2677,15 +2730,22 @@ mod debug_tests {
 
         let compact = format!("{request:?}");
         let pretty = format!("{request:#?}");
-        assert!(!compact.contains(marker));
-        assert!(!pretty.contains(marker));
-        assert!(compact.contains(r#"api_key: Some("<redacted>")"#));
-        assert!(pretty.contains("api_key: Some(\n        \"<redacted>\",\n    )"));
+        assert!(!compact.contains(marker), "{compact}");
+        assert!(!pretty.contains(marker), "{pretty}");
+        assert!(
+            compact.contains(r#"api_key: Some("<redacted>")"#),
+            "{compact}"
+        );
+        assert!(
+            pretty.contains("api_key: Some(\n        \"<redacted>\",\n    )"),
+            "{pretty}"
+        );
 
         request.api_key = None;
         let expected = "WorkerUpdateRequest { priority: Some(73), cost: None, labels: None, api_key: None, health: None }";
-        assert!(format!("{request:?}") == expected);
-        assert!(format!("{request:#?}").contains("api_key: None"));
+        assert_eq!(format!("{request:?}"), expected);
+        let pretty = format!("{request:#?}");
+        assert!(pretty.contains("api_key: None"), "{pretty}");
     }
 
     #[test]
@@ -2696,8 +2756,11 @@ mod debug_tests {
         };
 
         let text = format!("{spec:?}");
-        assert!(text.starts_with(r#"WorkerSpec { url: "http://worker:8000","#));
-        assert!(text.contains("priority: 73"));
+        assert!(
+            text.starts_with(r#"WorkerSpec { url: "http://worker:8000","#),
+            "{text}"
+        );
+        assert!(text.contains("priority: 73"), "{text}");
 
         let pretty = format!("{spec:#?}");
         let field_count = pretty
