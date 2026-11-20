@@ -105,11 +105,19 @@ impl StageBuild<'_> {
     /// The profile's count of sends. The first call for a profile makes
     /// its tally under that profile's `sent_ttl_ms`.
     pub fn sent(&mut self) -> Arc<SentCredit> {
-        Arc::clone(
-            self.sent
-                .get_or_insert_with(|| Arc::new(SentCredit::new(self.profile, self.sent_ttl_ms))),
-        )
+        profile_sent(self.sent, self.profile, self.sent_ttl_ms)
     }
+}
+
+/// The count of sends in a profile's slot, made at the first ask under the
+/// profile's `sent_ttl_ms`. A factory's context and a typed stage both ask
+/// here, so a profile holds one count.
+pub(crate) fn profile_sent(
+    slot: &mut Option<Arc<SentCredit>>,
+    profile: &str,
+    sent_ttl_ms: Option<u32>,
+) -> Arc<SentCredit> {
+    Arc::clone(slot.get_or_insert_with(|| Arc::new(SentCredit::new(profile, sent_ttl_ms))))
 }
 
 /// Why a factory refuses what the document wrote. It displays as the

@@ -6,11 +6,15 @@ use crate::view::LoadRow;
 pub(crate) enum Term {
     Load(LoadField),
     InFlight,
+    /// The sends to the row that no report of it shows yet.
+    SentRequests,
+    /// The prompt tokens those sends stated.
+    SentTokens,
 }
 
 impl Term {
     /// Every name a document may write, with the term it reads.
-    pub(crate) const NAMES: [(&str, Self); 7] = [
+    pub(crate) const NAMES: [(&str, Self); 9] = [
         ("candidate.in_flight", Self::InFlight),
         ("load.active_kv_permille", Self::Load(LoadField::ActiveKv)),
         ("load.kv_usage_permille", Self::Load(LoadField::KvUsage)),
@@ -24,6 +28,8 @@ impl Term {
             "load.waiting_uncached_tokens",
             Self::Load(LoadField::WaitingUncachedTokens),
         ),
+        ("sent.requests", Self::SentRequests),
+        ("sent.tokens", Self::SentTokens),
     ];
 
     pub(crate) fn named(name: &str) -> Option<Self> {
@@ -36,11 +42,17 @@ impl Term {
         matches!(self, Self::Load(_))
     }
 
+    pub(crate) fn reads_sent(self) -> bool {
+        matches!(self, Self::SentRequests | Self::SentTokens)
+    }
+
     #[cfg(test)]
     pub(crate) fn read(self, load: Option<&LoadRow>, in_flight: u32) -> Option<f64> {
         match self {
             Self::Load(field) => field.read(load?),
             Self::InFlight => Some(f64::from(in_flight)),
+            // The walk leaves the sends to the pass behind it.
+            Self::SentRequests | Self::SentTokens => Some(0.0),
         }
     }
 }
@@ -86,6 +98,8 @@ pub(crate) struct Coefficients {
     pub(crate) resident_tokens: f64,
     running: f64,
     pub(crate) waiting_uncached_tokens: f64,
+    pub(crate) sent_requests: f64,
+    pub(crate) sent_tokens: f64,
 }
 
 impl Coefficients {
@@ -102,6 +116,8 @@ impl Coefficients {
                     LoadField::Running => &mut coefficients.running,
                     LoadField::WaitingUncachedTokens => &mut coefficients.waiting_uncached_tokens,
                 },
+                Term::SentRequests => &mut coefficients.sent_requests,
+                Term::SentTokens => &mut coefficients.sent_tokens,
             };
             debug_assert!(
                 coefficient != 0.0,

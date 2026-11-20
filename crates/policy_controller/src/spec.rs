@@ -43,7 +43,7 @@ use crate::{
         SampledBest, SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS,
         DEFAULT_THROUGHPUT,
     },
-    catalog::{Catalog, Found, StageBuild},
+    catalog::{profile_sent, Catalog, Found, StageBuild},
     framework::{Binding, Engine, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted},
     ring::ConsistentHash,
     routing_key::KeySources,
@@ -2411,7 +2411,11 @@ fn check_stage(stage: &ScoreStage, at: &At) -> Result<(), SpecError> {
 }
 
 /// Check the cost parameters while resolving the field names into readers.
-fn least_cost_of(p: &LeastCostParams, at: &At) -> Result<LeastCost, SpecError> {
+fn least_cost_of(
+    p: &LeastCostParams,
+    sent: impl FnOnce() -> Arc<SentCredit>,
+    at: &At,
+) -> Result<LeastCost, SpecError> {
     const COST_RANGE: &str = "a finite number from 0 to 1e15";
     if f64::from(p.weight) > COST_PARAMETER_LIMIT {
         return Err(at.bad(
@@ -2459,8 +2463,13 @@ fn least_cost_of(p: &LeastCostParams, at: &At) -> Result<LeastCost, SpecError> {
             ));
         }
     }
-    let scorer = LeastCost::new(terms.into_boxed_slice(), p.margin, p.unreported);
-    if scorer.needs().loads && p.unreported.is_none() {
+    // A sent term needs the reports and reads none: the rule for a row
+    // without a report is asked only where a term reads one.
+    let reads_report = terms.iter().any(|&(term, _)| term.reads_load());
+    // Only a term that reads sends makes the profile's count.
+    let sent = terms.iter().any(|&(term, _)| term.reads_sent()).then(sent);
+    let scorer = LeastCost::new(terms.into_boxed_slice(), p.margin, p.unreported, sent);
+    if reads_report && p.unreported.is_none() {
         return Err(at.bad(
             "unreported", "null",
             "what a row with no report costs, which a term that reads a report needs: over-least or missing-as-zero",
@@ -2571,10 +2580,12 @@ fn gates_of(p: &ProfileSpec, view: &ViewSpec) -> Gates {
 }
 
 /// The stage's scorer, with its profile's gates and the view's settings.
+/// `sent` hands out the profile's count of sends.
 fn scorer_of(
     stage: &ScoreStage,
     gates: Gates,
     view: &ViewSpec,
+    sent: impl FnOnce() -> Arc<SentCredit>,
     at: &At,
 ) -> Result<Resolved<Box<dyn Scorer>>, SpecError> {
     let max_age = view.max_report_age_ms;
@@ -2623,7 +2634,7 @@ fn scorer_of(
             max_age,
         )),
         ScoreStage::LeastCost(p) => {
-            Resolved::Built(with_report_age(least_cost_of(p, at)?, max_age))
+            Resolved::Built(with_report_age(least_cost_of(p, sent, at)?, max_age))
         }
     })
 }
@@ -2910,7 +2921,8 @@ fn check_profile(
             );
             continue;
         }
-        match scorer_of(&stage, gates, view, &stage_at)? {
+        let count = || profile_sent(&mut sent, name, p.sent_ttl_ms);
+        match scorer_of(&stage, gates, view, count, &stage_at)? {
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
                 depth.deepen(read);
@@ -6313,6 +6325,7 @@ mod tests {
             &stage,
             Gates::of(None, None, None),
             &spec.view,
+            || panic!("no term reads sends"),
             &At::new("profiles.p.score[0].least-cost"),
         )
         .expect("valid parameters") else {
@@ -6321,6 +6334,36 @@ mod tests {
         assert_eq!(scorer.name(), "least-cost");
         assert!(scorer.row_wise());
         assert!(!scorer.front_wise());
+    }
+
+    /// Only a `sent.` term makes the profile's count of sends, and a time
+    /// limit on the sends needs one where `least-cost` is the only scorer.
+    #[test]
+    fn least_cost_keeps_a_count_of_sends_only_for_a_sent_term() {
+        for (term, limit, want) in [
+            ("candidate.in_flight", None, Ok(0)),
+            ("sent.tokens", None, Ok(1)),
+            ("sent.requests", Some(43), Ok(1)),
+            (
+                "candidate.in_flight",
+                Some(43),
+                Err("profiles.p.sent_ttl_ms"),
+            ),
+        ] {
+            let mut spec =
+                spec_with_score(&format!(r#"{{"least-cost":{{"terms":{{"{term}":7}}}}}}"#));
+            spec.profiles.get_mut("p").expect("the profile").sent_ttl_ms = limit;
+            let counts = match spec.validate() {
+                Ok(engine) => Ok(engine.sent_credits.len()),
+                Err(SpecError::BadField { path, .. }) => Err(path),
+                Err(other) => panic!("{term} under {limit:?}: {other:?}"),
+            };
+            assert_eq!(
+                counts,
+                want.map_err(str::to_owned),
+                "{term} under {limit:?}"
+            );
+        }
     }
 
     #[test]

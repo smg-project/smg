@@ -63,6 +63,8 @@ fn the_committed_schema_admits_least_cost_with_terms_and_a_margin() {
             "load.resident_tokens",
             "load.running",
             "load.waiting_uncached_tokens",
+            "sent.requests",
+            "sent.tokens",
         ])
     );
     let coefficient = &terms["additionalProperties"];

@@ -817,7 +817,9 @@
               "load.queued",
               "load.resident_tokens",
               "load.running",
-              "load.waiting_uncached_tokens"
+              "load.waiting_uncached_tokens",
+              "sent.requests",
+              "sent.tokens"
             ]
           }
         },
