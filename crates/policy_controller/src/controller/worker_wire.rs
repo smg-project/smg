@@ -69,17 +69,11 @@ pub(crate) fn of_a_new_row(refusal: &Refused) -> bool {
 /// The bounds of what a row states (contract: `WorkerSpec`). A row tells
 /// its URL three times, a replacement's answer carries two rows and a
 /// snapshot pages at 128 rows: under these each fits a frame of 4 MiB.
-///
-/// A URL's bytes.
-const URL_BYTES: usize = 2_048;
-/// The bytes of a name: a runtime, a zone, a model id.
-const NAME_BYTES: usize = 256;
-/// A label's key, in bytes.
-const KEY_BYTES: usize = 128;
-/// A label's value, in bytes.
-const VALUE_BYTES: usize = 4_096;
-/// The labels of one row.
-const LABELS: usize = 128;
+const URL_BYTES: usize = WorkerFacts::URL_BYTES;
+const NAME_BYTES: usize = WorkerFacts::NAME_BYTES;
+const KEY_BYTES: usize = WorkerFacts::LABEL_KEY_BYTES;
+const VALUE_BYTES: usize = WorkerFacts::LABEL_VALUE_BYTES;
+const LABELS: usize = WorkerFacts::LABELS;
 /// The model ids of one row: a limit of this build and no number of the
 /// contract, said again once the store's cost of a row's ids is measured.
 pub(super) const MODELS: usize = 128;

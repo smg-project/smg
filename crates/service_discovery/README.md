@@ -31,19 +31,26 @@ of a mesh is a different concern, and it stays in the gateway.
 
 ```toml
 [dependencies]
-smg-service-discovery.workspace = true
+smg-service-discovery = { workspace = true, features = ["kubernetes"] }
 ```
 
-A host implements `DiscoveryHost`. It resolves its settings with
+A host names the providers it runs as features, and implements
+`DiscoveryHost`. It resolves its settings with
 `RuntimeDiscoveryConfig::from_config`, and hands the result and itself to
 `start_service_discovery`, which starts the selected provider's task. The
 crate's top-level docs list its modules.
 
 ## Features
 
-The default feature set is empty, and no feature selects a provider: every
-build holds all four providers and the directory watch.
+The default feature set is empty: a host names the providers it runs and
+builds no other. Settings for a provider the build does not hold are refused,
+in words that name the provider and its feature.
 
 | Feature | What it adds |
 |---|---|
-| `test-util` | For the tests of a crate that hosts discovery: the Kubernetes provider started on a client the test hands it, a pod fixture, and a double of the host trait whose job queue records what it took. |
+| `kubernetes` | The Kubernetes provider, and the pod helpers a host's own pod readers share. |
+| `file` | The file provider, and the manifest a host writes its registry out as. It names `fs-watch`. |
+| `slurm` | The Slurm provider. |
+| `consul` | The Consul provider. |
+| `fs-watch` | The directory watch alone, for a host's own file readers. |
+| `test-util` | For the tests of a crate that hosts discovery: a double of the host trait whose job queue records what it took and, under `kubernetes`, that provider started on a client the test hands it and a pod fixture. |

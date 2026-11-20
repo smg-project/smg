@@ -72,6 +72,7 @@ pub mod journal;
 pub mod kv_events;
 pub mod leases;
 pub mod loads;
+pub mod membership;
 pub mod memory;
 pub mod pairing;
 pub mod reservations;
@@ -93,10 +94,11 @@ pub use kv_events::{
     SnapshotChunk,
 };
 pub use leases::{
-    DecodeSide, Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Picked, Said,
+    DecodeSide, Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Picked, Said, Sides,
 };
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
-pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts};
+pub use membership::{Laid, NotMaker};
+pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts, Watch};
 pub use pairing::{PairClasses, PairingDescriptor};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};

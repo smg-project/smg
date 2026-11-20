@@ -430,12 +430,60 @@ pub fn available_cpus() -> usize {
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 impl ConfigValidator {
-    pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
+    /// The shapes of the routing part: the mode, the bounds, the policy, the
+    /// routing-key headers and the cache boundaries. A start's first checks.
+    fn validate_routing_shapes(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_routing_key_headers(config)?;
-        Self::validate_cache_boundaries(&config.cache_boundaries)?;
+        Self::validate_cache_boundaries(&config.cache_boundaries)
+    }
+
+    /// The two overload thresholds. They are `>=` comparisons, so the
+    /// excluded ends of these ranges are exactly the values that would veto
+    /// every worker unconditionally. Mirrors the CLI parsers for the
+    /// config-file and bindings paths.
+    fn validate_overload_thresholds(config: &RouterConfig) -> ConfigResult<()> {
+        if config.worker_overload_waiting_requests == Some(0) {
+            return Err(ConfigError::invalid_value(
+                "worker_overload_waiting_requests",
+                "0",
+                "Must be >= 1 (0 would mark every worker overloaded)",
+            ));
+        }
+        if let Some(threshold) = config.worker_overload_token_usage {
+            if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
+                return Err(ConfigError::invalid_value(
+                    "worker_overload_token_usage",
+                    threshold,
+                    "Must be a fraction in (0.0, 1.0]",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The validator's checks of the routing part, in a start's order: its
+    /// shapes, the overload thresholds, the tenant header's name, the
+    /// discovery settings, then the fit of the policies to the pools. A
+    /// start runs them among its other checks ([`Self::validate`]), and
+    /// then resolves a discovery provider's own configuration: a Consul
+    /// address and the Consul environment are checked there alone.
+    /// `--print-policy-spec` runs these alone, over a configuration that
+    /// holds the routing part alone. None reads a file.
+    pub(crate) fn validate_routing(config: &RouterConfig) -> ConfigResult<()> {
+        Self::validate_routing_shapes(config)?;
+        Self::validate_overload_thresholds(config)?;
+        Self::validate_tenant_resolution(config)?;
+        if let Some(discovery) = &config.discovery {
+            Self::validate_discovery(discovery, &config.mode)?;
+        }
+        Self::validate_compatibility(config)
+    }
+
+    pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        Self::validate_routing_shapes(config)?;
         Self::validate_server_settings(config)?;
         Self::validate_cors_allowed_origins(config)?;
         Self::validate_value_shapes(config)?;
@@ -1319,26 +1367,7 @@ impl ConfigValidator {
             ));
         }
 
-        // Overload thresholds are `>=` comparisons, so the excluded ends of
-        // these ranges are exactly the values that would veto every worker
-        // unconditionally. Mirrors the CLI parsers for the config-file and
-        // bindings paths.
-        if config.worker_overload_waiting_requests == Some(0) {
-            return Err(ConfigError::invalid_value(
-                "worker_overload_waiting_requests",
-                "0",
-                "Must be >= 1 (0 would mark every worker overloaded)",
-            ));
-        }
-        if let Some(threshold) = config.worker_overload_token_usage {
-            if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
-                return Err(ConfigError::invalid_value(
-                    "worker_overload_token_usage",
-                    threshold,
-                    "Must be a fraction in (0.0, 1.0]",
-                ));
-            }
-        }
+        Self::validate_overload_thresholds(config)?;
 
         require_positive("request_timeout_secs", config.request_timeout_secs)?;
 

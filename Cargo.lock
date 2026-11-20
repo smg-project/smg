@@ -2233,6 +2233,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "zeromq",
 ]
 
 [[package]]
@@ -7813,7 +7814,6 @@ dependencies = [
  "metrics-util",
  "mock-worker",
  "ndarray",
- "notify",
  "once_cell",
  "openai-harmony",
  "openai-protocol",
@@ -7851,6 +7851,7 @@ dependencies = [
  "smg-mcp",
  "smg-mesh",
  "smg-mm-rdma",
+ "smg-policy-controller",
  "smg-response-template",
  "smg-rl",
  "smg-service-discovery",
@@ -8002,6 +8003,7 @@ dependencies = [
 name = "smg-grpc-client"
 version = "1.17.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
  "h2",
@@ -8128,6 +8130,7 @@ dependencies = [
  "sha2 0.11.0",
  "smg-grpc-client",
  "smg-policy-controller",
+ "smg-worker",
  "tempfile",
  "thiserror 2.0.21",
  "thread_local",

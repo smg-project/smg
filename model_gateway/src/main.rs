@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, process::ExitCode};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
@@ -674,6 +674,19 @@ struct RoutingArgs {
     /// workload where every request has a holder. 0 disables.
     #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
     worker_warmup_divert_every: u64,
+
+    /// Print the policy document these routing flags mean, as YAML, and
+    /// exit. The routing part of the line is read and checked as a start
+    /// checks it: the routing flags, the discovery flags and the tenant
+    /// header's name. A Consul address and the Consul environment are
+    /// resolved at a start alone. A flag of a wrong shape is refused first,
+    /// as at a start. Nothing is started and no file is read, so no secret
+    /// and no key. A start checks the rest of the command line. A setting the
+    /// document cannot say yet, and a part of the document this build's
+    /// controller does not run yet, is named in one sentence on stderr, and
+    /// the exit is then a failure
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    print_policy_spec: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1975,19 +1988,48 @@ fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> 
     server::run(&runtime, server_config)
 }
 
+/// Says the refusal of a `--print-policy-spec` on stderr, as its type writes
+/// the sentence, and answers with the failing exit. `main`'s own error
+/// return would print the type's debug form.
+#[expect(
+    clippy::print_stderr,
+    reason = "the refusal of --print-policy-spec, said before any logger is up"
+)]
+fn refused_print(refusal: &str) -> ExitCode {
+    eprintln!("error: {refusal}");
+    ExitCode::FAILURE
+}
+
 /// The start-up sequence: parse, resolve the secrets' sources, announce,
 /// configure, serve. The version flags are answered first, before clap sees
-/// the line.
-#[expect(clippy::print_stdout, reason = "the version flags' answer")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// the line. `--print-policy-spec` is answered right after the parse, ahead
+/// of the secrets and the banner: its output is the document alone, it
+/// reads no secret, and nothing is started. A refusal of it is a failing
+/// exit with its sentence on stderr; every other failure is the error return.
+#[expect(
+    clippy::print_stdout,
+    reason = "the answers of the version flags and of --print-policy-spec"
+)]
+fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     register_jemalloc_as_global_allocator();
     let args: Vec<String> = std::env::args().collect();
     if let Some(version) = version_flag(&args) {
         println!("{version}");
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     let command_line = CommandLine::split(&args);
     let (mut cli_args, igw_enabled_for_discovery) = parse_cli_args(command_line.clap_args);
+    if cli_args.routing.print_policy_spec {
+        let (prefill, encode) = (command_line.prefill_urls, command_line.encode_urls);
+        let answer = cli_args.policy_spec_print(prefill, encode);
+        if let Some(document) = answer.document() {
+            print!("{document}");
+        }
+        return Ok(match answer.refusal() {
+            Some(refusal) => refused_print(refusal),
+            None => ExitCode::SUCCESS,
+        });
+    }
     cli_args.resolve_secret_sources(&process_env)?;
     cli_args.announce(
         igw_enabled_for_discovery,
@@ -1995,7 +2037,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &command_line.encode_urls,
     );
     let server_config = cli_args.configure(command_line.prefill_urls, command_line.encode_urls)?;
-    serve(server_config)
+    serve(server_config)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
@@ -4707,7 +4750,7 @@ mod tests {
     /// The runtime pin only disambiguates the ZMQ wire protocol: gRPC (and
     /// HTTP) workers keep backend auto-detection even when `--backend` names an
     /// engine, and a ZMQ deployment without `--backend` stays unpinned
-    /// (detect_backend's vLLM default applies).
+    /// (the registration's ZMQ label step applies its vLLM default).
     #[test]
     fn startup_worker_runtime_stays_unpinned_off_the_zmq_path() {
         let grpc = cli_args_from(&[

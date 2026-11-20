@@ -1,8 +1,4 @@
 mod create_worker;
-mod detect_backend;
-mod detect_connection;
-mod discover_dp;
-mod discover_metadata;
 mod ensure_harmony_encoding;
 mod find_worker_to_update;
 mod rediscover_labels;
@@ -14,14 +10,11 @@ pub(crate) mod test_support;
 mod update_policies_for_worker;
 mod update_remaining_policies;
 mod update_worker_properties;
+mod zmq_labels;
 
 use std::{sync::Arc, time::Duration};
 
 pub use create_worker::CreateLocalWorkerStep;
-pub use detect_backend::DetectBackendStep;
-pub use detect_connection::DetectConnectionModeStep;
-pub use discover_dp::{get_dp_info, DiscoverDPInfoStep, DpInfo};
-pub use discover_metadata::DiscoverMetadataStep;
 pub use ensure_harmony_encoding::EnsureHarmonyEncodingStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;
 use openai_protocol::worker::WorkerUpdateRequest;
@@ -36,6 +29,7 @@ pub use update_policies_for_worker::UpdatePoliciesForWorkerStep;
 pub use update_remaining_policies::UpdateRemainingPoliciesStep;
 pub use update_worker_properties::UpdateWorkerPropertiesStep;
 use wfaas::{BackoffStrategy, RetryPolicy, StepDefinition, WorkflowDefinition};
+pub(crate) use zmq_labels::{DiscoverZmqLabelsStep, ZMQ_LABELS_STEP};
 
 use crate::{
     app_context::AppContext,

@@ -19,18 +19,21 @@
 //! of their registration keys, so a cut answer names the same rows at each
 //! call while the rows stand.
 //!
-//! The rows are the feed's cut at the log's last watched write, read as a
-//! watch's start reads them
-//! ([`Feed::rows_at_head`](super::watch_workers::Feed::rows_at_head)). The
-//! first read at a place copies every row under the membership lock,
-//! whatever the limit, and each read that starts there shares that copy.
-//! So calls one behind another hold that lock once a write, as watches do:
-//! a call let in shares the copy as a watch can. The last call out lets
-//! the copy go where no watch is open to share it ([`Turn`],
+//! The rows come by one of three roads ([`read`]). A cut kept at the log's
+//! last watched write is shared with no copy, as a watch's start shares it
+//! ([`Feed::rows_at_head`](super::watch_workers::Feed::rows_at_head)).
+//! Where another call is let in or a watch is open, the first read at a
+//! place copies every row under the membership lock and keeps the copy,
+//! and each read that starts there shares it: calls that come together
+//! hold that lock once a write, as watches do. A call with no limit and no
+//! models takes that road too, alone or not: it would copy every row
+//! anyway, and a call let in while it runs shares the copy. The last call
+//! out lets the copy go where no watch is open to share it ([`Turn`],
 //! [`Watchers::unshared`](super::watch_workers::Watchers::unshared)): a
-//! copy of every row is held only while a reader can share it. A lone call
-//! with no watch open is its own last call out: a loop of such calls
-//! copies once a call.
+//! copy of every row is held only while a reader can share it. Any other
+//! call that is alone with no watch open copies the rows it may tell and
+//! keeps nothing ([`MemoryStore::rows_serving`]): its limit's worth, or
+//! every row its models serve where it states no limit.
 //!
 //! A decision reads the published world and does not wait on that lock.
 //! Whatever takes it waits for a copy, on the thread that brought it.
@@ -65,7 +68,7 @@ use super::{generations::Generations, replication::age_ms, watch_workers, worker
 use crate::{
     ingest::loads::{split, Address, UNPARSABLE},
     proto::{self, snapshot_request::Slice},
-    store::{Cut, WorkerRow},
+    store::{Cut, MemoryStore, WorkerRow},
 };
 
 /// Every slice of the contract, in its order.
@@ -115,9 +118,10 @@ fn names(keep: impl Fn(Slice) -> bool) -> String {
         .join(", ")
 }
 
-/// One snapshot at a time, off the runtime's workers. A snapshot copies
-/// every worker row under the membership lock and builds its answer from
-/// the copy: tens of milliseconds and megabytes at ten thousand rows. A
+/// One snapshot at a time, off the runtime's workers. A snapshot builds its
+/// answer from the rows it reads ([`read`]). The first read behind a write
+/// that somebody can share copies every worker row under the membership
+/// lock: tens of milliseconds and megabytes at ten thousand rows. A
 /// second call waits its turn, in the order the calls came, and a call past
 /// the [`SNAPSHOTS_WAITING`] that wait is told to ask again. The take holds
 /// the turn, so a caller that leaves frees it no earlier than its take
@@ -193,7 +197,6 @@ impl Turn {
 
     /// The calls let in at this instant: the one taken and the ones that
     /// wait.
-    #[cfg(test)]
     pub(crate) fn let_in(&self) -> usize {
         self.let_in.load(Ordering::Acquire)
     }
@@ -300,9 +303,57 @@ pub(crate) fn asked(request: proto::SnapshotRequest) -> Result<Asked, Status> {
     })
 }
 
+/// The rows a take reads ([`read`]).
+pub(crate) enum Rows {
+    /// The feed's cut at the log's head, shared.
+    Shared(Arc<Cut>),
+    /// The limit's worth of the rows that serve the asked models, in key
+    /// order, and the count that serve.
+    Told(Vec<WorkerRow>, usize),
+}
+
+/// The rows of one take, by the cheapest road that keeps calls that come
+/// together at one copy a write. A cut kept at the log's head is shared
+/// with no copy. Where another call is let in or a watch is open the
+/// feed's cut is taken and kept: somebody can share it. A call with no
+/// limit and no models takes it too: it would copy every row anyway, and a
+/// call let in while it runs shares the copy. Any other call that is alone
+/// with no watch open reads the rows it may tell and keeps nothing.
+pub(crate) fn read(
+    asked: &Asked,
+    turn: &Turn,
+    feed: &watch_workers::Feed,
+    watchers: &watch_workers::Watchers,
+    store: &MemoryStore,
+) -> Rows {
+    if let Some(cut) = feed.kept_at_head() {
+        return Rows::Shared(cut);
+    }
+    let every = asked.limit == usize::MAX && asked.models.is_empty();
+    if every || turn.let_in() > 1 || watchers.open() {
+        return Rows::Shared(feed.rows_at_head(store));
+    }
+    let (rows, serving) = store.rows_serving(&asked.models, asked.limit);
+    Rows::Told(rows, serving)
+}
+
+/// What [`rows`] tells of a cut, told of the rows one call read for itself:
+/// `read` is the limit's worth of the `serving` rows that serve the asked
+/// models, in key order.
+fn read_rows(
+    read: &[WorkerRow],
+    serving: usize,
+    asked: &Asked,
+    now: Instant,
+) -> (Vec<proto::WorkerRow>, bool) {
+    let told = watch_workers::fill_within(asked.limit, read.iter(), |row| redacted(row, now));
+    let truncated = told.len() < serving;
+    (told, truncated)
+}
+
 /// The snapshot `asked` for, as this replica holds it at `now` under
-/// `term`: the header, then each slice asked. The rows are `cut`'s, which
-/// is read where the worker rows are asked and never else. The spec slice
+/// `term`: the header, then each slice asked. The rows are `read`'s, which
+/// is called where the worker rows are asked and never else. The spec slice
 /// of a controller with no spec source is refused ahead of the turn
 /// ([`Asked::sourced`]), and the take keeps its own read of the source,
 /// before a row is copied. The header's generation is the spec slice's own
@@ -312,7 +363,7 @@ pub(crate) fn taken(
     asked: &Asked,
     term: u64,
     controller_id: &str,
-    cut: impl FnOnce() -> Arc<Cut>,
+    read: impl FnOnce() -> Rows,
     generations: &Generations,
     now: Instant,
 ) -> Result<proto::Snapshot, Status> {
@@ -325,7 +376,10 @@ pub(crate) fn taken(
         None
     };
     let (workers, truncated) = if asked.workers {
-        rows(&cut().rows, asked, now)
+        match read() {
+            Rows::Shared(cut) => rows(&cut.rows, asked, now),
+            Rows::Told(read, serving) => read_rows(&read, serving, asked, now),
+        }
     } else {
         (Vec::new(), false)
     };
@@ -411,8 +465,8 @@ mod tests {
     use tonic::Code;
 
     use super::{
-        asked, rows, served, taken, without_userinfo, Asked, Turn, SLICES, SNAPSHOTS_WAITING,
-        UNPARSABLE,
+        asked, read_rows, rows, served, taken, without_userinfo, Asked, Rows, Turn, SLICES,
+        SNAPSHOTS_WAITING, UNPARSABLE,
     };
     use crate::{
         catalog::Catalog,
@@ -422,7 +476,7 @@ mod tests {
             worker_wire,
         },
         proto::{self, snapshot_request::Slice},
-        store::{Cut, Kinds, MemoryStore, WorkerFacts, WorkersStore},
+        store::{Kinds, MemoryStore, WorkerFacts, WorkersStore},
     };
 
     /// The rows slice alone: every model, no limit.
@@ -777,6 +831,12 @@ mod tests {
         let (page, truncated) = rows(&cut.rows, &ROWS, Instant::now());
         assert_eq!((page.len(), truncated), (1, true));
         assert!(page[0].url.starts_with("grpc://0."));
+        // A lone call's own read is held to the same bytes.
+        let asked = Asked { limit: 3, ..ROWS };
+        let (read, serving) = store.rows_serving(&asked.models, asked.limit);
+        let (page, truncated) = read_rows(&read, serving, &asked, Instant::now());
+        assert_eq!((page.len(), truncated), (1, true));
+        assert!(page[0].url.starts_with("grpc://0."));
     }
 
     /// The count of a watch's page is no bound of a snapshot. A watch pages
@@ -819,6 +879,48 @@ mod tests {
         assert_eq!(told(1), (serving[..1].to_vec(), true));
     }
 
+    /// The rows a lone call reads for itself are the rows a shared cut
+    /// tells, with the same word on what was left out: limit by limit, a
+    /// limit of zero among them, with a models filter and with none, and
+    /// with a list of models out of order. No more rows are copied than
+    /// the limit tells.
+    #[test]
+    fn the_rows_read_for_one_call_are_the_cuts_rows() {
+        let store = MemoryStore::new();
+        let models = ["model-a", "model-b", "model-a", "model-b", "model-a"];
+        for (n, model) in models.into_iter().enumerate() {
+            register(&store, &url(n), model);
+        }
+        let cut = store.cut(Kinds::Watched);
+        let filters = [
+            Vec::new(),
+            vec!["model-b".to_owned()],
+            vec!["model-c".to_owned()],
+            vec![
+                "model-d".to_owned(),
+                "model-c".to_owned(),
+                "model-b".to_owned(),
+            ],
+        ];
+        for models in filters {
+            for limit in [0, 1, 2, 3, 5, 6, usize::MAX] {
+                let asked = Asked {
+                    models: models.clone(),
+                    limit,
+                    ..ROWS
+                };
+                let now = Instant::now();
+                let (read, serving) = store.rows_serving(&asked.models, asked.limit);
+                assert!(read.len() <= limit, "models {models:?}, limit {limit}");
+                assert_eq!(
+                    read_rows(&read, serving, &asked, now),
+                    rows(&cut.rows, &asked, now),
+                    "models {models:?}, limit {limit}"
+                );
+            }
+        }
+    }
+
     /// A controller with no spec source serves its rows under the header
     /// and refuses the spec slice by its name, in the spec calls' words.
     /// The answer names no place of the log: no standby starts from it.
@@ -832,7 +934,7 @@ mod tests {
                 asked,
                 3,
                 "controller-0",
-                || Arc::new(store.cut(Kinds::Watched)),
+                || Rows::Shared(Arc::new(store.cut(Kinds::Watched))),
                 &generations,
                 Instant::now(),
             )
@@ -902,7 +1004,7 @@ mod tests {
             &status,
             1,
             "controller-0",
-            || -> Arc<Cut> { panic!("no row is asked: no cut is read") },
+            || -> Rows { panic!("no row is asked: no row is read") },
             &generations,
             Instant::now(),
         )

@@ -44,6 +44,8 @@
 //! with it, so the ceiling of watches bounds what a principal leaves
 //! unread.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     pin::Pin,
     sync::Arc,
@@ -113,21 +115,19 @@ pub(crate) struct Feed {
     /// watch leaves, and by the last snapshot call out with no watch open:
     /// a copy of every row is held only while a reader can share it.
     rows: Arc<Mutex<Option<Arc<Cut>>>>,
+    /// The cuts of every row this feed took, for a case.
+    #[cfg(test)]
+    cuts: Arc<AtomicUsize>,
 }
 
 impl Feed {
-    /// The feed of `log`, whose watched writes wake the feed's one task,
-    /// each once its store has let its locks go. The store that journals
-    /// to the log is built beside it
-    /// ([`journaled`](super::replication::journaled)).
-    pub(crate) fn of(log: Log) -> Self {
-        let landed = Arc::new(Notify::new());
-        let log = {
-            let landed = Arc::clone(&landed);
-            // One wake of one task, whatever the count of watches. While
-            // that task is busy or not started the wake is kept, once.
-            Arc::new(log.on_watched(move || landed.notify_one()))
-        };
+    /// The feed of `log`, whose watched writes wake the feed's one task
+    /// through `landed`, each once its store has let its locks go: one wake
+    /// of one task, whatever the count of watches, and while that task is
+    /// busy or not started the wake is kept, once. The log's listener is
+    /// made where the log is, beside the store that journals to it
+    /// ([`journaled_at`](super::replication::journaled_at)).
+    pub(crate) fn of(log: Arc<Log>, landed: Arc<Notify>) -> Self {
         Self {
             log,
             landed,
@@ -135,6 +135,8 @@ impl Feed {
             teller: Arc::default(),
             unwired: Arc::default(),
             rows: Arc::default(),
+            #[cfg(test)]
+            cuts: Arc::default(),
         }
     }
 
@@ -209,8 +211,25 @@ impl Feed {
             return Arc::clone(cut);
         }
         let cut = Arc::new(store.cut(Kinds::Watched));
+        #[cfg(test)]
+        self.cuts.fetch_add(1, Ordering::Relaxed);
         *kept = Some(Arc::clone(&cut));
         cut
+    }
+
+    /// The kept cut where it stands at the log's last watched write: what a
+    /// read shares with no copy. None where a write moved the log past it,
+    /// and where none is kept.
+    pub(crate) fn kept_at_head(&self) -> Option<Arc<Cut>> {
+        let kept = self.rows.lock();
+        let head = self.log.head(Kinds::Watched);
+        kept.as_ref().filter(|cut| cut.at == head).cloned()
+    }
+
+    /// The cuts of every row this feed took, for a case.
+    #[cfg(test)]
+    pub(crate) fn cuts(&self) -> usize {
+        self.cuts.load(Ordering::Relaxed)
     }
 
     /// The kept cut, for a case.
@@ -487,10 +506,14 @@ impl Watchers {
     /// given back first, as there: a watch that opens now takes a cut of
     /// its own at worst.
     pub(crate) fn unshared(&self, feed: &Feed) {
-        let none = self.held.lock().is_empty();
-        if none {
+        if !self.open() {
             *feed.rows.lock() = None;
         }
+    }
+
+    /// Whether a watch holds a seat: a reader that can share a kept cut.
+    pub(crate) fn open(&self) -> bool {
+        !self.held.lock().is_empty()
     }
 
     /// The watches `by` holds open.

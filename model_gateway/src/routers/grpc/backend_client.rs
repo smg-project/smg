@@ -24,7 +24,9 @@ use openai_protocol::{
     worker::{ProfileOptions, WorkerLoadResponse},
 };
 use smg_grpc_client::{
-    common_proto, connect_channel_with_timeout, sglang_proto,
+    common_proto, connect_channel_with_timeout,
+    engine_labels::{ModelInfo, ServerInfo},
+    sglang_proto,
     tokenizer_bundle::StreamBundle,
     tokenspeed_encoder::{tokenspeed_encoder_proto as tokenspeed_encoder, TokenSpeedEncoderClient},
     tokenspeed_proto, vllm_proto, OutputConstraint, SglangGenerateRequestOptions,
@@ -44,8 +46,8 @@ use smg_worker::{
 
 use crate::routers::grpc::{
     client::{
-        GenerateRequestBuildOptions, GrpcClient, HealthCheckResponse, ModelInfo, ServerInfo,
-        TokenSpeedMmBuilder, TokenSpeedPlainBuilder, VllmMmBuilder, VllmPlainBuilder,
+        GenerateRequestBuildOptions, GrpcClient, HealthCheckResponse, TokenSpeedMmBuilder,
+        TokenSpeedPlainBuilder, VllmMmBuilder, VllmPlainBuilder,
     },
     common::stages::helpers,
     proto_wrapper::{

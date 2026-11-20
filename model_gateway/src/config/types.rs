@@ -651,6 +651,13 @@ pub struct RouterConfig {
     /// When set, wraps all storage backends with hook-based interceptors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_hook_wasm_path: Option<String>,
+    /// Which code decides a request's worker: the classic policies (off, the
+    /// default) or the policy controller in this process (on). One temporary
+    /// setting, whole for a process. At this step it is for tests alone: no
+    /// flag, no binding keyword and no chart value sets it, and it is in no
+    /// serialized form.
+    #[serde(skip)]
+    pub policy_controller: bool,
 }
 
 /// Capacity threshold for one PD role.
@@ -2066,6 +2073,7 @@ impl Default for RouterConfig {
             mcp_config: None,
             enable_wasm: false,
             storage_hook_wasm_path: None,
+            policy_controller: false,
             server_cert: None,
             server_key: None,
             server_key_path: None,

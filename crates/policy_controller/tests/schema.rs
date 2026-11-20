@@ -71,6 +71,7 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
         "profiles",
         "plans",
         "bindings",
+        "explain",
     ]
     .into_iter()
     .collect();

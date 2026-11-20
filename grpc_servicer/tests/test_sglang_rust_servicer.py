@@ -933,7 +933,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
 
     monkeypatch.setattr(rust, "launch_scheduler_ranks", fake_launch)
 
-    async def fake_supervise(server, engine, *, drain_secs):
+    async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
         assert isinstance(server, FakeServer) and engine == "engine"
         return 7
 
@@ -1026,7 +1026,8 @@ def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_pat
     _run_serve_rust(monkeypatch, tmp_path, real_facts=True)
     recorded = _run_serve_rust.recorded
     assert recorded["server"].ready == [] and recorded["server"].serving == []
-    assert recorded["supervise_kwargs"] == {}
+    assert "warmup" not in recorded["supervise_kwargs"]
+    assert recorded["supervise_kwargs"]["linger_secs"] == rust_lifecycle.DRAIN_LINGER_SECS
 
 
 def test_a_disaggregation_role_plans_its_warm_up_without_a_peer(monkeypatch, tmp_path):
@@ -1395,7 +1396,7 @@ def test_serve_rust_serves_a_prefill_decode_launch(monkeypatch, tmp_path):
         lambda server_args, *, handshake_port: launched.setdefault("args", server_args),
     )
 
-    async def fake_supervise(server, engine, *, drain_secs):
+    async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
         return 0
 
     monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)

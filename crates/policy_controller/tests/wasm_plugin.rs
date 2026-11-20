@@ -2442,9 +2442,19 @@ fn a_lone_spinner_on_an_armed_thread_is_charged_and_the_failure_rule_opens_it() 
 
 /// Two plugins in one profile: the scorer spends most of the budget, the
 /// picker runs out under what is left. The decision's budget is spent, the
-/// picker's instance goes, and the picker's breaker is untouched.
+/// picker's instance goes, and the picker's breaker is untouched. A call is
+/// late by the wall clock: a try whose thread was held off the CPU reads a
+/// late call that nothing read, and is made again.
 #[test]
 fn an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent() {
+    tried(an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent_in_a_try);
+}
+
+/// One try of the case above, told its number: whether it stood.
+fn an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent_in_a_try(
+    made: u32,
+) -> bool {
+    const CASE: &str = "an exhaustion under another plugin's clamp";
     let runtime = runtime();
     let scorer = load_slow(
         &runtime,
@@ -2488,6 +2498,7 @@ fn an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent() {
     // A burn and a half, plus a little for the constructors: the scorer's
     // burn fits, the picker's does not.
     let budget_micros = u32::try_from((burn * 3 / 2).div_ceil(fuel_per_micro) + 20).expect("fits");
+    let (wall, cpu) = (std::time::Instant::now(), bound_clock());
     let decision = engine.decide(
         &RequestFacts {
             budget_micros,
@@ -2502,11 +2513,20 @@ fn an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent() {
         &Constraints::default(),
         &mut Scratch::new(),
     );
+    let held = off_cpu_since(wall, cpu);
     assert!(
         matches!(decision, Decision::Pick(_)),
         "the fallback picker decides"
     );
     let (s, p) = (scorer.stats(), picker.stats());
+    let stood = (s.fuel_exhausted, s.traps, s.answered - gauged) == (0, 0, 2)
+        && (p.fuel_exhausted, p.traps, p.budget_spent) == (0, 0, 1)
+        && (p.unread, p.stalls) == (0, 0)
+        && (p.instantiations, p.lazy_instantiations) == (2, 1)
+        && p.breaker_opens == 0;
+    if held_counts_are_made_again(CASE, stood, held, made) {
+        return false;
+    }
     assert_eq!(
         (s.fuel_exhausted, s.traps, s.answered - gauged),
         (0, 0, 2),
@@ -2528,6 +2548,7 @@ fn an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent() {
         "the picker's interrupted instance went and the close rebuilt it: {p:?}"
     );
     assert_eq!(p.breaker_opens, 0);
+    true
 }
 
 /// The decision's first open seeds its budget and every later open draws on
@@ -3865,10 +3886,16 @@ struct LeftLent {
 
 impl LeftLent {
     fn by_a_thread_that_exited(name: &str) -> Self {
-        let plugin = loaded(
-            &runtime(),
-            spec(name, guest::record_guest(), mode::LOG_IN_DESTRUCTOR),
-        );
+        let row = spec(name, guest::record_guest(), mode::LOG_IN_DESTRUCTOR);
+        Self::of(&runtime(), row)
+    }
+
+    /// As [`Self::by_a_thread_that_exited`], the plugin loaded from `row` on
+    /// `runtime`: a guest of the row's mode writes a log line in its
+    /// destructor.
+    fn of(runtime: &Arc<Runtime>, row: PluginSpec) -> Self {
+        let name = row.name.clone();
+        let plugin = loaded(runtime, row);
         let engine = single_engine(Profile {
             name: "one-stage".into(),
             filters: vec![],
@@ -3885,7 +3912,7 @@ impl LeftLent {
             place: thread_local::ThreadLocal::new(),
         };
         left.place.get_or_default().set(false);
-        panic_in_a_line_of(name);
+        panic_in_a_line_of(&name);
         let ended = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
@@ -4032,6 +4059,85 @@ fn a_turn_under_the_same_name_in_a_place_left_lent_runs_on_the_state_at_rest() {
         shared,
         Some((true, [0, 1], (2, false), 0, 2)),
         "the second thread's turn as decider 1 heard the two changes on the state at rest, kept no instance of the stale hold, and left that state at rest"
+    );
+}
+
+/// A hold of the same decider is checked by the open that reaches the bring,
+/// also where the open breaker turned the decision's first open away. The
+/// first thread exits with decider 1's instance in its place ([`LeftLent`]),
+/// and decider 1 takes a turn on the case's own thread: the rest names that
+/// place. A warm-up then faults on a snapshot of five and opens the breaker,
+/// and four members go. The thread that takes the first thread's place
+/// decides a pair as decider 1. Its prefill side meets the open breaker, the
+/// cool-down ends inside that side's scope, and the decode side's open is
+/// the first to reach the bring. The hold it finds is stale: it drops it and
+/// decides on the state at rest, which hears the list as it stands and rests
+/// behind the decision, so decider 1's next decision on the case's thread
+/// hears nothing. On the instance the first thread left, the close would
+/// come late, and that next decision would hear the list again.
+#[test]
+fn a_hold_is_checked_by_the_open_that_reaches_the_bring_behind_an_open_breaker() {
+    use smg_policy_controller::Membership;
+    const START: u64 = 1_000_000;
+    const COOL_DOWN: u64 = 1_000_000;
+    // The host's clock is the case's own: the cool-down ends when the
+    // prefill side's scope says so.
+    static CLOCK: AtomicU64 = AtomicU64::new(START);
+    // One pair: whether the second thread stood in the first's place, what
+    // decider 1's first turn here heard, the warm-up's fault, what the pair
+    // decision heard and bypassed, and what decider 1's next turn here heard.
+    let pair = || {
+        CLOCK.store(START, Ordering::Relaxed);
+        let runtime = Arc::new(
+            Runtime::with_clock(&OpenDecisions::new(), || CLOCK.load(Ordering::Relaxed))
+                .expect("a runtime"),
+        );
+        let mode = mode::TRAP_ON_FIVE_AND_LOG_IN_DESTRUCTOR;
+        let mut row = spec("corner", guest::record_guest(), mode);
+        row.breaker = BreakerSpec {
+            failures: 1,
+            window_micros: 60_000_000,
+            cooldown_micros: COOL_DOWN,
+        };
+        let left = LeftLent::of(&runtime, row);
+        let anew = left.heard_as_decider_1();
+        let five: Vec<WorkerId> = (100..105).map(WorkerId).collect();
+        left.engine.on_membership(&Membership::Snapshot(&five));
+        left.plugin.warm().expect("the warm-up's own work is done");
+        let warmed = left.plugin.stats();
+        for id in [104, 103, 102, 101] {
+            left.engine
+                .on_membership(&Membership::Removed(WorkerId(id)));
+        }
+        let plain = Arc::new(plugin_engine(&left.plugin));
+        let ends = Inside::MovesTheClock(&CLOCK, START + COOL_DOWN);
+        let prefill = profile_that(&left.plugin, &plain, ends);
+        let decode = plugin_profile(&left.plugin, None, None, None);
+        let engine = pair_engine(vec![prefill, decode], 1);
+        let (shared, paired) = left.taken(|left| {
+            let before = left.plugin.stats();
+            let _turn = Decider::new(1).enter();
+            let _ = pair_decide(&engine);
+            let after = left.plugin.stats();
+            (
+                after.observed - before.observed,
+                after.bypassed - before.bypassed,
+            )
+        });
+        let next = left.heard_as_decider_1();
+        (
+            shared,
+            anew,
+            (warmed.traps, warmed.breaker_opens),
+            paired,
+            next,
+        )
+    };
+    let shared = (0..PLACES).map(|_| pair()).find(|(shared, ..)| *shared);
+    assert_eq!(
+        shared,
+        Some((true, 0, (1, 1), (1, 1), 0)),
+        "the decode side's open checked the hold: the state at rest heard the list and rests behind the pair"
     );
 }
 
@@ -4780,7 +4886,9 @@ fn a_score_the_host_held_that_then_declines_is_a_decline_and_the_hosts_stall() {
 /// hold and half of what the hold leaves of the budget, where the calls
 /// after the score run out under what is left. The case's hold is off the
 /// CPU and a decision's own work is not: a call that work ends is the
-/// host's fault, however long its decision took.
+/// host's fault, however long its decision took. A budget spent with no
+/// call failed is the runner's wherever the time went: the hold leaves
+/// four tenths of the budget, and the clock alone took the rest.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn one_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool) {
     let runtime = runtime();
@@ -4804,13 +4912,16 @@ fn one_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool)
     // of that again was held by the runner too, and a call that runs out in
     // it ran out under what the runner left.
     let late = short + (frame - short) / 2;
-    let faults = || {
+    // Such a call is the decision's budget spent and no fault of the
+    // plugin's, so the witness reads that count beside the two faults. The
+    // arming decision's long hold spends its own budget by design.
+    let ran_out = || {
         let stats = plugin.stats();
-        (stats.fuel_exhausted, stats.traps)
+        (stats.fuel_exhausted, stats.traps, stats.budget_spent)
     };
     let (mut cheap, mut by_the_runner, mut by_the_host) = (true, 0, 0);
     for seed in 0..64 {
-        let before = faults();
+        let before = ran_out();
         let (wall, cpu) = (std::time::Instant::now(), bound_clock());
         let decision = engine.decide(
             &timed(seed),
@@ -4822,12 +4933,20 @@ fn one_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool)
         let off_the_cpu = off_cpu_since(wall, cpu);
         cheap &= bound_clock().saturating_sub(cpu) < frame / 4;
         assert!(matches!(decision, Decision::Pick(_)), "decision {seed}");
-        if faults() != before {
-            if (arm && seed == 0) || off_the_cpu < late {
+        let arming = arm && seed == 0;
+        let (fuel, traps, spent) = ran_out();
+        let faulted = (fuel, traps) != (before.0, before.1);
+        let budget_gone = spent != before.2 && !arming;
+        if faulted {
+            if arming || off_the_cpu < late {
                 by_the_host += 1;
             } else {
                 by_the_runner += 1;
             }
+        } else if budget_gone {
+            // No call failed and the decision's calls still took its whole
+            // budget: on the CPU or off it, that time was the clock's.
+            by_the_runner += 1;
         }
     }
     (plugin, cheap, by_the_runner > 0 && by_the_host == 0)
@@ -4837,7 +4956,7 @@ fn one_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool)
 /// is made again.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const A_HOLD_REACHED_A_PICK: &str =
-    "a call ran out in a decision whose thread was off the CPU for its short hold and half of what the hold leaves of the budget";
+    "a call ran out in a decision whose thread was off the CPU for its short hold and half of what the hold leaves of the budget, or a decision's budget ran out with no call failed";
 
 /// [`one_window_of_short_holds`], made again while its faults are the
 /// runner's, [`TRIES`] windows at most, each under a plugin name of its own
@@ -4874,7 +4993,8 @@ fn a_window_of_short_holds(case: &str, name: &str, arm: bool) -> (Arc<Plugin>, b
 /// A call that runs out is the host's fault unless its decision's thread
 /// was off the CPU for its short hold and half of what the hold leaves of
 /// the budget: a hold of the runner's own past that reaches the remainder
-/// the later calls run under. A window whose faults all fell there says so
+/// the later calls run under. A decision's budget spent with no call failed
+/// is the runner's too. A window whose faults are all the runner's says so
 /// and is made again, [`TRIES`] windows at most.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
@@ -4883,9 +5003,14 @@ fn a_hold_short_of_late_on_an_armed_thread_is_no_slow_sample() {
         a_window_of_short_holds("a window of holds short of late", "held-short", true);
     let stats = plugin.stats();
     assert_eq!(
-        (stats.fuel_exhausted, stats.traps, stats.instantiations),
-        (0, 0, 1),
-        "a hold fails nothing: {stats:?}"
+        (
+            stats.fuel_exhausted,
+            stats.traps,
+            stats.budget_spent,
+            stats.instantiations
+        ),
+        (0, 0, 1, 1),
+        "a hold fails nothing, and the arming hold alone spends its decision's budget: {stats:?}"
     );
     assert!(
         stats.unread >= 1,
@@ -4932,8 +5057,13 @@ fn a_window_of_holds_short_of_late_on_a_thread_nothing_armed_is_one_slow_sample(
     );
     let stats = plugin.stats();
     assert_eq!(
-        (stats.fuel_exhausted, stats.traps, stats.instantiations),
-        (0, 0, 1),
+        (
+            stats.fuel_exhausted,
+            stats.traps,
+            stats.budget_spent,
+            stats.instantiations
+        ),
+        (0, 0, 0, 1),
         "a hold fails nothing: {stats:?}"
     );
     assert!(
@@ -8582,6 +8712,8 @@ enum Inside {
     HandsAMember(WorkerId),
     /// Moves the case's own clock to a time, in microseconds.
     MovesTheClock(&'static AtomicU64, u64),
+    /// Lets another thread take a whole turn as a decider, and exit.
+    TurnsElsewhereAs(Decider),
 }
 
 thread_local! {
@@ -8637,6 +8769,18 @@ impl smg_policy_controller::DecisionScope for ActsInside {
                     .on_membership(&smg_policy_controller::Membership::Added(worker));
             }
             Inside::MovesTheClock(clock, to) => clock.store(to, Ordering::Relaxed),
+            Inside::TurnsElsewhereAs(other) => {
+                let tells = &self.tells;
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            let _turn = other.enter();
+                            let _ = decide(tells, &pool(4), 1);
+                        })
+                        .join()
+                        .expect("the thread that takes its turn elsewhere");
+                });
+            }
         }
     }
 
@@ -8741,6 +8885,51 @@ fn a_thread_whose_name_ends_gives_the_held_decider_back_before_it_acts_as_itself
             .expect("the thread that acts as the first decider")
     });
     assert_eq!(as_first, Some(102), "its two dispatches and no more");
+}
+
+/// Both opens of a decision run on the instance its bring brought. A
+/// thread acts as a decider whose instance heard two dispatches, and
+/// decides a pair. Between the pair's two opens another thread takes a
+/// whole turn as that decider: the rest then names that thread's place and
+/// keeps an instance that heard none. The pair's second side still decides
+/// on the instance its first side brought. An open that checked that hold
+/// would find it stale, drop it and decide on the instance at rest.
+#[test]
+fn both_opens_of_a_pair_decide_on_the_instance_its_bring_brought() {
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "one-pair",
+        guest::record_guest(),
+        mode::COUNT_DISPATCHES,
+    );
+    let plain = Arc::new(plugin_engine(&plugin));
+    let first = Decider::new(5);
+    // The first side's profile: the plugin's scope opens and brings the
+    // decider's instance, then the host's scope lets another thread take a
+    // turn as that decider. The second side's open follows it.
+    let prefill = profile_that(&plugin, &plain, Inside::TurnsElsewhereAs(first));
+    let decode = plugin_profile(&plugin, None, None, None);
+    let engine = pair_engine(vec![prefill, decode], 1);
+    let _turn = first.enter();
+    for _ in 0..2 {
+        plain.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    }
+    let decision = pair_decide(&engine);
+    let Some(pick) = decision.pick() else {
+        panic!("a pair pick, not {decision:?}")
+    };
+    let lead = pick.targets.first().expect("a target");
+    let stats = plugin.stats();
+    assert_eq!(
+        (lead.id, lead.pair.map(|p| p.decode_id)),
+        (WorkerId(102), Some(WorkerId(202))),
+        "each side counted the two dispatches its instance heard: {stats:?}"
+    );
+    assert_eq!(
+        stats.instantiations, 2,
+        "the other thread's turn made an instance of its own: {stats:?}"
+    );
 }
 
 /// An instance hears the feed once a decision, at the first open that

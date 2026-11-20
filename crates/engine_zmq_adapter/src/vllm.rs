@@ -31,10 +31,7 @@ use crate::{
     fanout::fan_out_n,
     multimodal,
     stream::{finish, poll_mapped, FinishParts, MappedGenerateStream, StreamState},
-    structured_outputs::{
-        refuse_unenforceable_constraint, ConstraintRef, StructuredOutputsBackendConfig,
-        StructuredOutputsSupport,
-    },
+    structured_outputs::{ConstraintRef, StructuredOutputsBackendConfig, StructuredOutputsSupport},
 };
 
 /// Ranked candidates to emit per position for a requested logprob count:
@@ -682,7 +679,13 @@ pub(crate) fn translate_request_with_backend(
     structured_backend: StructuredOutputsBackendConfig,
 ) -> Result<EngineCoreRequest, String> {
     let media = translate_media(&mut req, model_dtype)?;
-    translate_request_with_media(req, media, max_model_len, eos, structured_backend.into())
+    let support: StructuredOutputsSupport = structured_backend.into();
+    // The client refuses an unenforceable constraint before it fans the
+    // request out (`ZmqEngineClient::generate_vllm_streams`).
+    if let Some(sp) = req.sampling_params.as_ref() {
+        crate::structured_outputs::refuse_unenforceable_constraint(constraint_ref(sp), support)?;
+    }
+    translate_request_with_media(req, media, max_model_len, eos, support)
 }
 
 /// Translate a request whose media was already translated
@@ -729,7 +732,6 @@ pub(crate) fn translate_request_with_media(
         .transpose()?;
     if let Some(sp) = req.sampling_params.as_ref() {
         validate_sampling(sp, sp.max_tokens.unwrap_or(default_max_tokens))?;
-        refuse_unenforceable_constraint(constraint_ref(sp), support)?;
     }
     // A grammar the gateway led with the model's thought for a worker whose
     // grammar starts at the first token starts there whatever reasoning parser
@@ -989,8 +991,9 @@ pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> R
 }
 
 /// The request's constraint as the shared refusal reads it
-/// ([`refuse_unenforceable_constraint`]): the proto `constraint` one-of by
-/// kind, with its text. `json_object = false` is an opt-out, no constraint.
+/// ([`crate::structured_outputs::refuse_unenforceable_constraint`]): the
+/// proto `constraint` one-of by kind, with its text. `json_object = false`
+/// is an opt-out, no constraint.
 pub(crate) fn constraint_ref(sp: &vllm::SamplingParams) -> Option<ConstraintRef<'_>> {
     use vllm::sampling_params::Constraint;
     match sp.constraint.as_ref()? {

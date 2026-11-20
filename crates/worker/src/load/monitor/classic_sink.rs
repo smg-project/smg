@@ -346,9 +346,10 @@ impl<G: Generation> LoadSink for ClassicLoadSink<G> {
         // but say so — a wiped gauge is otherwise indistinguishable from a
         // genuine recovery. With no thresholds anywhere no flag was ever
         // written, so this clears nothing and stays silent. The line keeps
-        // the monitor's log target. The receipts stay, as before the port:
-        // a worker that pushed is polled again once its receipt is older
-        // than a tick.
+        // the monitor's log target. The receipts stay: the collector said
+        // `forget` for every pusher an event it lost would have evicted,
+        // and a worker that stays is polled again once its receipt is
+        // older than a tick.
         let cleared = self.worker_registry.clear_all_overload_flags();
         if cleared > 0 {
             warn!(

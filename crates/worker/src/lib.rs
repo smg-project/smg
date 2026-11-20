@@ -6,9 +6,11 @@
 //! `openai-protocol` re-exports these, and [`UNKNOWN_MODEL_ID`], at the paths
 //! they had there.
 //!
-//! [`settings`] and [`labels`] hold the vocabulary the worker's own code
-//! shares with a host's configuration. The gateway re-exports each item at
-//! the path it had there.
+//! [`settings`] holds the vocabulary the worker's own code shares with a
+//! host's configuration; the gateway's configuration module re-exports each
+//! item at the path it had there. [`labels`] holds the label names the
+//! worker's own code and its hosts read, and the flat map an engine's answer
+//! becomes.
 //!
 //! [`metrics_labels`] holds the metric label values the worker's writers
 //! share with a host's; [`worker::WorkerType::as_str`] and

@@ -196,8 +196,8 @@ pub struct LoadRow {
     pub resident_counted: bool,
     /// Age of the report's sample at the decision, in milliseconds. On a
     /// row a store lends, it is the age the report carried when it was
-    /// recorded: the age at the decision is then the request's
-    /// `now_micros` less the row's `load_sampled_at_micros`.
+    /// recorded. The request's `now_micros` less the row's
+    /// `load_sampled_at_micros` gives the age on either form of the row.
     pub report_age_ms: u32,
     /// Where the row came from.
     pub source: SignalSource,
@@ -713,6 +713,26 @@ pub struct Candidate {
     pub key: u32,
 }
 
+/// How far back the store's decision clock starts.
+pub(crate) const REPORT_CLOCK_HISTORY_MS: u32 = 3_600_000;
+
+/// A sample clipped to the clock's origin must already be past the limit.
+pub(crate) const MAX_REPORT_AGE_MS: u32 = REPORT_CLOCK_HISTORY_MS - 1;
+
+/// The oldest sample a decision can use under a report age limit.
+#[derive(Clone, Copy)]
+pub(crate) struct ReportCutoff(u64);
+
+impl ReportCutoff {
+    pub(crate) fn new(now_micros: u64, max_age_ms: u64) -> Self {
+        Self(now_micros.saturating_sub(max_age_ms * 1_000))
+    }
+
+    pub(crate) fn load(self, row: &Candidate) -> Option<LoadRow> {
+        row.load.filter(|_| row.load_sampled_at_micros >= self.0)
+    }
+}
+
 /// Media on the request: counts and bytes, for workers that take media.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MediaCounts {
@@ -782,6 +802,9 @@ pub struct RequestFacts<'a> {
     pub tried: &'a [WorkerId],
     /// Time left for the whole decision, relative to the host's receipt; a
     /// plugin's own share of it rides its frame, clamped to at most this.
+    /// A host that asks in process states no budget by `0`
+    /// ([`crate::door::Request`]); on the wire a frame's `0` says none is
+    /// left.
     pub budget_micros: u32,
     /// Allow-listed headers only.
     pub headers: &'a [Header<'a>],
@@ -1229,6 +1252,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::print_stdout, reason = "the case reports the candidate layout")]
     fn a_candidate_row_is_two_lines_and_its_affinity_facts_20_bytes() {
         // The filters walk the rows once a filter, so the rows' stride is a
         // cost every policy pays: the pin is exact, 128 bytes at a 64-byte
@@ -1236,8 +1260,10 @@ mod tests {
         // decision bench (`benches/decision.rs`) where the pull-request gate
         // runs as well as on a build host: the two read a narrower stride in
         // opposite directions.
-        assert_eq!(size_of::<Candidate>(), 128);
-        assert_eq!(align_of::<Candidate>(), 64);
+        let size = size_of::<Candidate>();
+        let alignment = align_of::<Candidate>();
+        println!("Candidate size {size} bytes, alignment {alignment} bytes");
+        assert_eq!((size, alignment), (128, 64));
         assert_eq!(size_of::<AffinityFacts>(), 20);
     }
 

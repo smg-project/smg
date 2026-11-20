@@ -262,11 +262,12 @@ jobs:
           cp crates/grpc_client/proto/*.proto crates/worker/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
           # msgspec and pydantic gate the sidecar-protocol, fake-redis and
           # limit-options tests; numpy gates the Rust servicer's media bridge
-          # tests (it lends tensor buffers as numpy views). Modules gated on
+          # tests (it lends tensor buffers as numpy views); prometheus_client
+          # gates the SGLang scheduler-metrics tests. Modules gated on
           # zmq or vllm still skip here (-rs lists them): the zmq ones import
           # engine servicers that need torch, and the vllm cases run on the
           # vLLM e2e lane.
-          pip install ./crates/grpc_client/python msgspec pydantic numpy pyzmq
+          pip install ./crates/grpc_client/python msgspec pydantic numpy pyzmq prometheus_client
           pytest -q grpc_servicer/tests -rs
 
       # The release tests drive scripts/release/release.sh, which runs `make`; this

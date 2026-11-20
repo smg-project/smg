@@ -14,12 +14,17 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
+use smg_policy_controller::store::MemoryStore;
 use smg_worker::{
-    connection::http_client::{
-        build_client, connect_timeout_secs_below, WorkerHttpClientCache,
-        DEFAULT_CONNECT_TIMEOUT_SECS,
+    connection::{
+        engine::EngineConnector,
+        http_client::{
+            build_client, connect_timeout_secs_below, WorkerHttpClientCache,
+            DEFAULT_CONNECT_TIMEOUT_SECS,
+        },
     },
     health::liveness,
+    settings::RegistrationSettings,
     workflow::WorkflowHost,
 };
 use tokio::sync::broadcast::error::RecvError;
@@ -32,6 +37,7 @@ use crate::{
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::{kv_index::event_monitor::KvEventMonitor, PolicyRegistry},
+    policy_controller,
     rate_limit::RateLimitManager,
     rl_adapter,
     routers::{
@@ -52,7 +58,7 @@ use crate::{
     },
     server::http_client_builder,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
+    workflow::{data::RegistrationNotes, JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
 
 /// Error type for AppContext builder
@@ -123,8 +129,13 @@ pub struct AppContext {
     /// Worker-directed HTTP clients, shared across workers with the same
     /// effective connection config.
     pub worker_client_cache: Arc<WorkerHttpClientCache>,
+    /// What the worker crate's registration steps read of the configuration.
+    pub registration_settings: RegistrationSettings,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    /// The policy controller's store, where the controller was picked to
+    /// decide for this process; `None` under the classic policies.
+    pub policy_store: Option<Arc<MemoryStore>>,
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
     pub rl: Option<Arc<smg_rl::RlState>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
@@ -216,17 +227,32 @@ pub struct AppContextBuilder {
     mcp_format_registry: Option<FormatRegistry>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    policy_store: Option<Arc<MemoryStore>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
 }
 
 /// The context hosts the worker crate's workflow steps: they read the
-/// registry through this and nothing else of the gateway.
+/// registry, the worker clients, the registration's settings and the engine
+/// connector through this and nothing else of the gateway.
 impl WorkflowHost for AppContext {
     type Generation = ModelWorkerSnapshot;
+    type RegistrationNotes = RegistrationNotes;
 
     fn worker_registry(&self) -> &Arc<WorkerRegistry> {
         &self.worker_registry
+    }
+
+    fn worker_client_cache(&self) -> &WorkerHttpClientCache {
+        &self.worker_client_cache
+    }
+
+    fn registration_settings(&self) -> &RegistrationSettings {
+        &self.registration_settings
+    }
+
+    fn engine_connector(&self) -> Arc<dyn EngineConnector> {
+        BackendConnector::shared()
     }
 }
 
@@ -314,6 +340,7 @@ impl AppContextBuilder {
             mcp_format_registry: None,
             wasm_manager: None,
             kv_event_monitor: None,
+            policy_store: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         }
@@ -572,6 +599,7 @@ impl AppContextBuilder {
         let worker_client_cache = Arc::new(WorkerHttpClientCache::new(
             router_config.worker_http_client_settings(),
         ));
+        let registration_settings = router_config.registration_settings();
         let gateway_auth = AuthConfig::with_tenant_keys(
             router_config.api_key.clone(),
             &router_config.tenant_api_keys,
@@ -622,8 +650,10 @@ impl AppContextBuilder {
             wasm_manager: self.wasm_manager,
             worker_service,
             worker_client_cache,
+            registration_settings,
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
+            policy_store: self.policy_store,
             rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
@@ -660,6 +690,7 @@ impl AppContextBuilder {
             .with_tool_parser_factory()
             .with_worker_registry()
             .with_policy_registry(&router_config)
+            .with_policy_controller(&router_config)?
             .with_storage(&router_config)
             .await?
             .with_worker_monitor(&router_config)?
@@ -834,6 +865,15 @@ impl AppContextBuilder {
             WorkerRegistry::new().with_engine_connector(BackendConnector::shared()),
         ));
         self
+    }
+
+    /// Start the policy controller's store where the controller was picked
+    /// to decide for this process. A start it refuses stops this one, by
+    /// name.
+    fn with_policy_controller(mut self, config: &RouterConfig) -> Result<Self, String> {
+        self.policy_store =
+            policy_controller::start(config).map_err(|refusal| refusal.to_string())?;
+        Ok(self)
     }
 
     /// Create policy registry
@@ -1724,6 +1764,7 @@ pub(crate) mod testing {
             worker_client_cache: Arc::new(WorkerHttpClientCache::new(
                 router_config.worker_http_client_settings(),
             )),
+            registration_settings: router_config.registration_settings(),
             worker_service: Arc::new(WorkerService::new(
                 worker_registry,
                 job_queue,
@@ -1731,6 +1772,7 @@ pub(crate) mod testing {
             )),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
+            policy_store: None,
             rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,

@@ -165,6 +165,17 @@ pub struct WorkerFacts {
 }
 
 impl WorkerFacts {
+    /// A URL's bytes.
+    pub const URL_BYTES: usize = 2_048;
+    /// The bytes of a name: a runtime, a zone, a model id.
+    pub const NAME_BYTES: usize = 256;
+    /// A label's key, in bytes.
+    pub const LABEL_KEY_BYTES: usize = 128;
+    /// A label's value, in bytes.
+    pub const LABEL_VALUE_BYTES: usize = 4_096;
+    /// The labels of one row.
+    pub const LABELS: usize = 128;
+
     /// Whether these facts name the models `other` names, in any order and
     /// however often. The order is a fact of its own (a row's events are
     /// indexed under its first model), and a reorder alone is no other
@@ -387,7 +398,9 @@ pub enum MembershipTail {
 /// Every write moves the store's epoch; a write of a row's facts moves the
 /// row's revision, a status change does not. A watcher
 /// reads a snapshot with its epoch, then the changes since it; past the
-/// store's buffer it is told to snapshot again. The snapshot carries the
+/// store's buffer it is told to snapshot again, and it snapshots again
+/// where the store took another store's rows ([`Self::history`]). The
+/// snapshot carries the
 /// facts the gateways' pools derive from (role, wire modes, engine kind,
 /// reachability), never a pool list.
 ///
@@ -451,4 +464,16 @@ pub trait WorkersStore: Send + Sync {
 
     /// The changes after `epoch`, or the instruction to snapshot again.
     fn changes_since(&self, epoch: u64) -> MembershipTail;
+
+    /// Which history of rows the store holds: it moves when the rows are
+    /// replaced whole by another store's
+    /// ([`MemoryStore::restore_from`](super::MemoryStore::restore_from))
+    /// and at no write. An epoch names a place in one history, and a row
+    /// under one id and one revision may state other facts in the next, so
+    /// a watcher that keeps its place keeps this beside it and starts again
+    /// from a snapshot, trusting nothing it held, when it moves. A store
+    /// that never takes another's rows stays at `0`.
+    fn history(&self) -> u64 {
+        0
+    }
 }

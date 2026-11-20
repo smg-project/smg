@@ -115,7 +115,7 @@ mod wasm_guest;
 use std::{
     collections::{HashMap, HashSet},
     io::Write,
-    sync::mpsc,
+    sync::{mpsc, Arc},
     time::{Duration, Instant},
 };
 
@@ -131,16 +131,21 @@ use smg_policy_controller::{
     client::{self, blocking, Answer, Client},
     controller::{State, PROTOCOL_VERSION},
     proto::{
-        busy, completed::Class, decision::Outcome, identity::Form, principal, released, Completed,
-        DecideRequest, Decision, Identity, OverloadThresholds, Released, RequestFacts, ShedReason,
-        Side,
+        busy, completed::Class, decision::Outcome, identity::Form, principal, released,
+        worker_event, Completed, DecideRequest, Decision, Identity, OverloadThresholds, Released,
+        RequestFacts, ShedReason, Side, WatchWorkersRequest,
     },
     spec::{BindingSpec, Match},
-    store::{LaneCounts, WorkerStatus},
-    view::{Role, SignalSource, WireModes},
+    store::{LaneCounts, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
+    view::{Role, SignalSource, WireModes, WorkerId},
+    watcher::{Ended, Following, Watcher},
     PolicySpec, PowerOfTwoMetric, SpecError,
 };
-use tokio::sync::oneshot;
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{oneshot, Notify},
+    task::JoinSet,
+};
 use tonic::Code;
 
 const MODEL: &str = "fleet-model";
@@ -2406,6 +2411,8 @@ async fn a_pair_plan_answers_its_prefill_for_both_sides_by_the_loads_their_engin
 
 /// The blocking form of the reference client asks the same started
 /// controller from a thread that runs no runtime, and holds the same floor.
+/// Its watch tells the controller's refusal of a request and, of one the
+/// controller takes, the snapshot first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_blocking_client_asks_a_started_controller_from_a_thread_of_its_own() {
     let case = async {
@@ -2422,11 +2429,24 @@ async fn the_blocking_client_asks_a_started_controller_from_a_thread_of_its_own(
                         .as_ref()
                         .map(|told| told.subject.clone());
                     let decided = client.decide(ask(b"blocking"))?;
-                    Ok((leader, client.term_floor(), subject, decided))
+                    // A resume under a term with no place is refused by its field.
+                    let unplaced = WatchWorkersRequest {
+                        resume_term: 1,
+                        ..WatchWorkersRequest::default()
+                    };
+                    let refused = match client.watch_workers(unplaced) {
+                        Err(client::Error::Status(status)) => {
+                            Some((status.code(), status.message().to_owned()))
+                        }
+                        _ => None,
+                    };
+                    let mut watch = client.watch_workers(WatchWorkersRequest::default())?;
+                    let told = client.next_of(&mut watch)?;
+                    Ok((leader, client.term_floor(), subject, decided, refused, told))
                 });
             let _ = answered.send(asked.map_err(|error| error.to_string()));
         });
-        let (leader, floor, subject, decided) = tokio::time::timeout(ROOM, answer)
+        let (leader, floor, subject, decided, refused, told) = tokio::time::timeout(ROOM, answer)
             .await
             .expect("the blocking client answers inside its bound")
             .expect("the client's thread sends its answer")
@@ -2445,6 +2465,18 @@ async fn the_blocking_client_asks_a_started_controller_from_a_thread_of_its_own(
             matches!(&decided, Answer::Decision(Decision { outcome: Some(Outcome::Shed(shed)), .. })
                 if shed.reason() == ShedReason::PolicyDeclined && shed.emptied_by == "binding"),
             "{decided:?}"
+        );
+        // The watch: an open the controller refuses tells its status, and
+        // the first event of one it takes is the snapshot of no worker.
+        assert!(
+            matches!(&refused, Some((Code::InvalidArgument, said)) if said.contains("resume_term")),
+            "{refused:?}"
+        );
+        let told = told.expect("the watch tells a snapshot first");
+        assert!(
+            matches!(&told.event, Some(worker_event::Event::Snapshot(page))
+                if page.last && page.workers.is_empty()),
+            "{told:?}"
         );
         harness.stop().await.expect("a clean stop");
     };
@@ -2506,6 +2538,185 @@ async fn the_client_at_a_replica_that_does_not_lead_is_told_the_leader() {
         leader.stop().await.expect("the leader stops clean");
     };
     tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+/// What a watcher's store holds of its controller's workers, by id: each
+/// row's facts, status and revision.
+fn watched(watcher: &Watcher) -> Vec<(WorkerId, WorkerFacts, WorkerStatus, u64)> {
+    let (_, mut rows) = WorkersStore::snapshot(&**watcher.store());
+    rows.sort_by_key(|row| row.id.0);
+    rows.into_iter()
+        .map(|row| (row.id, row.facts, row.status, row.revision))
+        .collect()
+}
+
+/// The status a watcher holds for a row, if it holds the row.
+fn status_of(watcher: &Watcher, id: WorkerId) -> Option<WorkerStatus> {
+    WorkersStore::get(&**watcher.store(), id).map(|row| row.status)
+}
+
+/// Follows the stream until `stands` holds of its watcher, each event
+/// inside the room of a wait.
+async fn follows(
+    following: &mut Following<'_>,
+    mut stands: impl FnMut(&Watcher) -> bool,
+) -> Result<(), String> {
+    while !stands(following.watcher()) {
+        let taken = tokio::time::timeout(ROOM, following.next())
+            .await
+            .map_err(|_| "the watch told nothing inside its room".to_owned())?
+            .map_err(|ended| format!("the stream is followed no further: {ended:?}"))?;
+        if !taken {
+            return Err("the watch ended with no status".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// A gateway that watches holds the controller's rows. A snapshot tells the
+/// fleet as it registered. The tail tells each status the prober writes, an
+/// engine that registers behind the snapshot and a dead engine's status. A
+/// stream opened after the last place taken is told the tail alone. At one
+/// place, the watcher holds what one that started from a later snapshot
+/// holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
+    let case = async {
+        let mut harness = Harness::start().await.expect("the harness starts");
+        let engines = harness
+            .register(&FLEET[..3])
+            .await
+            .expect("the fleet registers");
+        let ids: Vec<WorkerId> = engines
+            .iter()
+            .map(|engine| harness.worker(*engine).expect("the engine's row"))
+            .collect();
+        let dead = |watcher: &Watcher, id: WorkerId| {
+            status_of(watcher, id).is_some_and(|status| status != WorkerStatus::Ready)
+        };
+
+        // The snapshot tells the fleet as it registered: pending, with no
+        // prober started yet.
+        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+        let opened = watcher.open(harness.client()).await;
+        let mut stream = opened.expect("the watch opens");
+        let told = follows(&mut stream, |held| held.at().is_some()).await;
+        told.expect("a snapshot is told");
+        for id in &ids {
+            let status = status_of(stream.watcher(), *id);
+            assert_eq!(status, Some(WorkerStatus::Pending));
+        }
+
+        // The prober starts: the tail tells each engine it heard.
+        harness.feed();
+        let ready = |watcher: &Watcher| {
+            ids.iter()
+                .all(|id| status_of(watcher, *id) == Some(WorkerStatus::Ready))
+        };
+        let told = follows(&mut stream, ready).await;
+        told.expect("the fleet is told ready");
+
+        // An engine that registers behind the snapshot.
+        let late = harness.register(&FLEET[3..4]).await;
+        let late = late.expect("one more engine registers")[0];
+        let late = harness.worker(late).expect("the late engine's row");
+        let ready = |watcher: &Watcher| status_of(watcher, late) == Some(WorkerStatus::Ready);
+        let told = follows(&mut stream, ready).await;
+        told.expect("the late engine is told ready");
+
+        // A dead engine: the prober's word reaches the watcher.
+        harness.kill(engines[0]).await.expect("an engine dies");
+        let told = follows(&mut stream, |held| dead(held, ids[0])).await;
+        told.expect("the death is told");
+
+        // A stream opened after the last place taken: the tail alone.
+        drop(stream);
+        let opened = watcher.open(harness.client()).await;
+        let mut stream = opened.expect("the watch opens again");
+        harness
+            .kill(engines[1])
+            .await
+            .expect("a second engine dies");
+        let told = follows(&mut stream, |held| dead(held, ids[1])).await;
+        told.expect("the second death is told");
+        assert_eq!(
+            stream.watcher().snapshots(),
+            1,
+            "no snapshot behind a place"
+        );
+
+        // A watcher that starts now takes a snapshot. Both are then told
+        // one more death, and at its place the first holds what the second
+        // holds.
+        let mut fresh = Watcher::new(Arc::new(MemoryStore::new()));
+        let opened = fresh.open(harness.client()).await;
+        let mut snapshot = opened.expect("a second watch opens");
+        let told = follows(&mut snapshot, |held| held.at().is_some()).await;
+        told.expect("a snapshot is told");
+        harness.kill(engines[2]).await.expect("a third engine dies");
+        let told = follows(&mut stream, |held| dead(held, ids[2])).await;
+        told.expect("the third death is told on the tail");
+        let told = follows(&mut snapshot, |held| dead(held, ids[2])).await;
+        told.expect("the third death is told behind the snapshot");
+        let (first, second) = (stream.watcher(), snapshot.watcher());
+        assert_eq!(first.at(), second.at(), "both stand at the death's place");
+        assert_eq!(watched(first), watched(second));
+        assert_eq!(watched(first).len(), 4, "four engines of one rank");
+        assert_eq!((first.snapshots(), second.snapshots()), (1, 1));
+
+        drop((stream, snapshot));
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+/// A watch whose controller goes silent, with its connection still open,
+/// ends: the client keeps its channel alive, and a peer that answers no
+/// ping ends the streams on it. A relay stands between the two. At a word
+/// it stops relaying and closes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watch_ends_when_its_controller_goes_silent() {
+    let case = async {
+        let harness = Harness::start().await.expect("the harness starts");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let relay = listener.local_addr().expect("the relay's address");
+        let controller = harness.gateway();
+        let silent = Arc::new(Notify::new());
+        let word = Arc::clone(&silent);
+        let mut relayed = JoinSet::new();
+        relayed.spawn(async move {
+            let (mut near, _) = listener.accept().await.expect("the client dials");
+            let far = TcpStream::connect(controller).await;
+            let mut far = far.expect("the controller listens");
+            tokio::select! {
+                _ = tokio::io::copy_bidirectional(&mut near, &mut far) => {}
+                () = word.notified() => std::future::pending::<()>().await,
+            }
+        });
+
+        let address = format!("http://{relay}");
+        let connected = Client::connect(&address, "silent-gateway").await;
+        let mut client = connected.expect("the client connects through the relay");
+        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+        let opened = watcher.open(&mut client).await;
+        let mut stream = opened.expect("the watch opens");
+        let first = tokio::time::timeout(ROOM, stream.next()).await;
+        assert!(matches!(first, Ok(Ok(true))), "the snapshot: {first:?}");
+
+        silent.notify_one();
+        let ended = tokio::time::timeout(ROOM, stream.next())
+            .await
+            .expect("a silent controller ends the stream inside the room");
+        assert!(matches!(ended, Err(Ended::Client(_))), "{ended:?}");
+
+        relayed.abort_all();
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
         .await
         .expect("the case ends inside its outer bound");
 }

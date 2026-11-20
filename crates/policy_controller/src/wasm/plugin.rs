@@ -853,6 +853,14 @@ struct Standing {
 #[derive(Default)]
 struct Working {
     standing: Cell<Standing>,
+    /// The decision whose open brought the hold in this place or last
+    /// checked it, by its number on this thread, zero where none did: its
+    /// later opens take the hold as theirs. No later decision takes that
+    /// number here: the thread's count rises by one a decision, and a
+    /// thread that takes an exited thread's place takes its count with it
+    /// ([`OpenDecisions`]). A word of its own, so the standing a bring
+    /// copies stays small: the bring stores this word and does not read it.
+    checked: Cell<u64>,
     slot: RefCell<Option<Instance>>,
 }
 
@@ -1311,10 +1319,12 @@ impl Plugin {
     /// What the place never gave back (a close that did not return, on this
     /// thread or on one that exited and left it the place) goes back first,
     /// under another name or under none: a thread decides on no instance
-    /// but the one of the decider it acts as. `start` says the call begins
-    /// a span of its own, a decision's first open or a call outside a
-    /// decision: a hold of the same decider found there is checked.
-    fn lend(&self, working: &Working, start: bool) -> bool {
+    /// but the one of the decider it acts as. `decision` numbers the
+    /// decision whose open calls, zero for a call outside one: a hold of
+    /// the same decider is taken as it stands by the later opens of the
+    /// decision that brought it or last checked it, and is checked by
+    /// every other call.
+    fn lend(&self, working: &Working, decision: u64) -> bool {
         let mut now = working.standing.get();
         let Some(decider) = Decider::acting() else {
             // Under no name the thread acts as itself. The mark is read in
@@ -1326,14 +1336,21 @@ impl Plugin {
             return false;
         };
         match now.lent {
-            // The state is here: an earlier open of the decision brought it,
-            // or a decision open around a told event did. At a start that
-            // holds only where the rest still names this place. A close that
-            // did not return can have left the hold, and the decider can
-            // have been brought elsewhere since: such a hold is stale, its
-            // instance is dropped, and the state at rest comes.
+            // The state is here. An open of the decision that brought the
+            // hold or last checked it takes it as it stands, so a decision
+            // of two opens decides both on one instance. Any other call
+            // takes it only where the rest still names this place. A close
+            // that did not return can have left the hold, and the decider
+            // can have been brought elsewhere since: such a hold is stale,
+            // its instance is dropped, and the state at rest comes.
             Some(held) if held == decider => {
-                if !start || self.brought_here(working, decider) {
+                if decision != 0 && working.checked.get() == decision {
+                    return false;
+                }
+                if self.brought_here(working, decider) {
+                    if decision != 0 {
+                        working.checked.set(decision);
+                    }
                     return false;
                 }
                 *working.slot.borrow_mut() = None;
@@ -1341,6 +1358,10 @@ impl Plugin {
             Some(held) => self.give_back(working, held),
             None => {}
         }
+        // The bring. Its decision need not check the hold it brings: the
+        // number is stored ahead of the lock, while it is at hand, and
+        // nothing below returns early.
+        working.checked.set(decision);
         let mut rest = self.rest_of(decider).lock();
         let rest = rest.get_or_insert_with(Rest::new);
         let mut slot = working.slot.borrow_mut();
@@ -1418,7 +1439,8 @@ impl Plugin {
         Lent {
             plugin: self,
             working,
-            brought: self.lend(working, true),
+            // No decision's open: a hold found is checked.
+            brought: self.lend(working, 0),
         }
     }
 
@@ -1792,17 +1814,19 @@ impl Plugin {
     }
 
     /// One of this plugin's opens of decision `decision` on this thread;
-    /// says whether the plugin already failed that decision, and whether
-    /// this open is its first of it (the one read of the cell an open
-    /// makes).
-    fn note_open(&self, decision: u64) -> (bool, bool) {
+    /// says whether the plugin already failed that decision (the one read
+    /// of the cell an open makes).
+    fn note_open(&self, decision: u64) -> bool {
         let opens = self.decision_opens.get_or_default();
         let (mut part, init) = opens.get();
-        let first = !part.is_of(decision);
-        let init = if first { OwnTime::default() } else { init };
+        let init = if part.is_of(decision) {
+            init
+        } else {
+            OwnTime::default()
+        };
         let failed = part.open(decision);
         opens.set((part, init));
-        (failed, first)
+        failed
     }
 
     /// The time of a lazy `init` decision `decision` paid on this thread:
@@ -2336,8 +2360,7 @@ impl Bound {
         let mut budget = plugin.runtime.decisions.on_this_thread();
         let decision = budget.open(facts.budget_micros);
         open.decision = decision;
-        let (failed, first) = plugin.note_open(decision);
-        if failed {
+        if plugin.note_open(decision) {
             // The plugin already failed this decision (the other side of a
             // pair, another binding): its part in the decision is over, with
             // no call, no `init` and no second count.
@@ -2368,7 +2391,7 @@ impl Bound {
         // A named decider's kept state comes to this thread for the
         // decision; the plugin's last close of it gives it back.
         let working = plugin.working();
-        plugin.lend(working, first);
+        plugin.lend(working, decision);
         let mut guard = working.slot.borrow_mut();
         if guard.is_none() {
             if plugin.emptied.get_or_default().get() {

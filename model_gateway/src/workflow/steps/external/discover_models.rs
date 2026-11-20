@@ -8,7 +8,7 @@ use openai_protocol::{model_card::ModelCard, model_type::ModelType, worker::Prov
 use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
-use smg_worker::identity::endpoint::Endpoint;
+use smg_worker::{identity::endpoint::Endpoint, workflow::WorkerKind};
 use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
@@ -16,7 +16,7 @@ use crate::{
     admin::worker_service::{control_character_refusal, logged_strings},
     routers::provider_support,
     server::http_client_builder,
-    workflow::data::{WorkerKind, WorkerWorkflowData},
+    workflow::data::WorkerWorkflowData,
 };
 
 // HTTP client for API calls

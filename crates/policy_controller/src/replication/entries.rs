@@ -38,6 +38,8 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("WorkersStore", "epoch", Fate::Read),
     ("WorkersStore", "snapshot", Fate::Read),
     ("WorkersStore", "changes_since", Fate::Read),
+    // A replica's own count of the restores it took: nothing of it crosses.
+    ("WorkersStore", "history", Fate::Read),
     // The status a verdict moves is journaled as the status write it makes.
     // The streak between two moves is the prober's own count: a promoted
     // standby's prober starts it again.
@@ -58,6 +60,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     // standby holds the verdict of the engine's last rows until its own
     // first poll.
     ("LoadSink", "report", Fate::Journaled),
+    ("LoadSink", "report_sampled", Fate::Journaled),
     ("LoadSink", "poll_mode", Fate::Read),
     // The report period is the load driver's own setting, told where the
     // driver is built: every replica builds its own.
@@ -100,10 +103,12 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     // The term is told to the journal: every later position is under it.
     ("LeasesStore", "set_term", Fate::Journaled),
     ("LeasesStore", "issue", Fate::NotYet(PINS)),
+    ("LeasesStore", "issue_pair", Fate::NotYet(PINS)),
     ("LeasesStore", "dispatched", Fate::Rebuilt(DISPATCHED)),
     ("LeasesStore", "completed", Fate::NotYet(PINS)),
     ("LeasesStore", "released", Fate::NotYet(PINS)),
     ("LeasesStore", "get", Fate::Read),
+    ("LeasesStore", "sides", Fate::Read),
     ("LeasesStore", "expire", Fate::NotYet(PINS)),
     ("LeasesStore", "restore", Fate::Rebuilt(HELLO)),
     ("LeasesStore", "drop_gateways", Fate::NotYet(PINS)),
@@ -114,6 +119,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("MemoryStore", "journaled", Fate::Read),
     ("MemoryStore", "followed", Fate::Read),
     ("MemoryStore", "cut", Fate::Read),
+    ("MemoryStore", "rows_serving", Fate::Read),
     (
         "MemoryStore",
         "restore_from",

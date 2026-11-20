@@ -8,9 +8,17 @@
 //! This is the `tree` kind of the document's index settings
 //! ([`IndexKind`](crate::spec::IndexKind)). The `hash` kind is not built.
 //!
-//! One model has one decider, and the model's predictor is that decider's
-//! own state: one thread reads it and writes it, under the decider's turn.
-//! Nothing here is shared, locked or ordered against another thread.
+//! Under the served controller one model has one decider, and the model's
+//! predictor is that decider's own state: one thread reads it and writes
+//! it, under the decider's turn. Nothing here is shared, locked or ordered
+//! against another thread.
+//!
+//! The in-process door ([`Door`](crate::door::Door)) seats a request by
+//! its calling thread unless the generation holds a stage that keeps
+//! state a decider (`Engine::keeps_deciders`). A stage that reads a
+//! predictor there joins that fact, or the predictor takes a shared
+//! owner: with neither, a door would split a model's predictor between
+//! its callers' seats, with no error.
 //!
 //! What is kept. A request carries its prefix as one hash a block of its
 //! content ([`RequestFacts::block_hashes`](crate::RequestFacts::block_hashes)).

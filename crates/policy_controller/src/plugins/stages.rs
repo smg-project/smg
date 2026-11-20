@@ -713,6 +713,19 @@ mod tests {
         assert_eq!(named(&scoring, scored), (0, 0));
     }
 
+    /// A plugin's rule is its own, and its stage of each kind says
+    /// nothing of what it may refuse by: the trait's own answer stands,
+    /// that it may refuse by a report of leases, and the host of its
+    /// decision applies what its gateways reported first.
+    #[test]
+    fn a_plugins_stage_of_each_kind_is_taken_as_one_that_may_refuse_by_reports() {
+        use crate::framework::{Filter, Picker};
+
+        assert!(PluginFilter::new(Arc::new(Quiet), None).refuses_by_reports());
+        assert!(PluginScorer::new(Arc::new(Quiet), None).refuses_by_reports());
+        assert!(PluginPicker::new(Arc::new(Quiet), None).refuses_by_reports());
+    }
+
     /// The forwarding adapter hands the plugin the kinds its row lists and
     /// no other, each once: none for a row that lists nothing, every kind
     /// for one that lists them all, and each kind alone its own call.

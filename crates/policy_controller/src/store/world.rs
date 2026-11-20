@@ -245,6 +245,7 @@ impl PairBuffers {
     /// Both sides' views, the prefill's first: what a request's own
     /// gateway states of itself is taken from each ahead of the engine's
     /// pair entry.
+    #[cfg(feature = "controller")]
     pub(crate) fn sides_mut(&mut self) -> [&mut ViewBuffers; 2] {
         [&mut self.prefill, &mut self.decode]
     }
@@ -481,6 +482,10 @@ struct Derived {
     /// status (a status change is a health signal and moves no position).
     by_model: FxHashMap<Box<str>, [Option<u32>; ROLES]>,
     pools: Box<[PoolShape]>,
+    /// The members in no pool, by id, each with its slot in the counts:
+    /// a member that offers no model. With the pools' rows they are every
+    /// member the build read ([`World::unpooled_of`]).
+    unpooled: Box<[(WorkerId, Slot)]>,
     /// The store's counts of the leases on file, which the pools' slots
     /// name: the one table of the store's life, lent with its shapes.
     counts: Arc<Counts>,
@@ -860,6 +865,10 @@ pub struct World {
     /// The generation this publication was made under: its engine and its
     /// number, read with the rows in one load.
     spec: Arc<AppliedSpec>,
+    /// The served decider reads this with the world, before following
+    /// the pointer to the generation.
+    #[cfg(feature = "controller")]
+    samples_decisions: bool,
     /// Each pool's standing in its model's index, at the pool's index.
     indexes: Arc<[Option<Arc<PoolIndex>>]>,
 }
@@ -897,6 +906,11 @@ impl World {
     /// owned world, whose shared count a deciding thread would write.
     pub fn spec(&self) -> &AppliedSpec {
         &self.spec
+    }
+
+    #[cfg(feature = "controller")]
+    pub(crate) fn samples_decisions(&self) -> bool {
+        self.samples_decisions
     }
 
     /// `at` in the rows' clock: microseconds since the store's origin.
@@ -961,14 +975,26 @@ impl World {
     }
 
     /// The slot of worker `id`'s count wherever this world lists it: a
-    /// member's rows name one. `None` for a worker in no pool. It searches
-    /// every pool, for a lease written outside a decision.
+    /// member's rows name one. `None` for a worker in no pool: a member
+    /// there is read apart ([`World::unpooled_of`]). It searches every
+    /// pool, for a lease written outside a decision.
     pub(crate) fn booked_of(&self, id: WorkerId) -> Option<Slot> {
         let mut pools = self.rows.iter().zip(self.derived.pools.iter());
         pools.find_map(|(rows, shape)| {
             let row = rows.binary_search_by_key(&id, |row| row.id).ok()?;
             shape.booked.get(row).copied()
         })
+    }
+
+    /// The slot of worker `id`'s count where the worker is a member in no
+    /// pool of this world: one that offers no model. `None` for a member
+    /// a pool lists, and for a worker that was no member when this
+    /// world's membership was built. A lease's door reads it behind the
+    /// pools and the table, off the path of a listed target.
+    pub(crate) fn unpooled_of(&self, id: WorkerId) -> Option<Slot> {
+        let unpooled = &self.derived.unpooled;
+        let at = unpooled.binary_search_by_key(&id, |&(of, _)| of).ok()?;
+        unpooled.get(at).map(|&(_, slot)| slot)
     }
 
     /// Writes over `rows`, the candidates `built` left for `ask` before
@@ -1155,8 +1181,8 @@ impl World {
     /// nothing. The pinned worker's row is handed as one more than its
     /// position. Under `ask.affinity` the column is filled as the build
     /// fills it. A row's report age stays what the report carried when it
-    /// was recorded: the age at the decision is the decision's instant less
-    /// the row's sample instant, and no stage of this crate reads it.
+    /// was recorded. The report age limit uses the decision's instant less
+    /// the row's sample instant on either form of the row.
     ///
     /// The rows are copied and written ([`World::build`]) where they cannot
     /// be lent: in a pool that holds host-local rows, where the asking
@@ -2241,6 +2267,8 @@ impl Writer {
             unreported: Arc::clone(&self.unreported),
             vetoes: Arc::clone(&self.pool_vetoes),
             spec: Arc::clone(&self.spec),
+            #[cfg(feature = "controller")]
+            samples_decisions: self.spec.engine().explain_sample() != 0,
             indexes: Arc::clone(&self.indexes),
         })
     }
@@ -2921,6 +2949,10 @@ impl Writer {
         // Each model's members a side, by their place in `entries`: a
         // member's entry is written once, whatever it offers.
         let mut groups: FxHashMap<Box<str>, [Vec<u32>; ROLES]> = FxHashMap::default();
+        // The members that offer no model, by their place in `members`: in
+        // no pool, and named by the world all the same. None in most
+        // fleets.
+        let mut bare: Vec<u32> = Vec::new();
         // The members' ids are read by the vetoes alone: a membership build
         // with no veto standing does not collect them.
         let standing = !self.vetoes.by_gateway.is_empty();
@@ -3025,6 +3057,11 @@ impl Writer {
             };
             let at = entries.len() as u32;
             entries.push(entry);
+            if facts.models.is_empty() {
+                // In no pool, and done: the loop below starts on a model.
+                bare.push(at);
+                continue;
+            }
             let side = role_slot(facts.role);
             for model in &facts.models {
                 match groups.get_mut(model.as_str()) {
@@ -3335,11 +3372,21 @@ impl Writer {
         self.engines = engines;
         self.silenced = silenced;
         self.epoch = epoch;
+        // In id order, as the walk above pushed them.
+        // A place names its member's id and slot: the list stands by id, as
+        // the walk read the members.
+        let unpooled: Box<[(WorkerId, Slot)]> = bare
+            .iter()
+            .filter_map(|&at| members.get(at as usize))
+            .map(|&(id, _, slot)| (id, slot))
+            .collect();
+        debug_assert!(unpooled.is_sorted_by(|a, b| a.0 < b.0));
         let before = mem::replace(
             &mut self.derived,
             Arc::new(Derived {
                 by_model,
                 pools: pools.into_boxed_slice(),
+                unpooled,
                 counts: Arc::clone(&self.counts),
             }),
         );

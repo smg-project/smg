@@ -166,6 +166,21 @@ async fn through_the_door(
     }
 }
 
+/// [`document`], asked again inside the room while the replica holds none: a
+/// new leader's first document lands a moment behind the start of its lead,
+/// and its standby is told it behind that.
+async fn first_document(
+    door: &mut PolicyControllerClient<Channel>,
+) -> Result<proto::PolicySpecDocument, String> {
+    let asked = Instant::now();
+    loop {
+        match document(door).await {
+            Err(_) if asked.elapsed() < ROOM => tokio::time::sleep(PACE).await,
+            held => return held,
+        }
+    }
+}
+
 /// The document the replica behind `door` runs, as its operator reads it.
 async fn document(
     door: &mut PolicyControllerClient<Channel>,
@@ -398,13 +413,14 @@ async fn a_killed_leaders_standby_answers_each_routing_key_on_its_worker() {
         }
 
         // Both files change, each to another document. The leader's watch
-        // applies its own as the next generation. The standby's watch looks
-        // at nothing while it follows: its document is its leader's.
+        // applies its own as the next generation. The standby's watch shows
+        // its door the file and applies nothing while it follows: its
+        // document is its leader's.
         std::fs::write(&own, OWN).expect("the standby's file");
         std::fs::write(&spec, CHANGED).expect("the leader's file");
         let changed = Instant::now();
         loop {
-            let held = document(&mut door)
+            let held = first_document(&mut door)
                 .await
                 .expect("the leader answers its document");
             if held.generation == 2 {
@@ -655,7 +671,7 @@ async fn a_replica_that_starts_over_another_document_follows_its_leader() {
             .await
             .expect("the standby's control listener accepts");
         let mut door = PolicyControllerClient::new(channel);
-        let held = document(&mut door)
+        let held = first_document(&mut door)
             .await
             .expect("the standby answers its document");
         assert_eq!(
@@ -693,6 +709,98 @@ async fn a_replica_that_starts_over_another_document_follows_its_leader() {
             tokio::time::sleep(PACE).await;
         }
 
+        standby.terminate().expect("the stop's signal");
+        let stopped = standby.exited().expect("the standby stops");
+        assert!(stopped.success(), "a clean stop: {stopped}");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+/// A mount one step behind. Both replicas start over one document. The
+/// standby's mounted file takes the first of two changes, and its watch
+/// shows it to the door. The leader's file takes both, and the standby
+/// follows each. The leader is killed. The new leader keeps the document
+/// it followed: its file's document stood on it since the file took it,
+/// and its leader replaced it, so the take brings nothing older back. The
+/// file is left for its next move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_promoted_standby_whose_file_lags_keeps_the_document_it_followed() {
+    let case = async {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let lease = dir.path().join("lease");
+        let spec = dir.path().join("policy.yaml");
+        std::fs::write(&spec, DOCUMENT).expect("the leader's file");
+        let own = dir.path().join("standby.yaml");
+        std::fs::write(&own, DOCUMENT).expect("the standby's file");
+        let (mut leader, port) = first_of_the_pair(&lease, &flags(&spec));
+        let gateway = session_at(&leader).await.expect("the first replica leads");
+        let mut standby = Replica::start_on(
+            "fleet-standby",
+            (STANDBY, port),
+            Lease::File(&lease),
+            ElectionSettings::default(),
+            &flags(&own),
+        )
+        .expect("the standby starts");
+        assert!(
+            standby.logs(|replica| replica.logged(FOLLOWING)).await,
+            "the standby follows its leader's log: {}",
+            standby.log()
+        );
+        let channel = Channel::from_shared(format!("http://{}", standby.control))
+            .expect("a uri")
+            .connect()
+            .await
+            .expect("the standby's control listener accepts");
+        let mut door = PolicyControllerClient::new(channel);
+
+        // The first change reaches the standby's mount, and three looks of
+        // its watch show it to the door. Then the leader's file takes both
+        // changes, and the standby follows each: its own mount stays one
+        // step behind.
+        std::fs::write(&own, CHANGED).expect("the standby's file");
+        tokio::time::sleep(3 * POLL).await;
+        for (generation, written) in [(2, CHANGED), (3, OWN)] {
+            std::fs::write(&spec, written).expect("the leader's file");
+            let changed = Instant::now();
+            loop {
+                let held = document(&mut door)
+                    .await
+                    .expect("the standby answers its document");
+                if held.generation == generation {
+                    assert_eq!(held.document, written.as_bytes());
+                    break;
+                }
+                assert!(
+                    changed.elapsed() < ROOM,
+                    "the standby follows its leader's changed document inside the room: {}",
+                    standby.log()
+                );
+                tokio::time::sleep(PACE).await;
+            }
+        }
+
+        // The leader ends, and the standby leads: three looks of its watch
+        // later it runs the document it followed, under the same number.
+        drop(gateway);
+        leader.kill().expect("the kill");
+        leader.exited().expect("a killed leader is gone");
+        let gateway = session_at(&standby)
+            .await
+            .expect("the standby leads inside the room");
+        tokio::time::sleep(3 * POLL).await;
+        let held = document(&mut door)
+            .await
+            .expect("the new leader answers its document");
+        assert_eq!(
+            (held.generation, held.document.as_slice()),
+            (3, OWN.as_bytes()),
+            "a mount one step behind brings no older document back at a take"
+        );
+
+        drop(gateway);
         standby.terminate().expect("the stop's signal");
         let stopped = standby.exited().expect("the standby stops");
         assert!(stopped.success(), "a clean stop: {stopped}");

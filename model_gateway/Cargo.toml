@@ -66,7 +66,6 @@ dashmap.workspace = true
 futures.workspace = true
 http.workspace = true
 lru.workspace = true
-notify.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 prost-types.workspace = true
@@ -90,7 +89,7 @@ uuid = { workspace = true, features = ["serde", "fast-rng"] }
 # Workspace crates
 openai-protocol = { workspace = true, features = ["axum"] }
 smg-worker = { workspace = true, features = ["axum", "metrics", "runtime", "workflow"] }
-smg-service-discovery.workspace = true
+smg-service-discovery = { workspace = true, features = ["consul", "file", "fs-watch", "kubernetes", "slurm"] }
 reasoning-parser.workspace = true
 tool-parser.workspace = true
 smg-symphony.workspace = true
@@ -107,6 +106,10 @@ smg-mm-rdma.workspace = true
 smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
 smg-rl.workspace = true
+# The policy document and its presets alone, with none of the crate's
+# features: the routing configuration is written as a document
+# (`config/policy_document.rs`) and nothing decides by it.
+smg-policy-controller.workspace = true
 smg-grpc-client.workspace = true
 engine-zmq-client.workspace = true
 engine-zmq-adapter.workspace = true

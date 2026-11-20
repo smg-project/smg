@@ -1743,9 +1743,10 @@ async fn a_conflicting_parser_override_from_a_label_update_is_warned_about() {
 #[tokio::test]
 async fn a_refresh_fills_the_fields_an_empty_registration_label_left_unset() {
     use openai_protocol::worker::WorkerModels;
+    use smg_worker::workflow::WorkerKind;
 
     use crate::workflow::{
-        data::{WorkerKind, WorkerRegistrationMode},
+        data::WorkerRegistrationMode,
         steps::{create_worker_workflow_data, local::CreateLocalWorkerStep},
     };
 

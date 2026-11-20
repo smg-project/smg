@@ -1193,6 +1193,36 @@ fn replacement_adopts_the_backend_client_only_on_a_matching_transport() {
 }
 
 #[test]
+fn replacement_adopts_the_backend_client_only_at_the_same_base_address() {
+    // A host may key a worker by a URL of its own and state the engine's
+    // address beside it. A replacement under that key whose address moved
+    // dials another engine: the old connection is not its own.
+    let build = |engine: &str| {
+        let mut spec = WorkerSpec::new("grpc://worker:1");
+        spec.connection_mode = ConnectionMode::Grpc;
+        spec.dp_base_url = Some(engine.to_string());
+        BasicWorkerBuilder::from_spec(spec)
+            .health_config(no_health_check())
+            .build()
+    };
+
+    let old = build("grpc://engine-a:30000");
+    let same = build("grpc://engine-a:30000");
+    assert!(same.inherit_shared_state_from(&old));
+    assert!(Arc::ptr_eq(
+        &same.engine_connection.load_full(),
+        &old.engine_connection.load_full()
+    ));
+
+    let moved = build("grpc://engine-b:30000");
+    assert!(moved.inherit_shared_state_from(&old));
+    assert!(!Arc::ptr_eq(
+        &moved.engine_connection.load_full(),
+        &old.engine_connection.load_full()
+    ));
+}
+
+#[test]
 fn output_silence_is_read_only_while_a_stream_that_produced_output_is_open() {
     let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://decode:30000").build());
     // Nothing in flight it has shown output on: nothing to judge.

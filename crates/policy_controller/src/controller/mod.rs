@@ -59,7 +59,8 @@ mod standby;
 pub mod tls;
 mod watch_workers;
 mod wire;
-mod worker_wire;
+mod worker_objects;
+pub(crate) mod worker_wire;
 
 use std::{
     convert::Infallible, future::Future, io, net::SocketAddr, path::PathBuf, pin::pin, sync::Arc,
@@ -152,6 +153,10 @@ pub struct Controller {
     listeners: Vec<Bound>,
     admin: AdminSockets,
     admin_addr: SocketAddr,
+    /// The replica's worker objects: one object of the worker crate a row
+    /// of the store, followed by one task of the serve.
+    #[cfg(feature = "worker-host")]
+    workers: Arc<worker_objects::WorkerObjects>,
 }
 
 /// Sets an accepted socket to send at once. An answer is a few small writes
@@ -436,7 +441,18 @@ impl Controller {
         );
         let (standing, stood) = watch::channel(Standing::default());
         let steps = stood.clone();
-        let journal = replication::journaled(&config.election.lease, config.decide_shards);
+        // What a watched write wakes beside the feed: the follower of the
+        // replica's worker objects, where the build has one.
+        let objects = worker_objects::ObjectsWake::default();
+        #[cfg(feature = "worker-host")]
+        let woken = objects.clone();
+        let journal =
+            replication::journaled_waking(&config.election.lease, config.decide_shards, objects);
+        #[cfg(feature = "worker-host")]
+        let workers = Arc::new(worker_objects::WorkerObjects::new(
+            Arc::clone(&journal.0),
+            woken,
+        ));
         let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
@@ -466,6 +482,8 @@ impl Controller {
             listeners,
             admin,
             admin_addr,
+            #[cfg(feature = "worker-host")]
+            workers,
         })
     }
 
@@ -558,21 +576,28 @@ impl Controller {
     }
 
     /// Takes the controller's policy spec from the file at `path` (design
-    /// 4.6): the document is read and applied now, as generation 1 or under
-    /// the number its `generation` line writes, and the control scope
-    /// answers `GetPolicySpec` with it. [`Self::serve`] then watches the
-    /// file: a changed one is applied as the next generation, or under the
-    /// number it writes, and one that does not run is rejected whole, with
-    /// the running generation kept.
+    /// 4.6). A replica alone over its lease reads and applies the document
+    /// now, as generation 1 or under the number its `generation` line
+    /// writes, and the control scope answers `GetPolicySpec` with it.
+    /// [`Self::serve`] then watches the file: a changed one is applied as
+    /// the next generation, or under the number it writes, and one that
+    /// does not run is rejected whole, with the running generation kept.
     ///
     /// A replica under a lease another replica can take applies nothing
-    /// here: its document is passed, and applied at the replica's first
-    /// take where the replica runs nothing by then. Until it leads, a
-    /// replica that follows a leader runs what its leader's log gives it,
-    /// under the leader's number. Behind each take its watch reads the
-    /// file as a start does: a leader runs what its file says. The lease
-    /// alone decides this, whatever the order the listeners are configured
-    /// in.
+    /// here: its document is passed, and applied under the replica's first
+    /// lead where the replica runs nothing by then, at its first take or by
+    /// its watch once that lead opens. It holds no document until it
+    /// follows or leads, and `GetPolicySpec` says so. Until its document
+    /// lands, a replica that leads has no decision for a request. Until it
+    /// leads, a replica that follows a leader runs what its leader's log
+    /// gives it, under the leader's number. Its watch looks at the file
+    /// all the while and applies nothing: it shows the door what the file
+    /// holds, and says nothing of a file it cannot read. Once the replica
+    /// leads, the watch reads the file again unless its document stood on
+    /// the replica since the file took it: a rollout's new file is
+    /// applied, and a mount that lags brings nothing older back. The lease
+    /// alone decides which of the two starts this is, whatever the order
+    /// the listeners are configured in.
     ///
     /// A file that cannot be read, or a document the validator refuses, is
     /// refused here, before anything serves. The document names the stages
@@ -585,8 +610,9 @@ impl Controller {
         let generations = Arc::clone(&self.shared.generations);
         // Under a shared lease a replica may follow a leader, and then
         // runs its leader's generations: its own file is passed here and
-        // applied at its first take, and its source writes while the
-        // replica leads, by the fence.
+        // applied under its first lead, and its source writes while the
+        // replica leads under the term its bytes were read under, by the
+        // fence.
         let deferred = self.config.election.lease.is_shared();
         if deferred {
             generations.under(Arc::clone(&self.shared.fence));
@@ -773,6 +799,8 @@ impl Controller {
             spec_file,
             listeners,
             admin,
+            #[cfg(feature = "worker-host")]
+            workers,
             ..
         } = self;
         let store = Arc::clone(&shared.store);
@@ -880,6 +908,16 @@ impl Controller {
             let standby_stop = stop.subscribe();
             tasks.spawn(async move {
                 standby.run(standby_stop).await;
+                Ok(())
+            });
+        }
+        // The worker objects follow the store on every replica alike: a
+        // standby holds the objects its leader's rows make, there at a take.
+        #[cfg(feature = "worker-host")]
+        {
+            let workers_stop = stop.subscribe();
+            tasks.spawn(async move {
+                workers.run(workers_stop).await;
                 Ok(())
             });
         }
@@ -1276,6 +1314,8 @@ mod tests {
         tell_readiness, tell_role, unnamed_port, Bound, ConfigError, Controller, EngineProbe,
         Error, NoFollow, Scope,
     };
+    #[cfg(feature = "worker-host")]
+    use crate::store::{WorkerFacts, WorkersStore};
     use crate::{
         door::TERM_MARK,
         elector::{
@@ -1479,6 +1519,53 @@ mod tests {
             }
             terms.dedup();
             assert_eq!(terms, [1, 2], "the term of the mark, then the next");
+            stop.send(()).expect("the serve waits for its stop");
+        };
+        let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })
+            .await
+            .expect("the serve ends at its stop");
+        served.expect("a serve that leaves by its signal");
+    }
+
+    /// The serve starts the follower of the replica's worker objects, on
+    /// the wake the store's log tells: a row written while the controller
+    /// leads has its object, and a row removed has none.
+    #[cfg(feature = "worker-host")]
+    #[tokio::test]
+    async fn a_served_controller_holds_the_worker_objects_of_its_stores_rows() {
+        let controller = Controller::bind(valid()).await.expect("the listeners bind");
+        let (shared, store) = (Arc::clone(&controller.shared), controller.store());
+        let workers = Arc::clone(&controller.workers);
+        let (stop, stopped) = oneshot::channel::<()>();
+        let serve = controller.serve(async {
+            let _ = stopped.await;
+        });
+        let case = async {
+            let (wait, begun) = (Duration::from_secs(20), Instant::now());
+            while shared.fence.leader_term(Instant::now()).is_none() {
+                assert!(begun.elapsed() < wait, "no first take");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let url = "http://w:8000".to_owned();
+            let row = store
+                .upsert(WorkerFacts {
+                    key: url.clone(),
+                    engine: url,
+                    models: vec!["m".to_owned()],
+                    dp_size: 1,
+                    ..WorkerFacts::default()
+                })
+                .id();
+            while workers.objects().object(row).is_none() {
+                assert!(begun.elapsed() < wait, "no object of the row");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let revision = store.get(row).expect("the row").revision;
+            store.remove(row, revision).expect("a removal");
+            while !workers.objects().is_empty() {
+                assert!(begun.elapsed() < wait, "the object of a row that went");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             stop.send(()).expect("the serve waits for its stop");
         };
         let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })

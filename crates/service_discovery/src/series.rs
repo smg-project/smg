@@ -4,9 +4,13 @@ use std::time::Duration;
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 
+#[cfg(any(test, feature = "kubernetes"))]
 pub(super) const DISCOVERY_KUBERNETES: &str = "kubernetes";
+#[cfg(any(test, feature = "file"))]
 pub(super) const DISCOVERY_FILE: &str = "file";
+#[cfg(any(test, feature = "slurm"))]
 pub(super) const DISCOVERY_SLURM: &str = "slurm";
+#[cfg(any(test, feature = "consul"))]
 pub(super) const DISCOVERY_CONSUL: &str = "consul";
 
 pub(super) const REGISTRATION_SUCCESS: &str = "success";
@@ -15,13 +19,17 @@ pub(super) const DEREGISTRATION_RECONCILED: &str = "reconciled";
 
 /// `reason` values of `smg_discovery_snapshot_errors_total`: the source could
 /// not be read, or was read and rejected as invalid.
+#[cfg(any(feature = "consul", feature = "file", feature = "slurm"))]
 pub(super) const SNAPSHOT_ERROR_UNREADABLE: &str = "unreadable";
+#[cfg(any(feature = "consul", feature = "file", feature = "slurm"))]
 pub(super) const SNAPSHOT_ERROR_INVALID: &str = "invalid";
 
 /// `reason` values of `smg_discovery_skipped_total`, for a worker a provider
 /// left out of an otherwise good snapshot: its record could not be used, or
 /// one started earlier at its address.
+#[cfg(any(feature = "consul", feature = "slurm"))]
 pub(super) const DISCOVERY_SKIP_INVALID: &str = "invalid";
+#[cfg(any(feature = "consul", feature = "slurm"))]
 pub(super) const DISCOVERY_SKIP_CONFLICT: &str = "conflict";
 
 /// Describe the discovery series to the installed recorder. A host calls it
@@ -93,6 +101,7 @@ pub(super) fn set_workers_discovered(source: &'static str, count: usize) {
 
 /// Record a discovered worker a provider left out of a snapshot it
 /// otherwise applied
+#[cfg(any(feature = "consul", feature = "slurm"))]
 pub(super) fn record_skip(source: &'static str, reason: &'static str) {
     counter!(
         "smg_discovery_skipped_total",
@@ -104,6 +113,7 @@ pub(super) fn record_skip(source: &'static str, reason: &'static str) {
 
 /// Record a discovery source observation that was rejected; the provider
 /// keeps reconciling its last good snapshot meanwhile
+#[cfg(any(feature = "consul", feature = "file", feature = "slurm"))]
 pub(super) fn record_snapshot_error(source: &'static str, reason: &'static str) {
     counter!(
         "smg_discovery_snapshot_errors_total",

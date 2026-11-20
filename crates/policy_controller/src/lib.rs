@@ -95,9 +95,21 @@
 //!   later PRs.
 //! - Behind the `client` feature, the reference client of the controller's
 //!   protocol (`client`): one gateway's side of it (the dial, `Leader`,
-//!   the session's `Hello` answered by a `Welcome`, and a request's
-//!   lifecycle reports on that session), with a blocking form. No shipped
-//!   binary builds it.
+//!   the session's `Hello` answered by a `Welcome`, a request's lifecycle
+//!   reports on that session, and the watch of the workers' rows), with a
+//!   blocking form. No shipped binary builds it.
+//! - Behind the same feature, the watcher (`watcher`): a gateway's copy of
+//!   the controller's workers. It takes the watch's events in their order
+//!   into a [`store::MemoryStore`] of its own, through the door a
+//!   standby's applier writes a followed row by, and names the place a
+//!   watch opened again goes on from.
+//! - Behind the `worker-host` feature, a replica's worker objects
+//!   (`worker_host`): one object of the worker crate for every row of the
+//!   membership store, in a registry the host hands in, built, replaced and
+//!   dropped as the rows come, change and go. A controller built with it
+//!   follows its own store, on a leader and on a standby alike, and hands
+//!   each object a gRPC connector: an object connects to its engine at its
+//!   first use.
 //!
 //! What this step does not hold: the gRPC plugin service, the operator calls,
 //! the other ingestion drivers and the gRPC API; they arrive in later
@@ -138,7 +150,11 @@ pub mod store;
 pub mod view;
 #[cfg(feature = "wasm")]
 pub mod wasm;
+#[cfg(feature = "client")]
+pub mod watcher;
 pub mod wit;
+#[cfg(feature = "worker-host")]
+pub mod worker_host;
 
 pub use catalog::{Catalog, CatalogError, StageKind};
 pub use counts::{KeptCounts, LentCounts};

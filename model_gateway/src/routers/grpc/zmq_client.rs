@@ -13,12 +13,10 @@ pub use engine_zmq_adapter::{
     ZmqServerInfo,
 };
 use llm_tokenizer::traits::Tokenizer;
+use smg_grpc_client::engine_labels::{ModelInfo, ServerInfo};
 use smg_worker::identity::basic::CONTEXT_WINDOW_LABELS;
 
-use crate::routers::grpc::{
-    client::{ModelInfo, ServerInfo},
-    proto_wrapper::ProtoGenerateRequest,
-};
+use crate::routers::grpc::proto_wrapper::ProtoGenerateRequest;
 
 /// Submit the wrapper's request to the engine it was built for.
 pub(crate) async fn generate(

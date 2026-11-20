@@ -105,6 +105,10 @@ pub mod mode {
     /// As `COUNT_MEMBERS`, and `observe` traps on a snapshot of five
     /// members: a telling that faults one instance and not the next.
     pub const TRAP_ON_FIVE_MEMBERS: u8 = 33;
+    /// As `TRAP_ON_FIVE_MEMBERS`, and the destructor writes a log line as
+    /// `LOG_IN_DESTRUCTOR` does: a close a test can stop, on a guest whose
+    /// telling can fault.
+    pub const TRAP_ON_FIVE_AND_LOG_IN_DESTRUCTOR: u8 = 37;
     /// `observe` counts members as `COUNT_MEMBERS` does and, at a dispatch,
     /// keeps the count as it stood then; `pick` names the row at that count:
     /// whether a change told ahead of a dispatch was heard ahead of it.
@@ -604,7 +608,7 @@ fn guest_wat(guest: Guest) -> String {
         (i32.store8 offset=4 (local.get $r) (i32.const 1))
         (i32.store offset=8 (local.get $r) (global.get $heard))
         (return (local.get $r))))
-    (if (i32.or (i32.eq (global.get $mode) (i32.const {count_members})) (i32.eq (global.get $mode) (i32.const {trap_on_five_members})))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {count_members})) (i32.or (i32.eq (global.get $mode) (i32.const {trap_on_five_members})) (i32.eq (global.get $mode) (i32.const {trap_on_five_log_dtor}))))
       (then
         (i32.store8 offset=4 (local.get $r) (i32.const 1))
         (i32.store offset=8 (local.get $r) (global.get $members))
@@ -650,7 +654,7 @@ fn guest_wat(guest: Guest) -> String {
       (then
         (if (i64.eq (local.get 1) (i64.const 5))
           (then
-            (if (i32.and (i32.eq (global.get $mode) (i32.const {trap_on_five_members})) (i64.eq (local.get 3) (i64.const 5)))
+            (if (i32.and (i32.or (i32.eq (global.get $mode) (i32.const {trap_on_five_members})) (i32.eq (global.get $mode) (i32.const {trap_on_five_log_dtor}))) (i64.eq (local.get 3) (i64.const 5)))
               (then unreachable))
             (global.set $members (i32.wrap_i64 (local.get 3)))))
         (if (i64.eq (local.get 1) (i64.const 0))
@@ -706,7 +710,7 @@ fn guest_wat(guest: Guest) -> String {
           (drop (call $now))
           (local.set $i (i32.sub (local.get $i) (i32.const 1)))
           (br_if $calls (local.get $i)))))
-    (if (i32.eq (global.get $mode) (i32.const {log_dtor}))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {log_dtor})) (i32.eq (global.get $mode) (i32.const {trap_on_five_log_dtor})))
       (then
         (call $log (i32.const 2) (i32.const 32) (i32.const 8))
         (loop $once (br_if $once (i32.const 0)))))
@@ -749,6 +753,7 @@ fn guest_wat(guest: Guest) -> String {
         count_dispatches = mode::COUNT_DISPATCHES,
         count_members = mode::COUNT_MEMBERS,
         trap_on_five_members = mode::TRAP_ON_FIVE_MEMBERS,
+        trap_on_five_log_dtor = mode::TRAP_ON_FIVE_AND_LOG_IN_DESTRUCTOR,
         members_at_a_dispatch = mode::MEMBERS_AT_A_DISPATCH,
         count_kinds = mode::COUNT_KINDS,
         count_left = mode::COUNT_LEFT,
