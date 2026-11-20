@@ -942,23 +942,66 @@ def test_no_document_and_no_policy_value_renders_the_line_as_before():
     assert router_container(documents)["args"] == expected
 
 
+CACHE_TUNING_DEFAULTS = (
+    "router.cacheThreshold=0.3",
+    "router.balanceAbsThreshold=64",
+    "router.balanceRelThreshold=1.5",
+    "router.evictionIntervalSecs=120",
+    "router.maxTreeSize=67108864",
+    "router.blockSize=16",
+)
+
+
 @needs_helm
 @pytest.mark.parametrize(
-    "settings", [INLINE_ROUTER_POLICY, (NAMED_ROUTER_POLICY,)], ids=["inline", "named"]
+    "settings",
+    [
+        INLINE_ROUTER_POLICY,
+        (NAMED_ROUTER_POLICY,),
+        (NAMED_ROUTER_POLICY, "router.disaggregation.mode=pd"),
+        (NAMED_ROUTER_POLICY, *CACHE_TUNING_DEFAULTS),
+    ],
+    ids=["inline", "named", "pd", "defaults written out"],
 )
-def test_a_document_and_no_policy_value_renders_no_policy_flag(settings):
+def test_a_document_renders_no_flag_a_document_replaces(settings):
     _, documents = render(POLICY_CONTROLLER_ON, *settings)
     args = router_container(documents)["args"]
-    assert "--policy" not in args
-    # The launcher refuses a routing option that is not at its default beside
-    # a document. The line's six routing numbers are the launcher's defaults.
+    # The command line refuses each of these beside a document, at its
+    # default too. The Python launcher refuses one that is not at its default.
+    replaced = {"--" + name.replace("_", "-") for name in router_args.DOCUMENT_REPLACES}
+    assert {"--policy", "--prefill-policy", "--cache-threshold", "--block-size"} <= replaced
+    assert replaced.isdisjoint(args)
     assert launcher_args(args).options_a_document_replaces() == []
 
 
 @needs_helm
-def test_a_policy_value_beside_a_document_fails_the_render():
-    error = render_error(POLICY_CONTROLLER_ON, NAMED_ROUTER_POLICY, "router.policy=random")
-    assert "router.policy is set beside a policy document" in error
+@pytest.mark.parametrize(
+    ("value", "settings"),
+    [
+        ("router.policy", ("router.policy=random",)),
+        (
+            "router.disaggregation.prefillPolicy",
+            ("router.disaggregation.mode=pd", "router.disaggregation.prefillPolicy=random"),
+        ),
+        (
+            "router.disaggregation.decodePolicy",
+            ("router.disaggregation.mode=pd", "router.disaggregation.decodePolicy=random"),
+        ),
+        (
+            "router.disaggregation.encodePolicy",
+            ("router.disaggregation.mode=epd", "router.disaggregation.encodePolicy=random"),
+        ),
+        ("router.cacheThreshold", ("router.cacheThreshold=0.5",)),
+        ("router.balanceAbsThreshold", ("router.balanceAbsThreshold=32",)),
+        ("router.balanceRelThreshold", ("router.balanceRelThreshold=2",)),
+        ("router.evictionIntervalSecs", ("router.evictionIntervalSecs=60",)),
+        ("router.maxTreeSize", ("router.maxTreeSize=1024",)),
+        ("router.blockSize", ("router.blockSize=8",)),
+    ],
+)
+def test_a_value_a_document_replaces_fails_the_render_by_name(value, settings):
+    error = render_error(POLICY_CONTROLLER_ON, NAMED_ROUTER_POLICY, *settings)
+    assert f"{value} is set beside a policy document" in error
 
 
 @needs_helm
@@ -996,6 +1039,7 @@ def test_default_values_render_no_policy_controller_flag():
     assert defaults["policySpec"] == {}
     assert defaults["policySpecConfigMap"] == ""
     _, documents = render()
+    assert render("router.policyController=false")[1] == documents
     pod = router_pod(documents)
     container = router_container(documents)
     assert not {"--policy-controller", "--policy-spec"} & set(container["args"])
@@ -1008,8 +1052,10 @@ def test_default_values_render_no_policy_controller_flag():
 
 
 @needs_helm
-def test_the_switch_renders_its_flag():
-    _, documents = render(POLICY_CONTROLLER_ON)
+@pytest.mark.parametrize("switch", ["on", "true"])
+def test_the_switch_renders_its_flag(switch):
+    # A values file that writes a bare on gives a boolean: both forms mean on.
+    _, documents = render(f"router.policyController={switch}")
     args = router_container(documents)["args"]
     assert has_run(args, ["--policy-controller", "on"])
     assert "--policy-spec" not in args
