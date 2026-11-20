@@ -17,8 +17,9 @@ use bytes::Bytes;
 use http_body::{Body as _, Frame, SizeHint};
 use parking_lot::Mutex;
 use smg_policy_controller::{lease::TransportClass, ReleaseReason};
+use smg_worker::identity::basic::Worker;
 
-use super::{transport_class, End, Placed};
+use super::{transport_class, Ask, End, Host, Placed};
 use crate::{middleware::metrics::BodyProgress, routers::common::attempt_ledger::UpstreamAnswer};
 
 /// Response extension: the gateway made this answer behind the worker's own
@@ -133,6 +134,18 @@ impl Sent {
             self.at = Some(now);
         }
         self.placed.decode_dispatched(now);
+    }
+
+    /// Asks the pair's decode again at `now`, behind its prefill's answer
+    /// ([`Placed::decode_again`]).
+    pub(crate) fn decode_again(
+        &mut self,
+        host: &Host,
+        ask: &Ask<'_>,
+        holds: impl Fn(&dyn Worker) -> bool,
+        now: Instant,
+    ) -> Option<&Arc<dyn Worker>> {
+        self.placed.decode_again(host, ask, holds, now)
     }
 
     /// A pair's prefill answered `status` at `now`, ahead of the end of the

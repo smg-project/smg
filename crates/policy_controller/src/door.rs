@@ -2682,17 +2682,18 @@ impl Stated for Request<'_> {
     }
 }
 
-/// A decode call's request with the seat of its lease's file. The call
-/// decides at that seat, behind the decision that stands there: a caller
-/// that takes up a seat's work applies what was handed to its file, so a
-/// prefill's dispatch that waits there is applied ahead of the call's read.
-/// From another seat the call would read a file that applies nothing while
-/// its own caller decides, and a sent prefill would read as not sent.
-struct Called<'r, 'q>(&'r Request<'q>, usize);
+/// A decode call's request with the seat of its lease's file: one its host
+/// stated, or one its host makes. The call decides at that seat, behind the
+/// decision that stands there: a caller that takes up a seat's work applies
+/// what was handed to its file, so a prefill's dispatch that waits there is
+/// applied ahead of the call's read. From another seat the call would read
+/// a file that applies nothing while its own caller decides, and a sent
+/// prefill would read as not sent.
+struct Called<'s, S>(&'s S, usize);
 
-impl Stated for Called<'_, '_> {
+impl<S: Stated> Stated for Called<'_, S> {
     fn model(&self) -> &str {
-        self.0.facts.model
+        self.0.model()
     }
 
     fn own_seat(&self) -> Option<usize> {
@@ -2700,8 +2701,8 @@ impl Stated for Called<'_, '_> {
     }
 
     #[inline(always)]
-    fn under<R>(&self, _: &World, order: impl FnOnce(&Request<'_>) -> R) -> R {
-        order(self.0)
+    fn under<R>(&self, world: &World, order: impl FnOnce(&Request<'_>) -> R) -> R {
+        self.0.under(world, order)
     }
 }
 
@@ -3143,6 +3144,37 @@ impl Door {
         &self,
         gateway: GatewayId,
         request: &Request<'_>,
+        lease: LeaseId,
+        now: Instant,
+    ) -> Result<Decided, Refused> {
+        self.decode_called(gateway, request, lease, now)
+    }
+
+    /// [`Door::decide_decode`] for a request its host makes from the world
+    /// the call decides under ([`Maker::make`]). The sources of the
+    /// request's routing key and the decode profile that reads the key are
+    /// then of one load, across a reload that lands beside the call.
+    ///
+    /// A maker that panics is a decision that faulted.
+    ///
+    /// # Errors
+    ///
+    /// As [`Door::decide_decode`].
+    pub fn decide_decode_under(
+        &self,
+        gateway: GatewayId,
+        maker: &impl Maker,
+        lease: LeaseId,
+        now: Instant,
+    ) -> Result<Decided, Refused> {
+        self.decode_called(gateway, &Made(maker), lease, now)
+    }
+
+    /// The decode call for `request` at the seat of its lease's file.
+    fn decode_called(
+        &self,
+        gateway: GatewayId,
+        request: &impl Stated,
         lease: LeaseId,
         now: Instant,
     ) -> Result<Decided, Refused> {
@@ -5593,6 +5625,49 @@ pub(crate) mod tests {
         assert!(store.sides(GATEWAY, lease).is_none());
         assert_eq!(*reloaded.lock(), [""; 0]);
         assert_eq!(*first.lock(), ["issued", "dispatched"]);
+    }
+
+    /// A decode call's request its host makes is made from the world the
+    /// call decides under, as a first decision's is. An apply that lands
+    /// while the host makes it is the next decision's: the call in hand
+    /// keeps the world it handed.
+    #[test]
+    fn a_decode_calls_request_is_made_from_the_world_the_call_decides_under() {
+        /// Says the generation it was handed, then applies the next one.
+        struct Reloads<'t>(&'t MemoryStore, Cell<u64>);
+
+        impl Maker for Reloads<'_> {
+            fn model(&self) -> &str {
+                MODEL
+            }
+
+            fn make<'w>(&'w self, world: &'w World) -> Request<'w> {
+                let handed = world.spec().generation();
+                self.1.set(handed);
+                let document = PolicySpec::pair_presets("least_load", "least_load");
+                let mut document = document.expect("a spec");
+                document.generation = handed + 1;
+                apply_pair_document(self.0, document).expect("a later generation");
+                later_request(b"pair")
+            }
+        }
+
+        let store = pair_fleet(1, 1).expect("a pair fleet");
+        let door = Door::new(Arc::clone(&store));
+        let now = Instant::now();
+        let asked = later_request(b"pair");
+        let answer = door.decide(GATEWAY, &asked, now).expect("the pair");
+        let lease = answer.lease.expect("a lease").lease.id;
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+        let standing = || store.with_world(|world| world.spec().generation());
+        let before = standing();
+        let raced = Reloads(&store, Cell::new(0));
+        let answer = door.decide_decode_under(GATEWAY, &raced, lease, now);
+        let answer = answer.expect("a decode decision");
+        let side = answer.lease.map(|leased| leased.lease.side);
+        assert_eq!(side, Some(Side::Decode));
+        assert_eq!(answer.decision.trace().generation, raced.1.get());
+        assert_eq!((raced.1.get(), standing()), (before, before + 1));
     }
 
     /// A caller that stands at its seat until the case sends it on: it

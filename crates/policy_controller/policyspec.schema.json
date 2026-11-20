@@ -1242,7 +1242,8 @@
         "pd-pair": {
           "$ref": "#/$defs/PdPairPlanSpec",
           "default": {
-            "pairing": "lenient"
+            "pairing": "lenient",
+            "decode": "with-prefill"
           }
         }
       },
@@ -1255,6 +1256,11 @@
         "pairing": {
           "$ref": "#/$defs/Pairing",
           "default": "lenient"
+        },
+        "decode": {
+          "description": "When a pair's decode side is picked: `with-prefill` (the default)\nor `after-prefill`.",
+          "$ref": "#/$defs/DecodePick",
+          "default": "with-prefill"
         }
       },
       "additionalProperties": false
@@ -1276,6 +1282,21 @@
           "description": "Runtime, transport and KV layout are known on both sides and agree,\nand reported engine versions match.",
           "type": "string",
           "const": "strict"
+        }
+      ]
+    },
+    "DecodePick": {
+      "description": "When a pair's decode side is picked.",
+      "oneOf": [
+        {
+          "description": "With the prefill, in the pair's one decision.",
+          "type": "string",
+          "const": "with-prefill"
+        },
+        {
+          "description": "After the prefill has run, on a route that sends the decode then.\nThe pair's first decision books the prefill alone and names the\ndecode's targets. The host asks the decode again when the prefill\nhas answered, and that decision reads the rows of its own instant.\nA route that sends both sides at once keeps the first decision's\ndecode.",
+          "type": "string",
+          "const": "after-prefill"
         }
       ]
     },

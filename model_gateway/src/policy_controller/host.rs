@@ -45,6 +45,7 @@ use smg_policy_controller::{
     door::{Door, Maker, Refused, Request},
     handle::Handle,
     lease::{Outcome, ReleaseReason, Side, TransportClass},
+    spec::DecodePick,
     store::{GatewayId, MemoryStore, World},
     view::{Constraints, Identity, Phase, RequestFacts, WorkerId},
     worker_host::Objects,
@@ -136,6 +137,13 @@ pub(crate) struct Ask<'a> {
     pub rid: Option<&'a str>,
     /// A regular attempt is single. A pair is asked at its prefill.
     pub phase: Phase,
+    /// The route asks a pair's decode again behind its prefill's answer
+    /// ([`Placed::decode_again`]). Where the document in force picks the
+    /// decode after the prefill ([`DecodePick::AfterPrefill`]), such an ask
+    /// states the later decode: its decision books the prefill alone and
+    /// names the decode's targets. A route that never asks again states
+    /// nothing here, and keeps one decision under every document.
+    pub decode_again: bool,
     /// The size of the prompt in tokens. Zero uses the count from hashing if available.
     pub prompt_tokens: u32,
     /// The media the request carries, by count. Zero where it carries
@@ -160,7 +168,7 @@ impl<'a> Ask<'a> {
     /// An ask for `model` under the request's `id` that states no other
     /// fact: a single request of no stated prompt size, not streamed, no
     /// input of a routing key, no media, no stated wire, nothing tried, no
-    /// stated attempt, no hashes.
+    /// stated attempt, no hashes, no second ask of a decode.
     pub(crate) const fn of(id: &'a [u8], model: &'a str) -> Self {
         Self {
             id,
@@ -169,6 +177,7 @@ impl<'a> Ask<'a> {
             headers: None,
             rid: None,
             phase: Phase::Single,
+            decode_again: false,
             prompt_tokens: 0,
             media: MediaCounts::NONE,
             wires: WireModes::NONE,
@@ -256,6 +265,13 @@ impl<'a> Ask<'a> {
             },
         }
     }
+
+    /// Whether this ask states the later decode under `spec`: its route
+    /// asks the decode again, and the document picks the decode after the
+    /// prefill.
+    fn decode_later(&self, spec: &AppliedSpec) -> bool {
+        self.decode_again && spec.decode_pick() == DecodePick::AfterPrefill
+    }
 }
 
 /// One ask of an attempt, as the door takes it up: its request is made from
@@ -283,7 +299,11 @@ impl Maker for Made<'_, '_> {
             KeySource::Rid => "rid",
         }));
         let key = derived.map_or(Identity::NONE, |derived| derived.key);
-        self.ask.request(key, client_key, self.missed)
+        let mut request = self.ask.request(key, client_key, self.missed);
+        // The document's word, like the keys: read from the generation
+        // that decides.
+        request.constraints.decode_later = self.ask.decode_later(world.spec());
+        request
     }
 }
 
@@ -531,6 +551,31 @@ impl Host {
             let profile = spec.engine().profiles().get(usize::from(trace.profile))?;
             Some(Arc::from(profile.name.as_str()))
         })
+    }
+
+    /// Counts a pair's second ask of its decode for `model`, as an ask
+    /// counts its decision: under the generation and the profile of a
+    /// call that `picked`, and under none for a call that shed or was
+    /// refused, whose decision the handle does not hand on.
+    fn count_decode_call(
+        &self,
+        model: &str,
+        picked: Option<&Decision>,
+        outcome: &'static str,
+        seconds: f64,
+    ) {
+        let trace = picked.map(Decision::trace);
+        Metrics::record_policy_decision(
+            model,
+            PolicyDecision {
+                generation: trace.map_or(0, |trace| trace.generation),
+                profile: picked.and_then(profile_of),
+                outcome,
+                mode: "embedded",
+            },
+            || trace.and_then(|trace| self.profile_name(trace)),
+            seconds,
+        );
     }
 
     fn trace_decision(&self, decision: &Decision, worker: Option<&Arc<dyn Worker>>) {
@@ -1139,6 +1184,85 @@ impl Placed {
         }
         false
     }
+
+    /// Whether the pair's decode stands chosen and booked nowhere: its ask
+    /// stated the later decode, and the decode's dispatch is still owed.
+    /// The route asks it again behind its prefill's answer
+    /// ([`Self::decode_again`]), or sends the first pick's.
+    pub(crate) fn decode_waits(&self) -> bool {
+        self.handle.decode_chosen()
+    }
+
+    /// Asks the pair's decode again at `now`, on the rows of that instant:
+    /// behind the prefill's answer, and ahead of the prefill's end. `ask`
+    /// states the request as its first ask did. A pick moves the placement
+    /// to the first of its decodes the gateway can send to and `holds`
+    /// admits: the route's rule, as at the first commit. Returns the decode
+    /// the call moved the placement to, and `None` where the placement
+    /// keeps the decode it named.
+    ///
+    /// The call never fails its request. A decode that does not stand
+    /// chosen takes no call. A call the door sheds or refuses leaves the
+    /// decode the first pick named, still chosen. Where the call picked
+    /// and the gateway can send to none of its decodes, the decode side's
+    /// lease is given up: the first pick's decode is then sent unbooked.
+    pub(crate) fn decode_again(
+        &mut self,
+        host: &Host,
+        ask: &Ask<'_>,
+        holds: impl Fn(&dyn Worker) -> bool,
+        now: Instant,
+    ) -> Option<&Arc<dyn Worker>> {
+        let placed = self.pair.as_deref_mut()?;
+        if !self.handle.decode_chosen() {
+            return None;
+        }
+        let made = Made {
+            ask,
+            missed: &[],
+            source: Cell::new(None),
+        };
+        let handle = &mut self.handle;
+        let started = Instant::now();
+        // The call's request is made as the first ask's was: from the
+        // world the door decides it under, by the sources of that document.
+        let decided = handle.decide_decode_under(&made, now).copied();
+        let seconds = started.elapsed().as_secs_f64();
+        // A pick issued the side. A shed and a refusal left it chosen: the
+        // handle answers the first pick behind a shed, so the side tells
+        // the two apart.
+        let (outcome, picked) = match decided {
+            Err(_) => ("refused", None),
+            Ok(_) if handle.decode_chosen() => ("shed", None),
+            Ok(decision) => (outcome(&decision), Some(decision)),
+        };
+        host.count_decode_call(ask.model, picked.as_ref(), outcome, seconds);
+        let Some(Decision::Pick(pick)) = picked else {
+            return None;
+        };
+        for (index, target) in pick.targets.iter().enumerate() {
+            let Some(pair) = target.pair.filter(|_| target.id == self.id) else {
+                continue;
+            };
+            let sendable = |worker: &Arc<dyn Worker>| {
+                routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref())
+            };
+            let Some(worker) = host.worker(pair.decode_id).filter(sendable) else {
+                continue;
+            };
+            // The call took its first target. A later one is taken by name.
+            if index == 0 || self.handle.take_decode(index).is_some() {
+                placed.decode = worker;
+                placed.side = pair;
+                placed.targets = pick.targets;
+                placed.index = index;
+                return Some(&placed.decode);
+            }
+        }
+        self.handle
+            .released_decode(ReleaseReason::CommitFailed, now);
+        None
+    }
 }
 
 impl fmt::Debug for Placed {
@@ -1189,6 +1313,8 @@ impl Held {
 
 mod ride;
 pub(crate) use ride::{BehindAnswer, Sent};
+#[cfg(test)]
+mod decode_again_tests;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]
