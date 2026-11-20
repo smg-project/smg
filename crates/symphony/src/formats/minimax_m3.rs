@@ -61,9 +61,12 @@ mod tests {
     use crate::{
         adapt::chat,
         engine::Engine,
-        event::{DropReason, Event, MalformedReason},
+        event::{CallEnd, DropReason, Event, MalformedReason},
         input::EngineFinish,
-        testing::{arguments_of, bytes, content, drive, drive_to, dropped, names, reasoning},
+        testing::{
+            arguments_of, bytes, content, drive, drive_to, dropped, endings, losses, names,
+            reasoning,
+        },
         Declared,
     };
 
@@ -685,6 +688,172 @@ mod tests {
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })
         ));
+    }
+
+    /// The bytes dropped as a malformed call's, in order.
+    fn refused_bytes(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::MalformedCall,
+                } => Some(text.text.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One `get_weather` invoke for Paris in a block, whole.
+    const WHOLE: &str = concat!(
+        "<tool_call>\n<invoke name=\"get_weather\">\n<city>Paris</city>\n</invoke>\n",
+        "</tool_call>"
+    );
+    /// The same block, ended inside the city's value.
+    const OPEN: &str = "<tool_call>\n<invoke name=\"get_weather\">\n<city>Par";
+
+    /// Every invoke's end says who ended it. The model ends an invoke with its closing tag,
+    /// with the next invoke's opener or with the block's close; the model's own stop finds one
+    /// open, whatever the syntax closes for it; the token limit and an abort cut one. Only the
+    /// invoke the output's end found open ends as stopped or cut.
+    #[test]
+    fn an_invokes_end_says_who_ended_it() {
+        let read = |output: &str, finish: EngineFinish| {
+            drive_to(
+                &mut Engine::new(minimax_m3(), get_weather()),
+                "",
+                &[output],
+                finish,
+            )
+        };
+        for finish in [EngineFinish::Stop, EngineFinish::Length] {
+            let events = read(WHOLE, finish);
+            assert_eq!(endings(&events), [(0, CallEnd::Closed)]);
+            assert_eq!(losses(&events), []);
+        }
+        // The next invoke's opener ends the first, the block's close the second.
+        let events = read(
+            concat!(
+                "<tool_call>\n<invoke name=\"get_weather\"><city>Paris</city>",
+                "<invoke name=\"get_weather\"><city>Rome</city></tool_call>"
+            ),
+            EngineFinish::Stop,
+        );
+        assert_eq!(
+            endings(&events),
+            [(0, CallEnd::Closed), (1, CallEnd::Closed)]
+        );
+        assert_eq!(losses(&events), []);
+        // The model's own stop inside the value: the string and the object are closed for it,
+        // which is said as a repair, and the end says that the stop found the invoke open.
+        let stopped = read(OPEN, EngineFinish::Stop);
+        assert_eq!(endings(&stopped), [(0, CallEnd::Stop)]);
+        assert_eq!(arguments_of(&stopped, 0), r#"{"city": "Par"}"#);
+        assert_eq!(
+            malformed(&stopped),
+            [(String::new(), MalformedReason::OpenAtTheStop)]
+        );
+        assert_eq!(losses(&stopped), []);
+        // The stop between two elements closes the object: stopped all the same.
+        let between = read(
+            "<tool_call>\n<invoke name=\"get_weather\">\n<city>Paris</city>\n",
+            EngineFinish::Stop,
+        );
+        assert_eq!(endings(&between), [(0, CallEnd::Stop)]);
+        assert_eq!(arguments_of(&between, 0), r#"{"city": "Paris"}"#);
+        for finish in [EngineFinish::Length, EngineFinish::Abort] {
+            let cut = read(OPEN, finish);
+            assert_eq!(endings(&cut), [(0, CallEnd::Cut)]);
+            assert_eq!(arguments_of(&cut, 0), r#"{"city": "Par"#);
+            assert_eq!(losses(&cut), [MalformedReason::UnterminatedRegion]);
+        }
+        // The invoke before the one the limit cut closed at its own tag.
+        let two = format!(
+            "{}\n<invoke name=\"get_weather\">\n<city>Ro",
+            WHOLE.trim_end_matches("</tool_call>").trim_end()
+        );
+        let events = read(&two, EngineFinish::Length);
+        assert_eq!(endings(&events), [(0, CallEnd::Closed), (1, CallEnd::Cut)]);
+    }
+
+    /// A block the syntax could not read says that a call was lost: by the reason of its
+    /// `Malformed` event and by the bytes dropped as a malformed call's. Inside an invoke the
+    /// model closed, the invoke's end is the model's and its arguments are no whole value; an
+    /// invoke that named no call has no end at all, at its closing tag or at the output's end.
+    /// What loses no call says so too: a function the request did not declare, and a value the
+    /// invoke's close found open.
+    #[test]
+    fn a_block_the_syntax_could_not_read_says_a_call_was_lost() {
+        let read = |output: &str, finish: EngineFinish| {
+            drive_to(
+                &mut Engine::new(minimax_m3(), get_weather()),
+                "",
+                &[output],
+                finish,
+            )
+        };
+        // Prose where the invoke has tags.
+        let events = read(
+            "<tool_call>\n<invoke name=\"get_weather\">\nParis\n</invoke>\n</tool_call>",
+            EngineFinish::Stop,
+        );
+        assert_eq!(endings(&events), [(0, CallEnd::Closed)]);
+        assert_eq!(losses(&events), [MalformedReason::TextBetweenTags]);
+        assert_eq!(refused_bytes(&events), ["Paris"]);
+        assert_eq!(arguments_of(&events, 0), "");
+        // An invoke without a name starts no call and ends none.
+        let events = read(
+            "<tool_call>\n<invoke name=\"\"><city>Paris</city></invoke>\n</tool_call>",
+            EngineFinish::Stop,
+        );
+        assert_eq!(endings(&events), []);
+        assert_eq!(names(&events), [] as [&str; 0]);
+        assert_eq!(losses(&events)[0], MalformedReason::EmptyName);
+        assert!(!refused_bytes(&events).is_empty());
+        // An invoke the output ended inside before its name closed: no call, no end, and the
+        // bytes refused in the output's last step, cut or stopped.
+        let cut = read("<tool_call>\n<invoke name=\"get_wea", EngineFinish::Length);
+        assert_eq!(endings(&cut), []);
+        assert_eq!(losses(&cut), [MalformedReason::UnterminatedRegion]);
+        assert_eq!(refused_bytes(&cut), ["get_wea"]);
+        let stopped = read("<tool_call>\n<invoke name=\"get_wea", EngineFinish::Stop);
+        assert_eq!(endings(&stopped), []);
+        assert_eq!(losses(&stopped), [MalformedReason::CallWithoutName]);
+        assert_eq!(refused_bytes(&stopped), ["get_wea"]);
+        // Prose in the block where an invoke should be.
+        let events = read(
+            "<tool_call>\nget_weather Paris\n</tool_call>",
+            EngineFinish::Stop,
+        );
+        assert_eq!(endings(&events), []);
+        assert_eq!(
+            losses(&events),
+            [MalformedReason::TextBetweenCalls; 2],
+            "{events:?}"
+        );
+        // No call lost: the function is not one the request declares, and the call goes out.
+        let events = read(
+            "<tool_call>\n<invoke name=\"other\"><city>Paris</city></invoke>\n</tool_call>",
+            EngineFinish::Stop,
+        );
+        assert_eq!(endings(&events), [(0, CallEnd::Closed)]);
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::UnknownTool)]
+        );
+        assert_eq!(losses(&events), []);
+        // No call lost: the invoke's close found the value open, and the value is whole.
+        let events = read(
+            "<tool_call>\n<invoke name=\"get_weather\"><city>Paris</invoke>\n</tool_call>",
+            EngineFinish::Stop,
+        );
+        assert_eq!(endings(&events), [(0, CallEnd::Closed)]);
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Paris"}"#);
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::OpenAtTheMarker)]
+        );
+        assert_eq!(losses(&events), []);
     }
 
     #[test]

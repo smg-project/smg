@@ -2610,7 +2610,7 @@ fn check_well_formed(subject: &Subject, text: &str, cuts: &[usize], events: &[Ev
                     }
                 }
             }
-            Event::ToolCallEnd { index, source } => {
+            Event::ToolCallEnd { index, source, .. } => {
                 assert!(
                     started.contains(index),
                     "{}: before the call's start",

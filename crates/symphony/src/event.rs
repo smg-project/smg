@@ -286,9 +286,125 @@ malformed_reasons! {
     OpenAtTheMarker => "a string value left open at the call's closing marker",
 }
 
+impl MalformedReason {
+    /// Whether the reason says that the model wrote a tool call the syntax could not read
+    /// whole: bytes written for a call that are in no call the output delivers (refused as a
+    /// malformed call's, or returned as text where the syntax has a call, a name, a key, a value
+    /// or arguments), or a call that ends without its whole arguments. A driver that must not
+    /// hand on a call it could not read asks this of every `Malformed` event, beside the two
+    /// other words the events carry: [`DropReason::MalformedCall`] on bytes of a call block
+    /// that were refused, and [`CallEnd`] on a call the model did not end.
+    ///
+    /// The reasons that lose no call, each for its own cause:
+    ///
+    /// - [`UnknownTool`](Self::UnknownTool): the call is read whole and goes out as the model
+    ///   wrote it; only its name is not one the request declares.
+    /// - [`MarkerOutOfPlace`](Self::MarkerOutOfPlace): a marker kept as text in a content
+    ///   state, where no call is read.
+    /// - [`OpenAtTheStop`](Self::OpenAtTheStop) and [`OpenAtTheMarker`](Self::OpenAtTheMarker):
+    ///   the syntax closed what the model left open, and every byte the model wrote is in the
+    ///   call. Whether the model ended the call itself is [`CallEnd`]'s to say, on the call's
+    ///   end.
+    /// - [`TextAfterTheArguments`](Self::TextAfterTheArguments) and
+    ///   [`TextAfterTheList`](Self::TextAfterTheList): text after a call, or a list of calls,
+    ///   that was read whole; the text is returned and no call is short of it.
+    ///
+    /// Every other reason loses one. A reason a syntax gives in more than one way is classed by
+    /// the use that loses a call, since the reason alone does not tell them apart:
+    /// [`TagOutOfPlace`](Self::TagOutOfPlace) also names a closing tag that closes nothing open,
+    /// which costs its call nothing; [`TagCutShort`](Self::TagCutShort) also names a declared
+    /// list or object written empty where the tag around it closed first; and
+    /// [`TextBetweenCalls`](Self::TextBetweenCalls) names text where a call should begin and
+    /// prose between two whole calls alike.
+    ///
+    /// The match names every reason, so a reason added to the crate is classed here before the
+    /// crate builds.
+    pub fn loses_a_call(self) -> bool {
+        match self {
+            // The call is read whole, or no call is read where the reason stands.
+            Self::UnknownTool
+            | Self::MarkerOutOfPlace
+            | Self::OpenAtTheStop
+            | Self::OpenAtTheMarker
+            | Self::TextAfterTheArguments
+            | Self::TextAfterTheList => false,
+            // The stream ended inside a call or a block that named none; arguments that are no
+            // JSON; bytes inside a call the syntax refused; a block that made no call of the
+            // bytes it held.
+            Self::UnterminatedRegion
+            | Self::InvalidArguments
+            | Self::TextBetweenTags
+            | Self::TagOutOfPlace
+            | Self::TagCutShort
+            | Self::TagTail
+            | Self::EmptyName
+            | Self::CallWithoutName
+            | Self::CallWithoutFunctionTag
+            | Self::SecondFunctionTag
+            | Self::ClosedBeforeTheName
+            | Self::TextWhereTheNameShouldBe
+            | Self::TextBetweenCalls
+            | Self::TextWhereAnArgumentShouldBegin
+            | Self::TextInPlaceOfTheList
+            | Self::NameWithoutArguments
+            | Self::NameWithoutACall
+            | Self::KeyWrittenTwice
+            | Self::KeyWithoutAValue
+            | Self::KeyCutShort
+            | Self::ValueCutShort
+            | Self::EmptyKey
+            | Self::BlockWithoutACompleteCall
+            | Self::NoForcedFunction => true,
+        }
+    }
+}
+
 impl std::fmt::Display for MalformedReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.sentence())
+    }
+}
+
+/// How a tool call ended: what closed it. Every [`Event::ToolCallEnd`] says it, so a driver knows
+/// of each call whether the model ended it. A call ends once, and its fragments say what its
+/// arguments are either way; this says who ended it.
+///
+/// The engine writes it, from how the call's region ended. Only a call the end of the output
+/// found open ends as [`Stop`](Self::Stop) or [`Cut`](Self::Cut), so at most the output's last
+/// call does; every call before it ended [`Closed`](Self::Closed).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallEnd {
+    /// The model ended the call: its closing marker arrived, or what the syntax reads as the
+    /// call's end (the next call's opener, the block's close, the brace that closes a call's
+    /// object), or the stream's stop where the table's stop row stands for the closing marker
+    /// the stop decoder hides.
+    #[default]
+    Closed,
+    /// The model's own end of output found the call open, in a state the table has no stop row
+    /// for: the stream stopped (`EngineFinish::Stop`) before anything the syntax reads as the
+    /// call's end. A syntax that writes the arguments' JSON closes what was open there, and says
+    /// so by a `Malformed { OpenAtTheStop }` event; the model still did not end the call.
+    Stop,
+    /// The stream was cut inside the call: by the token limit, an abort, or a finish the crate
+    /// does not read. Nothing is closed for the client, and a `Malformed` event before the end
+    /// says that the arguments are no whole value.
+    Cut,
+}
+
+impl CallEnd {
+    /// Whether the model ended the call ([`CallEnd::Closed`]).
+    pub fn is_closed(self) -> bool {
+        matches!(self, Self::Closed)
+    }
+
+    /// [`Self::is_closed`] as serde asks whether to write the member.
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's `skip_serializing_if` passes the field by reference"
+    )]
+    fn is_unwritten(&self) -> bool {
+        self.is_closed()
     }
 }
 
@@ -358,6 +474,11 @@ pub enum Event<'d> {
         /// The output bytes this event accounts for: the closing marker, and any buffered bytes
         /// no earlier event of this call accounted for.
         source: Text<'d>,
+        /// How the call ended: closed by the model, left open at the model's own stop, or cut.
+        /// Not written when serialized for a call the model closed, and read as that when
+        /// absent, so an event recorded before the field reads and writes as it did.
+        #[serde(default, skip_serializing_if = "CallEnd::is_unwritten")]
+        ended: CallEnd,
     },
     /// Text the format consumed without showing it.
     Dropped {
@@ -413,9 +534,14 @@ impl Event<'_> {
                 json: Cow::Owned(json.into_owned()),
                 source: source.into_owned(),
             },
-            Event::ToolCallEnd { index, source } => Event::ToolCallEnd {
+            Event::ToolCallEnd {
+                index,
+                source,
+                ended,
+            } => Event::ToolCallEnd {
                 index,
                 source: source.into_owned(),
+                ended,
             },
             Event::Dropped { text, why } => Event::Dropped {
                 text: text.into_owned(),
@@ -752,6 +878,90 @@ mod tests {
         assert_eq!(seen.len(), MalformedReason::ALL.len());
     }
 
+    /// The reasons that lose no call are the six the method's doc names; every other reason of
+    /// the crate loses one. Pinned by name, so a reason moved from one side to the other is a
+    /// change made here on purpose.
+    #[test]
+    fn the_reasons_that_lose_no_call_are_the_six_named() {
+        let harmless: Vec<MalformedReason> = MalformedReason::ALL
+            .iter()
+            .copied()
+            .filter(|why| !why.loses_a_call())
+            .collect();
+        assert_eq!(
+            harmless,
+            [
+                MalformedReason::UnknownTool,
+                MalformedReason::TextAfterTheArguments,
+                MalformedReason::TextAfterTheList,
+                MalformedReason::MarkerOutOfPlace,
+                MalformedReason::OpenAtTheStop,
+                MalformedReason::OpenAtTheMarker,
+            ]
+        );
+        assert_eq!(
+            MalformedReason::ALL.len() - harmless.len(),
+            24,
+            "every other reason loses a call"
+        );
+    }
+
+    /// A call's end serializes as it did before it said how the call ended, for a call the
+    /// model closed: the member is not written, and an end recorded without it reads as closed.
+    /// A call the stop or a cut ended writes the word and reads it back.
+    #[test]
+    fn a_closed_end_serializes_as_before_and_the_other_two_say_their_word() {
+        let end = |ended| Event::ToolCallEnd {
+            index: 0,
+            source: Text::uncounted("</c>"),
+            ended,
+        };
+        let closed = serde_json::to_value(end(CallEnd::Closed)).expect("an event serializes");
+        assert_eq!(
+            closed,
+            serde_json::json!({
+                "kind": "tool_call_end", "index": 0, "source": {"text": "</c>", "tokens": null}
+            })
+        );
+        let read: Event = serde_json::from_value(closed).expect("the event reads back");
+        assert_eq!(read, end(CallEnd::Closed));
+        assert!(CallEnd::default().is_closed());
+        for (ended, word) in [(CallEnd::Stop, "stop"), (CallEnd::Cut, "cut")] {
+            assert!(!ended.is_closed());
+            let written = serde_json::to_value(end(ended)).expect("an event serializes");
+            assert_eq!(written["ended"], word);
+            let read: Event = serde_json::from_value(written).expect("the event reads back");
+            assert_eq!(read, end(ended));
+        }
+    }
+
+    /// An end keeps its word when the event is freed of its delta, and a call the request drops
+    /// loses it with the rest of the call.
+    #[test]
+    fn an_end_keeps_how_the_call_ended_when_it_is_owned() {
+        let end = Event::ToolCallEnd {
+            index: 0,
+            source: Text::uncounted("x"),
+            ended: CallEnd::Cut,
+        };
+        assert!(matches!(
+            end.clone().into_owned(),
+            Event::ToolCallEnd {
+                ended: CallEnd::Cut,
+                ..
+            }
+        ));
+        let mut events = [end];
+        forbidden_calls(&mut events);
+        assert!(matches!(
+            &events[0],
+            Event::Dropped {
+                why: DropReason::ForbiddenCall,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn reasoning_text_tokens_sum_the_reasoning_texts_alone() {
         let events = vec![
@@ -782,6 +992,7 @@ mod tests {
             Event::ToolCallEnd {
                 index,
                 source: Text::uncounted(">"),
+                ended: CallEnd::Closed,
             },
         ]
     }
@@ -819,6 +1030,7 @@ mod tests {
         let end = Event::ToolCallEnd {
             index: 1,
             source: Text::uncounted(">"),
+            ended: CallEnd::Closed,
         };
         let mut events = vec![tail("a"), end, tail("b")];
         first_call_only(&mut events);

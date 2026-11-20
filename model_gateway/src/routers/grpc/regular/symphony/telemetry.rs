@@ -1230,7 +1230,7 @@ impl Sampler {
 mod tests {
     use serde_json::Value;
     use smg_external_router::metrics::handles::force_on_this_thread;
-    use symphony::{DropReason, FinishReason, Text};
+    use symphony::{CallEnd, DropReason, FinishReason, Text};
 
     use super::*;
     use crate::routers::grpc::regular::symphony::testing::{
@@ -1353,6 +1353,7 @@ mod tests {
             Event::ToolCallEnd {
                 index: 0,
                 source: Text::uncounted("</tool_call>"),
+                ended: CallEnd::Closed,
             },
             finish(1),
         ] {
@@ -2172,6 +2173,7 @@ mod tests {
             tally.see_forbidden(&Event::ToolCallEnd {
                 index: 0,
                 source: Text::uncounted("</tool_call>"),
+                ended: CallEnd::Closed,
             });
             tally.see_forbidden(&malformed("", MalformedReason::UnknownTool));
             tally.see_forbidden(&call_named(1, "nope", "<tool_call>"));

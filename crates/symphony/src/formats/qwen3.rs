@@ -76,7 +76,7 @@ mod tests {
     use crate::{
         adapt::chat,
         engine::Engine,
-        event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
+        event::{CallEnd, DropReason, Event, Events, FinishReason, MalformedReason, Text},
         input::{EngineFinish, Input, TokenSpan},
         parser::{ParseError, Parser},
         Declared,
@@ -236,6 +236,7 @@ mod tests {
                 Event::ToolCallEnd {
                     index: 0,
                     source: Text::uncounted("}"),
+                    ended: CallEnd::Closed,
                 },
                 dropped("\n"),
                 dropped("</tool_call>"),
@@ -656,6 +657,7 @@ mod tests {
                 Event::ToolCallEnd {
                     index: 0,
                     source: Text::default(),
+                    ended: CallEnd::Closed,
                 },
                 dropped("</tool_call>"),
                 Event::Finish {
@@ -1164,6 +1166,7 @@ mod tests {
                 Event::ToolCallEnd {
                     index: 0,
                     source: Text::uncounted("</function>"),
+                    ended: CallEnd::Closed,
                 },
                 dropped("\n"),
                 dropped("</tool_call>"),
@@ -1358,7 +1361,7 @@ mod tests {
         assert_eq!(bytes(&events), output);
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::ToolCallEnd { index: 0, source } if source.text.is_empty()
+            Event::ToolCallEnd { index: 0, source, .. } if source.text.is_empty()
         )));
         assert!(matches!(
             events.last(),
