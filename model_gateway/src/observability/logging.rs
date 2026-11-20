@@ -809,6 +809,23 @@ pub(crate) mod test_support {
         }
     }
 
+    /// A callsite first met on a thread with no subscriber, after this thread
+    /// took its own, still reaches this thread's subscriber.
+    #[test]
+    fn a_callsite_first_met_on_another_thread_reaches_this_threads_subscriber() {
+        fn span_is_live() -> bool {
+            !tracing::info_span!("first met on another thread").is_disabled()
+        }
+        let _subscriber = test_subscriber(tracing_subscriber::layer::Identity::new());
+        std::thread::spawn(span_is_live)
+            .join()
+            .expect("the other thread");
+        assert!(
+            span_is_live(),
+            "the callsite reads this thread's subscriber as absent"
+        );
+    }
+
     /// Every event of the `smg::response` target, as (level, message): the
     /// lines the response-side middleware writes, as a test reads them.
     #[derive(Clone, Default)]
