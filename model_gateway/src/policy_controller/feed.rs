@@ -16,7 +16,9 @@
 //! The store's index is fed by the workers' cache events. The feed runs
 //! the crate's follow of them for as long as its answer is kept. It is the
 //! gateway's one collector of cache events: the classic one is not built
-//! beside it.
+//! beside it. So the follow also carries what the classic one carried
+//! beside the events: each worker's pushed load records, to the worker
+//! monitor, which says them to the feed's load sink.
 
 use std::{
     sync::Arc,
@@ -46,7 +48,7 @@ use tokio::{
 use tokio_util::task::AbortOnDropHandle;
 use tracing::warn;
 
-use crate::routers::common::snapshot::{ModelWorkerSnapshot, WorkerRegistry};
+use crate::routers::common::snapshot::{ModelWorkerSnapshot, WorkerMonitor, WorkerRegistry};
 
 /// The feed of a gateway that decides in its own process: the door its
 /// worker workflows write at, and the holder that keeps the registry as
@@ -163,12 +165,16 @@ impl Feed {
         settle(&self.objects, &self.store, Some(Instant::now().max(due)));
     }
 
-    /// Read the cache events of the store's workers into its index, for as
-    /// long as the answer is kept. The follow is the crate's own: it asks a
-    /// stream of each gRPC worker whose row asks for events, as the
-    /// registry changes. A worker no row stands for is asked none.
-    pub(crate) fn cache_events(&self) -> CacheEvents {
+    /// Read the cache events of the store's workers into its index, and
+    /// their pushed load records into `loads`, for as long as the answer is
+    /// kept. The follow is the crate's own: as the registry changes it asks
+    /// a stream of each gRPC worker, for its cache events where its row asks
+    /// for them and for its load records alone where `loads` wants them.
+    pub(crate) fn cache_events(&self, loads: Option<&Arc<WorkerMonitor>>) -> CacheEvents {
         let follow = KvFeed::new(Arc::clone(&self.store), Arc::clone(&self.objects));
+        if let Some(monitor) = loads {
+            follow.set_load_sink(monitor);
+        }
         let (stop, stopped) = watch::channel(false);
         #[expect(
             clippy::disallowed_methods,

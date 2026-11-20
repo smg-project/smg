@@ -16,7 +16,9 @@ mod tests {
         tokenspeed_proto::{GenerateRequest, SamplingParams, TokenizedInput},
         TokenSpeedSchedulerClient as SchedulerClient,
     };
-    use smg_worker::kv_events::SubscriptionKind;
+    use smg_worker::{
+        kv_events::SubscriptionKind, load::monitor::WorkerMonitor, test_support::LoadReaders,
+    };
     use tokio::{
         net::TcpListener,
         sync::{broadcast::error::TryRecvError, oneshot, watch},
@@ -221,6 +223,74 @@ mod tests {
         })
         .await
         .expect("the feed processes the worker whose row asks for events");
+    }
+
+    /// A gRPC row that is not indexed streams its load records alone once
+    /// the host hands a monitor that wants its loads, and has no stream
+    /// under a monitor that wants none.
+    #[tokio::test]
+    async fn a_row_that_is_not_indexed_streams_its_loads_where_the_monitor_wants_them() {
+        // Whether the monitor polls by need alone, and whether the row streams:
+        // a monitor with no reader of loads wants none of a worker's.
+        for (by_need, streams) in [(false, true), (true, false)] {
+            let f = Fixture::new();
+            let monitor = Arc::new(WorkerMonitor::new(
+                Arc::clone(f.objects.registry()),
+                Arc::new(LoadReaders::Blind),
+                1,
+                false,
+                by_need,
+            ));
+            f.feed.set_load_sink(&monitor);
+            f.check(async {
+                f.lay(facts(FIRST, WireModes::GRPC, false));
+                f.lay(facts(SECOND, WireModes::GRPC, true));
+                f.new_slot(SECOND, None).await;
+                let (slot, _) = f.feed.collector().slot_ids(FIRST).await;
+                assert_eq!(slot.is_some(), streams, "by need: {by_need}");
+            })
+            .await
+            .expect("the feed processes the indexed worker behind the other");
+        }
+    }
+
+    /// The kind of stream each rank of an indexed data-parallel worker
+    /// gets. Rank 0 streams its cache events. A rank above it opens no
+    /// events feed, so it streams its load records alone where a monitor
+    /// wants them, and has no stream without one.
+    #[tokio::test]
+    async fn an_upper_rank_of_an_indexed_worker_streams_its_loads_alone() {
+        const UPPER: &str = "grpc://127.0.0.1:1#1";
+        let f = Fixture::new();
+        let lower = WorkerFacts {
+            dp_size: 2,
+            ..facts(FIRST, WireModes::GRPC, true)
+        };
+        f.lay(WorkerFacts {
+            key: UPPER.to_owned(),
+            dp_rank: 1,
+            ..lower.clone()
+        });
+        f.lay(lower);
+        let stream = |url: &str| {
+            let registry = f.objects.registry();
+            let id = registry.get_id_by_url(url).expect("the row has an object");
+            let worker = registry.get_by_url(url).expect("the row has an object");
+            f.feed.stream_of(&id, &worker)
+        };
+        assert_eq!(stream(FIRST), Some(SubscriptionKind::Events));
+        assert_eq!(stream(UPPER), None, "no monitor wants its loads");
+
+        let monitor = Arc::new(WorkerMonitor::new(
+            Arc::clone(f.objects.registry()),
+            Arc::new(LoadReaders::Blind),
+            1,
+            false,
+            false,
+        ));
+        f.feed.set_load_sink(&monitor);
+        assert_eq!(stream(FIRST), Some(SubscriptionKind::Events));
+        assert_eq!(stream(UPPER), Some(SubscriptionKind::Loads));
     }
 
     #[tokio::test]

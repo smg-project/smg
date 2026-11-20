@@ -1,5 +1,6 @@
-//! Cases of the feed's cache events: the crate's follow under the gateway's
-//! feed, over a mock engine that stores cache blocks.
+//! Cases of the feed's cache events and pushed load records: the crate's
+//! follow under the gateway's feed, over a mock engine that stores cache
+//! blocks and pushes its load records.
 
 use std::{
     error::Error,
@@ -15,8 +16,8 @@ use smg_grpc_client::{
 };
 use smg_policy_controller::{
     store::{
-        Ask as ViewAsk, GatewayId, HealthPolicy, Maker, MemoryStore, Named, Naming, Signals,
-        ViewBuffers, WorkerFacts,
+        Ask as ViewAsk, GatewayId, HealthPolicy, LoadSink, Maker, MemoryStore, Named, Naming,
+        Signals, ViewBuffers, WorkerFacts,
     },
     view::{Role, WireModes, WorkerId},
     worker_host::{Expect, Wrote},
@@ -29,9 +30,15 @@ use tokio::{
 use tokio_stream::StreamExt as _;
 
 use super::{feed, Feed};
-use crate::routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BackendConnector};
+use crate::routers::{
+    common::snapshot::{WorkerMonitor, WorkerRegistry},
+    grpc::backend_client::BackendConnector,
+};
 
 const MODEL: &str = "model-a";
+/// The preset whose decisions read the index, and one that reads loads alone.
+const CACHE_AWARE: &str = "cache_aware";
+const LEAST_LOAD: &str = "least_load";
 /// A prompt of these tokens fills one block of the engine's cache.
 const TOKENS: [u32; 4] = [1, 2, 3, 4];
 const BLOCK: u32 = 4;
@@ -72,8 +79,8 @@ impl Engine {
         })
     }
 
-    /// The row of a gRPC worker that asks for its cache events.
-    fn row(&self) -> WorkerFacts {
+    /// The engine's row, asking for its cache events or not.
+    fn row(&self, events: bool) -> WorkerFacts {
         WorkerFacts {
             key: self.url.clone(),
             engine: self.url.clone(),
@@ -84,7 +91,7 @@ impl Engine {
             engine_kind: self.kind.clone(),
             kv_block_size: Some(BLOCK),
             signals: Signals {
-                events: true,
+                events,
                 loads: true,
                 ..Signals::default()
             },
@@ -96,9 +103,15 @@ impl Engine {
         }
     }
 
-    /// Write the engine's row at the feed's door.
+    /// Write the engine's row at the feed's door, asking for its cache
+    /// events.
     fn register(&self, feed: &Feed) -> Result<WorkerId, String> {
-        let facts = self.row();
+        self.register_as(feed, true)
+    }
+
+    /// Write the engine's row at the feed's door.
+    fn register_as(&self, feed: &Feed, events: bool) -> Result<WorkerId, String> {
+        let facts = self.row(events);
         match feed
             .door
             .found(&Maker::Control, Expect::Nothing, &self.url, &|_| {
@@ -151,10 +164,10 @@ fn is_dialed(registry: &WorkerRegistry, url: &str) -> bool {
         .is_some()
 }
 
-/// A store whose one generation is the cache-aware preset, which names the
+/// A store whose one generation is `preset`. The cache-aware one names the
 /// holders of a request's blocks.
-fn cache_store() -> Result<Arc<MemoryStore>, Box<dyn Error>> {
-    let mut spec = PolicySpec::preset("cache_aware")?;
+fn store_under(preset: &str) -> Result<Arc<MemoryStore>, Box<dyn Error>> {
+    let mut spec = PolicySpec::preset(preset)?;
     spec.generation = 1;
     let store = MemoryStore::new();
     store.apply(AppliedSpec::validate(&spec)?)?;
@@ -223,9 +236,9 @@ async fn named_holders(store: &MemoryStore) -> Option<Vec<(WorkerId, u32)>> {
 #[tokio::test]
 async fn a_stored_block_reaches_the_stores_index_under_the_feed() {
     let engine = Engine::serve().await.expect("the mock engine serves");
-    let store = cache_store().expect("the store takes the preset");
+    let store = store_under(CACHE_AWARE).expect("the store takes the preset");
     let (registry, feed) = bed(&store);
-    let _events = feed.cache_events();
+    let _events = feed.cache_events(None);
     let row = engine.register(&feed).expect("the worker registers");
     assert!(engine.dialed(&registry).await, "the follow asks the stream");
     assert!(holders(&store).is_empty());
@@ -244,12 +257,12 @@ async fn a_stored_block_reaches_the_stores_index_under_the_feed() {
 #[tokio::test]
 async fn the_follow_ends_when_the_answer_is_dropped() {
     let engine = Engine::serve().await.expect("the mock engine serves");
-    let store = cache_store().expect("the store takes the preset");
+    let store = store_under(CACHE_AWARE).expect("the store takes the preset");
     let (registry, feed) = bed(&store);
     engine.register(&feed).expect("the worker registers");
     let held = Arc::strong_count(&store);
     // The follow's first read holds the worker laid before it.
-    let events = feed.cache_events();
+    let events = feed.cache_events(None);
     assert!(engine.dialed(&registry).await, "the follow asks the stream");
     assert!(
         Arc::strong_count(&store) > held,
@@ -267,4 +280,47 @@ async fn the_follow_ends_when_the_answer_is_dropped() {
     timeout(WAIT, ended)
         .await
         .expect("the follow and its streams end");
+}
+
+/// Under the feed a worker's pushed load records reach its row in the store:
+/// on its events stream where its row is indexed, and on a stream of its own
+/// where it is not.
+#[tokio::test]
+async fn a_pushed_load_record_reaches_the_stores_row_under_the_feed() {
+    for (preset, events) in [(CACHE_AWARE, true), (LEAST_LOAD, false)] {
+        let engine = Engine::serve().await.expect("the mock engine serves");
+        let store = store_under(preset).expect("the store takes the preset");
+        let (registry, feed) = bed(&store);
+        // The gateway's monitor under the feed: its sink is the feed's.
+        let monitor = Arc::new(WorkerMonitor::with_sink(
+            Arc::clone(&registry),
+            feed.load_sink(Duration::from_secs(1)),
+            1,
+            false,
+            false,
+        ));
+        let _events = feed.cache_events(Some(&monitor));
+        let row = engine
+            .register_as(&feed, events)
+            .expect("the worker registers");
+        assert!(
+            engine.dialed(&registry).await,
+            "the follow asks a stream under {preset}"
+        );
+
+        engine
+            .store_block()
+            .await
+            .expect("the engine serves a request");
+
+        let pushed = async {
+            while LoadSink::load(&*store, row, 0).is_none() {
+                sleep(POLL).await;
+            }
+        };
+        assert!(
+            timeout(WAIT, pushed).await.is_ok(),
+            "no pushed record reached the row under {preset}"
+        );
+    }
 }

@@ -1139,8 +1139,9 @@ impl AppContextBuilder {
     /// gauges.
     ///
     /// Under the policy controller's feed none is built: the feed's own
-    /// follow reads the workers' cache events into the store's index, and
-    /// each reader of the monitor takes `None`.
+    /// follow reads the workers' cache events into the store's index and
+    /// their load records into the worker monitor, and each reader of this
+    /// monitor takes `None`.
     fn with_kv_event_monitor(mut self) -> Self {
         // One collector a gateway: under the feed the store's follow is it.
         if self.policy_feed.is_some() {

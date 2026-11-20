@@ -1,5 +1,10 @@
 //! A host reads its workers' cache events into its own store's index: every
 //! replica of the controller, and a gateway that decides in its own process.
+//! A host that hands the follow its worker monitor
+//! ([`KvFeed::set_load_sink`]) reads the load records the streams carry as
+//! well. A gRPC worker whose row is not indexed then streams its load
+//! records alone, and so does a rank above 0 of a data-parallel worker,
+//! which opens no events feed.
 //!
 //! # Limits
 //!
@@ -10,11 +15,15 @@
 //! generation moves a standing worker's stream only when its row is laid
 //! again as another life.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::{Arc, OnceLock, Weak},
+};
 
 use smg_worker::{
     identity::basic::Worker,
     kv_events::{KvEventCollector, SubscriptionKind},
+    load::monitor::WorkerMonitor,
     registry::{event::WorkerEvent, Generation, WorkerId, WorkerRegistry},
     worker::ConnectionMode,
 };
@@ -33,6 +42,10 @@ pub struct KvFeed<G: Generation> {
     registry: Arc<WorkerRegistry<G>>,
     store: Arc<MemoryStore>,
     objects: Arc<Objects<G>>,
+    /// The host's worker monitor, once handed: it says whether a worker's
+    /// loads are wanted. The collector keeps its own hold of it, for the
+    /// records.
+    loads: OnceLock<Weak<WorkerMonitor<G>>>,
 }
 
 impl<G: Generation> KvFeed<G> {
@@ -50,7 +63,19 @@ impl<G: Generation> KvFeed<G> {
             registry,
             store,
             objects,
+            loads: OnceLock::new(),
         }
+    }
+
+    /// Hand the follow the host's worker monitor (once; a later call is
+    /// ignored). The load records every stream carries then reach the
+    /// monitor, and a gRPC worker whose row is not indexed gets a stream
+    /// for its load records alone where the monitor wants them
+    /// ([`WorkerMonitor::loads_wanted`]). A worker already told keeps the
+    /// stream it has, so a host calls this before [`Self::run`].
+    pub fn set_load_sink(&self, monitor: &Arc<WorkerMonitor<G>>) {
+        self.collector.set_load_sink(monitor);
+        let _ = self.loads.set(Arc::downgrade(monitor));
     }
 
     /// The collector, for the stock controller's cases of the follow.
@@ -108,19 +133,39 @@ impl<G: Generation> KvFeed<G> {
     }
 
     pub(crate) async fn tell(&self, id: &WorkerId, worker: &Arc<dyn Worker>) {
-        if *worker.connection_mode() == ConnectionMode::Grpc
+        match self.stream_of(id, worker) {
+            Some(kind) => self.collector.on_worker_added(worker, kind).await,
+            None => self.collector.on_worker_added_without_stream(worker).await,
+        }
+    }
+
+    /// The stream a worker gets: its cache events where its row is indexed,
+    /// its load records alone where the host's monitor wants them, and none
+    /// otherwise. Only a gRPC worker streams. A rank above 0 of a
+    /// data-parallel worker opens no events feed, since the host refuses it
+    /// one, so it streams as a row that is not indexed.
+    pub(crate) fn stream_of(
+        &self,
+        id: &WorkerId,
+        worker: &Arc<dyn Worker>,
+    ) -> Option<SubscriptionKind> {
+        if *worker.connection_mode() != ConnectionMode::Grpc {
+            return None;
+        }
+        let indexed = worker.dp_rank().is_none_or(|rank| rank == 0)
             && self
                 .objects
                 .standing(id)
                 .and_then(|standing| self.store.get(standing.row))
-                .is_some_and(|row| indexed_under(&row).is_some())
-        {
-            self.collector
-                .on_worker_added(worker, SubscriptionKind::Events)
-                .await;
-        } else {
-            self.collector.on_worker_added_without_stream(worker).await;
+                .is_some_and(|row| indexed_under(&row).is_some());
+        if indexed {
+            return Some(SubscriptionKind::Events);
         }
+        self.loads
+            .get()
+            .and_then(Weak::upgrade)
+            .is_some_and(|monitor| monitor.loads_wanted(std::slice::from_ref(worker)))
+            .then_some(SubscriptionKind::Loads)
     }
 
     pub(crate) async fn removed(&self, url: &str, told: &mut HashSet<String>) {
