@@ -658,6 +658,19 @@ async fn the_regular_router_under_the_setting_holds_the_host() -> Case {
     Ok(())
 }
 
+/// The router's selection stage asks the host; the stage's cases hold that.
+#[tokio::test]
+async fn the_regular_grpc_router_is_built_under_the_setting() -> Case {
+    let mut config = picked(quiet());
+    config.connection_mode = ConnectionMode::Grpc;
+    let gateway = build_gateway(config).await?;
+    let router = gateway
+        .select_router_for_request(None)
+        .ok_or("the regular gRPC router is missing")?;
+    assert_eq!(router.router_type(), "grpc");
+    Ok(())
+}
+
 async fn assert_refusing_router(router: &dyn RouterTrait, family: &str) -> Case {
     assert_eq!(router.router_type(), ROUTER_TYPE, "{family}");
     let answer = router.health_generate(Request::new(Body::empty())).await;
@@ -674,7 +687,7 @@ async fn assert_refusing_router(router: &dyn RouterTrait, family: &str) -> Case 
 }
 
 #[tokio::test]
-async fn the_pair_the_grpc_and_the_provider_routers_refuse_by_name() -> Case {
+async fn the_pair_and_the_provider_routers_refuse_by_name() -> Case {
     let mut pair = picked(quiet());
     pair.mode = RoutingMode::PrefillDecode {
         prefill_urls: vec![],
@@ -682,9 +695,9 @@ async fn the_pair_the_grpc_and_the_provider_routers_refuse_by_name() -> Case {
         prefill_policy: None,
         decode_policy: None,
     };
-    let mut grpc = picked(quiet());
-    grpc.connection_mode = ConnectionMode::Grpc;
-    for (family, config) in [("HTTP pair", pair), ("gRPC regular", grpc)] {
+    let mut grpc_pair = pair.clone();
+    grpc_pair.connection_mode = ConnectionMode::Grpc;
+    for (family, config) in [("HTTP pair", pair), ("gRPC pair", grpc_pair)] {
         let gateway = build_gateway(config).await?;
         let router = gateway
             .select_router_for_request(None)

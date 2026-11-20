@@ -179,8 +179,12 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
         mode: Mode,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        if let Some(router) = policy_controller::undecided(ctx) {
-            return Ok(router);
+        // The regular router's selection stage asks the controller's host.
+        // A pair mode places no request through it yet.
+        if mode != Mode::Regular {
+            if let Some(router) = policy_controller::undecided(ctx) {
+                return Ok(router);
+            }
         }
         let router = GrpcRouter::new(ctx, mode)?;
 

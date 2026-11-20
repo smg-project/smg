@@ -9,11 +9,12 @@
 //! The setting starts the store with the policy document for the routing
 //! configuration. The context holds the membership feed over that store and
 //! a host over the feed's holder. A regular HTTP router with that host asks
-//! it to place typed requests for a model the registry serves. The gateway's
-//! workflows leave the feed's door unused, so without a controller's address
-//! nothing feeds the store yet. Other router families mount a refusing
-//! router under their usual ids ([`undecided()`]). With the setting off, the
-//! context holds neither the store, its feed nor its host.
+//! it to place typed requests for a model the registry serves, and a regular
+//! gRPC router asks it in its selection stage. The gateway's workflows leave
+//! the feed's door unused, so without a controller's address nothing feeds
+//! the store yet. Other router families mount a refusing router under their
+//! usual ids ([`undecided()`]). With the setting off, the context holds
+//! neither the store, its feed nor its host.
 //!
 //! One site reads the setting, [`start_with`]. Every other site asks what
 //! the start left in the context.
@@ -147,8 +148,7 @@ pub(crate) fn feeds(
 /// It mounts under the family's usual id so the gateway can select it.
 /// Returns `None` under the classic policies.
 ///
-/// The pair routers need pair placement. The regular gRPC router needs
-/// host placement in its routing stage. Provider and external routers
+/// The pair routers need pair placement. Provider and external routers
 /// need the worker registry populated from the store.
 pub(crate) fn undecided(context: &AppContext) -> Option<Box<dyn RouterTrait>> {
     context
