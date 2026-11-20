@@ -1565,10 +1565,12 @@ impl JsonSchema for FilterSpec {
     }
 
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        // A name is open: a host adds names. The stock filters stand as
+        // the open string's examples, listed and not enforced.
         json_schema!({
             "description": "A filter: its bare name, a built-in mapped to its parameters, or the name of a filter the host adds mapped to its parameters.",
             "anyOf": [
-                { "type": "string" },
+                { "type": "string", "examples": FILTERS },
                 generator.subschema_for::<FilterStage>(),
                 {
                     "type": "object",
@@ -1618,7 +1620,8 @@ impl JsonSchema for ScoreSpec {
         // both forms: the validator refuses an unknown one by its path. The
         // bare form stands for a stock scorer at its defaults, so one whose
         // parameters have none is written in the parameter form only: the
-        // description lists the stock scorers that stand bare.
+        // stock scorers that stand bare are the open string's examples,
+        // listed and not enforced, and the description names them too.
         let names: Vec<&str> = SCORERS
             .iter()
             .copied()
@@ -1631,7 +1634,7 @@ impl JsonSchema for ScoreSpec {
         json_schema!({
             "description": description,
             "anyOf": [
-                { "type": "string" },
+                { "type": "string", "examples": names },
                 generator.subschema_for::<ScoreStage>(),
                 {
                     "type": "object",
@@ -1797,8 +1800,9 @@ impl JsonSchema for PickSpec {
             .copied()
             .filter(|name| *name != "best-with-temperature")
             .collect();
-        // A name is open in both forms, as a scorer's is: the description
-        // lists the stock pickers a document names bare.
+        // A name is open in both forms, as a scorer's is: the stock pickers
+        // a document names bare are the open string's examples, and the
+        // description names them too.
         let description = format!(
             "{} The stock pickers a document names bare: {}.",
             "A picker: its bare name, a built-in mapped to its parameters, or the name of a picker the host adds mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool.",
@@ -1807,7 +1811,7 @@ impl JsonSchema for PickSpec {
         json_schema!({
             "description": description,
             "anyOf": [
-                { "type": "string" },
+                { "type": "string", "examples": names },
                 generator.subschema_for::<PickStage>(),
                 {
                     "type": "object",
