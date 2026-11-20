@@ -1489,9 +1489,11 @@ mod tests {
 
     /// A handed object starts at its row's status, as one built from the
     /// row does: here a row that stood Ready before the holder's first read.
+    /// The registry is handed the object at that status, so it tells one
+    /// registration and no status change behind it.
     #[test]
     fn a_handed_object_starts_at_its_rows_status() {
-        let (replica, door) = handing();
+        let (mut replica, door) = handing();
         let first = built(A, KEY_A);
         door.found_built(&Maker::Control, Expect::Anything, &first, None)
             .expect("a write the holder has not read");
@@ -1507,6 +1509,9 @@ mod tests {
         assert!(matches!(wrote, Ok(Wrote::Unmoved(_))), "{wrote:?}");
         assert!(Arc::ptr_eq(&replica.at(A), &second));
         assert_eq!(second.status(), ObjectStatus::Ready);
+        let registry = replica.objects.registry();
+        let id = registry.get_id_by_url(A).expect("the object's id");
+        assert_eq!(replica.told(), [("registered", id)]);
         assert_eq!(replica.objects.unhanded(), 0);
     }
 
