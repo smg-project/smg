@@ -98,6 +98,8 @@ pub(crate) use plan::{
     validate_rendered_media_anchors, DeploymentFault, MediaPlan, PlaceholderTokens, RequestRefusal,
 };
 pub(crate) use process::process_multimodal_plan;
+#[cfg(test)]
+pub(crate) use refs::MM_PROCESSOR_LABEL;
 pub(crate) use refs::{
     assemble_media_refs, ensure_selection_supports_media_refs, media_refs_pipeline_pin,
     models_without_media_processing, pool_processes_media_refs,

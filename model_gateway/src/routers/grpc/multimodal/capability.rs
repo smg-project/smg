@@ -89,7 +89,8 @@ fn pixel_modalities(plan: &MediaPlan) -> Vec<Modality> {
 /// ([`worker_accepts_media_refs`]) counts as taking every modality here:
 /// what its engine's own processor takes, audio among them, is the
 /// reference gates' call, not the matrix's. Not where the gateway processes
-/// every item itself (`router_processes`, `--mm-processing router`): no
+/// the items itself (`router_processes`): under `--mm-processing router`,
+/// and for a request another mode placed on the gateway's own pipeline. No
 /// reference travels to a worker there, and the matrix alone answers.
 pub(crate) fn ensure_model_accepts_media(
     registry: &WorkerRegistry,
@@ -162,7 +163,9 @@ fn ensure_pool_takes_modalities(
 
 /// Whether `worker` may take `modality`: its engine does by the matrix, or
 /// it processes media references itself and the reference gates decide,
-/// unless the router processes the media and hands the worker no reference.
+/// unless the gateway processes the media and hands the worker no reference
+/// (`router_processes`: the router mode, or a request another mode placed
+/// on the gateway's own pipeline).
 fn worker_takes_modality(worker: &dyn Worker, modality: Modality, router_processes: bool) -> bool {
     runtime_supports_modality(worker.metadata().spec.runtime_type, modality)
         || (!router_processes && worker_accepts_media_refs(worker))
