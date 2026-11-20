@@ -2700,18 +2700,29 @@ async fn a_decision_that_reads_every_target_full_waits_and_is_admitted_at_a_rele
     assert_eq!(live(&bed.store, 1), 1);
 }
 
-/// A model under the encode plan: prefills, one decode and encoders that
+/// A model under the encode plan: prefills, decodes and encoders that
 /// push, each a row of the store with its worker in the registry.
 struct EncodeBed {
     host: Host,
     store: Arc<MemoryStore>,
     prefills: Vec<(WorkerId, Arc<dyn Worker>)>,
-    decode: (WorkerId, Arc<dyn Worker>),
+    decodes: Vec<(WorkerId, Arc<dyn Worker>)>,
     encoders: Vec<(WorkerId, Arc<dyn Worker>)>,
 }
 
 impl EncodeBed {
+    /// One decode that takes no image.
     fn new(prefills: usize, encoders: usize) -> Result<Self, Box<dyn Error>> {
+        Self::with(prefills, 1, encoders, false)
+    }
+
+    /// `vision` says whether the decodes take images.
+    fn with(
+        prefills: usize,
+        decodes: usize,
+        encoders: usize,
+        vision: bool,
+    ) -> Result<Self, Box<dyn Error>> {
         let store = Arc::new(MemoryStore::new());
         let registry = Arc::new(WorkerRegistry::new());
         let add = |name: String, role, worker_type| -> Result<_, Box<dyn Error>> {
@@ -2726,6 +2737,7 @@ impl EncodeBed {
                 models: vec![MODEL.to_owned()],
                 dp_size: 1,
                 max_running: Some(4_096),
+                vision: vision && role == Role::Decode,
                 encode: EncodeOffer {
                     handoff: EncodeHandoff::Push,
                     producer: role == Role::Encode,
@@ -2752,7 +2764,9 @@ impl EncodeBed {
                 .ok_or("the worker did not register")?;
             Ok((id, worker))
         };
-        let decode = add("d0".to_owned(), Role::Decode, WorkerType::Decode)?;
+        let decodes = (0..decodes)
+            .map(|n| add(format!("d{n}"), Role::Decode, WorkerType::Decode))
+            .collect::<Result<Vec<_>, _>>()?;
         let prefills = (0..prefills)
             .map(|n| add(format!("p{n}"), Role::Prefill, WorkerType::Prefill))
             .collect::<Result<Vec<_>, _>>()?;
@@ -2774,7 +2788,7 @@ impl EncodeBed {
             host: Host::at_keys(Arc::clone(&store), registry),
             store,
             prefills,
-            decode,
+            decodes,
             encoders,
         })
     }
@@ -2824,17 +2838,260 @@ async fn an_ask_with_items_places_each_item_and_holds_the_pairs_lease() {
     let (prefill, prefill_worker) = &bed.prefills[0];
     assert_eq!(placed.id(), *prefill);
     assert!(Arc::ptr_eq(placed.worker(), prefill_worker));
-    assert_eq!(placed.decode_id(), Some(bed.decode.0));
+    let (decode, decode_worker) = &bed.decodes[0];
+    assert_eq!(placed.decode_id(), Some(*decode));
     assert!(placed
         .decode()
-        .is_some_and(|decode| Arc::ptr_eq(decode, &bed.decode.1)));
+        .is_some_and(|placed| Arc::ptr_eq(placed, decode_worker)));
     let (encoder, worker) = &bed.encoders[0];
     assert_eq!(placed.encoders().len(), keys.len(), "an encoder a key");
     for held in placed.encoders() {
-        assert_eq!(held.id, *encoder);
+        assert_eq!((held.id, held.rank), (*encoder, 0), "the row and its rank");
         assert!(Arc::ptr_eq(&held.worker, worker));
     }
     assert!(!placed.one_key());
     assert_eq!(live(&bed.store, 1), 1, "one lease holds both sides");
     assert_eq!(bed.encoder_counts(), [0], "an encoder holds no lease");
+}
+
+/// The items of an ask: `keys` each on its own.
+fn items<'a>(keys: &'a [Identity<'a>]) -> EncodeItems<'a> {
+    EncodeItems {
+        keys,
+        ..EncodeItems::default()
+    }
+}
+
+/// An ask without items under the encode plan is its pair's alone: no
+/// encoder is named.
+#[tokio::test]
+async fn an_ask_without_items_is_decided_as_its_pair_and_names_no_encoder() {
+    let bed = EncodeBed::new(1, 1).expect("an encode fleet");
+    let now = Instant::now();
+    let asked = bed.host.ask(&pair_ask(), &[], now).await;
+    let asked = asked.expect("a pair");
+    assert!(asked.encoders.is_empty() && !asked.one_key);
+    let placed = bed
+        .host
+        .commit_pair(asked, None, &mut Vec::new(), now)
+        .expect("a placement");
+    assert_eq!(placed.id(), bed.prefills[0].0);
+    assert_eq!(placed.decode_id(), Some(bed.decodes[0].0));
+    assert!(placed.encoders().is_empty());
+    assert!(!placed.one_key());
+    assert_eq!(live(&bed.store, 1), 1);
+}
+
+/// The demand that the decode take images is part of the decision: a
+/// decode that takes none is not placed, and one that takes them is.
+#[tokio::test]
+async fn an_ask_whose_decode_must_take_images_is_decided_with_that_demand() {
+    let ask = Ask {
+        items: EncodeItems {
+            decode_images: true,
+            ..EncodeItems::default()
+        },
+        ..pair_ask()
+    };
+    let now = Instant::now();
+    let blind = EncodeBed::new(1, 1).expect("an encode fleet");
+    let unplaced = blind.host.ask(&ask, &[], now).await.err();
+    assert!(
+        matches!(
+            unplaced,
+            Some(Unplaced::Shed {
+                emptied_by: "decode-vision",
+                ..
+            })
+        ),
+        "{unplaced:?}"
+    );
+    assert_eq!(live(&blind.store, 0), 0);
+
+    let seeing = EncodeBed::with(1, 1, 1, true).expect("an encode fleet");
+    let asked = seeing.host.ask(&ask, &[], now).await;
+    let asked = asked.expect("a pair whose decode takes images");
+    let placed = seeing
+        .host
+        .commit_pair(asked, None, &mut Vec::new(), now)
+        .expect("a placement");
+    assert_eq!(placed.decode_id(), Some(seeing.decodes[0].0));
+    assert!(placed.encoders().is_empty(), "no item, no encoder");
+}
+
+/// An encoder the gateway cannot send to ends the pass: the lease is
+/// given up and the encoder joins the misses. The next ask names it, and
+/// the item is placed on another.
+#[tokio::test]
+async fn an_encoder_the_gateway_cannot_send_to_ends_the_pass_and_is_named_in_the_next_ask() {
+    let bed = EncodeBed::new(1, 2).expect("an encode fleet");
+    let keys = [Identity::hashed(11)];
+    let ask = Ask {
+        items: items(&keys),
+        ..pair_ask()
+    };
+    let now = Instant::now();
+    let asked = bed.host.ask(&ask, &[], now).await;
+    let asked = asked.expect("a pair with its item");
+    let lost = asked.encoders[0].id;
+    let mut encoders = bed.encoders.iter();
+    let (_, worker) = encoders
+        .find(|(id, _)| *id == lost)
+        .expect("an encoder of the bed");
+    worker.set_status(WorkerStatus::NotReady);
+    let mut missed = Vec::new();
+    let result = bed.host.commit_pair(asked, None, &mut missed, now);
+    assert_eq!(
+        result.expect_err("an encoder takes no request"),
+        Unplaced::NoTargetHolds
+    );
+    assert_eq!(missed, [lost]);
+    assert_eq!(live(&bed.store, 0), 0, "the lease is given up");
+
+    let asked = bed.host.ask(&ask, &missed, now).await;
+    let asked = asked.expect("the item placed around the miss");
+    let placed = bed
+        .host
+        .commit_pair(asked, None, &mut missed, now)
+        .expect("a placement");
+    let held: Vec<_> = placed.encoders().iter().map(|held| held.id).collect();
+    let other = bed.encoders.iter().map(|(id, _)| *id);
+    let other: Vec<_> = other.filter(|id| *id != lost).collect();
+    assert_eq!(held, other, "the other encoder takes the item");
+    assert_eq!(missed, [lost], "a placement adds no miss");
+}
+
+/// With items the commit walks a pick's alternates as a pair without
+/// items does. They name the same prefill, so the placed encoders hold.
+#[tokio::test]
+async fn with_items_an_alternate_decode_of_the_same_prefill_is_taken_with_its_encoders() {
+    let bed = EncodeBed::with(1, 2, 1, false).expect("an encode fleet");
+    let keys = [Identity::hashed(11)];
+    let ask = Ask {
+        items: items(&keys),
+        ..pair_ask()
+    };
+    let now = Instant::now();
+    let asked = bed.host.ask(&ask, &[], now).await;
+    let asked = asked.expect("a pair with its item");
+    let decodes = asked.targets.iter().filter_map(|target| target.pair);
+    let decodes: Vec<_> = decodes.map(|pair| pair.decode_id).collect();
+    let &[first, alternate] = decodes.as_slice() else {
+        panic!("the pair and an alternate decode, got {decodes:?}");
+    };
+    let mut workers = bed.decodes.iter();
+    let (_, decoder) = workers
+        .find(|(id, _)| *id == first)
+        .expect("a decode of the bed");
+    decoder.set_status(WorkerStatus::NotReady);
+    let mut missed = Vec::new();
+    let placed = bed
+        .host
+        .commit_pair(asked, None, &mut missed, now)
+        .expect("the alternate holds");
+    assert_eq!(placed.id(), bed.prefills[0].0);
+    assert_eq!(placed.decode_id(), Some(alternate));
+    let held: Vec<_> = placed.encoders().iter().map(|held| held.id).collect();
+    assert_eq!(held, [bed.encoders[0].0], "the encoders are kept");
+    assert!(missed.is_empty(), "a placement adds no miss");
+    assert_eq!(live(&bed.store, 1), 1);
+}
+
+/// The encoders were placed for the first target's prefill. A target of
+/// another prefill is passed over. No pick names one: this case lays it
+/// by hand.
+#[tokio::test]
+async fn with_items_a_target_of_another_prefill_is_not_taken() {
+    let bed = EncodeBed::new(2, 1).expect("an encode fleet");
+    let keys = [Identity::hashed(11)];
+    let ask = Ask {
+        items: items(&keys),
+        ..pair_ask()
+    };
+    let now = Instant::now();
+    let asked = bed.host.ask(&ask, &[], now).await;
+    let mut asked = asked.expect("a pair with its item");
+    assert_eq!(asked.targets.len(), 1, "one prefill and its one decode");
+    let first = *asked.targets.first().expect("a target");
+    let mut prefills = bed.prefills.iter();
+    let (_, placed_for) = prefills
+        .find(|(id, _)| *id == first.id)
+        .expect("a prefill of the bed");
+    let mut prefills = bed.prefills.iter();
+    let (other, other_worker) = prefills
+        .find(|(id, _)| *id != first.id)
+        .expect("the other prefill");
+    asked.targets.push(Target {
+        id: *other,
+        ..first
+    });
+    asked.pairs[1] = [
+        Some(Arc::clone(other_worker)),
+        Some(Arc::clone(&bed.decodes[0].1)),
+    ];
+    placed_for.set_status(WorkerStatus::NotReady);
+    let mut missed = Vec::new();
+    let result = bed.host.commit_pair(asked, None, &mut missed, now);
+    assert_eq!(
+        result.expect_err("no target of the placed prefill holds"),
+        Unplaced::NoTargetHolds
+    );
+    assert_eq!(missed, [first.id]);
+    assert_eq!(live(&bed.store, 0), 0, "the lease is given up");
+}
+
+/// Under a class that pushes the one key stands for every item: the
+/// placement says so and names one encoder.
+#[tokio::test]
+async fn the_one_key_is_said_under_a_class_that_pushes() {
+    let bed = EncodeBed::new(1, 1).expect("an encode fleet");
+    let keys = [Identity::hashed(11), Identity::hashed(12)];
+    let ask = Ask {
+        items: EncodeItems {
+            one: Some(Identity::hashed(99)),
+            ..items(&keys)
+        },
+        ..pair_ask()
+    };
+    let now = Instant::now();
+    let asked = bed.host.ask(&ask, &[], now).await;
+    let asked = asked.expect("a pair with its items");
+    let placed = bed
+        .host
+        .commit_pair(asked, None, &mut Vec::new(), now)
+        .expect("a placement");
+    assert!(placed.one_key());
+    let held: Vec<_> = placed.encoders().iter().map(|held| held.id).collect();
+    assert_eq!(held, [bed.encoders[0].0]);
+}
+
+/// A shed of the encode side reaches the caller under its stage's name,
+/// and no lease stands behind it.
+#[tokio::test]
+async fn a_shed_of_the_encode_side_names_its_stage() {
+    let bed = EncodeBed::new(1, 1).expect("an encode fleet");
+    let (encoder, _) = &bed.encoders[0];
+    let row = WorkersStore::get(&*bed.store, *encoder).expect("the encoder's row");
+    bed.store
+        .set_status(*encoder, RowStatus::NotReady, row.revision)
+        .expect("the row turns");
+    bed.store.publish_now();
+    let keys = [Identity::hashed(11)];
+    let ask = Ask {
+        items: items(&keys),
+        ..pair_ask()
+    };
+    let unplaced = bed.host.ask(&ask, &[], Instant::now()).await.err();
+    assert!(
+        matches!(
+            unplaced,
+            Some(Unplaced::Shed {
+                reason: ShedReason::NoEndpoints,
+                emptied_by: "encoders",
+                ..
+            })
+        ),
+        "{unplaced:?}"
+    );
+    assert_eq!(live(&bed.store, 0), 0);
 }
