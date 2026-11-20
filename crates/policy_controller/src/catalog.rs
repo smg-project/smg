@@ -110,15 +110,34 @@ impl<'a> StageBuild<'a> {
             resolved_signal: false,
         };
         let stage = build(&mut context)?;
-        match (context.resolved_signal, needs(&stage).signal_cells) {
+        Self::held_to_cells(
+            context.resolved_signal,
+            needs(&stage),
+            "resolve one or leave the need unset",
+        )?;
+        Ok(stage)
+    }
+
+    /// A stage's own word on the signal cells, held to what its build
+    /// resolved. `resolved` says whether a factory resolved a signal under
+    /// its context. It is false for a stage the catalog built with no
+    /// context: that stage resolved no column of this document, so it
+    /// declares no cells. `remedy` ends the refusal of such a need with
+    /// what the stage's author can do, which differs by how the stage is
+    /// registered.
+    pub(crate) fn held_to_cells(
+        resolved: bool,
+        needs: Needs,
+        remedy: &'static str,
+    ) -> Result<(), StageError> {
+        match (resolved, needs.signal_cells) {
             (true, false) => Err(StageError::other(
                 "the stage keeps a signal's column: its needs must set signal_cells",
             )),
-            (false, true) => Err(StageError::other(
-                "the stage's needs set signal_cells and its build resolved no signal: \
-                 resolve one or leave the need unset",
-            )),
-            _ => Ok(stage),
+            (false, true) => Err(StageError::other(format!(
+                "the stage's needs set signal_cells and its build resolved no signal: {remedy}"
+            ))),
+            _ => Ok(()),
         }
     }
 }
@@ -378,6 +397,9 @@ impl Catalog {
     /// Adds a filter under `name`: a document names it as it names a
     /// built-in. It takes no parameter: a map written under its name is
     /// refused. Refused when the name is held or is not the filter's own.
+    /// Built with no context, the filter resolves no signal: validation
+    /// refuses one whose needs set `signal_cells`
+    /// ([`Self::filter_with`] resolves one).
     pub fn filter<F>(&mut self, name: &'static str, factory: F) -> Result<&mut Self, CatalogError>
     where
         F: Fn() -> Box<dyn Filter> + Send + Sync + 'static,
@@ -411,7 +433,9 @@ impl Catalog {
 
     /// Adds a scorer under `name`; a document gives it a weight, `{ name:
     /// { weight } }`, or names it bare at weight one. Refused when the name
-    /// is held or is not the scorer's own.
+    /// is held or is not the scorer's own. Built with no context, the
+    /// scorer resolves no signal: validation refuses one whose needs set
+    /// `signal_cells` ([`Self::scorer_with`] resolves one).
     pub fn scorer<F>(&mut self, name: &'static str, factory: F) -> Result<&mut Self, CatalogError>
     where
         F: Fn() -> Box<dyn Scorer> + Send + Sync + 'static,
@@ -444,7 +468,8 @@ impl Catalog {
     }
 
     /// Adds a picker under `name`. Refused when the name is held or is not
-    /// the picker's own.
+    /// the picker's own. A picker resolves no signal: validation refuses
+    /// one whose needs set `signal_cells`.
     pub fn picker<F>(&mut self, name: &'static str, factory: F) -> Result<&mut Self, CatalogError>
     where
         F: Fn() -> Box<dyn Picker> + Send + Sync + 'static,

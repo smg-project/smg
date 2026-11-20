@@ -251,9 +251,11 @@ pub struct Needs {
     /// The signal cells beside the rows
     /// ([`RequestFacts::signal_cells`](crate::RequestFacts::signal_cells)).
     /// A stage that keeps a signal's column declares this, and no other
-    /// stage does: the validator holds every stage it builds under a
-    /// build context to both
+    /// stage does: the validator holds every stage a catalog adds to both.
+    /// One a factory builds under a build context resolves its column
+    /// there
     /// ([`StageBuild::signal_column`](crate::StageBuild::signal_column)).
+    /// One built with no context resolves none, so it declares none.
     /// A host hands the cells where this is declared and none elsewhere.
     pub signal_cells: bool,
 }
@@ -3085,7 +3087,15 @@ fn picker_of(
 ) -> Result<Resolved<Box<dyn Picker>>, SpecError> {
     Ok(match pick {
         PickSpec::Name(name) => match catalog.find_picker(name) {
-            Some(Found::Built(picker)) => Resolved::Built(picker),
+            Some(Found::Built(picker)) => {
+                // A picker has no registration with a context.
+                no_cells_without_a_context(
+                    picker.needs(),
+                    "a picker resolves none: leave the need unset",
+                    || at.sub("pick").field(name),
+                )?;
+                Resolved::Built(picker)
+            }
             // The one picker with parameters, named without them.
             Some(Found::Typed) => {
                 return Err(at.bad(
@@ -3122,6 +3132,19 @@ fn picker_of(
             Resolved::NotInBuild("the best-with-temperature picker")
         }
     })
+}
+
+/// Holds a stage the catalog built with no context to the signal cells,
+/// as [`StageBuild::built`] holds one a factory built under a context. It
+/// resolved no signal, so its needs declare no cells: a host would hand
+/// cells nothing reads. `remedy` is what the stage's author can do, and
+/// `path` is the stage's own, made where a refusal names it.
+fn no_cells_without_a_context(
+    needs: Needs,
+    remedy: &'static str,
+    path: impl FnOnce() -> String,
+) -> Result<(), SpecError> {
+    StageBuild::held_to_cells(false, needs, remedy).map_err(|error| error.at(&path()))
 }
 
 /// What a document's stages are built from: the catalog that makes them,
@@ -3190,7 +3213,14 @@ fn filtered<'a>(
         (Some(Found::Built(_) | Found::With(_)), FilterSpec::Params(stage)) => {
             Ok(Filtered::Typed(stage))
         }
-        (Some(Found::Built(filter)), FilterSpec::Name(_)) => Ok(Filtered::Built(filter)),
+        (Some(Found::Built(filter)), FilterSpec::Name(_)) => {
+            no_cells_without_a_context(
+                filter.needs(),
+                "register it by filter_with to resolve one, or leave the need unset",
+                path,
+            )?;
+            Ok(Filtered::Built(filter))
+        }
         // A filter registered with no parameter is written by its name
         // alone: whatever stands under it is refused.
         (Some(Found::Built(_)), FilterSpec::Added { written, .. }) => Err(SpecError::BadField {
@@ -3315,6 +3345,14 @@ fn scored(
             name: name.to_string(),
         });
     };
+    // A scorer the catalog built with no context, bare or under a weight.
+    if let Found::Built(scorer) = &found {
+        no_cells_without_a_context(
+            scorer.needs(),
+            "register it by scorer_with to resolve one, or leave the need unset",
+            || at.field(name),
+        )?;
+    }
     match (entry, found) {
         (ScoreSpec::Params(stage), _) => Ok(Scored::Typed(stage.clone())),
         (ScoreSpec::Name(_), Found::Typed) => match ScoreStage::by_name(name) {
