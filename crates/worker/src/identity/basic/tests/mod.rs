@@ -1741,13 +1741,13 @@ fn a_worker_and_its_metadata_print_no_api_key() {
 
     let worker = BasicWorkerBuilder::new(url).api_key(marker).build();
     for text in debug(&worker) {
-        assert!(!text.contains(marker));
-        assert!(text.contains("api_key: Some("));
-        assert!(text.contains(r#""<redacted>""#));
+        assert!(!text.contains(marker), "{text}");
+        assert!(text.contains("api_key: Some("), "{text}");
+        assert!(text.contains(r#""<redacted>""#), "{text}");
     }
 
     let worker = BasicWorkerBuilder::new(url).build();
     for text in debug(&worker) {
-        assert!(text.contains("api_key: None"));
+        assert!(text.contains("api_key: None"), "{text}");
     }
 }
