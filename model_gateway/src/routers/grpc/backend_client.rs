@@ -496,15 +496,14 @@ impl EngineConnection for BackendClient {
     }
 }
 
-/// Makes the gateway's client for a worker. It is the default of the worker
-/// builder as the gateway names it, and the gateway hands it to the registry
-/// it builds, for the workers the registry imports.
+/// Makes the gateway's client for a worker. The gateway uses it when the
+/// host supplies no connector. A host's connector can delegate to it for
+/// workers that use the gateway's client.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BackendConnector;
 
 impl BackendConnector {
-    /// The connector as a worker builder and the registry take it: one
-    /// allocation for the process, and each worker holds a clone of it.
+    /// The stock connector, shared in one allocation for the process.
     pub fn shared() -> Arc<dyn EngineConnector> {
         static SHARED: LazyLock<Arc<dyn EngineConnector>> =
             LazyLock::new(|| Arc::new(BackendConnector));

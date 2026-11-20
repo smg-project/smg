@@ -28,22 +28,46 @@ use crate::{
             sse::{sse_channel, SseSender},
         },
         grpc::{
-            common::responses::{
-                await_stream_startup, ensure_mcp_connection, load_history,
-                persist_response_if_needed, stream_startup_channel,
-                streaming::{ResponseStreamEventEmitter, StreamStartupSender},
-                tool_call_limit,
-                utils::{
-                    add_model_call_usage, iteration_exceeds_safety_limit, tool_call_allowance,
-                    tool_call_overflow, McpToolCallLimit,
+            common::{
+                response_formatting::TokenCounts,
+                responses::{
+                    await_stream_startup, ensure_mcp_connection, load_history,
+                    persist_response_if_needed, stream_startup_channel,
+                    streaming::{ResponseStreamEventEmitter, StreamStartupSender},
+                    tool_call_limit,
+                    utils::{
+                        add_model_call_usage, iteration_exceeds_safety_limit, tool_call_allowance,
+                        tool_call_overflow, McpToolCallLimit,
+                    },
+                    BackgroundStream, ReplayInto, ResponsesContext,
                 },
-                BackgroundStream, ReplayInto, ResponsesContext,
+                stages::RateLimitCell,
             },
+            context::LoadGuards,
             harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
         },
     },
     tenant::storage_tenant,
 };
+
+/// Settle the iteration. The counts come with the terminal frame; a stream
+/// that ended before it brought none, and the reservation keeps its debit
+/// as the chat streams' does. A placed iteration that ended whole says its
+/// end with the same counts.
+async fn settle_iteration(
+    reservation: &RateLimitCell,
+    guards: Option<&LoadGuards>,
+    counts: Option<TokenCounts>,
+) {
+    if let Some(counts) = counts {
+        reservation.settle(counts.settlement()).await;
+        if let Some(placement) = guards.and_then(LoadGuards::placement) {
+            placement.completed(counts.prompt, counts.completion);
+        }
+    } else {
+        reservation.close_unsettled().await;
+    }
+}
 
 /// Serve Harmony Responses API with streaming (SSE)
 ///
@@ -278,7 +302,7 @@ async fn execute_mcp_tool_loop_streaming(
         // Execute pipeline and get stream + load guards, under the
         // iteration's tenant rate-limit reservation
         let startup_pending = startup.is_some();
-        let (execution_result, _load_guards, reservation, router_stops) = match ctx
+        let (execution_result, load_guards, reservation, router_stops) = match ctx
             .pipeline
             .execute_harmony_responses_streaming(
                 &current_request,
@@ -327,13 +351,7 @@ async fn execute_mcp_tool_loop_streaming(
         .await
         {
             Ok((result, counts)) => {
-                // The counts come with the terminal frame; a stream that
-                // ended before it brought none, and the reservation keeps
-                // its debit as the chat streams' does.
-                match counts {
-                    Some(counts) => reservation.settle(counts.settlement()).await,
-                    None => reservation.close_unsettled().await,
-                }
+                settle_iteration(&reservation, load_guards.as_ref(), counts).await;
                 result
             }
             Err(err_msg) => {
@@ -608,7 +626,7 @@ async fn execute_without_mcp_streaming(
     // with its context instead of copying it.
     let current_request = Arc::new(current_request);
     let startup_pending = startup.is_some();
-    let (execution_result, _load_guards, reservation, router_stops) = match ctx
+    let (execution_result, load_guards, reservation, router_stops) = match ctx
         .pipeline
         .execute_harmony_responses_streaming(
             &current_request,
@@ -650,13 +668,7 @@ async fn execute_without_mcp_streaming(
     .await
     {
         Ok((result, counts)) => {
-            // The counts come with the terminal frame; a stream that ended
-            // before it brought none, and the reservation keeps its debit
-            // as the chat streams' does.
-            match counts {
-                Some(counts) => reservation.settle(counts.settlement()).await,
-                None => reservation.close_unsettled().await,
-            }
+            settle_iteration(&reservation, load_guards.as_ref(), counts).await;
             result
         }
         Err(err_msg) => {
@@ -667,7 +679,6 @@ async fn execute_without_mcp_streaming(
             return;
         }
     };
-    // _load_guards dropped here after iteration completes
 
     // Extract usage from iteration result
     let usage = match iteration_result {

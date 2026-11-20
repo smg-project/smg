@@ -72,8 +72,8 @@
 //! - Behind the `ingest` feature, the ingestion drivers (`ingest`): the load
 //!   path (the `GetLoads` poll per engine under the store's poll
 //!   arbitration, the metrics scrape of an engine without a servicer) and
-//!   the load helpers (the row conversion, the scrape parser). The KV
-//!   subscription, the prober and discovery arrive in the step's later PRs.
+//!   the metrics parser. The load driver and the worker host's load adapter
+//!   share the `load_report` conversion.
 //!
 //! - Behind the `operator` feature, `operator::SpecDoor` applies a
 //!   host's start document and serves its status, document and dry run.
@@ -86,17 +86,15 @@
 //!   handle, and its timer calls the door's clock ([`door::Door::sweep`]).
 //!   The standalone controller runs the same order on its deciders'
 //!   threads.
-//! - The handle ([`handle`]): one decision of the door, held until its
-//!   request ends. A host that holds a [`handle::Handle`] says the target
-//!   it took, the dispatch, and the completion or the release, and the
-//!   handle says each report to the door once, whatever way the request
-//!   ends.
+//! - The handle ([`handle`]): one decision held until its request ends.
+//!   A host that holds a [`handle::Handle`] says the target it took, the
+//!   dispatch, and the completion or the release. The handle reports to
+//!   the in-process door or, with the `client` feature, over a link.
 //! - Behind the `controller` feature, the standalone controller
 //!   (`controller`): the listeners with their credentialed scopes, the
-//!   health service on each, the admin endpoints, readiness and the drain,
-//!   the load driver over the store, and the binary of the package's name
-//!   over them. The scopes' calls and the election arrive in the step's
-//!   later PRs.
+//!   health service on each, the admin endpoints, readiness, the drain and
+//!   the load driver over the store. The stock binary also requires the
+//!   `worker-host` feature so it can read cache events.
 //! - Behind the `client` feature, the gateway's side of the controller's
 //!   protocol (`client`). The reference client (`client::Client`) asks
 //!   one request at a time, reports its lifecycle and watches workers'
@@ -114,6 +112,11 @@
 //!   follows its own store, on a leader and on a standby alike, and hands
 //!   each object a gRPC connector: an object connects to its engine at its
 //!   first use.
+//! - Behind the `discovery` feature, worker discovery under the controller:
+//!   the binary takes the discovery flags, and the replica that leads runs
+//!   the selected provider over the replica's worker objects. A pass asks
+//!   the job queue the host was handed, and defers what it found while none
+//!   stands.
 //!
 //! The in-process view carries two host instants (the decision's clock and a
 //! report's sample instant); the wire carries durations only.
@@ -140,6 +143,8 @@ pub mod handle;
 #[cfg(feature = "ingest")]
 pub mod ingest;
 pub mod lease;
+#[cfg(any(feature = "ingest", feature = "worker-host"))]
+pub mod load_report;
 #[cfg(feature = "operator")]
 pub mod operator;
 #[cfg(any(feature = "wasm", feature = "controller"))]
@@ -148,6 +153,7 @@ pub mod predictor;
 #[cfg(feature = "controller")]
 pub mod proto;
 pub mod replication;
+pub mod reports;
 pub mod ring;
 pub mod routing_key;
 pub mod sent;
@@ -170,7 +176,7 @@ pub use decision::{
     Decision, Lifted, Overlap, OverlapSource, Pair, Pick, Queue, Shed, ShedReason, Survivors,
     Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
-pub use door::{Explained, Names};
+pub use door::{DecisionRecord, Explained, Names};
 pub use framework::{
     Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
     Front, Narrowed, PairPools, PairTable, PairTableError, Picker, Plan, Profile, Scorer, Scratch,
@@ -180,6 +186,7 @@ pub use lease::{
     EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason,
     Side, Signal, TransportClass,
 };
+pub use reports::{ReportReads, Reports};
 pub use ring::{ConsistentHash, Ring};
 pub use routing_key::{DerivedKey, KeySource, KeySources};
 pub use sent::{Sent, SentCredit};

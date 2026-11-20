@@ -137,8 +137,11 @@ pub struct Health {
     /// breaker bit too. A host writes it into a row it copies for the
     /// decision. Over a publication's own rows the asking host's vetoes
     /// stand beside the rows instead, and a reader of this bit asks both
-    /// ([`Constraints::masks`]). The all-vetoed rule lifts it as its last
-    /// resort, on a row whose breaker bit is clear.
+    /// ([`Constraints::masks`]). A store's own rows carry the bit for one
+    /// doubt, the leader's own, whoever asks
+    /// ([`HealthSink::leader_bits`](crate::store::HealthSink::leader_bits)).
+    /// The all-vetoed rule lifts it as its last resort, on a row whose
+    /// breaker bit is clear.
     pub stalled: bool,
     /// Being drained; nothing new goes there.
     pub draining: bool,
@@ -174,6 +177,15 @@ impl Health {
 /// read on either side of it.
 pub fn permille(ratio: f64) -> u16 {
     (ratio * 1000.0).round().clamp(0.0, 1000.0) as u16
+}
+
+/// A usage threshold as a permille field: [`permille`]'s rounding with a
+/// floor of one, the one conversion every threshold stated as a ratio
+/// takes. At no permille the store reads every engine with a rank on file
+/// as over the threshold, an idle one too, so a valid threshold that would
+/// round to none is held as one.
+pub(crate) fn threshold_permille(usage: f64) -> u16 {
+    permille(usage).max(1)
 }
 
 /// One load row as the view carries it: the engine load record's routing
@@ -304,9 +316,9 @@ impl ModelFingerprint {
 }
 
 /// A session: a key within its model and phase, as the one value a lease
-/// carries and the session table is keyed by. Only
-/// [`RequestFacts::session`] makes one, so a lease or a pin cannot carry a
-/// key's own fingerprint in its place.
+/// carries and the session table is keyed by. [`RequestFacts::session`]
+/// derives the value from a request. A lease read from the wire already
+/// carries that value.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Session(u64);
 
@@ -324,8 +336,8 @@ impl Session {
         self.0
     }
 
-    /// A session from its value, for the session table's own cases.
-    #[cfg(test)]
+    /// A session from the scoped value a lease carries on the wire.
+    #[cfg(any(test, feature = "client"))]
     pub(crate) const fn from_raw(value: u64) -> Self {
         Self(value)
     }
@@ -730,10 +742,14 @@ pub(crate) const REPORT_CLOCK_HISTORY_MS: u32 = 3_600_000;
 pub(crate) const MAX_REPORT_AGE_MS: u32 = REPORT_CLOCK_HISTORY_MS - 1;
 
 /// The oldest sample a decision can use under a report age limit.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct ReportCutoff(u64);
 
 impl ReportCutoff {
+    /// The cutoff of a view that sets no limit: no sample is older than
+    /// the clock's origin, so every report is read.
+    pub(crate) const ANY_AGE: Self = Self(0);
+
     pub(crate) fn new(now_micros: u64, max_age_ms: u64) -> Self {
         Self(now_micros.saturating_sub(max_age_ms * 1_000))
     }

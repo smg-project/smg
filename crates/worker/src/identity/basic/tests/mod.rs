@@ -1705,3 +1705,49 @@ async fn a_failed_http_admin_call_names_the_worker_once_without_the_clients_url(
         "{text}"
     );
 }
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_failed_http_health_check_is_logged_without_the_clients_url() {
+    let refused = RefusedAddress::reserve();
+    let url = format!("{}/?token=s3cret", refused.http_url());
+    let worker = BasicWorkerBuilder::new(&url).build();
+
+    worker
+        .check_health_async()
+        .await
+        .expect_err("nothing listens at the address");
+
+    assert!(!logs_contain("s3cret"));
+    assert!(logs_contain(&format!(
+        "HTTP health check failed for {}:",
+        refused.http_url()
+    )));
+}
+
+#[test]
+fn a_worker_and_its_metadata_print_no_api_key() {
+    let marker = "marble";
+    let url = "http://worker:8000";
+    let debug = |worker: &BasicWorker| {
+        let metadata = worker.metadata();
+        [
+            format!("{metadata:?}"),
+            format!("{metadata:#?}"),
+            format!("{worker:?}"),
+            format!("{worker:#?}"),
+        ]
+    };
+
+    let worker = BasicWorkerBuilder::new(url).api_key(marker).build();
+    for text in debug(&worker) {
+        assert!(!text.contains(marker), "{text}");
+        assert!(text.contains("api_key: Some("), "{text}");
+        assert!(text.contains(r#""<redacted>""#), "{text}");
+    }
+
+    let worker = BasicWorkerBuilder::new(url).build();
+    for text in debug(&worker) {
+        assert!(text.contains("api_key: None"), "{text}");
+    }
+}

@@ -6,10 +6,13 @@ use serde_json::json;
 use crate::{
     door::{Door, Request},
     handle::Handle,
-    store::{Dispatch, GatewayId, MemoryStore, Said, WorkerFacts, WorkerStatus, WorkersStore},
-    AppliedSpec, Candidate, Catalog, Constraints, Engine, Lease, Lifecycle, LoadRow, Membership,
-    Pair, PolicySpec, RequestFacts, Scorer, Sent, SentCredit, Side, SpecError, Target, TieBand,
-    WorkerId, API_VERSION,
+    store::{
+        Dispatch, GatewayId, LeaseState, LeasesStore, MemoryStore, Said, StaleGeneration,
+        WorkerFacts, WorkerStatus, WorkersStore,
+    },
+    AppliedSpec, Candidate, Catalog, Constraints, Engine, Filter, Lease, Lifecycle, LoadRow,
+    Membership, Pair, PolicySpec, RequestFacts, Scorer, Sent, SentCredit, Side, SpecError, Target,
+    TieBand, WorkerId, API_VERSION,
 };
 
 const POOL: &str = "work";
@@ -17,6 +20,7 @@ const GATEWAY: GatewayId = GatewayId(37);
 const START: u64 = 91_300;
 const DELAY: u32 = 47;
 const TOKENS: u32 = 317;
+const NEXT_GENERATION: u64 = 43;
 
 fn one(tokens: u32) -> Sent {
     Sent {
@@ -259,11 +263,21 @@ fn removing_a_worker_clears_its_ranks_sends() {
     assert_eq!(reads.of(&b), one(TOKENS));
 }
 
-fn apply(store: &MemoryStore, document: &PolicySpec, catalog: &Catalog) {
+fn validated(document: &PolicySpec, catalog: &Catalog) -> AppliedSpec {
     let digest = document.digest().expect("a digest");
-    let spec = AppliedSpec::validate_digested(document, digest, catalog, &[])
-        .expect("the policy validates");
-    store.apply(spec).expect("a newer generation");
+    AppliedSpec::validate_digested(document, digest, catalog, &[]).expect("the policy validates")
+}
+
+fn apply(store: &MemoryStore, document: &PolicySpec, catalog: &Catalog) {
+    store
+        .apply(validated(document, catalog))
+        .expect("a newer generation");
+}
+
+fn next_document(limit: Option<u32>) -> PolicySpec {
+    let mut next = document(limit);
+    next.generation = NEXT_GENERATION;
+    next
 }
 
 fn door() -> (Door, Catalog, Readers) {
@@ -343,6 +357,172 @@ fn a_dispatch_of_an_older_lease_reaches_the_standing_generation() {
     let readers = readers.lock();
     assert_eq!(readers[1].read(&clock(0), &sent_to), one(TOKENS));
     assert_eq!(readers[0].read(&clock(0), &sent_to), Sent::default());
+}
+
+#[test]
+fn a_decision_reads_the_sends_carried_to_its_profile() {
+    let (door, catalog, readers) = door();
+    let now = Instant::now();
+    let mut first = decide(&door, b"choose", now);
+    let sent_to = chosen(&first);
+    first.dispatched(now);
+
+    apply(door.store(), &next_document(None), &catalog);
+    let next = decide(&door, b"choose", now);
+    assert_eq!(readers.lock()[1].read(&clock(0), &sent_to), one(TOKENS));
+    assert_ne!(chosen(&next).id, sent_to.id);
+}
+
+#[test]
+fn a_profile_under_a_new_name_starts_with_no_sends() {
+    let (door, catalog, readers) = door();
+    let now = Instant::now();
+    let mut first = decide(&door, b"before", now);
+    let sent_to = chosen(&first);
+    first.dispatched(now);
+
+    let mut next = next_document(None);
+    let profile = next.profiles.remove(POOL).expect("the standing profile");
+    next.profiles.insert("new".into(), profile);
+    apply(door.store(), &next, &catalog);
+    let readers = readers.lock();
+    assert_eq!(readers[1].read(&clock(0), &sent_to), Sent::default());
+    assert_eq!(readers[0].read(&clock(0), &sent_to), one(TOKENS));
+}
+
+#[test]
+fn the_new_profiles_limit_applies_to_carried_sends() {
+    let (door, catalog, readers) = door();
+    let now = Instant::now();
+    let mut first = decide(&door, b"before", now);
+    let sent_to = chosen(&first);
+    let issued = first.lease().expect("the pick's lease").lease.issued_micros;
+    first.dispatched(now);
+
+    let limit = 29;
+    apply(door.store(), &next_document(Some(limit)), &catalog);
+    let edge = issued + u64::from(limit) * 1000;
+    let readers = readers.lock();
+    assert_eq!(readers[1].read(&clock(edge - 1), &sent_to), one(TOKENS));
+    assert_eq!(readers[0].read(&clock(edge), &sent_to), one(TOKENS));
+    assert_eq!(readers[1].read(&clock(edge), &sent_to), Sent::default());
+}
+
+#[test]
+fn a_refused_generation_takes_no_sends_from_the_standing_profile() {
+    let (door, catalog, readers) = door();
+    let now = Instant::now();
+    let mut first = decide(&door, b"before", now);
+    let sent_to = chosen(&first);
+    first.dispatched(now);
+
+    let stale = document(None);
+    assert_eq!(
+        door.store().apply(validated(&stale, &catalog)),
+        Err(StaleGeneration {
+            standing: stale.generation,
+            offered: stale.generation,
+        })
+    );
+    let readers = readers.lock();
+    assert_eq!(readers[1].read(&clock(0), &sent_to), Sent::default());
+    assert_eq!(readers[0].read(&clock(0), &sent_to), one(TOKENS));
+}
+
+#[test]
+fn a_decision_holding_the_standing_world_reads_the_same_carried_entry() {
+    let (door, catalog, _) = door();
+    let now = Instant::now();
+    let mut first = decide(&door, b"choose", now);
+    let mut second = decide(&door, b"choose", now);
+    let sent_to = chosen(&first);
+    assert_eq!(chosen(&second).id, sent_to.id);
+    first.dispatched(now);
+
+    let store = door.store();
+    store.deciding(|world| {
+        let standing = &world.spec().engine().sent_credits[0];
+        apply(store, &next_document(None), &catalog);
+        second.dispatched(now);
+
+        let both = Sent {
+            requests: 2,
+            tokens: 2 * u64::from(TOKENS),
+        };
+        assert_eq!(standing.read(&clock(0), &sent_to), both);
+        store.deciding(|next| {
+            let carried = &next.spec().engine().sent_credits[0];
+            assert_eq!(carried.read(&clock(0), &sent_to), both);
+        });
+    });
+}
+
+#[test]
+fn a_late_dispatch_adds_no_entry_for_a_row_that_left() {
+    for resize in [false, true] {
+        let (door, _, readers) = door();
+        let now = Instant::now();
+        let mut first = decide(&door, b"before", now);
+        let sent_to = chosen(&first);
+        let lease = first.lease().expect("the pick's lease").lease;
+        let store = door.store();
+        let worker = WorkersStore::get(&**store, sent_to.id).expect("the worker");
+        if resize {
+            let facts = WorkerFacts {
+                dp_rank: 6,
+                dp_size: 9,
+                ..worker.facts
+            };
+            assert_eq!(store.upsert(facts).id(), sent_to.id);
+            store.publish_now();
+        } else {
+            store.remove(sent_to.id, worker.revision).expect("removal");
+        }
+        first.dispatched(now);
+
+        let record = LeasesStore::get(&**store, GATEWAY, lease.id).expect("the filed lease");
+        assert!(matches!(record.state, LeaseState::Dispatched { .. }));
+        let tally = readers.lock()[0].credits.tally.load();
+        assert!(!tally.contains_key(&(sent_to.id, sent_to.dp_rank)));
+    }
+}
+
+#[test]
+fn a_generation_with_no_readers_leaves_sends_behind() {
+    let (door, catalog, readers) = door();
+    let now = Instant::now();
+    let mut first = decide(&door, b"before", now);
+    let sent_to = chosen(&first);
+    first.dispatched(now);
+
+    let mut next: PolicySpec = serde_json::from_value(json!({
+        "apiVersion": API_VERSION,
+        "generation": NEXT_GENERATION,
+        "profiles": { (POOL): { "pick": "random" } }
+    }))
+    .expect("a document");
+    apply(door.store(), &next, &catalog);
+    door.store().deciding(|world| {
+        let engine = world.spec().engine();
+        assert!(engine.sent_credits.is_empty());
+        engine.dispatched_sent(
+            &Lease::default(),
+            &Target::default(),
+            Side::Single,
+            0,
+            || {
+                panic!("a dispatch with no readers checked membership");
+            },
+        );
+    });
+
+    next = next_document(None);
+    next.generation += 5;
+    apply(door.store(), &next, &catalog);
+    let readers = readers.lock();
+    assert_eq!(readers.len(), 2);
+    assert_eq!(readers[0].read(&clock(0), &sent_to), one(TOKENS));
+    assert_eq!(readers[1].read(&clock(0), &sent_to), Sent::default());
 }
 
 #[test]
@@ -491,5 +671,84 @@ fn an_unset_limit_leaves_a_documents_canonical_form_and_digest_intact() {
     assert_eq!(
         document.digest().expect("a digest").to_string(),
         "sha256:5d615ed114ca79046283cd72596dd3428baa2ec110170a5bb72ea4bc525b1ade"
+    );
+}
+
+/// Keeps the rows its profile sent fewer than `most` requests.
+#[derive(Debug)]
+struct SentUnder {
+    sent: Arc<SentCredit>,
+    most: u32,
+}
+
+impl Filter for SentUnder {
+    fn name(&self) -> &'static str {
+        "sent-under"
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, candidate: &Candidate, _: &Constraints<'_>) -> bool {
+        self.sent.read(facts, candidate).requests < self.most
+    }
+}
+
+/// A registered filter holds its profile's count of sends, as a registered
+/// scorer does. The count is made where the filter's factory asks for it,
+/// ahead of any scorer, so the profile's limit has its reader.
+#[test]
+fn a_registered_filter_reads_the_sends_of_its_profile() {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Most {
+        requests: u32,
+    }
+
+    let readers = Readers::default();
+    let kept = Arc::clone(&readers);
+    let mut catalog = Catalog::builtin();
+    catalog
+        .filter_with("sent-under", move |build| {
+            let Most { requests } = build.params()?;
+            let sent = build.sent();
+            kept.lock().push(Arc::clone(&sent));
+            Ok(Box::new(SentUnder {
+                sent,
+                most: requests,
+            }))
+        })
+        .expect("a free name");
+    let document: PolicySpec = serde_json::from_value(json!({
+        "apiVersion": API_VERSION,
+        "generation": 4,
+        "profiles": {
+            "work": {
+                "sent_ttl_ms": 24_001,
+                "filter": [{ "sent-under": { "requests": 2 } }],
+                "pick": "random"
+            }
+        }
+    }))
+    .expect("a document");
+    let engine = document
+        .validate_in(&catalog, &[])
+        .expect("the filter reads the sends the limit ages");
+    assert_eq!(engine.sent_credits.len(), 1);
+
+    let a = row(127, 3);
+    let b = row(131, a.dp_rank);
+    let facts = clock(START + 700);
+    let filter = &engine.profiles()[0].filters[0];
+    let keeps = |row: &Candidate| filter.keep(&facts, row, &Constraints::default());
+    send(&engine, &a, START, TOKENS);
+    assert!(keeps(&a) && keeps(&b), "one send is under two");
+    send(&engine, &a, START, TOKENS);
+    assert!(!keeps(&a), "two sends are not under two");
+    assert!(keeps(&b), "another row's sends are its own");
+    // The count the factory was handed is the one the engine feeds.
+    assert_eq!(
+        readers.lock()[0].read(&facts, &a),
+        Sent {
+            requests: 2,
+            tokens: 2 * u64::from(TOKENS),
+        }
     );
 }

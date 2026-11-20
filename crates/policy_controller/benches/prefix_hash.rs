@@ -4,7 +4,9 @@
 //! rule, so the fewest requests in flight take it (`passed_over`). The two
 //! `levels_` paths are the same two under the boundaries 64 and 256 tokens:
 //! the prompt is keyed at 256, its deepest, and a passed owner hands it to
-//! the owner at 64 before the fewest requests take it. Ids:
+//! the owner at 64 before the fewest requests take it. `owner_after_join`
+//! is `owner` over a ring that learned its lowest healthy row last, as
+//! after a worker joins. Ids:
 //! `policy_engine/prefix_hash/<path>/<n>`. The fleet is the one the
 //! `decision` bench decides over, whose `policy_engine/decide/prefix_hash/<n>`
 //! ids time the preset for a request with nothing to hash. The request
@@ -164,6 +166,23 @@ fn paths(c: &mut Criterion) {
             }
             decide_over(&mut group, passed, &engine, &view, &hashes);
         }
+        // A ring that learned its lowest row last: the engine first decides
+        // over the fleet without that row.
+        let engine = engine_of("prefix_hash");
+        let mut view = Vec::with_capacity(n);
+        build_view(&fleet(n), &mut view);
+        let lowest = view
+            .iter()
+            .position(|row| row.health.healthy)
+            .expect("a healthy row");
+        let mut late = view.clone();
+        late.remove(lowest);
+        for (position, row) in late.iter_mut().enumerate() {
+            row.position = position as u32;
+        }
+        placed(&engine, &late, &hashes);
+        placed(&engine, &view, &hashes);
+        decide_over(&mut group, "owner_after_join", &engine, &view, &hashes);
     }
     group.finish();
 }

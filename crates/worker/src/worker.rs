@@ -23,7 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(feature = "axum")]
 use serde_json::json;
 
-use super::model_card::ModelCard;
+use super::{identity::endpoint::Endpoint, model_card::ModelCard, value_bounds};
 
 // ── Default value constants ──────────────────────────────────────────
 
@@ -762,6 +762,8 @@ impl GrammarStart {
 
 // ── Core identity ────────────────────────────────────────────────────
 
+const REDACTED_API_KEY: &str = "<redacted>";
+
 /// Core worker identity and configuration.
 ///
 /// The single canonical representation of "what is a worker". Used as the
@@ -771,7 +773,7 @@ impl GrammarStart {
 /// Fields use `#[serde(default)]` so the same struct works for both input
 /// (partial config from user) and output (fully resolved state).
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkerSpec {
     /// Worker URL.
     pub url: String,
@@ -914,6 +916,93 @@ pub struct WorkerSpec {
     /// protection for this worker even when the gateway leaves it off.
     #[serde(default, skip_serializing_if = "OverloadUpdate::is_empty")]
     pub overload: OverloadUpdate,
+}
+
+impl std::fmt::Debug for WorkerSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // List every field so new fields require a formatting decision.
+        let Self {
+            url,
+            models,
+            worker_type,
+            connection_mode,
+            runtime_type,
+            provider,
+            labels,
+            priority,
+            cost,
+            api_key,
+            bootstrap_port,
+            bootstrap_host,
+            dp_base_url,
+            dp_rank,
+            dp_size,
+            kv_connector,
+            kv_role,
+            kv_engine_id,
+            kv_block_size,
+            pairing_protocol,
+            constrained_decoding,
+            health,
+            http_pool,
+            resilience,
+            max_connection_attempts,
+            load_monitor_interval_secs,
+            multimodal_tensor_transport,
+            multimodal_shm_min_bytes,
+            zmq_handshake_address,
+            overload,
+        } = self;
+
+        // An address prints in its redacted form: its userinfo can carry
+        // a credential. A rank is read out of the address alone that a
+        // registration wrote beside its base: in any other, an `@` and
+        // digits at the end are a userinfo and a host, and read as a rank
+        // they would print the userinfo.
+        let unranked = |address: &str| {
+            Endpoint::parse(address).map_or_else(
+                |_| "<unparsable address>".to_string(),
+                |address| address.redacted(),
+            )
+        };
+        let url = if dp_base_url.is_some() {
+            Endpoint::redacted_str(url)
+        } else {
+            unranked(url.as_str())
+        };
+        f.debug_struct("WorkerSpec")
+            .field("url", &url)
+            .field("models", models)
+            .field("worker_type", worker_type)
+            .field("connection_mode", connection_mode)
+            .field("runtime_type", runtime_type)
+            .field("provider", provider)
+            .field("labels", labels)
+            .field("priority", priority)
+            .field("cost", cost)
+            .field("api_key", &api_key.is_some().then_some(REDACTED_API_KEY))
+            .field("bootstrap_port", bootstrap_port)
+            .field("bootstrap_host", bootstrap_host)
+            .field("dp_base_url", &dp_base_url.as_deref().map(unranked))
+            .field("dp_rank", dp_rank)
+            .field("dp_size", dp_size)
+            .field("kv_connector", kv_connector)
+            .field("kv_role", kv_role)
+            .field("kv_engine_id", kv_engine_id)
+            .field("kv_block_size", kv_block_size)
+            .field("pairing_protocol", pairing_protocol)
+            .field("constrained_decoding", constrained_decoding)
+            .field("health", health)
+            .field("http_pool", http_pool)
+            .field("resilience", resilience)
+            .field("max_connection_attempts", max_connection_attempts)
+            .field("load_monitor_interval_secs", load_monitor_interval_secs)
+            .field("multimodal_tensor_transport", multimodal_tensor_transport)
+            .field("multimodal_shm_min_bytes", multimodal_shm_min_bytes)
+            .field("zmq_handshake_address", zmq_handshake_address)
+            .field("overload", overload)
+            .finish()
+    }
 }
 
 impl WorkerSpec {
@@ -1424,7 +1513,7 @@ impl ResilienceUpdate {
 
 /// Worker update request
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkerUpdateRequest {
     /// Update priority
     pub priority: Option<u32>,
@@ -1440,6 +1529,26 @@ pub struct WorkerUpdateRequest {
 
     /// Update health check configuration (partial — only specified fields change)
     pub health: Option<HealthCheckUpdate>,
+}
+
+impl std::fmt::Debug for WorkerUpdateRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            priority,
+            cost,
+            labels,
+            api_key,
+            health,
+        } = self;
+
+        f.debug_struct("WorkerUpdateRequest")
+            .field("priority", priority)
+            .field("cost", cost)
+            .field("labels", labels)
+            .field("api_key", &api_key.is_some().then_some(REDACTED_API_KEY))
+            .field("health", health)
+            .finish()
+    }
 }
 
 // ── Request types ───────────────────────────────────────────────────
@@ -1661,7 +1770,26 @@ pub struct SchedulerLoadSnapshot {
     /// in its snapshot, and that says nothing about the value. A reader
     /// that wants a value across records keeps the last one it read; the
     /// load sink hears every record.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// A report holds a list to bounds ([`Self::bound_values`]). A pushed
+    /// record's snapshot is built under them, and the load monitor puts a
+    /// polled answer's list under them before a sink or a reader sees it.
+    /// Off the wire the key fails no answer: an entry that is no named
+    /// value is read with no name, and a key that is no list as no list.
+    #[serde(
+        default,
+        deserialize_with = "value_bounds::stated",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    #[schemars(
+        description = "Values the engine reports by name, as the one record or answer this \
+                       snapshot was read from states them. A list takes the place of the \
+                       rank's last: a name it leaves out is not in the snapshot, and that says \
+                       nothing about the value. A report keeps the first 64 entries of a list, \
+                       less each one with an empty name, a name over 63 bytes, a unit over 31 \
+                       bytes, a value that is not finite, or a name an entry kept ahead of it \
+                       states."
+    )]
     pub values: Vec<NamedValue>,
     /// The parts of this entry that its own record did not carry: the load
     /// monitor kept them from an older record of the rank. Empty for a
@@ -1673,6 +1801,22 @@ pub struct SchedulerLoadSnapshot {
 }
 
 impl SchedulerLoadSnapshot {
+    /// Puts [`Self::values`] under the bounds a report holds named values
+    /// to, in place, and answers how many entries left the list. A report
+    /// considers a list's first 64 entries. Of those it drops each one
+    /// with an empty name, a name over 63 bytes, a unit over 31 bytes, a
+    /// value that is not finite, or a name an entry kept ahead of it
+    /// states: the first of a name stands. The kept entries keep their
+    /// order.
+    ///
+    /// The load monitor passes every polled answer through this and counts
+    /// what it answers. A pushed record's snapshot is built under the same
+    /// bounds. A host that takes an answer by a way of its own calls this
+    /// before it reads the list.
+    pub fn bound_values(&mut self) -> usize {
+        value_bounds::bound(&mut self.values)
+    }
+
     /// Values the engine reports by name, followed by the two fixed token
     /// counts, each where it is nonzero, its name is absent from the list
     /// and this snapshot's own record carried it. A count the entry kept
@@ -2545,5 +2689,120 @@ mod constrained_decoding_tests {
             r#"{"url":"http://w:8000","constrained_decoding":"sometimes"}"#
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::{WorkerSpec, WorkerUpdateRequest};
+
+    #[test]
+    fn a_spec_prints_no_api_key() {
+        let marker = "pebble";
+        let mut spec = WorkerSpec::new("http://worker:8000");
+        spec.api_key = Some(marker.to_string());
+
+        let compact = format!("{spec:?}");
+        let pretty = format!("{spec:#?}");
+        assert!(!compact.contains(marker), "{compact}");
+        assert!(!pretty.contains(marker), "{pretty}");
+        assert!(
+            compact.contains(r#"api_key: Some("<redacted>")"#),
+            "{compact}"
+        );
+        assert!(
+            pretty.contains("api_key: Some(\n        \"<redacted>\",\n    )"),
+            "{pretty}"
+        );
+
+        spec.api_key = None;
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(text.contains("api_key: None"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_spec_prints_no_credential_of_its_addresses() {
+        let mut spec = WorkerSpec::new("http://user:pebble@worker:8000");
+        spec.dp_base_url = Some("http://cedar@worker:8001".to_string());
+
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(!text.contains("pebble"), "{text}");
+            assert!(!text.contains("cedar"), "{text}");
+            assert!(text.contains("***@worker:8000"), "{text}");
+            assert!(text.contains("***@worker:8001"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_spec_reads_a_rank_out_of_the_address_beside_a_base_alone() {
+        // With no base, an `@` and digits at the end are a userinfo and a
+        // host.
+        let mut spec = WorkerSpec::new("http://pebble@2130706433");
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(!text.contains("pebble"), "{text}");
+        }
+
+        // A base carries no rank, and the address written beside it does.
+        spec.url = "http://worker:8000@1".to_string();
+        spec.dp_base_url = Some("http://cedar@8001".to_string());
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(!text.contains("cedar"), "{text}");
+            assert!(text.contains(r#"url: "http://worker:8000@1""#), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_key_rotation_request_prints_no_api_key() {
+        let marker = "cedar";
+        let mut request = WorkerUpdateRequest {
+            priority: Some(73),
+            cost: None,
+            labels: None,
+            api_key: Some(marker.to_string()),
+            health: None,
+        };
+
+        let compact = format!("{request:?}");
+        let pretty = format!("{request:#?}");
+        assert!(!compact.contains(marker), "{compact}");
+        assert!(!pretty.contains(marker), "{pretty}");
+        assert!(
+            compact.contains(r#"api_key: Some("<redacted>")"#),
+            "{compact}"
+        );
+        assert!(
+            pretty.contains("api_key: Some(\n        \"<redacted>\",\n    )"),
+            "{pretty}"
+        );
+
+        request.api_key = None;
+        let expected = "WorkerUpdateRequest { priority: Some(73), cost: None, labels: None, api_key: None, health: None }";
+        assert_eq!(format!("{request:?}"), expected);
+        let pretty = format!("{request:#?}");
+        assert!(pretty.contains("api_key: None"), "{pretty}");
+    }
+
+    #[test]
+    fn a_spec_still_prints_its_other_fields() {
+        let spec = WorkerSpec {
+            priority: 73,
+            ..WorkerSpec::new("http://worker:8000")
+        };
+
+        let text = format!("{spec:?}");
+        assert!(
+            text.starts_with(r#"WorkerSpec { url: "http://worker:8000","#),
+            "{text}"
+        );
+        assert!(text.contains("priority: 73"), "{text}");
+
+        let pretty = format!("{spec:#?}");
+        let field_count = pretty
+            .lines()
+            .filter_map(|line| line.strip_prefix("    "))
+            .filter(|line| line.starts_with(|c: char| c.is_ascii_lowercase()))
+            .count();
+        assert_eq!(field_count, 30);
     }
 }

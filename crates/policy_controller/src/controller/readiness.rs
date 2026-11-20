@@ -214,7 +214,7 @@ impl Readiness {
 
 /// Resolves at `turn`, at once where it is past; never where there is
 /// none.
-async fn reached(turn: Option<Instant>) {
+pub(super) async fn reached(turn: Option<Instant>) {
     match turn {
         Some(turn) => tokio::time::sleep_until(turn.into()).await,
         None => std::future::pending().await,

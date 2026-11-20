@@ -224,8 +224,9 @@ pub(crate) fn all() -> Vec<Probe> {
             reported, engines,
         } host [reach, reported, engines], &pool),
         // The lease's session crosses under the name both contracts still
-        // spell, `session-key`: the change that first reads a lease from the
-        // wire renames the field in both and takes this pair out.
+        // spell, `session-key`. A gateway's client reads it under that name.
+        // A change that renames the field renames it in both contracts and
+        // takes this pair out.
         probe!("lease", before [], Lease {
             id, kind, side, target_index, booked, generation, session as "session-key",
             session_verdict, issued_micros, tokens,

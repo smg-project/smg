@@ -6,25 +6,44 @@ use crate::view::LoadRow;
 pub(crate) enum Term {
     Load(LoadField),
     InFlight,
+    /// The sends to the row that no report of it shows yet.
+    SentRequests,
+    /// The prompt tokens those sends stated.
+    SentTokens,
 }
 
 impl Term {
+    /// Every name a document may write, with the term it reads.
+    pub(crate) const NAMES: [(&str, Self); 9] = [
+        ("candidate.in_flight", Self::InFlight),
+        ("load.active_kv_permille", Self::Load(LoadField::ActiveKv)),
+        ("load.kv_usage_permille", Self::Load(LoadField::KvUsage)),
+        ("load.queued", Self::Load(LoadField::Queued)),
+        (
+            "load.resident_tokens",
+            Self::Load(LoadField::ResidentTokens),
+        ),
+        ("load.running", Self::Load(LoadField::Running)),
+        (
+            "load.waiting_uncached_tokens",
+            Self::Load(LoadField::WaitingUncachedTokens),
+        ),
+        ("sent.requests", Self::SentRequests),
+        ("sent.tokens", Self::SentTokens),
+    ];
+
     pub(crate) fn named(name: &str) -> Option<Self> {
-        let field = match name {
-            "candidate.in_flight" => return Some(Self::InFlight),
-            "load.active_kv_permille" => LoadField::ActiveKv,
-            "load.kv_usage_permille" => LoadField::KvUsage,
-            "load.queued" => LoadField::Queued,
-            "load.resident_tokens" => LoadField::ResidentTokens,
-            "load.running" => LoadField::Running,
-            "load.waiting_uncached_tokens" => LoadField::WaitingUncachedTokens,
-            _ => return None,
-        };
-        Some(Self::Load(field))
+        Self::NAMES
+            .iter()
+            .find_map(|&(written, term)| (written == name).then_some(term))
     }
 
     pub(crate) fn reads_load(self) -> bool {
         matches!(self, Self::Load(_))
+    }
+
+    pub(crate) fn reads_sent(self) -> bool {
+        matches!(self, Self::SentRequests | Self::SentTokens)
     }
 
     #[cfg(test)]
@@ -32,6 +51,8 @@ impl Term {
         match self {
             Self::Load(field) => field.read(load?),
             Self::InFlight => Some(f64::from(in_flight)),
+            // The walk leaves the sends to the pass behind it.
+            Self::SentRequests | Self::SentTokens => Some(0.0),
         }
     }
 }
@@ -77,6 +98,8 @@ pub(crate) struct Coefficients {
     pub(crate) resident_tokens: f64,
     running: f64,
     pub(crate) waiting_uncached_tokens: f64,
+    pub(crate) sent_requests: f64,
+    pub(crate) sent_tokens: f64,
 }
 
 impl Coefficients {
@@ -93,7 +116,13 @@ impl Coefficients {
                     LoadField::Running => &mut coefficients.running,
                     LoadField::WaitingUncachedTokens => &mut coefficients.waiting_uncached_tokens,
                 },
+                Term::SentRequests => &mut coefficients.sent_requests,
+                Term::SentTokens => &mut coefficients.sent_tokens,
             };
+            debug_assert!(
+                coefficient != 0.0,
+                "a named term has a coefficient other than zero"
+            );
             *field = coefficient;
         }
         coefficients

@@ -2,12 +2,21 @@
 //! the credentials and the shutdown settings are read at start; the routing
 //! policy is the spec's and never here): the listeners with their scopes and
 //! TLS, the admin listener, the controller's identity, the election and the
-//! shutdown bounds, validated as a whole before anything binds so a refusal
-//! names the field it refuses.
+//! shutdown bounds, and worker discovery settings when built with discovery.
+//! The configuration is validated before anything binds.
 
 use std::{collections::BTreeMap, fmt, net::SocketAddr, path::PathBuf, thread, time::Duration};
 
+#[cfg(feature = "discovery")]
+pub use super::discovery::DiscoverySettings;
 use super::election::Election;
+
+/// Worker discovery's settings in a build without the `discovery` feature:
+/// a type with no value. Such a build runs no provider, so its
+/// configuration names none.
+#[cfg(not(feature = "discovery"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DiscoverySettings {}
 
 /// A credentialed group of the controller's calls (design 8). Each scope is
 /// mounted on exactly one listener, alone or beside others; a listener's
@@ -126,6 +135,10 @@ pub struct Config {
     /// this replica's dialable address. The default is one replica that
     /// leads itself over a lease in its own process.
     pub election: Election,
+    /// The worker discovery provider to run while this replica leads. A
+    /// build without the `discovery` feature runs none: the type has no
+    /// value there, and the field is always `None`.
+    pub discovery: Option<DiscoverySettings>,
 }
 
 impl Config {
@@ -238,9 +251,7 @@ impl Config {
     }
 }
 
-/// A configuration refused, by name. The last four come from the binary's
-/// command line, which maps one server identity and one client authority
-/// per scope onto the listeners; the eight before them are the election's.
+/// A controller setting refused by name.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ConfigError {
     /// `controller_id` is empty.
@@ -384,6 +395,14 @@ pub enum ConfigError {
         /// The scope naming another.
         second: Scope,
     },
+    /// A discovery flag was refused.
+    #[error("{flag}: {reason}")]
+    DiscoveryFlag {
+        /// The flag that was refused.
+        flag: &'static str,
+        /// Why the flag was refused.
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -428,6 +447,7 @@ pub(crate) mod tests {
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
             decide_shards: 2,
             election: Election::default(),
+            discovery: None,
         }
     }
 

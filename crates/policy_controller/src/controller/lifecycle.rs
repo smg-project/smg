@@ -29,7 +29,8 @@
 //! completion or its release. A generation that no longer stands is told
 //! nothing: the stages of a later one never saw the issue. A dispatch
 //! alone goes further: it feeds the standing generation's counts of
-//! sends, whichever generation issued the lease.
+//! sends, whichever generation issued the lease, where the standing
+//! world still lists the worker at the rank the dispatch names.
 //!
 //! A pair's lease stands under one id: its record is the prefill side,
 //! and its decode side is filed beside the record. A frame moves the

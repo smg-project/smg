@@ -2,17 +2,20 @@
 
 use smg_worker::{
     identity::basic::Worker,
-    worker::{ConnectionMode, WorkerType},
+    worker::{ConnectionMode, HealthCheckConfig},
 };
 
+use super::object::role;
 use crate::{
-    store::{HealthPolicy, WorkerFacts},
-    view::{Role, WireModes},
+    store::{HealthPolicy, Overload, WorkerFacts},
+    view::{threshold_permille, WireModes},
 };
 
 /// The facts a provider states of a worker it found, from the object to the
 /// row as the module's table describes. Facts the object does not carry
-/// come from the standing row, or from the store's defaults.
+/// come from the standing row, or from the store's defaults. The models are
+/// the ones the object serves now, and a threshold of its own registration
+/// is stated over the standing row's.
 pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts {
     let defaults = WorkerFacts::default();
     let standing = standing.unwrap_or(&defaults);
@@ -23,12 +26,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
         key: spec.url.clone(),
         engine: spec.dp_base_url.as_ref().unwrap_or(&spec.url).clone(),
         incarnation: standing.incarnation,
-        role: match spec.worker_type {
-            WorkerType::Regular => Role::Single,
-            WorkerType::Prefill => Role::Prefill,
-            WorkerType::Decode => Role::Decode,
-            WorkerType::Encode => Role::Encode,
-        },
+        role: role(spec.worker_type),
         wire_modes: match spec.connection_mode {
             ConnectionMode::Http => WireModes::HTTP,
             ConnectionMode::Grpc => WireModes::GRPC,
@@ -39,7 +37,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
         } else {
             String::new()
         },
-        models: spec.models.iter().map(|card| card.id.clone()).collect(),
+        models: worker.models().into_iter().map(|card| card.id).collect(),
         // Values wider than a row's fields take the largest value they hold.
         dp_rank: u16::try_from(spec.dp_rank.unwrap_or(0)).unwrap_or(u16::MAX),
         dp_size: u16::try_from(spec.dp_size.unwrap_or(1)).unwrap_or(u16::MAX),
@@ -67,7 +65,23 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
             timeout_ms: milliseconds(checks.timeout_secs),
             probes: !checks.disable_health_check,
         },
-        overload: standing.overload,
+        overload: Overload {
+            kv_usage_permille: spec
+                .overload
+                .token_usage
+                .map(threshold_permille)
+                .or(standing.overload.kv_usage_permille),
+            waiting_requests: spec
+                .overload
+                .waiting_requests
+                .map(|waiting| u32::try_from(waiting).unwrap_or(u32::MAX))
+                .or(standing.overload.waiting_requests),
+        },
+        // A window the object's registration left at the default is not a
+        // fact of the row: the object built from the row takes the default.
+        drain_settle_secs: (checks.drain_settle_secs
+            != HealthCheckConfig::default().drain_settle_secs)
+            .then(|| u32::try_from(checks.drain_settle_secs).unwrap_or(u32::MAX)),
     }
 }
 
@@ -79,11 +93,15 @@ fn milliseconds(seconds: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Instant};
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use smg_worker::{
-        identity::builder::BasicWorkerBuilder,
-        worker::{HealthCheckConfig, WorkerSpec},
+        identity::{basic::Worker, builder::BasicWorkerBuilder},
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, OverloadUpdate, WorkerSpec},
     };
 
     use super::facts;
@@ -91,10 +109,11 @@ mod tests {
         store::{
             encoding::{EncodeHandoff, EncodeOffer},
             pairing::PairingDescriptor,
-            GatewayId, HealthPolicy, Maker, Overload, Reachability, Signals, WorkerFacts,
-            WorkerRow, WorkerStatus,
+            Ask, GatewayId, HealthPolicy, LoadSink as _, LoadSource, Maker, MemoryStore, Overload,
+            Reachability, Signals, ViewBuffers, WorkerFacts, WorkerRow, WorkerStatus,
+            WorkersStore as _,
         },
-        view::{Role, WireModes, WorkerId},
+        view::{LoadRow, Role, WireModes, WorkerId},
         worker_host::object,
     };
 
@@ -131,6 +150,7 @@ mod tests {
                 labels: [("tier".to_owned(), "gold".to_owned())].into(),
                 bootstrap_port: Some(8_998),
                 kv_block_size: Some(32),
+                drain_settle_secs: Some(30),
                 health: HealthPolicy {
                     failure_threshold: 4,
                     success_threshold: 5,
@@ -212,6 +232,73 @@ mod tests {
         assert_eq!(facts(&worker, Some(&old)), expected);
     }
 
+    /// A model list set after the object was built, and a threshold of its
+    /// own registration: the row states both, and keeps the standing
+    /// threshold the object leaves unset.
+    #[test]
+    fn an_object_states_the_models_it_serves_now_and_its_own_thresholds() {
+        let spec = WorkerSpec {
+            models: vec![ModelCard::new("first")].into(),
+            overload: OverloadUpdate {
+                waiting_requests: Some(7),
+                token_usage: None,
+            },
+            ..WorkerSpec::new(URL.to_owned())
+        };
+        let worker = <BasicWorkerBuilder>::from_spec(spec).build();
+        worker.set_models(vec![ModelCard::new("second")]);
+        let standing = WorkerFacts {
+            overload: Overload {
+                kv_usage_permille: Some(800),
+                waiting_requests: Some(12),
+            },
+            ..WorkerFacts::default()
+        };
+        let found = facts(&worker, Some(&standing));
+        assert_eq!(found.models, ["second"]);
+        let stated = Overload {
+            kv_usage_permille: Some(800),
+            waiting_requests: Some(7),
+        };
+        assert_eq!(found.overload, stated);
+    }
+
+    /// A threshold of the object's own under half a permille is held as
+    /// one, as a document's is. At none the store reads every engine with
+    /// a rank on file as over it, so an idle worker would be vetoed.
+    #[test]
+    fn a_threshold_under_half_a_permille_is_held_as_one_and_vetoes_no_idle_worker() {
+        let spec = WorkerSpec {
+            models: vec![ModelCard::new("model")].into(),
+            overload: OverloadUpdate {
+                waiting_requests: None,
+                token_usage: Some(0.0004),
+            },
+            ..WorkerSpec::new(URL.to_owned())
+        };
+        let found = facts(&<BasicWorkerBuilder>::from_spec(spec).build(), None);
+        let stated = found.overload.kv_usage_permille;
+
+        let store = MemoryStore::with_publish_window(Duration::ZERO);
+        let now = Instant::now();
+        let id = store.upsert(found).id();
+        store.publish_now();
+        store.record(id, 0, LoadRow::default(), now, LoadSource::Stream);
+        store.publish_now();
+        let ask = Ask {
+            gateway: GatewayId(1),
+            now,
+            pinned: None,
+            affinity: false,
+        };
+        let mut view = ViewBuffers::default();
+        store
+            .build_view("model", Role::Single, &ask, &mut view)
+            .expect("the pool");
+        assert!(!view.candidates[0].health.overloaded, "idle, and read over");
+        assert_eq!(stated, Some(1));
+    }
+
     #[test]
     fn a_wildcard_names_no_model_and_an_unset_width_is_one() {
         let worker = <BasicWorkerBuilder>::from_spec(WorkerSpec::new(URL.to_owned())).build();
@@ -228,6 +315,7 @@ mod tests {
             (0, 1, None, None)
         );
         assert_eq!(found.engine, URL);
+        assert_eq!(found.drain_settle_secs, None);
 
         let spec = WorkerSpec {
             dp_rank: Some(usize::from(u16::MAX) + 1),

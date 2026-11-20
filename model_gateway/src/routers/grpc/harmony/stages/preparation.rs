@@ -10,7 +10,7 @@ use openai_protocol::{
     responses::ResponsesRequest,
 };
 use serde_json::json;
-use tracing::error;
+use tracing::{error, warn};
 
 use super::super::HarmonyBuilder;
 use crate::routers::{
@@ -198,14 +198,14 @@ impl HarmonyPreparationStage {
         };
 
         if tool_constraint.is_some() && text_constraint.is_some() {
-            error!(
+            warn!(
                 function = "prepare_responses",
                 "Conflicting constraints: both tool_choice and text format specified"
             );
-            return Err(error::bad_request(
+            return Err(utils::reported(error::bad_request(
                 "conflicting_constraints",
                 "Cannot use both tool_choice (required/function) and text format (json_object/json_schema) simultaneously".to_string(),
-            ));
+            )));
         }
 
         let constraint = tool_constraint.or(text_constraint);
@@ -466,9 +466,18 @@ fn build_text_format_structural_tag(schema: &serde_json::Value) -> Result<String
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::http::StatusCode;
     use serde_json::Value;
+    use tracing::Level;
 
     use super::*;
+    use crate::{
+        middleware::ReportedRefusal,
+        observability::logging::test_support::{test_subscriber, LinesAtWarnOrAbove},
+        routers::grpc::regular::stages::testing::components,
+    };
 
     /// A `structural_tag` response format is the engine's constraint as the
     /// client sent it, key for key, with no channel framing around it; a JSON
@@ -500,5 +509,78 @@ mod tests {
             json!({"type": "object"})
         );
         assert_eq!(constraint(&ResponseFormat::Text), None);
+    }
+
+    /// A Responses request that forces a tool call and also asks for a JSON text format brings
+    /// the conflict itself: one WARN with the cause, and the answer is marked reported. The
+    /// check answers before the Harmony build and before the context is touched.
+    #[test]
+    fn a_tool_choice_with_a_text_format_is_one_warn_and_marked() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "weather as json",
+            "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}],
+            "tool_choice": {"type": "function", "name": "get_weather"},
+            "text": {"format": {"type": "json_object"}}
+        }))
+        .expect("a Responses request");
+        let request = Arc::new(request);
+        let mut ctx = RequestContext::for_responses(
+            Arc::clone(&request),
+            None,
+            "m".to_string(),
+            components(),
+        );
+        let lines = LinesAtWarnOrAbove::default();
+        let _subscriber = test_subscriber(lines.clone());
+
+        let response = HarmonyPreparationStage::new()
+            .prepare_responses(&mut ctx, &request)
+            .expect_err("the two constraints conflict");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "conflicting_constraints"
+        );
+        assert!(response.extensions().get::<ReportedRefusal>().is_some());
+        assert_eq!(
+            lines.lines(),
+            [(
+                Level::WARN,
+                "Conflicting constraints: both tool_choice and text format specified".to_string()
+            )]
+        );
+    }
+
+    /// A forced call that names a tool the request does not declare cannot come from a request:
+    /// validation refuses it at the door, and the Responses preparation narrows the tools to the
+    /// chosen one first. If the stage meets it, the two have drifted apart: the line stays ERROR
+    /// and the answer is not marked.
+    #[test]
+    fn a_forced_call_to_an_undeclared_tool_keeps_the_error_line() {
+        let choice: ToolChoice = serde_json::from_value(json!({
+            "type": "function", "function": {"name": "get_weather"}
+        }))
+        .expect("a forced call");
+        let lines = LinesAtWarnOrAbove::default();
+        let _subscriber = test_subscriber(lines.clone());
+
+        let response = HarmonyPreparationStage::generate_tool_call_constraint(&[], Some(&choice))
+            .expect_err("the tool is not declared");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "tool_not_found"
+        );
+        assert!(response.extensions().get::<ReportedRefusal>().is_none());
+        assert_eq!(
+            lines.lines(),
+            [(
+                Level::ERROR,
+                "Specified tool not found in tools list".to_string()
+            )]
+        );
     }
 }

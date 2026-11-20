@@ -78,7 +78,10 @@ pub fn deepseek_v4() -> Format {
         .transition("invoke", "invoke_open", "invoke")
         .transition("invoke", "calls_close", "content")
         .transition("calls", "calls_close", "content")
-        .calls(CallSyntax::Attributed(Tags::DSML_V4))
+        .calls(CallSyntax::Attributed(Tags {
+            stuttered_marker: Some("｜DSML｜"),
+            ..Tags::DSML_V4
+        }))
         .opens_turn("<｜Assistant｜>")
         .unopened_turn_starts_in("reasoning", "<｜end▁of▁sentence｜>")
 }
@@ -974,6 +977,107 @@ mod tests {
                 matches!(events.last(), Some(Event::Finish { tool_calls: 1, .. })),
                 "cut at {cut}"
             );
+        }
+    }
+
+    /// One complete call, with `between` after the first parameter's line.
+    fn sum_call(between: &str) -> String {
+        format!(
+            concat!(
+                "Adding them.</think>\n\n<｜DSML｜tool_calls>\n",
+                "<｜DSML｜invoke name=\"add_integers\">\n",
+                "<｜DSML｜parameter name=\"a\" string=\"false\">7</｜DSML｜parameter>\n",
+                "{}</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+            ),
+            between
+        )
+    }
+
+    /// The second parameter's line, whole.
+    const SECOND: &str = "<｜DSML｜parameter name=\"b\" string=\"false\">4</｜DSML｜parameter>\n";
+
+    /// The bytes refused as a malformed call's.
+    fn refused_bytes(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::MalformedCall,
+                } => Some(&*text.text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A tag sentinel written on its own immediately before the same whole parameter opener is
+    /// counted as text between tags, but loses no parameter and therefore does not cost the call
+    /// its close. The result is the same at every stream cut.
+    #[test]
+    fn a_bare_sentinel_before_a_whole_parameter_opener_keeps_the_call_whole() {
+        let read = |pieces: &[&str]| run("<｜Assistant｜><think>", pieces);
+        let output = sum_call(&format!("｜DSML｜{SECOND}"));
+        let said = the_same_at_every_cut(|pieces| read(pieces), &output);
+        assert_eq!(
+            said.calls,
+            [(
+                "add_integers".to_string(),
+                r#"{"a": 7, "b": 4}"#.to_string()
+            )]
+        );
+        assert_eq!(
+            (said.content.as_str(), said.reasoning.as_str()),
+            ("", "Adding them.")
+        );
+        let events = read(&[&output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::TextBetweenTags)]
+        );
+        assert_eq!(refused_bytes(&events), "｜DSML｜");
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
+    }
+
+    /// Nearby malformed shapes keep the existing refusal: text after the sentinel, a damaged
+    /// opener, two sentinels, a sentinel before a closing tag, and one before the call's end.
+    /// Whole input and every stream cut produce an arguments prefix with no closing brace.
+    #[test]
+    fn other_bare_sentinel_shapes_still_cost_the_call_its_close() {
+        let read = |pieces: &[&str]| run("<｜Assistant｜><think>", pieces);
+        let damaged = "｜DSML｜<parameter name=\"b\" string=\"false\">4</｜DSML｜parameter>\n";
+        for (between, arguments) in [
+            (
+                format!("｜DSML｜parameter>\n{SECOND}"),
+                r#"{"a": 7, "b": 4"#,
+            ),
+            (damaged.to_string(), r#"{"a": 7"#),
+            (format!("｜DSML｜｜DSML｜{SECOND}"), r#"{"a": 7, "b": 4"#),
+            (
+                format!("｜DSML｜</｜DSML｜parameter>\n{SECOND}"),
+                r#"{"a": 7, "b": 4"#,
+            ),
+            ("｜DSML｜".to_string(), r#"{"a": 7"#),
+        ] {
+            let output = sum_call(&between);
+            let said = the_same_at_every_cut(|pieces| read(pieces), &output);
+            assert_eq!(
+                said.calls,
+                [("add_integers".to_string(), arguments.to_string())],
+                "{between:?}"
+            );
+            let events = read(&[&output]);
+            assert_eq!(bytes(&events), output, "{between:?}");
+            assert!(
+                malformed(&events)
+                    .iter()
+                    .any(|(_, why)| *why == MalformedReason::TextBetweenTags),
+                "{between:?}"
+            );
+            assert!(refused_bytes(&events).contains("｜DSML｜"), "{between:?}");
         }
     }
 

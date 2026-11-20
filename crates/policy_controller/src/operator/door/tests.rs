@@ -233,8 +233,8 @@ fn a_document_that_only_changed_its_form_is_no_change() {
 }
 
 /// The apply counter by result: a new generation counts as applied, a
-/// refusal a running source hands back counts as rejected, once, and the
-/// standing document again counts as neither.
+/// refusal counts as rejected, once, and the standing document again
+/// counts as neither.
 #[test]
 fn the_counts_follow_the_outcomes() {
     let (_store, generations) = generations();
@@ -244,8 +244,7 @@ fn the_counts_follow_the_outcomes() {
     assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Unchanged(1)));
     assert_eq!(generations.counts(), counts(1, 0));
 
-    let refused =
-        yaml(&generations, with_line(RANDOM, 1)).map_err(|rejected| generations.reject(rejected));
+    let refused = yaml(&generations, with_line(RANDOM, 1));
     assert!(matches!(
         refused,
         Err(SpecRejected::ChangedUnderItsLine { .. })
@@ -842,14 +841,18 @@ fn a_dry_run_refuses_what_an_apply_would_by_the_same_name() {
         (vec![b'#'; over], ""),
     ];
     for (document, path) in rows {
+        let before = generations.counts();
         let refused = generations
             .dry_run("", &document, Format::Yaml)
             .expect("no guard")
             .would_run
             .expect_err("refused");
         assert_eq!(refused.field_path(), path, "{refused}");
+        assert_eq!(generations.counts(), before, "a dry run counts nothing");
         assert_eq!(yaml(&generations, document), Err(refused));
+        assert_eq!(generations.counts(), applied(1, before.rejected + 1));
     }
+    let before = generations.counts();
     let lower = generations
         .dry_run("", &with_line(RANDOM, 3), Format::Yaml)
         .expect("no guard");
@@ -859,13 +862,7 @@ fn a_dry_run_refuses_what_an_apply_would_by_the_same_name() {
     };
     assert_eq!(lower.would_run, Err(SpecRejected::Stale(stale)));
     assert!(lower.needs.is_none(), "a refused document carries no diff");
-    assert_eq!(
-        generations.counts(),
-        Counts {
-            applied: 1,
-            rejected: 0
-        }
-    );
+    assert_eq!(generations.counts(), before, "a dry run counts nothing");
 }
 
 /// The bound fails fast: a document one byte over it is refused by its
@@ -1065,6 +1062,64 @@ fn a_start_runs_the_newest_generation_on_file_under_its_number() {
     assert_eq!(enforce(&after, RANDOM).map(|(number, _)| number), Ok(4));
 }
 
+/// A store that runs the newest file's document already, by another hand
+/// than this door's and under a lower number, takes the file's number at
+/// the bind: the next enforce writes the one after it, which no file
+/// holds. Under the number the store runs, the file is the standing
+/// document again and nothing is applied.
+#[test]
+fn a_start_takes_the_files_number_for_a_document_the_store_runs_under_a_lower_one() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    std::fs::write(dir.path().join(name_of(2, "yaml")), LEAST_LOAD).expect("the file");
+    let (store, first) = generations();
+    assert_eq!(yaml(&first, LEAST_LOAD), Ok(Applied::Generation(1)));
+    let (_, runs) = standing(&store);
+
+    let bound = SpecDoor::new(Arc::clone(&store), stock(), Vec::new());
+    bind(&bound, dir.path());
+    assert_eq!(standing(&store), (2, runs));
+    assert_eq!(enforce(&bound, RANDOM).map(|(number, _)| number), Ok(3));
+
+    let same = tempfile::tempdir().expect("a temp dir");
+    std::fs::write(same.path().join(name_of(3, "yaml")), RANDOM).expect("the file");
+    let again = SpecDoor::new(Arc::clone(&store), stock(), Vec::new());
+    bind(&again, same.path());
+    assert_eq!(standing(&store).0, 3);
+    assert_eq!(again.counts(), applied(0, 0));
+}
+
+/// A dry run reads the standing generation and its source's rule on one
+/// side of a bind. While a bind's side is held, as a bind in flight holds
+/// it, a dry run reads nothing and a bind applies nothing; once it is let
+/// go, the line the dry run is asked is the next number on either side.
+#[test]
+fn a_dry_run_reads_on_one_side_of_a_bind() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    std::fs::write(dir.path().join(name_of(4, "yaml")), LEAST_LOAD).expect("the file");
+    let (store, generations) = generations();
+    let opened = SpecStore::open(dir.path().to_owned()).expect("the directory opens");
+    let next = with_line(RANDOM, 5);
+    let (answer, answered) = mpsc::channel();
+    thread::scope(|scope| {
+        let side = generations.binding.lock();
+        let (generations, next) = (&generations, &next);
+        scope.spawn(move || {
+            generations
+                .bind_store(opened, || false)
+                .expect("the store binds");
+        });
+        scope.spawn(move || {
+            let _ = answer.send(generations.dry_run("", next, Format::Yaml));
+        });
+        let waited = answered.recv_timeout(Duration::from_millis(100));
+        assert!(waited.is_err(), "the dry run waits");
+        assert_eq!(standing(&store).0, 0, "the bind waits");
+        drop(side);
+    });
+    let dry = answered.recv().expect("an answer").expect("no guard");
+    assert_eq!(dry.would_run.map(|(number, _)| number), Ok(5));
+}
+
 /// A document on file runs under its file's number whatever line its
 /// bytes write.
 #[test]
@@ -1210,6 +1265,65 @@ fn a_generation_the_entry_refuses_goes_off_file_again() {
     assert_eq!(generations.counts(), applied(1, 1));
 }
 
+/// A generation the entry refuses whose name does not come off file: the
+/// write says both, the store finds the number no more, and the next
+/// write takes the name off first. Another hand enters the number while
+/// the write waits for the documents' lock, its file persisted, and lays
+/// a directory under the name, which no removal of a file takes; the name
+/// is a file again by the next write.
+#[test]
+fn a_refused_generation_that_stays_on_file_is_told_and_goes_at_the_next_write() {
+    let (dir, store, generations) = stored();
+    enforce(&generations, LEAST_LOAD).expect("it runs");
+    let name = dir.path().join(name_of(2, "yaml"));
+    let refused = thread::scope(|scope| {
+        let documents = generations.held.lock();
+        let write = scope.spawn(|| enforce(&generations, RANDOM));
+        let began = Instant::now();
+        while !name.exists() {
+            assert!(
+                began.elapsed() < Duration::from_secs(30),
+                "the write persists"
+            );
+            thread::yield_now();
+        }
+        let behind = SpecDoor::new(Arc::clone(&store), stock(), Vec::new());
+        let entered = yaml(&behind, with_line(&bound_to(0), 2));
+        assert_eq!(entered, Ok(Applied::Generation(2)));
+        std::fs::remove_file(&name).expect("the persisted file");
+        std::fs::create_dir(&name).expect("a directory in its place");
+        drop(documents);
+        write.join().expect("no panic")
+    });
+    let Err(SpecRejected::Unpersisted(told)) = refused else {
+        panic!("{refused:?}");
+    };
+    let (stale, left) = told
+        .split_once("; generation 2 was not taken off file again (")
+        .expect("the entry's refusal, then the removal's");
+    assert_eq!(stale, "generation 2 is not above the standing generation 2");
+    assert!(
+        left.ends_with(
+            "): a start may run it, and beside the other form's name the two refuse a start"
+        ),
+        "{told}"
+    );
+    assert!(matches!(
+        generations.roll_back(2),
+        Err(Unanswered::NotHeld(_))
+    ));
+
+    std::fs::remove_dir(&name).expect("the directory goes");
+    std::fs::write(&name, RANDOM).expect("a file again");
+    assert_eq!(
+        enforce(&generations, RANDOM).map(|(number, _)| number),
+        Ok(3)
+    );
+    let on_file = BTreeSet::from([name_of(1, "yaml"), name_of(3, "yaml")]);
+    assert_eq!(names(dir.path()), on_file);
+    assert_eq!(generations.counts(), applied(2, 1));
+}
+
 /// Two enforces that read one digest as standing: one lands, and the
 /// others are told that another apply landed first.
 #[test]
@@ -1225,7 +1339,11 @@ fn enforces_under_one_guard_land_once() {
                 scope.spawn(move || {
                     let document = bound_to(n).into_bytes();
                     match generations.enforce(read, document, Format::Yaml) {
-                        Ok(enforced) => enforced.ran.is_ok(),
+                        // The guard admits one, and its document runs.
+                        Ok(enforced) => {
+                            enforced.ran.expect("the one the guard admits runs");
+                            true
+                        }
                         Err(Unanswered::Guarded(..)) => false,
                         Err(other) => panic!("{other:?}"),
                     }
@@ -1325,17 +1443,19 @@ fn a_pipe_under_a_generations_name_holds_no_start() {
         let opened = SpecStore::open(dir.to_owned()).expect("the directory opens");
         let (answer, answered) = mpsc::channel();
         thread::spawn(move || {
-            let _ = answer.send(generations.bind_store(opened, || false));
+            let bound = generations.bind_store(opened, || false);
+            let listed = generations.status().map(|status| status.retained);
+            let _ = answer.send((bound, listed));
         });
-        let bound = answered
+        let (bound, listed) = answered
             .recv_timeout(Duration::from_secs(5))
             .expect("the bind answers: its open does not wait");
-        (bound, standing(&store).0)
+        (bound, standing(&store).0, listed)
     };
     let dir = tempfile::tempdir().expect("a temp dir");
     pipe_at(&dir.path().join(name_of(1, "yaml")));
 
-    let (bound, runs) = bound_in_time(dir.path());
+    let (bound, runs, listed) = bound_in_time(dir.path());
     let refused = bound.expect_err("no regular file");
     assert!(
         matches!(
@@ -1347,12 +1467,12 @@ fn a_pipe_under_a_generations_name_holds_no_start() {
         ),
         "{refused:?}"
     );
-    assert_eq!(runs, 0);
+    assert_eq!((runs, listed), (0, None));
 
     std::fs::write(dir.path().join(name_of(2, "yaml")), LEAST_LOAD).expect("the file");
-    let (bound, runs) = bound_in_time(dir.path());
+    let (bound, runs, listed) = bound_in_time(dir.path());
     bound.expect("the newest runs");
-    assert_eq!(runs, 2);
+    assert_eq!((runs, listed), (2, Some(Vec::new())));
 }
 
 /// At the last number none is left: an enforce and a rollback are

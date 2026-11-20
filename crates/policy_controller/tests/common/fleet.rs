@@ -1011,6 +1011,7 @@ impl Replica {
             shutdown_settle: Duration::ZERO,
             shutdown_grace: Duration::from_secs(5),
             load_poll_interval: POLL_INTERVAL,
+            discovery: None,
             election: Election {
                 lease: lease.map_or(LeasePlace::Process, |file| {
                     LeasePlace::File(file.to_owned())
@@ -1712,6 +1713,15 @@ impl Harness {
         Ok(())
     }
 
+    /// Sends a request on the worker's own wire and reads it to its end.
+    pub async fn serve_request(&self, engine: usize, id: String) -> Result<(Class, u32), String> {
+        let worker = self
+            .engines
+            .get(engine)
+            .ok_or_else(|| format!("no engine {engine}"))?;
+        Ok(sent(&worker.endpoint, id).await)
+    }
+
     /// Sends one short request to the engine at `engine` on the engine's own
     /// wire and reads it to its end, as a gateway that decided by itself
     /// sends one, the whole under [`DIAL_TIMEOUT`]. Then it reports the
@@ -1721,16 +1731,13 @@ impl Harness {
     /// The lease is the harness's own number: no leader issued it. Returns
     /// the class.
     pub async fn send(&mut self, engine: usize) -> Result<Class, String> {
-        let endpoint = self
-            .engines
-            .get(engine)
-            .map(|engine| engine.endpoint.clone())
-            .ok_or_else(|| format!("no engine {engine}"))?;
         let served = self.worker(engine)?;
         self.sent += 1;
         let lease_id = self.sent;
         let started = Instant::now();
-        let (class, frames) = sent(&endpoint, format!("sent-{engine}-{lease_id}")).await;
+        let (class, frames) = self
+            .serve_request(engine, format!("sent-{engine}-{lease_id}"))
+            .await?;
         let side = Side::Single.into();
         let dispatched = Dispatched {
             lease_id,

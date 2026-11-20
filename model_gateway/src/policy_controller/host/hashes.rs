@@ -80,7 +80,7 @@ mod tests {
     use openai_protocol::common::CachePartition;
     use smg_policy_controller::{
         store::{Ask as ViewAsk, BatchOutcome, KvEventSink, Named, Naming, ViewBuffers},
-        view::{HashKind, RequestFacts, Role},
+        view::{HashKind, Identity, RequestFacts, Role},
         AppliedSpec, PolicySpec,
     };
 
@@ -131,7 +131,7 @@ mod tests {
             hashes: Some(&scoped),
             ..first(b"scoped")
         };
-        let facts = scoped.request(&[]).facts;
+        let facts = scoped.request(Identity::NONE, &[]).facts;
 
         let blocks =
             request_content_hashes_with_seed(&tokens, BLOCK_SIZE as usize, namespace.event_seed());
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn an_ask_with_no_hashes_states_the_facts_of_today() {
         let _bed = cache_bed();
-        let facts = first(b"plain").request(&[]).facts;
+        let facts = first(b"plain").request(Identity::NONE, &[]).facts;
         let defaults = RequestFacts::default();
         assert_eq!(facts.block_hashes, defaults.block_hashes);
         assert_eq!(facts.hash_kind, defaults.hash_kind);

@@ -57,7 +57,12 @@
 //! the directory again, and says which of the two failed. A name that stays
 //! may run at a start, or refuse it beside the other form's name. A name
 //! that is gone where the directory did not sync may come back after a
-//! crash.
+//! crash. A generation the store's entry refuses once it is on file goes
+//! the same way, told the same. One whose name stays is no generation of
+//! this store's from then on: no read lists it, and the next write tries
+//! its removal first. A process that starts while the name stands cannot
+//! tell it from a generation that ran: it reads it as one on file, and
+//! runs it where it is the newest.
 //!
 //! A start reads the directory: the highest number is the generation to
 //! run, and a file a write left under its temporary name is removed, or
@@ -89,7 +94,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{Format, SpecRejected, MAX_DOCUMENT_BYTES};
 
@@ -276,27 +281,26 @@ fn backs_out(generation: u64) -> io::Error {
     io::Error::new(io::ErrorKind::AlreadyExists, text)
 }
 
-/// What a write says where its refused generation's name did not come off
-/// file again: the write's own failure, then the removal's, then what a
-/// start may meet. A start runs the newest generation on file, which this
-/// one may be, and beside the other form's name the two refuse a start.
-fn stays(generation: u64, failed: &io::Error, left: &io::Error) -> io::Error {
-    let text = format!(
-        "{failed}; generation {generation} was not taken off file again ({left}): a start may run it, \
-         and beside the other form's name the two refuse a start"
-    );
-    io::Error::other(text)
+/// What a refused generation leaves where its name did not come off file
+/// again, said beside its refusal, a write's own failure or the store's
+/// entry's: the removal's failure, then what a start may meet. A start
+/// runs the newest generation on file, which this one may be, and beside
+/// the other form's name the two refuse a start.
+fn stays(generation: u64, left: &io::Error) -> String {
+    format!(
+        "generation {generation} was not taken off file again ({left}): a start may run it, and \
+         beside the other form's name the two refuse a start"
+    )
 }
 
-/// What a write says where its refused generation's name came off file
-/// again and the directory did not sync after it: the write's own failure,
-/// then the sync's. The name is gone, and a crash may bring it back.
-fn unsynced(generation: u64, failed: &io::Error, left: &io::Error) -> io::Error {
-    let text = format!(
-        "{failed}; generation {generation} was taken off file again, but the directory did not sync \
+/// What a refused generation leaves where its name came off file again and
+/// the directory did not sync after it, said beside its refusal: the
+/// sync's failure. The name is gone, and a crash may bring it back.
+fn unsynced(generation: u64, left: &io::Error) -> String {
+    format!(
+        "generation {generation} was taken off file again, but the directory did not sync \
          ({left}): a crash may bring its name back"
-    );
-    io::Error::other(text)
+    )
 }
 
 /// The store: the directory and the generations on file in it.
@@ -315,6 +319,10 @@ pub(crate) struct SpecStore {
     _held: fs::File,
     /// The generations on file, ascending.
     kept: Vec<Persisted>,
+    /// The generations the store's entry refused whose names did not come
+    /// off file ([`SpecStore::forget`]): none is among the kept, and the
+    /// next write tries their removal first.
+    refused: Vec<Persisted>,
     /// When this store was opened, in nanoseconds: with the process's id it
     /// tells this store's temporary names from another's on the directory.
     /// A process id alone does not: it is 1 in each of two containers.
@@ -533,6 +541,7 @@ impl SpecStore {
             root: Arc::new(root),
             _held: held,
             kept,
+            refused: Vec::new(),
             opened,
             writes: 0,
         })
@@ -638,7 +647,9 @@ impl SpecStore {
     /// start runs the newest generation on file. A write is refused where
     /// the store's path leads to another directory than the one it holds
     /// ([`SpecStore::same`]); behind that check every step of it goes
-    /// through the directory held ([`SpecStore::write_held`]).
+    /// through the directory held ([`SpecStore::write_held`]). Ahead of
+    /// both, a generation the entry refused whose name stayed on file is
+    /// tried again ([`SpecStore::forget_again`]).
     pub(crate) fn persist(&mut self, persisted: Persisted, document: &[u8]) -> io::Result<()> {
         self.persist_synced(persisted, document, fs::File::sync_all)
     }
@@ -649,8 +660,9 @@ impl SpecStore {
         &mut self,
         persisted: Persisted,
         document: &[u8],
-        sync: impl FnMut(&fs::File) -> io::Result<()>,
+        mut sync: impl FnMut(&fs::File) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.forget_again(&mut sync);
         self.same()?;
         self.write_held(persisted, document, sync)
     }
@@ -730,25 +742,60 @@ impl SpecStore {
         // generation on file: the removal is synced as the link was. A name
         // that stays and a removal that did not sync are each told, in its
         // own words, beside the write's own failure.
-        if let Err(left) = remove_at(root, &name) {
-            return Err(stays(generation, &failed, &left));
-        }
-        match sync(root) {
-            Ok(()) => Err(failed),
-            Err(left) => Err(unsynced(generation, &failed, &left)),
-        }
+        let left = match remove_at(root, &name) {
+            Err(left) => stays(generation, &left),
+            Ok(()) => match sync(root) {
+                Ok(()) => return Err(failed),
+                Err(left) => unsynced(generation, &left),
+            },
+        };
+        Err(io::Error::other(format!("{failed}; {left}")))
     }
 
     /// Takes the newest generation off file again: the store's entry
     /// refused it after it was persisted. The file goes from the directory
     /// this store holds, wherever the path leads by then: no start there
-    /// reads a generation the entry refused.
+    /// reads a generation the entry refused. The store lists it no more,
+    /// whatever the removal says. A name that does not come off and a
+    /// removal that does not sync are each told, in its own words
+    /// ([`stays`], [`unsynced`]); a name that stays is tried again ahead
+    /// of the next write ([`SpecStore::forget_again`]).
     pub(crate) fn forget(&mut self) -> io::Result<()> {
         let Some(newest) = self.kept.pop() else {
             return Ok(());
         };
-        self.remove(newest)?;
-        self.root.sync_all()
+        let Persisted { generation, .. } = newest;
+        if let Err(left) = self.remove(newest) {
+            self.refused.push(newest);
+            return Err(io::Error::other(stays(generation, &left)));
+        }
+        self.root
+            .sync_all()
+            .map_err(|left| io::Error::other(unsynced(generation, &left)))
+    }
+
+    /// Tries again the removal of each generation the entry refused whose
+    /// name stayed on file ([`SpecStore::forget`]), and syncs the directory
+    /// where one went, by the write's `sync`. One that stays still is tried
+    /// at the next write, and each failure here is logged: no call answers
+    /// it.
+    fn forget_again(&mut self, sync: &mut impl FnMut(&fs::File) -> io::Result<()>) {
+        let root = &*self.root;
+        let stood = self.refused.len();
+        self.refused.retain(|&refused| {
+            let Err(error) = remove_at(root, &file_name(refused)) else {
+                return false;
+            };
+            let generation = refused.generation;
+            warn!(generation, %error, "a refused generation stays on file: a start may run it");
+            true
+        });
+        if self.refused.len() < stood {
+            // The removal's own sync: the write that follows may not land.
+            if let Err(error) = sync(root) {
+                warn!(%error, "a refused generation went off file, but the directory did not sync: a crash may bring its name back");
+            }
+        }
     }
 
     /// Removes the generations under the [`RETAINED`] newest, and returns
@@ -1725,6 +1772,57 @@ pub(crate) mod tests {
             "{told}"
         );
         assert_eq!(store.kept(), []);
+    }
+
+    /// The second try of a refused generation's removal is answered by no
+    /// call, so each failure of it is said in a line: a name that stays,
+    /// and a directory that does not sync once the name went.
+    #[test]
+    fn a_second_try_that_fails_is_said_in_a_line() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut store = SpecStore::open(dir.path().to_owned()).expect("an empty directory");
+        store.persist(at(1, YAML), b"one").expect("it persists");
+        let name = dir.path().join(name_of(1, "yaml"));
+        fs::remove_file(&name).expect("the persisted file");
+        fs::create_dir(&name).expect("a directory in its place");
+        store
+            .forget()
+            .expect_err("no removal of a file takes a directory");
+
+        let lines = Logged::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _kept = tracing::subscriber::set_default(subscriber);
+        let said = |words: &str| {
+            let text = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+            text.lines().filter(|line| line.contains(words)).count()
+        };
+
+        store.persist(at(2, YAML), b"two").expect("it persists");
+        let stayed = said("stays on file: a start may run it generation=1");
+
+        fs::remove_dir(&name).expect("the directory goes");
+        fs::write(&name, b"one").expect("a file again");
+        let mut syncs = 0;
+        let unsynced_once = |root: &fs::File| {
+            syncs += 1;
+            if syncs == 1 {
+                return Err(io::Error::other("the directory did not sync"));
+            }
+            root.sync_all()
+        };
+        store
+            .persist_synced(at(3, YAML), b"three", unsynced_once)
+            .expect("the write's own syncs hold");
+        let unsynced = said("went off file, but the directory did not sync");
+        // The name stayed at one try and went at the next.
+        assert_eq!((stayed, said("stays on file"), unsynced), (1, 1, 1));
+        let on_file = BTreeSet::from([name_of(2, "yaml"), name_of(3, "yaml")]);
+        assert_eq!(names(dir.path()), on_file);
     }
 
     /// A back-out whose linked name is gone already, another hand's work

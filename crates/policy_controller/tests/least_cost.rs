@@ -8,8 +8,8 @@
 
 use smg_policy_controller::{
     builtins::score_costs, spec::CostMargin, Candidate, Catalog, Constraints, Engine, Health,
-    Lifecycle, LoadRow, Pick, PolicySpec, PoolFacts, RequestFacts, Scorer, Scratch, SpecError,
-    TieBand, WorkerId, API_VERSION,
+    Lease, Lifecycle, LoadRow, Pick, PolicySpec, PoolFacts, RequestFacts, Scorer, Scratch, Side,
+    SpecError, Target, TieBand, WorkerId, API_VERSION,
 };
 
 fn parse(score: &str, pick: &str) -> Result<PolicySpec, serde_yaml::Error> {
@@ -60,22 +60,217 @@ fn decide(engine: &Engine, rows: &[Candidate], seed: u64, scratch: &mut Scratch)
         seed,
         ..RequestFacts::default()
     };
+    decide_with(engine, rows, &facts, scratch)
+}
+
+fn decide_with(
+    engine: &Engine,
+    rows: &[Candidate],
+    facts: &RequestFacts<'_>,
+    scratch: &mut Scratch,
+) -> Pick {
     let pool = PoolFacts {
         pool_size: rows.len() as u32,
         ..PoolFacts::default()
     };
     *engine
-        .decide(&facts, &pool, rows, &Constraints::default(), scratch)
+        .decide(facts, &pool, rows, &Constraints::default(), scratch)
         .pick()
         .expect("the rows route")
 }
 
 fn scores(params: &str, rows: &[Candidate]) -> Vec<(u64, f32)> {
-    let pick = decide(&engine(params), rows, 0, &mut Scratch::new());
+    scores_at(&engine(params), rows, 0)
+}
+
+/// The scores of a decision at `now_micros` on the host's clock.
+fn scores_at(engine: &Engine, rows: &[Candidate], now_micros: u64) -> Vec<(u64, f32)> {
+    let facts = RequestFacts {
+        now_micros,
+        ..RequestFacts::default()
+    };
+    let pick = decide_with(engine, rows, &facts, &mut Scratch::new());
     pick.trace.top[..usize::from(pick.trace.top_len)]
         .iter()
         .map(|&(id, score)| (id.0, score))
         .collect()
+}
+
+const SENT_AT: u64 = 85_000;
+
+/// Tells the engine of one send to the row at `SENT_AT`, of `tokens` prompt tokens.
+fn send(engine: &Engine, row: &Candidate, tokens: u32) {
+    engine.on_dispatched(
+        &Lease {
+            issued_micros: SENT_AT,
+            tokens,
+            ..Lease::default()
+        },
+        &Target {
+            id: row.id,
+            dp_rank: row.dp_rank,
+            ..Target::default()
+        },
+        Side::Single,
+        0,
+    );
+}
+
+#[test]
+fn a_held_send_costs_a_row_the_request_coefficient() {
+    let engine = engine("terms: {candidate.in_flight: 250, sent.requests: 1000}");
+    let rows = [row(0, 0, None), row(1, 0, None), row(2, 8, None)];
+    send(&engine, &rows[1], 317);
+    // The costs are 0, 1000 and 2000: one send weighs four requests in flight.
+    assert_eq!(
+        scores_at(&engine, &rows, SENT_AT + 1),
+        [(1, 1.0), (2, 0.5), (3, 0.0)]
+    );
+}
+
+#[test]
+fn a_new_documents_engine_keeps_the_sends_of_the_standing_one() {
+    let params = "terms: {candidate.in_flight: 250, sent.requests: 1000}";
+    let standing = engine(params);
+    let rows = [row(0, 0, None), row(1, 0, None), row(2, 8, None)];
+    send(&standing, &rows[1], 317);
+    let next = engine(params);
+    next.succeed(&standing);
+    assert_eq!(
+        scores_at(&next, &rows, SENT_AT + 1),
+        [(1, 1.0), (2, 0.5), (3, 0.0)]
+    );
+}
+
+#[test]
+fn sent_terms_alone_need_the_reports_and_no_rule_for_a_row_without_one() {
+    let engine = engine("terms: {sent.requests: 3, sent.tokens: 1}");
+    assert!(engine.needs().loads);
+    assert!(!engine.profiles()[0].scoped());
+}
+
+#[test]
+fn sent_tokens_adds_the_tokens_the_sends_stated() {
+    let engine = engine("terms: {candidate.in_flight: 100, sent.tokens: 2}");
+    let rows = [row(0, 0, None), row(1, 0, None), row(2, 16, None)];
+    // The third send states no size and adds no token.
+    for tokens in [317, 83, 0] {
+        send(&engine, &rows[1], tokens);
+    }
+    assert_eq!(
+        scores_at(&engine, &rows, SENT_AT + 1),
+        [(1, 1.0), (2, 0.5), (3, 0.0)]
+    );
+}
+
+#[test]
+fn missing_as_zero_keeps_the_sends_of_a_row_with_no_report() {
+    let engine =
+        engine("terms: {load.running: 10, sent.requests: 100}, unreported: missing-as-zero");
+    let mut rows = reports([(0, 0), (0, 0), (20, 0)]);
+    rows[1].load = None;
+    send(&engine, &rows[1], 317);
+    assert_eq!(
+        scores_at(&engine, &rows, SENT_AT + 1),
+        [(1, 1.0), (2, 0.5), (3, 0.0)]
+    );
+}
+
+#[test]
+fn a_report_sampled_after_a_send_ends_its_charge() {
+    let engine = engine("terms: {sent.requests: 1000}");
+    let mut rows = reports([(0, 0), (0, 0)]);
+    rows[1].load_sampled_at_micros = SENT_AT - 1;
+    send(&engine, &rows[1], 317);
+    assert_eq!(scores_at(&engine, &rows, SENT_AT + 2), [(1, 1.0), (2, 0.0)]);
+
+    rows[1].load_sampled_at_micros = SENT_AT + 1;
+    let mut tied = scores_at(&engine, &rows, SENT_AT + 2);
+    tied.sort_unstable_by_key(|&(id, _)| id);
+    assert_eq!(tied, [(1, 1.0), (2, 1.0)]);
+}
+
+#[test]
+fn a_report_past_the_age_limit_still_ends_the_sends_before_it() {
+    const NOW: u64 = SENT_AT + 2_000_000;
+    let mut spec =
+        document("terms: {load.running: 5, sent.requests: 100}, unreported: missing-as-zero");
+    spec.view.max_report_age_ms = Some(1_000);
+    let engine = spec
+        .validate()
+        .expect("a least-cost profile under an age limit");
+    // The first two reports are too old for the terms: their running
+    // requests add nothing. The first was sampled ahead of its row's send
+    // and the second behind it.
+    let mut rows = reports([(7, 0), (7, 0), (10, 0)]);
+    rows[0].load_sampled_at_micros = SENT_AT - 1;
+    rows[1].load_sampled_at_micros = SENT_AT + 1;
+    rows[2].load_sampled_at_micros = NOW;
+    for sent in [0, 1] {
+        send(&engine, &rows[sent], 317);
+    }
+    // The costs are 100, 0 and 50.
+    assert_eq!(
+        scores_at(&engine, &rows, NOW),
+        [(2, 1.0), (3, 0.5), (1, 0.0)]
+    );
+}
+
+#[test]
+fn the_profiles_time_limit_ends_a_charge_with_no_report() {
+    let mut spec = document("terms: {candidate.in_flight: 1, sent.requests: 1000}");
+    spec.profiles.get_mut("p").expect("the profile").sent_ttl_ms = Some(43);
+    let engine = spec.validate().expect("a reader of sends under a limit");
+    let rows = [row(0, 11, None), row(1, 0, None)];
+    send(&engine, &rows[1], 317);
+    assert_eq!(
+        scores_at(&engine, &rows, SENT_AT + 42_000),
+        [(1, 1.0), (2, 0.0)]
+    );
+    assert_eq!(
+        scores_at(&engine, &rows, SENT_AT + 44_000),
+        [(2, 1.0), (1, 0.0)]
+    );
+}
+
+#[test]
+fn over_least_prices_an_unreported_row_over_the_least_cost_with_its_sends() {
+    let engine = engine(
+        "terms: {load.running: 1, sent.requests: 24}, unreported: {over-least: {request_cost: 4}}",
+    );
+    let [first, second] = reports([(4, 0), (12, 0)]);
+    let rows = [first, second, row(2, 2, None)];
+    for sent in [0, 2] {
+        send(&engine, &rows[sent], 317);
+    }
+    // The send turns the reported costs to 28 and 12. The third row has no
+    // report: it costs 12 and its two requests in flight, without its send.
+    assert_eq!(
+        scores_at(&engine, &rows, SENT_AT + 1),
+        [(2, 1.0), (3, 0.5), (1, 0.0)]
+    );
+}
+
+#[test]
+fn the_margin_ties_rows_by_their_costs_with_the_sends() {
+    let engine = engine("terms: {candidate.in_flight: 1, sent.requests: 8}, margin: {absolute: 2}");
+    let rows = [row(0, 10, None), row(1, 16, None), row(2, 20, None)];
+    send(&engine, &rows[0], 317);
+    // The costs are 18, 16 and 20: the first row ties the second by its send.
+    let mut scored = scores_at(&engine, &rows, SENT_AT + 1);
+    scored.sort_unstable_by_key(|&(id, _)| id);
+    assert_eq!(scored, [(1, 1.0), (2, 1.0), (3, 0.0)]);
+}
+
+#[test]
+fn the_sends_close_the_sum_with_the_requests_before_the_tokens() {
+    let engine =
+        engine("terms: {candidate.in_flight: 1e15, sent.requests: -1e15, sent.tokens: 0.03125}");
+    let rows = [row(0, 0, None), row(1, 1, None)];
+    send(&engine, &rows[1], 1);
+    // The request term cancels the count in flight, and the token term then
+    // stands alone. Added to either large number first, it would round away.
+    assert_eq!(scores_at(&engine, &rows, SENT_AT + 1), [(1, 1.0), (2, 0.0)]);
 }
 
 #[test]
@@ -500,7 +695,7 @@ fn terms_need_a_known_field_and_a_bounded_nonzero_coefficient() {
         "load.quue",
         "load.live_rate",
         "load.max_running",
-        "sent.requests",
+        "sent.queued",
     ] {
         refused(
             &format!("terms: {{{name}: 3}}"),

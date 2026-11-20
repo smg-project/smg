@@ -58,9 +58,10 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
-use super::{rows::load_row, scrape};
+use super::scrape;
 use crate::{
     address::{split, UNPARSABLE},
+    load_report::load_row,
     store::{LoadSink, LoadSource, PollMode, Reachability, WorkerRow, WorkerStatus, WorkersStore},
     view::{Role, SignalSource, WireModes, WorkerId},
 };

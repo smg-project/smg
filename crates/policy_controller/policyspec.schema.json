@@ -97,7 +97,7 @@
           "default": 256
         },
         "max_report_age_ms": {
-          "description": "With this limit in milliseconds set, `least-load`, `resident-work`,\n`least-cost` and the KV-pressure gates of `prefix-affinity` and\n`warmup-slice` treat older reports as missing. A report exactly at\nthe limit still counts. Overload verdicts can still reflect older\nreports, plugins interpret report age themselves, and host-registered\nstages keep their own rules. Omit it to use reports of any age.",
+          "description": "With this limit in milliseconds set, `least-load`, `resident-work`,\n`least-cost` and the KV-pressure gates of `prefix-affinity` and\n`warmup-slice` treat older reports as missing. A report exactly at\nthe limit still counts. A host-registered stage reads a report\nunder the limit through its build context's `reports()`, and one\nthat reads the row's report itself sees it at any age. Overload\nverdicts can still reflect older reports, and plugins interpret\nreport age themselves. Omit it to use reports of any age.",
           "type": [
             "integer",
             "null"
@@ -185,10 +185,10 @@
       "type": "object",
       "properties": {
         "filter": {
-          "description": "The hard filters, in order. Which workers the hard filters keep does\nnot turn on their order; a shed's reason does: a shed names the\nfirst filter, in this order, that left nobody.",
+          "description": "The hard filters, in order: each a name, or the name of a filter the\ncatalog adds mapped to its parameters. Which workers the hard\nfilters keep does not turn on their order; a shed's reason does: a\nshed names the first filter, in this order, that left nobody.",
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/FilterSpec"
           },
           "default": []
         },
@@ -205,7 +205,7 @@
           "$ref": "#/$defs/PickSpec"
         },
         "sent_ttl_ms": {
-          "description": "The number of milliseconds a send counts for. An unset limit keeps\nsends from expiring by age. A stage must ask for the profile's tally\nfor the limit to be used.",
+          "description": "The number of milliseconds a send counts for. An unset limit keeps\nsends from expiring by age. A profile whose stages do not read its\ncount of sends is refused if it sets a limit.",
           "type": [
             "integer",
             "null"
@@ -217,6 +217,22 @@
       "additionalProperties": false,
       "required": [
         "pick"
+      ]
+    },
+    "FilterSpec": {
+      "description": "A filter: its bare name, or the name of a filter the host adds mapped to its parameters.",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 1,
+          "additionalProperties": {
+            "type": "object"
+          }
+        }
       ]
     },
     "ScoreSpec": {
@@ -801,9 +817,27 @@
           "type": "object",
           "additionalProperties": {
             "type": "number",
-            "format": "double"
+            "format": "double",
+            "minimum": -1000000000000000.0,
+            "maximum": 1000000000000000.0,
+            "not": {
+              "const": 0
+            }
           },
-          "minProperties": 1
+          "minProperties": 1,
+          "propertyNames": {
+            "enum": [
+              "candidate.in_flight",
+              "load.active_kv_permille",
+              "load.kv_usage_permille",
+              "load.queued",
+              "load.resident_tokens",
+              "load.running",
+              "load.waiting_uncached_tokens",
+              "sent.requests",
+              "sent.tokens"
+            ]
+          }
         },
         "margin": {
           "description": "How far above the least cost a row still ties for the top score.",

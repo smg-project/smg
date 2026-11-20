@@ -1172,28 +1172,30 @@ impl WarmupSlice {
         TieBand(0.0)
     }
 
-    /// How a pass tells a warming row over a host's column, which the
-    /// passes over the pool walk: `None` when nobody warms. A settled fleet
-    /// (no index size fed, nobody young) costs one pass over it.
+    /// How a pass tells a warming row over a host's column: `None` when
+    /// nobody warms. It takes one pass over the column. The fleet's median
+    /// is read only where its smallest index is thin against its largest.
     #[inline(always)]
     fn ruled(&self, column: &[AffinityFacts]) -> Option<Warm<'static>> {
-        let mut any_indexed = false;
+        let mut smallest = u32::MAX;
+        let mut largest = 0;
         let mut young = 0usize;
         for &held in column {
-            any_indexed |= held.indexed_blocks > 0;
+            smallest = smallest.min(held.indexed_blocks);
+            largest = largest.max(held.indexed_blocks);
             young += usize::from(self.is_young(held));
         }
-        if !any_indexed && young == 0 {
+        if largest == 0 && young == 0 {
             return None;
         }
-        let level = if any_indexed {
-            self.fleet_level(column)
+        // Even the largest index is too low a level to make anyone thin
+        // if the smallest index passes at that level.
+        let (level, thin_any) = if self.is_thin(smallest, largest) {
+            let level = self.fleet_level(column);
+            (level, self.is_thin(smallest, level))
         } else {
-            0
+            (0, false)
         };
-        let thin_any = column
-            .iter()
-            .any(|held| self.is_thin(held.indexed_blocks, level));
         if !thin_any && (young == 0 || young == column.len()) {
             return None;
         }
@@ -1869,6 +1871,14 @@ mod tests {
         // A hit (a deep match on another worker) is not sliced.
         let hit = [sized(0, 1, 12, 0), sized(1, 1, 0, 0), young];
         assert_eq!(scores(&slice, &facts(16), &hit), vec![1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn the_median_sets_the_thin_boundary_when_one_index_is_large() {
+        let slice = warmup(1.0, 0);
+        let pool = [sized(0, 0, 0, 32), sized(1, 0, 0, 64), sized(2, 0, 0, 1024)];
+        assert_eq!(scores(&slice, &facts(16), &pool), vec![1.0; 3]);
+        assert_eq!(slice.misses.load(Ordering::Relaxed), 0);
     }
 
     #[test]

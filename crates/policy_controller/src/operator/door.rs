@@ -24,8 +24,10 @@
 //!
 //! A dry run ([`SpecDoor::dry_run`]) runs a document's pass and applies
 //! nothing: it answers what an apply would do against the generation that
-//! stands at that instant, and it reserves no number. A host can make one
-//! dry run at a time to budget one pass beside the source's apply.
+//! stands at that instant, and it reserves no number. It reads that
+//! generation and its source's rule on one side of a store's bind, never
+//! one of each. A host can make one dry run at a time to budget one pass
+//! beside the source's apply.
 //!
 //! A spec store is the source an apply call writes ([`SpecStore`],
 //! [`SpecDoor::enforce`]): a directory held by the process. One
@@ -33,12 +35,17 @@
 //! entry is called.** The document's pass, its file and the entry run
 //! under this door's one lock, so a generation that runs was persisted
 //! first, and a start applies the newest one on file, under the number its
-//! file's name states ([`SpecDoor::bind_store`]). A call's document
-//! writes the next number or none ([`Line::Next`]): another line is
-//! refused by naming the standing one. A host has one source: a store
-//! can be bound where no document was applied or deferred
-//! ([`StoreRefused::SecondSource`]), and a source's document is refused
-//! where a store is bound ([`SpecRejected::SecondSource`]).
+//! file's name states ([`SpecDoor::bind_store`]): a store that runs that
+//! document under a lower number takes the file's, so the next write's
+//! number is above every file's. A generation the entry refuses goes off
+//! file again under that lock. Where its name stays, the write says so
+//! beside the refusal, the store lists it no more, and the next write
+//! tries its removal first. A call's document writes the next number or
+//! none ([`Line::Next`]): another line is refused by naming the standing
+//! one. A host has one source: a store can be bound where no document was
+//! applied or deferred ([`StoreRefused::SecondSource`]), and a source's
+//! document is refused where a store is bound
+//! ([`SpecRejected::SecondSource`]).
 //!
 //! A rollback ([`SpecDoor::roll_back`]) is such a write of a document
 //! the store has on file: it runs again under the next number, whatever
@@ -48,9 +55,9 @@
 //! digest and the time the door lists it by, and takes no lock an apply
 //! holds.
 //!
-//! A source that keeps running hands a refusal back here
-//! ([`SpecDoor::reject`]): it is one event and one count, and the
-//! running generation stays.
+//! A refusal an apply or a write returns is one event and one count, and
+//! the running generation stays. A source that keeps running hands its
+//! own findings back the same way ([`SpecDoor::reject`]).
 //!
 //! The number and the digest have one holder, the store's
 //! ([`World::spec`](crate::store::World::spec)). What lives here is the
@@ -176,8 +183,21 @@ pub(crate) enum Line {
     /// An apply call's: a claim of the next number, which the call writes,
     /// or of the standing one for the standing document again.
     Next,
-    /// None: the document is a spec store's own and runs under the number
-    /// its file's name states, whatever its bytes write.
+    /// None: the document is a rollback's and runs under the next number,
+    /// whatever its bytes write. The standing document again is no change.
+    Rollback,
+    /// None: the document is a record's and runs under the number the
+    /// record states, whatever its bytes write: a spec store's file by its
+    /// name, a leader's generation by its event. A record above the
+    /// standing number runs whatever its digest: a store that runs the
+    /// same document under a lower number takes the record's.
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(
+            dead_code,
+            reason = "Only a spec store's start and a standby read a record."
+        )
+    )]
     Record(u64),
 }
 
@@ -217,6 +237,10 @@ fn check(
             spec.generation = number;
             0
         }
+        Line::Rollback => {
+            spec.generation = minted;
+            0
+        }
         Line::Claim | Line::Next => {
             if spec.generation == 0 {
                 // The mint. At the last number the entry refuses it by
@@ -238,7 +262,10 @@ fn check(
             standing,
         });
     }
-    if line == 0 || line == standing {
+    // A record above the standing number is that number's document, not the
+    // standing one's again: it runs, so the next number minted is above it.
+    let recorded_above = matches!(rule, Line::Record(number) if number > standing);
+    if !recorded_above && (line == 0 || line == standing) {
         if standing_digest == Some(digest) {
             // The standing generation's document again, or in another form.
             return Ok(Checked {
@@ -297,6 +324,12 @@ fn publish_local(store: &MemoryStore, spec: AppliedSpec) -> Result<bool, StaleGe
     store.apply(spec).map(|()| true)
 }
 
+/// The refusal of a write where no spec store is bound: the document has
+/// nowhere to be persisted.
+fn no_spec_store() -> SpecRejected {
+    SpecRejected::Unpersisted("no spec store is bound".to_owned())
+}
+
 /// What a write answers: the number its document runs under, its digest,
 /// and what a host must feed under it, `None` where it is the standing
 /// document again.
@@ -333,6 +366,11 @@ pub struct SpecDoor {
     /// store's directory is written under it alone. No reader takes it. It
     /// holds the spec store, once one is bound.
     pub(crate) applying: Mutex<Option<SpecStore>>,
+    /// One side of a store's bind: the bind holds this from before it
+    /// applies the newest generation on file until the directory is set,
+    /// and a dry run holds it while it reads the standing generation and
+    /// the source's rule. No apply and no reader takes it.
+    binding: Mutex<()>,
     /// The spec store's directory itself, open, once one is bound: the
     /// source takes writes, and the read call reads a generation on file
     /// through it, under no lock of the door.
@@ -385,6 +423,7 @@ impl SpecDoor {
             denied_headers,
             validate,
             applying: Mutex::new(None),
+            binding: Mutex::new(()),
             dir: OnceLock::new(),
             on_file: Mutex::new(Vec::new()),
             #[cfg(feature = "controller")]
@@ -399,7 +438,8 @@ impl SpecDoor {
 
     /// Applies a source's document through the store's own entry. A host
     /// with one source can apply its start's document here. For an
-    /// operator write, use [`SpecDoor::enforce`].
+    /// operator write, use [`SpecDoor::enforce`]. A refusal is counted,
+    /// once, and the running generation stays.
     pub fn apply(&self, document: Vec<u8>, format: Format) -> Result<Applied, SpecRejected> {
         self.apply_where(document, format, |_| None, publish_local)
     }
@@ -409,7 +449,12 @@ impl SpecDoor {
     /// held during both callbacks. For a changed document, `publish` runs
     /// the store's entry under the document lock. It can return `false`
     /// to leave both the store and the door as they were. An unchanged
-    /// document does not call `publish`.
+    /// document does not call `publish`. A refusal is counted as
+    /// [`SpecDoor::apply`] counts one.
+    ///
+    /// Both callbacks run under the door's locks. Neither may call a
+    /// method of this door: `status`, `document` and the other reads take
+    /// the same locks and would wait on themselves.
     pub fn apply_where(
         &self,
         document: Vec<u8>,
@@ -418,6 +463,7 @@ impl SpecDoor {
         publish: impl FnOnce(&MemoryStore, AppliedSpec) -> Result<bool, StaleGeneration>,
     ) -> Result<Applied, SpecRejected> {
         self.apply_notifying(document, format, unread, publish, |_| {}, |_, _| {})
+            .map_err(|rejected| self.reject(rejected))
     }
 
     /// Reports the pass under the apply lock before the second admission
@@ -540,7 +586,8 @@ impl SpecDoor {
     /// against that same generation, then the rule of the store's entry in
     /// its own words (a number at or under the standing one is refused by
     /// naming it), and what a host must feed before and after. One load
-    /// serves the four. The number answered is the one an apply would run
+    /// serves the four, taken with the source's rule on one side of a
+    /// store's bind. The number answered is the one an apply would run
     /// the document under now. It reserves nothing: an apply that lands
     /// first takes it.
     pub fn dry_run(
@@ -549,10 +596,13 @@ impl SpecDoor {
         document: &[u8],
         format: Format,
     ) -> Result<DryRun, Unanswered> {
-        let world = self.store.world();
+        let (world, rule) = {
+            let _one_side = self.binding.lock();
+            (self.store.world(), self.line())
+        };
         let standing = guard(world.spec(), expected)?;
         let mut needs = None;
-        let would_run = self.pass(standing, document, format, self.line()).and_then(
+        let would_run = self.pass(standing, document, format, rule).and_then(
             |Checked { digest, next, .. }| {
                 let before = needs_rows(world.spec().engine());
                 let Some(next) = next else {
@@ -590,6 +640,8 @@ impl SpecDoor {
         if applying.is_some() || self.held.lock().is_some() || deferred() {
             return Err(StoreRefused::SecondSource);
         }
+        // A dry run reads on one side of what follows.
+        let _one_side = self.binding.lock();
         let mut on_file = Vec::with_capacity(dir.kept().len());
         if let Some((&newest, older)) = dir.kept().split_last() {
             let restored = self
@@ -629,7 +681,8 @@ impl SpecDoor {
         let applied = dir.written(newest).map_err(unreadable)?;
         let rule = Line::Record(generation);
         let Checked { digest, next, .. } = self.pass(self.standing(), &document, format, rule)?;
-        // Where the store runs this document already, none is entered.
+        // Where the store runs this document already, at the file's number
+        // or above it, none is entered.
         if let Some(next) = next {
             let kept = Held {
                 generation,
@@ -683,9 +736,7 @@ impl SpecDoor {
         let before = needs_rows(world.spec().engine());
         let written = match applying.as_mut() {
             Some(dir) => self.write(dir, standing, document, format, Line::Next),
-            None => Err(SpecRejected::Unpersisted(
-                "no spec store is bound".to_owned(),
-            )),
+            None => Err(no_spec_store()),
         };
         drop(applying);
         Ok(self.enforced(standing, before, written))
@@ -699,21 +750,23 @@ impl SpecDoor {
     /// document is no change. A generation that is not on file is not held.
     /// A document that does not run now, or that the directory does not
     /// give or take, is refused with the running generation kept, and
-    /// counted as rejected.
+    /// counted as rejected. So is every roll back where no spec store is
+    /// bound, in the words an enforce is refused by there.
     pub fn roll_back(&self, wanted: u64) -> Result<Enforced, Unanswered> {
         let mut applying = self.applying.lock();
-        let found = applying.as_mut().and_then(|dir| {
-            let on_file = dir.kept().iter().copied();
-            let persisted = on_file.rev().find(|kept| kept.generation == wanted)?;
-            Some((dir, persisted))
-        });
-        let Some((dir, persisted)) = found else {
+        let Some(dir) = applying.as_mut() else {
+            let standing = self.standing();
+            drop(applying);
+            return Ok(self.enforced(standing, Vec::new(), Err(no_spec_store())));
+        };
+        let on_file = dir.kept().iter().copied();
+        let Some(persisted) = on_file.rev().find(|kept| kept.generation == wanted) else {
             return Err(Unanswered::NotHeld(self.not_held(wanted)));
         };
         let world = self.store.world();
         let standing = (world.spec().generation(), world.spec().digest());
         let before = needs_rows(world.spec().engine());
-        let rule = Line::Record(standing.0.saturating_add(1));
+        let rule = Line::Rollback;
         let written = dir
             .read(persisted)
             .map_err(|error| SpecRejected::Unreadable(error.to_string()))
@@ -750,7 +803,9 @@ impl SpecDoor {
     /// One write under the door's lock: the pass, the persist, the entry,
     /// then the read call's list. A number that is not above the standing
     /// one is refused in the entry's words before a file is written, as a
-    /// dry run refuses it. It answers the number the document runs
+    /// dry run refuses it. A generation the entry itself refuses goes off
+    /// file again, and where it does not the refusal is a failed write's,
+    /// which says both. It answers the number the document runs
     /// under with its digest, and what a host must feed under it: `None`
     /// where it is the standing document again, which is no change.
     fn write(
@@ -782,11 +837,12 @@ impl SpecDoor {
         };
         if let Err(stale) = self.enter(next, kept, publish_local, |_, _| {}) {
             // What was persisted goes before the door's lock does: a start
-            // never reads a generation the entry refused.
-            if let Err(error) = dir.forget() {
-                warn!(generation, %error, "a refused generation stays on file");
-            }
-            return Err(stale.into());
+            // never reads a generation the entry refused. Where it does not
+            // go, the store says what stays, beside the refusal.
+            return Err(match dir.forget() {
+                Ok(()) => stale.into(),
+                Err(left) => SpecRejected::Unpersisted(format!("{stale}; {left}")),
+            });
         }
         for (pruned, removed) in dir.prune() {
             if let Err(error) = removed {
@@ -831,8 +887,10 @@ impl SpecDoor {
         }
     }
 
-    /// Whether the spec's source takes writes: a spec store is bound.
-    pub(crate) fn writable(&self) -> bool {
+    /// Whether the spec's source takes writes: a spec store is bound. A
+    /// host asks before it offers an [`enforce`](Self::enforce) or a
+    /// [`roll_back`](Self::roll_back).
+    pub fn writable(&self) -> bool {
         self.dir.get().is_some()
     }
 

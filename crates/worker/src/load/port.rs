@@ -152,8 +152,9 @@ pub trait LoadSink: Send + Sync {
     /// leave the file.
     fn report_empty(&self, answer: &[PolledMember<'_>], polled_at: Instant) -> Vec<i32>;
 
-    /// The fetch of one engine failed: no answer for any polled member.
-    fn fetch_failed(&self, members: &[Arc<dyn Worker>]);
+    /// The fetch of one engine failed: no answer for any polled member of
+    /// the poll asked at `polled_at`.
+    fn fetch_failed(&self, members: &[Arc<dyn Worker>], polled_at: Instant);
 
     /// The worker's loads are forgotten: it left the registry, was
     /// replaced, or its status left `Ready`. It is also said for a worker
@@ -167,14 +168,17 @@ pub trait LoadSink: Send + Sync {
 
     /// The collector reset itself: it stopped its groups and dropped every
     /// load it published. It does so on two paths: at its start and after
-    /// it lost registry events. What the sink derived from loads is void:
-    /// its verdicts and its rows. Just before this call the collector says
-    /// [`Self::forget`] for every worker whose pushed report it held and
-    /// that is no longer the registry's `Ready` worker at its URL. So a
-    /// sink may keep what it knows of a stream, as the collector keeps the
-    /// report of a pusher that stays. A polled worker that left while
-    /// events were lost is never said: nothing of a polled worker outlives
-    /// this call.
+    /// it lost registry events. What the sink derived from loads and
+    /// cannot tie to a standing worker by itself is void: its verdicts and
+    /// its rows. Just before this call the collector says [`Self::forget`]
+    /// for every worker whose pushed report it held and that is no longer
+    /// the registry's `Ready` worker at its URL. So a sink may keep what it
+    /// knows of a stream, as the collector keeps the report of a pusher
+    /// that stays. A polled worker that left while events were lost is
+    /// never said: in a sink that keeps rows of its own, nothing of a
+    /// polled worker outlives this call. A sink whose rows end with the
+    /// write that removes their worker keeps them: no row of a worker that
+    /// left stands there.
     ///
     /// A dropped collector says nothing: its drop stops its tasks and calls
     /// no sink. The host that drops a collector owns the sink too: it voids

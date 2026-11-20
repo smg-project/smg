@@ -67,7 +67,8 @@ impl GenerateResponseProcessingStage {
                 ctx.workers.as_ref(),
                 &dispatch,
                 metrics_labels::ENDPOINT_GENERATE,
-            );
+            )
+            .with_placement(ctx.placement().cloned());
             let response = self
                 .streaming_processor
                 .clone()

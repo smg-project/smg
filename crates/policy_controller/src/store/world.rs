@@ -114,6 +114,7 @@ use crate::{
     spec::{AppliedSpec, Listed, Pairing},
     store::{
         encoding::{EncodeClasses, EncodeHandoff, EncodeMember},
+        health::LeaderBits,
         index::{KvTables, Named, PoolIndex, Reading},
         loads::LoadSample,
         pairing::{known, Derivation, Member, PairClasses, Pool},
@@ -1164,10 +1165,25 @@ impl World {
     /// there is read apart ([`World::unpooled_of`]). It searches every
     /// pool, for a lease written outside a decision.
     pub(crate) fn booked_of(&self, id: WorkerId) -> Option<Slot> {
-        let mut pools = self.rows.iter().zip(self.derived.pools.iter());
-        pools.find_map(|(rows, shape)| {
+        let (pool, row) = self.pooled_row(id)?;
+        self.derived.pools.get(pool)?.booked.get(row).copied()
+    }
+
+    /// Whether this world lists `id` at `rank`: asked of a dispatch
+    /// report's row, which may have left or changed its rank since its
+    /// decision. A member holds one rank in every pool that lists it, so
+    /// the first pool found answers.
+    pub(crate) fn lists_rank(&self, id: WorkerId, rank: u16) -> bool {
+        self.pooled_row(id)
+            .is_some_and(|(pool, row)| self.rows[pool][row].dp_rank == rank)
+    }
+
+    /// The first pool that lists `id`, with the member's row there: one
+    /// binary search a pool, as a pool's rows stand in id order.
+    fn pooled_row(&self, id: WorkerId) -> Option<(usize, usize)> {
+        self.rows.iter().enumerate().find_map(|(pool, rows)| {
             let row = rows.binary_search_by_key(&id, |row| row.id).ok()?;
-            shape.booked.get(row).copied()
+            Some((pool, row))
         })
     }
 
@@ -1767,12 +1783,13 @@ struct Held {
 }
 
 /// The candidate row of one member: its fixed fields from its registration,
-/// its status bits, its load record when one is on file, and its engine
-/// family, zone and labels as `listed` reads them under the standing
-/// generation's lists. Its pair class is the membership's to derive
-/// ([`pair_up`]).
+/// its status bits, the bits the leader's own worker object sets, its load
+/// record when one is on file, and its engine family, zone and labels as
+/// `listed` reads them under the standing generation's lists. Its pair
+/// class is the membership's to derive ([`pair_up`]).
 fn row_of(
     member: &WorkerRow,
+    leader: LeaderBits,
     sample: Option<&LoadSample>,
     origin: Instant,
     listed: Listed,
@@ -1783,7 +1800,10 @@ fn row_of(
         role: facts.role,
         dp_rank: facts.dp_rank,
         dp_size: facts.dp_size,
-        health: health_of(member.status),
+        health: Health {
+            stalled: leader.stalled,
+            ..health_of(member.status)
+        },
         wire_modes: facts.wire_modes,
         load: sample.map(|sample| sample.row),
         load_sampled_at_micros: sample.map_or(0, |sample| micros(origin, sample.sampled_at)),
@@ -2557,7 +2577,7 @@ impl Writer {
         &mut self,
         spec: Arc<AppliedSpec>,
         epoch: u64,
-        members: impl Iterator<Item = (&'a WorkerRow, Slot)>,
+        members: impl Iterator<Item = (&'a WorkerRow, Slot, LeaderBits)>,
         sample_of: impl Fn(WorkerId, u16) -> Option<LoadSample>,
     ) -> Result<(Arc<World>, Option<Arc<AppliedSpec>>), StaleGeneration> {
         let standing = self.spec.generation();
@@ -2600,7 +2620,7 @@ impl Writer {
     /// the members written since the last and carries every other's
     /// ([`Writer::rebuild`]). A pool with a row that moved is published
     /// whole.
-    fn list<'a>(&mut self, members: impl Iterator<Item = (&'a WorkerRow, Slot)>) {
+    fn list<'a>(&mut self, members: impl Iterator<Item = (&'a WorkerRow, Slot, LeaderBits)>) {
         let Self {
             places,
             working,
@@ -2613,7 +2633,7 @@ impl Writer {
         let listing = !lists.is_empty();
         *outside = OutsideLists::default();
         held.clear();
-        for (member, _) in members {
+        for (member, ..) in members {
             let facts = &member.facts;
             let listed = lists.listed(&facts.engine_kind, facts.zone.as_deref(), &facts.labels);
             outside.engines += u32::from(listed.engine_outside);
@@ -3129,6 +3149,12 @@ impl Writer {
         self.outside
     }
 
+    /// Forget the fields read under the generation's lists. A snapshot
+    /// can give the same id and revision different facts.
+    pub(super) fn clear_listed(&mut self) {
+        self.listed.clear();
+    }
+
     /// Derive the pools of the membership `members` at the store's `epoch`,
     /// each row with its load record on file, make them the working copy
     /// and publish them through the one door: every pool is new, so the
@@ -3143,7 +3169,7 @@ impl Writer {
     pub(super) fn rebuild<'a>(
         &mut self,
         epoch: u64,
-        members: impl Iterator<Item = (&'a WorkerRow, Slot)>,
+        members: impl Iterator<Item = (&'a WorkerRow, Slot, LeaderBits)>,
         sample_of: impl Fn(WorkerId, u16) -> Option<LoadSample>,
         classes: Classes,
     ) -> Arc<World> {
@@ -3195,12 +3221,12 @@ impl Writer {
         let standing = !self.vetoes.by_gateway.is_empty();
         let mut ids = Vec::new();
         // The members in id order, by this write's one sort, each id beside
-        // its row and the slot its write gave it: an id is one member, so
-        // every pool's entries, the ranks and the ids are pushed in order
-        // and nothing below sorts them. The sort moves an id, a reference
-        // and a slot, never a whole entry.
-        let mut members: Vec<(WorkerId, &'a WorkerRow, Slot)> = members
-            .map(|(member, slot)| (member.id, member, slot))
+        // its row, the slot its write gave it and the leader's bits: an id
+        // is one member, so every pool's entries, the ranks and the ids are
+        // pushed in order and nothing below sorts them. The sort moves an
+        // id, a reference, a slot and those bits, never a whole entry.
+        let mut members: Vec<(WorkerId, &'a WorkerRow, Slot, LeaderBits)> = members
+            .map(|(member, slot, leader)| (member.id, member, slot, leader))
             .collect();
         members.sort_unstable_by_key(|&(id, ..)| id);
         // Every member's entry, in that order. A pool's list of whole
@@ -3220,7 +3246,7 @@ impl Writer {
         incoming.clear();
         let mut from = 0;
         let mut outside = OutsideLists::default();
-        for &(_, member, slot) in &members {
+        for &(_, member, slot, leader) in &members {
             if standing {
                 ids.push(member.id);
             }
@@ -3280,7 +3306,7 @@ impl Writer {
                 Listed::default()
             };
             let entry = Entry {
-                row: row_of(member, sample.as_ref(), origin, listed),
+                row: row_of(member, leader, sample.as_ref(), origin, listed),
                 facts,
                 admitted_micros: micros(origin, member.admitted_at),
                 local: match facts.reachable_from {
@@ -3615,7 +3641,7 @@ impl Writer {
         let unpooled: Box<[(WorkerId, Slot)]> = bare
             .iter()
             .filter_map(|&at| members.get(at as usize))
-            .map(|&(id, _, slot)| (id, slot))
+            .map(|&(id, _, slot, _)| (id, slot))
             .collect();
         debug_assert!(unpooled.is_sorted_by(|a, b| a.0 < b.0));
         let before = mem::replace(
@@ -3805,10 +3831,37 @@ impl Writer {
     /// statuses a row reads alike: nothing a decision reads moved.
     #[must_use]
     pub(super) fn fold_status(&mut self, id: WorkerId, status: WorkerStatus) -> Option<Arc<World>> {
+        let health = health_of(status);
+        self.fold_health(id, |row| {
+            let moved = (row.healthy, row.draining) != (health.healthy, health.draining);
+            row.healthy = health.healthy;
+            row.draining = health.draining;
+            moved
+        })
+    }
+
+    /// Fold what the leader's own worker object knows of a member into its
+    /// rows and publish at once, as a status change is: a decision does
+    /// not wait a window for a worker the leader doubts. `None` for a
+    /// worker with no row, and for the bits its rows carry already.
+    #[must_use]
+    pub(super) fn fold_leader(&mut self, id: WorkerId, bits: LeaderBits) -> Option<Arc<World>> {
+        self.fold_health(id, |row| {
+            mem::replace(&mut row.stalled, bits.stalled) != bits.stalled
+        })
+    }
+
+    /// Write `fold` over the health bits of each of the member's rows, and
+    /// publish at once where it says a bit of one moved: a pool with a row
+    /// that moved is published whole. `None` where none did.
+    fn fold_health(
+        &mut self,
+        id: WorkerId,
+        fold: impl Fn(&mut Health) -> bool,
+    ) -> Option<Arc<World>> {
         let Self {
             places, working, ..
         } = self;
-        let health = health_of(status);
         let mut folded = false;
         for place in places_of(places, id) {
             let Some(pool) = working.get_mut(place.pool as usize) else {
@@ -3817,13 +3870,10 @@ impl Writer {
             let Some(row) = pool.rows.get_mut(place.row as usize) else {
                 continue;
             };
-            if (row.health.healthy, row.health.draining) == (health.healthy, health.draining) {
-                continue;
+            if fold(&mut row.health) {
+                pool.dirty = true;
+                folded = true;
             }
-            row.health.healthy = health.healthy;
-            row.health.draining = health.draining;
-            pool.dirty = true;
-            folded = true;
         }
         folded.then(|| self.publish())
     }
@@ -3932,7 +3982,7 @@ impl Writer {
         &mut self,
         at: Option<Instant>,
         epoch: u64,
-        members: impl Iterator<Item = (&'a WorkerRow, Slot)>,
+        members: impl Iterator<Item = (&'a WorkerRow, Slot, LeaderBits)>,
         sample_of: impl Fn(WorkerId, u16) -> Option<LoadSample>,
     ) -> Option<Arc<World>> {
         let owed = self.owed.take()?;

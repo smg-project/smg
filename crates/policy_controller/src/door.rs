@@ -13,8 +13,8 @@
 //! `Asked`): a frame as the served controller checked it, or the facts a
 //! host in process holds ([`Request`]).
 //!
-//! A seat has one lock for decisions and another for sampled picks and
-//! sheds. A sampling decision takes the slot lock before the ring lock.
+//! With sampling on, a seat counts picks and sheds under its decision
+//! lock. Only a decision that keeps a record also takes the ring lock.
 //! [`Door::explain`] reads by gateway and request id under the ring lock.
 //! [`Door::explained`] also reads the names when their generation stands.
 //!
@@ -59,8 +59,8 @@ use crate::{
 
 mod explain;
 
-pub(crate) use explain::Samples;
 pub use explain::{DecisionRecord, Explained, Names};
+pub(crate) use explain::{SampleCount, Samples};
 
 /// A request as a door reads it: what the rows' narrowing, the engine's
 /// request and the lease take of it, in whatever form it was asked.
@@ -271,22 +271,22 @@ impl Keyed {
     }
 
     /// Hands `decide` the request with its key's count beside the rows,
-    /// where `sessions` are lent and the request carries a key. One hold
-    /// of the key's shard reads the count and the pin of record: the
-    /// engine is handed the count by row, and asks that read for the pin.
-    /// Any other request is handed on as it stands.
-    // Forced into each of the hand's two calls: out of line a decision
-    // that reads no key would pay a call ahead of its engine's.
+    /// where the request carries a key. One hold of the key's shard in
+    /// `sessions` reads the count and the pin of record: the engine is
+    /// handed the count by row, and asks that read for the pin. A request
+    /// that carries no key is handed on as it stands.
+    // Forced into each of the hand's two calls: out of line a request
+    // with no key would pay a call ahead of its engine's.
     #[inline(always)]
     fn lend<'a, R>(
         &'a mut self,
-        sessions: Option<&'a StorePins<'a>>,
+        sessions: &'a StorePins<'a>,
         facts: &RequestFacts<'_>,
         constraints: &Constraints<'_>,
         candidates: &[Candidate],
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R {
-        let read = sessions.and_then(|pins| self.read(pins, facts.session(), candidates));
+        let read = self.read(sessions, facts.session(), candidates);
         let lent;
         let (facts, constraints) = match &read {
             Some((pin, rows)) => {
@@ -559,14 +559,7 @@ pub(crate) fn encode_pair_in<A: Asked>(
         |rows, engine, model, mut ask, wires, subset| {
             if !items.keys.is_empty() {
                 // The prefill binding names the encode profile for the pair.
-                let encode =
-                    engine
-                        .binding(model, Phase::Prefill)
-                        .and_then(|binding| match binding.plan {
-                            Plan::Epd { encode } => engine.profiles().get(usize::from(encode)),
-                            Plan::Single | Plan::PdPair => None,
-                        });
-                ask.affinity |= encode.is_some_and(|profile| profile.needs().affinity);
+                ask.affinity |= engine.pair_encode_needs(model).affinity;
             }
             let built = world.build_encode_pair(model, &ask, rows)?;
             // Counts follow the build's row order until narrowing moves it.
@@ -1162,7 +1155,8 @@ pub(crate) fn hand<A: Asked, R>(
         pins: pins.map(|pins| pins as &dyn PinSource),
     };
     // The store's sessions, where the decision's rule has an in-flight
-    // cap: a keyed request reads its key's count there.
+    // cap: a keyed request reads its key's count there. Under any other
+    // rule the engine is asked at once, past the key's read.
     let sessions = pins.filter(|_| needs.session_in_flight);
     if names {
         // A row is named by its place among the rows the decision is made
@@ -1186,8 +1180,9 @@ pub(crate) fn hand<A: Asked, R>(
             named: Some(named.affinity()),
             ..viewed
         };
-        let answer = request.read(lists, viewed, |facts, constraints| {
-            keyed.lend(
+        let answer = request.read(lists, viewed, |facts, constraints| match sessions {
+            None => decide.over_named(facts, &pool, candidates, constraints, scratch),
+            Some(sessions) => keyed.lend(
                 sessions,
                 facts,
                 constraints,
@@ -1195,18 +1190,19 @@ pub(crate) fn hand<A: Asked, R>(
                 |facts, constraints| {
                     decide.over_named(facts, &pool, candidates, constraints, scratch)
                 },
-            )
+            ),
         });
         return (answer, built);
     }
-    let answer = request.read(lists, viewed, |facts, constraints| {
-        keyed.lend(
+    let answer = request.read(lists, viewed, |facts, constraints| match sessions {
+        None => decide.over(facts, &pool, candidates, constraints, scratch),
+        Some(sessions) => keyed.lend(
             sessions,
             facts,
             constraints,
             candidates,
             |facts, constraints| decide.over(facts, &pool, candidates, constraints, scratch),
-        )
+        ),
     });
     (answer, built)
 }
@@ -1270,10 +1266,13 @@ pub(crate) struct Viewed<'a> {
 /// lease's own engine. A dispatch also feeds the counts of sends of the
 /// generation `world` holds, whichever generation issued the lease: a
 /// send is the host's, whatever document decided it
-/// ([`Engine::dispatched_sent`]). A dispatch is told on the target its
-/// report names by index, as the record holds the pick, and the lease
-/// told names that index: the record was read before the door wrote it.
-/// A report that names no target of the pick tells nothing.
+/// ([`Engine::dispatched_sent`]). It feeds them where `world` lists the
+/// worker at the rank the report names ([`World::lists_rank`]): a row
+/// that left takes no send, so a late report enters no rank behind a
+/// removal. A dispatch is told on the target its report names by index,
+/// as the record holds the pick, and the lease told names that index:
+/// the record was read before the door wrote it. A report that names no
+/// target of the pick tells nothing.
 ///
 /// A pair's lease is told by side: a dispatch on the side its frame names,
 /// with that side's lease and on that side's worker, and an end once a
@@ -1344,6 +1343,7 @@ fn tell(store: &MemoryStore, world: &World, found: &Sides, said: Said) {
                 &target,
                 dispatch.side,
                 dispatch.since_decision_micros,
+                || world.lists_rank(id, dp_rank),
             );
             // The table hears first and the pin of record reads it.
             // The stages hear last, so nothing is held across their
@@ -1460,7 +1460,7 @@ fn pinned_by_rule(
 /// session's hand at the file or the door's report, and the gateway's
 /// completion is written on the served worker for the health precedence,
 /// whether or not the lease is on file. A served controller's handler of a
-/// `Completed` frame and a host's handle both say a completion here, so
+/// `Completed` frame and a handle over an in-process door both call here, so
 /// what one means stands once.
 pub(crate) fn completed(
     store: &MemoryStore,
@@ -1496,20 +1496,17 @@ pub(crate) fn decider_of(model: &str, deciders: usize) -> usize {
     usize::try_from(fingerprint(model.as_bytes()) % deciders).unwrap_or(0)
 }
 
-/// A request as a host in process asks it: the engine's request and the
-/// host's constraints as the host holds them. No frame is built.
+/// A request and its constraints as the host holds them. A door reads
+/// these facts in process. A link carries them to the controller.
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
     /// The request's id as the host states it: its lease keeps the id's
     /// fingerprint.
     pub id: &'a [u8],
-    /// The request as the engine reads it. The door writes over the
-    /// host's what the deciding view adds: the instant in the rows'
-    /// clock, the affinity column, the rows the store names, the leases'
-    /// counts and, for a keyed request under a rule with an in-flight
-    /// cap, the count of its key. A budget of 0 states none, and the
-    /// engine is told no bound. A frame's 0 says none is left: a host
-    /// itself refuses a request whose time is spent.
+    /// The request as the engine reads it. The deciding view supplies the
+    /// clock value, affinity, named rows, lease counts and the key's count
+    /// under a rule with an in-flight cap. A budget of 0 leaves a decision
+    /// in process unbounded. Over a link it says the request's time is spent.
     pub facts: RequestFacts<'a>,
     /// What the host alone knows. The door writes its standing vetoes and
     /// the pins of record over the host's.
@@ -1589,13 +1586,68 @@ impl Asked for Request<'_> {
     }
 }
 
+/// A request its host makes from the world the door decides under
+/// ([`Door::decide_under`]). What the host reads of the applied document to
+/// state the request, the sources of its routing key for one
+/// ([`AppliedSpec::key_sources_for`]), is then of the same load as the
+/// engine and the rows.
+pub trait Maker {
+    /// The model of the request. The door takes its seat by it, ahead of
+    /// the load: the request [`Maker::make`] makes names this model.
+    fn model(&self) -> &str;
+    /// The request, made from the world its decision is made under. It is
+    /// made inside the door's hold of its seat: a maker that waits holds
+    /// up the seat's other requests, and one that asks the door again can
+    /// wait on the seat it holds.
+    fn make<'w>(&'w self, world: &'w World) -> Request<'w>;
+}
+
+/// A request as the door's order takes it up under the world it loaded:
+/// one its host stated ahead of the load ([`Request`]), or one its host
+/// makes from that world ([`Maker`]).
+trait Stated {
+    /// The model the request is for. The door takes its seat by it, ahead
+    /// of the load.
+    fn model(&self) -> &str;
+    /// Hands `order` the request as it stands under `world`.
+    fn under<R>(&self, world: &World, order: impl FnOnce(&Request<'_>) -> R) -> R;
+}
+
+impl Stated for Request<'_> {
+    fn model(&self) -> &str {
+        self.facts.model
+    }
+
+    // Forced into the order's one call: a request stated ahead of the load
+    // pays nothing for the form a host's maker takes.
+    #[inline(always)]
+    fn under<R>(&self, _: &World, order: impl FnOnce(&Request<'_>) -> R) -> R {
+        order(self)
+    }
+}
+
+/// A [`Maker`]'s request, as the door's order takes it up.
+struct Made<'m, M>(&'m M);
+
+impl<M: Maker> Stated for Made<'_, M> {
+    fn model(&self) -> &str {
+        self.0.model()
+    }
+
+    fn under<R>(&self, world: &World, order: impl FnOnce(&Request<'_>) -> R) -> R {
+        let request = self.0.make(world);
+        debug_assert_eq!(request.facts.model, self.0.model(), "the seat's model");
+        order(&request)
+    }
+}
+
 /// A decision as its host takes it.
 #[derive(Debug)]
 pub struct Decided {
     /// The engine's decision.
     pub decision: Decision,
-    /// The lease filed for a pick, a credit on the pick's first target.
-    /// For a pair this is the prefill side. `None` for a decision that
+    /// The lease issued for a pick, with the target index it books. For
+    /// a pair this is the prefill side. `None` for a decision that
     /// picks no worker.
     pub lease: Option<Leased>,
 }
@@ -1610,15 +1662,14 @@ impl Decided {
     }
 }
 
-/// A pick's lease as its door hands it over: the lease the store filed,
-/// and when its dispatch span ends.
+/// A pick's lease as its host receives it, with its dispatch deadline.
 #[derive(Clone, Copy, Debug)]
 pub struct Leased {
-    /// The lease as the store filed it.
+    /// The lease issued for the pick.
     pub lease: Lease,
-    /// When its dispatch span ends: the host names a dispatch before
-    /// then, or the lease is ended as abandoned, by the next issue at its
-    /// file or by the door's clock ([`Door::sweep`]).
+    /// When its dispatch span ends on the host's clock. The store ends
+    /// leases whose dispatch span has passed and whose dispatch is still
+    /// owed.
     pub due: Instant,
 }
 
@@ -1756,23 +1807,28 @@ impl Drop for Handed<'_> {
     }
 }
 
-/// A seat a file of the store, on cache lines of its own.
+/// A seat at a file of the store, on lines of its own: a thread that
+/// decides at one seat writes no line the thread at the next one reads.
 #[derive(Default)]
 #[repr(align(128))]
 struct Seat {
-    /// The seat's state across decisions. Only decisions take this lock.
+    /// The seat's state across decisions, including its sample count.
+    /// Only decisions take this lock.
     slot: Mutex<DeciderSlot>,
-    /// The seat's recent decisions, locked by sampling decisions and reads.
+    /// The seat's recent decisions. A read or a decision that keeps a
+    /// record takes this lock.
     samples: Mutex<Samples>,
 }
 
-/// What a seat's holder keeps across decisions, under the decision lock.
+/// What a seat's holder keeps under the decision lock, including the
+/// count toward its next sample.
 #[derive(Default)]
 struct DeciderSlot {
     buffers: Buffers<()>,
     /// The holder's place at the seat's file, taken at the seat's first
     /// decision.
     at_file: Option<AtWork>,
+    sample_count: SampleCount,
 }
 
 thread_local! {
@@ -1810,9 +1866,9 @@ impl Door {
     /// A door over `store`, with a seat for each of its files. The store
     /// is given the door's word to the engine: whoever applies a report
     /// to a lease tells the engine that issued it, and a dispatch feeds
-    /// the standing generation's counts of sends. A store that names no
-    /// decider has one file: the door decides there, and tells what is
-    /// said of its leases, as decider 0.
+    /// the standing generation's counts of sends for a row its world
+    /// still lists. A store that names no decider has one file: the door
+    /// decides there, and tells what is said of its leases, as decider 0.
     #[must_use]
     pub fn new(store: Arc<MemoryStore>) -> Self {
         let deciders = store.deciders();
@@ -1876,6 +1932,31 @@ impl Door {
         now: Instant,
     ) -> Result<Decided, Refused> {
         self.deciding(gateway, request, now, |world, at, term, taken, buffers| {
+            let entry = entry(world, taken);
+            self.order(world, at, term, taken, buffers, entry)
+        })
+    }
+
+    /// [`Door::decide`] for a request its host makes from the world the
+    /// door decides under. `maker` is handed that world behind the door's
+    /// load ([`Maker::make`]), once for each run of the order: a load an
+    /// apply moved to another decider is dropped before it asks. It is
+    /// asked again where the order runs a second time behind a lease the
+    /// store refused.
+    ///
+    /// A maker that panics is a decision that faulted.
+    ///
+    /// # Errors
+    ///
+    /// [`Refused`]: no decision is made for the request.
+    pub fn decide_under(
+        &self,
+        gateway: GatewayId,
+        maker: &impl Maker,
+        now: Instant,
+    ) -> Result<Decided, Refused> {
+        let made = Made(maker);
+        self.deciding(gateway, &made, now, |world, at, term, taken, buffers| {
             let entry = entry(world, taken);
             self.order(world, at, term, taken, buffers, entry)
         })
@@ -1960,7 +2041,7 @@ impl Door {
     /// A completion said here ends the lease and is no health write: the
     /// gateway's completed dispatch on the worker that served is the
     /// host's to write ([`HealthSink::completed`]). A host that holds a
-    /// handle says one completion and the handle writes both
+    /// handle over this door says one completion and the handle writes both
     /// ([`crate::handle::Handle::completed`]).
     pub fn report(&self, gateway: GatewayId, lease: LeaseId, said: Said) {
         let at = self.store.file_of(lease);
@@ -2000,7 +2081,7 @@ impl Door {
     fn deciding(
         &self,
         gateway: GatewayId,
-        request: &Request<'_>,
+        request: &impl Stated,
         now: Instant,
         mut order: impl FnMut(
             &World,
@@ -2023,7 +2104,7 @@ impl Door {
     fn once(
         &self,
         gateway: GatewayId,
-        request: &Request<'_>,
+        request: &impl Stated,
         now: Instant,
         order: impl FnOnce(
             &World,
@@ -2056,7 +2137,7 @@ impl Door {
         &self,
         term: u64,
         gateway: GatewayId,
-        request: &Request<'_>,
+        request: &impl Stated,
         now: Instant,
         order: impl FnOnce(
             &World,
@@ -2070,14 +2151,18 @@ impl Door {
         let mut seen = self.seat_flags.load(Ordering::Relaxed);
         loop {
             let (at, mut slot) = if seen & KEEPS_DECIDERS != 0 {
-                self.home(request.facts.model)
+                self.home(request.model())
             } else {
                 self.seat()
             };
             // The store lays at most one file for each byte-sized name.
             debug_assert!(at < Decider::COUNT);
             let _acting = Decider::new(at as u8).enter();
-            let DeciderSlot { buffers, at_file } = &mut *slot;
+            let DeciderSlot {
+                buffers,
+                at_file,
+                sample_count,
+            } = &mut *slot;
             let at_file = at_file.get_or_insert_with(|| self.store.at_work());
             // The thread works at the seat's file for this decision: what
             // was handed is applied as it takes up the work.
@@ -2099,32 +2184,38 @@ impl Door {
                 }
             }
             let pins = StorePins { store, now };
-            let taken = Taken {
-                request,
-                gateway,
-                now,
-                // The host's own budget, as the engine is told it.
-                left: match request.facts.budget_micros {
-                    0 => Duration::MAX,
-                    micros => Duration::from_micros(micros.into()),
-                },
-                pins: Some(&pins),
-                // No place is lent in process: no file's frames wait
-                // for a look. What is said of a lease is applied at once
-                // where no caller decides at its file, and a file whose
-                // caller decides is that caller's, as a decider's at
-                // work is.
-                place: None,
-            };
-            let decided = catch_unwind(AssertUnwindSafe(|| {
-                order(&world, at, term, &taken, buffers)
-            }));
-            if flags & SAMPLES_DECISIONS != 0 {
-                if let Ok(Ok(answer)) = &decided {
-                    let samples = &self.seats[at].samples;
-                    samples.lock().keep(0, engine, &taken, &answer.decision);
+            // The request is taken up under this load: one its host makes
+            // is made here, of the world its decision and its sample read.
+            let taken_up = |request: &Request<'_>| {
+                let taken = Taken {
+                    request,
+                    gateway,
+                    now,
+                    // The host's own budget, as the engine is told it.
+                    left: match request.facts.budget_micros {
+                        0 => Duration::MAX,
+                        micros => Duration::from_micros(micros.into()),
+                    },
+                    pins: Some(&pins),
+                    // No place is lent in process: no file's frames wait
+                    // for a look. What is said of a lease is applied at
+                    // once where no caller decides at its file, and a file
+                    // whose caller decides is that caller's, as a
+                    // decider's at work is.
+                    place: None,
+                };
+                let decided = order(&world, at, term, &taken, buffers);
+                if flags & SAMPLES_DECISIONS != 0 {
+                    if let Ok(answer) = &decided {
+                        if sample_count.keeps(0, engine, &answer.decision) {
+                            let samples = &self.seats[at].samples;
+                            samples.lock().push(0, engine, &taken, &answer.decision);
+                        }
+                    }
                 }
-            }
+                decided
+            };
+            let decided = catch_unwind(AssertUnwindSafe(|| request.under(&world, taken_up)));
             // The load ends with the decision.
             drop(world);
             self.leave(at, at_file);
@@ -2332,6 +2423,7 @@ impl Door {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{
+        cell::Cell,
         collections::BTreeSet,
         error::Error,
         sync::{
@@ -2345,7 +2437,7 @@ pub(crate) mod tests {
     use parking_lot::Mutex;
 
     use super::{
-        decider_of, pinned, DecisionRecord, Door, Refused, Request, Swept, DISPATCH_TTL,
+        decider_of, pinned, Door, Maker, Refused, Request, Swept, World, DISPATCH_TTL,
         ON_SAMPLE_READ, SEAT, TERM_MARK,
     };
     use crate::{
@@ -2366,6 +2458,7 @@ pub(crate) mod tests {
             Candidate, Constraints, Identity, KeyedRow, Phase, PoolFacts, RequestFacts, Role,
             Session, WireModes, WorkerId,
         },
+        DecisionRecord,
     };
 
     const MODEL: &str = "model-a";
@@ -2474,9 +2567,7 @@ pub(crate) mod tests {
         ready(store, encode_facts(key, role, connector))
     }
 
-    fn encode_door() -> Result<Door, Box<dyn Error>> {
-        let store = Arc::new(MemoryStore::new());
-        encode_member(&store, "grpc://d0:8000", Role::Decode, "c0");
+    fn encode_document() -> Result<PolicySpec, Box<dyn Error>> {
         let mut document =
             PolicySpec::epd_presets("consistent_hashing", "least_load", "least_load")?;
         for side in ["prefill", "decode"] {
@@ -2486,7 +2577,7 @@ pub(crate) mod tests {
                 .ok_or("missing pair profile")?;
             profile
                 .filter
-                .retain(|stage| !matches!(stage.as_str(), "has-capacity" | "has-room"));
+                .retain(|stage| !matches!(stage.name(), "has-capacity" | "has-room"));
             profile.pick = "count-first".into();
         }
         let encode = document
@@ -2494,7 +2585,13 @@ pub(crate) mod tests {
             .get_mut("encode")
             .ok_or("missing encode profile")?;
         encode.score.push("prefix-affinity".into());
-        store.apply(AppliedSpec::validate(&document)?)?;
+        Ok(document)
+    }
+
+    fn encode_door() -> Result<Door, Box<dyn Error>> {
+        let store = Arc::new(MemoryStore::new());
+        encode_member(&store, "grpc://d0:8000", Role::Decode, "c0");
+        store.apply(AppliedSpec::validate(&encode_document()?)?)?;
         Ok(Door::new(store))
     }
 
@@ -2685,18 +2782,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_read_of_a_ring_leaves_a_caller_at_its_seat() {
-        let door = &Door::new(fleet(2));
-        thread::scope(|scope| {
-            let _read = hold_read(scope, door).expect("the read holds the first ring");
-            let (answer, answered) = mpsc::channel();
-            scope.spawn(move || {
-                seated(0);
-                let (lease, _) = leased(door, b"caller", 7);
-                let _ = answer.send((door.store().file_of(lease), SEAT.get()));
+    fn a_decision_that_keeps_no_record_waits_on_no_read() {
+        for sample in [0, 2] {
+            let store = fleet(2);
+            sampling(&store, 2, sample);
+            let door = &Door::new(store);
+            thread::scope(|scope| {
+                let _read = hold_read(scope, door).expect("the read holds the first ring");
+                let (answer, answered) = mpsc::channel();
+                scope.spawn(move || {
+                    seated(0);
+                    let (lease, _) = leased(door, b"caller", 7);
+                    let _ = answer.send((door.store().file_of(lease), SEAT.get()));
+                });
+                assert_eq!(
+                    answered.recv_timeout(PATIENCE),
+                    Ok((0, 0)),
+                    "sample {sample}"
+                );
             });
-            assert_eq!(answered.recv_timeout(PATIENCE), Ok((0, 0)));
-        });
+            assert!(door.explain(GATEWAY, b"caller").is_none());
+        }
     }
 
     #[test]
@@ -2756,9 +2862,8 @@ pub(crate) mod tests {
         let door = Door::new(fleet(1));
         let _ = leased(&door, b"off", 1);
         assert!(door.explain(GATEWAY, b"off").is_none());
-        let samples = door.seats[0].samples.lock();
-        assert_eq!(samples.slots(), 0);
-        assert_eq!(samples.counted(), 0);
+        assert_eq!(door.seats[0].samples.lock().slots(), 0);
+        assert_eq!(door.seats[0].slot.lock().sample_count.counted(), 0);
     }
 
     #[test]
@@ -2827,28 +2932,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_door_sheds_before_the_first_profile_and_names_the_plan_alone() {
+        let store = fleet(1);
+        sampling(&store, 2, 1);
+        let door = Door::new(store);
+
+        let id = b"narrowed";
+        let mut ask = request(id, 7);
+        ask.constraints.subset_hint = Some(0);
+        let answer = door.decide(GATEWAY, &ask, Instant::now()).expect("a shed");
+        let Decision::Shed(shed) = answer.decision else {
+            panic!("the subset left no candidate");
+        };
+        assert_eq!(shed.emptied_by, super::SUBSET_HINT);
+        let explained = door.explained(GATEWAY, id).expect("the sampled shed");
+        assert_eq!(explained.record.binding, Some(0));
+        assert_eq!(
+            explained.names,
+            Some(crate::Names {
+                plan: "single",
+                ..crate::Names::default()
+            }),
+        );
+        assert_eq!(shed.trace.made_under(), None);
+    }
+
+    #[test]
     fn each_seat_keeps_every_nth_answer_by_its_own_count() {
         let store = fleet(2);
         sampling(&store, 2, 3);
         let door = Door::new(store);
-        thread::scope(|scope| {
-            let door = &door;
+        for n in 1..=6 {
             for seat in [0_u8, 1] {
-                scope.spawn(move || {
-                    let at = usize::from(seat);
-                    seated(at);
-                    for n in 1..=6 {
-                        let id = [seat, n];
-                        let (lease, _) = leased(door, &id, u64::from(n));
-                        assert_eq!(door.store().file_of(lease), at);
-                        door.report(GATEWAY, lease, gone());
-                        if n < 3 {
-                            assert_eq!(door.seats[at].samples.lock().slots(), 0);
-                        }
-                    }
-                });
+                let at = usize::from(seat);
+                seated(at);
+                let id = [seat, n];
+                let (lease, _) = leased(&door, &id, u64::from(n));
+                assert_eq!(door.store().file_of(lease), at);
+                door.report(GATEWAY, lease, gone());
+                if n < 3 {
+                    assert_eq!(door.seats[at].samples.lock().slots(), 0);
+                }
             }
-        });
+        }
         for seat in [0, 1] {
             for n in 1..=6 {
                 assert_eq!(door.explain(GATEWAY, &[seat, n]).is_some(), n % 3 == 0);
@@ -2882,6 +3008,59 @@ pub(crate) mod tests {
             slots * bytes
         )
         .expect("stdout");
+    }
+
+    /// A maker that says the generation it was handed, and applies another
+    /// before its request is back at the door where it is told one.
+    struct Reads<'t> {
+        store: &'t MemoryStore,
+        handed: Cell<u64>,
+        applies: Option<u64>,
+        id: &'t [u8],
+    }
+
+    impl Maker for Reads<'_> {
+        fn model(&self) -> &str {
+            MODEL
+        }
+
+        fn make<'w>(&'w self, world: &'w World) -> Request<'w> {
+            self.handed.set(world.spec().generation());
+            if let Some(generation) = self.applies {
+                let later = self.store.apply(preset("random", generation));
+                later.expect("a later generation");
+            }
+            request(self.id, 7)
+        }
+    }
+
+    /// A request its host makes is made from the world its decision is made
+    /// under. An apply that lands while the host makes it is the next
+    /// decision's: the one in hand keeps the world it handed.
+    #[test]
+    fn a_request_is_made_from_the_world_its_decision_is_made_under() {
+        let store = fleet(1);
+        let door = Door::new(Arc::clone(&store));
+        let standing = || store.with_world(|world| world.spec().generation());
+        let reads = |applies, id| Reads {
+            store: &store,
+            handed: Cell::new(0),
+            applies,
+            id,
+        };
+        let raced = reads(Some(2), b"made");
+        let decided = door.decide_under(GATEWAY, &raced, Instant::now());
+        let decided = decided.expect("a decision");
+        assert_eq!(decided.decision.trace().generation, raced.handed.get());
+        assert_eq!((raced.handed.get(), standing()), (1, 2));
+
+        let next = reads(None, b"next");
+        let decided = door.decide_under(GATEWAY, &next, Instant::now());
+        let decided = decided.expect("a decision");
+        assert_eq!(
+            (next.handed.get(), decided.decision.trace().generation),
+            (2, 2)
+        );
     }
 
     #[test]
@@ -3503,7 +3682,11 @@ pub(crate) mod tests {
         asked.constraints.wire_modes = WireModes::ZMQ;
         let decided = door.decide(GATEWAY, &asked, Instant::now());
         let decided = decided.expect("a decision");
-        assert!(decided.decision.pick().is_none(), "no member it can dial");
+        let Decision::Shed(shed) = decided.decision else {
+            panic!("the gateway can dial no member");
+        };
+        assert_eq!(shed.emptied_by, super::WIRES);
+        assert_eq!(shed.trace.made_under(), None);
         assert!(decided.lease.is_none());
         assert_eq!((door.undialed(), door.hashes_cut()), (3, 0));
     }
@@ -4292,24 +4475,17 @@ pub(crate) mod tests {
         asked
     }
 
-    /// The door hands a keyed decision its key's count beside the rows, by
-    /// row, and writes none into a row: over the publication's own rows,
-    /// and over the rows written for a gateway that states its wires. A
-    /// worker that is no candidate of the decision is dropped from the
-    /// count, and a request with no key is handed none.
-    #[test]
-    fn the_door_hands_a_keys_count_beside_the_rows_and_writes_none_into_a_row() {
-        let store = fleet(1);
+    /// Applies `document` to `store` with the counting picker as the pick
+    /// of its `manual` profile, under a rule whose keys the profile's own
+    /// stages place: the picker is handed each key no pin takes and each
+    /// key placed again at its cap. Returns the reader of what the last
+    /// decision handed the picker.
+    fn counting(store: &MemoryStore, mut document: PolicySpec) -> impl Fn() -> Handed {
         let handed = Arc::new(Mutex::new(Vec::new()));
         let kept = Arc::clone(&handed);
         let mut catalog = Catalog::builtin();
         let added = catalog.picker("counted", move || Box::new(Counted(Arc::clone(&kept))));
         added.expect("a free name");
-        // A cap of one, under a rule whose keys the profile's own stages
-        // place: the picker is handed each key no pin takes and each key
-        // placed again at its cap. Its draw may land on the key's worker
-        // again, which is the pin taken.
-        let mut document = capped(2, 1);
         let profile = document.profiles.get_mut("manual");
         profile.expect("the preset's profile").pick = "counted".into();
         let rule = document.bindings[0].sessions.as_mut();
@@ -4318,12 +4494,25 @@ pub(crate) mod tests {
         let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
         let applied = store.apply(spec.expect("the catalog holds the stage"));
         applied.expect("a later generation");
-        let door = Door::new(Arc::clone(&store));
-        let last = || {
+        move || {
             let handed = handed.lock();
             let last: Option<&Handed> = handed.last();
             last.cloned().expect("a decision reached the picker")
-        };
+        }
+    }
+
+    /// The door hands a keyed decision its key's count beside the rows, by
+    /// row, and writes none into a row: over the publication's own rows,
+    /// and over the rows written for a gateway that states its wires. A
+    /// worker that is no candidate of the decision is dropped from the
+    /// count, and a request with no key is handed none.
+    #[test]
+    fn the_door_hands_a_keys_count_beside_the_rows_and_writes_none_into_a_row() {
+        let store = fleet(1);
+        // A cap of one. The picker's draw may land on the key's worker
+        // again, which is the pin taken.
+        let last = counting(&store, capped(2, 1));
+        let door = Door::new(Arc::clone(&store));
         // A key's first request: none of its requests is in flight.
         let (first, owner, _) = placed(&door, &keyed(b"r-1", 7, 1));
         assert_eq!((last().lent(), last().counted), (Some(vec![]), true));
@@ -4366,6 +4555,39 @@ pub(crate) mod tests {
         assert_eq!(verdict == SessionVerdict::Respill, next != held);
         assert_eq!(last().lent(), Some(vec![(held, 1)]));
         assert_eq!(last().rows.len(), 2);
+    }
+
+    /// A profile whose own stages read the affinity column is asked over
+    /// the rows the store names for it ([`Decides::over_named`]). A keyed
+    /// decision reads its key's count at that call as at the other: the
+    /// picker is handed the count beside the rows, and each lease books the
+    /// key.
+    #[test]
+    fn a_decision_over_named_rows_reads_its_keys_count() {
+        let store = fleet(1);
+        let mut document = capped(2, 1);
+        let profile = document.profiles.get_mut("manual");
+        let profile = profile.expect("the preset's profile");
+        profile.score.push("prefix-affinity".into());
+        let last = counting(&store, document);
+        let named = store.with_world(|world| {
+            let engine = world.spec().engine();
+            engine.named_for(MODEL, Phase::Single)
+        });
+        assert_ne!(named, 0, "the profile is named its rows");
+        let door = Door::new(Arc::clone(&store));
+        let (first, owner, _) = placed(&door, &keyed(b"r-1", 7, 1));
+        assert_eq!((last().lent(), last().counted), (Some(vec![]), true));
+        report(&door, first, dispatched());
+        // The second finds the cap met: the picker reads the first on the
+        // key's worker.
+        placed(&door, &keyed(b"r-2", 7, 2));
+        assert_eq!(last().lent(), Some(vec![(owner, 1)]));
+        // Each of the two leases books the key.
+        let mut carried = Vec::new();
+        store.keyed(keyed(b"r-0", 7, 0).facts.session(), &mut carried);
+        let booked: u32 = carried.iter().map(|&(_, count)| count).sum();
+        assert_eq!(booked, 2, "{carried:?}");
     }
 
     /// One read of a key's shard names the rows that carry the key's
@@ -4737,26 +4959,36 @@ pub(crate) mod tests {
         assert_eq!(door.faults(), 0);
     }
 
-    /// A picker that holds a decision's scope and panics where it is
-    /// asked what it needs, once armed.
+    /// A picker that holds a decision's scope and panics once armed: where
+    /// it picks, or else where it is asked what it needs.
     #[derive(Debug)]
-    struct Needy(Arc<AtomicBool>);
+    struct Armed {
+        armed: Arc<AtomicBool>,
+        at_pick: bool,
+    }
 
-    impl Lifecycle for Needy {}
+    impl Armed {
+        fn called(&self, at_pick: bool) {
+            let fires = self.at_pick == at_pick && self.armed.load(Ordering::Relaxed);
+            assert!(!fires, "the case's own panic");
+        }
+    }
 
-    impl DecisionScope for Needy {
+    impl Lifecycle for Armed {}
+
+    impl DecisionScope for Armed {
         fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
 
         fn close(&self) {}
     }
 
-    impl Picker for Needy {
+    impl Picker for Armed {
         fn name(&self) -> &'static str {
-            "needy"
+            "armed"
         }
 
         fn needs(&self) -> Needs {
-            assert!(!self.0.load(Ordering::Relaxed), "the case's own panic");
+            self.called(false);
             Needs::default()
         }
 
@@ -4769,6 +5001,7 @@ pub(crate) mod tests {
             band: TieBand,
             out: &mut Targets,
         ) {
+            self.called(true);
             Random.pick(facts, candidates, kept, scores, band, out);
         }
 
@@ -4777,14 +5010,67 @@ pub(crate) mod tests {
         }
     }
 
-    /// A stage is asked what it needs at each decision, and that call can
-    /// panic as any other. The seat's question calls no stage, so the
-    /// panic is the decision's own, at the first request under the
-    /// stage's generation and at a later one: each is refused as faulted,
-    /// nothing unwinds into the host, and the seat the caller left is at
-    /// rest.
+    /// A stage is asked what it needs once, where its generation is built:
+    /// the engine keeps the answer and a decision calls no stage for it.
+    /// So a stage whose answer would panic later costs no request.
     #[test]
-    fn a_stage_that_panics_at_its_needs_costs_its_request_alone() {
+    fn a_stage_is_asked_what_it_needs_at_the_build_alone() {
+        let store = fleet(2);
+        let door = Door::new(Arc::clone(&store));
+        let armed = Arc::new(AtomicBool::new(false));
+        let stage = Arc::clone(&armed);
+        picking(&store, 2, "armed", move || {
+            Box::new(Armed {
+                armed: Arc::clone(&stage),
+                at_pick: false,
+            })
+        });
+        armed.store(true, Ordering::Relaxed);
+        for id in [b"r-1", b"r-2"] {
+            let decided = door.decide(GATEWAY, &request(id, 7), Instant::now());
+            assert!(decided.is_ok(), "{:?}", decided.err());
+        }
+        assert_eq!(door.faults(), 0);
+    }
+
+    /// So with the encode profile of a pair: a request with encode items
+    /// reads the answer kept at the build.
+    #[test]
+    fn an_encode_profiles_stage_is_asked_what_it_needs_at_the_build_alone(
+    ) -> Result<(), Box<dyn Error>> {
+        let (door, _) = push_fleet()?;
+        let armed = Arc::new(AtomicBool::new(false));
+        let stage = Arc::clone(&armed);
+        let mut catalog = Catalog::builtin();
+        catalog.picker("armed", move || {
+            Box::new(Armed {
+                armed: Arc::clone(&stage),
+                at_pick: false,
+            })
+        })?;
+        let mut document = encode_document()?;
+        document.generation = 2;
+        let encode = document.profiles.get_mut("encode");
+        encode.ok_or("missing encode profile")?.pick = "armed".into();
+        let digest = document.digest()?;
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])?;
+        door.store().apply(spec)?;
+        armed.store(true, Ordering::Relaxed);
+        let mut placed = EncodePlaced::new();
+        for id in [b"r-1", b"r-2"] {
+            let asked = pair_request(id);
+            let decided =
+                door.decide_encode_pair(GATEWAY, &asked, items(), &mut placed, Instant::now());
+            assert!(decided.is_ok(), "{:?}", decided.err());
+        }
+        assert_eq!(door.faults(), 0);
+        Ok(())
+    }
+
+    /// A decision that panics after its caller left its own seat for the
+    /// model's costs its request alone, and the seat it left is at rest.
+    #[test]
+    fn a_stage_that_panics_at_the_models_seat_costs_its_request_alone() {
         // The model's seat is not the first, where the calling thread
         // sits.
         let files = (2..=8).find(|&files| decider_of(MODEL, files) != 0);
@@ -4795,8 +5081,11 @@ pub(crate) mod tests {
         let (own, _) = leased(&door, b"r-0", 7);
         let armed = Arc::new(AtomicBool::new(false));
         let stage = Arc::clone(&armed);
-        picking(&store, 2, "needy", move || {
-            Box::new(Needy(Arc::clone(&stage)))
+        picking(&store, 2, "armed", move || {
+            Box::new(Armed {
+                armed: Arc::clone(&stage),
+                at_pick: true,
+            })
         });
         armed.store(true, Ordering::Relaxed);
         // The first request under the generation leaves the caller's own

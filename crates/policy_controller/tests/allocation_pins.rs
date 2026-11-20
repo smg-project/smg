@@ -1,6 +1,6 @@
 //! What a decision allocates, pinned at zero: once a first decision has sized
 //! the per-thread scratch, a decision of every preset over a reporting fleet
-//! of 64 and of 512 rows, a least-cost decision over mixed reports, a
+//! of 64 and of 512 rows, a least-cost decision over mixed reports and sends, a
 //! decision over rows with a credit held in the least-load tally, a decision
 //! over a pool doubted on every row, and a pair decision allocate nothing
 //! (design 4.4: a scorer or picker allocates nothing per decision; the host
@@ -121,7 +121,7 @@ fn a_decision_after_the_first_allocates_nothing_for_any_preset() {
 #[test]
 fn a_least_cost_decision_after_the_first_allocates_nothing() {
     let profile = serde_yaml::from_str(
-        "filter: [healthy]\nscore: [{least-cost: {terms: {load.running: 7, load.queued: 13}, unreported: {over-least: {request_cost: 11}}}}]\npick: best",
+        "filter: [healthy]\nscore: [{least-cost: {terms: {load.running: 7, load.queued: 13, sent.requests: 3, sent.tokens: 1}, unreported: {over-least: {request_cost: 11}}}}]\npick: best",
     )
     .expect("a least-cost profile");
     let engine = PolicySpec::new([("p".to_string(), profile)].into())
@@ -134,6 +134,21 @@ fn a_least_cost_decision_after_the_first_allocates_nothing() {
         if i.is_multiple_of(3) {
             row.load = None;
         }
+    }
+    // Every row holds a send later than its report.
+    let lease = Lease {
+        issued_micros: 1_000_000,
+        tokens: 512,
+        ..Lease::default()
+    };
+    for row in &view {
+        let target = Target {
+            position: row.position,
+            id: row.id,
+            dp_rank: row.dp_rank,
+            pair: None,
+        };
+        engine.on_dispatched(&lease, &target, Side::Single, 0);
     }
     let cx = Constraints::default();
     let mut scratch = Scratch::new();
@@ -169,7 +184,7 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
     for profile in bare.profiles.values_mut() {
         profile
             .filter
-            .retain(|name| name != "not-tried" && name != "has-room");
+            .retain(|entry| !matches!(entry.name(), "not-tried" | "has-room"));
     }
     let engines = [
         (true, engine_of("cache_aware")),

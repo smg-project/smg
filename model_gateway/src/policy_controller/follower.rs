@@ -299,6 +299,7 @@ pub(crate) mod tests {
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
             decide_shards: 1,
             election: Election::default(),
+            discovery: None,
         }
     }
 

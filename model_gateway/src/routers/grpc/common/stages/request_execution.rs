@@ -305,10 +305,14 @@ pub(crate) async fn execute_plan(
     // request retried on it.
     let ledger = &ctx.ledger;
 
-    ctx.load_guards = Some(LoadGuards::admitted(
-        admission,
-        LoadGuards::scaled(workers, ctx.sticky_key.as_deref(), sub_requests),
-    ));
+    let guards = LoadGuards::at_dispatch(
+        workers,
+        ctx.sticky_key.as_deref(),
+        sub_requests,
+        ctx.placed.take().map(|placed| *placed),
+        Instant::now(),
+    );
+    ctx.load_guards = Some(LoadGuards::admitted(admission, guards));
     // A sticky request to a grouped data-parallel worker goes to its key's
     // engine.
     pin_grouped_dp_rank(

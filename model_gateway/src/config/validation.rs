@@ -468,8 +468,8 @@ impl ConfigValidator {
     /// shapes, the overload thresholds, the tenant header's name, the
     /// discovery settings, then the fit of the policies to the pools. A
     /// start runs them among its other checks ([`Self::validate`]), and
-    /// then resolves a discovery provider's own configuration: a Consul
-    /// address and the Consul environment are checked there alone.
+    /// then resolves a discovery provider's runtime settings. Consul's
+    /// address syntax and environment are checked during that resolution.
     /// `--print-policy-spec` runs these alone, over a configuration that
     /// holds the routing part alone. None reads a file.
     pub(crate) fn validate_routing(config: &RouterConfig) -> ConfigResult<()> {
@@ -1620,296 +1620,19 @@ impl ConfigValidator {
     }
 
     fn validate_discovery(discovery: &DiscoveryConfig, mode: &RoutingMode) -> ConfigResult<()> {
-        match discovery {
-            DiscoveryConfig::Kubernetes(kubernetes) => {
-                Self::validate_kubernetes_discovery(kubernetes, mode)
-            }
-            DiscoveryConfig::File(file) => Self::validate_file_discovery(file, mode),
-            DiscoveryConfig::Slurm(slurm) => Self::validate_slurm_discovery(slurm, mode),
-            DiscoveryConfig::Consul(consul) => Self::validate_consul_discovery(consul, mode),
-        }
-    }
-
-    /// What `squeue` and `scontrol` report is checked at every poll, not here.
-    /// This checks that the job names map onto the routing mode's pools.
-    fn validate_slurm_discovery(
-        discovery: &SlurmDiscoveryConfig,
-        mode: &RoutingMode,
-    ) -> ConfigResult<()> {
-        let invalid = |field: &str, value: String, reason: &str| ConfigError::InvalidValue {
-            field: field.to_string(),
-            value,
-            reason: reason.to_string(),
+        let Some(roles) = mode.discovery_roles() else {
+            let unsupported = match mode {
+                RoutingMode::OpenAI { .. } => "OpenAI",
+                RoutingMode::Anthropic { .. } => "Anthropic",
+                RoutingMode::Gemini { .. } => "Gemini",
+                RoutingMode::Regular { .. } => "Regular",
+                RoutingMode::PrefillDecode { .. } => "PD",
+                RoutingMode::EncodePrefillDecode { .. } => "EPD",
+            };
+            let reason = format!("{unsupported} mode does not support service discovery");
+            return Err(ConfigError::ValidationFailed { reason });
         };
-        if discovery.port == 0 {
-            return Err(invalid(
-                "discovery.port",
-                "0".to_string(),
-                "Port must be > 0",
-            ));
-        }
-        if discovery.bootstrap_port == Some(0) {
-            return Err(invalid(
-                "discovery.bootstrap_port",
-                "0".to_string(),
-                "Port must be > 0",
-            ));
-        }
-        require_positive(
-            "discovery.check_interval_secs",
-            discovery.check_interval_secs,
-        )?;
-
-        let roles = [
-            ("discovery.job_names", "regular", &discovery.job_names),
-            (
-                "discovery.encode_job_names",
-                "encode",
-                &discovery.encode_job_names,
-            ),
-            (
-                "discovery.prefill_job_names",
-                "prefill",
-                &discovery.prefill_job_names,
-            ),
-            (
-                "discovery.decode_job_names",
-                "decode",
-                &discovery.decode_job_names,
-            ),
-        ];
-        // Each value reaches `squeue` inside a comma-separated list, where a
-        // comma would split it into two filters.
-        let scopes = [
-            ("discovery.user", &discovery.user),
-            ("discovery.account", &discovery.account),
-            ("discovery.partition", &discovery.partition),
-        ];
-        let values = roles
-            .iter()
-            .flat_map(|(field, _, names)| names.iter().map(move |name| (*field, name)))
-            .chain(
-                scopes
-                    .iter()
-                    .filter_map(|(field, value)| value.as_ref().map(|value| (*field, value))),
-            );
-        for (field, value) in values {
-            if value.is_empty() || value.contains(',') {
-                return Err(invalid(
-                    field,
-                    value.clone(),
-                    "Must be non-empty and contain no comma",
-                ));
-            }
-        }
-
-        let mut role_of = std::collections::HashMap::<&str, &str>::new();
-        for (_, role, names) in &roles {
-            for name in *names {
-                if let Some(other) = role_of.insert(name, role) {
-                    if other != *role {
-                        return Err(ConfigError::ValidationFailed {
-                            reason: format!(
-                                "Slurm job name '{name}' maps to both {other} and {role} workers"
-                            ),
-                        });
-                    }
-                }
-            }
-        }
-
-        let [regular, encode, prefill, decode] = roles.map(|(_, _, names)| !names.is_empty());
-        let (needed, unused) = match mode {
-            RoutingMode::Regular { .. } => (
-                (!regular)
-                    .then_some("Regular mode with Slurm discovery requires a regular job name"),
-                (encode || prefill || decode).then_some(
-                    "Regular mode has no encode, prefill or decode workers to map Slurm jobs to",
-                ),
-            ),
-            RoutingMode::PrefillDecode { .. } => (
-                (!(prefill || decode)).then_some(
-                    "PD mode with Slurm discovery requires a prefill or decode job name",
-                ),
-                (regular || encode)
-                    .then_some("PD mode has no regular or encode workers to map Slurm jobs to"),
-            ),
-            RoutingMode::EncodePrefillDecode { .. } => (
-                (!(encode && prefill && decode)).then_some(
-                    "EPD mode with Slurm discovery requires encode, prefill and decode job names",
-                ),
-                regular.then_some("EPD mode has no regular workers to map Slurm jobs to"),
-            ),
-            RoutingMode::OpenAI { .. } => {
-                (Some("OpenAI mode does not support service discovery"), None)
-            }
-            RoutingMode::Anthropic { .. } => (
-                Some("Anthropic mode does not support service discovery"),
-                None,
-            ),
-            RoutingMode::Gemini { .. } => {
-                (Some("Gemini mode does not support service discovery"), None)
-            }
-        };
-        if let Some(reason) = needed.or(unused) {
-            return Err(ConfigError::ValidationFailed {
-                reason: reason.to_string(),
-            });
-        }
-        if discovery.bootstrap_port.is_some() && !(encode || prefill) {
-            return Err(ConfigError::ValidationFailed {
-                reason: "A Slurm bootstrap port applies only to encode and prefill workers"
-                    .to_string(),
-            });
-        }
-        Ok(())
-    }
-
-    /// The manifest's own contents (worker types against the routing mode
-    /// included) are checked each time it is read, not here: it may not exist
-    /// yet, and it changes while the router runs.
-    fn validate_file_discovery(
-        discovery: &FileDiscoveryConfig,
-        mode: &RoutingMode,
-    ) -> ConfigResult<()> {
-        if discovery.path.as_os_str().is_empty() {
-            return Err(ConfigError::invalid_value(
-                "discovery.path",
-                String::new(),
-                "File discovery needs a manifest path",
-            ));
-        }
-        Self::validate_record_discovery(discovery.check_interval_secs, mode)
-    }
-
-    /// Consul's address, ACL token and TLS settings are resolved, with the
-    /// environment, when discovery starts; each instance's metadata is checked
-    /// against the routing mode whenever Consul answers.
-    fn validate_consul_discovery(
-        discovery: &ConsulDiscoveryConfig,
-        mode: &RoutingMode,
-    ) -> ConfigResult<()> {
-        if discovery.service.is_empty() {
-            return Err(ConfigError::invalid_value(
-                "discovery.service",
-                String::new(),
-                "Consul discovery needs a service name",
-            ));
-        }
-        for (field, value) in [
-            ("discovery.address", &discovery.address),
-            ("discovery.datacenter", &discovery.datacenter),
-        ] {
-            if value.as_deref() == Some("") {
-                return Err(ConfigError::invalid_value(
-                    field,
-                    String::new(),
-                    "Must not be empty when given",
-                ));
-            }
-        }
-        Self::validate_record_discovery(discovery.check_interval_secs, mode)
-    }
-
-    /// What the file and Consul providers share: their records name their own
-    /// worker types, so any mode with worker pools can use them.
-    fn validate_record_discovery(check_interval_secs: u64, mode: &RoutingMode) -> ConfigResult<()> {
-        require_positive("discovery.check_interval_secs", check_interval_secs)?;
-
-        let unsupported = match mode {
-            RoutingMode::Regular { .. }
-            | RoutingMode::PrefillDecode { .. }
-            | RoutingMode::EncodePrefillDecode { .. } => return Ok(()),
-            RoutingMode::OpenAI { .. } => "OpenAI",
-            RoutingMode::Anthropic { .. } => "Anthropic",
-            RoutingMode::Gemini { .. } => "Gemini",
-        };
-        Err(ConfigError::ValidationFailed {
-            reason: format!("{unsupported} mode does not support service discovery"),
-        })
-    }
-
-    fn validate_kubernetes_discovery(
-        discovery: &KubernetesDiscoveryConfig,
-        mode: &RoutingMode,
-    ) -> ConfigResult<()> {
-        if discovery.port == 0 {
-            return Err(ConfigError::invalid_value(
-                "discovery.port",
-                discovery.port,
-                "Port must be > 0",
-            ));
-        }
-
-        require_positive(
-            "discovery.check_interval_secs",
-            discovery.check_interval_secs,
-        )?;
-
-        for (field, value) in [
-            (
-                "discovery.kv_connector_annotation",
-                &discovery.kv_connector_annotation,
-            ),
-            (
-                "discovery.kv_engine_id_annotation",
-                &discovery.kv_engine_id_annotation,
-            ),
-        ] {
-            let trimmed = value.trim();
-            if trimmed.is_empty() || trimmed != value {
-                return Err(ConfigError::invalid_value(
-                    field,
-                    value,
-                    "Annotation name must not be empty or padded with whitespace",
-                ));
-            }
-        }
-
-        match mode {
-            RoutingMode::Regular { .. } => {
-                if discovery.selector.is_empty() {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: "Regular mode with service discovery requires a non-empty selector"
-                            .to_string(),
-                    });
-                }
-            }
-            RoutingMode::PrefillDecode { .. } => {
-                if discovery.prefill_selector.is_empty() && discovery.decode_selector.is_empty() {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: "PD mode with service discovery requires at least one non-empty selector (prefill or decode)".to_string(),
-                    });
-                }
-            }
-            RoutingMode::EncodePrefillDecode { .. } => {
-                if discovery.encode_selector.is_empty()
-                    || discovery.prefill_selector.is_empty()
-                    || discovery.decode_selector.is_empty()
-                {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: "EPD mode with service discovery requires non-empty encode_selector, prefill_selector, and decode_selector".to_string(),
-                    });
-                }
-            }
-            RoutingMode::OpenAI { .. } => {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "OpenAI mode does not support service discovery".to_string(),
-                });
-            }
-            RoutingMode::Anthropic { .. } => {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "Anthropic mode does not support service discovery".to_string(),
-                });
-            }
-            RoutingMode::Gemini { .. } => {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "Gemini mode does not support service discovery".to_string(),
-                });
-            }
-        }
-
-        Ok(())
+        discovery.validate(roles).map_err(ConfigError::from)
     }
 
     fn validate_metrics(metrics: &MetricsConfig) -> ConfigResult<()> {
@@ -4332,6 +4055,41 @@ mod tests {
 
         // Should pass validation since service discovery is enabled
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn vendor_modes_refuse_discovery_before_any_provider_check() {
+        let discovery = KubernetesDiscoveryConfig {
+            port: 0,
+            ..Default::default()
+        }
+        .into();
+        for (mode, expected) in [
+            (
+                RoutingMode::OpenAI {
+                    worker_urls: vec![],
+                },
+                "OpenAI mode does not support service discovery",
+            ),
+            (
+                RoutingMode::Anthropic {
+                    worker_urls: vec![],
+                },
+                "Anthropic mode does not support service discovery",
+            ),
+            (
+                RoutingMode::Gemini {
+                    worker_urls: vec![],
+                },
+                "Gemini mode does not support service discovery",
+            ),
+        ] {
+            let result = ConfigValidator::validate_discovery(&discovery, &mode);
+            assert!(
+                matches!(&result, Err(ConfigError::ValidationFailed { reason }) if reason == expected),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]
