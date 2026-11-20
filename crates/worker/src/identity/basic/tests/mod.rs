@@ -25,12 +25,11 @@ fn cb_state_gauge(rendered: &str) -> Option<f64> {
         .map(|value| value.parse().unwrap())
 }
 
-/// A same-URL replacement is built on a fresh breaker, which sets the
-/// URL's state gauge to closed before the registry adopts the live
-/// breaker. Adoption must publish the adopted state again, or an open
-/// breaker reads as closed until its next transition.
+/// A same-URL replacement is built on a fresh breaker, and neither its
+/// build nor its adoption of the live breaker writes the URL's state gauge:
+/// an open breaker reads open through both.
 #[test]
-fn adopting_a_live_breaker_republishes_its_state_gauge() {
+fn building_and_adopting_leave_a_live_breakers_state_gauge_as_it_stood() {
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     metrics::with_local_recorder(&recorder, || {
@@ -48,7 +47,7 @@ fn adopting_a_live_breaker_republishes_its_state_gauge() {
         let new = BasicWorkerBuilder::new("http://worker:8000")
             .circuit_breaker_config(config)
             .build();
-        assert_eq!(cb_state_gauge(&handle.render()), Some(0.0));
+        assert_eq!(cb_state_gauge(&handle.render()), Some(1.0));
 
         assert!(new.inherit_shared_state_from(&old));
         assert_eq!(new.circuit_breaker_state(), CircuitState::Open);
@@ -1397,12 +1396,25 @@ fn the_first_excluding_fact_names_the_state_and_a_registration_republishes_it() 
         late.record_circuit_breaker_outcome(false);
         let rendered = handle.render();
         assert_eq!(current_state(&rendered), "excluded/circuit_open");
-        assert!(
+        // Neither worker entered a registry, so no counter started at zero:
+        // a transition that was never counted has no series, and the two
+        // trips have theirs.
+        let counted = |from_to: &str| {
             rendered
                 .lines()
-                .any(|line| line.contains("smg_worker_cb_transitions_total")
-                    && line.contains("from=\"open\",to=\"half_open\"")
-                    && line.ends_with(" 0")),
+                .find(|line| {
+                    line.starts_with("smg_worker_cb_transitions_total{") && line.contains(from_to)
+                })
+                .and_then(|line| line.rsplit(' ').next())
+        };
+        assert_eq!(
+            counted("from=\"closed\",to=\"open\""),
+            Some("2"),
+            "{rendered}"
+        );
+        assert_eq!(
+            counted("from=\"open\",to=\"half_open\""),
+            None,
             "{rendered}"
         );
         assert!(
@@ -1692,4 +1704,50 @@ async fn a_failed_http_admin_call_names_the_worker_once_without_the_clients_url(
         1,
         "{text}"
     );
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_failed_http_health_check_is_logged_without_the_clients_url() {
+    let refused = RefusedAddress::reserve();
+    let url = format!("{}/?token=s3cret", refused.http_url());
+    let worker = BasicWorkerBuilder::new(&url).build();
+
+    worker
+        .check_health_async()
+        .await
+        .expect_err("nothing listens at the address");
+
+    assert!(!logs_contain("s3cret"));
+    assert!(logs_contain(&format!(
+        "HTTP health check failed for {}:",
+        refused.http_url()
+    )));
+}
+
+#[test]
+fn a_worker_and_its_metadata_print_no_api_key() {
+    let marker = "marble";
+    let url = "http://worker:8000";
+    let debug = |worker: &BasicWorker| {
+        let metadata = worker.metadata();
+        [
+            format!("{metadata:?}"),
+            format!("{metadata:#?}"),
+            format!("{worker:?}"),
+            format!("{worker:#?}"),
+        ]
+    };
+
+    let worker = BasicWorkerBuilder::new(url).api_key(marker).build();
+    for text in debug(&worker) {
+        assert!(!text.contains(marker));
+        assert!(text.contains("api_key: Some("));
+        assert!(text.contains(r#""<redacted>""#));
+    }
+
+    let worker = BasicWorkerBuilder::new(url).build();
+    for text in debug(&worker) {
+        assert!(text.contains("api_key: None"));
+    }
 }

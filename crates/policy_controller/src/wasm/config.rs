@@ -27,12 +27,14 @@ impl Abi {
     /// The major the host speaks.
     pub const MAJOR: u32 = 1;
     /// The oldest minor the host speaks.
-    pub const FLOOR_MINOR: u32 = 1;
+    pub const FLOOR_MINOR: u32 = 2;
     /// The newest minor the host speaks.
-    pub const SUPPORTED_MINOR: u32 = 1;
+    pub const SUPPORTED_MINOR: u32 = 2;
 
-    /// The one committed version today.
+    /// The version before `score` answered a record: under the floor.
     pub const V1_1: Self = Self { major: 1, minor: 1 };
+    /// The one committed version today.
+    pub const V1_2: Self = Self { major: 1, minor: 2 };
 
     /// Whether a module of this version runs on this host: the major must
     /// match and the minor lie within the supported range.
@@ -189,20 +191,21 @@ mod tests {
 
     #[test]
     fn the_abi_range_is_one_major_from_the_floor_to_the_supported_minor() {
-        assert!(Abi::V1_1.accepted());
-        assert!(!Abi { major: 2, minor: 1 }.accepted());
-        // Under the floor: the minor a shape was changed in place after.
+        assert!(Abi::V1_2.accepted());
+        assert!(!Abi { major: 2, minor: 2 }.accepted());
+        // Under the floor: the minors a shape was changed in place after.
         assert!(!Abi { major: 1, minor: 0 }.accepted());
-        assert_eq!(Abi::accepted_range(), "1.1");
+        assert!(!Abi::V1_1.accepted());
+        assert_eq!(Abi::accepted_range(), "1.2");
         assert!(!Abi {
             major: 1,
             minor: Abi::SUPPORTED_MINOR + 1
         }
         .accepted());
-        assert_eq!(Abi::parse("1.1.0"), Some(Abi::V1_1));
-        assert_eq!(Abi::parse("1.2"), Some(Abi { major: 1, minor: 2 }));
+        assert_eq!(Abi::parse("1.2.0"), Some(Abi::V1_2));
+        assert_eq!(Abi::parse("1.1"), Some(Abi::V1_1));
         assert_eq!(Abi::parse("one"), None);
-        assert_eq!(Abi::V1_1.to_string(), "1.1");
+        assert_eq!(Abi::V1_2.to_string(), "1.2");
     }
 
     #[test]

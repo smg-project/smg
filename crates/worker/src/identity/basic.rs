@@ -447,6 +447,18 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.is_healthy() && !self.is_overloaded() && self.stall_reason().is_none()
     }
 
+    /// Publish the series this worker carries while it is registered: its
+    /// health, its HTTP/2 flag and its circuit breaker's state. The registry
+    /// calls this where the worker enters, at a registration and at a
+    /// replacement. Building a worker writes none of them, so a worker that
+    /// is built and never enters leaves the series of its address as they
+    /// stood.
+    fn publish_series(&self) {
+        Metrics::set_worker_health(self.url(), self.is_healthy());
+        Metrics::set_worker_http2(self.url(), self.http2());
+        Metrics::set_worker_cb_state(self.url(), self.circuit_breaker_state().as_int());
+    }
+
     /// Publish the worker's routing state for an address whose series were
     /// dropped and come back (a registration): the current pair of state and
     /// reason is set whether or not it was the one published before.
@@ -1217,19 +1229,18 @@ impl BasicWorker {
         }
     }
 
+    /// The adoption writes no health and no breaker series: the registry has
+    /// the replacement publish its own once it has entered
+    /// ([`Worker::publish_series`]). The routing state moves here, from the
+    /// pair the replaced instance published.
     fn install_shared_state_from_basic(&self, other: &BasicWorker) {
         let shared_runtime = other.shared_runtime();
         shared_runtime.bump_revision();
-        let shared_status = shared_runtime.status();
         self.runtime.store(shared_runtime);
-        Metrics::set_worker_health(self.url(), shared_status == WorkerStatus::Ready);
 
         let existing_cb = self.circuit_breaker.load();
         let other_cb = other.circuit_breaker.load_full();
         if other_cb.config() == existing_cb.config() {
-            // Building this worker reset the URL's breaker state gauge to
-            // closed; the adopted breaker is what monitoring must show.
-            other_cb.publish_metrics();
             self.circuit_breaker.store(other_cb);
         }
         self.publish_state();
@@ -1392,8 +1403,9 @@ impl BasicWorker {
             }
             Err(err) => {
                 tracing::warn!(
-                    "HTTP health check failed for {}: {err:?}",
-                    super::endpoint::Endpoint::redacted_str(&health_url)
+                    "HTTP health check failed for {}: {:?}",
+                    super::endpoint::Endpoint::redacted_str(&health_url),
+                    err.without_url()
                 );
                 Ok(false)
             }
@@ -1800,6 +1812,17 @@ impl Worker for BasicWorker {
         if after != before || after == CircuitState::Open {
             self.publish_state();
         }
+    }
+
+    /// The breaker publishes itself, under the lock that orders its gauge
+    /// writes: a transition that races the entry cannot leave the gauge
+    /// behind the state. Its counters are on the scrape from zero.
+    fn publish_series(&self) {
+        Metrics::set_worker_health(self.url(), self.is_healthy());
+        Metrics::set_worker_http2(self.url(), self.http2());
+        let breaker = self.circuit_breaker.load();
+        breaker.publish_zero_counters();
+        breaker.publish_metrics();
     }
 
     fn republish_state(&self) {

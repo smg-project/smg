@@ -427,6 +427,38 @@ fn build_worker_spec_carries_the_record_and_stamps_provenance() {
     );
 }
 
+#[test]
+fn build_worker_spec_omits_a_blank_model_override() {
+    let host = TestHost::without_a_queue();
+    for model_id_override in ["", " \t"] {
+        let worker = DiscoveredWorker {
+            model_id_override: Some(model_id_override.to_string()),
+            ..published("10.0.0.1:8081", "uid-1:8081")
+        };
+        let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*host);
+
+        assert!(
+            !spec.labels.contains_key("served_model_name"),
+            "override {model_id_override:?} was stamped as served_model_name"
+        );
+    }
+}
+
+#[test]
+fn build_worker_spec_trims_a_padded_model_override() {
+    let host = TestHost::without_a_queue();
+    let worker = DiscoveredWorker {
+        model_id_override: Some(" llama \t".to_string()),
+        ..published("10.0.0.1:8081", "uid-1:8081")
+    };
+    let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*host);
+
+    assert_eq!(
+        spec.labels.get("served_model_name").map(String::as_str),
+        Some("llama")
+    );
+}
+
 /// Compatibility labels are opaque here: any key a provider supplies is
 /// written verbatim. The keys below are deliberately not Kubernetes' — the
 /// reconciler has no notion of which provider's labels it is carrying.
@@ -542,6 +574,29 @@ fn register_an_unpublished_worker(host: &TestHost, url: &str) {
     );
 }
 
+#[tokio::test]
+async fn the_reconciler_asks_as_discovery() {
+    let (host, jobs) = TestHost::recording();
+    register_an_unpublished_worker(&host, "http://10.0.0.2:8080");
+    let desired = desired_state_of(&[published("http://10.0.0.1:8080", "u1")]);
+
+    pass(&desired, &host).await;
+
+    assert!(matches!(
+        jobs.queued().as_slice(),
+        [
+            Queued::Remove {
+                asker: WorkerJobAsker::Discovery,
+                ..
+            },
+            Queued::Add {
+                asker: WorkerJobAsker::Discovery,
+                ..
+            },
+        ]
+    ));
+}
+
 /// What a pass hands the queue is the spec its host stamped, the credential
 /// and the budget of attempts on it, under an Upsert.
 #[tokio::test]
@@ -551,7 +606,7 @@ async fn a_pass_registers_the_spec_its_host_stamped() {
     pass(&desired_state_of(slice::from_ref(&worker)), &host).await;
 
     let queued = jobs.queued();
-    let [Queued::Add { spec, mode }] = queued.as_slice() else {
+    let [Queued::Add { spec, mode, .. }] = queued.as_slice() else {
         panic!("one addition and nothing else: {queued:?}");
     };
     assert_eq!(*mode, WorkerRegistrationMode::Upsert);
@@ -585,7 +640,7 @@ async fn a_pass_leaves_an_address_whose_job_is_in_flight() {
     jobs.release("http://10.0.0.1:8080");
     pass(&desired, &host).await;
     let queued = jobs.queued();
-    let [Queued::Remove { url, guards }, Queued::Add { spec, .. }] = queued.as_slice() else {
+    let [Queued::Remove { url, guards, .. }, Queued::Add { spec, .. }] = queued.as_slice() else {
         panic!("the removal, then the addition: {queued:?}");
     };
     assert_eq!(url, "10.0.0.2:8080");

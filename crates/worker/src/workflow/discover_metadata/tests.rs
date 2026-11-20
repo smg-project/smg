@@ -6,7 +6,7 @@ use wfaas::WorkflowInstanceId;
 
 use super::*;
 use crate::{
-    jobs::WorkerRegistrationMode,
+    jobs::{WorkerJobAsker, WorkerRegistrationMode},
     test_support::{ScriptedAnswers, ScriptedConnector},
     worker::WorkerSpec,
     workflow::host::testing::{serve_json_routes, ProbingHost},
@@ -19,7 +19,12 @@ fn local_context(
     runtime: Option<&str>,
 ) -> WorkflowContext<WorkerRegistrationWorkflowData<ProbingHost>> {
     let host = ProbingHost::new(false, connector);
-    let mut data = WorkerRegistrationWorkflowData::new(spec, WorkerRegistrationMode::Upsert, host);
+    let mut data = WorkerRegistrationWorkflowData::new(
+        spec,
+        WorkerRegistrationMode::Upsert,
+        host,
+        WorkerJobAsker::Api,
+    );
     data.worker_kind = Some(WorkerKind::Local);
     data.connection_mode = Some(connection_mode);
     data.detected_runtime_type = runtime.map(str::to_string);
@@ -67,7 +72,7 @@ async fn an_http_workers_labels_are_read_with_the_hosts_client() {
 /// runtime the detection settled.
 #[tokio::test]
 async fn a_grpc_workers_labels_are_read_through_the_hosts_connector() {
-    let runtime = METADATA_DEFAULT;
+    let runtime = DEFAULT_RUNTIME;
     let engine = Arc::new(ScriptedAnswers::describing(
         Ok(&[("model_path", "org/model-a")]),
         Ok(&[("version", "1.2")]),
@@ -109,7 +114,7 @@ async fn a_read_that_fails_leaves_no_labels_and_passes() {
         ScriptedConnector::default(),
         WorkerSpec::new("grpc://worker-a:9000"),
         ConnectionMode::Grpc,
-        Some(METADATA_DEFAULT.as_str()),
+        Some(DEFAULT_RUNTIME.as_str()),
     );
     ctx.data
         .discovered_labels

@@ -61,16 +61,17 @@ kube = { version = "3.0.1", default-features = false, features = ["client", "rus
 
 # The ingestion drivers (the `ingest` feature): the load path over the
 # store's ingress traits (the `GetLoads` poll through the engines' gRPC
-# clients, the metrics scrape over HTTP) and the load helpers (the row
-# conversion, the scrape parser).
+# clients and the metrics scrape over HTTP).
 openai-protocol = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["rustls-no-provider"], optional = true }
 smg-grpc-client = { workspace = true, optional = true }
 
-# A replica's worker objects (the `worker-host` feature): the worker crate's
-# object, its builder and its registry, for the host that keeps an object for
-# every row of the membership store.
-smg-worker = { workspace = true, features = ["runtime"], optional = true }
+# The load report type for `ingest` and `worker-host`. The worker host also
+# needs the runtime for worker objects, the registry and collector ports.
+smg-worker = { workspace = true, optional = true }
+# Worker discovery (the `discovery` feature): the discovery crate with its
+# four providers, each of which the controller's flags can select.
+smg-service-discovery = { workspace = true, features = ["consul", "file", "kubernetes", "slurm"], optional = true }
 
 # The standalone controller (the `controller` feature): the listeners, the
 # health service, the admin endpoints and the binary. Every dependency below
@@ -87,7 +88,7 @@ prost = { workspace = true, optional = true }
 # or HTTP client; the gateway, the servicer and the mock worker install the
 # same one.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
-tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"], optional = true }
+tokio = { workspace = true, features = ["sync"], optional = true }
 tonic = { workspace = true, features = ["tls-ring"], optional = true }
 tonic-health = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
@@ -126,55 +127,71 @@ tonic-prost-build = { version = "0.14.6", optional = true }
 [features]
 # The ingestion drivers over the store: the load path (the `GetLoads` poll
 # per engine under the store's poll arbitration, the metrics scrape of an
-# engine without a servicer) and the load helpers. Off by default; the
-# controller turns it on.
+# engine without a servicer). Off by default. The controller turns it on.
 ingest = [
     "dep:openai-protocol",
     "dep:reqwest",
     "dep:rustls",
     "dep:smg-grpc-client",
+    "dep:smg-worker",
     "dep:tokio",
     "dep:tonic",
+    "dep:tracing",
+    "tokio/macros",
+    "tokio/rt",
+    "tokio/time",
+]
+# Reading and applying a policy document in process. The turn uses only
+# Tokio's sync primitives. It builds on every target. The spec store's file
+# calls come of `rustix`, a dependency on Linux and macOS alone: on another
+# target a door has no spec store to bind.
+operator = [
+    "dep:rustix",
+    "dep:serde_path_to_error",
+    "dep:serde_yaml",
+    "dep:tokio",
     "dep:tracing",
 ]
 # The standalone controller: the ingestion drivers, the listeners with their
 # scopes, the protocol's generated service and client, the election, the gRPC
-# health service, the admin endpoints and the binary of the package's name.
+# health service and the admin endpoints. The stock binary also needs
+# `worker-host` to read cache events.
 # Off by default: the engine alone has no server dependency. It builds on
 # Linux and macOS: the gRPC plugin kind dials a Unix socket and reads its
 # peer's user through `rustix`, which is declared for those two.
 controller = [
     "ingest",
+    "operator",
     "dep:axum",
     "dep:clap",
     "dep:hyper-util",
     "dep:metrics",
     "dep:metrics-exporter-prometheus",
     "dep:prost",
-    "dep:rustix",
     "dep:rustls",
-    "dep:serde_path_to_error",
-    "dep:serde_yaml",
     "dep:thread_local",
     "dep:tikv-jemallocator",
-    "dep:tokio",
     "dep:tokio-stream",
     "dep:tonic",
     "dep:tonic-health",
     "dep:tonic-prost",
     "dep:tonic-prost-build",
     "dep:tower",
-    "dep:tracing",
     "dep:tracing-subscriber",
+    "tokio/fs",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+    "tokio/signal",
 ]
 
-# The reference client of the controller's protocol, for the crate's cases
-# and for examples: the generated client behind one type. It adds no
-# dependency to the controller's, and no shipped binary builds it.
+# The gateway's side of the controller's protocol: the reference client, the
+# link a host's requests share and the watcher. It adds no dependency to the
+# controller's. The gateway builds it on the targets the controller builds
+# on, to follow a controller.
 client = ["controller"]
 
 # The Kubernetes Lease backend of the elector.
-kubernetes = ["dep:k8s-openapi", "dep:kube", "dep:tokio"]
+kubernetes = ["dep:k8s-openapi", "dep:kube", "tokio/rt"]
 
 # A replica's worker objects: one object of the worker crate for every row of
 # the membership store, in a registry the host hands in, built, replaced and
@@ -183,7 +200,11 @@ kubernetes = ["dep:k8s-openapi", "dep:kube", "dep:tokio"]
 # without it. Where the build holds the engine clients, as the controller's
 # does, it turns their engine port on: the controller hands each object the
 # gRPC connector.
-worker-host = ["dep:smg-worker", "smg-grpc-client?/engine-port"]
+worker-host = ["dep:smg-worker", "dep:tracing", "smg-grpc-client?/engine-port", "smg-worker/runtime"]
+
+# Worker discovery on the leading controller, over the replica's worker
+# objects. Off by default.
+discovery = ["controller", "worker-host", "dep:smg-service-discovery"]
 
 default = ["wasm"]
 # The WebAssembly plugin host over the committed `smg:policy` worlds.
@@ -192,7 +213,7 @@ wasm = ["dep:wasmtime", "dep:thread_local", "dep:tracing", "dep:rustix"]
 # host that takes the thread's core. The package's own tests and benches
 # turn it on through the dev-dependency on the package itself; no build of
 # a product has it.
-test-util = []
+test-util = ["smg-worker?/test-util"]
 
 [dev-dependencies]
 # The package itself with `test-util`, for its own tests and benches alone.
@@ -203,6 +224,8 @@ test-util = []
 # name first, and the controller image's line, which names its features so,
 # would turn them on for this test edge alone and build no binary.
 smg-policy-controller-test-util = { package = "smg-policy-controller", path = ".", default-features = false, features = ["test-util"] }
+# The discovery cases record the jobs a provider submits.
+smg-service-discovery = { workspace = true, features = ["test-util"] }
 criterion = "0.8"
 # The Kubernetes elector's tests run its client against a service in the
 # test's process that plays one Lease, and its three-process cell against
@@ -211,6 +234,8 @@ axum = { workspace = true }
 http = { workspace = true }
 # The load driver's unit tests add the test macro and tokio's paused clock.
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
+# The spec store cases collect the lines the source logs.
+tracing-subscriber = { workspace = true }
 # The corpus test reads YAML documents.
 serde_yaml = { workspace = true }
 # The contract tests (tests/contracts.rs) compile the protocol to a
@@ -246,21 +271,25 @@ rustix = { version = "1", default-features = false, features = ["pty"] }
 [[bin]]
 name = "smg-policy-controller"
 path = "src/bin/smg-policy-controller.rs"
-required-features = ["controller"]
+required-features = ["controller", "worker-host"]
 
 [[test]]
 name = "binary"
-required-features = ["controller"]
+required-features = ["controller", "worker-host"]
+
+[[test]]
+name = "operator_door"
+required-features = ["operator"]
 
 [[test]]
 name = "spec_file"
-required-features = ["controller"]
+required-features = ["controller", "worker-host"]
 
 [[test]]
 name = "spec_store"
-required-features = ["controller"]
+required-features = ["controller", "worker-host"]
 
-# Replays recorded rows through the row builder of `ingest`: a bare test run builds no part of it.
+# Replays recorded rows through the load report conversion under `ingest`.
 [[test]]
 name = "classic_rows"
 required-features = ["ingest"]
@@ -275,7 +304,7 @@ required-features = ["kubernetes"]
 
 [[test]]
 name = "failover"
-required-features = ["client"]
+required-features = ["client", "worker-host"]
 
 [[test]]
 name = "fleet"
@@ -296,11 +325,11 @@ required-features = ["controller"]
 
 [[test]]
 name = "membership_door"
-required-features = ["controller"]
+required-features = ["controller", "worker-host"]
 
 [[test]]
 name = "replicas"
-required-features = ["controller"]
+required-features = ["controller", "worker-host"]
 
 [[test]]
 name = "replication"
@@ -308,10 +337,14 @@ required-features = ["controller"]
 
 [[test]]
 name = "watch_workers"
-required-features = ["controller"]
+required-features = ["controller", "worker-host"]
 
 [[bench]]
 name = "decision"
+harness = false
+
+[[bench]]
+name = "shadow"
 harness = false
 
 # One validation by a spec's index keys. Apart from `decision`: that binary
@@ -427,6 +460,10 @@ harness = false
 # predictor yet, so no id of `decision` moves with it.
 [[bench]]
 name = "predictor"
+harness = false
+
+[[bench]]
+name = "sent"
 harness = false
 
 [lints]

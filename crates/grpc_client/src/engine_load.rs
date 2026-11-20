@@ -2,8 +2,8 @@
 //! against the engines' `GetLoads` shapes: what a servicer fills from its
 //! engine's per-rank report. What the gateway reads back into its per-rank
 //! snapshot is the worker crate's conversion, beside both of its types; the
-//! cases here hold the two directions together, so the `smg_engine_*` gauges
-//! and `GET /loads` show the same under pushes as under a poll.
+//! cases here hold the fixed fields together so those figures agree under
+//! pushes and polls.
 //!
 //! The routing core (running and waiting requests, the queued token-work,
 //! KV usage, generation rate, the admission window) rides every record; the
@@ -316,6 +316,7 @@ mod tests {
         let rank = sglang_rank();
         let polled = SchedulerLoadSnapshot::from(rank.clone());
         let record = common::EngineLoad::from(&rank);
+        assert!(polled.values.is_empty() && record.values.is_empty());
         assert_eq!(record.cache_hit_rate, Some(0.42));
         assert_eq!(
             record.disaggregation.as_ref().map(|d| d.mode.as_str()),
@@ -360,6 +361,7 @@ mod tests {
         };
         let polled = SchedulerLoadSnapshot::from(rank);
         let record = common::EngineLoad::from(&rank);
+        assert!(polled.values.is_empty() && record.values.is_empty());
         assert!(record.memory.is_some() && record.disaggregation.is_none());
         assert_eq!(record.num_resident_tokens, Some(70_000));
         assert_eq!(polled.num_resident_tokens, Some(70_000));
@@ -389,6 +391,7 @@ mod tests {
         };
         let polled = SchedulerLoadSnapshot::from(rank);
         let record = common::EngineLoad::from(&rank);
+        assert!(polled.values.is_empty() && record.values.is_empty());
         assert!(record.memory.is_none() && record.queues.is_none());
         assert_eq!(
             format!("{polled:?}"),
@@ -418,6 +421,7 @@ mod tests {
         let polled = SchedulerLoadSnapshot::from(rank);
         let record = common::EngineLoad::from(&rank);
         assert!(record.memory.is_none() && record.queues.is_none());
+        assert!(polled.values.is_empty() && record.values.is_empty());
         assert_eq!(record.prefill_throughput, Some(12_000.0));
         assert_eq!(
             format!("{polled:?}"),
@@ -433,6 +437,7 @@ mod tests {
         let mut record = common::EngineLoad::from(&sglang_rank());
         core_only(&mut record);
         let snapshot = SchedulerLoadSnapshot::from(&record);
+        assert!(record.values.is_empty() && snapshot.values.is_empty());
         assert!(record.cache_hit_rate.is_none() && record.memory.is_none());
         assert!(snapshot.memory.is_none() && snapshot.disagg_mode.is_none());
         assert_eq!(

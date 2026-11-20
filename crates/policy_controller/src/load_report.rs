@@ -1,11 +1,9 @@
-//! A worker's load row from its report: the conversion the gateway's
-//! policies have read since the engine host took the view, moved here so
-//! the controller's drivers and the gateway's embedded path produce the
-//! same row from the same report.
+//! A worker's load row from its report, shared by the load driver and the
+//! worker host's load adapter.
 
 use std::time::Instant;
 
-use openai_protocol::worker::WorkerLoadResponse;
+use smg_worker::worker::WorkerLoadResponse;
 
 use crate::view::{permille, LoadRow, Role, SignalSource};
 
@@ -91,7 +89,7 @@ fn narrow(count: i64) -> u32 {
 mod tests {
     use std::time::Duration;
 
-    use openai_protocol::worker::SchedulerLoadSnapshot;
+    use smg_worker::worker::SchedulerLoadSnapshot;
 
     use super::*;
 

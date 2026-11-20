@@ -57,6 +57,7 @@ mod tests {
 
     use smg_worker::{
         identity::{basic::ConnectionMode, endpoint::Endpoint},
+        jobs::WorkerJobAsker,
         workflow::{
             discover_engine_labels, grpc_health_answer, grpc_reachable_url, http_health_url,
             try_grpc_reachable,
@@ -180,6 +181,7 @@ mod tests {
                 spec,
                 WorkerRegistrationMode::Upsert,
                 create_test_app_context(),
+                WorkerJobAsker::Api,
             );
             data.worker_kind = Some(WorkerKind::Local);
             data.connection_mode = Some(ConnectionMode::Grpc);

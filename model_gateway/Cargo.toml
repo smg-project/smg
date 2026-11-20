@@ -53,7 +53,7 @@ path = "src/main.rs"
 [[bin]]
 name = "amg"
 path = "src/main.rs"
-# The same source as `smg`: its unit tests run in the `smg` binary's test harness, so this one builds none.
+# Both binaries use the library's command line. Its unit tests run with the library.
 test = false
 
 [dependencies]
@@ -106,9 +106,9 @@ smg-mm-rdma.workspace = true
 smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
 smg-rl.workspace = true
-# The policy document and its presets alone, with none of the crate's
-# features: the routing configuration is written as a document
-# (`config/policy_document.rs`) and nothing decides by it.
+# The policy document, its presets, and the controller's store, door and
+# handle in this process: every target builds them, with none of the crate's
+# features. The crate's client is two targets': see the end of this file.
 smg-policy-controller.workspace = true
 smg-grpc-client.workspace = true
 engine-zmq-client.workspace = true
@@ -327,3 +327,10 @@ workspace = true
 [target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true, features = ["stats"] }
+
+# The controller crate's client, for a gateway that follows a controller
+# (`src/policy_controller/follower.rs`). The client builds on the controller's
+# own runtime, which builds on Linux and macOS. Those two take it, and a
+# controller's address is refused at startup elsewhere.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+smg-policy-controller = { workspace = true, features = ["client"] }

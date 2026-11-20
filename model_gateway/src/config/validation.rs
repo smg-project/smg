@@ -3,7 +3,7 @@ use std::{
     path::Path,
 };
 
-use axum::http::{HeaderName, HeaderValue, Uri};
+use axum::http::{uri::Authority, HeaderName, HeaderValue, Uri};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use smg_worker::identity::url_door::listed_worker_url_refusal;
@@ -483,6 +483,7 @@ impl ConfigValidator {
     }
 
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        Self::validate_policy_controller(config)?;
         Self::validate_routing_shapes(config)?;
         Self::validate_server_settings(config)?;
         Self::validate_cors_allowed_origins(config)?;
@@ -2194,6 +2195,68 @@ impl ConfigValidator {
         Ok(())
     }
 
+    fn validate_policy_controller(config: &RouterConfig) -> ConfigResult<()> {
+        let refuse = |reason: &str| {
+            Err(ConfigError::IncompatibleConfig {
+                reason: reason.to_owned(),
+            })
+        };
+        let Some(address) = &config.policy_controller_address else {
+            let tls = [
+                (
+                    "--policy-controller-tls-ca-cert",
+                    &config.policy_controller_tls_ca_cert,
+                ),
+                (
+                    "--policy-controller-tls-cert",
+                    &config.policy_controller_tls_cert,
+                ),
+                (
+                    "--policy-controller-tls-key",
+                    &config.policy_controller_tls_key,
+                ),
+            ];
+            if let Some((option, _)) = tls.into_iter().find(|(_, path)| path.is_some()) {
+                return refuse(&format!("{option} requires --policy-controller-address"));
+            }
+            return Ok(());
+        };
+        if !config.policy_controller {
+            return refuse("--policy-controller-address requires the policy_controller setting (--policy-controller)");
+        }
+        // The follower dials through the controller crate's client, which
+        // the gateway's manifest takes on these two targets alone.
+        if cfg!(not(any(target_os = "linux", target_os = "macos"))) {
+            return refuse("--policy-controller-address is followed on Linux and macOS alone");
+        }
+        let valid_address = address.parse::<Authority>().is_ok_and(|authority| {
+            !address.contains('@')
+                && url::Host::parse(authority.host()).is_ok()
+                && authority.port_u16().is_some_and(|port| port != 0)
+        });
+        if !valid_address {
+            return refuse("--policy-controller-address must be host:port with a port from 1 to 65535 and brackets around IPv6");
+        }
+        if config.policy_controller_tls_cert.is_some() != config.policy_controller_tls_key.is_some()
+        {
+            return refuse("--policy-controller-tls-cert and --policy-controller-tls-key must be given together");
+        }
+        // The connection trusts the authority's file and no other root: a
+        // client certificate without it could verify no controller.
+        if config.policy_controller_tls_cert.is_some()
+            && config.policy_controller_tls_ca_cert.is_none()
+        {
+            return refuse("--policy-controller-tls-cert requires --policy-controller-tls-ca-cert, the one root the connection trusts");
+        }
+        if config.mode.worker_count() != 0 {
+            return refuse("--policy-controller-address supplies the workers and conflicts with --worker-urls, --encode, --prefill and --decode");
+        }
+        if config.discovery.is_some() {
+            return refuse("--policy-controller-address supplies the workers and conflicts with --service-discovery and --discovery-provider");
+        }
+        Ok(())
+    }
+
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
         let has_service_discovery = config.discovery.is_some();
         let invalid_decode_policy = match &config.mode {
@@ -2223,7 +2286,9 @@ impl ConfigValidator {
         Self::validate_mtls(config)?;
 
         // Under dp_aware each URL registers one worker per DP rank.
-        if !has_service_discovery && !config.dp_aware {
+        // A followed fleet gets its workers from the controller.
+        if !has_service_discovery && !config.dp_aware && config.policy_controller_address.is_none()
+        {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
                 let worker_count = config.mode.worker_count();
                 if worker_count < 2 {
@@ -2306,6 +2371,220 @@ impl ConfigValidator {
 mod tests {
 
     use super::*;
+
+    /// A configuration under an address. Startup refuses the address first
+    /// on a target that does not build the follower, so the cases that
+    /// read past that refusal are built on the two targets that do.
+    fn following_config() -> RouterConfig {
+        RouterConfig {
+            policy_controller: true,
+            policy_controller_address: Some("controller:30100".to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn controller_refusal(config: &RouterConfig, names: &[&str]) {
+        let error = config
+            .validate()
+            .expect_err("the configuration is refused")
+            .to_string();
+        for name in names {
+            assert!(error.contains(name), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_controller_address_requires_the_policy_controller() {
+        controller_refusal(
+            &RouterConfig {
+                policy_controller: false,
+                ..following_config()
+            },
+            &["--policy-controller-address", "policy_controller"],
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_controller_address_is_a_host_with_a_port() {
+        for address in [
+            "",
+            ":30100",
+            "controller",
+            "controller:0",
+            "controller:65536",
+            "http://controller:30100",
+            "controller:30100/path",
+            "user@controller:30100",
+            "2001:db8::1:30100",
+            "[not-an-ip]:30100",
+        ] {
+            controller_refusal(
+                &RouterConfig {
+                    policy_controller_address: Some(address.to_owned()),
+                    ..following_config()
+                },
+                &["--policy-controller-address", "host:port"],
+            );
+        }
+        // Each end of the port range is taken.
+        for address in [
+            "controller:30100",
+            "127.0.0.1:80",
+            "[::1]:443",
+            "controller:1",
+            "controller:65535",
+        ] {
+            RouterConfig {
+                policy_controller_address: Some(address.to_owned()),
+                ..following_config()
+            }
+            .validate()
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn every_controller_tls_option_requires_an_address() {
+        for (name, config) in [
+            (
+                "--policy-controller-tls-ca-cert",
+                RouterConfig {
+                    policy_controller_tls_ca_cert: Some("ca.pem".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "--policy-controller-tls-cert",
+                RouterConfig {
+                    policy_controller_tls_cert: Some("cert.pem".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "--policy-controller-tls-key",
+                RouterConfig {
+                    policy_controller_tls_key: Some("key.pem".to_owned()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            controller_refusal(&config, &[name, "--policy-controller-address"]);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_controller_tls_certificate_and_key_require_each_other() {
+        for config in [
+            RouterConfig {
+                policy_controller_tls_cert: Some("cert.pem".to_owned()),
+                ..following_config()
+            },
+            RouterConfig {
+                policy_controller_tls_key: Some("key.pem".to_owned()),
+                ..following_config()
+            },
+        ] {
+            controller_refusal(
+                &config,
+                &[
+                    "--policy-controller-tls-cert",
+                    "--policy-controller-tls-key",
+                ],
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_controller_client_certificate_requires_its_authority() {
+        let pair = || RouterConfig {
+            policy_controller_tls_cert: Some("cert.pem".to_owned()),
+            policy_controller_tls_key: Some("key.pem".to_owned()),
+            ..following_config()
+        };
+        controller_refusal(
+            &pair(),
+            &[
+                "--policy-controller-tls-cert",
+                "--policy-controller-tls-ca-cert",
+            ],
+        );
+        RouterConfig {
+            policy_controller_tls_ca_cert: Some("ca.pem".to_owned()),
+            ..pair()
+        }
+        .validate()
+        .expect("a pair beside its authority's file is taken");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_controller_address_refuses_worker_urls() {
+        controller_refusal(
+            &RouterConfig {
+                mode: RoutingMode::Regular {
+                    worker_urls: vec!["http://worker:8000".to_owned()],
+                },
+                ..following_config()
+            },
+            &["--policy-controller-address", "--worker-urls"],
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_controller_address_refuses_service_discovery() {
+        controller_refusal(
+            &RouterConfig {
+                discovery: Some(
+                    FileDiscoveryConfig {
+                        path: "fleet.yaml".into(),
+                        check_interval_secs: 1,
+                    }
+                    .into(),
+                ),
+                ..following_config()
+            },
+            &[
+                "--policy-controller-address",
+                "--service-discovery",
+                "--discovery-provider",
+            ],
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_followed_fleet_can_use_power_of_two_without_static_workers() {
+        let config = RouterConfig {
+            policy: PolicyConfig::PowerOfTwo {
+                load_metric: Default::default(),
+            },
+            ..following_config()
+        };
+        config.validate().unwrap();
+        assert!(RouterConfig {
+            policy_controller_address: None,
+            ..config
+        }
+        .validate()
+        .is_err());
+    }
+
+    /// A following configuration read back from its own record is the one
+    /// that was written: the setting the address needs is written with it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_following_configuration_read_back_from_its_record_is_valid() {
+        let record = serde_json::to_value(following_config()).unwrap();
+        let back: RouterConfig = serde_json::from_value(record.clone()).unwrap();
+        back.validate()
+            .expect("the record of a following gateway reads back whole");
+        assert_eq!(record["policy_controller"], true);
+        assert!(back.policy_controller);
+    }
 
     /// The reason reads "Must be > 0", so a signed zero and a negative are refused alike.
     #[test]

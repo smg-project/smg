@@ -331,9 +331,10 @@ async fn a_poll_carries_its_sample_time_and_keeps_the_poll_start_for_arbitration
         );
     };
     for (reported, sampled, age) in [
-        (None, started, 0),
         (Some(before), before, 750),
         (Some(during), during, 350),
+        // An unstamped poll uses its start even after a later sample.
+        (None, started, 0),
         (Some(received + Duration::from_millis(1)), received, 0),
     ] {
         write(reported);
@@ -344,7 +345,7 @@ async fn a_poll_carries_its_sample_time_and_keeps_the_poll_start_for_arbitration
     }
 
     store.record(id, 0, LoadRow::default(), during, LoadSource::Stream);
-    write(Some(before));
+    write(Some(received));
     assert_eq!(
         store.load(id, 0).expect("the pushed row").source,
         LoadSource::Stream

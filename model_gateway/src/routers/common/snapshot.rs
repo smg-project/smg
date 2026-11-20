@@ -72,7 +72,10 @@ impl RoutingPool {
         }
     }
 
-    fn matches(self, worker: &Arc<dyn Worker>) -> bool {
+    /// Whether `worker` is a member of this pool: the one rule of
+    /// membership. The snapshot projects its pools by it, and a route asks
+    /// it of a worker handed to it from outside the snapshot.
+    pub(crate) fn matches(self, worker: &dyn Worker) -> bool {
         match self {
             Self::HttpRegular => {
                 *worker.worker_type() == WorkerType::Regular
@@ -108,7 +111,7 @@ impl RoutingPool {
 /// encode/prefill/decode dispatch: a gRPC worker, or a direct-ZMQ
 /// engine whose wire carries the rendezvous and the encode request (the
 /// other ZMQ wires carry neither, and registration refuses them a role).
-fn serves_disaggregated_role(worker: &Arc<dyn Worker>) -> bool {
+fn serves_disaggregated_role(worker: &dyn Worker) -> bool {
     match worker.connection_mode() {
         ConnectionMode::Grpc => true,
         ConnectionMode::Zmq => worker.metadata().spec.runtime_type == RuntimeType::TokenSpeed,
@@ -348,12 +351,12 @@ impl ModelWorkerSnapshot {
     /// keeps the pool past the snapshot clones the `Arc` itself.
     pub(crate) fn pool(&self, pool: RoutingPool) -> &WorkerSnapshot {
         self.pools[pool.index()].get_or_init(|| {
-            if self.all.iter().all(|worker| pool.matches(worker)) {
+            if self.all.iter().all(|worker| pool.matches(worker.as_ref())) {
                 return Arc::clone(&self.all);
             }
             self.all
                 .iter()
-                .filter(|worker| pool.matches(worker))
+                .filter(|worker| pool.matches(worker.as_ref()))
                 .cloned()
                 .collect()
         })

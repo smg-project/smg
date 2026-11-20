@@ -651,13 +651,23 @@ pub struct RouterConfig {
     /// When set, wraps all storage backends with hook-based interceptors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_hook_wasm_path: Option<String>,
-    /// Which code decides a request's worker: the classic policies (off, the
-    /// default) or the policy controller in this process (on). One temporary
-    /// setting, whole for a process. At this step it is for tests alone: no
-    /// flag, no binding keyword and no chart value sets it, and it is in no
-    /// serialized form.
-    #[serde(skip)]
+    /// Select the policy controller for this process. The classic policies
+    /// are the default. Written where it is on, so a configuration under a
+    /// controller's address reads back with the setting the address needs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub policy_controller: bool,
+    /// Address of the controller's gateway listener, as `host:port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_controller_address: Option<String>,
+    /// PEM certificate authority file for the controller connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_controller_tls_ca_cert: Option<String>,
+    /// PEM client certificate file for the controller connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_controller_tls_cert: Option<String>,
+    /// PEM client private key file for the controller connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_controller_tls_key: Option<String>,
 }
 
 /// Capacity threshold for one PD role.
@@ -2074,6 +2084,10 @@ impl Default for RouterConfig {
             enable_wasm: false,
             storage_hook_wasm_path: None,
             policy_controller: false,
+            policy_controller_address: None,
+            policy_controller_tls_ca_cert: None,
+            policy_controller_tls_cert: None,
+            policy_controller_tls_key: None,
             server_cert: None,
             server_key: None,
             server_key_path: None,
@@ -2182,6 +2196,46 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_controller_options_round_trip_and_unset_options_are_omitted() {
+        let default = serde_json::to_value(RouterConfig::default()).unwrap();
+        let paths = [
+            ("policy_controller_address", "controller:30100"),
+            ("policy_controller_tls_ca_cert", "ca.pem"),
+            ("policy_controller_tls_cert", "cert.pem"),
+            ("policy_controller_tls_key", "key.pem"),
+        ];
+        let mut configured = default.clone();
+        for (name, value) in paths {
+            assert!(default.get(name).is_none(), "{name}");
+            configured[name] = value.into();
+        }
+        // The setting the address needs is written where it is on, and
+        // nowhere else.
+        assert!(default.get("policy_controller").is_none());
+        configured["policy_controller"] = true.into();
+        let config: RouterConfig = serde_json::from_value(configured).unwrap();
+        assert!(config.policy_controller);
+        assert_eq!(
+            config.policy_controller_address.as_deref(),
+            Some("controller:30100")
+        );
+        assert_eq!(
+            config.policy_controller_tls_ca_cert.as_deref(),
+            Some("ca.pem")
+        );
+        assert_eq!(
+            config.policy_controller_tls_cert.as_deref(),
+            Some("cert.pem")
+        );
+        assert_eq!(config.policy_controller_tls_key.as_deref(), Some("key.pem"));
+        let serialized = serde_json::to_value(config).unwrap();
+        for (name, value) in paths {
+            assert_eq!(serialized[name], value);
+        }
+        assert_eq!(serialized["policy_controller"], true);
+    }
 
     /// The mode is in the gateway's start-up lines: a worker URL's secret is
     /// never written there, the rest of the derive's form is kept.

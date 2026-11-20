@@ -51,6 +51,22 @@ pub fn intern_string(s: &str) -> Arc<str> {
         .clone()
 }
 
+/// The ranks whose label [`rank_label`] keeps in its table.
+const TABLED_RANKS: usize = 16;
+
+/// The `dp_rank` label of a data-parallel rank, the same text for every
+/// writer of a rank's series. The first ranks come from a table built
+/// once: a record that builds its own keys formats nothing and interns
+/// nothing for its rank. A rank past the table is formatted and interned.
+fn rank_label(dp_rank: i32) -> Arc<str> {
+    static FIRST: Lazy<[Arc<str>; TABLED_RANKS]> =
+        Lazy::new(|| std::array::from_fn(|rank| Arc::from(rank.to_string())));
+    usize::try_from(dp_rank)
+        .ok()
+        .and_then(|rank| FIRST.get(rank))
+        .map_or_else(|| intern_string(&dp_rank.to_string()), Arc::clone)
+}
+
 #[cfg(any(test, feature = "test-util"))]
 pub fn interner_size() -> usize {
     STRING_INTERNER.len()
@@ -85,7 +101,7 @@ mod handles {
     use metrics::{Counter, Gauge, Histogram};
     use rustc_hash::FxHashMap;
 
-    use super::{intern_model_label, intern_string};
+    use super::{intern_model_label, intern_string, rank_label};
     #[cfg(test)]
     pub(super) use crate::metrics::handles::force_on_this_thread;
     pub(super) use crate::metrics::handles::{
@@ -139,7 +155,7 @@ mod handles {
             Self {
                 worker: intern_string(worker_url),
                 model: intern_model_label(model_id),
-                dp_rank: intern_string(&dp_rank.to_string()),
+                dp_rank: rank_label(dp_rank),
             }
         }
     }
@@ -479,6 +495,12 @@ pub fn describe_series() {
         "Load-monitor tick decisions by worker and mode: poll (no pushed load record on file), \
          fallback (pushed records older than the tick interval), skipped_fresh_push (the \
          worker's KV-event stream pushed its load within the interval; no GetLoads RPC)"
+    );
+    describe_counter!(
+        "smg_engine_load_values_dropped_total",
+        "Named values of pushed load records dropped at the report's bounds, by worker: an \
+         entry past the first 64 of a record, an empty name, a name over 63 bytes, a unit \
+         over 31 bytes, a value that is not finite, a name the record states again"
     );
     describe_counter!(
         "smg_kv_event_gaps_total",
@@ -1019,6 +1041,16 @@ impl Metrics {
             .set(if unavailable { 1.0 } else { 0.0 });
     }
 
+    /// Named values a pushed load record stated and its snapshot dropped at
+    /// a bound.
+    pub fn record_engine_load_values_dropped(worker_url: &str, dropped: usize) {
+        counter!(
+            "smg_engine_load_values_dropped_total",
+            "worker" => intern_string(worker_url)
+        )
+        .increment(dropped as u64);
+    }
+
     /// One load-monitor tick decision for a worker (see `PollMode`).
     pub fn record_engine_load_poll(worker_url: &str, mode: &'static str) {
         counter!(
@@ -1504,51 +1536,93 @@ impl Metrics {
         STRING_INTERNER.remove(worker_url);
     }
 
-    /// Sentinel-out the `smg_engine_*` series of a worker whose load feed
-    /// ended while its URL stays registered: its status left `Ready`, or a
-    /// same-URL replacement has not yet published its own load (see
-    /// `WorkerMonitor::evict_worker_loads`). The worker series store keeps
-    /// those series, so the last load would read as live. Each gauge is set
-    /// to -1, an impossible value for gauges whose 0 is meaningful. A removed
+    /// Sentinel-out one rank's `smg_engine_*` series at a worker's URL: the
+    /// six load gauges under each of `models`, which carry the worker, the
+    /// model and the rank, and the four pair gauges under every role
+    /// (prefill/decode/null), which carry the worker, the engine's role
+    /// and the rank, and no model. The collector sets them for a worker
+    /// whose load feed ended while its URL stays registered: its status
+    /// left `Ready`, or a same-URL replacement took its place (see
+    /// `WorkerMonitor::clear_series`). The worker series store keeps those
+    /// series, so the last load would read as live. Each gauge is set to
+    /// -1, an impossible value for gauges whose 0 is meaningful. A removed
     /// worker needs no sentinel: the store drops every `worker`-labelled
     /// series with the registration ([`Self::remove_worker_metrics`]) and
     /// no-ops the writes that follow, this one included.
-    /// `dp_size` bounds the rank labels; the role label is unknown at teardown,
-    /// so the full `dp_rank` × role (prefill/decode/null) space is cleared. The
-    /// label set must exactly match `record_engine_load` (including `model` and
-    /// `dp_rank`) or a fresh series is created instead of overwriting the live one.
-    pub fn remove_engine_load_metrics(worker_url: &str, model_id: &str, dp_size: usize) {
+    ///
+    /// A series a live writer writes is left. The writer asks `live`,
+    /// series by series: does a live writer at the URL hold an entry of
+    /// this rank that passes the series' test, under a model for the load
+    /// gauges and under any (`None`) for the pair gauges? The tests are
+    /// [`Self::record_engine_rank_load`]'s own conditions: any entry for
+    /// the five core gauges, one that carries the capacity for the
+    /// capacity gauge, one that reports the role and carries the figure
+    /// for a pair gauge. The collector answers over every entry of the
+    /// rank its live writers hold: a rollup's row names a rank once a
+    /// downstream worker, and a poll writes each. The label sets must
+    /// match that writer's exactly, or a fresh series is created instead
+    /// of overwriting the live one. One call a rank: no rank between two
+    /// is written, and the rank's label is built once.
+    pub(crate) fn remove_engine_rank_metrics(
+        worker_url: &str,
+        models: &[String],
+        dp_rank: i32,
+        live: impl Fn(Option<&str>, &LoadTest<'_>) -> bool,
+    ) {
         let worker = intern_string(worker_url);
-        let model = intern_model_label(model_id);
-
-        for rank in 0..dp_size.max(1) {
-            let dp_rank = intern_string(&rank.to_string());
-            for name in [
-                "smg_engine_running_requests",
-                "smg_engine_waiting_requests",
-                "smg_engine_token_usage",
-                "smg_engine_gen_throughput",
-                "smg_engine_cache_hit_rate",
-                "smg_engine_kv_capacity_tokens",
-            ] {
-                gauge!(
-                    name,
-                    "worker" => Arc::clone(&worker),
-                    "model" => Arc::clone(&model),
-                    "dp_rank" => Arc::clone(&dp_rank),
-                )
-                .set(-1.0);
+        let dp_rank = rank_label(dp_rank);
+        for model_id in models {
+            let model_id = model_id.as_str();
+            let core = live(Some(model_id), &|_| true);
+            let capacity = live(Some(model_id), &|load| load.max_total_num_tokens > 0);
+            if core && capacity {
+                continue;
             }
-
-            // PD gauges are labeled {worker, role, dp_rank}; the role is unknown
-            // at teardown, so clear every role for this rank.
-            for role in ["prefill", "decode", "null"] {
-                for name in [
+            let model = intern_model_label(model_id);
+            for (name, written) in [
+                ("smg_engine_running_requests", core),
+                ("smg_engine_waiting_requests", core),
+                ("smg_engine_token_usage", core),
+                ("smg_engine_gen_throughput", core),
+                ("smg_engine_cache_hit_rate", core),
+                ("smg_engine_kv_capacity_tokens", capacity),
+            ] {
+                if !written {
+                    gauge!(
+                        name,
+                        "worker" => Arc::clone(&worker),
+                        "model" => Arc::clone(&model),
+                        "dp_rank" => Arc::clone(&dp_rank),
+                    )
+                    .set(-1.0);
+                }
+            }
+        }
+        for role in ["prefill", "decode", "null"] {
+            let carries = |figure: fn(&crate::worker::SchedulerLoadSnapshot) -> bool| {
+                live(None, &|load| {
+                    load.disagg_mode.as_deref() == Some(role) && figure(load)
+                })
+            };
+            for (name, written) in [
+                (
                     "smg_engine_pd_kv_transfer_latency_ms",
+                    carries(|load| load.kv_transfer_latency_ms.is_some()),
+                ),
+                (
                     "smg_engine_pd_kv_transfer_speed_gb_s",
+                    carries(|load| load.kv_transfer_speed_gb_s.is_some()),
+                ),
+                (
                     "smg_engine_pd_prefill_queue_reqs",
+                    carries(|load| load.prefill_queue_reqs.is_some()),
+                ),
+                (
                     "smg_engine_pd_decode_queue_reqs",
-                ] {
+                    carries(|load| load.decode_queue_reqs.is_some()),
+                ),
+            ] {
+                if !written {
                     gauge!(
                         name,
                         "worker" => Arc::clone(&worker),
@@ -1561,6 +1635,11 @@ impl Metrics {
         }
     }
 }
+
+/// A test of one entry of a load, for the sentinel's guard
+/// ([`Metrics::remove_engine_rank_metrics`]): whether the entry carries
+/// the figure of the series in question.
+pub(crate) type LoadTest<'t> = dyn Fn(&crate::worker::SchedulerLoadSnapshot) -> bool + 't;
 
 #[cfg(test)]
 mod tests;

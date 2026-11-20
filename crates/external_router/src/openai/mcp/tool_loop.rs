@@ -384,9 +384,10 @@ fn streaming_call_item(
 }
 
 /// A streamed call closed on the wire with its item (the format's completed
-/// event, then the item's `response.output_item.done`) and recorded in the
-/// loop's state, as the non-streamed loop records a call. Returns false when
-/// the client left.
+/// event, or `response.mcp_call.failed` for an `mcp_call` that failed, then
+/// the item's `response.output_item.done`) and recorded in the loop's state,
+/// as the non-streamed loop records a call. Returns false when the client
+/// left.
 async fn close_streaming_call(
     call: FunctionCallInProgress,
     mcp_call_item: Value,
@@ -764,7 +765,10 @@ async fn send_tool_call_intermediate_event(
 
 /// Send tool call completion events after tool execution.
 /// Handles mcp_call, web_search_call, code_interpreter_call, file_search_call,
-/// and image_generation_call items.
+/// and image_generation_call items. An `mcp_call` whose item reads `failed`
+/// closes under `response.mcp_call.failed`, as a call past the allowance
+/// does ([`skip_streaming_tool_calls`]); the hosted formats have no failed
+/// sub-event, so their item's status says it.
 /// Returns false if client disconnected.
 async fn send_tool_call_completion_events(
     tx: &SseSender,
@@ -776,32 +780,39 @@ async fn send_tool_call_completion_events(
     let effective_output_index = call.effective_output_index();
     let item_id = stable_streaming_tool_item_id(call, response_format);
 
-    // Resolve the completion event from the item's `type` (the typed
+    // Resolve the closing event from the item's `type` (the typed
     // `tool_call_item` may have been re-tagged after dispatch); fall back
-    // to the format-derived event for unknown types.
+    // to the format-derived event for unknown types. A failed `mcp_call`
+    // has a sub-event of its own.
     let item_type = tool_call_item
         .get("type")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let completed_event_type: &str = openai_bridge::format_from_type_str(item_type)
-        .map(|f| openai_bridge::descriptor(f).completed_event)
-        .unwrap_or_else(|| openai_bridge::descriptor(response_format).completed_event);
+    let failed_mcp_call = item_type == ItemType::MCP_CALL
+        && tool_call_item.get("status").and_then(|v| v.as_str()) == Some("failed");
+    let close_event_type: &str = if failed_mcp_call {
+        McpEvent::CALL_FAILED
+    } else {
+        openai_bridge::format_from_type_str(item_type)
+            .map(|f| openai_bridge::descriptor(f).completed_event)
+            .unwrap_or_else(|| openai_bridge::descriptor(response_format).completed_event)
+    };
 
-    // Event 1: response.<type>.completed
-    let completed_payload = json!({
-        "type": completed_event_type,
+    // Event 1: response.<type>.completed, or response.mcp_call.failed
+    let close_payload = json!({
+        "type": close_event_type,
         "sequence_number": *sequence_number,
         "output_index": effective_output_index,
         "item_id": item_id
     });
     *sequence_number += 1;
 
-    let completed_event = format!("event: {completed_event_type}\ndata: {completed_payload}\n\n");
-    if tx.send(Ok(Bytes::from(completed_event))).await.is_err() {
+    let close_event = format!("event: {close_event_type}\ndata: {close_payload}\n\n");
+    if tx.send(Ok(Bytes::from(close_event))).await.is_err() {
         return false;
     }
 
-    // Event 2: response.output_item.done (with completed tool call)
+    // Event 2: response.output_item.done (with the call's final item)
     let done_payload = json!({
         "type": OutputItemEvent::DONE,
         "sequence_number": *sequence_number,
@@ -2556,8 +2567,70 @@ mod tests {
         );
     }
 
-    /// A streamed call the session cannot run is closed on the wire the way
-    /// an executed one is: the format's completed event, then the item's
+    /// The sub-event a dispatched call closes under, read from its item: an
+    /// `mcp_call` that failed closes under `response.mcp_call.failed`, the
+    /// event a call past the allowance closes under; an `mcp_call` that
+    /// completed, and a hosted-format call whatever its status (the API has
+    /// no failed sub-event for those item types), close under the format's
+    /// completed event. The item's `response.output_item.done` follows each.
+    #[tokio::test]
+    async fn a_dispatched_call_closes_under_the_sub_event_its_item_reads() {
+        for (item_type, status, format, sub_event) in [
+            (
+                "mcp_call",
+                "completed",
+                ResponseFormat::Passthrough,
+                "response.mcp_call.completed",
+            ),
+            (
+                "mcp_call",
+                "failed",
+                ResponseFormat::Passthrough,
+                "response.mcp_call.failed",
+            ),
+            (
+                "web_search_call",
+                "failed",
+                ResponseFormat::WebSearchCall,
+                "response.web_search_call.completed",
+            ),
+        ] {
+            let call = super::FunctionCallInProgress {
+                call_id: "call_1".to_string(),
+                name: "search".to_string(),
+                arguments_buffer: "{}".to_string(),
+                item_id: Some("fc_1".to_string()),
+                output_index: 0,
+                last_obfuscation: None,
+                assigned_output_index: Some(0),
+            };
+            let item = json!({"type": item_type, "id": "item_1", "status": status});
+            let (tx, mut rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+            let mut sequence_number: u64 = 0;
+            let ok = super::send_tool_call_completion_events(
+                &tx,
+                &call,
+                &item,
+                format,
+                &mut sequence_number,
+            )
+            .await;
+            assert!(ok);
+            drop(tx);
+            let types: Vec<String> = drain_channel(&mut rx)
+                .iter()
+                .map(|block| event_type_from_sse_block(block))
+                .collect();
+            assert_eq!(
+                types,
+                [sub_event, "response.output_item.done"],
+                "{item_type} with status {status}"
+            );
+        }
+    }
+
+    /// A streamed call the session cannot run is closed on the wire as a
+    /// call that failed: `response.mcp_call.failed`, then the item's
     /// `response.output_item.done`, in sequence, under the id the stream
     /// announced for the call; the loop's state records the call with its
     /// error output and its errored-call metric counts it once.
@@ -2598,10 +2671,18 @@ mod tests {
             .collect();
         assert_eq!(
             types,
-            ["response.mcp_call.completed", "response.output_item.done"],
+            ["response.mcp_call.failed", "response.output_item.done"],
             "the call's events, in order"
         );
         assert_eq!(sequence_number, 9, "one sequence number per event");
+        let failed: serde_json::Value = events[0]
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .and_then(|data| serde_json::from_str(data).ok())
+            .expect("the failed event's data");
+        assert_eq!(failed["sequence_number"], 7);
+        assert_eq!(failed["output_index"], 3);
+        assert_eq!(failed["item_id"], "mcp_9", "the id the stream announced");
         let done: serde_json::Value = events[1]
             .lines()
             .find_map(|line| line.strip_prefix("data: "))

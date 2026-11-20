@@ -442,9 +442,47 @@ async fn a_worker_registered_without_labels_is_refreshed_when_it_comes_into_serv
     );
 }
 
+#[tokio::test]
+async fn the_health_manager_asks_as_health() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let url = "http://worker:8000";
+    let worker = make_worker(url, 1, 1);
+    let id = registry.register(Arc::clone(&worker)).unwrap();
+    let revision = worker.revision();
+    let removals = RecordedJobs::default();
+    let refreshes = RecordedQueue::default();
+
+    submit_removal_job(
+        &registry,
+        &id,
+        url,
+        revision,
+        &removals,
+        UnhealthyRemovalScope::AllLocal,
+    )
+    .await;
+    submit_label_refresh(&worker, &refreshes).await;
+
+    assert_eq!(
+        *removals.0.lock(),
+        [(
+            url.to_string(),
+            id.as_str().to_string(),
+            revision,
+            WorkerJobAsker::Health
+        )]
+    );
+    assert_eq!(
+        refreshes.get_status(url).unwrap().asker,
+        Some(WorkerJobAsker::Health)
+    );
+}
+
 /// The job a [`RecordedQueue`] holds for an address.
+#[derive(Clone)]
 struct HeldJob {
     job_type: &'static str,
+    asker: Option<WorkerJobAsker>,
 }
 
 /// A `WorkerJobs` in the job queue's place, for a case that reads what the
@@ -454,40 +492,53 @@ struct HeldJob {
 #[derive(Default)]
 struct RecordedQueue {
     /// The job in flight for each address, by its type.
-    held: parking_lot::Mutex<HashMap<String, &'static str>>,
-    /// The addresses whose refresh waits behind the job in flight.
-    kept: parking_lot::Mutex<Vec<String>>,
+    held: parking_lot::Mutex<HashMap<String, HeldJob>>,
+    /// The refreshes that wait behind the job in flight.
+    kept: parking_lot::Mutex<Vec<(String, WorkerJobAsker)>>,
 }
 
 impl RecordedQueue {
     /// Hold `url` for a job of `job_type`, as a job in flight does.
     fn hold_url_for_tests(&self, url: &str, job_type: &'static str) {
-        self.held.lock().insert(url.to_string(), job_type);
+        self.held.lock().insert(
+            url.to_string(),
+            HeldJob {
+                job_type,
+                asker: None,
+            },
+        );
     }
 
     /// Whether a refresh waits behind the job that holds `url`.
     fn kept_for(&self, url: &str) -> bool {
-        self.kept.lock().iter().any(|kept| kept == url)
+        self.kept.lock().iter().any(|(kept, _)| kept == url)
     }
 
     /// The job that holds `url`.
     fn get_status(&self, url: &str) -> Option<HeldJob> {
-        self.held
-            .lock()
-            .get(url)
-            .map(|&job_type| HeldJob { job_type })
+        self.held.lock().get(url).cloned()
     }
 }
 
 #[async_trait]
 impl WorkerJobs for RecordedQueue {
-    async fn refresh_worker_labels(&self, url: String) -> Result<bool, String> {
+    async fn refresh_worker_labels(
+        &self,
+        url: String,
+        asker: WorkerJobAsker,
+    ) -> Result<bool, String> {
         let mut held = self.held.lock();
         if held.contains_key(&url) {
-            self.kept.lock().push(url);
+            self.kept.lock().push((url, asker));
             return Ok(false);
         }
-        held.insert(url, "RefreshWorkerLabels");
+        held.insert(
+            url,
+            HeldJob {
+                job_type: "RefreshWorkerLabels",
+                asker: Some(asker),
+            },
+        );
         Ok(true)
     }
 
@@ -495,6 +546,7 @@ impl WorkerJobs for RecordedQueue {
         &self,
         _spec: WorkerSpec,
         _mode: WorkerRegistrationMode,
+        _asker: WorkerJobAsker,
     ) -> Result<bool, String> {
         Ok(true)
     }
@@ -503,6 +555,7 @@ impl WorkerJobs for RecordedQueue {
         &self,
         _url: String,
         _guards: Vec<(WorkerId, u64)>,
+        _asker: WorkerJobAsker,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -512,8 +565,8 @@ impl WorkerJobs for RecordedQueue {
     }
 }
 
-/// What a recorded removal names: the address, the worker's id and its revision.
-type Removal = (String, String, u64);
+/// A removal's address, worker id, revision and asker.
+type Removal = (String, String, u64, WorkerJobAsker);
 
 /// A `WorkerJobs` that keeps the removals it is asked for.
 #[derive(Default)]
@@ -521,7 +574,11 @@ struct RecordedJobs(parking_lot::Mutex<Vec<Removal>>);
 
 #[async_trait]
 impl WorkerJobs for RecordedJobs {
-    async fn refresh_worker_labels(&self, _url: String) -> Result<bool, String> {
+    async fn refresh_worker_labels(
+        &self,
+        _url: String,
+        _asker: WorkerJobAsker,
+    ) -> Result<bool, String> {
         Ok(true)
     }
 
@@ -529,6 +586,7 @@ impl WorkerJobs for RecordedJobs {
         &self,
         _spec: WorkerSpec,
         _mode: WorkerRegistrationMode,
+        _asker: WorkerJobAsker,
     ) -> Result<bool, String> {
         Ok(true)
     }
@@ -537,10 +595,16 @@ impl WorkerJobs for RecordedJobs {
         &self,
         url: String,
         guards: Vec<(WorkerId, u64)>,
+        asker: WorkerJobAsker,
     ) -> Result<(), String> {
         let mut removals = self.0.lock();
         for (worker_id, revision) in guards {
-            removals.push((url.clone(), worker_id.as_str().to_string(), revision));
+            removals.push((
+                url.clone(),
+                worker_id.as_str().to_string(),
+                revision,
+                asker.clone(),
+            ));
         }
         Ok(())
     }
@@ -598,6 +662,7 @@ async fn a_worker_that_fails_under_a_removal_scope_is_handed_over_by_id_and_revi
             worker.base_url().to_string(),
             worker_id.as_str().to_string(),
             revision,
+            WorkerJobAsker::Health,
         )]
     );
 }

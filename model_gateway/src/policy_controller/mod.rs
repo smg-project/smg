@@ -1,15 +1,16 @@
 //! The policy controller in this process.
 //!
 //! A request's worker has two possible deciders: the classic policies, and
-//! the policy controller's engine over the controller's store. One temporary
-//! setting picks one of them for the whole process
+//! the policy controller's engine over the controller's store. One
+//! setting picks a decider for the whole process
 //! ([`RouterConfig::policy_controller`]). The classic policies are the
 //! default.
 //!
 //! At this step the setting starts the store and hands it the policy
-//! document the routing configuration means. Nothing feeds the store yet and
-//! no code of the controller decides. So the server answers with one
-//! refusing router in the gateway object's place ([`router`]). No gateway
+//! document the routing configuration means. Without a controller's address
+//! nothing feeds the store yet, and no code of the controller decides. So
+//! the server answers with one refusing router in the gateway object's
+//! place ([`router`]). No gateway
 //! object and no classic router is built, and each request is refused by
 //! name: the classic policies never decide for a process the controller was
 //! picked for. With the setting off nothing here is constructed, and no
@@ -17,6 +18,10 @@
 //!
 //! One site reads the setting, [`start`]. Every other site asks what the
 //! start left in the context.
+//!
+//! Under a controller's address a follower keeps the store's worker rows
+//! as that controller's watch tells them ([`follower`]). The gateway then
+//! discovers, registers and probes no worker of its own.
 
 use std::sync::Arc;
 
@@ -32,8 +37,26 @@ use crate::{
     routers::RouterTrait,
 };
 
+// The follower dials through the controller crate's client, which two
+// targets build (the manifest says why). Elsewhere its names stand in its
+// place, and startup refuses a controller's address before one is started.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod follower;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[path = "follower_absent.rs"]
+pub(crate) mod follower;
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the request's end and the pair's routers call the rest in later changes"
+    )
+)]
+pub(crate) mod host;
 mod undecided;
 
+pub(crate) use undecided::refused;
 use undecided::Undecided;
 
 /// Why the controller's store did not start.

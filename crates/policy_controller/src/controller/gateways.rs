@@ -35,8 +35,10 @@
 //! welcomed and let go again.
 //!
 //! A gateway's vetoes are noted here by kind (design 5.1). The store shows
-//! one end a gateway and worker: the latest of the kinds' ends that still
-//! stand, so a kind that clears never lifts another. A session writes a
+//! one veto a gateway and worker, with no kind and two ends. The first is
+//! the latest of the kinds' ends that still stand, so a kind that clears
+//! never lifts another. The second is the veto's hold: the latest end of
+//! the kinds no rule lifts ([`hold_of`]). A session writes a
 //! veto through its seat, under the table's lock, where the question is
 //! asked again: a replaced session's veto is never written, and no pass
 //! reclaims one. The note follows the store: a veto is about a worker's
@@ -51,6 +53,7 @@
 //! present gateway's key is refused, never merged into that gateway's row.
 
 use std::{
+    collections::BTreeSet,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Weak,
@@ -68,6 +71,7 @@ use tracing::{info, warn};
 
 use crate::{
     elector::Fence,
+    proto::gateway_veto::Kind,
     store::{GatewayId, HealthSink, LeasesStore, MemoryStore, VetoWrite, WorkersStore},
     view::WorkerId,
 };
@@ -78,6 +82,19 @@ type Ends = Vec<(i32, Instant)>;
 /// The latest of a worker's ends: what the store shows.
 fn latest(ends: &[(i32, Instant)]) -> Option<Instant> {
     ends.iter().map(|&(_, end)| end).max()
+}
+
+/// The kind the all-vetoed rule lifts as its last resort: the contract's
+/// `KIND_LIVENESS`, a doubt of the worker's liveness.
+const LIVENESS: i32 = Kind::Liveness as i32;
+
+/// The hold among a worker's ends, which the store shows beside the latest:
+/// the latest end of the kinds no rule lifts. Every kind but [`LIVENESS`]
+/// holds. A breaker's open window does, and so does a number this build
+/// has no name for: the rule lifts what it can name.
+fn hold_of(ends: &[(i32, Instant)]) -> Option<Instant> {
+    let holding = ends.iter().filter(|&&(kind, _)| kind != LIVENESS);
+    holding.map(|&(_, end)| end).max()
 }
 
 /// How many kinds of veto one worker holds for one gateway at most. A kind
@@ -154,6 +171,11 @@ pub(crate) struct Gateways {
 #[derive(Default)]
 struct Table {
     rows: FxHashMap<GatewayId, Row>,
+    /// The next instant each row needs a sweep visit, ordered by instant.
+    /// A row has at most one entry, kept in step with [`Row::deadline`].
+    deadlines: BTreeSet<(Instant, GatewayId)>,
+    #[cfg(test)]
+    sweep_visits: usize,
     /// The highest term the table was read under since this replica last
     /// led; `None` when the last read found the fence closed, and before
     /// the first.
@@ -187,6 +209,8 @@ struct Row {
     /// ends past their instants ([`Row::prune`]) sets it to the earliest
     /// end left. `None` only while the note holds no end.
     next_end: Option<Instant>,
+    /// This row's entry in [`Table::deadlines`].
+    deadline: Option<Instant>,
     /// The membership epoch at the note's last walk for rows that left
     /// ([`Row::left`]), `None` before the first: a row leaves by a
     /// membership write alone, so one walk an epoch finds every one.
@@ -211,6 +235,14 @@ pub(crate) struct Seat {
     gateway: GatewayId,
     session: u64,
     superseded: Arc<Replaced>,
+    #[cfg(test)]
+    drop_pause: Option<Arc<DropPause>>,
+}
+
+#[cfg(test)]
+struct DropPause {
+    gone: std::sync::Barrier,
+    swept: std::sync::Barrier,
 }
 
 impl Row {
@@ -264,7 +296,8 @@ impl Seat {
     }
 
     /// One kind's veto on `worker` set until `until`, or lifted, at `now`:
-    /// the other kinds' ends stand, and the store shows the latest.
+    /// the other kinds' ends stand, and the store shows the latest of them
+    /// with the hold among them ([`hold_of`]).
     pub(crate) fn veto(
         &self,
         worker: WorkerId,
@@ -286,7 +319,8 @@ impl Seat {
     /// The session ended at `now`, where a case names the instant.
     #[cfg(test)]
     pub(crate) fn end(self, now: Instant) {
-        self.gateways.gone(self.gateway, self.session, now);
+        self.gateways
+            .gone(self.gateway, self.session, &self.superseded, now);
     }
 }
 
@@ -294,7 +328,12 @@ impl Drop for Seat {
     fn drop(&mut self) {
         // A no-op after `end`: the row's period started there.
         self.gateways
-            .gone(self.gateway, self.session, Instant::now());
+            .gone(self.gateway, self.session, &self.superseded, Instant::now());
+        #[cfg(test)]
+        if let Some(pause) = &self.drop_pause {
+            pause.gone.wait();
+            pause.swept.wait();
+        }
     }
 }
 
@@ -349,9 +388,51 @@ impl Gateways {
             .map_or(0, |row| row.replaced.len())
     }
 
+    /// How many rows the sweep has visited.
+    #[cfg(test)]
+    fn take_sweep_visits(&self) -> usize {
+        std::mem::take(&mut self.table.lock().sweep_visits)
+    }
+
     /// The grace period, as a `Welcome` tells it.
     pub(crate) fn grace(&self) -> Duration {
         self.grace
+    }
+
+    /// The next instant a row needs pruning or may be over. A gone row is
+    /// first asked at one grace period; if a replaced session still runs,
+    /// it is asked once more at the hard two-period limit.
+    fn deadline(&self, row: &Row, now: Instant) -> Option<Instant> {
+        let presence = row.gone.and_then(|gone| {
+            let first = gone.checked_add(self.grace)?;
+            let runs = row
+                .replaced
+                .iter()
+                .any(|session| session.strong_count() > 0);
+            if first <= now && runs {
+                gone.checked_add(self.grace.saturating_mul(2))
+            } else {
+                Some(first)
+            }
+        });
+        presence.into_iter().chain(row.next_end).min()
+    }
+
+    /// Replace one row's scheduled instant. Removing the old entry before
+    /// adding the new one keeps the index bounded to one entry per row.
+    fn set_deadline(table: &mut Table, gateway: GatewayId, deadline: Option<Instant>) {
+        let Some(row) = table.rows.get_mut(&gateway) else {
+            return;
+        };
+        if row.deadline == deadline {
+            return;
+        }
+        if let Some(old) = std::mem::replace(&mut row.deadline, deadline) {
+            table.deadlines.remove(&(old, gateway));
+        }
+        if let Some(deadline) = deadline {
+            table.deadlines.insert((deadline, gateway));
+        }
     }
 
     /// A `Welcome` at `now` under `term`, the session's read of the fence,
@@ -377,7 +458,7 @@ impl Gateways {
     ) -> Result<Seat, Refused> {
         let mut table = self.table.lock();
         let shown = self.fence.leader_term(now);
-        Self::observe(&mut table, shown, now);
+        self.observe(&mut table, shown, now);
         // The seat is taken under the term this read shows or not at all:
         // a Hello read under a term the election has left would supersede
         // a session of the term that stands.
@@ -389,6 +470,7 @@ impl Gateways {
             .get(&gateway)
             .is_some_and(|row| self.over(row, now))
         {
+            Self::set_deadline(&mut table, gateway, None);
             if let Some(row) = table.rows.remove(&gateway) {
                 self.end(vec![(gateway, row)]);
             }
@@ -430,6 +512,7 @@ impl Gateways {
             vetoes: FxHashMap::default(),
             held: 0,
             next_end: None,
+            deadline: None,
             left_at: None,
             ended: watch::channel(()).0,
         });
@@ -444,11 +527,16 @@ impl Gateways {
         row.session = session;
         row.gone = None;
         row.superseded = Arc::new(Replaced::default());
+        let superseded = Arc::clone(&row.superseded);
+        let deadline = self.deadline(row, now);
+        Self::set_deadline(&mut table, gateway, deadline);
         Ok(Seat {
             gateways: Arc::clone(self),
             gateway,
             session,
-            superseded: Arc::clone(&row.superseded),
+            superseded,
+            #[cfg(test)]
+            drop_pause: None,
         })
     }
 
@@ -456,7 +544,7 @@ impl Gateways {
     /// when it is not present. No decision asks: a stream's open and end do.
     pub(crate) fn presence(&self, gateway: GatewayId, now: Instant) -> Option<Presence> {
         let mut table = self.table.lock();
-        Self::observe(&mut table, self.fence.leader_term(now), now);
+        self.observe(&mut table, self.fence.leader_term(now), now);
         let row = table.rows.get(&gateway)?;
         (!self.over(row, now)).then(|| Presence(row.ended.subscribe()))
     }
@@ -466,18 +554,39 @@ impl Gateways {
     /// were let go. A replica that does not lead at `now` lets nothing go.
     pub(crate) fn sweep(&self, now: Instant) -> usize {
         let mut table = self.table.lock();
-        if !Self::observe(&mut table, self.fence.leader_term(now), now) {
+        if !self.observe(&mut table, self.fence.leader_term(now), now) {
             return 0;
         }
-        for row in table.rows.values_mut() {
+        let mut gone = Vec::new();
+        while table
+            .deadlines
+            .first()
+            .is_some_and(|(deadline, _)| *deadline <= now)
+        {
+            let Some((deadline, gateway)) = table.deadlines.pop_first() else {
+                break;
+            };
+            #[cfg(test)]
+            {
+                table.sweep_visits += 1;
+            }
+            let Some(row) = table.rows.get_mut(&gateway) else {
+                continue;
+            };
+            row.deadline = None;
             row.prune(now);
+            if self.over(row, now) {
+                if let Some(row) = table.rows.remove(&gateway) {
+                    gone.push((gateway, row));
+                }
+            } else {
+                let next = self.deadline(row, now);
+                debug_assert_ne!(next, Some(deadline));
+                Self::set_deadline(&mut table, gateway, next);
+            }
         }
-        let over: Vec<(GatewayId, Row)> = table
-            .rows
-            .extract_if(|_, row| self.over(row, now))
-            .collect();
-        let let_go = over.len();
-        self.end(over);
+        let let_go = gone.len();
+        self.end(gone);
         let_go
     }
 
@@ -581,9 +690,13 @@ impl Gateways {
                 }
             }
             let shown = latest(&ends).into_iter().chain(until).max();
+            // The frame's own end is a hold's unless its kind is the one a
+            // rule lifts.
+            let own = until.filter(|_| kind != LIVENESS);
+            let hold = hold_of(&ends).into_iter().chain(own).max();
             match self
                 .store
-                .gateway_veto_noted(gateway, worker, shown, stands, now)
+                .gateway_veto_noted(gateway, worker, shown, hold, stands, now)
             {
                 VetoWrite::Written => {
                     ends.extend(until.map(|until| (kind, until)));
@@ -610,6 +723,8 @@ impl Gateways {
             row.next_end = first.into_iter().chain(row.next_end).min();
             row.vetoes.insert(worker, ends);
         }
+        let deadline = self.deadline(row, now);
+        Self::set_deadline(&mut table, gateway, deadline);
         vetoed
     }
 
@@ -649,9 +764,14 @@ impl Gateways {
         // The list is the gateway's word of this instant: no note stands
         // behind it, and a worker with no row keeps nothing.
         listed.retain(|worker, ends| {
-            let written = self
-                .store
-                .gateway_veto_noted(gateway, *worker, latest(ends), false, now);
+            let written = self.store.gateway_veto_noted(
+                gateway,
+                *worker,
+                latest(ends),
+                hold_of(ends),
+                false,
+                now,
+            );
             written == VetoWrite::Written
         });
         row.vetoes = listed;
@@ -661,7 +781,10 @@ impl Gateways {
         row.left_at = None;
         row.held = row.vetoes.values().map(Vec::len).sum();
         row.next_end = row.vetoes.values().flatten().map(|&(_, end)| end).min();
-        row.held
+        let held = row.held;
+        let deadline = self.deadline(row, now);
+        Self::set_deadline(&mut table, gateway, deadline);
+        held
     }
 
     /// How many ends the table keeps for the gateway: the row's count,
@@ -686,17 +809,23 @@ impl Gateways {
     /// above the one the table was last read under, or after a read that
     /// found the fence closed, every gone gateway's period starts again at
     /// `now`.
-    fn observe(table: &mut Table, term: Option<u64>, now: Instant) -> bool {
+    fn observe(&self, table: &mut Table, term: Option<u64>, now: Instant) -> bool {
         match (term, table.led) {
             // The term the table was last read under, or a read that lost
             // its race to a later one: nothing moved.
             (Some(term), Some(led)) if term <= led => {}
             (Some(_), _) => {
-                for row in table.rows.values_mut() {
+                let mut deadlines = BTreeSet::new();
+                for (&gateway, row) in &mut table.rows {
                     if row.gone.is_some() {
                         row.gone = Some(now);
                     }
+                    row.deadline = self.deadline(row, now);
+                    if let Some(deadline) = row.deadline {
+                        deadlines.insert((deadline, gateway));
+                    }
                 }
+                table.deadlines = deadlines;
                 table.led = term;
             }
             (None, _) => table.led = None,
@@ -742,13 +871,21 @@ impl Gateways {
 
     /// The session `session` of `gateway` ended at `now`: its grace period
     /// starts, unless a newer session stands or the period already runs.
-    fn gone(&self, gateway: GatewayId, session: u64, now: Instant) {
+    fn gone(&self, gateway: GatewayId, session: u64, superseded: &Arc<Replaced>, now: Instant) {
         let mut table = self.table.lock();
-        if let Some(row) = table.rows.get_mut(&gateway) {
+        let Some(deadline) = table.rows.get_mut(&gateway).map(|row| {
+            // The seat releases its Arc after this call. Removing its weak
+            // entry here makes its end and the new deadline one locked step.
+            row.replaced
+                .retain(|replaced| !std::ptr::eq(replaced.as_ptr(), Arc::as_ptr(superseded)));
             if row.session == session && row.gone.is_none() {
                 row.gone = Some(now);
             }
-        }
+            self.deadline(row, now)
+        }) else {
+            return;
+        };
+        Self::set_deadline(&mut table, gateway, deadline);
     }
 }
 
@@ -761,7 +898,7 @@ pub(crate) mod tests {
 
     use tokio::{sync::watch, task::JoinSet, time::timeout};
 
-    use super::{over_kinds, Gateways, Refused, Seat, Vetoed, KINDS_MAX, VETOES_MAX};
+    use super::{over_kinds, DropPause, Gateways, Refused, Seat, Vetoed, KINDS_MAX, VETOES_MAX};
     use crate::{
         controller::lifecycle::{
             self,
@@ -771,10 +908,10 @@ pub(crate) mod tests {
         lease::{Lease, LeaseId},
         spec::{AppliedSpec, PolicySpec},
         store::{
-            GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, Picked,
-            SessionsStore, WorkersStore,
+            Ask, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, Picked,
+            SessionsStore, ViewBuffers, WorkersStore,
         },
-        view::WorkerId,
+        view::{Role, WorkerId},
     };
 
     pub(crate) const GRACE: Duration = Duration::from_secs(10);
@@ -885,6 +1022,37 @@ pub(crate) mod tests {
         assert_eq!(store.live(A), 1, "the gap's lease stands");
         assert!(gateways.presence(A, t0 + 100 * GRACE).is_some());
         drop(seat);
+    }
+
+    #[test]
+    fn the_sweep_visits_only_rows_with_a_due_deadline() {
+        const ROWS: u64 = 4_096;
+
+        let (_elector, store, gateways, t0) = ceiled(GRACE, ROWS as usize);
+        let gone = welcomed(&gateways, GatewayId(1), "gateway-1", TERM, t0);
+        let standing: Vec<Seat> = (2..=ROWS)
+            .map(|id| welcomed(&gateways, GatewayId(id), &format!("gateway-{id}"), TERM, t0))
+            .collect();
+
+        assert_eq!(gateways.sweep(t0 + Duration::from_secs(1)), 0);
+        assert_eq!(gateways.take_sweep_visits(), 0, "no row has work due");
+
+        let noted = worker(&store, "http://noted:8000");
+        assert_eq!(
+            standing[0].veto(noted, 1, Some(t0 + 2 * GRACE), t0),
+            Vetoed::Shown
+        );
+        gone.end(t0);
+        assert_eq!(gateways.sweep(t0 + GRACE), 1);
+        assert_eq!(
+            gateways.take_sweep_visits(),
+            1,
+            "only the expired row is visited"
+        );
+
+        assert_eq!(gateways.sweep(t0 + 2 * GRACE), 0);
+        assert_eq!(gateways.take_sweep_visits(), 1, "the due note is visited");
+        assert_eq!(gateways.kept(GatewayId(2)), 0);
     }
 
     #[tokio::test]
@@ -1028,6 +1196,29 @@ pub(crate) mod tests {
         assert_eq!(gateways.sweep(t0 + GRACE), 1);
     }
 
+    #[test]
+    fn a_replaced_sessions_end_and_due_sweep_cleanup_atomically() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        store.issue(lease(A, 1, t0)).expect("a lease");
+        let mut replaced = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        welcomed(&gateways, A, "gateway-a", TERM, t0).end(t0);
+        assert!(replaced.replaced());
+
+        let pause = Arc::new(DropPause {
+            gone: std::sync::Barrier::new(2),
+            swept: std::sync::Barrier::new(2),
+        });
+        replaced.drop_pause = Some(Arc::clone(&pause));
+        let ending = std::thread::spawn(move || drop(replaced));
+        pause.gone.wait();
+        let let_go = gateways.sweep(t0 + GRACE);
+        pause.swept.wait();
+        ending.join().expect("the session ends");
+
+        assert_eq!(let_go, 1, "the next due sweep lets the gateway go");
+        assert_eq!(store.live(A), 0, "the gateway's lease is released");
+    }
+
     /// A replaced session that never ends holds its gateway's row for one
     /// period more and no longer: the gateway is let go two periods after
     /// its last session ended, whatever still runs.
@@ -1055,7 +1246,7 @@ pub(crate) mod tests {
             drop(stands);
             stands = newer;
         }
-        assert_eq!(gateways.noted(A), 1, "the session the last Hello replaced");
+        assert_eq!(gateways.noted(A), 0, "no ended session remains");
         drop(stands);
     }
 
@@ -1553,6 +1744,89 @@ pub(crate) mod tests {
         );
         assert_eq!(seat.veto(w, 7, None, t0), Vetoed::Shown);
         assert!(!store.vetoed(A, w, t0));
+    }
+
+    /// What a view built for `gateway` at `now` reads of the worker: the
+    /// breaker bit and the stalled bit of its row.
+    fn bits(
+        store: &MemoryStore,
+        gateway: GatewayId,
+        worker: WorkerId,
+        now: Instant,
+    ) -> (bool, bool) {
+        let ask = Ask {
+            gateway,
+            now,
+            pinned: None,
+            affinity: false,
+        };
+        let mut out = ViewBuffers::default();
+        // A registration is in force at its window's publication: the case
+        // asks for one.
+        store.publish_now();
+        store
+            .build_view("m", Role::Single, &ask, &mut out)
+            .expect("the pool");
+        let row = out.candidates.iter().find(|row| row.id == worker);
+        let health = row.expect("the worker's row").health;
+        (health.breaker_open, health.stalled)
+    }
+
+    /// The store reads no kind: the note says which ends hold. Every kind
+    /// but the doubt of liveness holds, a number this build has no name for
+    /// among them, and the hold shown is the latest of their ends. A worker
+    /// reads to its gateway as masked to its veto's end, and as behind an
+    /// open breaker too while a hold stands.
+    #[test]
+    fn the_store_is_shown_the_hold_among_a_workers_kinds() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let w = worker(&store, "http://a:8000");
+        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let (held, doubted, clear) = ((true, true), (false, true), (false, false));
+        // A doubt of liveness alone holds nothing.
+        assert_eq!(seat.veto(w, LIVENESS, Some(t0 + 9 * S), t0), Vetoed::Shown);
+        assert_eq!(bits(&store, A, w, t0), doubted);
+        // A breaker's window beside it holds to its own end, and the doubt
+        // stands from there.
+        assert_eq!(seat.veto(w, BREAKER, Some(t0 + 5 * S), t0), Vetoed::Shown);
+        assert_eq!(bits(&store, A, w, t0 + 5 * S - MS), held);
+        assert_eq!(bits(&store, A, w, t0 + 5 * S), doubted);
+        assert_eq!(bits(&store, A, w, t0 + 9 * S), clear);
+        assert_eq!(bits(&store, B, w, t0), clear);
+        // The doubt cleared: the breaker's window holds alone.
+        assert_eq!(seat.veto(w, LIVENESS, None, t0), Vetoed::Shown);
+        assert_eq!(bits(&store, A, w, t0), held);
+        assert_eq!(bits(&store, A, w, t0 + 5 * S), clear);
+        // The breaker closed beside a new doubt: nothing holds.
+        assert_eq!(seat.veto(w, LIVENESS, Some(t0 + 9 * S), t0), Vetoed::Shown);
+        assert_eq!(seat.veto(w, BREAKER, None, t0), Vetoed::Shown);
+        assert_eq!(bits(&store, A, w, t0), doubted);
+        // A kind with no name holds: the rule lifts what it can name.
+        assert_eq!(seat.veto(w, 7, Some(t0 + 3 * S), t0), Vetoed::Shown);
+        assert_eq!(bits(&store, A, w, t0), held);
+        assert_eq!(bits(&store, A, w, t0 + 3 * S), doubted);
+    }
+
+    /// A `Hello`'s list is shown the same way: each listed worker's latest
+    /// end, with the hold among its kinds.
+    #[test]
+    fn a_hellos_list_is_shown_with_the_hold_among_each_workers_kinds() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let (held, doubted) = (
+            worker(&store, "http://a:8000"),
+            worker(&store, "http://b:8000"),
+        );
+        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let list = [
+            (held, BREAKER, t0 + 5 * S),
+            (held, LIVENESS, t0 + 9 * S),
+            (doubted, LIVENESS, t0 + 9 * S),
+        ];
+        assert_eq!(seat.restore(&list, t0), 3);
+        assert_eq!(bits(&store, A, held, t0), (true, true));
+        assert_eq!(bits(&store, A, held, t0 + 5 * S), (false, true));
+        assert_eq!(bits(&store, A, doubted, t0), (false, true));
+        assert_eq!(bits(&store, A, doubted, t0 + 9 * S), (false, false));
     }
 
     #[test]

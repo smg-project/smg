@@ -716,6 +716,18 @@ impl ConsistentHash {
     /// `true` when every kept candidate is one.
     fn fill(ring: &Ring, candidates: &[Candidate], kept: &[u32], slots: &mut Vec<u32>) -> bool {
         slots.clear();
+        let members = ring.members();
+        // When the survivors stand in member order, each member's slot is
+        // its own position.
+        if kept.len() == members.len()
+            && kept
+                .iter()
+                .zip(members)
+                .all(|(&row, &id)| candidates[row as usize].id == id)
+        {
+            slots.extend((0..kept.len()).map(|slot| slot as u32));
+            return true;
+        }
         slots.resize(ring.len(), FREE);
         let mut every = true;
         for (i, &k) in kept.iter().enumerate() {
@@ -1217,6 +1229,11 @@ mod tests {
         let expected = owner_of(&scorer.ring(), 11).expect("an owner");
         assert_eq!(pool[owner].id, expected);
         assert_eq!(leader(&scored(&scorer, &keyed(11), &pool)), owner);
+        let reversed: Vec<Candidate> = pool.iter().rev().copied().collect();
+        assert_eq!(
+            scored(&scorer, &keyed(11), &reversed),
+            scores.iter().rev().copied().collect::<Vec<_>>()
+        );
         // A survivor set without the owner is owned by the owner's successor.
         let rest: Vec<Candidate> = pool
             .iter()

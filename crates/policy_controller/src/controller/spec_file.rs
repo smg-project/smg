@@ -16,13 +16,12 @@
 //! are never closer than a poll, however long one took. A file is read
 //! only when its identity moved from the one last read and then stood still
 //! for one poll: an update that swaps a link is a new identity at once, and
-//! an edit in place is not read half written. Every state the file settles
-//! in is read once and has one outcome: applied, unchanged or rejected. A
-//! rejected state (a document that does not run, a file over the bound, a
-//! file that cannot be read) is one event and one count however long it
-//! stands, and the running generation stays. A file that does not stand
-//! still, look after look, is never read: it is told once, as a rejected
-//! state is.
+//! an edit in place is not read half written. A leader's read applies the
+//! document, leaves it unchanged or rejects it. A rejected state (a
+//! document that does not run, a file over the bound, a file that cannot
+//! be read) is counted once while it stands under a lead, and the running
+//! generation stays. A file that keeps moving is never read and is told
+//! as a rejected state.
 //!
 //! Under a shared lease the watch looks whether its replica leads or
 //! follows. A leader's look hands the document to the door, which applies
@@ -56,6 +55,7 @@ use tokio::{sync::watch, task::JoinError, time::sleep};
 use tracing::debug;
 
 use super::generations::{Applied, Format, Generations, SpecRejected, MAX_DOCUMENT_BYTES};
+use crate::operator::spec_store::NOT_A_FILE;
 
 /// Between two looks at the file.
 pub(crate) const POLL: Duration = Duration::from_secs(1);
@@ -67,9 +67,6 @@ const START_READS: usize = 3;
 /// How many looks in a row find the file moved before the watch tells it as
 /// a file that does not stand still.
 const RESTLESS_LOOKS: u32 = 5;
-
-/// What a look or a read says of a path that leads to no regular file.
-pub(super) const NOT_A_FILE: &str = "the path leads to no regular file";
 
 /// What one look at the path found.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -567,7 +564,11 @@ pub(crate) mod tests {
         /// The number, the format and the bytes the read call answers.
         fn answered(&self) -> (u64, String, Vec<u8>) {
             let answer = self.generations.document(0).expect("the standing document");
-            (answer.generation, answer.format, answer.document)
+            (
+                answer.generation,
+                answer.format.as_str().to_owned(),
+                answer.document,
+            )
         }
     }
 
@@ -709,17 +710,8 @@ pub(crate) mod tests {
         assert_eq!(counts, (1, 1));
     }
 
-    /// A pipe at `path`, with no writer. The program makes it: the linked
-    /// system-call crate has no call for one on every system the crate
-    /// builds on.
     #[cfg(unix)]
-    pub(crate) fn pipe_at(path: &Path) {
-        let made = Command::new("mkfifo")
-            .arg(path)
-            .status()
-            .expect("mkfifo runs");
-        assert!(made.success(), "mkfifo: {made}");
-    }
+    pub(crate) use crate::operator::test_support::pipe_at;
 
     /// A pipe is refused by its kind, at the start and under the watch,
     /// unopened: this one has no writer, and an open would wait for one.
@@ -1691,10 +1683,11 @@ pub(crate) mod tests {
             document: &PolicySpec,
             digest: Digest,
             catalog: &Catalog,
+            denied_headers: &[&str],
         ) -> Result<AppliedSpec, SpecError> {
             let passed = PASSES.with(|passes| passes.replace(passes.get() + 1));
             assert_ne!(passed, 1, "a fault of the validator");
-            AppliedSpec::validate_digested(document, digest, catalog)
+            AppliedSpec::validate_digested(document, digest, catalog, denied_headers)
         }
         let dir = tempfile::tempdir().expect("a directory");
         let path = dir.path().join("policy.yaml");
@@ -2015,11 +2008,12 @@ pub(crate) mod tests {
             document: &PolicySpec,
             digest: Digest,
             catalog: &Catalog,
+            denied_headers: &[&str],
         ) -> Result<AppliedSpec, SpecError> {
             if let Some(door) = DOOR.with(|door| door.borrow_mut().take()) {
                 follow_at(&door, &[LEAST_LOAD, RANDOM]);
             }
-            AppliedSpec::validate_digested(document, digest, catalog)
+            AppliedSpec::validate_digested(document, digest, catalog, denied_headers)
         }
         let bed = bed_validating(LEAST_LOAD.as_bytes(), entered_under);
         let (mut file, mut elector) = standby(&bed);

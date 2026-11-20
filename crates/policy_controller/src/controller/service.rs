@@ -55,8 +55,7 @@ use super::{
     floor::Floors,
     gateways::Gateways,
     generations::{
-        unix_micros, DryRun, Enforced, Format, Generations, SpecRejected, Unanswered,
-        DRY_RUNS_WAITING, WRITES_WAITING,
+        Format, Generations, SpecRejected, Unanswered, DRY_RUNS_WAITING, WRITES_WAITING,
     },
     membership::Door,
     principal::{self, Layer, Principal},
@@ -70,13 +69,14 @@ use crate::{
     catalog::Catalog,
     door::DecisionRecord,
     elector::{Elector, Fence},
-    framework::{Engine, Plan},
+    framework::Engine,
+    operator::{DryRun, Enforced, NeedsRow, Turn, Unanswered as DoorUnanswered},
     proto::{
         self,
         policy_controller_server::{PolicyController, PolicyControllerServer},
     },
     replication::Unled,
-    spec::{Digest, PlanName},
+    spec::Digest,
     store::MemoryStore,
 };
 
@@ -194,7 +194,7 @@ pub(crate) struct Shared {
     pub(crate) lag: Arc<Lag>,
     /// The turn of the operators' snapshots: one is taken at a time, off
     /// the runtime's workers.
-    pub(crate) snapshots: snapshot::Turn,
+    pub(crate) snapshots: Turn,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -274,7 +274,7 @@ impl Shared {
             role: watch::channel(false).0,
             watchers: Arc::new(Watchers::new(session::PRESENT_MAX)),
             floors: Floors::default(),
-            snapshots: snapshot::Turn::default(),
+            snapshots: Turn::new(snapshot::SNAPSHOTS_WAITING),
         })
     }
 
@@ -652,7 +652,9 @@ fn explained(
 ) -> proto::DecisionRecord {
     let trace = record.decision.trace();
     let age = Instant::now().saturating_duration_since(record.at);
-    let at_unix_micros = SystemTime::now().checked_sub(age).map_or(0, unix_micros);
+    let at_unix_micros = SystemTime::now()
+        .checked_sub(age)
+        .map_or(0, wire::unix_micros);
     let mut answer = proto::DecisionRecord {
         request_id,
         gateway_id,
@@ -662,36 +664,12 @@ fn explained(
         at_unix_micros,
         ..Default::default()
     };
-    if trace.generation != engine.generation() {
-        return answer;
-    }
-    if let Some(binding) = record.binding.and_then(|at| engine.binding_at(at)) {
-        let plan = match binding.plan {
-            Plan::Single => PlanName::Single,
-            Plan::PdPair => PlanName::PdPair,
-            Plan::Epd { .. } => PlanName::Epd,
-        };
-        plan.name().clone_into(&mut answer.plan_name);
-        let at = trace.profile;
-        // A shed can precede the profile's run. Its trace can then hold
-        // zero even where the binding uses profiles at other positions.
-        let bound = at == binding.profile
-            || binding.decode_profile == Some(at)
-            || matches!(binding.plan, Plan::Epd { encode } if encode == at);
-        if let Some(profile) = engine.profiles().get(usize::from(at)).filter(|_| bound) {
-            answer.profile_name.clone_from(&profile.name);
-            profile.picker.name().clone_into(&mut answer.picker_name);
-            answer.filter_names = profile
-                .filters
-                .iter()
-                .map(|f| f.name().to_owned())
-                .collect();
-            answer.scorer_names = profile
-                .scorers
-                .iter()
-                .map(|w| w.scorer.name().to_owned())
-                .collect();
-        }
+    if let Some(names) = record.names(engine) {
+        names.plan.clone_into(&mut answer.plan_name);
+        answer.profile_name = names.profile;
+        answer.picker_name = names.picker;
+        answer.filter_names = names.filters;
+        answer.scorer_names = names.scorers;
     }
     answer
 }
@@ -718,7 +696,7 @@ fn read_only(generations: &Generations) -> proto::ApplyResult {
 fn verdict(
     (standing, standing_digest): (u64, Option<Digest>),
     outcome: Result<(u64, Digest), SpecRejected>,
-    needs: Option<proto::NeedsDiff>,
+    needs: Option<(Vec<NeedsRow>, Vec<NeedsRow>)>,
     read_only: bool,
 ) -> proto::ApplyResult {
     match outcome {
@@ -726,7 +704,7 @@ fn verdict(
             accepted: true,
             generation,
             digest: digest.to_string(),
-            needs,
+            needs: needs.map(wire::needs_diff),
             read_only,
             ..proto::ApplyResult::default()
         },
@@ -753,11 +731,8 @@ fn verdict(
 /// end or a file that was not read as internal.
 fn unanswered(unanswered: Unanswered) -> Status {
     match unanswered {
-        Unanswered::Guarded(standing, digest) => {
-            let digest = digest.map(|digest| digest.to_string()).unwrap_or_default();
-            Status::failed_precondition(format!(
-                "expected_digest: generation {standing} stands with digest {digest}"
-            ))
+        Unanswered::Door(door @ DoorUnanswered::Guarded(..)) => {
+            Status::failed_precondition(door.to_string())
         }
         Unanswered::Full => Status::resource_exhausted(format!(
             "{DRY_RUNS_WAITING} dry runs wait their turn: ask again later"
@@ -767,7 +742,9 @@ fn unanswered(unanswered: Unanswered) -> Status {
             "{WRITES_WAITING} applies wait their turn: ask again later"
         )),
         Unanswered::Unwritten(join) => Status::internal(format!("the apply did not end: {join}")),
-        Unanswered::NotHeld(not_held) => Status::not_found(not_held.to_string()),
+        Unanswered::Door(DoorUnanswered::NotHeld(not_held)) => {
+            Status::not_found(not_held.to_string())
+        }
         Unanswered::Unread { generation, why } => Status::internal(format!(
             "generation {generation} was not read from its file: {why}"
         )),
@@ -874,7 +851,7 @@ impl PolicyController for Service {
     /// field refused by its name, the spec slice of a controller with no
     /// spec source among them, and a refused request takes no turn. One
     /// snapshot is taken at a time, off the runtime's workers
-    /// ([`snapshot::Turn`]), and its rows come by one of the roads of
+    /// ([`Turn`]), and its rows come by one of the roads of
     /// [`snapshot::read`]. The lead is read again behind that wait: the
     /// answer is told while this replica still leads the term the call was
     /// admitted under. A standby is restored on its `Replicate` stream,
@@ -910,7 +887,7 @@ impl PolicyController for Service {
         // open to share it.
         let last = Arc::clone(&self.shared);
         let out = move || last.watchers.unshared(&last.feed);
-        let taken = self.shared.snapshots.run(take, out).await??;
+        let taken = snapshot::in_turn(&self.shared.snapshots, take, out).await??;
         if self.watched(Instant::now())? != term {
             return Err(Status::unavailable(TAKE_OVER));
         }
@@ -1007,7 +984,7 @@ impl PolicyController for Service {
             // then the form.
             generations
                 .guarded(&apply.expected_digest)
-                .map_err(unanswered)?;
+                .map_err(|refused| unanswered(refused.into()))?;
             return Err(Status::invalid_argument("format: name yaml or json"));
         };
         // The guard is the door's to read, behind the turn its pass waits.
@@ -3654,7 +3631,7 @@ mod tests {
 
         // Another call is let in beside it: the cut stays for that one, the
         // next call shares it, and the last call out lets it go.
-        let beside = control.shared.snapshots.place();
+        let beside = control.shared.snapshots.place().expect("a place is free");
         assert_eq!(told().await, 0);
         let cut = feed.kept().expect("a call is let in to share the cut");
         assert_eq!(told().await, 0);
@@ -3773,7 +3750,7 @@ mod tests {
         assert_eq!(feed.cuts(), 1, "a lone call for its models took the cut");
 
         // Another call is let in beside it: one cut, and both calls share it.
-        let beside = control.shared.snapshots.place();
+        let beside = control.shared.snapshots.place().expect("a place is free");
         assert_eq!(told(1).await, (1, true));
         assert_eq!(told(0).await, (4, false));
         assert_eq!(feed.cuts(), 2, "one copy for the calls let in");

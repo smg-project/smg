@@ -109,7 +109,8 @@ use rustc_hash::FxHashMap;
 use crate::{
     affinity::WarmRule,
     counts::{Counts, KeptCounts, LentCounts, Slot},
-    framework::{OverloadThresholds, PairPools, PairTable},
+    framework::{Engine, OverloadThresholds, PairPools, PairTable},
+    lease::{Lifecycle, Signal},
     spec::{AppliedSpec, Listed, Pairing},
     store::{
         encoding::{EncodeClasses, EncodeHandoff, EncodeMember},
@@ -209,6 +210,54 @@ pub struct ViewBuffers {
     pub kept: KeptCounts,
 }
 
+/// Narrows a built view by the gateway's wires and subset hint. Returns
+/// how many rows the wires took. A hint of zero clears the view first.
+/// A stated wire set keeps rows that share a wire. Omitted wires keep
+/// every row. Kept rows keep their order and take their new positions.
+pub(crate) fn narrow(view: &mut ViewBuffers, wires: Option<WireModes>, subset: Option<u32>) -> u64 {
+    narrow_view::<()>(view, wires, subset, None)
+}
+
+#[inline]
+fn narrow_view<T>(
+    view: &mut ViewBuffers,
+    wires: Option<WireModes>,
+    subset: Option<u32>,
+    column: Option<&mut Vec<T>>,
+) -> u64 {
+    if subset == Some(0) {
+        view.candidates.clear();
+        view.affinity.clear();
+        if let Some(column) = column {
+            column.clear();
+        }
+        return 0;
+    }
+    let Some(wires) = wires else {
+        return 0;
+    };
+    let rows = view.candidates.len();
+    let dialed = |row: &Candidate| row.wire_modes.intersects(wires);
+    // Each column follows the rows before the rows move.
+    retain_column(&view.candidates, &mut view.affinity, dialed);
+    if let Some(column) = column {
+        retain_column(&view.candidates, column, dialed);
+    }
+    view.candidates.retain(dialed);
+    let took = rows - view.candidates.len();
+    if took > 0 {
+        for (row, position) in view.candidates.iter_mut().zip(0..) {
+            row.position = position;
+        }
+    }
+    took as u64
+}
+
+fn retain_column<T>(rows: &[Candidate], column: &mut Vec<T>, dialed: impl Fn(&Candidate) -> bool) {
+    let mut beside = rows.iter();
+    column.retain(|_| beside.next().is_some_and(&dialed));
+}
+
 /// The buffers a host keeps across pair decisions: both sides' views and
 /// the table that says which of their classes pair, all of one publication.
 /// A pair build clears and fills them ([`World::build_pair`]).
@@ -242,12 +291,46 @@ impl PairBuffers {
         }
     }
 
-    /// Both sides' views, the prefill's first: what a request's own
-    /// gateway states of itself is taken from each ahead of the engine's
-    /// pair entry.
-    #[cfg(feature = "controller")]
-    pub(crate) fn sides_mut(&mut self) -> [&mut ViewBuffers; 2] {
-        [&mut self.prefill, &mut self.decode]
+    /// Narrows both sides and reports what the wires took and whether a
+    /// side went empty.
+    pub(crate) fn narrow(
+        &mut self,
+        wires: Option<WireModes>,
+        subset: Option<u32>,
+        built: &(Built, Built),
+    ) -> (u64, bool) {
+        self.narrow_with_classes(wires, subset, built, None)
+    }
+
+    #[inline]
+    fn narrow_with_classes(
+        &mut self,
+        wires: Option<WireModes>,
+        subset: Option<u32>,
+        built: &(Built, Built),
+        classes: Option<&mut Vec<u32>>,
+    ) -> (u64, bool) {
+        let prefill = narrow_view(&mut self.prefill, wires, subset, classes);
+        let decode = narrow(&mut self.decode, wires, subset);
+        (prefill + decode, self.emptied(built))
+    }
+
+    fn emptied(&self, built: &(Built, Built)) -> bool {
+        (built.0.pool_size > 0 && self.prefill.candidates.is_empty())
+            || (built.1.pool_size > 0 && self.decode.candidates.is_empty())
+    }
+
+    /// Reports the pair's narrowing when the wire cut may have included
+    /// another view. A subset of zero counts no rows as taken by wires.
+    pub(crate) fn narrowing(&self, built: &(Built, Built), cut_by_wires: bool) -> (u64, bool) {
+        let took = if cut_by_wires {
+            u64::from(built.0.pool_size) + u64::from(built.1.pool_size)
+                - self.prefill.candidates.len() as u64
+                - self.decode.candidates.len() as u64
+        } else {
+            0
+        };
+        (took, self.emptied(built))
     }
 
     fn clear(&mut self) {
@@ -291,6 +374,31 @@ impl EncodePairBuffers {
             affinity: &self.encode.affinity,
         };
         (self.pair.pools(), encode)
+    }
+
+    /// The pair's buffers, for the lease counts on each side's rows.
+    pub(crate) fn pair_mut(&mut self) -> &mut PairBuffers {
+        &mut self.pair
+    }
+
+    /// Narrows the three views by the gateway's wires and subset hint.
+    /// The prefill classes and encoder facts follow their rows. Returns
+    /// how many rows the wires took and whether a populated view went empty.
+    pub(crate) fn narrow(
+        &mut self,
+        wires: Option<WireModes>,
+        subset: Option<u32>,
+        built: &(Built, Built),
+    ) -> (u64, bool) {
+        let (took, emptied) =
+            self.pair
+                .narrow_with_classes(wires, subset, built, Some(&mut self.prefill_classes));
+        let had_encoders = !self.encode.candidates.is_empty();
+        let encoded = narrow_view(&mut self.encode, wires, subset, Some(&mut self.facts));
+        (
+            took + encoded,
+            emptied || (had_encoders && self.encode.candidates.is_empty()),
+        )
     }
 }
 
@@ -354,7 +462,9 @@ pub struct PoolView<'a> {
     /// The rows a veto of the asking gateway masks at the decision's
     /// instant, by position, in order: what
     /// [`Constraints::stalled`](crate::Constraints::stalled) takes. Empty
-    /// where the rows carry their stalled bits.
+    /// where the rows carry their stalled bits. The rows of it a hold of
+    /// that gateway stands on are asked apart ([`World::held`]): a view
+    /// under no veto has none, and carries nothing for them.
     pub stalled: &'a [u32],
     /// One more than the position of the pinned worker's row: what
     /// [`RequestFacts::pinned_at`](crate::RequestFacts::pinned_at) takes.
@@ -571,14 +681,42 @@ impl Ends<'_> {
 }
 
 /// One standing veto as its gateway's run in a pool carries it: the row it
-/// masks, by index and by id, and its end. The index finds the row in a
+/// masks, by index and by id, and its ends. The index finds the row in a
 /// pool every gateway copies whole, the id in a pool that holds host-local
 /// rows, whichever gateway asks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PoolVeto {
     row: u32,
     id: WorkerId,
+    ends: VetoEnds,
+}
+
+/// A veto's two ends as the writer keeps them, with no kind. The veto masks
+/// its row until `until`. Its hold stands until `hold`, never past the
+/// veto's own end: while it does, a decision of the gateway reads the row
+/// as behind an open breaker, a veto no rule lifts, and from then to the
+/// veto's end as doubted
+/// ([`HealthSink::gateway_veto_noted`](crate::store::HealthSink::gateway_veto_noted)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VetoEnds {
     until: Instant,
+    hold: Option<Instant>,
+}
+
+impl VetoEnds {
+    /// The ends as a door hands them: a hold past the veto's end is cut to
+    /// it.
+    fn new(until: Instant, hold: Option<Instant>) -> Self {
+        Self {
+            until,
+            hold: hold.map(|hold| hold.min(until)),
+        }
+    }
+
+    /// Whether the hold stands at `now`: the veto then stands too.
+    fn held_at(self, now: Instant) -> bool {
+        self.hold.is_some_and(|hold| hold > now)
+    }
 }
 
 /// One gateway's standing vetoes in one pool, sorted by row: never empty.
@@ -586,6 +724,20 @@ struct PoolVeto {
 struct GatewayRun {
     gateway: GatewayId,
     vetoes: Arc<[PoolVeto]>,
+    /// Whether a veto of the run has a hold's end, passed or not: a view
+    /// that lends its rows reads the holds of such a run alone.
+    holds: bool,
+}
+
+impl GatewayRun {
+    fn new(gateway: GatewayId, vetoes: Arc<[PoolVeto]>) -> Self {
+        let holds = vetoes.iter().any(|veto| veto.ends.hold.is_some());
+        Self {
+            gateway,
+            vetoes,
+            holds,
+        }
+    }
 }
 
 /// One pool's standing vetoes: a run for each gateway that holds one in
@@ -666,14 +818,14 @@ fn run_of(runs: &[GatewayRun], gateway: GatewayId) -> Option<&GatewayRun> {
 }
 
 /// A pool's runs with `gateway`'s veto on the row `row` of worker `id` set
-/// until `until`, or cleared: that gateway's run built again, each other
-/// run shared.
+/// to `ends`, or cleared: that gateway's run built again, each other run
+/// shared.
 fn with_veto(
     runs: &PoolVetoes,
     gateway: GatewayId,
     row: u32,
     id: WorkerId,
-    until: Option<Instant>,
+    ends: Option<VetoEnds>,
 ) -> PoolVetoes {
     let found = runs.binary_search_by_key(&gateway, |run| run.gateway);
     let own: &[PoolVeto] = match found {
@@ -682,12 +834,12 @@ fn with_veto(
     };
     // Each arm is one pass of a known length: one allocation, the run's
     // own, and no entry of another gateway is read.
-    let own: Arc<[PoolVeto]> = match (own.binary_search_by_key(&row, |veto| veto.row), until) {
-        (Ok(at), Some(until)) => own
+    let own: Arc<[PoolVeto]> = match (own.binary_search_by_key(&row, |veto| veto.row), ends) {
+        (Ok(at), Some(ends)) => own
             .iter()
             .enumerate()
             .map(|(n, standing)| PoolVeto {
-                until: if n == at { until } else { standing.until },
+                ends: if n == at { ends } else { standing.ends },
                 ..*standing
             })
             .collect(),
@@ -696,12 +848,12 @@ fn with_veto(
             let after = after.get(1..).unwrap_or_default();
             before.iter().chain(after).copied().collect()
         }
-        (Err(at), Some(until)) => {
+        (Err(at), Some(ends)) => {
             let (before, after) = own.split_at(at);
             before
                 .iter()
                 .copied()
-                .chain(std::iter::once(PoolVeto { row, id, until }))
+                .chain(std::iter::once(PoolVeto { row, id, ends }))
                 .chain(after.iter().copied())
                 .collect()
         }
@@ -714,10 +866,7 @@ fn with_veto(
     };
     let (before, after) = runs.split_at(at);
     let after = after.get(held..).unwrap_or_default();
-    let own = (!own.is_empty()).then_some(GatewayRun {
-        gateway,
-        vetoes: own,
-    });
+    let own = (!own.is_empty()).then(|| GatewayRun::new(gateway, own));
     before
         .iter()
         .cloned()
@@ -727,7 +876,7 @@ fn with_veto(
 }
 
 /// The gateways' vetoes as the writer keeps them: per gateway its vetoed
-/// workers by id, each until an instant. Replaced whole at each of the
+/// workers by id, each with its ends. Replaced whole at each of the
 /// four writes that change them, all rare: a veto's write, a gateway's
 /// leaving that takes its whole list, a membership write that takes a
 /// departed worker's vetoes with its row, and a window's publication that
@@ -735,25 +884,25 @@ fn with_veto(
 /// derived from them: each pool's runs by gateway ([`PoolVetoes`]).
 #[derive(Debug, Default)]
 struct Vetoes {
-    by_gateway: FxHashMap<GatewayId, Arc<[(WorkerId, Instant)]>>,
+    by_gateway: FxHashMap<GatewayId, Arc<[(WorkerId, VetoEnds)]>>,
 }
 
 impl Vetoes {
-    /// The vetoes with `gateway`'s veto on `id` set until `until`, or
-    /// cleared; `None` when that changes nothing.
-    fn with(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) -> Option<Self> {
-        let mut list: Vec<(WorkerId, Instant)> = self
+    /// The vetoes with `gateway`'s veto on `id` set to `ends`, or cleared;
+    /// `None` when that changes nothing.
+    fn with(&self, gateway: GatewayId, id: WorkerId, ends: Option<VetoEnds>) -> Option<Self> {
+        let mut list: Vec<(WorkerId, VetoEnds)> = self
             .by_gateway
             .get(&gateway)
             .map(|list| list.to_vec())
             .unwrap_or_default();
-        match (list.binary_search_by_key(&id, |&(worker, _)| worker), until) {
-            (Ok(at), Some(until)) if list[at].1 == until => return None,
-            (Ok(at), Some(until)) => list[at].1 = until,
+        match (list.binary_search_by_key(&id, |&(worker, _)| worker), ends) {
+            (Ok(at), Some(ends)) if list[at].1 == ends => return None,
+            (Ok(at), Some(ends)) => list[at].1 = ends,
             (Ok(at), None) => {
                 list.remove(at);
             }
-            (Err(at), Some(until)) => list.insert(at, (id, until)),
+            (Err(at), Some(ends)) => list.insert(at, (id, ends)),
             (Err(_), None) => return None,
         }
         let mut by_gateway = self.by_gateway.clone();
@@ -768,13 +917,13 @@ impl Vetoes {
     /// The vetoes still standing at `at`, when some veto ended at or before
     /// it: what the clock has ended leaves by the store's own clock.
     fn standing_at(&self, at: Instant) -> Option<Self> {
-        let stands = |&(_, until): &(WorkerId, Instant)| until > at;
+        let stands = |&(_, ends): &(WorkerId, VetoEnds)| ends.until > at;
         if self.by_gateway.values().all(|list| list.iter().all(stands)) {
             return None;
         }
         let mut by_gateway = FxHashMap::default();
         for (gateway, list) in &self.by_gateway {
-            let kept: Vec<(WorkerId, Instant)> = list.iter().copied().filter(stands).collect();
+            let kept: Vec<(WorkerId, VetoEnds)> = list.iter().copied().filter(stands).collect();
             if !kept.is_empty() {
                 by_gateway.insert(*gateway, kept.into());
             }
@@ -789,16 +938,16 @@ impl Vetoes {
         /// The entries of `list` on a worker in `members`. Both rise by
         /// worker id: one walk over each joins them.
         fn kept<'a>(
-            list: &'a [(WorkerId, Instant)],
+            list: &'a [(WorkerId, VetoEnds)],
             members: &'a [WorkerId],
-        ) -> impl Iterator<Item = (WorkerId, Instant)> + 'a {
+        ) -> impl Iterator<Item = (WorkerId, VetoEnds)> + 'a {
             let mut at = 0;
             list.iter().copied().filter(move |&(id, _)| {
                 at = seek(members, at, id, |&member| member);
                 members.get(at) == Some(&id)
             })
         }
-        let whole = |list: &Arc<[(WorkerId, Instant)]>| kept(list, members).count() == list.len();
+        let whole = |list: &Arc<[(WorkerId, VetoEnds)]>| kept(list, members).count() == list.len();
         if self.by_gateway.values().all(whole) {
             return None;
         }
@@ -808,7 +957,7 @@ impl Vetoes {
                 by_gateway.insert(*gateway, Arc::clone(list));
                 continue;
             }
-            let kept: Vec<(WorkerId, Instant)> = kept(list, members).collect();
+            let kept: Vec<(WorkerId, VetoEnds)> = kept(list, members).collect();
             if !kept.is_empty() {
                 by_gateway.insert(*gateway, kept.into());
             }
@@ -913,6 +1062,42 @@ impl World {
         self.samples_decisions
     }
 
+    /// Tells this world's engine each rank's report, where a stage of it
+    /// keeps a number of them ([`Lifecycle::keeps_loads`]): what the store
+    /// does before it shows a world, so a decision over the world finds
+    /// the numbers of its own rows. An engine with no such stage says so
+    /// by one word made at its build, and the tell is not entered: by
+    /// count the call alone read 29 instructions a publication.
+    pub(crate) fn tell_kept_loads(&self) {
+        let engine = self.spec.engine();
+        if engine.keeps_loads() {
+            self.tell_loads(engine);
+        }
+    }
+
+    /// Tells each stage of `engine` that keeps a number of the reports
+    /// each rank's report as this world shows it to a decision, with the
+    /// rank's slot and the report's sample instant ([`Signal::Load`]). A
+    /// stage that keeps none is sent nothing. A member of several pools is
+    /// told once a pool, the same word.
+    pub fn tell_loads(&self, engine: &Engine) {
+        engine.tell_loads(|tell| {
+            for (rows, shape) in self.rows.iter().zip(self.derived.pools.iter()) {
+                for (row, &slot) in rows.iter().zip(shape.booked.iter()) {
+                    if let Some(load) = row.load {
+                        tell(&Signal::Load {
+                            worker: row.id,
+                            dp_rank: row.dp_rank,
+                            row: load,
+                            slot,
+                            sampled_at_micros: row.load_sampled_at_micros,
+                        });
+                    }
+                }
+            }
+        });
+    }
+
     /// `at` in the rows' clock: microseconds since the store's origin.
     pub fn micros(&self, at: Instant) -> u64 {
         micros(self.origin, at)
@@ -979,10 +1164,25 @@ impl World {
     /// there is read apart ([`World::unpooled_of`]). It searches every
     /// pool, for a lease written outside a decision.
     pub(crate) fn booked_of(&self, id: WorkerId) -> Option<Slot> {
-        let mut pools = self.rows.iter().zip(self.derived.pools.iter());
-        pools.find_map(|(rows, shape)| {
+        let (pool, row) = self.pooled_row(id)?;
+        self.derived.pools.get(pool)?.booked.get(row).copied()
+    }
+
+    /// Whether this world lists `id` at `rank`: asked of a dispatch
+    /// report's row, which may have left or changed its rank since its
+    /// decision. A member holds one rank in every pool that lists it, so
+    /// the first pool found answers.
+    pub(crate) fn lists_rank(&self, id: WorkerId, rank: u16) -> bool {
+        self.pooled_row(id)
+            .is_some_and(|(pool, row)| self.rows[pool][row].dp_rank == rank)
+    }
+
+    /// The first pool that lists `id`, with the member's row there: one
+    /// binary search a pool, as a pool's rows stand in id order.
+    fn pooled_row(&self, id: WorkerId) -> Option<(usize, usize)> {
+        self.rows.iter().enumerate().find_map(|(pool, rows)| {
             let row = rows.binary_search_by_key(&id, |row| row.id).ok()?;
-            shape.booked.get(row).copied()
+            Some((pool, row))
         })
     }
 
@@ -1052,10 +1252,12 @@ impl World {
     /// Each row is as this publication left it, its engine's overload
     /// verdict with the rest ([`LoadSink::report`](crate::store::LoadSink::report)),
     /// with what is the decision's own written over it: its position in the slice, its
-    /// report's age at `ask.now`, the stalled bit where a veto of the
-    /// asking gateway is in this publication and stands at that instant,
-    /// whichever kind of veto it is, and the session bit on the pinned
-    /// worker. A veto past its end masks nothing and costs the build one
+    /// report's age at `ask.now`, the bit of a veto of the asking gateway
+    /// that is in this publication and stands at that instant, and the
+    /// session bit on the pinned worker. A veto writes the stalled bit,
+    /// and the breaker bit beside it while its hold stands: the store
+    /// keeps no kind, and the hold says which veto no rule lifts. A veto
+    /// past its end masks nothing and costs the build one
     /// compare until a window's publication drops it; a store that
     /// publishes no window keeps it. A window's publication drops every
     /// veto ended by its own instant, so a decision dated before that
@@ -1071,9 +1273,10 @@ impl World {
     /// ([`World::count_in_flight`]).
     ///
     /// What no fact of the store feeds yet reads as the row's default: the
-    /// two session counts, the two admission bits, the breaker
-    /// bit, the four positions into declared lists, the encode bit, and the
-    /// column's four index facts. The
+    /// two session counts, the two admission bits, the four positions into
+    /// declared lists, the encode bit, and the column's four index facts.
+    /// The breaker bit reads a hold of the asking gateway and nothing else
+    /// yet. The
     /// healthy bit is the status alone: the health sink's precedence rule
     /// (a gateway's completed dispatches against the prober) is not
     /// applied here yet.
@@ -1178,7 +1381,9 @@ impl World {
     /// position was published with it. The vetoes of the asking gateway
     /// that stand at `ask.now` are handed as positions, in order, read from
     /// its own run alone and by the build's rule: a veto past its end masks
-    /// nothing. The pinned worker's row is handed as one more than its
+    /// nothing. The rows of them a hold stands on are handed once more,
+    /// apart: where the build writes a row both bits, the view names the
+    /// row twice. The pinned worker's row is handed as one more than its
     /// position. Under `ask.affinity` the column is filled as the build
     /// fills it. A row's report age stays what the report carried when it
     /// was recorded. The report age limit uses the decision's instant less
@@ -1230,7 +1435,7 @@ impl World {
             .get(index)
             .and_then(|runs| run_of(runs, ask.gateway));
         if let Some(run) = own {
-            let standing = run.vetoes.iter().filter(|veto| veto.until > ask.now);
+            let standing = run.vetoes.iter().filter(|veto| veto.ends.until > ask.now);
             out.stalled.extend(standing.map(|veto| veto.row));
         }
         // The search of the build's own pin, over the same rows.
@@ -1269,6 +1474,43 @@ impl World {
                 unreported: self.unreported_at(index),
             },
         })
+    }
+
+    /// The rows of a lent view's mask ([`PoolView::stalled`]) a hold of the
+    /// asking gateway stands on at the decision's instant, by position, in
+    /// order, into `rows`: what
+    /// [`Constraints::held`](crate::Constraints::held) takes beside the
+    /// mask. Asked of the publication the view was read from, with the
+    /// view's own `ask`. A hold stands no longer than its veto, so a held
+    /// row is a row of the mask.
+    ///
+    /// A view under no veto has no held row and is answered here at one
+    /// test: its pool's vetoes are not read again. Rows written for a
+    /// decision carry the breaker bit beside the stalled one where a hold
+    /// stands, and their view's mask is empty.
+    #[inline]
+    pub fn held<'a>(&self, view: &PoolView<'_>, ask: &Ask, rows: &'a mut Vec<u32>) -> &'a [u32] {
+        if view.stalled.is_empty() {
+            return &[];
+        }
+        self.held_rows(view.built.pool, ask, rows)
+    }
+
+    /// The walk behind [`Self::held`], out of line: the asking gateway's
+    /// run in pool `pool`, and the row of each of its vetoes whose hold
+    /// stands at the ask's instant. A run with no hold is one test.
+    #[inline(never)]
+    fn held_rows<'a>(&self, pool: u32, ask: &Ask, rows: &'a mut Vec<u32>) -> &'a [u32] {
+        rows.clear();
+        let own = self
+            .vetoes
+            .get(pool as usize)
+            .and_then(|runs| run_of(runs, ask.gateway));
+        if let Some(run) = own.filter(|run| run.holds) {
+            let held = run.vetoes.iter().filter(|veto| veto.ends.held_at(ask.now));
+            rows.extend(held.map(|veto| veto.row));
+        }
+        rows
     }
 
     /// Build both sides of one pair decision into `out`: the model's
@@ -1438,8 +1680,9 @@ impl World {
     }
 }
 
-/// Write the stalled bit on each row of `rows` a veto of `run` masks at
-/// `now`, and say whether one did.
+/// Write a veto's bits on each row of `rows` a veto of `run` masks at
+/// `now`, and say whether one did: the stalled bit, and the breaker bit
+/// beside it while the veto's hold stands.
 ///
 /// A pool every gateway dials whole is copied whole (`whole`): a veto's row
 /// is its position. Another gateway's host-local rows are left out, so
@@ -1451,7 +1694,7 @@ impl World {
 fn mask(run: &GatewayRun, now: Instant, whole: bool, rows: &mut [Candidate]) -> bool {
     let mut masked = false;
     for veto in run.vetoes.iter() {
-        if veto.until <= now {
+        if veto.ends.until <= now {
             continue;
         }
         let row = if whole {
@@ -1460,7 +1703,16 @@ fn mask(run: &GatewayRun, now: Instant, whole: bool, rows: &mut [Candidate]) -> 
             row_of_id(rows, veto.id)
         };
         if let Some(row) = row {
+            // Every standing veto masks its row, as the mask beside lent
+            // rows names it: a stage that reads the stalled bit refuses
+            // the row whichever way its host handed it. A hold says more,
+            // by the breaker bit: it refuses execution as an open breaker
+            // does, and no rule lifts it. A veto with no hold, or past its
+            // hold's end, is a doubt alone.
             row.health.stalled = true;
+            if veto.ends.held_at(now) {
+                row.health.breaker_open = true;
+            }
             masked = true;
         }
     }
@@ -2892,6 +3144,12 @@ impl Writer {
         self.outside
     }
 
+    /// Forget the fields read under the generation's lists. A snapshot
+    /// can give the same id and revision different facts.
+    pub(super) fn clear_listed(&mut self) {
+        self.listed.clear();
+    }
+
     /// Derive the pools of the membership `members` at the store's `epoch`,
     /// each row with its load record on file, make them the working copy
     /// and publish them through the one door: every pool is new, so the
@@ -3452,7 +3710,7 @@ impl Writer {
             // The list and the places both rise by worker id: one walk
             // over each joins them.
             let mut at = 0;
-            for &(id, until) in list.iter() {
+            for &(id, ends) in list.iter() {
                 at = seek(&self.places, at, id, |place| place.id);
                 while let Some(place) = self.places.get(at).filter(|place| place.id == id) {
                     at += 1;
@@ -3462,7 +3720,7 @@ impl Writer {
                     let veto = PoolVeto {
                         row: place.row,
                         id,
-                        until,
+                        ends,
                     };
                     match pool.last_mut() {
                         Some((owner, run)) if *owner == gateway => run.push(veto),
@@ -3478,10 +3736,7 @@ impl Writer {
             .into_iter()
             .map(|runs| {
                 runs.into_iter()
-                    .map(|(gateway, vetoes)| GatewayRun {
-                        gateway,
-                        vetoes: vetoes.into(),
-                    })
+                    .map(|(gateway, vetoes)| GatewayRun::new(gateway, vetoes.into()))
                     .collect()
             })
             .collect();
@@ -3491,7 +3746,7 @@ impl Writer {
     /// a row in, the writing gateway's run takes the veto, moves its end
     /// or loses it. No other gateway's run and no other pool's is built
     /// again: a publication shares them with the one before.
-    fn write_veto(&mut self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) {
+    fn write_veto(&mut self, gateway: GatewayId, id: WorkerId, ends: Option<VetoEnds>) {
         if self.vetoes.by_gateway.is_empty() {
             // The last veto left: no list at all, as before the first.
             self.pool_vetoes = Arc::default();
@@ -3506,7 +3761,7 @@ impl Writer {
             .map(|pool| {
                 let runs = self.pool_vetoes.get(pool).unwrap_or(&none);
                 match places.next_if(|place| place.pool as usize == pool) {
-                    Some(place) => with_veto(runs, gateway, place.row, id, until),
+                    Some(place) => with_veto(runs, gateway, place.row, id, ends),
                     None => Arc::clone(runs),
                 }
             })
@@ -3594,18 +3849,21 @@ impl Writer {
         folded.then(|| self.publish())
     }
 
-    /// Set `gateway`'s veto on `id` until `until`, or clear it, and publish
-    /// at once; `None` when the write changes no veto.
+    /// Set `gateway`'s veto on `id` until `until` and its hold until `hold`,
+    /// never past the veto's own end, or clear both, and publish at once;
+    /// `None` when the write changes neither end.
     #[must_use]
     pub(super) fn veto(
         &mut self,
         gateway: GatewayId,
         id: WorkerId,
         until: Option<Instant>,
+        hold: Option<Instant>,
     ) -> Option<Arc<World>> {
-        let vetoes = self.vetoes.with(gateway, id, until)?;
+        let ends = until.map(|until| VetoEnds::new(until, hold));
+        let vetoes = self.vetoes.with(gateway, id, ends)?;
         self.vetoes = Arc::new(vetoes);
-        self.write_veto(gateway, id, until);
+        self.write_veto(gateway, id, ends);
         Some(self.publish())
     }
 

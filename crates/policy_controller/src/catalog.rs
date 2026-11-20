@@ -5,17 +5,20 @@
 //!
 //! One namespace covers the three kinds. A built-in whose parameters are a
 //! struct of the spec (every scorer, the `best-with-temperature` picker) is
-//! held by name and built by the validator from what the document wrote. A
-//! stage with no parameters is built by its factory: once when it is
-//! registered, to ask the stage its name, and once for each place a document
-//! names it, each time a document becomes an engine. An engine owns its
-//! stages, and state shared across engines rides the factory's closure.
+//! held by name and built by the validator from what the document wrote.
+//! A factory that takes no parameters builds a stage at registration to
+//! check its name and again for each use during validation. A factory that
+//! takes parameters builds during validation from each entry that names it.
+//! Each validated policy owns its stages.
 //!
 //! A stage in code is the host's own binary, trusted as a built-in is: no
 //! sandbox and no budget. A policy that must change without a rebuild is a
 //! plugin.
 
-use std::fmt;
+use std::{convert::Infallible, fmt, sync::Arc};
+
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value};
 
 use crate::{
     builtins::{
@@ -23,29 +26,169 @@ use crate::{
         Passthrough, PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
     },
     framework::{Filter, Picker, Scorer},
-    spec::SCORERS,
+    sent::SentCredit,
+    spec::{SpecError, SCORERS},
 };
 
 /// Builds one stage: once at its registration, then once for each place a
 /// document names it in each engine.
 type Factory<T> = Box<dyn Fn() -> Box<T> + Send + Sync>;
 
+type ScorerFactory =
+    dyn Fn(&mut StageBuild<'_>) -> Result<Box<dyn Scorer>, StageError> + Send + Sync;
+type ScorerBuild = Build<dyn Scorer, Box<ScorerFactory>>;
+
 /// How a held name becomes a stage.
-enum Build<T: ?Sized> {
+enum Build<T: ?Sized, F = Infallible> {
     /// By the validator, from the parameters the document writes under the
     /// name.
     Typed,
     /// By its factory.
     Factory(Factory<T>),
+    /// By its factory, once the validator has read the parameters.
+    With(F),
 }
 
 /// What the validator gets for a name the catalog holds.
-pub(crate) enum Found<T: ?Sized> {
+pub(crate) enum Found<T: ?Sized, F = Infallible> {
     /// A built-in with typed parameters: the validator builds it.
     Typed,
     /// The stage, built for the engine under validation.
     Built(Box<T>),
+    /// The factory the validator calls with the parameters.
+    With(F),
 }
+
+/// The parameters and profile state available to a stage's factory.
+/// The factory borrows the parameters for the call. A stage owns any
+/// parameters it keeps.
+pub struct StageBuild<'a> {
+    written: &'a Map<String, Value>,
+    profile: &'a str,
+    sent_ttl_ms: Option<u32>,
+    sent: &'a mut Option<Arc<SentCredit>>,
+}
+
+impl<'a> StageBuild<'a> {
+    pub(crate) fn new(
+        written: &'a Map<String, Value>,
+        profile: &'a str,
+        sent_ttl_ms: Option<u32>,
+        sent: &'a mut Option<Arc<SentCredit>>,
+    ) -> Self {
+        Self {
+            written,
+            profile,
+            sent_ttl_ms,
+            sent,
+        }
+    }
+}
+
+impl StageBuild<'_> {
+    /// Reads the parameters into `T`. A bare name supplies an empty map.
+    /// The validator removes the scorer's `weight`, so it appears in
+    /// neither `T`'s input nor [`Self::written`]. Derive
+    /// `#[serde(deny_unknown_fields)]` on `T`: otherwise a misspelled
+    /// parameter is ignored and its default runs.
+    pub fn params<T: DeserializeOwned>(&self) -> Result<T, StageError> {
+        serde_json::from_value(Value::Object(self.written.clone())).map_err(StageError::from)
+    }
+
+    /// The document's parameter map with `weight` removed, the keys of
+    /// every map in order: the order of the canonical bytes, whatever
+    /// order the document wrote them in.
+    pub fn written(&self) -> &Map<String, Value> {
+        self.written
+    }
+
+    /// The profile's count of sends. The first call for a profile makes
+    /// its tally under that profile's `sent_ttl_ms`.
+    pub fn sent(&mut self) -> Arc<SentCredit> {
+        profile_sent(self.sent, self.profile, self.sent_ttl_ms)
+    }
+}
+
+/// The count of sends in a profile's slot, made at the first ask under the
+/// profile's `sent_ttl_ms`. A factory's context and a typed stage both ask
+/// here, so a profile holds one count.
+pub(crate) fn profile_sent(
+    slot: &mut Option<Arc<SentCredit>>,
+    profile: &str,
+    sent_ttl_ms: Option<u32>,
+) -> Arc<SentCredit> {
+    Arc::clone(slot.get_or_insert_with(|| Arc::new(SentCredit::new(profile, sent_ttl_ms))))
+}
+
+/// Why a factory refuses what the document wrote. It displays as the
+/// refusal reads in a document's error, without the stage's path.
+#[derive(Debug)]
+pub struct StageError(StageRefusal);
+
+#[derive(Debug)]
+enum StageRefusal {
+    Field {
+        field: String,
+        value: String,
+        reason: &'static str,
+    },
+    Other(String),
+}
+
+impl StageError {
+    /// Refuses `value` in `field`, with `reason` describing what it must be.
+    pub fn bad(field: &str, value: impl fmt::Display, reason: &'static str) -> Self {
+        Self(StageRefusal::Field {
+            field: field.to_owned(),
+            value: value.to_string(),
+            reason,
+        })
+    }
+
+    /// Refuses the stage's parameters in the factory's own words.
+    pub fn other(reason: impl Into<String>) -> Self {
+        Self(StageRefusal::Other(reason.into()))
+    }
+
+    pub(crate) fn at(self, path: &str) -> SpecError {
+        match self.0 {
+            StageRefusal::Field {
+                field,
+                value,
+                reason,
+            } => SpecError::BadField {
+                path: format!("{path}.{field}"),
+                value,
+                reason,
+            },
+            StageRefusal::Other(reason) => SpecError::BadStage {
+                path: path.to_owned(),
+                reason,
+            },
+        }
+    }
+}
+
+impl From<serde_json::Error> for StageError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::other(error.to_string())
+    }
+}
+
+impl fmt::Display for StageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            StageRefusal::Field {
+                field,
+                value,
+                reason,
+            } => write!(f, "{field} = {value} is not {reason}"),
+            StageRefusal::Other(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for StageError {}
 
 /// What a stage is in a profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,7 +230,7 @@ pub enum CatalogError {
 /// the validator ([`crate::PolicySpec::validate_in`]).
 pub struct Catalog {
     filters: Vec<(&'static str, Factory<dyn Filter>)>,
-    scorers: Vec<(&'static str, Build<dyn Scorer>)>,
+    scorers: Vec<(&'static str, ScorerBuild)>,
     pickers: Vec<(&'static str, Build<dyn Picker>)>,
     /// Whether the host makes the lifecycle's calls: a stage that needs
     /// them ([`crate::Lifecycle::needs_lifecycle`]) is in no other build.
@@ -194,6 +337,28 @@ impl Catalog {
         Ok(self)
     }
 
+    /// Adds a scorer that reads parameters beside `weight` under `name`.
+    /// A bare name supplies an empty map. Returns [`CatalogError::Held`]
+    /// when any stage already holds the name.
+    ///
+    /// The factory runs once for each place the document names the scorer
+    /// at every validation, including a start, an apply, and a dry run.
+    /// It must have no effect outside the scorer it returns.
+    pub fn scorer_with<F>(
+        &mut self,
+        name: &'static str,
+        build: F,
+    ) -> Result<&mut Self, CatalogError>
+    where
+        F: Fn(&mut StageBuild<'_>) -> Result<Box<dyn Scorer>, StageError> + Send + Sync + 'static,
+    {
+        if let Some(held) = self.held(name) {
+            return Err(CatalogError::Held { name, held });
+        }
+        self.scorers.push((name, Build::With(Box::new(build))));
+        Ok(self)
+    }
+
     /// Adds a picker under `name`. Refused when the name is held or is not
     /// the picker's own.
     pub fn picker<F>(&mut self, name: &'static str, factory: F) -> Result<&mut Self, CatalogError>
@@ -265,24 +430,28 @@ impl Catalog {
             .map(|(_, factory)| factory())
     }
 
-    /// The scorer a document names: built for one engine, or the validator's
-    /// to build from its parameters.
-    pub(crate) fn find_scorer(&self, name: &str) -> Option<Found<dyn Scorer>> {
-        find(&self.scorers, name)
+    /// The scorer a document names, or how the validator builds it.
+    pub(crate) fn find_scorer(&self, name: &str) -> Option<Found<dyn Scorer, &ScorerFactory>> {
+        find(&self.scorers, name, Box::as_ref)
     }
 
     /// The picker a document names, as [`Self::find_scorer`].
     pub(crate) fn find_picker(&self, name: &str) -> Option<Found<dyn Picker>> {
-        find(&self.pickers, name)
+        find(&self.pickers, name, |&never| match never {})
     }
 }
 
-fn find<T: ?Sized>(held: &[(&'static str, Build<T>)], name: &str) -> Option<Found<T>> {
+fn find<'a, T: ?Sized, B, F>(
+    held: &'a [(&'static str, Build<T, B>)],
+    name: &str,
+    factory_ref: impl FnOnce(&'a B) -> F,
+) -> Option<Found<T, F>> {
     held.iter()
         .find(|(held, _)| *held == name)
         .map(|(_, build)| match build {
             Build::Typed => Found::Typed,
             Build::Factory(factory) => Found::Built(factory()),
+            Build::With(factory) => Found::With(factory_ref(factory)),
         })
 }
 
@@ -748,7 +917,7 @@ profiles:
                 answers: "worst",
             })
         );
-        assert!(catalog.scorers().eq(SCORERS));
+        assert!(catalog.scorers().eq(SCORERS.iter().copied()));
     }
 
     #[test]
@@ -975,7 +1144,7 @@ profiles:
             }
         }
         // Every scorer is the validator's to build.
-        for name in SCORERS {
+        for &name in SCORERS {
             assert!(
                 matches!(stock.find_scorer(name), Some(Found::Typed)),
                 "{name}"
@@ -987,7 +1156,7 @@ profiles:
     fn the_stock_catalog_is_the_lists_the_spec_publishes() {
         let stock = Catalog::builtin();
         assert!(stock.filters().eq(FILTERS), "{stock:?}");
-        assert!(stock.scorers().eq(SCORERS), "{stock:?}");
+        assert!(stock.scorers().eq(SCORERS.iter().copied()), "{stock:?}");
         assert!(stock.pickers().eq(PICKERS), "{stock:?}");
         // Every bare name of the lists is held: whatever else a document
         // that names it is refused for, it is not an unknown name.
@@ -1007,5 +1176,430 @@ profiles:
                 panic!("{name}: {unknown:?}");
             }
         }
+    }
+
+    const PRICE_PATH: &str = "profiles.default.score[0].queue-price";
+    const PRICE_FIELD: &str = "profiles.default.score[0].queue-price.per_request";
+    const BAD_PRICE: &str = "[{ queue-price: { per_request: -11 } }]";
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct QueuePrice {
+        per_request: i32,
+    }
+
+    impl Lifecycle for QueuePrice {}
+
+    impl Scorer for QueuePrice {
+        fn name(&self) -> &'static str {
+            "queue-price"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            for (&row, score) in kept.iter().zip(out) {
+                let cost = candidates[row as usize].in_flight as f32 * self.per_request as f32;
+                *score = 1.0 / (1.0 + cost);
+            }
+            TieBand::NORMALIZED
+        }
+    }
+
+    fn price_catalog() -> Catalog {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .scorer_with("queue-price", |build| {
+                let price: QueuePrice = build.params()?;
+                if price.per_request <= 0 {
+                    return Err(crate::StageError::bad(
+                        "per_request",
+                        price.per_request,
+                        "above zero",
+                    ));
+                }
+                Ok(Box::new(price))
+            })
+            .expect("a free name");
+        catalog
+    }
+
+    fn score_document(score: &str) -> PolicySpec {
+        let version = crate::API_VERSION;
+        serde_yaml::from_str(&format!(
+            "apiVersion: {version}\nprofiles:\n  default:\n    score: {score}\n    pick: best\n"
+        ))
+        .expect("a well-formed document")
+    }
+
+    #[test]
+    fn a_scorer_keeps_its_typed_parameter_and_the_profile_keeps_its_weight() {
+        let engine = score_document("[{ queue-price: { weight: 3.5, per_request: 137 } }]")
+            .validate_in(&price_catalog(), &[])
+            .expect("the scorer reads its price");
+        let weighted = &engine.profiles()[0].scorers[0];
+        assert_eq!(weighted.weight, 3.5);
+        let row = Candidate {
+            in_flight: 1,
+            ..Candidate::default()
+        };
+        let mut out = [0.0];
+        weighted
+            .scorer
+            .score(&RequestFacts::default(), &[row], &[0], &mut out);
+        assert_eq!(out, [1.0 / 138.0]);
+    }
+
+    #[test]
+    fn weight_is_absent_from_both_views_of_the_parameters() {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Price {
+            per_request: i32,
+            flat: u32,
+        }
+
+        let mut catalog = Catalog::builtin();
+        catalog
+            .scorer_with("queue-price", |build| {
+                let written = build.written();
+                assert!(written
+                    .keys()
+                    .map(String::as_str)
+                    .eq(["flat", "per_request"]));
+                let price: Price = build.params()?;
+                assert_eq!((price.per_request, price.flat), (41, 13));
+                Ok(Box::new(QueuePrice {
+                    per_request: price.per_request,
+                }))
+            })
+            .expect("a free name");
+        score_document("[{ queue-price: { weight: 6.25, per_request: 41, flat: 13 } }]")
+            .validate_in(&catalog, &[])
+            .expect("the weight is outside the parameters");
+    }
+
+    /// A factory reads its parameters in one order whatever order the
+    /// document wrote their keys in, at every depth: the order of the
+    /// canonical bytes, which the digest reads. Two files that are one
+    /// document by their digest hand a factory the same map.
+    #[test]
+    fn a_factory_reads_its_parameters_in_key_order() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heard = Arc::clone(&seen);
+        let mut catalog = Catalog::builtin();
+        catalog
+            .scorer_with("queue-price", move |build| {
+                let written = serde_json::to_string(build.written()).expect("serializes");
+                heard.lock().expect("no panic under the lock").push(written);
+                Ok(Box::new(QueuePrice { per_request: 0 }))
+            })
+            .expect("a free name");
+        let one = score_document(
+            "[{ queue-price: { weight: 2, per_request: 500, costs: [{ unit: 17, flat: 3 }] } }]",
+        );
+        let other = score_document(
+            "[{ queue-price: { costs: [{ flat: 3, unit: 17 }], per_request: 500, weight: 2 } }]",
+        );
+        assert_eq!(
+            one.digest().expect("digests"),
+            other.digest().expect("digests")
+        );
+        one.validate_in(&catalog, &[]).expect("validates");
+        other.validate_in(&catalog, &[]).expect("validates");
+        let seen = seen.lock().expect("no panic under the lock");
+        assert_eq!(seen[0], seen[1], "two orders of one map");
+        assert_eq!(
+            seen[0],
+            r#"{"costs":[{"flat":3,"unit":17}],"per_request":500}"#
+        );
+    }
+
+    #[test]
+    fn a_bare_name_builds_from_an_empty_map_at_weight_one() {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .scorer_with("high-id", |build| {
+                assert!(build.written().is_empty());
+                let typed: serde_json::Map<String, serde_json::Value> = build.params()?;
+                assert!(typed.is_empty());
+                Ok(Box::new(HighId))
+            })
+            .expect("a free name");
+        for score in ["[high-id]", "[{ high-id: {} }]"] {
+            let engine = score_document(score)
+                .validate_in(&catalog, &[])
+                .expect("the scorer needs no parameters");
+            assert_eq!(engine.profiles()[0].scorers[0].weight, 1.0);
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_mistyped_parameter_is_refused_at_the_stage() {
+        let catalog = price_catalog();
+        for (score, message) in [
+            ("[{ queue-price: { spare: 17 } }]", "unknown field `spare`"),
+            ("[{ queue-price: { per_request: 'many' } }]", "invalid type"),
+        ] {
+            let error = score_document(score)
+                .validate_in(&catalog, &[])
+                .expect_err("the parameter is refused");
+            let SpecError::BadStage { path, reason } = error else {
+                panic!("{error}");
+            };
+            assert_eq!(path, PRICE_PATH);
+            assert!(reason.contains(message), "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_factory_can_refuse_a_value_at_its_field() {
+        let error = score_document(BAD_PRICE)
+            .validate_in(&price_catalog(), &[])
+            .expect_err("a negative price is refused");
+        assert_eq!(
+            error,
+            SpecError::BadField {
+                path: PRICE_FIELD.into(),
+                value: "-11".into(),
+                reason: "above zero",
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("{PRICE_FIELD} = -11 is not above zero")
+        );
+    }
+
+    #[test]
+    fn a_factory_refusal_names_the_field_to_edit() {
+        let catalog = price_catalog();
+        for (score, path) in [("[queue-price]", PRICE_PATH), (BAD_PRICE, PRICE_FIELD)] {
+            let error = score_document(score)
+                .validate_in(&catalog, &[])
+                .expect_err("the factory refuses the parameters");
+            assert_eq!(error.field_path(), path);
+        }
+    }
+
+    #[test]
+    fn a_refusal_displays_without_the_stages_path() {
+        let field = crate::StageError::bad("per_request", 0, "above zero");
+        assert_eq!(field.to_string(), "per_request = 0 is not above zero");
+        let other = crate::StageError::other("no price list");
+        assert_eq!(other.to_string(), "no price list");
+        let error: &dyn std::error::Error = &other;
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn a_held_name_is_refused_without_running_the_factory() {
+        let mut catalog = price_catalog();
+        let called = Arc::new(AtomicUsize::new(0));
+        for (name, held) in [
+            ("healthy", StageKind::Filter),
+            ("least-requests", StageKind::Scorer),
+            ("best", StageKind::Picker),
+            ("queue-price", StageKind::Scorer),
+        ] {
+            let calls = Arc::clone(&called);
+            assert_eq!(
+                catalog
+                    .scorer_with(name, move |_| {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        Ok(Box::new(HighId))
+                    })
+                    .map(|_| ()),
+                Err(CatalogError::Held { name, held })
+            );
+            assert_eq!(called.load(Ordering::Relaxed), 0);
+        }
+        assert_eq!(catalog.scorers().count(), SCORERS.len() + 1);
+    }
+
+    #[test]
+    fn a_factory_runs_only_for_valid_entries_that_name_it() {
+        let mut catalog = Catalog::builtin();
+        let called = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&called);
+        catalog
+            .scorer_with("high-id", move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::new(HighId))
+            })
+            .expect("a free name");
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        assert!(catalog.find_scorer("high-id").is_some());
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        score_document("[least-requests]")
+            .validate_in(&catalog, &[])
+            .expect("the document names another scorer");
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+
+        let refused = |score: &str| {
+            score_document(score)
+                .validate_in(&catalog, &[])
+                .expect_err("refused")
+        };
+        assert_eq!(
+            refused("[{ absent: [17] }]"),
+            SpecError::UnknownScorer {
+                profile: "default".into(),
+                name: "absent".into(),
+            }
+        );
+        let path = "profiles.default.score[0].high-id";
+        for (score, value) in [
+            ("[{ high-id: [17] }]", "[17]"),
+            ("[{ high-id: null }]", "null"),
+        ] {
+            assert_eq!(
+                refused(score),
+                SpecError::BadField {
+                    path: path.into(),
+                    value: value.into(),
+                    reason: "a map of the scorer's weight: { weight }",
+                }
+            );
+        }
+        for (weight, value) in [("-7", "-7"), ("9e70", "9e+70"), ("'many'", "\"many\"")] {
+            let error = refused(&format!("[{{ high-id: {{ weight: {weight} }} }}]"));
+            assert_eq!(
+                error,
+                SpecError::BadField {
+                    path: format!("{path}.weight"),
+                    value: value.into(),
+                    reason: "a finite number above zero",
+                }
+            );
+        }
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+
+        let named = score_document("[high-id, high-id, high-id]");
+        for expected in [3, 6] {
+            named.validate_in(&catalog, &[]).expect("validates again");
+            assert_eq!(called.load(Ordering::Relaxed), expected);
+        }
+    }
+
+    #[test]
+    fn each_build_checks_the_scorers_name() {
+        let mut catalog = Catalog::builtin();
+        let called = AtomicUsize::new(0);
+        catalog
+            .scorer_with(
+                "high-id",
+                move |_| -> Result<Box<dyn Scorer>, crate::StageError> {
+                    if called.fetch_add(1, Ordering::Relaxed) == 0 {
+                        Ok(Box::new(HighId))
+                    } else {
+                        Ok(Box::new(LowId))
+                    }
+                },
+            )
+            .expect("a free name");
+        let document = score_document("[high-id]");
+        document
+            .validate_in(&catalog, &[])
+            .expect("the name agrees");
+        let error = document
+            .validate_in(&catalog, &[])
+            .expect_err("the name disagrees");
+        let SpecError::BadStage { path, reason } = error else {
+            panic!("{error}");
+        };
+        assert_eq!(path, "profiles.default.score[0].high-id");
+        assert!(
+            reason.contains("high-id") && reason.contains("low-id"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_refused_profile_drops_the_stages_built_for_the_document() {
+        #[derive(Debug)]
+        struct CountDrop(Arc<AtomicUsize>);
+
+        impl Lifecycle for CountDrop {}
+
+        impl Scorer for CountDrop {
+            fn name(&self) -> &'static str {
+                "count-drop"
+            }
+
+            fn score(
+                &self,
+                facts: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                kept: &[u32],
+                out: &mut [f32],
+            ) -> TieBand {
+                HighId.score(facts, candidates, kept, out)
+            }
+        }
+
+        impl Drop for CountDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let mut catalog = Catalog::builtin();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::clone(&dropped);
+        catalog
+            .scorer_with("count-drop", move |_| {
+                Ok(Box::new(CountDrop(Arc::clone(&drops))))
+            })
+            .and_then(|catalog| {
+                catalog.scorer_with("refused", |_| Err(crate::StageError::other("no price")))
+            })
+            .expect("two free names");
+        let standing = score_document("[count-drop]")
+            .validate_in(&catalog, &[])
+            .expect("a valid document");
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        let version = crate::API_VERSION;
+        let invalid: PolicySpec = serde_yaml::from_str(&format!(
+            "apiVersion: {version}
+profiles:
+  before: {{ score: [count-drop], pick: best }}
+  later: {{ score: [refused], pick: best }}
+bindings: [{{ profile: before }}]
+"
+        ))
+        .expect("a well-formed document");
+        assert_eq!(
+            invalid
+                .validate_in(&catalog, &[])
+                .expect_err("a later profile is refused"),
+            SpecError::BadStage {
+                path: "profiles.later.score[0].refused".into(),
+                reason: "no price".into(),
+            }
+        );
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            standing.profiles()[0].scorers[0].scorer.name(),
+            "count-drop"
+        );
+        drop(standing);
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_plain_scorer_reports_that_it_takes_only_weight() {
+        let error = score_document("[{ high-id: { weight: 3.5, spread: 17 } }]")
+            .validate_in(&catalog(), &[])
+            .expect_err("the plain scorer accepts only weight");
+        assert!(matches!(&error, SpecError::BadField { .. }));
+        assert_eq!(
+            error.to_string(),
+            "profiles.default.score[0].high-id.spread = 17 is not a parameter of a scorer added in code, which takes its weight alone"
+        );
     }
 }

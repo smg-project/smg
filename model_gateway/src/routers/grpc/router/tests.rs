@@ -16,6 +16,7 @@ use serde_json::json;
 use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts};
 use smg_worker::{
     identity::basic::{BasicWorker, ConnectionMode, RuntimeType},
+    jobs::WorkerJobAsker,
     workflow::WorkerKind,
 };
 use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
@@ -135,6 +136,29 @@ async fn the_attempt_deadline_is_armed_only_by_grpc_request_timeout_secs() {
     for pipeline in pipelines_of(&router) {
         assert_eq!(pipeline.request_timeout(), Some(Duration::from_secs(30)));
     }
+}
+
+/// A store has one host, the context's. The router's stages ask that one,
+/// and the router builds none of its own.
+#[tokio::test]
+async fn a_router_asks_the_host_of_its_context() {
+    use crate::policy_controller::host::testing::bed;
+
+    let config = grpc_config(regular_routing_mode()).build_unchecked();
+    let mut ctx = grpc_ctx_from(&config, mcp_orchestrator().await);
+    let (host, _store, _workers) = bed(&[]);
+    let host = Arc::new(host);
+    Arc::get_mut(&mut ctx)
+        .expect("the context is not shared yet")
+        .policy_host = Some(Arc::clone(&host));
+    assert_eq!(Arc::strong_count(&host), 2);
+
+    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+    assert!(
+        Arc::strong_count(&host) > 2,
+        "the router's stages hold the context's host"
+    );
+    drop(router);
 }
 
 /// `--grouped-dp-sticky` reaches every pipeline a regular or PD router
@@ -463,6 +487,7 @@ fn tokenizer_step_input(
         WorkerSpec::new("grpc://worker:30000"),
         WorkerRegistrationMode::Upsert,
         ctx.clone(),
+        WorkerJobAsker::Api,
     );
     data.worker_kind = Some(WorkerKind::Local);
     data.connection_mode = Some(ConnectionMode::Grpc);

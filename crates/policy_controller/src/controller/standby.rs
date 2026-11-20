@@ -2923,9 +2923,12 @@ mod tests {
 
     #[test]
     fn a_standby_applies_its_leaders_generations_through_its_own_door() {
-        use crate::controller::generations::{
-            tests::{LEAST_LOAD, RANDOM},
-            Format,
+        use crate::controller::{
+            generations::{
+                tests::{LEAST_LOAD, RANDOM},
+                Format,
+            },
+            wire::spec_document,
         };
 
         let (leader, _, standby) = pair();
@@ -2946,8 +2949,8 @@ mod tests {
         assert_eq!(told(&standby.1), told(&leader.1), "one history");
         assert_eq!(held(&standby.0), held(&leader.0));
         assert_eq!(
-            following.document(0).expect("held"),
-            leading.document(0).expect("held")
+            spec_document(following.document(0).expect("held")),
+            spec_document(leading.document(0).expect("held"))
         );
         assert_eq!(following.counts().applied, 1, "the one that stood");
 
@@ -2964,7 +2967,10 @@ mod tests {
 
     #[test]
     fn a_snapshot_restores_its_leaders_standing_generation_or_nothing() {
-        use crate::controller::generations::{tests::LEAST_LOAD, Format};
+        use crate::controller::{
+            generations::{tests::LEAST_LOAD, Format},
+            wire::spec_document,
+        };
 
         let (leader, _, standby) = pair();
         let (leading, following) = (door(&leader), door(&standby));
@@ -3004,8 +3010,8 @@ mod tests {
         assert_eq!(follower.place(), leader.1.head(Kinds::All));
         assert_eq!(held(&standby.0), held(&leader.0));
         assert_eq!(
-            following.document(0).expect("held"),
-            leading.document(0).expect("held")
+            spec_document(following.document(0).expect("held")),
+            spec_document(leading.document(0).expect("held"))
         );
     }
 }

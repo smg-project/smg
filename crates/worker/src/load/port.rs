@@ -108,9 +108,11 @@ pub struct GroupTick<'a> {
 /// The lock: the collector calls [`Self::record`], [`Self::report`] and
 /// [`Self::report_empty`] while it holds the lock of its own reports, and
 /// lays what the sink answers under the same hold, so a record that lands
-/// between a sink's answer and the collector's lay is not undone. A sink
-/// called there neither calls the collector nor waits. The other calls are
-/// made with no lock of the collector's held.
+/// between a sink's answer and the collector's lay is not undone. It calls
+/// [`Self::forget`] there too, so a record lands ahead of a report's
+/// removal or behind the sink's word of it. A sink called there neither
+/// calls the collector nor waits. The other calls are made with no lock of
+/// the collector's held.
 ///
 /// A poll's unit is one engine: its polled members cross together, so a
 /// sink that judges an engine reads the answer whole.
@@ -150,25 +152,33 @@ pub trait LoadSink: Send + Sync {
     /// leave the file.
     fn report_empty(&self, answer: &[PolledMember<'_>], polled_at: Instant) -> Vec<i32>;
 
-    /// The fetch of one engine failed: no answer for any polled member.
-    fn fetch_failed(&self, members: &[Arc<dyn Worker>]);
+    /// The fetch of one engine failed: no answer for any polled member of
+    /// the poll asked at `polled_at`.
+    fn fetch_failed(&self, members: &[Arc<dyn Worker>], polled_at: Instant);
 
     /// The worker's loads are forgotten: it left the registry, was
-    /// replaced, or its status left `Ready`. It is also said, under the
-    /// lock of the reports, for a worker whose pushed report a record of
-    /// the registry's worker at the URL replaced.
+    /// replaced, or its status left `Ready`. It is also said for a worker
+    /// whose pushed report a record of the registry's worker at the URL
+    /// replaced. It is not said at the eviction of a worker whose URL holds
+    /// another worker's report: what the sink holds at the URL is that
+    /// worker's since its first record. A worker that never pushed is then
+    /// not said at all: a sink that keys its rows by the worker and not by
+    /// the URL lets them go at the first record of the URL's next worker.
     fn forget(&self, worker: &Arc<dyn Worker>);
 
     /// The collector reset itself: it stopped its groups and dropped every
     /// load it published. It does so on two paths: at its start and after
-    /// it lost registry events. What the sink derived from loads is void:
-    /// its verdicts and its rows. Just before this call the collector says
-    /// [`Self::forget`] for every worker whose pushed report it held and
-    /// that is no longer the registry's `Ready` worker at its URL. So a
-    /// sink may keep what it knows of a stream, as the collector keeps the
-    /// report of a pusher that stays. A polled worker that left while
-    /// events were lost is never said: nothing of a polled worker outlives
-    /// this call.
+    /// it lost registry events. What the sink derived from loads and
+    /// cannot tie to a standing worker by itself is void: its verdicts and
+    /// its rows. Just before this call the collector says [`Self::forget`]
+    /// for every worker whose pushed report it held and that is no longer
+    /// the registry's `Ready` worker at its URL. So a sink may keep what it
+    /// knows of a stream, as the collector keeps the report of a pusher
+    /// that stays. A polled worker that left while events were lost is
+    /// never said: in a sink that keeps rows of its own, nothing of a
+    /// polled worker outlives this call. A sink whose rows end with the
+    /// write that removes their worker keeps them: no row of a worker that
+    /// left stands there.
     ///
     /// A dropped collector says nothing: its drop stops its tasks and calls
     /// no sink. The host that drops a collector owns the sink too: it voids

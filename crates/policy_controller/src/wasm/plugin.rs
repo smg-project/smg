@@ -30,7 +30,7 @@ use super::{
 use crate::{
     decider::Decider,
     decision::{Decision, Target, MAX_TARGETS},
-    framework::{self, DecisionScope},
+    framework::{self, DecisionScope, TieBand},
     lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     plugins::{
         breaker::{Breaker, Latency},
@@ -2167,6 +2167,8 @@ struct Open {
     mask_set: bool,
     /// The scorer's answer, one per candidate, clamped, once `scores_set`.
     scores: Vec<f32>,
+    /// The band the scorer answered beside them, none where it sent none.
+    band: Option<f32>,
     scores_set: bool,
     /// The picker's input: the combined scores, `-1.0` on a filtered row.
     scores_in: Vec<f32>,
@@ -2190,6 +2192,7 @@ impl Default for Open {
             mask: Vec::new(),
             mask_set: false,
             scores: Vec::new(),
+            band: None,
             scores_set: false,
             scores_in: Vec::new(),
         }
@@ -2213,6 +2216,7 @@ impl Open {
         self.mask.clear();
         self.mask_set = false;
         self.scores.clear();
+        self.band = None;
         self.scores_set = false;
     }
 
@@ -2771,13 +2775,14 @@ impl BoundPlugin for Bound {
     }
 
     /// The scorer's answer for the phase's decision, computed once: `out[i]`
-    /// is the score of `kept[i]`.
+    /// is the score of `kept[i]`, and the band is the one the guest answered
+    /// beside its scores, the default one where it answered none.
     fn score(
         &self,
         facts: &RequestFacts<'_>,
         kept: &[u32],
         out: &mut [f32],
-    ) -> Result<(), Fallback> {
+    ) -> Result<TieBand, Fallback> {
         let mut open = self.state(facts.phase);
         if !open.scores_set {
             if open.score_declined {
@@ -2796,10 +2801,20 @@ impl BoundPlugin for Bound {
                         .call_score(&mut inst.store, resource),
                 })?;
             open.score_declined = matches!(answer, Call::Declined);
-            let mut scores = open.answered(answer)?;
+            let wit::ScoreAnswer {
+                mut scores,
+                tie_band,
+            } = open.answered(answer)?;
             // One finite value per candidate, clamped by the host.
             if scores.len() != count as usize || scores.iter().any(|s| !s.is_finite()) {
                 return Err(open.invalid(&self.plugin, &mut guard));
+            }
+            // A band the guest sends is a finite value from 0 to 1.
+            if let Some(band) = tie_band {
+                if !(0.0..=1.0).contains(&band) {
+                    return Err(open.invalid(&self.plugin, &mut guard));
+                }
+                open.band = Some(band);
             }
             for s in &mut scores {
                 *s = s.clamp(0.0, 1.0);
@@ -2811,7 +2826,7 @@ impl BoundPlugin for Bound {
         for (o, &i) in out.iter_mut().zip(kept) {
             *o = open.scores.get(i as usize).copied().unwrap_or(0.0);
         }
-        Ok(())
+        Ok(open.band.map_or(TieBand::NORMALIZED, TieBand))
     }
 
     /// The picker's answer over the survivors: `scores[i]` belongs to

@@ -17,7 +17,9 @@ use openai_protocol::worker::WorkerUpdateRequest as ProtocolWorkerUpdateRequest;
 pub use openai_protocol::worker::{WorkerSpec, WorkerUpdateRequest as ProtocolUpdateRequest};
 use serde::{Deserialize, Serialize};
 pub use smg_worker::jobs::WorkerRegistrationMode;
-use smg_worker::{identity::basic::Worker, registry::WorkerId, workflow as worker_workflow};
+use smg_worker::{
+    identity::basic::Worker, jobs::WorkerJobAsker, registry::WorkerId, workflow as worker_workflow,
+};
 use wfaas::{WorkflowData, WorkflowError, WorkflowResult};
 
 use super::{
@@ -140,6 +142,8 @@ pub type WorkerRemovalWorkflowData = worker_workflow::WorkerRemovalWorkflowData<
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerUpdateWorkflowData {
     pub config: ProtocolWorkerUpdateRequest,
+    /// Who asked for the update or label refresh. A host's own step reads it.
+    pub asker: WorkerJobAsker,
     /// URL of worker(s) to update
     pub worker_url: String,
     /// Application context (transient, must be re-initialized after deserialization)

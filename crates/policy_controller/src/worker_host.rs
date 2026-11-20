@@ -16,8 +16,9 @@
 //!
 //! # The one table
 //!
-//! [`object()`] makes the object from a row. Each fact of the row lands in
-//! one field of the object, or is not carried:
+//! [`object()`] reads the table from row to object and [`facts()`] reads it
+//! back. Each fact of the row lands in one field of the object, or is not
+//! carried:
 //!
 //! | The row's fact | The object's field |
 //! |---|---|
@@ -36,14 +37,39 @@
 //! | `signals`, `reachable_from` | not carried: the object has no field for them, and a collector reads them of the row by the id the holder keeps |
 //! | `zone`, `pairing`, `encode`, `vision`, `max_running`, `priority`, `overload` | not carried: a decision's facts, read of the store's rows and never of an object |
 //!
-//! Of the row's own columns, the status is the object's first status and is
-//! not followed after: the store's status is the truth, and what drives it
-//! writes the store. An object built in the place of a standing one takes
-//! that one's running state, its status with it, and not its row's status.
+//! A new object starts at its row's status. A replacement takes the
+//! standing object's running state, including its status. A host that gets
+//! health from the rows can use [`Objects::with_status_followed`] to copy
+//! their status on tail changes and snapshots, for objects kept or laid
+//! again. The holder checks the row's revision under the object's
+//! mutation lock and hands the registry the status, as the health
+//! adapter does: the registry's subscribers hear the change, and a
+//! promotion comes back as any promotion does. The host's vetoes stand.
 //! The id and the revision stand beside the object in the
 //! holder ([`Standing`]). No credential and no connector is a row's fact. A
 //! host hands the holder its connector ([`Objects::with_connector`]); a
 //! credential has no door yet.
+//!
+//! # The adapters
+//!
+//! [`HealthAdapter`] writes probe outcomes and connect signals to the store
+//! and sets the object's status to the status that stands there. The host
+//! supplies the [`Lead`] and the term the adapter writes under.
+//!
+//! [`LoadAdapter`] writes load records and poll answers to the store. The
+//! store decides when the collector polls and keeps the overload verdict.
+//!
+//! [`KvAdapter`] decodes the worker's KV events for the store's index, and
+//! [`KvHost`] gives each subscription its row in the store. Every replica
+//! runs the adapter over its own streams. The adapter keeps what a row's
+//! stream showed of its cache groups, as the gateway's index does. A row
+//! above rank 0 of a data-parallel worker gets no feed yet ([`NoFeed`]).
+//! The module `kv` names the decode's limits.
+//!
+//! # The door
+//!
+//! The host hands out a [`Membership`] door. A host without election uses
+//! [`StoreDoor`]. A replica that may lead uses the controller's door.
 //!
 //! # What the module does not hold
 //!
@@ -51,8 +77,22 @@
 //! registry and hands it in, and calls [`Objects::follow`] where the store
 //! moved. It names nothing of the controller.
 
+mod door;
+mod found;
+mod health;
+mod kv;
+mod lead;
+mod loads;
 mod object;
 mod objects;
 
+#[cfg(feature = "controller")]
+pub(crate) use door::{drain, lay, take, Turn};
+pub use door::{Membership, Refused, StoreDoor, Wrote};
+pub use found::facts;
+pub use health::HealthAdapter;
+pub use kv::{KvAdapter, KvHost, NoFeed, Unfed};
+pub use lead::{Lead, SoleLead};
+pub use loads::LoadAdapter;
 pub use object::object;
 pub use objects::{Members, Objects, Standing};

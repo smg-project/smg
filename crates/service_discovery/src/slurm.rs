@@ -98,7 +98,9 @@ pub struct SlurmProviderConfig {
 
 impl SlurmProviderConfig {
     /// The host's validation has checked the mapping against the routing
-    /// mode; a mode with no worker pools to fill is still refused here.
+    /// mode; a mode with no worker pools to fill is still refused here. So
+    /// is a job name under two roles: the map holds one role a name, and
+    /// the later role would replace the earlier with no word.
     /// `routing` is the roles the routing mode accepts: `roles` here names
     /// the provider's own map of job names.
     pub fn new(
@@ -112,15 +114,25 @@ impl SlurmProviderConfig {
                     .to_string(),
             });
         }
-        let roles = [
+        let mut roles = BTreeMap::new();
+        for (names, worker_type) in [
             (&config.job_names, WorkerType::Regular),
             (&config.encode_job_names, WorkerType::Encode),
             (&config.prefill_job_names, WorkerType::Prefill),
             (&config.decode_job_names, WorkerType::Decode),
-        ]
-        .into_iter()
-        .flat_map(|(names, worker_type)| names.iter().map(move |name| (name.clone(), worker_type)))
-        .collect();
+        ] {
+            for name in names {
+                if let Some(other) = roles.insert(name.clone(), worker_type) {
+                    if other != worker_type {
+                        return Err(DiscoveryConfigError::ValidationFailed {
+                            reason: format!(
+                                "Slurm job name '{name}' maps to both {other} and {worker_type} workers"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
         Ok(Self {
             roles,
             port: config.port,

@@ -210,11 +210,10 @@ pub enum Maker {
 }
 
 impl Maker {
-    /// The bytes of a provider's name: a label key's bound on the wire.
-    pub const NAME_BYTES: usize = 128;
-    /// The bytes of a provider's key for one worker: a URL's bound on the
-    /// wire.
-    pub const KEY_BYTES: usize = 2_048;
+    /// The bytes of a provider's name: a label key's bound.
+    pub const NAME_BYTES: usize = WorkerFacts::LABEL_KEY_BYTES;
+    /// The bytes of a provider's key for one worker: a URL's bound.
+    pub const KEY_BYTES: usize = WorkerFacts::URL_BYTES;
 
     /// The maker `provider` is for the worker it knows by `key`, or the part
     /// that breaks its rule. The rules are checked here and nowhere else, so
@@ -432,6 +431,11 @@ pub trait WorkersStore: Send + Sync {
     /// that stands under the key keeps the maker it has, through a refresh
     /// and through a new incarnation, whoever calls. Who may write a row is
     /// the membership door's test, not the store's.
+    ///
+    /// The store takes the incarnation as stated. A caller numbers a new
+    /// life of a key with a number no life of the key had: the membership
+    /// doors do ([`life`](super::membership::life)), and a row they made
+    /// never comes back under its id.
     fn upsert_by(&self, facts: WorkerFacts, maker: Maker) -> MembershipChange;
 
     /// Change a row's mutable facts; `None` when the row is gone or
@@ -466,9 +470,10 @@ pub trait WorkersStore: Send + Sync {
     fn changes_since(&self, epoch: u64) -> MembershipTail;
 
     /// Which history of rows the store holds: it moves when the rows are
-    /// replaced whole by another store's
-    /// ([`MemoryStore::restore_from`](super::MemoryStore::restore_from))
-    /// and at no write. An epoch names a place in one history, and a row
+    /// replaced from a snapshot
+    /// ([`MemoryStore::restore_from`](super::MemoryStore::restore_from) or
+    /// [`MemoryStore::watch_from`](super::MemoryStore::watch_from)).
+    /// An epoch names a place in one history, and a row
     /// under one id and one revision may state other facts in the next, so
     /// a watcher that keeps its place keeps this beside it and starts again
     /// from a snapshot, trusting nothing it held, when it moves. A store

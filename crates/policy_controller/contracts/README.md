@@ -13,7 +13,7 @@ rewrites it; the test fails on any other difference).
 |---|---|---|
 | `policy_plugin.proto` | package `smg.policy.v1`: the view (`RequestFacts`, `Candidate`, `LoadRow`, `Constraints`, `PoolFacts`, `Identity`), the decision (`Decision`, `Pick`, `Target`, `Pair`, `Shed`, `Queue`, `Trace`, `Lease`, `Busy`), the lifecycle (`LifecycleEvent`) and the `PolicyPlugin` service a user policy serves over gRPC | 4.1, 4.2, 4.3, 4.5, appendix A |
 | `policy_controller.proto` | the same package: the `PolicyController` service of the standalone controller in its four scopes (gateway, ingestion, control, replication), its frames, credits, worker events, snapshots, spec operations, leadership and the replication log; imports the file above and the engine wire's `common.proto` for the relayed load record and event batch | 5.1 to 5.5, 8, appendix A |
-| `smg-policy.wit` | package `smg:policy@1.1.0`: the `types` and `host` interfaces and the two worlds a WebAssembly policy targets, `policy` (the view as records) and `policy-packed` (the view as bytes) | 4.5, appendix B |
+| `smg-policy.wit` | package `smg:policy@1.2.0`: the `types` and `host` interfaces and the two worlds a WebAssembly policy targets, `policy` (the view as records) and `policy-packed` (the view as bytes) | 4.5, appendix B |
 
 Section numbers are the policy controller design's. The in-process form of
 every view, decision and lifecycle message is the crate's own type in
@@ -29,7 +29,10 @@ clock, a lease's issue instant), and each file's comments name them.
   number and name, enum values are never renumbered, a `oneof` only grows. An
   unknown `oneof` case decodes as unset: a `Decision` with no outcome is a
   deadline miss, a `PluginDecision` that answers none of its asked stages a
-  decline. An empty filter mask is a present, empty `survivors` message and
+  decline.
+  A `PluginDecision` may carry a `tie_band` with its scores, and the host uses
+  its default band when the field is absent.
+  An empty filter mask is a present, empty `survivors` message and
   sheds the request; it is never a decline. `Hello` carries the protocol
   range and `Welcome` the chosen version; the controller speaks N and N-1 and
   upgrades first. A plugin speaks one version on all its streams, fixed by
@@ -39,16 +42,16 @@ clock, a lease's issue instant), and each file's comments name them.
   lifecycle wires (budgets, ages and vetoes are durations relative to receipt);
   the control scope's audit records carry wall-clock instants on purpose.
 - The WIT package carries the world version. The engine accepts
-  `smg:policy@1.x` within a stated range and the spec may pin `abi: 1.1`. The
+  `smg:policy@1.x` within a stated range and the spec may pin `abi: 1.2`. The
   component model types a record, variant, flags or function by its exact
   shape, so within `1.x` no type or signature changes: a `1.y` release adds
   host functions, interfaces or worlds a module may leave unused, a module's
   extra exports are ignored, and a changed shape is a new type or the next
   major. The world is pre-release until a shipped release carries it: until
   then a shape changes in place under the next minor and the range's floor
-  rises with it (1.1 added `left` to `membership`, and a 1.0 module is
-  refused). The loader's error names the module's version and the accepted
-  range.
+  rises with it (1.1 added `left` to `membership`, 1.2 gave `score` its
+  answer record, and a 1.0 or 1.1 module is refused). The loader's error
+  names the module's version and the accepted range.
 - Both are pre-release until the first shipped release that carries them; the
   rules above bind from then on.
 - `tests/contracts.rs` pins the names: the RPC list of each service with its
@@ -80,9 +83,9 @@ clock, a lease's issue instant), and each file's comments name them.
   as a gRPC plugin's frame does.
 - The validity rules a plugin must keep are in the files: surviving positions
   unique and in range, one finite score per candidate clamped to `0..1`, a
-  pick inside the surviving set; a violation is a trap (the instance is
-  re-instantiated), a `decline` runs the stage's fallback and keeps the
-  instance.
+  tie band that is, where sent, a finite value from 0 to 1, a pick inside the
+  surviving set; a violation is a trap (the instance is re-instantiated), a
+  `decline` runs the stage's fallback and keeps the instance.
 
 ## Conformance
 

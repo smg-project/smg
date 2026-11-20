@@ -11,6 +11,7 @@
 use std::fmt;
 
 use crate::{
+    counts::Slot,
     decision::{Decision, Target},
     sessions::SessionVerdict,
     view::{Health, LoadRow, Session, WorkerId},
@@ -168,11 +169,21 @@ pub enum Membership<'a> {
 /// A signal about one worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signal {
-    /// A load row for one rank of a worker.
+    /// A load row for one rank of a worker, as the host shows it to its
+    /// decisions.
     Load {
         worker: WorkerId,
         dp_rank: u16,
         row: LoadRow,
+        /// The place of the rank's count in the host's counts: a stage that
+        /// keeps a number a member finds the member's cell by it.
+        /// In-process only; [`Slot::NONE`] from a host that keeps no
+        /// counts.
+        slot: Slot,
+        /// The sample instant of `row` on the host's clock, in microseconds
+        /// since the host's origin, as the rank's row names it to a
+        /// decision. In-process only; the wire carries the row's age.
+        sampled_at_micros: u64,
     },
     Health {
         worker: WorkerId,
@@ -310,6 +321,19 @@ pub trait Lifecycle: Send + Sync {
 
     fn on_signal(&self, _signal: &Signal) {}
 
+    /// Whether the stage keeps a number of each rank's report, which a host
+    /// tells it before it shows a decision that report ([`Signal::Load`]
+    /// with the rank's slot and the report's sample instant). `false` by
+    /// default: a host tells no report to an engine none of whose stages
+    /// keeps one, and such a stage decides the same untold. The engine asks
+    /// once, at its build: the answer is the stage's for the engine's life.
+    /// A host tells such a stage under its own locks, as the policy store
+    /// does under its membership and load locks: a stage that calls from
+    /// that word a door of the host that takes one of them waits on itself.
+    fn keeps_loads(&self) -> bool {
+        false
+    }
+
     /// Whether the stage decides wrong under a host that makes none of
     /// these calls: `true` for one whose state the calls keep, as the
     /// workers it lists or the bookings it learns from. The standalone
@@ -356,6 +380,10 @@ impl<T: Lifecycle + ?Sized> Lifecycle for Box<T> {
 
     fn on_signal(&self, signal: &Signal) {
         (**self).on_signal(signal);
+    }
+
+    fn keeps_loads(&self) -> bool {
+        (**self).keeps_loads()
     }
 
     fn needs_lifecycle(&self) -> bool {

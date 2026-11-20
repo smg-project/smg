@@ -37,10 +37,9 @@ pub fn http_base_url(url: &str) -> String {
     }
 }
 
-/// The address the HTTP probe asks for `url`: its health route, under the
-/// scheme `url` starts with, or under `http://` for an address with none. A
-/// scheme the probe does not take is refused, the address masked. A host's
-/// door reads it to learn where an address it takes would be dialled.
+/// The URL of the worker's HTTP health route. Keep the worker's HTTP or
+/// HTTPS scheme and use HTTP for an address without a scheme. Refuse any
+/// other scheme and mask credentials in the error.
 pub fn http_health_url(url: &str) -> Result<String, String> {
     match url_scheme(url).as_deref() {
         Some("http") | Some("https") => Ok(format!("{}/health", url.trim_end_matches('/'))),

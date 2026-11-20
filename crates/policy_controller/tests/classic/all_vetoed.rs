@@ -32,6 +32,10 @@ enum State {
     Over,
     /// Ready, under its thresholds, doubted by the liveness tracker.
     Stalled,
+    /// Ready, over its thresholds and doubted by the liveness tracker.
+    StalledOver,
+    /// Ready and under its thresholds, behind an open circuit breaker.
+    Breaker,
     /// Not ready.
     Down,
 }
@@ -40,8 +44,9 @@ impl State {
     fn health(self) -> Health {
         Health {
             healthy: self != Self::Down,
-            overloaded: self == Self::Over,
-            stalled: self == Self::Stalled,
+            breaker_open: self == Self::Breaker,
+            overloaded: matches!(self, Self::Over | Self::StalledOver),
+            stalled: matches!(self, Self::Stalled | Self::StalledOver),
             ..Health::default()
         }
     }

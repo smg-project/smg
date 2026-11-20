@@ -4,7 +4,12 @@
 //! enums, and core configuration. These types are shared across API
 //! request/response boundaries and internal runtime state.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 #[cfg(feature = "axum")]
 use axum::{
@@ -461,7 +466,7 @@ fn default_drain_settle_secs() -> u64 {
 // ── Health check config ─────────────────────────────────────────────
 
 /// Health check configuration shared across protocol and runtime layers.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HealthCheckConfig {
     /// Health check timeout in seconds (default: 30).
     #[serde(default = "default_health_check_timeout")]
@@ -603,7 +608,7 @@ impl<'de> Deserialize<'de> for WorkerModels {
 
 /// JsonSchema: wire format is `Vec<ModelCard>`.
 impl JsonSchema for WorkerModels {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
+    fn schema_name() -> Cow<'static, str> {
         "WorkerModels".into()
     }
 
@@ -757,6 +762,8 @@ impl GrammarStart {
 
 // ── Core identity ────────────────────────────────────────────────────
 
+const REDACTED_API_KEY: &str = "<redacted>";
+
 /// Core worker identity and configuration.
 ///
 /// The single canonical representation of "what is a worker". Used as the
@@ -766,7 +773,7 @@ impl GrammarStart {
 /// Fields use `#[serde(default)]` so the same struct works for both input
 /// (partial config from user) and output (fully resolved state).
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkerSpec {
     /// Worker URL.
     pub url: String,
@@ -909,6 +916,77 @@ pub struct WorkerSpec {
     /// protection for this worker even when the gateway leaves it off.
     #[serde(default, skip_serializing_if = "OverloadUpdate::is_empty")]
     pub overload: OverloadUpdate,
+}
+
+impl std::fmt::Debug for WorkerSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // List every field so new fields require a formatting decision.
+        let Self {
+            url,
+            models,
+            worker_type,
+            connection_mode,
+            runtime_type,
+            provider,
+            labels,
+            priority,
+            cost,
+            api_key,
+            bootstrap_port,
+            bootstrap_host,
+            dp_base_url,
+            dp_rank,
+            dp_size,
+            kv_connector,
+            kv_role,
+            kv_engine_id,
+            kv_block_size,
+            pairing_protocol,
+            constrained_decoding,
+            health,
+            http_pool,
+            resilience,
+            max_connection_attempts,
+            load_monitor_interval_secs,
+            multimodal_tensor_transport,
+            multimodal_shm_min_bytes,
+            zmq_handshake_address,
+            overload,
+        } = self;
+
+        f.debug_struct("WorkerSpec")
+            .field("url", url)
+            .field("models", models)
+            .field("worker_type", worker_type)
+            .field("connection_mode", connection_mode)
+            .field("runtime_type", runtime_type)
+            .field("provider", provider)
+            .field("labels", labels)
+            .field("priority", priority)
+            .field("cost", cost)
+            .field("api_key", &api_key.is_some().then_some(REDACTED_API_KEY))
+            .field("bootstrap_port", bootstrap_port)
+            .field("bootstrap_host", bootstrap_host)
+            .field("dp_base_url", dp_base_url)
+            .field("dp_rank", dp_rank)
+            .field("dp_size", dp_size)
+            .field("kv_connector", kv_connector)
+            .field("kv_role", kv_role)
+            .field("kv_engine_id", kv_engine_id)
+            .field("kv_block_size", kv_block_size)
+            .field("pairing_protocol", pairing_protocol)
+            .field("constrained_decoding", constrained_decoding)
+            .field("health", health)
+            .field("http_pool", http_pool)
+            .field("resilience", resilience)
+            .field("max_connection_attempts", max_connection_attempts)
+            .field("load_monitor_interval_secs", load_monitor_interval_secs)
+            .field("multimodal_tensor_transport", multimodal_tensor_transport)
+            .field("multimodal_shm_min_bytes", multimodal_shm_min_bytes)
+            .field("zmq_handshake_address", zmq_handshake_address)
+            .field("overload", overload)
+            .finish()
+    }
 }
 
 impl WorkerSpec {
@@ -1419,7 +1497,7 @@ impl ResilienceUpdate {
 
 /// Worker update request
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkerUpdateRequest {
     /// Update priority
     pub priority: Option<u32>,
@@ -1435,6 +1513,26 @@ pub struct WorkerUpdateRequest {
 
     /// Update health check configuration (partial — only specified fields change)
     pub health: Option<HealthCheckUpdate>,
+}
+
+impl std::fmt::Debug for WorkerUpdateRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            priority,
+            cost,
+            labels,
+            api_key,
+            health,
+        } = self;
+
+        f.debug_struct("WorkerUpdateRequest")
+            .field("priority", priority)
+            .field("cost", cost)
+            .field("labels", labels)
+            .field("api_key", &api_key.is_some().then_some(REDACTED_API_KEY))
+            .field("health", health)
+            .finish()
+    }
 }
 
 // ── Request types ───────────────────────────────────────────────────
@@ -1565,10 +1663,36 @@ pub struct StopProfileRequest {
     pub url: Option<String>,
 }
 
-/// Per-DP-rank load snapshot from a backend.
-///
-/// Contains core metrics from the engine's `/v1/loads` endpoint or the `GetLoads` gRPC RPC.
-/// Each snapshot represents one data-parallel rank's scheduler state.
+/// A token count offered by name from the fixed used-token field.
+pub const KV_TOKENS_USED: &str = "kv_tokens_used";
+/// A token count offered by name from the fixed token-capacity field.
+pub const KV_TOKENS_CAPACITY: &str = "kv_tokens_capacity";
+
+/// The two names offered from the fixed token counts and their unit, each
+/// made once.
+static FIXED_COUNT_NAMES: LazyLock<[Arc<str>; 3]> = LazyLock::new(|| {
+    [
+        Arc::from(KV_TOKENS_USED),
+        Arc::from(KV_TOKENS_CAPACITY),
+        Arc::from("tokens"),
+    ]
+});
+
+/// One value an engine reports by name alongside its fixed fields. The name
+/// and the unit are shared strings: a copy of a report, which the load
+/// monitor makes at each publish, allocates none. A connection that knows
+/// a name ahead of its reports makes it once and clones it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct NamedValue {
+    pub name: Arc<str>,
+    pub unit: Arc<str>,
+    pub value: f64,
+    /// Age of this value's sample in milliseconds, when the engine reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u32>,
+}
+
+/// The scheduler's load report for one data-parallel rank.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SchedulerLoadSnapshot {
@@ -1624,6 +1748,54 @@ pub struct SchedulerLoadSnapshot {
     /// "prefill", "decode", or "null" as reported by the backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disagg_mode: Option<String>,
+    /// Values the engine reports by name, as the one record or answer this
+    /// snapshot was read from states them. A pushed record's list takes
+    /// the place of the rank's last: a name the record leaves out is not
+    /// in its snapshot, and that says nothing about the value. A reader
+    /// that wants a value across records keeps the last one it read; the
+    /// load sink hears every record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<NamedValue>,
+    /// The parts of this entry that its own record did not carry: the load
+    /// monitor kept them from an older record of the rank. Empty for a
+    /// polled answer and for a rank's first record. Never serialized: an
+    /// answer on the wire states its figures and no mark.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub kept: LoadTelemetry,
+}
+
+impl SchedulerLoadSnapshot {
+    /// Values the engine reports by name, followed by the two fixed token
+    /// counts, each where it is nonzero, its name is absent from the list
+    /// and this snapshot's own record carried it. A count the entry kept
+    /// from an older record ([`Self::kept`]) is not offered: what a
+    /// snapshot offers by name is its own record's. Missing fixed counts
+    /// are stored as zero.
+    pub fn named_values(&self) -> impl Iterator<Item = NamedValue> + '_ {
+        let [used, capacity, tokens] = &*FIXED_COUNT_NAMES;
+        let fixed = [
+            (used, self.num_used_tokens, LoadTelemetry::USED_TOKENS),
+            (
+                capacity,
+                self.max_total_num_tokens,
+                LoadTelemetry::TOTAL_TOKENS,
+            ),
+        ]
+        .into_iter()
+        .filter(|&(name, count, part)| {
+            count != 0
+                && !self.kept.contains(part)
+                && !self.values.iter().any(|value| value.name == *name)
+        })
+        .map(move |(name, count, _)| NamedValue {
+            name: Arc::clone(name),
+            unit: Arc::clone(tokens),
+            value: f64::from(count),
+            age_ms: None,
+        });
+        self.values.iter().cloned().chain(fixed)
+    }
 }
 
 bitflags! {
@@ -1631,7 +1803,7 @@ bitflags! {
     /// flag for each part of [`SchedulerLoadSnapshot`] whose figure a report
     /// keeps from the last record that carried it. An optional figure
     /// outside these six is published as the record sends it.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct LoadTelemetry: u8 {
         /// `cache_hit_rate`.
         const CACHE_HIT_RATE = 1 << 0;
@@ -1661,10 +1833,16 @@ pub trait LoadRecord {
     /// nothing else is kept.
     fn telemetry(&self) -> LoadTelemetry;
 
-    /// The rank's entry a poll would have produced from the record, with
-    /// the telemetry it leaves out at the type's default. The rank is the
-    /// caller's to set.
+    /// The rank's entry from the record, with omitted telemetry at the
+    /// type's default. The rank is the caller's to set.
     fn snapshot(&self) -> SchedulerLoadSnapshot;
+
+    /// How many values the record names, ahead of the bounds its snapshot
+    /// keeps them under: what the snapshot's list holds fewer was dropped
+    /// at a bound, and the load monitor counts it. Zero for a record that
+    /// names none. Every record type says it: a default would let one that
+    /// carries values count no drop.
+    fn values_sent(&self) -> usize;
 
     /// How long the engine has produced no output while it held requests
     /// it reports on every step. `None` while it holds none, or when the
@@ -2207,6 +2385,120 @@ mod overload_update_tests {
 }
 
 #[cfg(test)]
+mod load_snapshot_tests {
+    use std::{fs, path::Path};
+
+    use super::*;
+
+    #[test]
+    fn named_values_offer_the_fixed_token_counts_independently() {
+        let mut snapshot = SchedulerLoadSnapshot::default();
+        assert!(snapshot.named_values().next().is_none());
+
+        snapshot.num_used_tokens = 211;
+        let used = NamedValue {
+            name: "kv_tokens_used".into(),
+            unit: "tokens".into(),
+            value: 211.0,
+            age_ms: None,
+        };
+        assert_eq!(
+            snapshot.named_values().collect::<Vec<_>>().as_slice(),
+            std::slice::from_ref(&used)
+        );
+
+        snapshot.max_total_num_tokens = 1_373;
+        let capacity = NamedValue {
+            name: "kv_tokens_capacity".into(),
+            unit: "tokens".into(),
+            value: 1_373.0,
+            age_ms: None,
+        };
+        let values: Vec<_> = snapshot.named_values().collect();
+        assert_eq!(values, [used, capacity.clone()]);
+        // The offered names and their unit are made once: two offers share
+        // them.
+        let again: Vec<_> = snapshot.named_values().collect();
+        assert!(values.iter().zip(&again).all(|(first, second)| {
+            Arc::ptr_eq(&first.name, &second.name) && Arc::ptr_eq(&first.unit, &second.unit)
+        }));
+        assert!(Arc::ptr_eq(&values[0].unit, &values[1].unit));
+
+        snapshot.num_used_tokens = 0;
+        assert_eq!(snapshot.named_values().collect::<Vec<_>>(), [capacity]);
+    }
+
+    #[test]
+    fn named_values_offer_no_count_the_entry_kept_from_an_older_record() {
+        let mut snapshot = SchedulerLoadSnapshot {
+            num_used_tokens: 211,
+            max_total_num_tokens: 1_373,
+            ..Default::default()
+        };
+        let names = |snapshot: &SchedulerLoadSnapshot| -> Vec<String> {
+            snapshot
+                .named_values()
+                .map(|value| value.name.to_string())
+                .collect()
+        };
+        assert_eq!(names(&snapshot), [KV_TOKENS_USED, KV_TOKENS_CAPACITY]);
+        snapshot.kept = LoadTelemetry::USED_TOKENS;
+        assert_eq!(names(&snapshot), [KV_TOKENS_CAPACITY]);
+        snapshot.kept = LoadTelemetry::USED_TOKENS | LoadTelemetry::TOTAL_TOKENS;
+        assert!(names(&snapshot).is_empty());
+        // The mark is the process's own: the answer on the wire states both
+        // counts and no mark.
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["num_used_tokens"], 211);
+        assert_eq!(json["max_total_num_tokens"], 1_373);
+        assert!(json.get("kept").is_none());
+    }
+
+    #[test]
+    fn explicit_token_values_take_precedence_over_fixed_counts() {
+        for (name, other) in [
+            ("kv_tokens_used", "kv_tokens_capacity"),
+            ("kv_tokens_capacity", "kv_tokens_used"),
+        ] {
+            let value = NamedValue {
+                name: name.into(),
+                unit: "tokens".into(),
+                value: 0.0,
+                age_ms: Some(43),
+            };
+            let snapshot = SchedulerLoadSnapshot {
+                num_used_tokens: 313,
+                max_total_num_tokens: 2_812,
+                values: vec![value.clone()],
+                ..Default::default()
+            };
+            let values: Vec<_> = snapshot.named_values().collect();
+            assert_eq!(values.len(), 2);
+            assert_eq!(values[0], value);
+            assert_eq!(&*values[1].name, other);
+        }
+    }
+
+    #[test]
+    fn the_snapshot_schema_matches_the_snapshot_type() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("scheduler-load.schema.json");
+        let schema = schemars::schema_for!(SchedulerLoadSnapshot);
+        let generated = serde_json::to_string_pretty(&schema).unwrap() + "\n";
+        if std::env::var_os("WRITE_SCHEDULER_LOAD_SCHEMA").is_some() {
+            fs::write(path, generated).unwrap();
+        } else {
+            assert_eq!(
+                fs::read_to_string(path).unwrap(),
+                generated,
+                "scheduler-load.schema.json is stale; write it again with \
+                 WRITE_SCHEDULER_LOAD_SCHEMA=1 cargo test -p smg-worker --all-features \
+                 the_snapshot_schema_matches_the_snapshot_type",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod aggregate_rollup_tests {
     use super::{EngineAggregateMetricsSnapshot, SchedulerLoadSnapshot};
 
@@ -2346,5 +2638,73 @@ mod constrained_decoding_tests {
             r#"{"url":"http://w:8000","constrained_decoding":"sometimes"}"#
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::{WorkerSpec, WorkerUpdateRequest};
+
+    #[test]
+    fn a_spec_prints_no_api_key() {
+        let marker = "pebble";
+        let mut spec = WorkerSpec::new("http://worker:8000");
+        spec.api_key = Some(marker.to_string());
+
+        let compact = format!("{spec:?}");
+        let pretty = format!("{spec:#?}");
+        assert!(!compact.contains(marker));
+        assert!(!pretty.contains(marker));
+        assert!(compact.contains(r#"api_key: Some("<redacted>")"#));
+        assert!(pretty.contains("api_key: Some(\n        \"<redacted>\",\n    )"));
+
+        spec.api_key = None;
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(text.contains("api_key: None"));
+        }
+    }
+
+    #[test]
+    fn a_key_rotation_request_prints_no_api_key() {
+        let marker = "cedar";
+        let mut request = WorkerUpdateRequest {
+            priority: Some(73),
+            cost: None,
+            labels: None,
+            api_key: Some(marker.to_string()),
+            health: None,
+        };
+
+        let compact = format!("{request:?}");
+        let pretty = format!("{request:#?}");
+        assert!(!compact.contains(marker));
+        assert!(!pretty.contains(marker));
+        assert!(compact.contains(r#"api_key: Some("<redacted>")"#));
+        assert!(pretty.contains("api_key: Some(\n        \"<redacted>\",\n    )"));
+
+        request.api_key = None;
+        let expected = "WorkerUpdateRequest { priority: Some(73), cost: None, labels: None, api_key: None, health: None }";
+        assert!(format!("{request:?}") == expected);
+        assert!(format!("{request:#?}").contains("api_key: None"));
+    }
+
+    #[test]
+    fn a_spec_still_prints_its_other_fields() {
+        let spec = WorkerSpec {
+            priority: 73,
+            ..WorkerSpec::new("http://worker:8000")
+        };
+
+        let text = format!("{spec:?}");
+        assert!(text.starts_with(r#"WorkerSpec { url: "http://worker:8000","#));
+        assert!(text.contains("priority: 73"));
+
+        let pretty = format!("{spec:#?}");
+        let field_count = pretty
+            .lines()
+            .filter_map(|line| line.strip_prefix("    "))
+            .filter(|line| line.starts_with(|c: char| c.is_ascii_lowercase()))
+            .count();
+        assert_eq!(field_count, 30);
     }
 }

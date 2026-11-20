@@ -1,6 +1,8 @@
 //! Integration tests for workflow engine
 
 use std::{
+    future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
@@ -224,6 +226,383 @@ async fn test_workflow_failure_after_max_retries() {
 
     // Verify counter
     assert_eq!(counter.load(Ordering::SeqCst), 3);
+}
+
+/// A step that panics with words of its own.
+struct PanickingStep;
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for PanickingStep {
+    #[expect(clippy::panic, reason = "the case needs a step that panics")]
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        panic!("the step's own words");
+    }
+}
+
+/// A step that panics fails its attempt, and its run ends as failed after
+/// that one attempt. Left to unwind its task, the step read as running for
+/// ever, and a wait on its run lasted the whole timeout.
+#[tokio::test]
+async fn a_step_that_panics_ends_its_run_as_failed() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let workflow = WorkflowDefinition::new("panicking_workflow", "A step panics").add_step(
+        StepDefinition::new(
+            "panicking_step",
+            "Step that panics",
+            Arc::new(PanickingStep),
+        )
+        .with_retry(RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffStrategy::Fixed(Duration::from_millis(10)),
+        })
+        .with_failure_action(FailureAction::FailWorkflow),
+    );
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let state = engine
+        .wait_for_terminal_state(instance_id, "panicking", Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    let step_state = state
+        .step_states
+        .get(&StepId::new("panicking_step"))
+        .unwrap();
+    assert_eq!(step_state.status, StepStatus::Failed);
+    assert_eq!(step_state.attempt, 1);
+    assert_eq!(
+        step_state.last_error.as_deref(),
+        Some("Step panicked: the step's own words")
+    );
+}
+
+/// Where a step author's other code panics.
+#[derive(Debug, Clone, Copy)]
+enum PanicsIn {
+    RunIf,
+    IsRetryable,
+    OnSuccess,
+    OnFailure,
+}
+
+/// A step whose named code panics. It fails where that code needs a failure,
+/// and counts each entry into the code that panics.
+struct HookPanics {
+    at: PanicsIn,
+    entered: Arc<AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for HookPanics {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        match self.at {
+            PanicsIn::RunIf | PanicsIn::OnSuccess => Ok(StepResult::Success),
+            PanicsIn::IsRetryable | PanicsIn::OnFailure => Err(WorkflowError::StepFailed {
+                step_id: StepId::new("hooked_step"),
+                message: "its own failure".to_string(),
+            }),
+        }
+    }
+
+    #[expect(clippy::panic, reason = "the case needs a retry answer that panics")]
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        if matches!(self.at, PanicsIn::IsRetryable) {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            panic!("the retry answer's own words");
+        }
+        false
+    }
+
+    #[expect(clippy::panic, reason = "the case needs a hook that panics")]
+    async fn on_success(&self, _context: &WorkflowContext<TestWorkflowData>) -> WorkflowResult<()> {
+        if matches!(self.at, PanicsIn::OnSuccess) {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            panic!("the success hook's own words");
+        }
+        Ok(())
+    }
+
+    #[expect(clippy::panic, reason = "the case needs a hook that panics")]
+    async fn on_failure(
+        &self,
+        _context: &WorkflowContext<TestWorkflowData>,
+        _error: &WorkflowError,
+    ) -> WorkflowResult<()> {
+        if matches!(self.at, PanicsIn::OnFailure) {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            panic!("the failure hook's own words");
+        }
+        Ok(())
+    }
+}
+
+/// A panic in a step author's other code ends the run too: the condition,
+/// the retry answer and the two end hooks. A hook's panic is logged like its
+/// error and leaves what the step came to. Each row hung its run before. The
+/// case reads that the code ran, so it fails where the engine calls it no more.
+#[tokio::test]
+async fn a_panic_in_a_steps_condition_or_hooks_ends_its_run() {
+    const FAILURE: &str = "Step failed: hooked_step - its own failure";
+    let rows = [
+        (
+            PanicsIn::RunIf,
+            WorkflowStatus::Failed,
+            StepStatus::Failed,
+            Some("run_if panicked: the condition's own words"),
+        ),
+        (
+            PanicsIn::IsRetryable,
+            WorkflowStatus::Failed,
+            StepStatus::Failed,
+            Some(FAILURE),
+        ),
+        (
+            PanicsIn::OnSuccess,
+            WorkflowStatus::Completed,
+            StepStatus::Succeeded,
+            None,
+        ),
+        (
+            PanicsIn::OnFailure,
+            WorkflowStatus::Failed,
+            StepStatus::Failed,
+            Some(FAILURE),
+        ),
+    ];
+    for (panics_in, run, step, error) in rows {
+        let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+        let entered = Arc::new(AtomicU32::new(0));
+        let mut hooked = StepDefinition::new(
+            "hooked_step",
+            "Step whose other code panics",
+            Arc::new(HookPanics {
+                at: panics_in,
+                entered: Arc::clone(&entered),
+            }),
+        )
+        .with_retry(RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffStrategy::Fixed(Duration::from_millis(10)),
+        })
+        .with_failure_action(FailureAction::FailWorkflow);
+        if matches!(panics_in, PanicsIn::RunIf) {
+            let entered = Arc::clone(&entered);
+            let condition = move |_: &WorkflowContext<TestWorkflowData>| -> bool {
+                entered.fetch_add(1, Ordering::SeqCst);
+                panic!("the condition's own words")
+            };
+            hooked = hooked.run_if(condition);
+        }
+        let workflow = WorkflowDefinition::new("hooked_workflow", "A step's other code panics")
+            .add_step(hooked);
+        let instance_id = started(&engine, workflow).await.unwrap();
+
+        let state = engine
+            .wait_for_terminal_state(instance_id, "hooked", Duration::from_secs(5))
+            .await
+            .map_err(|error| format!("{panics_in:?}: {error}"))
+            .unwrap();
+
+        assert_eq!(state.status, run, "{panics_in:?}");
+        let step_state = state.step_states.get(&StepId::new("hooked_step")).unwrap();
+        assert_eq!(step_state.status, step, "{panics_in:?}");
+        assert_eq!(step_state.last_error.as_deref(), error, "{panics_in:?}");
+        if matches!(panics_in, PanicsIn::IsRetryable) {
+            assert_eq!(step_state.attempt, 1, "a panicked answer allows no retry");
+        }
+        assert_eq!(entered.load(Ordering::SeqCst), 1, "{panics_in:?} ran once");
+    }
+}
+
+/// Which method of a step panics as it is called, before it returns its
+/// future.
+#[derive(Debug, Clone, Copy)]
+enum Call {
+    Execute,
+    OnSuccess,
+    OnFailure,
+}
+
+/// A step's future, as a method written without the async sugar returns it.
+type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// A step written without the async sugar: the named method panics in the
+/// call itself. It fails where the failure hook needs a failure.
+struct PanicsAtCall(Call);
+
+impl StepExecutor<TestWorkflowData> for PanicsAtCall {
+    #[expect(clippy::panic, reason = "the case needs a call that panics")]
+    fn execute<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _context: &'life1 mut WorkflowContext<TestWorkflowData>,
+    ) -> Boxed<'async_trait, WorkflowResult<StepResult>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        match self.0 {
+            Call::Execute => panic!("the call's own words"),
+            Call::OnSuccess => Box::pin(async { Ok(StepResult::Success) }),
+            Call::OnFailure => Box::pin(async {
+                Err(WorkflowError::StepFailed {
+                    step_id: StepId::new("called_step"),
+                    message: "its own failure".to_string(),
+                })
+            }),
+        }
+    }
+
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        false
+    }
+
+    #[expect(clippy::panic, reason = "the case needs a call that panics")]
+    fn on_success<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _context: &'life1 WorkflowContext<TestWorkflowData>,
+    ) -> Boxed<'async_trait, WorkflowResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        if matches!(self.0, Call::OnSuccess) {
+            panic!("the call's own words");
+        }
+        Box::pin(async { Ok(()) })
+    }
+
+    #[expect(clippy::panic, reason = "the case needs a call that panics")]
+    fn on_failure<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        _context: &'life1 WorkflowContext<TestWorkflowData>,
+        _error: &'life2 WorkflowError,
+    ) -> Boxed<'async_trait, WorkflowResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        if matches!(self.0, Call::OnFailure) {
+            panic!("the call's own words");
+        }
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A method that panics as it is called, before it returns its future, is
+/// caught as a panic inside the future is. The engine makes the call inside
+/// its guard. Each row hung its run before.
+#[tokio::test]
+async fn a_method_that_panics_as_it_is_called_is_caught() {
+    let rows = [
+        (
+            Call::Execute,
+            WorkflowStatus::Failed,
+            StepStatus::Failed,
+            Some("Step panicked: the call's own words"),
+        ),
+        (
+            Call::OnSuccess,
+            WorkflowStatus::Completed,
+            StepStatus::Succeeded,
+            None,
+        ),
+        (
+            Call::OnFailure,
+            WorkflowStatus::Failed,
+            StepStatus::Failed,
+            Some("Step failed: called_step - its own failure"),
+        ),
+    ];
+    for (call, run, step, error) in rows {
+        let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+        let workflow = WorkflowDefinition::new("called_workflow", "A call panics").add_step(
+            StepDefinition::new(
+                "called_step",
+                "Step whose call panics",
+                Arc::new(PanicsAtCall(call)),
+            )
+            .with_failure_action(FailureAction::FailWorkflow),
+        );
+        let instance_id = started(&engine, workflow).await.unwrap();
+
+        let state = engine
+            .wait_for_terminal_state(instance_id, "called", Duration::from_secs(5))
+            .await
+            .map_err(|error| format!("{call:?}: {error}"))
+            .unwrap();
+
+        assert_eq!(state.status, run, "{call:?}");
+        let step_state = state.step_states.get(&StepId::new("called_step")).unwrap();
+        assert_eq!(step_state.status, step, "{call:?}");
+        assert_eq!(step_state.last_error.as_deref(), error, "{call:?}");
+    }
+}
+
+/// A condition that panics ends its run by its step's failure action, as a
+/// panic in `execute` does, and the run's outcome names the step and the
+/// panic. Under `ContinueNextStep` the step is skipped with the panic's
+/// words kept, and the workflow goes on to its end.
+#[tokio::test]
+async fn a_condition_that_panics_ends_its_run_by_the_steps_failure_action() {
+    const PANIC: &str = "run_if panicked: the condition's own words";
+    let rows = [
+        (
+            FailureAction::FailWorkflow,
+            WorkflowStatus::Failed,
+            StepStatus::Failed,
+            Err(format!("Workflow failed at step gated_step: {PANIC}")),
+        ),
+        (
+            FailureAction::ContinueNextStep,
+            WorkflowStatus::Completed,
+            StepStatus::Skipped,
+            Ok("gated completed successfully via workflow".to_string()),
+        ),
+    ];
+    for (action, run, step, outcome) in rows {
+        let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+        let condition =
+            |_: &WorkflowContext<TestWorkflowData>| -> bool { panic!("the condition's own words") };
+        let workflow = WorkflowDefinition::new("gated_workflow", "A condition panics").add_step(
+            StepDefinition::new(
+                "gated_step",
+                "Step whose condition panics",
+                Arc::new(HookPanics {
+                    at: PanicsIn::RunIf,
+                    entered: Arc::default(),
+                }),
+            )
+            .with_failure_action(action)
+            .run_if(condition),
+        );
+        let instance_id = started(&engine, workflow).await.unwrap();
+
+        let state = engine
+            .wait_for_terminal_state(instance_id, "gated", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(state.status, run, "{action:?}");
+        let step_state = state.step_states.get(&StepId::new("gated_step")).unwrap();
+        assert_eq!(step_state.status, step, "{action:?}");
+        assert_eq!(step_state.last_error.as_deref(), Some(PANIC), "{action:?}");
+        assert_eq!(
+            wfaas::completion_outcome(&state, "gated"),
+            outcome,
+            "{action:?}"
+        );
+    }
 }
 
 #[tokio::test]

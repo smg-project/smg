@@ -17,7 +17,7 @@ use openai_protocol::worker::WorkerSpec;
 use parking_lot::Mutex;
 use smg_worker::{
     identity::basic::Worker,
-    jobs::{WorkerJobs, WorkerRegistrationMode},
+    jobs::{WorkerJobAsker, WorkerJobs, WorkerRegistrationMode},
     registry::{WorkerId, WorkerOrigin},
     test_support::{BasicWorkerBuilder, WorkerRegistry},
 };
@@ -103,10 +103,12 @@ pub enum Queued {
     Add {
         spec: Box<WorkerSpec>,
         mode: WorkerRegistrationMode,
+        asker: WorkerJobAsker,
     },
     Remove {
         url: String,
         guards: Vec<(WorkerId, u64)>,
+        asker: WorkerJobAsker,
     },
 }
 
@@ -210,6 +212,7 @@ impl WorkerJobs for RecordedJobs {
         &self,
         url: String,
         guards: Vec<(WorkerId, u64)>,
+        asker: WorkerJobAsker,
     ) -> Result<(), String> {
         if let Some(registry) = &self.applies_to {
             for (worker_id, _) in &guards {
@@ -219,11 +222,15 @@ impl WorkerJobs for RecordedJobs {
         self.queue
             .lock()
             .queued
-            .push(Queued::Remove { url, guards });
+            .push(Queued::Remove { url, guards, asker });
         Ok(())
     }
 
-    async fn refresh_worker_labels(&self, _url: String) -> Result<bool, String> {
+    async fn refresh_worker_labels(
+        &self,
+        _url: String,
+        _asker: WorkerJobAsker,
+    ) -> Result<bool, String> {
         Ok(true)
     }
 
@@ -231,6 +238,7 @@ impl WorkerJobs for RecordedJobs {
         &self,
         spec: WorkerSpec,
         mode: WorkerRegistrationMode,
+        asker: WorkerJobAsker,
     ) -> Result<bool, String> {
         let lands_now = {
             let mut queue = self.queue.lock();
@@ -241,6 +249,7 @@ impl WorkerJobs for RecordedJobs {
             queue.queued.push(Queued::Add {
                 spec: Box::new(spec.clone()),
                 mode,
+                asker,
             });
             if queue.slow.remove(&spec.url) {
                 queue.held.insert(spec.url.clone(), Hold::Registration);
@@ -315,14 +324,22 @@ mod tests {
         jobs.hold_for_another_job(url);
         assert!(jobs.job_in_flight(url));
         let taken = jobs
-            .add_worker(WorkerSpec::new(url), WorkerRegistrationMode::Upsert)
+            .add_worker(
+                WorkerSpec::new(url),
+                WorkerRegistrationMode::Upsert,
+                WorkerJobAsker::Discovery,
+            )
             .await;
         assert_eq!(taken, Ok(true));
         assert!(jobs.refused().is_empty());
 
         jobs.hold(url);
         let refused = jobs
-            .add_worker(WorkerSpec::new(url), WorkerRegistrationMode::Upsert)
+            .add_worker(
+                WorkerSpec::new(url),
+                WorkerRegistrationMode::Upsert,
+                WorkerJobAsker::Discovery,
+            )
             .await;
         assert_eq!(refused, Ok(false));
         assert_eq!(jobs.refused(), [url]);
