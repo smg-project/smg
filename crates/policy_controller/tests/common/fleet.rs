@@ -1011,6 +1011,7 @@ impl Replica {
             shutdown_settle: Duration::ZERO,
             shutdown_grace: Duration::from_secs(5),
             load_poll_interval: POLL_INTERVAL,
+            discovery: None,
             election: Election {
                 lease: lease.map_or(LeasePlace::Process, |file| {
                     LeasePlace::File(file.to_owned())

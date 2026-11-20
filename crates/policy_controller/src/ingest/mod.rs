@@ -2,8 +2,9 @@
 //! engines. This step holds the load path: the row conversion, the scrape
 //! parser, and the driver of the `GetLoads` poll and the metrics scrape
 //! over the store's [`LoadSink`](crate::store::LoadSink) under its poll
-//! arbitration. The KV subscription, the prober and discovery arrive in the
-//! step's later PRs.
+//! arbitration. The KV subscription and the prober arrive in the step's
+//! later PRs. Worker discovery runs in the controller, behind its
+//! `discovery` feature.
 
 pub mod loads;
 pub mod probe;

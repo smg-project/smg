@@ -73,7 +73,7 @@
 //!   path (the `GetLoads` poll per engine under the store's poll
 //!   arbitration, the metrics scrape of an engine without a servicer) and
 //!   the load helpers (the row conversion, the scrape parser). The KV
-//!   subscription, the prober and discovery arrive in the step's later PRs.
+//!   subscription and the prober arrive in the step's later PRs.
 //!
 //! - Behind the `operator` feature, `operator::SpecDoor` applies a
 //!   host's start document and serves its status, document and dry run.
@@ -114,6 +114,11 @@
 //!   follows its own store, on a leader and on a standby alike, and hands
 //!   each object a gRPC connector: an object connects to its engine at its
 //!   first use.
+//! - Behind the `discovery` feature, worker discovery under the controller:
+//!   the binary takes the discovery flags, and the replica that leads runs
+//!   the selected provider over the replica's worker objects. A pass asks
+//!   the job queue the host was handed, and defers what it found while none
+//!   stands.
 //!
 //! The in-process view carries two host instants (the decision's clock and a
 //! report's sample instant); the wire carries durations only.

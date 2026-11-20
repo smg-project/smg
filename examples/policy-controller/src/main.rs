@@ -478,6 +478,7 @@ mod tests {
             shutdown_grace: Config::DEFAULT_SHUTDOWN_GRACE,
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
             election: Election::default(),
+            discovery: None,
         }
     }
 

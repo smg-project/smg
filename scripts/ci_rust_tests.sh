@@ -188,6 +188,10 @@ commands_of() {
             # `worker-host` is on for the cases of the crate's worker objects: no test target requires it,
             # so nothing else would turn it on.
             echo "-p kv-index -p smg-mesh -p smg-mm-rdma -p smg-policy-controller -p policy-controller-example --features smg-policy-controller/client,smg-policy-controller/kubernetes,smg-policy-controller/worker-host"
+            # The policy crate's library once more, under `discovery`: no package of the shard asks for
+            # that feature, so nothing else would run the cases behind it. The line above stays as it
+            # is: it runs the case of a build without the feature.
+            echo "-p smg-policy-controller --lib --features smg-policy-controller/discovery"
             # The radix tree without its fuzz binary (the radix-fuzz shard); --doc cannot share an invocation with --test.
             selectors=$(test_selectors_except smg-radix-tree fuzz_differential)
             echo "-p smg-radix-tree --lib$selectors"

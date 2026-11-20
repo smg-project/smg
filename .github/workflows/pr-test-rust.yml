@@ -1006,6 +1006,8 @@ jobs:
               - 'crates/mesh/**'
               - 'crates/mm_rdma/**'
               - 'crates/policy_controller/**'
+              # The controller runs worker discovery behind its `discovery` feature.
+              - 'crates/service_discovery/**'
               # The controller binary's allocator settings are held to the
               # gateway's constant, which the crate's test reads from this file.
               - 'model_gateway/src/observability/metrics.rs'

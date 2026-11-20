@@ -623,6 +623,30 @@ fn modes_without_worker_pools_cannot_use_slurm_discovery() {
     assert!(SlurmProviderConfig::new(&discovery_config(&["w"]), None).is_err());
 }
 
+/// The map holds one role a name: the later role would replace the earlier
+/// with no word, and the earlier pool would stay empty.
+#[test]
+fn a_job_name_under_two_roles_is_refused() {
+    let shared = SlurmDiscoveryConfig {
+        prefill_job_names: vec!["shared".to_string()],
+        decode_job_names: vec!["shared".to_string()],
+        ..discovery_config(&[])
+    };
+    let error = SlurmProviderConfig::new(&shared, Some(Roles::PrefillDecode))
+        .expect_err("one name under two roles");
+    assert_eq!(
+        error.to_string(),
+        "Validation failed: Slurm job name 'shared' maps to both prefill and decode workers"
+    );
+
+    let twice = SlurmDiscoveryConfig {
+        prefill_job_names: vec!["prefill".to_string(), "prefill".to_string()],
+        decode_job_names: vec!["decode".to_string()],
+        ..discovery_config(&[])
+    };
+    assert!(SlurmProviderConfig::new(&twice, Some(Roles::PrefillDecode)).is_ok());
+}
+
 // ---- The commands, against scripts standing in for them. ----
 
 #[cfg(unix)]

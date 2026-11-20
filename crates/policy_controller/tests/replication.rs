@@ -136,6 +136,7 @@ where
         shutdown_grace: Duration::from_secs(5),
         load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
         decide_shards: 2,
+        discovery: None,
         election: Election {
             lease: place.clone(),
             settings: settings(),
@@ -1873,6 +1874,7 @@ impl Replica {
             shutdown_grace: Duration::from_secs(5),
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
             decide_shards: 2,
+            discovery: None,
             election: Election {
                 lease: place.clone(),
                 settings: settings(),
