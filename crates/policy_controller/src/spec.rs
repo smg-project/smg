@@ -39,9 +39,9 @@ use crate::{
     affinity::{blocks_within, Gates, KvPressure, PrefixAffinity, WarmupSlice},
     bucket::Bucket,
     builtins::{
-        with_report_age, FewestSessions, LeastCost, LeastLoad, LeastRequests, ResidentWork,
-        SampledBest, SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS,
-        DEFAULT_THROUGHPUT,
+        with_report_age, FewestSessions, LeastCost, LeastCostSent, LeastLoad, LeastRequests,
+        ResidentWork, SampledBest, SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT,
+        DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
     },
     catalog::{profile_sent, Catalog, Found, StageBuild},
     framework::{Binding, Engine, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted},
@@ -2414,8 +2414,9 @@ fn check_stage(stage: &ScoreStage, at: &At) -> Result<(), SpecError> {
 fn least_cost_of(
     p: &LeastCostParams,
     sent: impl FnOnce() -> Arc<SentCredit>,
+    max_age_ms: Option<u64>,
     at: &At,
-) -> Result<LeastCost, SpecError> {
+) -> Result<Box<dyn Scorer>, SpecError> {
     const COST_RANGE: &str = "a finite number from 0 to 1e15";
     if f64::from(p.weight) > COST_PARAMETER_LIMIT {
         return Err(at.bad(
@@ -2463,19 +2464,21 @@ fn least_cost_of(
             ));
         }
     }
-    // A sent term needs the reports and reads none: the rule for a row
-    // without a report is asked only where a term reads one.
-    let reads_report = terms.iter().any(|&(term, _)| term.reads_load());
-    // Only a term that reads sends makes the profile's count.
-    let sent = terms.iter().any(|&(term, _)| term.reads_sent()).then(sent);
-    let scorer = LeastCost::new(terms.into_boxed_slice(), p.margin, p.unreported, sent);
-    if reads_report && p.unreported.is_none() {
+    let reads_sent = terms.iter().any(|&(term, _)| term.reads_sent());
+    let scorer = LeastCost::new(terms.into_boxed_slice(), p.margin, p.unreported);
+    if scorer.needs().loads && p.unreported.is_none() {
         return Err(at.bad(
             "unreported", "null",
             "what a row with no report costs, which a term that reads a report needs: over-least or missing-as-zero",
         ));
     }
-    Ok(scorer)
+    // Only a term that reads sends makes the profile's count, and the
+    // scorer that adds it.
+    Ok(if reads_sent {
+        with_report_age(LeastCostSent::new(scorer, sent()), max_age_ms)
+    } else {
+        with_report_age(scorer, max_age_ms)
+    })
 }
 
 /// A stage of this build, or the name of what the build lacks.
@@ -2633,9 +2636,7 @@ fn scorer_of(
             ResidentWork::new(p.request_tokens),
             max_age,
         )),
-        ScoreStage::LeastCost(p) => {
-            Resolved::Built(with_report_age(least_cost_of(p, sent, at)?, max_age))
-        }
+        ScoreStage::LeastCost(p) => Resolved::Built(least_cost_of(p, sent, max_age, at)?),
     })
 }
 

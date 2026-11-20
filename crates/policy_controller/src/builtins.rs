@@ -2242,8 +2242,6 @@ pub struct LeastCost {
     margin: CostMargin,
     request_cost: Option<f64>,
     loads: bool,
-    /// The profile's count of sends, where a term reads it.
-    sent: Option<Arc<SentCredit>>,
 }
 
 impl LeastCost {
@@ -2253,7 +2251,6 @@ impl LeastCost {
         terms: Box<[(Term, f64)]>,
         margin: CostMargin,
         unreported: Option<Unreported>,
-        sent: Option<Arc<SentCredit>>,
     ) -> Self {
         let loads = terms.iter().any(|&(term, _)| term.reads_load());
         let request_cost = match unreported {
@@ -2265,8 +2262,34 @@ impl LeastCost {
             margin,
             request_cost,
             loads,
-            sent,
         }
+    }
+
+    /// Prices the rows left open over the least kept sum, then scores the
+    /// costs between their ends.
+    #[inline(always)]
+    fn price_and_score(
+        &self,
+        out: &mut [f32],
+        costs: &mut [RowCost],
+        mut bounds: CostBounds,
+        pending: bool,
+    ) -> TieBand {
+        if pending {
+            let baseline = if bounds.least.is_finite() {
+                bounds.least
+            } else {
+                0.0
+            };
+            for cost in costs.iter_mut() {
+                if let RowCost::OverLeast(price) = *cost {
+                    let sum = baseline + price;
+                    bounds.include(sum);
+                    *cost = RowCost::Sum(sum);
+                }
+            }
+        }
+        write_cost_scores(out, self.margin, costs, bounds)
     }
 
     /// The cost of a row with its report and count as the decision reads them.
@@ -2413,9 +2436,7 @@ impl Scorer for LeastCost {
 
     fn needs(&self) -> Needs {
         Needs {
-            // A report ends the sends before it, so a sent term needs the
-            // reports though it reads none.
-            loads: self.loads || self.sent.is_some(),
+            loads: self.loads,
             ..Needs::default()
         }
     }
@@ -2441,38 +2462,91 @@ impl ReadsLoad for LeastCost {
         load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> TieBand {
         with_costs(|costs| {
-            let (mut bounds, pending) = self.collect_costs(facts, candidates, kept, costs, load);
-            if let Some(credit) = &self.sent {
-                // The sends close the sum: their names sort behind every
-                // field the walk adds. A row priced over the least kept no
-                // sum and takes none. The sends move the ends of the sums,
-                // so the ends are taken again.
-                let sends = credit.reads(facts);
-                bounds = CostBounds::EMPTY;
-                for (&row, cost) in kept.iter().zip(costs.iter_mut()) {
-                    if let RowCost::Sum(sum) = cost {
-                        let sent = sends.of(&candidates[row as usize]);
-                        *sum += f64::from(sent.requests) * self.terms.sent_requests;
-                        *sum += sent.tokens as f64 * self.terms.sent_tokens;
-                        bounds.include(*sum);
-                    }
+            let (bounds, pending) = self.collect_costs(facts, candidates, kept, costs, load);
+            self.price_and_score(out, costs, bounds, pending)
+        })
+    }
+}
+
+/// `least-cost` where the document names a `sent.` term: the sum of
+/// [`LeastCost`], then the profile's sends. A document that names none is
+/// built as [`LeastCost`] alone and reads no count.
+#[derive(Debug)]
+pub(crate) struct LeastCostSent {
+    cost: LeastCost,
+    sent: Arc<SentCredit>,
+}
+
+impl LeastCostSent {
+    pub(crate) fn new(cost: LeastCost, sent: Arc<SentCredit>) -> Self {
+        Self { cost, sent }
+    }
+}
+
+impl Lifecycle for LeastCostSent {}
+
+impl Scorer for LeastCostSent {
+    fn name(&self) -> &'static str {
+        self.cost.name()
+    }
+
+    fn refuses_by_reports(&self) -> bool {
+        self.cost.refuses_by_reports()
+    }
+
+    fn row_wise(&self) -> bool {
+        self.cost.row_wise()
+    }
+
+    // A report ends the sends before it, so the sends need the reports
+    // though no term may read one.
+    fn needs(&self) -> Needs {
+        Needs {
+            loads: true,
+            ..Needs::default()
+        }
+    }
+
+    fn score(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        self.score_with(facts, candidates, kept, out, |c| c.load.as_ref())
+    }
+}
+
+impl ReadsLoad for LeastCostSent {
+    fn score_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
+    ) -> TieBand {
+        with_costs(|costs| {
+            let (_, pending) = self
+                .cost
+                .collect_costs(facts, candidates, kept, costs, load);
+            // The sends close the sum: their names sort behind every field
+            // the walk adds. A row priced over the least kept no sum and
+            // takes none. The sends move the ends of the sums, so the ends
+            // are taken here and the walk's are dropped.
+            let terms = &self.cost.terms;
+            let sends = self.sent.reads(facts);
+            let mut bounds = CostBounds::EMPTY;
+            for (&row, cost) in kept.iter().zip(costs.iter_mut()) {
+                if let RowCost::Sum(sum) = cost {
+                    let sent = sends.of(&candidates[row as usize]);
+                    *sum += f64::from(sent.requests) * terms.sent_requests;
+                    *sum += sent.tokens as f64 * terms.sent_tokens;
+                    bounds.include(*sum);
                 }
             }
-            if pending {
-                let baseline = if bounds.least.is_finite() {
-                    bounds.least
-                } else {
-                    0.0
-                };
-                for cost in costs.iter_mut() {
-                    if let RowCost::OverLeast(price) = *cost {
-                        let sum = baseline + price;
-                        bounds.include(sum);
-                        *cost = RowCost::Sum(sum);
-                    }
-                }
-            }
-            write_cost_scores(out, self.margin, costs, bounds)
+            self.cost.price_and_score(out, costs, bounds, pending)
         })
     }
 }
@@ -4339,7 +4413,7 @@ mod tests {
                 let rule = price.map_or(Unreported::MissingAsZero, |request_cost| {
                     Unreported::OverLeast { request_cost }
                 });
-                let stage = LeastCost::new(terms.clone(), CostMargin::default(), Some(rule), None);
+                let stage = LeastCost::new(terms.clone(), CostMargin::default(), Some(rule));
                 costs.clear();
                 stage.collect_costs(&facts, &rows, &kept, &mut costs, |row| row.load.as_ref());
                 assert_eq!(costs.len(), rows.len());
@@ -4387,7 +4461,7 @@ mod tests {
                 .iter()
                 .map(|(name, &coefficient)| (Term::named(name).unwrap(), coefficient))
                 .collect();
-            let stage = LeastCost::new(terms, params.margin, params.unreported, None);
+            let stage = LeastCost::new(terms, params.margin, params.unreported);
             let want = f64::from(value) * -2.5;
             costs.clear();
             stage.collect_costs(
@@ -4413,7 +4487,6 @@ mod tests {
             Box::new(terms),
             CostMargin::default(),
             Some(Unreported::OverLeast { request_cost: 2.5 }),
-            None,
         );
         let mut rows = [candidate(0, 2), candidate(1, 3), candidate(2, 4)];
         for index in [0, 2] {
@@ -4442,7 +4515,6 @@ mod tests {
             ]),
             CostMargin::default(),
             Some(Unreported::OverLeast { request_cost: 4.0 }),
-            None,
         );
         let count = Cell::new(13);
         let missing = stage.cost_of::<false, false, false>(None, true, || count.replace(29));
