@@ -58,7 +58,7 @@ use crate::{
         },
         gateway::Gateway,
         grpc::{
-            backend_client::BackendConnector,
+            backend_client::{BackendConnector, Fronting},
             multimodal::MultimodalConfigRegistry,
             regular::symphony::{check_names, named_table},
             utils::{Names, ALIASES},
@@ -405,7 +405,9 @@ impl AppContextBuilder {
             reasoning_parser_factory: None,
             tool_parser_factory: None,
             worker_registry: None,
-            engine_connector: connector.unwrap_or_else(BackendConnector::shared),
+            // A host's connector is wrapped once: the gateway fronts each
+            // gRPC connection it makes.
+            engine_connector: connector.map_or_else(BackendConnector::shared, Fronting::around),
             policy_registry: None,
             gateway: None,
             response_storage: None,
