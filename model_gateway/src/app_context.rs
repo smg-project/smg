@@ -20,7 +20,7 @@ use smg_worker::{
     connection::{
         engine::EngineConnector,
         http_client::{
-            build_client, connect_timeout_secs_below, WorkerHttpClientCache,
+            build_client, connect_timeout_secs_below, pool_idle_timeout, WorkerHttpClientCache,
             DEFAULT_CONNECT_TIMEOUT_SECS,
         },
     },
@@ -806,10 +806,7 @@ impl AppContextBuilder {
         // Idle pooled connections must expire before the backend server's
         // keep-alive closes them (the engines' default: 5s), or checkout races
         // the server's FIN and non-idempotent sends fail.
-        let pool_idle_timeout = match config.upstream_pool_idle_timeout_secs {
-            0 => None,
-            secs => Some(Duration::from_secs(secs)),
-        };
+        let pool_idle_timeout = pool_idle_timeout(config.upstream_pool_idle_timeout_secs);
         // mTLS client identity and CA certificates for verifying worker TLS
         // (both loaded during config creation), parsed once: the builder
         // closure runs again if the first build fails for want of a root store.
