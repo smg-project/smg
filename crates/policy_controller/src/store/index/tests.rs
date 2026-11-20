@@ -67,6 +67,12 @@ mod sent_prefixes {
         );
     }
 
+    /// A batch with one stored block no request of these cases holds: the
+    /// store has heard the lane's cache events.
+    fn hear(store: &MemoryStore, id: WorkerId) -> BatchOutcome {
+        store.admit(id, 0, batch(1), &stored(None, &chain(&[999])))
+    }
+
     fn record(store: &MemoryStore) -> Option<Arc<Predicted>> {
         store.deciding(|world| world.standing(MODEL, Role::Single)?.predicted())
     }
@@ -293,25 +299,75 @@ mod sent_prefixes {
     }
 
     #[test]
-    fn a_pool_where_every_row_has_events_reads_no_record() -> Case {
+    fn a_pool_whose_lanes_are_all_heard_reads_no_record() -> Case {
         let store = MemoryStore::new();
-        admitted(&store, "a");
-        admitted(&store, "b");
+        let a = admitted(&store, "a");
+        let b = admitted(&store, "b");
         store.apply(applied(&merged(1)?)?)?;
-        assert!(record(&store).is_none());
-        let (named, rows) = named(&store, None, 16, 7);
-        assert!(named.holders.is_empty());
-        assert!(named.keys.is_empty());
-        assert!(named.sent_pool().is_none());
-        store.deciding(|world| world.sent(&named, rows[0]));
-        assert!(store
-            .deciding(|world| world.sent_slices(MODEL, Role::Single))
-            .is_none());
+        // The pool holds its model's record whatever its lanes heard: no
+        // publication follows a lane's first batch.
+        assert!(record(&store).is_some());
+        for id in [a, b] {
+            assert_eq!(hear(&store, id), BatchOutcome::Applied);
+        }
+        let (read, rows) = named(&store, None, 16, 7);
+        assert!(read.holders.is_empty());
+        // The heard bits answered: no key was folded and no record read.
+        assert!(read.keys.is_empty());
+        assert!(read.sent_pool().is_none());
+        store.deciding(|world| world.sent(&read, rows[0]));
+        let slices = store.deciding(|world| world.sent_slices(MODEL, Role::Single));
+        assert_eq!(slices, Some(0));
+        // One lane unheard again, and the record is read again.
+        KvEventSink::removed(&store, a);
+        let (again, _) = named(&store, None, 16, 7);
+        assert!(!again.keys.is_empty());
+        assert!(again.sent_pool().is_some());
         Ok(())
     }
 
     #[test]
-    fn a_stale_prediction_cannot_name_a_worker_with_a_lane() -> Case {
+    fn a_batch_with_no_event_leaves_the_record_its_row() -> Case {
+        let store = MemoryStore::new();
+        let a = admitted(&store, "a");
+        store.apply(applied(&merged(1)?)?)?;
+        predicted(&store, a).ok_or("a record with a placement")?;
+        // A batch ran through the lane and carried no event: the index holds
+        // nothing of the row, so the record still speaks for it.
+        assert_eq!(store.admit(a, 0, batch(1), &[]), BatchOutcome::Applied);
+        let (read, rows) = named(&store, None, 16, 7);
+        assert_eq!(read.holders.len(), 1);
+        assert_eq!(rows[read.holders[0].row as usize], a);
+        // Its first event ends the cover.
+        let event = stored(None, &chain(&[999]));
+        assert_eq!(store.admit(a, 0, batch(2), &event), BatchOutcome::Applied);
+        let (read, _) = named(&store, None, 16, 7);
+        assert!(read.holders.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_row_that_takes_a_heard_rows_id_is_not_heard() -> Case {
+        let store = MemoryStore::new();
+        let a = admitted(&store, "a");
+        let c = admitted(&store, "c");
+        store.apply(applied(&merged(1)?)?)?;
+        for id in [a, c] {
+            assert_eq!(hear(&store, id), BatchOutcome::Applied);
+        }
+        let (read, _) = named(&store, None, 16, 7);
+        assert!(read.sent_pool().is_none(), "both lanes are heard");
+        // A row leaves, and the next row takes its id in the index.
+        let revision = store.get(a).ok_or("the row")?.revision;
+        store.remove(a, revision).ok_or("the removal")?;
+        admitted(&store, "b");
+        let (read, _) = named(&store, None, 16, 7);
+        assert!(read.sent_pool().is_some(), "a lane made anew is not heard");
+        Ok(())
+    }
+
+    #[test]
+    fn a_stale_prediction_cannot_name_a_worker_whose_lane_is_heard() -> Case {
         let store = MemoryStore::new();
         let event = admitted(&store, "event");
         admitted(&store, "other-event");
@@ -666,16 +722,34 @@ mod sent_prefixes {
     }
 
     #[test]
-    fn a_worker_that_takes_a_lane_forgets_its_placements() -> Case {
+    fn a_worker_that_takes_a_lane_is_read_from_the_record_until_its_lane_is_heard() -> Case {
         let store = MemoryStore::new();
         let id = plain(&store, "a", WireModes::GRPC, Reachability::Any);
         plain(&store, "b", WireModes::GRPC, Reachability::Any);
         store.apply(applied(&merged(1)?)?)?;
         predicted(&store, id).ok_or("the old placement")?;
         let record = record(&store).ok_or("the model's record")?;
-        assert_eq!(admitted(&store, "a"), id);
-        assert_eq!(record.record.read().deepest(&keys(&HASHES)).blocks(), 0);
-        assert!(record.sweeping.load(Ordering::Relaxed));
+        // The row asks for events now: it holds a lane no batch ran through.
+        let asks = WorkerFacts {
+            wire_modes: WireModes::GRPC,
+            reachable_from: Reachability::Any,
+            ..publisher("a", &[MODEL])
+        };
+        assert_eq!(store.upsert(asks).id(), id);
+        store.publish_now();
+        assert!(store.lane_counts(id, 0).is_some(), "the row holds a lane");
+        let (read, rows) = named(&store, None, 16, 7);
+        assert_eq!(read.holders.len(), 1);
+        let holder = read.holders[0];
+        assert_eq!(rows[holder.row as usize], id);
+        assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (0, 4));
+        // Its first batch: the index speaks for the row. The record's
+        // placement stays to age out under the bound, read by nobody.
+        assert_eq!(hear(&store, id), BatchOutcome::Applied);
+        let (read, _) = named(&store, None, 16, 7);
+        assert!(read.holders.is_empty());
+        assert_eq!(record.record.read().deepest(&keys(&HASHES)).blocks(), 4);
+        assert!(!record.sweeping.load(Ordering::Relaxed));
         Ok(())
     }
 

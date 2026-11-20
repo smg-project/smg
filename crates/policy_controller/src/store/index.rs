@@ -39,13 +39,19 @@
 //! known whole. Two cases alone make the lookup again: a row it kept had
 //! its id taken since, or its cap is full of holders the pass refuses.
 //!
-//! A pool whose profile reads sent prefixes can also hold its model's
-//! record of sends. Naming lists its holders without lanes beside the
-//! index's under one cap: after them, in the room they leave, or ahead of
-//! them where the profile's prefix stage reads the record alone. Issuing a
-//! lease writes the blocks sent to its first target when that target has
-//! no lane: token blocks, or windows of a request's text, which the index
-//! of cache events is never asked for.
+//! A pool whose profile reads sent prefixes holds its model's record of
+//! sends. The record speaks for a row until the row's lane is heard: a row
+//! with no lane, and a row whose lane heard no event yet, since a
+//! worker that asks for cache events may never publish one. A lane says so
+//! by one bit of its model's index (`Index`), which a decision reads with
+//! no lock: no publication follows a lane's first event. Naming lists the
+//! record's holders beside the index's under one cap: after them, in the
+//! room they leave, or ahead of them where the profile's prefix stage
+//! reads the record alone. Issuing a lease writes the blocks sent to its
+//! first target while the record speaks for it: token blocks, or windows
+//! of a request's text, which the index of cache events is never asked
+//! for. Once a lane is heard the index alone speaks for its row, and what
+//! the record holds of the row ages out under the record's bound.
 //!
 //! Locks: the table's, taken under the workers lock by a membership write
 //! and alone by a batch, each for as long as it takes to find or to change
@@ -242,7 +248,9 @@ fn store<B: Blocks>(
 struct Lane {
     cursor: RankCursor,
     /// A batch ran through the cursor since the lane was made or its worker
-    /// was reported gone.
+    /// was reported gone. The index keeps a bit beside it
+    /// ([`Index::hear`]), set at the first such batch that carries an event
+    /// and cleared with this word, where a decision reads it with no lock.
     heard: bool,
     /// `None` once the row left: a batch that found the lane before the
     /// removal writes nothing.
@@ -361,8 +369,8 @@ impl Named {
     }
 }
 
-/// One model's record of the prefixes sent to its workers that publish no
-/// cache events, shared by every deciding thread.
+/// One model's record of the prefixes sent to its workers whose cache
+/// events the store has not heard, shared by every deciding thread.
 ///
 /// A membership write takes the workers lock, then the table's lock, then
 /// a record's guard when it needs all three. A decision takes a record's
@@ -445,11 +453,16 @@ struct Tables {
     role: Option<Role>,
     /// The model's index; `None` while no row of the model is indexed.
     index: Option<Arc<Index>>,
-    /// The model's record of sent prefixes, where a row can read it.
+    /// The model's record of sent prefixes, where the pool's generation
+    /// asks for one. It speaks for a row until the row's lane is heard
+    /// ([`Self::covered`]).
     predicted: Option<Arc<Predicted>>,
+    /// Whether a row of the pool holds no lane in the index: the record
+    /// speaks for that row whatever a lane hears.
+    lacking: bool,
     /// Whether an issue over this pool may still record for each row.
-    /// The store clears the word when the worker leaves or takes a lane.
-    /// Empty where the pool has no record.
+    /// The store clears the word when the worker leaves, or stays under
+    /// another offer or rank. Empty where the pool has no record.
     allowed: Box<[Arc<AtomicBool>]>,
     /// Index id -> row of the pool; [`NONE`] for an id no row of it holds.
     row_of: Box<[u32]>,
@@ -472,6 +485,29 @@ struct Tables {
 }
 
 impl Tables {
+    /// Whether the record of sent prefixes speaks for the pool's row at
+    /// `row`: the row holds no lane, or no batch with an event ran through
+    /// its lane. One decision's naming and its write both ask here, so the
+    /// two read one bit.
+    fn covered(&self, row: usize) -> bool {
+        match (self.id_of[row], &self.index) {
+            (NONE, _) | (_, None) => true,
+            (id, Some(index)) => !index.heard(id),
+        }
+    }
+
+    /// Whether the record speaks for a row of the pool now. Where every
+    /// row holds a lane this is one read of the index's heard bits against
+    /// the pool's members, a word for 64 rows: a pool whose events flow
+    /// pays that for the record it holds.
+    fn covers(&self) -> bool {
+        self.lacking
+            || self
+                .index
+                .as_ref()
+                .is_some_and(|index| index.unheard_among(&self.members))
+    }
+
     /// The workers a read is kept within for the view a decision holds: the
     /// pool's members, those that state one of its gateway's wires where it
     /// states them, less another gateway's host-local rows. `mask` is the
@@ -916,7 +952,7 @@ impl PoolIndex {
     /// past it, on another stream.
     ///
     /// Where the pool holds a record of sent prefixes, its rows with no
-    /// lane are named beside the index's holders under the same cap: after
+    /// heard lane are named beside the index's holders under the same cap: after
     /// them, in the room they leave, or ahead of them where the profile's
     /// prefix stage reads the record alone. That lookup finds the deepest
     /// block a worker of the view was sent. The index is asked for a token
@@ -983,18 +1019,21 @@ impl PoolIndex {
         };
         let mut draw = Draw::new(naming.seed ^ HOLDERS_STREAM);
         let hashed = !naming.block_hashes.is_empty();
-        let record = tables.predicted.as_ref().filter(|_| hashed);
+        // The record is read where it speaks for a row of the pool: a pool
+        // whose lanes are all heard reads the heard bits and no record.
+        let record = tables.predicted.as_ref();
+        let record = record.filter(|_| hashed && tables.covers());
         // The record's holders, in the room the cap leaves where this runs.
         let name_record = |named: &mut Named, draw: &mut Draw| {
             let Some(predicted) = record else {
                 return;
             };
             // The row of the view a recorded worker stands at, where the
-            // record may name it: a row of the pool with no lane that is
-            // not another gateway's host-local row.
+            // record may name it: a row of the pool with no heard lane that
+            // is not another gateway's host-local row.
             let row_of = |id: WorkerId| -> Option<u32> {
                 let row = pool.binary_search_by_key(&id, |row| row.id).ok()?;
-                if tables.id_of[row] != NONE {
+                if !tables.covered(row) {
                     return None;
                 }
                 let row = row as u32;
@@ -1197,6 +1236,8 @@ impl PoolIndex {
     }
 
     /// Writes the naming's keys for the leased worker, if it has no lane.
+    /// A lane whose cache events are not heard counts as none: the record
+    /// speaks for the worker until they are.
     pub(super) fn sent(&self, rows: &[Candidate], named: &Named, target: WorkerId) {
         let Some(predicted) = &self.tables.predicted else {
             return;
@@ -1204,7 +1245,7 @@ impl PoolIndex {
         let Ok(row) = rows.binary_search_by_key(&target, |row| row.id) else {
             return;
         };
-        if self.tables.id_of[row] == NONE {
+        if self.tables.covered(row) {
             predicted.sent(named, target, &self.tables.allowed[row]);
         }
     }
@@ -1291,8 +1332,8 @@ fn name_predicted(
     }
 }
 
-/// One model's index: the chain index, how many times an id was taken, and
-/// the count each id was last taken at.
+/// One model's index: the chain index, how many times an id was taken, the
+/// count each id was last taken at, and whether each id's lane was heard.
 ///
 /// The chain frees an id for the next row once its row leaves, and a pool's
 /// tables of before still map the id to the row that left
@@ -1331,6 +1372,16 @@ struct Index {
     took: [AtomicU64; INDEX_WORKERS],
     /// How many times a row took an id ([`Self::take`]).
     taken: AtomicU64,
+    /// A bit an index id: a batch that carried an event ran through the
+    /// lane of the row that holds the id ([`Lane::heard`]). A batch with no
+    /// event sets nothing: the index holds nothing of the row yet, so the
+    /// record keeps its cover. The lane writes its own bit under
+    /// its lock, and a decision reads it with no lock: until the bit is
+    /// set the record of sent prefixes speaks for the row
+    /// ([`Tables::covered`]). The bit is a hint of this instant and orders
+    /// nothing: a decision that reads it a batch late names or writes one
+    /// prediction more or fewer.
+    heard: [AtomicU64; MASK_WORDS],
 }
 
 impl Index {
@@ -1339,7 +1390,33 @@ impl Index {
             chain: ChainIndex::with_max_workers(INDEX_WORKERS),
             took: std::array::from_fn(|_| AtomicU64::new(0)),
             taken: AtomicU64::new(0),
+            heard: std::array::from_fn(|_| AtomicU64::new(0)),
         }
+    }
+
+    /// The lane that holds `id` says whether a batch ran through it.
+    fn hear(&self, id: u32, heard: bool) {
+        let Some(word) = self.heard.get((id / 64) as usize) else {
+            return;
+        };
+        let bit = 1u64 << (id % 64);
+        if heard {
+            word.fetch_or(bit, Ordering::Relaxed);
+        } else {
+            word.fetch_and(!bit, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a batch ran through the lane that holds `id`.
+    fn heard(&self, id: u32) -> bool {
+        let word = self.heard.get((id / 64) as usize);
+        word.is_some_and(|word| word.load(Ordering::Relaxed) & (1 << (id % 64)) != 0)
+    }
+
+    /// Whether a lane among `members`, a bit an id, was not heard.
+    fn unheard_among(&self, members: &[u64]) -> bool {
+        let mut words = members.iter().zip(&self.heard);
+        words.any(|(&members, heard)| members & !heard.load(Ordering::Relaxed) != 0)
     }
 
     /// A row takes `id`, which the chain just handed out: the take is
@@ -1347,6 +1424,9 @@ impl Index {
     /// lock, before the row's lane exists: every block the row writes
     /// reaches the chain after it, behind the lane's fence.
     fn take(&self, id: u32) {
+        // The row that held the id before may have been heard: the row
+        // that takes it is not.
+        self.hear(id, false);
         let count = self.taken.fetch_add(1, Ordering::Release) + 1;
         if let Some(took) = self.took.get(id as usize) {
             took.store(count, Ordering::Relaxed);
@@ -1579,8 +1659,6 @@ impl KvTables {
                 lane: Arc::new(Mutex::new(lane)),
             },
         );
-        drop(table);
-        self.forget_sent(row.id);
         Some(worker)
     }
 
@@ -1617,9 +1695,7 @@ impl KvTables {
                     _ => NONE,
                 })
                 .collect();
-            let predicted = predict
-                .filter(|_| id_of.contains(&NONE))
-                .map(|predict| table.predicted(model, predict.bound));
+            let predicted = predict.map(|predict| table.predicted(model, predict.bound));
             let allowed = if predicted.is_some() {
                 table.allows(rows)
             } else {
@@ -1661,6 +1737,7 @@ impl KvTables {
             role: rows.first().map(|row| row.role),
             index,
             predicted,
+            lacking: id_of.contains(&NONE),
             allowed,
             row_of: row_of.into(),
             id_of,
@@ -1738,7 +1815,7 @@ impl KvTables {
         }
     }
 
-    /// A worker left, took a lane, or stays under another offer or rank.
+    /// A worker left, or stays under another offer or rank.
     /// Skip its predictions at once and take its placements out over later
     /// sweeps. A record that holds no place for it is read under its
     /// shared guard and left: a model's deciders wait on no removal from
@@ -1793,6 +1870,9 @@ impl KvTables {
             return BatchOutcome::Skipped;
         };
         *heard = true;
+        if !events.is_empty() && !held.index.heard(held.worker) {
+            held.index.hear(held.worker, true);
+        }
         let (outcome, emptied) = admit(cursor, held, facts, events, counts);
         if let Some(reason) = emptied {
             self.note(reason);
@@ -1838,6 +1918,7 @@ impl KvTables {
             lane.cursor.reset();
             lane.heard = false;
             if let Some(held) = &mut lane.held {
+                held.index.hear(held.worker, false);
                 held.cleared();
             }
         }

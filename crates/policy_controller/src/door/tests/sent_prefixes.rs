@@ -162,6 +162,24 @@ fn slices(store: &MemoryStore, role: Role) -> Option<usize> {
     store.deciding(|world| world.sent_slices(MODEL, role))
 }
 
+/// A batch through the worker's lane with one stored block no request of
+/// these cases holds: the store has heard the worker's cache events.
+fn hear(store: &MemoryStore, id: WorkerId) -> BatchOutcome {
+    let other = StoredBlock {
+        seq_hash: kv_index::SequenceHash(999),
+        content_hash: kv_index::ContentHash(999),
+    };
+    let event = KvEvent::Stored {
+        parent: None,
+        blocks: vec![other],
+    };
+    let facts = BatchFacts {
+        sequence: 1,
+        ..BatchFacts::default()
+    };
+    store.admit(id, 0, facts, &[event])
+}
+
 #[test]
 fn a_worker_with_no_events_is_named_by_what_it_was_sent() -> Case {
     let store = fleet();
@@ -181,6 +199,73 @@ fn a_worker_with_no_events_is_named_by_what_it_was_sent() -> Case {
     load(&store, b, 0, later);
     assert_eq!(issued(&door, &asked, later, &mut buffers)?, a);
     assert_eq!(depths(&buffers), vec![(u32::from(a > b), 8)]);
+    Ok(())
+}
+
+/// A worker can ask for cache events and never publish one. Its lane is
+/// never heard, so the record speaks for it as for a worker with no lane.
+#[test]
+fn a_worker_that_asks_for_events_and_publishes_none_keeps_its_prompt() -> Case {
+    let store = fleet();
+    let a = worker(&store, "a", Role::Single, &[MODEL], true)?;
+    let b = worker(&store, "b", Role::Single, &[MODEL], true)?;
+    let c = worker(&store, "c", Role::Single, &[MODEL], true)?;
+    store.apply(applied(&merged(1)?)?)?;
+    let door = Door::new(store.clone());
+    let mut buffers = Buffers::default();
+    let start = Instant::now() + Duration::from_secs(120);
+    for id in [a, b, c] {
+        load(&store, id, u32::from(id != a), start);
+    }
+    let asked = token_request(&HASHES[..8]);
+    assert_eq!(issued(&door, &asked, start, &mut buffers)?, a);
+    // From here its worker is the heaviest row: load alone would move the
+    // prompt at every turn.
+    for turn in 1..40 {
+        let now = start + Duration::from_millis(20 * turn);
+        load(&store, a, 2, now);
+        load(&store, b, 0, now);
+        load(&store, c, 0, now);
+        assert_eq!(issued(&door, &asked, now, &mut buffers)?, a, "turn {turn}");
+    }
+    Ok(())
+}
+
+/// A lane's first batch hands its row to the index, with no publication
+/// between. Its worker reported gone hands the row back to the record,
+/// which still holds what the row was sent before.
+#[test]
+fn a_heard_lane_hands_its_row_to_the_index_and_a_worker_gone_hands_it_back() -> Case {
+    let store = fleet();
+    let a = worker(&store, "a", Role::Single, &[MODEL], true)?;
+    let b = worker(&store, "b", Role::Single, &[MODEL], true)?;
+    store.apply(applied(&merged(1)?)?)?;
+    let door = Door::new(store.clone());
+    let mut buffers = Buffers::default();
+    let now = Instant::now() + Duration::from_secs(120);
+    load(&store, a, 0, now);
+    load(&store, b, 1, now);
+    let asked = token_request(&HASHES[..8]);
+    assert_eq!(issued(&door, &asked, now, &mut buffers)?, a);
+    let row = u32::from(a > b);
+    let later = now + Duration::from_millis(20);
+    decide_only(&door, &asked, later, &mut buffers);
+    assert_eq!(depths(&buffers), vec![(row, 8)]);
+
+    assert_eq!(hear(&store, a), BatchOutcome::Applied);
+    decide_only(&door, &asked, later, &mut buffers);
+    assert!(buffers.named.holders.is_empty(), "the index speaks for it");
+    // A lease on the heard worker writes nothing.
+    let written = slices(&store, Role::Single);
+    load(&store, a, 0, later);
+    load(&store, b, 1, later);
+    let other = token_request(&HASHES[..4]);
+    assert_eq!(issued(&door, &other, later, &mut buffers)?, a);
+    assert_eq!(slices(&store, Role::Single), written);
+
+    KvEventSink::removed(&*store, a);
+    decide_only(&door, &asked, later, &mut buffers);
+    assert_eq!(depths(&buffers), vec![(row, 8)]);
     Ok(())
 }
 
@@ -269,12 +354,13 @@ fn a_long_request_is_written_in_slices_of_sixteen() -> Case {
 }
 
 #[test]
-fn a_worker_with_events_is_neither_written_nor_listed() -> Case {
+fn a_worker_whose_events_are_heard_is_neither_written_nor_listed() -> Case {
     let store = fleet();
     let event = worker(&store, "event", Role::Single, &[MODEL], true)?;
     let plain = worker(&store, "plain", Role::Single, &[MODEL], false)?;
     let other = worker(&store, "other", Role::Single, &[MODEL], false)?;
     store.apply(applied(&merged(1)?)?)?;
+    assert_eq!(hear(&store, event), BatchOutcome::Applied);
     let door = Door::new(store.clone());
     let mut buffers = Buffers::default();
     let now = Instant::now() + Duration::from_secs(120);

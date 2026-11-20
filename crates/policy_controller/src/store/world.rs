@@ -1639,7 +1639,7 @@ impl World {
     /// none), and the pool's warming rows as this publication read them,
     /// less those whose naming ended by the decision's instant. Under a cap
     /// the holders' lookup lists nothing of the pool's length. Where the
-    /// pool holds a record of sent prefixes, its rows with no lane are
+    /// pool holds a record of sent prefixes, its rows with no heard lane are
     /// named beside the index's holders under the same cap: after them, in
     /// the room they leave, or ahead of them where the profile's prefix
     /// stage reads the record alone. That lookup finds the deepest block a
