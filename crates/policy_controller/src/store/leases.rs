@@ -21,9 +21,6 @@ pub(crate) const DISPATCH_TTL: std::time::Duration = std::time::Duration::from_s
 /// The state of a single's lease or of one side of a pair's lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeaseState {
-    /// A pair's decode targets before issue. The side books no count and
-    /// has no dispatch deadline. A lease record's own state is never chosen.
-    Chosen,
     /// Decided, not yet dispatched; the dispatch deadline bounds this. It
     /// holds the TTL of the sessions rule the lease's decision was made
     /// under, in microseconds, for the commit that ends the key's pin of
@@ -41,6 +38,9 @@ pub enum LeaseState {
     },
     Completed,
     Released(ReleaseReason),
+    /// A pair's decode targets before issue. The side books no count and
+    /// has no dispatch deadline. A lease record's own state is never chosen.
+    Chosen,
 }
 
 impl LeaseState {

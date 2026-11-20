@@ -2064,15 +2064,53 @@ fn a_chosen_side_ends_with_its_prefill() {
     leases.set_term(1);
     issue_pair(leases, chosen_pair(1, p, &[d], now)).expect("the key is free");
     assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
-    let before = leases.sides(gateway, id);
-    assert!(leases.completed(gateway, id, &done(Side::Decode)));
-    assert_eq!(leases.sides(gateway, id), before);
+    // The gateway gives the chosen side up: its end stands and no call
+    // issues it.
     assert!(leases.released(gateway, id, Some(Side::Decode), ReleaseReason::ClientGone));
-    assert_eq!(leases.sides(gateway, id), before);
+    let gone = LeaseState::Released(ReleaseReason::ClientGone);
+    assert_eq!(
+        sides(&store, 1),
+        Some((LeaseState::Dispatched { at: now }, gone))
+    );
+    let decode = chosen_pair(1, p, &[d], now).1;
+    assert_eq!(
+        leases.issue_decode(gateway, id, decode, now),
+        Err(DecodeRefused::DecodeStands)
+    );
+    assert_eq!(booked(&store, &[p, d]), [1, 0]);
     assert!(leases.completed(gateway, id, &done(Side::Prefill)));
     assert_eq!(leases.sides(gateway, id), None);
     assert_eq!(store.paired(), [vec![], vec![]]);
     assert_eq!(booked(&store, &[p, d]), [0, 0]);
+}
+
+#[test]
+fn a_chosen_side_dispatched_by_a_handed_frame_is_told_once() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (id, now) = (LeaseId(1), Instant::now());
+    leases.set_term(1);
+    store.tell_through(heard);
+    issue_pair(leases, chosen_pair(1, p, &[d], now)).expect("the key is free");
+    drop(told_sides());
+    let hand = Hand::new(GatewayId(1));
+    let sent = |side| Said::Dispatched(on(side, 0), now);
+    store.hand(&hand, id, sent(Side::Prefill));
+    store.hand(&hand, id, sent(Side::Decode));
+    store.hand(&hand, id, sent(Side::Decode));
+    // Each side's dispatch is told once, with the lease as its frame found
+    // it: the decode side stood chosen.
+    let told: Vec<_> = told_sides()
+        .into_iter()
+        .map(|(found, said)| (found.decode.map(|side| side.state), said))
+        .collect();
+    let chosen = Some(LeaseState::Chosen);
+    assert_eq!(
+        told,
+        [(chosen, sent(Side::Prefill)), (chosen, sent(Side::Decode))]
+    );
+    assert_eq!(booked(&store, &[p, d]), [1, 1]);
 }
 
 #[test]
