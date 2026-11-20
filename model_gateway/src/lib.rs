@@ -51,9 +51,11 @@ pub mod workflow;
 /// arguments. The executable owns allocator selection and registration.
 ///
 /// The call builds its own runtime and blocks its thread until the server
-/// stops, so it must not be made from async code. On return it has closed
-/// the process's logging and tracing. A host whose process goes on after
-/// the server calls [`server::startup_with`] instead.
+/// stops, so it must not be made from async code. A call that served has
+/// closed the process's logging and tracing when it returns. A version
+/// flag and `--print-policy-spec` answer and return before either starts.
+/// A host whose process goes on after the server calls
+/// [`server::startup_with`] instead.
 pub fn main_from_args() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
     main_with(server::Extensions::default())
 }
