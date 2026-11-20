@@ -9,12 +9,13 @@
 //! of its own registration alone: one that states no policy is checked,
 //! whatever stood under its URL.
 //!
-//! An answer carries the log's place after the call's write, with the term
-//! that place was written under: the write's own place, since the door is
-//! the only writer of the kinds a watcher follows but the start of a term.
-//! A caller that watches the rows holds the call's write once its stream
-//! has passed that place. A call that wrote nothing answers the place the
-//! log stands at.
+//! An answer carries the log's place read after the call's write, with the
+//! term that place was written under: the write's own place or a later one.
+//! The door is not the only writer of the kinds a watcher follows: a
+//! probe's verdict moves a row's status beside it, and so does the start
+//! of a term. A caller that watches the rows holds the call's write once
+//! its stream has passed that place. A call that wrote nothing answers the
+//! place the log stands at.
 //!
 //! **The door is the process's only membership writer.** A call's read, its
 //! write and its read back run under the door's one lock, so a mode's test
@@ -145,7 +146,8 @@ impl Door {
         }
     }
 
-    /// The log's place: read after a call's write, that write's own.
+    /// The log's place: read after a call's write, that write's own or one
+    /// past it.
     fn place(&self) -> Position {
         self.log.head(Kinds::Watched)
     }
