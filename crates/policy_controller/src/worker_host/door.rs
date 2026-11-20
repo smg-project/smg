@@ -16,6 +16,7 @@ use super::{
 use crate::{
     store::{
         membership::{self, NotMaker, Past},
+        pairing::PairingDescriptor,
         HealthSink, Laid, Maker, MembershipChange, MemoryStore, WorkerFacts, WorkerPatch,
         WorkerRow, WorkerStatus, WorkersStore,
     },
@@ -67,15 +68,15 @@ pub enum Refused {
     Draining,
     /// The row's maker is outside the health removal scope.
     OutOfScope,
-    /// A refresh's worker states another fact than the row's labels. A
-    /// refresh writes the labels alone.
+    /// A refresh's worker states another fact than the row's labels and
+    /// the pairing they derive. A refresh writes those alone.
     NotLabelsAlone,
 }
 
 impl Refused {
     pub(crate) const OUT_OF_SCOPE: &str = "the row's maker is outside the health removal scope";
     pub(crate) const NOT_LABELS_ALONE: &str =
-        "a refresh writes a row's labels and states no other fact";
+        "a refresh writes a row's labels and the pairing they derive, and states no other fact";
 }
 
 /// Who asks to drain or remove a row.
@@ -175,7 +176,7 @@ pub trait Membership: Send + Sync + 'static {
     /// Lays the rows one registration states of one engine, each with the
     /// worker its registration built, over what it expects to stand. A
     /// row's URL is its worker's, and its facts are the ones the worker
-    /// states over the standing row ([`facts`](super::facts)), by the
+    /// states over the standing row ([`facts`]), by the
     /// write's verb. The engine is the one the rows' own facts state, so no
     /// caller names it another way.
     ///
@@ -234,30 +235,34 @@ pub trait Membership: Send + Sync + 'static {
     fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused>;
 
     /// Write the labels of the worker the health loop's refresh rebuilt,
-    /// over the row the asker saw under the worker's URL. The labels are
-    /// the engine's word and nobody's registration: no maker is asked, a
-    /// control call's row and a provider's are served alike, and the row
-    /// keeps the maker it has.
+    /// and the pairing descriptor they derive, over the row the asker saw
+    /// under the worker's URL. Both are the engine's word and nobody's
+    /// registration: no maker is asked, a control call's row and a
+    /// provider's are served alike, and the row keeps the maker it has.
     ///
     /// The facts `built` states over the standing row ([`facts`]) may
-    /// differ from the row's in the labels alone. Any other difference is
-    /// refused ([`Refused::NotLabelsAlone`]), so a refresh starts no life. No
-    /// row, another row or revision, and a draining row refuse it too. The
-    /// labels' room is tested as a registration's is. Equal labels write
-    /// nothing and answer [`Wrote::Unmoved`].
+    /// differ from the row's in the labels and the descriptor alone. Any
+    /// other difference is refused ([`Refused::NotLabelsAlone`]), so a
+    /// refresh starts no life. No row, another row or revision, and a
+    /// draining row refuse it too. The stated facts' room is tested as a
+    /// registration's is: the controller's door, whose log carries no
+    /// descriptor, refuses a refresh that states one as it refuses such a
+    /// registration. Equal labels and an equal descriptor write nothing
+    /// and answer [`Wrote::Unmoved`].
     ///
     /// Each door says what it does with the object, as for
     /// [`Self::found_built`]. A door whose host keeps built objects hands
     /// `built` to the holder in the write's turn, whether or not a label
     /// moved: a refresh can rebuild what no row states. A door over a door
-    /// passes the call on. Any other door writes the labels alone.
+    /// passes the call on. Any other door writes the row alone.
     ///
-    /// `over` is the object the refresh rebuilt from. Equal labels move no
-    /// revision, so the row's guard cannot tell an older rebuild from a
-    /// newer one: a door that hands `built` in refuses the refresh as moved
-    /// where another object stands for the row by then, or none. It asks
-    /// ahead of the row's guard, so a worker that left reads as moved
-    /// there. A door that keeps no object has nothing to hold it against.
+    /// `over` is the object the refresh rebuilt from. Equal labels and an
+    /// equal descriptor move no revision, so the row's guard cannot tell an
+    /// older rebuild from a newer one: a door that hands `built` in refuses
+    /// the refresh as moved where another object stands for the row by
+    /// then, or none. It asks ahead of the row's guard, so a worker that
+    /// left reads as moved there. A door that keeps no object has nothing
+    /// to hold it against.
     fn refreshed(
         &self,
         seen: Standing,
@@ -692,35 +697,79 @@ pub(crate) fn take(
     changed(store.remove(row.id, row.revision), Wrote::Removed)
 }
 
-/// Write the labels a refresh's rebuilt worker states over the guarded row
-/// while the door holds its turn. The row's other facts are the test of
-/// the refresh's scope and are not written: the door states a row's event
-/// signal at its registration, and a refresh leaves it as it stands.
+/// Write what a refresh's rebuilt worker states over the guarded row while
+/// the door holds its turn: its labels, and the pairing descriptor they
+/// derive. The row's other facts are the test of the refresh's scope and
+/// are not written: the door states a row's event signal at its
+/// registration, and a refresh leaves it as it stands.
 pub(crate) fn refresh(
     turn: &impl Turn,
     seen: Standing,
     built: &dyn Worker,
 ) -> Result<Wrote, Refused> {
+    refresh_stated(turn, seen, built.url(), &|standing| {
+        facts(built, Some(standing))
+    })
+}
+
+/// [`refresh`] over the facts `state` makes of the guarded row.
+///
+/// Labels are no part of a row's offer, and a patch writes them under the
+/// row's guard. A descriptor is part of it. Where it moved, the row takes
+/// the write a registration takes in place, and the store derives the
+/// row's pair classes again there. That write has no guard of its own: the
+/// door's turn holds the row as the guard read it.
+fn refresh_stated(
+    turn: &impl Turn,
+    seen: Standing,
+    url: &str,
+    state: &dyn Fn(&WorkerFacts) -> WorkerFacts,
+) -> Result<Wrote, Refused> {
     let store = turn.store();
-    let row = seen_row(store, built.url(), seen)?;
+    let row = seen_row(store, url, seen)?;
     // A draining row is leaving: its removal wins over a refresh, as over
     // a replacement.
     if row.status == WorkerStatus::Draining {
         return Err(Refused::Draining);
     }
-    let mut stated = facts(built, Some(&row.facts));
+    let mut stated = state(&row.facts);
     let labels = mem::replace(&mut stated.labels, row.facts.labels.clone());
+    let mut pairing = mem::replace(&mut stated.pairing, row.facts.pairing.clone());
     if stated != row.facts {
         return Err(Refused::NotLabelsAlone);
     }
-    if labels == row.facts.labels {
+    // The row holds its descriptor as the pairing rule reads it. A stated
+    // one that differs is read the same way before it counts as moved: its
+    // blanks are dropped. One that reports nothing is none on either side,
+    // as the rule reads a row that has no descriptor.
+    let held = row.facts.pairing.as_ref();
+    if let Some(descriptor) = pairing.as_mut().filter(|said| held != Some(&**said)) {
+        Arc::make_mut(descriptor).normalize();
+    }
+    let reports = |said: &Arc<PairingDescriptor>| **said != PairingDescriptor::default();
+    pairing = pairing.filter(reports);
+    let pairing_moved = pairing.as_ref() != held.filter(|held| reports(held));
+    if labels == row.facts.labels && !pairing_moved {
         return Ok(Wrote::Unmoved(row.id));
     }
     stated.labels = labels;
+    stated.pairing = pairing;
     stated.bounded(&row.maker).map_err(Refused::Past)?;
     turn.room(&stated, &row.maker)?;
-    // The patch is a write of the turn: the term is asked ahead of it.
+    // The write, in place or by the patch, is a write of the turn: the term
+    // is asked ahead of it.
     turn.check_term()?;
+    if pairing_moved {
+        return match store.upsert_by(stated, row.maker) {
+            MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
+                Ok(Wrote::InPlace(id))
+            }
+            MembershipChange::Registered { .. }
+            | MembershipChange::Replaced { .. }
+            | MembershipChange::Removed { .. }
+            | MembershipChange::StatusChanged { .. } => Err(Refused::Moved),
+        };
+    }
     let patch = WorkerPatch {
         labels: Some(stated.labels),
         ..WorkerPatch::default()
@@ -834,7 +883,7 @@ impl Membership for StoreDoor {
         self.call(|| take(&self.store, by, url, seen), Wrote::changed)
     }
 
-    // This door has no holder. The row takes the labels alone.
+    // This door has no holder. The row alone takes the refresh.
     fn refreshed(
         &self,
         seen: Standing,
@@ -864,8 +913,8 @@ pub(super) mod tests {
     };
 
     use super::{
-        changed, lay, lay_one, Expect, Membership, Refused, Remover, Standing, Stated, StoreDoor,
-        Turn, Wrote,
+        changed, lay, lay_one, refresh_stated, Expect, Membership, Refused, Remover, Standing,
+        Stated, StoreDoor, Turn, Wrote,
     };
     use crate::{
         demands::{DemandFacts, Demands},
@@ -877,6 +926,7 @@ pub(super) mod tests {
         store::{
             index::indexed_under,
             membership::{self, Past},
+            pairing::PairingDescriptor,
             Maker, MembershipChange, MembershipTail, MemoryStore, Signals, WorkerFacts, WorkerRow,
             WorkerStatus, WorkersStore,
         },
@@ -1959,6 +2009,109 @@ pub(super) mod tests {
             assert_eq!(door.refreshed(seen, &late, &first), Err(Refused::Absent));
         }
         Ok(())
+    }
+
+    /// A refresh's scope is its worker's labels and the pairing descriptor
+    /// they derive. A descriptor that moved is laid in place, with a label
+    /// or by itself, and the row keeps its id, its maker and every other
+    /// fact. One that differs from the row's by its blanks alone is the
+    /// row's. One that reports nothing is none, stated or held: it
+    /// withdraws a row's descriptor and writes nothing over a row with
+    /// none. Another fact beside a moved descriptor is refused, and
+    /// nothing is written.
+    #[test]
+    fn a_refresh_lays_the_pairing_its_labels_derive() {
+        let (store, door) = door();
+        let first: Arc<dyn Worker> = Arc::new(built("gold").build());
+        let registered = door.found_built(&Maker::Control, Expect::Nothing, &first, None);
+        assert!(registered.is_ok(), "{registered:?}");
+        let row = store.by_key(URL).expect("the registered row");
+        let version = |version: &str| {
+            Some(Arc::new(PairingDescriptor {
+                version: Some(version.to_owned()),
+                ..PairingDescriptor::default()
+            }))
+        };
+        let refresh = |seen: &WorkerRow, pairing: Option<Arc<PairingDescriptor>>, tier: &str| {
+            refresh_stated(&door, standing(seen), URL, &|standing| {
+                let mut facts = standing.clone();
+                facts.pairing.clone_from(&pairing);
+                facts.labels.insert("tier".to_owned(), tier.to_owned());
+                facts
+            })
+        };
+
+        // The descriptor and a label move together.
+        let wrote = refresh(&row, version("2"), "silver");
+        assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
+        let moved = store.by_key(URL).expect("the refreshed row");
+        let mut facts = row.facts.clone();
+        facts.labels.insert("tier".to_owned(), "silver".to_owned());
+        facts.pairing = version("2");
+        assert_eq!(
+            moved,
+            WorkerRow {
+                facts,
+                revision: row.revision + 1,
+                ..row.clone()
+            }
+        );
+
+        // The same version between blanks is the row's descriptor.
+        let equal = refresh(&moved, version(" 2 "), "silver");
+        assert_eq!(equal, Ok(Wrote::Unmoved(row.id)));
+        assert_eq!(store.by_key(URL).as_ref(), Some(&moved));
+
+        // The descriptor moves by itself, then is withdrawn: by none, and
+        // by one that reports nothing, which the row holds as none.
+        let empty = || Some(Arc::new(PairingDescriptor::default()));
+        let mut bare = moved.clone();
+        for withdrawn in [None, version(" ")] {
+            let wrote = refresh(&bare, version("3"), "silver");
+            assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
+            let again = store.by_key(URL).expect("the row of a moved descriptor");
+            assert_eq!(again.facts.pairing, version("3"));
+            assert_eq!(again.facts.labels, moved.facts.labels);
+            let wrote = refresh(&again, withdrawn, "silver");
+            assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
+            bare = store
+                .by_key(URL)
+                .expect("the row of a withdrawn descriptor");
+            assert_eq!(bare.facts.pairing, None);
+        }
+
+        // Over a row with none, one that reports nothing writes nothing.
+        for nothing in [empty(), version(" ")] {
+            let unmoved = refresh(&bare, nothing, "silver");
+            assert_eq!(unmoved, Ok(Wrote::Unmoved(row.id)));
+            assert_eq!(store.by_key(URL).as_ref(), Some(&bare));
+        }
+
+        // Another fact beside a moved descriptor is outside the scope.
+        let stray = refresh_stated(&door, standing(&bare), URL, &|standing| {
+            let mut facts = standing.clone();
+            facts.pairing = version("4");
+            facts.priority += 1;
+            facts
+        });
+        assert_eq!(stray, Err(Refused::NotLabelsAlone));
+        assert_eq!(store.by_key(URL).as_ref(), Some(&bare));
+
+        // A row may hold one that reports nothing, as a registration states
+        // it. It reads as a row with none.
+        let laid = door.found(&Maker::Control, Expect::Anything, URL, &|standing| {
+            let mut facts = standing.expect("the standing row").clone();
+            facts.pairing = empty();
+            facts
+        });
+        assert_eq!(laid, Ok(Wrote::InPlace(row.id)));
+        let held = store.by_key(URL).expect("the row of the registration");
+        assert_eq!(held.facts.pairing, empty());
+        for nothing in [None, empty()] {
+            let unmoved = refresh(&held, nothing, "silver");
+            assert_eq!(unmoved, Ok(Wrote::Unmoved(row.id)));
+            assert_eq!(store.by_key(URL).as_ref(), Some(&held));
+        }
     }
 
     #[test]
