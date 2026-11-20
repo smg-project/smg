@@ -407,3 +407,51 @@ fn worker_jobs_keep_their_status_names_and_address_keys() {
         assert_eq!(WorkerJob::shown_key(name, url), "http://***@worker:8000");
     }
 }
+
+#[test]
+fn a_merged_removal_pins_the_later_revision_of_a_worker_both_pin() {
+    type Pins<'a> = &'a [(&'a str, Option<u64>)];
+    fn pins(pins: Pins<'_>) -> HashMap<String, Option<u64>> {
+        pins.iter()
+            .map(|(id, pin)| ((*id).to_string(), *pin))
+            .collect()
+    }
+    fn removal(held: Pins<'_>) -> WorkerJob {
+        WorkerJob::Remove {
+            url: "http://worker:8000".to_string(),
+            expected_revisions: Some(pins(held)),
+            asker: WorkerJobAsker::Health,
+        }
+    }
+
+    // The held job's pins, the newer job's, the merged job's. A revision
+    // only grows, so the earlier pin of a replaced worker matches nothing.
+    let rows: [(Pins<'_>, Pins<'_>, Pins<'_>); 4] = [
+        (
+            &[("one", Some(7))],
+            &[("one", Some(8))],
+            &[("one", Some(8))],
+        ),
+        (
+            &[("one", Some(8))],
+            &[("one", Some(7))],
+            &[("one", Some(8))],
+        ),
+        (&[("one", Some(7))], &[("one", None)], &[("one", None)]),
+        (
+            &[("one", Some(7))],
+            &[("two", Some(3))],
+            &[("one", Some(7)), ("two", Some(3))],
+        ),
+    ];
+    for (held, newer, merged) in rows {
+        let Ok(WorkerJob::Remove {
+            expected_revisions: Some(kept),
+            ..
+        }) = WorkerJob::merge_removals(removal(held), removal(newer))
+        else {
+            panic!("two pinned removals of one asker merge into a pinned one");
+        };
+        assert_eq!(kept, pins(merged), "{held:?} then {newer:?}");
+    }
+}
