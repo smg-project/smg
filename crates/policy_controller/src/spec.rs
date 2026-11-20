@@ -1511,18 +1511,32 @@ impl JsonSchema for ScoreSpec {
     }
 
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-        // The bare form stands for the stage at its defaults, so a scorer
-        // whose parameters have none is written in the parameter form only.
+        // The schema cannot know a host's catalog, so a name is open in
+        // both forms: the validator refuses an unknown one by its path. The
+        // bare form stands for a stock scorer at its defaults, so one whose
+        // parameters have none is written in the parameter form only: the
+        // description lists the stock scorers that stand bare.
         let names: Vec<&str> = SCORERS
             .iter()
             .copied()
             .filter(|name| ScoreStage::by_name(name).is_some())
             .collect();
+        let description = format!(
+            "A scorer: its bare name (a stock scorer at its defaults, or a scorer the host adds at weight one), a stock scorer mapped to its weight and parameters, or the name of a scorer the host adds mapped to its weight and parameters. The stock scorers a document names bare: {}.",
+            names.join(", ")
+        );
         json_schema!({
-            "description": "A scorer: its bare name (the stage at its defaults), or the name mapped to its weight and parameters.",
+            "description": description,
             "anyOf": [
-                { "type": "string", "enum": names },
-                generator.subschema_for::<ScoreStage>()
+                { "type": "string" },
+                generator.subschema_for::<ScoreStage>(),
+                {
+                    "type": "object",
+                    "minProperties": 1,
+                    "maxProperties": 1,
+                    "propertyNames": { "not": { "enum": SCORERS } },
+                    "additionalProperties": { "type": "object" }
+                }
             ]
         })
     }
@@ -1680,10 +1694,17 @@ impl JsonSchema for PickSpec {
             .copied()
             .filter(|name| *name != "best-with-temperature")
             .collect();
+        // A name is open in both forms, as a scorer's is: the description
+        // lists the stock pickers a document names bare.
+        let description = format!(
+            "{} The stock pickers a document names bare: {}.",
+            "A picker: its bare name, a built-in mapped to its parameters, or the name of a picker the host adds mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool.",
+            names.join(", ")
+        );
         json_schema!({
-            "description": "A picker: its bare name, a built-in mapped to its parameters, or the name of a picker the host adds mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool.",
+            "description": description,
             "anyOf": [
-                { "type": "string", "enum": names },
+                { "type": "string" },
                 generator.subschema_for::<PickStage>(),
                 {
                     "type": "object",
@@ -3205,6 +3226,13 @@ fn picker_of(
             Ok(Resolved::NotInBuild("the best-with-temperature picker"))
         }
         PickSpec::Added { name, written } => match from.catalog.find_picker(name) {
+            // Only a document built in code: the reader reads a typed
+            // built-in's key into its parameter struct.
+            _ if TYPED_PICKERS.contains(&name.as_str()) => Err(SpecError::BadField {
+                path: path(),
+                value: name.clone(),
+                reason: "a picker added in code: a built-in's parameters are typed",
+            }),
             Some(Found::With(build)) => {
                 let params = written.as_object().ok_or_else(|| SpecError::BadField {
                     path: path(),

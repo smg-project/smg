@@ -613,7 +613,7 @@ mod tests {
     use super::{Catalog, CatalogError, Found, StageKind};
     use crate::{
         builtins::target_of,
-        spec::{ScoreSpec, FILTERS, PICKERS, SCORERS},
+        spec::{PickSpec, ScoreSpec, FILTERS, PICKERS, SCORERS},
         Candidate, Constraints, Engine, Filter, Health, Lifecycle, Picker, PolicySpec, PoolFacts,
         RequestFacts, Scorer, Scratch, SpecError, Targets, TieBand, WorkerId,
     };
@@ -2312,6 +2312,38 @@ bindings: [{{ profile: before }}]
                 serde_yaml::from_str::<PolicySpec>(&yaml).expect("reads YAML"),
                 read,
                 "{pick}"
+            );
+        }
+    }
+
+    /// Only a document built in code holds a typed built-in's name under an
+    /// added entry: the reader reads that key into its parameter struct.
+    /// The refusal says what the entry is, as a scorer's does.
+    #[test]
+    fn a_typed_built_ins_name_under_an_added_entry_is_refused_by_what_it_is() {
+        for (name, written) in [
+            ("best", serde_json::json!({ "sample": 2 })),
+            (
+                "best-with-temperature",
+                serde_json::json!({ "temperature": 0.5 }),
+            ),
+        ] {
+            let mut document = pick_document("random");
+            let profile = document.profiles.get_mut("default").expect("the profile");
+            profile.pick = PickSpec::Added {
+                name: name.into(),
+                written,
+            };
+            assert_eq!(
+                document
+                    .validate_in(&Catalog::builtin(), &[])
+                    .expect_err("refused"),
+                SpecError::BadField {
+                    path: format!("profiles.default.pick.{name}"),
+                    value: name.into(),
+                    reason: "a picker added in code: a built-in's parameters are typed",
+                },
+                "{name}"
             );
         }
     }
