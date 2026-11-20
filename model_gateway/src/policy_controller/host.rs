@@ -1122,7 +1122,7 @@ impl Held {
 }
 
 mod ride;
-pub(crate) use ride::Sent;
+pub(crate) use ride::{BehindAnswer, Sent};
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]

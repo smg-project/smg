@@ -78,7 +78,8 @@ fn stage_with_cached_prompt(
     let document = PolicySpec::preset("cache_aware")?;
     store.apply(AppliedSpec::validate(&document)?)?;
     let rows = URLS.map(|url| (url, Some(MODEL)));
-    let (_, store, rows) = host::testing::bed_with(store, Arc::new(WorkerRegistry::new()), rows);
+    let (_, store, rows) =
+        host::testing::bed_with(store, Arc::new(WorkerRegistry::new()), rows, None);
     let workers = URLS.map(|url| (url, WorkerType::Regular, ConnectionMode::Grpc, runtime));
     let stage = stage_on_rows(&workers, &store, &rows);
 
