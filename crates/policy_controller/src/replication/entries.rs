@@ -109,6 +109,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("LeasesStore", "set_term", Fate::Journaled),
     ("LeasesStore", "issue", Fate::NotYet(PINS)),
     ("LeasesStore", "issue_pair", Fate::NotYet(PINS)),
+    ("LeasesStore", "issue_decode", Fate::NotYet(PINS)),
     ("LeasesStore", "dispatched", Fate::Rebuilt(DISPATCHED)),
     ("LeasesStore", "completed", Fate::NotYet(PINS)),
     ("LeasesStore", "released", Fate::NotYet(PINS)),
