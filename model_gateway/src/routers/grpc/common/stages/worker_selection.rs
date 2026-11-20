@@ -18,7 +18,7 @@ use smg_policy_controller::{
     framework::EncodeItems,
     lease::ReleaseReason,
     view::{fingerprint, Identity, Phase},
-    WireModes,
+    MediaCounts, WireModes,
 };
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 use tracing::{debug, error, warn};
@@ -2317,8 +2317,9 @@ impl WorkerSelectionStage {
     /// item's key in order; the one key a class that pushes places in the
     /// items' stead, and none under an image fan-out, where each item is
     /// placed; whether the items are references; whether the decode must
-    /// take images. That the request carries pixel media has no word in the
-    /// ask yet: the encoders are held to it after the commit.
+    /// take images. Where the request's media demands vision the ask counts
+    /// its items as images, so the controller places no encoder that takes
+    /// none.
     ///
     /// The ask states the wires the route dials, so the controller names no
     /// pair and no encoder on another wire. The pair's commit takes the
@@ -2365,10 +2366,20 @@ impl WorkerSelectionStage {
         let needs_encode = !keys.is_empty();
         let one = (needs_encode && !demand.image_fanout)
             .then(|| key(items_digest(encode_item_hashes).as_bytes()));
+        // The items are images where the request's media demands vision.
+        let images = if demand.encode.vision {
+            u16::try_from(keys.len()).unwrap_or(u16::MAX)
+        } else {
+            0
+        };
         let ask = Ask {
             phase: Phase::Prefill,
             attempt: Some(attempt.number()),
             wires: route_wires(demand.wire),
+            media: MediaCounts {
+                images,
+                ..MediaCounts::NONE
+            },
             items: EncodeItems {
                 keys: &keys,
                 one,

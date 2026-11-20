@@ -1821,6 +1821,51 @@ async fn a_pinned_encode_attempt_passes_over_a_pair_of_another_runtime() -> anyh
     Ok(())
 }
 
+/// A request with images takes an encoder that takes images: the ask counts
+/// its items as images, so the controller places none of them on an encoder
+/// that takes none. With no image stated such an encoder drew its share of
+/// the keys, and each attempt it drew was given up at the gateway's own
+/// read. A request whose items are no images still takes either encoder.
+#[tokio::test]
+async fn a_request_with_images_takes_an_encoder_that_takes_images() -> anyhow::Result<()> {
+    const BLIND: &str = "http://e1:8000";
+    let blind = Member {
+        vision: false,
+        ..Member::of(BLIND, WorkerType::Encode, MEET)
+    };
+    let seeing = Member::of(ENCODER, WorkerType::Encode, MEET);
+    let (stage, store) = encode_stage(&fleet_around(MEET, &[blind, seeing]))?;
+    for key in 0..32_u8 {
+        let ((assignments, ..), placed) = encode_attempt(&stage, &[vec![key]], IMAGES)
+            .await
+            .ok()
+            .context("an encoder that takes images")?;
+        assert_eq!(assignments.len(), 1, "{key}");
+        assert_eq!(assignments[0].worker.url(), ENCODER, "{key}");
+        drop(placed);
+    }
+
+    let no_images = EpdDemands {
+        encode: MediaDemands {
+            vision: false,
+            ..IMAGES.encode
+        },
+        ..IMAGES
+    };
+    let mut drawn = false;
+    for key in 0..32_u8 {
+        let ((assignments, ..), placed) = encode_attempt(&stage, &[vec![key]], no_images)
+            .await
+            .ok()
+            .context("either encoder")?;
+        drawn |= assignments[0].worker.url() == BLIND;
+        drop(placed);
+    }
+    assert!(drawn, "no key of the 32 fell to the other encoder");
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+    Ok(())
+}
+
 /// Equal items carry one key, so one encoder takes them, and the keys of a
 /// fleet spread over more encoders than one.
 #[tokio::test]
@@ -1894,6 +1939,10 @@ async fn each_shed_of_the_encode_side_is_answered_under_the_classics_name() -> a
         ..IMAGES
     };
     let encoder = Member::of(ENCODER, WorkerType::Encode, MEET);
+    let blind = Member {
+        vision: false,
+        ..encoder
+    };
     let mute = Member {
         states_end: false,
         ..Member::of(ENCODER, WorkerType::Encode, PUSH)
@@ -1906,13 +1955,20 @@ async fn each_shed_of_the_encode_side_is_answered_under_the_classics_name() -> a
         },
         encoder,
     ];
-    let rows: [(&str, Vec<Member>, EpdDemands, Name); 3] = [
+    let rows: [(&str, Vec<Member>, EpdDemands, Name); 4] = [
         // No registered encoder processes a reference.
         (
             "encode-media",
             fleet_around(MEET, &[encoder]),
             references,
             || EpdSelectionFailure::EncodeNotSupported,
+        ),
+        // No encoder takes the images the request carries.
+        (
+            "encode-vision",
+            fleet_around(MEET, &[blind]),
+            IMAGES,
+            || EpdSelectionFailure::EncodeVisionUnsupported,
         ),
         // A pushing encoder states no role.
         ("ec-compatible", fleet_around(PUSH, &[mute]), IMAGES, || {
@@ -1937,18 +1993,6 @@ async fn each_shed_of_the_encode_side_is_answered_under_the_classics_name() -> a
         );
         assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0, "{shed}");
     }
-
-    // The engine names `encode-vision` from the request's images, which no
-    // ask states yet: the name is held at the table.
-    let unseen = host::Unplaced::Shed {
-        reason: ShedReason::NoEndpoints,
-        emptied_by: "encode-vision",
-        retry_after_secs: 0,
-    };
-    assert!(matches!(
-        epd_shed(&unseen),
-        Some(EpdSelectionFailure::EncodeVisionUnsupported)
-    ));
 
     // An encoder is registered and none is open: the classic's verdict by
     // role.
@@ -1988,10 +2032,11 @@ async fn each_shed_of_the_encode_side_is_answered_under_the_classics_name() -> a
     Ok(())
 }
 
-/// The ask states no pixel media yet, so an encoder that takes no image can
-/// be placed for a request with images. The gateway's own read of the
-/// encoder refuses it: the placement is let go as a failed commit, and the
-/// request reads the host's answer for an attempt no target holds.
+/// A row can trail its worker. Here the row says its encoder takes images
+/// and the registry's object says it takes none, so the controller places
+/// the encoder by its row. The gateway's own read of the encoder refuses
+/// it: the placement is let go as a failed commit, and the request reads
+/// the host's answer for an attempt no target holds.
 #[tokio::test]
 async fn an_encoder_the_route_cannot_send_to_is_given_up_as_a_failed_commit() -> anyhow::Result<()>
 {
@@ -2000,6 +2045,16 @@ async fn an_encoder_the_route_cannot_send_to_is_given_up_as_a_failed_commit() ->
         ..Member::of(ENCODER, WorkerType::Encode, MEET)
     };
     let (stage, store) = encode_stage(&fleet_around(MEET, &[blind]))?;
+    let mut facts = store.by_key(ENCODER).context("the encoder's row")?.facts;
+    facts.vision = true;
+    let id = store.upsert(facts).id();
+    let row = WorkersStore::get(&*store, id).context("the row")?;
+    if row.status != RowStatus::Ready {
+        store
+            .set_status(id, RowStatus::Ready, row.revision)
+            .context("the row stands")?;
+    }
+    store.publish_now();
     let refused = encode_attempt(&stage, &[vec![1]], IMAGES)
         .await
         .err()
