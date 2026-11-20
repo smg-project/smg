@@ -1972,8 +1972,8 @@ mod tests {
         use tokio_stream::StreamExt as _;
 
         use super::{
-            outcome, request, Door, Duration, Handle, Instant, Side, TransportClass, WorkerId,
-            PATIENCE,
+            outcome, request, DecodeRefused, Door, Duration, Handle, Instant, Refused, Request,
+            Side, TransportClass, WorkerId, PATIENCE,
         };
         use crate::{
             client::{poll, Error, Peer, Unanswered},
@@ -2017,10 +2017,20 @@ mod tests {
             told: proto::Decision,
             now: Instant,
         ) -> Result<Handle<&'static Door>, Unanswered> {
-            peer.read_hello().await;
-            let link = peer.link.clone();
             let mut ask = request(&[1], 7);
             ask.facts.budget_micros = 200_000;
+            answered_to(peer, &ask, told, now).await
+        }
+
+        /// [`answered`] for the request `ask`, of id 1 and a budget of 200 ms.
+        async fn answered_to(
+            peer: &mut Peer,
+            ask: &Request<'_>,
+            told: proto::Decision,
+            now: Instant,
+        ) -> Result<Handle<&'static Door>, Unanswered> {
+            peer.read_hello().await;
+            let link = peer.link.clone();
             let exchange = async {
                 let sent = peer.requests.next().await.expect("an ask went out");
                 assert_eq!(sent.request_id, [1]);
@@ -2028,7 +2038,7 @@ mod tests {
                 peer.answer(1, link.term_floor(), Answer::Decision(told));
             };
             let both = async {
-                let held = pin!(Handle::asked(&link, &ask, now, PATIENCE));
+                let held = pin!(Handle::asked(&link, ask, now, PATIENCE));
                 let (handle, ()) = tokio::join!(held, exchange);
                 handle
             };
@@ -2370,6 +2380,39 @@ mod tests {
             let mut handle = answered(&mut peer, paired(), now)
                 .await
                 .expect("another pair");
+            handle.completed(&outcome(WorkerId(28), TransportClass::Ok), now);
+            drop(handle);
+            reports(
+                &mut peer,
+                [
+                    pair_dispatch(proto::Side::Prefill, 0, 0),
+                    pair_completion(proto::Side::Prefill, 28),
+                    released(proto::Side::Decode, Reason::Abandoned),
+                ],
+            )
+            .await;
+        }
+
+        /// No link asks a decode later: the link's request drops the word,
+        /// so its controller issues both sides, and the handle owes the
+        /// decode its dispatch or its release. A decode call on such a
+        /// handle is refused as not chosen, and nothing crosses the link
+        /// for it.
+        #[tokio::test(start_paused = true)]
+        async fn a_linked_pair_asked_with_its_decode_later_is_held_as_issued_and_takes_no_call() {
+            let now = Instant::now();
+            let mut peer = Peer::new(1);
+            let mut ask = request(&[1], 7);
+            ask.facts.budget_micros = 200_000;
+            ask.constraints.decode_later = true;
+            let mut handle = answered_to(&mut peer, &ask, paired(), now)
+                .await
+                .expect("the pair is held");
+            handle.dispatched(now);
+            assert_eq!(
+                handle.decide_decode(&ask, now).err(),
+                Some(Refused::Decode(DecodeRefused::NotChosen))
+            );
             handle.completed(&outcome(WorkerId(28), TransportClass::Ok), now);
             drop(handle);
             reports(
