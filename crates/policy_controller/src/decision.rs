@@ -518,6 +518,21 @@ impl ShadowKind {
         }
     }
 
+    /// How many kinds there are: the width of a count by kind.
+    pub(crate) const COUNT: usize = 4;
+
+    /// The kind's place in a count by kind, under [`Self::COUNT`]. Every
+    /// kind is named here: one added to the enum does not build until it
+    /// takes a place.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Agreed => 0,
+            Self::OtherTarget => 1,
+            Self::OtherOutcome => 2,
+            Self::Skipped => 3,
+        }
+    }
+
     /// The comparison's label.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -532,6 +547,14 @@ impl ShadowKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_shadow_kind_takes_a_place_of_its_own_under_the_count() {
+        use ShadowKind::{Agreed, OtherOutcome, OtherTarget, Skipped};
+        let places = [Agreed, OtherTarget, OtherOutcome, Skipped].map(ShadowKind::index);
+        assert_eq!(places, [0, 1, 2, 3]);
+        assert_eq!(places.len(), ShadowKind::COUNT);
+    }
 
     #[test]
     fn shadow_kind_compares_the_outcome_and_first_target() {

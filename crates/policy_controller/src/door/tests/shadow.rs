@@ -4,6 +4,7 @@
 //! changes, fails or books the live answer.
 
 use std::{
+    error::Error,
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc, Arc,
@@ -12,7 +13,10 @@ use std::{
     time::Instant,
 };
 
-use super::{counted, dispatched, fleet, keyed, placed, report, request, seated, GATEWAY};
+use super::{
+    counted, dispatched, fleet, items, keyed, pair_fleet, pair_request, place_one, placed,
+    push_fleet, release, report, request, seated, GATEWAY,
+};
 use crate::{
     builtins::target_of,
     catalog::Catalog,
@@ -21,7 +25,10 @@ use crate::{
     framework::{Picker, TieBand},
     lease::{LeaseId, Lifecycle, Side},
     sessions::SessionVerdict,
-    spec::{AppliedSpec, BestParams, PickStage, PolicySpec, ShadowSpec},
+    spec::{
+        AppliedSpec, BestParams, PickStage, PolicySpec, ProfileSpec, ScoreStage, ShadowSpec,
+        WarmupSliceParams,
+    },
     store::{Dispatch, LeasesStore, MemoryStore, Said},
     view::{Candidate, RequestFacts, WorkerId},
     Assignment,
@@ -129,8 +136,42 @@ fn bed(live: Rule, shadow: Rule) -> (Door, Arc<AtomicUsize>) {
 /// The door's counts of the first binding's shadows: agreed, another
 /// target, another outcome, skipped.
 fn kinds(door: &Door) -> [u64; 4] {
+    kinds_at(door, 0)
+}
+
+/// [`kinds`] of the binding at `binding`.
+fn kinds_at(door: &Door, binding: u32) -> [u64; 4] {
     use ShadowKind::{Agreed, OtherOutcome, OtherTarget, Skipped};
-    [Agreed, OtherTarget, OtherOutcome, Skipped].map(|kind| door.shadowed(0, kind))
+    [Agreed, OtherTarget, OtherOutcome, Skipped].map(|kind| door.shadowed(binding, kind))
+}
+
+/// A picker that takes the first row kept, counting the decisions that
+/// hand it named rows.
+#[derive(Debug)]
+struct SeesNames(Arc<AtomicUsize>);
+
+impl Lifecycle for SeesNames {}
+
+impl Picker for SeesNames {
+    fn name(&self) -> &'static str {
+        "sees-names"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        _: &[f32],
+        _: TieBand,
+        out: &mut Targets,
+    ) {
+        let named = usize::from(facts.named.is_some());
+        self.0.fetch_add(named, Ordering::Relaxed);
+        if let Some(&row) = kept.first() {
+            out.push(target_of(&candidates[row as usize]));
+        }
+    }
 }
 
 /// A shadow that takes another row is counted as one, and the answer is
@@ -367,19 +408,22 @@ fn a_decision_made_again_is_shadowed_from_its_own_reading() {
     assert_eq!(kinds(&door), [2, 0, 0, 0]);
 }
 
-/// Rows named for the live profile's sample are not the rows a shadow
-/// profile of another sample would be named. That shadow is not asked,
-/// and is counted as skipped. A shadow of the live profile's own sample
-/// is asked over the same rows.
+/// Rows are named for the live profile alone, by its sample and its
+/// warm-up ruling. A shadow profile that would be named other rows is not
+/// asked, and is counted as skipped: one of another sample, one of
+/// another ruling, and one that reads cached blocks behind a live profile
+/// that is named no row. A shadow of the live profile's own sample and
+/// ruling is asked over the same rows.
 #[test]
 fn a_shadow_that_would_be_named_other_rows_is_skipped() {
-    let sampled = |sample: u32| {
+    let shadowed = |live: &str, turn: &dyn Fn(&mut ProfileSpec)| {
         let store = fleet(2);
-        let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
+        let mut document = PolicySpec::preset(live).expect("a preset of this build");
         document.generation = 2;
-        let live = document.profiles.values().next();
-        let mut twin = live.expect("the preset's profile").clone();
-        twin.pick = PickStage::Best(BestParams { sample }).into();
+        let aware = PolicySpec::preset("cache_aware").expect("a preset of this build");
+        let twin = aware.profiles.into_values().next();
+        let mut twin = twin.expect("the preset's profile");
+        turn(&mut twin);
         document.profiles.insert("twin".into(), twin);
         document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
         let spec = AppliedSpec::validate(&document).expect("the document validates");
@@ -388,7 +432,102 @@ fn a_shadow_that_would_be_named_other_rows_is_skipped() {
         placed(&door, &request(b"r-1", 7));
         kinds(&door)
     };
-    assert_eq!(sampled(8), [0, 0, 0, 1]);
-    let same = sampled(16);
+    let sample = |sample: u32| {
+        move |twin: &mut ProfileSpec| twin.pick = PickStage::Best(BestParams { sample }).into()
+    };
+    let ruling = |twin: &mut ProfileSpec| {
+        let slice = WarmupSliceParams {
+            weight: 8.0,
+            secs: Some(120),
+            ..WarmupSliceParams::default()
+        };
+        twin.score[0] = ScoreStage::WarmupSlice(slice).into();
+    };
+    assert_eq!(shadowed("cache_aware", &sample(8)), [0, 0, 0, 1]);
+    assert_eq!(shadowed("cache_aware", &ruling), [0, 0, 0, 1]);
+    assert_eq!(shadowed("random", &|_| {}), [0, 0, 0, 1]);
+    let same = shadowed("cache_aware", &sample(16));
     assert_eq!((same.iter().sum::<u64>(), same[3]), (1, 0), "{same:?}");
+}
+
+/// A profile that reads no column is named no row when it decides live.
+/// As a shadow behind a live profile that is named rows it is asked
+/// without them: the names would turn a sampling picker's pick to a draw.
+#[test]
+fn a_shadow_that_reads_no_column_is_asked_without_the_live_rows() {
+    let store = fleet(2);
+    let named = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&named);
+    let mut catalog = Catalog::builtin();
+    let added = catalog.picker("sees-names", move || -> Box<dyn Picker> {
+        Box::new(SeesNames(Arc::clone(&seen)))
+    });
+    added.expect("a free name");
+    let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
+    document.generation = 2;
+    let plain = PolicySpec::preset("random").expect("a preset of this build");
+    let twin = plain.profiles.into_values().next();
+    let mut twin = twin.expect("the preset's profile");
+    twin.pick = "sees-names".into();
+    document.profiles.insert("twin".into(), twin);
+    document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+    let digest = document.digest().expect("the document digests");
+    let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+    let applied = store.apply(spec.expect("the document validates"));
+    applied.expect("a later generation");
+    let door = Door::new(store);
+    placed(&door, &request(b"r-1", 7));
+    let kinds = kinds(&door);
+    assert_eq!((kinds.iter().sum::<u64>(), kinds[3]), (1, 0), "{kinds:?}");
+    assert_eq!(named.load(Ordering::Relaxed), 0);
+}
+
+/// A request whose binding names no shadow takes the plain order under a
+/// generation that shadows another binding. A pair beside a shadowed
+/// single is decided by either entry as it is by the other, with what was
+/// placed cleared, and no shadow is counted. A shadowed single that comes
+/// by the pair's entry is shadowed as by the plain one, and what was
+/// placed is cleared.
+#[test]
+fn a_pair_beside_a_shadowed_single_is_ordered_as_before() -> Result<(), Box<dyn Error>> {
+    let (donor, _) = push_fleet()?;
+    let now = Instant::now();
+    let store = pair_fleet(1, 1)?;
+    let mut document = PolicySpec::pair_presets("least_load", "least_load")?;
+    document.generation = 2;
+    for profile in document.profiles.values_mut() {
+        profile.filter.clear();
+    }
+    let single = PolicySpec::preset("random")?;
+    let live = single.profiles.values().next();
+    let live = live.ok_or("the preset's profile")?;
+    document.profiles.insert("single".into(), live.clone());
+    document.profiles.insert("twin".into(), live.clone());
+    let mut binding = single.bindings[0].clone();
+    "another-model".clone_into(&mut binding.matcher.model);
+    binding.profile = Some("single".into());
+    binding.shadow = Some(ShadowSpec::Profile("twin".into()));
+    document.bindings.insert(0, binding);
+    store.apply(AppliedSpec::validate(&document)?)?;
+    let door = Door::new(store);
+    let asked = pair_request(b"pair");
+    let ordinary = door.decide(GATEWAY, &asked, now).expect("a decision");
+    release(&door, &ordinary);
+    let mut placed = place_one(&donor, now).expect("a decision");
+    let answer = door
+        .decide_encode_pair(GATEWAY, &asked, items(), &mut placed, now)
+        .expect("a decision");
+    assert_eq!(answer.decision, ordinary.decision);
+    assert!(answer.pair() && !placed.one() && placed.encoders().is_empty());
+    assert_eq!([kinds_at(&door, 0), kinds_at(&door, 1)], [[0; 4]; 2]);
+
+    let (door, shadow_asked) = bed(Rule::Place(0), Rule::Place(1));
+    let mut placed = place_one(&donor, now).expect("a decision");
+    let answer = door
+        .decide_encode_pair(GATEWAY, &request(b"r-1", 7), items(), &mut placed, now)
+        .expect("a decision");
+    assert!(!answer.pair() && !placed.one() && placed.encoders().is_empty());
+    assert_eq!(kinds(&door), [0, 1, 0, 0]);
+    assert_eq!(shadow_asked.load(Ordering::Relaxed), 1);
+    Ok(())
 }

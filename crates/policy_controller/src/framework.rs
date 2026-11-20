@@ -2558,6 +2558,54 @@ impl Binding {
     }
 }
 
+/// How a binding's shadow reads the rows its live decision was handed
+/// ([`Engine::shadow_for`]). A host names rows for the live profile alone
+/// ([`Engine::named_for`]), by that profile's cap and by its warm-up
+/// ruling, so they are a shadow profile's own rows only where it names by
+/// both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShadowRows {
+    /// As the live decision read them: the shadow profile would be handed
+    /// the same.
+    Same,
+    /// Less the rows named for the live profile: the shadow profile reads
+    /// no column, and would be named none.
+    Unnamed,
+    /// Not at all: the shadow profile would be named other rows, or
+    /// handed a column the live decision was not.
+    Apart,
+}
+
+impl ShadowRows {
+    /// How the shadow of `binding` reads its live decision's rows, by what
+    /// each of the two profiles is named ([`Profile::named_cap`]) and
+    /// whether the shadow's reads the column at all.
+    fn of(binding: &Binding, profiles: &[Profile], named: &[u32], needs: &[Needs]) -> Self {
+        let Some(shadow) = binding.single_shadow().map(usize::from) else {
+            return Self::Apart;
+        };
+        let live = usize::from(binding.profile);
+        let ruling = |at: usize| {
+            profiles
+                .get(at)
+                .and_then(|profile| profile.warm_rules().next())
+        };
+        let column = needs.get(shadow).is_some_and(|needs| needs.affinity);
+        match (named.get(live), named.get(shadow)) {
+            // Neither is named a row: both read the view as it is handed.
+            (Some(0), Some(0)) => Self::Same,
+            // The live profile alone is named rows. A shadow that reads
+            // no column decides without them, as it would live.
+            (Some(_), Some(0)) if !column => Self::Unnamed,
+            // One cap and one ruling name the same rows.
+            (Some(live_cap), Some(cap)) if live_cap == cap && ruling(live) == ruling(shadow) => {
+                Self::Same
+            }
+            _ => Self::Apart,
+        }
+    }
+}
+
 /// The engine: validated profiles and the ordered bindings over them, and the
 /// session table the bindings' sessions rules read.
 #[derive(Debug)]
@@ -2569,6 +2617,9 @@ pub struct Engine {
     /// A shadow's placing assignment beside each binding, in the same
     /// order. Empty when no binding names a shadow.
     shadow_placing: Box<[Option<Assignment>]>,
+    /// How each binding's shadow reads the rows its live decision was
+    /// handed ([`ShadowRows`]), in the same order and as empty.
+    shadow_rows: Box<[ShadowRows]>,
     generation: u64,
     needs: Needs,
     /// The needs of every binding that covers a phase, its profile's stages
@@ -3669,9 +3720,11 @@ impl Engine {
             .iter()
             .any(|binding| binding.shadow.is_some() || binding.decode_shadow.is_some());
         let mut shadow_placing = Vec::new();
+        let mut shadow_rows = Vec::new();
         let mut live = Vec::new();
         if shadows {
             shadow_placing.reserve_exact(bindings.len());
+            shadow_rows.reserve_exact(bindings.len());
             live.resize(profiles.len(), false);
             for binding in &bindings {
                 for phase in PHASES {
@@ -3707,6 +3760,7 @@ impl Engine {
                             .then(|| placed_by(declared, marks.by_assignment()))
                     });
                     shadow_placing.push(placing);
+                    shadow_rows.push(ShadowRows::of(&binding, &profiles, &named, &profile_needs));
                 }
                 Entry {
                     placing: placed_by(declared, by_assignment),
@@ -3719,6 +3773,7 @@ impl Engine {
             profiles,
             bindings,
             shadow_placing: shadow_placing.into_boxed_slice(),
+            shadow_rows: shadow_rows.into_boxed_slice(),
             generation,
             needs,
             phase_needs,
@@ -4079,11 +4134,11 @@ impl Engine {
 
     /// The binding a request of `phase` for `model` resolves to, where
     /// its shadow is asked ([`Self::shadow`]): its position in this
-    /// generation, and whether the rows a host names for its live profile
-    /// ([`Self::named_for`]) are the rows its shadow profile would be
-    /// named. They are where that profile names by the same cap, and
-    /// where its stages read no column.
-    pub(crate) fn shadow_for(&self, model: &str, phase: Phase) -> Option<(u32, bool)> {
+    /// generation, and how that shadow reads the rows a host handed the
+    /// live decision ([`ShadowRows`]). `None` where the binding names no
+    /// shadow: one lookup says so, and a host orders such a request as it
+    /// does under a generation that shadows nowhere.
+    pub(crate) fn shadow_for(&self, model: &str, phase: Phase) -> Option<(u32, ShadowRows)> {
         let at = self
             .bindings
             .iter()
@@ -4091,11 +4146,8 @@ impl Engine {
         // The placing stands where the build found the shadow profile
         // free to run beside the live one.
         self.shadow_placing.get(at).copied().flatten()?;
-        let binding = &self.bindings[at].binding;
-        let shadow = usize::from(binding.shadow?);
-        let live = self.named[usize::from(binding.profile)];
-        let shares = !self.profile_needs[shadow].affinity || self.named[shadow] == live;
-        Some((u32::try_from(at).ok()?, shares))
+        let rows = *self.shadow_rows.get(at)?;
+        Some((u32::try_from(at).ok()?, rows))
     }
 
     /// The profile a request resolves to for its phase; `None` when no
@@ -7476,6 +7528,54 @@ mod tests {
             fallback,
         );
         assert!(run(&reused, "second").is_none());
+    }
+
+    /// A host names rows for the live profile alone, by its cap and its
+    /// warm-up ruling. A shadow reads them where its own profile would be
+    /// named the same, reads the view without them where that profile
+    /// reads no column, and is not asked anywhere else.
+    #[test]
+    fn a_shadow_reads_its_live_rows_only_where_it_would_be_handed_them() {
+        use crate::spec::{BestParams, PickStage, ProfileSpec, ScoreStage, WarmupSliceParams};
+        type Turn<'a> = &'a dyn Fn(&mut ProfileSpec);
+        let rows = |live: &str, shadow: &str, turn: Turn<'_>| {
+            let mut document = PolicySpec::preset(live).expect("a preset");
+            let next = PolicySpec::preset(shadow).expect("a preset");
+            let profile = next.profiles.into_values().next();
+            let mut profile = profile.expect("the preset's profile");
+            turn(&mut profile);
+            document.profiles.insert("second".into(), profile);
+            document.bindings[0].shadow = Some(crate::spec::ShadowSpec::Profile("second".into()));
+            let engine = document.validate().expect("a binding with a shadow");
+            engine.shadow_for("m", Phase::Single).map(|(_, rows)| rows)
+        };
+        let as_it_is = |_: &mut ProfileSpec| {};
+        let sample = |profile: &mut ProfileSpec| {
+            profile.pick = PickStage::Best(BestParams { sample: 8 }).into();
+        };
+        let ruling = |profile: &mut ProfileSpec| {
+            let slice = WarmupSliceParams {
+                weight: 8.0,
+                secs: Some(120),
+                ..WarmupSliceParams::default()
+            };
+            profile.score[0] = ScoreStage::WarmupSlice(slice).into();
+        };
+        let cases: [(&str, &str, Turn<'_>, ShadowRows); 6] = [
+            ("cache_aware", "cache_aware", &as_it_is, ShadowRows::Same),
+            ("least_load", "random", &as_it_is, ShadowRows::Same),
+            ("cache_aware", "cache_aware", &sample, ShadowRows::Apart),
+            ("cache_aware", "cache_aware", &ruling, ShadowRows::Apart),
+            ("least_load", "cache_aware", &as_it_is, ShadowRows::Apart),
+            ("cache_aware", "least_load", &as_it_is, ShadowRows::Unnamed),
+        ];
+        for (live, shadow, turn, wanted) in cases {
+            assert_eq!(
+                rows(live, shadow, turn),
+                Some(wanted),
+                "{shadow} behind {live}"
+            );
+        }
     }
 
     #[test]
