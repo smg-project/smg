@@ -34,7 +34,8 @@ pub struct Names {
     /// The binding's plan, spelled as in the policy document.
     pub plan: &'static str,
     /// The profile named by the trace. This and the stage names are empty
-    /// when no profile ran or the trace's profile is outside the binding.
+    /// where the decision was made ahead of every profile, or the trace's
+    /// profile is outside the binding.
     pub profile: String,
     /// The profile's picker.
     pub picker: String,

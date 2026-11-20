@@ -220,8 +220,8 @@ impl From<Lifted> for LiftedVeto {
 /// with the observability contract.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Trace {
-    /// The position of the profile that decided, or [`Self::NO_PROFILE`]
-    /// when no profile ran.
+    /// The position of the profile the decision was made under, or
+    /// [`Self::NO_PROFILE`] where it was made ahead of every profile.
     pub profile: u16,
     /// Candidates after the filters, where the decision counted them
     /// ([`Survivors`]).
@@ -263,10 +263,14 @@ impl Default for Trace {
 }
 
 impl Trace {
-    /// The value of `profile` when no profile ran.
+    /// The value of `profile` where the decision was made ahead of every
+    /// profile: no binding resolved one. An engine holds at most this many
+    /// profiles, so the value is no profile's position.
     pub const NO_PROFILE: u16 = u16::MAX;
 
-    /// The position of the profile that decided, if one ran.
+    /// The position of the profile the decision was made under: none where
+    /// it was made ahead of every profile. A shed made once a profile is
+    /// resolved names it, though no stage of it ran.
     #[must_use]
     pub const fn profile_ran(&self) -> Option<u16> {
         if self.profile == Self::NO_PROFILE {
@@ -286,7 +290,7 @@ impl Trace {
         self.survivors.get().is_none()
     }
 
-    /// The trace on the wire. When no profile ran, the position stays zero.
+    /// The trace on the wire. Ahead of every profile the position stays zero.
     #[cfg(feature = "controller")]
     pub(crate) fn wire(&self) -> proto::Trace {
         let profile = self.profile_ran();

@@ -478,8 +478,10 @@ impl Engine {
         let Some(profile) = self.profiles.get(usize::from(index)) else {
             return turned_away(ShedReason::PolicyDeclined, "binding", unbound);
         };
-        // The encode profile is resolved: a shed below is made under it,
-        // and its trace says so.
+        // The encode profile is resolved: a shed of the encode side below
+        // is made under it, and its trace says so. A column of the pair's
+        // or of the request's is refused as the other two entries refuse
+        // it, ahead of every profile.
         let bare = Trace {
             profile: index,
             ..unbound
@@ -498,13 +500,13 @@ impl Engine {
         if !column_fits(pools.prefill_affinity, pools.prefills)
             || !column_fits(pools.decode_affinity, pools.decodes)
         {
-            return declined(AFFINITY_COLUMN);
+            return turned_away(ShedReason::PolicyDeclined, AFFINITY_COLUMN, unbound);
         }
         // A column on the request, or rows named on it, name neither pool.
         // The pair entry refuses them: here they are refused before a stage
         // of the encode side is asked.
         if carries_a_column(facts) {
-            return declined(AFFINITY_COLUMN);
+            return turned_away(ShedReason::PolicyDeclined, AFFINITY_COLUMN, unbound);
         }
         debug_assert_indexed(encode.encoders);
         let needs = !items.keys.is_empty();

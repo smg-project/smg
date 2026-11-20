@@ -1137,6 +1137,7 @@ fn a_pair_column_of_another_length_declines_before_a_cut() {
             shed_of(&decision),
             (ShedReason::PolicyDeclined, "affinity-column")
         );
+        assert_eq!(decision.trace().profile_ran(), None, "as the pair entry");
     }
 }
 
@@ -1190,6 +1191,7 @@ fn a_request_with_a_column_or_named_rows_declines_before_a_stage_is_asked() {
             shed_of(&decision),
             (ShedReason::PolicyDeclined, "affinity-column")
         );
+        assert_eq!(decision.trace().profile_ran(), None, "as the pair entry");
         assert!(placed.encoders().is_empty());
         assert_eq!(asked.load(Ordering::Relaxed), 0, "no stage is asked");
     }

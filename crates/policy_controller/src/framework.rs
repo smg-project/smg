@@ -3244,11 +3244,11 @@ fn carries_a_column(facts: &RequestFacts<'_>) -> bool {
 /// plugin was handed rows that carry a mask or a pin beside them.
 const WRITTEN_ROWS: &str = "written-rows";
 
-/// The decline of a pair decision whose rows were not written for the
-/// plugin they are shown to. Cold and out of line: the pair entry's path
-/// past the refusal keeps its weight, and the passes it calls stay
-/// inlined. Built in place, the refusal cost a pair decision under no mask
-/// 26 instructions.
+/// The decline of a decision whose rows were not written for the plugin
+/// they are shown to, under the profile that declines. Cold and out of
+/// line: an entry's path past the refusal keeps its weight, and the passes
+/// it calls stay inlined. Built in place, the refusal cost a pair decision
+/// under no mask 26 instructions.
 #[cold]
 #[inline(never)]
 fn rows_not_written(bare: Trace, profile: u16) -> Decision {
@@ -3333,13 +3333,19 @@ impl Engine {
     /// Every profile's stages are folded in here, so the summary
     /// ([`Self::needs`]) holds a stage's needs however the engine was built.
     /// A binding built in code can shadow with a separate profile without
-    /// a decision scope under the single plan.
+    /// a decision scope under the single plan. An engine holds at most
+    /// 65,535 profiles: the position past them marks a decision made ahead
+    /// of every profile ([`Trace::NO_PROFILE`]).
     pub fn new(
         profiles: Vec<Profile>,
         bindings: Vec<Binding>,
         generation: u64,
         needs: Needs,
     ) -> Self {
+        debug_assert!(
+            profiles.len() <= usize::from(Trace::NO_PROFILE),
+            "the position past 65,535 profiles is the mark of no profile"
+        );
         // Each profile's needs, asked of its stages once: the summary and
         // the phase answers below fold them.
         let profile_needs: Vec<Needs> = profiles.iter().map(Profile::needs).collect();
@@ -3897,14 +3903,7 @@ impl Engine {
             None
         } else if marks.opens_first() {
             if unwritten() {
-                return shed(
-                    ShedReason::PolicyDeclined,
-                    WRITTEN_ROWS,
-                    Trace {
-                        profile: index,
-                        ..bare
-                    },
-                );
+                return rows_not_written(bare, index);
             }
             let opened = profile.open(facts, candidates, pool);
             if placed() {
@@ -3920,14 +3919,7 @@ impl Engine {
             // The key's mark: a keyed request keeps its key's worker over
             // the overload veto, where the binding steers.
             if marks.keyed_scope() && unwritten() {
-                return shed(
-                    ShedReason::PolicyDeclined,
-                    WRITTEN_ROWS,
-                    Trace {
-                        profile: index,
-                        ..bare
-                    },
-                );
+                return rows_not_written(bare, index);
             }
             let opened = marks
                 .keyed_scope()
