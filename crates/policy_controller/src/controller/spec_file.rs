@@ -16,13 +16,12 @@
 //! are never closer than a poll, however long one took. A file is read
 //! only when its identity moved from the one last read and then stood still
 //! for one poll: an update that swaps a link is a new identity at once, and
-//! an edit in place is not read half written. Every state the file settles
-//! in is read once and has one outcome: applied, unchanged or rejected. A
-//! rejected state (a document that does not run, a file over the bound, a
-//! file that cannot be read) is one event and one count however long it
-//! stands, and the running generation stays. A file that does not stand
-//! still, look after look, is never read: it is told once, as a rejected
-//! state is.
+//! an edit in place is not read half written. A leader's read applies the
+//! document, leaves it unchanged or rejects it. A rejected state (a
+//! document that does not run, a file over the bound, a file that cannot
+//! be read) is counted once while it stands under a lead, and the running
+//! generation stays. A file that keeps moving is never read and is told
+//! as a rejected state.
 //!
 //! Under a shared lease the watch looks whether its replica leads or
 //! follows. A leader's look hands the document to the door, which applies
@@ -53,8 +52,10 @@ use std::{
 };
 
 use tokio::{sync::watch, task::JoinError, time::sleep};
+use tracing::debug;
 
 use super::generations::{Applied, Format, Generations, SpecRejected, MAX_DOCUMENT_BYTES};
+use crate::operator::spec_store::NOT_A_FILE;
 
 /// Between two looks at the file.
 pub(crate) const POLL: Duration = Duration::from_secs(1);
@@ -66,9 +67,6 @@ const START_READS: usize = 3;
 /// How many looks in a row find the file moved before the watch tells it as
 /// a file that does not stand still.
 const RESTLESS_LOOKS: u32 = 5;
-
-/// What a look or a read says of a path that leads to no regular file.
-pub(super) const NOT_A_FILE: &str = "the path leads to no regular file";
 
 /// What one look at the path found.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -363,8 +361,12 @@ impl SpecFile {
         if lead.is_none() {
             // A replica that follows: the door is shown what the file
             // holds and applies nothing, and nothing is said of a file the
-            // look could not read. The next look that leads reads the state
-            // again where its document has not stood since.
+            // look could not read, but for one debug line. The next look
+            // that leads reads the state again where its document has not
+            // stood since.
+            if let Err(unread) = &document {
+                debug!(%unread, "policy spec file not read on a standby: its take tells it");
+            }
             self.generations
                 .shown(document.as_deref().ok(), self.format);
             self.read = now;
@@ -434,8 +436,9 @@ impl SpecFile {
     /// wait.
     ///
     /// A replica under a shared lease that does not lead looks all the
-    /// same, and applies nothing: its look tells the door what the file
-    /// holds, by a digest ([`Generations::shown`]). The door holds who
+    /// same, and applies nothing: its look shows the door what the file
+    /// holds, passed and by its digest and its own line
+    /// ([`Generations::shown`]). The door holds who
     /// writes, and a look that was in flight when the replica stopped
     /// leading applies nothing there ([`Applied::Waits`]). So two replicas
     /// that read one file never apply it twice under two numbers. The
@@ -482,7 +485,7 @@ impl SpecFile {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{
-        cell::Cell,
+        cell::{Cell, RefCell},
         process::Command,
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -561,7 +564,11 @@ pub(crate) mod tests {
         /// The number, the format and the bytes the read call answers.
         fn answered(&self) -> (u64, String, Vec<u8>) {
             let answer = self.generations.document(0).expect("the standing document");
-            (answer.generation, answer.format, answer.document)
+            (
+                answer.generation,
+                answer.format.as_str().to_owned(),
+                answer.document,
+            )
         }
     }
 
@@ -703,17 +710,8 @@ pub(crate) mod tests {
         assert_eq!(counts, (1, 1));
     }
 
-    /// A pipe at `path`, with no writer. The program makes it: the linked
-    /// system-call crate has no call for one on every system the crate
-    /// builds on.
     #[cfg(unix)]
-    pub(crate) fn pipe_at(path: &Path) {
-        let made = Command::new("mkfifo")
-            .arg(path)
-            .status()
-            .expect("mkfifo runs");
-        assert!(made.success(), "mkfifo: {made}");
-    }
+    pub(crate) use crate::operator::test_support::pipe_at;
 
     /// A pipe is refused by its kind, at the start and under the watch,
     /// unopened: this one has no writer, and an open would wait for one.
@@ -1566,7 +1564,12 @@ pub(crate) mod tests {
     /// `bed` follows the standing generation of a leader that applied
     /// `documents` in their order, as a stream that begins now brings it.
     fn follow(bed: &Bed, documents: &[&str]) {
-        let leader = self::bed(b"");
+        follow_at(&bed.generations, documents);
+    }
+
+    /// [`follow`] on a door.
+    fn follow_at(door: &Generations, documents: &[&str]) {
+        let leader = bed(b"");
         for document in documents {
             let applied = leader
                 .generations
@@ -1574,7 +1577,7 @@ pub(crate) mod tests {
             applied.expect("a document that runs");
         }
         let told = leader.generations.standing_sent().expect("it stands");
-        let following = bed.generations.following(&told);
+        let following = door.following(&told);
         following
             .and_then(|following| following.land(None))
             .expect("above no generation");
@@ -1667,7 +1670,7 @@ pub(crate) mod tests {
 
     /// A start's document that its take's pass refuses is counted and let
     /// go, and the mark of a document awaited stays: no decision is made.
-    /// The watch's next look behind the take lands the file's document, and
+    /// The watch reads the file behind the take and lands its document, and
     /// the mark goes.
     #[test]
     fn a_starts_document_refused_at_its_take_is_landed_by_the_next_look() {
@@ -1680,10 +1683,11 @@ pub(crate) mod tests {
             document: &PolicySpec,
             digest: Digest,
             catalog: &Catalog,
+            denied_headers: &[&str],
         ) -> Result<AppliedSpec, SpecError> {
             let passed = PASSES.with(|passes| passes.replace(passes.get() + 1));
             assert_ne!(passed, 1, "a fault of the validator");
-            AppliedSpec::validate_digested(document, digest, catalog)
+            AppliedSpec::validate_digested(document, digest, catalog, denied_headers)
         }
         let dir = tempfile::tempdir().expect("a directory");
         let path = dir.path().join("policy.yaml");
@@ -1988,6 +1992,57 @@ pub(crate) mod tests {
         );
         assert_eq!((bed.rejected(), bed.generation()), (1, 1));
         assert_eq!(file.poll(), Look::Same, "told once");
+    }
+
+    /// A generation that enters while a standby passes its file leaves the
+    /// file's document one that stood: the pass found it standing. The
+    /// file is a mount one step behind, and the take leaves it.
+    #[test]
+    fn a_generation_that_enters_under_a_standbys_pass_leaves_the_file_stood() {
+        thread_local! {
+            static DOOR: RefCell<Option<Arc<Generations>>> = const { RefCell::new(None) };
+        }
+        // The pass of the file's document brings the leader's next
+        // generation first, once: it enters under the look's pass.
+        fn entered_under(
+            document: &PolicySpec,
+            digest: Digest,
+            catalog: &Catalog,
+            denied_headers: &[&str],
+        ) -> Result<AppliedSpec, SpecError> {
+            if let Some(door) = DOOR.with(|door| door.borrow_mut().take()) {
+                follow_at(&door, &[LEAST_LOAD, RANDOM]);
+            }
+            AppliedSpec::validate_digested(document, digest, catalog, denied_headers)
+        }
+        let bed = bed_validating(LEAST_LOAD.as_bytes(), entered_under);
+        let (mut file, mut elector) = standby(&bed);
+        follow(&bed, &[LEAST_LOAD]);
+        DOOR.with(|door| *door.borrow_mut() = Some(Arc::clone(&bed.generations)));
+        // The mount turns to the same document, and the look reads it.
+        replace(&bed.path, LEAST_LOAD.as_bytes());
+        assert_eq!(file.poll(), Look::Settling);
+        assert_eq!(file.poll(), Look::Shown);
+        assert_eq!(bed.generation(), 2, "it entered under the pass");
+        elector.tick(Instant::now()).expect("a take");
+        assert_eq!(file.poll(), Look::Same, "a mount one step behind");
+        assert_eq!(bed.generation(), 2);
+        assert_eq!(bed.answered().2, RANDOM.as_bytes());
+    }
+
+    /// A file that gains a number while its replica follows has not stood
+    /// under it. The standby's file takes the running document under the
+    /// line 10: the take reads it and runs it under that number.
+    #[test]
+    fn a_file_that_gains_a_number_while_its_replica_follows_runs_at_the_take() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let (mut file, mut elector) = standby(&bed);
+        follow(&bed, &[LEAST_LOAD]);
+        let numbered = with_line(LEAST_LOAD, 10);
+        shown(&bed, &mut file, &numbered);
+        elector.tick(Instant::now()).expect("a take");
+        assert_eq!(settle(&mut file), Ok(Applied::Generation(10)));
+        assert_eq!(bed.answered().2, numbered);
     }
 
     /// A mount one step behind. The standby's file takes the first of two

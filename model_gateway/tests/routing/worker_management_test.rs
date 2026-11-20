@@ -29,7 +29,7 @@ mod dp_removal_tests {
         routers::{grpc::backend_client::BasicWorkerBuilder, http::router::Router as HttpRouter},
         workflow::create_worker_removal_workflow_data,
     };
-    use smg_worker::identity::basic::Worker;
+    use smg_worker::{identity::basic::Worker, jobs::WorkerJobAsker};
     use wfaas::WorkflowId;
 
     use super::*;
@@ -155,6 +155,7 @@ mod dp_removal_tests {
             url.to_string(),
             expected_revisions,
             Arc::clone(context),
+            WorkerJobAsker::Api,
         );
         let instance = engine
             .start_workflow(WorkflowId::new("worker_removal"), data)

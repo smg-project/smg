@@ -18,9 +18,15 @@ pub const DISCOVERY_PROVIDER_LABEL: &str = "smg.ai/discovery-provider";
 ///
 /// The label is tri-state. A `false` becomes a label only where the engine's
 /// servicer computes the verdict itself; elsewhere a `false` cannot be told
-/// from a default and is dropped. An absent label reads as unknown, never as
-/// a refusal.
+/// from a default and is dropped. A servicer that carries no media to its
+/// engine says so in its server info instead, and that deliberate `false` is
+/// kept. An absent label reads as unknown, never as a refusal.
 pub const SUPPORTS_VISION_LABEL: &str = "supports_vision";
+
+/// Whether text contains a Unicode control character.
+pub fn has_control_character(text: &str) -> bool {
+    text.chars().any(char::is_control)
+}
 
 /// Serialize to flat label map, skipping nulls/zeros/empty.
 ///

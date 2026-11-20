@@ -1,22 +1,20 @@
-//! The reference client of the controller's protocol: one gateway's side of
-//! it, for the crate's own cases and for examples (the `client` feature; no
-//! shipped binary builds it).
+//! Clients for the controller's gateway protocol, behind the `client`
+//! feature.
 //!
-//! It dials a controller's gateway listener, asks who leads and opens the
-//! gateway's session: a `Hello`, answered by the leader's `Welcome`. On that
-//! session it reports a request's life as its caller tells it: a
-//! `Dispatched`, a `Completed`, a `Released`. It asks the controller which
-//! worker a request goes to on one decide stream, one ask at a time
-//! ([`Client::decide`]). The term of every answer raises its term floor, and
-//! a frame of the session or an answer of the decide stream under a term
-//! below the floor is refused. What a gateway's own host adds is not here: a
-//! fallback engine, asks in flight together and a second decide stream, the
-//! lease a decision books and its release, the spec push and its
-//! acknowledgement, and reconnection.
+//! Both clients dial a gateway listener, ask who leads and send a `Hello`
+//! to open a session. The leader answers with a `Welcome`. The session
+//! carries `Dispatched`, `Completed` and `Released` reports. The clients
+//! raise their term floor from answers and refuse frames below it.
 //!
-//! A watch of the controller's workers opens on the same channel
-//! ([`Client::watch_workers`]): a stream of its own, which the session and
-//! an ask do not wait for.
+//! [`Client`] is the reference client. It asks for a decision one request at
+//! a time ([`Client::decide`]). [`Link`] shares the session and one decide
+//! stream across a host's requests and releases the leases of a decision
+//! its caller never takes. The host makes its own fallback decisions.
+//!
+//! A watch of the controller's workers opens on either client's channel
+//! ([`Client::watch_workers`], [`Link::watch_workers`]). Once open it has
+//! its own stream, so the session and asks can proceed while the watch
+//! waits.
 //!
 //! The client takes its channel and makes no credential:
 //! [`Client::connect`] dials an address in the clear, and
@@ -25,7 +23,7 @@
 //! (`x-smg-principal`); a stated id is no credential. [`blocking::Client`]
 //! drives the same calls for a caller that runs no runtime.
 //!
-//! No wait of the client for its peer but one outlasts [`ANSWER_WAIT`], on
+//! No wait of [`Client`] for its peer but one outlasts [`ANSWER_WAIT`], on
 //! any endpoint: the dial, each call from its send to its answer's end, the
 //! session's call with its first frame, a report's wait for room in the
 //! session's queue, the wait for the session's end, the decide stream's
@@ -37,6 +35,13 @@
 //! ([`Watch::next`]): a fleet that does not change tells nothing, and a
 //! peer gone silent ends that wait through the channel's keepalive
 //! ([`KEEPALIVE`]).
+//!
+//! A [`Link`] holds [`ANSWER_WAIT`] over its dial, its `Leader` ask and the
+//! opens of its session, decide stream and watch. An ask waits its
+//! caller's budget ([`Link::ask`]) and a report waits for nothing
+//! ([`Link::report`]). The readers of the session and decide stream wait
+//! with no bound of their own. The link sets the channel's keepalive,
+//! which ends a link whose controller went silent ([`Link::connect`]).
 
 use std::{
     future::{poll_fn, Future},
@@ -48,7 +53,7 @@ use std::{
 use prost::Message as _;
 use tokio::sync::mpsc;
 use tonic::{
-    codegen::tokio_stream::wrappers::ReceiverStream,
+    codegen::tokio_stream::{wrappers::ReceiverStream, Stream},
     metadata::AsciiMetadataValue,
     service::{interceptor::InterceptedService, Interceptor},
     transport::{Channel, Endpoint},
@@ -64,6 +69,9 @@ use crate::{
         LeaderRequest, Released, WatchWorkersRequest, Welcome, WorkerEvent,
     },
 };
+
+mod link;
+pub use link::{Full, Link, Unanswered};
 
 /// Frames the client may queue toward the controller.
 const SESSION_QUEUE: usize = 16;
@@ -101,7 +109,8 @@ pub enum Error {
     /// The peer did not answer inside the client's bound. Every wait that
     /// bound ends is this kind and names the wait: the dial, the `Leader`
     /// ask, the session's welcome, the session's queue, the session's
-    /// end, the decide stream's open, its queue, its end or the decision.
+    /// end, the decide stream's open, its queue, its end, the decision or
+    /// the watch's open.
     /// A time-out the caller set on its own endpoint is not this
     /// kind: it ends a call as [`Error::Status`] and the dial as
     /// [`Error::Connect`].
@@ -148,6 +157,18 @@ pub enum Error {
     /// nothing.
     #[error("a DecideRequest of {0} bytes is over the call's limit of {limit} bytes with no block hash to cut", limit = MAX_FRAME)]
     TooLarge(usize),
+    /// A field of an ask's facts is outside the range the call reads, named
+    /// by its path in the contract. The controller ends a stream at such a
+    /// frame, and a link's one stream is every caller's: the link refuses
+    /// the frame at its own door and sends nothing ([`Link::ask`]).
+    #[error("an ask's {0} is out of its range in this protocol version")]
+    OutOfRange(&'static str),
+    /// A link's report queue was full: its session took no report for as
+    /// long as the queue covers. The link ended, and the controller's
+    /// session grace covers the leases whose end was not said
+    /// ([`Link::report`]).
+    #[error("the link's report queue was full")]
+    ReportsFull,
     /// The decide stream has no credit left: the gateway decides this
     /// request itself. Nothing was sent, and the stream stands.
     #[error("the decide stream has no credit left: the gateway decides this request itself")]
@@ -230,11 +251,29 @@ impl Session {
             .send(hello(gateway_id, floor))
             .await
             .map_err(|_| Error::NoWelcome("the session's queue is closed".to_owned()))?;
+        let (answers, welcome, term) =
+            Self::welcomed(stub, ReceiverStream::new(queued), floor, wait).await?;
+        Ok((
+            Self {
+                frames,
+                answers,
+                seq: 1,
+                ended: None,
+                welcome,
+            },
+            term,
+        ))
+    }
+
+    /// Opens a session on a stream whose first frame is its hello.
+    async fn welcomed(
+        stub: &mut Stub,
+        frames: impl Stream<Item = GatewayFrame> + Send + 'static,
+        floor: u64,
+        wait: Duration,
+    ) -> Result<(Streaming<ControllerFrame>, Welcome, u64), Error> {
         let opened = async {
-            let mut answers = stub
-                .session(ReceiverStream::new(queued))
-                .await?
-                .into_inner();
+            let mut answers = stub.session(frames).await?.into_inner();
             let first = answers.message().await?;
             Ok::<_, Status>((answers, first))
         };
@@ -244,16 +283,7 @@ impl Session {
                 term,
                 frame: Some(controller_frame::Frame::Welcome(welcome)),
                 ..
-            }) => Ok((
-                Self {
-                    frames,
-                    answers,
-                    seq: 1,
-                    ended: None,
-                    welcome,
-                },
-                term,
-            )),
+            }) => Ok((answers, welcome, term)),
             Some(ControllerFrame {
                 frame: Some(controller_frame::Frame::NotLeader(not_leader)),
                 ..
@@ -374,6 +404,21 @@ async fn ask_leader(stub: &mut Stub, wait: Duration) -> Result<LeaderInfo, Error
         .into_inner())
 }
 
+/// Dials as `gateway_id` and takes the floor from the peer's leader answer.
+async fn dial_leader(
+    dial: impl Future<Output = Result<Channel, tonic::transport::Error>>,
+    gateway_id: &str,
+    wait: Duration,
+) -> Result<(Stub, u64), Error> {
+    let principal = Principal::of(gateway_id)?;
+    let channel = answered("the dial", wait, dial)
+        .await?
+        .map_err(Error::Connect)?;
+    let mut stub = PolicyControllerClient::with_interceptor(channel, principal);
+    let floor = ask_leader(&mut stub, wait).await?.term;
+    Ok((stub, floor))
+}
+
 /// What the controller answered one ask.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Answer {
@@ -406,15 +451,25 @@ impl Decide {
     /// session of the gateway stands.
     async fn open(stub: &mut Stub, window: u32, wait: Duration) -> Result<Self, Error> {
         let (requests, queued) = mpsc::channel(1);
-        let opened = stub.decide(ReceiverStream::new(queued));
-        let answers = answered("the decide stream's open", wait, opened)
-            .await??
-            .into_inner();
+        let answers = Self::opened(stub, ReceiverStream::new(queued), wait).await?;
         Ok(Self {
             requests,
             answers,
             credit: window,
         })
+    }
+
+    /// Opens the decide stream with the caller's request stream.
+    async fn opened(
+        stub: &mut Stub,
+        requests: impl Stream<Item = DecideRequest> + Send + 'static,
+        wait: Duration,
+    ) -> Result<Streaming<DecideAnswer>, Error> {
+        Ok(
+            answered("the decide stream's open", wait, stub.decide(requests))
+                .await??
+                .into_inner(),
+        )
     }
 
     /// Queues `request` within `wait` and spends one credit. With none
@@ -585,14 +640,25 @@ fn fit(request: &mut DecideRequest) -> Result<usize, Error> {
     }
 }
 
-/// A watch of the controller's workers, open on the client's channel
-/// ([`Client::watch_workers`]).
+/// A watch of the controller's workers, open on either client's channel
+/// ([`Client::watch_workers`], [`Link::watch_workers`]).
 #[derive(Debug)]
 pub struct Watch {
     events: Streaming<WorkerEvent>,
 }
 
 impl Watch {
+    async fn open(
+        stub: &mut Stub,
+        request: WatchWorkersRequest,
+        wait: Duration,
+    ) -> Result<Self, Error> {
+        let response = answered("the watch's open", wait, stub.watch_workers(request)).await??;
+        Ok(Self {
+            events: response.into_inner(),
+        })
+    }
+
     /// The watch's next event, or none where the controller ended the
     /// stream with no error: it ends a stream whose watcher took nothing
     /// for a while after an event, and the watcher opens the watch again
@@ -600,8 +666,8 @@ impl Watch {
     /// ([`Error::Status`]): `ABORTED` where its replica stopped leading.
     /// This wait holds no bound of the client's: a fleet that does not
     /// change tells nothing. A peer gone silent ends it through the
-    /// channel's keepalive ([`KEEPALIVE`]); a caller that brings its own
-    /// endpoint ([`Client::connect_with`]) sets one on it.
+    /// channel's keepalive ([`KEEPALIVE`]). A caller that brings its own
+    /// endpoint to [`Client::connect_with`] sets one on it.
     pub async fn next(&mut self) -> Result<Option<WorkerEvent>, Error> {
         Ok(self.events.message().await?)
     }
@@ -661,7 +727,7 @@ impl Client {
         gateway_id: &str,
         wait: Duration,
     ) -> Result<Self, Error> {
-        Self::over(endpoint.connect(), gateway_id, wait).await
+        Box::pin(Self::over(endpoint.connect(), gateway_id, wait)).await
     }
 
     /// The client over the channel `dial` makes: the dial, the `Leader` ask
@@ -671,12 +737,7 @@ impl Client {
         gateway_id: &str,
         wait: Duration,
     ) -> Result<Self, Error> {
-        let principal = Principal::of(gateway_id)?;
-        let channel = answered("the dial", wait, dial)
-            .await?
-            .map_err(Error::Connect)?;
-        let mut stub = PolicyControllerClient::with_interceptor(channel, principal);
-        let floor = ask_leader(&mut stub, wait).await?.term;
+        let (mut stub, floor) = dial_leader(dial, gateway_id, wait).await?;
         let (session, term) = Session::open(&mut stub, gateway_id, floor, wait).await?;
         Ok(Self {
             gateway_id: gateway_id.to_owned(),
@@ -790,11 +851,7 @@ impl Client {
     /// is [`Error::NoAnswer`]; one the controller refuses tells its status
     /// ([`Error::Status`]).
     pub async fn watch_workers(&mut self, request: WatchWorkersRequest) -> Result<Watch, Error> {
-        let open = self.stub.watch_workers(request);
-        let events = answered("the watch's open", self.wait, open)
-            .await??
-            .into_inner();
-        Ok(Watch { events })
+        Watch::open(&mut self.stub, request, self.wait).await
     }
 
     /// The session's end, awaited within the client's bound: the status the
@@ -2119,6 +2176,7 @@ mod tests {
                 ..RequestFacts::default()
             }),
             constraints: None,
+            again: false,
         };
         // A longer name is written with a longer length: fill, then mend.
         let mut name = size - request.encoded_len();

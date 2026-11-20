@@ -3,7 +3,7 @@ use std::{
     path::Path,
 };
 
-use axum::http::{HeaderName, HeaderValue, Uri};
+use axum::http::{uri::Authority, HeaderName, HeaderValue, Uri};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use smg_worker::identity::url_door::listed_worker_url_refusal;
@@ -468,8 +468,8 @@ impl ConfigValidator {
     /// shapes, the overload thresholds, the tenant header's name, the
     /// discovery settings, then the fit of the policies to the pools. A
     /// start runs them among its other checks ([`Self::validate`]), and
-    /// then resolves a discovery provider's own configuration: a Consul
-    /// address and the Consul environment are checked there alone.
+    /// then resolves a discovery provider's runtime settings. Consul's
+    /// address syntax and environment are checked during that resolution.
     /// `--print-policy-spec` runs these alone, over a configuration that
     /// holds the routing part alone. None reads a file.
     pub(crate) fn validate_routing(config: &RouterConfig) -> ConfigResult<()> {
@@ -483,6 +483,7 @@ impl ConfigValidator {
     }
 
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        Self::validate_policy_controller(config)?;
         Self::validate_routing_shapes(config)?;
         Self::validate_server_settings(config)?;
         Self::validate_cors_allowed_origins(config)?;
@@ -1619,296 +1620,19 @@ impl ConfigValidator {
     }
 
     fn validate_discovery(discovery: &DiscoveryConfig, mode: &RoutingMode) -> ConfigResult<()> {
-        match discovery {
-            DiscoveryConfig::Kubernetes(kubernetes) => {
-                Self::validate_kubernetes_discovery(kubernetes, mode)
-            }
-            DiscoveryConfig::File(file) => Self::validate_file_discovery(file, mode),
-            DiscoveryConfig::Slurm(slurm) => Self::validate_slurm_discovery(slurm, mode),
-            DiscoveryConfig::Consul(consul) => Self::validate_consul_discovery(consul, mode),
-        }
-    }
-
-    /// What `squeue` and `scontrol` report is checked at every poll, not here.
-    /// This checks that the job names map onto the routing mode's pools.
-    fn validate_slurm_discovery(
-        discovery: &SlurmDiscoveryConfig,
-        mode: &RoutingMode,
-    ) -> ConfigResult<()> {
-        let invalid = |field: &str, value: String, reason: &str| ConfigError::InvalidValue {
-            field: field.to_string(),
-            value,
-            reason: reason.to_string(),
+        let Some(roles) = mode.discovery_roles() else {
+            let unsupported = match mode {
+                RoutingMode::OpenAI { .. } => "OpenAI",
+                RoutingMode::Anthropic { .. } => "Anthropic",
+                RoutingMode::Gemini { .. } => "Gemini",
+                RoutingMode::Regular { .. } => "Regular",
+                RoutingMode::PrefillDecode { .. } => "PD",
+                RoutingMode::EncodePrefillDecode { .. } => "EPD",
+            };
+            let reason = format!("{unsupported} mode does not support service discovery");
+            return Err(ConfigError::ValidationFailed { reason });
         };
-        if discovery.port == 0 {
-            return Err(invalid(
-                "discovery.port",
-                "0".to_string(),
-                "Port must be > 0",
-            ));
-        }
-        if discovery.bootstrap_port == Some(0) {
-            return Err(invalid(
-                "discovery.bootstrap_port",
-                "0".to_string(),
-                "Port must be > 0",
-            ));
-        }
-        require_positive(
-            "discovery.check_interval_secs",
-            discovery.check_interval_secs,
-        )?;
-
-        let roles = [
-            ("discovery.job_names", "regular", &discovery.job_names),
-            (
-                "discovery.encode_job_names",
-                "encode",
-                &discovery.encode_job_names,
-            ),
-            (
-                "discovery.prefill_job_names",
-                "prefill",
-                &discovery.prefill_job_names,
-            ),
-            (
-                "discovery.decode_job_names",
-                "decode",
-                &discovery.decode_job_names,
-            ),
-        ];
-        // Each value reaches `squeue` inside a comma-separated list, where a
-        // comma would split it into two filters.
-        let scopes = [
-            ("discovery.user", &discovery.user),
-            ("discovery.account", &discovery.account),
-            ("discovery.partition", &discovery.partition),
-        ];
-        let values = roles
-            .iter()
-            .flat_map(|(field, _, names)| names.iter().map(move |name| (*field, name)))
-            .chain(
-                scopes
-                    .iter()
-                    .filter_map(|(field, value)| value.as_ref().map(|value| (*field, value))),
-            );
-        for (field, value) in values {
-            if value.is_empty() || value.contains(',') {
-                return Err(invalid(
-                    field,
-                    value.clone(),
-                    "Must be non-empty and contain no comma",
-                ));
-            }
-        }
-
-        let mut role_of = std::collections::HashMap::<&str, &str>::new();
-        for (_, role, names) in &roles {
-            for name in *names {
-                if let Some(other) = role_of.insert(name, role) {
-                    if other != *role {
-                        return Err(ConfigError::ValidationFailed {
-                            reason: format!(
-                                "Slurm job name '{name}' maps to both {other} and {role} workers"
-                            ),
-                        });
-                    }
-                }
-            }
-        }
-
-        let [regular, encode, prefill, decode] = roles.map(|(_, _, names)| !names.is_empty());
-        let (needed, unused) = match mode {
-            RoutingMode::Regular { .. } => (
-                (!regular)
-                    .then_some("Regular mode with Slurm discovery requires a regular job name"),
-                (encode || prefill || decode).then_some(
-                    "Regular mode has no encode, prefill or decode workers to map Slurm jobs to",
-                ),
-            ),
-            RoutingMode::PrefillDecode { .. } => (
-                (!(prefill || decode)).then_some(
-                    "PD mode with Slurm discovery requires a prefill or decode job name",
-                ),
-                (regular || encode)
-                    .then_some("PD mode has no regular or encode workers to map Slurm jobs to"),
-            ),
-            RoutingMode::EncodePrefillDecode { .. } => (
-                (!(encode && prefill && decode)).then_some(
-                    "EPD mode with Slurm discovery requires encode, prefill and decode job names",
-                ),
-                regular.then_some("EPD mode has no regular workers to map Slurm jobs to"),
-            ),
-            RoutingMode::OpenAI { .. } => {
-                (Some("OpenAI mode does not support service discovery"), None)
-            }
-            RoutingMode::Anthropic { .. } => (
-                Some("Anthropic mode does not support service discovery"),
-                None,
-            ),
-            RoutingMode::Gemini { .. } => {
-                (Some("Gemini mode does not support service discovery"), None)
-            }
-        };
-        if let Some(reason) = needed.or(unused) {
-            return Err(ConfigError::ValidationFailed {
-                reason: reason.to_string(),
-            });
-        }
-        if discovery.bootstrap_port.is_some() && !(encode || prefill) {
-            return Err(ConfigError::ValidationFailed {
-                reason: "A Slurm bootstrap port applies only to encode and prefill workers"
-                    .to_string(),
-            });
-        }
-        Ok(())
-    }
-
-    /// The manifest's own contents (worker types against the routing mode
-    /// included) are checked each time it is read, not here: it may not exist
-    /// yet, and it changes while the router runs.
-    fn validate_file_discovery(
-        discovery: &FileDiscoveryConfig,
-        mode: &RoutingMode,
-    ) -> ConfigResult<()> {
-        if discovery.path.as_os_str().is_empty() {
-            return Err(ConfigError::invalid_value(
-                "discovery.path",
-                String::new(),
-                "File discovery needs a manifest path",
-            ));
-        }
-        Self::validate_record_discovery(discovery.check_interval_secs, mode)
-    }
-
-    /// Consul's address, ACL token and TLS settings are resolved, with the
-    /// environment, when discovery starts; each instance's metadata is checked
-    /// against the routing mode whenever Consul answers.
-    fn validate_consul_discovery(
-        discovery: &ConsulDiscoveryConfig,
-        mode: &RoutingMode,
-    ) -> ConfigResult<()> {
-        if discovery.service.is_empty() {
-            return Err(ConfigError::invalid_value(
-                "discovery.service",
-                String::new(),
-                "Consul discovery needs a service name",
-            ));
-        }
-        for (field, value) in [
-            ("discovery.address", &discovery.address),
-            ("discovery.datacenter", &discovery.datacenter),
-        ] {
-            if value.as_deref() == Some("") {
-                return Err(ConfigError::invalid_value(
-                    field,
-                    String::new(),
-                    "Must not be empty when given",
-                ));
-            }
-        }
-        Self::validate_record_discovery(discovery.check_interval_secs, mode)
-    }
-
-    /// What the file and Consul providers share: their records name their own
-    /// worker types, so any mode with worker pools can use them.
-    fn validate_record_discovery(check_interval_secs: u64, mode: &RoutingMode) -> ConfigResult<()> {
-        require_positive("discovery.check_interval_secs", check_interval_secs)?;
-
-        let unsupported = match mode {
-            RoutingMode::Regular { .. }
-            | RoutingMode::PrefillDecode { .. }
-            | RoutingMode::EncodePrefillDecode { .. } => return Ok(()),
-            RoutingMode::OpenAI { .. } => "OpenAI",
-            RoutingMode::Anthropic { .. } => "Anthropic",
-            RoutingMode::Gemini { .. } => "Gemini",
-        };
-        Err(ConfigError::ValidationFailed {
-            reason: format!("{unsupported} mode does not support service discovery"),
-        })
-    }
-
-    fn validate_kubernetes_discovery(
-        discovery: &KubernetesDiscoveryConfig,
-        mode: &RoutingMode,
-    ) -> ConfigResult<()> {
-        if discovery.port == 0 {
-            return Err(ConfigError::invalid_value(
-                "discovery.port",
-                discovery.port,
-                "Port must be > 0",
-            ));
-        }
-
-        require_positive(
-            "discovery.check_interval_secs",
-            discovery.check_interval_secs,
-        )?;
-
-        for (field, value) in [
-            (
-                "discovery.kv_connector_annotation",
-                &discovery.kv_connector_annotation,
-            ),
-            (
-                "discovery.kv_engine_id_annotation",
-                &discovery.kv_engine_id_annotation,
-            ),
-        ] {
-            let trimmed = value.trim();
-            if trimmed.is_empty() || trimmed != value {
-                return Err(ConfigError::invalid_value(
-                    field,
-                    value,
-                    "Annotation name must not be empty or padded with whitespace",
-                ));
-            }
-        }
-
-        match mode {
-            RoutingMode::Regular { .. } => {
-                if discovery.selector.is_empty() {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: "Regular mode with service discovery requires a non-empty selector"
-                            .to_string(),
-                    });
-                }
-            }
-            RoutingMode::PrefillDecode { .. } => {
-                if discovery.prefill_selector.is_empty() && discovery.decode_selector.is_empty() {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: "PD mode with service discovery requires at least one non-empty selector (prefill or decode)".to_string(),
-                    });
-                }
-            }
-            RoutingMode::EncodePrefillDecode { .. } => {
-                if discovery.encode_selector.is_empty()
-                    || discovery.prefill_selector.is_empty()
-                    || discovery.decode_selector.is_empty()
-                {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: "EPD mode with service discovery requires non-empty encode_selector, prefill_selector, and decode_selector".to_string(),
-                    });
-                }
-            }
-            RoutingMode::OpenAI { .. } => {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "OpenAI mode does not support service discovery".to_string(),
-                });
-            }
-            RoutingMode::Anthropic { .. } => {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "Anthropic mode does not support service discovery".to_string(),
-                });
-            }
-            RoutingMode::Gemini { .. } => {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "Gemini mode does not support service discovery".to_string(),
-                });
-            }
-        }
-
-        Ok(())
+        discovery.validate(roles).map_err(ConfigError::from)
     }
 
     fn validate_metrics(metrics: &MetricsConfig) -> ConfigResult<()> {
@@ -2194,6 +1918,68 @@ impl ConfigValidator {
         Ok(())
     }
 
+    fn validate_policy_controller(config: &RouterConfig) -> ConfigResult<()> {
+        let refuse = |reason: &str| {
+            Err(ConfigError::IncompatibleConfig {
+                reason: reason.to_owned(),
+            })
+        };
+        let Some(address) = &config.policy_controller_address else {
+            let tls = [
+                (
+                    "--policy-controller-tls-ca-cert",
+                    &config.policy_controller_tls_ca_cert,
+                ),
+                (
+                    "--policy-controller-tls-cert",
+                    &config.policy_controller_tls_cert,
+                ),
+                (
+                    "--policy-controller-tls-key",
+                    &config.policy_controller_tls_key,
+                ),
+            ];
+            if let Some((option, _)) = tls.into_iter().find(|(_, path)| path.is_some()) {
+                return refuse(&format!("{option} requires --policy-controller-address"));
+            }
+            return Ok(());
+        };
+        if !config.policy_controller {
+            return refuse("--policy-controller-address requires the policy_controller setting (--policy-controller)");
+        }
+        // The follower dials through the controller crate's client, which
+        // the gateway's manifest takes on these two targets alone.
+        if cfg!(not(any(target_os = "linux", target_os = "macos"))) {
+            return refuse("--policy-controller-address is followed on Linux and macOS alone");
+        }
+        let valid_address = address.parse::<Authority>().is_ok_and(|authority| {
+            !address.contains('@')
+                && url::Host::parse(authority.host()).is_ok()
+                && authority.port_u16().is_some_and(|port| port != 0)
+        });
+        if !valid_address {
+            return refuse("--policy-controller-address must be host:port with a port from 1 to 65535 and brackets around IPv6");
+        }
+        if config.policy_controller_tls_cert.is_some() != config.policy_controller_tls_key.is_some()
+        {
+            return refuse("--policy-controller-tls-cert and --policy-controller-tls-key must be given together");
+        }
+        // The connection trusts the authority's file and no other root: a
+        // client certificate without it could verify no controller.
+        if config.policy_controller_tls_cert.is_some()
+            && config.policy_controller_tls_ca_cert.is_none()
+        {
+            return refuse("--policy-controller-tls-cert requires --policy-controller-tls-ca-cert, the one root the connection trusts");
+        }
+        if config.mode.worker_count() != 0 {
+            return refuse("--policy-controller-address supplies the workers and conflicts with --worker-urls, --encode, --prefill and --decode");
+        }
+        if config.discovery.is_some() {
+            return refuse("--policy-controller-address supplies the workers and conflicts with --service-discovery and --discovery-provider");
+        }
+        Ok(())
+    }
+
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
         let has_service_discovery = config.discovery.is_some();
         let invalid_decode_policy = match &config.mode {
@@ -2223,7 +2009,9 @@ impl ConfigValidator {
         Self::validate_mtls(config)?;
 
         // Under dp_aware each URL registers one worker per DP rank.
-        if !has_service_discovery && !config.dp_aware {
+        // A followed fleet gets its workers from the controller.
+        if !has_service_discovery && !config.dp_aware && config.policy_controller_address.is_none()
+        {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
                 let worker_count = config.mode.worker_count();
                 if worker_count < 2 {
@@ -2306,6 +2094,220 @@ impl ConfigValidator {
 mod tests {
 
     use super::*;
+
+    /// A configuration under an address. Startup refuses the address first
+    /// on a target that does not build the follower, so the cases that
+    /// read past that refusal are built on the two targets that do.
+    fn following_config() -> RouterConfig {
+        RouterConfig {
+            policy_controller: true,
+            policy_controller_address: Some("controller:30100".to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn controller_refusal(config: &RouterConfig, names: &[&str]) {
+        let error = config
+            .validate()
+            .expect_err("the configuration is refused")
+            .to_string();
+        for name in names {
+            assert!(error.contains(name), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_controller_address_requires_the_policy_controller() {
+        controller_refusal(
+            &RouterConfig {
+                policy_controller: false,
+                ..following_config()
+            },
+            &["--policy-controller-address", "policy_controller"],
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_controller_address_is_a_host_with_a_port() {
+        for address in [
+            "",
+            ":30100",
+            "controller",
+            "controller:0",
+            "controller:65536",
+            "http://controller:30100",
+            "controller:30100/path",
+            "user@controller:30100",
+            "2001:db8::1:30100",
+            "[not-an-ip]:30100",
+        ] {
+            controller_refusal(
+                &RouterConfig {
+                    policy_controller_address: Some(address.to_owned()),
+                    ..following_config()
+                },
+                &["--policy-controller-address", "host:port"],
+            );
+        }
+        // Each end of the port range is taken.
+        for address in [
+            "controller:30100",
+            "127.0.0.1:80",
+            "[::1]:443",
+            "controller:1",
+            "controller:65535",
+        ] {
+            RouterConfig {
+                policy_controller_address: Some(address.to_owned()),
+                ..following_config()
+            }
+            .validate()
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn every_controller_tls_option_requires_an_address() {
+        for (name, config) in [
+            (
+                "--policy-controller-tls-ca-cert",
+                RouterConfig {
+                    policy_controller_tls_ca_cert: Some("ca.pem".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "--policy-controller-tls-cert",
+                RouterConfig {
+                    policy_controller_tls_cert: Some("cert.pem".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "--policy-controller-tls-key",
+                RouterConfig {
+                    policy_controller_tls_key: Some("key.pem".to_owned()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            controller_refusal(&config, &[name, "--policy-controller-address"]);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_controller_tls_certificate_and_key_require_each_other() {
+        for config in [
+            RouterConfig {
+                policy_controller_tls_cert: Some("cert.pem".to_owned()),
+                ..following_config()
+            },
+            RouterConfig {
+                policy_controller_tls_key: Some("key.pem".to_owned()),
+                ..following_config()
+            },
+        ] {
+            controller_refusal(
+                &config,
+                &[
+                    "--policy-controller-tls-cert",
+                    "--policy-controller-tls-key",
+                ],
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_controller_client_certificate_requires_its_authority() {
+        let pair = || RouterConfig {
+            policy_controller_tls_cert: Some("cert.pem".to_owned()),
+            policy_controller_tls_key: Some("key.pem".to_owned()),
+            ..following_config()
+        };
+        controller_refusal(
+            &pair(),
+            &[
+                "--policy-controller-tls-cert",
+                "--policy-controller-tls-ca-cert",
+            ],
+        );
+        RouterConfig {
+            policy_controller_tls_ca_cert: Some("ca.pem".to_owned()),
+            ..pair()
+        }
+        .validate()
+        .expect("a pair beside its authority's file is taken");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_controller_address_refuses_worker_urls() {
+        controller_refusal(
+            &RouterConfig {
+                mode: RoutingMode::Regular {
+                    worker_urls: vec!["http://worker:8000".to_owned()],
+                },
+                ..following_config()
+            },
+            &["--policy-controller-address", "--worker-urls"],
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_controller_address_refuses_service_discovery() {
+        controller_refusal(
+            &RouterConfig {
+                discovery: Some(
+                    FileDiscoveryConfig {
+                        path: "fleet.yaml".into(),
+                        check_interval_secs: 1,
+                    }
+                    .into(),
+                ),
+                ..following_config()
+            },
+            &[
+                "--policy-controller-address",
+                "--service-discovery",
+                "--discovery-provider",
+            ],
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_followed_fleet_can_use_power_of_two_without_static_workers() {
+        let config = RouterConfig {
+            policy: PolicyConfig::PowerOfTwo {
+                load_metric: Default::default(),
+            },
+            ..following_config()
+        };
+        config.validate().unwrap();
+        assert!(RouterConfig {
+            policy_controller_address: None,
+            ..config
+        }
+        .validate()
+        .is_err());
+    }
+
+    /// A following configuration read back from its own record is the one
+    /// that was written: the setting the address needs is written with it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_following_configuration_read_back_from_its_record_is_valid() {
+        let record = serde_json::to_value(following_config()).unwrap();
+        let back: RouterConfig = serde_json::from_value(record.clone()).unwrap();
+        back.validate()
+            .expect("the record of a following gateway reads back whole");
+        assert_eq!(record["policy_controller"], true);
+        assert!(back.policy_controller);
+    }
 
     /// The reason reads "Must be > 0", so a signed zero and a negative are refused alike.
     #[test]
@@ -4053,6 +4055,41 @@ mod tests {
 
         // Should pass validation since service discovery is enabled
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn vendor_modes_refuse_discovery_before_any_provider_check() {
+        let discovery = KubernetesDiscoveryConfig {
+            port: 0,
+            ..Default::default()
+        }
+        .into();
+        for (mode, expected) in [
+            (
+                RoutingMode::OpenAI {
+                    worker_urls: vec![],
+                },
+                "OpenAI mode does not support service discovery",
+            ),
+            (
+                RoutingMode::Anthropic {
+                    worker_urls: vec![],
+                },
+                "Anthropic mode does not support service discovery",
+            ),
+            (
+                RoutingMode::Gemini {
+                    worker_urls: vec![],
+                },
+                "Gemini mode does not support service discovery",
+            ),
+        ] {
+            let result = ConfigValidator::validate_discovery(&discovery, &mode);
+            assert!(
+                matches!(&result, Err(ConfigError::ValidationFailed { reason }) if reason == expected),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]

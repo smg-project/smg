@@ -97,7 +97,7 @@
           "default": 256
         },
         "max_report_age_ms": {
-          "description": "Maximum load report age in milliseconds. Built-in scorers use their\nunreported path for a sample older than this at the decision's instant.\nOmit to use reports of any age.",
+          "description": "With this limit in milliseconds set, `least-load`, `resident-work`,\n`least-cost` and the KV-pressure gates of `prefix-affinity` and\n`warmup-slice` treat older reports as missing. A report exactly at\nthe limit still counts. Overload verdicts can still reflect older\nreports, plugins interpret report age themselves, and host-registered\nstages keep their own rules. Omit it to use reports of any age.",
           "type": [
             "integer",
             "null"
@@ -203,6 +203,15 @@
         "pick": {
           "description": "The picker.",
           "$ref": "#/$defs/PickSpec"
+        },
+        "sent_ttl_ms": {
+          "description": "The number of milliseconds a send counts for. An unset limit keeps\nsends from expiring by age. A profile whose stages do not read its\ncount of sends is refused if it sets a limit.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
         }
       },
       "additionalProperties": false,
@@ -352,6 +361,18 @@
           },
           "required": [
             "resident-work"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "least-cost": {
+              "$ref": "#/$defs/LeastCostParams"
+            }
+          },
+          "required": [
+            "least-cost"
           ],
           "additionalProperties": false
         }
@@ -763,6 +784,128 @@
         "request_tokens"
       ]
     },
+    "LeastCostParams": {
+      "description": "The least-cost scorer: a sum of a row's fields times their coefficients,\nin the document's units. Lower cost scores higher.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0,
+          "maximum": 1000000000000000.0
+        },
+        "terms": {
+          "description": "Field names and their coefficients. At least one field is required.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "format": "double",
+            "minimum": -1000000000000000.0,
+            "maximum": 1000000000000000.0,
+            "not": {
+              "const": 0
+            }
+          },
+          "minProperties": 1,
+          "propertyNames": {
+            "enum": [
+              "candidate.in_flight",
+              "load.active_kv_permille",
+              "load.kv_usage_permille",
+              "load.queued",
+              "load.resident_tokens",
+              "load.running",
+              "load.waiting_uncached_tokens",
+              "sent.requests",
+              "sent.tokens"
+            ]
+          }
+        },
+        "margin": {
+          "description": "How far above the least cost a row still ties for the top score.",
+          "$ref": "#/$defs/CostMargin",
+          "default": {
+            "absolute": 0.0,
+            "relative": 0.0
+          }
+        },
+        "unreported": {
+          "description": "What a row costs when a named value is missing. Required for terms\nthat read a report.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Unreported"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "terms"
+      ]
+    },
+    "CostMargin": {
+      "description": "The sum of the absolute and relative margins. Both default to zero.",
+      "type": "object",
+      "properties": {
+        "absolute": {
+          "description": "In cost units.",
+          "type": "number",
+          "format": "double",
+          "default": 0.0,
+          "minimum": 0,
+          "maximum": 1000000000000000.0
+        },
+        "relative": {
+          "description": "A share of the magnitude of the least cost.",
+          "type": "number",
+          "format": "double",
+          "default": 0.0,
+          "minimum": 0,
+          "maximum": 1000000.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Unreported": {
+      "description": "How to cost a row that lacks a value a term reads.",
+      "oneOf": [
+        {
+          "description": "Start at the least cost among the reported rows handed to the scorer,\nor zero if none report, and add `request_cost` for each request in flight.",
+          "type": "object",
+          "properties": {
+            "over-least": {
+              "type": "object",
+              "properties": {
+                "request_cost": {
+                  "type": "number",
+                  "format": "double",
+                  "minimum": 0,
+                  "maximum": 1000000000000000.0
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "request_cost"
+              ]
+            }
+          },
+          "required": [
+            "over-least"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Sum the row's available values. A missing value adds nothing.",
+          "type": "string",
+          "const": "missing-as-zero"
+        }
+      ]
+    },
     "PickSpec": {
       "description": "A picker: its bare name, or the name mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool.",
       "anyOf": [
@@ -937,6 +1080,17 @@
             }
           ]
         },
+        "routing_key": {
+          "description": "Where the binding's requests take their routing key from. Absent, a\nsessions rule's own headers are the sources, and a binding with no\nrule names none.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoutingKeySpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "sessions": {
           "description": "Sticky sessions.",
           "anyOf": [
@@ -949,10 +1103,14 @@
           ]
         },
         "shadow": {
-          "description": "A profile evaluated after the live one on the same view, never\ndispatched, counted as disagreement.",
-          "type": [
-            "string",
-            "null"
+          "description": "A second profile for comparison on the same view. Only the live\nprofile's decision serves the request.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShadowSpec"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "canary": {
@@ -1175,9 +1333,60 @@
           "exclusiveMinimum": 0
         },
         "shed_when_all_vetoed": {
-          "description": "Shed with a 503 when every usable worker is vetoed, instead of\nfalling back to the least-vetoed one. The same word decides what a\nsession key does while its own worker is vetoed, where the ring\nalone places the request: under the single plan, in a profile whose\nonly scorer is `consistent-hash` with no `prefix_tokens` and no\n`bounded_load`, picked by `best` with no parameters, under no\nsessions rule or one that delegates. A rule with an in-flight cap\nkeeps the key only under a host that counts the key's requests,\nwhich the controller's own service does not yet. A rule with\n`inflight_cap: 65535` has no cap. Set, the key moves to the ring's\nnext worker; unset, the key stays on its worker over the veto.\nEverywhere else a keyed request keeps the veto.",
+          "description": "Shed with a 503 when every usable worker is vetoed, instead of\nfalling back to the least-vetoed one. The same word decides what a\nsession key does while its own worker is vetoed, where the ring\nalone places the request: under the single plan, in a profile whose\nonly scorer is `consistent-hash` with no `prefix_tokens` and no\n`bounded_load`, picked by `best` with no parameters, under no\nsessions rule or one that delegates. A rule with an in-flight cap\nkeeps the key only under a host that counts the key's requests, as\nthe controller's own service does. A rule with\n`inflight_cap: 65535` has no cap. Set, the key moves on: under a\nsessions rule to its next routable pin, and to the ring's next\nworker where no pin stands or no rule does. Unset, the key stays\non its worker over the veto. Everywhere else a keyed request\nkeeps the veto. The word is the overload veto's alone: a worker\nthe liveness check doubts still takes a request no other worker\ncan, unless it is over its thresholds too.",
           "type": "boolean",
           "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "RoutingKeySpec": {
+      "description": "Where a binding's requests take their routing key from: the sources a\nhost reads in order, and the first that holds a value is the key. A ring\nplaces by the key and a sessions rule pins it. No value enters a view,\nso the list is not held to `view.headers`.",
+      "type": "object",
+      "properties": {
+        "sources": {
+          "description": "The sources, read in order: one to eight, each named once.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/KeySourceSpec"
+          },
+          "minItems": 1,
+          "maxItems": 8
+        },
+        "strip_lineage": {
+          "description": "Take the turn and retry suffixes off a key, so every turn of a\nconversation shares one (`conv_t2_r1` keys as `conv`); default\nfalse.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sources"
+      ]
+    },
+    "KeySourceSpec": {
+      "description": "One source of a routing key: exactly one of `header` and `rid`.",
+      "type": "object",
+      "properties": {
+        "header": {
+          "description": "A request header, lowercase. A credential header is refused, as on\n`view.headers`; `cookie` is not. A key from a header `view.headers`\ndoes not list leaves as its fingerprint alone.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rid": {
+          "description": "The request's own id, the `rid` of its body: `true` names it.",
+          "type": "boolean"
+        },
+        "max_bytes": {
+          "description": "The most bytes of a value this source hands, 8192 at most (default\n128). A longer value is passed over and the next source is read.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1,
+          "maximum": 8192
         }
       },
       "additionalProperties": false
@@ -1187,11 +1396,11 @@
       "type": "object",
       "properties": {
         "sticky_header": {
-          "description": "The header whose value is the session key; listed in `view.headers`.",
+          "description": "The header whose value is the session key; listed in `view.headers`.\nLeft out where the binding names its key's sources under\n`routing_key`: a binding names them once.",
           "type": "string"
         },
         "headers": {
-          "description": "The headers looked up in order for the key, the sticky header among\nthem; empty means the sticky header alone. Each listed in\n`view.headers`.",
+          "description": "The headers looked up in order for the key, the sticky header among\nthem; empty means the sticky header alone. Each listed in\n`view.headers`. Left out under `routing_key` too.",
           "type": "array",
           "items": {
             "type": "string"
@@ -1235,10 +1444,7 @@
           "default": "original"
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "sticky_header"
-      ]
+      "additionalProperties": false
     },
     "Assignment": {
       "description": "How a session key seen for the first time picks its worker. Under the\n`manual` picker the same assignment places a request with no key, which\nis not pinned, and a `manual` profile bound with no sessions rule places\nevery request by `min_load`.",
@@ -1271,6 +1477,22 @@
       "enum": [
         "original",
         "latest"
+      ]
+    },
+    "ShadowSpec": {
+      "description": "A second profile for a binding of one profile, or a profile per side.",
+      "anyOf": [
+        {
+          "description": "The shadow of a binding that names one live profile.",
+          "type": "string"
+        },
+        {
+          "description": "Shadow profiles by side. Validation currently refuses this form.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
       ]
     },
     "CanarySpec": {

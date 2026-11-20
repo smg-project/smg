@@ -99,6 +99,8 @@ fn engine_under(spec: PluginSpec) -> (Arc<Plugin>, Engine) {
             plan: Plan::Single,
             profile: 0,
             decode_profile: None,
+            shadow: None,
+            decode_shadow: None,
             sessions: None,
             overload: None,
         }],

@@ -6,6 +6,7 @@ use std::{
 use dashmap::DashSet;
 use llm_tokenizer::registry::TokenizerRegistry;
 use openai_protocol::profile::ProviderProfile;
+use parking_lot::Mutex;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use reqwest::Client;
 use smg_data_connector::{
@@ -14,7 +15,7 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
-use smg_policy_controller::store::MemoryStore;
+use smg_policy_controller::{store::MemoryStore, Catalog};
 use smg_worker::{
     connection::{
         engine::EngineConnector,
@@ -37,7 +38,11 @@ use crate::{
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::{kv_index::event_monitor::KvEventMonitor, PolicyRegistry},
-    policy_controller,
+    policy_controller::{
+        self,
+        follower::{Follower, Settings},
+        host::Host,
+    },
     rate_limit::RateLimitManager,
     rl_adapter,
     routers::{
@@ -136,6 +141,11 @@ pub struct AppContext {
     /// The policy controller's store, where the controller was picked to
     /// decide for this process; `None` under the classic policies.
     pub policy_store: Option<Arc<MemoryStore>>,
+    /// The worker watch, owned by the context until server teardown.
+    pub(crate) policy_follower: Option<Arc<Mutex<Option<Follower>>>>,
+    /// The policy controller's host. Routers ask it for placement wherever
+    /// the policy store is present.
+    pub(crate) policy_host: Option<Arc<Host>>,
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
     pub rl: Option<Arc<smg_rl::RlState>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
@@ -228,6 +238,7 @@ pub struct AppContextBuilder {
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
     policy_store: Option<Arc<MemoryStore>>,
+    policy_follower: Option<Arc<Mutex<Option<Follower>>>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
 }
@@ -261,6 +272,15 @@ impl AppContext {
         AppContextBuilder::new()
     }
 
+    /// Whether a policy controller supplies this gateway's workers: the
+    /// context was built under a controller's address and holds the
+    /// follower of its watch. The start asks it at each step such a
+    /// gateway leaves to the controller: the startup registration, the
+    /// health checks and the discovery.
+    pub(crate) fn follows_controller(&self) -> bool {
+        self.policy_follower.is_some()
+    }
+
     /// Create AppContext from config with all components initialized
     /// This is the main entry point that replaces ~194 lines of initialization in server.rs
     pub fn from_config(
@@ -269,12 +289,29 @@ impl AppContext {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
+        Self::from_config_with_stages(
+            router_config,
+            request_timeout_secs,
+            webrtc_bind_addr,
+            webrtc_stun_server,
+            None,
+        )
+    }
+
+    pub(crate) fn from_config_with_stages(
+        router_config: RouterConfig,
+        request_timeout_secs: u64,
+        webrtc_bind_addr: Option<std::net::IpAddr>,
+        webrtc_stun_server: Option<String>,
+        stages: Option<Catalog>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
         Box::pin(async move {
-            Box::pin(AppContextBuilder::from_config(
+            Box::pin(AppContextBuilder::from_config_with_stages(
                 router_config,
                 request_timeout_secs,
                 webrtc_bind_addr,
                 webrtc_stun_server,
+                stages,
             ))
             .await?
             .build()
@@ -341,6 +378,7 @@ impl AppContextBuilder {
             wasm_manager: None,
             kv_event_monitor: None,
             policy_store: None,
+            policy_follower: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         }
@@ -606,6 +644,10 @@ impl AppContextBuilder {
         );
 
         let rl = rl_adapter::build_rl_state(&worker_registry, &worker_client_cache, &router_config);
+        let policy_host = self
+            .policy_store
+            .as_ref()
+            .map(|store| Arc::new(Host::new(Arc::clone(store), Arc::clone(&worker_registry))));
 
         Ok(AppContext {
             gateway_auth,
@@ -654,6 +696,8 @@ impl AppContextBuilder {
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
             policy_store: self.policy_store,
+            policy_follower: self.policy_follower,
+            policy_host,
             rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
@@ -668,6 +712,23 @@ impl AppContextBuilder {
         request_timeout_secs: u64,
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
+    ) -> Result<Self, String> {
+        Box::pin(Self::from_config_with_stages(
+            router_config,
+            request_timeout_secs,
+            webrtc_bind_addr,
+            webrtc_stun_server,
+            None,
+        ))
+        .await
+    }
+
+    async fn from_config_with_stages(
+        router_config: RouterConfig,
+        request_timeout_secs: u64,
+        webrtc_bind_addr: Option<std::net::IpAddr>,
+        webrtc_stun_server: Option<String>,
+        stages: Option<Catalog>,
     ) -> Result<Self, String> {
         // A served model aliased under a vendor name keeps that vendor's
         // contract profile after the alias is resolved into the served name.
@@ -690,7 +751,7 @@ impl AppContextBuilder {
             .with_tool_parser_factory()
             .with_worker_registry()
             .with_policy_registry(&router_config)
-            .with_policy_controller(&router_config)?
+            .with_policy_controller(&router_config, stages)?
             .with_storage(&router_config)
             .await?
             .with_worker_monitor(&router_config)?
@@ -867,12 +928,25 @@ impl AppContextBuilder {
         self
     }
 
-    /// Start the policy controller's store where the controller was picked
-    /// to decide for this process. A start it refuses stops this one, by
-    /// name.
-    fn with_policy_controller(mut self, config: &RouterConfig) -> Result<Self, String> {
+    /// Start the policy store and, when configured, its worker watch. A start
+    /// the store refuses stops this one, by name.
+    fn with_policy_controller(
+        mut self,
+        config: &RouterConfig,
+        stages: Option<Catalog>,
+    ) -> Result<Self, String> {
         self.policy_store =
-            policy_controller::start(config).map_err(|refusal| refusal.to_string())?;
+            policy_controller::start_with(config, stages, RouterConfig::policy_document)
+                .map_err(|refusal| refusal.to_string())?;
+        if let (Some(address), Some(store)) =
+            (&config.policy_controller_address, &self.policy_store)
+        {
+            let settings = Settings::new(address.clone(), config);
+            self.policy_follower = Some(Arc::new(Mutex::new(Some(Follower::start(
+                settings,
+                Arc::clone(store),
+            )))));
+        }
         Ok(self)
     }
 
@@ -928,6 +1002,10 @@ impl AppContextBuilder {
 
     /// Create load monitor
     fn with_worker_monitor(mut self, config: &RouterConfig) -> Result<Self, String> {
+        if config.policy_controller_address.is_some() {
+            info!("Skipping worker load monitoring because --policy-controller-address is set");
+            return Ok(self);
+        }
         let policy_registry = self
             .policy_registry
             .as_ref()
@@ -1097,6 +1175,21 @@ mod tests {
         },
     };
 
+    #[tokio::test]
+    async fn a_context_without_a_controller_address_has_no_follower() {
+        for policy_controller in [false, true] {
+            let config = RouterConfig {
+                policy_controller,
+                ..Default::default()
+            };
+            let context = AppContext::from_config(config, 10, None, None)
+                .await
+                .unwrap();
+            assert!(context.policy_follower.is_none());
+            assert_eq!(context.policy_store.is_some(), policy_controller);
+            assert!(context.worker_monitor.is_some());
+        }
+    }
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
     /// h2c on the same listener, mirroring a dual-protocol engine.
     async fn spawn_echo_server() -> String {
@@ -1773,6 +1866,8 @@ pub(crate) mod testing {
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
             policy_store: None,
+            policy_follower: None,
+            policy_host: None,
             rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,

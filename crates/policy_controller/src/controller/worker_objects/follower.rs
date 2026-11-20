@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use smg_grpc_client::engine_port::GrpcConnector;
 use smg_worker::registry::WorkerRegistry;
 use tokio::sync::watch;
 
@@ -14,10 +15,12 @@ use crate::{
 
 /// The replica's worker objects: their holder, the store it follows and the
 /// wake of its one task. The registry is built here, and the holder alone
-/// writes it.
+/// writes it. Each object connects to its engine through the engine clients'
+/// gRPC connector, so a worker of the host-local wire has no connection
+/// here.
 pub(crate) struct WorkerObjects {
     store: Arc<MemoryStore>,
-    objects: Objects<Members>,
+    objects: Arc<Objects<Members>>,
     wake: ObjectsWake,
 }
 
@@ -27,9 +30,17 @@ impl WorkerObjects {
     pub(crate) fn new(store: Arc<MemoryStore>, wake: ObjectsWake) -> Self {
         Self {
             store,
-            objects: Objects::new(Arc::new(WorkerRegistry::new())),
+            objects: Arc::new(
+                Objects::new(Arc::new(WorkerRegistry::new()))
+                    .with_connector(Arc::new(GrpcConnector)),
+            ),
             wake,
         }
+    }
+
+    /// The holder shared with readers of the replica's worker objects.
+    pub(crate) fn holder(&self) -> Arc<Objects<Members>> {
+        Arc::clone(&self.objects)
     }
 
     /// The holder, for a case that reads what stands.
@@ -63,7 +74,11 @@ impl WorkerObjects {
 mod tests {
     use std::{collections::BTreeMap, time::Instant};
 
-    use tokio::task::{yield_now, JoinSet};
+    use tokio::{
+        net::TcpListener,
+        sync::oneshot,
+        task::{yield_now, JoinSet},
+    };
 
     use super::*;
     use crate::{
@@ -76,7 +91,7 @@ mod tests {
         store::{
             Kinds, LeasesStore, Position, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
         },
-        view::WorkerId,
+        view::{WireModes, WorkerId},
     };
 
     const URL: &str = "http://w:8000";
@@ -305,6 +320,111 @@ mod tests {
             }
         }
         assert_eq!(replica.held(), replica.rows());
+        replica.stopped().await;
+    }
+
+    /// A mock engine that serves `model` behind a port of its own: its
+    /// address, what stops it and its task.
+    async fn engine(model: &str) -> (String, oneshot::Sender<()>, JoinSet<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let addr = listener.local_addr().expect("the port's address");
+        let config = mock_worker::config::Config {
+            grpc_base_port: addr.port(),
+            grpc_count: 1,
+            grpc_dp_size: 1,
+            grpc_wire: mock_worker::config::SchedulerWire::Vllm,
+            loads_like: mock_worker::engine::LoadsLike::Vllm,
+            realistic: true,
+            model_id: model.to_string(),
+            ..mock_worker::config::Config::default()
+        };
+        let (stop, stopped) = oneshot::channel::<()>();
+        let mut task = JoinSet::new();
+        task.spawn(mock_worker::grpc::serve_with_listener_until(
+            Arc::new(config),
+            listener,
+            async move {
+                let _ = stopped.await;
+            },
+        ));
+        (format!("http://{addr}"), stop, task)
+    }
+
+    /// The facts of a gRPC worker under `key` whose engine answers at
+    /// `engine`.
+    fn grpc_worker(key: &str, engine: &str) -> WorkerFacts {
+        WorkerFacts {
+            key: key.to_string(),
+            engine: engine.to_string(),
+            incarnation: 1,
+            models: vec!["m".to_string()],
+            dp_size: 1,
+            wire_modes: WireModes::GRPC,
+            engine_kind: "vllm".to_string(),
+            ..WorkerFacts::default()
+        }
+    }
+
+    /// A row of a gRPC worker builds an object that reaches its engine. The
+    /// holder hands each object the gRPC connector, and the object's own
+    /// connection reads the engine's health, its model's labels and its load.
+    #[tokio::test]
+    async fn a_rows_object_reaches_its_engine_over_the_controllers_connector() {
+        let (url, stop, _engine) = engine("served").await;
+        let replica = Replica::new();
+        replica.store.set_term(1);
+        replica.store.upsert(grpc_worker(&url, &url));
+        replica.caught_up("the registration").await;
+        let registry = replica.workers.objects.registry();
+        let object = registry.get_by_url(&url).expect("the row's object");
+        let connection = object
+            .engine_connection()
+            .await
+            .expect("a connect")
+            .expect("a gRPC worker's connection");
+        assert!(connection.health_check().await.expect("a verdict"));
+        let labels = connection.model_labels().await.expect("the labels");
+        assert!(labels.values().any(|value| value == "served"), "{labels:?}");
+        let loads = connection.get_loads().await.expect("a load answer");
+        assert_eq!(loads.dp_rank_count, 1);
+
+        drop(stop);
+        replica.stopped().await;
+    }
+
+    /// A row whose engine's address moved reads the new engine. The row
+    /// keeps its key, so its object is replaced in place, and the replacement
+    /// connects for itself: the standing object's connection is the old
+    /// engine's.
+    #[tokio::test]
+    async fn a_row_whose_engine_moved_reads_the_new_engine() {
+        const KEY: &str = "http://worker:8000";
+        let (first, _stop_first, _first_engine) = engine("first").await;
+        let (second, _stop_second, _second_engine) = engine("second").await;
+        let replica = Replica::new();
+        replica.store.set_term(1);
+        let registry = replica.workers.objects.registry();
+        // The model the engine behind the row's object says it serves.
+        let served = || async {
+            let object = registry.get_by_url(KEY).expect("the row's object");
+            let connection = object
+                .engine_connection()
+                .await
+                .expect("a connect")
+                .expect("a gRPC worker's connection");
+            connection.model_labels().await.expect("the labels")
+        };
+
+        replica.store.upsert(grpc_worker(KEY, &first));
+        replica.caught_up("the registration").await;
+        let labels = served().await;
+        assert!(labels.values().any(|value| value == "first"), "{labels:?}");
+
+        replica.store.upsert(grpc_worker(KEY, &second));
+        replica.caught_up("the engine's move").await;
+        let labels = served().await;
+        assert!(labels.values().any(|value| value == "second"), "{labels:?}");
+
         replica.stopped().await;
     }
 }

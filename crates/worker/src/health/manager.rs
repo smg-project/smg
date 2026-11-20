@@ -50,7 +50,7 @@ use crate::{
         endpoint::{grpc_base_url, Endpoint},
         error::WorkerResult,
     },
-    jobs::WorkerJobs,
+    jobs::{WorkerJobAsker, WorkerJobs},
     labels::DISCOVERY_PROVIDER_LABEL,
     load::{
         metrics_aggregator::{self, MetricPack},
@@ -1169,7 +1169,10 @@ fn labels_follow_the_engine<G: Generation>(
 /// submission is logged; the next transition retries.
 async fn submit_label_refresh(worker: &Arc<dyn Worker>, job_queue: &dyn WorkerJobs) {
     let url = worker.url().to_string();
-    match job_queue.refresh_worker_labels(url.clone()).await {
+    match job_queue
+        .refresh_worker_labels(url.clone(), WorkerJobAsker::Health)
+        .await
+    {
         Ok(true) => debug!(
             worker_url = %Endpoint::redacted_str(&url),
             "Submitted a label refresh for a worker that came into service"
@@ -1394,7 +1397,12 @@ async fn submit_removal_job<G: Generation>(
         "Removing failed worker from registry"
     );
     if let Err(e) = job_queue
-        .remove_worker(url.clone(), worker_id, expected_revision)
+        .remove_worker(
+            url.clone(),
+            worker_id,
+            expected_revision,
+            WorkerJobAsker::Health,
+        )
         .await
     {
         error!(
@@ -1644,7 +1652,7 @@ impl WorkerManager {
     }
 
     /// Build the fleet-wide load body from the monitor's published
-    /// snapshot: the same numbers the routing policies are acting on.
+    /// snapshot, with each rank's report under its worker's address.
     ///
     /// No request reaches a worker. That is what makes the route safe to
     /// stack — a gateway registered as a worker under another gateway

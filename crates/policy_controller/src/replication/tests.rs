@@ -1325,7 +1325,7 @@ fn a_restore_leaves_nothing_of_the_tables_it_replaces() {
     let stalled = |store: &MemoryStore| {
         let rows = pool(store, later());
         rows.iter()
-            .any(|(id, _, health, _)| *id == kept && health.stalled)
+            .any(|(id, _, health, _)| *id == kept && health.breaker_open)
     };
     assert!(stalled(&store));
     assert!(store.restore_from(leader.cut(Kinds::All)));

@@ -21,8 +21,9 @@ use crate::{
     proto::{self, worker_event::Event},
     replication::{Entry, Event as Written},
     store::{
-        GatewayId, HealthPolicy, LoadSample, LoadSource, Maker, MembershipChange, Overload,
-        Position, Reachability, Signals, Unmade, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
+        membership::blank, GatewayId, HealthPolicy, LoadSample, LoadSource, Maker,
+        MembershipChange, Overload, Position, Reachability, Signals, Unmade, WorkerFacts,
+        WorkerPatch, WorkerRow, WorkerStatus,
     },
     view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
 };
@@ -66,28 +67,18 @@ pub(crate) fn of_a_new_row(refusal: &Refused) -> bool {
     *refusal == NEW_WIRE || *refusal == NEW_ROLE
 }
 
-/// The bounds of what a row states (contract: `WorkerSpec`). A row tells
-/// its URL three times, a replacement's answer carries two rows and a
-/// snapshot pages at 128 rows: under these each fits a frame of 4 MiB.
-///
-/// A URL's bytes.
-const URL_BYTES: usize = 2_048;
-/// The bytes of a name: a runtime, a zone, a model id.
-const NAME_BYTES: usize = 256;
-/// A label's key, in bytes.
-const KEY_BYTES: usize = 128;
-/// A label's value, in bytes.
-const VALUE_BYTES: usize = 4_096;
-/// The labels of one row.
-const LABELS: usize = 128;
-/// The model ids of one row: a limit of this build and no number of the
-/// contract, said again once the store's cost of a row's ids is measured.
+/// The bounds of what a row states (contract: `WorkerSpec`). A replacement's
+/// answer carries two rows and a snapshot pages at 128 rows. Both fit a
+/// frame of 4 MiB.
+const URL_BYTES: usize = WorkerFacts::URL_BYTES;
+const NAME_BYTES: usize = WorkerFacts::NAME_BYTES;
+const KEY_BYTES: usize = WorkerFacts::LABEL_KEY_BYTES;
+const VALUE_BYTES: usize = WorkerFacts::LABEL_VALUE_BYTES;
+const LABELS: usize = WorkerFacts::LABELS;
+/// The most model ids a watch or snapshot request can select.
 pub(super) const MODELS: usize = 128;
 /// The row whole on the wire, as [`weight`] measures it.
-const ROW_BYTES: usize = 16 * 1024;
-// A provider's name takes a label key's bound and its key a URL's. The store
-// states both numbers for a build without the wire, and each pair is one.
-const _: () = assert!(Maker::NAME_BYTES == KEY_BYTES && Maker::KEY_BYTES == URL_BYTES);
+const ROW_BYTES: usize = WorkerFacts::ROW_BYTES;
 
 /// The contract's status of a row.
 pub(crate) const fn status(status: WorkerStatus) -> proto::WorkerStatus {
@@ -372,6 +363,70 @@ fn maker_weight(maker: &Maker) -> usize {
     key_len(27) + length(inner) + inner
 }
 
+/// Refuses, by its fact's path, a row the log would not give back whole. A
+/// standby builds its rows from the log, so it would hold the row without
+/// the fact, and a promoted one would decide by other facts than its leader
+/// did. The row on the wire carries a pairing's port alone and no encode
+/// offer, vision bit, priority or drain window, and it reads an empty zone
+/// and a zero window, block size or port as none. The facts are written as the log
+/// writes them and read back as a standby reads them, so a fact the wire
+/// gains is taken here with no second list.
+#[cfg(feature = "worker-host")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the host's door asks it of each registration")
+)]
+pub(crate) fn carried(facts: &WorkerFacts) -> Result<(), Refused> {
+    const WHY: &str = "the log's row does not carry this fact: not served by this build";
+    let sent = told(WorkerId(0), facts, WorkerStatus::Ready, 1);
+    let back = told_row(&sent, Instant::now())?.facts;
+    let lost = [
+        ("row.pairing", back.pairing != facts.pairing),
+        ("row.encode", back.encode != facts.encode),
+        ("row.vision", back.vision != facts.vision),
+        ("row.priority", back.priority != facts.priority),
+        ("row.zone", back.zone != facts.zone),
+        ("row.max_running", back.max_running != facts.max_running),
+        (
+            "row.kv_block_size",
+            back.kv_block_size != facts.kv_block_size,
+        ),
+        (
+            "row.bootstrap_port",
+            back.bootstrap_port != facts.bootstrap_port,
+        ),
+        (
+            "row.drain_settle_secs",
+            back.drain_settle_secs != facts.drain_settle_secs,
+        ),
+        ("row", back != *facts),
+    ];
+    match lost.iter().find(|(_, lost)| *lost) {
+        Some((path, _)) => Err(refused(path, WHY)),
+        None => Ok(()),
+    }
+}
+
+/// The controller's rule of a row's wire and its reach, refused by `path`.
+/// A host-local wire is reachable from the one gateway that holds its
+/// socket, so a row of that wire names its gateway: the store reads a row as
+/// host-local by its reach alone, and a row every gateway reaches stands in
+/// every gateway's pool. A control call's registration and a host's found
+/// worker are held to it alike.
+pub(crate) fn wire_reach(
+    wire: WireModes,
+    from: Reachability,
+    path: &'static str,
+) -> Result<(), Refused> {
+    if wire.contains(WireModes::ZMQ) && from == Reachability::Any {
+        return Err(refused(
+            path,
+            "a host-local wire is one gateway's and a registration names none: not served by this build",
+        ));
+    }
+    Ok(())
+}
+
 /// Refuses, by `path`, a row of these facts under `labels` that passes
 /// [`ROW_BYTES`] with its maker: the facts' own bound ([`fits`]) is told
 /// where they are read, and a provider's row holds its maker inside the
@@ -423,11 +478,6 @@ pub(crate) fn start_again(floor: Position) -> proto::WorkerEvent {
         oldest_seq: floor.seq + 1,
     };
     event(Event::SnapshotRequired(word), 0, 0, 0)
-}
-
-/// Whether a stated name holds a blank or a control character.
-fn blank(name: &str) -> bool {
-    name.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// A log entry of a membership or status write in its envelope, at the
@@ -865,11 +915,6 @@ pub(crate) fn registration(
 ///
 /// The URL's own rules are [`key`]'s, held before this is called.
 fn over(spec: &proto::WorkerSpec, standing: Option<&WorkerFacts>) -> Result<WorkerFacts, Refused> {
-    // The count first, before one id is read or copied: every membership
-    // write walks the ids of every standing row.
-    if spec.models.len() > MODELS {
-        return Err(refused("spec.models", "a row names at most 128 model ids"));
-    }
     if spec.runtime.len() > NAME_BYTES {
         return Err(refused("spec.runtime", "a runtime is at most 256 bytes"));
     }
@@ -898,17 +943,16 @@ fn over(spec: &proto::WorkerSpec, standing: Option<&WorkerFacts>) -> Result<Work
     let wire_modes = match proto::WireMode::try_from(spec.wire) {
         Ok(proto::WireMode::Http) => Some(WireModes::HTTP),
         Ok(proto::WireMode::Grpc) => Some(WireModes::GRPC),
-        // A host-local wire is reachable from the one gateway that holds its
-        // socket, and no field of a registration names a gateway.
-        Ok(proto::WireMode::Zmq) => {
-            return Err(refused(
-                "spec.wire",
-                "a host-local wire is one gateway's and a registration names none: not served by this build",
-            ));
-        }
+        Ok(proto::WireMode::Zmq) => Some(WireModes::ZMQ),
         Ok(proto::WireMode::Unspecified) => standing.map(|row| row.wire_modes),
         Err(_) => return Err(refused("spec.wire", "a wire this build does not know")),
     };
+    // No field of a registration names a gateway: the row's reach is the
+    // standing row's, and a new row's is every gateway's.
+    let from = standing.map(|row| row.reachable_from).unwrap_or_default();
+    if let Some(wire) = wire_modes {
+        wire_reach(wire, from, "spec.wire")?;
+    }
     let role = match proto::Role::try_from(spec.role) {
         Ok(proto::Role::Single) => Some(Role::Single),
         Ok(proto::Role::Prefill) => Some(Role::Prefill),
@@ -1168,14 +1212,14 @@ mod tests {
     use super::{
         event, load, member, page, patch, refused, registration, removed, replaced, replication,
         row, start_again, status, status_changed, told_change, told_load, told_part, told_row,
-        Refused, KEY_BYTES, LABELS, MODELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
+        Refused, KEY_BYTES, LABELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
     };
     use crate::{
         proto::{self, replication_event::Event as Sent, worker_event::Event},
         replication::{Entry, Event as Written},
         store::{
-            identity, GatewayId, HealthPolicy, LoadSample, LoadSource, MembershipChange, Overload,
-            Position, Reachability, Signals, WorkerFacts, WorkerRow, WorkerStatus,
+            identity, GatewayId, HealthPolicy, LoadSample, LoadSource, Maker, MembershipChange,
+            Overload, Position, Reachability, Signals, WorkerFacts, WorkerRow, WorkerStatus,
         },
         view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
     };
@@ -1566,6 +1610,34 @@ mod tests {
         );
         assert!(made.health.probes);
         assert_eq!(made.reachable_from, Reachability::Any);
+    }
+
+    /// One rule of a row's wire and its reach, whoever states the wire: a
+    /// registration's row keeps the reach of the row that stands.
+    #[test]
+    fn a_host_local_wire_is_held_to_the_reach_of_the_row_that_stands() {
+        let stated = proto::WorkerSpec {
+            wire: proto::WireMode::Zmq as i32,
+            ..spec()
+        };
+        let unsaid = proto::WorkerSpec { wire: 0, ..spec() };
+        let standing = |from| WorkerFacts {
+            wire_modes: WireModes::ZMQ,
+            reachable_from: from,
+            ..facts(&spec(), None).expect("a row")
+        };
+        let one = Reachability::Gateway(GatewayId(7));
+        for ask in [&stated, &unsaid] {
+            // One gateway's row takes the wire, stated or left as it stood.
+            let made = facts(ask, Some(&standing(one))).expect("one gateway's row");
+            assert_eq!(
+                (made.wire_modes, made.reachable_from),
+                (WireModes::ZMQ, one)
+            );
+            // A row that every gateway reaches is refused it.
+            let refusal = facts(ask, Some(&standing(Reachability::Any))).expect_err("no gateway");
+            assert_eq!(refusal.path, "spec.wire");
+        }
     }
 
     #[test]
@@ -2095,7 +2167,7 @@ mod tests {
     #[test]
     fn a_field_at_its_bound_is_taken_and_one_over_is_refused_by_its_path() {
         type Stating = fn(usize) -> proto::WorkerSpec;
-        let cases: [(&str, usize, &str, Stating); 8] = [
+        let cases: [(&str, usize, &str, Stating); 7] = [
             (
                 "spec.url",
                 URL_BYTES,
@@ -2162,15 +2234,6 @@ mod tests {
                     }
                 },
             ),
-            (
-                "spec.models",
-                MODELS,
-                "a row names at most 128 model ids",
-                |count| proto::WorkerSpec {
-                    models: (0..count).map(|n| n.to_string()).collect(),
-                    ..spec()
-                },
-            ),
         ];
         for (path, bound, why, stating) in cases {
             assert!(facts(&stating(bound), None).is_ok(), "{path} at {bound}");
@@ -2181,15 +2244,33 @@ mod tests {
             );
             assert!(why.contains(&bound.to_string()), "{why}");
         }
-        // The models' count is read before the list is: past it a
-        // registration is refused by the count, whatever its ids hold.
-        let unread = proto::WorkerSpec {
-            models: vec![text(NAME_BYTES + 1); MODELS + 1],
+        let long_id = proto::WorkerSpec {
+            models: vec![text(NAME_BYTES + 1); 129],
             ..spec()
         };
         assert_eq!(
-            facts(&unread, None).map(|_| ()),
-            Err(refused("spec.models", "a row names at most 128 model ids"))
+            facts(&long_id, None).map(|_| ()),
+            Err(refused("spec.models", "a model id is at most 256 bytes"))
+        );
+    }
+
+    #[test]
+    fn a_registration_limits_model_ids_by_the_wires_row_weight() {
+        let short = proto::WorkerSpec {
+            models: (0..129).map(|n| n.to_string()).collect(),
+            ..spec()
+        };
+        assert_eq!(
+            facts(&short, None).expect("the ids fit").models,
+            short.models
+        );
+        let heavy = proto::WorkerSpec {
+            models: vec![text(256); 64],
+            ..spec()
+        };
+        assert_eq!(
+            facts(&heavy, None),
+            Err(refused("spec", "a row is at most 16384 bytes on the wire"))
         );
     }
 
@@ -2474,6 +2555,88 @@ mod tests {
         ] {
             let at = WorkerRow { status, ..full() };
             assert!(row(&at).encoded_len() <= weight(&at.facts), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn the_stores_measure_is_never_under_the_wires_weight() {
+        let widest = WorkerFacts {
+            incarnation: u64::MAX,
+            role: Role::Encode,
+            wire_modes: WireModes::HTTP.union(WireModes::GRPC).union(WireModes::ZMQ),
+            dp_rank: u16::MAX,
+            dp_size: u16::MAX,
+            kv_block_size: Some(u32::MAX),
+            max_running: Some(u32::MAX),
+            bootstrap_port: Some(u16::MAX),
+            priority: i32::MAX,
+            reachable_from: Reachability::Gateway(GatewayId(u64::MAX)),
+            overload: Overload {
+                kv_usage_permille: Some(u16::MAX),
+                waiting_requests: Some(u32::MAX),
+            },
+            health: HealthPolicy {
+                failure_threshold: u32::MAX,
+                success_threshold: u32::MAX,
+                check_interval_ms: u32::MAX,
+                timeout_ms: u32::MAX,
+                probes: false,
+            },
+            signals: Signals {
+                events: true,
+                loads: true,
+                scrape_interval_ms: u32::MAX,
+            },
+            ..WorkerFacts::default()
+        };
+        let mut numbers = row(&WorkerRow {
+            facts: widest.clone(),
+            id: WorkerId(u64::MAX),
+            revision: u64::MAX,
+            status: WorkerStatus::Ready,
+            ..full()
+        });
+        numbers.admitted_age_ms = u64::MAX;
+        assert!(
+            numbers.encoded_len() <= WorkerFacts::NUMBERS,
+            "{} numeric bytes",
+            numbers.encoded_len()
+        );
+
+        let makers = [
+            Maker::Control,
+            Maker::provider("p", "k").expect("the shortest maker"),
+            Maker::provider(text(128), text(2_048)).expect("the widest maker"),
+        ];
+        for long in [false, true] {
+            let sized = |least, most| text(if long { most } else { least });
+            for scrape in [false, true] {
+                let facts = WorkerFacts {
+                    key: sized(1, 2_048),
+                    engine: sized(0, 2_048),
+                    engine_kind: sized(0, 256),
+                    models: vec![sized(1, 256)],
+                    zone: Some(sized(0, 256)),
+                    labels: [
+                        (sized(0, 128), sized(0, 4_096)),
+                        ("policy".to_owned(), sized(0, 4_096)),
+                    ]
+                    .into(),
+                    signals: Signals {
+                        scrape_interval_ms: if scrape { u32::MAX } else { 0 },
+                        ..widest.signals
+                    },
+                    ..widest.clone()
+                };
+                for maker in &makers {
+                    let wire = weight(&facts) + super::maker_weight(maker);
+                    let stored = facts.weight(maker);
+                    assert!(
+                        wire <= stored,
+                        "long={long}, scrape={scrape}, wire={wire}, store={stored}"
+                    );
+                }
+            }
         }
     }
 

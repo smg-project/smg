@@ -38,8 +38,8 @@ struct Launch {
 /// until it exits, serves or `EXIT_TIMEOUT` passes.
 fn launch(args: &[&str], log_path: &Path) -> Launch {
     // The binary's launches run one at a time: the ports picked here are
-    // released for the gateway to bind, and another test's pick or listener
-    // must not take one meanwhile.
+    // for this gateway to bind, and another test's pick or listener must
+    // not take one meanwhile.
     let _serial = serial();
     let [port, metrics_port] = free_ports();
     let ip = IP.to_string();
@@ -60,11 +60,12 @@ fn launch(args: &[&str], log_path: &Path) -> Launch {
         .expect("spawn the gateway");
     let deadline = Instant::now() + EXIT_TIMEOUT;
     let address = SocketAddr::from((IP, port));
-    // The probe ports were released for the gateway to bind, and another
-    // process on the host can take one in between: a connection the port
-    // accepts is the gateway's only with its own word, the line it logs once
-    // its bind succeeded. Without the line the loop goes on, to the exit
-    // status of a gateway that refused with its port in a stranger's hands.
+    // Where `free_ports` cannot keep the probe ports (anywhere but Linux),
+    // another process on the host can take one before the gateway binds it:
+    // a connection the port accepts is the gateway's only with its own word,
+    // the line it logs once its bind succeeded. Without the line the loop
+    // goes on, to the exit status of a gateway that refused with its port in
+    // a stranger's hands.
     let bound = format!("Starting server on {address}");
     let mut listened = false;
     let status = loop {

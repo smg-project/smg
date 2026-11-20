@@ -72,6 +72,11 @@
 //! is no pick of a rotation until the gateway lifts the veto, and a session
 //! key keeps its ring worker over it.
 //!
+//! A gateway's link answers concurrent asks. Their leases leave the store
+//! on the caller's reports, or on the link's own release if an answer
+//! arrives after the caller's budget. A watch on the link takes the
+//! snapshot and the tail beside an ask, and can follow after the link ends.
+//!
 //! No stub server: the engines are the mock worker's, the controller is the
 //! one the binary runs and the client is the generated one. Every wait is
 //! bounded and named, and the case stands under one outer bound.
@@ -128,12 +133,12 @@ use net::vm_rss_kib;
 use openai_protocol::worker::RuntimeType;
 use prost::Message as _;
 use smg_policy_controller::{
-    client::{self, blocking, Answer, Client},
+    client::{self, blocking, Answer, Client, Link, Unanswered},
     controller::{State, PROTOCOL_VERSION},
     proto::{
-        busy, completed::Class, decision::Outcome, identity::Form, principal, released,
-        worker_event, Completed, DecideRequest, Decision, Identity, OverloadThresholds, Released,
-        RequestFacts, ShedReason, Side, WatchWorkersRequest,
+        busy, completed::Class, decision::Outcome, gateway_frame, identity::Form, principal,
+        released, worker_event, Completed, DecideRequest, Decision, Hello, Identity, Lease,
+        OverloadThresholds, Released, RequestFacts, ShedReason, Side, WatchWorkersRequest,
     },
     spec::{BindingSpec, Match},
     store::{LaneCounts, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
@@ -143,10 +148,10 @@ use smg_policy_controller::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{oneshot, Notify},
+    sync::{oneshot, Barrier, Notify},
     task::JoinSet,
 };
-use tonic::Code;
+use tonic::{transport::Endpoint, Code};
 
 const MODEL: &str = "fleet-model";
 
@@ -240,6 +245,7 @@ fn ask(id: &[u8]) -> DecideRequest {
             ..RequestFacts::default()
         }),
         constraints: None,
+        again: false,
     }
 }
 
@@ -910,12 +916,11 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             kv_usage_permille: Some(1),
             ..OverloadThresholds::default()
         };
-        let whole = harness.view(MODEL, Role::Single).expect("the view").len();
         harness
             .patch_overload(busy, least)
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, whole, Some(busy))
+        overloaded(&mut harness, ranks, Some(busy))
             .await
             .expect("an engine at its patched limit reads overloaded");
         let mut vetoed = HashSet::new();
@@ -946,14 +951,14 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "the gateway's lift of the veto keeps the overloaded row: {lifted:?}"
         );
         assert!(
-            reads_overloaded(&mut harness, whole, Some(busy)),
+            reads_overloaded(&mut harness, ranks, Some(busy)),
             "the engine read overloaded through both rotations"
         );
         harness
             .patch_overload(busy, OverloadThresholds::default())
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, whole, None)
+        overloaded(&mut harness, ranks, None)
             .await
             .expect("the patch taken back, no row reads overloaded");
 
@@ -1334,8 +1339,15 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "the busy engine's blocks reach its row's index",
             PROBE_INTERVAL + ROOM,
             || {
+                // The listener's stream and the store's own are two: they
+                // are read at rest, the cursor at the last sequence the
+                // listener heard and the index holding what it holds.
                 harness.heard(busy).first().is_some_and(|row| {
-                    row.indexed > 0 && row.cursor.is_some_and(|cursor| cursor.applied >= 1)
+                    row.indexed > 0
+                        && row.indexed == row.held
+                        && row
+                            .cursor
+                            .is_some_and(|cursor| cursor.applied >= 1 && cursor.applied == row.last)
                 })
             },
         )
@@ -1357,7 +1369,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "the cursor stands at what the stream delivered: {fed:?}"
         );
         assert!(
-            fed.applied >= 1 && fed.indexed == fed.held,
+            fed.indexed >= 1 && fed.indexed == fed.held,
             "the index holds each block the engine's events left it holding: {fed:?}"
         );
         assert_eq!(
@@ -1398,7 +1410,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         for engine in engines.iter().filter(|engine| **engine != busy) {
             for idle in harness.heard(*engine) {
                 assert!(
-                    idle.applied == 0 && idle.indexed == 0 && idle.held == 0,
+                    idle.last == 0 && idle.indexed == 0 && idle.held == 0,
                     "an engine that stored no block published none: engine {engine} {idle:?}"
                 );
             }
@@ -1428,12 +1440,11 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             }
         }
         let (key, row) = held.expect("of 256 routing keys one is the busy engine's");
-        let whole = harness.view(MODEL, Role::Single).expect("the view").len();
         harness
             .patch_overload(busy, least)
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, whole, Some(busy))
+        overloaded(&mut harness, ranks, Some(busy))
             .await
             .expect("an engine at its patched limit reads overloaded");
         for n in 0..8 {
@@ -1446,14 +1457,14 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             );
         }
         assert!(
-            reads_overloaded(&mut harness, whole, Some(busy)),
+            reads_overloaded(&mut harness, ranks, Some(busy)),
             "the engine read overloaded through the key's asks"
         );
         harness
             .patch_overload(busy, OverloadThresholds::default())
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, whole, None)
+        overloaded(&mut harness, ranks, None)
             .await
             .expect("the patch taken back, no row reads overloaded");
 
@@ -2210,7 +2221,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         writeln!(out, "FLEET_READY_MS {}", ready.as_millis()).expect("stdout");
         writeln!(out, "FLEET_LOADS_FOLLOW_MS {}", followed.as_millis()).expect("stdout");
         writeln!(out, "FLEET_KV_FOLLOW_MS {}", stored.as_millis()).expect("stdout");
-        writeln!(out, "FLEET_KV_BATCHES {}", fed.applied).expect("stdout");
+        writeln!(out, "FLEET_KV_BATCHES {}", fed.last).expect("stdout");
         writeln!(out, "FLEET_KV_BLOCKS {}", fed.indexed).expect("stdout");
         writeln!(out, "FLEET_DEATH_WRITTEN_MS {}", written.as_millis()).expect("stdout");
         writeln!(out, "FLEET_DEATH_SEEN_MS {}", seen.as_millis()).expect("stdout");
@@ -2485,6 +2496,181 @@ async fn the_blocking_client_asks_a_started_controller_from_a_thread_of_its_own(
         .expect("the case ends inside its outer bound");
 }
 
+/// One ready worker under a controller that leads itself.
+async fn linked_fleet(gateway: &str) -> Result<(Harness, Link), String> {
+    let mut harness = Harness::start().await?;
+    harness.apply("round_robin")?;
+    harness.register(&FLEET[..1]).await?;
+    harness.feed();
+    within("the worker is ready", ROOM, || {
+        harness
+            .view(MODEL, Role::Single)
+            .is_ok_and(|pool| pool.len() == 1 && pool[0].healthy)
+    })
+    .await?;
+    let endpoint = Endpoint::from_shared(format!("http://{}", harness.gateway()))
+        .map_err(|error| error.to_string())?;
+    let link = Box::pin(Link::connect(endpoint, gateway))
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((harness, link))
+}
+
+async fn linked_pick(link: &Link, request: DecideRequest) -> Result<Lease, String> {
+    let answer = link.ask(request, ROOM).await;
+    let Ok(Decision {
+        leases,
+        outcome: Some(Outcome::Pick(_)),
+        ..
+    }) = answer
+    else {
+        return Err(format!("no pick: {answer:?}"));
+    };
+    let [lease] = leases.as_slice() else {
+        return Err(format!("a pick with the wrong leases: {leases:?}"));
+    };
+    Ok(*lease)
+}
+
+async fn leases_before_expiry(
+    harness: &Harness,
+    link: &Link,
+    gateway: &str,
+    left: usize,
+    before: Instant,
+) -> Result<(), String> {
+    let span = Duration::from_millis(u64::from(link.welcome().dispatch_ttl_ms));
+    within(
+        "the store reaches the reported lease count before expiry",
+        span.saturating_sub(before.elapsed()),
+        || before.elapsed() < span && harness.leases(gateway) == left,
+    )
+    .await
+    .map(|_| ())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_answers_sixty_four_asks_and_reports_the_end_of_each_lease() {
+    const GATEWAY: &str = "fleet-link";
+    let case = async {
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY))
+            .await
+            .expect("a ready fleet");
+        let mut asks = JoinSet::new();
+        let count = usize::try_from(ASKS).expect("the number of asks fits");
+        let ready = Arc::new(Barrier::new(count + 1));
+        let before = Instant::now();
+        for n in 0..ASKS {
+            let link = link.clone();
+            let ready = Arc::clone(&ready);
+            asks.spawn(async move {
+                let session = session_of(&n.to_string(), MODEL);
+                ready.wait().await;
+                let lease = linked_pick(&link, keyed(nth("link", n), session))
+                    .await
+                    .expect("the controller answers with a pick");
+                assert_eq!(lease.session_key, session, "each ask gets its own decision");
+                (lease.id, lease.side)
+            });
+        }
+        ready.wait().await;
+        let mut leases = HashMap::new();
+        while let Some(answer) = asks.join_next().await {
+            let (id, side) = answer.expect("the caller gets its answer");
+            assert!(
+                leases.insert(id, side).is_none(),
+                "a distinct lease for every ask"
+            );
+        }
+        assert_eq!(harness.leases(GATEWAY), count);
+        for (lease_id, side) in leases {
+            link.report(gateway_frame::Frame::Released(Released {
+                what: Some(released::What::LeaseId(lease_id)),
+                reason: released::Reason::ClientGone.into(),
+                side,
+            }))
+            .expect("the link takes the report");
+        }
+        leases_before_expiry(&harness, &link, GATEWAY, 0, before)
+            .await
+            .expect("the reports end the leases");
+        assert!(link.stands());
+        drop(link);
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_releases_the_lease_of_a_zero_budget_ask() {
+    const GATEWAY: &str = "fleet-late-link";
+    let case = async {
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY))
+            .await
+            .expect("a ready fleet");
+        let before = Instant::now();
+        let first = linked_pick(&link, ask(b"first"))
+            .await
+            .expect("a first pick");
+        assert!(matches!(
+            link.ask(ask(b"late"), Duration::ZERO).await,
+            Err(Unanswered::Late)
+        ));
+        let last = linked_pick(&link, ask(b"last")).await.expect("a last pick");
+        // The three asks run on the same decider. The gap proves that the
+        // middle ask booked a lease even if its release has arrived already.
+        assert_eq!(last.id, first.id + 2);
+        leases_before_expiry(&harness, &link, GATEWAY, 2, before)
+            .await
+            .expect("only the first and last leases remain");
+        assert!(link.stands());
+        drop(link);
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+/// A frame the call refuses ends the stream it is sent on, and a link's
+/// stream is every caller's. The link refuses such a frame at its own door:
+/// nothing is sent, the link stands, and the next ask is answered on the
+/// stream that stood.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_refuses_a_frame_out_of_the_calls_ranges_and_stands() {
+    const GATEWAY: &str = "fleet-ranged-link";
+    let case = async {
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY))
+            .await
+            .expect("a ready fleet");
+        let first = linked_pick(&link, ask(b"first"))
+            .await
+            .expect("a first pick");
+        let mut wrong = ask(b"wrong");
+        wrong.facts.as_mut().expect("the ask states facts").phase = 99;
+        let refused = link.ask(wrong, ROOM).await;
+        assert!(
+            matches!(&refused, Err(Unanswered::Unsent(error))
+                if error.to_string().contains("facts.phase")),
+            "{refused:?}"
+        );
+        assert!(link.stands(), "the link stands");
+        let last = linked_pick(&link, ask(b"last"))
+            .await
+            .expect("a pick after the refusal");
+        // Both picks ran on the same decider: no lease was booked between
+        // them, so the refused frame reached no decider.
+        assert_eq!(last.id, first.id + 1);
+        drop(link);
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
 /// A replica that does not lead refuses the client's session and names the
 /// leader: two controllers elect over one lease file, and the client dials
 /// each.
@@ -2580,9 +2766,14 @@ async fn follows(
 /// engine that registers behind the snapshot and a dead engine's status. A
 /// stream opened after the last place taken is told the tail alone. At one
 /// place, the watcher holds what one that started from a later snapshot
-/// holds.
+/// holds. The later snapshot keeps a lease already on file in its store.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
+    use smg_policy_controller::{
+        lease::{Lease, LeaseId},
+        store::{GatewayId, LeaseRecord, LeaseState, LeasesStore, Picked},
+    };
+
     let case = async {
         let mut harness = Harness::start().await.expect("the harness starts");
         let engines = harness
@@ -2650,11 +2841,34 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
         // A watcher that starts now takes a snapshot. Both are then told
         // one more death, and at its place the first holds what the second
         // holds.
-        let mut fresh = Watcher::new(Arc::new(MemoryStore::new()));
+        let store = Arc::new(MemoryStore::new());
+        let leases: &dyn LeasesStore = &*store;
+        let gateway = GatewayId(1);
+        let now = Instant::now();
+        leases
+            .issue(LeaseRecord {
+                lease: Lease {
+                    id: LeaseId(1),
+                    ..Lease::default()
+                },
+                gateway,
+                request: 1,
+                target: late,
+                picked: Picked::default(),
+                decode: None,
+                term: 0,
+                issued_at: now,
+                dispatch_deadline: now + ROOM,
+                state: LeaseState::ISSUED,
+            })
+            .expect("filed");
+        assert_eq!(leases.live(gateway), 1);
+        let mut fresh = Watcher::new(Arc::clone(&store));
         let opened = fresh.open(harness.client()).await;
         let mut snapshot = opened.expect("a second watch opens");
         let told = follows(&mut snapshot, |held| held.at().is_some()).await;
         told.expect("a snapshot is told");
+        assert_eq!(leases.live(gateway), 1);
         harness.kill(engines[2]).await.expect("a third engine dies");
         let told = follows(&mut stream, |held| dead(held, ids[2])).await;
         told.expect("the third death is told on the tail");
@@ -2667,6 +2881,68 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
         assert_eq!((first.snapshots(), second.snapshots()), (1, 1));
 
         drop((stream, snapshot));
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_answers_beside_its_watch_and_the_watch_outlives_it() {
+    const GATEWAY: &str = "fleet-link-watch";
+    let case = async {
+        let (mut harness, link) = Box::pin(linked_fleet(GATEWAY))
+            .await
+            .expect("a ready fleet");
+        let first = harness.worker(0).expect("the first worker's row");
+        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+        let mut stream = watcher
+            .open_on(&link)
+            .await
+            .expect("the link opens a watch");
+        follows(&mut stream, |held| held.at().is_some())
+            .await
+            .expect("the watch takes a snapshot");
+        assert_eq!(watched(stream.watcher()).len(), 1);
+        assert_eq!(
+            status_of(stream.watcher(), first),
+            Some(WorkerStatus::Ready)
+        );
+
+        let tail = follows(&mut stream, |held| watched(held).len() == 2);
+        let ask_and_register = async {
+            linked_pick(&link, ask(b"watching"))
+                .await
+                .expect("the link answers while the watch waits");
+            harness
+                .register(&FLEET[1..2])
+                .await
+                .expect("a worker joins the fleet");
+        };
+        let (told, ()) = tokio::join!(biased; tail, ask_and_register);
+        told.expect("the watch takes the new row on its tail");
+        drop(stream);
+
+        let mut stream = watcher
+            .open_on(&link)
+            .await
+            .expect("the link resumes the watch");
+        link.report(gateway_frame::Frame::Hello(Hello::default()))
+            .expect("the session takes the frame");
+        tokio::time::timeout(ROOM, link.closed())
+            .await
+            .expect("the second hello ends the link");
+        drop(link);
+
+        harness.kill(0).await.expect("the first worker dies");
+        follows(&mut stream, |held| {
+            status_of(held, first).is_some_and(|status| status != WorkerStatus::Ready)
+        })
+        .await
+        .expect("the watch takes the status after the link ends");
+        assert_eq!(stream.watcher().snapshots(), 1);
+        drop(stream);
         harness.stop().await.expect("a clean stop");
     };
     tokio::time::timeout(CASE, Box::pin(case))
@@ -2708,9 +2984,12 @@ async fn a_watch_ends_when_its_controller_goes_silent() {
         assert!(matches!(first, Ok(Ok(true))), "the snapshot: {first:?}");
 
         silent.notify_one();
-        let ended = tokio::time::timeout(ROOM, stream.next())
+        // A ping goes out one keepalive after the last frame read, and the
+        // channel ends one answer's wait after a ping with no answer.
+        let bound = client::KEEPALIVE + client::ANSWER_WAIT + Duration::from_secs(5);
+        let ended = tokio::time::timeout(bound, stream.next())
             .await
-            .expect("a silent controller ends the stream inside the room");
+            .expect("a silent controller ends the stream inside its bound");
         assert!(matches!(ended, Err(Ended::Client(_))), "{ended:?}");
 
         relayed.abort_all();

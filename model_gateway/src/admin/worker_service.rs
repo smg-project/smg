@@ -24,6 +24,8 @@ use smg_worker::{
         basic::{merge_labels, worker_to_info, Worker, WorkerType},
         endpoint::Endpoint,
     },
+    jobs::WorkerJobAsker,
+    labels::has_control_character,
     registry::WorkerId,
     workflow::find_workers_by_url,
 };
@@ -31,9 +33,8 @@ use tracing::warn;
 
 use crate::{
     config::{unused_credentials_warning, validate_worker_url, RouterConfig},
-    observability::log_format::has_control_character,
     routers::{common::snapshot::WorkerRegistry, provider_support},
-    workflow::{Job, JobQueue, WorkerRegistrationMode},
+    workflow::{job_queue::cancel_registration, Job, JobQueue, WorkerRegistrationMode},
 };
 
 /// Validate the URL of an incoming worker-management request, translating a
@@ -686,6 +687,7 @@ impl WorkerService {
         let job = Job::AddWorker {
             config: Box::new(config),
             registration_mode: WorkerRegistrationMode::CreateOnly,
+            asker: WorkerJobAsker::Api,
         };
 
         // Exactly one create per URL is in flight at a time, so that attempt
@@ -803,6 +805,7 @@ impl WorkerService {
                 worker_id: worker_id.as_str().to_string(),
                 expected_revision: existing.revision(),
             },
+            asker: WorkerJobAsker::Api,
         };
 
         let job_queue = self.get_job_queue()?;
@@ -921,8 +924,7 @@ impl WorkerService {
         // flight reserves nothing), so no DELETE reaches this path for such a
         // registration before its worker exists.
         if self.worker_registry.get(&worker_id).is_none() {
-            let cancelled = job_queue
-                .cancel_registration(&url, &worker_id)
+            let cancelled = cancel_registration(job_queue, &url, &worker_id)
                 .await
                 .map_err(|message| WorkerServiceError::QueueSubmitFailed { message })?;
             if cancelled > 0 && self.worker_registry.get(&worker_id).is_none() {
@@ -953,6 +955,7 @@ impl WorkerService {
         let job = Job::RemoveWorker {
             url: url.clone(),
             expected_revisions: Some(entries),
+            asker: WorkerJobAsker::Api,
         };
         // One removal per URL at a time: a registration's own end queues one
         // for the workers it registered and did not finish, and a repeated
@@ -963,11 +966,8 @@ impl WorkerService {
         // A repeated DELETE's removal finds nothing left then; one behind a
         // guarded cleanup that skipped a worker replaced since the cleanup's
         // snapshot removes that worker, where a DELETE answered by the
-        // cleanup alone removed nothing. The queue keeps one job of each
-        // kind per URL; a label refresh is kept the same way
-        // (`submit_label_refresh`) and runs after a kept removal: the worker
-        // it would refresh may be the one leaving, or the one a guarded
-        // removal leaves standing.
+        // cleanup alone removed nothing. A kept label refresh runs after
+        // the kept removals, on any worker they leave standing.
         job_queue
             .submit_or_defer(job)
             .await
@@ -1004,6 +1004,7 @@ impl WorkerService {
         let job = Job::UpdateWorker {
             url: url.clone(),
             update: Box::new(update),
+            asker: WorkerJobAsker::Api,
         };
         let job_queue = self.get_job_queue()?;
         if worker.is_some() {
@@ -1042,12 +1043,13 @@ impl WorkerService {
 #[cfg(test)]
 mod tests {
     use openai_protocol::model_card::ModelCard;
-    use smg_worker::identity::basic::WorkerType;
+    use smg_worker::{identity::basic::WorkerType, jobs::queue::testing::QueueTest};
 
     use super::*;
     use crate::{
         app_context::testing::app_context_for_tests,
-        routers::grpc::backend_client::BasicWorkerBuilder, workflow::JobQueueConfig,
+        routers::grpc::backend_client::BasicWorkerBuilder,
+        workflow::{job_queue::recording_for_tests, JobQueueConfig},
     };
 
     fn make_service(registry: Arc<WorkerRegistry>) -> WorkerService {
@@ -1122,6 +1124,70 @@ mod tests {
 
     fn worker_spec(url: &str) -> WorkerSpec {
         serde_json::from_value(json!({ "url": url })).expect("worker spec")
+    }
+
+    #[tokio::test]
+    async fn the_worker_api_asks_as_api() {
+        use crate::app_context::testing::create_test_app_context;
+
+        let context = create_test_app_context();
+        let (queue, mut next_job) = recording_for_tests(&context);
+        context.worker_job_queue.set(queue).unwrap();
+        let registry = &context.worker_registry;
+        let registered = |url| {
+            register_worker(registry, url, Some("served"));
+            registry.get_id_by_url(url).unwrap()
+        };
+        let replace_url = "http://replace:8000";
+        let replace = registered(replace_url);
+        let update = registered("http://update:8000");
+        let delete = registered("http://delete:8000");
+        let service = &context.worker_service;
+
+        service
+            .create_worker(worker_spec("http://create:8000"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_job(),
+            Job::AddWorker {
+                registration_mode: WorkerRegistrationMode::CreateOnly,
+                asker: WorkerJobAsker::Api,
+                ..
+            }
+        ));
+        service
+            .replace_worker(replace.as_str(), worker_spec(replace_url))
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_job(),
+            Job::AddWorker {
+                registration_mode: WorkerRegistrationMode::ReplaceById { .. },
+                asker: WorkerJobAsker::Api,
+                ..
+            }
+        ));
+        let request = serde_json::from_value(json!({"priority": 2})).unwrap();
+        service
+            .update_worker(update.as_str(), request)
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_job(),
+            Job::UpdateWorker {
+                asker: WorkerJobAsker::Api,
+                ..
+            }
+        ));
+        service.delete_worker(delete.as_str()).await.unwrap();
+        assert!(matches!(
+            next_job(),
+            Job::RemoveWorker {
+                asker: WorkerJobAsker::Api,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1232,6 +1298,7 @@ mod tests {
         Job::AddWorker {
             config: Box::new(worker_spec(url)),
             registration_mode: WorkerRegistrationMode::CreateOnly,
+            asker: WorkerJobAsker::Api,
         }
     }
 
@@ -1489,6 +1556,7 @@ mod tests {
         let cleanup = Job::RemoveWorker {
             url: url.to_string(),
             expected_revisions: Some(HashMap::from([(id.as_str().to_string(), Some(1))])),
+            asker: WorkerJobAsker::Api,
         };
         assert!(queue.claim_if_idle(&cleanup), "the cleanup holds the URL");
         let deleted = service
@@ -1497,7 +1565,7 @@ mod tests {
             .expect("the DELETE is admitted");
         assert_eq!(deleted.worker_id, id);
         assert!(
-            queue.kept_for(url),
+            QueueTest::kept_for(&queue, url),
             "the DELETE's removal is kept for the removal in flight to run on its heels"
         );
     }

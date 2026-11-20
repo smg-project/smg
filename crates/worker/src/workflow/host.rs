@@ -31,7 +31,7 @@ pub trait WorkflowHost: Send + Sync + 'static {
     /// What the host fixes for every registration it runs.
     fn registration_settings(&self) -> &RegistrationSettings;
 
-    /// The connector a registration reaches a gRPC engine with.
+    /// The connector for gRPC probes and the workers a registration builds.
     fn engine_connector(&self) -> Arc<dyn EngineConnector>;
 }
 
@@ -46,7 +46,7 @@ pub fn require_host<H>(host: Option<&Arc<H>>) -> WorkflowResult<&Arc<H>> {
 pub(crate) mod testing {
     use std::{
         net::Ipv4Addr,
-        sync::{Arc, OnceLock},
+        sync::{Arc, LazyLock, OnceLock},
     };
 
     use tokio::net::TcpListener;
@@ -57,10 +57,33 @@ pub(crate) mod testing {
             engine::EngineConnector,
             http_client::{WorkerHttpClientCache, WorkerHttpClientSettings},
         },
-        settings::RegistrationSettings,
+        settings::{RegistrationSettings, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS},
         test_support::{CountingConnector, Members, ScriptedConnector, WorkerRegistry},
         worker::HttpPoolConfig,
     };
+
+    /// Settings shared by the test hosts.
+    pub(crate) fn registration_settings() -> RegistrationSettings {
+        RegistrationSettings {
+            upstream_http2: false,
+            health_check_timeout_secs: 5,
+            startup_timeout_secs: 1,
+            startup_delay_secs: 0,
+            startup_check_interval_secs: 1,
+            dp_aware: false,
+            model_path: None,
+            model_aliases: Default::default(),
+            retry: Default::default(),
+            retries_enabled: true,
+            circuit_breaker: Default::default(),
+            circuit_breaker_enabled: true,
+            overload_defaults: Default::default(),
+            health: Default::default(),
+            health_endpoint: "/health".to_string(),
+            zmq_startup_timeout_secs: DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
+            request_timeout_secs: 30,
+        }
+    }
 
     /// A host that keeps a registry and nothing else.
     #[derive(Debug)]
@@ -91,15 +114,7 @@ pub(crate) mod testing {
         }
 
         fn registration_settings(&self) -> &RegistrationSettings {
-            // No case of this host runs a detection: the values are never read.
-            static SETTINGS: RegistrationSettings = RegistrationSettings {
-                upstream_http2: false,
-                health_check_timeout_secs: 1,
-                startup_timeout_secs: 1,
-                startup_delay_secs: 0,
-                startup_check_interval_secs: 1,
-                dp_aware: false,
-            };
+            static SETTINGS: LazyLock<RegistrationSettings> = LazyLock::new(registration_settings);
             &SETTINGS
         }
 
@@ -120,17 +135,28 @@ pub(crate) mod testing {
 
     impl ProbingHost {
         pub(crate) fn new(upstream_http2: bool, connector: ScriptedConnector) -> Arc<Self> {
-            Self::with_settings(upstream_http2, false, connector)
+            Self::with_settings(
+                RegistrationSettings {
+                    upstream_http2,
+                    ..registration_settings()
+                },
+                connector,
+            )
         }
 
         /// A host whose settings turn the DP read on.
         pub(crate) fn reading_dp(connector: ScriptedConnector) -> Arc<Self> {
-            Self::with_settings(false, true, connector)
+            Self::with_settings(
+                RegistrationSettings {
+                    dp_aware: true,
+                    ..registration_settings()
+                },
+                connector,
+            )
         }
 
-        fn with_settings(
-            upstream_http2: bool,
-            dp_aware: bool,
+        pub(crate) fn with_settings(
+            settings: RegistrationSettings,
             connector: ScriptedConnector,
         ) -> Arc<Self> {
             Arc::new(Self {
@@ -138,18 +164,11 @@ pub(crate) mod testing {
                 clients: WorkerHttpClientCache::new(WorkerHttpClientSettings {
                     client_identity: None,
                     ca_certificates: Vec::new(),
-                    upstream_http2,
-                    request_timeout_secs: 30,
+                    upstream_http2: settings.upstream_http2,
+                    request_timeout_secs: settings.request_timeout_secs,
                     pool_idle_timeout_secs: 0,
                 }),
-                settings: RegistrationSettings {
-                    upstream_http2,
-                    health_check_timeout_secs: 5,
-                    startup_timeout_secs: 1,
-                    startup_delay_secs: 0,
-                    startup_check_interval_secs: 1,
-                    dp_aware,
-                },
+                settings,
                 connector: Arc::new(connector),
             })
         }

@@ -1,5 +1,5 @@
 //! The configuration a command line assembles, as a policy document: the
-//! policy controller's corpus through the binary's own parser.
+//! policy controller's corpus through the command-line parser.
 //!
 //! The corpus (`crates/policy_controller/tests/corpus`) holds one item a
 //! routing configuration of the gateway: its input, and under `## Expected
@@ -9,11 +9,13 @@
 use std::{borrow::Cow, fs, path::Path};
 
 use clap::Parser;
-use smg::config::{PolicyDocumentError, RouterConfig};
 use smg_policy_controller::{PolicySpec, SpecError, PRESETS};
 
-use super::PolicySpecPrint;
-use crate::{cli::url_port::CommandLine, Cli, CliArgs, Commands};
+use super::{
+    super::{url_port::CommandLine, Cli, CliArgs, Commands},
+    PolicySpecPrint,
+};
+use crate::config::{PolicyDocumentError, RouterConfig};
 
 /// The urls of a side that the binary reads ahead of clap, each with its
 /// bootstrap port.

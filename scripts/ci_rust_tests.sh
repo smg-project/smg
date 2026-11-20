@@ -145,12 +145,12 @@ commands_of() {
     local shard=$1
     case "$shard" in
         gateway-unit)
-            # The lib's unit tests and the smg binary's. The alias binary amg is the same
-            # source (its manifest entry says test = false); an explicit --bins would build
-            # and run its harness anyway, so the binary is named.
+            # The lib's unit tests. The command line's cases run with the library, and
+            # neither executable builds a test harness (their manifest entries say
+            # test = false).
             # One invocation for both packages: on its own, the harness's `-p` would unify the gateway
             # down to the harness's feature set and build the gateway lib a second time.
-            echo "-p smg -p smg-test-harness --lib --bin smg"
+            echo "-p smg -p smg-test-harness --lib"
             echo "-p smg --doc" ;;
         gateway-[0-9]*)
             local index=${shard#gateway-} selectors
@@ -178,14 +178,23 @@ commands_of() {
             # each provider's settings.
             echo "-p smg-service-discovery" ;;
         engine)
-            echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine" ;;
+            # `engine-port` is on for the cases of the client crate's engine port: no package of the shard
+            # asks for it, so nothing else would turn it on.
+            echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine,smg-grpc-client/engine-port" ;;
         kv)
             local selectors
             # The example controller rides the policy crate's invocation: it asks for the crate's
             # `controller` feature, which this line turns on already, so nothing is built twice.
-            # `worker-host` is on for the cases of the crate's worker objects: no test target requires it,
-            # so nothing else would turn it on.
+            # `worker-host` is on for the cases of the crate's worker objects and for the test targets that
+            # run the stock binary, which require it.
             echo "-p kv-index -p smg-mesh -p smg-mm-rdma -p smg-policy-controller -p policy-controller-example --features smg-policy-controller/client,smg-policy-controller/kubernetes,smg-policy-controller/worker-host"
+            # The policy crate's library once more, under `discovery`: no package of the shard asks for
+            # that feature, so nothing else would run the cases behind it. The line above stays as it
+            # is: it runs the case of a build without the feature.
+            echo "-p smg-policy-controller --lib --features smg-policy-controller/discovery"
+            # The policy crate's case for a host that builds the `operator` feature alone. The shard's
+            # first line turns the controller on, so that case would never run as such a host builds it.
+            echo "-p smg-policy-controller --no-default-features --features operator --test operator_door"
             # The radix tree without its fuzz binary (the radix-fuzz shard); --doc cannot share an invocation with --test.
             selectors=$(test_selectors_except smg-radix-tree fuzz_differential)
             echo "-p smg-radix-tree --lib$selectors"
@@ -269,6 +278,9 @@ lint() {
             for features in $(discovery_feature_sets) test-util; do
                 (set -x; cargo clippy -p smg-service-discovery --features "$features" --all-targets -- -D warnings)
             done
+            # The policy crate's `operator` feature is what a host calls in its own process. It
+            # builds with no controller behind it, and nothing of it is left unused there.
+            (set -x; cargo clippy -p smg-policy-controller --no-default-features --features operator --all-targets -- -D warnings)
             (set -x; cargo check --manifest-path bindings/python/Cargo.toml)
             (set -x; cargo check --manifest-path bindings/golang/Cargo.toml) ;;
         *) echo "ci_rust_tests.sh: unknown lint leg '$1' (all-features, self-hosted, anthropic-only, default-build)" >&2; exit 2 ;;

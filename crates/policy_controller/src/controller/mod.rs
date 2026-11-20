@@ -39,10 +39,14 @@ pub mod admin;
 pub mod config;
 mod decide;
 mod deciders;
+#[cfg(feature = "discovery")]
+mod discovery;
 pub mod election;
 mod floor;
 mod gateways;
 mod generations;
+#[cfg(feature = "worker-host")]
+mod kv_feed;
 mod lifecycle;
 mod membership;
 pub mod metrics;
@@ -54,11 +58,12 @@ mod service;
 mod session;
 mod snapshot;
 mod spec_file;
-mod spec_store;
+pub(crate) use crate::operator::spec_store;
+pub use crate::operator::SpecRejected;
 mod standby;
 pub mod tls;
 mod watch_workers;
-mod wire;
+pub(crate) mod wire;
 mod worker_objects;
 pub(crate) mod worker_wire;
 
@@ -85,7 +90,6 @@ pub use self::{
     admin::{Version, VERSION},
     config::{Config, ConfigError, Listener, Scope, Tls},
     election::{Election, LeaseError, LeasePlace},
-    generations::SpecRejected,
     principal::ENTRY as PRINCIPAL_ENTRY,
     readiness::{Readiness, State},
     run::run,
@@ -157,6 +161,12 @@ pub struct Controller {
     /// of the store, followed by one task of the serve.
     #[cfg(feature = "worker-host")]
     workers: Arc<worker_objects::WorkerObjects>,
+    #[cfg(feature = "worker-host")]
+    kv_feed: kv_feed::KvFeed,
+    /// Worker discovery, where the configuration names a provider: one task
+    /// of the serve, which runs the provider while this replica leads.
+    #[cfg(feature = "discovery")]
+    discovery: Option<Box<discovery::Discovery>>,
 }
 
 /// Sets an accepted socket to send at once. An answer is a few small writes
@@ -453,6 +463,8 @@ impl Controller {
             Arc::clone(&journal.0),
             woken,
         ));
+        #[cfg(feature = "worker-host")]
+        let kv_feed = kv_feed::KvFeed::new(Arc::clone(&journal.0), workers.holder());
         let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
@@ -466,6 +478,18 @@ impl Controller {
         shared.lag = Arc::new(Lag::new(standby::synced_within(config.load_poll_interval)));
         let (phase, readiness) =
             readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag));
+        #[cfg(feature = "discovery")]
+        let discovery = config.discovery.as_ref().map(|settings| {
+            let host = Arc::new(discovery::Host::new(
+                Arc::clone(workers.holder().registry()),
+                settings.credential().cloned(),
+            ));
+            Box::new(discovery::Discovery::new(
+                settings.runtime().clone(),
+                host,
+                Arc::clone(&shared.fence),
+            ))
+        });
         let shared = Arc::new(shared);
         let probe = Arc::new(EngineProbe::new());
         Ok(Self {
@@ -484,6 +508,10 @@ impl Controller {
             admin_addr,
             #[cfg(feature = "worker-host")]
             workers,
+            #[cfg(feature = "worker-host")]
+            kv_feed,
+            #[cfg(feature = "discovery")]
+            discovery,
         })
     }
 
@@ -801,6 +829,10 @@ impl Controller {
             admin,
             #[cfg(feature = "worker-host")]
             workers,
+            #[cfg(feature = "worker-host")]
+            kv_feed,
+            #[cfg(feature = "discovery")]
+            discovery,
             ..
         } = self;
         let store = Arc::clone(&shared.store);
@@ -918,6 +950,20 @@ impl Controller {
             let workers_stop = stop.subscribe();
             tasks.spawn(async move {
                 workers.run(workers_stop).await;
+                Ok(())
+            });
+            let kv_stop = stop.subscribe();
+            tasks.spawn(async move {
+                kv_feed.run(kv_stop).await;
+                Ok(())
+            });
+        }
+        #[cfg(feature = "discovery")]
+        if let Some(discovery) = discovery {
+            let standing = shared.standing.clone();
+            let discovery_stop = stop.subscribe();
+            tasks.spawn(async move {
+                discovery.run(standing, discovery_stop).await;
                 Ok(())
             });
         }

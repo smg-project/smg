@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use openai_protocol::worker::WorkerSpec;
 use smg_worker::{
     identity::endpoint::{Endpoint, EndpointKey},
-    jobs::WorkerRegistrationMode,
+    jobs::{WorkerJobAsker, WorkerRegistrationMode},
     registry::{WorkerId, WorkerOrigin},
 };
 use tokio::time;
@@ -311,10 +311,16 @@ fn build_worker_spec(
     // API key, the retry budget, compatibility labels — can move it.
     spec.labels
         .insert(DISCOVERY_SPEC_HASH_LABEL.to_string(), worker.fingerprint());
-    // served_model_name is priority #2 in create_worker's model_id chain.
-    if let Some(ref model_id) = worker.model_id_override {
+    // A nonblank served_model_name is priority #2 in create_worker's model_id chain.
+    // It is stamped without the blanks around it: a model id is matched exactly.
+    if let Some(model_id) = worker
+        .model_id_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|model_id| !model_id.is_empty())
+    {
         spec.labels
-            .insert("served_model_name".to_string(), model_id.clone());
+            .insert("served_model_name".to_string(), model_id.to_string());
     }
     spec.kv_connector.clone_from(&worker.kv_connector);
     spec.kv_role.clone_from(&worker.kv_role);
@@ -394,7 +400,11 @@ pub(super) async fn reconcile(
         // every spelling the group was registered under. An IPC endpoint keeps
         // its scheme, because its key is a bare socket path that would not
         // parse back.
-        let removal = jobs.remove_workers_at(target.endpoint.lookup_form(), target.guards.clone());
+        let removal = jobs.remove_workers_at(
+            target.endpoint.lookup_form(),
+            target.guards.clone(),
+            WorkerJobAsker::Discovery,
+        );
         match removal.await {
             Ok(()) => series::record_deregistration(
                 kind.metric_label(),
@@ -418,7 +428,14 @@ pub(super) async fn reconcile(
         // pass can wait for a queue slot between them: the claim is taken
         // with the check, so a registration that took the URL since (a
         // `POST`'s) keeps it, and the next pass adds what is still missing.
-        match jobs.add_worker(spec, WorkerRegistrationMode::Upsert).await {
+        match jobs
+            .add_worker(
+                spec,
+                WorkerRegistrationMode::Upsert,
+                WorkerJobAsker::Discovery,
+            )
+            .await
+        {
             Ok(true) => {
                 series::record_registration(kind.metric_label(), series::REGISTRATION_SUCCESS);
             }

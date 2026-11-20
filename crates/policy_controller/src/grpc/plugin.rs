@@ -29,7 +29,7 @@ use super::{
 };
 use crate::{
     decision::{Decision, Target},
-    framework::DecisionScope,
+    framework::{DecisionScope, TieBand},
     lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     plugins::{
         config::{EventSet, Exposure, Failure, FrameBudget},
@@ -1036,7 +1036,7 @@ impl Bound {
         facts: &RequestFacts<'_>,
         kept: &[u32],
         out: &mut [f32],
-    ) -> Result<(), Fallback> {
+    ) -> Result<TieBand, Fallback> {
         let mut open = self.state(facts.phase);
         if open.asked & SCORE == 0 {
             return Err(Fallback);
@@ -1048,7 +1048,7 @@ impl Bound {
         for (o, &i) in out.iter_mut().zip(kept) {
             *o = answer.scores.get(i as usize).copied().unwrap_or(0.0);
         }
-        Ok(())
+        Ok(answer.band.map_or(TieBand::NORMALIZED, TieBand))
     }
 
     /// The picker's answer over the survivors (`scores[i]` belongs to
@@ -1161,7 +1161,7 @@ impl BoundPlugin for Bound {
         facts: &RequestFacts<'_>,
         kept: &[u32],
         out: &mut [f32],
-    ) -> Result<(), Fallback> {
+    ) -> Result<TieBand, Fallback> {
         Bound::score(self, facts, kept, out)
     }
 

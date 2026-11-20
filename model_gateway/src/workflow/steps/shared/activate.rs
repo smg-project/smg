@@ -87,7 +87,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::WorkerSpec;
-    use smg_worker::registry::event::WorkerEvent;
+    use smg_worker::{jobs::WorkerJobAsker, registry::event::WorkerEvent};
     use wfaas::WorkflowInstanceId;
 
     use super::*;
@@ -171,6 +171,7 @@ mod tests {
             WorkerSpec::new(url),
             WorkerRegistrationMode::Upsert,
             Arc::clone(&app_context),
+            WorkerJobAsker::Api,
         );
         data.actual_workers = Some(vec![Arc::clone(&worker)]);
         let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);

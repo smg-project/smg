@@ -977,13 +977,30 @@ mod tests {
             let wire = preprocess_wire(params, &[&image], None, dtype)
                 .expect("offered with three tables")
                 .unwrap();
-            let floats = preprocess(params, &[&image], None).unwrap();
+            assert!(
+                matches!(&wire.encoder_input, EncoderInput::Wire { .. }),
+                "{dtype}: offered input is not a wire"
+            );
             assert_eq!(
-                wire.encoder_input.write_as(dtype),
-                floats.encoder_input.write_as(dtype),
+                wire.encoder_input.pixel_norm(),
+                Some(wire_norm(&params)),
+                "{dtype}: wire norm"
+            );
+            let floats = preprocess(params, &[&image], None).unwrap();
+            let wire_bytes = wire
+                .encoder_input
+                .view()
+                .try_write_as(dtype)
+                .expect("wire writes");
+            let float_bytes = floats
+                .encoder_input
+                .view()
+                .try_write_as(dtype)
+                .expect("float tensor writes");
+            assert_eq!(
+                wire_bytes, float_bytes,
                 "{dtype}: mean {:?}, std {:?}",
-                params.mean,
-                params.std
+                params.mean, params.std
             );
         }
     }

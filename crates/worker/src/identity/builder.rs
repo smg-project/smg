@@ -21,7 +21,6 @@ use crate::{
         resilience::ResolvedResilience,
     },
     identity::basic::Worker,
-    metrics::writers::Metrics,
     model_card::ModelCard,
     pd::pairing::PdPairing,
     registry::event::WorkerConnected,
@@ -396,7 +395,11 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
         self
     }
 
-    /// Build the BasicWorker instance
+    /// Build the BasicWorker instance.
+    ///
+    /// Building writes no metric series: a worker publishes its own where it
+    /// enters a registry ([`Worker::publish_series`]). A worker that is built
+    /// and never enters leaves the series of its address as they stood.
     pub fn build(mut self) -> BasicWorker {
         use std::sync::atomic::AtomicBool;
 
@@ -456,8 +459,6 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
                 } else {
                     WorkerStatus::Pending
                 });
-        Metrics::set_worker_health(&metadata.spec.url, initial_status == WorkerStatus::Ready);
-        Metrics::set_worker_http2(&metadata.spec.url, metadata.http2);
 
         let http_client = Arc::new(match self.http_client {
             Some(client) => LazyHttpClient::ready(client),

@@ -459,6 +459,26 @@ pub(crate) const TYPES: &[Item] = &[
         blank_before: true,
     },
     Item::Record {
+        name: "score-answer",
+        doc: &[
+            " A scorer's answer: one score per candidate, and the tie band on the",
+            " scores' 0 to 1 scale. Rows within this band of the best score tie.",
+            " The host uses its default band where the guest sends none.",
+        ],
+        fields: &[
+            Field {
+                name: "scores",
+                ty: "list<f32>",
+            },
+            Field {
+                name: "tie-band",
+                ty: "option<f32>",
+            },
+        ],
+        inline: true,
+        blank_before: true,
+    },
+    Item::Record {
         name: "lease",
         doc: &[
             " The record of one issued decision, or of one side of a pair decision. The",
@@ -652,8 +672,8 @@ pub(crate) const TYPES: &[Item] = &[
             " aggregated over every gateway (it stands while any gateway holds one, the",
             " microseconds are the longest remaining, 0 only when none remains). The",
             " deciding gateway's own veto is applied before any stage runs: in that",
-            " gateway's candidate rows alone the worker reads breaker-open (a breaker",
-            " veto) or stalled (a liveness veto).",
+            " gateway's candidate rows alone the worker reads stalled, and",
+            " breaker-open too under a breaker veto.",
         ],
         cases: &[
             "load(tuple<u64, u16, load>)",

@@ -186,7 +186,8 @@ mod held {
             ..BindingSpec::default()
         }];
         let digest = document.digest().expect("a digest");
-        AppliedSpec::validate_digested(&document, digest, &catalog).expect("the document validates")
+        AppliedSpec::validate_digested(&document, digest, &catalog, &[])
+            .expect("the document validates")
     }
 
     /// The worker a decision keyed `key` goes to at this instant; its view

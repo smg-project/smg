@@ -6,7 +6,9 @@
 //! feed before any request exists.
 //!
 //! The document has an `apiVersion` and no `kind`: its forms are a file and
-//! the API. An unknown field is refused by name, never ignored. A field this
+//! the API. An unknown field is refused by name, never ignored. The one
+//! exception is the parameters of a scorer a host registers, which its
+//! factory's own type reads ([`crate::StageBuild::params`]). A field this
 //! build cannot honour yet (a stage, a plan, a matcher or a binding rule of a
 //! later step) is checked in shape like every other field and then refused
 //! by name as not in this build, so a document written against the published
@@ -21,13 +23,13 @@ use std::{
     collections::{btree_map, BTreeMap, BTreeSet},
     fmt, io,
     marker::PhantomData,
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
 };
 
 use rustc_hash::FxHashMap;
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{
-    de::{self, value::SeqAccessDeserializer, MapAccess, SeqAccess, Visitor},
+    de::{self, MapAccess, SeqAccess, Visitor},
     ser::SerializeMap,
     Deserialize, Deserializer, Serialize, Serializer,
 };
@@ -37,15 +39,18 @@ use crate::{
     affinity::{blocks_within, Gates, KvPressure, PrefixAffinity, WarmupSlice},
     bucket::Bucket,
     builtins::{
-        with_report_age, FewestSessions, LeastLoad, LeastRequests, ResidentWork, SampledBest,
-        SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS,
-        DEFAULT_THROUGHPUT,
+        with_report_age, FewestSessions, LeastCost, LeastCostSent, LeastLoad, LeastRequests,
+        ResidentWork, SampledBest, SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT,
+        DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
     },
-    catalog::{Catalog, Found},
+    catalog::{profile_sent, Catalog, Found, StageBuild},
     framework::{Binding, Engine, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted},
     ring::ConsistentHash,
+    routing_key::KeySources,
+    sent::SentCredit,
     sessions::SessionRule,
-    view::{permille, HashKind, Phase, MAX_REPORT_AGE_MS},
+    terms::Term,
+    view::{threshold_permille, HashKind, Phase, MAX_REPORT_AGE_MS},
 };
 
 pub const API_VERSION: &str = "smg.policy/v1";
@@ -65,6 +70,30 @@ pub const DENIED_HEADERS: [&str; 7] = [
 /// The most headers `view.headers` may list: a view names an allow-listed
 /// header by its position in one byte.
 pub const MAX_HEADERS: usize = 256;
+
+/// Header names no routing key source may carry: the credentials of
+/// [`DENIED_HEADERS`]. `cookie` may be a source, and stays off every
+/// allow-list: a key read from it leaves as its fingerprint alone
+/// ([`DerivedKey`](crate::DerivedKey)). A host's tenant header is refused
+/// here as there.
+pub const DENIED_KEY_HEADERS: [&str; 6] = [
+    "authorization",
+    "proxy-authorization",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+];
+
+/// The most bytes of a value a routing key source hands where its entry
+/// names no `max_bytes`: the gateway's cap on a routing key header.
+pub const KEY_BYTES: u32 = 128;
+
+/// The most bytes an entry's `max_bytes` may ask for.
+pub const MAX_KEY_BYTES: u32 = 8192;
+
+/// The most sources one `routing_key` block lists.
+pub const MAX_KEY_SOURCES: usize = 8;
 
 /// The highest `view.max_block_hashes`: the hashes a `DecideRequest` at
 /// the contract's bound of 64 KiB carries beside an id of one byte, at
@@ -95,7 +124,7 @@ pub const FILTERS: [&str; 5] = [
 
 /// The scorers of v1. Each has a parameter struct in this module; the ones
 /// this build lacks parse and are refused as not in this build.
-pub const SCORERS: [&str; 10] = [
+pub const SCORERS: &[&str] = &[
     "least-load",
     "least-requests",
     "fewest-sessions",
@@ -106,6 +135,7 @@ pub const SCORERS: [&str; 10] = [
     "bucket",
     "consistent-hash",
     "resident-work",
+    LeastCost::NAME,
 ];
 
 /// The pickers of v1; `count-first` and `power-of-two-count-first` compare
@@ -266,9 +296,12 @@ pub struct ViewSpec {
     /// at most: one frame of the Decide call carries no more.
     #[schemars(range(min = 1, max = 8190))]
     pub max_block_hashes: u32,
-    /// Maximum load report age in milliseconds. Built-in scorers use their
-    /// unreported path for a sample older than this at the decision's instant.
-    /// Omit to use reports of any age.
+    /// With this limit in milliseconds set, `least-load`, `resident-work`,
+    /// `least-cost` and the KV-pressure gates of `prefix-affinity` and
+    /// `warmup-slice` treat older reports as missing. A report exactly at
+    /// the limit still counts. Overload verdicts can still reflect older
+    /// reports, plugins interpret report age themselves, and host-registered
+    /// stages keep their own rules. Omit it to use reports of any age.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = MAX_REPORT_AGE_MS))]
     pub max_report_age_ms: Option<u64>,
@@ -714,6 +747,114 @@ pub struct ResidentWorkParams {
     pub request_tokens: u32,
 }
 
+const COST_PARAMETER_LIMIT: f64 = 1e15;
+const RELATIVE_MARGIN_LIMIT: f64 = 1e6;
+
+/// The least-cost scorer: a sum of a row's fields times their coefficients,
+/// in the document's units. Lower cost scores higher.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LeastCostParams {
+    /// The scorer's weight in the profile's combined score.
+    #[serde(default = "one")]
+    #[schemars(extend("exclusiveMinimum" = 0, "maximum" = COST_PARAMETER_LIMIT))]
+    pub weight: f32,
+    /// Field names and their coefficients. At least one field is required.
+    #[serde(deserialize_with = "keyed_once")]
+    #[schemars(extend(
+        "minProperties" = 1,
+        "propertyNames" = { "enum": Term::NAMES.map(|(name, _)| name) },
+        "additionalProperties" = {
+            "type": "number",
+            "format": "double",
+            "minimum": -COST_PARAMETER_LIMIT,
+            "maximum": COST_PARAMETER_LIMIT,
+            "not": { "const": 0 }
+        }
+    ))]
+    pub terms: BTreeMap<String, f64>,
+    /// How far above the least cost a row still ties for the top score.
+    #[serde(default)]
+    pub margin: CostMargin,
+    /// What a row costs when a named value is missing. Required for terms
+    /// that read a report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreported: Option<Unreported>,
+}
+
+/// How to cost a row that lacks a value a term reads.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(
+    rename_all = "kebab-case",
+    deny_unknown_fields,
+    from = "UnreportedEntry",
+    into = "UnreportedEntry"
+)]
+#[schemars(!from, !into)]
+#[non_exhaustive]
+pub enum Unreported {
+    /// Start at the least cost among the reported rows handed to the scorer,
+    /// or zero if none report, and add `request_cost` for each request in flight.
+    OverLeast {
+        #[schemars(extend("minimum" = 0, "maximum" = COST_PARAMETER_LIMIT))]
+        request_cost: f64,
+    },
+    /// Sum the row's available values. A missing value adds nothing.
+    MissingAsZero,
+}
+
+// Use a string or a one-key map in both document formats.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+enum UnreportedEntry {
+    MissingAsZero,
+    #[serde(untagged)]
+    OverLeast {
+        #[serde(rename = "over-least")]
+        over_least: RequestCost,
+    },
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestCost {
+    request_cost: f64,
+}
+
+impl From<UnreportedEntry> for Unreported {
+    fn from(entry: UnreportedEntry) -> Self {
+        match entry {
+            UnreportedEntry::MissingAsZero => Self::MissingAsZero,
+            UnreportedEntry::OverLeast { over_least } => Self::OverLeast {
+                request_cost: over_least.request_cost,
+            },
+        }
+    }
+}
+
+impl From<Unreported> for UnreportedEntry {
+    fn from(unreported: Unreported) -> Self {
+        match unreported {
+            Unreported::MissingAsZero => Self::MissingAsZero,
+            Unreported::OverLeast { request_cost } => Self::OverLeast {
+                over_least: RequestCost { request_cost },
+            },
+        }
+    }
+}
+
+/// The sum of the absolute and relative margins. Both default to zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct CostMargin {
+    /// In cost units.
+    #[schemars(extend("minimum" = 0, "maximum" = COST_PARAMETER_LIMIT))]
+    pub absolute: f64,
+    /// A share of the magnitude of the least cost.
+    #[schemars(extend("minimum" = 0, "maximum" = RELATIVE_MARGIN_LIMIT))]
+    pub relative: f64,
+}
+
 /// The `best` picker's parameters.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -741,6 +882,7 @@ pub struct BestWithTemperatureParams {
 /// parameter is refused by name.
 #[derive(Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ScoreStage {
     LeastLoad(LeastLoadParams),
     LeastRequests(Weight),
@@ -752,6 +894,7 @@ pub enum ScoreStage {
     Bucket(BucketParams),
     ConsistentHash(ConsistentHashParams),
     ResidentWork(ResidentWorkParams),
+    LeastCost(LeastCostParams),
 }
 
 impl ScoreStage {
@@ -768,6 +911,7 @@ impl ScoreStage {
             Self::Bucket(_) => "bucket",
             Self::ConsistentHash(_) => "consistent-hash",
             Self::ResidentWork(_) => "resident-work",
+            Self::LeastCost(_) => LeastCost::NAME,
         }
     }
 
@@ -782,12 +926,13 @@ impl ScoreStage {
             Self::Bucket(p) => p.weight,
             Self::ConsistentHash(p) => p.weight,
             Self::ResidentWork(p) => p.weight,
+            Self::LeastCost(p) => p.weight,
         }
     }
 
     /// The stage a bare name stands for, with its parameters at their
     /// defaults; `None` for a name outside the catalog or one whose
-    /// parameters have no default (`resident-work`).
+    /// parameters have no default.
     fn by_name(name: &str) -> Option<Self> {
         Some(match name {
             "least-load" => Self::LeastLoad(LeastLoadParams::default()),
@@ -811,11 +956,9 @@ impl ScoreStage {
 pub enum ScoreSpec {
     Name(String),
     Params(ScoreStage),
-    /// A name that is no built-in's, mapped to what the document wrote under
-    /// it: a scorer the catalog adds, with its weight (`{ name: { weight }
-    /// }`). Kept as read: the validator asks the catalog for the name first
-    /// and reads the keys of a name it holds. A key written twice is the
-    /// parser's refusal, as under a built-in.
+    /// A name that is no built-in's, mapped to its weight and any parameters
+    /// its factory reads. The map is kept as read so the validator can ask
+    /// the catalog for the name first. Parsing refuses a repeated key.
     Added {
         name: String,
         written: serde_json::Value,
@@ -844,13 +987,37 @@ impl From<ScoreStage> for ScoreSpec {
     }
 }
 
+/// What a document wrote under a registered scorer's name, written with
+/// the keys of every map in order: the canonical bytes, and so the digest,
+/// are the same whatever order a file wrote the keys in. The validator
+/// hands a factory its parameters in that order too.
+struct Ordered<'a>(&'a serde_json::Value);
+
+impl Serialize for Ordered<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            serde_json::Value::Object(written) => {
+                let mut keys: Vec<&String> = written.keys().collect();
+                keys.sort_unstable();
+                let mut map = serializer.serialize_map(Some(keys.len()))?;
+                for key in keys {
+                    map.serialize_entry(key, &Ordered(&written[key.as_str()]))?;
+                }
+                map.end()
+            }
+            serde_json::Value::Array(values) => serializer.collect_seq(values.iter().map(Ordered)),
+            value => value.serialize(serializer),
+        }
+    }
+}
+
 impl Serialize for ScoreSpec {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let stage = match self {
             Self::Name(name) => return serializer.serialize_str(name),
             Self::Added { name, written } => {
                 let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry(name, written)?;
+                map.serialize_entry(name, &Ordered(written))?;
                 return map.end();
             }
             Self::Params(stage) => stage,
@@ -871,6 +1038,7 @@ impl Serialize for ScoreSpec {
             ScoreStage::Bucket(p) => map.serialize_entry(stage.name(), p)?,
             ScoreStage::ConsistentHash(p) => map.serialize_entry(stage.name(), p)?,
             ScoreStage::ResidentWork(p) => map.serialize_entry(stage.name(), p)?,
+            ScoreStage::LeastCost(p) => map.serialize_entry(stage.name(), p)?,
         }
         map.end()
     }
@@ -896,6 +1064,7 @@ fn scorer_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<ScoreSpec, A::Erro
         "bucket" => ScoreStage::Bucket(map.next_value()?),
         "consistent-hash" => ScoreStage::ConsistentHash(map.next_value()?),
         "resident-work" => ScoreStage::ResidentWork(map.next_value()?),
+        LeastCost::NAME => ScoreStage::LeastCost(map.next_value()?),
         _ => {
             let Written(written) = map.next_value()?;
             return single_key(map, ScoreSpec::Added { name: key, written });
@@ -955,10 +1124,8 @@ where
 }
 
 /// What a document wrote under a scorer's name that is no built-in's, kept
-/// as read for the validator. A key written twice is refused here, in the
-/// words a built-in's parameters refuse it: the map of `serde_json` keeps
-/// the last value and says nothing. Only the entry's own keys are asked:
-/// the validator takes the weight alone, a number.
+/// as read for the validator. Read maps and lists recursively so a key
+/// written twice is refused even inside a parameter.
 struct Written(serde_json::Value);
 
 impl<'de> Deserialize<'de> for Written {
@@ -996,8 +1163,12 @@ impl<'de> Deserialize<'de> for Written {
                 Ok(Written(serde_json::Value::Null))
             }
 
-            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Written, A::Error> {
-                Deserialize::deserialize(SeqAccessDeserializer::new(seq)).map(Written)
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Written, A::Error> {
+                let mut values = Vec::new();
+                while let Some(Written(value)) = seq.next_element()? {
+                    values.push(value);
+                }
+                Ok(Written(serde_json::Value::Array(values)))
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Written, A::Error> {
@@ -1006,7 +1177,8 @@ impl<'de> Deserialize<'de> for Written {
                     if keys.contains_key(&key) {
                         return Err(de::Error::custom(format_args!("duplicate field `{key}`")));
                     }
-                    keys.insert(key, map.next_value()?);
+                    let Written(value) = map.next_value()?;
+                    keys.insert(key, value);
                 }
                 Ok(Written(keys.into()))
             }
@@ -1053,7 +1225,7 @@ impl JsonSchema for ScoreSpec {
         let names: Vec<&str> = SCORERS
             .iter()
             .copied()
-            .filter(|name| *name != "resident-work")
+            .filter(|name| ScoreStage::by_name(name).is_some())
             .collect();
         json_schema!({
             "description": "A scorer: its bare name (the stage at its defaults), or the name mapped to its weight and parameters.",
@@ -1216,6 +1388,12 @@ pub struct ProfileSpec {
     pub score: Vec<ScoreSpec>,
     /// The picker.
     pub pick: PickSpec,
+    /// The number of milliseconds a send counts for. An unset limit keeps
+    /// sends from expiring by age. A profile whose stages do not read its
+    /// count of sends is refused if it sets a limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub sent_ttl_ms: Option<u32>,
 }
 
 /// A closed range with one or both bounds.
@@ -1317,11 +1495,15 @@ pub struct OverloadSpec {
     /// only scorer is `consistent-hash` with no `prefix_tokens` and no
     /// `bounded_load`, picked by `best` with no parameters, under no
     /// sessions rule or one that delegates. A rule with an in-flight cap
-    /// keeps the key only under a host that counts the key's requests,
-    /// which the controller's own service does not yet. A rule with
-    /// `inflight_cap: 65535` has no cap. Set, the key moves to the ring's
-    /// next worker; unset, the key stays on its worker over the veto.
-    /// Everywhere else a keyed request keeps the veto.
+    /// keeps the key only under a host that counts the key's requests, as
+    /// the controller's own service does. A rule with
+    /// `inflight_cap: 65535` has no cap. Set, the key moves on: under a
+    /// sessions rule to its next routable pin, and to the ring's next
+    /// worker where no pin stands or no rule does. Unset, the key stays
+    /// on its worker over the veto. Everywhere else a keyed request
+    /// keeps the veto. The word is the overload veto's alone: a worker
+    /// the liveness check doubts still takes a request no other worker
+    /// can, unless it is over its thresholds too.
     pub shed_when_all_vetoed: bool,
 }
 
@@ -1372,10 +1554,13 @@ pub enum Recovery {
 #[serde(deny_unknown_fields)]
 pub struct SessionsSpec {
     /// The header whose value is the session key; listed in `view.headers`.
+    /// Left out where the binding names its key's sources under
+    /// `routing_key`: a binding names them once.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sticky_header: String,
     /// The headers looked up in order for the key, the sticky header among
     /// them; empty means the sticky header alone. Each listed in
-    /// `view.headers`.
+    /// `view.headers`. Left out under `routing_key` too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<String>,
     /// How long an idle key stays pinned, in seconds; above zero (default
@@ -1419,6 +1604,42 @@ fn default_sweep_s() -> u32 {
 
 fn default_inflight_cap() -> u16 {
     2
+}
+
+/// Where a binding's requests take their routing key from: the sources a
+/// host reads in order, and the first that holds a value is the key. A ring
+/// places by the key and a sessions rule pins it. No value enters a view,
+/// so the list is not held to `view.headers`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingKeySpec {
+    /// The sources, read in order: one to eight, each named once.
+    #[schemars(length(min = 1, max = 8))]
+    pub sources: Vec<KeySourceSpec>,
+    /// Take the turn and retry suffixes off a key, so every turn of a
+    /// conversation shares one (`conv_t2_r1` keys as `conv`); default
+    /// false.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub strip_lineage: bool,
+}
+
+/// One source of a routing key: exactly one of `header` and `rid`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct KeySourceSpec {
+    /// A request header, lowercase. A credential header is refused, as on
+    /// `view.headers`; `cookie` is not. A key from a header `view.headers`
+    /// does not list leaves as its fingerprint alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// The request's own id, the `rid` of its body: `true` names it.
+    #[serde(skip_serializing_if = "is_default")]
+    pub rid: bool,
+    /// The most bytes of a value this source hands, 8192 at most (default
+    /// 128). A longer value is passed over and the next source is read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 8192))]
+    pub max_bytes: Option<u32>,
 }
 
 /// A second profile deciding a share of the binding's requests, the
@@ -1507,6 +1728,17 @@ impl PlanName {
     }
 }
 
+/// A second profile for a binding of one profile, or a profile per side.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+#[non_exhaustive]
+pub enum ShadowSpec {
+    /// The shadow of a binding that names one live profile.
+    Profile(String),
+    /// Shadow profiles by side. Validation currently refuses this form.
+    Sides(#[serde(deserialize_with = "keyed_once")] BTreeMap<String, String>),
+}
+
 /// A binding: the requests it matches, the profile or plan they resolve to,
 /// and the rules around the decision.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1538,13 +1770,18 @@ pub struct BindingSpec {
     /// and its decode pool is the decode phase's own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overload: Option<OverloadSpec>,
+    /// Where the binding's requests take their routing key from. Absent, a
+    /// sessions rule's own headers are the sources, and a binding with no
+    /// rule names none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_key: Option<RoutingKeySpec>,
     /// Sticky sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sessions: Option<SessionsSpec>,
-    /// A profile evaluated after the live one on the same view, never
-    /// dispatched, counted as disagreement.
+    /// A second profile for comparison on the same view. Only the live
+    /// profile's decision serves the request.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub shadow: Option<String>,
+    pub shadow: Option<ShadowSpec>,
     /// A second profile deciding a share of the requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canary: Option<CanarySpec>,
@@ -1616,6 +1853,7 @@ pub struct PolicySpec {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SpecError {
     #[error("the document carries kind {0:?}: a policy spec has no kind field; its forms are a file and the API, never a custom resource")]
     Kind(String),
@@ -1685,6 +1923,9 @@ pub enum SpecError {
         value: String,
         reason: &'static str,
     },
+    /// A factory's refusal or a stage whose name differs from its registration.
+    #[error("{path}: {reason}")]
+    BadStage { path: String, reason: String },
     #[error("{path}: {what} is not in this build")]
     NotInBuild { path: String, what: &'static str },
     #[error("{path}: header {name:?} is on the deny-list")]
@@ -1758,6 +1999,7 @@ impl SpecError {
             Self::TooManyHeaders { .. } => "view.headers".to_owned(),
             Self::TooManyListed { path, .. } => (*path).to_owned(),
             Self::BadField { path, .. }
+            | Self::BadStage { path, .. }
             | Self::NotInBuild { path, .. }
             | Self::DeniedHeader { path, .. }
             | Self::HeaderNotAllowed { path, .. }
@@ -1851,6 +2093,16 @@ fn glob_ok(model: &str) -> bool {
 
 /// A lowercase header name outside the deny-lists.
 fn check_header_name(name: &str, path: String, denied: &[&str]) -> Result<(), SpecError> {
+    check_header_outside(name, path, &DENIED_HEADERS, denied)
+}
+
+/// A lowercase header name outside `stock` and the host's own `denied`.
+fn check_header_outside(
+    name: &str,
+    path: String,
+    stock: &[&str],
+    denied: &[&str],
+) -> Result<(), SpecError> {
     let token =
         |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(&b);
     if name.is_empty() || !name.bytes().all(token) {
@@ -1860,7 +2112,7 @@ fn check_header_name(name: &str, path: String, denied: &[&str]) -> Result<(), Sp
             reason: "a lowercase header name",
         });
     }
-    if DENIED_HEADERS.contains(&name) || denied.iter().any(|d| d.eq_ignore_ascii_case(name)) {
+    if stock.contains(&name) || denied.iter().any(|d| d.eq_ignore_ascii_case(name)) {
         return Err(SpecError::DeniedHeader {
             path,
             name: name.to_string(),
@@ -2101,6 +2353,7 @@ fn check_stage(stage: &ScoreStage, at: &At) -> Result<(), SpecError> {
         | ScoreStage::FewestSessions(_)
         | ScoreStage::SessionAffinity(_)
         | ScoreStage::ResidentWork(_) => Ok(()),
+        ScoreStage::LeastCost(_) => Ok(()),
         ScoreStage::PrefixAffinity(p) => {
             at.number("threshold", p.threshold, unit_interval, "between 0 and 1")?;
             at.number(
@@ -2155,6 +2408,77 @@ fn check_stage(stage: &ScoreStage, at: &At) -> Result<(), SpecError> {
             }
         }
     }
+}
+
+/// Check the cost parameters while resolving the field names into readers.
+fn least_cost_of(
+    p: &LeastCostParams,
+    sent: impl FnOnce() -> Arc<SentCredit>,
+    max_age_ms: Option<u64>,
+    at: &At,
+) -> Result<Box<dyn Scorer>, SpecError> {
+    const COST_RANGE: &str = "a finite number from 0 to 1e15";
+    if f64::from(p.weight) > COST_PARAMETER_LIMIT {
+        return Err(at.bad(
+            "weight",
+            p.weight,
+            "a finite number above zero and at most 1e15",
+        ));
+    }
+    if p.terms.is_empty() {
+        return Err(at.bad("terms", "{}", "at least one field with its coefficient"));
+    }
+    let mut terms = Vec::new();
+    for (name, &coefficient) in &p.terms {
+        let term =
+            Term::named(name).ok_or_else(|| at.bad("terms", name, "a field this build reads"))?;
+        if coefficient == 0.0
+            || !(-COST_PARAMETER_LIMIT..=COST_PARAMETER_LIMIT).contains(&coefficient)
+        {
+            return Err(at.sub("terms").bad(
+                name,
+                coefficient,
+                "a finite number other than zero, of magnitude at most 1e15",
+            ));
+        }
+        terms.push((term, coefficient));
+    }
+    if !(0.0..=COST_PARAMETER_LIMIT).contains(&p.margin.absolute) {
+        return Err(at
+            .sub("margin")
+            .bad("absolute", p.margin.absolute, COST_RANGE));
+    }
+    if !(0.0..=RELATIVE_MARGIN_LIMIT).contains(&p.margin.relative) {
+        return Err(at.sub("margin").bad(
+            "relative",
+            p.margin.relative,
+            "a finite number from 0 to 1e6",
+        ));
+    }
+    if let Some(Unreported::OverLeast { request_cost }) = p.unreported {
+        if !(0.0..=COST_PARAMETER_LIMIT).contains(&request_cost) {
+            return Err(at.sub("unreported.over-least").bad(
+                "request_cost",
+                request_cost,
+                COST_RANGE,
+            ));
+        }
+    }
+    let reads_sent = terms.iter().any(|&(term, _)| term.reads_sent());
+    let scorer = LeastCost::new(terms.into_boxed_slice(), p.margin, p.unreported);
+    if scorer.needs().loads && p.unreported.is_none() {
+        return Err(at.bad(
+            "unreported", "null",
+            "what a row with no report costs, which a term that reads a report needs: over-least or missing-as-zero",
+        ));
+    }
+    // Only a term that reads sends makes the profile's count, and the
+    // scorer that adds it.
+    Ok(if reads_sent {
+        with_report_age(LeastCostSent::new(scorer, sent()), max_age_ms)
+    } else {
+        with_report_age(scorer, max_age_ms)
+    })
 }
 
 /// A stage of this build, or the name of what the build lacks.
@@ -2259,9 +2583,16 @@ fn gates_of(p: &ProfileSpec, view: &ViewSpec) -> Gates {
 }
 
 /// The stage's scorer, with its profile's gates and the view's settings.
-fn scorer_of(stage: &ScoreStage, gates: Gates, view: &ViewSpec) -> Resolved<Box<dyn Scorer>> {
+/// `sent` hands out the profile's count of sends.
+fn scorer_of(
+    stage: &ScoreStage,
+    gates: Gates,
+    view: &ViewSpec,
+    sent: impl FnOnce() -> Arc<SentCredit>,
+    at: &At,
+) -> Result<Resolved<Box<dyn Scorer>>, SpecError> {
     let max_age = view.max_report_age_ms;
-    match stage {
+    Ok(match stage {
         ScoreStage::LeastLoad(p) => Resolved::Built(with_report_age(
             LeastLoad::new(
                 p.kv_pressure_weight.unwrap_or(DEFAULT_KV_PRESSURE_WEIGHT),
@@ -2305,7 +2636,8 @@ fn scorer_of(stage: &ScoreStage, gates: Gates, view: &ViewSpec) -> Resolved<Box<
             ResidentWork::new(p.request_tokens),
             max_age,
         )),
-    }
+        ScoreStage::LeastCost(p) => Resolved::Built(least_cost_of(p, sent, max_age, at)?),
+    })
 }
 
 fn picker_of(
@@ -2372,6 +2704,8 @@ fn scored(
     profile: &str,
     at: &At,
     catalog: &Catalog,
+    sent_ttl_ms: Option<u32>,
+    sent: &mut Option<Arc<SentCredit>>,
 ) -> Result<Scored, SpecError> {
     let name = entry.name();
     let Some(found) = catalog.find_scorer(name) else {
@@ -2384,11 +2718,16 @@ fn scored(
         (ScoreSpec::Params(stage), _) => Ok(Scored::Typed(stage.clone())),
         (ScoreSpec::Name(_), Found::Typed) => match ScoreStage::by_name(name) {
             Some(stage) => Ok(Scored::Typed(stage)),
-            // The one scorer whose parameters have no default.
             None => Err(SpecError::BadField {
                 path: at.0.clone(),
                 value: name.to_string(),
-                reason: "a scorer with its request_tokens: { resident-work: { request_tokens } }",
+                reason: match name {
+                    "resident-work" => {
+                        "a scorer with its request_tokens: { resident-work: { request_tokens } }"
+                    }
+                    LeastCost::NAME => "a scorer with its terms: { least-cost: { terms } }",
+                    _ => "a scorer with its required parameters",
+                },
             }),
         },
         (ScoreSpec::Name(_), Found::Built(scorer)) => Ok(Scored::Built(Weighted {
@@ -2399,6 +2738,35 @@ fn scored(
             scorer,
             weight: added_weight(written, &at.sub(name))?,
         })),
+        (entry, Found::With(build)) => {
+            let at = at.sub(name);
+            let mut params = if let ScoreSpec::Added { written, .. } = entry {
+                added_parameters(written, &at)?.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            let weight = match params.shift_remove("weight") {
+                Some(value) => check_added_weight(&value, &at)?,
+                None => 1.0,
+            };
+            // One order for the factory, the canonical bytes and the
+            // digest: the keys of every map in order, whatever order the
+            // document wrote them in.
+            params.sort_keys();
+            params
+                .values_mut()
+                .for_each(serde_json::Value::sort_all_objects);
+            let mut context = StageBuild::new(&params, profile, sent_ttl_ms, sent);
+            let scorer = build(&mut context).map_err(|error| error.at(&at.0))?;
+            let answers = scorer.name();
+            if answers != name {
+                return Err(SpecError::BadStage {
+                    path: at.0,
+                    reason: format!("scorer registered as {name:?} answers the name {answers:?}"),
+                });
+            }
+            Ok(Scored::Built(Weighted { scorer, weight }))
+        }
         // Only a document built in code: the parser reads a built-in's key
         // into its parameter struct.
         (ScoreSpec::Added { .. }, Found::Typed) => Err(SpecError::BadField {
@@ -2409,16 +2777,21 @@ fn scored(
     }
 }
 
-/// The weight a document gives a scorer added in code: `{ weight }` and no
-/// other key, each refused by name; one when the map is empty.
+fn added_parameters<'a>(
+    written: &'a serde_json::Value,
+    at: &At,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, SpecError> {
+    written.as_object().ok_or_else(|| SpecError::BadField {
+        path: at.0.clone(),
+        value: written.to_string(),
+        reason: "a map of the scorer's weight: { weight }",
+    })
+}
+
+/// The weight of a scorer whose factory takes no parameters. Any other key
+/// is refused by name. An empty map weighs one.
 fn added_weight(written: &serde_json::Value, at: &At) -> Result<f32, SpecError> {
-    let Some(keys) = written.as_object() else {
-        return Err(SpecError::BadField {
-            path: at.0.clone(),
-            value: written.to_string(),
-            reason: "a map of the scorer's weight: { weight }",
-        });
-    };
+    let keys = added_parameters(written, at)?;
     let mut weight = 1.0;
     for (key, value) in keys {
         if key != "weight" {
@@ -2428,11 +2801,16 @@ fn added_weight(written: &serde_json::Value, at: &At) -> Result<f32, SpecError> 
                 "a parameter of a scorer added in code, which takes its weight alone",
             ));
         }
-        // A number past an `f32` narrows to infinity and is refused below.
-        weight = value.as_f64().map_or(f32::NAN, |number| number as f32);
-        if !above_zero(weight) {
-            return Err(at.bad("weight", value, "a finite number above zero"));
-        }
+        weight = check_added_weight(value, at)?;
+    }
+    Ok(weight)
+}
+
+fn check_added_weight(value: &serde_json::Value, at: &At) -> Result<f32, SpecError> {
+    // A number past an `f32` narrows to infinity and is refused below.
+    let weight = value.as_f64().map_or(f32::NAN, |number| number as f32);
+    if !above_zero(weight) {
+        return Err(at.bad("weight", value, "a finite number above zero"));
     }
     Ok(weight)
 }
@@ -2495,9 +2873,11 @@ fn check_profile(
     catalog: &Catalog,
     deferred: &mut Deferred,
     depth: &mut HashDepth,
+    sent_credits: &mut Vec<Arc<SentCredit>>,
 ) -> Result<Option<(Profile, bool)>, SpecError> {
     let gates = gates_of(p, view);
     let at = At::new(format!("profiles.{name}"));
+    at.nonzero("sent_ttl_ms", p.sent_ttl_ms)?;
     let mut filters = Vec::with_capacity(p.filter.len());
     for f in &p.filter {
         filters.push(
@@ -2512,9 +2892,10 @@ fn check_profile(
     let mut scorers = Vec::with_capacity(p.score.len());
     let mut complete = true;
     let mut plain_ring = false;
+    let mut sent = None;
     for (i, entry) in p.score.iter().enumerate() {
         let entry_at = At::new(format!("{}.score[{i}]", at.0));
-        let stage = match scored(entry, name, &entry_at, catalog)? {
+        let stage = match scored(entry, name, &entry_at, catalog, p.sent_ttl_ms, &mut sent)? {
             Scored::Typed(stage) => stage,
             Scored::Built(weighted) => {
                 depth.deepen(HashDepth::of(weighted.scorer.needs()));
@@ -2541,7 +2922,8 @@ fn check_profile(
             );
             continue;
         }
-        match scorer_of(&stage, gates, view) {
+        let count = || profile_sent(&mut sent, name, p.sent_ttl_ms);
+        match scorer_of(&stage, gates, view, count, &stage_at)? {
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
                 depth.deepen(read);
@@ -2568,6 +2950,9 @@ fn check_profile(
             None
         }
     };
+    if let Some(ms) = p.sent_ttl_ms.filter(|_| sent.is_none()) {
+        return Err(at.bad("sent_ttl_ms", ms, "a limit any stage of this profile reads"));
+    }
     // The scores combine by each weight's share of the weights' sum: a sum
     // that is not finite, or whose reciprocal is not, gives shares that
     // lose the order of every row. A stage this build does not carry adds
@@ -2631,6 +3016,7 @@ fn check_profile(
     }
     Ok(match picker {
         Some(picker) if complete => {
+            sent_credits.extend(sent);
             // A filter and a picker name no depth of their own.
             let unkeyed = filters.iter().map(|filter| filter.needs());
             depth.deepen(HashDepth::of(unkeyed.fold(picker.needs(), Needs::or)));
@@ -2655,6 +3041,8 @@ struct BindingContext<'a> {
     denied: &'a [&'a str],
     /// Profile name to its position in the document's map.
     profiles: &'a BTreeMap<&'a str, u16>,
+    live_profiles: &'a BTreeSet<&'a str>,
+    scoped_stages: &'a BTreeMap<&'a str, &'static str>,
     /// The profiles whose built picker leaves the placement to a sessions
     /// rule ([`Picker::by_assignment`]), by name.
     by_assignment: &'a [&'a str],
@@ -2731,18 +3119,17 @@ fn check_matcher(
 
 /// The thresholds a binding hands its pools: its block's values, each else
 /// the default, and none when the block is switched off. A binding with no
-/// block has the default block. The usage goes to permille by the rounding
-/// a report's usage takes ([`permille`]), so one rank's usage at or above
-/// the threshold in the document's unit is never read as under it. A usage
-/// that would round to no permille is held as one: at none, every engine
-/// with a row on file would read over it.
+/// block has the default block. The usage goes to permille by the one
+/// conversion of a threshold ([`threshold_permille`]): the rounding a
+/// report's usage takes, so one rank's usage at or above the threshold in
+/// the document's unit is never read as under it, and a floor of one.
 fn overload_thresholds(block: Option<&OverloadSpec>) -> Option<OverloadThresholds> {
     let (enabled, waiting, usage) = block.map_or((true, None, None), |block| {
         (block.enabled, block.waiting_requests, block.token_usage)
     });
     enabled.then(|| OverloadThresholds {
         waiting_requests: waiting.unwrap_or(OVERLOAD_WAITING_REQUESTS),
-        kv_usage_permille: permille(f64::from(usage.unwrap_or(OVERLOAD_TOKEN_USAGE))).max(1),
+        kv_usage_permille: threshold_permille(f64::from(usage.unwrap_or(OVERLOAD_TOKEN_USAGE))),
     })
 }
 
@@ -2757,6 +3144,43 @@ fn check_overload(overload: &OverloadSpec, at: &At) -> Result<(), SpecError> {
 }
 
 fn check_sessions(
+    sessions: &SessionsSpec,
+    by_routing_key: bool,
+    cx: &BindingContext<'_>,
+    at: &At,
+) -> Result<(), SpecError> {
+    if by_routing_key {
+        // A binding names its key's sources once: under `routing_key` the
+        // rule's own spelling is refused by name.
+        for (name, written) in [
+            ("sticky_header", !sessions.sticky_header.is_empty()),
+            ("headers", !sessions.headers.is_empty()),
+        ] {
+            if written {
+                return Err(SpecError::BadSessions {
+                    index: cx.index,
+                    name,
+                    reason: "left out while the binding names routing_key",
+                });
+            }
+        }
+    } else if sessions.sticky_header.is_empty() {
+        return Err(SpecError::BadSessions {
+            index: cx.index,
+            name: "sticky_header",
+            reason: "named while the binding names no routing_key",
+        });
+    } else {
+        check_session_headers(sessions, cx, at)?;
+    }
+    at.nonzero("ttl_s", Some(sessions.ttl_s))?;
+    at.nonzero("sweep_s", Some(sessions.sweep_s))?;
+    at.nonzero("inflight_cap", Some(sessions.inflight_cap))
+}
+
+/// The headers a sessions rule names itself: each a header name on the
+/// view's allow-list, the sticky header among the listed ones.
+fn check_session_headers(
     sessions: &SessionsSpec,
     cx: &BindingContext<'_>,
     at: &At,
@@ -2791,9 +3215,56 @@ fn check_sessions(
             });
         }
     }
-    at.nonzero("ttl_s", Some(sessions.ttl_s))?;
-    at.nonzero("sweep_s", Some(sessions.sweep_s))?;
-    at.nonzero("inflight_cap", Some(sessions.inflight_cap))
+    Ok(())
+}
+
+/// A binding's routing key sources: one to eight entries, each a header
+/// outside the credential names or the request's own id, each named once,
+/// with a byte cap inside the schema's.
+fn check_routing_key(
+    block: &RoutingKeySpec,
+    cx: &BindingContext<'_>,
+    at: &At,
+) -> Result<(), SpecError> {
+    let listed = block.sources.len();
+    if listed == 0 || listed > MAX_KEY_SOURCES {
+        return Err(at.bad(
+            "sources",
+            format_args!("{listed} entries"),
+            "a list of one to eight sources",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for (i, source) in block.sources.iter().enumerate() {
+        let at = At::new(format!("{}.sources[{i}]", at.0));
+        let name = match (&source.header, source.rid) {
+            (Some(name), false) => {
+                check_header_outside(name, at.field("header"), &DENIED_KEY_HEADERS, cx.denied)?;
+                name.as_str()
+            }
+            (None, true) => "rid",
+            (written, _) => {
+                return Err(SpecError::BadField {
+                    path: at.0,
+                    value: written.as_ref().map_or("neither", |_| "both").to_string(),
+                    reason: "one of header and rid",
+                });
+            }
+        };
+        if !seen.insert((source.rid, name)) {
+            return Err(SpecError::Duplicate {
+                path: at.0,
+                name: name.to_string(),
+            });
+        }
+        at.number(
+            "max_bytes",
+            source.max_bytes,
+            |bytes| (1..=MAX_KEY_BYTES).contains(&bytes),
+            "between 1 and 8192",
+        )?;
+    }
+    Ok(())
 }
 
 fn check_canary(canary: &CanarySpec, cx: &BindingContext<'_>, at: &At) -> Result<(), SpecError> {
@@ -2822,40 +3293,101 @@ fn check_canary(canary: &CanarySpec, cx: &BindingContext<'_>, at: &At) -> Result
     }
 }
 
+/// The first stage that needs to open a decision scope, in stage order.
+fn scoped_stage(profile: &Profile) -> Option<&'static str> {
+    profile
+        .filters
+        .iter()
+        .find_map(|stage| stage.scope().map(|_| stage.name()))
+        .or_else(|| {
+            profile
+                .scorers
+                .iter()
+                .find_map(|stage| stage.scorer.scope().map(|_| stage.scorer.name()))
+        })
+        .or_else(|| profile.picker.scope().map(|_| profile.picker.name()))
+}
+
+fn resolve_shadow_profile(
+    name: &str,
+    at: At,
+    cx: &BindingContext<'_>,
+    deferred: &mut Deferred,
+) -> Result<u16, SpecError> {
+    let Some(&position) = cx.profiles.get(name) else {
+        return Err(SpecError::UnknownProfileAt {
+            path: at.0,
+            name: name.to_owned(),
+        });
+    };
+    // Stages may change their state when asked to decide. A live profile
+    // must have its own stages.
+    if cx.live_profiles.contains(name) {
+        return Err(SpecError::BadField {
+            path: at.0,
+            value: name.to_owned(),
+            reason: "a profile unused by live decisions",
+        });
+    }
+    if let Some(&stage) = cx.scoped_stages.get(name) {
+        deferred.note(at.0, stage);
+    }
+    Ok(position)
+}
+
+fn check_shadow(
+    shadow: &ShadowSpec,
+    plan: PlanName,
+    cx: &BindingContext<'_>,
+    at: &At,
+    deferred: &mut Deferred,
+) -> Result<Option<u16>, SpecError> {
+    let shadow_at = at.sub("shadow");
+    match shadow {
+        ShadowSpec::Profile(name) if plan == PlanName::Single => {
+            resolve_shadow_profile(name, shadow_at, cx, deferred).map(Some)
+        }
+        ShadowSpec::Profile(name) => {
+            Err(at.bad("shadow", name, "a map of shadow profiles by side"))
+        }
+        ShadowSpec::Sides(sides) => {
+            for (side, name) in sides {
+                if !plan.sides().contains(&side.as_str()) {
+                    return Err(shadow_at.bad(side, name, "a profile on a side of the plan"));
+                }
+                resolve_shadow_profile(name, shadow_at.sub(side), cx, deferred)?;
+            }
+            deferred.note(shadow_at.0, "a shadow map");
+            Ok(None)
+        }
+    }
+}
+
 /// The binding's rules around the decision, in shape; the ones this build
-/// does not evaluate are noted as deferred.
+/// does not evaluate are noted as deferred. Returns the shadow's position.
 fn check_binding_rules(
     b: &BindingSpec,
     cx: &BindingContext<'_>,
     at: &At,
     deferred: &mut Deferred,
-) -> Result<(), SpecError> {
+) -> Result<Option<u16>, SpecError> {
     if let Some(overload) = &b.overload {
         check_overload(overload, &at.sub("overload"))?;
     }
+    if let Some(block) = &b.routing_key {
+        check_routing_key(block, cx, &at.sub("routing_key"))?;
+    }
     if let Some(sessions) = &b.sessions {
         let at = at.sub("sessions");
-        check_sessions(sessions, cx, &at)?;
+        check_sessions(sessions, b.routing_key.is_some(), cx, &at)?;
         if sessions.issue_session_id {
             deferred.note(at.field("issue_session_id"), "issuing a session id");
         }
     }
-    if let Some(shadow) = &b.shadow {
-        if !cx.profiles.contains_key(shadow.as_str()) {
-            return Err(SpecError::UnknownProfileAt {
-                path: at.field("shadow"),
-                name: shadow.clone(),
-            });
-        }
-        let live = b
-            .profile
-            .as_deref()
-            .or_else(|| b.profiles.get("single").map(String::as_str));
-        if live == Some(shadow.as_str()) {
-            return Err(at.bad("shadow", shadow, "a profile other than the live one"));
-        }
-        deferred.note(at.field("shadow"), "the shadow binding");
-    }
+    let shadow = match &b.shadow {
+        Some(shadow) => check_shadow(shadow, b.plan.unwrap_or_default(), cx, at, deferred)?,
+        None => None,
+    };
     if let Some(canary) = &b.canary {
         check_canary(canary, cx, &at.sub("canary"))?;
         deferred.note(at.field("canary"), "the canary binding");
@@ -2869,11 +3401,15 @@ fn check_binding_rules(
             reason: "admission is reserved in v1 and stays off",
         });
     }
-    Ok(())
+    Ok(shadow)
 }
 
 /// The binding's plan and sides, resolved to profile positions.
-fn resolve_plan(b: &BindingSpec, cx: &BindingContext<'_>) -> Result<Option<Binding>, SpecError> {
+fn resolve_plan(
+    b: &BindingSpec,
+    cx: &BindingContext<'_>,
+    shadow: Option<u16>,
+) -> Result<Option<Binding>, SpecError> {
     let index = cx.index;
     let plan = b.plan.unwrap_or_default();
     for key in b.profiles.keys() {
@@ -2907,6 +3443,8 @@ fn resolve_plan(b: &BindingSpec, cx: &BindingContext<'_>) -> Result<Option<Bindi
         plan,
         profile,
         decode_profile,
+        shadow,
+        decode_shadow: None,
         sessions: None,
         overload: overload_thresholds(b.overload.as_ref()),
     };
@@ -2968,8 +3506,8 @@ fn check_binding(
 ) -> Result<Option<Binding>, SpecError> {
     let at = At::new(format!("bindings[{}]", cx.index));
     check_matcher(&b.matcher, cx, &at, deferred)?;
-    check_binding_rules(b, cx, &at, deferred)?;
-    let mut built = resolve_plan(b, cx)?;
+    let shadow = check_binding_rules(b, cx, &at, deferred)?;
+    let mut built = resolve_plan(b, cx, shadow)?;
     // A picker that leaves the placement to a sessions rule, and a rule runs
     // under the single plan alone: on a side of a pair or of `epd` nothing
     // would place its requests. The built picker answers, as it answers the
@@ -3110,27 +3648,32 @@ impl PolicySpec {
                 filter: standard_filters(),
                 score: vec![],
                 pick: "random".into(),
+                sent_ttl_ms: None,
             },
             "round_robin" => ProfileSpec {
                 filter: standard_filters(),
                 score: vec![],
                 pick: "round-robin".into(),
+                sent_ttl_ms: None,
             },
             "passthrough" => ProfileSpec {
                 filter: standard_filters(),
                 score: vec![],
                 pick: "passthrough".into(),
+                sent_ttl_ms: None,
             },
             // The expected-wait form: two draws compared by least-load.
             "power_of_two" => ProfileSpec {
                 filter: standard_filters(),
                 score: vec!["least-load".into()],
                 pick: "power-of-two".into(),
+                sent_ttl_ms: None,
             },
             "least_load" => ProfileSpec {
                 filter: standard_filters(),
                 score: vec!["least-load".into()],
                 pick: "best".into(),
+                sent_ttl_ms: None,
             },
             // The ring owner of the decision's key (an encode item's content
             // hash, a request's routing key), the ring's next members as the
@@ -3139,6 +3682,7 @@ impl PolicySpec {
                 filter: standard_filters(),
                 score: vec!["consistent-hash".into()],
                 pick: "best".into(),
+                sent_ttl_ms: None,
             },
             // The ring owner of the request's key: its routing key, else its
             // prefix at 256 tokens. An owner past the bounded-load rule is
@@ -3164,6 +3708,7 @@ impl PolicySpec {
                     "least-requests".into(),
                 ],
                 pick: "best".into(),
+                sent_ttl_ms: None,
             },
             // Sticky sessions over a random assignment: a key stays with the
             // first worker it was placed on, no in-flight cap, the first
@@ -3175,6 +3720,7 @@ impl PolicySpec {
                 filter: standard_filters(),
                 score: vec![],
                 pick: "manual".into(),
+                sent_ttl_ms: None,
             },
             // Affinity first, the expected wait within the group: the slice
             // and the diversion over everything when due, the holder tiers
@@ -3200,6 +3746,7 @@ impl PolicySpec {
                 // A large pool is decided by a draw of sixteen rows and the
                 // rows the host names: its holders and its warming rows.
                 pick: PickStage::Best(BestParams { sample: 16 }).into(),
+                sent_ttl_ms: None,
             },
             // Prefill placement by request size: the worker whose range of
             // sizes holds the prompt, the least booked survivor when the
@@ -3209,6 +3756,7 @@ impl PolicySpec {
                 filter: standard_filters(),
                 score: vec!["bucket".into()],
                 pick: "best".into(),
+                sent_ttl_ms: None,
             },
             other => return Err(SpecError::UnknownPreset(other.to_string())),
         };
@@ -3363,6 +3911,9 @@ impl PolicySpec {
         // headers. The engine folds every profile's stages in.
         let mut needs = Needs::default();
         let mut profiles = Vec::with_capacity(self.profiles.len());
+        let has_shadows = self.bindings.iter().any(|binding| binding.shadow.is_some());
+        let mut scoped_stages = BTreeMap::new();
+        let mut sent_credits = Vec::new();
         // Noted by name: the built vector lines up with the document's
         // positions only once nothing is deferred.
         let mut by_assignment = Vec::new();
@@ -3377,8 +3928,14 @@ impl PolicySpec {
                 catalog,
                 &mut deferred,
                 &mut depth,
+                &mut sent_credits,
             )?;
             if let Some((built, by_key)) = built {
+                if has_shadows {
+                    if let Some(stage) = scoped_stage(&built) {
+                        scoped_stages.insert(name.as_str(), stage);
+                    }
+                }
                 if built.picker.by_assignment() {
                     by_assignment.push(name.as_str());
                 }
@@ -3400,6 +3957,17 @@ impl PolicySpec {
             positions.insert(name.as_str(), position);
         }
         let mut bindings = Vec::with_capacity(self.bindings.len());
+        let mut live_profiles = BTreeSet::new();
+        if has_shadows {
+            live_profiles.extend(self.bindings.iter().flat_map(|binding| {
+                binding
+                    .profile
+                    .iter()
+                    .chain(binding.profiles.values())
+                    .chain(binding.canary.iter().map(|canary| &canary.profile))
+                    .map(String::as_str)
+            }));
+        }
         // The built bindings whose document sheds a pool the overload veto
         // empties, by their place in `bindings`.
         let mut sheds = Vec::new();
@@ -3409,6 +3977,8 @@ impl PolicySpec {
                 view: &self.view,
                 denied: denied_headers,
                 profiles: &positions,
+                live_profiles: &live_profiles,
+                scoped_stages: &scoped_stages,
                 by_assignment: &by_assignment,
             };
             if let Some(built) = check_binding(binding, &cx, &mut needs, &mut deferred)? {
@@ -3438,12 +4008,20 @@ impl PolicySpec {
                 plan: Plan::Single,
                 profile: 0,
                 decode_profile: None,
+                shadow: None,
+                decode_shadow: None,
                 sessions: None,
                 overload: overload_thresholds(None),
             });
         }
         needs.headers |= !self.view.headers.is_empty();
         let mut engine = Engine::new(profiles, bindings, self.generation, needs);
+        // In the order of the profiles' names, as the map walks them: a
+        // later engine finds a profile's count by its name.
+        debug_assert!(sent_credits
+            .windows(2)
+            .all(|pair| pair[0].profile < pair[1].profile));
+        engine.sent_credits = sent_credits;
         engine.set_explain_sample(self.explain.sample);
         engine.limit_report_age(self.view.max_report_age_ms);
         for at in sheds {
@@ -3637,6 +4215,10 @@ pub struct AppliedSpec {
     block_size: u32,
     pairing: Pairing,
     lists: ViewLists,
+    /// Each binding's routing key sources, by the binding's place in the
+    /// document; none where a binding names none
+    /// ([`AppliedSpec::key_sources_for`]).
+    key_sources: Box<[Option<KeySources>]>,
     /// A start's document waits for the first lead of this store's
     /// replica ([`AppliedSpec::mark_document_awaited`]): set on the unbound start
     /// alone, and gone with it at the first publication.
@@ -3656,21 +4238,36 @@ impl AppliedSpec {
         document: &PolicySpec,
         denied_headers: &[&str],
     ) -> Result<Self, SpecError> {
-        let built = document.built(&STOCK, denied_headers)?;
+        Self::validate_in(document, &STOCK, denied_headers)
+    }
+
+    /// [`AppliedSpec::validate_with`] over the stages `catalog` holds,
+    /// including stages the host registers.
+    ///
+    /// The caller assigns the document's generation number.
+    /// [`MemoryStore::apply`](crate::store::MemoryStore::apply) accepts a
+    /// generation whose number is above the standing one.
+    pub fn validate_in(
+        document: &PolicySpec,
+        catalog: &Catalog,
+        denied_headers: &[&str],
+    ) -> Result<Self, SpecError> {
+        let built = document.built(catalog, denied_headers)?;
         Ok(Self::of(document, document.digest()?, built))
     }
 
     /// [`AppliedSpec::validate`] over the stages `catalog` holds, under a
-    /// digest its caller took already: the controller's door reads the
+    /// digest its caller took already: the operator door reads the
     /// document's digest against the standing one and hands it on, so an
     /// apply digests its document once.
-    #[cfg(any(test, feature = "controller"))]
+    #[cfg(any(test, feature = "operator"))]
     pub(crate) fn validate_digested(
         document: &PolicySpec,
         digest: Digest,
         catalog: &Catalog,
+        denied_headers: &[&str],
     ) -> Result<Self, SpecError> {
-        let built = document.built(catalog, &[])?;
+        let built = document.built(catalog, denied_headers)?;
         Ok(Self::of(document, digest, built))
     }
 
@@ -3685,6 +4282,11 @@ impl AppliedSpec {
             block_size: Gates::of(None, None, document.view.block_size).block_size,
             pairing: document.plans.pd_pair.pairing,
             lists: ViewLists::of(&document.view),
+            key_sources: document
+                .bindings
+                .iter()
+                .map(|binding| KeySources::of_binding(binding, &document.view))
+                .collect(),
             #[cfg(feature = "controller")]
             awaited: AtomicBool::new(false),
         }
@@ -3704,6 +4306,7 @@ impl AppliedSpec {
             block_size: Gates::default().block_size,
             pairing: Pairing::default(),
             lists: ViewLists::default(),
+            key_sources: Box::default(),
             #[cfg(feature = "controller")]
             awaited: AtomicBool::new(false),
         }
@@ -3789,6 +4392,19 @@ impl AppliedSpec {
     #[must_use]
     pub fn needs(&self) -> Needs {
         self.engine.needs()
+    }
+
+    /// The sources a request of `phase` for `model` takes its routing key
+    /// from: those of the first binding that matches it, a pair request's
+    /// by its prefill lookup. The host reads the request by them
+    /// ([`KeySources::derive`]) and hands the engine the one key
+    /// ([`RequestFacts::session_key`](crate::RequestFacts::session_key)).
+    /// `None` where no binding matches or the binding names no source: the
+    /// request carries no key.
+    #[must_use]
+    pub fn key_sources_for(&self, model: &str, phase: Phase) -> Option<&KeySources> {
+        let at = self.engine.binding_position(model, phase)?;
+        self.key_sources.get(usize::try_from(at).ok()?)?.as_ref()
     }
 
     /// The mode a store derives its pair classes under while this
@@ -3927,7 +4543,85 @@ impl ViewLists {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Candidate, Constraints, Filter, Lifecycle, RequestFacts, Targets, TieBand};
+    use crate::{
+        Candidate, Constraints, Filter, Lifecycle, PoolFacts, RequestFacts, Targets, TieBand,
+    };
+
+    #[test]
+    fn a_parameter_key_written_twice_is_refused_inside_maps_and_lists() {
+        let score_yaml = |score: &str| {
+            format!("apiVersion: {API_VERSION}\nprofiles:\n  default:\n    score: {score}\n    pick: best\n")
+        };
+        for score in [
+            "[{ queue-price: { costs: { unit: 17, unit: 31 } } }]",
+            "[{ queue-price: { costs: [[{ unit: 17, unit: 31 }]] } }]",
+        ] {
+            let error =
+                serde_yaml::from_str::<PolicySpec>(&score_yaml(score)).expect_err("duplicate key");
+            assert!(
+                error.to_string().contains("duplicate field `unit`"),
+                "{error}"
+            );
+        }
+        let json = format!(
+            r#"{{"apiVersion":"{API_VERSION}","profiles":{{"default":{{"score":[{{"queue-price":{{"costs":[{{"unit":17,"unit":31}}]}}}}],"pick":"best"}}}}}}"#
+        );
+        let error = serde_json::from_str::<PolicySpec>(&json).expect_err("duplicate key");
+        assert!(
+            error.to_string().contains("duplicate field `unit`"),
+            "{error}"
+        );
+
+        let read: PolicySpec = serde_yaml::from_str(&score_yaml(
+            "[{ queue-price: { costs: [[{ unit: 17 }]], weight: 3.5 } }]",
+        ))
+        .expect("a well-formed document");
+        let value = serde_json::to_value(&read).expect("serializes");
+        assert_eq!(
+            value["profiles"]["default"]["score"],
+            serde_json::json!([{ "queue-price": { "costs": [[{ "unit": 17 }]], "weight": 3.5 } }])
+        );
+        let again: PolicySpec = serde_json::from_value(value).expect("parses again");
+        assert_eq!(
+            read.digest().expect("digests"),
+            again.digest().expect("digests")
+        );
+    }
+
+    /// The order a file writes a registered scorer's parameter keys in is
+    /// in no digest, at any depth: two files that write one map in two
+    /// orders are one document. A value that differs is another.
+    #[test]
+    fn the_order_of_a_scorers_parameter_keys_is_in_no_digest() {
+        let document = |score: &str| -> PolicySpec {
+            serde_yaml::from_str(&format!(
+                "apiVersion: {API_VERSION}\nprofiles:\n  default:\n    score: {score}\n    pick: best\n"
+            ))
+            .expect("a well-formed document")
+        };
+        let one = document(
+            "[{ queue-price: { weight: 2, per_request: 500, costs: [{ unit: 17, flat: 3 }] } }]",
+        );
+        let other = document(
+            "[{ queue-price: { costs: [{ flat: 3, unit: 17 }], per_request: 500, weight: 2 } }]",
+        );
+        assert_eq!(
+            one.digest().expect("digests"),
+            other.digest().expect("digests"),
+            "two orders of one map"
+        );
+        assert_eq!(
+            serde_json::to_string(&one).expect("serializes"),
+            serde_json::to_string(&other).expect("serializes")
+        );
+        let moved = document(
+            "[{ queue-price: { weight: 2, per_request: 501, costs: [{ unit: 17, flat: 3 }] } }]",
+        );
+        assert_ne!(
+            one.digest().expect("digests"),
+            moved.digest().expect("digests")
+        );
+    }
 
     #[test]
     fn an_applied_generation_reads_block_hashes_as_deep_as_its_stages_do() {
@@ -3972,7 +4666,7 @@ mod tests {
         #[cfg(feature = "controller")]
         {
             let digest = keyed.digest().expect("the document digests");
-            let applied = AppliedSpec::validate_digested(&keyed, digest, &Catalog::builtin())
+            let applied = AppliedSpec::validate_digested(&keyed, digest, &Catalog::builtin(), &[])
                 .expect("the preset validates");
             assert_eq!(applied.block_hashes_read(Token, 0), 8);
         }
@@ -4140,6 +4834,264 @@ mod tests {
         doc(&format!(
             r#"{{"apiVersion":"smg.policy/v1","view":{{"headers":["x-session-id"]}},"profiles":{{"p":{{"pick":"best"}},"q":{{"pick":"random"}}}},"bindings":[{binding}]}}"#
         ))
+    }
+
+    #[test]
+    fn shadow_absent_keeps_every_preset_digest() {
+        let expected = [
+            (
+                "random",
+                "sha256:12f28a338634ac96fb8d5883f9e354341329ffb8cf23417c4b6ace700d03d3ec",
+            ),
+            (
+                "round_robin",
+                "sha256:62e5652e4940b185ed50b247c68b27c4a3f7ac43683f66b97404d449669720fc",
+            ),
+            (
+                "passthrough",
+                "sha256:3defa376775031aa71f5d87b1dd2c7dbdaf7eaf42f7f0f0616ac345cdddd6f1d",
+            ),
+            (
+                "power_of_two",
+                "sha256:4c4b153064585f5e23a4b62e1fd4cf2d6b07c0dea6340c24834260d2e4281f66",
+            ),
+            (
+                "least_load",
+                "sha256:80d7fcef3d2df7ee25aa79c1ccfa784cad0dbc91785194d48e108e660e8cda88",
+            ),
+            (
+                "consistent_hashing",
+                "sha256:9efb2b93ae8ceb8ba7468c8a611facf8c6f532e7f60f912f944cd4ca2c66bde6",
+            ),
+            (
+                "prefix_hash",
+                "sha256:f27dcbcd0d1adafc34c00bba709cad16f979a4d02c92da34e388fb1fe917e469",
+            ),
+            (
+                "manual",
+                "sha256:d12dd3db8aa8ece3fbb62bd354c3db14d97d92e57079dc191ac3546ccd04593e",
+            ),
+            (
+                "cache_aware",
+                "sha256:864958791685f8894b437e698f0bcee6ad48a81b56d248b230c93dd75b9b0513",
+            ),
+            (
+                "bucket",
+                "sha256:168a1e9a62410e6bba35226e96c40715392d7fe5e73b88cf242e2c48a0686f3c",
+            ),
+        ];
+        assert_eq!(expected.map(|(name, _)| name), PRESETS);
+        for (name, digest) in expected {
+            let spec = PolicySpec::preset(name).expect("a preset");
+            assert_eq!(
+                spec.digest().expect("a digest").to_string(),
+                digest,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_round_trips_as_a_profile_name() {
+        let spec = spec_with_binding(r#"{"profile":"p","shadow":"q"}"#);
+        let json = serde_json::to_value(&spec).expect("writes JSON");
+        assert_eq!(json["bindings"][0]["shadow"], "q");
+        assert_eq!(
+            serde_json::from_value::<PolicySpec>(json).expect("reads JSON"),
+            spec
+        );
+        let yaml = serde_yaml::to_string(&spec).expect("writes YAML");
+        assert_eq!(
+            serde_yaml::from_str::<PolicySpec>(&yaml).expect("reads YAML"),
+            spec
+        );
+        let engine = spec.validate().expect("a separate shadow profile is valid");
+        let binding = engine.binding("m", Phase::Single).expect("the binding");
+        assert_eq!(binding.shadow, Some(1));
+        assert_eq!(binding.decode_shadow, None);
+        assert_eq!(engine.profiles()[1].name, "q");
+    }
+
+    #[test]
+    fn shadow_refuses_an_unknown_profile_at_the_field() {
+        let spec = spec_with_binding(r#"{"profile":"p","shadow":"absent"}"#);
+        assert_eq!(
+            spec.validate().expect_err("the profile is absent"),
+            SpecError::UnknownProfileAt {
+                path: "bindings[0].shadow".into(),
+                name: "absent".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn shadow_refuses_a_profile_named_live_anywhere() {
+        for (bindings, name) in [
+            (r#"{"profile":"p","shadow":"p"}"#, "p"),
+            (r#"{"profiles":{"single":"p"},"shadow":"p"}"#, "p"),
+            (r#"{"profile":"p","shadow":"q"},{"profile":"q"}"#, "q"),
+            (
+                r#"{"profile":"p","shadow":"q"},{"plan":"pd-pair","profiles":{"prefill":"p","decode":"q"}}"#,
+                "q",
+            ),
+            (
+                r#"{"profile":"p","shadow":"q"},{"profile":"p","canary":{"profile":"q","percent":19}}"#,
+                "q",
+            ),
+        ] {
+            let error = spec_with_binding(bindings)
+                .validate()
+                .expect_err("the shadow is also named live");
+            assert!(
+                matches!(
+                    error,
+                    SpecError::BadField { ref path, ref value, .. }
+                        if path == "bindings[0].shadow" && value == name
+                ),
+                "{error} for {bindings}"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_on_a_pair_refuses_a_single_name_at_the_field() {
+        let spec = spec_with_binding(
+            r#"{"plan":"pd-pair","profiles":{"prefill":"p","decode":"p"},"shadow":"q"}"#,
+        );
+        let error = spec.validate().expect_err("a pair names its sides");
+        assert!(
+            matches!(
+                error,
+                SpecError::BadField { ref path, .. } if path == "bindings[0].shadow"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn shadow_map_checks_its_sides_and_names_before_deferral() {
+        let pair = |shadow: &str| {
+            spec_with_binding(&format!(
+                r#"{{"plan":"pd-pair","profiles":{{"prefill":"p","decode":"p"}},"shadow":{shadow}}}"#,
+            ))
+        };
+        assert_eq!(
+            not_in_build(&pair(r#"{"decode":"q"}"#)),
+            ("bindings[0].shadow".to_string(), "a shadow map")
+        );
+        assert_eq!(
+            bad_field(&pair(r#"{"encode":"q"}"#)),
+            "bindings[0].shadow.encode"
+        );
+        assert_eq!(
+            pair(r#"{"decode":"absent"}"#)
+                .validate()
+                .expect_err("unknown profile"),
+            SpecError::UnknownProfileAt {
+                path: "bindings[0].shadow.decode".into(),
+                name: "absent".into(),
+            }
+        );
+        assert_eq!(
+            bad_field(&pair(r#"{"decode":"p"}"#)),
+            "bindings[0].shadow.decode"
+        );
+        let doubled = r#"{"profile":"p","shadow":{"single":"q","single":"q"}}"#;
+        assert!(serde_json::from_str::<BindingSpec>(doubled).is_err());
+    }
+
+    #[test]
+    fn shadow_refuses_each_stage_that_opens_a_plugin_scope_by_name() {
+        #[derive(Debug)]
+        struct Scoped;
+
+        impl crate::DecisionScope for Scoped {
+            fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+            fn close(&self) {}
+        }
+
+        impl Lifecycle for Scoped {}
+
+        impl Filter for Scoped {
+            fn name(&self) -> &'static str {
+                "scoped-filter"
+            }
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+            fn scope(&self) -> Option<&dyn crate::DecisionScope> {
+                Some(self)
+            }
+        }
+
+        impl Scorer for Scoped {
+            fn name(&self) -> &'static str {
+                "scoped-scorer"
+            }
+            fn score(
+                &self,
+                _: &RequestFacts<'_>,
+                _: &[Candidate],
+                _: &[u32],
+                _: &mut [f32],
+            ) -> TieBand {
+                TieBand::NORMALIZED
+            }
+            fn scope(&self) -> Option<&dyn crate::DecisionScope> {
+                Some(self)
+            }
+        }
+
+        impl Picker for Scoped {
+            fn name(&self) -> &'static str {
+                "scoped-picker"
+            }
+            fn pick(
+                &self,
+                _: &RequestFacts<'_>,
+                _: &[Candidate],
+                _: &[u32],
+                _: &[f32],
+                _: TieBand,
+                _: &mut Targets,
+            ) {
+            }
+            fn scope(&self) -> Option<&dyn crate::DecisionScope> {
+                Some(self)
+            }
+        }
+
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter("scoped-filter", || Box::new(Scoped))
+            .and_then(|catalog| catalog.scorer("scoped-scorer", || Box::new(Scoped)))
+            .and_then(|catalog| catalog.picker("scoped-picker", || Box::new(Scoped)))
+            .expect("the stage names are available");
+        for (profile, name) in [
+            (
+                r#"{"filter":["scoped-filter"],"pick":"best"}"#,
+                "scoped-filter",
+            ),
+            (
+                r#"{"score":["scoped-scorer"],"pick":"best"}"#,
+                "scoped-scorer",
+            ),
+            (r#"{"pick":"scoped-picker"}"#, "scoped-picker"),
+        ] {
+            let mut spec = spec_with_binding(r#"{"profile":"p","shadow":"q"}"#);
+            spec.profiles.insert(
+                "q".into(),
+                serde_json::from_str(profile).expect("a profile"),
+            );
+            assert_eq!(
+                spec.validate_in(&catalog, &[])
+                    .expect_err("the stage needs a scope"),
+                SpecError::NotInBuild {
+                    path: "bindings[0].shadow".into(),
+                    what: name,
+                }
+            );
+        }
     }
 
     fn spec_with_view(view: &str) -> PolicySpec {
@@ -5357,6 +6309,69 @@ mod tests {
     }
 
     #[test]
+    fn least_cost_reads_the_compared_rows_whole_behind_a_rank() {
+        let spec = spec_with_score(
+            r#"{"least-cost":{"terms":{"load.running":7},"unreported":"missing-as-zero"}}"#,
+        );
+        let catalog = Catalog::builtin();
+        let entry = &spec.profiles["p"].score[0];
+        let Scored::Typed(stage) = scored(
+            entry,
+            "p",
+            &At::new("profiles.p.score[0]"),
+            &catalog,
+            None,
+            &mut None,
+        )
+        .expect("a built-in scorer") else {
+            panic!("a typed scorer");
+        };
+        let Resolved::Built(scorer) = scorer_of(
+            &stage,
+            Gates::of(None, None, None),
+            &spec.view,
+            || panic!("no term reads sends"),
+            &At::new("profiles.p.score[0].least-cost"),
+        )
+        .expect("valid parameters") else {
+            panic!("least-cost is built");
+        };
+        assert_eq!(scorer.name(), "least-cost");
+        assert!(scorer.row_wise());
+        assert!(!scorer.front_wise());
+    }
+
+    /// Only a `sent.` term makes the profile's count of sends, and a time
+    /// limit on the sends needs one where `least-cost` is the only scorer.
+    #[test]
+    fn least_cost_keeps_a_count_of_sends_only_for_a_sent_term() {
+        for (term, limit, want) in [
+            ("candidate.in_flight", None, Ok(0)),
+            ("sent.tokens", None, Ok(1)),
+            ("sent.requests", Some(43), Ok(1)),
+            (
+                "candidate.in_flight",
+                Some(43),
+                Err("profiles.p.sent_ttl_ms"),
+            ),
+        ] {
+            let mut spec =
+                spec_with_score(&format!(r#"{{"least-cost":{{"terms":{{"{term}":7}}}}}}"#));
+            spec.profiles.get_mut("p").expect("the profile").sent_ttl_ms = limit;
+            let counts = match spec.validate() {
+                Ok(engine) => Ok(engine.sent_credits.len()),
+                Err(SpecError::BadField { path, .. }) => Err(path),
+                Err(other) => panic!("{term} under {limit:?}: {other:?}"),
+            };
+            assert_eq!(
+                counts,
+                want.map_err(str::to_owned),
+                "{term} under {limit:?}"
+            );
+        }
+    }
+
+    #[test]
     fn every_catalog_scorer_parses_and_the_ones_this_build_lacks_are_refused_by_name() {
         let in_build = [
             "least-load",
@@ -5369,11 +6384,11 @@ mod tests {
             "warmup-slice",
             "bucket",
         ];
-        for name in SCORERS {
+        for &name in SCORERS {
             let bare = spec_with_score(&format!("{name:?}"));
             if in_build.contains(&name) {
                 assert!(bare.validate().is_ok(), "{name}");
-            } else if name == "resident-work" {
+            } else if matches!(name, "resident-work" | "least-cost") {
                 assert_eq!(bad_field(&bare), "profiles.p.score[0]");
             } else {
                 assert_eq!(
@@ -5883,27 +6898,16 @@ mod tests {
                 "issuing a session id"
             )
         );
-        let err = parse_error(
-            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"best"}},"bindings":[{"profile":"p","sessions":{"ttl_s":1}}]}"#,
-        );
-        assert!(err.contains("missing field `sticky_header`"), "{err}");
-
+        // A rule names its key's header, or the binding names `routing_key`.
         assert_eq!(
-            spec_with_binding(r#"{"profile":"p","shadow":"ghost"}"#)
+            spec_with_binding(r#"{"profile":"p","sessions":{"ttl_s":1}}"#)
                 .validate()
                 .err(),
-            Some(SpecError::UnknownProfileAt {
-                path: "bindings[0].shadow".into(),
-                name: "ghost".into()
+            Some(SpecError::BadSessions {
+                index: 0,
+                name: "sticky_header",
+                reason: "named while the binding names no routing_key",
             })
-        );
-        assert_eq!(
-            bad_field(&spec_with_binding(r#"{"profile":"p","shadow":"p"}"#)),
-            "bindings[0].shadow"
-        );
-        assert_eq!(
-            not_in_build(&spec_with_binding(r#"{"profile":"p","shadow":"q"}"#)),
-            ("bindings[0].shadow".to_string(), "the shadow binding")
         );
 
         assert_eq!(
@@ -5978,6 +6982,134 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+    }
+
+    /// A binding's `routing_key` block names one to eight sources, each a
+    /// header outside the credential names or the request's own id, each
+    /// once, with a byte cap inside the schema's. Beside it a sessions rule
+    /// names no header of its own.
+    #[test]
+    fn a_routing_key_block_is_checked_in_shape() {
+        let block = |block: &str| {
+            spec_with_binding(&format!(r#"{{"profile":"p","routing_key":{block}}}"#)).validate()
+        };
+        // Every form of a source, `cookie` among the headers: no value of
+        // these enters a view, so none is held to `view.headers`.
+        assert!(block(
+            r#"{"sources":[{"header":"x-smg-routing-key"},{"rid":true},{"header":"x-forwarded-for","max_bytes":8192},{"header":"cookie"}],"strip_lineage":true}"#
+        )
+        .is_ok());
+        // A header named `rid` and the request's own id are two sources.
+        assert!(block(r#"{"sources":[{"header":"rid"},{"rid":true}]}"#).is_ok());
+        let refused = |text: &str| block(text).expect_err(text).to_string();
+        let nine: Vec<String> = (0..9).map(|i| format!(r#"{{"header":"x-{i}"}}"#)).collect();
+        let nine = format!(r#"{{"sources":[{}]}}"#, nine.join(","));
+        for (text, message) in [
+            (
+                r#"{"sources":[]}"#,
+                "bindings[0].routing_key.sources = 0 entries is not a list of one to eight sources",
+            ),
+            (
+                nine.as_str(),
+                "bindings[0].routing_key.sources = 9 entries is not a list of one to eight sources",
+            ),
+            (
+                r#"{"sources":[{}]}"#,
+                "bindings[0].routing_key.sources[0] = neither is not one of header and rid",
+            ),
+            (
+                r#"{"sources":[{"header":"x-a","rid":true}]}"#,
+                "bindings[0].routing_key.sources[0] = both is not one of header and rid",
+            ),
+            (
+                r#"{"sources":[{"header":"X-A"}]}"#,
+                "bindings[0].routing_key.sources[0].header = X-A is not a lowercase header name",
+            ),
+            (
+                r#"{"sources":[{"header":"authorization"}]}"#,
+                "bindings[0].routing_key.sources[0].header: header \"authorization\" is on the deny-list",
+            ),
+            (
+                r#"{"sources":[{"header":"x-a"},{"header":"x-a"}]}"#,
+                "bindings[0].routing_key.sources[1]: \"x-a\" appears twice",
+            ),
+            (
+                r#"{"sources":[{"rid":true},{"rid":true}]}"#,
+                "bindings[0].routing_key.sources[1]: \"rid\" appears twice",
+            ),
+            (
+                r#"{"sources":[{"rid":true,"max_bytes":0}]}"#,
+                "bindings[0].routing_key.sources[0].max_bytes = 0 is not between 1 and 8192",
+            ),
+            (
+                r#"{"sources":[{"rid":true,"max_bytes":8193}]}"#,
+                "bindings[0].routing_key.sources[0].max_bytes = 8193 is not between 1 and 8192",
+            ),
+        ] {
+            assert_eq!(refused(text), message);
+        }
+        // One spelling or the other beside a sessions rule.
+        let beside = |sessions: &str| {
+            spec_with_binding(&format!(
+                r#"{{"profile":"p","routing_key":{{"sources":[{{"rid":true}}]}},"sessions":{sessions}}}"#
+            ))
+            .validate()
+            .err()
+        };
+        assert_eq!(beside(r#"{"ttl_s":600}"#), None);
+        for (sessions, name) in [
+            (r#"{"sticky_header":"x-session-id"}"#, "sticky_header"),
+            (r#"{"headers":["x-session-id"]}"#, "headers"),
+        ] {
+            assert_eq!(
+                beside(sessions),
+                Some(SpecError::BadSessions {
+                    index: 0,
+                    name,
+                    reason: "left out while the binding names routing_key",
+                })
+            );
+        }
+    }
+
+    /// The applied document answers a request's key sources from whichever
+    /// spelling its binding writes: the `routing_key` block, or a sessions
+    /// rule's own headers. A binding with neither names none.
+    #[test]
+    fn the_applied_document_answers_a_bindings_key_sources() {
+        let applied = AppliedSpec::validate(&doc(
+            r#"{"apiVersion":"smg.policy/v1","view":{"headers":["x-session-id","x-tenant-session"]},"profiles":{"p":{"pick":"best"}},"bindings":[
+                {"match":{"model":"chat/*"},"profile":"p","routing_key":{"sources":[{"header":"x-smg-routing-key"},{"rid":true},{"header":"cookie"}]}},
+                {"match":{"model":"code/*"},"profile":"p","sessions":{"sticky_header":"x-session-id","headers":["x-tenant-session","x-session-id"]}},
+                {"profile":"p"}]}"#,
+        ))
+        .expect("the document validates");
+        let read = |model: &str| {
+            applied
+                .key_sources_for(model, Phase::Single)
+                .map(|sources| (sources.headers().collect::<Vec<_>>(), sources.reads_rid()))
+        };
+        assert_eq!(
+            read("chat/a"),
+            Some((vec!["x-smg-routing-key", "cookie"], true))
+        );
+        assert_eq!(
+            read("code/a"),
+            Some((vec!["x-tenant-session", "x-session-id"], false))
+        );
+        assert_eq!(read("other"), None, "a binding with no source");
+        // A rule's own header is on the view's allow-list: its key leaves in
+        // the clear.
+        let rule = applied
+            .key_sources_for("code/a", Phase::Single)
+            .expect("the rule's headers");
+        let derived = rule
+            .derive(|name| (name == "x-session-id").then_some(&b"s-1"[..]), None)
+            .expect("a key");
+        assert_eq!(derived.key, crate::Identity::plain("s-1"));
+        assert!(AppliedSpec::unbound()
+            .key_sources_for("chat/a", Phase::Single)
+            .is_none());
     }
 
     #[test]
@@ -6077,13 +7209,14 @@ mod tests {
               ],
               "pick": { "best-with-temperature": { "temperature": 0.05 } }
             },
-            "least_load": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" }
+            "least_load": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" },
+            "spare": { "pick": "random" }
           },
           "plans": { "pd-pair": { "pairing": "lenient" } },
           "bindings": [
             { "match": { "model": "pd/*", "phase": ["prefill", "decode"], "tenant": "acme", "priority": { "max": -1 }, "header": { "name": "x-tenant-tier", "values": ["gold"] }, "prompt_tokens": { "min": 1, "max": 4096 }, "labels": ["large"] },
               "plan": "pd-pair", "profiles": { "prefill": "least_load", "decode": "least_load" } },
-            { "match": { "model": "*" }, "profile": "cache_aware", "shadow": "least_load",
+            { "match": { "model": "*" }, "profile": "cache_aware", "shadow": "spare",
               "canary": { "profile": "least_load", "percent": 5 }, "override": "allowed",
               "overload": { "enabled": true, "waiting_requests": 64, "token_usage": 0.9, "shed_when_all_vetoed": false },
               "sessions": { "sticky_header": "x-session-id", "headers": ["x-session-id"], "ttl_s": 600, "sweep_s": 120, "assignment": "delegate", "inflight_cap": 2, "issue_session_id": false },
@@ -6815,6 +7948,150 @@ mod tests {
         assert_eq!(AppliedSpec::unbound().digest(), None);
     }
 
+    #[test]
+    fn validate_in_builds_the_registered_scorer_for_a_store_decision() {
+        use crate::{store::MemoryStore, Health, PoolFacts, Scratch, WorkerId};
+
+        const SCORER: &str = "prefer-idle";
+
+        #[derive(Debug)]
+        struct PreferIdle;
+
+        impl Lifecycle for PreferIdle {}
+
+        impl Scorer for PreferIdle {
+            fn name(&self) -> &'static str {
+                SCORER
+            }
+
+            fn score(
+                &self,
+                _: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                kept: &[u32],
+                out: &mut [f32],
+            ) -> TieBand {
+                for (&index, score) in kept.iter().zip(out) {
+                    *score = if candidates[index as usize].in_flight == 0 {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                }
+                TieBand::NORMALIZED
+            }
+        }
+
+        let mut catalog = Catalog::builtin();
+        catalog
+            .scorer(SCORER, || Box::new(PreferIdle))
+            .expect("a free scorer name");
+        let mut document = spec_with_score(&format!(r#""{SCORER}""#));
+        document.generation = 43;
+        let applied = AppliedSpec::validate_in(&document, &catalog, &[])
+            .expect("the registered scorer validates");
+        let store = MemoryStore::new();
+        store.apply(applied).expect("a newer generation");
+
+        store.deciding(|world| {
+            let spec = world.spec();
+            let pool = PoolFacts {
+                pool_size: 2,
+                generation: spec.generation(),
+                ..PoolFacts::default()
+            };
+            let mut scratch = Scratch::new();
+            for idle in [0, 1] {
+                let row = |position| Candidate {
+                    position,
+                    id: WorkerId(137 + u64::from(position)),
+                    health: Health {
+                        healthy: true,
+                        ..Health::default()
+                    },
+                    in_flight: u32::from(position != idle),
+                    ..Candidate::default()
+                };
+                let decision = spec.engine().decide(
+                    &RequestFacts::default(),
+                    &pool,
+                    &[row(0), row(1)],
+                    &Constraints::default(),
+                    &mut scratch,
+                );
+                let targets = &decision.pick().expect("a pick").targets;
+                assert_eq!(targets.first().expect("a target").position, idle);
+            }
+        });
+    }
+
+    #[test]
+    fn validate_in_refuses_headers_the_host_denies() {
+        let document = spec_with_view(r#"{"headers":["x-private-context"]}"#);
+        let catalog = Catalog::builtin();
+        let denied = ["X-Private-Context"];
+        let expected = SpecError::DeniedHeader {
+            path: "view.headers[0]".into(),
+            name: "x-private-context".into(),
+        };
+        assert!(AppliedSpec::validate_in(&document, &catalog, &[]).is_ok());
+        assert_eq!(
+            AppliedSpec::validate_in(&document, &catalog, &denied).expect_err("a denied header"),
+            expected
+        );
+        assert_eq!(
+            AppliedSpec::validate_with(&document, &denied).expect_err("a denied header"),
+            expected
+        );
+    }
+
+    #[test]
+    fn validate_in_preserves_the_stock_generation_digest_and_depth() {
+        let mut document = spec_with_score(r#"{"consistent-hash":{"prefix_tokens":143}}"#);
+        document.generation = 47;
+        let catalog = Catalog::builtin();
+        let applied = AppliedSpec::validate_in(&document, &catalog, &[])
+            .expect("a stock scorer validates in the stock catalog");
+        let stock = AppliedSpec::validate_with(&document, &[]).expect("a stock scorer validates");
+        let depth = |spec: &AppliedSpec| spec.block_hashes_read(HashKind::Token, 11);
+        assert_eq!(applied.generation(), 47);
+        assert_eq!(applied.generation(), stock.generation());
+        assert_eq!(applied.digest(), Some(document.digest().expect("a digest")));
+        assert_eq!(applied.digest(), stock.digest());
+        assert_eq!(depth(&applied), 13);
+        assert_eq!(depth(&applied), depth(&stock));
+    }
+
+    #[test]
+    fn validate_in_leaves_an_unnumbered_document_at_generation_zero() {
+        use crate::store::{MemoryStore, StaleGeneration};
+
+        let document = spec_with_view("{}");
+        let catalog = Catalog::builtin();
+        let validate = |document: &PolicySpec| {
+            AppliedSpec::validate_in(document, &catalog, &[]).expect("the document validates")
+        };
+        let store = MemoryStore::new();
+        let standing = 71;
+        store
+            .apply(validate(&PolicySpec {
+                generation: standing,
+                ..document.clone()
+            }))
+            .expect("a newer generation");
+
+        let unnumbered = validate(&document);
+        assert_eq!(unnumbered.generation(), 0);
+        assert_eq!(
+            store.apply(unnumbered),
+            Err(StaleGeneration {
+                standing,
+                offered: 0,
+            })
+        );
+        assert_eq!(store.world().spec().generation(), standing);
+    }
+
     /// A digest handed on is the generation's, as given: the door's apply
     /// digests its document once.
     #[cfg(feature = "controller")]
@@ -6826,7 +8103,7 @@ mod tests {
             .digest()
             .expect("a digest");
         assert_ne!(document.digest(), Ok(handed));
-        let applied = AppliedSpec::validate_digested(&document, handed, &Catalog::builtin())
+        let applied = AppliedSpec::validate_digested(&document, handed, &Catalog::builtin(), &[])
             .expect("a preset validates");
         assert_eq!(applied.digest(), Some(handed));
     }
@@ -6840,7 +8117,7 @@ mod tests {
         let mut document = PolicySpec::preset("least_load").expect("a preset");
         document.plans.pd_pair.pairing = Pairing::Strict;
         let digest = document.digest().expect("a digest");
-        let handed = AppliedSpec::validate_digested(&document, digest, &Catalog::builtin())
+        let handed = AppliedSpec::validate_digested(&document, digest, &Catalog::builtin(), &[])
             .expect("a preset validates");
         assert_eq!(handed.pairing(), Pairing::Strict);
         let own = AppliedSpec::validate(&document).expect("a preset validates");
@@ -6900,10 +8177,14 @@ mod tests {
         let tempered = r#"{"best-with-temperature":{"temperature":1.0}}"#;
         let mut profiles: Vec<Vec<String>> = vec![
             vec![r#"{"score":[{"resident-work":{"request_tokens":512}}],"pick":"best"}"#.into()],
+            vec![
+                r#"{"score":[{"least-cost":{"terms":{"candidate.in_flight":3}}}],"pick":"best"}"#
+                    .into(),
+            ],
             vec![format!(r#"{{"score":[{bounded}],"pick":"best"}}"#)],
             vec![scored(tempered), alone(tempered)],
         ];
-        let apart = ["resident-work", "best-with-temperature"];
+        let apart = ["resident-work", "least-cost", "best-with-temperature"];
 
         for name in FILTERS {
             profiles.push(vec![format!(

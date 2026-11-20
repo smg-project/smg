@@ -26,6 +26,7 @@
 
 pub mod admin;
 pub mod app_context;
+mod cli;
 pub mod config;
 mod discovery_host;
 pub mod endpoints;
@@ -43,6 +44,28 @@ pub mod tenant;
 pub mod version;
 pub mod wasm;
 pub mod workflow;
+
+/// Runs the gateway from the process's command-line arguments.
+///
+/// The argument parser exits the process after printing help or rejecting
+/// arguments. The executable owns allocator selection and registration.
+///
+/// The call builds its own runtime and blocks its thread until the server
+/// stops, so it must not be made from async code. A call that served has
+/// closed the process's logging and tracing when it returns. A version
+/// flag and `--print-policy-spec` answer and return before either starts.
+/// A host whose process goes on after the server calls
+/// [`server::startup_with`] instead.
+pub fn main_from_args() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
+    main_with(server::Extensions::default())
+}
+
+/// [`main_from_args`] with the host's extensions.
+pub fn main_with(
+    extensions: server::Extensions,
+) -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
+    cli::main_from_args(extensions)
+}
 
 /// The lib's tests run under the allocator the executable runs under
 /// (`main.rs`), so a test can read what a path allocates on its own thread

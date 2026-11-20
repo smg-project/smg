@@ -28,9 +28,8 @@
 //!   error a provider refuses settings with.
 //! - `series` holds the metric series the providers and the reconciler
 //!   record.
-//! - `runtime` resolves configuration into the selected provider's runtime
-//!   settings, through the one conversion every input surface shares, and
-//!   starts that provider.
+//! - `runtime` checks configuration with `validation`, resolves it into the
+//!   selected provider's runtime settings, and starts that provider.
 //!
 //! Each provider is a feature of the crate (`kubernetes`, `file`, `slurm`,
 //! `consul`), and the directory watch is one of its own (`fs-watch`), which
@@ -78,6 +77,7 @@ mod slurm;
 mod snapshot;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
+mod validation;
 
 pub use config::{
     deserialize_discovery, ConsulDiscoveryConfig, DiscoveryConfig, DiscoveryConfigError,

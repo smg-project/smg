@@ -8003,6 +8003,7 @@ dependencies = [
 name = "smg-grpc-client"
 version = "1.17.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
  "h2",
@@ -8099,6 +8100,7 @@ name = "smg-policy-controller"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "axum",
  "clap",
  "criterion",
@@ -8129,6 +8131,7 @@ dependencies = [
  "sha2 0.11.0",
  "smg-grpc-client",
  "smg-policy-controller",
+ "smg-service-discovery",
  "smg-worker",
  "tempfile",
  "thiserror 2.0.21",
@@ -8145,6 +8148,7 @@ dependencies = [
  "tracing-subscriber",
  "wasmtime",
  "wat",
+ "wfaas",
  "wit-component",
  "wit-parser",
 ]

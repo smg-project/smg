@@ -6,14 +6,15 @@
 //! host's failure rules can be proven.
 //!
 //! The record guest reads the canonical ABI layout of the constructor's
-//! arguments; [`check_canonical_layout`] holds its offsets against
-//! wit-parser's own size computation, so a change to the WIT fails here by
-//! name before it fails inside the guest.
+//! arguments, and both guests write the layout of `score`'s result;
+//! [`check_canonical_layout`] holds their offsets against wit-parser's own
+//! size computation, so a change to the WIT fails here by name before it
+//! fails inside the guest.
 
 use std::path::PathBuf;
 
 use wit_component::{ComponentEncoder, StringEncoding};
-use wit_parser::{PackageId, Resolve, SizeAlign, TypeDefKind};
+use wit_parser::{Int, PackageId, Resolve, SizeAlign, Type, TypeDefKind};
 
 /// `init` modes, by the first config byte.
 pub mod mode {
@@ -122,6 +123,13 @@ pub mod mode {
     /// at that count: a word heard once, with its id and its names, ahead of
     /// its relabelling.
     pub const COUNT_LEFT: u8 = 36;
+    /// `score` answers the fixture's tie band beside its scores, and none on
+    /// a decision whose clock reads zero.
+    pub const SCORE_BAND: u8 = 38;
+    /// `score` answers a tie band that is no number.
+    pub const NAN_BAND: u8 = SCORE_BAND + 1;
+    /// `score` answers a tie band above one.
+    pub const ABOVE_ONE_BAND: u8 = NAN_BAND + 1;
     /// A second config byte: `init` asks the host's live clock once. An
     /// answer of zero lets it go on, of one makes it refuse, of two spin
     /// without end, of three trap at once.
@@ -150,8 +158,9 @@ pub mod counter {
     pub const HASHES: u32 = 6;
 }
 
-/// The canonical ABI layout the record guest reads: the constructor's
-/// arguments as one record of (request, list<candidate>, pool).
+/// The canonical ABI layout the record guest reads, the constructor's
+/// arguments as one record of (request, list<candidate>, pool), and the one
+/// both guests write, `score`'s result.
 pub mod canonical {
     /// Offset of the candidate list's pointer in the arguments.
     pub const ARGS_CANDIDATES_PTR: usize = 136;
@@ -164,6 +173,17 @@ pub mod canonical {
     pub const CANDIDATE_SIZE: usize = 120;
     /// Offset of `in-flight` within a `candidate`.
     pub const CANDIDATE_IN_FLIGHT: usize = 20;
+
+    /// Size of a `score-answer`.
+    pub const SCORE_ANSWER_SIZE: usize = 16;
+    /// Offset of `scores` within a `score-answer`: a pointer, then a length.
+    pub const SCORE_ANSWER_SCORES: usize = 0;
+    /// Offset of `tie-band` within a `score-answer`.
+    pub const SCORE_ANSWER_BAND: usize = 8;
+    /// Offset of the answer, or of the decline, within `score`'s result.
+    pub const SCORE_RESULT_PAYLOAD: usize = 4;
+    /// Offset of the band's value within `tie-band`.
+    pub const SCORE_BAND_PAYLOAD: usize = 4;
 }
 
 fn contracts_dir() -> PathBuf {
@@ -179,8 +199,8 @@ pub fn resolve() -> (Resolve, PackageId) {
     (resolve, package)
 }
 
-/// Holds the record guest's offsets against wit-parser's size computation
-/// of the committed WIT.
+/// Holds the guests' offsets against wit-parser's size computation of the
+/// committed WIT.
 pub fn check_canonical_layout() {
     let (resolve, package) = resolve();
     let mut sizes = SizeAlign::default();
@@ -206,13 +226,13 @@ pub fn check_canonical_layout() {
         .map(|(_, o)| *o)
         .expect("candidate has in-flight");
     assert_eq!(in_flight, canonical::CANDIDATE_IN_FLIGHT, "{candidate:?}");
-    let candidate_size = sizes.size(&wit_parser::Type::Id(type_named("candidate")));
+    let candidate_size = sizes.size(&Type::Id(type_named("candidate")));
     assert_eq!(
         candidate_size.size_wasm32(),
         canonical::CANDIDATE_SIZE,
         "{candidate:?}"
     );
-    let request_size = sizes.size(&wit_parser::Type::Id(type_named("request")));
+    let request_size = sizes.size(&Type::Id(type_named("request")));
     // The arguments record: request, then the list (align 4), then the pool.
     let list_at = request_size.size_wasm32().next_multiple_of(4);
     assert_eq!(list_at, canonical::ARGS_CANDIDATES_PTR);
@@ -225,6 +245,32 @@ pub fn check_canonical_layout() {
         .expect("request has block-hashes");
     // A list is a pointer, then its length.
     assert_eq!(hashes + 4, canonical::ARGS_HASHES_LEN, "{request:?}");
+
+    let score_answer = Type::Id(type_named("score-answer"));
+    let decline = Type::Id(type_named("decline"));
+    assert_eq!(
+        record_offsets("score-answer"),
+        [
+            ("scores".to_owned(), canonical::SCORE_ANSWER_SCORES),
+            ("tie-band".to_owned(), canonical::SCORE_ANSWER_BAND),
+        ]
+    );
+    assert_eq!(
+        sizes.size(&score_answer).size_wasm32(),
+        canonical::SCORE_ANSWER_SIZE
+    );
+    assert_eq!(
+        sizes
+            .payload_offset(Int::U8, [Some(&score_answer), Some(&decline)])
+            .size_wasm32(),
+        canonical::SCORE_RESULT_PAYLOAD
+    );
+    assert_eq!(
+        sizes
+            .payload_offset(Int::U8, [None, Some(&Type::F32)])
+            .size_wasm32(),
+        canonical::SCORE_BAND_PAYLOAD
+    );
 }
 
 /// Assembles `wat_text` and wraps it as a component of `world`.
@@ -233,18 +279,23 @@ pub fn component(world: &str, wat_text: &str) -> Vec<u8> {
     component_in(&resolve, package, world, wat_text)
 }
 
-/// A record guest built against the world as `smg:policy@1.0.0` named it.
-/// Its shapes are today's, so nothing but the version sets it apart from
-/// [`record_guest`]: a host that loads it reads no floor.
-pub fn older_minor_guest() -> Vec<u8> {
+/// A guest of `world` built against the world as `smg:policy@1.1.0` named
+/// it. Its shapes are today's, so nothing but the version sets it apart from
+/// today's guest of that world: a host that loads it reads no floor.
+pub fn older_minor_guest(world: &str) -> Vec<u8> {
     let committed = contracts_dir().join("smg-policy.wit");
     let text = std::fs::read_to_string(committed).expect("the committed WIT reads");
     let mut resolve = Resolve::new();
     let package = resolve
-        .push_str("smg-policy.wit", &text.replace("@1.1.0", "@1.0.0"))
+        .push_str("smg-policy.wit", &text.replace("@1.2.0", "@1.1.0"))
         .expect("the older package parses");
-    let wat_text = guest_wat(Guest::Record).replace("@1.1.0", "@1.0.0");
-    component_in(&resolve, package, "policy", &wat_text)
+    let guest = if world == "policy-packed" {
+        Guest::Packed
+    } else {
+        Guest::Record
+    };
+    let wat_text = guest_wat(guest).replace("@1.2.0", "@1.1.0");
+    component_in(&resolve, package, world, &wat_text)
 }
 
 /// Assembles `wat_text` and wraps it as a component of `world` in `package`.
@@ -271,6 +322,20 @@ pub fn record_guest() -> Vec<u8> {
 /// A guest of the packed world.
 pub fn packed_guest() -> Vec<u8> {
     component("policy-packed", &guest_wat(Guest::Packed))
+}
+
+/// Both guests with `band` as the tie band [`mode::SCORE_BAND`] answers.
+pub fn guests_with_band(band: f32) -> [(&'static str, Vec<u8>); 2] {
+    [
+        (
+            "record",
+            component("policy", &guest_wat_with_band(Guest::Record, band)),
+        ),
+        (
+            "packed",
+            component("policy-packed", &guest_wat_with_band(Guest::Packed, band)),
+        ),
+    ]
 }
 
 /// Both guests with a constructor that first tells the host, through the
@@ -325,7 +390,7 @@ pub fn wasi_importing_guest() -> Vec<u8> {
     let wasi = resolve
         .push_str("wasi-clocks.wit", wasi_text)
         .expect("the wasi package parses");
-    let extra_text = "package test:extra;\nworld with-wasi { include smg:policy/policy@1.1.0; import wasi:clocks/monotonic-clock@0.2.0; }";
+    let extra_text = "package test:extra;\nworld with-wasi { include smg:policy/policy@1.2.0; import wasi:clocks/monotonic-clock@0.2.0; }";
     let _ = (package, wasi);
     let extra = resolve
         .push_str("with-wasi.wit", extra_text)
@@ -353,14 +418,18 @@ enum Guest {
 /// export, the constructor's shape and where a candidate's in-flight count
 /// sits.
 fn guest_wat(guest: Guest) -> String {
+    guest_wat_with_band(guest, 0.25)
+}
+
+fn guest_wat_with_band(guest: Guest, band: f32) -> String {
     let (iface, row, in_flight, constructor) = match guest {
         Guest::Record => (
-            "smg:policy/plugin@1.1.0",
+            "smg:policy/plugin@1.2.0",
             canonical::CANDIDATE_SIZE,
             canonical::CANDIDATE_IN_FLIGHT,
             // One pointer to the arguments record: the list sits at +136.
             format!(
-                r#"(func (export "smg:policy/plugin@1.1.0#[constructor]decision") (param $args i32) (result i32)
+                r#"(func (export "smg:policy/plugin@1.2.0#[constructor]decision") (param $args i32) (result i32)
     (local $rep i32)
     (local.set $rep (call $alloc (i32.const 8) (i32.const 4)))
     (i32.store (local.get $rep) (i32.load offset={ptr} (local.get $args)))
@@ -372,12 +441,12 @@ fn guest_wat(guest: Guest) -> String {
             ),
         ),
         Guest::Packed => (
-            "smg:policy/plugin-packed@1.1.0",
+            "smg:policy/plugin-packed@1.2.0",
             104,
             8,
             // Seven flat params: request (ptr, len), candidates (ptr, len),
             // count, pool (ptr, len).
-            r#"(func (export "smg:policy/plugin-packed@1.1.0#[constructor]decision") (param $rptr i32) (param $rlen i32) (param $cptr i32) (param $cand_len i32) (param $count i32) (param $pptr i32) (param $plen i32) (result i32)
+            r#"(func (export "smg:policy/plugin-packed@1.2.0#[constructor]decision") (param $rptr i32) (param $rlen i32) (param $cptr i32) (param $cand_len i32) (param $count i32) (param $pptr i32) (param $plen i32) (result i32)
     (local $rep i32)
     (local.set $rep (call $alloc (i32.const 8) (i32.const 4)))
     (i32.store (local.get $rep) (local.get $cptr))
@@ -389,10 +458,10 @@ fn guest_wat(guest: Guest) -> String {
     };
     format!(
         r#"(module
-  (import "smg:policy/host@1.1.0" "counter" (func $counter (param i32 i64)))
-  (import "smg:policy/host@1.1.0" "now-micros" (func $now (result i64)))
-  (import "smg:policy/host@1.1.0" "random-u64" (func $random (result i64)))
-  (import "smg:policy/host@1.1.0" "log" (func $log (param i32 i32 i32)))
+  (import "smg:policy/host@1.2.0" "counter" (func $counter (param i32 i64)))
+  (import "smg:policy/host@1.2.0" "now-micros" (func $now (result i64)))
+  (import "smg:policy/host@1.2.0" "random-u64" (func $random (result i64)))
+  (import "smg:policy/host@1.2.0" "log" (func $log (param i32 i32 i32)))
   (import "[export]{iface}" "[resource-new]decision" (func $new (param i32) (result i32)))
   (memory (export "memory") 4)
   (table $t 1 funcref)
@@ -542,7 +611,8 @@ fn guest_wat(guest: Guest) -> String {
     (i32.store offset=8 (local.get $r) (local.get $n))
     (local.get $r))
 
-  ;; score() -> result<list<f32>, decline>: 1 - min(in-flight, 100) / 100.
+  ;; score() -> result<score-answer, decline>: 1 - min(in-flight, 100) / 100
+  ;; a row, and the tie band the mode asks for.
   (func (export "{iface}#[method]decision.score") (param $self i32) (result i32)
     (local $rep i32) (local $cands i32) (local $len i32) (local $r i32) (local $out i32) (local $i i32) (local $f i32)
     (local.set $rep (local.get $self))
@@ -564,11 +634,11 @@ fn guest_wat(guest: Guest) -> String {
         (loop $fill
           (memory.fill (i32.const 0) (i32.const 0) (i32.mul (memory.size) (i32.const 65536)))
           (br $fill))))
-    (local.set $r (call $alloc (i32.const 16) (i32.const 4)))
+    (local.set $r (call $alloc (i32.const {score_result_size}) (i32.const 4)))
     (if (i32.or (i32.eq (global.get $mode) (i32.const {decline_score})) (i32.eq (global.get $mode) (i32.const {log_then_decline})))
       (then
         (i32.store8 (local.get $r) (i32.const 1))
-        (i32.store8 offset=4 (local.get $r) (i32.const 0))
+        (i32.store8 offset={score_result_payload} (local.get $r) (i32.const 0))
         (return (local.get $r))))
     (local.set $out (call $alloc (i32.mul (local.get $len) (i32.const 4)) (i32.const 4)))
     (local.set $i (i32.const 0))
@@ -585,8 +655,19 @@ fn guest_wat(guest: Guest) -> String {
         (local.set $i (i32.add (local.get $i) (i32.const 1)))
         (br $next)))
     (i32.store8 (local.get $r) (i32.const 0))
-    (i32.store offset=4 (local.get $r) (local.get $out))
-    (i32.store offset=8 (local.get $r) (local.get $len))
+    (i32.store offset={score_list} (local.get $r) (local.get $out))
+    (i32.store offset={score_list_len} (local.get $r) (local.get $len))
+    (i32.store8 offset={score_option} (local.get $r) (i32.const 0))
+    (block $no_band
+      (br_if $no_band (i32.gt_u (i32.sub (global.get $mode) (i32.const {score_band})) (i32.const {band_mode_span})))
+      (if (i32.eq (global.get $mode) (i32.const {score_band}))
+        (then (br_if $no_band (i64.eqz (call $now)))))
+      (i32.store8 offset={score_option} (local.get $r) (i32.const 1))
+      (f32.store offset={score_band_value} (local.get $r)
+        (select
+          (f32.const nan)
+          (select (f32.const 1.125) (f32.const {band}) (i32.eq (global.get $mode) (i32.const {above_one_band})))
+          (i32.eq (global.get $mode) (i32.const {nan_band})))))
     (local.get $r))
 
   ;; pick(scores) -> result<option<u32>, decline>: the best score at or
@@ -728,6 +809,18 @@ fn guest_wat(guest: Guest) -> String {
         grow = mode::GROW_32_MIB,
         spin = mode::SPIN_IN_SCORE,
         nan_score = mode::NAN_SCORE,
+        score_band = mode::SCORE_BAND,
+        nan_band = mode::NAN_BAND,
+        above_one_band = mode::ABOVE_ONE_BAND,
+        band_mode_span = mode::ABOVE_ONE_BAND - mode::SCORE_BAND,
+        score_result_size = canonical::SCORE_RESULT_PAYLOAD + canonical::SCORE_ANSWER_SIZE,
+        score_result_payload = canonical::SCORE_RESULT_PAYLOAD,
+        score_list = canonical::SCORE_RESULT_PAYLOAD + canonical::SCORE_ANSWER_SCORES,
+        score_list_len = canonical::SCORE_RESULT_PAYLOAD + canonical::SCORE_ANSWER_SCORES + 4,
+        score_option = canonical::SCORE_RESULT_PAYLOAD + canonical::SCORE_ANSWER_BAND,
+        score_band_value = canonical::SCORE_RESULT_PAYLOAD
+            + canonical::SCORE_ANSWER_BAND
+            + canonical::SCORE_BAND_PAYLOAD,
         decline_score = mode::DECLINE_SCORE,
         decline_pick = mode::DECLINE_PICK,
         pick_filtered_out = mode::PICK_FILTERED_OUT,

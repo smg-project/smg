@@ -23,6 +23,12 @@ use crate::{
 /// The facts are taken apart with no rest pattern, so a fact added to the
 /// row does not build until this function and the table name it.
 pub fn object(row: &WorkerRow) -> Arc<dyn Worker> {
+    Arc::new(builder(row).build())
+}
+
+/// [`object`] before its build: what the holder builds from where its host
+/// handed it a connector, which no row holds.
+pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
     let WorkerFacts {
         key,
         engine,
@@ -46,6 +52,7 @@ pub fn object(row: &WorkerRow) -> Arc<dyn Worker> {
         signals: _,
         health,
         overload: _,
+        drain_settle_secs,
     } = &row.facts;
     let mut spec = WorkerSpec::new(key.clone());
     spec.models = models.iter().map(ModelCard::new).collect::<Vec<_>>().into();
@@ -73,12 +80,19 @@ pub fn object(row: &WorkerRow) -> Arc<dyn Worker> {
         spec.dp_rank = Some(usize::from(*dp_rank));
         spec.dp_size = Some(usize::from(*dp_size));
     }
-    Arc::new(
-        <BasicWorkerBuilder>::from_spec(spec)
-            .health_config(checks(health))
-            .status(status(row.status))
-            .build(),
-    )
+    <BasicWorkerBuilder>::from_spec(spec)
+        .health_config(checks(health, *drain_settle_secs))
+        .status(status(row.status))
+}
+
+/// The store's role for a worker object.
+pub(super) fn role(worker_type: WorkerType) -> Role {
+    match worker_type {
+        WorkerType::Regular => Role::Single,
+        WorkerType::Prefill => Role::Prefill,
+        WorkerType::Decode => Role::Decode,
+        WorkerType::Encode => Role::Encode,
+    }
 }
 
 /// The one wire an object speaks, of the set its row holds: gRPC first, then
@@ -94,16 +108,17 @@ fn wire(modes: WireModes) -> ConnectionMode {
     }
 }
 
-/// The object's health checks under the row's policy. Every other setting of
-/// the checks is the object's default.
-fn checks(policy: &HealthPolicy) -> HealthCheckConfig {
+/// The object's health checks under the row's policy, with the row's drain
+/// window where it states one: else the window is the object's default.
+fn checks(policy: &HealthPolicy, drain_settle_secs: Option<u32>) -> HealthCheckConfig {
+    let default = HealthCheckConfig::default();
     HealthCheckConfig {
         timeout_secs: seconds(policy.timeout_ms),
         check_interval_secs: seconds(policy.check_interval_ms),
         success_threshold: policy.success_threshold,
         failure_threshold: policy.failure_threshold,
         disable_health_check: !policy.probes,
-        ..HealthCheckConfig::default()
+        drain_settle_secs: drain_settle_secs.map_or(default.drain_settle_secs, u64::from),
     }
 }
 
@@ -113,7 +128,7 @@ fn seconds(milliseconds: u32) -> u64 {
     u64::from(milliseconds).div_ceil(1_000).max(1)
 }
 
-fn status(status: WorkerStatus) -> ObjectStatus {
+pub(super) fn status(status: WorkerStatus) -> ObjectStatus {
     match status {
         WorkerStatus::Pending => ObjectStatus::Pending,
         WorkerStatus::Ready => ObjectStatus::Ready,

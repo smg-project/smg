@@ -183,6 +183,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        jobs::WorkerJobAsker,
         model_card::ModelCard,
         test_support::{BasicWorkerBuilder, WorkerRegistry},
         worker::WorkerType,
@@ -215,6 +216,7 @@ mod tests {
         expected_revisions: Option<HashMap<String, Option<u64>>>,
     ) -> WorkflowContext<WorkerRemovalWorkflowData> {
         let data = WorkerRemovalWorkflowData {
+            asker: WorkerJobAsker::Api,
             config: WorkerRemovalRequest {
                 url: url.to_string(),
                 expected_revisions,
@@ -224,6 +226,7 @@ mod tests {
             affected_models: workers.iter().map(|w| w.model_id().to_string()).collect(),
             host: Some(host),
             actual_workers_to_remove: Some(workers),
+            drained_workers: Vec::new(),
             removed_workers: Vec::new(),
         };
         WorkflowContext::new(WorkflowInstanceId::new(), data)

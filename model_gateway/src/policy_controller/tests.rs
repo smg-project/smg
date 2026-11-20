@@ -1,6 +1,6 @@
 //! Cases of the store's start and of the router a server answers with.
 
-use std::{error::Error, sync::Arc};
+use std::{cell::Cell, error::Error, sync::Arc};
 
 use axum::{
     body::{to_bytes, Body},
@@ -15,12 +15,18 @@ use openai_protocol::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
+use smg_policy_controller::{
+    framework::{Scorer, TieBand},
+    lease::Lifecycle,
+    view::{Candidate, RequestFacts},
+    AppliedSpec, Catalog, CatalogError, PolicySpec, SpecError,
+};
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType};
 
-use super::{start, undecided::ROUTER_TYPE, StartError};
+use super::{refused, start, start_with, undecided::ROUTER_TYPE, StartError};
 use crate::{
     app_context::AppContext,
-    config::{ManualAssignmentMode, PolicyConfig, RouterConfig},
+    config::{ManualAssignmentMode, PolicyConfig, PolicyDocumentError, RouterConfig},
     middleware::{RouteRequestMeta, TenantKey},
     routers::{
         common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder, RouterTrait,
@@ -33,6 +39,20 @@ type Case = Result<(), Box<dyn Error>>;
 /// The refusal's code as a client reads it. A literal: the product's
 /// constant may not move it in silence.
 const BY_NAME: &str = "not_decided_by_policy_controller";
+
+#[tokio::test]
+async fn refused_names_its_shape_under_the_one_code() -> Case {
+    let answer = refused("a test request");
+    assert_eq!(answer.status(), StatusCode::NOT_IMPLEMENTED);
+    let bytes = to_bytes(answer.into_body(), 1024).await?;
+    let error: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(error["error"]["code"], BY_NAME);
+    assert_eq!(
+        error["error"]["message"],
+        "The policy controller is picked for this gateway and does not decide a test request yet"
+    );
+    Ok(())
+}
 
 /// `config` with the policy controller picked.
 fn picked(mut config: RouterConfig) -> RouterConfig {
@@ -394,6 +414,115 @@ async fn refused_whole(config: RouterConfig) -> Case {
     let mut other = not_by_name(every_route(router.as_ref(), "m").await).await;
     other.extend(not_by_name(adapter_asks(router.as_ref()).await).await);
     assert!(other.is_empty(), "not refused by name: {other:?}");
+    Ok(())
+}
+
+const SCORER: &str = "steady-score";
+
+#[derive(Debug)]
+struct SteadyScore;
+
+impl Lifecycle for SteadyScore {}
+
+impl Scorer for SteadyScore {
+    fn name(&self) -> &'static str {
+        SCORER
+    }
+
+    fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
+        out.fill(1.0);
+        TieBand(0.0)
+    }
+}
+
+fn host_stages() -> Result<Catalog, CatalogError> {
+    let mut stages = Catalog::builtin();
+    stages.scorer(SCORER, || Box::new(SteadyScore))?;
+    Ok(stages)
+}
+
+fn scorer_document(config: &RouterConfig, name: &str) -> Result<PolicySpec, PolicyDocumentError> {
+    let mut document = config.policy_document()?;
+    let profile = document
+        .profiles
+        .get_mut("random")
+        .expect("the random profile");
+    profile.score = vec![name.into()];
+    profile.pick = "best".into();
+    Ok(document)
+}
+
+#[test]
+fn the_store_starts_with_a_registered_scorer() -> Case {
+    let config = picked(RouterConfig::default());
+    let document = scorer_document(&config, SCORER)?;
+    let digest = document.digest()?;
+    let generation = document.generation;
+    let store = start_with(&config, Some(host_stages()?), |_| Ok(document))?
+        .ok_or("the controller was picked and no store started")?;
+    let world = store.world();
+    assert_eq!(world.spec().generation(), generation);
+    assert_eq!(world.spec().digest(), Some(digest));
+    Ok(())
+}
+
+#[test]
+fn the_stock_store_names_the_unknown_scorer() -> Case {
+    let config = picked(RouterConfig::default());
+    let refusal = start_with(&config, None, |config| scorer_document(config, SCORER))
+        .err()
+        .ok_or("the stock start took a scorer it does not hold")?;
+    assert!(matches!(
+        refusal,
+        StartError::Spec(SpecError::UnknownScorer { .. })
+    ));
+    assert_eq!(
+        refusal.to_string(),
+        format!("profile \"random\": unknown scorer {SCORER:?}")
+    );
+    Ok(())
+}
+
+#[test]
+fn the_classic_policies_skip_a_document_the_catalog_would_refuse() -> Case {
+    let document = |config: &RouterConfig| scorer_document(config, "unknown-score");
+    let config = RouterConfig::default();
+    assert!(matches!(
+        start_with(&picked(config.clone()), Some(host_stages()?), document),
+        Err(StartError::Spec(SpecError::UnknownScorer { .. }))
+    ));
+
+    let read = Cell::new(false);
+    let store = start_with(&config, Some(host_stages()?), |config| {
+        read.set(true);
+        document(config)
+    })?;
+    assert!(store.is_none());
+    assert!(!read.get());
+    Ok(())
+}
+
+#[test]
+fn the_gateways_tenant_header_is_denied_with_a_host_catalog() -> Case {
+    let mut config = picked(RouterConfig::default());
+    let tenant_header = "x-account-scope";
+    config.tenant_resolution.tenant_header_name = tenant_header.into();
+    let mut document = scorer_document(&config, SCORER)?;
+    document.view.headers.push(tenant_header.into());
+    let stages = host_stages()?;
+    AppliedSpec::validate_in(&document, &stages, &[])?;
+
+    let refusal = start_with(&config, Some(stages), |_| Ok(document))
+        .err()
+        .ok_or("the start took a view that reads the tenant header")?;
+    assert!(matches!(
+        refusal,
+        StartError::Spec(SpecError::DeniedHeader { .. })
+    ));
+    assert_eq!(
+        refusal.to_string(),
+        format!("view.headers[0]: header {tenant_header:?} is on the deny-list")
+    );
     Ok(())
 }
 

@@ -2129,7 +2129,7 @@ mod tests {
         assert_eq!(loads(&scorer), (vec![300, 300, 300], 900));
     }
 
-    /// A pair's decode side as its record keeps it. The lease the store
+    /// A pair's decode side as the store files it. The lease the store
     /// derives for the side names the side's own worker as the one its
     /// issue booked: a dispatch on another rank of that worker leaves the
     /// booking of the issue as it stands.

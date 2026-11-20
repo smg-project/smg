@@ -2,18 +2,20 @@
 //! side of `WatchWorkers` (design 5.2), for a host that decides against a
 //! standalone controller and keeps what it was last told.
 //!
-//! A [`Watcher`] writes one store as the watch tells it. A snapshot's rows
-//! land by one restore at its last page ([`MemoryStore::restore_from`]).
-//! Each membership and status event after it lands by the door a standby's
-//! applier uses for a row ([`MemoryStore::follow`]). Nothing is minted: a
+//! A [`Watcher`] takes a snapshot's rows at its last page
+//! ([`MemoryStore::watch_from`]). The store keeps its leases and session
+//! pins, and the workers still present keep their gateway vetoes.
+//! Each membership and status event after the snapshot lands by the door a
+//! standby's applier uses for a row ([`MemoryStore::follow`]). A
 //! row holds the controller's id and revision, and the store's epoch is
 //! the controller's. The watcher keeps the place of the last event it
-//! took, and its next stream goes on after it ([`Watcher::open`]).
+//! took, and its next stream goes on after it ([`Watcher::open`],
+//! [`Watcher::open_on`]).
 //!
 //! **One stream at a time.** A stream is followed through the watcher
 //! ([`Following`]), which borrows it: the watcher takes that stream's
 //! events and no other's, and opens its next stream only once this one is
-//! dropped. A snapshot's pages carry no number, so a page of a stream let
+//! dropped. A snapshot's pages carry no page number, so a page of a stream let
 //! go would read as a first page.
 //!
 //! **No journal.** A watch tells no load row, so the places it is told
@@ -29,14 +31,13 @@
 //! conversion refuses, at one out of its order (a page where the tail is
 //! due, a place not past the last) and at one that does not land where the
 //! store stands. The stream that told it is let go: the
-//! watcher takes nothing more of it, so no later page of it restores the
-//! store. The next stream starts from a snapshot, and what the store held
-//! stands until that snapshot's last page.
+//! watcher takes nothing more of it. The next stream starts from a
+//! snapshot. What the store held stands until that snapshot's last page.
 
-use std::{mem, sync::Arc, time::Instant};
+use std::{future::Future, mem, sync::Arc, time::Instant};
 
 use crate::{
-    client::{self, Client, Watch},
+    client::{self, Client, Link, Watch},
     controller::worker_wire::{self, Refused},
     proto::{self, worker_event::Event},
     store::{Cut, MemoryStore, Position, WorkerRow, WorkersStore},
@@ -54,9 +55,9 @@ pub enum Lost {
         /// Why it is refused.
         why: &'static str,
     },
-    /// A page of another snapshot, an event of the tail where a snapshot's
-    /// page is due or at a place not past the last, or a page or a change
-    /// of a stream that lost the place.
+    /// A page of another snapshot or at a place held, an event of the tail
+    /// where a snapshot's page is due or at a place not past the last, or
+    /// a page or a change of a stream that lost the place.
     Order,
     /// The event did not land: the store does not stand where the
     /// controller's stood before it.
@@ -90,7 +91,7 @@ enum Stands {
 pub struct Watcher {
     store: Arc<MemoryStore>,
     stands: Stands,
-    /// The snapshots restored so far.
+    /// The snapshots applied so far.
     snapshots: u64,
 }
 
@@ -108,8 +109,9 @@ pub struct Following<'w> {
 pub enum Ended {
     /// The watcher lost its place: its next stream starts from a snapshot.
     Lost(Lost),
-    /// The client's error on the stream: the watcher's place stands, and
-    /// its next stream goes on after it.
+    /// The client's error on the stream: what the watcher held stands, and
+    /// its next stream goes on after its place, or starts the snapshot
+    /// again where the stream was cut inside one.
     Client(client::Error),
 }
 
@@ -150,10 +152,11 @@ fn unread(refused: Refused) -> Lost {
 }
 
 impl Watcher {
-    /// A watcher of `store`, which a controller's watch alone writes from
-    /// here: a store with no journal. One with a journal restores a
-    /// snapshot only at a place its journal takes ([`Lost::Apart`]
-    /// otherwise), and a watch's places skip.
+    /// A watcher of `store`, whose worker rows come from the controller.
+    /// A snapshot keeps the store's leases and session pins, and gateway
+    /// vetoes for workers still present. Use a store with no journal, since
+    /// the places in a watch can skip. A journaled store takes a snapshot
+    /// only at a place its journal accepts ([`Lost::Apart`] otherwise).
     #[must_use]
     pub fn new(store: Arc<MemoryStore>) -> Self {
         Self {
@@ -179,7 +182,7 @@ impl Watcher {
         }
     }
 
-    /// The snapshots restored so far: one where the watcher never lost its
+    /// The snapshots applied so far: one where the watcher never lost its
     /// place, since a stream opened at a place that stands is told the
     /// tail alone.
     #[must_use]
@@ -196,8 +199,20 @@ impl Watcher {
     /// The client's: the open had no answer inside its bound, or the
     /// controller refused it.
     pub async fn open(&mut self, client: &mut Client) -> Result<Following<'_>, client::Error> {
-        let request = self.request();
-        let watch = client.watch_workers(request).await?;
+        self.open_with(move |request| client.watch_workers(request))
+            .await
+    }
+
+    /// Opens the watch as [`Self::open`] does, on the link's channel.
+    pub async fn open_on(&mut self, link: &Link) -> Result<Following<'_>, client::Error> {
+        self.open_with(|request| link.watch_workers(request)).await
+    }
+
+    async fn open_with<F: Future<Output = Result<Watch, client::Error>>>(
+        &mut self,
+        open: impl FnOnce(proto::WatchWorkersRequest) -> F,
+    ) -> Result<Following<'_>, client::Error> {
+        let watch = open(self.request()).await?;
         Ok(Following {
             watcher: self,
             watch,
@@ -224,7 +239,7 @@ impl Watcher {
     }
 
     /// One event of the watch, taken at `now`: a snapshot's page is kept
-    /// until its last, which restores the store, and an event of the tail
+    /// until its last, which applies the rows, and an event of the tail
     /// is written where the store stands. A generation's needs, which the
     /// watcher does not ask for, write no row.
     ///
@@ -280,8 +295,7 @@ impl Watcher {
         }
     }
 
-    /// One page of a snapshot: its rows are kept, and the last page
-    /// restores the store from them all.
+    /// Keep a snapshot's pages until the last, then apply its rows together.
     fn page(
         &mut self,
         at: Position,
@@ -289,13 +303,14 @@ impl Watcher {
         page: &proto::WorkerSnapshot,
         now: Instant,
     ) -> Result<(), Lost> {
-        // A snapshot's first page ends the place held: cut before its last
-        // page, the watcher asks for a snapshot again.
+        // A snapshot starts where the watcher stands nowhere. A page at a
+        // place held is out of its order: a stream that resumes is told
+        // the tail or the controller's word, and no page follows the tail.
         let mut staged = match mem::replace(&mut self.stands, Stands::Nowhere) {
             // Every page of one snapshot stands at its place.
             Stands::Inside(staged) if staged.at == at && staged.epoch == epoch => staged,
-            Stands::Inside(_) | Stands::LetGo => return Err(Lost::Order),
-            Stands::Nowhere | Stands::At(_) => Staged {
+            Stands::Inside(_) | Stands::At(_) | Stands::LetGo => return Err(Lost::Order),
+            Stands::Nowhere => Staged {
                 at,
                 epoch,
                 rows: Vec::new(),
@@ -316,7 +331,7 @@ impl Watcher {
             rows: staged.rows,
             loads: Vec::new(),
         };
-        if !self.store.restore_from(cut) {
+        if !self.store.watch_from(cut) {
             return Err(Lost::Apart);
         }
         self.snapshots += 1;
@@ -327,16 +342,21 @@ impl Watcher {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc, time::Instant};
+    use std::{
+        collections::BTreeMap,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use super::{Lost, Watcher};
     use crate::{
         controller::worker_wire,
+        lease::{Lease, LeaseId},
         proto::{self, worker_event::Event},
         replication::Log,
         store::{
-            Kinds, MembershipChange, MemoryStore, Position, WorkerFacts, WorkerPatch, WorkerRow,
-            WorkerStatus, WorkersStore,
+            GatewayId, Kinds, LeaseRecord, LeaseState, LeasesStore, MembershipChange, MemoryStore,
+            Picked, Position, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
         },
         view::WorkerId,
     };
@@ -527,9 +547,46 @@ mod tests {
         assert_eq!(watcher.snapshots(), 2);
     }
 
+    #[test]
+    fn a_lease_filed_between_watch_snapshots_stays_on_file() {
+        let told = Told::new();
+        let id = told.store.upsert(facts("grpc://10.0.0.1:8000", 1)).id();
+        let mut watcher = watching(&told, 8);
+        let store = Arc::clone(watcher.store());
+        let leases: &dyn LeasesStore = &*store;
+        let (gateway, now) = (GatewayId(1), Instant::now());
+        let lease = LeaseId(1);
+        leases
+            .issue(LeaseRecord {
+                lease: Lease {
+                    id: lease,
+                    ..Lease::default()
+                },
+                gateway,
+                request: 1,
+                target: id,
+                picked: Picked::default(),
+                decode: None,
+                term: 0,
+                issued_at: now,
+                dispatch_deadline: now + Duration::from_secs(1),
+                state: LeaseState::ISSUED,
+            })
+            .expect("filed");
+        assert_eq!(leases.live(gateway), 1);
+
+        let word = worker_wire::start_again(Position::default());
+        assert_eq!(watcher.take(&word, now), Err(Lost::Required));
+        assert_eq!(watcher.request().resume_seq, 0);
+        assert_eq!(watcher.take(&told.pages(8)[0], now), Ok(()));
+        assert_eq!(watcher.snapshots(), 2);
+        assert_eq!(leases.live(gateway), 1);
+        assert!(leases.get(gateway, lease).is_some());
+    }
+
     /// The controller's word, an event of the tail with no snapshot behind
-    /// it or inside one, a page of another snapshot and an event of no
-    /// known kind each lose the place.
+    /// it or inside one, a page of another snapshot or at a place held, and
+    /// an event of no known kind each lose the place.
     #[test]
     fn the_controllers_word_and_an_event_out_of_its_order_lose_the_place() {
         let mut told = Told::new();
@@ -557,6 +614,10 @@ mod tests {
             let other = worker_wire::event(Event::Snapshot(page), seq, epoch, TERM);
             assert_eq!(watcher.take(&other, now), Err(Lost::Order), "another's");
         }
+        // A page at a place held.
+        let mut watcher = watching(&told, 8);
+        let again = told.pages(8);
+        assert_eq!(watcher.take(&again[0], now), Err(Lost::Order), "held");
         // An event of a kind this build does not know.
         let mut watcher = watching(&told, 8);
         let unknown = proto::WorkerEvent {
@@ -600,9 +661,15 @@ mod tests {
             last: true,
         };
         let page = worker_wire::event(Event::Snapshot(blank), told.seq + 1, 9, TERM);
+        let mut watcher = watching(&told, 8);
+        let word = worker_wire::start_again(Position::default());
+        assert_eq!(watcher.take(&word, now), Err(Lost::Required));
+        assert_eq!(watcher.request().resume_seq, 0);
         let lost = watcher.take(&page, now);
         assert!(matches!(lost, Err(Lost::Unread { .. })), "{lost:?}");
         assert_eq!(held(watcher.store()), held(&told.store), "the rows stand");
+        let later = told.pages(8);
+        assert_eq!(watcher.take(&later[0], now), Err(Lost::Order), "let go");
 
         let mut watcher = watching(&told, 8);
         let blank = Event::Registered(proto::WorkerRow::default());
@@ -614,7 +681,7 @@ mod tests {
     }
 
     /// A stream that lost the place is let go: the pages it goes on to
-    /// tell are refused, so no part of a snapshot restores the store, and
+    /// tell are refused, so no part of a snapshot changes the store, and
     /// the stream the next request opens is taken from its first page.
     #[test]
     fn a_stream_that_lost_the_place_tells_nothing_more() {
@@ -623,7 +690,7 @@ mod tests {
             WorkersStore::upsert(&told.store, facts(&format!("grpc://10.0.0.{n}:8000"), 1));
         }
         let now = Instant::now();
-        let mut watcher = watching(&told, 8);
+        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
         WorkersStore::upsert(&told.store, facts("grpc://10.0.0.4:8000", 1));
         let before = held(watcher.store());
         let pages = told.pages(1);
@@ -640,7 +707,7 @@ mod tests {
             assert_eq!(watcher.take(page, now), Err(Lost::Order));
         }
         assert_eq!(watcher.at(), None);
-        assert_eq!(held(watcher.store()), before, "no page restored the store");
+        assert_eq!(held(watcher.store()), before, "the rows stand");
 
         assert_eq!(watcher.request().resume_seq, 0);
         for page in &pages {
@@ -649,8 +716,8 @@ mod tests {
         assert_eq!(held(watcher.store()), held(&told.store));
     }
 
-    /// A store whose journal refuses a snapshot's place restores nothing:
-    /// the watcher loses its place and the store holds what it held.
+    /// The watcher loses its place when the store's journal refuses a
+    /// snapshot. The store keeps its rows.
     #[test]
     fn a_snapshot_a_stores_journal_refuses_loses_the_place() {
         let told = Told::new();
@@ -662,7 +729,7 @@ mod tests {
         page.term = 0;
         assert_eq!(watcher.take(&page, Instant::now()), Err(Lost::Apart));
         assert_eq!(watcher.at(), None);
-        assert_eq!(held(&store).1, Vec::new(), "nothing is restored");
+        assert_eq!(held(&store).1, Vec::new(), "the store stays empty");
     }
 
     /// A watcher that followed one registration behind its snapshot, with

@@ -317,8 +317,8 @@ message RequestFacts {
 
 // What only the deciding gateway knows now. Its standing vetoes are not here:
 // the controller applies them to that gateway's candidate rows before any stage
-// runs (there alone the vetoed worker reads breaker-open for a breaker veto,
-// stalled for a liveness veto).
+// runs (there alone the vetoed worker reads stalled, and breaker-open too
+// under a breaker veto).
 message Constraints {
   // Ids this gateway just failed to connect to.
   repeated fixed64 excluded = 1 [packed = true];
@@ -476,6 +476,10 @@ enum LiftedVeto {
   LIFTED_VETO_NONE = 0;
   // Every usable worker was over its overload thresholds.
   LIFTED_VETO_OVERLOAD = 1;
+  // No worker stood until the liveness veto was lifted: the pick is of the
+  // workers the liveness check doubts. A reader built before this value
+  // reads a number it does not name.
+  LIFTED_VETO_LIVENESS = 2;
 }
 
 message FilterDrop {
@@ -635,9 +639,9 @@ message Signal {
     // while any gateway holds one, the micros are the longest remaining, 0
     // only when none remains; the veto's end instant is host-only. The
     // deciding gateway's own veto is applied before any stage runs: in that
-    // gateway's candidate rows alone the worker reads breaker-open (a breaker
-    // veto) or stalled (a liveness veto), so a plugin never needs this signal
-    // to honour it.
+    // gateway's candidate rows alone the worker reads stalled, and
+    // breaker-open too under a breaker veto, so a plugin never needs this
+    // signal to honour it.
     uint32 gateway_veto_micros = 5;
   }
 }
@@ -784,9 +788,12 @@ message Decline {
 // for and left unanswered is declined. A frame that declines a stage in
 // `decline.stage` and fills that stage's answer field is invalid: refused
 // as malformed like any other invalid frame (the decision falls back, the
-// breaker counts it), never read one way or the other. `counters` holds no
-// more increments than the hello declared counters; a longer list is
-// invalid the same way.
+// breaker counts it), never read one way or the other. When SCORE is asked
+// for, a set `tie_band` must be finite, in [0, 1], and beside `scores`.
+// A band beside a named SCORE decline or without scores makes the frame
+// malformed. The host ignores the band and scores for an unasked SCORE.
+// `counters` holds no more increments than the hello declared counters.
+// A longer list is invalid the same way.
 message PluginDecision {
   fixed64 decision_id = 1;
   Survivors survivors = 2;
@@ -795,6 +802,9 @@ message PluginDecision {
   Decline decline = 5;
   // Counter increments by declared id, applied by the controller.
   repeated CounterDelta counters = 6;
+  // The tie band on the scores' 0 to 1 scale. Rows within this band of the
+  // best score tie. The host uses its default band when the field is unset.
+  optional float tie_band = 7;
 }
 
 message CounterDelta {

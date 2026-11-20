@@ -14,6 +14,7 @@ use std::{
 use rustls::crypto::ring;
 use smg_policy_controller::proto::{
     self,
+    decline::Reason,
     policy_plugin_server::{PolicyPlugin, PolicyPluginServer},
 };
 use tokio::{
@@ -48,6 +49,8 @@ pub enum Behaviour {
     /// A score that rises with the row's in-flight count: the most loaded
     /// row scores highest, the opposite of the built-in scorer.
     ScoreMostLoaded,
+    /// Honest scores with a tie band in thousandths.
+    ScoreBand(u16),
     /// Declines these stages for this reason and answers the rest.
     Decline { stages: u32, reason: i32 },
     /// Answers with no field at all.
@@ -62,6 +65,16 @@ pub enum Behaviour {
     ScoreCount,
     /// A score that is not a number.
     ScoreNan,
+    /// A band that is not a number.
+    BandNan,
+    /// A band above one.
+    BandAboveOne,
+    /// A band below zero.
+    BandBelowZero,
+    /// A band with a named decline of the scorer.
+    BandWithScoreDecline,
+    /// A band without scores.
+    BandWithoutScores,
     /// A pick outside the plugin's own survivors.
     PickOutsideOwnSurvivors,
     /// Asked for the pick alone: a row the frame marked as dropped.
@@ -220,6 +233,7 @@ fn honest(frame: &proto::PluginDecide) -> proto::PluginDecision {
         pick: if asked & PICK != 0 { pick } else { None },
         decline: None,
         counters: Vec::new(),
+        tie_band: None,
     }
 }
 
@@ -249,6 +263,7 @@ fn answer(frame: &proto::PluginDecide, script: &Script) -> Option<proto::PluginD
                 *score = c.in_flight as f32 / most as f32;
             }
         }
+        Behaviour::ScoreBand(band) => out.tie_band = Some(f32::from(band) / 1_000.0),
         Behaviour::Decline { stages, reason } => {
             if stages & FILTER != 0 {
                 out.survivors = None;
@@ -291,6 +306,22 @@ fn answer(frame: &proto::PluginDecide, script: &Script) -> Option<proto::PluginD
                 *first = f32::NAN;
             }
         }
+        Behaviour::BandNan => out.tie_band = Some(f32::NAN),
+        Behaviour::BandAboveOne => out.tie_band = Some(1.375),
+        Behaviour::BandBelowZero => out.tie_band = Some(-0.375),
+        Behaviour::BandWithScoreDecline => {
+            out.scores.clear();
+            out.tie_band = Some(0.0625);
+            out.decline = Some(proto::Decline {
+                stage: SCORE,
+                reason: Reason::NotApplicable as i32,
+                detail: String::new(),
+            });
+        }
+        Behaviour::BandWithoutScores => {
+            out.scores.clear();
+            out.tie_band = Some(0.8125);
+        }
         Behaviour::PickOutsideOwnSurvivors => {
             out.survivors = Some(proto::Survivors { positions: vec![0] });
             out.pick = Some(1);
@@ -308,7 +339,7 @@ fn answer(frame: &proto::PluginDecide, script: &Script) -> Option<proto::PluginD
         Behaviour::DeclinedAndAnswered => {
             out.decline = Some(proto::Decline {
                 stage: FILTER,
-                reason: proto::decline::Reason::NotApplicable as i32,
+                reason: Reason::NotApplicable as i32,
                 detail: String::new(),
             });
         }

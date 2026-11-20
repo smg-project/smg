@@ -246,10 +246,12 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// however many threads share the total), toward 352 + 560 MiB with
 /// the rounding of more threads (the packed part toward twice its 352 MiB past
 /// some 680 threads, as above); the long pieces add `LONG_PIECE_BYTES_TOTAL` at
-/// most (a thread's long tier keeps its map's slots through an eviction's
-/// clear when they fit four times its share and gives them back when they
-/// do not; a share that fell below a quarter of what the tier holds, entries
-/// and empty slots together, makes it anew at the thread's next call). A
+/// most once every thread has added one under its present share, and can
+/// add more until then, see that constant (a thread's long tier keeps its map's
+/// slots through an eviction's clear when they fit four times its share and
+/// gives them back when they do not; a share that fell below a quarter of
+/// what the tier holds, entries and empty slots together, makes it anew at
+/// the thread's next call). A
 /// thread reads its share at the start of every encode call and keeps
 /// it for that call's misses (a call that was running when threads joined keeps
 /// its earlier share until it ends; the long tier reads the live share at every
@@ -259,22 +261,54 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// `THREAD_BACKING_SLOTS` slots at most, 33 bytes each, about 528 KiB per
 /// thread: more than the share's slots only once those fall under the
 /// reservation, a share under 6,144 entries, some 680 threads on this total),
-/// and holds at most its earlier share until then, or until it exits if it
-/// never encodes again: right after a join the total is the earlier share times
+/// and holds at most its earlier share until then, or while the encoder
+/// lives if it never encodes again (its exit frees nothing, the encoder owns
+/// the caches): right after a join the total is the earlier share times
 /// the threads that had it plus the new share times the rest, and settles as
 /// they encode. Before this bound the same ceilings were a sixteenth of these.
 /// All of it is freed with the encoder.
 const PIECE_CACHE_TOTAL_CAPACITY: usize = 16 * PIECE_CACHE_CAPACITY;
 /// Bytes of long pieces (each piece, its ids and their slot) a thread holds
 /// for one encoder before its long entries are cleared, at most; see
-/// `LONG_PIECE_BYTES_TOTAL`.
-const LONG_PIECE_BYTES_CAPACITY: usize = 2 << 20;
-/// Bytes of long pieces all threads together hold for one encoder, shared
-/// the way `PIECE_CACHE_TOTAL_CAPACITY` is. The long pieces of a prompt (its
-/// clauses, in a script without word spaces) are few in number and large,
-/// and each one that misses goes through the model's merges, so they are
-/// bounded by what they take rather than counted.
-const LONG_PIECE_BYTES_TOTAL: usize = 32 << 20;
+/// `LONG_PIECE_BYTES_TOTAL`. This is the cliff of a repeated document for
+/// its long pieces, as `PIECE_CACHE_CAPACITY` is for the others: a text
+/// whose long pieces fit is encoded again at the cost of their lookups, one
+/// with more merges them again on every pass, since the clear takes the
+/// pieces that recur with the rest. By this count the 33 documents of
+/// 128,000 tokens of the README's benchmark hold 2.8 to 3.0 MiB of long
+/// pieces in all and its 33 documents of 500,000 tokens 5.6 to 6.0 MiB
+/// (three byte-level vocabularies, some 14,000 and 29,000 entries of about
+/// 220 bytes), so the bound holds either set whole; at 2 MiB the tier was
+/// cleared once or twice in a pass over the first set and five or six
+/// times in a pass over the second, and a second pass merged most of the
+/// long pieces again (measured).
+/// Memory: a thread holds what the long pieces it met take, so one that
+/// meets few holds little; the count leaves out what the allocator rounds
+/// each box up by and the empty slots of the map.
+const LONG_PIECE_BYTES_CAPACITY: usize = 8 << 20;
+/// Bytes of long pieces the threads of one encoder share, the way they
+/// share `PIECE_CACHE_TOTAL_CAPACITY`: a thread's share is this total
+/// divided by the threads that have encoded with the encoder,
+/// `LONG_PIECE_BYTES_CAPACITY` at most, so sixteen threads have the full
+/// bound each and more threads a smaller share. A thread is held to its
+/// share in two places: where it adds a long piece, its long entries are
+/// cleared first when the piece would take them past the share read at
+/// that miss, and the start of a call makes anew a long tier that holds
+/// more than four times the share. Nothing reaches into another thread's
+/// cache, so the threads together are within this total only once each
+/// has added a long piece under the present share. A thread that filled a
+/// larger share and has added none since keeps what it holds, up to four
+/// times its share while it encodes and all of it while it does not, for
+/// as long as the encoder lives (a thread's exit frees nothing), and the
+/// threads together can stand above this total for that time: sixteen
+/// threads that filled 8 MiB each and a seventeenth that fills its share
+/// hold 135.5 MiB. At the worst, every thread filling its share as it
+/// joins and adding nothing after, the n-th keeps the total divided by n
+/// and the sum is 215 MiB at 32 threads, 302 MiB at 64. The long pieces
+/// of a prompt (its clauses, in a script without word spaces) are few in
+/// number and large, and each one that misses goes through the model's
+/// merges, so they are bounded by what they take rather than counted.
+const LONG_PIECE_BYTES_TOTAL: usize = 128 << 20;
 /// What an entry of the long tier takes beyond its piece and ids.
 const LONG_PIECE_ENTRY_BYTES: usize = size_of::<(Box<[u8]>, Box<[u32]>)>();
 
@@ -4226,10 +4260,13 @@ impl NativeEncoder {
     /// tier anew when it holds more than four times the long share, entries
     /// and empty slots together (see `PieceCache::remake_long`), so
     /// every thread that still encodes is within the share
-    /// from its next call on (the share is read here once and kept in the
+    /// from its next call on, its long tier within four times the long
+    /// share until it next adds a long piece (the share is read here once
+    /// and kept in the
     /// cache for the call's misses, so a call that was running when threads
     /// joined keeps the share it started with until it ends; a thread that
-    /// never encodes again holds what it had until it exits). Two relaxed
+    /// never encodes again holds what it had while the encoder lives, see
+    /// `LONG_PIECE_BYTES_TOTAL`). Two relaxed
     /// loads, two stores and five compares per call. A call that ended on
     /// a declined piece or unwound left its waiting pieces behind
     /// (`Self::waits`): they are dropped here, their holes stood in ids
