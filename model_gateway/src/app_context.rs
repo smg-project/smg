@@ -618,14 +618,14 @@ impl AppContextBuilder {
         }
 
         // Create WorkerService from the already-built components. Under a
-        // feed a local worker is a row, and a row holds no API key.
+        // feed a local worker is a row of the store.
         let worker_service = WorkerService::new(
             worker_registry.clone(),
             worker_job_queue.clone(),
             router_config.clone(),
         );
         let worker_service = Arc::new(if policy_feed.is_some() {
-            worker_service.refusing_worker_keys()
+            worker_service.with_local_workers_as_rows()
         } else {
             worker_service
         });

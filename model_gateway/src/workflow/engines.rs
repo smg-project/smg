@@ -10,7 +10,8 @@ use wfaas::{EventSubscriber, InMemoryStore, WorkflowEngine};
 use super::{
     create_mcp_registration_workflow, create_tokenizer_registration_workflow,
     create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
-    create_worker_removal_workflow, create_worker_update_workflow, steps::worker_registration_line,
+    create_worker_update_workflow,
+    steps::{worker_registration_line, worker_removal_line},
     McpWorkflowData, TokenizerWorkflowData, WasmRegistrationWorkflowData, WasmRemovalWorkflowData,
     WorkerRemovalWorkflowData, WorkerUpdateWorkflowData,
 };
@@ -84,7 +85,7 @@ impl WorkflowEngines {
         Self::with_feed(router_config, None)
     }
 
-    /// [`Self::new`], with the worker registration writing at the door of
+    /// [`Self::new`], with the two worker workflows writing at the door of
     /// `feed` where one stands: a local worker of such a gateway is a row
     /// of the policy controller's store. Every other engine is the same.
     #[expect(
@@ -98,10 +99,12 @@ impl WorkflowEngines {
             .register_workflow(worker_registration_line(router_config, feed))
             .expect("worker_registration workflow should be valid");
 
-        // Create worker removal engine
+        // Create worker removal engine. A health check's removal at the
+        // door reads the scope the health settings state.
+        let door = feed.map(|feed| (feed, router_config.unhealthy_removal_scope()));
         let worker_removal = WorkflowEngine::new();
         worker_removal
-            .register_workflow(create_worker_removal_workflow())
+            .register_workflow(worker_removal_line(door))
             .expect("worker_removal workflow should be valid");
 
         // Create worker update engine
