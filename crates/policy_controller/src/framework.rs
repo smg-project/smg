@@ -3031,6 +3031,19 @@ fn shortest_sweep(bindings: &[Binding]) -> u64 {
         .unwrap_or(0)
 }
 
+/// How long a worker that left keeps its pins in the session table
+/// ([`SessionTable::left`]): the longest TTL among the bindings' sessions
+/// rules, a rule with none counting as [`ABSENCE_MICROS`], which is the
+/// time too where no binding has a rule.
+///
+/// [`ABSENCE_MICROS`]: crate::sessions::ABSENCE_MICROS
+fn absence(bindings: &[Binding]) -> u64 {
+    let stated = crate::sessions::ABSENCE_MICROS;
+    let rules = bindings.iter().filter_map(|b| b.sessions.as_ref());
+    let longest = rules.map(|rule| rule.ttl_micros.unwrap_or(stated));
+    longest.max().unwrap_or(stated)
+}
+
 /// The stages a sessions rule places a key by when its binding's profile does
 /// not decide (every assignment but `delegate`).
 #[derive(Debug, Default)]
@@ -3564,7 +3577,8 @@ impl Engine {
                 break;
             }
         }
-        let sessions = SessionTable::new(shortest_sweep(&bindings));
+        let sessions =
+            SessionTable::new(shortest_sweep(&bindings)).with_absence(absence(&bindings));
         let orders: Vec<Order> = profiles.iter().map(Order::of).collect();
         let marks: Vec<Marks> = profiles
             .iter()
@@ -3702,6 +3716,32 @@ impl Engine {
     /// The session table: the pins of every key a sessions rule placed.
     pub fn sessions(&self) -> &SessionTable {
         &self.sessions
+    }
+
+    /// A worker that left membership stands again as `new`: its key was
+    /// registered again, and a registration makes a new id. The session
+    /// pins of `old` are `new`'s from here, so a key's recovery rules over
+    /// them as over two routable pins. A host says it behind the join's
+    /// own word ([`Membership::Added`], or [`Membership::Replaced`] where
+    /// the row never left), for a registration that is the same worker:
+    /// its role, its models and its wires.
+    pub fn pins_follow(&self, old: WorkerId, new: WorkerId) {
+        self.sessions.rename_worker(old, new);
+    }
+
+    /// A worker that left membership does not return as itself: its
+    /// session pins leave now, ahead of the absence's time. A key it owned
+    /// keeps its failover as its owner, and one with no pin left is placed
+    /// afresh.
+    pub fn pins_forget(&self, worker: WorkerId) {
+        self.sessions.forget_worker(worker);
+    }
+
+    /// How long a worker that left membership keeps its session pins, in
+    /// microseconds of the decision clock: the longest TTL among the
+    /// bindings' sessions rules, four hours where a rule has none.
+    pub fn pins_absence_micros(&self) -> u64 {
+        self.sessions.absence_micros()
     }
 
     /// This generation's sessions rules.
@@ -5601,9 +5641,19 @@ impl Lifecycle for Engine {
 
     fn on_membership(&self, change: &Membership<'_>) {
         match change {
-            Membership::Removed(worker) | Membership::Replaced { old: worker, .. } => {
-                self.sessions.forget_worker(*worker);
+            // The pins of a worker that left stand for the absence's
+            // time: its key may be registered again, and a host that
+            // knows says which way ([`Engine::pins_follow`],
+            // [`Engine::pins_forget`]).
+            Membership::Removed(worker) => self.sessions.left(*worker),
+            Membership::Replaced { old, new } => {
+                self.sessions.left(*old);
+                self.sessions.returned(*new);
             }
+            // A join under an id that left ends its absence, whoever tells
+            // it: the worker is back as it was, and its pins stand.
+            Membership::Added(worker) => self.sessions.returned(*worker),
+            Membership::Snapshot(workers) => self.sessions.returned_all(workers),
             _ => {}
         }
         for credit in &self.sent_credits {
@@ -11818,8 +11868,34 @@ mod tests {
         assert!(by(Assignment::Random) < 3);
     }
 
+    /// A join under an id that left ends its absence, whoever tells it:
+    /// the join's own word, a replacement's new id, a snapshot that lists
+    /// the worker.
     #[test]
-    fn a_removed_workers_keys_fall_to_their_failover_or_are_placed_afresh() {
+    fn a_join_under_an_id_that_left_ends_its_absence() {
+        let engine = session_engine(SESSIONS);
+        let pool = vec![candidate(0, 1), candidate(1, 4)];
+        // A key in the table: a table that holds none files no absence.
+        place_keyed(&engine, &pool, 7, 10);
+        let (a, b) = (WorkerId(100), WorkerId(101));
+        engine.on_membership(&Membership::Removed(a));
+        assert_eq!(engine.sessions.absent(), 1);
+        engine.on_membership(&Membership::Added(a));
+        assert_eq!(engine.sessions.absent(), 0, "a join's own word");
+        engine.on_membership(&Membership::Removed(a));
+        engine.on_membership(&Membership::Removed(b));
+        engine.on_membership(&Membership::Snapshot(&[a]));
+        assert_eq!(engine.sessions.absent(), 1, "the snapshot lists one");
+        let replaced = Membership::Replaced {
+            old: WorkerId(300),
+            new: b,
+        };
+        engine.on_membership(&replaced);
+        assert_eq!(engine.sessions.absent(), 1, "the old life alone");
+    }
+
+    #[test]
+    fn a_removed_workers_keys_fall_to_their_failover_and_go_back_with_the_worker() {
         let engine = session_engine(SESSIONS);
         let mut pool = vec![
             candidate(0, 1),
@@ -11848,28 +11924,54 @@ mod tests {
                 row.position = index;
             }
         };
-        // The host removes 102: key 8's failover is its owner, loaded or not.
+        // The host removes 102: key 8's pins stand through the leave, its
+        // owner reads as not routable and its failover serves, loaded or
+        // not.
         engine.on_membership(&Membership::Removed(WorkerId(102)));
         pool.remove(2);
         renumber(&mut pool);
         assert_eq!(
             engine.sessions.pins(session(8)),
-            Some([WorkerId(100), WorkerId(0)]),
-            "the removed owner left the pins, not just the routable set"
+            Some([WorkerId(102), WorkerId(100)]),
+            "the pins stand through the leave"
         );
         assert_eq!(place_keyed(&engine, &pool, 8, 40).id, WorkerId(100));
-        // The host replaces 100: both keys have no pin left and are placed
-        // afresh by the rule's assignment (the fewest requests).
+        // The host registers the key of 102 again, as the worker it was: a
+        // new id, and its pins with it.
+        engine.on_membership(&Membership::Added(WorkerId(202)));
+        engine.pins_follow(WorkerId(102), WorkerId(202));
+        pool.push(Candidate {
+            id: WorkerId(202),
+            ..candidate(3, 5)
+        });
+        assert_eq!(
+            engine.sessions.pins(session(8)),
+            Some([WorkerId(202), WorkerId(100)]),
+            "the pins follow the key"
+        );
+        assert_eq!(place_keyed(&engine, &pool, 8, 50).id, WorkerId(202));
+        // The host replaces 100 and says the new life is another worker:
+        // key 7 has no pin left and is placed afresh by the rule's
+        // assignment (the fewest requests), and key 8 keeps its owner.
         engine.on_membership(&Membership::Replaced {
             old: WorkerId(100),
             new: WorkerId(200),
         });
+        assert_eq!(
+            engine.sessions.pins(session(7)),
+            Some([WorkerId(100), WorkerId(0)]),
+            "a replacement's pins stand until the host says which way"
+        );
+        engine.pins_forget(WorkerId(100));
         pool.remove(0);
         renumber(&mut pool);
         assert_eq!(engine.sessions.pins(session(7)), None);
-        assert_eq!(engine.sessions.pins(session(8)), None);
-        assert_eq!(place_keyed(&engine, &pool, 7, 50).id, WorkerId(103));
-        assert_eq!(place_keyed(&engine, &pool, 8, 50).id, WorkerId(103));
+        assert_eq!(
+            engine.sessions.pins(session(8)),
+            Some([WorkerId(202), WorkerId(0)])
+        );
+        assert_eq!(place_keyed(&engine, &pool, 7, 60).id, WorkerId(103));
+        assert_eq!(place_keyed(&engine, &pool, 8, 60).id, WorkerId(202));
     }
 
     #[test]

@@ -473,6 +473,7 @@ impl MemoryStore {
                 loads.ranks.clear();
             }
             workers.by_key.clear();
+            workers.gone.clear();
             workers.log.clear();
             workers.epoch = cut.epoch;
             workers.history += 1;
@@ -1366,10 +1367,11 @@ impl MemoryStore {
     /// are swept at later issues. The vetoes a world
     /// carries are not among them: they leave with the row in the
     /// publication of the membership write that calls this. Nor are the
-    /// sessions' pins of record that name the worker: the leader's own
-    /// removal or replacement drops them once it let its lock go
-    /// ([`Self::forget_pins`]), and a row that leaves by a followed change
-    /// or a snapshot keeps them. A standby is sent no pin, so those are of
+    /// sessions' pins of record that name the worker: they stand through
+    /// the key's absence ([`Workers::gone`]) and leave where the key does
+    /// not return as the worker it was ([`Self::forget_gone`]). A row
+    /// that leaves by a followed change or a snapshot keeps them
+    /// too. A standby is sent no pin, so those are of
     /// a term this store led itself: no decision takes one while its
     /// worker is gone, and a worker that returns under the same key and
     /// incarnation is pinned by them again. Called under the workers
@@ -1398,6 +1400,39 @@ impl MemoryStore {
     /// stands, until the key's next dispatch writes it again.
     fn forget_pins(&self, id: WorkerId) {
         SessionsStore::drop_worker(self, id);
+    }
+
+    /// A key that left does not return as the worker it was, or stayed
+    /// away past the absence's time: its session pins leave the standing
+    /// engine's table and the pins of record. With the workers lock let
+    /// go, as [`Self::forget_pins`].
+    fn forget_gone(&self, id: WorkerId) {
+        self.world.load().spec().engine().pins_forget(id);
+        self.forget_pins(id);
+    }
+
+    /// The sessions' pins of record that name `old` name `new`: the key
+    /// was registered again as the worker it was. One walk of the pins of
+    /// record on a rare event, under the workers lock: a registration of
+    /// the key behind this one renames what this one left, and no walk
+    /// overtakes an earlier one.
+    fn follow_pins(&self, old: WorkerId, new: WorkerId) {
+        if old == new {
+            return;
+        }
+        for shard in self.sessions.shards() {
+            for pin in shard.lock().pins.values_mut() {
+                if pin.worker == old {
+                    pin.worker = new;
+                }
+            }
+        }
+    }
+
+    /// How long a key that left keeps its session pins: the standing
+    /// engine's time ([`Engine::pins_absence_micros`](crate::Engine::pins_absence_micros)).
+    fn pins_absence(&self) -> Duration {
+        Duration::from_micros(self.world.load().spec().engine().pins_absence_micros())
     }
 
     /// How many times a publication allocated a pool's rows since the store
@@ -1470,10 +1505,38 @@ impl MemoryStore {
 
 // ---------------------------------------------------------------- workers
 
+/// The most keys the store files as gone ([`Workers::gone`]): past it the
+/// one that left first is forgotten.
+const GONE_KEYS: usize = 4_096;
+
+/// A key that left membership while its session pins stand
+/// ([`Workers::gone`]).
+struct Gone {
+    /// The id the key had.
+    id: WorkerId,
+    /// The instant it left.
+    left: Instant,
+    /// The registration it stood under: the worker it was.
+    facts: WorkerFacts,
+}
+
+/// Whether `new` registers the worker `old` was: its role, its models and
+/// its wires. A registration that differs in one is another worker.
+fn same_worker(old: &WorkerFacts, new: &WorkerFacts) -> bool {
+    old.role == new.role && old.same_models(new) && old.wire_modes == new.wire_modes
+}
+
 #[derive(Default)]
 struct Workers {
     rows: FxHashMap<WorkerId, Row>,
     by_key: HashMap<String, WorkerId>,
+    /// The keys that left by this store's own removal, while their
+    /// session pins stand: one entry a key, [`GONE_KEYS`] at most. A key
+    /// registered again as the worker it was, inside the absence's time
+    /// ([`MemoryStore::pins_absence`]), takes its pins under its new id.
+    /// One that is not, or that stays away longer, is forgotten. In no
+    /// journal and no snapshot: a standby files none.
+    gone: HashMap<String, Gone>,
     epoch: u64,
     /// How often the rows were replaced whole by another store's
     /// ([`WorkersStore::history`]).
@@ -1520,6 +1583,49 @@ struct Probes {
 }
 
 impl Workers {
+    /// The ids of the keys gone longer than `bound` at `now`: they leave
+    /// the list, and their pins are the caller's to forget.
+    fn ended_gone(&mut self, now: Instant, bound: Duration) -> Vec<WorkerId> {
+        let mut ended = Vec::new();
+        self.gone.retain(|_, gone| {
+            let stays = now.saturating_duration_since(gone.left) <= bound;
+            if !stays {
+                ended.push(gone.id);
+            }
+            stays
+        });
+        ended
+    }
+
+    /// Files the key of `facts` as gone at `now`, under the id it had. The
+    /// ids whose pins leave now are returned: the keys gone longer than
+    /// `bound`, and the one that left first where the list is full.
+    fn file_gone(
+        &mut self,
+        facts: WorkerFacts,
+        id: WorkerId,
+        now: Instant,
+        bound: Duration,
+    ) -> Vec<WorkerId> {
+        let mut ended = self.ended_gone(now, bound);
+        if self.gone.len() >= GONE_KEYS {
+            let first = self.gone.iter().min_by_key(|(_, gone)| gone.left);
+            let first = first.map(|(key, _)| key.clone());
+            if let Some(gone) = first.and_then(|key| self.gone.remove(&key)) {
+                ended.push(gone.id);
+            }
+        }
+        self.gone.insert(
+            facts.key.clone(),
+            Gone {
+                id,
+                left: now,
+                facts,
+            },
+        );
+        ended
+    }
+
     /// Every member as a build reads it: its row, the slot of its count
     /// and what the leader's own worker object knows of it.
     fn members(&self) -> impl Iterator<Item = (&WorkerRow, Slot, LeaderBits)> {
@@ -1726,14 +1832,14 @@ impl WorkersStore for MemoryStore {
             // it starts another life: it is the same reachable worker.
             let old = workers.rows.remove(&old_id);
             let new_id = identity(&facts.key, facts.incarnation);
+            // The same worker under a new life: its role, its models and
+            // its wires stand. Its status and its session pins follow it.
+            let same = old
+                .as_ref()
+                .is_some_and(|old| same_worker(&old.row.facts, &facts));
             let status = old
                 .as_ref()
-                .filter(|old| {
-                    old.row.status != WorkerStatus::Draining
-                        && old.row.facts.role == facts.role
-                        && old.row.facts.same_models(&facts)
-                        && old.row.facts.wire_modes == facts.wire_modes
-                })
+                .filter(|old| same && old.row.status != WorkerStatus::Draining)
                 .map_or(WorkerStatus::Pending, |old| old.row.status);
             workers.by_key.insert(facts.key.clone(), new_id);
             workers.rows.insert(
@@ -1782,10 +1888,34 @@ impl WorkersStore for MemoryStore {
             self.pay_leave(&workers, classes, now);
             self.tell_membership(change);
             self.tell_left(new_id, &left);
+            // The engine heard the old id leave. Its session pins follow
+            // the key to the new life of the same worker, behind the
+            // replacement's own word, and leave with another worker's.
+            if same {
+                self.world
+                    .load()
+                    .spec()
+                    .engine()
+                    .pins_follow(old_id, new_id);
+                self.follow_pins(old_id, new_id);
+            }
             drop(workers);
-            self.forget_pins(old_id);
+            #[cfg(test)]
+            seam::released();
+            if !same {
+                self.forget_gone(old_id);
+            }
             return change;
         }
+        // A key that left and is registered again: the worker it was,
+        // inside the absence's time, takes its session pins back under
+        // the id this registration makes.
+        let bound = self.pins_absence();
+        let returned = workers.gone.remove(&facts.key).map(|gone| {
+            let inside = now.saturating_duration_since(gone.left) <= bound;
+            (gone.id, inside && same_worker(&gone.facts, &facts))
+        });
+        let ended = workers.ended_gone(now, bound);
         let id = identity(&facts.key, facts.incarnation);
         workers.by_key.insert(facts.key.clone(), id);
         workers.rows.insert(
@@ -1819,6 +1949,22 @@ impl WorkersStore for MemoryStore {
         self.wake_host(first);
         self.index_member(&workers, id);
         self.tell_membership(change);
+        // Behind the join's own word, under the workers lock: no decision
+        // reads the new row before its pins stand under its id, and the
+        // pins of record are renamed in the order of the registrations.
+        if let Some((old, true)) = returned {
+            self.world.load().spec().engine().pins_follow(old, id);
+            self.follow_pins(old, id);
+        }
+        drop(workers);
+        #[cfg(test)]
+        seam::released();
+        if let Some((old, false)) = returned {
+            self.forget_gone(old);
+        }
+        for old in ended {
+            self.forget_gone(old);
+        }
         change
     }
 
@@ -1866,10 +2012,18 @@ impl WorkersStore for MemoryStore {
             left: Some(id),
             joined: None,
         };
-        self.pay_leave(&workers, classes, Instant::now());
+        let now = Instant::now();
+        self.pay_leave(&workers, classes, now);
         self.tell_membership(change);
+        // The key's session pins stand through its absence, in the
+        // engine's table and of record: the key is filed as gone, and the
+        // worker it was takes them back where it is registered again in
+        // time.
+        let ended = workers.file_gone(row.row.facts, id, now, self.pins_absence());
         drop(workers);
-        self.forget_pins(id);
+        for old in ended {
+            self.forget_gone(old);
+        }
         Some(change)
     }
 
@@ -4522,5 +4676,34 @@ mod tests {
         assert_eq!(ended.len(), 1);
         assert_eq!(ended[0].record.lease.id, issued.id);
         assert_eq!(takes(), 1, "only the due lease's file is taken");
+    }
+}
+
+/// A seam for the cases: a hook the registering thread runs once, where a
+/// registration has let the workers lock go. No case reaches there from
+/// outside. In no build but the cases'.
+#[cfg(test)]
+pub(crate) mod seam {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static RELEASED: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// `hook` runs once, behind the workers lock of this thread's next
+    /// registration of a new life or of a new key.
+    pub(crate) fn on_release(hook: impl FnOnce() + 'static) {
+        RELEASED.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// The hook runs. It is taken out first: a registration the hook
+    /// itself makes meets none.
+    pub(super) fn released() {
+        let hook = RELEASED.with(|held| held.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }

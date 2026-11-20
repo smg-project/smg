@@ -31,8 +31,9 @@ pub struct Pin {
 }
 
 /// Where session pins are written: at the commit of a keyed decision, never
-/// at selection. Keys are fingerprints (never `0`). A removed worker takes its
-/// pins with it. By the design the gateways keep a bounded table of the pins
+/// at selection. Keys are fingerprints (never `0`). A worker that leaves
+/// keeps its pins while its key may be registered again, and takes them with
+/// it where it is not. By the design the gateways keep a bounded table of the pins
 /// they received and replay it in `Hello`, merged here by last use: no
 /// gateway replays its pins in this build, and the merge door has no caller.
 pub trait SessionsStore: Send + Sync {
@@ -51,7 +52,7 @@ pub trait SessionsStore: Send + Sync {
 
     fn unpin(&self, key: u64);
 
-    /// A worker left: its pins go with it. Returns how many.
+    /// A worker left for good: its pins go with it. Returns how many.
     fn drop_worker(&self, worker: WorkerId) -> usize;
 
     /// Drop the pins whose own end is at or before `now`, an instant of
