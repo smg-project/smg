@@ -65,14 +65,15 @@ pub enum Refused {
     /// The row's maker is outside the health removal scope.
     OutOfScope,
     /// A refresh's worker states another fact than the row's labels and
-    /// the pairing they derive. A refresh writes those alone.
+    /// what they derive: the pairing, the vision bit and the demand facts.
+    /// A refresh writes those alone.
     NotLabelsAlone,
 }
 
 impl Refused {
     pub(crate) const OUT_OF_SCOPE: &str = "the row's maker is outside the health removal scope";
     pub(crate) const NOT_LABELS_ALONE: &str =
-        "a refresh writes a row's labels and the pairing they derive, and states no other fact";
+        "a refresh writes a row's labels and the facts they derive, and states no other fact";
 }
 
 /// Who asks to drain or remove a row.
@@ -235,20 +236,25 @@ pub trait Membership: Send + Sync + 'static {
     fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused>;
 
     /// Write the labels of the worker the health loop's refresh rebuilt,
-    /// and the pairing descriptor they derive, over the row the asker saw
-    /// under the worker's URL. Both are the engine's word and nobody's
-    /// registration: no maker is asked, a control call's row and a
-    /// provider's are served alike, and the row keeps the maker it has.
+    /// and the facts they derive, over the row the asker saw under the
+    /// worker's URL: the pairing descriptor, the vision bit and what the
+    /// worker states for a request's hard demands. They are the engine's
+    /// word and nobody's registration: no maker is asked, a control call's
+    /// row and a provider's are served alike, and the row keeps the maker
+    /// it has.
     ///
     /// The facts `built` states over the standing row ([`facts`]) may
-    /// differ from the row's in the labels and the descriptor alone. Any
-    /// other difference is refused ([`Refused::NotLabelsAlone`]), so a
-    /// refresh starts no life. No row, another row or revision, and a
-    /// draining row refuse it too. The stated facts' room is tested as a
-    /// registration's is: the controller's door, whose log carries no
-    /// descriptor, refuses a refresh that states one as it refuses such a
-    /// registration. Equal labels and an equal descriptor write nothing
-    /// and answer [`Wrote::Unmoved`].
+    /// differ from the row's in the labels and those facts alone. Any
+    /// other difference is refused ([`Refused::NotLabelsAlone`]). A refresh
+    /// that moves the vision bit or a demand fact starts the worker's next
+    /// life ([`Wrote::Another`]), as a registration that states it does:
+    /// the worker takes other requests than it did. The life takes the
+    /// refresh's labels and the standing life's status. Any other refresh
+    /// starts no life. No row, another row or revision, and a draining row
+    /// refuse it too. The stated facts' room is tested as a registration's
+    /// is: the controller's door, whose log carries no descriptor, refuses
+    /// a refresh that states one as it refuses such a registration. Equal
+    /// labels and equal facts write nothing and answer [`Wrote::Unmoved`].
     ///
     /// Each door says what it does with the object, as for
     /// [`Self::found_built`]. A door whose host keeps built objects hands
@@ -599,16 +605,25 @@ pub(crate) fn lay_ready(
 fn write_row(
     turn: &impl Turn,
     maker: &Maker,
+    facts: WorkerFacts,
+    laid: Option<(WorkerId, Laid)>,
+) -> Result<Wrote, Refused> {
+    let wrote = lay_row(turn, maker, facts, laid)?;
+    turn.told(wrote);
+    Ok(wrote)
+}
+
+/// [`write_row`] less the turn's word of the write: for a write its caller
+/// tells under another name, as a refresh does.
+fn lay_row(
+    turn: &impl Turn,
+    maker: &Maker,
     mut facts: WorkerFacts,
     laid: Option<(WorkerId, Laid)>,
 ) -> Result<Wrote, Refused> {
     match laid {
         None | Some((_, Laid::Another)) => facts.incarnation = turn.life()?,
-        Some((id, Laid::Unmoved)) => {
-            let wrote = Wrote::Unmoved(id);
-            turn.told(wrote);
-            return Ok(wrote);
-        }
+        Some((id, Laid::Unmoved)) => return Ok(Wrote::Unmoved(id)),
         Some((_, Laid::InPlace)) => {}
     }
     let store = turn.store();
@@ -631,7 +646,6 @@ fn write_row(
             store.connected(row.id, row.revision, &|| true);
         }
     }
-    turn.told(wrote);
     Ok(wrote)
 }
 
@@ -708,12 +722,13 @@ pub(crate) fn take(
 }
 
 /// Write what a refresh's rebuilt worker states over the guarded row while
-/// the door holds its turn: its labels, and the pairing descriptor they
-/// derive. The row's other facts are the test of the refresh's scope and
-/// are not written: the door states a row's event signal at its
-/// registration, and a refresh leaves it as it stands. The worker is read
-/// as the door reads one (`read`), under no verb: a door whose log carries
-/// no descriptor keeps the standing one, so its refresh moves labels alone.
+/// the door holds its turn: its labels, and the facts they derive (the
+/// pairing descriptor, the vision bit and the demand facts). The row's
+/// other facts are the test of the refresh's scope and are not written:
+/// the door states a row's event signal at its registration, and a refresh
+/// leaves it as it stands. The worker is read as the door reads one
+/// (`read`), under no verb: a door whose log carries none of those facts
+/// keeps the standing ones, so its refresh moves labels alone.
 pub(crate) fn refresh(
     turn: &impl Turn,
     seen: Standing,
@@ -732,6 +747,11 @@ pub(crate) fn refresh(
 /// the write a registration takes in place, and the store derives the
 /// row's pair classes again there. That write has no guard of its own: the
 /// door's turn holds the row as the guard read it.
+///
+/// The vision bit and the demand facts say which requests the worker takes
+/// at all. Where one moved, the row takes the write a registration takes
+/// as the URL's next life: the worker a refresh fills in is the one a
+/// registration of the same labels would have stated.
 fn refresh_stated(
     turn: &impl Turn,
     seen: Standing,
@@ -748,6 +768,8 @@ fn refresh_stated(
     let mut stated = state(&row.facts);
     let labels = mem::replace(&mut stated.labels, row.facts.labels.clone());
     let mut pairing = mem::replace(&mut stated.pairing, row.facts.pairing.clone());
+    let vision = mem::replace(&mut stated.vision, row.facts.vision);
+    let demand_facts = mem::replace(&mut stated.demand_facts, row.facts.demand_facts);
     if stated != row.facts {
         return Err(Refused::NotLabelsAlone);
     }
@@ -762,16 +784,22 @@ fn refresh_stated(
     let reports = |said: &Arc<PairingDescriptor>| **said != PairingDescriptor::default();
     pairing = pairing.filter(reports);
     let pairing_moved = pairing.as_ref() != held.filter(|held| reports(held));
-    if labels == row.facts.labels && !pairing_moved {
+    let demands_moved = vision != row.facts.vision || demand_facts != row.facts.demand_facts;
+    if labels == row.facts.labels && !pairing_moved && !demands_moved {
         return Ok(Wrote::Unmoved(row.id));
     }
     stated.labels = labels;
     stated.pairing = pairing;
+    stated.vision = vision;
+    stated.demand_facts = demand_facts;
     stated.bounded(&row.maker).map_err(Refused::Past)?;
     turn.room(&stated, &row.maker)?;
     // The write, in place or by the patch, is a write of the turn: the term
     // is asked ahead of it.
     turn.check_term()?;
+    if demands_moved {
+        return lay_row(turn, &row.maker, stated, Some((row.id, Laid::Another)));
+    }
     if pairing_moved {
         return match store.upsert_by(stated, row.maker) {
             MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
@@ -927,7 +955,7 @@ pub(super) mod tests {
         identity::{basic::Worker, builder::BasicWorkerBuilder},
         model_card::ModelCard,
         settings::UnhealthyRemovalScope,
-        worker::{HealthCheckConfig, RuntimeType, WorkerType},
+        worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType},
     };
 
     use super::{
@@ -2236,6 +2264,81 @@ pub(super) mod tests {
         assert_eq!(wrote, Ok(Wrote::InPlace(first.id)));
         assert_eq!(pairs(), (1, None));
         assert_eq!(placed(b"third"), Some((first.id, Some(row.id))));
+    }
+
+    /// A refresh's scope takes what its worker's labels derive for a
+    /// request's hard demands: the vision bit and the demand facts. A
+    /// worker registered before its engine said what media it takes is
+    /// filled in by a refresh. The refresh that moves one of those facts
+    /// starts the worker's next life, as a registration that states it
+    /// does. The life takes every label of the refresh, the standing life's
+    /// maker and status, and another id. Another fact beside a moved one is
+    /// refused, and nothing is written.
+    #[test]
+    fn a_refresh_that_moves_a_demand_fact_starts_the_next_life() {
+        let (store, door) = door();
+        // No label says what media the worker takes: it reads as one that
+        // takes images and processes no reference.
+        let bare = || {
+            <BasicWorkerBuilder>::new(URL)
+                .model(ModelCard::new("m"))
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Sglang)
+        };
+        let first: Arc<dyn Worker> = Arc::new(bare().build());
+        let registered = door.found_built(&Maker::Control, Expect::Nothing, &first, None);
+        assert!(registered.is_ok(), "{registered:?}");
+        let row = store.by_key(URL).expect("the registered row");
+        assert!(row.facts.vision);
+        assert!(!row.facts.demand_facts.references);
+
+        // The engine's word: no vision encoder, and its host's pipeline
+        // processes its media.
+        let filled = || {
+            bare()
+                .label(smg_worker::labels::SUPPORTS_VISION_LABEL, "false")
+                .label(
+                    smg_worker::labels::MM_PROCESSOR_LABEL,
+                    smg_worker::labels::HOST_PIPELINE_PROCESSOR,
+                )
+                .label("tier", "gold")
+        };
+
+        // Another fact beside the moved ones is outside the scope.
+        let stray: Arc<dyn Worker> = Arc::new(filled().model(ModelCard::new("other")).build());
+        let refused = door.refreshed(standing(&row), &stray, &first);
+        assert_eq!(refused, Err(Refused::NotLabelsAlone));
+        assert_eq!(store.by_key(URL).as_ref(), Some(&row));
+
+        let rebuilt: Arc<dyn Worker> = Arc::new(filled().build());
+        let wrote = door.refreshed(standing(&row), &rebuilt, &first);
+        let next = store.by_key(URL).expect("the next life's row");
+        assert_eq!(
+            wrote,
+            Ok(Wrote::Another {
+                old: row.id,
+                new: next.id
+            })
+        );
+        assert_ne!(next.id, row.id);
+        assert!(store.get(row.id).is_none());
+        assert!(!next.facts.vision);
+        assert_eq!(
+            next.facts.demand_facts,
+            DemandFacts {
+                references: true,
+                host_pipeline: true,
+                ..row.facts.demand_facts
+            }
+        );
+        let tier = next.facts.labels.get("tier").map(String::as_str);
+        assert_eq!(tier, Some("gold"));
+        assert_eq!((&next.maker, next.status), (&row.maker, row.status));
+
+        // The same word again writes nothing.
+        let again = door.refreshed(standing(&next), &rebuilt, &rebuilt);
+        assert_eq!(again, Ok(Wrote::Unmoved(next.id)));
+        assert_eq!(store.by_key(URL).as_ref(), Some(&next));
     }
 
     #[test]

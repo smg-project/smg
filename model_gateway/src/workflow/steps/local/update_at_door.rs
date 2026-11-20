@@ -15,7 +15,10 @@
 //!
 //! A label refresh writes at the door's entry for it. The labels are the
 //! engine's word, so the entry asks no maker: the row takes the labels and
-//! no other fact, and the holder lays the worker the refresh rebuilt.
+//! the facts they derive, and the holder lays the worker the refresh
+//! rebuilt. A refresh that moves what a request's hard demands read starts
+//! the worker's next life, and the holder lays its worker under the same
+//! id.
 
 use std::sync::Arc;
 

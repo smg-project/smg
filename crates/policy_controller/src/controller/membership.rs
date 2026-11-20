@@ -2443,7 +2443,7 @@ pub(crate) mod tests {
         let hosted = Hosted::new(Arc::new(door), operator(), under(TERM));
         let maker = found("pods/a");
         let epoch = store.epoch();
-        let lost: [(&str, State); 9] = [
+        let lost: [(&str, State); 10] = [
             ("row.pairing", |facts| {
                 facts.pairing = Some(Arc::new(PairingDescriptor {
                     protocol: Some("pd".to_owned()),
@@ -2458,6 +2458,7 @@ pub(crate) mod tests {
                 };
             }),
             ("row.vision", |facts| facts.vision = true),
+            ("row.demand_facts", |facts| facts.demand_facts.runtime = 1),
             ("row.priority", |facts| facts.priority = 5),
             ("row.zone", |facts| facts.zone = Some(String::new())),
             ("row.max_running", |facts| facts.max_running = Some(0)),

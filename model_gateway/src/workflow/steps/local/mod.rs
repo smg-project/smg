@@ -720,6 +720,64 @@ mod tests {
         assert_eq!(feed.objects.unhanded(), 0);
     }
 
+    /// A worker registered before its engine said what media it takes is
+    /// filled in by a refresh. The row's facts follow the labels: the
+    /// refresh starts the worker's next life with every label written, and
+    /// the worker the refresh rebuilt stands under the worker's id.
+    #[test]
+    fn under_the_feed_a_refresh_that_fills_the_media_labels_in_starts_the_next_life() {
+        use smg_worker::identity::basic::RuntimeType;
+
+        let store = Arc::new(MemoryStore::default());
+        let registry = Arc::new(WorkerRegistry::new());
+        let feed = feed(&store, &registry, BackendConnector::shared());
+        let step = UpdateAtDoorStep::new(Arc::clone(&feed.door), Arc::clone(&feed.objects));
+        let url = "http://ours:8000";
+        let built = |labels: &[(&str, &str)]| -> Arc<dyn Worker> {
+            let worker = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("m"))
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Sglang);
+            let worker = labels
+                .iter()
+                .fold(worker, |worker, (name, value)| worker.label(*name, *value));
+            Arc::new(worker.build())
+        };
+
+        let first = built(&[]);
+        let wrote = feed
+            .door
+            .found_built(&Maker::Control, Expect::Anything, &first, None);
+        assert!(wrote.is_ok(), "{wrote:?}");
+        let id = registry.get_id_by_url(url).expect("the object's id");
+        let row = store.by_key(url).expect("the row");
+        assert!(row.facts.vision);
+        assert!(!row.facts.demand_facts.references);
+
+        // The engine's word: no vision encoder, the host's pipeline
+        // processes its media, and a parser.
+        let filled = built(&[
+            ("supports_vision", "false"),
+            ("mm_processor", "smg"),
+            ("tool_parser", "p"),
+        ]);
+        let seen = feed.objects.standing(&id).expect("the object's row");
+        let laid = step.refresh(seen, &filled, &first);
+        assert!(matches!(laid, Ok(true)), "{laid:?}");
+        let next = store.by_key(url).expect("the next life's row");
+        assert_ne!(next.id, row.id);
+        assert!(!next.facts.vision);
+        assert!(next.facts.demand_facts.references);
+        assert!(next.facts.demand_facts.host_pipeline);
+        let parser = next.facts.labels.get("tool_parser").map(String::as_str);
+        assert_eq!(parser, Some("p"));
+        assert_eq!((next.status, &next.maker), (row.status, &row.maker));
+        let stands = registry.get_by_url(url).expect("the worker");
+        assert!(Arc::ptr_eq(&stands, &filled));
+        assert_eq!(registry.get_id_by_url(url), Some(id));
+        assert_eq!(feed.objects.unhanded(), 0);
+    }
+
     /// With no feed the line is the one it was. Under a feed it is the
     /// store crate's removal at the door and four gateway steps, each
     /// behind one step alone. No step writes the classic policies, and none

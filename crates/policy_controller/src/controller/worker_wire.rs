@@ -382,10 +382,10 @@ fn maker_weight(maker: &Maker) -> usize {
 /// standby builds its rows from the log, so it would hold the row without
 /// the fact, and a promoted one would decide by other facts than its leader
 /// did. The row on the wire carries a pairing's port alone and no encode
-/// offer, vision bit, priority or drain window, and it reads an empty zone
-/// and a zero admission window, block size or port as none. The facts are
-/// written as the log writes them and read back as a standby reads them, so
-/// a fact the wire gains is taken here with no second list.
+/// offer, vision bit, demand fact, priority or drain window, and it reads
+/// an empty zone and a zero admission window, block size or port as none.
+/// The facts are written as the log writes them and read back as a standby
+/// reads them, so a fact the wire gains is taken here with no second list.
 #[cfg(feature = "worker-host")]
 #[cfg_attr(
     not(test),
@@ -399,6 +399,7 @@ pub(crate) fn carried(facts: &WorkerFacts) -> Result<(), Refused> {
         ("row.pairing", back.pairing != facts.pairing),
         ("row.encode", back.encode != facts.encode),
         ("row.vision", back.vision != facts.vision),
+        ("row.demand_facts", back.demand_facts != facts.demand_facts),
         ("row.priority", back.priority != facts.priority),
         ("row.zone", back.zone != facts.zone),
         ("row.max_running", back.max_running != facts.max_running),
