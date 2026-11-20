@@ -123,9 +123,9 @@ whose workers each name a queue threshold, and a controller handed this
 document, where the default stands.
 
 The stock build's catalog refuses this document by the scorer's name. The
-published schema (`crates/policy_controller/policyspec.schema.json`) lists
-the stock build's stages, so the document fails that schema too and
-validates over this build's catalog.
+published schema (`crates/policy_controller/policyspec.schema.json`) cannot
+know a host's catalog and takes a scorer by any name, so the document passes
+it. Only validation over a catalog tells the stock build from this one.
 
 ## Build and run
 
@@ -224,8 +224,8 @@ repository of your own needs its tag.
 ## What it leaves out
 
 - Parameters. `Pack` takes none from the document beyond its weight. A scorer
-  registered with `scorer_with` and a filter registered with `filter_with` read
-  typed parameters, and a picker takes none yet.
+  registered with `scorer_with`, a filter registered with `filter_with` and a
+  picker registered with `picker_with` read typed parameters.
 - A filter and a picker. They register as the scorer does.
 - State. `Lifecycle` reports what became of each decision to a scorer that
   learns from it. A scorer that keeps a number of each worker's load report
