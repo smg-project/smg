@@ -320,7 +320,7 @@ impl Llama4VisionProcessor {
         let resized = transforms::resize(image, width, height, FilterType::Triangle);
         let (width, height, rgb) = transforms::rgb_bytes(&resized);
         tile_rows(&rgb, (width, height), plan.grid, tile, &mut run);
-        if plan.grid.0 * plan.grid.1 > 1 {
+        if plan.has_global() {
             let global =
                 transforms::resize(image, self.tile_size, self.tile_size, FilterType::Triangle);
             let (width, height, rgb) = transforms::rgb_bytes(&global);
@@ -389,11 +389,14 @@ struct Plan {
 }
 
 impl Plan {
-    /// Tiles the image writes: its canvas, and the global view behind a
-    /// canvas of more than one.
+    /// Whether the global view follows the canvas: behind more than one tile.
+    fn has_global(&self) -> bool {
+        self.grid.0 * self.grid.1 > 1
+    }
+
+    /// Tiles the image writes: its canvas and the global view.
     fn tiles(&self) -> usize {
-        let canvas = self.grid.0 * self.grid.1;
-        canvas + usize::from(canvas > 1)
+        self.grid.0 * self.grid.1 + usize::from(self.has_global())
     }
 }
 
@@ -495,6 +498,7 @@ impl VisionPreProcessor for Llama4VisionProcessor {
                 written += row_bytes;
             });
         }
+        debug_assert_eq!(written, wire.len(), "the tiles cover the wire");
 
         Some(
             EncoderInput::wire(wire, dtype, vec![tiles, 3, tile, tile], norm)
@@ -717,6 +721,10 @@ mod tests {
         let processor = Llama4VisionProcessor::new();
         let result = processor.preprocess(&[]);
         assert!(matches!(result, Err(TransformError::EmptyBatch)));
+        assert!(matches!(
+            processor.preprocess_wire(&[], EncoderDtype::BFloat16),
+            Some(Err(TransformError::EmptyBatch))
+        ));
     }
 
     /// The one-pass wire against the two-pass bytes (`preprocess`, then the
