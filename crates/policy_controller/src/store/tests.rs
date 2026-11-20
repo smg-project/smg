@@ -1723,6 +1723,116 @@ fn the_tick_ends_the_absence_of_a_key_that_stays_away() {
     assert_eq!((sessions.lookup(11), table.pins(key)), (None, None));
 }
 
+/// `follower` takes `change`, a write `leader` just made, by the door a
+/// standby's applier and a gateway's watcher use.
+fn followed(leader: &MemoryStore, follower: &MemoryStore, change: MembershipChange) {
+    let row = match change {
+        MembershipChange::Registered { id } | MembershipChange::Replaced { new: id, .. } => {
+            WorkersStore::get(leader, id)
+        }
+        _ => None,
+    };
+    let epoch = WorkersStore::epoch(leader);
+    follower.follow(Position::default(), epoch, change, row);
+    assert_eq!(WorkersStore::epoch(follower), epoch, "the change landed");
+}
+
+/// A follower takes its leader's steps for a key's session pins, in its
+/// engine's table and of record. A followed removal drops none. The worker
+/// it was takes them back at its followed registration, under the id that
+/// registration made. A followed new life of the same worker keeps its
+/// own. Another worker under the key takes none.
+#[test]
+fn a_followed_key_registered_again_as_the_worker_it_was_takes_its_pins() {
+    let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
+    let join = |facts: WorkerFacts| {
+        let change = leader.upsert(facts);
+        followed(&leader, &follower, change);
+        change.id()
+    };
+    let leave = |id: WorkerId| {
+        let revision = WorkersStore::get(&leader, id).expect("the row").revision;
+        let change = leader.remove(id, revision).expect("removed");
+        followed(&leader, &follower, change);
+    };
+    let (a, b) = (
+        join(facts("http://a:8000", 1)),
+        join(facts("http://b:8000", 1)),
+    );
+    let sessions: &dyn SessionsStore = &follower;
+    let now = Instant::now();
+    sessions.pin(11, a, now, None);
+    sessions.pin(12, b, now, None);
+    let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
+    // The follower's engine holds a pin of its own.
+    let key = Session::from_raw(21);
+    let world = follower.world();
+    let table = world.spec().engine().sessions();
+    table.dispatched(key, SessionVerdict::Pinned, a);
+    let held = || table.pins(key).map(|pins| pins[0]);
+    leave(a);
+    assert_eq!((of(11), held()), (Some(a), Some(a)), "none is dropped");
+    let again = join(facts("http://a:8000", 2));
+    assert_ne!(again, a);
+    assert_eq!((of(11), held()), (Some(again), Some(again)));
+    assert_eq!(of(12), Some(b));
+    let life = join(facts("http://b:8000", 2));
+    assert_ne!(life, b);
+    assert_eq!(of(12), Some(life), "a new life of the same worker");
+    // Removed again, then registered in another role: another worker.
+    leave(again);
+    join(WorkerFacts {
+        role: Role::Decode,
+        ..facts("http://a:8000", 3)
+    });
+    assert_eq!((of(11), held()), (None, None));
+    assert_eq!(sessions.len(), 1);
+    // A new life in another role, in place: another worker too.
+    join(WorkerFacts {
+        role: Role::Prefill,
+        ..facts("http://b:8000", 3)
+    });
+    assert!(sessions.is_empty(), "the old worker's pin");
+}
+
+/// A follower counts a key's absence by its own clock, from the removal
+/// it followed: a key registered again past that time takes no pin.
+#[test]
+fn a_followed_key_registered_again_past_the_absences_time_takes_no_pin() {
+    let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
+    follower
+        .apply(manual_ruled(1, 1, 1))
+        .expect("above the unbound start");
+    let joined = leader.upsert(facts("http://a:8000", 1));
+    followed(&leader, &follower, joined);
+    let sessions: &dyn SessionsStore = &follower;
+    sessions.pin(11, joined.id(), Instant::now(), None);
+    let revision = WorkersStore::get(&leader, joined.id()).expect("the row");
+    let removed = leader.remove(joined.id(), revision.revision);
+    followed(&leader, &follower, removed.expect("removed"));
+    assert!(sessions.lookup(11).is_some(), "inside its time");
+    std::thread::sleep(Duration::from_millis(1_100));
+    let again = leader.upsert(facts("http://a:8000", 2));
+    followed(&leader, &follower, again);
+    assert_eq!(sessions.lookup(11), None);
+}
+
+/// A follower files the key of a removal it followed. Where it leads
+/// next, its own registration of the key takes the pins.
+#[test]
+fn a_key_a_follower_saw_leave_takes_its_pins_at_the_followers_own_write() {
+    let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
+    let joined = leader.upsert(facts("http://a:8000", 1));
+    followed(&leader, &follower, joined);
+    let sessions: &dyn SessionsStore = &follower;
+    sessions.pin(11, joined.id(), Instant::now(), None);
+    let revision = WorkersStore::get(&leader, joined.id()).expect("the row");
+    let removed = leader.remove(joined.id(), revision.revision);
+    followed(&leader, &follower, removed.expect("removed"));
+    let again = follower.upsert(facts("http://a:8000", 2)).id();
+    assert_eq!(sessions.lookup(11).map(|pin| pin.worker), Some(again));
+}
+
 /// The door of a writer that knows a key's rule by its lease alone: the
 /// worker and the last use move as at the plain door, and the end that
 /// stood stays where it is the later one. No end is later than any
