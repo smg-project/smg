@@ -7,7 +7,6 @@ use std::sync::Arc;
 use kv_index::{chain_prefix_hash, ContentHash, SequenceHash, StoredBlock};
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus, UNKNOWN_MODEL_ID};
 use smg_policy_controller::{
-    spec::{AffinitySource, ScoreSpec, ScoreStage},
     store::{
         BatchFacts, BatchOutcome, KvEvent, KvEventSink, MemoryStore, Signals, WorkerFacts,
         WorkerStatus as RowStatus, WorkersStore,
@@ -87,24 +86,32 @@ fn started<'a>(
     bed_with(store, registry, urls_and_models, ranked_url)
 }
 
-/// Three ready rows under the cache-aware preset, with the second row's id.
-pub(crate) fn cache_bed() -> (Host, Arc<MemoryStore>, WorkerId) {
+/// The URLs of a preset bed's three rows.
+const URLS: [&str; 3] = ["http://w0:8000", "http://w1:8000", "http://w2:8000"];
+
+/// One ready row a URL under the cache-aware preset, over workers
+/// registered in `registry`, each publishing cache events or none.
+fn preset_bed(registry: Arc<WorkerRegistry>, urls: &[&str], events: bool) -> Bed {
     let store = Arc::new(MemoryStore::new());
     let document = PolicySpec::preset("cache_aware").expect("the preset");
     let applied = AppliedSpec::validate(&document).expect("the preset validates");
     store.apply(applied).expect("the store takes the preset");
-    let urls = ["http://w0:8000", "http://w1:8000", "http://w2:8000"];
     let rows = urls.iter().map(|&url| (url, Some(MODEL)));
-    let (host, store, _) = bed_with(store, Arc::new(WorkerRegistry::new()), rows, None);
-    let holder = store.by_key(urls[1]).expect("the second worker's row").id;
+    bed_publishing(store, registry, rows, None, events)
+}
+
+/// [`preset_bed`] of three rows that publish cache events, with the second
+/// row's id.
+pub(crate) fn cache_bed() -> (Host, Arc<MemoryStore>, WorkerId) {
+    let (host, store, _) = preset_bed(Arc::new(WorkerRegistry::new()), &URLS, true);
+    let holder = store.by_key(URLS[1]).expect("the second worker's row").id;
     (host, store, holder)
 }
 
-/// Three ready rows that publish no cache events, under the cache-aware
-/// preset with its prefix stage reading the record of sent prefixes.
+/// [`preset_bed`] of three rows that publish none: the preset's prefix
+/// stage reads the record of sent prefixes for them.
 pub(crate) fn record_bed() -> (Host, Arc<MemoryStore>) {
-    let urls = ["http://w0:8000", "http://w1:8000", "http://w2:8000"];
-    record_bed_over(Arc::new(WorkerRegistry::new()), &urls)
+    record_bed_over(Arc::new(WorkerRegistry::new()), &URLS)
 }
 
 /// [`record_bed`] with one row a URL, over workers registered in `registry`.
@@ -112,18 +119,7 @@ pub(crate) fn record_bed_over(
     registry: Arc<WorkerRegistry>,
     urls: &[&str],
 ) -> (Host, Arc<MemoryStore>) {
-    let store = Arc::new(MemoryStore::new());
-    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
-    let stages = document.profiles.values_mut();
-    for stage in stages.flat_map(|profile| &mut profile.score) {
-        if let ScoreSpec::Params(ScoreStage::PrefixAffinity(params)) = stage {
-            params.source = Some(AffinitySource::Merged);
-        }
-    }
-    let applied = AppliedSpec::validate(&document).expect("the document validates");
-    store.apply(applied).expect("the store takes the document");
-    let rows = urls.iter().map(|&url| (url, Some(MODEL)));
-    let (host, store, _) = bed_publishing(store, registry, rows, None, false);
+    let (host, store, _) = preset_bed(registry, urls, false);
     (host, store)
 }
 

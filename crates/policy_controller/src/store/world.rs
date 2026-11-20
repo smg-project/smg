@@ -4321,13 +4321,13 @@ impl Writer {
     /// admission after it. A pool is found at its place, or among
     /// `before`, the pools as they stood, where the write moved its place.
     /// A write that moved no member and no offer ([`Classes::Carry`]) moved
-    /// no row, no admission and no wire a row states: where no lane moved
-    /// either and the generation reads no sent prefixes, every pool
-    /// stands as it did and none is walked. A pool is also made anew when
-    /// its sent-prefix settings change. Under
-    /// [`Classes::Derive`] the pools may stand under a generation of another
-    /// pairing mode, one the standings were not ruled by: every kept pool's
-    /// warming rows are ruled and read again.
+    /// no row, no admission and no wire a row states: where no lane, no
+    /// block size of record and no row's word to record moved either
+    /// ([`KvTables::moves`]), every pool stands as it did and none is
+    /// walked. A pool is also made anew when its sent-prefix settings
+    /// change. Under [`Classes::Derive`] the pools may stand under a
+    /// generation of another pairing mode, one the standings were not ruled
+    /// by: every kept pool's warming rows are ruled and read again.
     fn index_pools(&mut self, before: &Derived, classes: Classes) {
         let Self {
             derived,
@@ -4342,11 +4342,13 @@ impl Writer {
             ..
         } = self;
         let window = last_window.map_or(0, |at| micros(*origin, at));
-        // No lane was made or retired since the last write stood its
-        // pools: no pool's place in an index moved, and none is looked up.
+        // No lane was made or retired, no block size of record moved and
+        // no row's word to record was cleared since the last write stood
+        // its pools: no pool's place in an index moved, no record's bound
+        // and no row's word, and none is looked up.
         let moves = kv.moves();
         let still = mem::replace(lanes, moves) == moves;
-        if still && classes == Classes::Carry && !spec.needs().sent_prefixes {
+        if still && classes == Classes::Carry {
             return;
         }
         let ruled = classes != Classes::Derive;

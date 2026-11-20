@@ -861,7 +861,9 @@ impl MemoryStore {
             let workers = self.workers.lock();
             let mut loads = self.loads.lock();
             // The last word, behind every lock this entry waits for: what
-            // follows is the publication, and it waits for nothing.
+            // follows is the publication. It waits for one thing more: a
+            // model's record of sent prefixes, where this generation moves
+            // its bound and a decider holds the record for a slice.
             if !admit() {
                 return Ok(false);
             }

@@ -397,7 +397,9 @@ pub struct IndexSpec {
     #[schemars(range(min = 1))]
     pub ttl_s: u32,
     /// The size bound of a tree index: characters on a text host, tokens
-    /// otherwise.
+    /// otherwise. The crate's own store reads it for a pool whose profile
+    /// reads sent prefixes: the model's record holds `max_size` over the
+    /// block size placements at most, one a block a worker was sent.
     #[schemars(range(min = 1))]
     pub max_size: u64,
     /// The index's sweep cadence, in seconds.
@@ -508,13 +510,13 @@ impl Default for LeastLoadParams {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AffinitySource {
-    /// The event-fed prefix index.
-    #[default]
+    /// The index of cache events alone.
     Index,
-    /// The side index of prefixes sent, for workers without an event
-    /// subscription.
+    /// The record of the prefixes sent alone.
     Predictor,
-    /// Both, merged by per-worker maximum.
+    /// Each worker by what it has: its cache events where it publishes
+    /// them, and the prefixes sent to it where it does not.
+    #[default]
     Merged,
 }
 
@@ -557,7 +559,7 @@ pub struct PrefixAffinityParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0.0))]
     pub decay: Option<f32>,
-    /// Where placements come from (default `index`).
+    /// Where placements come from (default `merged`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<AffinitySource>,
     /// How long an optimistic dispatch booking lives before the engine
@@ -3578,22 +3580,6 @@ fn check_profile(
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
         check_prefix_depth(&stage, gates, view, &stage_at)?;
-        // A host that records no prefix it sent holds no source that reads
-        // them: where no worker publishes its blocks, the stage would score
-        // every worker as holding nothing.
-        let reads_sent = matches!(
-            &stage,
-            ScoreStage::PrefixAffinity(p)
-                if matches!(p.source, Some(AffinitySource::Predictor | AffinitySource::Merged))
-        );
-        if reads_sent && !catalog.records_sent_prefixes() {
-            complete = false;
-            deferred.note(
-                stage_at.field("source"),
-                "the record of sent prefixes this source reads",
-            );
-            continue;
-        }
         let count = || profile_sent(&mut sent, name, p.sent_ttl_ms);
         match scorer_of(&stage, gates, view, count, &stage_at)? {
             Resolved::Built(scorer) => {
@@ -6002,7 +5988,16 @@ mod tests {
             // affinity stage and the ring's prefix form.
             let hashes = ["cache_aware", "prefix_hash"].contains(&name);
             assert_eq!(engine.needs().token_hashes, hashes, "{name}");
+            assert_eq!(engine.needs().text_hashes, hashes, "{name}");
+            assert!(!engine.needs().text, "{name}");
+            // The affinity stage's source is left out: it reads each worker
+            // by what it has, its cache events or the prefixes sent to it.
             assert_eq!(engine.needs().events, name == "cache_aware", "{name}");
+            assert_eq!(
+                engine.needs().sent_prefixes,
+                name == "cache_aware",
+                "{name}"
+            );
             // The affinity column is fed where an affinity stage reads it
             // and nowhere else: a preset without one declares no column.
             assert_eq!(engine.needs().affinity, name == "cache_aware", "{name}");
@@ -7114,37 +7109,19 @@ mod tests {
             .expect("the tokens alone");
     }
 
-    /// A prefix-affinity source that reads the prefixes sent is refused by
-    /// its field where the host records none: `predictor` and `merged`
-    /// would place as with no affinity where no worker publishes its
-    /// blocks. A host that records them validates both. The event-fed
-    /// index validates on either host, named or left out.
+    /// A document that names no source reads each worker by what it has:
+    /// its stage asks a host for cache events and for the prefixes sent.
     #[test]
-    fn a_source_of_sent_prefixes_is_refused_where_the_host_records_none() {
-        let records_none = Catalog::builtin().without_sent_prefixes();
-        for source in ["predictor", "merged"] {
-            let score = format!(r#"{{"prefix-affinity":{{"source":"{source}"}}}}"#);
-            let spec = spec_with_score(&score);
-            let refused = spec
-                .validate_in(&records_none, &[])
-                .expect_err("a source this host cannot feed");
-            assert_eq!(
-                refused.to_string(),
-                "profiles.p.score[0].prefix-affinity.source: the record of sent prefixes this source reads is not in this build",
-                "{source}"
-            );
-            assert!(
-                spec.validate().is_ok(),
-                "{source}: a host that records them"
-            );
-        }
-        for score in [
-            r#"{"prefix-affinity":{"source":"index"}}"#,
-            r#"{"prefix-affinity":{}}"#,
-        ] {
-            let spec = spec_with_score(score);
-            assert!(spec.validate_in(&records_none, &[]).is_ok(), "{score}");
-        }
+    fn a_source_left_out_reads_cache_events_and_sent_prefixes() {
+        let needs = |score: &str| spec_with_score(score).validate().expect(score).needs();
+        let left_out = needs(r#"{"prefix-affinity":{}}"#);
+        assert_eq!(
+            left_out,
+            needs(r#"{"prefix-affinity":{"source":"merged"}}"#)
+        );
+        assert!(left_out.events && left_out.sent_prefixes);
+        let index = needs(r#"{"prefix-affinity":{"source":"index"}}"#);
+        assert!(index.events && !index.sent_prefixes);
     }
 
     #[test]

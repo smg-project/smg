@@ -937,6 +937,26 @@ mod sent_prefixes {
         Ok(())
     }
 
+    /// A model's block size of record moves its record's bound at the next
+    /// membership write, though that write moves no member and no offer.
+    #[test]
+    fn a_block_size_of_record_moves_the_records_bound() -> Case {
+        let store = MemoryStore::new();
+        let join = || plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        join();
+        store.apply(applied(&merged(1)?)?)?;
+        let record = record(&store).ok_or("the model's record")?;
+        let bound = record.bound();
+        let size = store.deciding(|world| world.spec().block_size());
+        KvEventSink::set_block_size(&store, MODEL, 2 * size);
+        join();
+        assert_eq!(record.bound(), bound / 2);
+        KvEventSink::forget_block_size(&store, MODEL);
+        join();
+        assert_eq!(record.bound(), bound);
+        Ok(())
+    }
+
     #[test]
     fn a_lower_bound_keeps_its_sweep_past_a_decider_that_holds_the_record() -> Case {
         let store = MemoryStore::new();
@@ -964,7 +984,13 @@ mod sent_prefixes {
         let lowered = thread::scope(|scope| {
             let store = &store;
             let lowering = scope.spawn(move || store.apply(smaller).is_ok());
-            while predicted.bound.load(Ordering::Relaxed) == was {
+            // A build that never moves the bound fails the case below: it
+            // does not hang here.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while predicted.bound.load(Ordering::Relaxed) == was
+                && !lowering.is_finished()
+                && Instant::now() < deadline
+            {
                 thread::yield_now();
             }
             // Time for a step the build must not take ahead of the guard.

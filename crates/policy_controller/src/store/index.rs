@@ -1514,8 +1514,11 @@ struct Table {
     /// The same word in every pool that can record for this worker.
     allowed: FxHashMap<WorkerId, Weak<AtomicBool>>,
     block_sizes: HashMap<String, u32>,
-    /// How many times a lane was made or retired: a pool's place in an
-    /// index moves with one of the two and with no other write.
+    /// How many times a lane was made or retired, a model's block size of
+    /// record moved, or a worker's word to record was cleared: a pool's
+    /// place in an index moves with one of the first two, its record's
+    /// bound with the third, a row's word with the fourth, and none of
+    /// them with any other write.
     moves: u64,
 }
 
@@ -1751,8 +1754,12 @@ impl KvTables {
     }
 
     /// How many times a lane was made or retired ([`Self::member`],
-    /// [`Self::forget`]): while the count stands, every pool stands in its
-    /// model's index where its tables hold it.
+    /// [`Self::forget`]), a model's block size of record moved
+    /// ([`Self::set_block_size`], [`Self::forget_block_size`]), or a
+    /// worker's word to record was cleared ([`Self::forget_sent`]): while
+    /// the count stands, every pool stands in its model's index where its
+    /// tables hold it, its record of sent prefixes under its bound, and
+    /// each of its rows may record as it could.
     pub(super) fn moves(&self) -> u64 {
         self.table.lock().moves
     }
@@ -1825,6 +1832,9 @@ impl KvTables {
             let mut table = self.table.lock();
             if let Some(allowed) = table.allowed.remove(&id).and_then(|held| held.upgrade()) {
                 allowed.store(false, Ordering::Relaxed);
+                // The pools that hold the word are made anew at this
+                // write, though it may move no member and no offer.
+                table.moves += 1;
             }
             table.predicted.values().filter_map(Weak::upgrade).collect()
         };
@@ -1930,15 +1940,19 @@ impl KvTables {
 
     pub(super) fn set_block_size(&self, model: &str, size: u32) {
         let mut table = self.table.lock();
-        let of_record = table.block_sizes.entry(model.to_string()).or_insert(size);
-        if size > *of_record {
-            *of_record = size;
+        let of_record = table.block_sizes.get(model).copied();
+        if of_record.is_none_or(|of_record| size > of_record) {
+            table.block_sizes.insert(model.to_string(), size);
+            table.moves += 1;
         }
     }
 
     /// Drop the size of record so a returning model can set it anew.
     pub(super) fn forget_block_size(&self, model: &str) {
-        self.table.lock().block_sizes.remove(model);
+        let mut table = self.table.lock();
+        if table.block_sizes.remove(model).is_some() {
+            table.moves += 1;
+        }
     }
 
     fn note(&self, reason: ResyncReason) {

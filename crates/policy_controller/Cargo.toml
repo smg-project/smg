@@ -469,8 +469,9 @@ required-features = ["controller"]
 name = "encode_classes"
 harness = false
 
-# The sent-prefix predictor's read and write. No decision reads the
-# predictor yet, so no id of `decision` moves with it.
+# The sent-prefix predictor's read and write, alone. A decision's naming
+# reads it through the store's record, and no id of `decision` times that
+# read yet.
 [[bench]]
 name = "predictor"
 harness = false

@@ -160,7 +160,7 @@
           "default": 180
         },
         "max_size": {
-          "description": "The size bound of a tree index: characters on a text host, tokens\notherwise.",
+          "description": "The size bound of a tree index: characters on a text host, tokens\notherwise. The crate's own store reads it for a pool whose profile\nreads sent prefixes: the model's record holds `max_size` over the\nblock size placements at most, one a block a worker was sent.",
           "type": "integer",
           "format": "uint64",
           "minimum": 1,
@@ -607,7 +607,7 @@
           "minimum": 0.0
         },
         "source": {
-          "description": "Where placements come from (default `index`).",
+          "description": "Where placements come from (default `merged`).",
           "anyOf": [
             {
               "$ref": "#/$defs/AffinitySource"
@@ -644,17 +644,17 @@
       "description": "Where prefix affinity reads placements from.",
       "oneOf": [
         {
-          "description": "The event-fed prefix index.",
+          "description": "The index of cache events alone.",
           "type": "string",
           "const": "index"
         },
         {
-          "description": "The side index of prefixes sent, for workers without an event\nsubscription.",
+          "description": "The record of the prefixes sent alone.",
           "type": "string",
           "const": "predictor"
         },
         {
-          "description": "Both, merged by per-worker maximum.",
+          "description": "Each worker by what it has: its cache events where it publishes\nthem, and the prefixes sent to it where it does not.",
           "type": "string",
           "const": "merged"
         }

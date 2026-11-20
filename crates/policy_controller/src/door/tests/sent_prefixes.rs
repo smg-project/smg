@@ -31,10 +31,11 @@ type Case<T = ()> = Result<T, Box<dyn Error>>;
 
 const HASHES: [u64; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 
+/// The `cache_aware` preset as it stands: its affinity stage names no
+/// source, so it reads `merged`.
 pub(crate) fn merged(generation: u64) -> Result<PolicySpec, crate::spec::SpecError> {
     let mut document = PolicySpec::preset("cache_aware")?;
     document.generation = generation;
-    use_sent_prefixes(&mut document, AffinitySource::Merged);
     Ok(document)
 }
 
@@ -636,7 +637,10 @@ fn a_profile_that_reads_sent_prefixes_keeps_no_decider() -> Case {
         assert!(!spec.engine().reads_sent_for("unbound", Phase::Single));
         assert!(!spec.engine().keeps_deciders());
     }
-    let index = PolicySpec::preset("cache_aware")?;
+    // The preset names no source and reads them too. `index` does not.
+    assert!(applied(&merged(1)?)?.needs().sent_prefixes);
+    let mut index = merged(1)?;
+    use_sent_prefixes(&mut index, AffinitySource::Index);
     assert!(!applied(&index)?.needs().sent_prefixes);
     let mut old = serde_json::to_value(Needs::default())?;
     old.as_object_mut()
