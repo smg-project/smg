@@ -724,7 +724,7 @@ mod tests {
         assert!(stands(&second));
 
         let by = Remover::Maker(&Maker::Control);
-        let drained = feed.door.drained(by, url, seen());
+        let drained = feed.door.drained(by, url, seen(), None);
         assert!(drained.is_ok(), "{drained:?}");
         let leaving = step.refresh(seen(), &built("m", "c"), &second);
         assert!(matches!(leaving, Ok(false)), "{leaving:?}");

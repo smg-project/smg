@@ -76,8 +76,16 @@ impl Membership for DrainingDoor {
         self.door.found_rows(maker, expect, built, over)
     }
 
-    fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
-        let wrote = self.door.drained(by, url, seen)?;
+    // The feed's door holds the mark against the object the asker read:
+    // pass the call on, then mark the worker.
+    fn drained(
+        &self,
+        by: Remover<'_>,
+        url: &str,
+        seen: Standing,
+        over: Option<&Arc<dyn Worker>>,
+    ) -> Result<Wrote, Refused> {
+        let wrote = self.door.drained(by, url, seen, over)?;
         // `Unmoved` is a row that was draining already: the removal that
         // marked it may have ended before its mark reached the worker.
         if let Wrote::Draining(row) | Wrote::Unmoved(row) = wrote {

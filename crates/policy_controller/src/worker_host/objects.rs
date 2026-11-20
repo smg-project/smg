@@ -536,6 +536,28 @@ impl<G: Generation> Objects<G> {
         wrote.first().copied().ok_or(Refused::Moved)
     }
 
+    /// Run `write`, a drain's mark of the row under `url`, in the hand-in's
+    /// turn, and return its answer.
+    ///
+    /// `over` is the object the drain's asker read. A removal takes the
+    /// object its asker selected and never a newer one, and an object can
+    /// change while its row's revision stands, as in [`Self::handing`]. So
+    /// the call refuses the mark as moved, ahead of it, where another
+    /// object stands under `url` by then.
+    ///
+    /// One layer calls it for a drain: the turn is not reentrant. The
+    /// drain step calls it for a holder with a keeper. A door calls it
+    /// where its holder keeps built objects, and such a holder has no
+    /// keeper ([`Self::with_built_kept`]).
+    pub fn draining(
+        &self,
+        url: &str,
+        over: Option<&Arc<dyn Worker>>,
+        write: impl FnOnce() -> Result<Wrote, Refused>,
+    ) -> Result<Wrote, Refused> {
+        self.keeping(url, over, write)?
+    }
+
     /// How many lays found no object handed in, under
     /// [`Self::with_built_kept`]: rows a writer moved or made with no
     /// hand-in, and offers that did not state the row. Each one warned.
@@ -1184,7 +1206,7 @@ mod tests {
         },
         worker_host::{
             facts as stated, object, Expect, HealthAdapter, KeptCredential, Membership, Over,
-            SoleLead, StoreDoor,
+            Remover, SoleLead, StoreDoor,
         },
         AppliedSpec, PolicySpec,
     };
@@ -1904,6 +1926,35 @@ mod tests {
                 .all(|(what, _)| *what != "removed" && *what != "registered"),
             "{told:?}"
         );
+    }
+
+    /// A drain is held against the object its asker read. A registration
+    /// of equal facts lays another object and leaves the row's revision,
+    /// so the row's standing alone lets the mark pass. The mark is refused
+    /// ahead of its write, and the row stays out of the drain. A drain
+    /// that names the object that stands marks the row, and so does one
+    /// that names none.
+    #[test]
+    fn a_drain_is_refused_once_another_object_stands_under_its_url() {
+        let (replica, door) = handing();
+        let first = built(A, KEY_A);
+        registered(&replica, &door, &first, Expect::Anything).expect("the first write");
+        let seen = replica.objects.standing_of(&replica.id(A), &first);
+        let seen = seen.expect("the first object's row");
+        let second = built(A, KEY_B);
+        let wrote = registered(&replica, &door, &second, Expect::Anything);
+        assert!(matches!(wrote, Ok(Wrote::Unmoved(_))), "{wrote:?}");
+
+        let by = Remover::Maker(&Maker::Control);
+        let drain = |over: Option<&Arc<dyn Worker>>| {
+            let mark = || door.drained(by, A, seen, over);
+            replica.objects.draining(A, over, mark)
+        };
+        assert_eq!(drain(Some(&first)), Err(Refused::Moved));
+        assert_ne!(replica.row(A).status, WorkerStatus::Draining);
+        let row = replica.row(A).id;
+        assert_eq!(drain(Some(&second)), Ok(Wrote::Draining(row)));
+        assert_eq!(drain(None), Ok(Wrote::Unmoved(row)));
     }
 
     /// A replacement takes the standing object's status, so a handed

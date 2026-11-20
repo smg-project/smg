@@ -229,7 +229,21 @@ pub trait Membership: Send + Sync + 'static {
     }
 
     /// Mark the row the asker saw as draining. Its revision stays the same.
-    fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused>;
+    ///
+    /// `over` names the object the asker read, where it read one. A
+    /// removal takes the object its asker selected, and an object can
+    /// change while its row's revision stands. So a door whose host keeps
+    /// built objects holds the mark against that object
+    /// ([`Objects::draining`](super::Objects::draining)): it refuses the
+    /// mark as moved where another stands under the URL by then. A door
+    /// over a door passes the call on. Any other door marks the row alone.
+    fn drained(
+        &self,
+        by: Remover<'_>,
+        url: &str,
+        seen: Standing,
+        over: Option<&Arc<dyn Worker>>,
+    ) -> Result<Wrote, Refused>;
 
     /// Remove the row the asker saw under the registered URL.
     fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused>;
@@ -875,7 +889,14 @@ impl Membership for StoreDoor {
         stating(built, over, |rows| self.rows(maker, expect, rows))
     }
 
-    fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
+    // This door has no holder: it marks the row alone.
+    fn drained(
+        &self,
+        by: Remover<'_>,
+        url: &str,
+        seen: Standing,
+        _: Option<&Arc<dyn Worker>>,
+    ) -> Result<Wrote, Refused> {
         self.call(|| drain(&self.store, by, url, seen), Wrote::changed)
     }
 
@@ -1719,7 +1740,7 @@ pub(super) mod tests {
         // which is told so. Another maker is told the row is not its own.
         let seen = standing(&next);
         assert_eq!(
-            door.drained(Remover::Maker(&control), URL, seen),
+            door.drained(Remover::Maker(&control), URL, seen, None),
             Ok(Wrote::Draining(next.id))
         );
         assert_eq!(
@@ -1812,7 +1833,7 @@ pub(super) mod tests {
             ..standing(&replacement)
         };
         for seen in [wrong_revision, standing(&first)] {
-            assert_eq!(door.drained(by, URL, seen), Err(Refused::Moved));
+            assert_eq!(door.drained(by, URL, seen, None), Err(Refused::Moved));
             assert_eq!(door.gone(by, URL, seen), Err(Refused::Moved));
             assert_eq!(
                 door.gone(Remover::Provider("other"), URL, seen),
@@ -1853,11 +1874,14 @@ pub(super) mod tests {
             let seen = standing(&row);
             if let Some(refusal) = refusal {
                 let expected = Err(Refused::NotMaker(refusal.to_owned()));
-                assert_eq!(door.drained(by, URL, seen), expected);
+                assert_eq!(door.drained(by, URL, seen, None), expected);
                 assert_eq!(door.gone(by, URL, seen), expected);
                 assert_eq!(store.by_key(URL), Some(row));
             } else {
-                assert_eq!(door.drained(by, URL, seen), Ok(Wrote::Draining(row.id)));
+                assert_eq!(
+                    door.drained(by, URL, seen, None),
+                    Ok(Wrote::Draining(row.id))
+                );
                 assert_eq!(door.gone(by, URL, seen), Ok(Wrote::Removed(row.id)));
                 assert_eq!(store.by_key(URL), None);
             }
@@ -1886,11 +1910,14 @@ pub(super) mod tests {
                 let by = Remover::Health(scope);
                 let seen = standing(&row);
                 if allowed {
-                    assert_eq!(door.drained(by, URL, seen), Ok(Wrote::Draining(row.id)));
+                    assert_eq!(
+                        door.drained(by, URL, seen, None),
+                        Ok(Wrote::Draining(row.id))
+                    );
                     assert_eq!(door.gone(by, URL, seen), Ok(Wrote::Removed(row.id)));
                     assert_eq!(store.by_key(URL), None);
                 } else {
-                    assert_eq!(door.drained(by, URL, seen), Err(Refused::OutOfScope));
+                    assert_eq!(door.drained(by, URL, seen, None), Err(Refused::OutOfScope));
                     assert_eq!(door.gone(by, URL, seen), Err(Refused::OutOfScope));
                     assert_eq!(store.by_key(URL), Some(row));
                 }
@@ -1912,7 +1939,7 @@ pub(super) mod tests {
         assert!(door.found_one(&maker, URL, &|_| stated()).is_ok());
         let row = store.by_key(URL).ok_or("the registered row")?;
         assert_eq!(
-            door.drained(Remover::Provider("pool"), URL, standing(&row)),
+            door.drained(Remover::Provider("pool"), URL, standing(&row), None),
             Ok(Wrote::Draining(row.id))
         );
         assert_eq!(
@@ -2003,7 +2030,10 @@ pub(super) mod tests {
             assert_eq!(door.refreshed(seen, &late, &first), Err(Refused::Moved));
             let seen = standing(&moved);
             let by = Remover::Maker(maker);
-            assert_eq!(door.drained(by, URL, seen), Ok(Wrote::Draining(moved.id)));
+            assert_eq!(
+                door.drained(by, URL, seen, None),
+                Ok(Wrote::Draining(moved.id))
+            );
             assert_eq!(door.refreshed(seen, &late, &first), Err(Refused::Draining));
             assert_eq!(door.gone(by, URL, seen), Ok(Wrote::Removed(moved.id)));
             assert_eq!(door.refreshed(seen, &late, &first), Err(Refused::Absent));
@@ -2374,7 +2404,7 @@ pub(super) mod tests {
                 expected
             );
             assert_eq!(
-                door.drained(Remover::Maker(&caller), URL, standing(&row)),
+                door.drained(Remover::Maker(&caller), URL, standing(&row), None),
                 expected
             );
             assert_eq!(
@@ -2649,7 +2679,7 @@ pub(super) mod tests {
             Err(Refused::Moved)
         );
         assert_eq!(
-            door.drained(Remover::Maker(&maker), URL, standing(&row)),
+            door.drained(Remover::Maker(&maker), URL, standing(&row), None),
             Ok(Wrote::Draining(row.id))
         );
         assert_eq!(
@@ -2661,7 +2691,7 @@ pub(super) mod tests {
         );
         assert_eq!(store.epoch(), 2);
         assert_eq!(
-            door.drained(Remover::Maker(&maker), URL, standing(&row)),
+            door.drained(Remover::Maker(&maker), URL, standing(&row), None),
             Ok(Wrote::Unmoved(row.id))
         );
         assert_eq!(store.epoch(), 2);
@@ -2678,7 +2708,7 @@ pub(super) mod tests {
         let (store, door) = door();
         let maker = Maker::provider("pool", "first").expect("a maker");
         assert_eq!(
-            door.drained(Remover::Maker(&maker), URL, ABSENT),
+            door.drained(Remover::Maker(&maker), URL, ABSENT, None),
             Err(Refused::Absent)
         );
         assert_eq!(
@@ -2710,7 +2740,7 @@ pub(super) mod tests {
             let found = door.found_one(&maker, URL, &|_| stated());
             let seen = standing(&store.by_key(URL).expect("the registered row"));
             let by = Remover::Maker(&maker);
-            let drained = door.drained(by, URL, seen);
+            let drained = door.drained(by, URL, seen, None);
             let gone = door.gone(by, URL, seen);
             done.send([found, drained, gone]).expect("the answers");
         });

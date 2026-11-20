@@ -610,11 +610,19 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
                 kept.push(Arc::clone(worker));
                 continue;
             };
-            let answer = removal_answer(
-                DRAIN_WORKERS_AT_DOOR_STEP,
-                url,
-                self.door.drained(by, url, seen),
-            )?;
+            // The drain names the object the step read, the one its asker
+            // selected. A line that keeps lays an object again in its
+            // holder's turn, so its mark runs in that turn. The plain line
+            // takes no turn here: where its holder keeps built objects,
+            // its door holds the mark against the object under that turn.
+            let over = Some(&current);
+            let mark = || self.door.drained(by, url, seen, over);
+            let marked = if self.objects.credentials().is_some() {
+                self.objects.draining(url, over, mark)
+            } else {
+                mark()
+            };
+            let answer = removal_answer(DRAIN_WORKERS_AT_DOOR_STEP, url, marked)?;
             match answer {
                 Left::Wrote(Wrote::Draining(_) | Wrote::Unmoved(_)) => {
                     data.drained_workers.push(current);
@@ -1347,7 +1355,13 @@ mod tests {
             Err(self.0.clone())
         }
 
-        fn drained(&self, _: Remover<'_>, _: &str, _: Standing) -> Result<Wrote, Refused> {
+        fn drained(
+            &self,
+            _: Remover<'_>,
+            _: &str,
+            _: Standing,
+            _: Option<&Arc<dyn Worker>>,
+        ) -> Result<Wrote, Refused> {
             Err(self.0.clone())
         }
 
@@ -1590,7 +1604,13 @@ mod tests {
             Err(Refused::Moved)
         }
 
-        fn drained(&self, _: Remover<'_>, _: &str, _: Standing) -> Result<Wrote, Refused> {
+        fn drained(
+            &self,
+            _: Remover<'_>,
+            _: &str,
+            _: Standing,
+            _: Option<&Arc<dyn Worker>>,
+        ) -> Result<Wrote, Refused> {
             Err(Refused::Moved)
         }
 
@@ -1902,7 +1922,7 @@ mod tests {
         let live = f.host.registry.get(&id).expect("the worker");
         let seen = f.objects.standing_of(&id, &live).expect("its row");
         f.door
-            .drained(Remover::Maker(&Maker::Control), URL, seen)
+            .drained(Remover::Maker(&Maker::Control), URL, seen, None)
             .expect("draining");
         let mut cx = f.registration(WorkerJobAsker::Api, vec![relabelled()]);
         cx.data.registration_mode = by_id(id.as_str(), live.revision());
@@ -2335,6 +2355,146 @@ mod tests {
         // Other facts, found again: the row is out of the drain as well.
         let status = row.map(|row| row.status);
         assert_ne!(status, Some(WorkerStatus::Draining));
+    }
+
+    /// What runs ahead of a drain. It reads the object the drain names.
+    type Before = dyn Fn(Option<&Arc<dyn Worker>>) + Send + Sync;
+
+    /// A door over a door that runs `before` ahead of each drain it passes
+    /// on: what a step's mark meets between its read and its write.
+    struct BeforeDrain {
+        door: Arc<dyn Membership>,
+        before: Box<Before>,
+    }
+
+    impl Membership for BeforeDrain {
+        fn found(
+            &self,
+            maker: &Maker,
+            expect: Expect,
+            url: &str,
+            state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
+        ) -> Result<Wrote, Refused> {
+            self.door.found(maker, expect, url, state)
+        }
+
+        fn found_built(
+            &self,
+            maker: &Maker,
+            expect: Expect,
+            built: &Arc<dyn Worker>,
+            over: Option<Over<'_>>,
+        ) -> Result<Wrote, Refused> {
+            self.door.found_built(maker, expect, built, over)
+        }
+
+        fn found_rows(
+            &self,
+            maker: &Maker,
+            expect: Expect,
+            built: &[Arc<dyn Worker>],
+            over: Option<Over<'_>>,
+        ) -> Result<Vec<Wrote>, Refused> {
+            self.door.found_rows(maker, expect, built, over)
+        }
+
+        fn drained(
+            &self,
+            by: Remover<'_>,
+            url: &str,
+            seen: Standing,
+            over: Option<&Arc<dyn Worker>>,
+        ) -> Result<Wrote, Refused> {
+            (self.before)(over);
+            self.door.drained(by, url, seen, over)
+        }
+
+        fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
+            self.door.gone(by, url, seen)
+        }
+
+        fn refreshed(
+            &self,
+            seen: Standing,
+            built: &Arc<dyn Worker>,
+            over: &Arc<dyn Worker>,
+        ) -> Result<Wrote, Refused> {
+            self.door.refreshed(seen, built, over)
+        }
+    }
+
+    /// The drain names the object the step read, the one its asker
+    /// selected, so a door that keeps built objects holds the mark against
+    /// it.
+    #[tokio::test]
+    async fn a_drain_names_the_object_its_step_read() {
+        let f = Fixture::new();
+        f.seed(&Maker::Control, worker(URL, "model").as_ref())
+            .expect("registered");
+        let live = f.host.registry.get_by_url(URL).expect("the held worker");
+        let named = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (names, read) = (Arc::clone(&named), Arc::clone(&live));
+        let before = move |over: Option<&Arc<dyn Worker>>| {
+            let very = over.is_some_and(|over| Arc::ptr_eq(over, &read));
+            names.lock().expect("the record").push(very);
+        };
+        let drain = DrainWorkersAtDoor {
+            door: Arc::new(BeforeDrain {
+                door: Arc::clone(&f.door),
+                before: Box::new(before),
+            }),
+            ..f.drain()
+        };
+        let mut removal = f.removal(WorkerJobAsker::Api, vec![live]);
+        drain.execute(&mut removal).await.expect("drained");
+        assert_eq!(*named.lock().expect("the record"), [true]);
+        assert_eq!(removal.data.drained_workers.len(), 1);
+    }
+
+    /// A line that keeps lays an object again in its holder's turn, so its
+    /// drain marks in that turn. Another registration that asks for the
+    /// turn inside the mark waits for the mark's end.
+    #[tokio::test]
+    async fn a_drain_of_a_line_that_keeps_marks_in_its_holders_turn() {
+        use std::{
+            sync::{mpsc, Mutex},
+            thread,
+        };
+
+        let (f, credentials) = Fixture::keeping();
+        let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-a")]);
+        let write = f.write_keeping(&credentials);
+        write.execute(&mut cx).await.expect("written");
+        f.objects.follow(&*f.store);
+        let live = f.host.registry.get_by_url(URL).expect("the held worker");
+
+        let asked = Arc::new(Mutex::new(None));
+        let (record, objects) = (Arc::clone(&asked), Arc::clone(&f.objects));
+        let before = move |_: Option<&Arc<dyn Worker>>| {
+            let (done, turn) = mpsc::channel();
+            let objects = Arc::clone(&objects);
+            let other = thread::spawn(move || {
+                let taken = objects.keeping(URL, None, || ());
+                let _ = done.send(());
+                taken
+            });
+            let waits = turn.recv_timeout(Duration::from_millis(100)).is_err();
+            *record.lock().expect("the record") = Some((waits, other));
+        };
+        let drain = DrainWorkersAtDoor {
+            door: Arc::new(BeforeDrain {
+                door: Arc::clone(&f.door),
+                before: Box::new(before),
+            }),
+            ..f.drain()
+        };
+        let mut removal = f.removal(WorkerJobAsker::Api, vec![live]);
+        drain.execute(&mut removal).await.expect("drained");
+        let asked = asked.lock().expect("the record").take();
+        let (waits, other) = asked.expect("one drain");
+        assert!(waits, "another registration took the turn inside the mark");
+        assert_eq!(other.join().expect("the other registration"), Ok(()));
+        assert_eq!(removal.data.drained_workers.len(), 1);
     }
 
     #[test]

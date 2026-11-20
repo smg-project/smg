@@ -872,7 +872,15 @@ impl Membership for Hosted {
         stating(built, over, |rows| self.rows(maker, expect, rows))
     }
 
-    fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, HostRefused> {
+    // The controller holds no object to hold the mark against: it marks
+    // the row alone.
+    fn drained(
+        &self,
+        by: Remover<'_>,
+        url: &str,
+        seen: Standing,
+        _: Option<&Arc<dyn Worker>>,
+    ) -> Result<Wrote, HostRefused> {
         self.removal("worker drain", by, || {
             drain(&self.door.store, by, url, seen)
         })
@@ -2711,7 +2719,7 @@ pub(crate) mod tests {
             )),
             refused
         );
-        assert_eq!(hosted.drained(by, URL, seen), refused);
+        assert_eq!(hosted.drained(by, URL, seen, None), refused);
         assert_eq!(hosted.gone(by, URL, seen), refused);
         assert_eq!(reads.load(Ordering::Relaxed), 3);
         assert_eq!(store.by_key(URL), row);
@@ -2852,9 +2860,15 @@ pub(crate) mod tests {
                 })
             );
             let seen = standing(&fresh);
-            assert_eq!(door.drained(by, URL, seen), Ok(Wrote::Draining(fresh.id)));
+            assert_eq!(
+                door.drained(by, URL, seen, None),
+                Ok(Wrote::Draining(fresh.id))
+            );
             let draining = store.by_key(URL).expect("the draining row");
-            assert_eq!(door.drained(by, URL, seen), Ok(Wrote::Unmoved(fresh.id)));
+            assert_eq!(
+                door.drained(by, URL, seen, None),
+                Ok(Wrote::Unmoved(fresh.id))
+            );
             assert_eq!(door.gone(by, URL, seen), Ok(Wrote::Removed(fresh.id)));
             assert_eq!(store.by_key(URL), None);
             [first, refreshed, fresh, draining].map(|row| {
@@ -3466,11 +3480,19 @@ pub(crate) mod tests {
             revision: row.revision,
         };
         assert_eq!(
-            door.drained(Remover::Health(UnhealthyRemovalScope::Disabled), URL, seen),
+            door.drained(
+                Remover::Health(UnhealthyRemovalScope::Disabled),
+                URL,
+                seen,
+                None
+            ),
             Err(Refused::OutOfScope)
         );
         let by = Remover::Health(UnhealthyRemovalScope::DiscoveryOwned);
-        assert_eq!(door.drained(by, URL, seen), Ok(Wrote::Draining(row.id)));
+        assert_eq!(
+            door.drained(by, URL, seen, None),
+            Ok(Wrote::Draining(row.id))
+        );
         assert_eq!(door.gone(by, URL, seen), Ok(Wrote::Removed(row.id)));
 
         let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
@@ -3598,8 +3620,8 @@ pub(crate) mod tests {
         let new = row.id.0;
         let seen = standing(&row);
         let by = Remover::Maker(&maker);
-        hosted.drained(by, URL, seen).expect("drained");
-        hosted.drained(by, URL, seen).expect("unmoved");
+        hosted.drained(by, URL, seen, None).expect("drained");
+        hosted.drained(by, URL, seen, None).expect("unmoved");
         hosted
             .gone(Remover::Maker(&found("another/key")), URL, seen)
             .expect_err("another maker");

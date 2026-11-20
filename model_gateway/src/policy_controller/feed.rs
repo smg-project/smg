@@ -438,8 +438,20 @@ impl Membership for FeedDoor {
         })
     }
 
-    fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
-        self.write(|door| door.drained(by, url, seen))
+    // The holder keeps built objects: the mark is held against the object
+    // its asker read, in the holder's turn. The drain step takes that turn
+    // for a holder with a keeper alone, and this holder has none.
+    fn drained(
+        &self,
+        by: Remover<'_>,
+        url: &str,
+        seen: Standing,
+        over: Option<&Arc<dyn Worker>>,
+    ) -> Result<Wrote, Refused> {
+        self.write(|door| {
+            self.objects
+                .draining(url, over, || door.drained(by, url, seen, over))
+        })
     }
 
     fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {

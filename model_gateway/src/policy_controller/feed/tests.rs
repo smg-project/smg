@@ -672,6 +672,44 @@ fn a_worker_that_states_a_width_and_no_rank_is_one_row_with_its_object() {
     assert_eq!(feed.objects.unhanded(), 0);
 }
 
+/// A drain names the object its asker read. A registration of equal facts
+/// lays another object and leaves the row's revision, so the row's
+/// standing alone lets the mark pass. The door refuses the mark as moved,
+/// and the row stays out of the drain. A drain that names the object that
+/// stands marks the row.
+#[test]
+fn a_drain_is_refused_once_another_object_stands_for_its_row() {
+    let store = Arc::new(MemoryStore::default());
+    let (registry, feed) = bed(&store);
+    let built = || -> Arc<dyn Worker> {
+        let worker = BasicWorkerBuilder::new(URL).model(ModelCard::new(MODEL));
+        Arc::new(worker.api_key("key").build())
+    };
+    let hand_in = |built: &Arc<dyn Worker>| {
+        feed.door
+            .found_built(&Maker::Control, Expect::Anything, built, None)
+    };
+    let first = built();
+    let wrote = hand_in(&first);
+    let Ok(Wrote::Registered(row)) = wrote else {
+        panic!("{wrote:?}");
+    };
+    let object = feed.objects.object(row).expect("the row has an object");
+    let seen = feed.objects.standing(&object).expect("the object's row");
+    let second = built();
+    assert_eq!(hand_in(&second), Ok(Wrote::Unmoved(row)));
+
+    let by = Remover::Maker(&Maker::Control);
+    let drain = |over| feed.door.drained(by, URL, seen, Some(over));
+    assert_eq!(drain(&first), Err(Refused::Moved));
+    let status = || store.by_key(URL).map(|row| row.status);
+    assert_ne!(status(), Some(RowStatus::Draining));
+    assert_eq!(drain(&second), Ok(Wrote::Draining(row)));
+    assert_eq!(status(), Some(RowStatus::Draining));
+    let held = registry.get_by_url(URL);
+    assert!(held.is_some_and(|held| Arc::ptr_eq(&held, &second)));
+}
+
 #[tokio::test]
 async fn a_drained_row_takes_no_decision_and_a_gone_row_leaves_the_registry() {
     let store = start_store().expect("the store starts");
@@ -688,7 +726,10 @@ async fn a_drained_row_takes_no_decision_and_a_gone_row_leaves_the_registry() {
     let object = feed.objects.object(row).expect("the row has an object");
     let seen = feed.objects.standing(&object).expect("the object's row");
     let by = Remover::Maker(&Maker::Control);
-    assert_eq!(feed.door.drained(by, URL, seen), Ok(Wrote::Draining(row)));
+    assert_eq!(
+        feed.door.drained(by, URL, seen, None),
+        Ok(Wrote::Draining(row))
+    );
     let drained = host
         .place(&ask(b"next"), Instant::now())
         .await
@@ -778,7 +819,7 @@ fn a_membership_write_holds_the_feed_turn_through_its_listener() {
         revision: store.get(row).expect("the worker's row").revision,
     };
     let by = Remover::Maker(&Maker::Control);
-    assert_eq!(door.drained(by, URL, seen), Ok(Wrote::Draining(row)));
+    assert_eq!(door.drained(by, URL, seen, None), Ok(Wrote::Draining(row)));
     assert_eq!(door.gone(by, URL, seen), Ok(Wrote::Removed(row)));
     assert_eq!(calls.load(Ordering::Relaxed), 3);
 }
