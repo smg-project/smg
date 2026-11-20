@@ -26,8 +26,8 @@ use super::{
     Refused, Remover, Standing, Wrote,
 };
 use crate::{
+    engine::view::WorkerId,
     store::{Maker, Unmade, WorkersStore},
-    view::WorkerId,
 };
 
 /// The provider name used by the host's own discovery source.

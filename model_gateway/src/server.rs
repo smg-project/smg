@@ -3956,7 +3956,7 @@ mod tests {
     #[tokio::test]
     async fn readiness_waits_for_the_first_snapshot_on_both_routers() {
         use axum::body::{to_bytes, Body};
-        use smg_policy_controller::controller::Scope;
+        use smg_policy_controller::service::controller::Scope;
         use tokio::{sync::oneshot, time};
         use tower::ServiceExt;
 
@@ -4084,8 +4084,8 @@ mod tests {
         use std::time::Instant;
 
         use smg_policy_controller::{
+            engine::view::{Role, WireModes},
             store::{Ask, GatewayId, HealthPolicy, Maker, ViewBuffers, WorkerFacts},
-            view::{Role, WireModes},
             worker_host::Expect,
         };
         use smg_worker::runtime::StallReason;

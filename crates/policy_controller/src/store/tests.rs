@@ -19,13 +19,17 @@ use super::{
     WorkerRow, WorkerStatus, WorkersStore, World,
 };
 use crate::{
-    decider::Decider,
-    decision::{Target, Targets},
-    demands::DemandFacts,
-    lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
-    replication::Log,
+    document::spec,
+    engine::{
+        decider::Decider,
+        decision,
+        decision::{Target, Targets},
+        demands::DemandFacts,
+        view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
+    },
+    service::replication::Log,
     sessions::SessionVerdict,
-    view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
+    tracking::lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
 };
 
 fn facts(key: &str, incarnation: u64) -> WorkerFacts {
@@ -1534,8 +1538,8 @@ fn two_gateways_sharing_a_lease_number_hold_separate_reservations() {
 
 /// The manual preset as `generation`, its keys pinned for `ttl_s` and swept
 /// every `sweep_s`.
-fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> crate::spec::AppliedSpec {
-    use crate::spec::{AppliedSpec, PolicySpec};
+fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> spec::AppliedSpec {
+    use crate::document::spec::{AppliedSpec, PolicySpec};
 
     let mut document = PolicySpec::preset("manual").expect("a preset of this build");
     document.generation = generation;
@@ -1635,7 +1639,7 @@ fn a_generation_replaced_before_any_pass_still_leaves_its_interval() {
 /// leaves at its own end, and a pin with none stays.
 #[test]
 fn a_pin_past_its_own_end_leaves_where_another_rule_keeps_its_keys_for_ever() {
-    use crate::spec::{AppliedSpec, PolicySpec};
+    use crate::document::spec::{AppliedSpec, PolicySpec};
 
     let store = MemoryStore::new();
     let now = Instant::now();
@@ -2198,7 +2202,7 @@ fn pair(
 ) -> (LeaseRecord, DecodeSide) {
     let mut targets = Targets::new();
     for &decode_id in decodes {
-        let pair = crate::decision::Pair {
+        let pair = decision::Pair {
             decode_id,
             ..Default::default()
         };
@@ -3521,7 +3525,7 @@ fn a_watch_snapshot_gives_a_new_incarnation_its_own_count() {
 #[test]
 fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
     use crate::{
-        view::{Candidate, RequestFacts},
+        engine::view::{Candidate, RequestFacts},
         AppliedSpec, Catalog, Lifecycle, PolicySpec, Scorer, TieBand,
     };
 

@@ -6,9 +6,9 @@
 use std::sync::{Arc, Mutex};
 
 use smg_policy_controller::{
-    spec::MAX_SIGNALS, AppliedSpec, Candidate, Catalog, Constraints, Decision, Engine, Filter,
-    Lifecycle, Needs, PairPools, Phase, Picker, PolicySpec, PoolFacts, RequestFacts, Scorer,
-    Scratch, SignalCell, SignalCells, SignalColumn, StageBuild, Targets, TieBand, WorkerId,
+    document::spec::MAX_SIGNALS, AppliedSpec, Candidate, Catalog, Constraints, Decision, Engine,
+    Filter, Lifecycle, Needs, PairPools, Phase, Picker, PolicySpec, PoolFacts, RequestFacts,
+    Scorer, Scratch, SignalCell, SignalCells, SignalColumn, StageBuild, Targets, TieBand, WorkerId,
 };
 
 /// The decisions' instant on the host's clock.
@@ -745,7 +745,7 @@ profiles:
 
 #[test]
 fn a_signal_declares_how_several_ranks_make_one_value_and_the_sum_is_left_unwritten() {
-    use smg_policy_controller::spec::AcrossRanks;
+    use smg_policy_controller::document::spec::AcrossRanks;
 
     let declaring = |across: &str| {
         document(&format!(

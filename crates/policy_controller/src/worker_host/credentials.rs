@@ -13,7 +13,7 @@ use std::{
 use parking_lot::RwLock;
 
 use super::object::dial_address;
-use crate::{store::WorkerFacts, view::WorkerId};
+use crate::{engine::view::WorkerId, store::WorkerFacts};
 
 /// The credentials of a host's workers, one entry per address, each bound
 /// to the rows its registrations wrote.
@@ -380,7 +380,7 @@ mod tests {
     use std::{sync::mpsc, thread, time::Duration};
 
     use super::{Credentials, KeptCredential, RegistrationInFlight};
-    use crate::{store::WorkerFacts, view::WorkerId};
+    use crate::{engine::view::WorkerId, store::WorkerFacts};
 
     const ADDRESS: &str = "http://a:8000";
     const OTHER_ADDRESS: &str = "http://b:8000";

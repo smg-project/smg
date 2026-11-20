@@ -13,7 +13,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    spec::{KeySourceSpec, RoutingKeySpec},
+    document::spec::{KeySourceSpec, RoutingKeySpec},
     store::{
         GatewayId, HealthSink, LeasesStore, MemoryStore, WorkerStatus as RowStatus, WorkersStore,
     },

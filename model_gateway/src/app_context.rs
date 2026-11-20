@@ -1523,8 +1523,8 @@ mod tests {
     #[tokio::test]
     async fn under_the_feed_the_collectors_sink_is_the_feeds() {
         use smg_policy_controller::{
+            engine::view::{Role, WireModes},
             store::{HealthPolicy, LoadSink, Maker, WorkerFacts},
-            view::{Role, WireModes},
             worker_host::{Expect, Wrote},
         };
         use smg_worker::common_proto::EngineLoad;

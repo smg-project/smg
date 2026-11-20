@@ -136,17 +136,24 @@ use net::vm_rss_kib;
 use openai_protocol::worker::RuntimeType;
 use prost::Message as _;
 use smg_policy_controller::{
-    client::{self, blocking, Answer, Client, Link, Unanswered},
-    controller::{State, PROTOCOL_VERSION},
-    proto::{
-        busy, completed::Class, decision::Outcome, gateway_frame, identity::Form, principal,
-        released, worker_event, Completed, DecideRequest, Decision, Dispatched, Hello, Identity,
-        Lease, OverloadThresholds, Released, RequestFacts, ShedReason, Side, WatchWorkersRequest,
+    document::{
+        spec,
+        spec::{BindingSpec, Match},
     },
-    spec::{BindingSpec, Match},
+    engine::view::{Role, SignalSource, WireModes, WorkerId},
+    service::{
+        client::{self, blocking, Answer, Client, Link, Unanswered},
+        controller::{State, PROTOCOL_VERSION},
+        proto,
+        proto::{
+            busy, completed::Class, decision::Outcome, gateway_frame, identity::Form, principal,
+            released, worker_event, Completed, DecideRequest, Decision, Dispatched, Hello,
+            Identity, Lease, OverloadThresholds, Released, RequestFacts, ShedReason, Side,
+            WatchWorkersRequest,
+        },
+        watcher::{Ended, Following, Watcher},
+    },
     store::{LaneCounts, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
-    view::{Role, SignalSource, WireModes, WorkerId},
-    watcher::{Ended, Following, Watcher},
     PolicySpec, PowerOfTwoMetric, SpecError,
 };
 use tokio::{
@@ -411,7 +418,7 @@ fn for_model(mut ask: DecideRequest, model: &str) -> DecideRequest {
 fn sized(mut ask: DecideRequest, tokens: u32) -> DecideRequest {
     if let Some(facts) = &mut ask.facts {
         SIZED.clone_into(&mut facts.model);
-        facts.phase = smg_policy_controller::proto::Phase::Prefill.into();
+        facts.phase = proto::Phase::Prefill.into();
         facts.prompt_tokens = tokens;
     }
     ask
@@ -422,12 +429,12 @@ fn sized(mut ask: DecideRequest, tokens: u32) -> DecideRequest {
 fn by_size() -> Result<PolicySpec, SpecError> {
     let mut document = PolicySpec::preset("bucket")?;
     for profile in document.profiles.values_mut() {
-        let sizes = smg_policy_controller::spec::BucketParams {
+        let sizes = spec::BucketParams {
             abs_threshold: Some(u32::MAX),
             adjust_interval_s: Some(3_600),
             ..Default::default()
         };
-        profile.score = vec![smg_policy_controller::spec::ScoreStage::Bucket(sizes).into()];
+        profile.score = vec![spec::ScoreStage::Bucket(sizes).into()];
     }
     Ok(document)
 }
@@ -1210,7 +1217,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         // returns to that failover.
         let away = |run: &str, n: u64| {
             let mut ask = keyed(nth(run, n), sticky);
-            ask.constraints = Some(smg_policy_controller::proto::Constraints {
+            ask.constraints = Some(proto::Constraints {
                 excluded: vec![sent.id],
                 ..Default::default()
             });
@@ -2314,7 +2321,7 @@ const PAIR_PLAN: &str = r#"{
 fn at_prefill(n: u64) -> DecideRequest {
     let mut ask = for_model(nth("pair", n), PAIRED);
     if let Some(facts) = &mut ask.facts {
-        facts.phase = smg_policy_controller::proto::Phase::Prefill.into();
+        facts.phase = proto::Phase::Prefill.into();
     }
     ask
 }
@@ -2795,8 +2802,8 @@ async fn a_link_refuses_a_frame_out_of_the_calls_ranges_and_stands() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_handle_over_a_link_ends_each_lease_on_the_worker_that_served() {
     use smg_policy_controller::{
-        door::{Door, Request},
-        handle::Handle,
+        engine::door::{Door, Request},
+        tracking::handle::Handle,
         Outcome, RequestFacts, Side, TransportClass,
     };
 
@@ -2971,8 +2978,8 @@ async fn follows(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
     use smg_policy_controller::{
-        lease::{Lease, LeaseId},
         store::{GatewayId, LeaseRecord, LeaseState, LeasesStore, Picked},
+        tracking::lease::{Lease, LeaseId},
     };
 
     let case = async {
@@ -3213,9 +3220,11 @@ mod hosted {
     use std::{collections::HashSet, sync::Arc};
 
     use smg_policy_controller::{
-        grpc::{self, GrpcPluginSpec, GrpcScorer, Transport},
-        plugins::OpenDecisions,
-        wasm::{self, PluginSpec, WasmScorer},
+        plugins::{
+            grpc::{self, GrpcPluginSpec, GrpcScorer, Transport},
+            shared::OpenDecisions,
+            wasm::{self, PluginSpec, WasmScorer},
+        },
         Candidate, Catalog, Lifecycle, Scorer, TieBand,
     };
 
@@ -3659,10 +3668,12 @@ mod embedded {
     use std::{sync::Arc, time::Instant};
 
     use smg_policy_controller::{
-        door::{Door, Request},
-        handle::Handle,
+        engine::{
+            door::{Door, Request},
+            view::fingerprint,
+        },
         store::{GatewayId, HealthSink, LeaseState, LeasesStore},
-        view::fingerprint,
+        tracking::handle::Handle,
         Constraints, Outcome, PolicySpec, ReleaseReason, RequestFacts, Side, TransportClass,
         WorkerId,
     };

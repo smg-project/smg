@@ -35,7 +35,7 @@ use serde_json::{
     value::{to_raw_value, RawValue},
     Value,
 };
-use smg_policy_controller::view::{Phase, WireModes, WorkerId};
+use smg_policy_controller::engine::view::{Phase, WireModes, WorkerId};
 use smg_worker::{
     identity::{
         basic::{RuntimeType, Worker, WorkerLoadGuard, WorkerType},

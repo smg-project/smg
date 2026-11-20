@@ -21,10 +21,12 @@ use std::{
 use parking_lot::Mutex;
 use serde::Deserialize;
 use smg_policy_controller::{
-    framework::{Scorer, TieBand},
-    lease::Lifecycle,
+    engine::{
+        framework::{Scorer, TieBand},
+        view::{Candidate, Phase, RequestFacts, Role, WireModes, WorkerId},
+    },
     store::{HealthPolicy, LoadSink as StoreLoadSink, Maker, MemoryStore, WorkerFacts},
-    view::{Candidate, Phase, RequestFacts, Role, WireModes, WorkerId},
+    tracking::lease::Lifecycle,
     worker_host::{Expect, Membership, Wrote},
     Catalog, CatalogError, Needs, PolicySpec, SignalColumn,
 };

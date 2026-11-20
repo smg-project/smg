@@ -35,7 +35,7 @@ use kv_index::{compute_content_hash, request_prefix_hashes, ContentHash};
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use smg_policy_controller::{
-    load_report,
+    load::load_report,
     store::{
         Ask, BatchFacts, BatchOutcome, GatewayId, KvEvent, KvEventSink, MemoryStore, Named, Naming,
         Signals, StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,

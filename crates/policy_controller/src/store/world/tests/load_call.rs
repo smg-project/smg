@@ -15,14 +15,18 @@ mod held {
 
     use super::super::{ask, load, member, MODEL};
     use crate::{
-        builtins::target_of,
-        counts::Slot,
-        decision::Targets,
-        framework::{Picker, Scorer, TieBand},
-        lease::{Lifecycle, Signal},
-        spec::BindingSpec,
+        document::spec::BindingSpec,
+        engine::{
+            decision::Targets,
+            framework::{Picker, Scorer, TieBand},
+            view::{Candidate, RequestFacts, Role, WorkerId},
+        },
+        stages::builtins::target_of,
         store::{world::ViewBuffers, Kinds, LoadSink, LoadSource, MemoryStore},
-        view::{Candidate, RequestFacts, Role, WorkerId},
+        tracking::{
+            counts::Slot,
+            lease::{Lifecycle, Signal},
+        },
         AppliedSpec, Catalog, PolicySpec,
     };
 

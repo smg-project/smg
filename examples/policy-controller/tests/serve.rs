@@ -13,10 +13,12 @@ use std::{
 
 use smg_grpc_client::{vllm_engine::AbortOnDropStream, vllm_proto, VllmEngineClient};
 use smg_policy_controller::{
-    client::{Answer, Client},
-    proto::{
-        self, decision, policy_controller_client::PolicyControllerClient,
-        register_worker_request::Mode, worker_event,
+    service::{
+        client::{Answer, Client},
+        proto::{
+            self, decision, policy_controller_client::PolicyControllerClient,
+            register_worker_request::Mode, worker_event,
+        },
     },
     store::PUBLISH_WINDOW,
 };

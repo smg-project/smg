@@ -34,17 +34,19 @@ use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    decision::{Decision, Shed, ShedReason, Trace},
-    door::Refused,
-    spec::{KeySourceSpec, Pairing, RoutingKeySpec},
+    document::spec::{KeySourceSpec, Pairing, RoutingKeySpec},
+    engine::{
+        decision::{Decision, Shed, ShedReason, Trace},
+        door::Refused,
+        view::{
+            fingerprint, Candidate, Identity, LoadRow, MediaCounts, Phase, RequestFacts, Role,
+            WireModes, WorkerId,
+        },
+    },
     store::{
         Ask as StoreAsk, BatchOutcome, HealthSink, KvEventSink, LeaseState, LeasesStore, LoadSink,
         LoadSource, MemoryStore, PairBuffers, PairingDescriptor, SessionsStore, WorkerFacts,
         WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
-    },
-    view::{
-        fingerprint, Candidate, Identity, LoadRow, MediaCounts, Phase, RequestFacts, Role,
-        WireModes, WorkerId,
     },
     AppliedSpec, Catalog, DerivedKey, KeySource, Lease, LeaseId, Lifecycle, Membership, Outcome,
     Picker, PolicySpec, ReleaseReason, Side, Target, Targets, TieBand, TransportClass,

@@ -18,8 +18,8 @@ use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
 use serde::{de::DeserializeOwned, Deserialize};
 use smg_policy_controller::{
-    door::{Door, Request},
-    spec::{BindingSpec, OverloadSpec},
+    document::spec::{BindingSpec, OverloadSpec},
+    engine::door::{Door, Request},
     store::{
         GatewayId, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore,
     },

@@ -16,9 +16,11 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use smg_policy_controller::{
-    client::{Client, Error, ANSWER_WAIT, KEEPALIVE},
+    service::{
+        client::{Client, Error, ANSWER_WAIT, KEEPALIVE},
+        watcher::{Ended, Watcher},
+    },
     store::token,
-    watcher::{Ended, Watcher},
 };
 use tokio::{
     sync::{oneshot, watch},
@@ -273,10 +275,12 @@ pub(crate) mod tests {
         x509::X509,
     };
     use smg_policy_controller::{
-        controller::{Config, Controller, Election, Listener, Scope, State, PRINCIPAL_ENTRY},
-        proto::{self, policy_controller_client::PolicyControllerClient, worker_event::Event},
+        engine::view::WorkerId,
+        service::{
+            controller::{Config, Controller, Election, Listener, Scope, State, PRINCIPAL_ENTRY},
+            proto::{self, policy_controller_client::PolicyControllerClient, worker_event::Event},
+        },
         store::{MemoryStore, WorkerStatus, WorkersStore},
-        view::WorkerId,
     };
     use tokio::{sync::oneshot, time};
     use tonic::{transport::Channel, Request};

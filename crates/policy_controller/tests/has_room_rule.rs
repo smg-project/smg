@@ -4,7 +4,7 @@
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 
 use smg_policy_controller::{
-    spec::{Capacity, FilterSpec, FilterStage, HasRoomParams},
+    document::spec::{Capacity, FilterSpec, FilterStage, HasRoomParams},
     Candidate, Constraints, Decision, Engine, Health, Lease, Lifecycle, LoadRow, PolicySpec,
     PoolFacts, RequestFacts, Scratch, Side, SpecError, Target, WorkerId, API_VERSION,
 };

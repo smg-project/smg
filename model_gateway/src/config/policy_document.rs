@@ -71,13 +71,15 @@ use smg_policy_controller::{
         DEFAULT_WARMUP_SECS, DEFAULT_WARMUP_SHARE, DEFAULT_WARMUP_THIN_RATIO,
     },
     bucket,
-    builtins::{DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT},
-    spec::{
+    document::spec::{
         BestWithTemperatureParams, BindingSpec, BoundedLoadParams, BucketParams,
         ConsistentHashParams, IndexKind, IndexSpec, KeySourceSpec, KvPressureParams,
         LeastLoadParams, OverloadSpec, Pairing, PickStage, PrefixAffinityParams, ProfileSpec,
         RoutingKeySpec, ScoreSpec, ScoreStage, SpillParams, WarmupSliceParams,
         MANUAL_SESSION_HEADER, MAX_KEY_SOURCES, OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS,
+    },
+    stages::builtins::{
+        DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
     },
     AppliedSpec, Assignment, Phase, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError,
 };
