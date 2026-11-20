@@ -781,19 +781,20 @@ impl SpecStore {
     /// it.
     fn forget_again(&mut self, sync: &mut impl FnMut(&fs::File) -> io::Result<()>) {
         let root = &*self.root;
-        let stood = self.refused.len();
+        let mut went = Vec::new();
         self.refused.retain(|&refused| {
+            let generation = refused.generation;
             let Err(error) = remove_at(root, &file_name(refused)) else {
+                went.push(generation);
                 return false;
             };
-            let generation = refused.generation;
             warn!(generation, %error, "a refused generation stays on file: a start may run it");
             true
         });
-        if self.refused.len() < stood {
+        if !went.is_empty() {
             // The removal's own sync: the write that follows may not land.
             if let Err(error) = sync(root) {
-                warn!(%error, "a refused generation went off file, but the directory did not sync: a crash may bring its name back");
+                warn!(generations = ?went, %error, "a refused generation went off file, but the directory did not sync: a crash may bring its name back");
             }
         }
     }
@@ -1795,6 +1796,9 @@ pub(crate) mod tests {
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
+        // A second subscriber stays registered beside the case's own, as in
+        // the door's audit case: with one alone a line is on or off by the
+        // thread that reaches it first.
         let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let _kept = tracing::subscriber::set_default(subscriber);
         let said = |words: &str| {
@@ -1818,7 +1822,7 @@ pub(crate) mod tests {
         store
             .persist_synced(at(3, YAML), b"three", unsynced_once)
             .expect("the write's own syncs hold");
-        let unsynced = said("went off file, but the directory did not sync");
+        let unsynced = said("a crash may bring its name back generations=[1]");
         // The name stayed at one try and went at the next.
         assert_eq!((stayed, said("stays on file"), unsynced), (1, 1, 1));
         let on_file = BTreeSet::from([name_of(2, "yaml"), name_of(3, "yaml")]);
