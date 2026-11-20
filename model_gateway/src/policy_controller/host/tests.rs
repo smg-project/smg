@@ -20,7 +20,10 @@ use std::{
 
 use axum::{
     body::{to_bytes, Body},
-    http::{header::RETRY_AFTER, HeaderMap, HeaderValue, StatusCode},
+    http::{
+        header::{CONTENT_LENGTH, RETRY_AFTER},
+        HeaderMap, HeaderValue, StatusCode,
+    },
     response::Response,
 };
 use bytes::Bytes;
@@ -337,6 +340,38 @@ async fn a_body_the_relay_marked_cut_ends_as_a_failure() {
         .expect("a clean end");
     assert_eq!(live(&store, 0), 0);
     assert!(!store.completed_ok_since(GATEWAY, row, sent));
+}
+
+/// An HTTP/1.1 server writes a declared length and asks for no frame after
+/// it. So the lease ends at the last declared byte, and a body dropped
+/// before that byte is cancelled.
+#[tokio::test]
+async fn a_sized_body_ends_its_lease_at_its_last_declared_byte() {
+    for whole in [true, false] {
+        let (host, store, _) = bed(&["http://w0:8000"]);
+        let sent = Instant::now();
+        let mut placed = Sent::from(host.place(&first(b"r1"), sent).await.expect("a worker"));
+        let row = placed.id();
+        placed.dispatched(sent);
+
+        let frames = [b"ab", b"cd"].map(|data| Ok::<_, Infallible>(Bytes::from_static(data)));
+        let mut response = Response::new(Body::from_stream(stream::iter(frames)));
+        response
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("4"));
+        let response = placed.held_to_the_end_of(response);
+        let mut body = response.into_body().into_data_stream();
+
+        body.next().await.expect("the first frame").expect("data");
+        assert_eq!(LeasesStore::live(&*store, GATEWAY), 1);
+        if whole {
+            body.next().await.expect("the last frame").expect("data");
+            assert_eq!(live(&store, 0), 0);
+        }
+        drop(body);
+        assert_eq!(live(&store, 0), 0);
+        assert_eq!(store.completed_ok_since(GATEWAY, row, sent), whole);
+    }
 }
 
 #[tokio::test]

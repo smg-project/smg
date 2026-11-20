@@ -72,13 +72,13 @@ use crate::{
     policies::{CacheNamespace, PolicyRegistry},
     policy_controller::{
         self,
-        host::{self, Ask, Host, Placed, Sent},
+        host::{self, Ask, BehindAnswer, Host, Placed, Sent},
     },
     rate_limit::RateLimitManager,
     routers::{
         common::{
             attach_sized_body,
-            attempt_ledger::{mark_upstream_answer, AttemptLedger, UpstreamAnswer},
+            attempt_ledger::{mark_upstream_answer, AttemptLedger},
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
@@ -805,8 +805,7 @@ impl Router {
             None => response,
             Some(placed) if head_success_recorded => placed.held_to_the_end_of(response),
             Some(placed) => {
-                let answered = response.extensions().get::<UpstreamAnswer>().is_some();
-                placed.ended(response.status(), answered, Instant::now());
+                placed.ended_by(&response, Instant::now());
                 response
             }
         }
@@ -1764,7 +1763,11 @@ impl Router {
                     mark_upstream_answer(&mut response);
                     response
                 }
-                Err(error_response) => error_response,
+                // The gateway's own answer, made behind the worker's head.
+                Err(mut error_response) => {
+                    error_response.extensions_mut().insert(BehindAnswer);
+                    error_response
+                }
             };
             header_utils::insert_routed_worker_id(
                 response.headers_mut(),

@@ -118,13 +118,13 @@ fn declared_body_length(response: &Response) -> Option<u64> {
 /// or once the bytes add up to the declared length: the one rule by which
 /// the edge body counts the response and closes its span, so a response
 /// cannot count as complete and read as cut short.
-pub(super) struct BodyProgress {
+pub(crate) struct BodyProgress {
     declared: Option<u64>,
     sent: u64,
 }
 
 impl BodyProgress {
-    pub(super) fn new(response: &Response) -> Self {
+    pub(crate) fn new(response: &Response) -> Self {
         Self {
             declared: declared_body_length(response),
             sent: 0,
@@ -143,7 +143,7 @@ impl BodyProgress {
 
     /// A frame went out; `at_end` is the body's own word (`is_end_stream`)
     /// after it. Whether the body has now gone out in full.
-    pub(super) fn frame_out(&mut self, frame: &http_body::Frame<Bytes>, at_end: bool) -> bool {
+    pub(crate) fn frame_out(&mut self, frame: &http_body::Frame<Bytes>, at_end: bool) -> bool {
         if let Some(data) = frame.data_ref() {
             self.sent = self.sent.saturating_add(data.len() as u64);
         }

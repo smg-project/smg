@@ -259,7 +259,7 @@ async fn a_whole_answer_completes_its_lease_as_ok() -> Case {
     let registry = Arc::new(WorkerRegistry::new());
     let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
     let row = store.by_key(&url).ok_or("the worker has no row")?.id;
-    let router = router(registry, Some(host));
+    let mut router = router(registry, Some(host));
     let start = Instant::now();
 
     let response = chat(&router).await?;
@@ -267,6 +267,14 @@ async fn a_whole_answer_completes_its_lease_as_ok() -> Case {
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
     assert!(store.completed_ok_since(GATEWAY, row, start));
+
+    // An answer over the cap is the gateway's own, made behind the worker's
+    // head. It says so, for the class of the lease's end.
+    router.max_payload_size = 1;
+    let response = chat(&router).await?;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(response.extensions().get::<BehindAnswer>().is_some());
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
     Ok(())
 }
 
