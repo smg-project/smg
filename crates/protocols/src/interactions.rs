@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use serde_with::skip_serializing_none;
 use validator::{Validate, ValidationError};
@@ -74,7 +74,8 @@ pub struct InteractionsRequest {
     #[serde(alias = "agentConfig")]
     pub agent_config: Option<AgentConfig>,
 
-    /// Response modalities (text, image, audio)
+    /// Response modalities: `text`, `image`, `audio`, `video`, `document`,
+    /// or a name the API adds later, which is kept as written
     #[serde(alias = "responseModalities")]
     pub response_modalities: Option<Vec<ResponseModality>>,
 
@@ -1141,12 +1142,40 @@ pub struct InteractionsUsage {
     pub total_tokens: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+/// A modality of the response, as the public API names them. Each also
+/// reads its uppercase name, which the SDK's own examples send
+/// (`response_modalities=["IMAGE"]`), and is written in lowercase. The SDK
+/// keeps the set open, so a modality this build does not name is kept as
+/// written (`Other`). A modality is read from a string alone: a derived
+/// reading also takes an object keyed by a name (`{"image": null}`) as that
+/// modality, which no API sends.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ResponseModality {
     Text,
     Image,
     Audio,
+    Video,
+    Document,
+    /// A modality this build does not name, kept as the client or upstream
+    /// wrote it
+    #[serde(untagged)]
+    Other(String),
+}
+
+impl<'de> Deserialize<'de> for ResponseModality {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Ok(match name.as_str() {
+            "text" | "TEXT" => Self::Text,
+            "image" | "IMAGE" => Self::Image,
+            "audio" | "AUDIO" => Self::Audio,
+            "video" | "VIDEO" => Self::Video,
+            "document" | "DOCUMENT" => Self::Document,
+            _ => Self::Other(name),
+        })
+    }
 }
 
 fn is_option_blank(v: Option<&String>) -> bool {
@@ -1316,6 +1345,82 @@ fn validate_stop_sequences(seqs: &[String]) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A response modality reads in lowercase and in the uppercase the SDK's
+    /// own examples send, video and document among them, and is written in
+    /// lowercase. A usage entry counts a document modality's tokens.
+    #[test]
+    fn a_response_modality_reads_in_either_case_and_writes_lowercase() {
+        let request: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "Generate an image of a futuristic city.",
+            "store": false,
+            "response_modalities": ["IMAGE", "text", "VIDEO", "document", "AUDIO"]
+        }))
+        .unwrap();
+        assert_eq!(
+            request.response_modalities,
+            Some(vec![
+                ResponseModality::Image,
+                ResponseModality::Text,
+                ResponseModality::Video,
+                ResponseModality::Document,
+                ResponseModality::Audio
+            ])
+        );
+        let written = crate::common::to_value_exact(&request).unwrap();
+        assert_eq!(
+            written["response_modalities"],
+            serde_json::json!(["image", "text", "video", "document", "audio"])
+        );
+
+        let usage: InteractionsUsage = serde_json::from_value(serde_json::json!({
+            "total_input_tokens": 12,
+            "input_tokens_by_modality": [
+                {"modality": "text", "tokens": 4},
+                {"modality": "document", "tokens": 8}
+            ]
+        }))
+        .unwrap();
+        let by_modality = usage.input_tokens_by_modality.unwrap();
+        assert_eq!(by_modality[1].modality, Some(ResponseModality::Document));
+
+        let unknown: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "Hello",
+            "store": false,
+            "response_modalities": ["A_Modality_Of_No_API"]
+        }))
+        .unwrap();
+        assert_eq!(
+            unknown.response_modalities,
+            Some(vec![ResponseModality::Other(
+                "A_Modality_Of_No_API".to_string()
+            )])
+        );
+        let written = crate::common::to_value_exact(&unknown).unwrap();
+        assert_eq!(
+            written["response_modalities"],
+            serde_json::json!(["A_Modality_Of_No_API"])
+        );
+
+        // A modality is a name: an object keyed by one, which a derived
+        // reading takes as that modality, is refused in either case.
+        for object in [
+            serde_json::json!({"IMAGE": null}),
+            serde_json::json!({"image": null}),
+        ] {
+            let refused = serde_json::from_value::<InteractionsRequest>(serde_json::json!({
+                "model": "m",
+                "input": "Hello",
+                "store": false,
+                "response_modalities": [object]
+            }))
+            .expect_err("an object in place of a modality's name")
+            .to_string();
+            assert!(refused.contains("expected a string"), "{object}: {refused}");
+        }
+    }
 
     /// The tools the public API declares beside the ones the gateway knew
     /// read, validate and are written back as sent: computer use, Google

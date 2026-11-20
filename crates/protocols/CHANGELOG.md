@@ -281,6 +281,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - A Responses `tool_choice` of type `computer` or `computer_use`, as the public API lists them
   (`ToolChoiceTypes`), parses. The crate refused the request whole, as matching no variant of
   `ResponsesToolChoice`. Breaking: `BuiltInToolChoiceType` gains `Computer` and `ComputerUse`.
+- An Interactions response modality takes `video` and `document`, and each modality reads its
+  uppercase name too (`"IMAGE"`), as the public API takes them and as the SDK's own examples send
+  `response_modalities`. Each is written in lowercase, and a modality this build does not name is
+  kept as written, as the SDK keeps the set open. An uppercase or a new modality refused the whole
+  request, and a usage entry that counted a new one failed the typed parse of an answer
+  (`InteractionsUsage`), which a user of the crate runs: the gateway relays an answer as written.
+  A modality is read from a string alone: an object keyed by a name (`{"image": null}`), which
+  the derived reading took as that modality, is refused. Breaking: `ResponseModality` gains
+  `Video`, `Document` and `Other`, and is `#[non_exhaustive]`.
 - A Messages web search result is written with its `type` (`web_search_result`) and its null
   `page_age`, and the web search error `request_too_large` and a tool search's error result
   (`tool_search_tool_result_error`) read, as the public API writes them. A result had been written
