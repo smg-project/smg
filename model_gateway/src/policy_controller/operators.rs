@@ -363,10 +363,12 @@ struct Snapshot {
 /// `truncated` says that a matching row was left out, by the cap or by
 /// the policy crate's bound on a page: 2 MiB by its measure of the rows,
 /// taken ahead of the JSON, whose keys and escapes may pass it. The page
-/// has no cursor: a fleet past the cap is read by model.
+/// has no cursor: a fleet past the cap is read by model, and a model that
+/// more than 1,024 rows serve cannot be read whole.
 ///
-/// 429 says that as many snapshots wait as may, with `Retry-After`. 409
-/// under the classic policies.
+/// 400 names the key of an ask outside the served call's bounds
+/// ([`asked`]). 429 says that as many snapshots wait as may, with
+/// `Retry-After`. 409 under the classic policies.
 pub(crate) async fn snapshot(
     State(state): State<Arc<AppState>>,
     AdminQuery(query): AdminQuery<SnapshotQuery>,
@@ -375,6 +377,10 @@ pub(crate) async fn snapshot(
         Ok(operators) => operators,
         Err(refused) => return refused,
     };
+    let asked = match asked(&query) {
+        Ok(asked) => asked,
+        Err(why) => return refusal(StatusCode::BAD_REQUEST, "BAD_REQUEST", why),
+    };
     let Some(turn) = operators.snapshots.take().await else {
         return full(
             "TOO_MANY_SNAPSHOTS",
@@ -382,34 +388,55 @@ pub(crate) async fn snapshot(
         );
     };
     let store = Arc::clone(&operators.store);
-    // The rows are copied off the runtime's workers, the turn kept to the
-    // copy's own end.
+    // The rows are copied and written as JSON off the runtime's workers,
+    // the turn kept to the writing's own end.
     let taken = tokio::task::spawn_blocking(move || {
         let _turn = turn;
-        let models = query.models.as_deref().unwrap_or_default().split(',');
-        let asked = Asked {
-            models: models
-                .map(str::trim)
-                .filter(|model| !model.is_empty())
-                .map(str::to_owned)
-                .collect(),
-            limit: query.limit.unwrap_or(SNAPSHOT_ROWS).min(SNAPSHOT_ROWS),
-        };
         let now = Instant::now();
         let (rows, serving) = store.rows_serving(&asked.models, asked.limit);
-        Snapshot {
+        serde_json::to_vec(&Snapshot {
             page: snapshot::told(&asked, Rows::Told(rows, serving), now),
             generation: store.world().spec().generation(),
-        }
+        })
     })
     .await;
     match taken {
-        Ok(snapshot) => Json(snapshot).into_response(),
+        Ok(Ok(page)) => ([(CONTENT_TYPE, "application/json")], page).into_response(),
+        Ok(Err(unwritten)) => {
+            error!(%unwritten, "the policy snapshot did not write as JSON");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
         Err(join) => {
             error!(%join, "the policy snapshot's task failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// What `query` asks, or the refusal of a key by its name. The models pass
+/// the policy crate's check of a snapshot's list, the one a served snapshot
+/// reads ([`Asked::refused`]). A `limit` is at least one: a served call
+/// reads zero as no limit, and this route keeps its cap. A `limit` past the
+/// cap is the cap, and an empty id between commas is no id.
+fn asked(query: &SnapshotQuery) -> Result<Asked, String> {
+    let models = query.models.as_deref().unwrap_or_default().split(',');
+    let models: Vec<String> = models
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if let Some(why) = Asked::refused(&models) {
+        return Err(format!("models: {why}"));
+    }
+    if query.limit == Some(0) {
+        return Err(format!(
+            "limit: a snapshot tells at least one row, and {SNAPSHOT_ROWS} where none is named"
+        ));
+    }
+    Ok(Asked {
+        models,
+        limit: query.limit.unwrap_or(SNAPSHOT_ROWS).min(SNAPSHOT_ROWS),
+    })
 }
 
 /// The form of a dry run's body by its `Content-Type`: YAML where none is

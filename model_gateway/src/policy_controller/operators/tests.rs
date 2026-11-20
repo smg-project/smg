@@ -485,6 +485,47 @@ async fn a_snapshot_stops_at_its_cap_of_rows() -> Case {
     Ok(())
 }
 
+/// A snapshot's ask keeps the bounds a served snapshot holds its own to: at
+/// most 128 model ids, each of at most 256 bytes and with no blank, and a
+/// limit of at least one. An ask outside them is refused by its key's name.
+/// An answer says that it is JSON.
+#[tokio::test]
+async fn a_snapshots_ask_keeps_the_served_calls_bounds() -> Case {
+    let app = app_under(picked()).await?;
+    let most = vec!["m"; 128].join(",");
+    let longest = "m".repeat(256);
+    let within = [
+        format!("?models={most}"),
+        format!("?models={longest}"),
+        "?limit=1".to_owned(),
+    ];
+    for query in within {
+        let (status, headers, _) = answered(&app, snapshot(&query)?).await?;
+        assert_eq!(status, StatusCode::OK, "{query}");
+        let form = headers.get(header::CONTENT_TYPE);
+        assert_eq!(
+            form.and_then(|form| form.to_str().ok()),
+            Some("application/json")
+        );
+    }
+    let outside = [
+        (format!("?models={most},m"), "models"),
+        (format!("?models={longest}m"), "models"),
+        ("?models=a%20b".to_owned(), "models"),
+        ("?limit=0".to_owned(), "limit"),
+    ];
+    for (query, key) in outside {
+        let (status, _, refused) = answered(&app, snapshot(&query)?).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        assert_eq!(refused["code"], "BAD_REQUEST");
+        let said = refused["error"]
+            .as_str()
+            .ok_or("the refusal says nothing")?;
+        assert!(said.starts_with(key), "{query}: {said}");
+    }
+    Ok(())
+}
+
 /// The OpenAPI document gives a snapshot's page as the route writes it,
 /// for a row that states the least and for one that states every nullable
 /// fact: each value of its listed type and names, each key listed, and no

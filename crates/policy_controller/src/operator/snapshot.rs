@@ -15,13 +15,17 @@ use serde::{Serialize, Serializer};
 use crate::{
     address::{split, Address, UNPARSABLE},
     store::{
-        pairing::LAYOUT_FACTS, Cut, EncodeHandoff, Maker, Reachability, WorkerRow, WorkerStatus,
+        membership::blank, pairing::LAYOUT_FACTS, Cut, EncodeHandoff, Maker, Reachability,
+        WorkerFacts, WorkerRow, WorkerStatus,
     },
     view::{Role, WireModes},
 };
 
 /// The byte bound for one page of rows.
 pub(crate) const PAGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// The most model ids a snapshot or a watch names.
+pub(crate) const MODELS: usize = 128;
 
 /// What a snapshot caller asks of the worker rows.
 #[derive(Debug)]
@@ -34,9 +38,37 @@ pub struct Asked {
 }
 
 impl Asked {
+    /// Why a snapshot may not name `models`, and `None` where it may. The
+    /// list is read at each row, so it keeps a row's own rules: at most 128
+    /// ids, each of at most 256 bytes, none empty, none with a blank or a
+    /// control character. Every host of a snapshot refuses by this, under
+    /// the key `models`.
+    #[must_use]
+    pub fn refused(models: &[String]) -> Option<&'static str> {
+        if models.len() > MODELS {
+            return Some("a snapshot names at most 128 model ids");
+        }
+        unnamed(models)
+    }
+
     pub(crate) fn serves(&self, row: &WorkerRow) -> bool {
         serves(&self.models, row)
     }
+}
+
+/// Why a list read at each row may not hold one of `models`, by a row's own
+/// rules of a model id, and `None` where it may hold each.
+pub(crate) fn unnamed(models: &[String]) -> Option<&'static str> {
+    if models
+        .iter()
+        .any(|model| model.len() > WorkerFacts::NAME_BYTES)
+    {
+        return Some("a model id is at most 256 bytes");
+    }
+    if models.iter().any(|model| model.is_empty() || blank(model)) {
+        return Some("a model id is not empty and holds no blank and no control character");
+    }
+    None
 }
 
 /// Whether a row serves any named model. An empty list includes every row.

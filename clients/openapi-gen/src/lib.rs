@@ -1819,7 +1819,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                 Some(vec![
                     // Model ids, comma separated: the rows that serve one.
                     optional_query_param("models"),
-                    // At most 1,024 rows, which is the default.
+                    // At least one row and at most 1,024, which is the default.
                     typed_query_param("limit", ParameterSchema::of("integer")),
                 ]),
                 None,
@@ -1838,7 +1838,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                     );
                     responses.insert(
                         "400".to_string(),
-                        refused("The query names a key other than models and limit, or limit is no number"),
+                        refused("The query names a key other than models and limit, names more than 128 models or one past 256 bytes or with a blank, or limit is zero or no number"),
                     );
                     responses.insert("409".to_string(), policy_off());
                     responses.insert(

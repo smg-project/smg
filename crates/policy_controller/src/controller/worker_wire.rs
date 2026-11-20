@@ -18,6 +18,7 @@ use std::{
 use prost::Message as _;
 
 use crate::{
+    operator::snapshot,
     proto::{self, worker_event::Event},
     replication::{Entry, Event as Written},
     store::{
@@ -49,16 +50,10 @@ pub(crate) fn watched(models: &[String]) -> Result<(), Refused> {
     if models.len() > MODELS {
         return Err(refused("models", "a watch names at most 128 model ids"));
     }
-    if models.iter().any(|model| model.len() > NAME_BYTES) {
-        return Err(refused("models", "a model id is at most 256 bytes"));
+    match snapshot::unnamed(models) {
+        Some(why) => Err(refused("models", why)),
+        None => Ok(()),
     }
-    if models.iter().any(|model| model.is_empty() || blank(model)) {
-        return Err(refused(
-            "models",
-            "a model id is not empty and holds no blank and no control character",
-        ));
-    }
-    Ok(())
 }
 
 /// Whether `refusal` is a rule of a new row alone, and so no rule of a call
@@ -76,7 +71,7 @@ const KEY_BYTES: usize = WorkerFacts::LABEL_KEY_BYTES;
 const VALUE_BYTES: usize = WorkerFacts::LABEL_VALUE_BYTES;
 const LABELS: usize = WorkerFacts::LABELS;
 /// The most model ids a watch or snapshot request can select.
-pub(super) const MODELS: usize = 128;
+pub(super) const MODELS: usize = snapshot::MODELS;
 /// The row whole on the wire, as [`weight`] measures it.
 const ROW_BYTES: usize = WorkerFacts::ROW_BYTES;
 
