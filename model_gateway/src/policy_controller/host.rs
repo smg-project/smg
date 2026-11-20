@@ -25,6 +25,7 @@
 //! stall vetoes are the controller's, read from its rows.
 
 use std::{
+    cell::Cell,
     fmt,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -45,7 +46,7 @@ use smg_policy_controller::{
     lease::{Outcome, ReleaseReason, Side, TransportClass},
     store::{GatewayId, MemoryStore, WorkersStore, World},
     view::{Constraints, HashKind, Identity, Phase, RequestFacts, WorkerId},
-    AppliedSpec,
+    AppliedSpec, DerivedKey, KeySource,
 };
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard};
 
@@ -178,26 +179,22 @@ impl<'a> Ask<'a> {
     }
 
     /// The request's routing key by the sources its binding names in `spec`:
-    /// the first that holds a value
+    /// the first that holds a value, with the source it came from
     /// ([`KeySources::derive`](smg_policy_controller::KeySources::derive)).
-    /// [`Identity::NONE`] where the binding names no source, or none of them
-    /// holds a value.
+    /// `None` where the binding names no source, or none of them holds a
+    /// value.
     ///
     /// The key borrows the document. The door hands the ask the world it
     /// decides under, and the key is derived there
     /// ([`Handle::decide_under`]).
-    fn key<'s>(&self, spec: &'s AppliedSpec) -> Identity<'s>
+    fn key<'s>(&self, spec: &'s AppliedSpec) -> Option<DerivedKey<'s>>
     where
         'a: 's,
     {
-        let Some(sources) = spec.key_sources_for(self.model, Phase::Single) else {
-            return Identity::NONE;
-        };
+        let sources = spec.key_sources_for(self.model, Phase::Single)?;
         let headers = self.headers;
         let header = |name: &str| headers?.get(name).map(HeaderValue::as_bytes);
-        sources
-            .derive(header, self.rid)
-            .map_or(Identity::NONE, |derived| derived.key)
+        sources.derive(header, self.rid)
     }
 
     /// The request as the controller reads it, with its routing `key` and
@@ -245,6 +242,11 @@ impl<'a> Ask<'a> {
 struct Made<'r, 'a> {
     ask: &'r Ask<'a>,
     missed: &'r [WorkerId],
+    /// Where the key of the last making came from, under the label the
+    /// gateway counts it by. The door may make the request a second time,
+    /// behind a lease the store refused: the host counts after the
+    /// decision, once.
+    source: Cell<Option<&'static str>>,
 }
 
 impl Maker for Made<'_, '_> {
@@ -253,7 +255,12 @@ impl Maker for Made<'_, '_> {
     }
 
     fn make<'w>(&'w self, world: &'w World) -> Request<'w> {
-        let key = self.ask.key(world.spec());
+        let derived = self.ask.key(world.spec());
+        self.source.set(derived.map(|derived| match derived.source {
+            KeySource::Header(_) => "header",
+            KeySource::Rid => "rid",
+        }));
+        let key = derived.map_or(Identity::NONE, |derived| derived.key);
         self.ask.request(key, self.missed)
     }
 }
@@ -493,10 +500,20 @@ impl Host {
         missed: &[WorkerId],
         now: Instant,
     ) -> Result<Asked, Unplaced> {
-        let made = Made { ask, missed };
+        let made = Made {
+            ask,
+            missed,
+            source: Cell::new(None),
+        };
         let started = Instant::now();
         let decided = Handle::decide_under(Arc::clone(&self.door), GATEWAY, &made, now);
         let seconds = started.elapsed().as_secs_f64();
+        // A key's source counts once an attempt, at its first ask, as a
+        // keyed selection of the gateway's own policies counts it: an ask
+        // again behind a missed commit is the same attempt's.
+        if let Some(source) = made.source.get().filter(|_| missed.is_empty()) {
+            Metrics::record_routing_key_source(source);
+        }
         let decision = decided.as_ref().ok().map(Handle::decision);
         let trace = decision.map(Decision::trace);
         let generation = trace.map_or(0, |trace| trace.generation);

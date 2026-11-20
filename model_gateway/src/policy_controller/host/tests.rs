@@ -26,7 +26,7 @@ use smg_policy_controller::{
         WorkerFacts, WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
     },
     view::{fingerprint, Identity, LoadRow},
-    AppliedSpec, PolicySpec,
+    AppliedSpec, DerivedKey, KeySource, PolicySpec,
 };
 use smg_worker::identity::basic::WorkerLoadGuard;
 
@@ -710,15 +710,17 @@ async fn an_ask_states_the_key_its_bindings_sources_hold() {
     };
     let (_, store, _) = bed_under(manual(), &URLS[..1]);
     store.deciding(|world| {
-        let key = ask.key(world.spec());
-        assert_eq!(key, Identity::plain("conv-1"));
-        assert_eq!(ask.request(key, &[]).facts.session_key, key);
+        let derived = ask.key(world.spec()).expect("the header's key");
+        assert_eq!(derived.key, Identity::plain("conv-1"));
+        assert_eq!(derived.source, KeySource::Header(KEY_HEADER));
+        let stated = ask.request(derived.key, &[]).facts.session_key;
+        assert_eq!(stated, derived.key);
         let bare = first(b"request");
-        assert_eq!(bare.key(world.spec()), Identity::NONE, "no header");
+        assert_eq!(bare.key(world.spec()), None, "no header");
     });
     // A binding that names no source gives its requests no key.
     let (_, store, _) = bed(&URLS[..1]);
-    store.deciding(|world| assert_eq!(ask.key(world.spec()), Identity::NONE));
+    store.deciding(|world| assert_eq!(ask.key(world.spec()), None));
 }
 
 #[tokio::test]
@@ -744,7 +746,11 @@ async fn a_key_is_read_by_the_documents_sources_in_their_order() {
             rid,
             ..first(b"request")
         };
-        store.deciding(|world| owned(ask.key(world.spec())))
+        let key = |derived: DerivedKey<'_>| owned(derived.key);
+        store.deciding(|world| {
+            ask.key(world.spec())
+                .map_or_else(|| owned(Identity::NONE), key)
+        })
     };
 
     let mut headers = keyed("x-conversation", "conv_t2_r1");
@@ -755,6 +761,58 @@ async fn a_key_is_read_by_the_documents_sources_in_their_order() {
     assert_eq!(key_of(Some(&headers), rid), owned(hashed("hint")));
     assert_eq!(key_of(None, rid), owned(Identity::plain("rid-key")));
     assert_eq!(key_of(Some(&HeaderMap::new()), None), owned(Identity::NONE));
+}
+
+/// A keyed attempt counts where its key came from, under the series the
+/// gateway's own keyed selection counts by: a header, or the request's own
+/// id. It counts once, however many asks its commits take, and an attempt
+/// with no key counts none.
+#[tokio::test]
+async fn an_attempt_counts_the_source_of_its_key_once() {
+    let (host, store, _) = bed_under(PolicyConfig::ConsistentHashing, &URLS);
+    let block = RoutingKeySpec {
+        sources: vec![
+            header(KEY_HEADER),
+            KeySourceSpec {
+                rid: true,
+                ..KeySourceSpec::default()
+            },
+        ],
+        strip_lineage: false,
+    };
+    name_sources(&store, PolicyConfig::ConsistentHashing, block);
+    let headers = keyed(KEY_HEADER, "conv-1");
+    let by_header = Ask {
+        headers: Some(&headers),
+        ..first(b"by header")
+    };
+    let by_rid = Ask {
+        rid: Some("rid-1"),
+        ..first(b"by rid")
+    };
+    let now = Instant::now();
+    let rendered = render_with_recorder(|| {
+        // An attempt's first ask counts its key's source. Its ask again,
+        // behind a commit that missed, names the missed target and counts
+        // nothing.
+        let asked = host.ask(&by_header, &[], now).now_or_never();
+        let asked = asked.expect("the door decides at once").expect("a pick");
+        let missed = [asked.targets.first().expect("a target").id];
+        drop(asked);
+        let again = host.ask(&by_header, &missed, now).now_or_never();
+        assert!(again.expect("the door decides at once").is_ok());
+        for ask in [by_rid, first(b"no key")] {
+            let placed = host.place(&ask, now).now_or_never();
+            assert!(placed.expect("the door decides at once").is_ok());
+        }
+    });
+    for expected in [
+        "smg_routing_key_source_total{source=\"header\"} 1",
+        "smg_routing_key_source_total{source=\"rid\"} 1",
+    ] {
+        let counted = rendered.lines().any(|line| line == expected);
+        assert!(counted, "{expected} in:\n{rendered}");
+    }
 }
 
 #[tokio::test]
