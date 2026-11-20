@@ -862,13 +862,11 @@ impl Router {
         let id = host::mark();
         let tried = attempt.tried_rows.lock().clone();
         let ask = Ask {
-            id: &id,
-            model: &model,
             streaming: attempt.is_stream,
             headers: attempt.headers,
             rid: attempt.rid,
             tried: &tried,
-            hashes: None,
+            ..Ask::of(&id, &model)
         };
         let ledger = attempt.ledger;
         let placed = host

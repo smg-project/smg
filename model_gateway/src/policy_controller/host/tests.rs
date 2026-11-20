@@ -875,11 +875,12 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
             Some("1"),
             None,
         ),
-        (Unplaced::NoRoom, unavailable, shed_code, Some("2")),
+        (Unplaced::NoRoom, unavailable, shed_code, Some("2"), None),
         (
             Unplaced::Admission(PrefillAdmissionRejection::QueueFull),
             StatusCode::TOO_MANY_REQUESTS,
             "pd_prefill_queue_full",
+            None,
             None,
         ),
         (
@@ -887,12 +888,14 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
             StatusCode::TOO_MANY_REQUESTS,
             "pd_prefill_queue_timeout",
             None,
+            None,
         ),
         (
             Unplaced::Admission(PrefillAdmissionRejection::Unavailable),
             unavailable,
             "no_available_workers",
             Some("1"),
+            None,
         ),
         (
             shed(ShedReason::FlowLimit),
@@ -1479,7 +1482,7 @@ impl PairBed {
         store.apply(pair_spec(mode, decode_targets, 1, &calls, None, None)?)?;
         store.publish_now();
         Ok(Self {
-            host: Host::new(Arc::clone(&store), registry),
+            host: Host::at_keys(Arc::clone(&store), registry),
             store,
             prefills,
             decodes,
@@ -1734,7 +1737,7 @@ async fn a_missing_prefill_and_an_open_decode_breaker_are_both_misses() {
     let (prefill, worker) = &bed.prefills[0];
     let (decode, decoder) = &bed.decodes[0];
     bed.host
-        .registry
+        .registry()
         .remove_by_url(worker.url())
         .expect("the prefill leaves the registry");
     decoder.record_circuit_breaker_outcome(false);
@@ -2126,7 +2129,7 @@ async fn a_request_behind_a_waiter_whose_fleet_is_gone_is_answered_at_once() {
             &bed.decodes[0]
         };
         bed.host
-            .registry
+            .registry()
             .remove_by_url(worker.url())
             .expect("the worker leaves the registry");
         let row = WorkersStore::get(&*bed.store, *id).expect("the row");
