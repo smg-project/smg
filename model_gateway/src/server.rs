@@ -910,7 +910,8 @@ fn gated_control_plane_routes() -> Router<Arc<AppState>> {
             get(rate_limit_document::get).put(rate_limit_document::put),
         )
         .route("/policy/spec", get(operators::spec))
-        // The door's bound at the edge: a longer body is refused unread.
+        // The door's bound at the edge: a body that declares a longer length
+        // is refused unread, and one that declares none is read to the bound.
         .route(
             "/policy/spec:validate",
             post(operators::validate).layer(middleware::RequestBodyLimitLayer::new(

@@ -1710,7 +1710,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                     );
                     responses.insert(
                         "429".to_string(),
-                        refused("As many dry runs wait as may (TOO_MANY_DRY_RUNS)"),
+                        refused("As many dry runs wait as may (TOO_MANY_DRY_RUNS); Retry-After says when to come again"),
                     );
                     responses
                 },

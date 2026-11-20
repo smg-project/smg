@@ -17,7 +17,7 @@ use super::{document_bytes, DRY_RUNS_WAITING};
 use crate::{
     app_context::AppContext,
     config::RouterConfig,
-    middleware::AuthConfig,
+    middleware::{AuthConfig, SHED_RETRY_AFTER_SECS},
     routers::gateway::Gateway,
     server::{build_app, health::ProbeState, AppState},
 };
@@ -142,6 +142,24 @@ async fn the_document_in_force_is_the_one_the_print_option_writes() -> Case {
     assert_eq!(in_force["digest"], digest);
     assert_eq!(in_force["format"], "yaml");
     assert_eq!(in_force["document"], printed);
+    Ok(())
+}
+
+/// A document given to the start, by `--policy-spec` or by a host, is the
+/// one in force: the read tells the gateway's YAML of it, under its digest.
+#[tokio::test]
+async fn a_given_document_is_told_as_the_one_in_force() -> Case {
+    let config = RouterConfig {
+        policy_spec: Some(serde_yaml::from_str(OTHER)?),
+        ..picked()
+    };
+    let given = config.policy_document_in_force()?;
+    let (status, _, in_force) = answered(&app_under(config).await?, read()?).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(in_force["digest"], given.digest()?.to_string());
+    let told = in_force["document"].as_str().ok_or("no document")?;
+    assert_eq!(told, serde_yaml::to_string(&given)?);
+    assert!(told.contains("preview"), "the given profile is told");
     Ok(())
 }
 
@@ -276,6 +294,9 @@ async fn a_documents_form_is_its_content_types() -> Case {
         ("application/x-yaml", OTHER, StatusCode::OK),
         ("application/json", OTHER, StatusCode::UNPROCESSABLE_ENTITY),
         ("text/plain", OTHER, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        // A form's name under another type, or under none, names no form.
+        ("image/json", OTHER, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ("/yaml", OTHER, StatusCode::UNSUPPORTED_MEDIA_TYPE),
     ] {
         let request = dry_run().header(header::CONTENT_TYPE, content_type);
         let body = Body::from(document.to_owned());
@@ -325,8 +346,12 @@ async fn a_dry_run_past_the_ones_that_may_wait_is_refused() -> Case {
     tokio::task::yield_now().await;
 
     let app = app(state)?;
-    let (status, _, refused) = answered(&app, dry_run().body(Body::from(OTHER))?).await?;
+    let (status, headers, refused) = answered(&app, dry_run().body(Body::from(OTHER))?).await?;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(refused["code"], "TOO_MANY_DRY_RUNS");
+    let again = headers
+        .get(header::RETRY_AFTER)
+        .and_then(|again| again.to_str().ok());
+    assert_eq!(again, Some(SHED_RETRY_AFTER_SECS.to_string().as_str()));
     Ok(())
 }

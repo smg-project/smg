@@ -18,7 +18,7 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{
-        header::{CONTENT_TYPE, ETAG, IF_MATCH},
+        header::{CONTENT_TYPE, ETAG, IF_MATCH, RETRY_AFTER},
         HeaderMap, HeaderValue, StatusCode,
     },
     response::{IntoResponse, Response},
@@ -35,7 +35,7 @@ use smg_policy_controller::{
 };
 use tracing::error;
 
-use crate::{admin::json::refusal, server::AppState};
+use crate::{admin::json::refusal, middleware::SHED_RETRY_AFTER_SECS, server::AppState};
 
 /// How many dry runs may wait for the one that runs. A call past them is
 /// answered 429.
@@ -216,7 +216,8 @@ struct Refused {
 /// field's path. 412 is a guard that names another digest. Each of the two
 /// tells the generation that stands. 413 is a body over the door's bound,
 /// refused at the edge and never passed. 429 says that as many dry runs
-/// wait as may. 409 under the classic policies.
+/// wait as may, with the `Retry-After` the gateway's sheds send. 409 under
+/// the classic policies.
 pub(crate) async fn validate(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -238,15 +239,21 @@ pub(crate) async fn validate(
         Err(refused) => return refused,
     };
     let Some(turn) = operators.dry_runs.take().await else {
-        return refusal(
+        let mut refused = refusal(
             StatusCode::TOO_MANY_REQUESTS,
             "TOO_MANY_DRY_RUNS",
             "As many dry runs wait as may; try again".to_string(),
         );
+        // When to come again, as the gateway's sheds say it.
+        let again = HeaderValue::from(SHED_RETRY_AFTER_SECS);
+        refused.headers_mut().insert(RETRY_AFTER, again);
+        return refused;
     };
     let door = Arc::clone(&operators.door);
     // The pass keeps its turn to its own end, off the runtime's workers: a
-    // client that leaves drops this handler, not the pass.
+    // client that leaves never stops a pass. Where the control plane records
+    // its mutations this handler runs on in a task of its own, so a call
+    // that waits keeps its place after its client left.
     let ran = tokio::task::spawn_blocking(move || {
         let _turn = turn;
         door.dry_run(&expected, &body, format)
@@ -304,7 +311,7 @@ pub(crate) async fn validate(
 }
 
 /// The form of a dry run's body by its `Content-Type`: YAML where none is
-/// given, else the form the subtype names (`application/yaml`,
+/// given, else the form its whole media type names (`application/yaml`,
 /// `application/x-yaml`, `text/yaml`, `application/json`). `None` for any
 /// other type.
 fn document_format(headers: &HeaderMap) -> Option<Format> {
@@ -312,9 +319,11 @@ fn document_format(headers: &HeaderMap) -> Option<Format> {
         return Some(Format::Yaml);
     };
     let media = value.to_str().ok()?.split(';').next()?.trim();
-    let (_, subtype) = media.split_once('/')?;
-    let subtype = subtype.to_ascii_lowercase();
-    Format::named(subtype.strip_prefix("x-").unwrap_or(&subtype))
+    match media.to_ascii_lowercase().as_str() {
+        "application/yaml" | "application/x-yaml" | "text/yaml" => Some(Format::Yaml),
+        "application/json" => Some(Format::Json),
+        _ => None,
+    }
 }
 
 /// A dry run's guard from `If-Match`: the digest its caller read as

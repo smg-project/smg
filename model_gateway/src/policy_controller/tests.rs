@@ -554,8 +554,7 @@ fn the_store_starts_with_a_registered_scorer() -> Case {
 /// same function.
 #[test]
 fn a_document_past_the_doors_bound_stops_the_start_by_its_size() -> Case {
-    let config = picked(RouterConfig::default());
-    let mut document = config.policy_document()?;
+    let mut document = RouterConfig::default().policy_document()?;
     let stock = document.bindings[0].clone();
     let many = (0..4096).map(|n| {
         let mut binding = stock.clone();
@@ -563,15 +562,36 @@ fn a_document_past_the_doors_bound_stops_the_start_by_its_size() -> Case {
         binding
     });
     document.bindings.splice(0..0, many);
-    let written = serde_yaml::to_string(&document)?.len();
+    let config = running(RouterConfig::default(), document);
+    let written = serde_yaml::to_string(&config.policy_document_in_force()?)?.len();
     let bound = document_bytes();
     assert!(written > bound, "{written}");
-    let refusal = start_with(&config, None, |_| Ok(document))
+    let refusal = start_with(&config, None)
         .err()
         .ok_or("the start took a document past the door's bound")?;
     assert_eq!(
         refusal.to_string(),
         format!("the document is {written} bytes; at most {bound}")
+    );
+    Ok(())
+}
+
+/// A given document's `kind` line is no part of its YAML, so the door never
+/// reads it: the start refuses it by name, by the door's own word.
+#[test]
+fn a_given_documents_kind_line_stops_the_start_by_name() -> Case {
+    let document: PolicySpec = serde_yaml::from_str(
+        "apiVersion: smg.policy/v1\nkind: PolicySpec\nprofiles:\n  preview:\n    score: [least-load]\n    pick: best\n",
+    )?;
+    let refusal = start_with(&running(RouterConfig::default(), document), None)
+        .err()
+        .ok_or("the start took a document with a kind line")?;
+    assert!(
+        matches!(
+            &refusal,
+            StartError::Spec(SpecRejected::Invalid(SpecError::Kind(kind))) if kind == "PolicySpec"
+        ),
+        "{refusal:?}"
     );
     Ok(())
 }

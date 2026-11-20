@@ -20,12 +20,12 @@
 //! feeds the store yet. With the setting off, the context holds neither the
 //! store, its feed nor its host.
 //!
-//! The document reaches the store through the policy crate's operators'
-//! door as YAML, the bytes `--print-policy-spec` prints for the document
-//! the routing configuration means, and the door stays in the context
-//! beside the store. The control plane reads the document in force through
-//! it and checks another against it ([`operators`]). Nothing is applied
-//! after the start.
+//! The document in force reaches the store through the policy crate's
+//! operators' door as YAML: the bytes `--print-policy-spec` prints where
+//! the routing configuration means it, and the gateway's YAML of it where
+//! it was given. The door stays in the context beside the store. The
+//! control plane reads the document in force through it and checks another
+//! against it ([`operators`]). Nothing is applied after the start.
 //!
 //! One site reads the setting, [`start_with`]. Every other site asks what
 //! the start left in the context.
@@ -135,8 +135,15 @@ pub(crate) fn start_with(
         return Ok(None);
     }
     let document = config.policy_document_in_force()?;
+    let stages = stages.unwrap_or_else(Catalog::builtin);
+    // A given document may hold what its YAML does not say, a `kind` line.
+    // The typed check refuses it by the door's own word before the door
+    // reads the YAML, over the same stages and denied headers.
+    document
+        .validate_in(&stages, &config.denied_view_headers())
+        .map_err(SpecRejected::Invalid)?;
     let written = serde_yaml::to_string(&document)?;
-    let started = hosted(config, stages, &written)?;
+    let started = hosted(config, Some(stages), &written)?;
     info!("The policy controller is picked for this gateway");
     Ok(Some(started))
 }
