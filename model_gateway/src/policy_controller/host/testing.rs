@@ -14,7 +14,7 @@ use smg_policy_controller::{
     view::{Role, WireModes, WorkerId},
     AppliedSpec, PolicySpec,
 };
-use smg_worker::identity::basic::{Worker, WorkerType};
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 
 use super::Host;
 use crate::{
@@ -157,6 +157,17 @@ pub(crate) fn pair_bed_over(
     prefill_urls: &[&str],
     decode_urls: &[&str],
 ) -> (Host, Arc<MemoryStore>, [Vec<Arc<dyn Worker>>; 2]) {
+    pair_bed_running(RuntimeType::default(), registry, prefill_urls, decode_urls)
+}
+
+/// [`pair_bed_over`] with every worker of `runtime`: a pair router picks its
+/// dispatch by its prefill worker's runtime.
+pub(crate) fn pair_bed_running(
+    runtime: RuntimeType,
+    registry: Arc<WorkerRegistry>,
+    prefill_urls: &[&str],
+    decode_urls: &[&str],
+) -> (Host, Arc<MemoryStore>, [Vec<Arc<dyn Worker>>; 2]) {
     let config = RouterConfig {
         policy_controller: true,
         mode: RoutingMode::PrefillDecode {
@@ -183,6 +194,7 @@ pub(crate) fn pair_bed_over(
             let builder = BasicWorkerBuilder::new(url)
                 .model(ModelCard::new(MODEL))
                 .worker_type(worker_type)
+                .runtime_type(runtime)
                 .status(WorkerStatus::Ready);
             let worker: Arc<dyn Worker> = Arc::new(builder.build());
             let facts = WorkerFacts {

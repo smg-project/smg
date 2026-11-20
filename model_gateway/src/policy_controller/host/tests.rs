@@ -2154,6 +2154,64 @@ async fn each_side_of_a_placed_pair_reports_its_own_dispatch_and_end() {
     );
 }
 
+/// A pair's router says the prefill's end where the prefill is done with,
+/// ahead of the answer its decode writes. The answer's end then ends the
+/// decode alone, so the prefill hears one completion.
+#[tokio::test]
+async fn a_sent_pairs_prefill_ends_ahead_of_its_answer() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
+    let placed = bed.commit().await.expect("a placement");
+    let lease = placed.handle.lease().expect("a lease").lease.id;
+    let mut sent = Sent::from(placed);
+    let now = Instant::now();
+    bed.calls.lock().clear();
+    sent.dispatched(now);
+    sent.decode_dispatched(now);
+    sent.prefill_ended(StatusCode::OK, now + Duration::from_micros(5));
+    let sides = bed
+        .store
+        .sides(GATEWAY, lease)
+        .expect("the decode still holds the lease");
+    assert_eq!(sides.record.state, LeaseState::Completed);
+    let decode = sides.decode.expect("the decode side").state;
+    assert_eq!(decode, LeaseState::Dispatched { at: now });
+    sent.ended(StatusCode::OK, true, now + Duration::from_micros(9));
+    assert_eq!(live(&bed.store, 0), 0);
+    let ended = |call: &PairCall| match call {
+        PairCall::Completed(outcome) => Some(outcome.side),
+        _ => None,
+    };
+    let ends: Vec<_> = bed.calls.lock().iter().filter_map(ended).collect();
+    assert_eq!(ends, [Side::Prefill, Side::Decode]);
+}
+
+/// A pair's router that sends its decode alone says no dispatch of the
+/// prefill. The answer's end then ends the decode, and the placement's drop
+/// releases the prefill: its row hears no dispatch and no completion for a
+/// request it never saw.
+#[tokio::test]
+async fn a_prefill_that_was_not_sent_hears_no_dispatch_and_no_end() {
+    let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
+    let placed = bed.commit().await.expect("a placement");
+    let lease = placed.handle.lease().expect("a lease").lease.id;
+    let decode = bed.decodes[0].0;
+    let mut sent = Sent::from(placed);
+    let now = Instant::now();
+    bed.calls.lock().clear();
+    sent.decode_dispatched(now);
+    sent.prefill_ended(StatusCode::OK, now + Duration::from_micros(5));
+    sent.ended(StatusCode::OK, true, now + Duration::from_micros(9));
+    assert_eq!(live(&bed.store, 0), 0);
+    let calls = bed.calls.lock();
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert!(matches!(calls[0], PairCall::Dispatched(Side::Decode, id, _) if id == decode));
+    assert!(matches!(calls[1], PairCall::Completed(outcome) if outcome.side == Side::Decode));
+    assert_eq!(
+        calls[2],
+        PairCall::Released(lease, Side::Prefill, ReleaseReason::Abandoned)
+    );
+}
+
 #[tokio::test]
 async fn releasing_the_decode_leaves_the_prefill_on_file() {
     let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");

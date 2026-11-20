@@ -40,6 +40,10 @@ fn answered(response: &Response) -> bool {
 pub(crate) struct Sent {
     placed: Placed,
     at: Option<Instant>,
+    /// Whether [`Self::dispatched`] was said: the request's own dispatch, or
+    /// a pair's prefill's. A pair's prefill that was not sent is said no
+    /// end, and the placement's drop releases its side.
+    own_sent: bool,
     cut: Option<Arc<AtomicU16>>,
 }
 
@@ -48,6 +52,7 @@ impl From<Placed> for Sent {
         Self {
             placed,
             at: None,
+            own_sent: false,
             cut: None,
         }
     }
@@ -65,6 +70,7 @@ impl Sent {
     /// The request was sent to the worker at `now`. Said once.
     pub(crate) fn dispatched(&mut self, now: Instant) {
         self.at = Some(now);
+        self.own_sent = true;
         self.placed.dispatched(now);
     }
 
@@ -78,9 +84,9 @@ impl Sent {
     }
 
     /// A pair's prefill answered `status` at `now`, ahead of the end of the
-    /// answer its decode writes. Said once.
+    /// answer its decode writes. Said once, and of a prefill that was sent.
     pub(crate) fn prefill_ended(&mut self, status: StatusCode, now: Instant) {
-        if let Some(at) = self.at {
+        if let (true, Some(at)) = (self.own_sent, self.at) {
             let class = transport_class(status, true);
             self.placed
                 .completed(End::http(status, class, at, None, now), now);
@@ -114,7 +120,8 @@ impl Sent {
 
     /// Say the placement's end where it was sent. A pair's answer is its
     /// decode's: the decode ends with it, and so does a prefill whose router
-    /// said no end ahead of it ([`Self::prefill_ended`]).
+    /// said no end ahead of it ([`Self::prefill_ended`]). A prefill that
+    /// was not sent hears no end: the drop releases its side.
     fn end(
         mut self,
         status: StatusCode,
@@ -124,7 +131,9 @@ impl Sent {
     ) {
         if let Some(at) = self.at {
             let end = End::http(status, class, at, first, now);
-            self.placed.completed(end, now);
+            if self.own_sent {
+                self.placed.completed(end, now);
+            }
             self.placed.decode_completed(end, now);
         }
     }

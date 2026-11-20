@@ -6,11 +6,11 @@ use serde_json::json;
 use smg_policy_controller::store::{GatewayId, LeasesStore, MemoryStore, WorkersStore};
 
 use super::{
-    tests::{create_test_pd_router, spawn_recording_stub},
+    tests::{create_test_pd_router, spawn_delayed_stub, spawn_recording_stub},
     *,
 };
 use crate::{
-    policy_controller::host::testing::{pair_bed_over, MODEL},
+    policy_controller::host::testing::{pair_bed_over, pair_bed_running, MODEL},
     tenant::TenantKey,
 };
 
@@ -30,6 +30,29 @@ async fn generate(router: &PDRouter) -> Case<Response> {
     let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
     let request = serde_json::from_value(json!({"text": "hi"}))?;
     Ok(router.route_generate(None, &meta, request, MODEL).await)
+}
+
+async fn chat(router: &PDRouter) -> Case<Response> {
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+    }))?;
+    Ok(router
+        .route_chat(None, &meta, Arc::new(request), MODEL)
+        .await)
+}
+
+/// A pair as the router's attempt asks for it, with no admission.
+async fn sent_pair(host: &Host) -> Case<Sent> {
+    let id = host::mark();
+    let ask = Ask {
+        phase: Phase::Prefill,
+        ..Ask::of(&id, MODEL)
+    };
+    let placed = host.place_pair(&ask, None, None).await;
+    let (placed, _guard) = placed.map_err(|unplaced| format!("{unplaced:?}"))?;
+    Ok(Sent::from(placed))
 }
 
 /// The gateway's live leases, read until they number `expected` or the
@@ -87,6 +110,93 @@ async fn a_pair_the_store_cannot_make_is_refused_though_the_registry_holds_one()
     assert!(!response.status().is_success(), "{}", response.status());
     assert!(prefill_seen.lock().map_err(|e| e.to_string())?.is_empty());
     assert!(decode_seen.lock().map_err(|e| e.to_string())?.is_empty());
+    assert_eq!(live(&store, 0).await, 0);
+    Ok(())
+}
+
+/// A pair whose answer a retry may replace names both its rows to the next
+/// ask where the answer names no side, each once. Its lease is given up
+/// with the answer.
+#[tokio::test]
+async fn a_retryable_answer_that_names_no_side_names_both_rows_as_tried() -> Case {
+    let (prefill, _) = spawn_recording_stub("{}").await;
+    let (decode, _) = spawn_recording_stub("{}").await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+    let sent = sent_pair(&host).await?;
+    let rows = [Some(sent.id()), sent.decode_id()];
+    let tried = parking_lot::Mutex::new(Vec::new());
+    let refusal = error::service_unavailable("worker_unavailable", "a worker is down");
+
+    let response = PDRouter::end_placed(Some(sent), &tried, refusal);
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let named: Vec<_> = tried.lock().iter().copied().map(Some).collect();
+    assert_eq!(named, rows);
+    assert_eq!(live(&store, 0).await, 0);
+    Ok(())
+}
+
+/// A definitive answer names its side, and that row alone is tried: the
+/// partner stays as selectable as it was.
+#[tokio::test]
+async fn a_definitive_answer_names_its_own_side_alone_as_tried() -> Case {
+    for (side, row) in [(PdSide::Prefill, 0), (PdSide::Decode, 1)] {
+        let (prefill, _) = spawn_recording_stub("{}").await;
+        let (decode, _) = spawn_recording_stub("{}").await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
+        let sent = sent_pair(&host).await?;
+        let rows = [Some(sent.id()), sent.decode_id()];
+        let tried = parking_lot::Mutex::new(Vec::new());
+        let mut refusal = error::internal_error("worker_failed", "the worker failed the request");
+        refusal.extensions_mut().insert(OwnFailure(side));
+
+        let _ = PDRouter::end_placed(Some(sent), &tried, refusal);
+
+        let named: Vec<_> = tried.lock().iter().copied().map(Some).collect();
+        assert_eq!(named, [rows[row]], "{side:?}");
+        assert_eq!(live(&store, 0).await, 0);
+    }
+    Ok(())
+}
+
+/// A decode that waits on its prefill is said dispatched with it. The
+/// prefill here holds its answer while a sweep runs past the dispatch
+/// deadline: the sweep ends no side, and the pair is then served.
+#[tokio::test]
+async fn a_decode_that_waits_on_its_prefill_outlives_the_dispatch_deadline() -> Case {
+    let hold = Duration::from_millis(400);
+    let (prefill, prefill_seen) = spawn_delayed_stub(StatusCode::OK, json!({}), hold).await;
+    let (decode, decode_seen) = spawn_recording_stub(r#"{"object":"chat.completion"}"#).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let bed = pair_bed_running(
+        RuntimeType::Vllm,
+        Arc::clone(&registry),
+        &[&prefill],
+        &[&decode],
+    );
+    let (host, store, _) = bed;
+    let router = router(registry, host);
+
+    let sweep = async {
+        // The prefill holds its answer: its request is in, the decode's is not.
+        for _ in 0..200 {
+            if prefill_seen.lock().is_ok_and(|seen| !seen.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let waits = decode_seen.lock().is_ok_and(|seen| seen.is_empty());
+        let past = Instant::now() + Duration::from_secs(6);
+        (waits, LeasesStore::expire(&*store, past).len())
+    };
+    let (response, (waits, swept)) = tokio::join!(chat(&router), sweep);
+
+    assert_eq!(response?.status(), StatusCode::OK);
+    assert!(waits, "the decode went out ahead of its prefill's answer");
+    assert_eq!(swept, 0, "the sweep ended a side of the pair");
+    assert_eq!(decode_seen.lock().map_err(|e| e.to_string())?.len(), 1);
     assert_eq!(live(&store, 0).await, 0);
     Ok(())
 }

@@ -1371,8 +1371,9 @@ impl PDRouter {
         Ok((Sent::from(placed), (prefill, decode), guards))
     }
 
-    /// The end of an attempt the policy controller placed. Both rows of a
-    /// pair whose answer a retry may replace join the request's tried rows.
+    /// The end of an attempt the policy controller placed. The rows of a
+    /// pair whose answer a retry may replace join the request's tried rows:
+    /// the row of the side a definitive answer names, else both.
     /// A success ends the decode at the end of the body it writes, and a
     /// prefill whose dispatch body said no end ahead of it at the answer's
     /// head. A failed attempt names no side here: the placement's drop
@@ -1387,9 +1388,16 @@ impl PDRouter {
             return response;
         };
         if is_retryable_response(&response) {
+            // A definitive answer names its side, and that row alone is
+            // tried: its partner stays as selectable as it was.
+            let named = response.extensions().get::<OwnFailure>().map(|own| own.0);
             let mut tried = tried_rows.lock();
-            tried.push(placed.id());
-            tried.extend(placed.decode_id());
+            if named != Some(PdSide::Decode) {
+                tried.push(placed.id());
+            }
+            if named != Some(PdSide::Prefill) {
+                tried.extend(placed.decode_id());
+            }
         }
         let status = response.status();
         if !status.is_success() {
@@ -2146,7 +2154,7 @@ impl PDRouter {
         };
         drop(prefill_guard);
         // A prefill that was sent is done with here. One that was not is
-        // said no end: the placement holds no dispatch for it yet.
+        // said no end.
         if let Some(placed) = placed.as_deref_mut() {
             placed.prefill_ended(StatusCode::OK, Instant::now());
         }
@@ -2352,7 +2360,7 @@ impl PDRouter {
                     Err(response) => return response,
                 };
                 drop(prefill_guard);
-                if let Some(placed) = placed.as_deref_mut() {
+                if let Some(placed) = placed {
                     placed.prefill_ended(StatusCode::OK, Instant::now());
                 }
                 Metrics::record_pd_prefill_duration(
@@ -6886,11 +6894,11 @@ mod tests {
         );
     }
 
-    type Arrivals = Arc<std::sync::Mutex<Vec<Value>>>;
+    pub(super) type Arrivals = Arc<std::sync::Mutex<Vec<Value>>>;
 
     /// A stub that records each request body, then answers `reply` with
     /// `status` after `delay`.
-    async fn spawn_delayed_stub(
+    pub(super) async fn spawn_delayed_stub(
         status: StatusCode,
         reply: Value,
         delay: std::time::Duration,
