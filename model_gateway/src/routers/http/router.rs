@@ -79,7 +79,7 @@ use crate::{
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
-                REASON_PLACED_BY_CONTROLLER, REASON_WORKER_MUTATES_BODY,
+                REASON_WORKER_MUTATES_BODY,
             },
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload, placement,
@@ -2528,16 +2528,17 @@ impl Router {
     /// forward the raw body verbatim (JSON validation and normalization
     /// defer to the worker). `Err` hands the request back untouched —
     /// body unconsumed — for the buffered typed path.
+    ///
+    /// Where the policy controller places requests, the worker is its
+    /// placement, asked from the same headers ([`Self::place_streamed`]).
+    /// The placement is said its dispatch at the send and is held to the
+    /// answer's end, as a typed attempt's is.
     pub(crate) async fn route_streaming_request(
         &self,
         req: Request<Body>,
         route: &'static str,
         wasm_request_hooks: bool,
     ) -> Result<Response, Request<Body>> {
-        if self.host.is_some() {
-            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_PLACED_BY_CONTROLLER);
-            return Err(req);
-        }
         let stream_reason = match self.request_body_path(req.headers(), wasm_request_hooks) {
             BodyPath::Buffer(reason) => {
                 Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
@@ -2562,25 +2563,62 @@ impl Router {
         // that needs partitioned affinity must take the buffered path.
         // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
-        let Some(worker) = self.select_worker_for_model(
-            model_id,
-            None,
-            hinted_tokens.as_deref(),
-            Some(req.headers()),
-            None,
-            None,
-            None,
-            &[],
-        ) else {
-            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
-            return Err(req);
+        let (worker, mut placed) = match &self.host {
+            None => {
+                let Some(worker) = self.select_worker_for_model(
+                    model_id,
+                    None,
+                    hinted_tokens.as_deref(),
+                    Some(req.headers()),
+                    None,
+                    None,
+                    None,
+                    &[],
+                ) else {
+                    Metrics::record_request_body_path(
+                        BODY_PATH_BUFFERED,
+                        REASON_NO_AVAILABLE_WORKER,
+                    );
+                    return Err(req);
+                };
+                (worker, None)
+            }
+            Some(host) => {
+                // The model is the one this router's workers serve, since
+                // the body that may name one is unread. A pool that does
+                // not settle it leaves the request to the typed path.
+                let Some(model) = self.model_of_an_unnamed_request() else {
+                    Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_MODEL_AMBIGUOUS);
+                    return Err(req);
+                };
+                // A request that names its worker is refused here as the
+                // typed path refuses it, unread.
+                if let Some(refusal) = self.explicit_target_refusal(&model, Some(req.headers())) {
+                    return Ok(refusal);
+                }
+                let asked = self
+                    .place_streamed(host, &model, req.headers(), hinted_tokens.as_deref())
+                    .await;
+                // A request the controller does not place goes to the
+                // typed path, which asks again with the body read and
+                // answers by name.
+                let Some(placed) = asked else {
+                    Metrics::record_request_body_path(
+                        BODY_PATH_BUFFERED,
+                        REASON_NO_AVAILABLE_WORKER,
+                    );
+                    return Err(req);
+                };
+                (Arc::clone(placed.worker()), Some(Sent::from(placed)))
+            }
         };
         // Guard the registration races the decision left open: a mutating
         // worker that joined after the fleet check must not receive an
         // unmutated stream, and a second model appearing re-opens
         // wrong-model selection. An alias registered after the decision is
         // not re-checked: the request named a name that did not exist when
-        // its path was decided.
+        // its path was decided. A placement the request is handed back with
+        // was not sent: its drop gives the lease up.
         if worker.mutates_request() {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_WORKER_MUTATES_BODY);
             return Err(req);
@@ -2615,14 +2653,15 @@ impl Router {
         let mut headers_with_trace = parts.headers;
         inject_trace_context_http(&mut headers_with_trace);
 
+        let mut source = RelaySource::new(model_id, route, Arc::clone(&worker));
+        if let Some(placed) = placed.as_mut() {
+            placed.dispatched(Instant::now());
+            // The request's `stream` flag is unread: the relay is marked for
+            // a cut whatever the answer turns out to be.
+            source = source.marking(placed.cut_mark());
+        }
         let response = self
-            .send_streamed_request(
-                &headers_with_trace,
-                body,
-                route,
-                RelaySource::new(model_id, route, Arc::clone(&worker)),
-                load_guard,
-            )
+            .send_streamed_request(&headers_with_trace, body, route, source, load_guard)
             .await;
 
         events::RequestReceivedEvent {}.emit();
@@ -2680,7 +2719,45 @@ impl Router {
                 error_reason_from_status(status),
             );
         }
-        Ok(response)
+        Ok(match placed {
+            None => response,
+            // A streamed head carries its placement to the body's end.
+            Some(placed) if head_success_recorded(&response) => placed.held_to_the_end_of(response),
+            Some(placed) => {
+                placed.ended_by(&response, Instant::now());
+                response
+            }
+        })
+    }
+
+    /// The placement of a request whose body is forwarded unread, by the
+    /// policy controller. The ask states what the headers state: the
+    /// sources of the routing key, and a valid tokens hint as the prompt's
+    /// hashes, the prompt the classic arm selects by on this path. The
+    /// commit keeps to this router's own pool, as a typed attempt's does.
+    /// `None` where the controller does not place the request.
+    async fn place_streamed(
+        &self,
+        host: &Host,
+        model: &str,
+        headers: &HeaderMap,
+        hinted_tokens: Option<&[u32]>,
+    ) -> Option<Placed> {
+        let id = host::mark();
+        let hashes = host.hashes(model, &Prompt::of(hinted_tokens, None));
+        let ask = Ask {
+            headers: Some(headers),
+            hashes: Some(&hashes),
+            ..Ask::of(&id, model)
+        };
+        let placed = host
+            .place_where(
+                &ask,
+                |worker| RoutingPool::HttpRegular.matches(worker),
+                Instant::now(),
+            )
+            .await;
+        placed.ok()
     }
 }
 

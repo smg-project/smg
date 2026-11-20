@@ -1010,17 +1010,138 @@ async fn a_streamed_transcription_holds_its_lease_to_its_last_frame() -> Case {
     Ok(())
 }
 
+/// One streamed `/generate` request, its body in two chunks.
+async fn streamed(router: &Router) -> Result<Response, Request<Body>> {
+    let request = streamed_request(&[br#"{"text":"#, br#""hi"}"#]);
+    router
+        .route_streaming_request(request, GENERATE, false)
+        .await
+}
+
+/// Whether `rendered` counts `count` requests on the body path `path` for
+/// `reason`.
+fn body_path_counted(rendered: &str, path: &str, reason: &str, count: usize) -> bool {
+    let line =
+        format!(r#"smg_router_request_body_path_total{{path="{path}",reason="{reason}"}} {count}"#);
+    rendered.lines().any(|counted| counted == line)
+}
+
+/// A body forwarded unread is placed by the controller. Of two registry
+/// workers the store holds one, and every streamed request reaches it with
+/// its bytes as sent. The path counter reads streamed, and no lease stays.
 #[tokio::test]
-async fn a_body_that_would_stream_takes_the_buffered_path_under_the_host() -> Case {
+async fn a_streamed_body_under_the_host_reaches_the_placed_worker_as_sent() -> Case {
+    let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let b = format!("http://{}", listener.local_addr()?);
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let capture = post(move |body: Bytes| {
+        let sink = Arc::clone(&sink);
+        async move {
+            sink.lock().push(body);
+            ([(CONTENT_TYPE, "application/json")], "{}")
+        }
+    });
+    serve_worker(listener, GENERATE, capture);
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, _, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
+    let (host, store, _) = bed_over(Arc::clone(&registry), &[&a, &b]);
+    let row = store.by_key(&a).ok_or("worker A had no row to remove")?;
+    store
+        .remove(row.id, row.revision)
+        .ok_or("worker A's row stood")?;
+    let hosted = router(registry, Some(host));
+    let recorder = PrometheusBuilder::new().build_recorder();
+    {
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        for _ in 0..4 {
+            let response = streamed(&hosted)
+                .await
+                .map_err(|_| "the router handed the request back")?;
+            assert_eq!(response.status(), StatusCode::OK);
+            to_bytes(response.into_body(), 1024).await?;
+        }
+    }
+    assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+    assert_eq!(*seen.lock(), vec![Bytes::from_static(GENERATE_BODY); 4]);
+    let rendered = recorder.handle().render();
+    assert!(
+        body_path_counted(&rendered, "streamed", "pure_forward", 4),
+        "{rendered}"
+    );
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_streamed_bodys_stream_holds_its_lease_to_its_last_frame() -> Case {
+    let (url, frames) = gated_stream(GENERATE).await?;
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+    let row = store.by_key(&url).ok_or("the worker has no row")?.id;
+    let router = router(registry, Some(host));
+
+    let response = timeout(FRAME_WAIT, streamed(&router))
+        .await?
+        .map_err(|_| "the router handed the request back")?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+    let at_head = LeasesStore::live(&*store, GATEWAY);
+    let mut body = response.into_body().into_data_stream();
+    frames.send(Bytes::from_static(FIRST_FRAME)).await?;
+    assert_eq!(next_frame(&mut body).await?.as_ref(), FIRST_FRAME);
+    // The send said its dispatch: a dispatched lease survives a sweep past
+    // its dispatch deadline.
+    let swept = LeasesStore::expire(&*store, Instant::now() + Duration::from_secs(60));
+    assert!(swept.is_empty());
+    assert_eq!((at_head, LeasesStore::live(&*store, GATEWAY)), (1, 1));
+    let last_frame = Instant::now();
+    drop(frames);
+    assert!(timeout(FRAME_WAIT, body.next()).await?.is_none());
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    assert!(store.completed_ok_since(GATEWAY, row, last_frame));
+    Ok(())
+}
+
+/// A worker's failure on the streamed path is relayed as it came, and its
+/// lease ends with it as no success.
+#[tokio::test]
+async fn a_streamed_body_the_worker_fails_ends_its_lease_as_a_failure() -> Case {
+    let (url, hits) = fixed_status_upstream(&[GENERATE], StatusCode::INTERNAL_SERVER_ERROR).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+    let row = store.by_key(&url).ok_or("the worker has no row")?.id;
+    let router = router(registry, Some(host));
+    let start = Instant::now();
+
+    let response = streamed(&router)
+        .await
+        .map_err(|_| "the router handed the request back")?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    assert!(!store.completed_ok_since(GATEWAY, row, start));
+    Ok(())
+}
+
+/// A streamed request the controller does not place is handed back with
+/// its body unread, for the typed path to answer by name.
+#[tokio::test]
+async fn a_streamed_body_the_controller_does_not_place_is_handed_back_whole() -> Case {
+    let (url, hits) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+    let row = store
+        .by_key(&url)
+        .ok_or("the worker had no row to remove")?;
+    store
+        .remove(row.id, row.revision)
+        .ok_or("the worker's row stood")?;
     let hosted = router(registry, Some(host));
     let recorder = PrometheusBuilder::new().build_recorder();
     let request = {
         let _guard = metrics::set_default_local_recorder(&recorder);
-        hosted
-            .route_streaming_request(streamed_request(&[GENERATE_BODY]), GENERATE, false)
-            .await
+        streamed(&hosted).await
     }
     .err()
     .ok_or("the router did not hand back the request")?;
@@ -1028,9 +1149,50 @@ async fn a_body_that_would_stream_takes_the_buffered_path_under_the_host() -> Ca
         to_bytes(request.into_body(), 1024).await?.as_ref(),
         GENERATE_BODY
     );
-    assert!(recorder.handle().render().lines().any(|line| {
-        line == r#"smg_router_request_body_path_total{path="buffered",reason="placed_by_controller"} 1"#
-    }));
+    let rendered = recorder.handle().render();
+    assert!(
+        body_path_counted(&rendered, "buffered", "no_available_worker", 1),
+        "{rendered}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    Ok(())
+}
+
+/// A streamed request that names its worker is refused by name under the
+/// host, its body unread, where the model's classic policy holds it to
+/// that worker. Under a policy that reads no target it is served.
+#[tokio::test]
+async fn a_streamed_body_that_names_its_worker_is_refused_by_name_under_the_host() -> Case {
+    for (policy, refused) in [
+        (PolicyConfig::ConsistentHashing, true),
+        (PolicyConfig::RoundRobin, false),
+    ] {
+        let (url, hits) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+        let mut router = router(registry, Some(host));
+        router.policy_registry = Arc::new(PolicyRegistry::new(policy));
+        let mut request = streamed_request(&[GENERATE_BODY]);
+        let target = HeaderValue::from_static("0");
+        request.headers_mut().insert("x-smg-target-worker", target);
+        let response = router
+            .route_streaming_request(request, GENERATE, false)
+            .await
+            .map_err(|_| "the router handed the request back")?;
+        if refused {
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+            assert_eq!(
+                extract_error_code_from_response(&response),
+                "not_decided_by_policy_controller"
+            );
+        } else {
+            assert_eq!(response.status(), StatusCode::OK);
+            to_bytes(response.into_body(), 1024).await?;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), usize::from(!refused));
+        assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    }
     Ok(())
 }
 

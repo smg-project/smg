@@ -36,9 +36,6 @@ pub(crate) const REASON_RETRYABLE: &str = "retryable";
 pub(crate) const REASON_RETRY_FORFEITED: &str = "retry_forfeited";
 pub(crate) const REASON_PURE_FORWARD: &str = "pure_forward";
 
-/// The policy controller places the request, and the streamed path does not ask it yet.
-pub(crate) const REASON_PLACED_BY_CONTROLLER: &str = "placed_by_controller";
-
 /// Per-request inputs, gathered by the caller before the body arrives.
 pub(crate) struct BodyPathInputs {
     pub routing_key_override: bool,
