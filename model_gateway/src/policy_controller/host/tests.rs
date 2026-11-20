@@ -374,6 +374,72 @@ async fn a_sized_body_ends_its_lease_at_its_last_declared_byte() {
     }
 }
 
+/// A body with bytes still to come: a stream that never yields.
+fn unended() -> Body {
+    Body::from_stream(stream::pending::<Result<Bytes, Infallible>>())
+}
+
+/// A server asks a body with nothing to send for no frame: a body at its
+/// end already, a declared length of zero, a status that declares no body.
+/// So the lease ends at the head, while the response is still held, as the
+/// answer it was. A cut the relay marked still decides the class.
+#[tokio::test]
+async fn a_response_with_nothing_to_send_ends_its_lease_at_its_head() {
+    const OK: StatusCode = StatusCode::OK;
+    for (status, at_end, declared, cut, ok) in [
+        (OK, true, None, None, true),
+        // The body's own word decides over a declared length.
+        (OK, true, Some("5"), None, true),
+        (OK, false, Some("0"), None, true),
+        (StatusCode::CONTINUE, false, None, None, true),
+        (StatusCode::NO_CONTENT, false, None, None, true),
+        (StatusCode::NOT_MODIFIED, false, None, None, true),
+        (OK, true, None, Some(StatusCode::GATEWAY_TIMEOUT), false),
+    ] {
+        let (host, store, _) = bed(&["http://w0:8000"]);
+        let sent = Instant::now();
+        let mut placed = Sent::from(host.place(&first(b"r1"), sent).await.expect("a worker"));
+        let row = placed.id();
+        placed.dispatched(sent);
+        if let Some(cut) = cut {
+            placed.cut_mark().store(cut.as_u16(), Ordering::Relaxed);
+        }
+
+        let mut response = Response::new(if at_end { Body::empty() } else { unended() });
+        *response.status_mut() = status;
+        if let Some(length) = declared {
+            response
+                .headers_mut()
+                .insert(CONTENT_LENGTH, HeaderValue::from_static(length));
+        }
+        let held = placed.held_to_the_end_of(response);
+        assert_eq!(live(&store, 0), 0, "{status} {at_end} {declared:?}");
+        assert_eq!(
+            store.completed_ok_since(GATEWAY, row, sent),
+            ok,
+            "{status} {at_end} {declared:?} {cut:?}"
+        );
+        drop(held);
+    }
+}
+
+/// A stream with bytes to come, dropped before its first poll, went out to
+/// nobody. Its lease ends cancelled, like one dropped mid-way.
+#[tokio::test]
+async fn a_pending_stream_dropped_unpolled_is_cancelled() {
+    let (host, store, _) = bed(&["http://w0:8000"]);
+    let sent = Instant::now();
+    let mut placed = Sent::from(host.place(&first(b"r1"), sent).await.expect("a worker"));
+    let row = placed.id();
+    placed.dispatched(sent);
+
+    let response = placed.held_to_the_end_of(Response::new(unended()));
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 1);
+    drop(response);
+    assert_eq!(live(&store, 0), 0);
+    assert!(!store.completed_ok_since(GATEWAY, row, sent));
+}
+
 #[tokio::test]
 async fn the_placement_drops_before_its_body() {
     struct ReadLiveOnDrop {

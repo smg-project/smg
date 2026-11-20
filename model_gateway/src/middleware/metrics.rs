@@ -147,6 +147,13 @@ impl BodyProgress {
         if let Some(data) = frame.data_ref() {
             self.sent = self.sent.saturating_add(data.len() as u64);
         }
+        self.out_in_full(at_end)
+    }
+
+    /// Whether the body has gone out in full; `at_end` is the body's own
+    /// word (`is_end_stream`). Asked at the head, before any frame, it says
+    /// whether the response has nothing to send.
+    pub(crate) fn out_in_full(&self, at_end: bool) -> bool {
         at_end || self.declared.is_some_and(|declared| self.sent >= declared)
     }
 }

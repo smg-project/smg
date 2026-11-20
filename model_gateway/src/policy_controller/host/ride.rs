@@ -14,7 +14,7 @@ use std::{
 
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
-use http_body::{Frame, SizeHint};
+use http_body::{Body as _, Frame, SizeHint};
 use smg_policy_controller::lease::TransportClass;
 
 use super::{transport_class, End, Placed};
@@ -109,19 +109,33 @@ impl Sent {
 
     /// `response` with this placement held to the end of its body. The body
     /// reports once: when it has gone out in full, or at its error frame. A
-    /// body dropped before either is cancelled.
+    /// body dropped before either is cancelled. A response with nothing to
+    /// send has gone out in full at its head, where a server asks its body
+    /// for no frame: its lease ends here, as the answer it was.
     pub(crate) fn held_to_the_end_of(self, response: Response) -> Response {
         let progress = BodyProgress::new(&response);
+        let status = response.status();
+        if declares_no_body(status) || progress.out_in_full(response.body().is_end_stream()) {
+            let class = class_at_the_end(false, self.cut(), status);
+            self.end(status, class, None, Instant::now());
+            return response;
+        }
         let (parts, body) = response.into_parts();
         let body = Body::new(Ride {
             sent: Some(self),
             inner: body,
-            status: parts.status,
+            status,
             first: None,
             progress,
         });
         Response::from_parts(parts, body)
     }
+}
+
+/// Whether a server writes no body under `status`, whatever the response
+/// holds: an informational status, 204 and 304.
+fn declares_no_body(status: StatusCode) -> bool {
+    status.is_informational() || matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED)
 }
 
 /// The class of a body's end. Where the relay marked a cut, the cut's
@@ -147,7 +161,8 @@ fn class_at_the_end(failed: bool, cut: Option<StatusCode>, status: StatusCode) -
 /// last frame, or once its data adds up to the length the response
 /// declared, since an HTTP/1.1 server asks for no frame after that. On an
 /// early drop the handle reports the cancellation. The body reads each
-/// frame's length and none of its bytes.
+/// frame's length and none of its bytes. A response with nothing to send
+/// gets no such body: its lease ended at its head.
 struct Ride {
     sent: Option<Sent>,
     inner: Body,
