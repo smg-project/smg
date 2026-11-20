@@ -26,8 +26,8 @@ use crate::{
     controller::wire::{self, Refusal},
     proto::{
         busy, controller_frame, decide_answer, gateway_frame, released, Busy, ControllerFrame,
-        DecideAnswer, DecideRequest, Decision, GatewayFrame, Released, Side, WatchWorkersRequest,
-        Welcome,
+        DecideAnswer, DecideRequest, Decision, GatewayFrame, Released, Side, SpecAck, SpecPush,
+        WatchWorkersRequest, Welcome,
     },
 };
 
@@ -51,6 +51,11 @@ const DECIDE_ENDED: &str = "the decide stream ended";
 /// so what it reports rides the session that stands when it reports,
 /// whichever session its decision came over. A report made while no
 /// session stands waits for the next one ([`Link::report`]).
+///
+/// A controller can push its policy document over the session
+/// ([`Link::spec_pushes`]). The link's holder applies a push to its own
+/// engine and answers it ([`Link::spec_ack`]). Every hello of the link
+/// states the generation the holder took last.
 #[derive(Clone, Debug)]
 pub struct Link {
     shared: Arc<Shared>,
@@ -77,6 +82,27 @@ pub enum Unanswered {
     /// The request could not be sent, or a handle could not read the
     /// decision it got back. An unread decision's leases are released as late.
     Unsent(Error),
+}
+
+/// The documents a controller pushes over a link, as the link's holder
+/// reads them ([`Link::spec_pushes`]).
+#[derive(Debug)]
+pub struct SpecPushes {
+    last: watch::Receiver<Option<Arc<SpecPush>>>,
+}
+
+impl SpecPushes {
+    /// Waits for a push this reader has not read, and answers the last one
+    /// the link read: a later push replaces an earlier one unread. None
+    /// once the link's last clone is gone.
+    pub async fn next(&mut self) -> Option<Arc<SpecPush>> {
+        loop {
+            self.last.changed().await.ok()?;
+            if let Some(push) = self.last.borrow_and_update().clone() {
+                return Some(push);
+            }
+        }
+    }
 }
 
 impl Link {
@@ -137,7 +163,7 @@ impl Link {
         // by a caller that left, the seat lets its session go.
         let (seat, floor) = shared.seat(stub.clone(), floor, report, request);
         let session = seat.session;
-        let frames = shared.session_frames(session, hello(gateway_id, floor), reports);
+        let frames = shared.session_frames(session, shared.hello(gateway_id, floor), reports);
         let (controller, welcome, term) =
             Session::welcomed(&mut stub, frames, floor, ANSWER_WAIT).await?;
         let requests = shared.decide_requests(session, requests);
@@ -162,7 +188,8 @@ impl Link {
     /// cause is kept, including the whole status of the session or decide
     /// stream. A clean end reads as an `OK` status that names the stream.
     /// A frame below the term floor, a replica that stopped leading, an
-    /// empty answer or a full report queue can also end a session.
+    /// empty answer, a full report queue or the link's next dial
+    /// ([`Error::Redialed`]) can also end a session.
     pub fn ended(&self) -> Option<Arc<Error>> {
         self.shared.state.lock().ended.clone()
     }
@@ -178,6 +205,33 @@ impl Link {
     /// full line ([`Self::report`]).
     pub fn reports_dropped(&self) -> usize {
         self.shared.state.lock().dropped
+    }
+
+    /// The documents the controller pushes over this link, for its holder.
+    /// The reader's first read answers the last push the link read, where
+    /// one came ahead of it. The welcome states the generation that stands
+    /// at the controller ([`Self::welcome`]).
+    pub fn spec_pushes(&self) -> SpecPushes {
+        let mut last = self.shared.spec.subscribe();
+        if last.borrow().is_some() {
+            last.mark_changed();
+        }
+        SpecPushes { last }
+    }
+
+    /// Answers the push of `generation`: taken, or refused with why. A
+    /// generation the holder took is the one every later hello of the link
+    /// states. A refused one changes nothing.
+    ///
+    /// The answer rides the session that stands. With no session it is not
+    /// sent and does not wait, also while a dial waits for its welcome: the
+    /// next hello built states what the holder runs, and the controller
+    /// pushes again where that is not its own. A hello that left ahead of
+    /// the answer states the generation before it, so the holder can read a
+    /// push of the generation it already runs. An answer that meets a full
+    /// queue ends the session, as a report does.
+    pub fn spec_ack(&self, generation: u64, taken: Result<(), String>) {
+        self.shared.spec_ack(generation, taken);
     }
 
     /// Opens a watch of the controller's workers on the link's channel,
@@ -316,6 +370,8 @@ struct Shared {
     state: Mutex<State>,
     // Held over a session's open: one dial at a time.
     dialing: AsyncMutex<()>,
+    // The document the controller pushed last, for the link's holder.
+    spec: watch::Sender<Option<Arc<SpecPush>>>,
 }
 
 #[derive(Debug)]
@@ -345,6 +401,9 @@ struct State {
     line: VecDeque<(Instant, gateway_frame::Frame)>,
     // The reports the line dropped at its bound.
     dropped: usize,
+    // The controller's generation whose document the holder took last.
+    // Every hello states it.
+    generation: u64,
 }
 
 impl State {
@@ -474,8 +533,10 @@ impl Shared {
                 stopped,
                 line: VecDeque::new(),
                 dropped: 0,
+                generation: 0,
             }),
             dialing: AsyncMutex::new(()),
+            spec: watch::Sender::new(None),
         })
     }
 
@@ -632,6 +693,35 @@ impl Shared {
         drop(open);
     }
 
+    /// The hello of the link's next session. It states the generation the
+    /// holder took last.
+    fn hello(&self, gateway_id: &str, floor: u64) -> GatewayFrame {
+        hello(gateway_id, floor, self.state.lock().generation)
+    }
+
+    fn spec_ack(&self, generation: u64, taken: Result<(), String>) {
+        let mut state = self.state.lock();
+        if taken.is_ok() {
+            state.generation = generation;
+        }
+        let frame = gateway_frame::Frame::SpecAck(SpecAck {
+            generation,
+            accepted: taken.is_ok(),
+            error: taken.err().unwrap_or_default(),
+        });
+        // An answer waits for no session: the next hello states what the
+        // holder runs.
+        let Some(open) = state.open.as_ref() else {
+            return;
+        };
+        // A full queue ends the session, as it does under a report.
+        if let Err(mpsc::error::TrySendError::Full(_)) = open.reports.try_send(frame) {
+            let full = state.close(Error::ReportsFull);
+            drop(state);
+            drop(full);
+        }
+    }
+
     fn report(&self, frame: gateway_frame::Frame) {
         let mut state = self.state.lock();
         let Some(open) = state.open.as_ref() else {
@@ -745,8 +835,20 @@ impl Shared {
         let (term, floor) = (frame.term, state.floor);
         if state.observe(term).is_none() {
             Self::end(state, session, Error::BelowFloor { term, floor });
-        } else if let Some(controller_frame::Frame::NotLeader(told)) = frame.frame {
-            Self::end(state, session, Error::NotLeader(told.leader_address));
+            return;
+        }
+        match frame.frame {
+            Some(controller_frame::Frame::NotLeader(told)) => {
+                Self::end(state, session, Error::NotLeader(told.leader_address));
+            }
+            // The holder reads the last push: a later one replaces it. The
+            // one it replaced is freed outside the lock.
+            Some(controller_frame::Frame::Spec(push)) => {
+                let before = self.spec.send_replace(Some(Arc::new(push)));
+                drop(state);
+                drop(before);
+            }
+            _ => {}
         }
     }
 
@@ -928,7 +1030,8 @@ pub(super) mod tests {
             let shared = &link.shared;
             let (seat, floor) = shared.seat(stub(endpoint), LEADER_TERM, report, request);
             let number = seat.session;
-            let reports = Box::pin(shared.session_frames(number, hello(GATEWAY, floor), reports));
+            let first = shared.hello(GATEWAY, floor);
+            let reports = Box::pin(shared.session_frames(number, first, reports));
             let requests = Box::pin(shared.decide_requests(number, requests));
             let readers = shared
                 .start(
@@ -1940,5 +2043,118 @@ pub(super) mod tests {
         assert_eq!(started.elapsed(), 2 * ANSWER_WAIT);
         // A dial that reached no leader let no session go.
         assert!(link.stands());
+    }
+
+    fn pushed(generation: u64, document: &str) -> controller_frame::Frame {
+        controller_frame::Frame::Spec(SpecPush {
+            generation,
+            document: document.as_bytes().to_vec(),
+            format: "yaml".to_owned(),
+            ..SpecPush::default()
+        })
+    }
+
+    /// The holder's answer to the push of `generation`: taken where
+    /// `refusal` is empty.
+    fn acked(generation: u64, refusal: &str) -> gateway_frame::Frame {
+        gateway_frame::Frame::SpecAck(SpecAck {
+            generation,
+            accepted: refusal.is_empty(),
+            error: refusal.to_owned(),
+        })
+    }
+
+    /// The generation a session's hello states, read off its first frame.
+    async fn stated(peer: &mut Peer) -> u64 {
+        let first = within(peer.reports.next()).await.expect("the hello");
+        match first.frame {
+            Some(gateway_frame::Frame::Hello(hello)) => Some(hello.generation),
+            _ => None,
+        }
+        .expect("the first frame is a hello")
+    }
+
+    /// A controller pushes its document over the session. The holder reads
+    /// the last push, and its answer rides the session that stands.
+    #[tokio::test]
+    async fn a_pushed_document_reaches_the_holder_and_its_answer_rides_the_session() {
+        let mut peer = Peer::new(1);
+        peer.read_hello().await;
+        let mut pushes = peer.link.spec_pushes();
+        assert!(poll(pin!(pushes.next())).is_pending());
+
+        peer.controller(WELCOME_TERM, Some(pushed(7, "first")));
+        let push = within(pushes.next()).await.expect("a push");
+        assert_eq!(
+            (push.generation, push.document.as_slice()),
+            (7, &b"first"[..])
+        );
+        peer.link.spec_ack(7, Ok(()));
+        let said = within(peer.reports.next()).await.expect("the answer");
+        assert_eq!(said.frame, Some(acked(7, "")));
+
+        // Two pushes between two reads: the holder reads the later one.
+        peer.controller(WELCOME_TERM, Some(pushed(8, "second")));
+        peer.controller(WELCOME_TERM + 1, Some(pushed(9, "third")));
+        peer.at_term(WELCOME_TERM + 1).await;
+        let push = within(pushes.next()).await.expect("a push");
+        assert_eq!(push.generation, 9);
+        assert!(poll(pin!(pushes.next())).is_pending());
+        peer.link.spec_ack(9, Err("no such stage".to_owned()));
+        let said = within(peer.reports.next()).await.expect("the answer");
+        assert_eq!(said.frame, Some(acked(9, "no such stage")));
+
+        // A reader that comes late reads the last push first.
+        let mut late = peer.link.spec_pushes();
+        let push = within(late.next()).await.expect("the last push");
+        assert_eq!(push.generation, 9);
+    }
+
+    /// Every hello of the link states the generation its holder took last.
+    /// A refused push moves nothing.
+    #[tokio::test]
+    async fn a_hello_states_the_generation_the_holder_took_last() {
+        let mut peer = Peer::patient(1);
+        assert_eq!(stated(&mut peer).await, 0);
+        peer.link.spec_ack(7, Ok(()));
+        peer.link.spec_ack(8, Err("no such stage".to_owned()));
+
+        drop(peer.redial(1));
+        assert_eq!(stated(&mut peer).await, 7);
+    }
+
+    /// An answer made with no session standing is not sent and does not
+    /// wait: the next hello states what the holder runs.
+    #[tokio::test]
+    async fn an_answer_with_no_session_does_not_wait_for_the_next_one() {
+        let mut peer = Peer::patient(1);
+        peer.read_hello().await;
+        let link = peer.link.clone();
+        peer.end_session().await;
+        link.spec_ack(7, Ok(()));
+        link.report(gone(3));
+
+        drop(peer.redial(1));
+        assert_eq!(stated(&mut peer).await, 7);
+        let said = within(peer.reports.next()).await.expect("a report");
+        assert_eq!(said.frame, Some(gone(3)));
+        assert_eq!(link.reports_dropped(), 0);
+    }
+
+    /// An answer that meets a full queue ends the session, as a report
+    /// does. The next hello states the generation.
+    #[tokio::test]
+    async fn an_answer_that_meets_a_full_queue_ends_the_session() {
+        let mut peer = Peer::patient(1);
+        peer.read_hello().await;
+        let link = peer.link.clone();
+        for _ in 0..REPORT_QUEUE {
+            link.report(gone(7));
+        }
+        closes(&link, || link.spec_ack(7, Ok(()))).await;
+        assert!(matches!(link.ended().as_deref(), Some(Error::ReportsFull)));
+
+        drop(peer.redial(1));
+        assert_eq!(stated(&mut peer).await, 7);
     }
 }
