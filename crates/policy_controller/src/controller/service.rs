@@ -179,9 +179,10 @@ pub(crate) struct Shared {
     /// The log that store journals to and the wake of its watched writes:
     /// what a watch of the rows reads.
     pub(crate) feed: Feed,
-    /// Whether this replica leads, told at a change alone by the run loop's
-    /// one task: how an idle watch learns its replica stopped leading.
-    pub(crate) role: watch::Sender<bool>,
+    /// The term this replica leads, if it leads one, told at a change alone
+    /// by the run loop's one task: how an idle watch learns its replica
+    /// stopped leading, and a task of the lead that another term began.
+    pub(crate) role: watch::Sender<Option<u64>>,
     /// Who watches this replica: the bounds of a watch's open.
     pub(crate) watchers: Arc<Watchers>,
     /// A gateway's term floor above this replica's term, on its way to the
@@ -271,7 +272,7 @@ impl Shared {
             streams: Arc::new(Streams::new(decide::MAX_STREAMS)),
             stop: watch::Sender::new(false),
             feed,
-            role: watch::channel(false).0,
+            role: watch::channel(None).0,
             watchers: Arc::new(Watchers::new(session::PRESENT_MAX)),
             floors: Floors::default(),
             snapshots: Turn::new(snapshot::SNAPSHOTS_WAITING),
@@ -1191,6 +1192,15 @@ mod tests {
     /// The election's writer and one listener's service over the fence of
     /// `elector`, handed back beside them.
     fn over(elector: Elector, scopes: &[Scope]) -> (Elector, watch::Sender<Standing>, Service) {
+        over_in(elector, scopes, Catalog::builtin())
+    }
+
+    /// [`over`]'s service, its documents naming the stages of `catalog`.
+    fn over_in(
+        elector: Elector,
+        scopes: &[Scope],
+        catalog: Catalog,
+    ) -> (Elector, watch::Sender<Standing>, Service) {
         let (standing, stood) = watch::channel(Standing::default());
         let shared = Arc::new(
             Shared::new(
@@ -1199,7 +1209,7 @@ mod tests {
                 &elector,
                 stood,
                 journaled_for(&LeasePlace::Process, 0, 2),
-                Arc::new(Catalog::builtin()),
+                Arc::new(catalog),
                 2,
             )
             .expect("the deciders start"),
@@ -2417,6 +2427,11 @@ mod tests {
     /// hour's deadline), with no spec source: the leader where `leads`,
     /// else a follower whose last look saw `controller-1` hold the lease.
     fn electing(leads: bool) -> (Elector, watch::Sender<Standing>, Service) {
+        electing_in(leads, Catalog::builtin())
+    }
+
+    /// [`electing`]'s service, its documents naming the stages of `catalog`.
+    fn electing_in(leads: bool, catalog: Catalog) -> (Elector, watch::Sender<Standing>, Service) {
         let hour = Duration::from_secs(3600);
         let settings = ElectionSettings {
             duration: 2 * hour,
@@ -2424,7 +2439,7 @@ mod tests {
             renew_deadline: hour,
         };
         let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
-        let (mut elector, standing, control) = over(elector, &[Scope::Control]);
+        let (mut elector, standing, control) = over_in(elector, &[Scope::Control], catalog);
         if leads {
             elector.lead_at(Instant::now());
             // The store enters the term, as the election has it at a take: a
@@ -2460,10 +2475,13 @@ mod tests {
             .expect("a valid document");
     }
 
-    async fn decide_for_explain(service: &Service, model: &str, id: u8) -> proto::Decision {
+    async fn decide_for_explain(
+        service: &Service,
+        request: proto::DecideRequest,
+    ) -> proto::Decision {
         let (answers, mut received) = mpsc::channel(1);
         let job = Job {
-            request: Checked::new(bed::frame_for(model, id, u64::from(id))).expect("a frame"),
+            request: Checked::new(request).expect("a frame"),
             gateway: gateway_id(EXPLAIN_GATEWAY),
             received: Instant::now(),
             answers,
@@ -2487,7 +2505,8 @@ mod tests {
         explain_spec(&control, "z-first", 1);
 
         for (model, id) in [(bed::MODEL, 1), ("empty", 2)] {
-            let mut decided = decide_for_explain(&control, model, id).await;
+            let frame = bed::frame_for(model, id, u64::from(id));
+            let mut decided = decide_for_explain(&control, frame).await;
             assert_eq!(!decided.leases.is_empty(), model == bed::MODEL);
             decided.leases.clear();
             let record = control
@@ -2519,7 +2538,7 @@ mod tests {
         assert_eq!(miss.code(), Code::NotFound);
 
         explain_spec(&control, "z-second", 0);
-        let _ = decide_for_explain(&control, bed::MODEL, 3).await;
+        let _ = decide_for_explain(&control, bed::frame(3, 3)).await;
         let miss = control
             .explain(explain_request(3))
             .await
@@ -2543,6 +2562,40 @@ mod tests {
             old.profile_name.is_empty() && old.plan_name.is_empty() && old.picker_name.is_empty()
         );
         assert!(old.filter_names.is_empty() && old.scorer_names.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explain_names_only_the_plan_for_a_shed_ahead_of_the_first_profile() {
+        let (_elector, _standing, control) = electing(true);
+        let _ = bed::fleet(&control.shared.store);
+        explain_spec(&control, "a-first", 1);
+
+        let mut frame = bed::frame(1, 1);
+        frame.constraints = Some(proto::Constraints {
+            subset_hint: Some(0),
+            ..proto::Constraints::default()
+        });
+        let decision = decide_for_explain(&control, frame).await;
+        assert!(matches!(
+            decision.outcome,
+            Some(proto::decision::Outcome::Shed(shed)) if shed.emptied_by == "subset-hint"
+        ));
+
+        let record = control
+            .explain(explain_request(1))
+            .await
+            .expect("the sampled shed")
+            .into_inner();
+        assert_eq!(record.plan_name, "single");
+        assert!(record.profile_name.is_empty(), "{}", record.profile_name);
+        assert!(record.picker_name.is_empty());
+        assert!(record.filter_names.is_empty());
+        assert!(record.scorer_names.is_empty());
+        let trace = record
+            .decision
+            .and_then(|decision| decision.trace)
+            .expect("the trace");
+        assert_eq!((trace.profile, trace.no_profile), (0, true));
     }
 
     #[tokio::test]
@@ -2578,7 +2631,7 @@ mod tests {
     async fn explain_is_for_the_leader_and_a_new_term_starts_empty() {
         let (mut elector, standing, control) = electing(true);
         explain_spec(&control, "z-first", 1);
-        let _ = decide_for_explain(&control, "empty", 1).await;
+        let _ = decide_for_explain(&control, bed::frame_for("empty", 1, 1)).await;
         assert!(control.explain(explain_request(1)).await.is_ok());
         let no_principal = control
             .explain(Request::new(explain_request(1).into_inner()))
@@ -2622,7 +2675,7 @@ mod tests {
             .await
             .expect_err("a new lead");
         assert_eq!(miss.code(), Code::NotFound);
-        let _ = decide_for_explain(&control, "empty", 2).await;
+        let _ = decide_for_explain(&control, bed::frame_for("empty", 2, 2)).await;
         assert!(control.explain(explain_request(2)).await.is_ok());
         let miss = control
             .explain(explain_request(1))
@@ -2750,6 +2803,78 @@ mod tests {
             "profile \"default\": unknown filter \"nowhere\""
         );
 
+        assert_eq!(control.shared.generations.standing(), standing);
+    }
+
+    /// A dry run a registered filter's factory refuses names the parameter's
+    /// own field: the path an operator edits.
+    #[tokio::test]
+    async fn a_dry_run_names_the_field_a_registered_filters_factory_refuses() {
+        /// Keeps the workers with `slots` of their eight request slots free.
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct MinFree {
+            slots: u32,
+        }
+
+        impl crate::Filter for MinFree {
+            fn name(&self) -> &'static str {
+                "min-free"
+            }
+
+            fn keep(
+                &self,
+                _: &crate::RequestFacts<'_>,
+                candidate: &crate::Candidate,
+                _: &crate::Constraints<'_>,
+            ) -> bool {
+                candidate.in_flight.saturating_add(self.slots) <= 8
+            }
+        }
+
+        const FIELD: &str = "profiles.default.filter[1].min-free.slots";
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter_with("min-free", |build| {
+                let rule: MinFree = build.params()?;
+                if rule.slots == 0 {
+                    return Err(crate::StageError::bad("slots", rule.slots, "above zero"));
+                }
+                Ok(Box::new(rule))
+            })
+            .expect("a free name");
+        let (_elector, _standing, control) = electing_in(true, catalog);
+        control
+            .shared
+            .generations
+            .apply(LEAST_LOAD.into(), Format::Yaml)
+            .expect("a valid document");
+        let standing = control.shared.generations.standing();
+        let dry_run = |slots: u32| {
+            let document = format!(
+                "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy, {{ min-free: {{ slots: {slots} }} }}]\n    pick: random\n"
+            );
+            apply(proto::ApplyMode::DryRun, document, "yaml", "")
+        };
+
+        let would = control
+            .apply_policy_spec(dry_run(2))
+            .await
+            .expect("a verdict")
+            .into_inner();
+        assert!(would.accepted, "{would:?}");
+
+        let refused = control
+            .apply_policy_spec(dry_run(0))
+            .await
+            .expect("a verdict")
+            .into_inner();
+        assert!(!refused.accepted, "{refused:?}");
+        let [issue] = refused.issues.as_slice() else {
+            panic!("one issue: {refused:?}")
+        };
+        assert_eq!(issue.field_path, FIELD);
+        assert_eq!(issue.message, format!("{FIELD} = 0 is not above zero"));
         assert_eq!(control.shared.generations.standing(), standing);
     }
 

@@ -16,10 +16,10 @@ use tokio::{
     time::{sleep, timeout},
 };
 use wfaas::{
-    BackoffStrategy, FailureAction, InMemoryStore, LoggingSubscriber, RetryPolicy, StateStore,
-    StepDefinition, StepExecutor, StepId, StepResult, StepStatus, ValidationError, WorkflowContext,
-    WorkflowData, WorkflowDefinition, WorkflowEngine, WorkflowError, WorkflowInstanceId,
-    WorkflowResult, WorkflowState, WorkflowStatus,
+    BackoffStrategy, EventSubscriber, FailureAction, InMemoryStore, LoggingSubscriber, RetryPolicy,
+    StateStore, StepDefinition, StepExecutor, StepId, StepResult, StepStatus, ValidationError,
+    WorkflowContext, WorkflowData, WorkflowDefinition, WorkflowEngine, WorkflowError,
+    WorkflowEvent, WorkflowInstanceId, WorkflowResult, WorkflowState, WorkflowStatus,
 };
 
 /// Test workflow data type for integration tests.
@@ -274,10 +274,12 @@ async fn a_step_that_panics_ends_its_run_as_failed() {
         .unwrap();
     assert_eq!(step_state.status, StepStatus::Failed);
     assert_eq!(step_state.attempt, 1);
+    assert_eq!(step_state.last_error.as_deref(), Some("Step failed"));
     assert_eq!(
-        step_state.last_error.as_deref(),
-        Some("Step panicked: the step's own words")
+        wfaas::completion_outcome(&state, "panicking"),
+        Err("Workflow failed at step panicking_step: Step failed".to_string())
     );
+    assert!(!format!("{state:?}").contains("the step's own words"));
 }
 
 /// Where a step author's other code panics.
@@ -355,7 +357,7 @@ async fn a_panic_in_a_steps_condition_or_hooks_ends_its_run() {
             PanicsIn::RunIf,
             WorkflowStatus::Failed,
             StepStatus::Failed,
-            Some("run_if panicked: the condition's own words"),
+            Some("Step failed"),
         ),
         (
             PanicsIn::IsRetryable,
@@ -509,7 +511,7 @@ async fn a_method_that_panics_as_it_is_called_is_caught() {
             Call::Execute,
             WorkflowStatus::Failed,
             StepStatus::Failed,
-            Some("Step panicked: the call's own words"),
+            Some("Step failed"),
         ),
         (
             Call::OnSuccess,
@@ -550,18 +552,18 @@ async fn a_method_that_panics_as_it_is_called_is_caught() {
 }
 
 /// A condition that panics ends its run by its step's failure action, as a
-/// panic in `execute` does, and the run's outcome names the step and the
-/// panic. Under `ContinueNextStep` the step is skipped with the panic's
-/// words kept, and the workflow goes on to its end.
+/// panic in `execute` does, and the run's outcome names the step and failure.
+/// Under `ContinueNextStep` the step is skipped with the failure kept, and the
+/// workflow goes on to its end.
 #[tokio::test]
 async fn a_condition_that_panics_ends_its_run_by_the_steps_failure_action() {
-    const PANIC: &str = "run_if panicked: the condition's own words";
+    const FAILURE: &str = "Step failed";
     let rows = [
         (
             FailureAction::FailWorkflow,
             WorkflowStatus::Failed,
             StepStatus::Failed,
-            Err(format!("Workflow failed at step gated_step: {PANIC}")),
+            Err(format!("Workflow failed at step gated_step: {FAILURE}")),
         ),
         (
             FailureAction::ContinueNextStep,
@@ -596,13 +598,240 @@ async fn a_condition_that_panics_ends_its_run_by_the_steps_failure_action() {
         assert_eq!(state.status, run, "{action:?}");
         let step_state = state.step_states.get(&StepId::new("gated_step")).unwrap();
         assert_eq!(step_state.status, step, "{action:?}");
-        assert_eq!(step_state.last_error.as_deref(), Some(PANIC), "{action:?}");
+        assert_eq!(
+            step_state.last_error.as_deref(),
+            Some(FAILURE),
+            "{action:?}"
+        );
         assert_eq!(
             wfaas::completion_outcome(&state, "gated"),
             outcome,
             "{action:?}"
         );
     }
+}
+
+/// A step that fails for good, with words of its own.
+struct FailsForGood;
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for FailsForGood {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        Err(WorkflowError::StepFailed {
+            step_id: StepId::new("fails"),
+            message: "its own words".to_string(),
+        })
+    }
+
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        false
+    }
+}
+
+/// `fails` fails for good at once. `retries`, on a branch of its own, fails
+/// once and begins its second attempt after its backoff, so it is the last
+/// step an attempt named. It then succeeds.
+fn a_failure_beside_a_later_attempt(id: &str) -> WorkflowDefinition<TestWorkflowData> {
+    WorkflowDefinition::new(id, "A failure beside a later attempt")
+        .add_step(StepDefinition::new(
+            "fails",
+            "Fails for good",
+            Arc::new(FailsForGood),
+        ))
+        .add_step(
+            StepDefinition::new(
+                "retries",
+                "Succeeds at its second attempt",
+                Arc::new(CountingStep {
+                    counter: Arc::new(AtomicU32::new(0)),
+                    should_succeed_after: 2,
+                }),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 2,
+                backoff: BackoffStrategy::Fixed(Duration::from_millis(50)),
+            }),
+        )
+}
+
+const FAILED_AT_FAILS: &str = "Workflow failed at step fails: Step failed: fails - its own words";
+
+#[tokio::test]
+async fn a_failed_runs_outcome_names_the_step_that_failed() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let workflow = a_failure_beside_a_later_attempt("two_branches");
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    assert_eq!(
+        state.step_states[&StepId::new("retries")].status,
+        StepStatus::Succeeded
+    );
+    assert_eq!(
+        wfaas::completion_outcome(&state, "two branches"),
+        Err(FAILED_AT_FAILS.to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_runs_outcome_names_the_step_that_failed() {
+    // A third step waits on the one that fails, so it never runs and the
+    // run ends by the blocked verdict.
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let workflow = a_failure_beside_a_later_attempt("a_blocked_branch").add_step(
+        StepDefinition::new(
+            "waits",
+            "Waits on the step that fails",
+            Arc::new(AlwaysSucceedStep),
+        )
+        .depends_on(&["fails"]),
+    );
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    assert_eq!(
+        state.step_states[&StepId::new("retries")].status,
+        StepStatus::Succeeded
+    );
+    assert_eq!(
+        wfaas::completion_outcome(&state, "a blocked branch"),
+        Err(FAILED_AT_FAILS.to_string())
+    );
+}
+
+/// A step that fails for good after a wait.
+struct FailsLater(Duration);
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for FailsLater {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        sleep(self.0).await;
+        Err(WorkflowError::StepFailed {
+            step_id: StepId::new("fails_later"),
+            message: "its later words".to_string(),
+        })
+    }
+
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        false
+    }
+}
+
+/// Keeps the step each failed event names.
+#[derive(Default)]
+struct FailedSteps(parking_lot::Mutex<Vec<StepId>>);
+
+#[async_trait::async_trait]
+impl EventSubscriber for FailedSteps {
+    async fn on_event(&self, event: &WorkflowEvent) {
+        if let WorkflowEvent::WorkflowFailed { failed_step, .. } = event {
+            self.0.lock().push(failed_step.clone());
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_run_of_two_failed_steps_is_named_by_the_first_to_fail() {
+    // Two steps fail for good on branches of their own, one of them later.
+    // A set of the failed steps gives either first, so one run proves
+    // little: sixteen do.
+    const RUNS: usize = 16;
+    let failed = Arc::new(FailedSteps::default());
+    for run in 0..RUNS {
+        let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+        let events: Arc<dyn EventSubscriber> = Arc::clone(&failed) as _;
+        engine.event_bus().subscribe(events).await;
+        let workflow = WorkflowDefinition::new("two_failures", "Two failures")
+            .add_step(StepDefinition::new(
+                "fails",
+                "Fails for good",
+                Arc::new(FailsForGood),
+            ))
+            .add_step(StepDefinition::new(
+                "fails_later",
+                "Fails for good, later",
+                Arc::new(FailsLater(Duration::from_millis(20))),
+            ));
+        let instance_id = started(&engine, workflow).await.unwrap();
+
+        let state = wait_until_settled(&engine, instance_id).await.unwrap();
+        assert_eq!(
+            wfaas::completion_outcome(&state, "two failures"),
+            Err(FAILED_AT_FAILS.to_string()),
+            "run {run}"
+        );
+    }
+
+    // Each run's failed event names the same step. The bus tells its
+    // subscribers on tasks of their own, so the events are waited for.
+    timeout(Duration::from_secs(5), async {
+        while failed.0.lock().len() < RUNS {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("every run's failed event arrives");
+    assert_eq!(*failed.0.lock(), vec![StepId::new("fails"); RUNS]);
+}
+
+#[tokio::test]
+async fn a_step_that_fails_at_its_condition_is_the_current_step_at_once() {
+    // `gated` fails at its condition after `before` ran. A delayed step
+    // keeps the run going, so the run is read while it runs and then
+    // cancelled: neither read passes the run's end.
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let workflow = WorkflowDefinition::new("failed_gate", "A failed gate in a running workflow")
+        .add_step(StepDefinition::new(
+            "before",
+            "Runs first",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(
+            StepDefinition::new(
+                "gated",
+                "Fails at its condition",
+                Arc::new(AlwaysSucceedStep),
+            )
+            .depends_on(&["before"])
+            .run_if(|_| panic!("the condition's own words")),
+        )
+        .add_step(
+            StepDefinition::new("later", "Keeps the run going", Arc::new(AlwaysSucceedStep))
+                .with_delay(Duration::from_secs(60)),
+        );
+    let instance_id = started(&engine, workflow).await.unwrap();
+    let gated = StepId::new("gated");
+
+    let running = timeout(Duration::from_secs(5), async {
+        loop {
+            let state = engine.get_status(instance_id).await.unwrap();
+            if state.step_states[&gated].status == StepStatus::Failed {
+                break state;
+            }
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the gate fails");
+    assert_eq!(running.status, WorkflowStatus::Running);
+    assert_eq!(running.current_step, Some(gated.clone()));
+
+    engine.cancel_workflow(instance_id).await.unwrap();
+    assert!(engine.wait_for_shutdown(Duration::from_secs(5)).await);
+    let cancelled = engine
+        .wait_for_terminal_state(instance_id, "failed gate", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status, WorkflowStatus::Cancelled);
+    assert_eq!(cancelled.current_step, Some(gated));
 }
 
 #[tokio::test]

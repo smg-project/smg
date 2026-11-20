@@ -163,6 +163,56 @@ fn a_least_cost_decision_after_the_first_allocates_nothing() {
     assert_eq!(allocations, 0);
 }
 
+/// `has-room` by a rule reads every row's report and its sends. A decision
+/// after the first allocates nothing at 512 rows, under a picker that
+/// reads the whole pool and under one that draws first.
+#[test]
+fn a_decision_under_a_has_room_rule_allocates_nothing_after_the_first() {
+    for picker in ["round-robin", "random"] {
+        let profile = serde_yaml::from_str(&format!(
+            "filter: [healthy, {{has-room: {{used: {{load.running: 1, load.queued: 1, request.prompt_tokens: 1, sent.tokens: 1}}, capacity: 2000, headroom: 0.05}}}}]\npick: {picker}",
+        ))
+        .expect("a profile with the rule");
+        let engine = PolicySpec::new([("p".to_string(), profile)].into())
+            .validate()
+            .expect("the profile validates");
+        let n = 512;
+        let mut view = fleet(n);
+        for (i, row) in (0u32..).zip(&mut view) {
+            row.health.healthy = true;
+            if i.is_multiple_of(3) {
+                row.load = None;
+            }
+        }
+        // Every row holds a send later than its report.
+        let lease = Lease {
+            issued_micros: 1_000_000,
+            tokens: 512,
+            ..Lease::default()
+        };
+        for row in &view {
+            let target = Target {
+                position: row.position,
+                id: row.id,
+                dp_rank: row.dp_rank,
+                pair: None,
+            };
+            engine.on_dispatched(&lease, &target, Side::Single, 0);
+        }
+        let cx = Constraints::default();
+        let mut scratch = Scratch::new();
+        let pool = pool(n);
+        assert!(engine
+            .decide(&facts(1), &pool, &view, &cx, &mut scratch)
+            .pick()
+            .is_some());
+        let (decision, allocations) =
+            allocations_during(|| engine.decide(&facts(2), &pool, &view, &cx, &mut scratch));
+        assert!(decision.pick().is_some());
+        assert_eq!(allocations, 0, "{picker}");
+    }
+}
+
 /// A decision asked by rank allocates nothing after the thread's first of
 /// its size, whatever that first was: by rank where no row holds the
 /// request's prefix, a draw for a request that names rows, or the whole
@@ -184,7 +234,7 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
     for profile in bare.profiles.values_mut() {
         profile
             .filter
-            .retain(|name| name != "not-tried" && name != "has-room");
+            .retain(|entry| !matches!(entry.name(), "not-tried" | "has-room"));
     }
     let engines = [
         (true, engine_of("cache_aware")),
@@ -573,6 +623,7 @@ fn a_build_from_the_store_after_the_first_allocates_nothing() {
                 now: opened + Duration::from_secs(1),
                 pinned: None,
                 affinity,
+                signal_cells: false,
             };
             // The first build sizes the host's buffers.
             store
@@ -630,6 +681,7 @@ fn a_pair_build_with_its_table_allocates_nothing_after_the_first() {
         now: Instant::now(),
         pinned: None,
         affinity: true,
+        signal_cells: false,
     };
     let mut out = PairBuffers::default();
     // The first build sizes the host's buffers: the rows, the columns and
@@ -794,6 +846,7 @@ fn a_lent_view_from_the_store_after_the_first_allocates_nothing() {
                 now: opened + Duration::from_secs(1),
                 pinned: Some(ids[0]),
                 affinity,
+                signal_cells: false,
             };
             // The first view sizes the host's buffers: the mask and the
             // column.

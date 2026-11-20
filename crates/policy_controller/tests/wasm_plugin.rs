@@ -2006,10 +2006,13 @@ fn each_open_decision_of_a_pair_draws_its_own_sequence() {
     let (p1, p2) = (prefill.next_u64(), prefill.next_u64());
     let mut decode = Draw::new(p1);
     let (d1, d2) = (decode.next_u64(), decode.next_u64());
-    assert_eq!(counter_value(&plugin, counter::RANDOM), p1.wrapping_add(d1));
+    assert_eq!(
+        counter_value(&plugin, counter::RANDOM),
+        p1.saturating_add(d1)
+    );
     assert_eq!(
         counter_value(&plugin, counter::PICK_RANDOM),
-        p2.wrapping_add(d2),
+        p2.saturating_add(d2),
         "each pick drew the second value of its own side's sequence"
     );
 }

@@ -19,9 +19,9 @@ use crate::{
     lease::{Lease, Lifecycle, Side},
     spec::{BindingSpec, Match, OverloadSpec, Pairing},
     store::{
-        loads::LoadSample, pairing::Refusal, GatewayId, HealthSink, LeasesStore, LoadSink,
-        LoadSource, MembershipTail, MemoryStore, Overload, PairingDescriptor, Reachability,
-        VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        loads::LoadSample, pairing::Refusal, GatewayId, HealthSink, LeaderBits, LeasesStore,
+        LoadSink, LoadSource, MembershipTail, MemoryStore, Overload, PairingDescriptor,
+        Reachability, VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
@@ -33,6 +33,7 @@ use crate::{
 mod encode_classes;
 mod encode_door;
 mod engines;
+mod leader_bits;
 mod list_room;
 mod load_call;
 mod membership_call;
@@ -43,20 +44,107 @@ mod repeated_models;
 mod unnamed_rank;
 mod written;
 
+mod sent_prefixes {
+    use super::*;
+    use crate::{
+        door::tests::sent_prefixes::{applied, merged},
+        spec::{IndexKind, IndexSpec},
+        store::{index::Predicted, KvEventSink},
+    };
+
+    type Case = Result<(), Box<dyn std::error::Error>>;
+
+    fn record(store: &MemoryStore) -> Option<Arc<Predicted>> {
+        store.deciding(|world| world.standing(MODEL, Role::Single)?.predicted())
+    }
+
+    #[test]
+    fn a_generation_that_reads_no_sent_prefix_drops_the_record() -> Case {
+        let store = MemoryStore::new();
+        member(&store, "a");
+        store.apply(applied(&merged(1)?)?)?;
+        assert_eq!(record(&store).map(|record| record.bound()), Some(4_194_304));
+        let mut idle = PolicySpec::preset("least_load")?;
+        idle.generation = 2;
+        store.apply(applied(&idle)?)?;
+        assert!(record(&store).is_none());
+        store.apply(applied(&merged(3)?)?)?;
+        assert!(record(&store).is_some());
+        let mut hash = merged(4)?;
+        hash.view.boundaries = vec![16];
+        hash.index.insert(
+            MODEL.into(),
+            IndexSpec {
+                kind: IndexKind::Hash,
+                ..IndexSpec::default()
+            },
+        );
+        hash.plans.pd_pair.pairing = Pairing::Off;
+        store.apply(applied(&hash)?)?;
+        assert!(record(&store).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_changed_bound_applies_in_place() -> Case {
+        let store = MemoryStore::new();
+        member(&store, "a");
+        let mut document = merged(1)?;
+        document.view.block_size = Some(8);
+        document.index.insert(
+            "*".into(),
+            IndexSpec {
+                max_size: 1024,
+                ..IndexSpec::default()
+            },
+        );
+        store.apply(applied(&document)?)?;
+        let first = record(&store).ok_or("the model's record")?;
+        assert_eq!(first.bound(), 128, "the generation's block size");
+
+        store.set_block_size(MODEL, 32);
+        // A refresh carries the classes, but the model's block size moved.
+        member(&store, "a");
+        assert_eq!(first.bound(), 32, "the model's block size of record");
+
+        document.generation = 2;
+        document.index.insert(
+            MODEL.into(),
+            IndexSpec {
+                max_size: 16,
+                ..IndexSpec::default()
+            },
+        );
+        store.apply(applied(&document)?)?;
+        let next = record(&store).ok_or("the model's record")?;
+        assert!(Arc::ptr_eq(&first, &next));
+        assert_eq!(
+            next.bound(),
+            1,
+            "the exact key wins and the bound stays positive"
+        );
+        Ok(())
+    }
+}
+
 const MODEL: &str = "m";
 const ASKER: GatewayId = GatewayId(1);
 
 /// A store's write gives each member its slot. The cases here hand a writer
 /// rows no store filed and read no count of theirs, so a row is given the
-/// next slot of the writer's counts where it is handed.
+/// next slot of the writer's counts where it is handed. No leader said a
+/// word of such a row.
 trait Filed {
-    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot)>;
+    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot, LeaderBits)>;
 }
 
 impl Filed for [WorkerRow] {
-    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot)> {
+    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot, LeaderBits)> {
         let counts = writer.counts();
-        let filed: Vec<_> = self.iter().map(|row| (row, counts.claim())).collect();
+        let filed: Vec<_> = self
+            .iter()
+            .map(|row| (row, counts.claim(), LeaderBits::default()))
+            .collect();
         filed.into_iter()
     }
 }
@@ -105,6 +193,7 @@ fn ask(now: Instant) -> Ask {
         now,
         pinned: None,
         affinity: false,
+        signal_cells: false,
     }
 }
 
@@ -352,6 +441,59 @@ fn another_gateways_host_local_row_is_not_written_and_the_slice_is_its_own_index
         },
     );
     assert!(rows.iter().all(|row| !row.session_hit));
+}
+
+/// What each row states for a request's hard demands is read beside the
+/// rows a build writes for the asking gateway, one entry a row in the rows'
+/// order: another gateway's host-local row has no entry there.
+#[test]
+fn the_demand_facts_stand_beside_the_rows_written_for_the_asking_gateway() {
+    use crate::demands::DemandFacts;
+
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let stating = |key: &str, runtime: u32, reachable_from: Reachability| {
+        admit(
+            &store,
+            WorkerFacts {
+                reachable_from,
+                demand_facts: DemandFacts {
+                    runtime,
+                    ..DemandFacts::default()
+                },
+                ..facts(key, Role::Single, &[MODEL])
+            },
+        )
+    };
+    let open = stating("http://a:8000", 7, Reachability::Any);
+    let theirs = stating("unix:///b", 8, Reachability::Gateway(GatewayId(2)));
+    let ours = stating("unix:///c", 9, Reachability::Gateway(GatewayId(1)));
+    let last = stating("http://d:8000", 0, Reachability::Any);
+    let stated_to = |gateway: u64| {
+        let ask = Ask {
+            gateway: GatewayId(gateway),
+            ..ask(now)
+        };
+        let (mut out, mut stated) = (ViewBuffers::default(), Vec::new());
+        store.with_world(|world| {
+            let built = world.build(MODEL, Role::Single, &ask, &mut out);
+            world.demand_facts(&built.expect("the pool"), &ask, &mut stated);
+        });
+        assert_eq!(stated.len(), out.candidates.len());
+        let rows = out.candidates.iter().zip(&stated);
+        rows.map(|(row, facts)| (row.id, facts.runtime))
+            .collect::<Vec<_>>()
+    };
+    let sorted = |mut rows: Vec<(WorkerId, u32)>| {
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(stated_to(1), sorted(vec![(open, 7), (ours, 9), (last, 0)]));
+    assert_eq!(
+        stated_to(2),
+        sorted(vec![(open, 7), (theirs, 8), (last, 0)])
+    );
+    assert_eq!(stated_to(3), sorted(vec![(open, 7), (last, 0)]));
 }
 
 #[test]
@@ -1674,7 +1816,9 @@ fn a_row_carries_its_registrations_fixed_facts_and_reads_its_own_rank() {
         (row.in_flight, row.session_in_flight, row.active_sessions),
         (0, 0, 0)
     );
-    assert!(!row.has_capacity && !row.has_room && !row.health.overloaded);
+    assert!(!row.health.overloaded);
+    // No admission window is the store's to know: both bits read open.
+    assert!(row.has_capacity && row.has_room);
     assert_eq!(row.connector, 0);
     // Under a generation that declares no list the listed fields read 0.
     assert_eq!((row.zone, row.labels, row.engine_kind), (0, 0, 0));
@@ -1749,7 +1893,7 @@ fn a_probes_verdict_and_a_connect_signal_are_read_at_once() {
     assert!(!healthy());
 
     // The connect signal of a handshake-promoted worker.
-    assert!(store.connected(id, revision()).moved().is_some());
+    assert!(store.connected(id, revision(), &|| true).moved().is_some());
     assert!(healthy());
 
     // The prober takes a ready worker out after its failure threshold.
@@ -1760,7 +1904,7 @@ fn a_probes_verdict_and_a_connect_signal_are_read_at_once() {
         .failure_threshold;
     for _ in 0..threshold {
         assert!(healthy());
-        store.probe_outcome(id, false, revision());
+        store.probe_outcome(id, false, revision(), &|| true);
     }
     assert!(!healthy());
 }
@@ -2497,10 +2641,9 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
             0 => {
                 let n = next(12) as usize;
                 present[n] = !present[n];
-                let members = all
-                    .iter()
-                    .zip(present)
-                    .filter_map(|(row, here)| here.then_some((row, counts.claim())));
+                let members = all.iter().zip(present).filter_map(|(row, here)| {
+                    here.then_some((row, counts.claim(), LeaderBits::default()))
+                });
                 writer.rebuild(step + 2, members, |_, _| None, Classes::Derive);
             }
             // A window's publication, which drops what its instant ended.
@@ -3720,6 +3863,105 @@ fn a_store_with_no_threshold_writes_no_verdict() {
     store.record(a, 0, pressure(1_000, 1_000), t0, LoadSource::Stream);
     assert_eq!(overloaded(&store, t0), []);
     assert_eq!(store.overload_flips(), 0, "no write moved a verdict");
+}
+
+/// The workers the standing world publishes under an overload verdict, and
+/// the epoch of its verdicts.
+fn shown(store: &MemoryStore) -> (Vec<WorkerId>, u64) {
+    store.with_world(|world| {
+        let over = world.overloaded().map(|row| row.id).collect();
+        (over, world.overload_epoch())
+    })
+}
+
+#[test]
+fn the_published_world_hands_the_rows_under_an_overload_verdict() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    store
+        .apply(generation_with(1, block(2, 0.9)))
+        .expect("applied");
+    let a = member(&store, "http://a:8000");
+    let b = member(&store, "http://b:8000");
+    store.record(a, 0, pressure(3, 0), t0, LoadSource::Stream);
+    store.record(b, 0, pressure(1, 0), t0, LoadSource::Stream);
+    assert_eq!(shown(&store).0, [a]);
+    // The queue drains, and the next publication hands no row.
+    store.record(a, 0, pressure(0, 0), t0, LoadSource::Stream);
+    assert_eq!(shown(&store).0, []);
+    // A worker's row is handed by its id with the figures it carries, and
+    // none for a worker no pool lists.
+    let queued = |id| {
+        store.with_world(|world| {
+            let load = world.first_row_of(id).and_then(|row| row.load);
+            load.map(|load| load.queued)
+        })
+    };
+    assert_eq!((queued(a), queued(b)), (Some(0), Some(1)));
+    assert_eq!(queued(WorkerId(u64::MAX)), None);
+}
+
+#[test]
+fn a_worlds_overload_epoch_moves_in_the_world_that_shows_the_verdict() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    store
+        .apply(generation_with(1, block(2, 0.9)))
+        .expect("applied");
+    let a = member(&store, "http://a:8000");
+    // The first record after a quiet window is shown at once. Under the
+    // threshold it moves no verdict and no epoch.
+    let (_, quiet) = shown(&store);
+    store.record(a, 0, pressure(1, 0), t0, LoadSource::Stream);
+    assert_eq!(shown(&store), (vec![], quiet));
+    // A record over the threshold lands inside the window. The store has
+    // counted its flip, and the standing world shows neither the verdict
+    // nor another epoch.
+    let late = t0 + Duration::from_millis(5);
+    store.record(a, 0, pressure(3, 0), late, LoadSource::Stream);
+    assert_eq!(store.overload_flips(), 1);
+    assert_eq!(shown(&store), (vec![], quiet));
+    // A call ahead of the window's end shows nothing and moves neither.
+    store.publish(t0 + PUBLISH_WINDOW - Duration::from_millis(1));
+    assert_eq!(shown(&store), (vec![], quiet));
+    // The window's end shows the verdict and its epoch in one world.
+    let end = t0 + PUBLISH_WINDOW;
+    store.publish(end);
+    let (over, vetoed) = shown(&store);
+    assert_eq!(over, [a]);
+    assert_ne!(vetoed, quiet);
+    // A record that moves no verdict leaves the epoch where it stands.
+    store.record(a, 0, pressure(4, 0), end, LoadSource::Stream);
+    store.publish(end + PUBLISH_WINDOW);
+    assert_eq!(shown(&store), (vec![a], vetoed));
+}
+
+#[test]
+fn a_membership_build_moves_the_overload_epoch_whatever_it_judges() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    // One worker names a count of its own, under no pool's pair.
+    let naming = |overload| WorkerFacts {
+        overload,
+        ..facts("http://a:8000", Role::Single, &[MODEL])
+    };
+    let count = Overload {
+        waiting_requests: Some(2),
+        kv_usage_permille: None,
+    };
+    let a = admit(&store, naming(count));
+    store.record(a, 0, pressure(3, 0), t0, LoadSource::Stream);
+    let (over, vetoed) = shown(&store);
+    assert_eq!(over, [a]);
+    // Its registration is written again and names no count. The build's
+    // rows start with no bit and no threshold has the engine judged: the
+    // verdict goes with no judgment to move it, and no write is counted.
+    let flips = store.overload_flips();
+    admit(&store, naming(Overload::default()));
+    let (over, built) = shown(&store);
+    assert_eq!(over, []);
+    assert_ne!(built, vetoed);
+    assert_eq!(store.overload_flips(), flips);
 }
 
 #[test]

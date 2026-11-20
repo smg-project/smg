@@ -408,6 +408,7 @@ impl Served {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let read = world
                 .view(MODEL, Role::Single, &ask, false, view)
@@ -415,6 +416,7 @@ impl Served {
             let naming = Naming {
                 gateway: GATEWAY,
                 block_hashes: &hashes,
+                namespace_seed: 0,
                 seed,
                 cap: world.spec().engine().named_for(MODEL, Phase::Single),
                 wires: None,

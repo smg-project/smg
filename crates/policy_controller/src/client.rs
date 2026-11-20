@@ -4,12 +4,15 @@
 //! Both clients dial a gateway listener, ask who leads and send a `Hello`
 //! to open a session. The leader answers with a `Welcome`. The session
 //! carries `Dispatched`, `Completed` and `Released` reports. The clients
-//! raise their term floor from answers and refuse frames below it.
+//! raise their term floor from answers and refuse terms below it.
 //!
 //! [`Client`] is the reference client. It asks for a decision one request at
 //! a time ([`Client::decide`]). [`Link`] shares the session and one decide
 //! stream across a host's requests and releases the leases of a decision
-//! its caller never takes. The host makes its own fallback decisions.
+//! its caller never takes. [`Handle::asked`](crate::handle::Handle::asked)
+//! holds a linked decision and sends its reports on the session that
+//! stands when it reports ([`Link::redial`]). A document the controller
+//! pushes reaches the link's holder ([`Link::spec_pushes`]).
 //!
 //! A watch of the controller's workers opens on either client's channel
 //! ([`Client::watch_workers`], [`Link::watch_workers`]). Once open it has
@@ -41,7 +44,7 @@
 //! caller's budget ([`Link::ask`]) and a report waits for nothing
 //! ([`Link::report`]). The readers of the session and decide stream wait
 //! with no bound of their own. The link sets the channel's keepalive,
-//! which ends a link whose controller went silent ([`Link::connect`]).
+//! which ends a session whose controller went silent ([`Link::connect`]).
 
 use std::{
     future::{poll_fn, Future},
@@ -71,7 +74,11 @@ use crate::{
 };
 
 mod link;
-pub use link::{Full, Link, Unanswered};
+pub(crate) mod wire;
+
+#[cfg(test)]
+pub(crate) use link::tests::{poll, Peer};
+pub use link::{Link, SpecPushes, Unanswered};
 
 /// Frames the client may queue toward the controller.
 const SESSION_QUEUE: usize = 16;
@@ -79,6 +86,10 @@ const SESSION_QUEUE: usize = 16;
 /// The bytes one block hash takes in a frame: a fixed 64 bits of a packed
 /// list.
 const HASH: usize = 8;
+
+/// The most block hashes one frame can hold. A frame's other fields take
+/// room too, so the fit may cut a few more.
+pub(crate) const MAX_HASHES: usize = MAX_FRAME / HASH;
 
 /// The bound on each wait of the client for its peer: an answer a leader
 /// under load can give, and a wait a blocking caller can afford. The client
@@ -134,16 +145,17 @@ pub enum Error {
     /// welcome.
     #[error("the session answered the hello with no welcome: {0}")]
     NoWelcome(String),
-    /// A frame of the session or an answer of the decide stream came
-    /// under a term below the client's floor. A gateway rejects a frame
-    /// below its floor whatever it carries. At the open the session is not
-    /// taken, and the address a `NotLeader` names is not read; after the
-    /// welcome the frame is read no further. A decide stream is dropped.
-    #[error("a frame's term {term} is below the floor {floor}")]
+    /// A `Leader` answer, a frame of the session or an answer of the decide
+    /// stream came under a term below the client's floor. A gateway rejects
+    /// an answer below its floor whatever it carries. A `Leader` answer below
+    /// the floor is not returned. At the open the session is not taken, and
+    /// the address a `NotLeader` names is not read; after the welcome the
+    /// frame is read no further. A decide stream is dropped.
+    #[error("an answer's term {term} is below the floor {floor}")]
     BelowFloor {
-        /// The term the frame came under.
+        /// The term the answer came under.
         term: u64,
-        /// The floor the frame was read under.
+        /// The floor the answer was read under.
         floor: u64,
     },
     /// An ask's request id is outside the call's range. The controller
@@ -161,21 +173,34 @@ pub enum Error {
     /// by its path in the contract. The controller ends a stream at such a
     /// frame, and a link's one stream is every caller's: the link refuses
     /// the frame at its own door and sends nothing ([`Link::ask`]).
+    ///
+    /// A hard demand of a host's request is refused under this kind too, as
+    /// `constraints.demands`: this protocol version states none, so a
+    /// handle sends no request that states one
+    /// ([`Handle::asked`](crate::handle::Handle::asked)).
     #[error("an ask's {0} is out of its range in this protocol version")]
     OutOfRange(&'static str),
     /// A link's report queue was full: its session took no report for as
-    /// long as the queue covers. The link ended, and the controller's
-    /// session grace covers the leases whose end was not said
-    /// ([`Link::report`]).
+    /// long as the queue covers. The session ended, and the reports its
+    /// queue held are lost with it ([`Link::report`]).
     #[error("the link's report queue was full")]
     ReportsFull,
+    /// A watch was asked of a link with no session standing.
+    /// [`Link::ended`] gives the cause.
+    #[error("the link has ended")]
+    LinkEnded,
+    /// A link was dialed again while its session stood, or a dial found
+    /// its session let go ahead of its start. The next session took that
+    /// one's place, as it does at the controller ([`Link::redial`]).
+    #[error("the link was dialed again")]
+    Redialed,
     /// The decide stream has no credit left: the gateway decides this
     /// request itself. Nothing was sent, and the stream stands.
     #[error("the decide stream has no credit left: the gateway decides this request itself")]
     NoCredit,
-    /// The decide stream answered an ask with a frame that is no answer
-    /// to it: one that names another request's id, or carries no answer
-    /// this client reads. The stream is dropped.
+    /// The decide stream answered an ask with no usable decision. The
+    /// reference client drops its stream on a mismatched id or missing
+    /// answer. A handle that cannot read its decision gives back its leases.
     #[error("the decide stream answered an ask with no answer to it: {0}")]
     NoDecision(String),
     /// The blocking form could not build its runtime.
@@ -247,8 +272,10 @@ impl Session {
         wait: Duration,
     ) -> Result<(Self, u64), Error> {
         let (frames, queued) = mpsc::channel(SESSION_QUEUE);
+        // This client takes no pushed document: its hello states no
+        // generation.
         frames
-            .send(hello(gateway_id, floor))
+            .send(hello(gateway_id, floor, 0))
             .await
             .map_err(|_| Error::NoWelcome("the session's queue is closed".to_owned()))?;
         let (answers, welcome, term) =
@@ -366,8 +393,10 @@ fn numbered(seq: u64, floor: u64, frame: gateway_frame::Frame) -> GatewayFrame {
 }
 
 /// The session's first frame: the hello of `gateway_id`, numbered 1, which
-/// states `floor` as the term it saw and as its term floor.
-fn hello(gateway_id: &str, floor: u64) -> GatewayFrame {
+/// states `floor` as the term it saw and as its term floor. `generation`
+/// is the controller's generation whose document the gateway's own engine
+/// runs, and 0 where it runs none of the controller's.
+fn hello(gateway_id: &str, floor: u64, generation: u64) -> GatewayFrame {
     GatewayFrame {
         seq: 1,
         term_floor: floor,
@@ -376,6 +405,7 @@ fn hello(gateway_id: &str, floor: u64) -> GatewayFrame {
             protocol_min: PROTOCOL_VERSION,
             protocol_max: PROTOCOL_VERSION,
             term_seen: floor,
+            generation,
             version: env!("CARGO_PKG_VERSION").to_owned(),
             ..Hello::default()
         })),
@@ -750,11 +780,17 @@ impl Client {
         })
     }
 
-    /// Asks the replica who leads, within the client's bound. The answer's
-    /// term raises the floor.
+    /// Asks the replica who leads, within the client's bound. An answer below
+    /// the floor is [`Error::BelowFloor`]; otherwise its term raises the floor.
     pub async fn leader(&mut self) -> Result<LeaderInfo, Error> {
         let info = ask_leader(&mut self.stub, self.wait).await?;
-        self.floor = self.floor.max(info.term);
+        if info.term < self.floor {
+            return Err(Error::BelowFloor {
+                term: info.term,
+                floor: self.floor,
+            });
+        }
+        self.floor = info.term;
         Ok(info)
     }
 
@@ -1069,7 +1105,7 @@ mod tests {
     };
     use tonic::{
         codegen::tokio_stream::{iter, once, pending, Stream, StreamExt},
-        server::{Grpc, StreamingService},
+        server::{Grpc, StreamingService, UnaryService},
         service::{Interceptor, Routes},
         transport::{server::TcpIncoming, Endpoint, Server},
         Code, Request, Status, Streaming,
@@ -1081,7 +1117,10 @@ mod tests {
         GatewayFrame, PolicyControllerClient, Principal, Session, Stub, Welcome, ANSWER_WAIT,
         MAX_FRAME, MAX_REQUEST_ID, PRINCIPAL_ENTRY, PROTOCOL_VERSION,
     };
-    use crate::proto::{busy, Completed, Credit, Dispatched, NotLeader, Released, RequestFacts};
+    use crate::proto::{
+        busy, Completed, Credit, Dispatched, LeaderInfo, LeaderRequest, NotLeader, Released,
+        RequestFacts,
+    };
 
     /// The bound a case gives a wait it wants ended.
     const SHORT: Duration = Duration::from_millis(300);
@@ -1117,7 +1156,7 @@ mod tests {
 
     #[test]
     fn the_hello_is_the_first_frame_and_states_the_floor_twice() {
-        let frame = hello("gateway-1", 7);
+        let frame = hello("gateway-1", 7, 3);
         assert_eq!((frame.seq, frame.term_floor), (1, 7), "{frame:?}");
         let hello = match frame.frame {
             Some(gateway_frame::Frame::Hello(hello)) => Some(hello),
@@ -1126,6 +1165,7 @@ mod tests {
         .expect("the first frame is a hello");
         assert_eq!(hello.gateway_id, "gateway-1");
         assert_eq!(hello.term_seen, 7);
+        assert_eq!(hello.generation, 3);
         assert_eq!(
             (hello.protocol_min, hello.protocol_max),
             (PROTOCOL_VERSION, PROTOCOL_VERSION)
@@ -1277,6 +1317,70 @@ mod tests {
             .await
             .expect(ends);
         assert!(ran_out(&asked, "the Leader ask", SHORT), "{asked:?}");
+    }
+
+    /// The `Leader` call of a peer that answers each ask with `answer`.
+    #[derive(Clone, Copy)]
+    struct Leads(fn() -> LeaderInfo);
+
+    impl UnaryService<LeaderRequest> for Leads {
+        type Response = LeaderInfo;
+        type Future = Ready<Result<tonic::Response<Self::Response>, Status>>;
+
+        fn call(&mut self, _request: Request<LeaderRequest>) -> Self::Future {
+            ready(Ok(tonic::Response::new((self.0)())))
+        }
+    }
+
+    /// A peer that answers each call with `answer`, for as long as the case
+    /// holds its task.
+    async fn leading(
+        answer: fn() -> LeaderInfo,
+    ) -> (SocketAddr, JoinSet<Result<(), tonic::transport::Error>>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("a listener");
+        let address = listener.local_addr().expect("its address");
+        let answer = Router::new().fallback(move |request: axum::extract::Request| async move {
+            Grpc::new(tonic_prost::ProstCodec::<LeaderInfo, LeaderRequest>::default())
+                .unary(Leads(answer), request)
+                .await
+                .map(Body::new)
+        });
+        let mut serving = JoinSet::new();
+        serving.spawn(
+            Server::builder()
+                .add_routes(Routes::from(answer))
+                .serve_with_incoming(TcpIncoming::from(listener)),
+        );
+        (address, serving)
+    }
+
+    #[tokio::test]
+    async fn a_leader_answer_below_the_clients_floor_is_refused() {
+        let (deciding, _deciding) = deciding(|| (Vec::new(), None)).await;
+        let (stream, _stub) = stream(deciding, 0).await;
+        let (mut client, _welcoming) = holding(stream, ROOM).await;
+        let (leading, _leading) = leading(|| LeaderInfo {
+            term: 7,
+            address: "old".to_owned(),
+            ..LeaderInfo::default()
+        })
+        .await;
+        client.stub = stub(leading).await;
+        client.floor = 8;
+
+        let refused = client.leader().await;
+
+        assert!(
+            matches!(refused, Err(Error::BelowFloor { term: 7, floor: 8 })),
+            "a stale leader answer is refused: {refused:?}"
+        );
+        assert_eq!(
+            client.term_floor(),
+            8,
+            "the floor remains at its high-water mark"
+        );
     }
 
     #[tokio::test]
@@ -2177,6 +2281,7 @@ mod tests {
             }),
             constraints: None,
             again: false,
+            ..Default::default()
         };
         // A longer name is written with a longer length: fill, then mend.
         let mut name = size - request.encoded_len();

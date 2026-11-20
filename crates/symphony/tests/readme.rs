@@ -814,6 +814,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "deepseek-v4-flash-0731",
+        model: "deepseek-ai/DeepSeek-V4-Flash-0731",
+        also: &[],
+        released: "2026-07-31",
+        smg: (Some("deepseek_v4"), Some("deepseek_v4")),
+        table: Some(Table::DeepSeekV4),
+        set: None,
+        status: Status::AwaitingFixtures,
+    },
+    Group {
         slug: "deepseek-v4.1-flash",
         model: "deepseek-ai/DeepSeek-V4.1-Flash",
         also: &[

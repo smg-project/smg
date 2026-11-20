@@ -59,8 +59,8 @@ pub struct Lease {
     /// lease, and the worker it moved to behind one. A stage that books at
     /// the issue reads it at the dispatch ([`Lifecycle::on_dispatched`]),
     /// where `target_index` names the target the dispatch took.
-    /// `WorkerId(0)` where a host names none. In-process only: no contract
-    /// carries it.
+    /// `WorkerId(0)` where a host names none. A controller answer gives
+    /// the worker by `target_index` into its pick.
     pub booked: WorkerId,
     pub generation: u64,
     /// The request's session ([`crate::RequestFacts::session`]: its key
@@ -68,9 +68,7 @@ pub struct Lease {
     /// request, whatever rule governed it, so the commit moves that
     /// session's pins and a sticky in-flight cap counts per session per
     /// worker from leases; [`Session::NONE`] when the request carried no
-    /// key. The wire carries [`Session::get`], in the field both contracts
-    /// still spell `session_key`: the change that first reads a lease from
-    /// the wire renames it in both.
+    /// key. The wire carries [`Session::get`] in its `session_key` field.
     pub session: Session,
     /// What the decision did with the session key, copied from its pick, so
     /// the commit moves the key's pins by its own decision alone.
@@ -166,7 +164,9 @@ pub enum Membership<'a> {
     },
 }
 
-/// A signal about one worker.
+/// A signal about one worker. The named values a document declares under
+/// `signals` are the other thing of that name: numbers read beside the
+/// rows ([`SignalCells`](crate::SignalCells)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signal {
     /// A load row for one rank of a worker, as the host shows it to its
@@ -282,13 +282,35 @@ impl fmt::Debug for EventSet {
 /// hooks are bounded, and call no door of the leases' store. A hook that
 /// panics at a dispatch, a completion or a release that a frame brings,
 /// or at a dispatch deadline's end, is held there: the lease's
-/// event stands as applied. One that panics at the issue, or at the
+/// event stands as applied, and so does one that panics at the issue a
+/// dispatch or a decode call brings: that call still hands its host the
+/// pick on file. One that panics at another decision's issue, or at the
 /// release of a lease its decision gives up, costs that request its
 /// decision.
 pub trait Lifecycle: Send + Sync {
     /// The engine issued `decision` under `lease`. Its host filed the
     /// lease as it issued it, in process as behind a served controller:
     /// the lease books its first target from here.
+    ///
+    /// A pair's decode side whose request asked for it later is not issued
+    /// with the pair, and no call here names it then. A decode call issues
+    /// it and is told here, where the lease's generation still stands. A
+    /// side no call issued goes out as the first pick's, and its dispatch
+    /// is its issue: a store that files leases tells it here just ahead of
+    /// that dispatch's own word. The decision told then is the pair's pick
+    /// as the lease's record keeps it: every target's workers and ranks,
+    /// with no trace. The record keeps no position, and each target bears
+    /// the default one, 0, as the target of a dispatch's word does: a
+    /// stage reads the worker by its id. The lease names the target the
+    /// dispatch took.
+    ///
+    /// A lease told here bears the instant its side was filed, on the
+    /// clock of every `issued_micros`. A later decode's is the instant of
+    /// its decode call, or the instant its dispatch was told: never the
+    /// pair's first decision, and never the date a gateway gives the
+    /// dispatch. In process the host states that instant with its call.
+    /// The lease's later words keep the instant of the pair's first
+    /// decision.
     fn on_decision_issued(&self, _lease: &Lease, _decision: &Decision) {}
 
     /// The host dispatched to `target` (one of the decision's targets), on
@@ -297,7 +319,12 @@ pub trait Lifecycle: Send + Sync {
     /// decision a queue may have held. The untaken targets are released by
     /// the host's commit. The lease told names the target the dispatch
     /// took: its `target_index` is that target's index in the pick, and its
-    /// [`Lease::booked`] is still the worker its issue booked.
+    /// [`Lease::booked`] is still the worker its issue booked. A decode
+    /// side no call issued was told issued just ahead of this word, on the
+    /// target it names ([`Self::on_decision_issued`]). That word was dated
+    /// at its telling. This one, and every later word of the lease, keeps
+    /// the decision's `issued_micros`, so `issued_micros +
+    /// since_decision_micros` still dates the dispatch.
     fn on_dispatched(
         &self,
         _lease: &Lease,
@@ -390,6 +417,9 @@ impl<T: Lifecycle + ?Sized> Lifecycle for Box<T> {
         (**self).needs_lifecycle()
     }
 }
+
+#[cfg(feature = "controller")]
+pub(crate) mod wire;
 
 #[cfg(test)]
 mod tests {

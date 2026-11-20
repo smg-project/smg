@@ -19,7 +19,8 @@
 //! holds a figure measured for its rank, never an aggregate. A failed read
 //! writes no row: the row on file ages, the engine's overload verdict
 //! reads clear until the engine is heard again unless a rank of it is
-//! still heard on its stream, and health is the prober's (a later PR). A
+//! still heard on its stream, and health is the prober's: the controller
+//! probes its workers while it leads, under its `worker-host` feature. A
 //! read that lands after its worker left writes nothing: the store keeps
 //! a worker's load rows exactly as long as its row.
 //! A row reachable only through a gateway is never dialed: its records
@@ -49,7 +50,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use openai_protocol::worker::{RuntimeType, WorkerLoadResponse};
+use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse};
 use parking_lot::Mutex;
 use tokio::{
     sync::{watch, Notify},
@@ -61,8 +62,11 @@ use tracing::{debug, warn};
 use super::scrape;
 use crate::{
     address::{split, UNPARSABLE},
-    load_report::load_row,
-    store::{LoadSink, LoadSource, PollMode, Reachability, WorkerRow, WorkerStatus, WorkersStore},
+    load_report::{load_row, signal_values},
+    store::{
+        LoadSink, LoadSource, PollMode, Reachability, SignalSink, WorkerRow, WorkerStatus,
+        WorkersStore,
+    },
     view::{Role, SignalSource, WireModes, WorkerId},
 };
 
@@ -212,6 +216,11 @@ pub struct Stats {
     /// record arrived while the read was out keeps that record, so the rows
     /// on file can be fewer.
     pub rows: AtomicU64,
+    /// Named values the bounds took out of polled answers. This poll
+    /// passes no load monitor, so the driver puts each rank's list under
+    /// the worker crate's bounds itself, where the document declares a
+    /// signal and the list is read.
+    pub values_dropped: AtomicU64,
 }
 
 /// Failed reads by [`ReadError::label`].
@@ -409,7 +418,7 @@ async fn at(instant: Option<Instant>) {
 }
 
 /// The gate's next word; for ever once its teller is gone.
-async fn turned(polls: &mut watch::Receiver<bool>) -> bool {
+async fn turned(polls: &mut watch::Receiver<Option<u64>>) -> Option<u64> {
     if polls.changed().await.is_err() {
         std::future::pending::<()>().await;
     }
@@ -427,7 +436,7 @@ fn peer(engine: &str) -> &str {
 
 impl<S, P> LoadDriver<S, P>
 where
-    S: WorkersStore + LoadSink + 'static,
+    S: WorkersStore + LoadSink + SignalSink + 'static,
     P: LoadProbe,
 {
     /// A driver over `store`. The store is told the report period
@@ -462,35 +471,35 @@ where
     /// its own rows alone, never the fleet's or the stop, which cancels the
     /// calls still out.
     pub async fn run(&self, stop: watch::Receiver<bool>) {
-        // No role to read: the polls run for the loop's length.
-        let (_always, polls) = watch::channel(true);
-        self.run_while(stop, polls, || 0).await;
+        // No role to read: the polls run for the loop's length, as under
+        // one term.
+        let (_always, polls) = watch::channel(Some(0));
+        self.run_while(stop, polls).await;
     }
 
     /// [`LoadDriver::run`] on a replica that may follow a leader: the loop
-    /// runs for the process's life and polls only while `polls` reads
-    /// `true`. It pays the store's publications either way, whoever wrote
-    /// the rows: a follower's applier writes them, and the instant the
-    /// store names is read again at each tick. A turn to `false` ends the
-    /// run of polls, with its calls still out and its grouping of the
-    /// membership; a turn to `true` starts the next with a tick at once.
+    /// runs for the process's life and polls only while `polls` names a
+    /// term, the one the replica leads. It pays the store's publications
+    /// either way, whoever wrote the rows: a follower's applier writes
+    /// them, and the instant the store names is read again at each tick. A
+    /// turn to no term ends the run of polls, with its calls still out and
+    /// its grouping of the membership; a turn to a term starts the next
+    /// with a tick at once.
     ///
-    /// `led` says the term the replica last took, read beside each word.
     /// The watch keeps its last word alone: a loss and the take after it,
-    /// told before the loop looked, read as one `true`. Under another
-    /// term that word ends the run of polls and starts the next all the
-    /// same, so no call of the last lead lands on a store restored since.
+    /// told before the loop looked, read as one word. It names another
+    /// term, so it ends the run of polls and starts the next all the same,
+    /// and no call of the last lead lands on a store restored since.
     pub async fn run_while(
         &self,
         mut stop: watch::Receiver<bool>,
-        mut polls: watch::Receiver<bool>,
-        led: impl Fn() -> u64,
+        mut polls: watch::Receiver<Option<u64>>,
     ) {
         let mut ticker = tokio::time::interval(self.config.tick);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut schedule = Schedule::default();
-        // The word, and the term it was read under: one run of polls.
-        let (mut polling, mut under) = (*polls.borrow_and_update(), led());
+        // The term the polls run under, where they run: one run of polls.
+        let mut under = *polls.borrow_and_update();
         // A write of another task can leave the store an instant this loop
         // read none of (a registration's build): the store wakes the loop,
         // which reads the instant again.
@@ -512,13 +521,10 @@ where
                 biased;
                 _ = stop.wait_for(|stop| *stop) => return,
                 word = turned(&mut polls) => {
-                    // The term is read after the word: a take sets it
-                    // before its word is told.
-                    let term = led();
-                    if (word, term) != (polling, under) {
-                        (polling, under) = (word, term);
+                    if word != under {
+                        under = word;
                         schedule = Schedule::default();
-                        if polling {
+                        if under.is_some() {
                             self.tick(&mut schedule);
                         }
                     }
@@ -527,7 +533,7 @@ where
                 () = woken.notified() => {}
                 () = at(due) => self.store.publish(now()),
                 _ = ticker.tick() => {
-                    if polling {
+                    if under.is_some() {
                         self.tick(&mut schedule);
                     }
                 }
@@ -723,6 +729,14 @@ where
     /// left out a rank its own records serve says nothing of the engine,
     /// which is heard. The store drops a row for a worker that left while
     /// the call was out.
+    ///
+    /// Behind each polled row the store took go the values its rank's
+    /// answer states of the signals the document declares
+    /// ([`signal_values`]), dated as the row is. A row the store passed
+    /// over takes its values with it. Each rank's list is first put under
+    /// the worker crate's bounds, and what left is counted
+    /// ([`Stats::values_dropped`]). A scrape's sample states nothing by
+    /// name. A document that declares no signal costs a poll one test.
     fn apply(&self, engine: &Engine, polled_at: Instant, read: Read) {
         match read {
             Read::Poll {
@@ -730,7 +744,7 @@ where
                 served,
                 answer,
             } => {
-                let report = match answer {
+                let mut report = match answer {
                     Ok(report) => report,
                     Err(error) => {
                         debug!(engine = peer(&engine.key), %error, "the load poll produced no report");
@@ -750,21 +764,37 @@ where
                 // unavailable: nothing is written for it, never another
                 // rank's figures.
                 let parallel = engine.dp_size > 1;
+                // Each rank's scoped answer, kept past its row where the
+                // document declares a signal.
+                let columns = self.store.signal_columns();
+                let mut scoped_answers = Vec::new();
+                if !columns.is_empty() {
+                    // No load monitor stands ahead of this poll: the list
+                    // is bound here, before anything reads it.
+                    let ranks = report.loads.iter_mut();
+                    let dropped: usize = ranks.map(SchedulerLoadSnapshot::bound_values).sum();
+                    self.stats
+                        .values_dropped
+                        .fetch_add(dropped as u64, Ordering::Relaxed);
+                }
                 let answer: Vec<_> = ranks
                     .into_iter()
                     .map(|(rank, id)| {
-                        let row = report
+                        let scoped = report
                             .clone()
-                            .for_dp_rank(parallel.then_some(usize::from(rank)))
-                            .map(|scoped| {
-                                load_row(
-                                    &scoped,
-                                    engine.role,
-                                    received,
-                                    sampled_at.unwrap_or(received),
-                                    SignalSource::Poll,
-                                )
-                            });
+                            .for_dp_rank(parallel.then_some(usize::from(rank)));
+                        let row = scoped.as_ref().map(|scoped| {
+                            load_row(
+                                scoped,
+                                engine.role,
+                                received,
+                                sampled_at.unwrap_or(received),
+                                SignalSource::Poll,
+                            )
+                        });
+                        if !columns.is_empty() {
+                            scoped_answers.push(scoped);
+                        }
                         (id, rank, row)
                     })
                     .collect();
@@ -774,11 +804,33 @@ where
                 // none and is the word that no report came, which a poll
                 // that left out a served rank does not say.
                 if rows > 0 || !served {
-                    if let Some(sampled_at) = sampled_at {
+                    let passed = if let Some(sampled_at) = sampled_at {
                         self.store
-                            .report_sampled(&answer, polled_at, sampled_at, LoadSource::Poll);
+                            .report_sampled(&answer, polled_at, sampled_at, LoadSource::Poll)
                     } else {
-                        self.store.report(&answer, polled_at, LoadSource::Poll);
+                        self.store.report(&answer, polled_at, LoadSource::Poll)
+                    };
+                    // The rows first, then their values. The positions the
+                    // store passed over stand in the answer's order.
+                    let mut passed = passed.into_iter().peekable();
+                    let stated = answer.iter().zip(&scoped_answers);
+                    for (position, (&(id, rank, _), scoped)) in stated.enumerate() {
+                        if passed.next_if_eq(&position).is_some() {
+                            continue;
+                        }
+                        let Some(scoped) = scoped else {
+                            continue;
+                        };
+                        // A value is dated from its row's sample: the
+                        // answer's stamp, else the poll's start.
+                        signal_values(
+                            scoped,
+                            &columns,
+                            sampled_at.unwrap_or(polled_at),
+                            |column, unit, value, at| {
+                                self.store.signal_value(id, rank, column, unit, value, at);
+                            },
+                        );
                     }
                 }
                 self.stats.rows.fetch_add(rows as u64, Ordering::Relaxed);

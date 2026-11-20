@@ -94,7 +94,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{Format, SpecRejected, MAX_DOCUMENT_BYTES};
 
@@ -660,9 +660,9 @@ impl SpecStore {
         &mut self,
         persisted: Persisted,
         document: &[u8],
-        sync: impl FnMut(&fs::File) -> io::Result<()>,
+        mut sync: impl FnMut(&fs::File) -> io::Result<()>,
     ) -> io::Result<()> {
-        self.forget_again();
+        self.forget_again(&mut sync);
         self.same()?;
         self.write_held(persisted, document, sync)
     }
@@ -776,15 +776,26 @@ impl SpecStore {
 
     /// Tries again the removal of each generation the entry refused whose
     /// name stayed on file ([`SpecStore::forget`]), and syncs the directory
-    /// where one went. One that stays still is tried at the next write.
-    fn forget_again(&mut self) {
+    /// where one went, by the write's `sync`. One that stays still is tried
+    /// at the next write, and each failure here is logged: no call answers
+    /// it.
+    fn forget_again(&mut self, sync: &mut impl FnMut(&fs::File) -> io::Result<()>) {
         let root = &*self.root;
-        let stood = self.refused.len();
-        self.refused
-            .retain(|&refused| remove_at(root, &file_name(refused)).is_err());
-        if self.refused.len() < stood {
+        let mut went = Vec::new();
+        self.refused.retain(|&refused| {
+            let generation = refused.generation;
+            let Err(error) = remove_at(root, &file_name(refused)) else {
+                went.push(generation);
+                return false;
+            };
+            warn!(generation, %error, "a refused generation stays on file: a start may run it");
+            true
+        });
+        if !went.is_empty() {
             // The removal's own sync: the write that follows may not land.
-            let _ = root.sync_all();
+            if let Err(error) = sync(root) {
+                warn!(generations = ?went, %error, "a refused generation went off file, but the directory did not sync: a crash may bring its name back");
+            }
         }
     }
 
@@ -1762,6 +1773,60 @@ pub(crate) mod tests {
             "{told}"
         );
         assert_eq!(store.kept(), []);
+    }
+
+    /// The second try of a refused generation's removal is answered by no
+    /// call, so each failure of it is said in a line: a name that stays,
+    /// and a directory that does not sync once the name went.
+    #[test]
+    fn a_second_try_that_fails_is_said_in_a_line() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut store = SpecStore::open(dir.path().to_owned()).expect("an empty directory");
+        store.persist(at(1, YAML), b"one").expect("it persists");
+        let name = dir.path().join(name_of(1, "yaml"));
+        fs::remove_file(&name).expect("the persisted file");
+        fs::create_dir(&name).expect("a directory in its place");
+        store
+            .forget()
+            .expect_err("no removal of a file takes a directory");
+
+        let lines = Logged::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        // A second subscriber stays registered beside the case's own, as in
+        // the door's audit case: with one alone a line is on or off by the
+        // thread that reaches it first.
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _kept = tracing::subscriber::set_default(subscriber);
+        let said = |words: &str| {
+            let text = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+            text.lines().filter(|line| line.contains(words)).count()
+        };
+
+        store.persist(at(2, YAML), b"two").expect("it persists");
+        let stayed = said("stays on file: a start may run it generation=1");
+
+        fs::remove_dir(&name).expect("the directory goes");
+        fs::write(&name, b"one").expect("a file again");
+        let mut syncs = 0;
+        let unsynced_once = |root: &fs::File| {
+            syncs += 1;
+            if syncs == 1 {
+                return Err(io::Error::other("the directory did not sync"));
+            }
+            root.sync_all()
+        };
+        store
+            .persist_synced(at(3, YAML), b"three", unsynced_once)
+            .expect("the write's own syncs hold");
+        let unsynced = said("a crash may bring its name back generations=[1]");
+        // The name stayed at one try and went at the next.
+        assert_eq!((stayed, said("stays on file"), unsynced), (1, 1, 1));
+        let on_file = BTreeSet::from([name_of(2, "yaml"), name_of(3, "yaml")]);
+        assert_eq!(names(dir.path()), on_file);
     }
 
     /// A back-out whose linked name is gone already, another hand's work

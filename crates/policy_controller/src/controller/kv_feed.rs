@@ -1,128 +1,12 @@
-//! Every replica reads its workers' cache events into its own store's index.
-//!
-//! # Limits
-//!
-//! Eligible workers keep streaming when the active generation reads no index.
-
-use std::{collections::HashSet, sync::Arc};
-
-use smg_worker::{
-    identity::basic::Worker,
-    kv_events::{KvEventCollector, SubscriptionKind},
-    registry::{event::WorkerEvent, WorkerId, WorkerRegistry},
-    worker::ConnectionMode,
-};
-use tokio::sync::{broadcast::error::RecvError, watch};
-
-use crate::{
-    store::{index::indexed_under, MemoryStore, WorkersStore},
-    worker_host::{KvHost, Members, Objects},
-};
-
-/// The replica's cache-event collector and the worker objects it follows.
-pub(crate) struct KvFeed {
-    collector: KvEventCollector<KvHost<Members, MemoryStore>>,
-    registry: Arc<WorkerRegistry<Members>>,
-    store: Arc<MemoryStore>,
-    objects: Arc<Objects<Members>>,
-}
-
-impl KvFeed {
-    /// The feed over `store` and its worker objects. [`Self::run`] starts
-    /// the streams.
-    pub(crate) fn new(store: Arc<MemoryStore>, objects: Arc<Objects<Members>>) -> Self {
-        let registry = Arc::clone(objects.registry());
-        let collector = KvEventCollector::new(Arc::new(KvHost::new(
-            Arc::clone(&objects),
-            Arc::clone(&store),
-        )));
-        collector.set_worker_registry(&registry);
-        Self {
-            collector,
-            registry,
-            store,
-            objects,
-        }
-    }
-
-    /// Follow the registry until `stop` reads true, then end every stream.
-    pub(crate) async fn run(&self, mut stop: watch::Receiver<bool>) {
-        let mut told = HashSet::new();
-        // Take events before the whole read so a worker laid during it is heard.
-        let mut events = self.registry.subscribe_events();
-        self.reconcile(&mut told).await;
-        loop {
-            let event = tokio::select! {
-                _ = stop.wait_for(|stop| *stop) => break,
-                event = events.recv() => event,
-            };
-            match event {
-                Ok(
-                    WorkerEvent::Registered { worker_id, worker }
-                    | WorkerEvent::Replaced {
-                        worker_id,
-                        new: worker,
-                        ..
-                    },
-                ) => {
-                    self.tell(&worker_id, &worker).await;
-                    told.insert(worker.url().to_owned());
-                }
-                Ok(WorkerEvent::Removed { worker, .. }) => {
-                    self.removed(worker.url(), &mut told).await;
-                }
-                Ok(WorkerEvent::StatusChanged { .. }) => {}
-                Err(RecvError::Lagged(_)) => self.reconcile(&mut told).await,
-                Err(RecvError::Closed) => break,
-            }
-        }
-        self.collector.stop().await;
-    }
-
-    /// Tell the collector of each worker in the read and each URL missing
-    /// from it. Keep the read's URLs for the next turn.
-    async fn reconcile(&self, told: &mut HashSet<String>) {
-        let mut present = HashSet::new();
-        for (id, worker) in self.registry.get_all_with_ids() {
-            self.tell(&id, &worker).await;
-            present.insert(worker.url().to_owned());
-        }
-        for url in told.difference(&present) {
-            self.collector.on_worker_removed(url).await;
-        }
-        *told = present;
-    }
-
-    async fn tell(&self, id: &WorkerId, worker: &Arc<dyn Worker>) {
-        if *worker.connection_mode() == ConnectionMode::Grpc
-            && self
-                .objects
-                .standing(id)
-                .and_then(|standing| self.store.get(standing.row))
-                .is_some_and(|row| indexed_under(&row).is_some())
-        {
-            self.collector
-                .on_worker_added(worker, SubscriptionKind::Events)
-                .await;
-        } else {
-            self.collector.on_worker_added_without_stream(worker).await;
-        }
-    }
-
-    async fn removed(&self, url: &str, told: &mut HashSet<String>) {
-        // A whole read may already have told the collector of the next worker
-        // under this URL. Keep tracking it while it stands.
-        if self.registry.get_by_url(url).is_none() {
-            told.remove(url);
-        }
-        self.collector.on_worker_removed(url).await;
-    }
-}
+//! The stock controller's cases of the cache-event follow
+//! ([`crate::worker_host::KvFeed`]).
 
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashSet,
         future::Future,
+        sync::Arc,
         time::{Duration, Instant},
     };
 
@@ -132,23 +16,29 @@ mod tests {
         tokenspeed_proto::{GenerateRequest, SamplingParams, TokenizedInput},
         TokenSpeedSchedulerClient as SchedulerClient,
     };
+    use smg_worker::{
+        kv_events::SubscriptionKind, load::monitor::WorkerMonitor, test_support::LoadReaders,
+    };
     use tokio::{
         net::TcpListener,
-        sync::{broadcast::error::TryRecvError, oneshot},
+        sync::{broadcast::error::TryRecvError, oneshot, watch},
         task::JoinSet,
         time::{error::Elapsed, sleep, timeout},
     };
     use tokio_stream::StreamExt as _;
 
-    use super::*;
     use crate::{
         controller::{
             config::tests::valid,
             worker_objects::{ObjectsWake, WorkerObjects},
             Controller,
         },
-        store::{Ask, GatewayId, Named, Naming, Signals, ViewBuffers, WorkerFacts, WorkerStatus},
+        store::{
+            Ask, GatewayId, KvEventSink as _, Maker, MemoryStore, Named, Naming, Signals,
+            ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+        },
         view::{Role, WireModes, WorkerId as RowId},
+        worker_host::{Expect, KvFeed, Members, Membership as _, Objects, StoreDoor},
         AppliedSpec, PolicySpec,
     };
 
@@ -179,7 +69,7 @@ mod tests {
     struct Fixture {
         store: Arc<MemoryStore>,
         objects: Arc<Objects<Members>>,
-        feed: KvFeed,
+        feed: KvFeed<Members>,
     }
 
     impl Fixture {
@@ -224,11 +114,33 @@ mod tests {
         /// Wait within `check` for a new active slot, past any removal.
         async fn new_slot(&self, url: &str, before: Option<u64>) -> u64 {
             loop {
-                if let (Some(id), None) = self.feed.collector.slot_ids(url).await {
+                if let (Some(id), None) = self.feed.collector().slot_ids(url).await {
                     if Some(id) != before {
                         return id;
                     }
                 }
+                sleep(POLL).await;
+            }
+        }
+
+        /// Wait within `check` for `url`'s stream: its slot, then its task's
+        /// open of the feed. The task opens the feed in its first turn, so
+        /// one turn of the runtime's other tasks carries it there. A worker
+        /// removed ahead of that turn gets no feed: its ticket opens
+        /// nothing, its task ends by itself, and no removal waits for it.
+        async fn streaming(&self, url: &str) -> u64 {
+            let id = self.new_slot(url, None).await;
+            // On the case's current-thread runtime, the stream's task is
+            // queued before its slot shows, and this turn runs it.
+            tokio::task::yield_now().await;
+            id
+        }
+
+        /// Wait within `check` for `url`'s slot to stand empty. A removal
+        /// runs on a task of its own, so its end is not ordered with the
+        /// events behind it.
+        async fn freed(&self, url: &str) {
+            while self.feed.collector().slot_ids(url).await != (None, None) {
                 sleep(POLL).await;
             }
         }
@@ -251,13 +163,13 @@ mod tests {
         f.lay(facts(FIRST, WireModes::GRPC, true));
         let old = f.objects.registry().get_by_url(FIRST).expect("the worker");
         f.feed
-            .collector
+            .collector()
             .on_worker_added(&old, SubscriptionKind::Events)
             .await;
         f.lay(facts(FIRST, WireModes::GRPC, true));
         f.check(async {
             // The first read has its workers and waits for the old task to end.
-            assert!(f.feed.collector.slot_ids(FIRST).await.1.is_some());
+            assert!(f.feed.collector().slot_ids(FIRST).await.1.is_some());
             f.lay(facts(SECOND, WireModes::GRPC, true));
             f.new_slot(SECOND, None).await;
         })
@@ -274,8 +186,8 @@ mod tests {
             assert!(f.remove(row));
             f.lay(facts(SECOND, WireModes::GRPC, true));
             f.new_slot(SECOND, None).await;
-            assert_eq!(f.feed.collector.slot_ids(FIRST).await, (None, None));
-            assert!(f.feed.collector.task_ended(FIRST).await);
+            f.freed(FIRST).await;
+            assert!(f.feed.collector().task_ended(FIRST).await);
         })
         .await
         .expect("the feed starts and processes the next worker");
@@ -288,16 +200,38 @@ mod tests {
         let id = f.objects.object(row).expect("the worker's id");
         f.check(async {
             f.new_slot(FIRST, None).await;
-            assert!(!f.feed.collector.task_ended(FIRST).await);
+            assert!(!f.feed.collector().task_ended(FIRST).await);
             assert_eq!(f.lay(facts(FIRST, WireModes::HTTP, true)), row);
             assert_eq!(f.objects.object(row).as_ref(), Some(&id));
             f.lay(facts(SECOND, WireModes::GRPC, true));
             f.new_slot(SECOND, None).await;
-            assert_eq!(f.feed.collector.slot_ids(FIRST).await, (None, None));
-            assert!(f.feed.collector.task_ended(FIRST).await);
+            assert_eq!(f.feed.collector().slot_ids(FIRST).await, (None, None));
+            assert!(f.feed.collector().task_ended(FIRST).await);
         })
         .await
         .expect("the feed starts and processes the next worker");
+    }
+
+    /// The door states the signal the follow reads: the facts state none.
+    #[tokio::test]
+    async fn a_worker_found_at_a_door_gets_its_stream_after_one_registration() {
+        let f = Fixture::new();
+        let mut spec = PolicySpec::preset("cache_aware").expect("the cache-aware preset");
+        spec.generation = 1;
+        f.store
+            .apply(AppliedSpec::validate(&spec).expect("the preset validates"))
+            .expect("the first generation");
+        let door = StoreDoor::new(Arc::clone(&f.store));
+        f.check(async {
+            door.found(&Maker::Control, Expect::Nothing, FIRST, &|_| {
+                facts(FIRST, WireModes::GRPC, false)
+            })
+            .expect("registered");
+            f.objects.follow(&*f.store);
+            f.new_slot(FIRST, None).await;
+        })
+        .await
+        .expect("the feed asks the stream of the found worker");
     }
 
     #[tokio::test]
@@ -307,10 +241,78 @@ mod tests {
             f.lay(facts(FIRST, WireModes::GRPC, false));
             f.lay(facts(SECOND, WireModes::GRPC, true));
             f.new_slot(SECOND, None).await;
-            assert_eq!(f.feed.collector.slot_ids(FIRST).await, (None, None));
+            assert_eq!(f.feed.collector().slot_ids(FIRST).await, (None, None));
         })
         .await
         .expect("the feed processes the worker whose row asks for events");
+    }
+
+    /// A gRPC row that is not indexed streams its load records alone once
+    /// the host hands a monitor that wants its loads, and has no stream
+    /// under a monitor that wants none.
+    #[tokio::test]
+    async fn a_row_that_is_not_indexed_streams_its_loads_where_the_monitor_wants_them() {
+        // Whether the monitor polls by need alone, and whether the row streams:
+        // a monitor with no reader of loads wants none of a worker's.
+        for (by_need, streams) in [(false, true), (true, false)] {
+            let f = Fixture::new();
+            let monitor = Arc::new(WorkerMonitor::new(
+                Arc::clone(f.objects.registry()),
+                Arc::new(LoadReaders::Blind),
+                1,
+                false,
+                by_need,
+            ));
+            f.feed.set_load_sink(&monitor);
+            f.check(async {
+                f.lay(facts(FIRST, WireModes::GRPC, false));
+                f.lay(facts(SECOND, WireModes::GRPC, true));
+                f.new_slot(SECOND, None).await;
+                let (slot, _) = f.feed.collector().slot_ids(FIRST).await;
+                assert_eq!(slot.is_some(), streams, "by need: {by_need}");
+            })
+            .await
+            .expect("the feed processes the indexed worker behind the other");
+        }
+    }
+
+    /// The kind of stream each rank of an indexed data-parallel worker
+    /// gets. Rank 0 streams its cache events. A rank above it opens no
+    /// events feed, so it streams its load records alone where a monitor
+    /// wants them, and has no stream without one.
+    #[tokio::test]
+    async fn an_upper_rank_of_an_indexed_worker_streams_its_loads_alone() {
+        const UPPER: &str = "grpc://127.0.0.1:1#1";
+        let f = Fixture::new();
+        let lower = WorkerFacts {
+            dp_size: 2,
+            ..facts(FIRST, WireModes::GRPC, true)
+        };
+        f.lay(WorkerFacts {
+            key: UPPER.to_owned(),
+            dp_rank: 1,
+            ..lower.clone()
+        });
+        f.lay(lower);
+        let stream = |url: &str| {
+            let registry = f.objects.registry();
+            let id = registry.get_id_by_url(url).expect("the row has an object");
+            let worker = registry.get_by_url(url).expect("the row has an object");
+            f.feed.stream_of(&id, &worker)
+        };
+        assert_eq!(stream(FIRST), Some(SubscriptionKind::Events));
+        assert_eq!(stream(UPPER), None, "no monitor wants its loads");
+
+        let monitor = Arc::new(WorkerMonitor::new(
+            Arc::clone(f.objects.registry()),
+            Arc::new(LoadReaders::Blind),
+            1,
+            false,
+            false,
+        ));
+        f.feed.set_load_sink(&monitor);
+        assert_eq!(stream(FIRST), Some(SubscriptionKind::Events));
+        assert_eq!(stream(UPPER), Some(SubscriptionKind::Loads));
     }
 
     #[tokio::test]
@@ -326,7 +328,10 @@ mod tests {
             let second = f.new_slot(FIRST, Some(first)).await;
             // Hearing of the old object again leaves the new object's stream.
             f.feed.tell(&id, &old).await;
-            assert_eq!(f.feed.collector.slot_ids(FIRST).await, (Some(second), None));
+            assert_eq!(
+                f.feed.collector().slot_ids(FIRST).await,
+                (Some(second), None)
+            );
         })
         .await
         .expect("the replacement takes a new slot");
@@ -352,16 +357,18 @@ mod tests {
                 // A later replacement takes its slot after the whole read ends.
                 f.lay(facts(LAST, WireModes::GRPC, true));
                 last = Some(f.new_slot(LAST, Some(slot)).await);
-                assert_eq!(f.feed.collector.slot_ids(gone).await, (None, None));
-                assert!(f.feed.collector.slot_ids(joined).await.0.is_some());
-                assert_eq!(f.feed.collector.slot_ids(FLOOD).await, (None, None));
+                f.freed(gone).await;
+                assert!(f.feed.collector().slot_ids(joined).await.0.is_some());
+                assert_eq!(f.feed.collector().slot_ids(FLOOD).await, (None, None));
             }
 
             // A queued removal can name a URL that a whole read saw again.
             let mut told = HashSet::from([FIRST.to_owned()]);
-            f.feed.removed(FIRST, &mut told).await;
+            let mut removals = JoinSet::new();
+            f.feed.removed(FIRST, &mut told, &mut removals);
+            while removals.join_next().await.is_some() {}
             assert!(told.contains(FIRST));
-            assert!(f.feed.collector.slot_ids(FIRST).await.0.is_some());
+            assert!(f.feed.collector().slot_ids(FIRST).await.0.is_some());
         })
         .await
         .expect("the feed processes the last worker after the lost events");
@@ -377,15 +384,82 @@ mod tests {
         f.check(async {
             for url in workers {
                 f.new_slot(url, None).await;
-                assert!(!f.feed.collector.task_ended(url).await);
+                assert!(!f.feed.collector().task_ended(url).await);
             }
         })
         .await
         .expect("the feed ends at the stop");
         for url in workers {
-            assert_eq!(f.feed.collector.slot_ids(url).await, (None, None));
-            assert!(f.feed.collector.task_ended(url).await);
+            assert_eq!(f.feed.collector().slot_ids(url).await, (None, None));
+            assert!(f.feed.collector().task_ended(url).await);
         }
+    }
+
+    /// Every removal permit of the process. Held, they hold a leaving task
+    /// at its last word to the sink, so its removal does not end.
+    async fn removals_held() -> tokio::sync::SemaphorePermit<'static> {
+        smg_worker::kv_events::SINK_REMOVAL_PERMITS
+            .acquire_many(smg_worker::kv_events::MAX_CONCURRENT_SINK_REMOVALS as u32)
+            .await
+            .expect("the removal semaphore is open")
+    }
+
+    /// A removal that does not end holds no add behind it: the next
+    /// worker's add is told and its slot opens while the removal waits.
+    #[tokio::test]
+    async fn a_slow_removal_holds_no_add_behind_it() {
+        let f = Fixture::new();
+        let row = f.lay(facts(FIRST, WireModes::GRPC, true));
+        f.check(async {
+            let leaving = f.streaming(FIRST).await;
+            let permits = removals_held().await;
+            assert!(f.remove(row));
+            f.lay(facts(SECOND, WireModes::GRPC, true));
+            f.new_slot(SECOND, None).await;
+            // The removal is under way and does not end: its reservation
+            // stands beside the second worker's stream.
+            while f.feed.collector().slot_ids(FIRST).await != (None, Some(leaving)) {
+                sleep(POLL).await;
+            }
+            assert!(f.feed.collector().slot_ids(SECOND).await.0.is_some());
+            drop(permits);
+        })
+        .await
+        .expect("the add behind a slow removal takes its slot");
+        assert_eq!(f.feed.collector().slot_ids(FIRST).await, (None, None));
+    }
+
+    /// A removal and a later add of one address keep their order while the
+    /// removal is slow: the new worker's stream starts behind the old
+    /// task's end, and the removal leaves it standing.
+    #[tokio::test]
+    async fn a_removal_and_a_later_add_of_one_address_keep_their_order() {
+        let f = Fixture::new();
+        let row = f.lay(facts(FIRST, WireModes::GRPC, true));
+        f.check(async {
+            let old = f.streaming(FIRST).await;
+            let permits = removals_held().await;
+            assert!(f.remove(row));
+            f.lay(facts(FIRST, WireModes::GRPC, true));
+            // The old task does not end: the address holds its reservation,
+            // and the new worker has no stream.
+            while f.feed.collector().slot_ids(FIRST).await != (None, Some(old)) {
+                sleep(POLL).await;
+            }
+            for _ in 0..5 {
+                sleep(POLL).await;
+                assert_eq!(f.feed.collector().slot_ids(FIRST).await, (None, Some(old)));
+            }
+            drop(permits);
+            let new = f.new_slot(FIRST, Some(old)).await;
+            // The removal's task ends and leaves the new stream standing.
+            for _ in 0..5 {
+                sleep(POLL).await;
+                assert_eq!(f.feed.collector().slot_ids(FIRST).await, (Some(new), None));
+            }
+        })
+        .await
+        .expect("the later add takes the address's slot behind the old task");
     }
 
     #[tokio::test]
@@ -407,9 +481,9 @@ mod tests {
             },
             ..MockConfig::default()
         };
+        // The row states no block size: the stream is the store's one word of it.
         let row = WorkerFacts {
             engine_kind: mock.grpc_wire.as_str().to_owned(),
-            kv_block_size: Some(block_size),
             ..facts(&url, WireModes::GRPC, true)
         };
         let (stop_mock, mock_stopped) = oneshot::channel();
@@ -468,6 +542,7 @@ mod tests {
                         now: Instant::now(),
                         pinned: None,
                         affinity: false,
+                        signal_cells: false,
                     };
                     let mut view = ViewBuffers::default();
                     let built = world
@@ -476,6 +551,7 @@ mod tests {
                     let naming = Naming {
                         gateway,
                         block_hashes: &hashes,
+                        namespace_seed: 0,
                         seed: 0,
                         cap: 0,
                         wires: None,
@@ -521,6 +597,8 @@ mod tests {
                 }
                 sleep(POLL).await;
             }
+            // The store learned the model's size from the engine's stored block.
+            assert_eq!(store.block_size(MODEL), Some(block_size));
             stop.send(()).expect("the controller is still serving");
         };
         let (result, ()) = timeout(Duration::from_secs(15), async { tokio::join!(serve, case) })

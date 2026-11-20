@@ -24,7 +24,8 @@ pub use crate::worker::ConnectionMode;
 use crate::{
     connection::{
         engine::{
-            EngineConnection, EngineConnectionCache, EngineConnector, ZmqLink, NO_ENGINE_CONNECTOR,
+            EngineConnection, EngineConnectionCache, EngineConnector, LoadSource, ZmqLink,
+            NO_ENGINE_CONNECTOR,
         },
         engine_admin::{
             admin_backend_client, admin_grpc_result, admin_http_post, failed, FLUSH_HTTP_TIMEOUT,
@@ -40,7 +41,7 @@ use crate::{
     metrics::writers::Metrics,
     model_card::ModelCard,
     pd::pairing::PdPairing,
-    registry::event::WorkerConnected,
+    registry::event::{WorkerConnected, WorkerSignal},
     runtime::{
         routing_state_series, AVAILABLE_CODE, CIRCUIT_OPEN_CODE, ROUTING_STATE_SERIES, STALE_BIT,
     },
@@ -152,8 +153,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// The URL as a request's success path shows it (the routed-worker
     /// response header, the cache-trace header, the request-sent event): the
     /// registered URL byte for byte when it has no userinfo, query or
-    /// fragment, otherwise `Endpoint::redacted_str`'s form (see
-    /// `Endpoint::redacted_url`). Computed once at construction
+    /// fragment, otherwise its redacted form by the spec's own rule
+    /// (`WorkerSpec::redacted_url`), which reads a rank out of the address
+    /// its spec ranks alone. Computed once at construction
     /// (`WorkerMetadata::redacted_url`).
     fn redacted_url(&self) -> &str {
         &self.metadata().redacted_url
@@ -466,8 +468,10 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Whether the absolute overload guard currently vetoes this worker.
     ///
-    /// Written only by the load monitor, once per ingested load report, and
-    /// always `false` while overload protection is unconfigured.
+    /// Written through the registry, by whoever judges the worker's load:
+    /// the load monitor, once per ingested load report, or a host that
+    /// judges load in a store of its own and mirrors each verdict. Always
+    /// `false` while overload protection is unconfigured.
     fn is_overloaded(&self) -> bool {
         false
     }
@@ -488,7 +492,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Set or clear the liveness veto, returning `true` when it changed.
     /// Route writes through the `liveness` module, which logs and counts the
-    /// transition.
+    /// transition. A worker that holds its registry's signal sender says
+    /// each change to the manager's loop, which tells the health sink
+    /// ([`HealthSink::liveness_moved`](crate::health::port::HealthSink::liveness_moved)).
     fn set_stall(&self, _reason: Option<StallReason>) -> bool {
         false
     }
@@ -839,6 +845,15 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Returns None for HTTP workers, Some(connection) for gRPC and ZMQ workers
     async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>>;
 
+    /// The host's load source of this worker, where it is an HTTP worker
+    /// whose connector keeps one ([`EngineConnector::http_load_source`]):
+    /// asked at the first call and kept once the connector has answered.
+    /// `None` for every other worker, which the load monitor polls over its
+    /// own wire.
+    async fn load_source(&self) -> Option<Arc<dyn LoadSource>> {
+        None
+    }
+
     /// Release background work owned by this worker instance.
     ///
     /// Called by the registry when the worker leaves it (removal) or is
@@ -990,6 +1005,10 @@ pub struct BasicWorker {
     /// What makes the engine connection: the host's connector, as the
     /// builder resolved it. Without one a gRPC or ZMQ connect is refused.
     pub engine_connector: Option<Arc<dyn EngineConnector>>,
+    /// The host's load source of an HTTP worker, as its connector answered
+    /// at the worker's first load poll: kept once the connector answers,
+    /// `None` inside where the connector keeps none. Clones share the slot.
+    pub load_source: Arc<OnceCell<Option<Arc<dyn LoadSource>>>>,
     /// Guards the one-shot background ZMQ handshake driver so the health probe
     /// never cancels a long (model-load) handshake. Clears at completion to
     /// allow a retry. Unused for HTTP/gRPC.
@@ -1006,11 +1025,12 @@ pub struct BasicWorker {
     /// (a trip of a shared breaker behind a request in flight, a stall) marks
     /// the code stale, and the replacement's next read publishes it again.
     pub superseded: AtomicBool,
-    /// Wakes the manager the instant the ZMQ handshake completes so it can
-    /// promote the worker without waiting for the next health poll. Set only
-    /// for ZMQ workers built through the registration path; `None` elsewhere
-    /// (HTTP/gRPC, tests), where promotion stays poll-driven.
-    pub connect_signal_tx: Option<mpsc::UnboundedSender<WorkerConnected>>,
+    /// The registry's signal sender ([`WorkerSignal`]). It wakes the
+    /// manager the instant the ZMQ handshake completes or a demoted worker
+    /// is heard from again, and it says each move of the liveness veto. Set
+    /// for a worker built for a registry; `None` elsewhere (tests), where
+    /// promotion stays poll-driven and no sink is told of the veto.
+    pub connect_signal_tx: Option<mpsc::UnboundedSender<WorkerSignal>>,
     /// Runtime-mutable models override (for lazy discovery).
     /// When not `Wildcard`, overrides metadata.models for routing decisions.
     /// Uses `ArcSwap` for lock-free reads on the hot path (`supports_model`).
@@ -1042,6 +1062,7 @@ impl Clone for BasicWorker {
             circuit_breaker: ArcSwap::from(self.circuit_breaker.load_full()),
             engine_connection: Arc::clone(&self.engine_connection),
             engine_connector: self.engine_connector.clone(),
+            load_source: Arc::clone(&self.load_source),
             zmq_connect_started: Arc::clone(&self.zmq_connect_started),
             zmq_connect_abort: Arc::clone(&self.zmq_connect_abort),
             connect_signal_tx: self.connect_signal_tx.clone(),
@@ -1152,7 +1173,7 @@ impl BasicWorker {
                     // manager, or receiver gone) is harmless — polling
                     // still promotes on the success threshold.
                     if let Some(tx) = &signal_tx {
-                        let _ = tx.send(WorkerConnected { url, revision });
+                        let _ = tx.send(WorkerConnected { url, revision }.into());
                     }
                 }
                 Err(e) => {
@@ -1300,6 +1321,23 @@ impl BasicWorker {
     /// veto, the circuit breaker).
     fn publish_state(&self) {
         self.publish_state_under(&self.runtime.load(), false);
+    }
+
+    /// Say to the manager's loop that the liveness veto moved
+    /// ([`WorkerSignal::LivenessMoved`]), where the worker holds its
+    /// registry's signal sender. The running state is marked at the send,
+    /// and the loop takes the mark before it tells the health sink. So at
+    /// most one such signal of a worker waits in the channel, however often
+    /// the veto moves and whether or not a loop reads.
+    fn signal_liveness(&self) {
+        let Some(tx) = &self.connect_signal_tx else {
+            return;
+        };
+        if self.runtime.load().mark_liveness_signalled() {
+            let _ = tx.send(WorkerSignal::LivenessMoved {
+                url: self.url().to_string(),
+            });
+        }
     }
 
     async fn grpc_health_check(&self) -> WorkerResult<bool> {
@@ -1656,6 +1694,7 @@ impl Worker for BasicWorker {
         let changed = self.runtime.load().set_stall(reason);
         if changed {
             self.publish_state();
+            self.signal_liveness();
         }
         changed
     }
@@ -1666,10 +1705,10 @@ impl Worker for BasicWorker {
 
     fn signal_connected(&self) {
         if let Some(tx) = &self.connect_signal_tx {
-            let _ = tx.send(WorkerConnected {
+            let _ = tx.send(WorkerSignal::Connected(WorkerConnected {
                 url: self.url().to_string(),
                 revision: self.revision(),
-            });
+            }));
         }
     }
 
@@ -1882,6 +1921,20 @@ impl Worker for BasicWorker {
         );
         self.models_override
             .store(Arc::new(WorkerModels::from(models)));
+    }
+
+    async fn load_source(&self) -> Option<Arc<dyn LoadSource>> {
+        if self.metadata.spec.connection_mode != ConnectionMode::Http {
+            return None;
+        }
+        let connector = self.engine_connector.as_ref()?;
+        self.load_source
+            .get_or_init(|| {
+                connector
+                    .http_load_source(self.metadata.base_url(), self.metadata.spec.runtime_type)
+            })
+            .await
+            .clone()
     }
 
     async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>> {

@@ -336,6 +336,8 @@ pub(crate) const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
 
 const POLICY_DECISIONS_TOTAL: &str = "smg_policy_decisions_total";
 const POLICY_DECISION_SECONDS: &str = "smg_policy_decision_seconds";
+const POLICY_SHADOW_DECISIONS_TOTAL: &str = "smg_policy_shadow_decisions_total";
+const POLICY_DECISION_FAULTS_TOTAL: &str = "smg_policy_decision_faults_total";
 
 /// Time to first token on edges that resolve it. The same observation as
 /// `smg_router_ttft_seconds`, which keeps the request-duration buckets (and
@@ -436,14 +438,13 @@ fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
     }
 }
 
-/// Jemalloc's run-time options for a long-running gateway, for every final
-/// artifact (the `smg` executable, the Python extension, the Go FFI library)
-/// to export as `_rjem_malloc_conf` next to its `#[global_allocator]`. The
+/// Jemalloc's run-time options for a long-running gateway. Binaries that use
+/// [`crate::stock_allocator!`] and the Python and Go bindings export them as
+/// `_rjem_malloc_conf` next to their `#[global_allocator]`. The
 /// multimodal crate's baseline harness (`crates/multimodal/examples/mm_baseline.rs`)
 /// sits below this crate and repeats the bytes by hand; the test
 /// `the_multimodal_harness_repeats_the_malloc_conf` keeps that copy equal. With
-/// the stock
-/// settings a thread's freed pages decay back to the OS only when that thread
+/// the allocator's defaults, a thread's freed pages decay back only when it
 /// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB
 /// resident over ~270 MB of live objects (soak s2, ten hours). A background
 /// thread purges on schedule instead; dirty pages are returned after 10 s and
@@ -508,20 +509,40 @@ fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
 pub const SERVER_MALLOC_CONF: &[u8; 100] =
     b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432\0";
 
-/// Marks jemalloc as the final artifact's Rust global allocator.
+/// The bytes of the one allocation that tells which allocator serves the
+/// process.
+#[cfg(all(
+    feature = "jemalloc-stats",
+    not(target_env = "msvc"),
+    not(target_env = "musl")
+))]
+const ALLOCATOR_PROBE_BYTES: usize = 4096;
+
+/// Whether this process's Rust allocations go through the library's
+/// jemalloc.
 ///
-/// Call this before [`start_prometheus`] only from a binary or extension that
-/// declares `tikv_jemallocator::Jemalloc` with `#[global_allocator]`. Keeping
-/// this registration at the artifact boundary prevents `smg` rlib consumers
-/// that use the system allocator from publishing statistics for an unused
-/// linked jemalloc instance.
-pub fn register_jemalloc_as_global_allocator() {
-    #[cfg(all(
-        feature = "jemalloc-stats",
-        not(target_env = "msvc"),
-        not(target_env = "musl")
-    ))]
-    allocator_stats::register_global_allocator();
+/// The gateway finds out and is not told: it makes one allocation and reads
+/// the allocator's own count of this thread's bytes before and after. A
+/// count that did not move means another allocator serves the process, and
+/// the statistics of the linked jemalloc are then not published. The answer
+/// is found once and kept.
+#[cfg(all(
+    feature = "jemalloc-stats",
+    not(target_env = "msvc"),
+    not(target_env = "musl")
+))]
+pub(crate) fn jemalloc_is_global() -> bool {
+    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        let Ok(allocated) = tikv_jemalloc_ctl::thread::allocatedp::read() else {
+            return false;
+        };
+        let before = allocated.get();
+        let probe = std::hint::black_box(Vec::<u8>::with_capacity(ALLOCATOR_PROBE_BYTES));
+        let after = allocated.get();
+        drop(probe);
+        after > before
+    })
 }
 
 pub(crate) fn init_metrics() {
@@ -545,7 +566,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         symphony_telemetry::CALLS_FORBIDDEN,
-        "Tool calls a Symphony table read under tool_choice: none and the gateway dropped, by table"
+        "Tool calls a Symphony table read and the gateway dropped under a tool_choice that forbids them (every call under none; a call outside the callable tools under a named function, an allowed list or required), by table"
     );
     describe_counter!(
         symphony_telemetry::FALLBACK,
@@ -777,6 +798,18 @@ pub(crate) fn init_metrics() {
     describe_histogram!(
         POLICY_DECISION_SECONDS,
         "Seconds spent asking the policy controller for one decision, by mode and outcome"
+    );
+    describe_counter!(
+        POLICY_SHADOW_DECISIONS_TOTAL,
+        "Shadow decisions of the policy controller beside a live decision. A row is a \
+         binding's position in the policy document: the last row also counts every binding \
+         behind it, and a document applied later counts on in the same rows. By binding, side \
+         (single) and kind (agreed, other-target, other-outcome, skipped)"
+    );
+    describe_counter!(
+        POLICY_DECISION_FAULTS_TOTAL,
+        "Policy controller decisions that panicked, with the shadow decisions that panicked \
+         beside a live decision that stood"
     );
     describe_counter!(
         "smg_worker_errors_total",
@@ -1262,22 +1295,12 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     not(target_env = "musl")
 ))]
 pub(crate) mod allocator_stats {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use metrics::{describe_gauge, gauge};
 
-    static JEMALLOC_IS_GLOBAL: AtomicBool = AtomicBool::new(false);
-
-    pub(super) fn register_global_allocator() {
-        JEMALLOC_IS_GLOBAL.store(true, Ordering::Release);
-    }
-
-    fn is_global_allocator() -> bool {
-        JEMALLOC_IS_GLOBAL.load(Ordering::Acquire)
-    }
+    use super::jemalloc_is_global;
 
     pub(crate) fn describe() {
-        if !is_global_allocator() {
+        if !jemalloc_is_global() {
             return;
         }
         describe_gauge!(
@@ -1317,10 +1340,10 @@ pub(crate) mod allocator_stats {
         }
     }
 
-    /// Registration at the final-artifact boundary keeps these gauges tied to
-    /// Rust's actual global allocator.
+    /// The gauges are published where this jemalloc serves the process's Rust
+    /// allocations, and nowhere else.
     pub(crate) fn start_reporting() {
-        if !is_global_allocator() {
+        if !jemalloc_is_global() {
             return;
         }
         record();
@@ -1335,6 +1358,13 @@ pub(crate) mod allocator_stats {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn the_allocator_of_the_lib_tests_is_found() {
+            // The lib's tests declare jemalloc as their allocator (lib.rs),
+            // so the one allocation moves its count.
+            assert!(super::jemalloc_is_global());
+        }
+
         #[test]
         fn jemalloc_stats_interface_readable() {
             use tikv_jemalloc_ctl::{epoch, stats};
@@ -2327,6 +2357,28 @@ impl Metrics {
             || histogram!(POLICY_DECISION_SECONDS, "mode" => mode, "outcome" => outcome),
             |time| time.record(seconds),
         );
+    }
+
+    /// The count of the shadow decisions that said `kind` beside a live
+    /// decision of the binding at position `binding`, on `side`. The caller
+    /// keeps the handle and sets it from the policy controller's own count.
+    pub fn policy_shadow_decisions(
+        binding: u32,
+        side: &'static str,
+        kind: &'static str,
+    ) -> metrics::Counter {
+        counter!(
+            POLICY_SHADOW_DECISIONS_TOTAL,
+            "binding" => binding.to_string(),
+            "side" => side,
+            "kind" => kind
+        )
+    }
+
+    /// The count of the policy decisions that panicked. The caller keeps the
+    /// handle and sets it from the policy controller's own count.
+    pub fn policy_decision_faults() -> metrics::Counter {
+        counter!(POLICY_DECISION_FAULTS_TOTAL)
     }
 
     /// Record worker error

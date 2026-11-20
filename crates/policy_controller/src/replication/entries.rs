@@ -25,6 +25,7 @@ const DISPATCHED: &str = "a new leader reads dispatched leases from the engines'
                           snapshots and rebuilds credits from its own tally";
 const PINS: &str = "pins, reservations and lease ends are journaled once pins have one table";
 const PUBLISHED: &str = "every replica publishes its own world";
+const REPORTED: &str = "each engine's next load report states its values again";
 
 /// The list: `(trait or type, entry, fate)`, each in its file's own order.
 pub const ENTRIES: &[(&str, &str, Fate)] = &[
@@ -45,6 +46,13 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     // standby's prober starts it again.
     ("HealthSink", "probe_outcome", Fate::Journaled),
     ("HealthSink", "connected", Fate::Journaled),
+    // What the leader's own worker object knows is that replica's alone: a
+    // standby holds none of it.
+    (
+        "HealthSink",
+        "leader_bits",
+        Fate::Rebuilt("a new leader writes what its own worker objects know"),
+    ),
     ("HealthSink", "gateway_veto", Fate::Rebuilt(HELLO)),
     ("HealthSink", "gateway_veto_noted", Fate::Rebuilt(HELLO)),
     ("HealthSink", "vetoed", Fate::Read),
@@ -71,15 +79,24 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ),
     ("LoadSink", "load", Fate::Read),
     ("LoadSink", "ranks", Fate::Read),
+    // The load adapter of a host with no standby is the one caller.
     (
         "LoadSink",
         "evict",
-        Fate::NotYet("no caller yet: its first caller brings its event"),
+        Fate::NotYet("the first host with a standby beside the load adapter brings its event"),
+    ),
+    (
+        "LoadSink",
+        "evict_unready",
+        Fate::Rebuilt("each replica's collector says its own reset, under its own lead"),
     ),
     ("LoadSink", "publish_due", Fate::Read),
     ("LoadSink", "publish", Fate::Rebuilt(PUBLISHED)),
     ("LoadSink", "wake_with", Fate::Read),
+    ("SignalSink", "signal_columns", Fate::Read),
+    ("SignalSink", "signal_value", Fate::Rebuilt(REPORTED)),
     ("KvEventSink", "admit", Fate::Rebuilt(SUBSCRIPTION)),
+    ("KvEventSink", "admit_through", Fate::Rebuilt(SUBSCRIPTION)),
     ("KvEventSink", "reconnected", Fate::Rebuilt(SUBSCRIPTION)),
     ("KvEventSink", "resync", Fate::Rebuilt(SUBSCRIPTION)),
     ("KvEventSink", "cursor", Fate::Read),
@@ -99,7 +116,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("SessionsStore", "pin_no_earlier", Fate::NotYet(PINS)),
     ("SessionsStore", "lookup", Fate::Read),
     ("SessionsStore", "unpin", Fate::NotYet(PINS)),
-    ("SessionsStore", "drop_worker", Fate::NotYet(PINS)),
+    ("SessionsStore", "drop_workers", Fate::NotYet(PINS)),
     ("SessionsStore", "expire", Fate::NotYet(PINS)),
     ("SessionsStore", "merge", Fate::Rebuilt(HELLO)),
     ("SessionsStore", "len", Fate::Read),
@@ -109,6 +126,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("LeasesStore", "set_term", Fate::Journaled),
     ("LeasesStore", "issue", Fate::NotYet(PINS)),
     ("LeasesStore", "issue_pair", Fate::NotYet(PINS)),
+    ("LeasesStore", "issue_decode", Fate::NotYet(PINS)),
     ("LeasesStore", "dispatched", Fate::Rebuilt(DISPATCHED)),
     ("LeasesStore", "completed", Fate::NotYet(PINS)),
     ("LeasesStore", "released", Fate::NotYet(PINS)),
@@ -172,10 +190,11 @@ mod tests {
     use super::*;
 
     /// The store's ingress traits, each with its file's text.
-    const TRAITS: [(&str, &str); 7] = [
+    const TRAITS: [(&str, &str); 8] = [
         ("WorkersStore", include_str!("../store/workers.rs")),
         ("HealthSink", include_str!("../store/health.rs")),
         ("LoadSink", include_str!("../store/loads.rs")),
+        ("SignalSink", include_str!("../store/signals.rs")),
         ("KvEventSink", include_str!("../store/kv_events.rs")),
         ("ReservationStore", include_str!("../store/reservations.rs")),
         ("SessionsStore", include_str!("../store/sessions.rs")),

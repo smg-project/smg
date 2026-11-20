@@ -206,11 +206,13 @@ kubernetes = ["dep:k8s-openapi", "dep:kube", "tokio/rt"]
 worker-host = [
     "dep:async-trait",
     "dep:smg-worker",
+    "dep:tokio",
     "dep:tracing",
     "dep:wfaas",
     "smg-grpc-client?/engine-port",
     "smg-worker/runtime",
     "smg-worker/workflow",
+    "tokio/macros",
 ]
 
 # Worker discovery on the leading controller, over the replica's worker
@@ -399,6 +401,10 @@ name = "encode_pair"
 harness = false
 
 [[bench]]
+name = "decode_later"
+harness = false
+
+[[bench]]
 name = "contention"
 harness = false
 
@@ -428,6 +434,10 @@ harness = false
 
 [[bench]]
 name = "store_named"
+harness = false
+
+[[bench]]
+name = "store_signals"
 harness = false
 
 [[bench]]
@@ -467,14 +477,31 @@ required-features = ["controller"]
 name = "encode_classes"
 harness = false
 
-# The sent-prefix predictor's read and write. No decision reads the
-# predictor yet, so no id of `decision` moves with it.
+# The sent-prefix predictor's read and write, alone. A decision's naming
+# reads it through the store's record, and no id of `decision` times that
+# read yet.
 [[bench]]
 name = "predictor"
 harness = false
 
 [[bench]]
 name = "sent"
+harness = false
+
+[[bench]]
+name = "signals"
+harness = false
+
+# A `has-room` rule beside the same profile without it. Apart from
+# `decision`, whose binary takes no new id.
+[[bench]]
+name = "has_room"
+harness = false
+
+# A registered scorer's read of a row's report through the view's
+# reading, beside the same scorer reading the row's field.
+[[bench]]
+name = "reports"
 harness = false
 
 [lints]

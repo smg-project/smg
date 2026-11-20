@@ -21,12 +21,41 @@ pub(crate) async fn mock_grpc_engine() -> (String, Arc<mock_worker::overrides::W
 /// client by the runtime's name: the engine's model info and server info
 /// answer as its overrides say (served until told otherwise).
 #[cfg(test)]
+pub(crate) async fn mock_grpc_engine_on(
+    wire: mock_worker::config::SchedulerWire,
+) -> (String, Arc<mock_worker::overrides::WorkerOverrides>) {
+    serve_mock(wire, Vec::new()).await
+}
+
+/// [`mock_grpc_engine_on`] whose worker states `value` of `name` under
+/// `unit` in every load report it makes: the engine's `grpc://` URL.
+#[cfg(test)]
+pub(crate) async fn mock_grpc_engine_stating(
+    wire: mock_worker::config::SchedulerWire,
+    name: &str,
+    unit: &str,
+    value: f64,
+) -> String {
+    let stated = smg_grpc_client::common_proto::NamedValue {
+        name: name.to_owned(),
+        unit: unit.to_owned(),
+        value,
+        age_ms: None,
+    };
+    let (url, _) = serve_mock(wire, vec![stated]).await;
+    url
+}
+
+/// A mock gRPC engine on `wire` whose one worker states `values` by name in
+/// every load report it makes.
+#[cfg(test)]
 #[expect(
     clippy::disallowed_methods,
     reason = "test helper: the mock engine's serve task runs for the test process's lifetime"
 )]
-pub(crate) async fn mock_grpc_engine_on(
+async fn serve_mock(
     wire: mock_worker::config::SchedulerWire,
+    values: Vec<smg_grpc_client::common_proto::NamedValue>,
 ) -> (String, Arc<mock_worker::overrides::WorkerOverrides>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -42,6 +71,8 @@ pub(crate) async fn mock_grpc_engine_on(
         grpc_wire: wire,
         model_id: "probe-model".to_string(),
         tokenizer_path: "probe-model".to_string(),
+        // The mock names a gRPC worker by its port.
+        worker_load_values: [(format!("grpc:{port}"), values)].into(),
         ..mock_worker::config::Config::default()
     });
     // A port an earlier test's engine served on keeps that engine's

@@ -156,15 +156,25 @@ pub enum WorkerJob {
     },
 }
 
+impl WorkerJob {
+    /// The type word of an update, as the queue files a status under it.
+    /// A host whose own job wraps this one reads the words here.
+    pub const UPDATE_TYPE: &'static str = "UpdateWorker";
+    /// The type word of a labels refresh.
+    pub const REFRESH_LABELS_TYPE: &'static str = "RefreshWorkerLabels";
+    /// The type word of a removal.
+    pub const REMOVAL_TYPE: &'static str = "RemoveWorker";
+}
+
 impl QueueJob for WorkerJob {
     const REGISTRATION_TYPE: &'static str = "AddWorker";
 
     fn job_type(&self) -> &'static str {
         match self {
             Self::Add { .. } => Self::REGISTRATION_TYPE,
-            Self::Update { .. } => "UpdateWorker",
-            Self::RefreshLabels { .. } => "RefreshWorkerLabels",
-            Self::Remove { .. } => "RemoveWorker",
+            Self::Update { .. } => Self::UPDATE_TYPE,
+            Self::RefreshLabels { .. } => Self::REFRESH_LABELS_TYPE,
+            Self::Remove { .. } => Self::REMOVAL_TYPE,
         }
     }
 
@@ -185,6 +195,9 @@ impl QueueJob for WorkerJob {
         matches!(self, Self::Remove { .. })
     }
 
+    /// Two removals of one asker merge into one job with the pins of both.
+    /// For a worker both pin, the later revision stays. A key so keeps at
+    /// most one removal for each asker.
     fn merge_removals(mut held: Self, mut newer: Self) -> Result<Self, (Self, Self)> {
         match (&mut held, &mut newer) {
             (
@@ -216,8 +229,10 @@ impl QueueJob for WorkerJob {
     }
 }
 
-/// Merged removals take the union of their pins. A pin that accepts any
-/// revision takes precedence. An unguarded removal takes the whole address.
+/// Merged removals take the union of their pins. For a worker both pin, a
+/// pin that accepts any revision takes precedence, then the later revision:
+/// a revision only grows, so the earlier one can no longer match. An
+/// unguarded removal takes the whole address.
 fn merge_pins(
     held: Option<HashMap<String, Option<u64>>>,
     newer: Option<HashMap<String, Option<u64>>>,
@@ -226,10 +241,9 @@ fn merge_pins(
         return None;
     };
     for (id, revision) in newer {
-        let pin = pins.entry(id).or_insert(revision);
-        if revision.is_none() {
-            *pin = None;
-        }
+        pins.entry(id)
+            .and_modify(|pin| *pin = pin.zip(revision).map(|(one, other)| one.max(other)))
+            .or_insert(revision);
     }
     Some(pins)
 }

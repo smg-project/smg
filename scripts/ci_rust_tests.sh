@@ -195,6 +195,9 @@ commands_of() {
             # The policy crate's case for a host that builds the `operator` feature alone. The shard's
             # first line turns the controller on, so that case would never run as such a host builds it.
             echo "-p smg-policy-controller --no-default-features --features operator --test operator_door"
+            # The policy crate's library as a host in process builds it: `worker-host` without the
+            # controller. The shard's first line turns the controller on, so that build would never be made.
+            echo "-p smg-policy-controller --lib --no-default-features --features worker-host"
             # The radix tree without its fuzz binary (the radix-fuzz shard); --doc cannot share an invocation with --test.
             selectors=$(test_selectors_except smg-radix-tree fuzz_differential)
             echo "-p smg-radix-tree --lib$selectors"

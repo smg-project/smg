@@ -13,7 +13,8 @@
 //! - `GET /admin/cache/{worker}`: the worker's cached block keys.
 //! - `POST /admin/reset/{worker}` and `POST /admin/reset`: clear one or every
 //!   cache and publish `AllBlocksCleared` (an engine restart, to the index).
-//! - `POST /admin/fault/{worker}/drop?batches=N`, `.../delay?ms=D`,
+//! - `POST /admin/fault/{worker}/drop?batches=N`, `.../duplicate?batches=N`,
+//!   `.../swap?pairs=N`, `.../cut-streams`, `.../delay?ms=D`,
 //!   `.../restart-publisher`, `.../pause`, `.../resume`,
 //!   `.../fail?status=S[&count=N|&secs=T][&after_tokens=K][&stall_ms=M]` and
 //!   `GET /admin/fault/{worker}`: the fault hooks (see the README).
@@ -81,6 +82,9 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/reset/{worker}", post(reset_one))
         .route("/admin/fault/{worker}", get(fault_status))
         .route("/admin/fault/{worker}/drop", post(fault_drop))
+        .route("/admin/fault/{worker}/duplicate", post(fault_duplicate))
+        .route("/admin/fault/{worker}/swap", post(fault_swap))
+        .route("/admin/fault/{worker}/cut-streams", post(fault_cut_streams))
         .route("/admin/fault/{worker}/delay", post(fault_delay))
         .route("/admin/fault/{worker}/admit-delay", post(fault_admit_delay))
         .route("/admin/fault/{worker}/admit-rate", post(fault_admit_rate))
@@ -268,6 +272,12 @@ fn status_json(e: &Engine) -> Value {
         "worker": e.name(),
         "drop_pending": s.drop_pending,
         "dropped_total": s.dropped_total,
+        "duplicate_pending": s.duplicate_pending,
+        "duplicated_total": s.duplicated_total,
+        "swap_pending": s.swap_pending,
+        "swap_waiting": s.swap_waiting,
+        "swapped_total": s.swapped_total,
+        "stream_cuts": s.stream_cuts,
         "delay_ms": s.delay_ms,
         "admit_delay_ms": s.admit_delay_ms,
         "admit_per_sec": s.admit_per_sec,
@@ -571,6 +581,35 @@ async fn fault_drop(
         Err(response) => return response,
     };
     apply(&worker, |e| e.fault_drop(batches))
+}
+
+/// The next `batches` event batches go out twice.
+async fn fault_duplicate(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let batches: u32 = match param(&q, "batches") {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    apply(&worker, |e| e.fault_duplicate(batches))
+}
+
+/// The next `pairs` pairs of event batches go out second batch first.
+async fn fault_swap(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let pairs: u32 = match param(&q, "pairs") {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    apply(&worker, |e| e.fault_swap(pairs))
+}
+
+/// The worker's open event streams end with `UNAVAILABLE`.
+async fn fault_cut_streams(Path(worker): Path<String>) -> Response {
+    apply(&worker, Engine::fault_cut_streams)
 }
 
 async fn fault_delay(

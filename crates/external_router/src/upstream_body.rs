@@ -20,6 +20,10 @@ use crate::error;
 /// The most of an upstream error body that is read before it is answered.
 pub const MAX_ERROR_RESPONSE_SIZE: usize = 1024 * 1024;
 
+/// What a caller reads where an upstream error body past the bound would
+/// have stood.
+pub(crate) const ERROR_BODY_TOO_LARGE: &str = "Upstream error response too large";
+
 /// Result of reading a response body with size limit
 pub enum ReadBodyResult {
     /// Successfully read the full body
@@ -62,6 +66,19 @@ pub async fn read_response_body_limited(
     match String::from_utf8(buf) {
         Ok(body) => ReadBodyResult::Ok(body),
         Err(e) => ReadBodyResult::Error(format!("invalid UTF-8 in response body: {e}")),
+    }
+}
+
+/// An upstream's error body as the text a relay builds its own message
+/// around: the body within [`MAX_ERROR_RESPONSE_SIZE`] with the provider's
+/// account identifiers removed, [`ERROR_BODY_TOO_LARGE`] for a body past the
+/// bound, and nothing for a body that cannot be read.
+#[cfg(feature = "openai")]
+pub(crate) async fn error_body_text(resp: reqwest::Response) -> String {
+    match read_response_body_limited(resp, MAX_ERROR_RESPONSE_SIZE).await {
+        ReadBodyResult::Ok(body) => error::sanitize_error_body(&body),
+        ReadBodyResult::TooLarge => ERROR_BODY_TOO_LARGE.to_string(),
+        ReadBodyResult::Error(_) => String::new(),
     }
 }
 
@@ -141,11 +158,9 @@ pub fn error_response(error: UpstreamError) -> Response {
             }
             response
         }
-        Err(Unread::TooLarge) => error::create_error(
-            error.status,
-            "upstream_error",
-            "Upstream error response too large",
-        ),
+        Err(Unread::TooLarge) => {
+            error::create_error(error.status, "upstream_error", ERROR_BODY_TOO_LARGE)
+        }
         Err(Unread::Failed) => error::create_error(
             error.status,
             "upstream_error",

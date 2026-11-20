@@ -3215,4 +3215,28 @@ mod tests {
             "the replay picked {picks:?}; the recorded sequence is the decision"
         );
     }
+
+    /// The policy controller's strip hands the key this registry's own
+    /// strip hands: a suffix's counter has any number of digits on both.
+    #[test]
+    fn the_controllers_strip_hands_the_registrys_key() {
+        let padded = "9".repeat(21);
+        for key in [
+            "conv_t2",
+            "conv_t2_r1",
+            "conv_r3",
+            "conv_t2_t3",
+            "_t1",
+            "conv_t",
+            "conv",
+            &format!("conv_t{padded}"),
+            &format!("conv_t2_r{padded}"),
+        ] {
+            assert_eq!(
+                smg_policy_controller::routing_key::strip_lineage(key),
+                PolicyRegistry::strip_header_key(key),
+                "{key}"
+            );
+        }
+    }
 }

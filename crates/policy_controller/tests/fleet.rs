@@ -1,17 +1,20 @@
 //! The end-to-end case, the harness first: a controller on ephemeral ports,
 //! a fleet of mock engines and the generated client, in one process. The
 //! fleet registers, an engine of one rank through the control scope's call;
-//! the controller's own load driver polls it; a probe turn of the case asks
-//! each engine its health and writes what it heard; and the pool is read
-//! back as a decision's view reads it: every rank a row, healthy by its
-//! probe, its load from a poll, an engine that holds requests reading them.
+//! the controller's own load driver polls it; each engine is asked its
+//! health and what it answered is written, by the controller's own prober
+//! where its build has one and by a probe turn of the case elsewhere; and
+//! the pool is read back as a decision's view reads it: every rank a row,
+//! healthy by its probe, its load from a poll, an engine that holds
+//! requests reading them.
 //! That engine's KV events follow: a subscriber of the case hands each batch
 //! of its stream to the sink, and its row's index holds every block the
 //! events left the engine holding, where the cache-aware preset then asks a
-//! prompt that states them. Then one engine is killed: the first dial
+//! prompt that states them. Then one engine is killed: the first probe
 //! that hears it dead writes it, and the pool reads its rows unhealthy and
 //! every other row healthy. Next, an engine stops answering with its sockets
-//! open: a probe turn waits out its dial bound, writes it and goes on. Last,
+//! open: its probe waits out its bound and writes it, and a dial turn of
+//! the case waits out its own and goes on to every other engine. Last,
 //! the gateway sends requests of its own and reports each on its session:
 //! the store holds the completion of the engine that answered, none of class
 //! ok for the dead and the hung one, and nothing of it for another gateway;
@@ -127,7 +130,7 @@ use std::{
 use engines::cpu_seconds;
 use fleet::{
     within, DialEnd, Harness, Replica, Shape, DIAL_TIMEOUT, GATEWAY, POLL_INTERVAL, PROBE_INTERVAL,
-    ROOM,
+    PRODUCT_PROBES, ROOM,
 };
 use net::vm_rss_kib;
 use openai_protocol::worker::RuntimeType;
@@ -137,8 +140,8 @@ use smg_policy_controller::{
     controller::{State, PROTOCOL_VERSION},
     proto::{
         busy, completed::Class, decision::Outcome, gateway_frame, identity::Form, principal,
-        released, worker_event, Completed, DecideRequest, Decision, Hello, Identity, Lease,
-        OverloadThresholds, Released, RequestFacts, ShedReason, Side, WatchWorkersRequest,
+        released, worker_event, Completed, DecideRequest, Decision, Dispatched, Hello, Identity,
+        Lease, OverloadThresholds, Released, RequestFacts, ShedReason, Side, WatchWorkersRequest,
     },
     spec::{BindingSpec, Match},
     store::{LaneCounts, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
@@ -246,6 +249,7 @@ fn ask(id: &[u8]) -> DecideRequest {
         }),
         constraints: None,
         again: false,
+        ..Default::default()
     }
 }
 
@@ -684,8 +688,10 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .sum();
         let pool = harness.view(MODEL, Role::Single).expect("the view");
         assert_eq!(pool.len(), ranks, "every rank is a row: {pool:?}");
+        // A controller that probes by itself asks an engine as its row
+        // arrives: nothing is asked yet only where the stand-in probes.
         assert!(
-            pool.iter().all(|row| !row.healthy && row.load.is_none()),
+            PRODUCT_PROBES || pool.iter().all(|row| !row.healthy && row.load.is_none()),
             "nothing is known of an engine nobody asked: {pool:?}"
         );
 
@@ -1869,7 +1875,33 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         })
         .await
         .expect("a live engine reads healthy");
+        let killed = harness.mark();
         let death = harness.kill(dead).await.expect("the kill");
+        // The death's verdicts are the statuses the store moved from the
+        // kill on, one a rank, whoever probes. The liveness rule moves a
+        // not-ready row on to failed three failures later: that step
+        // follows the death, it is not its verdict.
+        let verdicts = |harness: &Harness| {
+            let mut moved = harness.moved(killed).expect("the store's tail");
+            moved.retain(|moved| moved.engine == dead && moved.to != WorkerStatus::Failed);
+            moved
+        };
+        within(
+            "the death is written, one verdict a rank",
+            PROBE_INTERVAL + DIAL_TIMEOUT + ROOM,
+            || verdicts(&harness).len() >= 2,
+        )
+        .await
+        .expect("the death is written");
+        let written = death.at.elapsed();
+        assert_eq!(
+            verdicts(&harness)
+                .iter()
+                .map(|moved| (moved.from, moved.to))
+                .collect::<Vec<_>>(),
+            [(WorkerStatus::Ready, WorkerStatus::NotReady); 2],
+            "one verdict a rank from the kill on"
+        );
         within(
             "a dead engine's rows read unhealthy and every other row healthy",
             PROBE_INTERVAL + DIAL_TIMEOUT + ROOM,
@@ -1888,48 +1920,39 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             ranks,
             "a dead engine's rows stay rows: {pool:?}"
         );
-        // The death's verdicts are the ones written from the kill on, one a
-        // rank, by the first dial that heard the engine dead: a turn in
-        // flight at the kill, or the first one begun after the death. The
-        // liveness rule moves a not-ready row on to failed three failures
-        // later: that step follows the death, it is not its verdict.
-        let moved: Vec<_> = harness
-            .verdicts()
-            .into_iter()
-            .filter(|verdict| {
-                verdict.engine == dead
-                    && verdict.at >= death.at
-                    && verdict.to != WorkerStatus::Failed
-            })
-            .collect();
-        assert_eq!(
-            moved.len(),
-            2,
-            "one verdict a rank from the kill on: {moved:?}"
-        );
-        let first = harness
-            .first_unhealthy(dead, death.asked)
-            .expect("a dial heard the engine dead");
-        assert!(
-            first <= death.turn + 1,
-            "the first turn after the death dialed it: turn {first} after {death:?}"
-        );
-        for verdict in &moved {
-            assert_eq!(
-                (verdict.from, verdict.to),
-                (WorkerStatus::Ready, WorkerStatus::NotReady),
-                "{verdict:?}"
+        // Where the stand-in probes, its turns tell which dial wrote: the
+        // first that heard the engine dead, a turn in flight at the kill
+        // or the first one begun after the death.
+        if !PRODUCT_PROBES {
+            let first = harness
+                .first_unhealthy(dead, death.asked)
+                .expect("a dial heard the engine dead");
+            assert!(
+                first <= death.turn + 1,
+                "the first turn after the death dialed it: turn {first} after {death:?}"
             );
-            assert_eq!(
-                verdict.turn, first,
-                "the first dial that heard the engine dead wrote it: {verdict:?} after {death:?}"
-            );
+            let wrote: Vec<_> = harness
+                .verdicts()
+                .into_iter()
+                .filter(|verdict| {
+                    verdict.engine == dead
+                        && verdict.at >= death.at
+                        && verdict.to != WorkerStatus::Failed
+                })
+                .collect();
+            assert_eq!(wrote.len(), 2, "one verdict a rank: {wrote:?}");
+            for verdict in &wrote {
+                assert_eq!(
+                    (verdict.from, verdict.to),
+                    (WorkerStatus::Ready, WorkerStatus::NotReady),
+                    "{verdict:?}"
+                );
+                assert_eq!(
+                    verdict.turn, first,
+                    "the first dial that heard the engine dead wrote it: {verdict:?} after {death:?}"
+                );
+            }
         }
-        let written = moved
-            .iter()
-            .map(|verdict| verdict.at.duration_since(death.at))
-            .max()
-            .unwrap_or_default();
         // No decision names the dead engine: from the probe that heard it
         // dead its rows are no candidates.
         harness
@@ -1963,6 +1986,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         // costs a probe turn its dial bound and no more: that turn writes
         // the engine's row not ready, and no live row moves.
         let hung = engines[2];
+        let hanged = harness.mark();
         let hang = Instant::now();
         harness.hang(hung).expect("the hang");
         within(
@@ -1978,24 +2002,29 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         .await
         .expect("the hang is seen");
         let hung_seen = hang.elapsed();
-        let moved: Vec<_> = harness
-            .verdicts()
-            .into_iter()
-            .filter(|verdict| {
-                verdict.engine == hung && verdict.at >= hang && verdict.to != WorkerStatus::Failed
-            })
-            .collect();
+        let moved = harness.moved(hanged).expect("the store's tail");
         assert_eq!(
             moved
                 .iter()
-                .map(|verdict| (verdict.from, verdict.to))
+                .filter(|moved| moved.engine == hung && moved.to != WorkerStatus::Failed)
+                .map(|moved| (moved.from, moved.to))
                 .collect::<Vec<_>>(),
             [(WorkerStatus::Ready, WorkerStatus::NotReady)],
             "one verdict for the hung engine's one rank: {moved:?}"
         );
-        // That turn went on to every engine after the hung one, and from
-        // the hang on no live row moved.
-        let turn = moved[0].turn;
+        // The dialer's turn that waited out the bound went on to every
+        // engine after the hung one, and from the hang on no live row
+        // moved.
+        within(
+            "a dial waits out the hung engine",
+            PROBE_INTERVAL + DIAL_TIMEOUT + ROOM,
+            || harness.first_unhealthy(hung, 0).is_some(),
+        )
+        .await
+        .expect("a dial of the hung engine ends");
+        let turn = harness
+            .first_unhealthy(hung, 0)
+            .expect("the turn that waited out the bound");
         within("the turn that waited out the bound ends", ROOM, || {
             harness.dialed(turn).len() == FLEET.len()
         })
@@ -2017,13 +2046,8 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             ],
             "the turn that waited out the bound went on to every engine"
         );
-        let others: Vec<_> = harness
-            .verdicts()
-            .into_iter()
-            .filter(|verdict| {
-                verdict.at >= hang && verdict.engine != hung && verdict.engine != dead
-            })
-            .collect();
+        let mut others = harness.moved(hanged).expect("the store's tail");
+        others.retain(|moved| moved.engine != hung && moved.engine != dead);
         assert!(
             others.is_empty(),
             "no live row moves at the hang: {others:?}"
@@ -2496,16 +2520,16 @@ async fn the_blocking_client_asks_a_started_controller_from_a_thread_of_its_own(
         .expect("the case ends inside its outer bound");
 }
 
-/// One ready worker under a controller that leads itself.
-async fn linked_fleet(gateway: &str) -> Result<(Harness, Link), String> {
+/// Ready workers under a controller that leads itself.
+async fn linked_fleet(gateway: &str, workers: usize) -> Result<(Harness, Link), String> {
     let mut harness = Harness::start().await?;
     harness.apply("round_robin")?;
-    harness.register(&FLEET[..1]).await?;
+    harness.register(&FLEET[..workers]).await?;
     harness.feed();
-    within("the worker is ready", ROOM, || {
+    within("the workers are ready", ROOM, || {
         harness
             .view(MODEL, Role::Single)
-            .is_ok_and(|pool| pool.len() == 1 && pool[0].healthy)
+            .is_ok_and(|pool| pool.len() == workers && pool.iter().all(|row| row.healthy))
     })
     .await?;
     let endpoint = Endpoint::from_shared(format!("http://{}", harness.gateway()))
@@ -2553,7 +2577,7 @@ async fn leases_before_expiry(
 async fn a_link_answers_sixty_four_asks_and_reports_the_end_of_each_lease() {
     const GATEWAY: &str = "fleet-link";
     let case = async {
-        let (harness, link) = Box::pin(linked_fleet(GATEWAY))
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY, 1))
             .await
             .expect("a ready fleet");
         let mut asks = JoinSet::new();
@@ -2588,8 +2612,7 @@ async fn a_link_answers_sixty_four_asks_and_reports_the_end_of_each_lease() {
                 what: Some(released::What::LeaseId(lease_id)),
                 reason: released::Reason::ClientGone.into(),
                 side,
-            }))
-            .expect("the link takes the report");
+            }));
         }
         leases_before_expiry(&harness, &link, GATEWAY, 0, before)
             .await
@@ -2603,11 +2626,109 @@ async fn a_link_answers_sixty_four_asks_and_reports_the_end_of_each_lease() {
         .expect("the case ends inside its outer bound");
 }
 
+/// A request can outlast the session its decision came over. The gateway
+/// dials its link again, and what the request reports then reaches the
+/// controller on the link's next session: a dispatched lease, which no
+/// deadline ends, ends at that report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dispatched_lease_is_ended_by_a_report_on_the_links_next_session() {
+    const GATEWAY: &str = "fleet-redial";
+    let case = async {
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY, 1))
+            .await
+            .expect("a ready fleet");
+        let endpoint =
+            Endpoint::from_shared(format!("http://{}", harness.gateway())).expect("a URI");
+        // A request in flight holds a clone of the link.
+        let held = link.clone();
+        let sent = |lease: Lease| {
+            gateway_frame::Frame::Dispatched(Dispatched {
+                lease_id: lease.id,
+                target_index: 0,
+                side: lease.side,
+                since_decision_micros: 0,
+            })
+        };
+        let ended = |lease: Lease| {
+            gateway_frame::Frame::Released(Released {
+                what: Some(released::What::LeaseId(lease.id)),
+                reason: released::Reason::ClientGone.into(),
+                side: lease.side,
+            })
+        };
+
+        // The controller ends the session under a dispatched request: a
+        // second hello on one stream is refused.
+        let first = linked_pick(&link, ask(b"first"))
+            .await
+            .expect("a first pick");
+        held.report(sent(first));
+        within("the store reads the first lease dispatched", ROOM, || {
+            harness.dispatched(GATEWAY, first.id)
+        })
+        .await
+        .expect("the session said the dispatch");
+        link.report(gateway_frame::Frame::Hello(Hello::default()));
+        tokio::time::timeout(ROOM, link.closed())
+            .await
+            .expect("the session ends");
+        assert!(!held.stands());
+
+        // The request ends with no session standing. Its report waits, and
+        // the link's next session says it.
+        held.report(ended(first));
+        assert_eq!(harness.leases(GATEWAY), 1, "no session said the end");
+        Box::pin(link.redial(endpoint.clone(), GATEWAY))
+            .await
+            .expect("the link's next session");
+        within("the report that waited ends the lease", ROOM, || {
+            harness.leases(GATEWAY) == 0
+        })
+        .await
+        .expect("the next session said the report");
+
+        // A redial over a session that stands: the next session takes its
+        // place, and the gateway's lease with it.
+        let second = linked_pick(&held, ask(b"second"))
+            .await
+            .expect("a pick on the next session");
+        held.report(sent(second));
+        within("the store reads the second lease dispatched", ROOM, || {
+            harness.dispatched(GATEWAY, second.id)
+        })
+        .await
+        .expect("the session said the dispatch");
+        Box::pin(link.redial(endpoint, GATEWAY))
+            .await
+            .expect("the link's third session");
+        assert_eq!(
+            harness.leases(GATEWAY),
+            1,
+            "the lease stands through the redial"
+        );
+        held.report(ended(second));
+        within(
+            "the report on the third session ends the lease",
+            ROOM,
+            || harness.leases(GATEWAY) == 0,
+        )
+        .await
+        .expect("the third session said the report");
+        assert!(held.stands());
+        assert_eq!(held.reports_dropped(), 0);
+        drop((link, held));
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_link_releases_the_lease_of_a_zero_budget_ask() {
     const GATEWAY: &str = "fleet-late-link";
     let case = async {
-        let (harness, link) = Box::pin(linked_fleet(GATEWAY))
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY, 1))
             .await
             .expect("a ready fleet");
         let before = Instant::now();
@@ -2642,7 +2763,7 @@ async fn a_link_releases_the_lease_of_a_zero_budget_ask() {
 async fn a_link_refuses_a_frame_out_of_the_calls_ranges_and_stands() {
     const GATEWAY: &str = "fleet-ranged-link";
     let case = async {
-        let (harness, link) = Box::pin(linked_fleet(GATEWAY))
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY, 1))
             .await
             .expect("a ready fleet");
         let first = linked_pick(&link, ask(b"first"))
@@ -2667,6 +2788,86 @@ async fn a_link_refuses_a_frame_out_of_the_calls_ranges_and_stands() {
         harness.stop().await.expect("a clean stop");
     };
     tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handle_over_a_link_ends_each_lease_on_the_worker_that_served() {
+    use smg_policy_controller::{
+        door::{Door, Request},
+        handle::Handle,
+        Outcome, RequestFacts, Side, TransportClass,
+    };
+
+    const GATEWAY: &str = "fleet-handle";
+    let case = async {
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY, 2))
+            .await
+            .expect("a ready fleet");
+        for id in ["held-0", "held-1", "held-2"] {
+            let asked = Request {
+                id: id.as_bytes(),
+                facts: RequestFacts {
+                    model: MODEL,
+                    budget_micros: 5_000_000,
+                    ..RequestFacts::default()
+                },
+                constraints: Default::default(),
+            };
+            let started = Instant::now();
+            let held = Box::pin(Handle::<&Door>::asked(&link, &asked, started, ROOM)).await;
+            let mut handle = held.expect("the controller's decision");
+            let taken = handle.take(0).expect("a picked worker");
+            let alternate = handle.decision().pick().expect("a pick").targets.as_slice()[1];
+            let (picked, _) = harness
+                .named(taken.id.0)
+                .expect("the picked worker is in the fleet");
+            let (served, _) = harness
+                .named(alternate.id.0)
+                .expect("the alternate is in the fleet");
+            assert_ne!(served, picked);
+            assert_eq!(harness.leases(GATEWAY), 1, "the controller filed the lease");
+            let sent = Instant::now();
+            handle.dispatched(sent);
+            let (class, frames) = harness
+                .serve_request(served, id.to_owned())
+                .await
+                .expect("the worker answers");
+            assert_eq!(class, Class::Ok);
+            assert!(frames > 0);
+            let ended = Instant::now();
+            handle.completed(
+                &Outcome {
+                    side: Side::Single,
+                    served: alternate.id,
+                    status: 0,
+                    class: TransportClass::Ok,
+                    ttft_micros: 0,
+                    tokens_in: 8,
+                    tokens_out: frames,
+                    duration_micros: u32::try_from(ended.duration_since(sent).as_micros())
+                        .unwrap_or(u32::MAX),
+                },
+                ended,
+            );
+            leases_before_expiry(&harness, &link, GATEWAY, 0, started)
+                .await
+                .expect("the completion ends the lease");
+            within(
+                "the completion is written on the served worker",
+                ROOM,
+                || harness.completed_ok(GATEWAY, served, started),
+            )
+            .await
+            .expect("the controller records the named worker's completion");
+            assert!(!harness.completed_ok(GATEWAY, picked, started));
+        }
+        assert!(link.stands());
+        drop(link);
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
         .await
         .expect("the case ends inside its outer bound");
 }
@@ -2788,8 +2989,9 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
             status_of(watcher, id).is_some_and(|status| status != WorkerStatus::Ready)
         };
 
-        // The snapshot tells the fleet as it registered: pending, with no
-        // prober started yet.
+        // The snapshot tells the fleet as it registered. Where the stand-in
+        // probes, no prober has started yet and every row is pending. A
+        // controller that probes by itself may have readied a row already.
         let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
         let opened = watcher.open(harness.client()).await;
         let mut stream = opened.expect("the watch opens");
@@ -2797,7 +2999,11 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
         told.expect("a snapshot is told");
         for id in &ids {
             let status = status_of(stream.watcher(), *id);
-            assert_eq!(status, Some(WorkerStatus::Pending));
+            assert!(
+                status == Some(WorkerStatus::Pending)
+                    || (PRODUCT_PROBES && status == Some(WorkerStatus::Ready)),
+                "a row of the snapshot reads {status:?}"
+            );
         }
 
         // The prober starts: the tail tells each engine it heard.
@@ -2892,7 +3098,7 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
 async fn a_link_answers_beside_its_watch_and_the_watch_outlives_it() {
     const GATEWAY: &str = "fleet-link-watch";
     let case = async {
-        let (mut harness, link) = Box::pin(linked_fleet(GATEWAY))
+        let (mut harness, link) = Box::pin(linked_fleet(GATEWAY, 1))
             .await
             .expect("a ready fleet");
         let first = harness.worker(0).expect("the first worker's row");
@@ -2928,8 +3134,7 @@ async fn a_link_answers_beside_its_watch_and_the_watch_outlives_it() {
             .open_on(&link)
             .await
             .expect("the link resumes the watch");
-        link.report(gateway_frame::Frame::Hello(Hello::default()))
-            .expect("the session takes the frame");
+        link.report(gateway_frame::Frame::Hello(Hello::default()));
         tokio::time::timeout(ROOM, link.closed())
             .await
             .expect("the second hello ends the link");

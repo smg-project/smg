@@ -26,6 +26,7 @@
 //! cross them. The collector itself comes with the `runtime` feature: it
 //! keeps one subscription task a worker, over the engine handle's two stream
 //! calls, for a host that says what an events subscription feeds.
+//! The `runtime` feature also adds the rules for applying events to an index.
 //!
 //! The `metrics` feature adds `metrics`, the mechanism those writers share
 //! with a host's: the bounded label set, the model labels' one set and the
@@ -94,6 +95,7 @@ pub mod runtime;
 pub mod settings;
 #[cfg(all(feature = "runtime", any(test, feature = "test-util")))]
 pub mod test_support;
+mod value_bounds;
 pub mod worker;
 #[cfg(feature = "workflow")]
 pub mod workflow;

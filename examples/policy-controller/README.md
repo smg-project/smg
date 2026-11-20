@@ -123,9 +123,9 @@ whose workers each name a queue threshold, and a controller handed this
 document, where the default stands.
 
 The stock build's catalog refuses this document by the scorer's name. The
-published schema (`crates/policy_controller/policyspec.schema.json`) lists
-the stock build's stages, so the document fails that schema too and
-validates over this build's catalog.
+published schema (`crates/policy_controller/policyspec.schema.json`) cannot
+know a host's catalog and takes a scorer by any name, so the document passes
+it. Only validation over a catalog tells the stock build from this one.
 
 ## Build and run
 
@@ -174,7 +174,7 @@ smg-policy-controller = { git = "https://github.com/smg-project/smg", features =
 ```
 
 - `controller`: the listeners, the command line and `controller::run`.
-- `worker-host`: the cache-event feed. With it a controller reads cache events from each gRPC worker whose row asks for them. The stock image is built with it. Without it a cache-aware document places by warm-up and load.
+- `worker-host`: the cache-event feed. With it a controller reads cache events from each gRPC worker whose row asks for them and names a model. The stock image is built with it. Without it a cache-aware document places by warm-up and load.
 - `kubernetes`: the Lease election the Helm chart's replicas use.
 - `client`: the reference client of the protocol. The example's tests ask
   the started controller its decisions through it.
@@ -224,8 +224,8 @@ repository of your own needs its tag.
 ## What it leaves out
 
 - Parameters. `Pack` takes none from the document beyond its weight. A scorer
-  registered with `scorer_with` reads typed parameters, and a filter and a
-  picker take none yet.
+  registered with `scorer_with`, a filter registered with `filter_with` and a
+  picker registered with `picker_with` read typed parameters.
 - A filter and a picker. They register as the scorer does.
 - State. `Lifecycle` reports what became of each decision to a scorer that
   learns from it. A scorer that keeps a number of each worker's load report

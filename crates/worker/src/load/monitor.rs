@@ -78,6 +78,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
+    connection::engine::LoadSource,
     health::liveness,
     identity::{
         basic::{ConnectionMode, Worker},
@@ -87,7 +88,10 @@ use crate::{
         port::{GroupTick, LoadSink, PollMode, PolledMember, PolledRanks, PolledReport},
         state::{LoadReceiver, LoadSnapshot, LoadState},
     },
-    metrics::writers::{LoadTest, Metrics},
+    metrics::{
+        intern_model_label,
+        writers::{registered_engine_role, LoadTest, Metrics},
+    },
     registry::{event::WorkerEvent, worker_model_ids, Generation, WorkerRegistry},
     worker::{
         LoadRecord, LoadTelemetry, RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey,
@@ -232,6 +236,9 @@ enum NativeLoads {
     Available(WorkerLoadResponse),
     /// The backend answered, and the endpoint is not there. Memoizable.
     Absent,
+    /// The backend answered success with a body that is no load response.
+    /// What that says of the route depends on whether it ever answered.
+    Unreadable,
     /// Nothing was learned about the endpoint — retry on the next tick.
     Inconclusive,
 }
@@ -374,14 +381,21 @@ impl PushedFile {
     /// pusher's series is made under that lock, where the sentinel is
     /// written too ([`WorkerMonitor::clear_series`]).
     fn write_rank_series(&self, at: usize, url: &str, model_id: &str) {
-        Metrics::record_engine_rank_load(url, model_id, &self.report.loads[at]);
+        Metrics::record_engine_rank_load(
+            url,
+            model_id,
+            registered_engine_role(*self.pusher.worker_type()),
+            &self.report.loads[at],
+        );
     }
 }
 
-/// The ranks `report` holds at or past `width`, its worker's own width: a
-/// report taken off the file, or the load of a row the batch removed. The
-/// sentinel of the worker's series covers the width and each of these,
-/// and no rank between: a far rank costs one sentinel.
+/// The rank of each entry `report` holds at or past `width`, its worker's
+/// own width: a report taken off the file, or the load of a row the batch
+/// removed. A rollup's row names a rank once for each downstream worker
+/// that holds it, so a rank can come more than once. The sentinel of the
+/// worker's series covers the width and each of these ranks once, and no
+/// rank between.
 fn ranks_past(report: &WorkerLoadResponse, width: usize) -> impl Iterator<Item = i32> + '_ {
     report
         .loads
@@ -396,9 +410,9 @@ fn ranks_past(report: &WorkerLoadResponse, width: usize) -> impl Iterator<Item =
 /// model. `ended` is the report or the row that ends with the worker's
 /// feed, where there is one. A series a live writer writes is left: the
 /// writer asks `live` whether a live writer holds an entry of the rank
-/// that passes the series' test, under a model or, given none, under any
-/// ([`Metrics::remove_engine_rank_metrics`]). Its callers hold the lock
-/// of the reports, under which every series is written.
+/// that passes the series' test, under a model's label or, given none,
+/// under any ([`Metrics::remove_engine_rank_metrics`]). Its callers hold
+/// the lock of the reports, under which every series is written.
 #[cold]
 fn write_sentinel(
     worker: &Arc<dyn Worker>,
@@ -407,19 +421,25 @@ fn write_sentinel(
 ) {
     let url = worker.url();
     let width = worker.dp_size().unwrap_or(1).max(1);
-    let ranks = (0..width)
+    let mut ranks: Vec<i32> = (0..width)
         .filter_map(|rank| i32::try_from(rank).ok())
         .chain(
             ended
                 .into_iter()
                 .flat_map(|report| ranks_past(report, width)),
-        );
+        )
+        .collect();
+    // An ended row can name a far rank more than once: one pass a rank.
+    ranks.sort_unstable();
+    ranks.dedup();
     // A worker can serve multiple models (one load group per model),
     // so sentinel every model's series — not just the primary.
     let models = worker_model_ids(worker);
+    // The worker's load series carry the role it is registered in.
+    let role = registered_engine_role(*worker.worker_type());
     for rank in ranks {
-        Metrics::remove_engine_rank_metrics(url, &models, rank, |model_id, test| {
-            live(model_id, rank, test)
+        Metrics::remove_engine_rank_metrics(url, &models, rank, role, |label, test| {
+            live(label, rank, test)
         });
     }
 }
@@ -494,9 +514,10 @@ type EngineAnswer = Vec<(Arc<dyn Worker>, Option<WorkerLoadResponse>)>;
 /// the engine's figures between heartbeats. Absent is absent: a section the
 /// engine never reports stays unset. `previous` is the rank's entry the
 /// record replaces; what it keeps moves out of it. `carried` is the
-/// record's own word on what it carries. The entry is marked with the
-/// parts it kept (`SchedulerLoadSnapshot::kept`), so what it offers by
-/// name is its own record's.
+/// record's own word on what it carries. The mark of what the record did
+/// not state (`SchedulerLoadSnapshot::kept`) is the fresh snapshot's own,
+/// written at its making: what the entry offers by name is its own
+/// record's, and nothing here sets the mark.
 fn keep_telemetry(
     fresh: &mut SchedulerLoadSnapshot,
     previous: SchedulerLoadSnapshot,
@@ -524,7 +545,6 @@ fn keep_telemetry(
         fresh.decode_queue_reqs = previous.decode_queue_reqs;
         fresh.disagg_mode = previous.disagg_mode;
     }
-    fresh.kept = LoadTelemetry::all().difference(carried);
 }
 
 /// A pushed record is sampled this much before its receipt on top of its own
@@ -938,15 +958,16 @@ impl<G: Generation> WorkerMonitor<G> {
     /// written there, so no record and no eviction runs between a poll's
     /// series and its row, which the sentinel's guard reads. The series
     /// are written behind the publish's own fence, read under the hold:
-    /// an answer for a worker that left during the fetch writes none, and
-    /// the sentinel of its eviction stands.
+    /// an answer for a worker that left during the fetch writes none. A
+    /// row the publish takes from a worker that left ends under the same
+    /// hold ([`Self::publish_rows`]).
     fn publish_polled(
         &self,
         model_id: &str,
         polled_urls: &[String],
         group_loads: Vec<(Arc<dyn Worker>, WorkerLoadResponse, bool)>,
     ) {
-        let _reports = self.pushed_reports.lock();
+        let reports = self.pushed_reports.lock();
         // Every successful load poll is also the canonical observability
         // sample. Load-aware policies already require this poll; the
         // explicit engine-metrics option only forces polling when routing
@@ -954,7 +975,12 @@ impl<G: Generation> WorkerMonitor<G> {
         // pushed record feeds the same gauges from `apply_pushed_load`.)
         for (worker, load, _) in &group_loads {
             if self.load_state.is_current_incarnation(worker) {
-                Metrics::record_engine_load(worker.url(), model_id, load);
+                Metrics::record_engine_load(
+                    worker.url(),
+                    model_id,
+                    registered_engine_role(*worker.worker_type()),
+                    load,
+                );
             }
         }
         // Merge into the shared snapshot in one rebuild: clear stale entries
@@ -968,7 +994,27 @@ impl<G: Generation> WorkerMonitor<G> {
             .into_iter()
             .map(|(worker, load, _)| (worker, Arc::new(load)))
             .collect();
-        self.load_state.publish_group(polled_urls, fresh);
+        self.publish_rows(&reports, polled_urls, fresh);
+    }
+
+    /// Publish rows, and end each row the publish took away from a worker
+    /// that is not its URL's `Ready` worker: a row that went under its
+    /// successor's, or one a tick pruned behind its worker's leave. That
+    /// worker's eviction finds no row of its own, so its batch can name no
+    /// rank the row held past the worker's width, or finds no row at the
+    /// URL and writes nothing. The row's series end here instead, but for
+    /// the ones a live writer writes ([`Self::clear_series`]). A row taken
+    /// from the URL's `Ready` worker, whose fetch failed this tick, ends
+    /// nothing. `reports` is the locked map of the pushed reports.
+    fn publish_rows(
+        &self,
+        reports: &FxHashMap<String, PushedFile>,
+        group_urls: &[String],
+        fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)>,
+    ) {
+        for (worker, row) in self.load_state.publish_group(group_urls, fresh) {
+            self.clear_series(reports, &worker, Some(&row));
+        }
     }
 
     /// One engine's answer of a tick, reconciled with what its members'
@@ -1171,9 +1217,10 @@ impl<G: Generation> WorkerMonitor<G> {
         }
         if !fresh.is_empty() {
             // No URL is pruned. A report the fence admits overwrites its
-            // worker's row. A refused one leaves the row to the eviction,
-            // which writes the sentinel of the series with it.
-            self.load_state.publish_group(&[], fresh);
+            // worker's row, and a row of another worker it overwrites ends
+            // there. A refused one leaves the row to the eviction, which
+            // writes the sentinel of the series with it.
+            self.publish_rows(&reports, &[], fresh);
         }
         if !held.is_empty() {
             // Under the hold of the reports still: no record has queued
@@ -1523,15 +1570,17 @@ impl<G: Generation> WorkerMonitor<G> {
     /// and a load can name a rank more than once: every entry is asked.
     /// The pair series carry the engine's role and no model: one is a live
     /// writer's under the role such an entry reports, whatever its model.
+    /// A load series carries its model's label, and two models share one
+    /// past the label cap: a writer's model is matched by that label.
     /// A report with a held record is no live writer: its worker was not
     /// `Ready` at that record, and the flush that finds it `Ready` writes
     /// its series. `reports` is the locked map of the pushed reports, and
     /// every series is written under that lock, so a sentinel and a live
     /// write do not cross. `ended` is what ends with the worker's feed,
     /// where there is one: the report an eviction or a successor's first
-    /// record took off the file, or the load of the row the batch removed.
-    /// The sentinel covers the worker's own width and each rank it held
-    /// past that.
+    /// record took off the file, or the load of the row the batch removed
+    /// or a publish took away. The sentinel covers the worker's own width
+    /// and each rank it held past that.
     fn clear_series(
         &self,
         reports: &FxHashMap<String, PushedFile>,
@@ -1544,23 +1593,50 @@ impl<G: Generation> WorkerMonitor<G> {
         let row = self
             .load_state
             .another_live_workers_row(worker)
-            .map(|(source, load)| (worker_model_ids(&source), load));
-        let row = row.as_ref();
+            .map(|(source, load)| {
+                (
+                    worker_model_ids(&source),
+                    registered_engine_role(*source.worker_type()),
+                    load,
+                )
+            });
+        // Each live writer's labels are read once, and the guard compares
+        // texts alone. The read is the intern the writers use, so it gives
+        // the label a writer's series carry, and it admits at most the
+        // label that writer's own first write admits. A second kind of
+        // read of the label map would stop the compiler inlining the
+        // map's lookup into the intern, a cost to every record that
+        // builds its own keys.
+        let row = row.as_ref().map(|(models, registered, load)| {
+            let labels: Vec<Arc<str>> = models
+                .iter()
+                .map(|model| intern_model_label(model))
+                .collect();
+            (labels, *registered, load)
+        });
         let other = reports
             .get(worker.url())
-            .filter(|other| !Arc::ptr_eq(&other.pusher, worker) && !other.series_held);
-        write_sentinel(worker, ended, |model_id, rank, carries| {
-            let holds = |loads: &[SchedulerLoadSnapshot]| {
+            .filter(|other| !Arc::ptr_eq(&other.pusher, worker) && !other.series_held)
+            .map(|other| {
+                (
+                    intern_model_label(other.pusher.model_id()),
+                    registered_engine_role(*other.pusher.worker_type()),
+                    other,
+                )
+            });
+        write_sentinel(worker, ended, |label, rank, carries| {
+            // An entry is tested with its own writer's registered role,
+            // the one that writer's load series carry.
+            let holds = |loads: &[SchedulerLoadSnapshot], registered: &'static str| {
                 loads
                     .iter()
-                    .any(|load| load.dp_rank == rank && carries(load))
+                    .any(|load| load.dp_rank == rank && carries(load, registered))
             };
-            row.is_some_and(|(models, load)| {
-                model_id.is_none_or(|id| models.iter().any(|model| model == id))
-                    && holds(&load.loads)
-            }) || other.is_some_and(|other| {
-                model_id.is_none_or(|id| other.pusher.model_id() == id)
-                    && holds(&other.report.loads)
+            row.as_ref().is_some_and(|(labels, registered, load)| {
+                label.is_none_or(|label| labels.iter().any(|own| **own == *label))
+                    && holds(&load.loads, registered)
+            }) || other.as_ref().is_some_and(|(own, registered, other)| {
+                label.is_none_or(|label| **own == *label) && holds(&other.report.loads, registered)
             })
         });
     }
@@ -1639,7 +1715,12 @@ impl<G: Generation> WorkerMonitor<G> {
                     response = Some((path, load));
                     break;
                 }
-                NativeLoads::Absent => memo.record_absent(path),
+                // On a route that had answered, a body that does not read is
+                // one bad answer: the memo keeps the route and the next tick
+                // asks it again. On a route that never answered it means
+                // something else is mounted here, as definitive as a 404.
+                NativeLoads::Unreadable if known.answered == Some(path) => {}
+                NativeLoads::Absent | NativeLoads::Unreadable => memo.record_absent(path),
                 NativeLoads::Inconclusive => {}
             }
         }
@@ -1730,9 +1811,9 @@ impl<G: Generation> WorkerMonitor<G> {
                 response.loads = loads;
                 NativeLoads::Available(response)
             }
-            // A 200 that is not a load response means something else is
-            // mounted here; that is as definitive as a 404.
-            Err(_) => NativeLoads::Absent,
+            // Not a load response. Whether the route is absent is the
+            // caller's to say: it knows if the route ever answered.
+            Err(_) => NativeLoads::Unreadable,
         }
     }
 
@@ -1784,21 +1865,36 @@ impl<G: Generation> WorkerMonitor<G> {
     /// member asks; the outcome is every member's, as each one's own poll
     /// would have had it: the whole answer (the caller scopes it to each
     /// member's rank), the contact that ends an unreachable veto, a
-    /// transport failure. Returns `None` on no members, a missing client or
-    /// an error.
+    /// transport failure. Returns `None` on no members, a missing client, a
+    /// connect or a call the poll's deadline ended, or an error.
     pub(crate) async fn fetch_backend_load(
         members: &[Arc<dyn Worker>],
     ) -> Option<WorkerLoadResponse> {
         let worker = members.first()?;
-        let backend_client = match worker.engine_connection().await {
-            Ok(Some(client)) => client,
-            Ok(None) => {
+        // A first use connects through the host's connector. The connect
+        // stands under the deadline as the call below does, and for its
+        // reason: a connector that never returns must not stall the group's
+        // poll. A connect the deadline ends is a missing report for this
+        // tick. The next tick connects again, and the worker's health
+        // check, its event stream and its requests drive a slow connect to
+        // its end.
+        let connected = tokio::time::timeout(LOAD_POLL_DEADLINE, worker.engine_connection());
+        let backend_client = match connected.await {
+            Ok(Ok(Some(client))) => client,
+            Ok(Ok(None)) => {
                 debug!("No backend client for worker {}", worker.redacted_url());
                 return None;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 debug!(
                     "Failed to get backend client for {}: {e}",
+                    worker.redacted_url()
+                );
+                return None;
+            }
+            Err(_) => {
+                debug!(
+                    "the connect of {} did not end within {LOAD_POLL_DEADLINE:?}",
                     worker.redacted_url()
                 );
                 return None;
@@ -1835,19 +1931,85 @@ impl<G: Generation> WorkerMonitor<G> {
         }
     }
 
+    /// One call of a host's load source for the HTTP workers of one engine,
+    /// under the poll's deadline. A failure or a late answer is a missing
+    /// report. Nothing here speaks to the worker, so no contact is noted
+    /// and none is failed: an HTTP worker's health stays its health check's.
+    async fn fetch_source_load(
+        worker: &Arc<dyn Worker>,
+        source: &dyn LoadSource,
+    ) -> Option<WorkerLoadResponse> {
+        match tokio::time::timeout(LOAD_POLL_DEADLINE, source.get_loads()).await {
+            Ok(Ok(load)) => Some(load),
+            Ok(Err(e)) => {
+                debug!(
+                    "the host's load source failed for {}: {e}",
+                    worker.redacted_url()
+                );
+                None
+            }
+            Err(_) => {
+                debug!(
+                    "the host's load source for {} did not answer within {LOAD_POLL_DEADLINE:?}",
+                    worker.redacted_url()
+                );
+                None
+            }
+        }
+    }
+
     /// One tick's fetch for the polled workers of one engine: one worker, or
     /// the rank workers of a data-parallel engine under `--dp-aware`, which
     /// share it. The engine answers once; each member's report is that
     /// answer scoped to its own rank, as its own poll would have had it (a
-    /// rank the answer omits is an empty report).
+    /// rank the answer omits is an empty report). A report's named values
+    /// stand under the report's bounds, and what left them is counted for
+    /// its member.
+    ///
+    /// Where the host keeps a load source for an HTTP worker
+    /// ([`Worker::load_source`]), the source answers for the engine in the
+    /// worker's place: no load request goes to the worker, and its entry in
+    /// the native loads memo is never written. The connector's word on the
+    /// source and the source's call each stand under the poll's deadline.
     async fn fetch_engine_loads(
         members: Vec<Arc<dyn Worker>>,
         connection_mode: ConnectionMode,
         native_loads_memo: &DashMap<String, NativeLoadsMemo>,
     ) -> Vec<(Arc<dyn Worker>, Option<WorkerLoadResponse>)> {
         let mut reports = Vec::with_capacity(members.len());
-        match connection_mode {
-            ConnectionMode::Http => {
+        // The first member asks for the engine, as it does on every wire.
+        // The connector's answer stands under the poll's deadline, as its
+        // source's call does, so a host that is slow to say stalls no poll
+        // of the group. A late answer is a missing report for this tick,
+        // never a poll over HTTP in the source's place: the next tick asks
+        // again.
+        let source = match (connection_mode, members.first()) {
+            (ConnectionMode::Http, Some(first)) => {
+                let asked = tokio::time::timeout(LOAD_POLL_DEADLINE, first.load_source());
+                let Ok(source) = asked.await else {
+                    debug!(
+                        "the host's connector did not say within {LOAD_POLL_DEADLINE:?} \
+                         whether it keeps a load source for {}",
+                        first.redacted_url()
+                    );
+                    return members.into_iter().map(|member| (member, None)).collect();
+                };
+                source
+            }
+            _ => None,
+        };
+        match (source, connection_mode) {
+            (Some(source), _) => {
+                let answer = Self::fetch_source_load(&members[0], source.as_ref()).await;
+                for member in &members {
+                    reports.push(
+                        answer
+                            .clone()
+                            .map(|load| load.for_dp_rank(member.dp_rank()).unwrap_or_default()),
+                    );
+                }
+            }
+            (None, ConnectionMode::Http) => {
                 if let [worker] = members.as_slice() {
                     reports.push(Self::fetch_http_load(worker, Some(native_loads_memo)).await);
                 } else {
@@ -1870,7 +2032,7 @@ impl<G: Generation> WorkerMonitor<G> {
                     }
                 }
             }
-            ConnectionMode::Grpc | ConnectionMode::Zmq => {
+            (None, ConnectionMode::Grpc | ConnectionMode::Zmq) => {
                 let answer = Self::fetch_backend_load(&members).await;
                 for member in &members {
                     reports.push(
@@ -1881,7 +2043,20 @@ impl<G: Generation> WorkerMonitor<G> {
                 }
             }
         }
-        members.into_iter().zip(reports).collect()
+        let mut answers: Vec<_> = members.into_iter().zip(reports).collect();
+        // A polled list is held to the bounds a pushed record's is read
+        // under, here: ahead of the sink and of every reader.
+        for (member, report) in &mut answers {
+            let dropped: usize = report
+                .iter_mut()
+                .flat_map(|answer| &mut answer.loads)
+                .map(SchedulerLoadSnapshot::bound_values)
+                .sum();
+            if dropped != 0 {
+                Metrics::record_engine_load_values_dropped(member.url(), dropped);
+            }
+        }
+        answers
     }
 }
 
@@ -2246,7 +2421,7 @@ async fn poll_group_once<G: Generation>(
 
     if group_loads.is_empty() {
         debug!("No loads fetched for group {group_key}, pruning stale entries");
-        monitor.load_state.publish_group(&polled_urls, Vec::new());
+        monitor.publish_polled(&group_key.model_id, &polled_urls, Vec::new());
         return;
     }
 
@@ -2280,10 +2455,14 @@ mod native_loads_tests {
 
     use super::{tests::PushedRecord, *};
     use crate::{
+        connection::engine::{EngineConnection, EngineConnector, ZmqLink},
         identity::basic::{ConnectionMode, WorkerLoadGuard, WorkerType},
         model_card::ModelCard,
-        test_support::{BasicWorkerBuilder, LoadReaders, WorkerMonitor, WorkerRegistry},
-        worker::{HealthCheckConfig, OverloadUpdate},
+        test_support::{
+            assert_metric, render_with_recorder, BasicWorkerBuilder, LoadReaders, WorkerMonitor,
+            WorkerRegistry,
+        },
+        worker::{HealthCheckConfig, NamedValue, OverloadUpdate},
     };
 
     const ENGINE_METRICS: &str = "vllm:num_requests_running{m=\"a\"} 7.0\n\
@@ -2294,6 +2473,9 @@ mod native_loads_tests {
     /// gauge for — so its presence identifies which path answered.
     const NATIVE_BODY: &str = r#"{"loads":[{"dp_rank":0,"num_running_reqs":3,
         "num_waiting_reqs":4,"num_waiting_uncached_tokens":900,"token_usage":0.25}]}"#;
+
+    /// A native response but for one value: a bare token no JSON reader takes.
+    const UNREADABLE_NATIVE_BODY: &str = r#"{"loads":[{"dp_rank":0,"num_running_reqs":NaN}]}"#;
 
     const NATIVE_DP_BODY: &str = r#"{"dp_rank_count":2,"loads":[
         {"dp_rank":0,"num_running_reqs":3,"token_usage":0.25},
@@ -2313,28 +2495,30 @@ mod native_loads_tests {
         gateway_query: Arc<Mutex<Option<String>>>,
     }
 
-    /// Loopback backend stub. Each native route answers with the status and
-    /// body it was given and counts its hits; `/metrics` always serves the
-    /// first family's gauges.
+    /// Loopback backend stub. Each native route answers with the statuses and
+    /// bodies it was given, in order, the last one repeating, and counts its
+    /// hits; `/metrics` always serves the first family's gauges.
     async fn spawn_backend(
-        gateway: (StatusCode, &'static str),
-        engine: (StatusCode, &'static str),
+        gateway: &[(StatusCode, &'static str)],
+        engine: &[(StatusCode, &'static str)],
     ) -> Stub {
         fn route(
             hits: &Arc<AtomicUsize>,
             query: &Arc<Mutex<Option<String>>>,
-            (status, body): (StatusCode, &'static str),
+            answers: &[(StatusCode, &'static str)],
         ) -> axum::routing::MethodRouter {
+            assert!(!answers.is_empty());
+            let answers: Arc<[_]> = answers.into();
             let counter = Arc::clone(hits);
             let sink = Arc::clone(query);
             axum::routing::get(
                 move |axum::extract::RawQuery(raw): axum::extract::RawQuery| {
-                    let counter = Arc::clone(&counter);
+                    let hit = counter.fetch_add(1, Ordering::SeqCst);
+                    let answer = answers[hit.min(answers.len() - 1)];
                     let sink = Arc::clone(&sink);
                     async move {
-                        counter.fetch_add(1, Ordering::SeqCst);
                         *sink.lock() = raw;
-                        (status, body)
+                        answer
                     }
                 },
             )
@@ -2371,12 +2555,12 @@ mod native_loads_tests {
 
     /// An engine: serves `/v1/loads`, 404s the gateway route.
     async fn spawn_engine(status: StatusCode, body: &'static str) -> Stub {
-        spawn_backend((StatusCode::NOT_FOUND, ""), (status, body)).await
+        spawn_backend(&[(StatusCode::NOT_FOUND, "")], &[(status, body)]).await
     }
 
     /// A gateway registered as a worker: serves `/loads` only.
     async fn spawn_gateway(body: &'static str) -> Stub {
-        spawn_backend((StatusCode::OK, body), (StatusCode::NOT_FOUND, "")).await
+        spawn_backend(&[(StatusCode::OK, body)], &[(StatusCode::NOT_FOUND, "")]).await
     }
 
     fn gauge_worker(url: &str) -> Arc<dyn Worker> {
@@ -2792,6 +2976,484 @@ mod native_loads_tests {
         );
     }
 
+    /// Seventy named values for rank 0, and for rank 1 a `values` key of
+    /// the engine's own shape.
+    fn named_body() -> &'static str {
+        let entries: Vec<String> = (0..70)
+            .map(|index| format!(r#"{{"name":"ready_{index}","unit":"items","value":{index}}}"#))
+            .collect();
+        Box::leak(
+            format!(
+                r#"{{"dp_rank_count":2,"loads":[
+                {{"dp_rank":0,"num_running_reqs":3,"values":[{}]}},
+                {{"dp_rank":1,"num_running_reqs":9,"values":{{"depth":3}}}}]}}"#,
+                entries.join(",")
+            )
+            .into_boxed_str(),
+        )
+    }
+
+    /// One tick's fetch: each member with its report.
+    type Answers = Vec<(Arc<dyn Worker>, Option<WorkerLoadResponse>)>;
+
+    /// One tick's fetch for `members` of the engine behind `body`, with
+    /// the scrape its counters wrote.
+    fn fetched(
+        body: &'static str,
+        members: impl FnOnce(&str) -> Vec<Arc<dyn Worker>>,
+    ) -> (Answers, String) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let stub = runtime.block_on(spawn_engine(StatusCode::OK, body));
+        let members = members(&stub.url);
+        let memo = DashMap::new();
+        let mut answers = Vec::new();
+        let rendered = render_with_recorder(|| {
+            answers = runtime.block_on(WorkerMonitor::fetch_engine_loads(
+                members,
+                ConnectionMode::Http,
+                &memo,
+            ));
+        });
+        (answers, rendered)
+    }
+
+    /// A host's load source that answers what it was made with, or fails
+    /// where it was made with nothing, and counts its calls.
+    #[derive(Debug, Default)]
+    struct HostLoads {
+        answer: Option<WorkerLoadResponse>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LoadSource for HostLoads {
+        async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.answer
+                .clone()
+                .ok_or_else(|| tonic::Status::unavailable("the host's service is down"))
+        }
+    }
+
+    /// A host's connector for HTTP workers: it keeps the source it was made
+    /// with, or none, and notes each address it is asked a source for.
+    #[derive(Debug, Default)]
+    struct SourceConnector {
+        source: Option<Arc<HostLoads>>,
+        asked: Mutex<Vec<String>>,
+        /// How many of the next asks never answer.
+        silent_asks: AtomicUsize,
+    }
+
+    impl SourceConnector {
+        fn keeping(answer: Option<WorkerLoadResponse>) -> Arc<Self> {
+            Arc::new(Self {
+                source: Some(Arc::new(HostLoads {
+                    answer,
+                    calls: AtomicUsize::new(0),
+                })),
+                asked: Mutex::new(Vec::new()),
+                silent_asks: AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.source
+                .as_ref()
+                .map_or(0, |source| source.calls.load(Ordering::Relaxed))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EngineConnector for SourceConnector {
+        async fn connect_grpc(
+            &self,
+            _base_url: &str,
+            _runtime: RuntimeType,
+        ) -> Result<Arc<dyn EngineConnection>, String> {
+            Err("an HTTP worker connects no engine".to_string())
+        }
+
+        async fn connect_zmq(&self, _link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
+            Err("an HTTP worker connects no engine".to_string())
+        }
+
+        async fn dial_grpc(&self, _base_url: &str, _timeout: Duration) -> Result<(), String> {
+            Err("an HTTP worker dials no engine".to_string())
+        }
+
+        async fn http_load_source(
+            &self,
+            base_url: &str,
+            _runtime: RuntimeType,
+        ) -> Option<Arc<dyn LoadSource>> {
+            self.asked.lock().push(base_url.to_string());
+            // One poll asks at a time in these cases: a read, then a write.
+            if self.silent_asks.load(Ordering::Relaxed) > 0 {
+                self.silent_asks.fetch_sub(1, Ordering::Relaxed);
+                std::future::pending::<()>().await;
+            }
+            let source = self.source.clone()?;
+            Some(source)
+        }
+    }
+
+    /// An HTTP worker, or one rank of an HTTP engine, built with a host's
+    /// connector.
+    fn hosted_worker(
+        url: &str,
+        connector: &Arc<SourceConnector>,
+        rank: Option<(usize, usize)>,
+    ) -> Arc<dyn Worker> {
+        let mut builder = BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Http)
+            .runtime_type(RuntimeType::Vllm)
+            .model(ModelCard::new("a"))
+            .engine_connector(Arc::clone(connector) as Arc<dyn EngineConnector>)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            });
+        if let Some((rank, size)) = rank {
+            builder = builder.dp_config(rank, size);
+        }
+        Arc::new(builder.build())
+    }
+
+    fn queue_age(value: f64) -> NamedValue {
+        NamedValue {
+            name: "queue_age".into(),
+            unit: "ms".into(),
+            value,
+            age_ms: Some(37),
+        }
+    }
+
+    /// What a host's service answers for an engine of `ranks` ranks: rank
+    /// `k` runs `41 + 2k` requests and states one named value, beside an
+    /// entry with no name that the report's bounds drop.
+    fn host_answer(ranks: i32) -> WorkerLoadResponse {
+        let loads = (0..ranks)
+            .map(|rank| SchedulerLoadSnapshot {
+                dp_rank: rank,
+                num_running_reqs: 41 + 2 * rank,
+                values: vec![
+                    queue_age(6.5 - f64::from(rank)),
+                    NamedValue {
+                        name: "".into(),
+                        ..queue_age(1.0)
+                    },
+                ],
+                ..Default::default()
+            })
+            .collect();
+        WorkerLoadResponse {
+            dp_rank_count: ranks,
+            loads,
+            ..Default::default()
+        }
+    }
+
+    async fn engine_fetch(
+        members: Vec<Arc<dyn Worker>>,
+        memo: &DashMap<String, NativeLoadsMemo>,
+    ) -> Vec<Option<WorkerLoadResponse>> {
+        WorkerMonitor::fetch_engine_loads(members, ConnectionMode::Http, memo)
+            .await
+            .into_iter()
+            .map(|(_, report)| report)
+            .collect()
+    }
+
+    /// An HTTP worker whose host keeps a load source reports the source's
+    /// answer, its named values under the report's bounds, and no load
+    /// request reaches the worker. The connector is asked once, for the
+    /// worker's address, and the native loads memo stays empty.
+    #[tokio::test]
+    async fn an_http_worker_with_a_load_source_reports_its_answer_and_is_asked_nothing() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let connector = SourceConnector::keeping(Some(host_answer(1)));
+        let worker = hosted_worker(&stub.url, &connector, None);
+        let memo = DashMap::new();
+        for _ in 0..2 {
+            let report = engine_fetch(vec![Arc::clone(&worker)], &memo)
+                .await
+                .pop()
+                .flatten()
+                .expect("the source's answer");
+            assert_eq!(report.loads.len(), 1);
+            assert_eq!(report.loads[0].num_running_reqs, 41);
+            assert_eq!(report.loads[0].values, [queue_age(6.5)]);
+        }
+        assert_eq!(connector.calls(), 2);
+        assert_eq!(
+            connector.asked.lock().as_slice(),
+            std::slice::from_ref(&stub.url)
+        );
+        assert_eq!(stub.probes.load(Ordering::Relaxed), 0);
+        assert!(memo.is_empty());
+    }
+
+    /// The rank workers of one engine share one call of their source: the
+    /// first member asks, for the engine's own address, and each member's
+    /// report is its own rank of the answer.
+    #[tokio::test]
+    async fn the_rank_workers_of_one_engine_share_one_call_of_their_source() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_DP_BODY).await;
+        let connector = SourceConnector::keeping(Some(host_answer(2)));
+        let members = vec![
+            hosted_worker(&stub.url, &connector, Some((0, 2))),
+            hosted_worker(&stub.url, &connector, Some((1, 2))),
+        ];
+        let ranks: Vec<(i32, i32, f64)> = engine_fetch(members, &DashMap::new())
+            .await
+            .into_iter()
+            .map(|report| {
+                let report = report.expect("its rank's report");
+                assert_eq!(report.loads.len(), 1);
+                let rank = &report.loads[0];
+                assert_eq!(rank.values.len(), 1);
+                (rank.dp_rank, rank.num_running_reqs, rank.values[0].value)
+            })
+            .collect();
+        assert_eq!(ranks, [(0, 41, 6.5), (1, 43, 5.5)]);
+        assert_eq!(connector.calls(), 1);
+        assert_eq!(
+            connector.asked.lock().as_slice(),
+            std::slice::from_ref(&stub.url)
+        );
+        assert_eq!(stub.probes.load(Ordering::Relaxed), 0);
+    }
+
+    /// A connector that keeps no source is asked once, and its worker is
+    /// then polled over HTTP as a worker with no connector is: one request
+    /// a poll, the engine's own answer, the same memo.
+    #[tokio::test]
+    async fn a_worker_whose_host_keeps_no_source_is_polled_over_http_as_before() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let connector = Arc::new(SourceConnector::default());
+        let memo = DashMap::new();
+        let workers = [
+            hosted_worker(&stub.url, &connector, None),
+            gauge_worker(&stub.url),
+        ];
+        let mut probes = 0;
+        for worker in workers {
+            for _ in 0..2 {
+                let report = engine_fetch(vec![Arc::clone(&worker)], &memo)
+                    .await
+                    .pop()
+                    .flatten()
+                    .expect("the engine's own answer");
+                probes += 1;
+                assert_eq!(report.loads[0].num_waiting_uncached_tokens, 900);
+                assert_eq!(stub.probes.load(Ordering::Relaxed), probes);
+            }
+        }
+        assert_eq!(
+            connector.asked.lock().as_slice(),
+            std::slice::from_ref(&stub.url)
+        );
+        assert_eq!(
+            memo.get(&stub.url).and_then(|hit| hit.answered()),
+            Some(NativeLoadsPath::Engine)
+        );
+    }
+
+    /// A source that fails is a missing report. No request goes to the
+    /// worker in its place, and nothing is said of the worker's health: no
+    /// contact is noted and none is failed.
+    #[tokio::test]
+    async fn a_load_source_that_fails_is_a_missing_report_and_no_word_on_health() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let connector = SourceConnector::keeping(None);
+        let worker = hosted_worker(&stub.url, &connector, None);
+        let before = (worker.status(), worker.stall_reason());
+        let memo = DashMap::new();
+        for _ in 0..2 {
+            let reports = engine_fetch(vec![Arc::clone(&worker)], &memo).await;
+            assert!(matches!(reports.as_slice(), [None]));
+        }
+        assert_eq!(connector.calls(), 2);
+        assert_eq!(stub.probes.load(Ordering::Relaxed), 0);
+        assert!(memo.is_empty());
+        assert_eq!((worker.status(), worker.stall_reason()), before);
+    }
+
+    /// A host's connector whose gRPC connect never returns.
+    #[derive(Debug)]
+    struct SilentConnect;
+
+    #[async_trait::async_trait]
+    impl EngineConnector for SilentConnect {
+        async fn connect_grpc(
+            &self,
+            _base_url: &str,
+            _runtime: RuntimeType,
+        ) -> Result<Arc<dyn EngineConnection>, String> {
+            std::future::pending().await
+        }
+
+        async fn connect_zmq(&self, _link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
+            Err("a gRPC worker runs no handshake".to_string())
+        }
+
+        async fn dial_grpc(&self, _base_url: &str, _timeout: Duration) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A gRPC worker whose connect never returns stalls no poll. Its engine
+    /// has a missing report for the tick and holds no connection, and an
+    /// engine fetched beside it has its report.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_never_returns_is_a_missing_report_and_stalls_no_other_engine() {
+        let silent: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://engine-a.invalid:50051")
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .model(ModelCard::new("a"))
+                .engine_connector(Arc::new(SilentConnect))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let prompt = SourceConnector::keeping(Some(host_answer(1)));
+        let beside = hosted_worker("http://engine-b.invalid:8000", &prompt, None);
+        let memo = DashMap::new();
+
+        let (stalled, answered) = tokio::join!(
+            WorkerMonitor::fetch_engine_loads(
+                vec![Arc::clone(&silent)],
+                ConnectionMode::Grpc,
+                &memo
+            ),
+            engine_fetch(vec![beside], &memo),
+        );
+        assert!(matches!(stalled.as_slice(), [(_, None)]));
+        assert!(matches!(answered.as_slice(), [Some(_)]));
+        assert!(silent.engine_connection_if_initialized().is_none());
+    }
+
+    /// A connector that does not say in time whether it keeps a source
+    /// stalls no poll. Its engine has a missing report for the tick, no
+    /// load request goes to the worker in the source's place, and another
+    /// engine fetched beside it has its report. The next poll asks again
+    /// and takes the source's answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_connector_that_is_late_to_say_is_a_missing_report_and_asked_again() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let late = SourceConnector::keeping(Some(host_answer(1)));
+        late.silent_asks.store(1, Ordering::Relaxed);
+        let prompt = SourceConnector::keeping(Some(host_answer(1)));
+        let worker = hosted_worker(&stub.url, &late, None);
+        let beside = hosted_worker("http://engine-b.invalid:8000", &prompt, None);
+        let memo = DashMap::new();
+
+        let (stalled, answered) = tokio::join!(
+            engine_fetch(vec![Arc::clone(&worker)], &memo),
+            engine_fetch(vec![beside], &memo),
+        );
+        assert!(matches!(stalled.as_slice(), [None]));
+        assert!(matches!(answered.as_slice(), [Some(_)]));
+        assert_eq!(late.calls(), 0);
+        assert_eq!(stub.probes.load(Ordering::Relaxed), 0);
+
+        let report = engine_fetch(vec![worker], &memo)
+            .await
+            .pop()
+            .flatten()
+            .expect("the source's answer at the next poll");
+        assert_eq!(report.loads[0].num_running_reqs, 41);
+        assert_eq!(late.asked.lock().len(), 2);
+        assert_eq!(late.calls(), 1);
+        assert_eq!(stub.probes.load(Ordering::Relaxed), 0);
+        assert!(memo.is_empty());
+    }
+
+    /// A polled answer's named values stand under the bounds a pushed
+    /// record's do, and what left them is counted for the worker. A
+    /// `values` key of another shape is the engine's own: its rank is
+    /// read, with no list.
+    #[test]
+    fn a_polled_answers_named_values_are_bound_and_counted() {
+        let (mut answers, rendered) = fetched(named_body(), |url| vec![gauge_worker(url)]);
+        let (worker, report) = answers.pop().expect("the one member");
+        let report = report.expect("the native answer");
+        assert_eq!(report.loads.len(), 2);
+        assert_eq!(report.loads[0].values.len(), 64);
+        assert_eq!(report.loads[0].values[63].name.as_ref(), "ready_63");
+        assert_eq!(report.loads[1].num_running_reqs, 9);
+        assert!(report.loads[1].values.is_empty());
+        assert_metric(
+            &rendered,
+            "smg_engine_load_values_dropped_total",
+            &[&format!("worker=\"{}\"", worker.url())],
+            "6",
+        );
+    }
+
+    /// The rank workers of one engine share its answer. Each one's report
+    /// is bound, and what left a rank's list is counted for that rank's
+    /// worker alone.
+    #[test]
+    fn a_ranks_dropped_values_are_counted_for_its_own_worker() {
+        let (answers, rendered) = fetched(named_body(), |url| {
+            vec![gauge_dp_worker(url, 0, 2), gauge_dp_worker(url, 1, 2)]
+        });
+        let lists: Vec<usize> = answers
+            .iter()
+            .map(|(_, report)| {
+                report.as_ref().expect("its rank's report").loads[0]
+                    .values
+                    .len()
+            })
+            .collect();
+        assert_eq!(lists, [64, 0]);
+        let series: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_engine_load_values_dropped_total{"))
+            .collect();
+        assert_eq!(series.len(), 1, "{rendered}");
+        assert_metric(
+            &rendered,
+            "smg_engine_load_values_dropped_total",
+            &[&format!("worker=\"{}\"", answers[0].0.url())],
+            "6",
+        );
+    }
+
+    /// A `values` key of another shape fails no native answer: the
+    /// engine's route stays the worker's load source.
+    #[tokio::test]
+    async fn a_values_key_of_another_shape_keeps_the_native_route() {
+        let stub = spawn_engine(
+            StatusCode::OK,
+            r#"{"loads":[{"dp_rank":0,"num_running_reqs":3,
+                "num_waiting_uncached_tokens":900,"values":{"depth":3}}]}"#,
+        )
+        .await;
+        let worker = gauge_worker(&stub.url);
+        let memo = DashMap::new();
+
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+            .await
+            .expect("load response");
+
+        assert_eq!(resp.loads[0].num_waiting_uncached_tokens, 900);
+        assert!(resp.loads[0].values.is_empty());
+        assert_eq!(
+            memo.get(worker.url()).and_then(|hit| hit.answered()),
+            Some(NativeLoadsPath::Engine)
+        );
+    }
+
     /// The load probe of a dp-aware HTTP worker goes to its engine's address:
     /// the `@rank` suffix of the worker's URL is the router's, not a host. The
     /// test checks the address (one probe, the engine's native report read);
@@ -2924,9 +3586,71 @@ mod native_loads_tests {
     }
 
     #[tokio::test]
+    async fn a_route_that_had_answered_survives_a_body_that_does_not_read() {
+        let stub = spawn_backend(
+            &[(StatusCode::NOT_FOUND, "")],
+            &[
+                (StatusCode::OK, NATIVE_BODY),
+                (StatusCode::OK, UNREADABLE_NATIVE_BODY),
+                (StatusCode::OK, NATIVE_BODY),
+            ],
+        )
+        .await;
+        let worker = gauge_worker(&stub.url);
+        let memo = DashMap::new();
+        let route = NativeLoadsPath::Engine;
+
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo)).await;
+        assert_eq!(
+            resp.as_ref()
+                .map(WorkerLoadResponse::total_waiting_uncached_tokens),
+            Some(900),
+            "first tick uses the native report"
+        );
+        assert_eq!(
+            memo.get(worker.url()).and_then(|hit| hit.answered()),
+            Some(route),
+            "first tick records the answering route"
+        );
+
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo)).await;
+        assert_eq!(
+            resp.as_ref().map(WorkerLoadResponse::total_running_reqs),
+            Some(7),
+            "second tick uses the gauge report"
+        );
+        let hit = *memo.get(worker.url()).expect("second tick keeps the memo");
+        assert_eq!(
+            hit.answered(),
+            Some(route),
+            "second tick keeps the answering route"
+        );
+        assert!(!hit.is_absent(route), "route stays eligible");
+
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo)).await;
+        assert_eq!(
+            resp.as_ref()
+                .map(WorkerLoadResponse::total_waiting_uncached_tokens),
+            Some(900),
+            "third tick uses the native report again"
+        );
+        assert_eq!(
+            stub.probes.load(Ordering::SeqCst),
+            3,
+            "the answering route is probed on all three ticks"
+        );
+        assert_eq!(
+            stub.gateway_probes.load(Ordering::SeqCst),
+            1,
+            "the other route is probed only at discovery"
+        );
+    }
+
+    #[tokio::test]
     /// Unrelated JSON and malformed load fields cannot suppress metrics fallback.
     async fn non_load_body_on_200_is_treated_as_absent() {
         for body in [
+            UNREADABLE_NATIVE_BODY,
             "<html>nope</html>",
             "{}",
             r#"{"status":"ok"}"#,

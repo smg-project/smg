@@ -2251,10 +2251,13 @@ impl CacheAwarePolicy {
         if shallow {
             self.divert_shallow_seen.store(true, Ordering::Relaxed);
         }
-        let hits = self.divert_hits.fetch_add(1, Ordering::Relaxed) + 1;
+        let hits = self
+            .divert_hits
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         let shallow_seen = self.divert_shallow_seen.load(Ordering::Relaxed);
         let due = (hits >= warmup.divert_every && (shallow || !shallow_seen))
-            || hits >= 2 * warmup.divert_every;
+            || hits >= warmup.divert_every.saturating_mul(2);
         if !due {
             return None;
         }

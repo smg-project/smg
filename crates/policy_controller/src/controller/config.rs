@@ -141,6 +141,19 @@ pub struct Config {
     pub discovery: Option<DiscoverySettings>,
 }
 
+/// Whether two listener addresses certainly contend when bound. Mapped IPv4
+/// addresses are compared as IPv4. An IPv6 wildcard's coverage of IPv4 is a
+/// host socket setting, so addresses in different families do not overlap here.
+fn addresses_overlap(first: SocketAddr, second: SocketAddr) -> bool {
+    if first.port() == 0 || first.port() != second.port() {
+        return false;
+    }
+    let (a, b) = (first.ip().to_canonical(), second.ip().to_canonical());
+    first == second
+        || (a.is_ipv6() && b.is_ipv6() && (a.is_unspecified() || b.is_unspecified()))
+        || (a.is_ipv4() && b.is_ipv4() && (a == b || a.is_unspecified() || b.is_unspecified()))
+}
+
 impl Config {
     /// The default settle window, the gateway's.
     pub const DEFAULT_SHUTDOWN_SETTLE: Duration = Duration::from_secs(5);
@@ -161,7 +174,9 @@ impl Config {
     /// Refuses the configuration by the first field that is wrong.
     ///
     /// Two listeners on port `0` do not share an address: each takes its
-    /// own ephemeral port at bind.
+    /// own ephemeral port at bind. Within one address family after mapped IPv4
+    /// addresses are canonicalized, a wildcard listener shares its port with
+    /// every listener it covers. The refusal names the later listener's address.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.controller_id.is_empty() {
             return Err(ConfigError::EmptyControllerId);
@@ -212,14 +227,12 @@ impl Config {
             .map(|l| (l.addr, l.name.as_str()))
             .chain(std::iter::once((self.admin, "admin")));
         for (addr, name) in named {
-            if addr.port() != 0 {
-                if let Some((_, first)) = seen.iter().find(|(a, _)| *a == addr) {
-                    return Err(ConfigError::AddressShared {
-                        addr,
-                        first: (*first).to_owned(),
-                        second: name.to_owned(),
-                    });
-                }
+            if let Some((_, first)) = seen.iter().find(|(a, _)| addresses_overlap(*a, addr)) {
+                return Err(ConfigError::AddressShared {
+                    addr,
+                    first: (*first).to_owned(),
+                    second: name.to_owned(),
+                });
             }
             seen.push((addr, name));
         }
@@ -284,7 +297,8 @@ pub enum ConfigError {
     /// A scope on no listener.
     #[error("scope {0} is mounted on no listener")]
     ScopeUnmounted(Scope),
-    /// Two listeners, the admin listener included, on one address.
+    /// Two listeners, the admin listener included, on overlapping addresses;
+    /// `addr` is the later listener's address.
     #[error("listeners {first} and {second} share the address {addr}")]
     AddressShared {
         /// The address.
@@ -408,7 +422,7 @@ pub enum ConfigError {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{
-        net::{Ipv4Addr, SocketAddr},
+        net::{Ipv4Addr, Ipv6Addr, SocketAddr},
         path::PathBuf,
         time::Duration,
     };
@@ -588,6 +602,128 @@ pub(crate) mod tests {
             "ephemeral ports are not shared addresses"
         );
         assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_wildcard_and_a_specific_listener_never_share_a_real_port() {
+        let wildcard = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 30100));
+        let specific = loopback(30100);
+
+        let mut config = valid();
+        config.listeners[0].addr = wildcard;
+        config.listeners[1].addr = specific;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::AddressShared {
+                addr: specific,
+                first: "gateway".to_owned(),
+                second: "control".to_owned(),
+            })
+        );
+
+        let mut config = valid();
+        config.listeners[0].addr = specific;
+        config.listeners[1].addr = wildcard;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::AddressShared {
+                addr: wildcard,
+                first: "gateway".to_owned(),
+                second: "control".to_owned(),
+            })
+        );
+
+        let mut config = valid();
+        config.listeners[1].addr = wildcard;
+        config.admin = specific;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::AddressShared {
+                addr: specific,
+                first: "control".to_owned(),
+                second: "admin".to_owned(),
+            })
+        );
+
+        let mut config = valid();
+        config.listeners[1].addr = specific;
+        config.admin = wildcard;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::AddressShared {
+                addr: wildcard,
+                first: "control".to_owned(),
+                second: "admin".to_owned(),
+            })
+        );
+
+        let v6_wildcard = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 30100));
+        let v6_specific = SocketAddr::from((Ipv6Addr::LOCALHOST, 30100));
+        let mut config = valid();
+        config.listeners[0].addr = v6_wildcard;
+        config.listeners[1].addr = v6_specific;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::AddressShared {
+                addr: v6_specific,
+                first: "gateway".to_owned(),
+                second: "control".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn wildcard_listeners_overlap_every_address_they_cover() {
+        let specific = loopback(30100);
+
+        let mapped_wildcard = SocketAddr::from((Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(), 30100));
+        let mut config = valid();
+        config.listeners[0].addr = mapped_wildcard;
+        config.listeners[1].addr = specific;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::AddressShared {
+                addr: specific,
+                first: "gateway".to_owned(),
+                second: "control".to_owned(),
+            })
+        );
+
+        let mapped_specific = SocketAddr::from((Ipv4Addr::LOCALHOST.to_ipv6_mapped(), 30100));
+        let mut config = valid();
+        config.listeners[0].addr = mapped_wildcard;
+        config.listeners[1].addr = mapped_specific;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::AddressShared {
+                addr: mapped_specific,
+                first: "gateway".to_owned(),
+                second: "control".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn listener_addresses_that_do_not_overlap_are_accepted() {
+        let mut config = valid();
+        config.listeners[0].addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
+        config.listeners[1].addr = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 30100));
+        config.listeners[2].addr = loopback(30100);
+        config.admin = SocketAddr::from((Ipv6Addr::LOCALHOST, 30100));
+        assert_eq!(
+            config.validate(),
+            Ok(()),
+            "port 0, two specific addresses and two families share no address"
+        );
+
+        let mut config = valid();
+        config.listeners[1].addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 30100));
+        config.listeners[2].addr = loopback(30100);
+        assert_eq!(
+            config.validate(),
+            Ok(()),
+            "an IPv6 wildcard is not known to cover the IPv4 family"
+        );
     }
 
     #[test]

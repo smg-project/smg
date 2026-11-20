@@ -5,14 +5,11 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
 
-use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse};
+use openai_protocol::worker::{NamedValue, RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse};
 use parking_lot::Mutex;
 use tokio::{
     sync::{watch, Notify},
@@ -23,7 +20,7 @@ use super::{
     now, peer, Failures, LoadDriver, LoadDriverConfig, LoadProbe, Read, ReadError, Schedule, Target,
 };
 use crate::{
-    spec::{BindingSpec, OverloadSpec},
+    spec::{AcrossRanks, BindingSpec, OverloadSpec, SignalSpec},
     store::{
         Ask, GatewayId, Kinds, LoadSink, LoadSource, MembershipChange, MemoryStore, Position,
         Reachability, Signals, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
@@ -1041,6 +1038,7 @@ async fn run_shows_a_row_that_landed_inside_the_window_at_the_windows_end() {
                     now: now(),
                     pinned: None,
                     affinity: false,
+                    signal_cells: false,
                 },
                 &mut out,
             )
@@ -1447,6 +1445,7 @@ fn vetoed(store: &MemoryStore) -> Vec<bool> {
         now: now(),
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     store
         .build_view("m", Role::Single, &ask, &mut out)
@@ -1884,13 +1883,13 @@ async fn the_polls_group_the_membership_anew_at_a_take_after_a_restore_to_the_sa
     probe.answers("grpc://x:1", &[figures]);
     let driver = Arc::new(driver(&store, &probe, TEN));
     let (_stop, stopped) = watch::channel(false);
-    let (leads, polls) = watch::channel(true);
+    let (leads, polls) = watch::channel(Some(1));
     let mut tasks = JoinSet::new();
     let running = Arc::clone(&driver);
-    tasks.spawn(async move { running.run_while(stopped, polls, || 1).await });
+    tasks.spawn(async move { running.run_while(stopped, polls).await });
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(row(&store, own, 0).is_some());
-    leads.send_replace(false);
+    leads.send_replace(None);
     // It follows: a leader's cut of as many writes, of another engine.
     let leader = MemoryStore::new();
     let theirs = ready(
@@ -1908,7 +1907,7 @@ async fn the_polls_group_the_membership_anew_at_a_take_after_a_restore_to_the_sa
     tokio::time::sleep(TEN + TEN).await;
     assert_eq!(probe.polls().len(), before, "a follower polled");
     // The take: the polls start at once, over the membership as it stands.
-    leads.send_replace(true);
+    leads.send_replace(Some(2));
     tokio::time::sleep(TEN + TEN).await;
     let polled = probe.polls().split_off(before);
     assert!(
@@ -1922,9 +1921,9 @@ async fn the_polls_group_the_membership_anew_at_a_take_after_a_restore_to_the_sa
 }
 
 /// A loss and the take after it, both told before the loop looked, leave
-/// the watch one word, `true` as it read before. The term beside it moved:
-/// the run of polls ends and the next starts over the membership a restore
-/// between the two left, at the epoch the last run grouped at.
+/// the watch one word, a term as it read before. The word names another
+/// term: the run of polls ends and the next starts over the membership a
+/// restore between the two left, at the epoch the last run grouped at.
 #[tokio::test(start_paused = true)]
 async fn a_take_whose_word_folded_over_a_loss_starts_the_polls_anew() {
     let store = Arc::new(MemoryStore::new());
@@ -1939,20 +1938,16 @@ async fn a_take_whose_word_folded_over_a_loss_starts_the_polls_anew() {
     probe.answers("grpc://x:1", &[figures]);
     let driver = Arc::new(driver(&store, &probe, TEN));
     let (_stop, stopped) = watch::channel(false);
-    let (leads, polls) = watch::channel(true);
-    let term = Arc::new(AtomicU64::new(1));
+    let (leads, polls) = watch::channel(Some(1));
     let mut tasks = JoinSet::new();
-    let (running, led) = (Arc::clone(&driver), Arc::clone(&term));
-    tasks.spawn(async move {
-        let led = move || led.load(Ordering::Relaxed);
-        running.run_while(stopped, polls, led).await;
-    });
+    let running = Arc::clone(&driver);
+    tasks.spawn(async move { running.run_while(stopped, polls).await });
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(row(&store, own, 0).is_some());
     // The loss, a leader's cut of as many writes of another engine, and
     // the take under the next term: nothing is awaited between them, so
     // the loop reads one word.
-    leads.send_replace(false);
+    leads.send_replace(None);
     let leader = MemoryStore::new();
     let theirs = ready(
         &leader,
@@ -1965,8 +1960,7 @@ async fn a_take_whose_word_folded_over_a_loss_starts_the_polls_anew() {
     );
     assert_eq!(leader.epoch(), store.epoch());
     assert!(store.restore_from(leader.cut(Kinds::All)));
-    term.store(2, Ordering::Relaxed);
-    leads.send_replace(true);
+    leads.send_replace(Some(2));
     let before = probe.polls().len();
     tokio::time::sleep(TEN + TEN).await;
     let polled = probe.polls().split_off(before);
@@ -1988,10 +1982,10 @@ async fn a_followers_loop_pays_the_stores_publications_and_polls_no_engine() {
     let probe = Arc::new(FakeProbe::default());
     let driver = Arc::new(driver(&store, &probe, TEN));
     let (_stop, stopped) = watch::channel(false);
-    let (leads, polls) = watch::channel(false);
+    let (leads, polls) = watch::channel(None);
     let mut tasks = JoinSet::new();
     let running = Arc::clone(&driver);
-    tasks.spawn(async move { running.run_while(stopped, polls, || 1).await });
+    tasks.spawn(async move { running.run_while(stopped, polls).await });
     // What a decision reads of the worker's load; `None` while the worker
     // is no member of the published world.
     let seen = |id: WorkerId| {
@@ -2001,6 +1995,7 @@ async fn a_followers_loop_pays_the_stores_publications_and_polls_no_engine() {
             now: now(),
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         store.build_view("m", Role::Single, &ask, &mut out)?;
         let row = out.candidates.iter().find(|row| row.id == id)?;
@@ -2049,7 +2044,233 @@ async fn a_followers_loop_pays_the_stores_publications_and_polls_no_engine() {
     assert_eq!(seen(id), Some(Some(7)), "a followed load row");
     assert!(probe.polls().is_empty(), "a follower polled");
     // The take: the first tick polls the worker that joined meanwhile.
-    leads.send_replace(true);
+    leads.send_replace(Some(1));
     tokio::time::sleep(Duration::from_millis(1)).await;
     assert_eq!(probe.polls(), ["grpc://a:1"]);
+}
+
+/// The `random` preset as `generation`, declaring each of `signals` by its
+/// name and unit, applied.
+fn declare(store: &MemoryStore, generation: u64, signals: &[(&str, &str)]) {
+    let mut document = PolicySpec::preset("random").expect("a preset of this build");
+    document.generation = generation;
+    for &(name, unit) in signals {
+        let spec = SignalSpec {
+            unit: unit.to_owned(),
+            max_age_ms: None,
+            across_ranks: AcrossRanks::default(),
+        };
+        document.signals.insert(name.to_owned(), spec);
+    }
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    store.apply(spec).expect("a newer generation");
+}
+
+/// Each row's signal cells once the window's writes are shown, by worker:
+/// a cell's value and its sample instant, or none.
+fn cells(store: &MemoryStore) -> HashMap<WorkerId, Vec<Option<(f64, u64)>>> {
+    if let Some(due) = store.publish_due() {
+        store.publish(due);
+    }
+    store.deciding(|world| {
+        let ask = Ask {
+            gateway: GatewayId(1),
+            now: now(),
+            pinned: None,
+            affinity: false,
+            signal_cells: true,
+        };
+        let mut out = ViewBuffers::default();
+        let view = world
+            .view("m", Role::Single, &ask, false, &mut out)
+            .expect("the pool");
+        let block = view.signal_cells.expect("the publication's block");
+        let held = |cell: &crate::SignalCell| {
+            (!cell.is_none()).then_some((cell.value, cell.sampled_at_micros))
+        };
+        let cells = block.cells().chunks(block.signals());
+        let ids = view.candidates.iter().map(|row| row.id);
+        ids.zip(cells.map(|cells| cells.iter().map(held).collect()))
+            .collect()
+    })
+}
+
+/// One rank's answer: its depth by name, a name no document declares, and
+/// the fixed count of used tokens.
+fn stating(rank: i32, depth: f64, age_ms: Option<u32>) -> SchedulerLoadSnapshot {
+    let stated = |name: &str, value| NamedValue {
+        name: name.into(),
+        unit: "items".into(),
+        value,
+        age_ms,
+    };
+    SchedulerLoadSnapshot {
+        dp_rank: rank,
+        num_used_tokens: 1_024 + rank,
+        max_total_num_tokens: 8_192,
+        values: vec![stated("depth", depth), stated("other", 1.0)],
+        ..Default::default()
+    }
+}
+
+/// Two ranks of one engine under a document that declares `signals`, and
+/// the driver over them.
+fn two_ranks(
+    signals: &[(&str, &str)],
+) -> (
+    Arc<MemoryStore>,
+    LoadDriver<MemoryStore, FakeProbe>,
+    [WorkerId; 2],
+) {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let ranks = [0, 1].map(|rank| {
+        let key = format!("grpc://b:1@{rank}");
+        ready(&store, &key, "grpc://b:1", rank, 2, WireModes::GRPC, 0)
+    });
+    declare(&store, 2, signals);
+    let driver = driver(&store, &probe, TEN);
+    (store, driver, ranks)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_polls_answer_writes_each_ranks_declared_values_behind_its_row() {
+    let (store, driver, [rank0, rank1]) =
+        two_ranks(&[("depth", "items"), ("kv_tokens_used", "tokens")]);
+    let members = driver.engines(&mut None);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let started = now();
+    tokio::time::advance(Duration::from_millis(400)).await;
+    driver.apply(
+        &members[0],
+        started,
+        Read::Poll {
+            ranks: vec![(0, rank0), (1, rank1)],
+            served: false,
+            answer: Ok(WorkerLoadResponse {
+                loads: vec![stating(0, 3.0, Some(150)), stating(1, 5.0, None)],
+                dp_rank_count: 2,
+                ..Default::default()
+            }),
+        },
+    );
+    // A value is as old as it says before the poll began, and one that
+    // states no age is as old as its row: an unstamped poll's is sampled
+    // at the poll's start, never at its arrival.
+    let aged = store.micros(started - Duration::from_millis(150));
+    let fresh = store.micros(started);
+    let held = cells(&store);
+    assert_eq!(held[&rank0], [Some((3.0, aged)), Some((1_024.0, fresh))]);
+    assert_eq!(held[&rank1], [Some((5.0, fresh)), Some((1_025.0, fresh))]);
+    // Each rank's row stands too, and the name no document declares was
+    // never offered: no write counts it.
+    assert!(row(&store, rank0, 0).is_some() && row(&store, rank1, 1).is_some());
+    assert_eq!(store.counts().signal_writes, [4, 0, 0, 0, 0, 0]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_row_the_store_passes_over_takes_its_values_with_it() {
+    let (store, driver, [rank0, rank1]) = two_ranks(&[("depth", "items")]);
+    let members = driver.engines(&mut None);
+    let started = now();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    // Rank 0's own record arrives while the poll is out: its polled row
+    // is passed over, and the record stands.
+    let pushed = LoadRow {
+        running: 9,
+        ..LoadRow::default()
+    };
+    store.record(rank0, 0, pushed, now(), LoadSource::Stream);
+    tokio::time::advance(Duration::from_millis(100)).await;
+    driver.apply(
+        &members[0],
+        started,
+        Read::Poll {
+            ranks: vec![(0, rank0), (1, rank1)],
+            served: false,
+            answer: Ok(WorkerLoadResponse {
+                loads: vec![stating(0, 3.0, None), stating(1, 5.0, None)],
+                dp_rank_count: 2,
+                ..Default::default()
+            }),
+        },
+    );
+    let held = cells(&store);
+    assert_eq!(held[&rank0], [None]);
+    assert_eq!(held[&rank1], [Some((5.0, store.micros(started)))]);
+    let (stands, source) = row(&store, rank0, 0).expect("rank 0's record");
+    assert_eq!((stands.running, source), (9, LoadSource::Stream));
+    assert_eq!(store.counts().signal_writes, [1, 0, 0, 0, 0, 0]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_polled_list_is_put_under_the_bounds_before_it_is_read_and_what_left_is_counted() {
+    let (store, driver, [rank0, rank1]) = two_ranks(&[("depth", "items"), ("late", "items")]);
+    let members = driver.engines(&mut None);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let started = now();
+    let named = |name: &str, value: f64| NamedValue {
+        name: name.into(),
+        unit: "items".into(),
+        value,
+        age_ms: None,
+    };
+    // Rank 0 states a declared name as its 65th value: past the list's
+    // bound. Rank 1 states a declared name twice, and one whose value is
+    // no number.
+    let mut crowded: Vec<_> = (0..64)
+        .map(|nth| named(&format!("filler_{nth}"), 1.0))
+        .collect();
+    crowded.push(named("late", 7.0));
+    let twice = vec![
+        named("depth", 5.0),
+        named("depth", 9.0),
+        named("late", f64::NAN),
+    ];
+    let rank = |rank: i32, values| SchedulerLoadSnapshot {
+        dp_rank: rank,
+        values,
+        ..Default::default()
+    };
+    driver.apply(
+        &members[0],
+        started,
+        Read::Poll {
+            ranks: vec![(0, rank0), (1, rank1)],
+            served: false,
+            answer: Ok(WorkerLoadResponse {
+                loads: vec![rank(0, crowded), rank(1, twice)],
+                dp_rank_count: 2,
+                ..Default::default()
+            }),
+        },
+    );
+    // The 65th value is never read, the name's first statement stands,
+    // and the value that is no number never reaches the store.
+    let held = cells(&store);
+    assert_eq!(held[&rank0], [None, None]);
+    assert_eq!(held[&rank1], [Some((5.0, store.micros(started))), None]);
+    assert_eq!(driver.stats().values_dropped.load(Ordering::Relaxed), 3);
+    assert_eq!(store.counts().signal_writes, [1, 0, 0, 0, 0, 0]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_document_with_no_signal_takes_no_value_of_an_answer() {
+    let (store, driver, [rank0, rank1]) = two_ranks(&[]);
+    let members = driver.engines(&mut None);
+    driver.apply(
+        &members[0],
+        now(),
+        Read::Poll {
+            ranks: vec![(0, rank0), (1, rank1)],
+            served: false,
+            answer: Ok(WorkerLoadResponse {
+                loads: vec![stating(0, 3.0, None), stating(1, 5.0, None)],
+                dp_rank_count: 2,
+                ..Default::default()
+            }),
+        },
+    );
+    assert!(row(&store, rank0, 0).is_some() && row(&store, rank1, 1).is_some());
+    assert_eq!(store.counts().signal_writes, [0; 6]);
 }

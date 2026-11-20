@@ -150,8 +150,9 @@ pub enum DropReason {
     Whitespace,
     /// A call after the first, where the request takes one call only ([`first_call_only`]).
     LaterCall,
-    /// A call the request forbade (`tool_choice: none`), read whole so its bytes are no content
-    /// and delivered as none ([`forbidden_calls`]).
+    /// A call the request forbade (every call under `tool_choice: none`; under a choice that
+    /// narrows the tools, a call to a function it leaves out), read whole so its bytes are no
+    /// content and delivered as none ([`forbidden_calls`]).
     ForbiddenCall,
     /// Bytes of a call block the call syntax could not read as the call, for a syntax whose block
     /// is never prose (the keyed syntax: the block's markers and its four tags are the format's
@@ -615,23 +616,54 @@ pub fn first_call_only(events: &mut [Event]) {
 /// call become its dropped text, as [`first_call_only`] drops the later calls, so a call the
 /// model writes anyway is neither a call nor content, as the engine's own server reads and
 /// withholds it; the finish counts none, and a `tool_calls` finish is the engine's `stop` again.
+/// A caller may pass one call's events alone: under a choice that narrows the tools, the call to
+/// a function the choice leaves out, and the finish once no call is kept.
 pub fn forbidden_calls(events: &mut [Event]) {
     drop_calls_from(events, 0, DropReason::ForbiddenCall);
 }
 
 /// The events of every call from the index `kept` on become their dropped text under `why`, so
 /// every byte of the output still lands in one event; the finish counts at most `kept` calls,
-/// and one that counts none no longer says `tool_calls`.
+/// and one that counts none no longer says `tool_calls`. Text the syntax could not read inside
+/// such a call (the bytes behind the arguments of an object that never closed) is the call's
+/// and is dropped with it.
 fn drop_calls_from(events: &mut [Event], kept: u32, why: DropReason) {
+    // A call that began before `events` goes on in them: its next event is then no start.
+    let mut inside = events
+        .iter()
+        .find_map(|event| match event {
+            Event::ToolCallStart { .. } => Some(false),
+            Event::ToolCallArguments { index, .. } | Event::ToolCallEnd { index, .. } => {
+                Some(*index >= kept)
+            }
+            _ => None,
+        })
+        .unwrap_or(false);
     for event in events {
         match event {
             Event::ToolCallStart { index, source, .. }
             | Event::ToolCallArguments { index, source, .. }
-            | Event::ToolCallEnd { index, source, .. }
                 if *index >= kept =>
             {
+                inside = true;
                 *event = Event::Dropped {
                     text: std::mem::take(source),
+                    why,
+                };
+            }
+            Event::ToolCallEnd { index, source, .. } if *index >= kept => {
+                inside = false;
+                *event = Event::Dropped {
+                    text: std::mem::take(source),
+                    why,
+                };
+            }
+            Event::ToolCallStart { .. }
+            | Event::ToolCallArguments { .. }
+            | Event::ToolCallEnd { .. } => inside = false,
+            Event::Malformed { text, .. } if inside => {
+                *event = Event::Dropped {
+                    text: std::mem::take(text),
                     why,
                 };
             }
@@ -760,6 +792,44 @@ mod tests {
         events.extend(call(0));
         events.extend(call(1));
         events
+    }
+
+    /// Text the syntax could not read inside a dropped call is dropped with it; such text after
+    /// a call's end, or inside a call that is kept, stays.
+    #[test]
+    fn text_inside_a_dropped_call_is_dropped_with_it() {
+        fn dropped(events: &[Event]) -> Vec<String> {
+            let text = |event: &Event| match event {
+                Event::Dropped { text, .. } => Some(text.text.to_string()),
+                _ => None,
+            };
+            events.iter().filter_map(text).collect()
+        }
+        let tail = |text: &'static str| Event::Malformed {
+            text: Text::uncounted(text),
+            why: MalformedReason::UnterminatedRegion,
+        };
+        let mut events: Vec<Event> = call(0).into();
+        events.insert(2, tail("a"));
+        events.push(tail("b"));
+        forbidden_calls(&mut events);
+        assert_eq!(dropped(&events), ["<", "{}", "a", ">"]);
+        assert!(matches!(events.last(), Some(Event::Malformed { text, .. }) if text.text == "b"));
+
+        let end = Event::ToolCallEnd {
+            index: 1,
+            source: Text::uncounted(">"),
+        };
+        let mut events = vec![tail("a"), end, tail("b")];
+        first_call_only(&mut events);
+        assert_eq!(dropped(&events), ["a", ">"]);
+        assert!(matches!(events.last(), Some(Event::Malformed { text, .. }) if text.text == "b"));
+
+        let mut events: Vec<Event> = call(0).into();
+        events.insert(2, tail("a"));
+        first_call_only(&mut events);
+        assert!(dropped(&events).is_empty(), "{events:?}");
+        assert!(matches!(&events[2], Event::Malformed { text, .. } if text.text == "a"));
     }
 
     #[test]

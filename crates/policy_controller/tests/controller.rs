@@ -696,6 +696,7 @@ async fn a_present_gateway_is_answered_which_worker_on_its_decide_stream() {
                     }),
                     constraints: None,
                     again: false,
+                    ..Default::default()
                 })
                 .await
                 .expect("the stream takes the request");
@@ -741,6 +742,7 @@ async fn a_present_gateway_is_answered_which_worker_on_its_decide_stream() {
                 }),
                 constraints: None,
                 again: false,
+                ..Default::default()
             })
             .await
             .expect("the stream takes the request");
@@ -895,6 +897,7 @@ async fn a_worker_added_over_the_wire_is_decided_with_no_ask_for_a_build() {
                     }),
                     constraints: None,
                     again: false,
+                    ..Default::default()
                 })
                 .await
                 .expect("the stream takes the request");
@@ -1008,6 +1011,7 @@ async fn a_drain_ends_the_open_decide_streams_and_returns_inside_its_grace_perio
                 }),
                 constraints: None,
                 again: false,
+                ..Default::default()
             })
             .await
             .expect("the stream takes the request");
@@ -1645,6 +1649,7 @@ async fn a_served_dispatch_feeds_a_registered_scorer_without_lifecycle_hooks() {
                             }),
                             constraints: None,
                             again: false,
+                            ..Default::default()
                         })
                         .await
                         .expect("a request");
@@ -1663,13 +1668,11 @@ async fn a_served_dispatch_feeds_a_registered_scorer_without_lifecycle_hooks() {
                     if let Some(dispatched) = first {
                         assert_ne!(target, dispatched);
                         let seen = seen.lock().expect("the scores");
-                        assert!(seen.contains(&(
-                            dispatched,
-                            Sent {
-                                requests: 1,
-                                tokens: u64::from(TOKENS),
-                            }
-                        )));
+                        assert!(seen.iter().any(|&(id, sent)| {
+                            id == dispatched
+                                && (sent.requests, sent.tokens, sent.unsized_requests)
+                                    == (1, u64::from(TOKENS), 0)
+                        }));
                         assert!(seen.contains(&(target, Sent::default())));
                     } else {
                         first = Some(target);

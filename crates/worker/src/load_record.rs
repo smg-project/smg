@@ -9,41 +9,42 @@ use std::{sync::Arc, time::Duration};
 
 use crate::{
     common_proto as common,
+    value_bounds::{stands, MAX_VALUES},
     worker::{
         EngineMemoryMetricsSnapshot, EngineQueueMetricsSnapshot, LoadRecord, LoadTelemetry,
         NamedValue, SchedulerLoadSnapshot,
     },
 };
 
-const MAX_VALUES: usize = 64;
-const MAX_NAME_BYTES: usize = 63;
-const MAX_UNIT_BYTES: usize = 31;
-
-/// The record's named values under the snapshot's bounds: the first
-/// `MAX_VALUES` entries, less those with an empty name, a name or a unit
-/// over its bound, a value that is not finite, or a name an entry kept
-/// ahead of it states. The first of a name stands. What is left out here
-/// is counted where the record is taken: the record's list less this one
+/// The record's named values under the report's bounds: of the record's
+/// first `MAX_VALUES` entries, those that stand by the test every list is
+/// held to, in a list sized for them once. What is left out here is
+/// counted where the record is taken: the record's list less this one
 /// ([`LoadRecord::values_sent`]).
 fn read_values(values: &[common::NamedValue]) -> Vec<NamedValue> {
-    let mut named: Vec<NamedValue> = Vec::new();
+    let mut named: Vec<NamedValue> = Vec::with_capacity(values.len().min(MAX_VALUES));
     for sample in values.iter().take(MAX_VALUES) {
-        if sample.name.is_empty()
-            || sample.name.len() > MAX_NAME_BYTES
-            || sample.unit.len() > MAX_UNIT_BYTES
-            || !sample.value.is_finite()
-            || named.iter().any(|kept| *kept.name == *sample.name)
-        {
-            continue;
+        if stands(&sample.name, &sample.unit, sample.value, &named) {
+            named.push(NamedValue::from(sample));
         }
-        named.push(NamedValue {
-            name: Arc::from(sample.name.as_str()),
-            unit: Arc::from(sample.unit.as_str()),
-            value: sample.value,
-            age_ms: sample.age_ms,
-        });
     }
     named
+}
+
+/// A named value as a wire states it, field for field: the one read of an
+/// entry, for a pushed record's list and for a polled answer's. A polled
+/// answer's list is read whole by it, and the load monitor holds that list
+/// to the report's bounds and counts what leaves it, as it does the list
+/// of a poll over HTTP.
+impl From<&common::NamedValue> for NamedValue {
+    fn from(stated: &common::NamedValue) -> Self {
+        Self {
+            name: Arc::from(stated.name.as_str()),
+            unit: Arc::from(stated.unit.as_str()),
+            value: stated.value,
+            age_ms: stated.age_ms,
+        }
+    }
 }
 
 /// A record's fixed fields take the shape of a poll's. The two
@@ -51,6 +52,11 @@ fn read_values(values: &[common::NamedValue]) -> Vec<NamedValue> {
 /// is KV usage, and the request total is the sum of running and waiting
 /// requests. The caller sets the rank and can merge fixed telemetry the
 /// record omitted with the last figures it received.
+///
+/// The fields alone: a part the record left out is at the type's default
+/// and bears no mark, so the named values of this shape offer a count the
+/// record did not state. A reader of named values takes the record's entry
+/// from [`LoadRecord::snapshot`], which marks it.
 impl From<&common::EngineLoad> for SchedulerLoadSnapshot {
     /// Read input capacity directly, including absence after the samples expire.
     fn from(record: &common::EngineLoad) -> Self {
@@ -140,7 +146,7 @@ impl LoadRecord for common::EngineLoad {
     }
 
     #[inline]
-    fn snapshot(&self) -> SchedulerLoadSnapshot {
+    fn fields(&self) -> SchedulerLoadSnapshot {
         SchedulerLoadSnapshot::from(self)
     }
 
@@ -219,6 +225,49 @@ mod tests {
         assert_eq!(serde_json::to_string(&snapshot).unwrap(), legacy);
         let decoded: SchedulerLoadSnapshot = serde_json::from_str(legacy).unwrap();
         assert!(decoded.values.is_empty());
+    }
+
+    /// The record's own entry bears the mark of what the record did not
+    /// state: a count it left out is not offered as a zero, and neither
+    /// count is where the record states no capacity.
+    #[test]
+    fn a_records_snapshot_is_marked_with_what_the_record_did_not_state() {
+        let offered = |snapshot: &SchedulerLoadSnapshot| -> Vec<(String, f64)> {
+            snapshot
+                .named_values()
+                .map(|value| (value.name.to_string(), value.value))
+                .collect()
+        };
+        let record = |held: Option<i32>, capacity: Option<i32>| common::EngineLoad {
+            running_requests: 2,
+            num_used_tokens: held,
+            max_total_num_tokens: capacity,
+            ..Default::default()
+        };
+        let capacity = ("kv_tokens_capacity".to_owned(), 8_192.0);
+        // Both stated beside a capacity: both offered, the zero held too.
+        let idle = record(Some(0), Some(8_192)).snapshot();
+        assert_eq!(
+            offered(&idle),
+            [("kv_tokens_used".to_owned(), 0.0), capacity.clone()]
+        );
+        // The sections the record left out are marked with the counts.
+        assert!(idle
+            .kept
+            .contains(LoadTelemetry::MEMORY | LoadTelemetry::QUEUES));
+        // The held count left out: the capacity alone.
+        let core = record(None, Some(8_192)).snapshot();
+        assert_eq!(offered(&core), [capacity]);
+        // No capacity: neither, stated as zeros or beside a held count.
+        for (held, capacity) in [
+            (Some(0), Some(0)),
+            (Some(211), Some(-1)),
+            (Some(211), None),
+            (None, None),
+        ] {
+            let snapshot = record(held, capacity).snapshot();
+            assert!(offered(&snapshot).is_empty(), "{held:?} {capacity:?}");
+        }
     }
 
     fn sample(name: &str, unit: &str, value: f64) -> common::NamedValue {
@@ -311,5 +360,36 @@ mod tests {
         ];
         let kept = read_values(&values);
         assert_eq!((kept.len(), kept[0].value), (1, 5.0));
+    }
+
+    /// A polled answer's list and a pushed record's are held to one test:
+    /// of the same entries the same ones stand, in the same order, and as
+    /// many leave.
+    #[test]
+    fn a_polled_list_keeps_what_a_pushed_record_of_its_entries_keeps() {
+        let mut values: Vec<_> = (0..70)
+            .map(|index| sample(&format!("ready_{index}"), "items", f64::from(index)))
+            .collect();
+        values[3] = sample("", "items", 1.0);
+        values[5] = sample("ready_4", "items", 2.0);
+        values[7] = sample("ready_7", "items", f64::INFINITY);
+        values[9] = sample(&"n".repeat(64), "items", 3.0);
+        values[11] = sample("ready_11", &"u".repeat(32), 4.0);
+        let pushed = read_values(&values);
+        assert_eq!(pushed.len(), 59);
+        let mut polled = SchedulerLoadSnapshot {
+            values: values
+                .iter()
+                .map(|value| NamedValue {
+                    name: value.name.as_str().into(),
+                    unit: value.unit.as_str().into(),
+                    value: value.value,
+                    age_ms: value.age_ms,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(polled.bound_values(), values.len() - pushed.len());
+        assert_eq!(polled.values, pushed);
     }
 }

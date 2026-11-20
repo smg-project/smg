@@ -7,8 +7,8 @@
 
 use crate::{
     counts::with_counts,
-    decision::{Decision, Target, Trace},
-    lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
+    decision::{Decision, Target},
+    lease::{wire, Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal},
     plugins::{
         config::{Exposure, Reveal},
         shown_hashes,
@@ -77,12 +77,7 @@ fn phase(p: Phase) -> i32 {
 }
 
 fn side(s: Side) -> i32 {
-    (match s {
-        Side::Single => proto::Side::Single,
-        Side::Prefill => proto::Side::Prefill,
-        Side::Decode => proto::Side::Decode,
-        Side::Encode => proto::Side::Encode,
-    }) as i32
+    proto::Side::from(s).into()
 }
 
 fn hash_kind(k: HashKind) -> i32 {
@@ -250,6 +245,9 @@ fn request(facts: &RequestFacts<'_>, exposure: &Exposure, needs: Needs) -> proto
         seed: facts.seed,
         prompt_text: Vec::new(),
         block_size: facts.block_size,
+        // The client's key is the host's and the controller's: no exposure
+        // shows it.
+        client_key: 0,
     }
 }
 
@@ -360,32 +358,6 @@ fn target(t: &Target) -> proto::Target {
     }
 }
 
-fn trace(t: &Trace) -> proto::Trace {
-    proto::Trace {
-        profile: u32::from(t.profile),
-        survivors: t.survivors.get(),
-        top: t.top[..usize::from(t.top_len)]
-            .iter()
-            .map(|(id, score)| proto::Scored {
-                worker_id: id.0,
-                score: *score,
-                contributions: Vec::new(),
-                dp_rank: 0,
-            })
-            .collect(),
-        seed: t.seed,
-        generation: t.generation,
-        plan: 0,
-        drops: Vec::new(),
-        picker: 0,
-        shadow_pick: 0,
-        fallback: false,
-        affinity_source: 0,
-        drew_first: t.drew_first(),
-        lifted: proto::LiftedVeto::from(t.lifted) as i32,
-    }
-}
-
 fn decision(d: &Decision, l: &Lease, exposure: &Exposure) -> proto::Decision {
     use proto::decision::Outcome;
     let (outcome, t) = match d {
@@ -423,7 +395,7 @@ fn decision(d: &Decision, l: &Lease, exposure: &Exposure) -> proto::Decision {
     proto::Decision {
         leases: vec![lease(l, exposure)],
         outcome: Some(outcome),
-        trace: Some(trace(t)),
+        trace: Some(t.wire()),
     }
 }
 
@@ -452,37 +424,13 @@ pub(crate) fn dispatched(
 }
 
 pub(crate) fn completed(l: &Lease, o: &Outcome) -> proto::lifecycle_event::Event {
-    proto::lifecycle_event::Event::Completed(proto::Completed {
-        lease_id: l.id.0,
-        side: side(o.side),
-        served: o.served.0,
-        status: u32::from(o.status),
-        class: (match o.class {
-            TransportClass::Ok => proto::completed::Class::Ok,
-            TransportClass::ClientError => proto::completed::Class::ClientError,
-            TransportClass::ServerError => proto::completed::Class::ServerError,
-            TransportClass::ConnectFailed => proto::completed::Class::ConnectFailed,
-            TransportClass::Timeout => proto::completed::Class::Timeout,
-            TransportClass::Cancelled => proto::completed::Class::Cancelled,
-        }) as i32,
-        ttft_micros: o.ttft_micros,
-        tokens_in: o.tokens_in,
-        tokens_out: o.tokens_out,
-        duration_micros: o.duration_micros,
-    })
+    proto::lifecycle_event::Event::Completed(wire::completed(l.id, o))
 }
 
 pub(crate) fn released(l: &Lease, r: ReleaseReason) -> proto::lifecycle_event::Event {
     proto::lifecycle_event::Event::Released(proto::Released {
         what: Some(proto::released::What::LeaseId(l.id.0)),
-        reason: (match r {
-            ReleaseReason::Abandoned => proto::released::Reason::Abandoned,
-            ReleaseReason::LateDecision => proto::released::Reason::LateDecision,
-            ReleaseReason::ClientGone => proto::released::Reason::ClientGone,
-            ReleaseReason::CommitFailed => proto::released::Reason::CommitFailed,
-            ReleaseReason::Expired => proto::released::Reason::Expired,
-            ReleaseReason::WorkerRemoved => proto::released::Reason::WorkerRemoved,
-        }) as i32,
+        reason: proto::released::Reason::from(r).into(),
         side: side(l.side),
     })
 }
@@ -1067,6 +1015,7 @@ mod tests {
             text_hashes: false,
             loads: true,
             events: true,
+            sent_prefixes: true,
             ring: true,
             headers: true,
             media: true,
@@ -1074,6 +1023,7 @@ mod tests {
             session_in_flight: true,
             affinity: true,
             sample: 8,
+            signal_cells: true,
         };
         assert_eq!(sent(&held[..3], tokens), [1, 2, 3]);
         assert_eq!(sent(&held[..3], text), [1, 2, 3]);
@@ -1123,6 +1073,36 @@ mod tests {
         );
         let read: Vec<u32> = frame.candidates.iter().map(|c| c.in_flight).collect();
         assert_eq!(read, [4, 0, 9]);
+    }
+
+    /// A plugin's frame carries no client key, whatever the plugin is shown
+    /// of the tenant and the session.
+    #[test]
+    fn the_frame_carries_no_client_key() {
+        use crate::{
+            plugins::config::{Exposure, Reveal},
+            spec::Needs,
+            view::{PoolFacts, RequestFacts},
+        };
+
+        let facts = RequestFacts {
+            client_key: 29,
+            ..RequestFacts::default()
+        };
+        let exposure = Exposure {
+            tenant: Reveal::Plain,
+            session_key: Reveal::Plain,
+            ..Exposure::default()
+        };
+        let frame = super::decide(
+            1,
+            &facts,
+            &[],
+            &PoolFacts::default(),
+            &exposure,
+            Needs::default(),
+        );
+        assert_eq!(frame.request.expect("the frame's request").client_key, 0);
     }
 
     /// The frame carries each candidate's count of the request's session
@@ -1182,14 +1162,14 @@ mod tests {
             generation: 6,
             ..Trace::default()
         };
-        let wire = super::trace(&counted);
+        let wire = counted.wire();
         assert_eq!((wire.survivors, wire.drew_first), (Some(5), false));
         assert_eq!((wire.profile, wire.seed, wire.generation), (3, 41, 6));
         let drawn = Trace {
             survivors: Survivors::NOT_COUNTED,
             ..counted
         };
-        let wire = super::trace(&drawn);
+        let wire = drawn.wire();
         assert_eq!((wire.survivors, wire.drew_first), (None, true));
     }
 
@@ -1202,13 +1182,24 @@ mod tests {
             lifted: Lifted::Overload,
             ..Trace::default()
         };
+        assert_eq!(steered.wire().lifted, proto::LiftedVeto::Overload as i32);
         assert_eq!(
-            super::trace(&steered).lifted,
-            proto::LiftedVeto::Overload as i32
-        );
-        assert_eq!(
-            super::trace(&Trace::default()).lifted,
+            Trace::default().wire().lifted,
             proto::LiftedVeto::None as i32
+        );
+    }
+
+    #[test]
+    fn the_plugin_decision_carries_the_no_profile_mark() {
+        use prost::Message as _;
+
+        use crate::{decision::ShedReason, lease::Lease, plugins::config::Exposure};
+
+        let shed = crate::door::shed(ShedReason::NoEndpoints, "wires", 0, 0);
+        let decision = super::decision(&shed, &Lease::default(), &Exposure::default());
+        assert_eq!(
+            decision.trace.expect("a trace").encode_to_vec(),
+            [0x10, 0, 0x70, 1]
         );
     }
 

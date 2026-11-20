@@ -26,12 +26,12 @@ pub fn object(row: &WorkerRow) -> Arc<dyn Worker> {
     Arc::new(builder(row).build())
 }
 
-/// [`object`] before its build: what the holder builds from where its host
-/// handed it a connector, which no row holds.
+/// [`object`] before its build. The holder can give it the host's connector
+/// and credential.
 pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
     let WorkerFacts {
         key,
-        engine,
+        engine: _,
         incarnation: _,
         role,
         wire_modes,
@@ -53,6 +53,7 @@ pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
         health,
         overload: _,
         drain_settle_secs,
+        demand_facts: _,
     } = &row.facts;
     let mut spec = WorkerSpec::new(key.clone());
     spec.models = models.iter().map(ModelCard::new).collect::<Vec<_>>().into();
@@ -70,19 +71,31 @@ pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
         .collect();
     spec.kv_block_size = kv_block_size.and_then(|size| usize::try_from(size).ok());
     spec.bootstrap_port = *bootstrap_port;
-    // The object dials its base address where it has one, else its URL: a
-    // rank's row names its engine there, and a row that is its own engine
-    // dials its key.
-    if !engine.is_empty() && engine != key {
-        spec.dp_base_url = Some(engine.clone());
+    let address = dial_address(&row.facts);
+    let ranked = address != key;
+    if ranked {
+        spec.dp_base_url = Some(address.to_owned());
     }
     if *dp_size > 1 {
-        spec.dp_rank = Some(usize::from(*dp_rank));
+        // A row under its engine's own address that states no rank is the
+        // engine whole: the width it states is no rank's.
+        let whole = !ranked && *dp_rank == 0;
+        spec.dp_rank = (!whole).then(|| usize::from(*dp_rank));
         spec.dp_size = Some(usize::from(*dp_size));
     }
     <BasicWorkerBuilder>::from_spec(spec)
         .health_config(checks(health, *drain_settle_secs))
         .status(status(row.status))
+}
+
+/// [`builder`] with the checks off, whatever the row's policy says: what
+/// the holder builds from for a row its host cannot dial.
+pub(super) fn unchecked(row: &WorkerRow) -> BasicWorkerBuilder {
+    let facts = &row.facts;
+    builder(row).health_config(HealthCheckConfig {
+        disable_health_check: true,
+        ..checks(&facts.health, facts.drain_settle_secs)
+    })
 }
 
 /// The store's role for a worker object.
@@ -92,6 +105,16 @@ pub(super) fn role(worker_type: WorkerType) -> Role {
         WorkerType::Prefill => Role::Prefill,
         WorkerType::Decode => Role::Decode,
         WorkerType::Encode => Role::Encode,
+    }
+}
+
+/// The address the row's object dials, as written. A row that names no
+/// engine dials its key.
+pub(super) fn dial_address(facts: &WorkerFacts) -> &str {
+    if facts.engine.is_empty() {
+        &facts.key
+    } else {
+        &facts.engine
     }
 }
 
@@ -223,6 +246,19 @@ mod tests {
         assert_eq!(made.status(), ObjectStatus::Ready);
         assert_eq!(made.api_key(), None);
         assert!(made.engine_connector().is_none());
+    }
+
+    /// A row under its engine's own address that states a width is the
+    /// engine whole: the object holds the width and no rank.
+    #[test]
+    fn a_row_under_its_engines_address_holds_its_width_and_no_rank() {
+        let made = object(&row(WorkerFacts {
+            engine: URL.to_string(),
+            dp_size: 4,
+            ..at(URL)
+        }));
+        assert_eq!(made.metadata().spec.dp_base_url, None);
+        assert_eq!((made.dp_rank(), made.dp_size()), (None, Some(4)));
     }
 
     /// A row that is its own engine, and one that names none, dials its key

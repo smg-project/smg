@@ -253,6 +253,12 @@ Options:
 - `FailureAction::ContinueNextStep` - Skip failed step, continue workflow
 - `FailureAction::RetryIndefinitely` - Keep retrying until manual intervention
 
+A panic in a step's `execute` method or `run_if` condition is logged and treated as a failure with the
+error text `Step failed`; its failure action applies, and no further attempt is made whatever its retry
+policy says. The step reads `Failed` when the action ends the workflow and `Skipped` when the action
+continues it. A panic in an `on_success` or `on_failure` hook is also logged and leaves the outcome the
+step has written, as a hook that returns an error does.
+
 ## Conditional Execution
 
 Skip steps based on runtime conditions:

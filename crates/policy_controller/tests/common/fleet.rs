@@ -11,17 +11,18 @@
 //!
 //! Every fact the store holds of an engine came from that engine, through a
 //! sink. Loads are the controller's own load driver's: the harness writes no
-//! load row. Health has no driver in the crate yet, so the harness stands in
-//! for one ([`probe`]): once an interval it asks each engine its wire's
-//! health check and writes what it heard, never what the case knows. A dial
-//! is bounded, so an engine that stops answering costs a turn that bound and
-//! no more. KV events are the controller's own feed's where its build has
-//! the `worker-host` feature: the store then has one writer, the product's,
-//! and a listener ([`subscribe`]) holds one event stream an engine and keeps
-//! what the stream said. A build without that feature has no driver, so
-//! there the listener stands in for one: it decodes each batch into the
-//! events an index applies and hands it to the sink. Each stand-in leaves
-//! the day a driver feeds its sink.
+//! load row. Health and KV events are the controller's own where its build
+//! has the `worker-host` feature: its prober and its feed are then the
+//! store's one writer of each, and the harness only listens. Its dialer
+//! ([`probe`]) asks each engine its wire's health check once an interval
+//! and keeps how the dial ended, and a listener ([`subscribe`]) holds one
+//! event stream an engine and keeps what the stream said. A build without
+//! that feature has no driver of either, so there each stands in for one.
+//! The dialer writes what it heard, never what the case knows, and the
+//! listener decodes each batch into the events an index applies and hands
+//! it to the sink. A host that embeds the engine ([`Embedded`]) has no
+//! controller, so its dialer writes in every build. A dial is bounded, so
+//! an engine that stops answering costs a turn that bound and no more.
 //!
 //! An engine speaks the wire of its kind ([`Shape::runtime`]): the fleet's
 //! first wire, or the one whose load report counts resident tokens. The
@@ -73,8 +74,9 @@ use smg_policy_controller::{
     },
     store::{
         Ask, BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, Kinds, KvCursor,
-        KvEvent, KvEventSink, LaneCounts, LeaseState, MemoryStore, ResyncReason, SequenceHash,
-        Signals, StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+        KvEvent, KvEventSink, LaneCounts, LeaseState, MembershipChange, MembershipTail,
+        MemoryStore, ResyncReason, SequenceHash, Signals, StoredBlock, ViewBuffers, WorkerFacts,
+        WorkerStatus, WorkersStore,
     },
     view::{fingerprint, LoadRow, Role, WireModes, WorkerId},
     AppliedSpec, Catalog, LeaseId, PolicySpec, TransportClass,
@@ -122,6 +124,11 @@ pub const ROOM: Duration = Duration::from_secs(30);
 /// store, and the harness then only listens.
 const PRODUCT_FEEDS: bool = cfg!(feature = "worker-host");
 
+/// Whether the controller under test probes its own workers: a build with
+/// the `worker-host` feature probes each while it leads, and the harness's
+/// dialer then writes nothing.
+pub const PRODUCT_PROBES: bool = cfg!(feature = "worker-host");
+
 /// Every reason the store counts a resync under.
 const RESYNCS: [ResyncReason; 9] = [
     ResyncReason::OutOfRange,
@@ -134,6 +141,34 @@ const RESYNCS: [ResyncReason; 9] = [
     ResyncReason::GapCleared,
     ResyncReason::Snapshot,
 ];
+
+/// A reason's place in [`RESYNCS`]. The match names every reason, so a new
+/// one fails to build here, beside the list that must name it.
+const fn place(reason: ResyncReason) -> usize {
+    match reason {
+        ResyncReason::OutOfRange => 0,
+        ResyncReason::DataLoss => 1,
+        ResyncReason::StreamEnded => 2,
+        ResyncReason::SnapshotAbandoned => 3,
+        ResyncReason::RelayRestart => 4,
+        ResyncReason::EngineReplaced => 5,
+        ResyncReason::PublisherRestart => 6,
+        ResyncReason::GapCleared => 7,
+        ResyncReason::Snapshot => 8,
+    }
+}
+
+// Every place of the list holds its reason, read at the build.
+const _: () = {
+    let mut at = 0;
+    while at < RESYNCS.len() {
+        assert!(
+            place(RESYNCS[at]) == at,
+            "a resync reason is out of its place"
+        );
+        at += 1;
+    }
+};
 
 /// The metadata entry a caller states its name in.
 const PRINCIPAL: &str = "x-smg-principal";
@@ -174,6 +209,15 @@ pub struct Seen {
     /// thresholds that stand for it.
     pub overloaded: bool,
     pub load: Option<LoadRow>,
+}
+
+/// One status the store moved, whoever probed: the engine of the row, where
+/// its status came from and where it went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Moved {
+    pub engine: usize,
+    pub from: WorkerStatus,
+    pub to: WorkerStatus,
 }
 
 /// One status the stand-in prober moved.
@@ -429,7 +473,8 @@ fn millis(duration: Duration) -> u32 {
 
 /// The health policy every registration states: one probe turn moves a
 /// rank between ready and unhealthy, at the stand-in prober's interval and
-/// under its dial bound.
+/// under its dial bound. A controller that probes by itself counts both in
+/// whole seconds: it asks an engine once a second.
 fn health_policy() -> HealthPolicy {
     HealthPolicy {
         failure_threshold: 1,
@@ -724,15 +769,17 @@ async fn dial(
     }
 }
 
-/// The case's stand-in for the health prober: every [`PROBE_INTERVAL`] one
-/// turn asks each engine once and writes what the dial heard for each of
-/// its rows, under the row's revision. A status that moved is kept with the
-/// turn that moved it.
+/// The harness's dialer: every [`PROBE_INTERVAL`] one turn asks each engine
+/// once and keeps how the dial ended. Where it `writes` it stands in for
+/// the health prober: it writes what the dial heard for each of the
+/// engine's rows, under the row's revision, and a status that moved is kept
+/// with the turn that moved it.
 async fn probe(
     store: Arc<MemoryStore>,
     probed: Arc<Mutex<Vec<Probed>>>,
     turns: Arc<Turns>,
     mut stop: watch::Receiver<bool>,
+    writes: bool,
 ) {
     let mut clients = HashMap::new();
     let mut tick = tokio::time::interval(PROBE_INTERVAL);
@@ -754,12 +801,18 @@ async fn probe(
             let end = dial(&mut clients, runtime, &endpoint).await;
             let healthy = end.healthy();
             turns.dialed.lock().push(Dialed { engine, turn, end });
+            if !writes {
+                continue;
+            }
             for id in ids {
                 let Some(row) = store.get(id) else { continue };
                 // A verdict is pushed under the lock its write was made
                 // under: a reader that saw the write reads the verdict.
                 let mut verdicts = turns.verdicts.lock();
-                if let Some((from, to)) = store.probe_outcome(id, healthy, row.revision).moved() {
+                if let Some((from, to)) = store
+                    .probe_outcome(id, healthy, row.revision, &|| true)
+                    .moved()
+                {
                     verdicts.push(Verdict {
                         engine,
                         from,
@@ -1270,9 +1323,10 @@ impl Harness {
     /// releases the lease, and turns the harness to `standby` once it
     /// leads: the two clients connect to its listeners and the store read
     /// from here on is its own. The registrations stand, since a standby
-    /// holds its leader's rows under their ids. The stand-in prober goes
-    /// on writing to the stopped controller's store: the promoted one's
-    /// rows keep the status its leader's log told.
+    /// holds its leader's rows under their ids. A stand-in prober goes on
+    /// writing to the stopped controller's store, so there the promoted
+    /// one's rows keep the status its leader's log told. A controller that
+    /// probes by itself probes its rows from its take on.
     pub async fn hand_over(&mut self, standby: Replica) -> Result<(), String> {
         let stopped = std::mem::replace(&mut self.replica, standby);
         stopped.stop().await?;
@@ -1452,15 +1506,17 @@ impl Harness {
         }
     }
 
-    /// Feed: starts the stand-in prober and one stand-in subscriber an
-    /// engine, over every engine registered now and later. Loads need no
-    /// start: the controller's own driver polls every ready engine.
+    /// Feed: starts the dialer and one subscriber an engine, over every
+    /// engine registered now and later. Each stands in for a driver the
+    /// controller's build does not have. Loads need no start: the
+    /// controller's own driver polls every ready engine.
     pub fn feed(&mut self) {
         self.feeds.spawn(probe(
             Arc::clone(&self.store),
             Arc::clone(&self.probed),
             Arc::clone(&self.turns),
             self.stop_feeds.subscribe(),
+            !PRODUCT_PROBES,
         ));
         let engines = self.probed.lock().clone();
         for engine in engines {
@@ -1607,6 +1663,7 @@ impl Harness {
             now: Instant::now(),
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         if self
             .store
@@ -1713,6 +1770,15 @@ impl Harness {
         Ok(())
     }
 
+    /// Sends a request on the worker's own wire and reads it to its end.
+    pub async fn serve_request(&self, engine: usize, id: String) -> Result<(Class, u32), String> {
+        let worker = self
+            .engines
+            .get(engine)
+            .ok_or_else(|| format!("no engine {engine}"))?;
+        Ok(sent(&worker.endpoint, id).await)
+    }
+
     /// Sends one short request to the engine at `engine` on the engine's own
     /// wire and reads it to its end, as a gateway that decided by itself
     /// sends one, the whole under [`DIAL_TIMEOUT`]. Then it reports the
@@ -1722,16 +1788,13 @@ impl Harness {
     /// The lease is the harness's own number: no leader issued it. Returns
     /// the class.
     pub async fn send(&mut self, engine: usize) -> Result<Class, String> {
-        let endpoint = self
-            .engines
-            .get(engine)
-            .map(|engine| engine.endpoint.clone())
-            .ok_or_else(|| format!("no engine {engine}"))?;
         let served = self.worker(engine)?;
         self.sent += 1;
         let lease_id = self.sent;
         let started = Instant::now();
-        let (class, frames) = sent(&endpoint, format!("sent-{engine}-{lease_id}")).await;
+        let (class, frames) = self
+            .serve_request(engine, format!("sent-{engine}-{lease_id}"))
+            .await?;
         let side = Side::Single.into();
         let dispatched = Dispatched {
             lease_id,
@@ -1811,15 +1874,21 @@ impl Harness {
         )
         .await?
         .map_err(|error| error.to_string())?;
-        let gateway = GatewayId(fingerprint(GATEWAY.as_bytes()));
-        let store = self.store.as_ref();
         within("the store reads the lease dispatched", ROOM, || {
-            // By the trait's path, as `leases` reads the file.
-            smg_policy_controller::store::LeasesStore::get(store, gateway, LeaseId(lease))
-                .is_some_and(|record| matches!(record.state, LeaseState::Dispatched { .. }))
+            self.dispatched(GATEWAY, lease)
         })
         .await
         .map(|_| ())
+    }
+
+    /// Whether the store reads the lease `lease` of the gateway named
+    /// `gateway` dispatched: no dispatch deadline ends it then.
+    pub fn dispatched(&self, gateway: &str, lease: u64) -> bool {
+        let gateway = GatewayId(fingerprint(gateway.as_bytes()));
+        let store = self.store.as_ref();
+        // By the trait's path, as `leases` reads the file.
+        smg_policy_controller::store::LeasesStore::get(store, gateway, LeaseId(lease))
+            .is_some_and(|record| matches!(record.state, LeaseState::Dispatched { .. }))
     }
 
     /// The row the store's pin of record names for `session`, the value a
@@ -1946,9 +2015,33 @@ impl Harness {
         .map_err(|error| error.to_string())
     }
 
-    /// The statuses the stand-in prober moved so far, in the order written.
+    /// The statuses the stand-in prober moved so far, in the order written:
+    /// none where the controller probes by itself.
     pub fn verdicts(&self) -> Vec<Verdict> {
         self.turns.verdicts.lock().clone()
+    }
+
+    /// A place in the store's membership, for [`Harness::moved`].
+    pub fn mark(&self) -> u64 {
+        self.store.epoch()
+    }
+
+    /// Each status of a fleet's row the store moved since `mark`, in the
+    /// order written: the store's own word of it, whoever probes.
+    pub fn moved(&self, mark: u64) -> Result<Vec<Moved>, String> {
+        let MembershipTail::Changes(changes) = self.store.changes_since(mark) else {
+            return Err(format!("the store's tail no longer reaches {mark}"));
+        };
+        Ok(changes
+            .into_iter()
+            .filter_map(|(_, change)| match change {
+                MembershipChange::StatusChanged { id, from, to } => {
+                    let &(engine, _) = self.members.get(&id)?;
+                    Some(Moved { engine, from, to })
+                }
+                _ => None,
+            })
+            .collect())
     }
 
     /// Ends the feeds, the held requests, the engines and the controller,
@@ -2038,6 +2131,7 @@ impl Embedded {
             Arc::clone(&self.probed),
             Arc::clone(&self.turns),
             self.stop_feeds.subscribe(),
+            true,
         ));
     }
 
@@ -2063,6 +2157,7 @@ impl Embedded {
             now: Instant::now(),
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         let mut out = ViewBuffers::default();
         self.store.deciding(|world| {

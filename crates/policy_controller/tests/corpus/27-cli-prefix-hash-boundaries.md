@@ -30,4 +30,7 @@ profiles:
 bindings:
   - match: { model: "*" }
     profile: prefix_hash
+    routing_key:
+      sources:
+        - header: x-smg-routing-key
 ```

@@ -111,6 +111,9 @@ impl Engine {
     /// mark the rule's own pick carries ([`Lifted::Overload`]), under a rule
     /// and under none.
     ///
+    /// `KEEPS` is the keeping entry's form ([`Engine::decide_keeping`]):
+    /// under a rule the decision also keeps what it read of the key.
+    ///
     /// Out of line: a kept key is the rare decision, and the engine's
     /// decision path keeps its code for every other.
     #[inline(never)]
@@ -118,7 +121,7 @@ impl Engine {
         clippy::too_many_arguments,
         reason = "the profile run's inputs, as run_profile takes them"
     )]
-    pub(super) fn keep(
+    pub(super) fn keep<const KEEPS: bool>(
         &self,
         profile: &Profile,
         index: u16,
@@ -130,7 +133,7 @@ impl Engine {
         scratch: &mut Scratch,
     ) -> Decision {
         if let Some(rule) = rule {
-            return self.decide_session::<true>(
+            return self.decide_session::<true, KEEPS>(
                 profile,
                 index,
                 rule,
@@ -363,8 +366,11 @@ pub(super) fn emptied(
     // A doubt is a row's own bit or the host's mask beside the rows, and
     // the tier opens for a row the doubt alone refuses. A doubt on a row a
     // harder veto refuses too gains nobody when it is lifted. Nor does a
-    // row a hold of the host stands on: it stays masked.
-    let own = candidates.iter().any(|row| doubted_alone(row.health));
+    // row a hold of the host stands on, whichever doubt it carries: it
+    // stays masked, and both tests pass it by.
+    let own = candidates
+        .iter()
+        .any(|row| doubted_alone(row.health) && cx.held.binary_search(&row.position).is_err());
     // The two lengths answer for the rows only where every held row is a
     // row of the mask, named once: the store's view keeps that, and a host
     // that fills the constraints by hand owes it.
@@ -614,7 +620,7 @@ mod tests {
     fn engine_filtering(filters: &[&str], shed: bool) -> Engine {
         let mut spec = PolicySpec::preset("round_robin").expect("the preset's form");
         for profile in spec.profiles.values_mut() {
-            profile.filter = filters.iter().map(ToString::to_string).collect();
+            profile.filter = filters.iter().map(|&name| name.into()).collect();
         }
         if shed {
             spec.bindings
@@ -1742,10 +1748,11 @@ mod tests {
             rule.inflight_cap = cap;
         }
         spec.view.headers = manual.view.headers.clone();
-        spec.bindings
-            .first_mut()
-            .expect("the preset's binding")
-            .sessions = Some(rule);
+        let binding = spec.bindings.first_mut().expect("the preset's binding");
+        // The rule names the key's header, so the ring's own sources go: a
+        // binding names them once.
+        binding.routing_key = None;
+        binding.sessions = Some(rule);
         spec.validate().expect("the document builds")
     }
 
@@ -2225,6 +2232,37 @@ mod tests {
             ..keyed("k1")
         };
         assert_ne!(order(&decide(&engine, &other, &pool))[0], owner);
+    }
+
+    /// A client's key places like a session's and keeps nothing: the request
+    /// goes to the ring's worker for the key, and off it where that worker
+    /// is over its thresholds, which a session's key stays on.
+    #[test]
+    fn a_client_key_places_on_the_ring_and_lifts_no_veto() {
+        let engine = PolicySpec::preset("consistent_hashing")
+            .expect("the preset's form")
+            .validate()
+            .expect("the document builds");
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let as_client = |session: &RequestFacts<'static>| RequestFacts {
+            session_key: Identity::NONE,
+            client_key: session.session_key.hash,
+            ..*session
+        };
+        // Eight keys: one key alone passes a tie's draw one time in four.
+        for key in ["k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8"] {
+            let session = keyed(key);
+            let owner = ring_order(&engine, &session, &pool)[0];
+            let placed = order(&decide(&engine, &as_client(&session), &pool))[0];
+            assert_eq!(placed, owner, "{key}");
+        }
+        let session = keyed("k1");
+        let client = as_client(&session);
+        let owner = ring_order(&engine, &session, &pool)[0];
+        pool[owner as usize].health.overloaded = true;
+        pool[owner as usize].in_flight = 1;
+        assert_eq!(order(&decide(&engine, &session, &pool))[0], owner);
+        assert_ne!(order(&decide(&engine, &client, &pool))[0], owner);
     }
 
     /// The ring's preset with its one profile's scorers and picker replaced,
@@ -3726,6 +3764,45 @@ mod tests {
         assert_eq!(passes, pool.len());
         let (one, passes) = ask(&[0, 1, 3]);
         assert_eq!(order(&one), vec![2]);
+        assert_eq!(passes, 2 * pool.len());
+    }
+
+    /// A held row that carries a doubt of its own gains nobody either: the
+    /// hold stands through the tier, on a lent row with its leader's bit
+    /// as on any other. A pool held on every row costs its one pass
+    /// whether or not a row carries the bit. A row that carries it with no
+    /// hold on it still opens the tier and takes the request.
+    #[test]
+    fn a_held_row_that_carries_its_own_doubt_costs_no_further_pass() {
+        let mut pool = [free(0, 0), free(1, 1), free(2, 9)];
+        pool[0].health.stalled = true;
+        pool[1].health.stalled = true;
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counts: Box<dyn Filter> = Box::new(Counts(Arc::clone(&asked)));
+        let (engine, _) = counted_among(|_| vec![counts, Box::new(Healthy)]);
+        let ask = |stalled: &[u32], held: &[u32]| {
+            let masked = Constraints {
+                stalled,
+                held,
+                ..Constraints::default()
+            };
+            let mut scratch = Scratch::new();
+            let decision = engine.decide(
+                &facts(1),
+                &PoolFacts::default(),
+                &pool,
+                &masked,
+                &mut scratch,
+            );
+            (decision, asked.swap(0, Ordering::Relaxed))
+        };
+        let (whole, passes) = ask(&[0, 1, 2], &[0, 1, 2]);
+        assert_eq!(shed_of(&whole), (ShedReason::NoEndpoints, "healthy"));
+        assert_eq!(passes, pool.len());
+        // Row 1 carries the bit and no hold: the tier opens for it alone.
+        let (one, passes) = ask(&[0, 2], &[0, 2]);
+        assert_eq!(order(&one), vec![1]);
+        assert_eq!(one.trace().lifted, Lifted::Liveness);
         assert_eq!(passes, 2 * pool.len());
     }
 

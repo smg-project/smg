@@ -363,6 +363,61 @@ fn the_absolute_margin_includes_its_edge() {
     );
 }
 
+/// A bare number under `margin` is the absolute margin: the document of
+/// the map, read from YAML and from JSON, and written back as the map.
+#[test]
+fn a_bare_margin_is_the_absolute_margin() {
+    let bare = document("terms: {load.running: 2}, margin: 10, unreported: missing-as-zero");
+    let map =
+        document("terms: {load.running: 2}, margin: {absolute: 10}, unreported: missing-as-zero");
+    assert_eq!(bare, map);
+    assert_eq!(
+        document("terms: {candidate.in_flight: 1}, margin: 2.5"),
+        document("terms: {candidate.in_flight: 1}, margin: {absolute: 2.5}")
+    );
+    let rows = reports([(113, 0), (118, 0), (120, 0)]);
+    assert_eq!(
+        scores(
+            "terms: {load.running: 2}, margin: 10, unreported: missing-as-zero",
+            &rows
+        ),
+        [(1, 1.0), (2, 1.0), (3, 0.0)]
+    );
+    let json = serde_json::to_string(&bare).expect("the document writes as JSON");
+    let parts = r#""margin":{"absolute":10.0,"relative":0.0}"#;
+    assert!(json.contains(parts), "{json}");
+    for number in ["10", "10.0"] {
+        let written = json.replace(parts, &format!(r#""margin":{number}"#));
+        let read: PolicySpec = serde_json::from_str(&written).expect("the JSON reads");
+        assert_eq!(read, bare, "{number}");
+    }
+}
+
+/// A bare margin holds the absolute margin's bounds, and a margin that is
+/// neither a number nor the map is refused by the two forms it takes.
+#[test]
+fn a_bare_margin_is_bounded_and_no_third_form_reads() {
+    for value in ["-1", "-0.25", ".nan", ".inf", "1.2e15"] {
+        refused(
+            &format!("terms: {{candidate.in_flight: 3}}, margin: {value}"),
+            "margin.absolute",
+            "a finite number from 0 to 1e15",
+        );
+    }
+    for margin in ["wide", "true", "[10, 0]"] {
+        let err = parse(
+            &format!("{{least-cost: {{terms: {{candidate.in_flight: 3}}, margin: {margin}}}}}"),
+            "best",
+        )
+        .expect_err("a margin of a third form");
+        assert!(
+            err.to_string()
+                .contains("a number, the absolute margin, or a map of `absolute` and `relative`"),
+            "{margin}: {err}"
+        );
+    }
+}
+
 #[test]
 fn costs_one_apart_stay_distinct_at_large_magnitudes() {
     let rows = reports([(17_200_012, 0), (17_200_012, 2)]);
@@ -733,7 +788,7 @@ fn a_report_term_requires_a_rule_for_missing_values() {
     refused(
         "terms: {load.queued: 3}",
         "unreported",
-        "what a row with no report costs, which a term that reads a report needs: over-least or missing-as-zero",
+        "what a row with no report, or with no fresh value of a signal, costs, which a term that reads a report or a signal needs: over-least or missing-as-zero",
     );
 }
 

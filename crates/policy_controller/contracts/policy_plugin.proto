@@ -51,7 +51,7 @@ enum HashKind {
   HASH_KIND_UNSPECIFIED = 0;
   // Token blocks of the model's block size of record.
   HASH_KIND_TOKEN = 1;
-  // Fixed character windows over the text, for a host without a tokenizer.
+  // Fixed windows of bytes over the text, for a host without a tokenizer.
   HASH_KIND_TEXT = 2;
 }
 
@@ -276,7 +276,10 @@ message RequestFacts {
   bool streaming = 5;
   uint32 max_output_tokens = 6;
   uint32 prompt_tokens = 7;  // the host's count or estimate
-  // Prefix block hashes, capped by `view.max_block_hashes` (1 to 8,190): a
+  // One hash a whole block of the prompt, in order from the first. A hash is
+  // of its own block's content and of nothing ahead of it: a prefix is named
+  // by the fold of its blocks' hashes, which a stage that keys by one makes.
+  // The list is capped by `view.max_block_hashes` (1 to 8,190): a
   // controller reads the first of a longer list, as many as the stages of
   // its generation read and that many at most, and refuses no list for its
   // length under the frame's bound. A DecideRequest over that bound, 64 KiB
@@ -309,10 +312,20 @@ message RequestFacts {
   // request `Busy` with no reason and never decides it as a request with no
   // prefix.
   bytes prompt_text = 18;
-  // The size in tokens of one of the request's blocks as the host counted
-  // them: an index's learned block size on an event-fed request, the
-  // configured one on a tree-fed request; 0 reads the view's.
+  // The size of one of the request's blocks as the host counted them. Under
+  // the token kind it is in tokens: an index's learned block size on an
+  // event-fed request, the configured one on a tree-fed request; 0 reads the
+  // view's. Under the text kind it is the window's size in bytes, and a text
+  // request always states it. A text frame that carries hashes and states
+  // none is refused by this field.
   uint32 block_size = 19;
+  // The fingerprint of the request's client, as the host derives it from the
+  // client sources of its binding's routing key; 0 where the request names
+  // none. A plain ring places a request that has no session key by it, and
+  // nothing else reads it: it lifts no overload veto, pins no session and is
+  // counted under no key. Host to controller alone: a plugin's frame carries
+  // 0 under every exposure.
+  fixed64 client_key = 20;
 }
 
 // What only the deciding gateway knows now. Its standing vetoes are not here:
@@ -425,12 +438,13 @@ message Lease {
 
 // Serves the routing trace header and Explain; positions into the generation's
 // spec. The record carries the first five fields (its `top` at most three
-// entries, each only `worker_id` and `score`) and reads `drew_first` from
-// its count, which a decision that drew first does not hold, and `lifted`
-// from the all-vetoed rule's pick; the observability contract fills the
-// rest, unset until then.
+// entries, each only `worker_id` and `score`). It reads `drew_first` from its
+// count, `lifted` from the all-vetoed rule's pick, and `no_profile` from the
+// profile mark. The observability contract fills the rest, unset until then.
 message Trace {
-  // Zero-based position in the spec's profile names in ascending UTF-8 order.
+  // Read no_profile first. Where the decision was made under a profile, this
+  // is its zero-based position in the spec's profile names in ascending
+  // UTF-8 order.
   uint32 profile = 1;  // u16
   // Candidates left after the filters, where the decision counted them:
   // unset, never a zero, when it drew first (`drew_first`).
@@ -465,6 +479,9 @@ message Trace {
   // and so does the pick of a session key kept on its worker. A host counts
   // both from this field.
   LiftedVeto lifted = 13;
+  // True when the decision was made ahead of every profile, where no binding
+  // resolved one. In that case profile is 0.
+  bool no_profile = 14;
 }
 
 // The soft vetoes the all-vetoed rule lifts, in the order it lifts them. The
@@ -507,6 +524,16 @@ message Busy {
     REASON_NO_CREDIT = 2;
     REASON_BUDGET_GONE_ON_ARRIVAL = 3;
     REASON_NOT_LEADER = 4;
+    // The decode call names no lease of this gateway.
+    REASON_DECODE_NO_LEASE = 5;
+    // The lease's decode side was never chosen: its first request did not say
+    // that the decode comes later, or the lease is no pair's.
+    REASON_DECODE_NOT_CHOSEN = 6;
+    // The lease's prefill is not held: not dispatched yet, or ended.
+    REASON_DECODE_PREFILL_NOT_HELD = 7;
+    // The decode side stands: a call issued it, a dispatch named it, its
+    // gateway ended it, or it took as many calls as one lease takes (255).
+    REASON_DECODE_STANDS = 8;
   }
   Reason reason = 1;
   uint32 retry_after_micros = 2;

@@ -38,7 +38,8 @@ const SIZES: [usize; 3] = [8, 64, 512];
 const SHALLOW_BLOCKS: usize = 4;
 
 /// The block hashes of a prompt of 1,024 tokens in blocks of sixteen. The
-/// key is the sixteenth: the last whole block at or under 256 tokens.
+/// key folds the first sixteen, through the last whole block at or under
+/// 256 tokens.
 fn prompt() -> Vec<u64> {
     (1..=64u64)
         .map(|block| block.wrapping_mul(0x9e37_79b9_7f4a_7c15))

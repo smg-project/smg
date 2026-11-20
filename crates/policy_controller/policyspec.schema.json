@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "PolicySpec",
-  "description": "The policy specification, version `smg.policy/v1`: what the host builds\ninto the view, the per-model index settings, the profiles with their\nstages, the plans' rules and the ordered bindings. An unknown field at\nany level is refused by name.",
+  "description": "The policy specification, version `smg.policy/v1`: what the host builds\ninto the view, the per-model index settings, the signals its stages\nread, the profiles with their stages, the plans' rules and the ordered\nbindings. An unknown field at any level is refused by name.",
   "type": "object",
   "properties": {
     "apiVersion": {
@@ -24,6 +24,17 @@
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/IndexSpec"
+      }
+    },
+    "signals": {
+      "description": "The signals the document's stages read, by name: a lower-case\nletter, then lower-case letters, digits and underscores, at most 63\nbytes. At most 64. A signal's column is its place among the names,\nin name order.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/SignalSpec"
+      },
+      "maxProperties": 64,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]{0,62}$"
       }
     },
     "profiles": {
@@ -97,7 +108,7 @@
           "default": 256
         },
         "max_report_age_ms": {
-          "description": "With this limit in milliseconds set, `least-load`, `resident-work`,\n`least-cost` and the KV-pressure gates of `prefix-affinity` and\n`warmup-slice` treat older reports as missing. A report exactly at\nthe limit still counts. Overload verdicts can still reflect older\nreports, plugins interpret report age themselves, and host-registered\nstages keep their own rules. Omit it to use reports of any age.",
+          "description": "With this limit in milliseconds set, `least-load`, `resident-work`,\n`least-cost` and the KV-pressure gates of `prefix-affinity` and\n`warmup-slice` treat older reports as missing. A report exactly at\nthe limit still counts. A host-registered stage reads a report\nunder the limit through its build context's `reports()`, and one\nthat reads the row's report itself sees it at any age. Overload\nverdicts can still reflect older reports, and plugins interpret\nreport age themselves. Omit it to use reports of any age.",
           "type": [
             "integer",
             "null"
@@ -149,7 +160,7 @@
           "default": 180
         },
         "max_size": {
-          "description": "The size bound of a tree index: characters on a text host, tokens\notherwise.",
+          "description": "The size bound of a tree index: characters on a text host, tokens\notherwise. The crate's own store reads it for a pool whose profile\nreads sent prefixes: the model's record is bound to `max_size` over\nthe block size placements, never under one, one a block a worker\nwas sent. A lowered bound is met by sweeps at the record's next\nwrites, and a pool whose lanes are all heard writes none.",
           "type": "integer",
           "format": "uint64",
           "minimum": 1,
@@ -180,15 +191,71 @@
         }
       ]
     },
+    "SignalSpec": {
+      "description": "One declared signal: a named value of a worker's report that the\ndocument's stages read beside the rows.",
+      "type": "object",
+      "properties": {
+        "unit": {
+          "description": "The unit a source states for its value to be taken: 1 to 31 ASCII\ncharacters with no space. It is compared byte for byte with the\nunit a report states.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 31,
+          "pattern": "^[!-~]*$"
+        },
+        "max_age_ms": {
+          "description": "A value older than this reads as no value: 1 to 3,599,999, the\nbound of the view's `max_report_age_ms`. A store's clock keeps one\nhour, and a sample older than that stands at the clock's origin:\nunder a longer limit it would read as fresh. Absent: a value does\nnot end by its age.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1,
+          "maximum": 3599999
+        },
+        "across_ranks": {
+          "description": "How one row's value is made where its report holds several ranks.\nAbsent: the sum.",
+          "$ref": "#/$defs/AcrossRanks"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "unit"
+      ]
+    },
+    "AcrossRanks": {
+      "description": "How one row's value is made where its report holds several ranks: a\nworker of several data-parallel ranks that stands as one row. Where\neach rank is a row of its own, nothing is reduced.",
+      "oneOf": [
+        {
+          "description": "The ranks' values added: an amount each rank holds a part of.",
+          "type": "string",
+          "const": "sum"
+        },
+        {
+          "description": "The largest of the ranks' values.",
+          "type": "string",
+          "const": "max"
+        },
+        {
+          "description": "The smallest of the ranks' values.",
+          "type": "string",
+          "const": "min"
+        },
+        {
+          "description": "The mean of the ranks' values.",
+          "type": "string",
+          "const": "mean"
+        }
+      ]
+    },
     "ProfileSpec": {
       "description": "One profile: an ordered set of filters, weighted scorers and exactly one\npicker.",
       "type": "object",
       "properties": {
         "filter": {
-          "description": "The hard filters, in order. Which workers the hard filters keep does\nnot turn on their order; a shed's reason does: a shed names the\nfirst filter, in this order, that left nobody.",
+          "description": "The hard filters, in order: each a name, or the name of a filter the\ncatalog adds mapped to its parameters. Which workers the hard\nfilters keep does not turn on their order; a shed's reason does: a\nshed names the first filter, in this order, that left nobody.",
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/FilterSpec"
           },
           "default": []
         },
@@ -201,7 +268,7 @@
           "default": []
         },
         "pick": {
-          "description": "The picker.",
+          "description": "The picker: a name, a built-in mapped to its parameters, or the name\nof a picker the catalog adds mapped to its parameters.",
           "$ref": "#/$defs/PickSpec"
         },
         "sent_ttl_ms": {
@@ -219,12 +286,132 @@
         "pick"
       ]
     },
-    "ScoreSpec": {
-      "description": "A scorer: its bare name (the stage at its defaults), or the name mapped to its weight and parameters.",
+    "FilterSpec": {
+      "description": "A filter: its bare name, a built-in mapped to its parameters, or the name of a filter the host adds mapped to its parameters.",
       "anyOf": [
         {
           "type": "string",
-          "enum": [
+          "examples": [
+            "healthy",
+            "not-overloaded",
+            "has-capacity",
+            "has-room",
+            "not-tried"
+          ]
+        },
+        {
+          "$ref": "#/$defs/FilterStage"
+        },
+        {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 1,
+          "propertyNames": {
+            "not": {
+              "const": "has-room"
+            }
+          },
+          "additionalProperties": {
+            "type": "object"
+          }
+        }
+      ]
+    },
+    "FilterStage": {
+      "description": "A built-in filter with its parameters, keyed by the filter's name:\n`{ has-room: { used, capacity } }`. One key per entry.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "has-room": {
+              "$ref": "#/$defs/HasRoomParams"
+            }
+          },
+          "required": [
+            "has-room"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "HasRoomParams": {
+      "description": "`has-room` by a rule: a worker has room where what it holds is at most\nits capacity less the headroom, `used <= (1 - headroom) * capacity`.\nThe filter stays soft: where no worker has room, every worker stands.\nWritten bare, `has-room` reads the bit its host sets. A null under the\nname, the slip of a bare name written with a colon, is refused with\nboth forms named, whichever reader takes the document.",
+      "type": "object",
+      "properties": {
+        "used": {
+          "description": "What a worker holds: field names and their coefficients, summed. At\nleast one is required. A name written `signal.<name>` reads a signal\nthe document declares. Under a capacity that is a number, a field\nor a signal of the worker is required: the request's size alone\nreads nothing of a worker there. A worker that lacks a named value\nhas no room.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "format": "double",
+            "minimum": -1000000000000000.0,
+            "maximum": 1000000000000000.0,
+            "not": {
+              "const": 0
+            }
+          },
+          "minProperties": 1,
+          "propertyNames": {
+            "anyOf": [
+              {
+                "enum": [
+                  "candidate.in_flight",
+                  "load.active_kv_permille",
+                  "load.kv_usage_permille",
+                  "load.queued",
+                  "load.resident_tokens",
+                  "load.running",
+                  "load.waiting_uncached_tokens",
+                  "request.prompt_tokens",
+                  "sent.requests",
+                  "sent.tokens"
+                ]
+              },
+              {
+                "pattern": "^signal\\.[a-z][a-z0-9_]{0,62}$"
+              }
+            ]
+          }
+        },
+        "capacity": {
+          "description": "What a worker can hold, in the units of `used`: a number, or a\nsignal the document declares. A worker whose capacity reads zero or\nless has no room.",
+          "$ref": "#/$defs/Capacity"
+        },
+        "headroom": {
+          "description": "The share of the capacity kept free: from 0 to under 1.",
+          "type": "number",
+          "format": "double",
+          "default": 0.0,
+          "minimum": 0,
+          "exclusiveMaximum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "used",
+        "capacity"
+      ]
+    },
+    "Capacity": {
+      "description": "What a worker can hold: a number above zero in the units of `used`, or a signal the document declares, written `signal.<name>`.",
+      "anyOf": [
+        {
+          "type": "number",
+          "format": "double",
+          "exclusiveMinimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^signal\\.[a-z][a-z0-9_]{0,62}$"
+        }
+      ]
+    },
+    "ScoreSpec": {
+      "description": "A scorer: its bare name (a stock scorer at its defaults, or a scorer the host adds at weight one), a stock scorer mapped to its weight and parameters, or the name of a scorer the host adds mapped to its weight and parameters. The stock scorers a document names bare: least-load, least-requests, fewest-sessions, session-affinity, prefix-affinity, kv-pressure, warmup-slice, bucket, consistent-hash.",
+      "anyOf": [
+        {
+          "type": "string",
+          "examples": [
             "least-load",
             "least-requests",
             "fewest-sessions",
@@ -238,6 +425,31 @@
         },
         {
           "$ref": "#/$defs/ScoreStage"
+        },
+        {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 1,
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "least-load",
+                "least-requests",
+                "fewest-sessions",
+                "session-affinity",
+                "prefix-affinity",
+                "kv-pressure",
+                "warmup-slice",
+                "bucket",
+                "consistent-hash",
+                "resident-work",
+                "least-cost"
+              ]
+            }
+          },
+          "additionalProperties": {
+            "type": "object"
+          }
         }
       ]
     },
@@ -464,7 +676,7 @@
           "minimum": 0.0
         },
         "source": {
-          "description": "Where placements come from (default `index`).",
+          "description": "Where placements come from (default `merged`).",
           "anyOf": [
             {
               "$ref": "#/$defs/AffinitySource"
@@ -501,17 +713,17 @@
       "description": "Where prefix affinity reads placements from.",
       "oneOf": [
         {
-          "description": "The event-fed prefix index.",
+          "description": "The index of cache events alone.",
           "type": "string",
           "const": "index"
         },
         {
-          "description": "The side index of prefixes sent, for workers without an event\nsubscription.",
+          "description": "The record of the prefixes sent alone.",
           "type": "string",
           "const": "predictor"
         },
         {
-          "description": "Both, merged by per-worker maximum.",
+          "description": "Each worker by what it has: its cache events where it publishes\nthem, and the prefixes sent to it where it does not.",
           "type": "string",
           "const": "merged"
         }
@@ -714,7 +926,7 @@
           "exclusiveMinimum": 0
         },
         "prefix_tokens": {
-          "description": "The depth in tokens at which a request with no routing key is keyed\nby its prefix: the last whole block at or under the depth, so at\nleast one block of the view's block size and at most the blocks a\nrequest carries. Under the view's `boundaries` a request that reaches\none is keyed there instead, at the deepest it reaches. The depth is\nchecked in the view's token blocks and read in the blocks a request\nwas hashed by. A text request's windows are `block_size` characters,\na quarter of a token block, so it carries a quarter of the checked\ndepth and a deeper depth keys at its last window. Under a block size\nan engine published above the depth a request has no key. Absent, a\nrequest with no routing key has none.",
+          "description": "The depth in tokens at which a request with no routing key is keyed\nby its prefix through the last whole block at or under the depth, so at\nleast one block of the view's block size and at most the blocks a\nrequest carries. Under the view's `boundaries` a request that reaches\none is keyed there instead, at the deepest it reaches. The depth is\nchecked in the view's token blocks and read in the blocks a request\nwas hashed by. A host that hashes a text request by windows of the\nblock size times four bytes gives it the checked depth in windows,\nas a token request has it in blocks. Under a block size\nan engine published above the depth a request has no key. Absent, a\nrequest with no routing key has none.",
           "type": [
             "integer",
             "null"
@@ -797,7 +1009,7 @@
           "maximum": 1000000000000000.0
         },
         "terms": {
-          "description": "Field names and their coefficients. At least one field is required.",
+          "description": "Field names and their coefficients. At least one field is required.\nA name written `signal.<name>` reads a signal the document declares.",
           "type": "object",
           "additionalProperties": {
             "type": "number",
@@ -810,29 +1022,47 @@
           },
           "minProperties": 1,
           "propertyNames": {
-            "enum": [
-              "candidate.in_flight",
-              "load.active_kv_permille",
-              "load.kv_usage_permille",
-              "load.queued",
-              "load.resident_tokens",
-              "load.running",
-              "load.waiting_uncached_tokens",
-              "sent.requests",
-              "sent.tokens"
+            "anyOf": [
+              {
+                "enum": [
+                  "candidate.in_flight",
+                  "load.active_kv_permille",
+                  "load.kv_usage_permille",
+                  "load.queued",
+                  "load.resident_tokens",
+                  "load.running",
+                  "load.waiting_uncached_tokens",
+                  "sent.requests",
+                  "sent.tokens"
+                ]
+              },
+              {
+                "pattern": "^signal\\.[a-z][a-z0-9_]{0,62}$"
+              }
             ]
           }
         },
         "margin": {
-          "description": "How far above the least cost a row still ties for the top score.",
-          "$ref": "#/$defs/CostMargin",
+          "description": "How far above the least cost a row still ties for the top score: the\nmap of its two parts, or a bare number, the absolute margin.",
+          "anyOf": [
+            {
+              "description": "The absolute margin, in cost units.",
+              "type": "number",
+              "format": "double",
+              "minimum": 0,
+              "maximum": 1000000000000000.0
+            },
+            {
+              "$ref": "#/$defs/CostMargin"
+            }
+          ],
           "default": {
             "absolute": 0.0,
             "relative": 0.0
           }
         },
         "unreported": {
-          "description": "What a row costs when a named value is missing. Required for terms\nthat read a report.",
+          "description": "What a row costs when a named value is missing. Required for terms\nthat read a report or a signal.",
           "anyOf": [
             {
               "$ref": "#/$defs/Unreported"
@@ -907,11 +1137,11 @@
       ]
     },
     "PickSpec": {
-      "description": "A picker: its bare name, or the name mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool.",
+      "description": "A picker: its bare name, a built-in mapped to its parameters, or the name of a picker the host adds mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool. The stock pickers a document names bare: best, round-robin, random, power-of-two, count-first, power-of-two-count-first, passthrough, manual.",
       "anyOf": [
         {
           "type": "string",
-          "enum": [
+          "examples": [
             "best",
             "round-robin",
             "random",
@@ -924,6 +1154,22 @@
         },
         {
           "$ref": "#/$defs/PickStage"
+        },
+        {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 1,
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "best",
+                "best-with-temperature"
+              ]
+            }
+          },
+          "additionalProperties": {
+            "type": "object"
+          }
         }
       ]
     },
@@ -996,7 +1242,8 @@
         "pd-pair": {
           "$ref": "#/$defs/PdPairPlanSpec",
           "default": {
-            "pairing": "lenient"
+            "pairing": "lenient",
+            "decode": "with-prefill"
           }
         }
       },
@@ -1009,6 +1256,11 @@
         "pairing": {
           "$ref": "#/$defs/Pairing",
           "default": "lenient"
+        },
+        "decode": {
+          "description": "When a pair's decode side is picked: `with-prefill` (the default)\nor `after-prefill`.",
+          "$ref": "#/$defs/DecodePick",
+          "default": "with-prefill"
         }
       },
       "additionalProperties": false
@@ -1030,6 +1282,21 @@
           "description": "Runtime, transport and KV layout are known on both sides and agree,\nand reported engine versions match.",
           "type": "string",
           "const": "strict"
+        }
+      ]
+    },
+    "DecodePick": {
+      "description": "When a pair's decode side is picked.",
+      "oneOf": [
+        {
+          "description": "With the prefill, in the pair's one decision.",
+          "type": "string",
+          "const": "with-prefill"
+        },
+        {
+          "description": "After the prefill has run, on a route that sends the decode then.\nThe pair's first decision books the prefill alone and names the\ndecode's targets. The host asks the decode again when the prefill\nhas answered, and that decision reads the rows of its own instant.\nA route that sends both sides at once keeps the first decision's\ndecode.",
+          "type": "string",
+          "const": "after-prefill"
         }
       ]
     },
@@ -1323,7 +1590,7 @@
           "minimum": 1
         },
         "token_usage": {
-          "description": "Mean KV usage over an engine's ranks at or above which a worker is\nvetoed; above 0 and at most 1 (default 0.8).",
+          "description": "Mean active KV usage over an engine's ranks at or above which a\nworker is vetoed; above 0 and at most 1 (default 0.8). A rank that\nreports no active share counts its whole usage.",
           "type": [
             "number",
             "null"
@@ -1345,13 +1612,13 @@
       "type": "object",
       "properties": {
         "sources": {
-          "description": "The sources, read in order: one to eight, each named once.",
+          "description": "The sources, read in order: one to eight, each named once, and up\nto four client sources beside them.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/KeySourceSpec"
           },
           "minItems": 1,
-          "maxItems": 8
+          "maxItems": 12
         },
         "strip_lineage": {
           "description": "Take the turn and retry suffixes off a key, so every turn of a\nconversation shares one (`conv_t2_r1` keys as `conv`); default\nfalse.",
@@ -1379,7 +1646,7 @@
           "type": "boolean"
         },
         "max_bytes": {
-          "description": "The most bytes of a value this source hands, 8192 at most (default\n128). A longer value is passed over and the next source is read.",
+          "description": "The most bytes of a value this source hands, 8192 at most (default\n128). A longer value is passed over and the next source is read. A\nheader is measured as sent, and the request's own id after the\nblock's `strip_lineage` took its suffixes off.",
           "type": [
             "integer",
             "null"
@@ -1387,6 +1654,10 @@
           "format": "uint32",
           "minimum": 1,
           "maximum": 8192
+        },
+        "client": {
+          "description": "A source that tells one client from another, not one session: a\nheader a proxy or a browser sets. Its key places a request that\ncarries no session key on a ring. It lifts no overload veto, pins\nno session and is counted under no key. Of a binding's client\nsources, the first whose header a request carries is the one read,\nand a value it cannot hand ends the read. The value is read whole\nand leaves as its fingerprint alone, so `rid` and `max_bytes` are\nrefused beside it. A header may be named both ways: capped as a\nsession's source, and whole as a client's where that read handed no\nkey. Default false.",
+          "type": "boolean"
         }
       },
       "additionalProperties": false
@@ -1487,7 +1758,7 @@
           "type": "string"
         },
         {
-          "description": "Shadow profiles by side. Validation currently refuses this form.",
+          "description": "A pair's shadow profiles by side: `prefill`, `decode` or both.",
           "type": "object",
           "additionalProperties": {
             "type": "string"

@@ -20,11 +20,13 @@
 //! reads no membership: it pays the pair entry's cost alone.
 
 use super::{
-    carries_a_column, column_fits, debug_assert_indexed, reason_of, run_profile, shed, Buffers,
-    ClassBits, Engine, PairPools, Plan, Profile, Scratch, Set, AFFINITY_COLUMN,
+    carries_a_column, column_fits, debug_assert_cells, debug_assert_indexed, reason_of,
+    run_profile, shed, Buffers, ClassBits, Engine, PairPools, Plan, Profile, Scratch, Set,
+    AFFINITY_COLUMN,
 };
 use crate::{
     decision::{Decision, ShedReason, Target, Targets, Trace},
+    signals::{SignalCell, SignalCells},
     view::{AffinityFacts, Candidate, Constraints, Identity, Phase, PoolFacts, RequestFacts},
     Draw,
 };
@@ -83,6 +85,9 @@ pub struct EncodePool<'a> {
     pub prefill_classes: &'a [u32],
     /// The encoders' affinity facts: empty, or one entry an encoder.
     pub affinity: &'a [AffinityFacts],
+    /// The encoders' signal cells: what the encode side's stages find in
+    /// [`RequestFacts::signal_cells`]. `None` where they read no signal.
+    pub signal_cells: Option<&'a SignalCells>,
 }
 
 /// The encode items of a request and what it asks for them.
@@ -138,13 +143,18 @@ impl EncodePlaced {
 }
 
 /// Rows admitted from a pool, each standing at its index here, with where
-/// it stood in the pool and its affinity facts.
+/// it stood in the pool, its affinity facts and its signal cells.
 #[derive(Debug, Default)]
 struct Admitted {
     rows: Vec<Candidate>,
     /// Each row's index in the pool it was admitted from.
     from: Vec<u32>,
     affinity: Vec<AffinityFacts>,
+    /// The rows' signal cells, a row's after the row's before it: emptied
+    /// and filled for a side that was handed cells
+    /// ([`Admitted::copy_cells`]) and lent to that side alone. A pass that
+    /// was handed none leaves them as they were: it pays nothing for them.
+    cells: SignalCells,
     /// The rows here that a mask over the pool names, by their index here:
     /// empty until a mask is numbered anew ([`Admitted::renumber`]). Its
     /// room is taken with the rows ([`Admitted::take_room`]).
@@ -178,6 +188,24 @@ impl Admitted {
         self.from.clear();
         self.affinity.clear();
         self.masked.clear();
+    }
+
+    /// Copies the admitted rows' cells from the pool's, in the rows' order
+    /// here. The host's cells are by the pool's positions, and a stage
+    /// reads an admitted row by its index here: left on the host's cells
+    /// it would read another row's value. A row outside the host's cells
+    /// takes cells of no value. Asked once a pass, after its last row is
+    /// admitted, and only for a side that was handed cells. The cells here
+    /// keep their room from pass to pass.
+    fn copy_cells(&mut self, cells: &SignalCells) {
+        let signals = cells.signals();
+        let admitted = self.cells.refill(signals);
+        for &at in &self.from {
+            match cells.row(at) {
+                Some(row) => admitted.extend_from_slice(row),
+                None => admitted.extend(std::iter::repeat_n(SignalCell::NONE, signals)),
+            }
+        }
     }
 
     /// Numbers a mask over the pool's rows by the rows admitted, each by
@@ -343,7 +371,13 @@ fn saturation(
 /// pass; the list's stays a call.
 #[inline(always)]
 fn holds(classes: &ClassBits, far: &[u32], class: u32) -> bool {
-    classes.has(class) || (!far.is_empty() && far_holds(far, class))
+    holds_in(classes.words(), far, class)
+}
+
+/// [`holds`] over a set's words, for a pass that bound them once.
+#[inline(always)]
+fn holds_in(words: &[u64], far: &[u32], class: u32) -> bool {
+    ClassBits::has_in(words, class) || (!far.is_empty() && far_holds(far, class))
 }
 
 /// Whether `far` holds `class`. A numbering that is dense over the rows
@@ -459,13 +493,11 @@ impl Engine {
         side: &mut EncodeScratch,
         placed: &mut EncodePlaced,
     ) -> Decision {
-        let bare = Trace {
+        let unbound = Trace {
             seed: facts.seed,
             generation: pool.generation,
             ..Trace::default()
         };
-        let declined = |stage| turned_away(ShedReason::PolicyDeclined, stage, bare);
-        let gap = |stage| turned_away(ShedReason::NoEndpoints, stage, bare);
         // The prefill's lookup names the plan: a binding of another plan
         // declines, as a pair decision under a single binding is declined.
         let epd = self
@@ -475,11 +507,21 @@ impl Engine {
                 Plan::Single | Plan::PdPair => None,
             });
         let Some(index) = epd else {
-            return declined("binding");
+            return turned_away(ShedReason::PolicyDeclined, "binding", unbound);
         };
         let Some(profile) = self.profiles.get(usize::from(index)) else {
-            return declined("binding");
+            return turned_away(ShedReason::PolicyDeclined, "binding", unbound);
         };
+        // The encode profile is resolved: a shed of the encode side below
+        // is made under it, and its trace says so. A column of the pair's
+        // or of the request's is refused as the other two entries refuse
+        // it, ahead of every profile.
+        let bare = Trace {
+            profile: index,
+            ..unbound
+        };
+        let declined = |stage| turned_away(ShedReason::PolicyDeclined, stage, bare);
+        let gap = |stage| turned_away(ShedReason::NoEndpoints, stage, bare);
         if encode.facts.len() != encode.encoders.len()
             || encode.prefill_classes.len() != pools.prefills.len()
             || !column_fits(encode.affinity, encode.encoders)
@@ -492,15 +534,20 @@ impl Engine {
         if !column_fits(pools.prefill_affinity, pools.prefills)
             || !column_fits(pools.decode_affinity, pools.decodes)
         {
-            return declined(AFFINITY_COLUMN);
+            return turned_away(ShedReason::PolicyDeclined, AFFINITY_COLUMN, unbound);
         }
         // A column on the request, or rows named on it, name neither pool.
         // The pair entry refuses them: here they are refused before a stage
         // of the encode side is asked.
         if carries_a_column(facts) {
-            return declined(AFFINITY_COLUMN);
+            return turned_away(ShedReason::PolicyDeclined, AFFINITY_COLUMN, unbound);
         }
         debug_assert_indexed(encode.encoders);
+        debug_assert_cells(encode.signal_cells, encode.encoders);
+        // Both pools' cells too, here: the copy for the admitted rows pads
+        // a short set, so past this line nothing says a host's wrong shape.
+        debug_assert_cells(pools.prefill_signal_cells, pools.prefills);
+        debug_assert_cells(pools.decode_signal_cells, pools.decodes);
         let needs = !items.keys.is_empty();
         // A profile that shows its rows to a plugin answers inside a scope
         // opened over the rows of one decision. None is opened over the
@@ -522,6 +569,9 @@ impl Engine {
             // encode side takes neither.
             pinned_at: 0,
             lent_in_flight: None,
+            // The encoders' own cells: the request's would be read by
+            // another pool's positions.
+            signal_cells: encode.signal_cells,
             ..*facts
         };
         let takes = |row: &Candidate, of: &EncoderFacts| takes_media(&items, images, row, of);
@@ -655,10 +705,17 @@ impl Engine {
         let (mut cx, mut decode_cx) = (cx, decode_cx);
         if !every_prefill {
             side.prefills.clear();
+            // The open classes are read once a row here. Their words and
+            // their far list are bound ahead of the pass: read through the
+            // scratch, each row loaded their place and their count again.
+            let (open, far_open) = (side.open.words(), side.far_open.as_slice());
             for (at, row) in pools.prefills.iter().enumerate() {
-                if open_class(class_of(at)) {
+                if holds_in(open, far_open, class_of(at)) {
                     side.prefills.push(row, at, pools.prefill_affinity);
                 }
+            }
+            if let Some(cells) = pools.prefill_signal_cells {
+                side.prefills.copy_cells(cells);
             }
             side.prefills.take_room();
             if !cx.stalled.is_empty() {
@@ -672,6 +729,10 @@ impl Engine {
             }
             admitted.prefills = &side.prefills.rows;
             admitted.prefill_affinity = &side.prefills.affinity;
+            // The side's cells are numbered with its rows: the admitted
+            // rows' cells stand in the host's stead, where it handed any.
+            admitted.prefill_signal_cells =
+                pools.prefill_signal_cells.map(|_| &side.prefills.cells);
         }
         let every_decode = !vision || pools.decodes.iter().all(|row| row.vision);
         if !every_decode {
@@ -680,6 +741,9 @@ impl Engine {
                 if row.vision {
                     side.decodes.push(row, at, pools.decode_affinity);
                 }
+            }
+            if let Some(cells) = pools.decode_signal_cells {
+                side.decodes.copy_cells(cells);
             }
             side.decodes.take_room();
             if !decode_cx.stalled.is_empty() {
@@ -693,9 +757,13 @@ impl Engine {
             }
             admitted.decodes = &side.decodes.rows;
             admitted.decode_affinity = &side.decodes.affinity;
+            admitted.decode_signal_cells = pools.decode_signal_cells.map(|_| &side.decodes.cells);
         }
-        let pair = self.decide_pair(facts, pool, admitted, cx, decode_cx, scratch);
-        let Decision::Pick(mut pick) = pair else {
+        // The pair's pick is turned where its decision stands and returned
+        // as that decision: taking it out and putting it back copies it
+        // twice.
+        let mut pair = self.decide_pair(facts, pool, admitted, cx, decode_cx, scratch);
+        let Decision::Pick(pick) = &mut pair else {
             return pair;
         };
         if !every_prefill || !every_decode {
@@ -713,7 +781,7 @@ impl Engine {
             pick.targets = targets;
         }
         if !needs {
-            return Decision::Pick(pick);
+            return pair;
         }
         // The alternates of a pair keep its prefill, so the first target's
         // class is every target's.
@@ -731,6 +799,11 @@ impl Engine {
                 side.offered.push(row, at, encode.affinity);
             }
         }
+        // The offered encoders' cells, numbered with them: the pool's are
+        // by the pool's positions.
+        if let Some(cells) = encode.signal_cells {
+            side.offered.copy_cells(cells);
+        }
         side.offered.take_room();
         // The offered encoders are numbered anew unless they are the whole
         // pool, and the encode side's mask is numbered with them.
@@ -745,6 +818,7 @@ impl Engine {
             };
             encode_cx = &offered_mask;
         }
+        let offered_cells = encode.signal_cells.map(|_| &side.offered.cells);
         let one = items.one.filter(|_| pushes);
         placed.one = one.is_some();
         let keys = one.as_ref().map_or(items.keys, std::slice::from_ref);
@@ -755,6 +829,7 @@ impl Engine {
                 session_key: *key,
                 seed: seeds.next_u64(),
                 affinity: &side.offered.affinity,
+                signal_cells: offered_cells,
                 ..encode_facts
             };
             let of_key = run_profile(
@@ -767,7 +842,8 @@ impl Engine {
                 &mut side.run,
             );
             match of_key {
-                Decision::Pick(of_key) => {
+                // A key's pick is read where its decision stands.
+                Decision::Pick(ref of_key) => {
                     let Some(target) = of_key.targets.first() else {
                         return gap(ENCODERS);
                     };
@@ -780,6 +856,6 @@ impl Engine {
                 Decision::Shed(_) | Decision::Queue(_) => return of_key,
             }
         }
-        Decision::Pick(pick)
+        pair
     }
 }

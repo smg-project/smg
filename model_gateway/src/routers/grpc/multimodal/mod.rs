@@ -81,6 +81,8 @@ pub(crate) use capability::{
     ensure_backend_supports_modalities, ensure_model_accepts_media, fleet_reads_format,
     request_needs_vision, worker_language_model_only,
 };
+#[cfg(test)]
+pub(crate) use config::tests::{hub_answering, HubEnv};
 pub(crate) use config::{
     load_image_preprocessor_config, load_video_preprocessor_config, MultimodalComponents,
     MultimodalConfigRegistry, MultimodalModelConfig,
@@ -93,9 +95,11 @@ pub(crate) use inflight::{
 pub(crate) use item_limits::engine_item_limits;
 pub(crate) use plan::{
     anchor_rendered_markers, prepare_placeholder_tokens, resolve_media_part_order,
-    validate_rendered_media_anchors, MediaPlan, PlaceholderTokens, RequestRefusal,
+    validate_rendered_media_anchors, DeploymentFault, MediaPlan, PlaceholderTokens, RequestRefusal,
 };
 pub(crate) use process::process_multimodal_plan;
+#[cfg(test)]
+pub(crate) use refs::MM_PROCESSOR_LABEL;
 pub(crate) use refs::{
     assemble_media_refs, ensure_selection_supports_media_refs, media_refs_pipeline_pin,
     models_without_media_processing, pool_processes_media_refs,
@@ -186,7 +190,6 @@ pub(crate) fn media_verdict(error: &anyhow::Error) -> Option<&MediaConnectorErro
 /// of a modality the model does not take. A configuration file the model's
 /// hub failed to serve is answered by [`config_unavailable_response`].
 pub(crate) fn processing_failed_response(error: &anyhow::Error) -> Response {
-    const PIPELINE_CODE: &str = "multimodal_processing_failed";
     let message = processing_failed_message(error);
     if encoder_budget::ItemOverEncoderBudget::is(error) {
         return error::bad_request(encoder_budget::ITEM_OVER_ENCODER_BUDGET_CODE, message);
@@ -251,6 +254,27 @@ pub(crate) fn config_unavailable_response(error: &anyhow::Error) -> Option<Respo
              retry the request",
         )
     })
+}
+
+/// The code of a failure of the media pipeline that has no code of its own.
+const PIPELINE_CODE: &str = "multimodal_processing_failed";
+
+/// The client's answer when the placeholder preparation fails for a cause
+/// its site marks as the deployment's own ([`DeploymentFault`]): a
+/// `config.json` this gateway holds and cannot read or parse, a spec's
+/// media limits or its placeholder token that cannot be resolved from the
+/// model's files, a vocabulary that lacks the token. A 500 under the
+/// pipeline's own code with a generic message: a client cannot fix it by
+/// its request, and the cause (the file, the token) is for the log at the
+/// call site. Unmarked failures from resolving the configuration directory
+/// keep their existing answer; these include an absent or inaccessible
+/// configuration as well as local client or cache setup failures.
+pub(crate) fn preparation_fault_response() -> Response {
+    error::internal_error(
+        PIPELINE_CODE,
+        "The gateway could not prepare media processing for this model; \
+         the request is not at fault",
+    )
 }
 
 /// Whether verbose multimodal timing logs are enabled (`--log-mm-timing` /

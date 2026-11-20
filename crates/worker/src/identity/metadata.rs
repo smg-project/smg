@@ -33,10 +33,12 @@ pub struct WorkerMetadata {
     /// The URL as a request's success path shows it: the routed-worker
     /// response header, the cache-trace header and the request-sent event.
     /// The registered URL byte for byte when it has no userinfo, query or
-    /// fragment; otherwise `endpoint::Endpoint::redacted_str`'s form (see
-    /// `Endpoint::redacted_url`). Computed once at construction (the worker
-    /// builder, the Go binding's worker); nothing on a request path parses
-    /// the URL.
+    /// fragment; otherwise its redacted form. The spec's own rule writes it
+    /// (`WorkerSpec::redacted_url`): a rank is read out of the address its
+    /// spec ranks alone. In any other, an `@` and digits at the end are a
+    /// userinfo before a host, which is masked, or bytes of an IPC path.
+    /// Computed once at construction (the worker builder, the Go binding's
+    /// worker); nothing on a request path parses the URL.
     pub redacted_url: String,
     /// Resolved health check config (router defaults + per-worker overrides).
     /// This is the concrete config used at runtime; `spec.health` only stores

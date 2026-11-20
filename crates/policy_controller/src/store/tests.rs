@@ -9,18 +9,19 @@ use std::{
 
 use super::{
     identity, identity_of,
-    leases::{Counts, Slot},
-    Ask, AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeSide, Dispatch,
-    GatewayId, Hand, HealthSink, HealthWrite, Journal, Kinds, KvEvent, KvEventSink, LeaseRecord,
-    LeaseRefused, LeaseState, LeasesStore, LoadSample, LoadSink, LoadSource, MembershipChange,
-    MembershipTail, MemoryStore, Picked, Pin, PollMode, Position, Reachability, ReservationKind,
-    ReservationStore, ResyncReason, Said, SequenceHash, SessionsStore, Sides, Signals,
-    SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, Watch, WorkerFacts, WorkerPatch, WorkerRow,
-    WorkerStatus, WorkersStore, World,
+    leases::{Counts, Slot, DISPATCH_TTL},
+    Ask, AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeRefused, DecodeSide,
+    Dispatch, GatewayId, Hand, HealthSink, HealthWrite, Journal, Kinds, KvEvent, KvEventSink,
+    LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSample, LoadSink, LoadSource,
+    MembershipChange, MembershipTail, MemoryStore, Picked, Pin, PollMode, Position, Reachability,
+    ReservationKind, ReservationStore, ResyncReason, Said, SequenceHash, SessionsStore, Sides,
+    Signals, SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, Watch, WorkerFacts, WorkerPatch,
+    WorkerRow, WorkerStatus, WorkersStore, World,
 };
 use crate::{
     decider::Decider,
     decision::{Target, Targets},
+    demands::DemandFacts,
     lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
     replication::Log,
     sessions::SessionVerdict,
@@ -129,7 +130,19 @@ fn a_replacement_carries_a_matching_registrations_status_and_a_changed_one_start
         WorkersStore::get(&store, same).expect("the row").status,
         WorkerStatus::Ready
     );
-    let mut other_role = facts("http://w:8000", 3);
+    // What a registration states for a hard demand is none of the three
+    // facts: its next life is handed the status too.
+    let mut other_runtime = facts("http://w:8000", 3);
+    other_runtime.demand_facts = DemandFacts {
+        runtime: 9,
+        ..DemandFacts::default()
+    };
+    let stated = store.upsert(other_runtime).id();
+    assert_eq!(
+        WorkersStore::get(&store, stated).expect("the row").status,
+        WorkerStatus::Ready
+    );
+    let mut other_role = facts("http://w:8000", 4);
     other_role.role = Role::Prefill;
     let changed = store.upsert(other_role).id();
     assert_eq!(
@@ -226,14 +239,74 @@ fn a_watcher_tails_the_changes_after_its_epoch_and_snapshots_again_past_the_log(
 }
 
 #[test]
+fn snapshot_sort_does_not_hold_the_workers_lock() {
+    let store = Arc::new(MemoryStore::new());
+    let id = store.upsert(facts("http://c:8000", 1)).id();
+    store.upsert(facts("http://a:8000", 1));
+    store.upsert(facts("http://b:8000", 1));
+    let revision = WorkersStore::get(store.as_ref(), id)
+        .expect("the row")
+        .revision;
+    let epoch = store.epoch();
+    let (cloned, resume) = store.pause_snapshot_after_clone();
+
+    let snapshot_store = Arc::clone(&store);
+    let snapshot = std::thread::spawn(move || WorkersStore::snapshot(snapshot_store.as_ref()));
+    cloned
+        .recv_timeout(PATIENCE)
+        .expect("snapshot reached the sort");
+
+    let writer_store = Arc::clone(&store);
+    let (written_tx, written_rx) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let change = writer_store.set_status(id, WorkerStatus::Ready, revision);
+        written_tx
+            .send(change)
+            .expect("the test receives the write");
+    });
+    let written_while_paused = written_rx.recv_timeout(PATIENCE);
+
+    resume.send(()).expect("resume the snapshot");
+    let (snapshot_epoch, rows) = snapshot.join().expect("snapshot thread");
+    writer.join().expect("writer thread");
+    assert_eq!(snapshot_epoch, epoch, "epoch was read with the rows");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.facts.key.as_str())
+            .collect::<Vec<_>>(),
+        ["http://a:8000", "http://b:8000", "http://c:8000"],
+        "snapshot rows are ordered by key"
+    );
+    assert_eq!(
+        rows.iter().find(|row| row.id == id).map(|row| row.status),
+        Some(WorkerStatus::Pending),
+        "the snapshot keeps the row copied before the status write"
+    );
+    assert!(
+        matches!(
+            written_while_paused,
+            Ok(Some(MembershipChange::StatusChanged {
+                id: changed,
+                from: WorkerStatus::Pending,
+                to: WorkerStatus::Ready,
+            })) if changed == id
+        ),
+        "status write waited for snapshot sorting"
+    );
+}
+
+#[test]
 fn probe_outcomes_follow_the_rows_thresholds_and_a_stale_outcome_is_dropped() {
     let store = MemoryStore::new();
     let health: &dyn HealthSink = &store;
     let id = store.upsert(facts("http://w:8000", 1)).id();
     let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-    assert_eq!(health.probe_outcome(id, true, revision()).moved(), None);
     assert_eq!(
-        health.probe_outcome(id, true, revision()).moved(),
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
+        None
+    );
+    assert_eq!(
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Ready)),
         "two passes promote a pending worker"
     );
@@ -242,40 +315,62 @@ fn probe_outcomes_follow_the_rows_thresholds_and_a_stale_outcome_is_dropped() {
     let stale = revision();
     WorkersStore::patch(&store, id, WorkerPatch::default(), stale).expect("the patch");
     assert_eq!(
-        health.probe_outcome(id, false, stale).moved(),
+        health.probe_outcome(id, false, stale, &|| true).moved(),
         None,
         "a stale outcome is dropped"
     );
-    assert_eq!(health.probe_outcome(id, false, revision()).moved(), None);
-    assert_eq!(health.probe_outcome(id, false, revision()).moved(), None);
     assert_eq!(
-        health.probe_outcome(id, false, revision()).moved(),
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
+        None
+    );
+    assert_eq!(
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
+        None
+    );
+    assert_eq!(
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
         Some((WorkerStatus::Ready, WorkerStatus::NotReady)),
         "three failures demote"
     );
     for _ in 0..8 {
-        assert_eq!(health.probe_outcome(id, false, revision()).moved(), None);
+        assert_eq!(
+            health
+                .probe_outcome(id, false, revision(), &|| true)
+                .moved(),
+            None
+        );
     }
     assert_eq!(
-        health.probe_outcome(id, false, revision()).moved(),
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
         Some((WorkerStatus::NotReady, WorkerStatus::Failed)),
         "nine more fail it"
     );
-    assert_eq!(health.probe_outcome(id, true, revision()).moved(), None);
     assert_eq!(
-        health.probe_outcome(id, true, revision()).moved(),
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
+        None
+    );
+    assert_eq!(
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
         Some((WorkerStatus::Failed, WorkerStatus::Ready)),
         "two passes bring a failed worker back"
     );
     let fresh = store.upsert(facts("http://f:8000", 1)).id();
     let fresh_revision = WorkersStore::get(&store, fresh).expect("the row").revision;
     assert_eq!(
-        health.connected(fresh, fresh_revision).moved(),
+        health.connected(fresh, fresh_revision, &|| true).moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Ready)),
         "the connect signal promotes at once"
     );
     assert_eq!(
-        health.connected(fresh, fresh_revision).moved(),
+        health.connected(fresh, fresh_revision, &|| true).moved(),
         None,
         "a ready row takes no second promotion"
     );
@@ -295,20 +390,27 @@ fn a_threshold_past_the_counters_range_is_never_met_early() {
         // far under it.
         for _ in 0..5 {
             assert_eq!(
-                health.probe_outcome(id, false, revision()).moved(),
+                health
+                    .probe_outcome(id, false, revision(), &|| true)
+                    .moved(),
                 None,
                 "pending under {threshold}"
             );
         }
-        assert_eq!(health.probe_outcome(id, true, revision()).moved(), None);
         assert_eq!(
-            health.probe_outcome(id, true, revision()).moved(),
+            health.probe_outcome(id, true, revision(), &|| true).moved(),
+            None
+        );
+        assert_eq!(
+            health.probe_outcome(id, true, revision(), &|| true).moved(),
             Some((WorkerStatus::Pending, WorkerStatus::Ready))
         );
         // And a ready one stays ready through failures under the threshold.
         for _ in 0..5 {
             assert_eq!(
-                health.probe_outcome(id, false, revision()).moved(),
+                health
+                    .probe_outcome(id, false, revision(), &|| true)
+                    .moved(),
                 None,
                 "ready under {threshold}"
             );
@@ -327,17 +429,29 @@ fn a_counter_at_its_ranges_end_stays_there() {
     // A pending worker's cap is held at the counter's end: met there, and
     // one probe short of it not yet.
     store.probed(id, 0, 0, u32::MAX - 2);
-    assert_eq!(health.probe_outcome(id, false, revision()).moved(), None);
     assert_eq!(
-        health.probe_outcome(id, false, revision()).moved(),
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
+        None
+    );
+    assert_eq!(
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Failed))
     );
     // Each counter at its end takes one probe more and stays there.
     store.probed(id, u32::MAX, u32::MAX, u32::MAX);
-    assert_eq!(health.probe_outcome(id, false, revision()).moved(), None);
+    assert_eq!(
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
+        None
+    );
     store.probed(id, 0, u32::MAX, u32::MAX);
     assert_eq!(
-        health.probe_outcome(id, true, revision()).moved(),
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
         Some((WorkerStatus::Failed, WorkerStatus::Ready))
     );
 }
@@ -353,23 +467,30 @@ fn a_threshold_whose_triple_passes_the_counters_range_fails_no_row_early() {
     stated.health.failure_threshold = threshold;
     let id = store.upsert(stated).id();
     let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-    assert_eq!(health.probe_outcome(id, true, revision()).moved(), None);
     assert_eq!(
-        health.probe_outcome(id, true, revision()).moved(),
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
+        None
+    );
+    assert_eq!(
+        health.probe_outcome(id, true, revision(), &|| true).moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Ready))
     );
     // Ready, the row is not ready at the threshold's own count of failed
     // probes: the count is set one short of it.
     store.probed(id, threshold - 1, 0, 0);
     assert_eq!(
-        health.probe_outcome(id, false, revision()).moved(),
+        health
+            .probe_outcome(id, false, revision(), &|| true)
+            .moved(),
         Some((WorkerStatus::Ready, WorkerStatus::NotReady))
     );
     // Not ready, it fails at three thresholds of failed probes: five are
     // far under them.
     for _ in 0..5 {
         assert_eq!(
-            health.probe_outcome(id, false, revision()).moved(),
+            health
+                .probe_outcome(id, false, revision(), &|| true)
+                .moved(),
             None,
             "not ready under the triple"
         );
@@ -384,7 +505,7 @@ fn a_connect_signal_read_under_a_revision_the_row_left_is_dropped() {
     let read = WorkersStore::get(&store, id).expect("the row").revision;
     WorkersStore::patch(&store, id, WorkerPatch::default(), read).expect("the patch");
     assert_eq!(
-        health.connected(id, read).moved(),
+        health.connected(id, read, &|| true).moved(),
         None,
         "a stale signal is dropped"
     );
@@ -394,7 +515,7 @@ fn a_connect_signal_read_under_a_revision_the_row_left_is_dropped() {
         "and the row stays as it stood"
     );
     assert_eq!(
-        health.connected(id, read + 1).moved(),
+        health.connected(id, read + 1, &|| true).moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Ready)),
         "the signal read under the row's revision promotes"
     );
@@ -410,11 +531,11 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     let revision = || WorkersStore::get(&store, id).expect("the row").revision;
     // A write that moves nothing is judged, and says the status that stands.
     assert_eq!(
-        health.probe_outcome(id, true, revision()),
+        health.probe_outcome(id, true, revision(), &|| true),
         Stood(WorkerStatus::Pending)
     );
     assert_eq!(
-        health.probe_outcome(id, true, revision()),
+        health.probe_outcome(id, true, revision(), &|| true),
         Moved {
             from: WorkerStatus::Pending,
             to: WorkerStatus::Ready
@@ -424,13 +545,16 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     // failures ahead of it and one behind it are the threshold's three.
     for _ in 0..2 {
         assert_eq!(
-            health.probe_outcome(id, false, revision()),
+            health.probe_outcome(id, false, revision(), &|| true),
             Stood(WorkerStatus::Ready)
         );
     }
-    assert_eq!(health.connected(id, revision()), Stood(WorkerStatus::Ready));
     assert_eq!(
-        health.probe_outcome(id, false, revision()),
+        health.connected(id, revision(), &|| true),
+        Stood(WorkerStatus::Ready)
+    );
+    assert_eq!(
+        health.probe_outcome(id, false, revision(), &|| true),
         Moved {
             from: WorkerStatus::Ready,
             to: WorkerStatus::NotReady
@@ -442,15 +566,15 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     // threshold's two.
     let left = revision();
     WorkersStore::patch(&store, id, WorkerPatch::default(), left).expect("the patch");
-    assert_eq!(health.probe_outcome(id, true, left), Stale);
-    assert_eq!(health.connected(id, left), Stale);
+    assert_eq!(health.probe_outcome(id, true, left, &|| true), Stale);
+    assert_eq!(health.connected(id, left, &|| true), Stale);
     assert_eq!(
-        health.probe_outcome(id, true, revision()),
+        health.probe_outcome(id, true, revision(), &|| true),
         Stood(WorkerStatus::NotReady),
         "the stale pass was not counted"
     );
     assert_eq!(
-        health.probe_outcome(id, true, revision()),
+        health.probe_outcome(id, true, revision(), &|| true),
         Moved {
             from: WorkerStatus::NotReady,
             to: WorkerStatus::Ready
@@ -459,14 +583,14 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     // A draining row stands at the signal too.
     WorkersStore::set_status(&store, id, WorkerStatus::Draining, revision()).expect("drained");
     assert_eq!(
-        health.connected(id, revision()),
+        health.connected(id, revision(), &|| true),
         Stood(WorkerStatus::Draining)
     );
     // A write for a worker whose row is gone says no row.
     let last = revision();
     store.remove(id, last).expect("removed");
-    assert_eq!(health.probe_outcome(id, true, last), NoRow);
-    assert_eq!(health.connected(id, last), NoRow);
+    assert_eq!(health.probe_outcome(id, true, last, &|| true), NoRow);
+    assert_eq!(health.connected(id, last, &|| true), NoRow);
 }
 
 #[test]
@@ -1535,8 +1659,12 @@ fn a_pin_past_its_own_end_leaves_where_another_rule_keeps_its_keys_for_ever() {
     assert!(sessions.lookup(2).is_some());
 }
 
+/// A removed worker's pins of record stand through its absence, and the
+/// worker it was takes them back where its key is registered again, under
+/// the id the registration makes. A new life of the same worker in place
+/// keeps its own. Another worker under the key takes none.
 #[test]
-fn a_removed_workers_pins_of_record_leave_with_its_row() {
+fn a_key_registered_again_as_the_worker_it_was_takes_its_pins_of_record() {
     let store = MemoryStore::new();
     let (a, b) = (
         ready(&store, "http://a:8000"),
@@ -1547,17 +1675,343 @@ fn a_removed_workers_pins_of_record_leave_with_its_row() {
     sessions.pin(11, a, now, None);
     sessions.pin(12, b, now, None);
     sessions.pin(13, a, now, None);
+    let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
     let revision = WorkersStore::get(&store, a).expect("the row").revision;
     store.remove(a, revision).expect("removed");
-    // The removal's own write drops them: no sweep ran, and no rule
-    // stands.
-    assert!(sessions.lookup(11).is_none() && sessions.lookup(13).is_none());
-    assert_eq!(sessions.lookup(12).map(|pin| pin.worker), Some(b));
+    // The removal drops none: the key may be registered again.
+    assert_eq!((of(11), of(13)), (Some(a), Some(a)));
+    let again = store.upsert(facts("http://a:8000", 2)).id();
+    assert_ne!(again, a);
+    assert_eq!((of(11), of(13)), (Some(again), Some(again)));
+    assert_eq!(of(12), Some(b));
+    let life = store.upsert(facts("http://b:8000", 2)).id();
+    assert_ne!(life, b);
+    assert_eq!(of(12), Some(life), "a new life of the same worker");
+    // Removed again, then registered in another role: another worker.
+    let revision = WorkersStore::get(&store, again).expect("the row").revision;
+    store.remove(again, revision).expect("removed");
+    store.upsert(WorkerFacts {
+        role: Role::Decode,
+        ..facts("http://a:8000", 3)
+    });
+    assert_eq!((of(11), of(13)), (None, None));
     assert_eq!(sessions.len(), 1);
-    // A replaced incarnation's row is gone as well, and so is its pin.
-    let replaced = store.upsert(facts("http://b:8000", 2)).id();
-    assert_ne!(replaced, b);
-    assert!(sessions.is_empty(), "the old incarnation's pin");
+    // A new life in another role, in place: another worker too.
+    store.upsert(WorkerFacts {
+        role: Role::Prefill,
+        ..facts("http://b:8000", 3)
+    });
+    assert!(sessions.is_empty(), "the old worker's pin");
+}
+
+/// Two registrations of one key rename its pins of record in their order.
+/// The second lands where the first has let the workers lock go, and the
+/// pin names the last life: in place, and for a key that left.
+#[test]
+fn registrations_of_one_key_rename_its_pins_of_record_in_their_order() {
+    use std::{cell::Cell, rc::Rc};
+
+    use super::memory::seam;
+
+    let store = Rc::new(MemoryStore::new());
+    let sessions: &dyn SessionsStore = &*store;
+    let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
+    let now = Instant::now();
+    // The third life of `key`, registered behind the next registration.
+    let third_behind = |key: &'static str| {
+        let third = Rc::new(Cell::new(None));
+        let (behind, seen) = (Rc::clone(&store), Rc::clone(&third));
+        seam::on_release(move || seen.set(Some(behind.upsert(facts(key, 3)).id())));
+        third
+    };
+    // In place: the key's second life is replaced by its third at once.
+    let a = ready(&store, "http://a:8000");
+    sessions.pin(11, a, now, None);
+    let third = third_behind("http://a:8000");
+    store.upsert(facts("http://a:8000", 2));
+    assert!(third.get().is_some(), "the hook ran");
+    assert_eq!(of(11), third.get());
+    // A key that left: registered again, and that life replaced at once.
+    let b = ready(&store, "http://b:8000");
+    sessions.pin(12, b, now, None);
+    let revision = WorkersStore::get(&*store, b).expect("the row").revision;
+    store.remove(b, revision).expect("removed");
+    let third = third_behind("http://b:8000");
+    store.upsert(facts("http://b:8000", 2));
+    assert!(third.get().is_some(), "the hook ran");
+    assert_eq!(of(12), third.get());
+}
+
+/// A key that stays away longer than the absence's time takes no pin
+/// back: the time is the longest TTL among the document's session rules.
+#[test]
+fn a_key_registered_again_past_the_absences_time_takes_no_pin() {
+    let store = MemoryStore::new();
+    let ruled = manual_ruled(1, 1, 1);
+    store.apply(ruled).expect("above the unbound start");
+    let a = ready(&store, "http://a:8000");
+    let sessions: &dyn SessionsStore = &store;
+    sessions.pin(11, a, Instant::now(), None);
+    let revision = WorkersStore::get(&store, a).expect("the row").revision;
+    store.remove(a, revision).expect("removed");
+    assert!(sessions.lookup(11).is_some(), "inside its time");
+    std::thread::sleep(Duration::from_millis(1_100));
+    store.upsert(facts("http://a:8000", 2));
+    assert_eq!(sessions.lookup(11), None);
+}
+
+/// A key that stays away is forgotten at the store's tick, in the engine's
+/// table and of record: no membership write and no decision has to follow.
+#[test]
+fn the_tick_ends_the_absence_of_a_key_that_stays_away() {
+    let store = MemoryStore::new();
+    let ruled = manual_ruled(1, 1, 1);
+    store.apply(ruled).expect("above the unbound start");
+    let a = ready(&store, "http://a:8000");
+    let sessions: &dyn SessionsStore = &store;
+    sessions.pin(11, a, Instant::now(), None);
+    let key = Session::from_raw(21);
+    let world = store.world();
+    let table = world.spec().engine().sessions();
+    table.dispatched(key, SessionVerdict::Pinned, a);
+    let revision = WorkersStore::get(&store, a).expect("the row").revision;
+    store.remove(a, revision).expect("removed");
+    store.sweep_pins(Instant::now());
+    assert!(sessions.lookup(11).is_some(), "inside its time");
+    assert_eq!(table.pins(key).map(|pins| pins[0]), Some(a));
+    store.sweep_pins(Instant::now() + Duration::from_millis(1_100));
+    assert_eq!((sessions.lookup(11), table.pins(key)), (None, None));
+}
+
+/// `follower` takes `change`, a write `leader` just made, by the door a
+/// standby's applier and a gateway's watcher use.
+fn followed(leader: &MemoryStore, follower: &MemoryStore, change: MembershipChange) {
+    let row = match change {
+        MembershipChange::Registered { id } | MembershipChange::Replaced { new: id, .. } => {
+            WorkersStore::get(leader, id)
+        }
+        _ => None,
+    };
+    let epoch = WorkersStore::epoch(leader);
+    follower.follow(Position::default(), epoch, change, row);
+    assert_eq!(WorkersStore::epoch(follower), epoch, "the change landed");
+}
+
+/// A follower takes its leader's steps for a key's session pins, in its
+/// engine's table and of record. A followed removal drops none. The worker
+/// it was takes them back at its followed registration, under the id that
+/// registration made. A followed new life of the same worker keeps its
+/// own. Another worker under the key takes none.
+#[test]
+fn a_followed_key_registered_again_as_the_worker_it_was_takes_its_pins() {
+    let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
+    let join = |facts: WorkerFacts| {
+        let change = leader.upsert(facts);
+        followed(&leader, &follower, change);
+        change.id()
+    };
+    let leave = |id: WorkerId| {
+        let revision = WorkersStore::get(&leader, id).expect("the row").revision;
+        let change = leader.remove(id, revision).expect("removed");
+        followed(&leader, &follower, change);
+    };
+    let (a, b) = (
+        join(facts("http://a:8000", 1)),
+        join(facts("http://b:8000", 1)),
+    );
+    let sessions: &dyn SessionsStore = &follower;
+    let now = Instant::now();
+    sessions.pin(11, a, now, None);
+    sessions.pin(12, b, now, None);
+    let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
+    // The follower's engine holds a pin of its own.
+    let key = Session::from_raw(21);
+    let world = follower.world();
+    let table = world.spec().engine().sessions();
+    table.dispatched(key, SessionVerdict::Pinned, a);
+    let held = || table.pins(key).map(|pins| pins[0]);
+    leave(a);
+    assert_eq!((of(11), held()), (Some(a), Some(a)), "none is dropped");
+    let again = join(facts("http://a:8000", 2));
+    assert_ne!(again, a);
+    assert_eq!((of(11), held()), (Some(again), Some(again)));
+    assert_eq!(of(12), Some(b));
+    let life = join(facts("http://b:8000", 2));
+    assert_ne!(life, b);
+    assert_eq!(of(12), Some(life), "a new life of the same worker");
+    // Removed again, then registered in another role: another worker.
+    leave(again);
+    join(WorkerFacts {
+        role: Role::Decode,
+        ..facts("http://a:8000", 3)
+    });
+    assert_eq!((of(11), held()), (None, None));
+    assert_eq!(sessions.len(), 1);
+    // A new life in another role, in place: another worker too.
+    join(WorkerFacts {
+        role: Role::Prefill,
+        ..facts("http://b:8000", 3)
+    });
+    assert!(sessions.is_empty(), "the old worker's pin");
+}
+
+/// A follower counts a key's absence by its own clock, from the removal
+/// it followed. A key registered again past that time takes no pin, at
+/// its followed registration and at a snapshot that holds it again.
+#[test]
+fn a_followed_key_registered_again_past_the_absences_time_takes_no_pin() {
+    let leader = MemoryStore::new();
+    let followers = [MemoryStore::new(), MemoryStore::new()];
+    let joined = leader.upsert(facts("http://a:8000", 1));
+    let revision = WorkersStore::get(&leader, joined.id()).expect("the row");
+    for follower in &followers {
+        follower
+            .apply(manual_ruled(1, 1, 1))
+            .expect("above the unbound start");
+        followed(&leader, follower, joined);
+        SessionsStore::pin(follower, 11, joined.id(), Instant::now(), None);
+    }
+    let removed = leader.remove(joined.id(), revision.revision);
+    let removed = removed.expect("removed");
+    for follower in &followers {
+        followed(&leader, follower, removed);
+        let pin = SessionsStore::lookup(follower, 11);
+        assert!(pin.is_some(), "inside its time");
+    }
+    std::thread::sleep(Duration::from_millis(1_100));
+    let again = leader.upsert(facts("http://a:8000", 2));
+    followed(&leader, &followers[0], again);
+    assert!(followers[1].watch_from(leader.cut(Kinds::Watched)));
+    for follower in &followers {
+        assert_eq!(SessionsStore::lookup(follower, 11), None);
+    }
+}
+
+/// A follower files the key of a removal it followed. Where it leads
+/// next, its own registration of the key takes the pins.
+#[test]
+fn a_key_a_follower_saw_leave_takes_its_pins_at_the_followers_own_write() {
+    let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
+    let joined = leader.upsert(facts("http://a:8000", 1));
+    followed(&leader, &follower, joined);
+    let sessions: &dyn SessionsStore = &follower;
+    sessions.pin(11, joined.id(), Instant::now(), None);
+    let revision = WorkersStore::get(&leader, joined.id()).expect("the row");
+    let removed = leader.remove(joined.id(), revision.revision);
+    followed(&leader, &follower, removed.expect("removed"));
+    let again = follower.upsert(facts("http://a:8000", 2)).id();
+    assert_eq!(sessions.lookup(11).map(|pin| pin.worker), Some(again));
+}
+
+/// A snapshot's rows move a key's session pins as the writes it stands
+/// for would have, in the engine's table and of record, at a gateway's
+/// watch and at a standby's restore. A key the cut holds under a new id
+/// takes its pins where it is the worker it was. Another worker's pins
+/// leave. A key the cut drops keeps its pins on file, and takes them at
+/// its followed registration.
+#[test]
+fn a_snapshot_moves_the_pins_of_the_rows_it_drops() {
+    for restore in [false, true] {
+        let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
+        let lay = || {
+            let cut = leader.cut(Kinds::All);
+            if restore {
+                follower.restore_from(cut)
+            } else {
+                follower.watch_from(cut)
+            }
+        };
+        let keys = [
+            "http://a:8000",
+            "http://b:8000",
+            "http://c:8000",
+            "http://d:8000",
+        ];
+        let [a, b, c, d] = keys.map(|key| leader.upsert(facts(key, 1)).id());
+        assert!(lay());
+        let sessions: &dyn SessionsStore = &follower;
+        let now = Instant::now();
+        for (key, worker) in [(11, a), (12, b), (13, c), (14, d)] {
+            sessions.pin(key, worker, now, None);
+        }
+        let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
+        // The follower's engine holds a pin of its own.
+        let key = Session::from_raw(21);
+        let world = follower.world();
+        let table = world.spec().engine().sessions();
+        table.dispatched(key, SessionVerdict::Pinned, a);
+        let held = || table.pins(key).map(|pins| pins[0]);
+        // The follower hears none of these writes.
+        let leave = |id: WorkerId| {
+            let revision = WorkersStore::get(&leader, id).expect("the row").revision;
+            leader.remove(id, revision).expect("removed");
+        };
+        leave(a);
+        let again = leader.upsert(facts("http://a:8000", 2)).id();
+        leave(b);
+        leader.upsert(WorkerFacts {
+            role: Role::Decode,
+            ..facts("http://b:8000", 2)
+        });
+        leave(c);
+        assert!(lay());
+        assert_eq!((of(11), held()), (Some(again), Some(again)));
+        assert_eq!(of(12), None, "another worker under the key");
+        assert_eq!((of(13), of(14)), (Some(c), Some(d)), "none is dropped");
+        let back = leader.upsert(facts("http://c:8000", 2));
+        followed(&leader, &follower, back);
+        assert_eq!(of(13), Some(back.id()), "the dropped key was on file");
+    }
+}
+
+/// A key on file when a snapshot comes stays there where the cut does not
+/// hold it. Where the cut holds it again as the worker it was, it takes
+/// its pins.
+#[test]
+fn a_snapshot_returns_a_key_that_had_left_to_its_pins() {
+    let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
+    let [a, b] = ["http://a:8000", "http://b:8000"].map(|key| {
+        let change = leader.upsert(facts(key, 1));
+        followed(&leader, &follower, change);
+        change.id()
+    });
+    let sessions: &dyn SessionsStore = &follower;
+    let now = Instant::now();
+    sessions.pin(11, a, now, None);
+    sessions.pin(12, b, now, None);
+    let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
+    for id in [a, b] {
+        let revision = WorkersStore::get(&leader, id).expect("the row").revision;
+        let change = leader.remove(id, revision).expect("removed");
+        followed(&leader, &follower, change);
+    }
+    assert!(follower.watch_from(leader.cut(Kinds::Watched)));
+    assert_eq!((of(11), of(12)), (Some(a), Some(b)), "both stay on file");
+    let again = leader.upsert(facts("http://a:8000", 2)).id();
+    assert!(follower.watch_from(leader.cut(Kinds::Watched)));
+    assert_eq!((of(11), of(12)), (Some(again), Some(b)));
+    let back = leader.upsert(facts("http://b:8000", 2));
+    followed(&leader, &follower, back);
+    assert_eq!(of(12), Some(back.id()), "still on file behind two cuts");
+}
+
+/// The rows a snapshot drops are filed while the list has room. Past it
+/// a row's pins leave at once.
+#[test]
+fn a_snapshot_files_no_more_keys_than_the_list_holds() {
+    use super::memory::GONE_KEYS;
+    let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
+    let ids: Vec<WorkerId> = (0..GONE_KEYS + 2)
+        .map(|at| leader.upsert(facts(&format!("http://w{at}:8000"), 1)).id())
+        .collect();
+    assert!(follower.watch_from(leader.cut(Kinds::Watched)));
+    let sessions: &dyn SessionsStore = &follower;
+    let now = Instant::now();
+    for (key, &id) in (1..).zip(&ids) {
+        sessions.pin(key, id, now, None);
+    }
+    assert!(follower.watch_from(MemoryStore::new().cut(Kinds::Watched)));
+    assert_eq!(sessions.len(), GONE_KEYS);
 }
 
 /// The door of a writer that knows a key's rule by its lease alone: the
@@ -1637,7 +2091,7 @@ fn a_pin_is_written_at_the_commit_and_leaves_with_its_worker_or_at_its_end() {
         },
     );
     assert_eq!(sessions.len(), 3);
-    assert_eq!(sessions.drop_worker(WorkerId(9)), 1);
+    assert_eq!(sessions.drop_workers(&[WorkerId(9)]), 1);
     let two = store.micros(now + Duration::from_secs(2));
     assert_eq!(sessions.expire(two), 1);
     assert_eq!(sessions.lookup(11), None);
@@ -1673,9 +2127,9 @@ fn a_lease_above_the_stores_term_is_refused_and_one_below_is_kept() {
         1,
         "the undispatched lease passed its deadline"
     );
-    assert_eq!(expired[0].lease.id, LeaseId(2));
+    assert_eq!(expired[0].record.lease.id, LeaseId(2));
     assert_eq!(
-        expired[0].state,
+        expired[0].record.state,
         LeaseState::Released(ReleaseReason::Abandoned)
     );
     assert_eq!(leases.live(gateway), 1);
@@ -1799,6 +2253,408 @@ fn done(side: Side) -> Outcome {
 fn sides(store: &MemoryStore, id: u64) -> Option<(LeaseState, LeaseState)> {
     let found = LeasesStore::sides(store, GatewayId(1), LeaseId(id))?;
     Some((found.record.state, found.decode?.state))
+}
+
+/// A pair filed with its decode targets chosen.
+fn chosen_pair(
+    id: u64,
+    prefill: WorkerId,
+    decodes: &[WorkerId],
+    now: Instant,
+) -> (LeaseRecord, DecodeSide) {
+    let (mut record, mut decode) = pair(id, prefill, decodes, now);
+    record.dispatch_deadline = now + DISPATCH_TTL;
+    decode.state = LeaseState::Chosen;
+    (record, decode)
+}
+
+#[test]
+fn a_chosen_decode_side_books_nothing_and_waits_under_no_deadline() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+    let (record, mut decode) = chosen_pair(1, p, &[d], now);
+    decode.session = Session::from_raw(41);
+    issue_pair(leases, (record, decode)).expect("the key is free");
+    assert_eq!(booked(&store, &[p, d]), [1, 0]);
+    assert!(carried(&store, decode.session).is_empty());
+    assert!(decode.state.is_chosen());
+    assert!(!decode.state.is_live());
+    assert!(!decode.state.is_issued());
+    assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    assert!(leases.expire(now + Duration::from_secs(9)).is_empty());
+    assert_eq!(store.queued(), 0);
+    assert_eq!(
+        sides(&store, 1),
+        Some((LeaseState::Dispatched { at: now }, LeaseState::Chosen))
+    );
+}
+
+#[test]
+fn a_call_issues_the_chosen_side_afresh_and_books_it_once() {
+    let store = MemoryStore::new().with_deciders(2);
+    let [p, d0, d1] = ["http://p:1", "http://d0:1", "http://d1:1"].map(|key| ready(&store, key));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let (_, mut decode) = pair(0, p, &[d1, d0], now);
+    decode.session = Session::from_raw(42);
+    decode.tokens = 24;
+    decode.state = LeaseState::issued(Some(9_000_000));
+    decode.target_index = 1;
+
+    let id = LeaseId(1);
+    issue_pair(leases, chosen_pair(id.0, p, &[d0], now)).expect("the key is free");
+    assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    let prefill = leases.get(gateway, id);
+    assert_eq!(leases.issue_decode(gateway, id, decode, now), Ok(()));
+    let filed = leases.sides(gateway, id).expect("on file");
+    assert_eq!(Some(filed.record), prefill);
+    assert_eq!(
+        filed.decode,
+        Some(DecodeSide {
+            target_index: 0,
+            ..decode
+        })
+    );
+    assert_eq!(filed.target_of(Side::Decode, 0), Some((d1, 0)));
+    assert_eq!(filed.target_of(Side::Decode, 1), Some((d0, 0)));
+    assert_eq!(booked(&store, &[p, d0, d1]), [1, 0, 1]);
+    assert_eq!(carried(&store, decode.session), [(d1, 1)]);
+    assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
+    assert!(carried(&store, decode.session).is_empty());
+
+    // A lease of an older term in block one names the second file.
+    let id = LeaseId(1 << 20 | 2);
+    assert_eq!(store.file_of(id), 1);
+    issue_pair(leases, chosen_pair(id.0, p, &[d0], now)).expect("the key is free");
+    assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    let mut heard = None;
+    assert!(store.unlocked());
+    let (issued, _) = store
+        .issue_decided_decode(gateway, id, (decode, None), now, |lease| {
+            assert!(!store.unlocked(), "the issue is told under the turn");
+            heard = Some(*lease);
+        })
+        .expect("the prefill holds the chosen side");
+    assert_eq!(heard, Some(issued));
+    assert_eq!(
+        (
+            issued.id,
+            issued.side,
+            issued.booked,
+            issued.target_index,
+            issued.session,
+            issued.tokens
+        ),
+        (id, Side::Decode, d1, 0, decode.session, decode.tokens)
+    );
+    assert_eq!(
+        booked(&store, &[p, d0, d1]),
+        [1, 0, 0],
+        "no slot was supplied"
+    );
+}
+
+#[test]
+fn the_call_starts_the_dispatch_deadline_again() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, id, t0) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+    issue_pair(leases, chosen_pair(1, p, &[d], t0)).expect("the key is free");
+    assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), t0));
+    let pending = DecodeSide {
+        state: LeaseState::Chosen,
+        ..decode_side(d)
+    };
+    let now = t0 + Duration::from_secs(8);
+    assert_eq!(leases.issue_decode(gateway, id, pending, now), Ok(()));
+    assert_eq!(
+        sides(&store, 1),
+        Some((LeaseState::Dispatched { at: t0 }, LeaseState::ISSUED))
+    );
+    assert!(leases.expire(t0 + Duration::from_secs(9)).is_empty());
+    assert_eq!(store.queued(), 1);
+    assert_eq!(booked(&store, &[p, d]), [1, 1]);
+    let swept = leases.expire(t0 + Duration::from_secs(14));
+    let filed = leases.sides(gateway, id).expect("the prefill still stands");
+    assert_eq!(swept, [filed]);
+    assert_eq!(filed.record.state, LeaseState::Dispatched { at: t0 });
+    assert_eq!(
+        filed.decode.map(|side| side.state),
+        Some(LeaseState::Released(ReleaseReason::Abandoned))
+    );
+    assert_eq!(booked(&store, &[p, d]), [1, 0]);
+}
+
+#[test]
+fn the_call_is_refused_by_name() {
+    use DecodeRefused::{DecodeStands, NoLease, NotChosen, PrefillNotHeld};
+
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let (mut ended, decode) = chosen_pair(4, p, &[d], now);
+    ended.state = LeaseState::Completed;
+    issue_pair(leases, (ended, decode)).expect("the key is free");
+    leases
+        .issue(booking(gateway, 1, p, now))
+        .expect("the key is free");
+    issue_pair(leases, pair(2, p, &[d], now)).expect("the key is free");
+    for id in [3, 5, 6] {
+        issue_pair(leases, chosen_pair(id, p, &[d], now)).expect("the key is free");
+    }
+    for id in [2, 5, 6] {
+        assert!(leases.dispatched(gateway, LeaseId(id), on(Side::Prefill, 0), now));
+    }
+    let decode = decode_side(d);
+    assert_eq!(
+        leases.issue_decode(gateway, LeaseId(5), decode, now),
+        Ok(())
+    );
+    assert!(leases.dispatched(gateway, LeaseId(6), on(Side::Decode, 0), now));
+    let refused = |owner, id, reason| {
+        let before = (
+            leases.sides(gateway, id),
+            booked(&store, &[p, d]),
+            store.queued(),
+        );
+        let later = now + Duration::from_secs(8);
+        assert_eq!(
+            leases.issue_decode(owner, id, decode, later),
+            Err(reason),
+            "{owner:?} {id:?}"
+        );
+        assert_eq!(
+            (
+                leases.sides(gateway, id),
+                booked(&store, &[p, d]),
+                store.queued()
+            ),
+            before
+        );
+    };
+    refused(GatewayId(2), LeaseId(5), NoLease);
+    refused(gateway, LeaseId(1), NotChosen);
+    refused(gateway, LeaseId(2), NotChosen);
+    refused(gateway, LeaseId(3), PrefillNotHeld);
+    refused(gateway, LeaseId(4), PrefillNotHeld);
+    refused(gateway, LeaseId(5), DecodeStands);
+    refused(gateway, LeaseId(6), DecodeStands);
+    for id in [2, 5, 6] {
+        assert!(leases.completed(gateway, LeaseId(id), &done(Side::Decode)));
+    }
+    refused(gateway, LeaseId(2), NotChosen);
+    refused(gateway, LeaseId(5), DecodeStands);
+    refused(gateway, LeaseId(6), DecodeStands);
+    assert!(leases.completed(gateway, LeaseId(3), &done(Side::Prefill)));
+    refused(gateway, LeaseId(3), NoLease);
+}
+
+#[test]
+fn a_dispatch_on_a_chosen_side_books_it_once_as_it_lands() {
+    let store = MemoryStore::new();
+    let [p, d0, d1] = ["http://p:1", "http://d0:1", "http://d1:1"].map(|key| ready(&store, key));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    for (index, target, booked_index, counts) in
+        [(1, d1, 1, [1, 0, 1]), (u8::MAX, d0, 0, [1, 1, 0])]
+    {
+        let id = LeaseId(u64::from(index));
+        let (record, mut decode) = chosen_pair(id.0, p, &[d0, d1], now);
+        decode.session = Session::from_raw(41);
+        issue_pair(leases, (record, decode)).expect("the key is free");
+        assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
+        assert!(leases.expire(now + DISPATCH_TTL).is_empty());
+        assert_eq!(store.queued(), 0);
+        let at = now + Duration::from_secs(8);
+        assert!(leases.dispatched(gateway, id, on(Side::Decode, index), at));
+        let filed = leases.sides(gateway, id).expect("on file");
+        assert_eq!(
+            filed.decode,
+            Some(DecodeSide {
+                target,
+                target_index: booked_index,
+                state: LeaseState::Dispatched { at },
+                ..decode
+            })
+        );
+        assert_eq!(booked(&store, &[p, d0, d1]), counts);
+        assert_eq!(carried(&store, decode.session), [(target, 1)]);
+        assert_eq!(store.queued(), 0);
+        assert!(leases.dispatched(gateway, id, on(Side::Decode, 0), now));
+        assert_eq!(leases.sides(gateway, id), Some(filed));
+        assert_eq!(booked(&store, &[p, d0, d1]), counts);
+        assert_eq!(carried(&store, decode.session), [(target, 1)]);
+        assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
+        assert_eq!(booked(&store, &[p, d0, d1]), [0, 0, 0]);
+        assert!(carried(&store, decode.session).is_empty());
+    }
+}
+
+#[test]
+fn a_chosen_side_ends_with_its_prefill() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+    issue_pair(leases, chosen_pair(1, p, &[d], now)).expect("the key is free");
+    assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    // The gateway gives the chosen side up: its end stands and no call
+    // issues it.
+    assert!(leases.released(gateway, id, Some(Side::Decode), ReleaseReason::ClientGone));
+    let gone = LeaseState::Released(ReleaseReason::ClientGone);
+    assert_eq!(
+        sides(&store, 1),
+        Some((LeaseState::Dispatched { at: now }, gone))
+    );
+    let decode = chosen_pair(1, p, &[d], now).1;
+    assert_eq!(
+        leases.issue_decode(gateway, id, decode, now),
+        Err(DecodeRefused::DecodeStands)
+    );
+    assert_eq!(booked(&store, &[p, d]), [1, 0]);
+    assert!(leases.completed(gateway, id, &done(Side::Prefill)));
+    assert_eq!(leases.sides(gateway, id), None);
+    assert_eq!(store.paired(), [vec![], vec![]]);
+    assert_eq!(booked(&store, &[p, d]), [0, 0]);
+}
+
+#[test]
+fn a_chosen_side_dispatched_by_a_handed_frame_is_told_once() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (id, now) = (LeaseId(1), Instant::now());
+    leases.set_term(1);
+    store.tell_through(heard);
+    issue_pair(leases, chosen_pair(1, p, &[d], now)).expect("the key is free");
+    drop(told_sides());
+    let hand = Hand::new(GatewayId(1));
+    let sent = |side| Said::Dispatched(on(side, 0), now);
+    store.hand(&hand, id, sent(Side::Prefill));
+    store.hand(&hand, id, sent(Side::Decode));
+    store.hand(&hand, id, sent(Side::Decode));
+    // Each side's dispatch is told once, with the lease as its frame found
+    // it: the decode side stood chosen.
+    let told: Vec<_> = told_sides()
+        .into_iter()
+        .map(|(found, said)| (found.decode.map(|side| side.state), said))
+        .collect();
+    let chosen = Some(LeaseState::Chosen);
+    assert_eq!(
+        told,
+        [(chosen, sent(Side::Prefill)), (chosen, sent(Side::Decode))]
+    );
+    assert_eq!(booked(&store, &[p, d]), [1, 1]);
+}
+
+#[test]
+fn a_release_of_every_side_frees_a_chosen_side_s_place() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+    issue_pair(leases, chosen_pair(1, p, &[d], now)).expect("the key is free");
+    assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
+    assert_eq!(leases.sides(gateway, id), None);
+    assert_eq!(store.paired(), [vec![], vec![]]);
+    assert_eq!(booked(&store, &[p, d]), [0, 0]);
+}
+
+#[test]
+fn the_sweep_s_answer_tells_a_decode_side_that_completed_from_one_it_abandoned() {
+    let store = MemoryStore::new();
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let (p, d) = (WorkerId(7), WorkerId(8));
+    leases.set_term(1);
+    store.tell_through(heard);
+    drop(told_sides());
+    for id in [1, 2] {
+        issue_pair(leases, pair(id, p, &[d], now)).expect("the key is free");
+    }
+    assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Decode, 0), now));
+    assert!(leases.completed(gateway, LeaseId(1), &done(Side::Decode)));
+    let expired = leases.expire(now + Duration::from_secs(2));
+    let states = expired.iter().map(|sides| {
+        (
+            sides.record.lease.id,
+            sides.record.state,
+            sides.decode.map(|side| side.state),
+        )
+    });
+    let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
+    assert_eq!(
+        states.collect::<Vec<_>>(),
+        [
+            (LeaseId(1), abandoned, Some(LeaseState::Completed)),
+            (LeaseId(2), abandoned, Some(abandoned)),
+        ]
+    );
+    assert_eq!(leases.live(gateway), 0);
+    let told = |id, side| {
+        (
+            LeaseId(id),
+            Said::Released(Some(side), ReleaseReason::Abandoned),
+        )
+    };
+    let ends = told_sides()
+        .into_iter()
+        .map(|(sides, said)| (sides.record.lease.id, said));
+    assert_eq!(
+        ends.collect::<Vec<_>>(),
+        [
+            told(1, Side::Prefill),
+            told(2, Side::Prefill),
+            told(2, Side::Decode)
+        ]
+    );
+}
+
+#[test]
+fn a_pair_s_decode_side_is_told_issued_on_the_decode_worker() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    store.set_term(1);
+    let (mut record, mut decode) = pair(0, p, &[d], Instant::now());
+    record.lease.booked = p;
+    decode.session = Session::from_raw(41);
+    decode.tokens = 24;
+    let world = store.world();
+    let slots = [world.booked_of(p), world.booked_of(d)];
+    let heard = RefCell::new(Vec::new());
+    let prefill = store
+        .issue_decided_pair(record, decode, slots, |lease| {
+            heard.borrow_mut().push(*lease);
+        })
+        .expect("minted under the store's term");
+    let decode = Lease {
+        side: Side::Decode,
+        booked: d,
+        session: decode.session,
+        tokens: decode.tokens,
+        ..prefill
+    };
+    assert_eq!(heard.into_inner(), [prefill, decode]);
+}
+
+#[test]
+fn a_pair_with_both_sides_waiting_takes_one_place_of_the_queue() {
+    let store = MemoryStore::new();
+    store.set_term(1);
+    let (p, d) = (WorkerId(7), WorkerId(8));
+    issue_pair(&store, pair(1, p, &[d], Instant::now())).expect("the key is free");
+    assert_eq!(store.queued(), 1);
 }
 
 /// A pair filed with a side that ended books the side that lives, and
@@ -2044,12 +2900,12 @@ fn the_dispatch_deadline_ends_each_side_that_waits_and_a_dispatched_side_stands(
     assert!(leases.completed(gateway, LeaseId(1), &done(Side::Prefill)));
     assert_eq!(leases.get(gateway, LeaseId(1)), None);
     assert_eq!(booked(&store, &[p, d]), [1, 0]);
-    // The store's own sweep hands a pair's record back as it left its
-    // prefill part.
+    // The store's own sweep returns both sides as it left them.
     issue_pair(leases, pair(3, p, &[d], later)).expect("the key is free");
     assert!(leases.dispatched(gateway, LeaseId(3), on(Side::Decode, 0), later));
     let swept = leases.expire(later + Duration::from_secs(9));
-    let third = |record: &LeaseRecord| (record.lease.id, record.state) == (LeaseId(3), abandoned);
+    let third =
+        |found: &Sides| (found.record.lease.id, found.record.state) == (LeaseId(3), abandoned);
     assert!(swept.iter().any(third));
     let at = LeaseState::Dispatched { at: later };
     assert_eq!(sides(&store, 3), Some((abandoned, at)));
@@ -2098,14 +2954,16 @@ fn a_pair_issued_under_a_rule_with_a_ttl_stands_and_ends_as_any_pair() {
     let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
     assert_eq!(sides(&store, 1), Some((dispatched, dispatched)));
     assert_eq!(sides(&store, 2), Some((dispatched, abandoned)));
-    // The store's own sweep hands such a pair's record back as its
-    // prefill part stood, and the decode side's end is read from the
-    // store.
+    // The store's own sweep returns the prefill as it stood and the
+    // decode side as the sweep left it.
     issue_pair(leases, keyed(3, later)).expect("the key is free");
     assert!(leases.dispatched(gateway, LeaseId(3), on(Side::Prefill, 0), later));
     let swept = leases.expire(later + Duration::from_secs(9));
     let at = LeaseState::Dispatched { at: later };
-    let third = |record: &LeaseRecord| (record.lease.id, record.state) == (LeaseId(3), at);
+    let third = |found: &Sides| {
+        (found.record.lease.id, found.record.state) == (LeaseId(3), at)
+            && found.decode.is_some_and(|decode| decode.state == abandoned)
+    };
     assert!(swept.iter().any(third));
     assert_eq!(sides(&store, 3), Some((at, abandoned)));
 }
@@ -2294,6 +3152,7 @@ fn in_flight_for(store: &MemoryStore, gateway: GatewayId) -> Vec<(WorkerId, u32)
         now: Instant::now(),
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let mut out = ViewBuffers::default();
     store.deciding(|world| {
@@ -2545,6 +3404,7 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
         now,
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let mut out = ViewBuffers::default();
     store
@@ -2559,7 +3419,7 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     assert_eq!(store.kv().held_blocks("m"), 1);
     assert_eq!(WorkersStore::get(&store, id), Some(expected));
     assert_eq!(
-        store.probe_outcome(id, false, revision),
+        store.probe_outcome(id, false, revision, &|| true),
         HealthWrite::Moved {
             from: WorkerStatus::Ready,
             to: WorkerStatus::NotReady
@@ -2575,6 +3435,7 @@ fn held_count(world: &World, gateway: GatewayId, now: Instant) -> u32 {
         now,
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let mut out = ViewBuffers::default();
     let view = world
@@ -2737,6 +3598,7 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
         now: Instant::now(),
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let mut out = ViewBuffers::default();
     store
@@ -2936,6 +3798,7 @@ fn a_count_is_written_on_its_own_workers_row_past_another_gateways_local_row() {
         now,
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     store.build_view("m", Role::Single, &ask, &mut built);
     assert!(built.candidates.iter().all(|row| row.in_flight == 0));
@@ -4312,7 +5175,7 @@ fn the_dispatch_deadlines_fall_due_in_their_own_order_whatever_order_they_were_f
     }
     let due = |secs: u64| {
         let ended = leases.expire(now + Duration::from_secs(secs));
-        let ids = ended.iter().map(|record| record.lease.id.0);
+        let ids = ended.iter().map(|found| found.record.lease.id.0);
         ids.collect::<Vec<u64>>()
     };
     assert_eq!(due(0), NONE);
@@ -4352,7 +5215,7 @@ fn a_removal_and_a_sweep_reach_the_pins_of_every_shard() {
         }
     }
     assert_eq!(sessions.len(), keys);
-    assert_eq!(sessions.drop_worker(WorkerId(1)), keys / 2);
+    assert_eq!(sessions.drop_workers(&[WorkerId(1)]), keys / 2);
     assert_eq!(sessions.len(), keys / 2);
     for (i, key) in (1_u64..).take(keys).enumerate() {
         assert_eq!(sessions.lookup(key).is_some(), !first(i), "key {key}");
@@ -4387,6 +5250,53 @@ fn told_ids() -> Vec<(u64, Said)> {
     let told = told().into_iter();
     told.map(|(record, said)| (record.lease.id.0 & 0xffff_ffff, said))
         .collect()
+}
+
+thread_local! {
+    static LEASE_HASHES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[derive(Default)]
+pub(super) struct LeaseHashes;
+
+impl std::hash::BuildHasher for LeaseHashes {
+    type Hasher = rustc_hash::FxHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        LEASE_HASHES.set(LEASE_HASHES.get() + 1);
+        Self::Hasher::default()
+    }
+}
+
+#[test]
+fn dispatch_and_completion_each_look_up_the_lease_once() {
+    let now = Instant::now();
+    let (store, _, ids) = handed_bed(1, now);
+    let hand = Hand::new(GatewayId(1));
+    let hashes = |said| {
+        LEASE_HASHES.set(0);
+        store.hand(&hand, ids[0], said);
+        LEASE_HASHES.get()
+    };
+    let dispatch = Said::Dispatched(Dispatch::default(), now);
+    let complete = Said::Completed(done(Side::Single));
+    assert_eq!((hashes(dispatch), hashes(complete)), (1, 1));
+}
+
+#[cfg(feature = "controller")]
+#[test]
+fn a_decode_take_back_looks_up_the_lease_once() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    store.set_term(1);
+    issue_pair(&store, chosen_pair(id.0, p, &[d], now)).expect("the key is free");
+    assert!(store.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    assert_eq!(store.issue_decode(gateway, id, decode_side(d), now), Ok(()));
+
+    LEASE_HASHES.set(0);
+    assert!(store.take_back_decode(gateway, id, ReleaseReason::Abandoned));
+    assert_eq!(LEASE_HASHES.get(), 1);
 }
 
 #[test]
@@ -4666,12 +5576,41 @@ fn the_sweep_applies_at_a_watched_file_whose_thread_waits() {
     assert_eq!(told_ids(), []);
     // Past both leases' dispatch deadline.
     let ended = LeasesStore::expire(&*store, now + Duration::from_secs(6));
-    let ended: Vec<_> = ended.iter().map(|record| record.lease.id).collect();
+    let ended: Vec<_> = ended.iter().map(|found| found.record.lease.id).collect();
     assert_eq!(ended, [ids[1]]);
     let abandoned = Said::Released(None, ReleaseReason::Abandoned);
     assert_eq!(told_ids(), [(1, dispatch), (2, abandoned)]);
     assert_eq!(in_flight(&store), [(a, 1)]);
     assert_eq!(place.look(), Watch::Quiet, "the dispatched lease stands");
+}
+
+/// The sweep applies a release left by a thread that unwound even where
+/// the dispatched lease has no place left in the deadline queue.
+#[test]
+fn the_sweep_applies_a_release_left_before_an_unwind() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(1, now);
+    let hand = Hand::new(GatewayId(1));
+    let dispatch = Said::Dispatched(Dispatch::default(), now);
+    store.hand(&hand, ids[0], dispatch);
+    assert_eq!(told_ids(), [(1, dispatch)]);
+    assert!(LeasesStore::expire(&*store, now + Duration::from_secs(6)).is_empty());
+    assert_eq!(store.queued(), 0, "the dispatched lease's place is popped");
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut place = store.at_work();
+        assert_eq!(place.look(), Watch::Quiet);
+        store.hand(&hand, ids[0], GONE);
+        assert_eq!(told_ids(), []);
+        panic!("leave the release for the sweep");
+    }));
+    assert!(unwound.is_err());
+
+    assert!(LeasesStore::expire(&*store, now + Duration::from_secs(6)).is_empty());
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(1, GONE)], vec![(a, 0)])
+    );
 }
 
 /// A full ring under a watch: the hand that finds it applies where the
@@ -4819,6 +5758,7 @@ fn in_flight_once(store: &MemoryStore, out: &mut ViewBuffers) -> u32 {
         now: Instant::now(),
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     store.deciding(|world| {
         if let Some(built) = world.build("m", Role::Single, &ask, &mut *out) {
@@ -5861,7 +6801,7 @@ fn the_sweep_ends_a_resting_files_due_leases_under_its_deciders_name() {
         let ended = LeasesStore::expire(store, late);
         ended
             .iter()
-            .map(|record| record.lease.id)
+            .map(|found| found.record.lease.id)
             .collect::<Vec<_>>()
     };
     let (began, working) = mpsc::sync_channel(1);

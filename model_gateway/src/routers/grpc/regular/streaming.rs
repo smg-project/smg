@@ -16,6 +16,7 @@ use futures::future::try_join_all;
 use llm_tokenizer::{
     stop::{SequenceDecoderOutput, StopRules, StopSequenceDecoder},
     traits::Tokenizer,
+    Sequence,
 };
 use openai_protocol::{
     chat::ChatStreamChoice,
@@ -240,30 +241,97 @@ impl GenerateStreamUsage {
         &self,
         reservation: Option<Arc<SharedReservationHandle>>,
         expected_choices: u32,
+        counts: TokenCounts,
+        source: Option<&utils::StreamSource>,
     ) {
-        let Some(handle) = reservation else { return };
         if self.completed.len() as u32 >= expected_choices {
-            handle.settle_success(self.counts().settlement()).await;
-        } else {
+            if let Some(handle) = reservation {
+                handle.settle_success(counts.settlement()).await;
+            }
+            if let Some(source) = source {
+                source.completed(counts.prompt, counts.completion);
+            }
+        } else if let Some(handle) = reservation {
             handle.close_reserved_only().await;
         }
     }
 }
 
-/// What a generate stream keeps per choice: the choice's whole text so far,
-/// escaped once per chunk ([`EscapedText`]; the `/generate` protocol's `text`
-/// is cumulative, so every event of the choice carries it) and the choice's
-/// id, formatted once.
+/// What a generate stream keeps per choice: its incremental decoder, whole
+/// text so far (escaped once per decoded delta; the `/generate` protocol's
+/// `text` is cumulative), id, and the last chunk metadata needed if clean EOF
+/// releases decoder text without a Complete frame.
 struct GenerateChoice {
     text: EscapedText,
     id: String,
+    decoder: Sequence,
+    scratch: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cached_tokens: u32,
+    reasoning_tokens: u32,
+    weight_version: String,
+    finished: bool,
 }
 
 impl GenerateChoice {
-    fn new(request_id: &str, index: u32) -> Self {
+    fn new(
+        request_id: &str,
+        index: u32,
+        tokenizer: Arc<dyn Tokenizer>,
+        weight_version: &str,
+    ) -> Self {
         Self {
             text: EscapedText::default(),
             id: format!("{request_id}-{index}"),
+            decoder: Sequence::new_with_options(tokenizer, true),
+            scratch: String::new(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            reasoning_tokens: 0,
+            weight_version: weight_version.to_string(),
+            finished: false,
+        }
+    }
+
+    fn append_tokens(&mut self, token_ids: &[u32]) -> Result<(), String> {
+        self.scratch.clear();
+        for &token_id in token_ids {
+            self.decoder
+                .append_token_into(token_id, &mut self.scratch)
+                .map_err(|e| format!("Failed to decode generate chunk: {e}"))?;
+        }
+        self.text.push_str(&self.scratch);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<bool, String> {
+        if self.finished {
+            return Ok(false);
+        }
+        let text = self
+            .decoder
+            .finish()
+            .map_err(|e| format!("Failed to finish generate decode: {e}"))?;
+        self.finished = true;
+        let has_text = !text.is_empty();
+        self.text.push_str(&text);
+        Ok(has_text)
+    }
+
+    fn record_chunk(
+        &mut self,
+        chunk: &ProtoGenerateStreamChunk,
+        completion_tokens: u32,
+        weight_version: &str,
+    ) {
+        self.prompt_tokens = chunk.prompt_tokens();
+        self.completion_tokens = completion_tokens;
+        self.cached_tokens = chunk.cached_tokens();
+        self.reasoning_tokens = chunk.reasoning_tokens();
+        if self.weight_version != weight_version {
+            weight_version.clone_into(&mut self.weight_version);
         }
     }
 }
@@ -529,6 +597,7 @@ impl StreamingProcessor {
                         &tx,
                         None,
                         reservation,
+                        Some(&source),
                     ))
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
@@ -638,6 +707,7 @@ impl StreamingProcessor {
             tx,
             None,
             reservation,
+            None,
         )
         .await
     }
@@ -661,6 +731,7 @@ impl StreamingProcessor {
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
+        source: Option<&utils::StreamSource>,
     ) -> Result<(), utils::StreamFailure> {
         let mut stream = ChatStream::open(
             self,
@@ -701,7 +772,7 @@ impl StreamingProcessor {
         };
 
         stream
-            .settle_and_record(reservation, client_left || terminal.is_err())
+            .settle_and_record(reservation, client_left || terminal.is_err(), source)
             .await;
         terminal
     }
@@ -744,6 +815,7 @@ impl StreamingProcessor {
                 tx,
                 Some(pd_timing),
                 reservation,
+                None,
             )
             .await;
 
@@ -820,6 +892,7 @@ impl StreamingProcessor {
                         ctx,
                         &tx,
                         reservation,
+                        Some(&source),
                     ))
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.into()));
@@ -901,8 +974,16 @@ impl StreamingProcessor {
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
-        Self::process_generate_streaming_at(Instant::now(), tokenizer, stream, ctx, tx, reservation)
-            .await
+        Self::process_generate_streaming_at(
+            Instant::now(),
+            tokenizer,
+            stream,
+            ctx,
+            tx,
+            reservation,
+            None,
+        )
+        .await
     }
 
     async fn process_generate_streaming_at(
@@ -912,6 +993,7 @@ impl StreamingProcessor {
         ctx: GenerateStreamContext,
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
+        source: Option<&utils::StreamSource>,
     ) -> Result<(), utils::StreamFailure> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
@@ -976,21 +1058,22 @@ impl StreamingProcessor {
 
                         let current_completion_tokens = usage.record_chunk(&chunk);
 
-                        // Decode tokens to text (skip_special_tokens=true to handle
-                        // newlines correctly). A piece the tokenizer cannot decode
-                        // fails the stream, as it does the chat stream and the
-                        // collected generate answer: an empty piece would reach the
-                        // client as the model's own text, with nothing logged or
-                        // counted.
-                        let chunk_text = tokenizer
-                            .decode(chunk.token_ids(), true)
-                            .map_err(|e| format!("Failed to decode generate chunk: {e}"))?;
-
-                        // Accumulate text for this index
-                        let choice = choices
-                            .entry(index)
-                            .or_insert_with(|| GenerateChoice::new(&ctx.request_id, index));
-                        choice.text.push_str(&chunk_text);
+                        // Decode through the choice's sequence so a character can
+                        // span engine chunks, as it can on the chat path.
+                        let weight_version = effective_weight_version(
+                            chunk.weight_version(),
+                            Some(ctx.weight_version.as_str()),
+                        );
+                        let choice = choices.entry(index).or_insert_with(|| {
+                            GenerateChoice::new(
+                                &ctx.request_id,
+                                index,
+                                Arc::clone(&tokenizer),
+                                &ctx.weight_version,
+                            )
+                        });
+                        choice.append_tokens(chunk.token_ids())?;
+                        choice.record_chunk(&chunk, current_completion_tokens, weight_version);
 
                         // The streaming response chunk (the engine's own format)
                         let chunk_response = GenerateEvent {
@@ -1000,10 +1083,7 @@ impl StreamingProcessor {
                                 id: &choice.id,
                                 finish_reason: None,
                                 prompt_tokens: chunk.prompt_tokens(),
-                                weight_version: effective_weight_version(
-                                    chunk.weight_version(),
-                                    Some(ctx.weight_version.as_str()),
-                                ),
+                                weight_version,
                                 logprobs: None,
                                 completion_tokens: current_completion_tokens,
                                 cached_tokens: chunk.cached_tokens(),
@@ -1026,9 +1106,15 @@ impl StreamingProcessor {
                     ProtoResponseVariant::Complete(complete) => {
                         let index = complete.index();
                         let completion_tokens = usage.record_complete(&complete);
-                        let choice = choices
-                            .entry(index)
-                            .or_insert_with(|| GenerateChoice::new(&ctx.request_id, index));
+                        let choice = choices.entry(index).or_insert_with(|| {
+                            GenerateChoice::new(
+                                &ctx.request_id,
+                                index,
+                                Arc::clone(&tokenizer),
+                                &ctx.weight_version,
+                            )
+                        });
+                        choice.finish()?;
                         let e2e_latency = start_time.elapsed().as_secs_f64();
 
                         // Send final chunk with finish_reason
@@ -1078,6 +1164,31 @@ impl StreamingProcessor {
                 return Err(failure.into());
             }
         }
+        // A clean transport end has no Complete frame to carry text the
+        // decoder still holds. Send that text as one last cumulative chunk.
+        if !stream.client_left() {
+            for (&index, choice) in &mut choices {
+                let wrote_tail = match Self::write_finished_generate_choice(
+                    &mut sse_buffer,
+                    &mut room_owed,
+                    choice,
+                    index,
+                    None,
+                ) {
+                    Ok(wrote_tail) => wrote_tail,
+                    Err(failure) => {
+                        Self::flush_chunks(tx, &mut sse_buffer).await?;
+                        return Err(failure.into());
+                    }
+                };
+                if !wrote_tail {
+                    continue;
+                }
+                Self::flush_generate_frame(tx, &mut sse_buffer, &mut room_owed)
+                    .await
+                    .map_err(|()| "Failed to send chunk".to_string())?;
+            }
+        }
         // The frame being written leaves at the read's end; a client that
         // left gets nothing more (as on the chat path).
         if !stream.client_left() {
@@ -1089,11 +1200,19 @@ impl StreamingProcessor {
 
         // Record streaming metrics
         let counts = usage.counts();
-        usage.settle(reservation, ctx.expected_choices).await;
+        let client_left = stream.client_left();
+        usage
+            .settle(
+                reservation,
+                ctx.expected_choices,
+                counts,
+                source.filter(|_| !client_left),
+            )
+            .await;
         // The read ended with the client's leaving, not with the engine's end:
         // no terminal router metric for it, as the HTTP router has none for a
         // disconnect (neither a completed request nor a failure).
-        if stream.client_left() {
+        if client_left {
             return Ok(());
         }
         Self::record_generate_metrics(dispatch_start, first_token_time, counts, &ctx);
@@ -1250,17 +1369,22 @@ impl StreamingProcessor {
 
                         let current_completion_tokens = usage.record_chunk(&chunk);
 
-                        // Decode tokens to text; a piece the tokenizer cannot decode
-                        // fails the stream (see `process_generate_streaming`).
-                        let chunk_text = tokenizer
-                            .decode(chunk.token_ids(), true)
-                            .map_err(|e| format!("Failed to decode generate chunk: {e}"))?;
-
-                        // Accumulate text for this index
-                        let choice = choices
-                            .entry(index)
-                            .or_insert_with(|| GenerateChoice::new(&ctx.request_id, index));
-                        choice.text.push_str(&chunk_text);
+                        // Decode through the choice's sequence so a character can
+                        // span engine chunks (see `process_generate_streaming`).
+                        let weight_version = effective_weight_version(
+                            chunk.weight_version(),
+                            Some(ctx.weight_version.as_str()),
+                        );
+                        let choice = choices.entry(index).or_insert_with(|| {
+                            GenerateChoice::new(
+                                &ctx.request_id,
+                                index,
+                                Arc::clone(&tokenizer),
+                                &ctx.weight_version,
+                            )
+                        });
+                        choice.append_tokens(chunk.token_ids())?;
+                        choice.record_chunk(&chunk, current_completion_tokens, weight_version);
 
                         // Handle output logprobs by the stream's chunk semantics:
                         // cumulative chunks replace, delta chunks accumulate.
@@ -1294,10 +1418,7 @@ impl StreamingProcessor {
                                 id: &choice.id,
                                 finish_reason: None,
                                 prompt_tokens: chunk.prompt_tokens(),
-                                weight_version: effective_weight_version(
-                                    chunk.weight_version(),
-                                    Some(ctx.weight_version.as_str()),
-                                ),
+                                weight_version,
                                 logprobs: Some(GenerateLogprobs {
                                     input_token_logprobs: input_token_logprobs.as_deref(),
                                     output_token_logprobs: current_output_logprobs,
@@ -1323,9 +1444,15 @@ impl StreamingProcessor {
                     ProtoResponseVariant::Complete(complete) => {
                         let index = complete.index();
                         let completion_tokens = usage.record_complete(&complete);
-                        let choice = choices
-                            .entry(index)
-                            .or_insert_with(|| GenerateChoice::new(&ctx.request_id, index));
+                        let choice = choices.entry(index).or_insert_with(|| {
+                            GenerateChoice::new(
+                                &ctx.request_id,
+                                index,
+                                Arc::clone(&tokenizer),
+                                &ctx.weight_version,
+                            )
+                        });
+                        choice.finish()?;
                         let final_output_logprobs = accumulated_output_logprobs
                             .get(&index)
                             .and_then(|o| o.as_deref());
@@ -1384,6 +1511,37 @@ impl StreamingProcessor {
                 return Err(failure.into());
             }
         }
+        // A clean transport end has no Complete frame to carry text the
+        // decoder still holds. Send that text as one last cumulative chunk.
+        if !stream.client_left() {
+            for (&index, choice) in &mut choices {
+                let current_output_logprobs = accumulated_output_logprobs
+                    .get(&index)
+                    .and_then(|output| output.as_deref());
+                let wrote_tail = match Self::write_finished_generate_choice(
+                    &mut sse_buffer,
+                    &mut room_owed,
+                    choice,
+                    index,
+                    Some(GenerateLogprobs {
+                        input_token_logprobs: input_token_logprobs.as_deref(),
+                        output_token_logprobs: current_output_logprobs,
+                    }),
+                ) {
+                    Ok(wrote_tail) => wrote_tail,
+                    Err(failure) => {
+                        Self::flush_chunks(tx, &mut sse_buffer).await?;
+                        return Err(failure.into());
+                    }
+                };
+                if !wrote_tail {
+                    continue;
+                }
+                Self::flush_generate_frame(tx, &mut sse_buffer, &mut room_owed)
+                    .await
+                    .map_err(|()| "Failed to send chunk".to_string())?;
+            }
+        }
         // The frame being written leaves at the read's end; a client that
         // left gets nothing more (as on the chat path).
         if !stream.client_left() {
@@ -1395,7 +1553,9 @@ impl StreamingProcessor {
 
         // Record streaming metrics
         let counts = usage.counts();
-        usage.settle(reservation, ctx.expected_choices).await;
+        usage
+            .settle(reservation, ctx.expected_choices, counts, None)
+            .await;
         // The read ended with the client's leaving, not with the engine's end:
         // no terminal router metric for it, as the HTTP router has none for a
         // disconnect (neither a completed request nor a failure).
@@ -1812,6 +1972,38 @@ impl StreamingProcessor {
         }
         buffer.extend_from_slice(b"\n\n");
         Ok(())
+    }
+
+    /// Finish one choice at clean EOF and write the cumulative chunk only
+    /// when the decoder releases text.
+    fn write_finished_generate_choice(
+        buffer: &mut BytesMut,
+        room_owed: &mut usize,
+        choice: &mut GenerateChoice,
+        index: u32,
+        logprobs: Option<GenerateLogprobs<'_>>,
+    ) -> Result<bool, String> {
+        if !choice.finish()? {
+            return Ok(false);
+        }
+        let tail_response = GenerateEvent {
+            text: &choice.text,
+            output_ids: &[],
+            meta_info: GenerateMetaInfo {
+                id: &choice.id,
+                finish_reason: None,
+                prompt_tokens: choice.prompt_tokens,
+                weight_version: &choice.weight_version,
+                logprobs,
+                completion_tokens: choice.completion_tokens,
+                cached_tokens: choice.cached_tokens,
+                reasoning_tokens: choice.reasoning_tokens,
+                e2e_latency: None,
+            },
+            index,
+        };
+        Self::write_generate_event(buffer, room_owed, &tail_response, "chunk")?;
+        Ok(true)
     }
 
     /// Write the chunks Symphony's events make for the choice at `index`: the
@@ -2442,6 +2634,7 @@ impl StreamingProcessor {
                         &tx,
                         None,
                         reservation,
+                        Some(&source),
                     ))
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
@@ -2563,6 +2756,7 @@ impl StreamingProcessor {
             tx,
             None,
             reservation,
+            None,
         )
         .await
     }
@@ -2582,6 +2776,7 @@ impl StreamingProcessor {
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
+        source: Option<&utils::StreamSource>,
     ) -> Result<(), utils::StreamFailure> {
         let mut stream = MessagesStream::open(
             self,
@@ -2619,7 +2814,7 @@ impl StreamingProcessor {
         };
 
         stream
-            .settle_and_record(reservation, client_left || terminal.is_err())
+            .settle_and_record(reservation, client_left || terminal.is_err(), source)
             .await;
         terminal
     }
@@ -2663,6 +2858,7 @@ impl StreamingProcessor {
                 tx,
                 Some(pd_timing),
                 reservation,
+                None,
             )
             .await;
 
@@ -2913,6 +3109,9 @@ impl StreamingProcessor {
                     // generation and gets no terminal router metric.
                     if tx.is_closed() {
                         return ReadingEnd::Complete;
+                    }
+                    if all_saw_complete {
+                        source.completed(total_prompt, total_completion);
                     }
                     Metrics::record_streaming_metrics(StreamingMetricsParams {
                         router_type: metrics_labels::ROUTER_GRPC,
@@ -4699,22 +4898,25 @@ impl<'a> ChatStream<'a> {
         self,
         reservation: Option<Arc<SharedReservationHandle>>,
         client_left: bool,
+        source: Option<&utils::StreamSource>,
     ) {
         let model = &self.dispatch.model;
         let counts = self.counts();
         let (total_prompt, total_completion) = (counts.prompt, counts.completion);
-        if let Some(handle) = reservation {
-            // `prompt_tokens` has one entry per closed index: from its
-            // `Complete`, or from the chunk the gateway's own stop matched
-            // in. A clean EOF that didn't close every expected `n>1` choice
-            // has only partial usage -- settling with that would understate
-            // the real cost. Keep the reserved amount as final instead.
-            let expected_choices = self.spec.expected_choices;
-            if self.closed_choices() < expected_choices {
-                handle.close_reserved_only().await;
-            } else {
+        // `prompt_tokens` has one entry per closed index: from its
+        // `Complete`, or from the chunk the gateway's own stop matched
+        // in. A clean EOF that didn't close every expected `n>1` choice
+        // has only partial usage -- settling with that would understate
+        // the real cost. Keep the reserved amount as final instead.
+        if self.closed_choices() >= self.spec.expected_choices {
+            if let Some(handle) = reservation {
                 handle.settle_success(counts.settlement()).await;
             }
+            if let Some(source) = source.filter(|_| !client_left) {
+                source.completed(total_prompt, total_completion);
+            }
+        } else if let Some(handle) = reservation {
+            handle.close_reserved_only().await;
         }
         if client_left {
             return;
@@ -6014,11 +6216,12 @@ impl<'a> MessagesStream<'a> {
         self,
         reservation: Option<Arc<SharedReservationHandle>>,
         client_left: bool,
+        source: Option<&utils::StreamSource>,
     ) {
-        if let Some(handle) = reservation {
-            // The usage is settled by the engine's Complete, or by the
-            // gateway's own stop with the counts of the chunk it matched in.
-            if self.saw_complete || self.closed_by_stop {
+        // The usage is settled by the engine's Complete, or by the
+        // gateway's own stop with the counts of the chunk it matched in.
+        if self.saw_complete || self.closed_by_stop {
+            if let Some(handle) = reservation {
                 handle
                     .settle_success(UsageSettlement {
                         actual_input_tokens: self.prompt_tokens,
@@ -6027,9 +6230,12 @@ impl<'a> MessagesStream<'a> {
                         reasoning_tokens: self.engine_thinking_tokens,
                     })
                     .await;
-            } else {
-                handle.close_reserved_only().await;
             }
+            if let Some(source) = source.filter(|_| !client_left) {
+                source.completed(self.prompt_tokens, self.completion_tokens.total());
+            }
+        } else if let Some(handle) = reservation {
+            handle.close_reserved_only().await;
         }
 
         if client_left {

@@ -3,13 +3,13 @@
 
 use std::{collections::VecDeque, time::Instant};
 
-use super::{Asked, Taken};
+use super::{Asked, Shadowed, Taken};
 use crate::{
-    decision::Decision,
+    decision::{Decision, ShadowKind},
     framework::{Engine, Plan},
     spec::PlanName,
     store::GatewayId,
-    view::fingerprint,
+    view::{fingerprint, WorkerId},
 };
 
 /// The maximum records a decider holds.
@@ -20,10 +20,22 @@ const SLOTS: usize = 1_024;
 pub struct DecisionRecord {
     /// The decision and its trace, which carries the generation.
     pub decision: Decision,
-    /// The binding's position in that generation, if one matched.
+    /// The position in that generation of the binding the decision ran
+    /// under, if one matched. A decode decided after its prefill ran
+    /// under its pair's binding, whatever phase the call stated.
     pub binding: Option<u32>,
     /// The instant the request was taken.
     pub at: Instant,
+    /// What the binding's shadow said beside the decision, where one
+    /// was due.
+    pub shadow: Option<ShadowKind>,
+    /// The first target of the shadow's pick.
+    pub shadow_target: Option<WorkerId>,
+    /// What the decode side's shadow said beside a pair's decode, where
+    /// one was due. A pair's prefill side reads in `shadow`.
+    pub decode_shadow: Option<ShadowKind>,
+    /// The first target of the decode side's shadow.
+    pub decode_shadow_target: Option<WorkerId>,
     gateway: GatewayId,
     request: u64,
 }
@@ -34,7 +46,8 @@ pub struct Names {
     /// The binding's plan, spelled as in the policy document.
     pub plan: &'static str,
     /// The profile named by the trace. This and the stage names are empty
-    /// when the trace names no profile of the binding.
+    /// where the decision was made ahead of every profile, or the trace's
+    /// profile is outside the binding.
     pub profile: String,
     /// The profile's picker.
     pub picker: String,
@@ -71,9 +84,9 @@ impl DecisionRecord {
             plan: plan.name(),
             ..Names::default()
         };
-        let at = trace.profile;
-        // A shed can precede the profile's run. Its trace can then hold
-        // zero even where the binding uses profiles at other positions.
+        let Some(at) = trace.made_under() else {
+            return Some(names);
+        };
         let bound = at == binding.profile
             || binding.decode_profile == Some(at)
             || matches!(binding.plan, Plan::Epd { encode } if encode == at);
@@ -143,15 +156,22 @@ pub(crate) struct Samples {
 
 impl Samples {
     /// Pushes one record, allocating the ring on its first write. A new
-    /// lead starts with an empty ring.
+    /// lead starts with an empty ring. `binding` is the position of the
+    /// binding the decision ran under.
     #[cold]
     pub(crate) fn push<A: Asked>(
         &mut self,
         term: u64,
-        engine: &Engine,
+        binding: Option<u32>,
         taken: &Taken<'_, A>,
         decision: &Decision,
+        shadow: Option<Shadowed>,
+        sides: [Option<Shadowed>; 2],
     ) {
+        debug_assert!(
+            matches!(decision, Decision::Pick(_) | Decision::Shed(_)),
+            "a record is a pick's or a shed's: the count keeps no other"
+        );
         if self.term != term {
             *self = Self {
                 term,
@@ -164,10 +184,16 @@ impl Samples {
         if self.records.len() == SLOTS {
             self.records.pop_front();
         }
+        // A single's shadow, or a pair's by its two sides.
+        let [prefill, decode] = sides;
         self.records.push_back(DecisionRecord {
             decision: *decision,
-            binding: engine.binding_position(taken.request.model(), taken.request.phase()),
+            binding,
             at: taken.now,
+            shadow: shadow.or(prefill).map(|said| said.kind),
+            shadow_target: shadow.or(prefill).and_then(|said| said.first),
+            decode_shadow: decode.map(|said| said.kind),
+            decode_shadow_target: decode.and_then(|said| said.first),
             gateway: taken.gateway,
             request: fingerprint(taken.request.id()),
         });
@@ -262,6 +288,10 @@ mod tests {
             }),
             binding,
             at: Instant::now(),
+            shadow: None,
+            shadow_target: None,
+            decode_shadow: None,
+            decode_shadow_target: None,
             gateway: GATEWAY,
             request: fingerprint(b"shed"),
         }
@@ -288,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shed_ahead_of_its_profile_names_the_plan_alone() {
+    fn a_trace_for_a_profile_outside_its_binding_names_the_plan_alone() {
         let engine = naming_engine(7);
         let names = record(7, Some(2), 0).names(&engine).expect("a binding");
         assert_eq!(names.plan, "epd");

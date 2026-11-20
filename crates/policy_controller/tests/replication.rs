@@ -45,7 +45,10 @@ use smg_policy_controller::{
         self, policy_controller_client::PolicyControllerClient, replica_frame::Frame,
         replication_event::Event as Sent, worker_event::Event,
     },
-    store::{Kinds, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{
+        HealthPolicy, Kinds, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus,
+        WorkersStore,
+    },
     LoadRow, WireModes, WorkerId,
 };
 use tokio::{
@@ -431,6 +434,9 @@ impl Standby {
     }
 }
 
+/// A worker's facts, its checks off. No worker of the suite answers, and
+/// a served controller probes each worker whose checks are on: a probe's
+/// verdict would write the store beside a case that counts its writes.
 fn facts(key: &str, incarnation: u64, max_running: u32) -> WorkerFacts {
     WorkerFacts {
         key: key.to_owned(),
@@ -439,6 +445,10 @@ fn facts(key: &str, incarnation: u64, max_running: u32) -> WorkerFacts {
         models: vec!["model-a".to_owned()],
         dp_size: 1,
         max_running: (max_running != 0).then_some(max_running),
+        health: HealthPolicy {
+            probes: false,
+            ..HealthPolicy::default()
+        },
         ..WorkerFacts::default()
     }
 }

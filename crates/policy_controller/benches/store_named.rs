@@ -177,6 +177,7 @@ fn decide(
             now,
             pinned: None,
             affinity: !named,
+            signal_cells: false,
         };
         // The rows where their publication left them: lent, the door of a
         // pool every gateway reaches whole.
@@ -186,6 +187,7 @@ fn decide(
             let naming = Naming {
                 gateway: GATEWAY,
                 block_hashes: &host.hashes,
+                namespace_seed: 0,
                 seed,
                 cap: engine.named_for(MODEL, Phase::Single),
                 wires: None,

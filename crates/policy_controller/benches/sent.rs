@@ -1,8 +1,12 @@
 //! The cost of scoring with a profile's send tally over a whole pool. Each
 //! cell reads rows with no sends, a send held per row, or a send per row
 //! that reaches its time limit at the decision. The `policy_sent` cells read
-//! the tally from a registered scorer, the `policy_engine/least_cost_sent`
-//! cells through `least-cost` terms.
+//! the requests and the stated tokens from a registered scorer, the
+//! `policy_sent_whole` cells all three numbers, the
+//! `policy_engine/least_cost_sent` cells through `least-cost` terms. The
+//! `policy_sent/dispatch` cells read
+//! what 64 dispatch reports cost a profile of `least-load`, alone and
+//! beside a registered scorer that reads the same sends.
 
 #![expect(
     clippy::expect_used,
@@ -39,26 +43,66 @@ impl Scorer for SentScore {
     ) -> TieBand {
         let reads = self.0.reads(facts);
         for (&index, score) in kept.iter().zip(out) {
-            let sent = reads.of(&candidates[index as usize]);
+            let sent = reads.counts(&candidates[index as usize]);
             *score = 1.0 / (1.0 + sent.requests as f32 + sent.tokens as f32 / 1024.0);
         }
         TieBand::NORMALIZED
     }
 }
 
-fn engine() -> Engine {
+/// A registered scorer that prices a send of no stated size too: it reads
+/// all three numbers.
+#[derive(Debug)]
+struct SentWhole(Arc<SentCredit>);
+
+impl Lifecycle for SentWhole {}
+
+impl Scorer for SentWhole {
+    fn name(&self) -> &'static str {
+        "sent-whole"
+    }
+
+    fn score(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        let reads = self.0.reads(facts);
+        for (&index, score) in kept.iter().zip(out) {
+            let sent = reads.of(&candidates[index as usize]);
+            let tokens = sent.tokens as f32 / 1024.0 + sent.unsized_requests as f32;
+            *score = 1.0 / (1.0 + sent.requests as f32 + tokens);
+        }
+        TieBand::NORMALIZED
+    }
+}
+
+/// A profile of the registered scorer `name` alone, under the time limit.
+fn registered(name: &str) -> Engine {
     let mut catalog = Catalog::builtin();
     catalog
         .scorer_with("sent-score", |build| Ok(Box::new(SentScore(build.sent()))))
+        .expect("a free name")
+        .scorer_with("sent-whole", |build| Ok(Box::new(SentWhole(build.sent()))))
         .expect("a free name");
     let document: PolicySpec = serde_json::from_value(serde_json::json!({
         "apiVersion": API_VERSION,
         "profiles": {
-            "work": { "sent_ttl_ms": TTL_MS, "score": ["sent-score"], "pick": "best" }
+            "work": { "sent_ttl_ms": TTL_MS, "score": [name], "pick": "best" }
         }
     }))
     .expect("a document");
     document.validate_in(&catalog, &[]).expect("validates")
+}
+
+fn engine() -> Engine {
+    registered("sent-score")
+}
+
+fn whole() -> Engine {
+    registered("sent-whole")
 }
 
 fn least_cost() -> Engine {
@@ -144,9 +188,74 @@ fn cells(c: &mut Criterion, group: &str, engine: fn() -> Engine, in_flight_cycle
     group.finish();
 }
 
+/// A profile of `least-load`, with the registered reader beside it where
+/// `reader` says so.
+fn least_load(reader: bool) -> Engine {
+    let mut catalog = Catalog::builtin();
+    catalog
+        .scorer_with("sent-score", |build| Ok(Box::new(SentScore(build.sent()))))
+        .expect("a free name");
+    let score = if reader {
+        serde_json::json!(["least-load", "sent-score"])
+    } else {
+        serde_json::json!(["least-load"])
+    };
+    let document: PolicySpec = serde_json::from_value(serde_json::json!({
+        "apiVersion": API_VERSION,
+        "profiles": { "work": { "score": score, "pick": "best" } }
+    }))
+    .expect("a document");
+    document.validate_in(&catalog, &[]).expect("validates")
+}
+
+/// One dispatch report to each target. Out of line, so a count by
+/// function can name the timed part.
+#[inline(never)]
+fn tell_each(engine: &Engine, lease: &Lease, targets: &[Target]) {
+    for target in targets {
+        engine.on_dispatched(lease, target, Side::Single, 0);
+    }
+}
+
+/// A timed pass tells 64 dispatch reports, one a rank. Its engine is new
+/// and heard one report a rank ahead of the pass, so no timed report
+/// enters a rank and each rank holds two sends at the pass's end.
+fn dispatch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("policy_sent/dispatch");
+    let lease = Lease {
+        issued_micros: SENT_AT,
+        tokens: 379,
+        ..Lease::default()
+    };
+    let targets: Vec<_> = (0..64)
+        .map(|position| Target {
+            id: WorkerId(1003 + position),
+            ..Target::default()
+        })
+        .collect();
+    for (name, reader) in [("least_load", false), ("least_load_and_reader", true)] {
+        group.bench_function(name, |b| {
+            b.iter_batched_ref(
+                || {
+                    let engine = least_load(reader);
+                    for target in &targets {
+                        engine.on_dispatched(&lease, target, Side::Single, 0);
+                    }
+                    engine
+                },
+                |engine| tell_each(engine, black_box(&lease), &targets),
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 fn sent(c: &mut Criterion) {
     cells(c, "policy_sent", engine, 1);
+    cells(c, "policy_sent_whole", whole, 1);
     cells(c, "policy_engine/least_cost_sent", least_cost, 17);
+    dispatch(c);
 }
 
 criterion_group!(benches, sent);

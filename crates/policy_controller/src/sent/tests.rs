@@ -10,9 +10,9 @@ use crate::{
         Dispatch, GatewayId, LeaseState, LeasesStore, MemoryStore, Said, StaleGeneration,
         WorkerFacts, WorkerStatus, WorkersStore,
     },
-    AppliedSpec, Candidate, Catalog, Constraints, Engine, Lease, Lifecycle, LoadRow, Membership,
-    Pair, PolicySpec, RequestFacts, Scorer, Sent, SentCredit, Side, SpecError, Target, TieBand,
-    WorkerId, API_VERSION,
+    AppliedSpec, Candidate, Catalog, Constraints, Engine, Filter, Lease, Lifecycle, LoadRow,
+    Membership, Pair, PolicySpec, PoolFacts, RequestFacts, Scorer, Scratch, Sent, SentCounts,
+    SentCredit, Side, SpecError, Target, TieBand, WorkerId, API_VERSION,
 };
 
 const POOL: &str = "work";
@@ -26,6 +26,7 @@ fn one(tokens: u32) -> Sent {
     Sent {
         requests: 1,
         tokens: u64::from(tokens),
+        ..Sent::default()
     }
 }
 
@@ -160,7 +161,55 @@ fn a_send_with_no_stated_size_counts_only_as_a_request() {
     let (engine, sent) = built(None);
     let a = row(109, 5);
     send(&engine, &a, START, 0);
-    assert_eq!(sent.read(&clock(0), &a), one(0));
+    assert_eq!(
+        sent.read(&clock(0), &a),
+        Sent {
+            unsized_requests: 1,
+            ..one(0)
+        }
+    );
+}
+
+#[test]
+fn a_send_of_no_stated_size_leaves_the_count_with_its_release() {
+    let (engine, sent) = built(None);
+    let mut a = row(179, 5);
+    send(&engine, &a, START, 0);
+    send(&engine, &a, START + 9, 0);
+    send(&engine, &a, START + 20, TOKENS);
+    assert_eq!(
+        sent.read(&clock(0), &a),
+        Sent {
+            requests: 3,
+            tokens: u64::from(TOKENS),
+            unsized_requests: 2,
+        }
+    );
+    // A report that reflects the first two sends, each of no stated size.
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = START + 9 + u64::from(DELAY);
+    assert_eq!(sent.read(&clock(0), &a), one(TOKENS));
+}
+
+#[test]
+fn a_retired_batch_takes_its_sends_of_no_stated_size_with_it() {
+    let (engine, sent) = built(None);
+    let a = row(181, 5);
+    for _ in 0..300 {
+        send(&engine, &a, START, 0);
+    }
+    for _ in 300..8201 {
+        send(&engine, &a, START + 1, 13);
+    }
+    // The 256 oldest sends went, each of no stated size.
+    assert_eq!(
+        sent.read(&clock(0), &a),
+        Sent {
+            requests: 7945,
+            tokens: 7901 * 13,
+            unsized_requests: 44,
+        }
+    );
 }
 
 #[test]
@@ -175,6 +224,7 @@ fn a_busy_rows_tally_retires_its_oldest_batch() {
         Sent {
             requests: 8037,
             tokens: 8037 * 13,
+            ..Sent::default()
         }
     );
     for _ in 8037..8201 {
@@ -185,6 +235,7 @@ fn a_busy_rows_tally_retires_its_oldest_batch() {
         Sent {
             requests: 7945,
             tokens: 7781 * 13 + 164 * 19,
+            ..Sent::default()
         }
     );
 }
@@ -223,6 +274,89 @@ fn the_limit_ends_sends_at_its_cutoff_and_earlier() {
     assert_eq!(sent.read(&clock(at + 17_000), &a), one(331));
     a.load_sampled_at_micros = at + 4;
     assert_eq!(sent.read(&clock(at + 17_001), &a), Sent::default());
+}
+
+#[test]
+fn the_two_number_read_says_the_requests_and_stated_tokens_of_the_whole_read() {
+    let (engine, sent) = built(None);
+    let a = row(331, 3);
+    send(&engine, &a, START, TOKENS);
+    send(&engine, &a, START + 1, 0);
+    send(&engine, &a, START + 2, 293);
+
+    let facts = clock(START + 700);
+    let reads = sent.reads(&facts);
+    let whole = reads.of(&a);
+    assert_eq!(whole.unsized_requests, 1);
+    let counts = SentCounts {
+        requests: 3,
+        tokens: u64::from(TOKENS) + 293,
+    };
+    assert_eq!(reads.counts(&a), counts);
+    assert_eq!(
+        (whole.requests, whole.tokens),
+        (counts.requests, counts.tokens)
+    );
+    assert_eq!(reads.counts(&row(337, a.dp_rank)), SentCounts::default());
+}
+
+#[test]
+fn the_two_number_read_releases_the_sends_a_report_reflects() {
+    let (engine, sent) = built(None);
+    let mut a = row(347, 3);
+    let at = START + u64::from(DELAY);
+    send(&engine, &a, START, TOKENS);
+    send(&engine, &a, START + 7, 293);
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = at;
+
+    // No other read ran first: this one releases the send the report
+    // reflects, and the whole read finds it gone.
+    let facts = clock(at + 400);
+    let later = SentCounts {
+        requests: 1,
+        tokens: 293,
+    };
+    assert_eq!(sent.reads(&facts).counts(&a), later);
+    assert_eq!(sent.read(&facts, &a), one(293));
+}
+
+#[test]
+fn a_release_leaves_a_later_send_of_no_stated_size_in_the_read_that_ran_it() {
+    let (engine, sent) = built(None);
+    let mut a = row(353, 5);
+    send(&engine, &a, START, 0);
+    send(&engine, &a, START + 9, 0);
+    // A report that reflects the first send: the read that releases it
+    // still counts the second, and counts it as of no stated size.
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = START + u64::from(DELAY);
+    assert_eq!(
+        sent.read(&clock(0), &a),
+        Sent {
+            requests: 1,
+            tokens: 0,
+            unsized_requests: 1,
+        }
+    );
+}
+
+#[test]
+fn the_two_number_read_counts_no_send_past_the_time_limit() {
+    let (engine, sent) = built(Some(17));
+    let a = row(349, 3);
+    let at = START + u64::from(DELAY);
+    send(&engine, &a, START, TOKENS);
+
+    let held = SentCounts {
+        requests: 1,
+        tokens: u64::from(TOKENS),
+    };
+    assert_eq!(sent.reads(&clock(at + 16_999)).counts(&a), held);
+    assert_eq!(
+        sent.reads(&clock(at + 17_000)).counts(&a),
+        SentCounts::default()
+    );
 }
 
 #[test]
@@ -448,6 +582,7 @@ fn a_decision_holding_the_standing_world_reads_the_same_carried_entry() {
         let both = Sent {
             requests: 2,
             tokens: 2 * u64::from(TOKENS),
+            ..Sent::default()
         };
         assert_eq!(standing.read(&clock(0), &sent_to), both);
         store.deciding(|next| {
@@ -616,6 +751,192 @@ fn two_scorers_in_one_profile_share_one_tally() {
     assert_eq!(readers[1].read(&clock(0), &a), one(TOKENS));
 }
 
+/// A profile of `least-load` under `name`, with the registered reader
+/// beside it where `reader` says so.
+fn load_document(name: &str, limit: Option<u32>, reader: bool) -> PolicySpec {
+    let score = if reader {
+        json!(["least-load", "avoid-sent"])
+    } else {
+        json!(["least-load"])
+    };
+    serde_json::from_value(json!({
+        "apiVersion": API_VERSION,
+        "generation": 4,
+        "profiles": { (name): { "sent_ttl_ms": limit, "score": score, "pick": "best" } }
+    }))
+    .expect("a document")
+}
+
+fn load_engine(name: &str, limit: Option<u32>) -> Engine {
+    load_document(name, limit, false)
+        .validate()
+        .expect("the profile validates")
+}
+
+/// Two rows with equal reports, sampled ahead of every send of a case.
+fn reporting() -> [Candidate; 2] {
+    [(0, 191), (1, 193)].map(|(position, id)| Candidate {
+        position,
+        load: Some(LoadRow::default()),
+        load_sampled_at_micros: START - 1,
+        ..row(id, 3)
+    })
+}
+
+/// The scores of `rows` in a decision at `now_micros`, in the rows' order.
+fn scores(engine: &Engine, rows: &[Candidate; 2], now_micros: u64) -> [f32; 2] {
+    let pool = PoolFacts {
+        pool_size: 2,
+        ..PoolFacts::default()
+    };
+    let mut scratch = Scratch::new();
+    let decision = engine.decide(
+        &clock(now_micros),
+        &pool,
+        rows,
+        &Constraints::default(),
+        &mut scratch,
+    );
+    let pick = decision.pick().expect("the rows route");
+    let top = &pick.trace.top[..usize::from(pick.trace.top_len)];
+    rows.each_ref().map(|row| {
+        let scored = top.iter().find(|(id, _)| *id == row.id);
+        scored.expect("each row is scored").1
+    })
+}
+
+#[test]
+fn least_load_reads_its_profiles_count_and_keeps_none_of_its_own() {
+    let engine = load_engine(POOL, None);
+    assert_eq!(engine.sent_credits.len(), 1);
+    let rows = reporting();
+    let lease = Lease {
+        issued_micros: START,
+        tokens: TOKENS,
+        ..Lease::default()
+    };
+    // The counts alone hear this send: a stage with a tally of its own
+    // would score the two rows alike.
+    engine.dispatched_sent(&lease, &target(&rows[0]), Side::Single, DELAY, || true);
+    let [sent_to, other] = scores(&engine, &rows, START + 700);
+    assert!(sent_to < other, "{sent_to} against {other}");
+}
+
+#[test]
+fn least_load_and_a_reader_share_one_count_and_a_send_is_counted_once() {
+    let (catalog, readers) = catalog();
+    let engine = load_document(POOL, None, true)
+        .validate_in(&catalog, &[])
+        .expect("the profile validates");
+    assert_eq!(engine.sent_credits.len(), 1);
+    assert!(Arc::ptr_eq(&engine.sent_credits[0], &readers.lock()[0]));
+    let rows = reporting();
+    send(&engine, &rows[0], START, TOKENS);
+    assert_eq!(
+        engine.sent_credits[0].read(&clock(0), &rows[0]),
+        one(TOKENS)
+    );
+}
+
+#[test]
+fn least_load_prices_a_send_of_no_stated_size_at_its_mean() {
+    let mut document = load_document(POOL, None, false);
+    document.profiles.get_mut(POOL).expect("the profile").score =
+        vec![
+            serde_json::from_value(json!({ "least-load": { "mean_prefill_tokens": 701 } }))
+                .expect("a stage"),
+        ];
+    let engine = document.validate().expect("the profile validates");
+    let rows = reporting();
+    send(&engine, &rows[0], START, 0);
+    send(&engine, &rows[1], START, 701);
+    let sent = &engine.sent_credits[0];
+    assert_eq!(
+        sent.read(&clock(0), &rows[0]),
+        Sent {
+            unsized_requests: 1,
+            ..one(0)
+        }
+    );
+    let [unsized_send, stated] = scores(&engine, &rows, START + 700);
+    assert_eq!(unsized_send, stated);
+    send(&engine, &rows[1], START, 1);
+    let [unsized_send, stated] = scores(&engine, &rows, START + 700);
+    assert!(stated < unsized_send, "{stated} against {unsized_send}");
+}
+
+#[test]
+fn the_profiles_limit_ends_least_loads_credit() {
+    let limited = load_engine(POOL, Some(17));
+    let unlimited = load_engine(POOL, None);
+    let rows = reporting();
+    for engine in [&limited, &unlimited] {
+        send(engine, &rows[0], START, TOKENS);
+    }
+    let ends = START + u64::from(DELAY) + 17_000;
+    let [sent_to, other] = scores(&limited, &rows, ends - 1);
+    assert!(sent_to < other, "{sent_to} against {other}");
+    let [sent_to, other] = scores(&limited, &rows, ends);
+    assert_eq!(sent_to, other);
+    // With no limit the credit stands until a report reflects the send.
+    let [sent_to, other] = scores(&unlimited, &rows, ends + 7_300_000);
+    assert!(sent_to < other, "{sent_to} against {other}");
+    let reflected = rows.map(|row| Candidate {
+        load_sampled_at_micros: START + u64::from(DELAY),
+        ..row
+    });
+    let [sent_to, other] = scores(&unlimited, &reflected, ends + 7_300_000);
+    assert_eq!(sent_to, other);
+}
+
+#[test]
+fn a_new_documents_least_load_keeps_the_sends_of_the_standing_one() {
+    let standing = load_engine(POOL, None);
+    let rows = reporting();
+    send(&standing, &rows[0], START, TOKENS);
+    let next = load_engine(POOL, None);
+    next.succeed(&standing);
+    let [sent_to, other] = scores(&next, &rows, START + 700);
+    assert!(sent_to < other, "{sent_to} against {other}");
+}
+
+#[test]
+fn least_load_under_a_new_profile_name_starts_with_no_sends() {
+    let standing = load_engine(POOL, None);
+    let rows = reporting();
+    send(&standing, &rows[0], START, TOKENS);
+    let next = load_engine("renamed", None);
+    next.succeed(&standing);
+    let [sent_to, other] = scores(&next, &rows, START + 700);
+    assert_eq!(sent_to, other);
+}
+
+#[test]
+fn presence_is_asked_only_where_a_send_enters_a_rank() {
+    let (engine, sent) = built(None);
+    let a = row(197, 3);
+    let lease = Lease {
+        issued_micros: START,
+        tokens: TOKENS,
+        ..Lease::default()
+    };
+    // A rank the count does not know is asked for, and a row that left
+    // enters none.
+    engine.dispatched_sent(&lease, &target(&a), Side::Single, DELAY, || false);
+    assert!(!sent.credits.tally.load().contains_key(&(a.id, a.dp_rank)));
+    engine.dispatched_sent(&lease, &target(&a), Side::Single, DELAY, || true);
+    // A rank it knows takes the send unasked.
+    engine.dispatched_sent(&lease, &target(&a), Side::Single, DELAY, || {
+        panic!("a known rank was asked for")
+    });
+    assert_eq!(sent.read(&clock(0), &a).requests, 2);
+}
+
+#[test]
+fn a_limit_is_taken_where_least_load_reads_the_sends() {
+    assert_eq!(load_engine(POOL, Some(71)).sent_credits.len(), 1);
+}
+
 #[test]
 fn a_zero_limit_is_refused_at_the_profiles_field() {
     let (catalog, _) = catalog();
@@ -671,5 +992,163 @@ fn an_unset_limit_leaves_a_documents_canonical_form_and_digest_intact() {
     assert_eq!(
         document.digest().expect("a digest").to_string(),
         "sha256:5d615ed114ca79046283cd72596dd3428baa2ec110170a5bb72ea4bc525b1ade"
+    );
+}
+
+/// Keeps the rows its profile sent fewer than `most` requests.
+#[derive(Debug)]
+struct SentUnder {
+    sent: Arc<SentCredit>,
+    most: u32,
+}
+
+impl Filter for SentUnder {
+    fn name(&self) -> &'static str {
+        "sent-under"
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, candidate: &Candidate, _: &Constraints<'_>) -> bool {
+        self.sent.read(facts, candidate).requests < self.most
+    }
+}
+
+/// A registered filter holds its profile's count of sends, as a registered
+/// scorer does. The count is made where the filter's factory asks for it,
+/// ahead of any scorer, so the profile's limit has its reader.
+#[test]
+fn a_registered_filter_reads_the_sends_of_its_profile() {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Most {
+        requests: u32,
+    }
+
+    let readers = Readers::default();
+    let kept = Arc::clone(&readers);
+    let mut catalog = Catalog::builtin();
+    catalog
+        .filter_with("sent-under", move |build| {
+            let Most { requests } = build.params()?;
+            let sent = build.sent();
+            kept.lock().push(Arc::clone(&sent));
+            Ok(Box::new(SentUnder {
+                sent,
+                most: requests,
+            }))
+        })
+        .expect("a free name");
+    let document: PolicySpec = serde_json::from_value(json!({
+        "apiVersion": API_VERSION,
+        "generation": 4,
+        "profiles": {
+            "work": {
+                "sent_ttl_ms": 24_001,
+                "filter": [{ "sent-under": { "requests": 2 } }],
+                "pick": "random"
+            }
+        }
+    }))
+    .expect("a document");
+    let engine = document
+        .validate_in(&catalog, &[])
+        .expect("the filter reads the sends the limit ages");
+    assert_eq!(engine.sent_credits.len(), 1);
+
+    let a = row(127, 3);
+    let b = row(131, a.dp_rank);
+    let facts = clock(START + 700);
+    let filter = &engine.profiles()[0].filters[0];
+    let keeps = |row: &Candidate| filter.keep(&facts, row, &Constraints::default());
+    send(&engine, &a, START, TOKENS);
+    assert!(keeps(&a) && keeps(&b), "one send is under two");
+    send(&engine, &a, START, TOKENS);
+    assert!(!keeps(&a), "two sends are not under two");
+    assert!(keeps(&b), "another row's sends are its own");
+    // The count the factory was handed is the one the engine feeds.
+    assert_eq!(
+        readers.lock()[0].read(&facts, &a),
+        Sent {
+            requests: 2,
+            tokens: 2 * u64::from(TOKENS),
+            ..Sent::default()
+        }
+    );
+}
+
+/// Picks the kept row its profile sent the fewest requests, the first of
+/// them at a tie.
+#[derive(Debug)]
+struct LeastSent {
+    sent: Arc<SentCredit>,
+}
+
+impl Lifecycle for LeastSent {}
+
+impl crate::framework::Picker for LeastSent {
+    fn name(&self) -> &'static str {
+        "least-sent"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        _: &[f32],
+        _: TieBand,
+        out: &mut crate::decision::Targets,
+    ) {
+        let sent = |row: &&u32| self.sent.read(facts, &candidates[**row as usize]).requests;
+        if let Some(&row) = kept.iter().min_by_key(sent) {
+            out.push(crate::builtins::target_of(&candidates[row as usize]));
+        }
+    }
+}
+
+/// A registered picker holds its profile's count of sends, as a registered
+/// filter does. A profile whose only reader of sends is its picker keeps
+/// its limit: the picker is built ahead of the limit's check. The count its
+/// factory was handed is the profile's own, the one the engine feeds.
+#[test]
+fn a_registered_picker_reads_the_sends_of_its_profile() {
+    let readers = Readers::default();
+    let kept = Arc::clone(&readers);
+    let mut catalog = Catalog::builtin();
+    catalog
+        .picker_with("least-sent", move |build| {
+            let sent = build.sent();
+            kept.lock().push(Arc::clone(&sent));
+            Ok(Box::new(LeastSent { sent }))
+        })
+        .expect("a free name");
+    let document: PolicySpec = serde_json::from_value(json!({
+        "apiVersion": API_VERSION,
+        "generation": 4,
+        "profiles": {
+            "work": {
+                "sent_ttl_ms": 24_001,
+                "filter": ["healthy"],
+                "score": ["least-requests"],
+                "pick": "least-sent"
+            }
+        }
+    }))
+    .expect("a document");
+    let engine = document
+        .validate_in(&catalog, &[])
+        .expect("the picker reads the sends the limit ages");
+    assert_eq!(engine.sent_credits.len(), 1);
+
+    let a = row(127, 3);
+    let facts = clock(START + 700);
+    send(&engine, &a, START, TOKENS);
+    send(&engine, &a, START, TOKENS);
+    assert_eq!(
+        readers.lock()[0].read(&facts, &a),
+        Sent {
+            requests: 2,
+            tokens: 2 * u64::from(TOKENS),
+            ..Sent::default()
+        }
     );
 }

@@ -154,8 +154,10 @@
 //! loads', in that order. No path takes one of those and then a turn. A
 //! lifecycle call of a served controller therefore runs under a turn, or
 //! after it where a decision gives its own lease up: it is bounded and
-//! calls no door of the leases. A debug build marks the thread that holds
-//! a turn and refuses a second take of it by that thread.
+//! calls no door of the leases. A registration that takes its key's pins
+//! along holds the workers lock over the store's pins, each shard a leaf
+//! under it. A debug build marks the thread that holds a turn and refuses
+//! a second take of it by that thread.
 
 use std::{
     fmt,
@@ -174,12 +176,12 @@ use std::{
 use arc_swap::Guard;
 use parking_lot::{Mutex, MutexGuard};
 
-use super::{waits, Key, Leases, MemoryStore};
+use super::{takes_dispatch, Key, Leases, MemoryStore};
 use crate::{
     decider::Decider,
     lease::LeaseId,
     store::{
-        leases::{Said, Sides},
+        leases::{LeaseState, Said, Sides},
         world::World,
         GatewayId,
     },
@@ -214,8 +216,25 @@ impl OneLoad {
     }
 }
 
-/// What a frame said of a gateway's lease, as it waits in the ring.
-type Handed = (GatewayId, LeaseId, Said);
+/// What waits in a file's ring of a lease: what a frame said of it, or the
+/// served door's own word of a decode call's issue. No frame carries the
+/// second and no host says it: one function of the crate writes it
+/// ([`MemoryStore::hand_taken_back`]).
+#[derive(Clone, Copy)]
+enum Word {
+    /// What a frame said, or a stream's release.
+    Said(Said),
+    /// One issue of a decode call taken back, and the reason.
+    #[cfg(feature = "controller")]
+    TakenBack(super::DecodeIssue, crate::lease::ReleaseReason),
+}
+
+// The door's own word rides the room a frame's word leaves: a slot of the
+// ring is no wider for it.
+const _: () = assert!(size_of::<Word>() == size_of::<Said>());
+
+/// A word of a gateway's lease, as it waits in the ring.
+type Handed = (GatewayId, LeaseId, Word);
 
 /// A file's ring by its two ends. They stand in a module of their own
 /// and the queue is private to it: the turn module writes a frame through
@@ -246,6 +265,11 @@ mod ring {
         /// ([`MemoryStore::hand`]).
         pub(super) fn write(&self, frame: Handed) -> Result<(), Handed> {
             self.0.push(frame)
+        }
+
+        /// Whether a frame waits for the next take.
+        pub(super) fn waits(&self) -> bool {
+            !self.0.is_empty()
         }
     }
 
@@ -310,6 +334,9 @@ pub(super) struct Behind {
 pub(super) struct File {
     /// The turn: its holder writes the file.
     turn: Mutex<Behind>,
+    /// When a sweep next asks the file, written under `turn`
+    /// ([`super::NextDue`]).
+    next_due: Arc<super::NextDue>,
     /// What a hand reads at each frame.
     shown: Shown,
     /// Who is at work at the file: what a hand reads where no watch
@@ -321,13 +348,18 @@ pub(super) struct File {
     /// The thread that holds the turn; 0 for none.
     #[cfg(debug_assertions)]
     holder: AtomicUsize,
+    /// Takes of this file's turn, for cases that assert a path avoided it.
+    #[cfg(test)]
+    takes: AtomicUsize,
 }
 
 impl File {
     fn new(leases: Leases, name: Option<Decider>) -> Self {
         let (hands, ring) = ring::ends();
+        let next_due = Arc::clone(&leases.next_due);
         Self {
             turn: Mutex::new(Behind { leases, ring }),
+            next_due,
             shown: Shown {
                 hands,
                 watched: AtomicBool::new(false),
@@ -338,12 +370,21 @@ impl File {
             name,
             #[cfg(debug_assertions)]
             holder: AtomicUsize::new(0),
+            #[cfg(test)]
+            takes: AtomicUsize::new(0),
         }
+    }
+
+    /// Whether this file may hold work for a sweep.
+    pub(super) fn sweep_needed(&self, now: std::time::Instant) -> bool {
+        self.next_due.reached(now) || self.shown.hands.waits()
     }
 
     /// Takes the turn and applies nothing: for the term's read, which no
     /// handed frame changes.
     pub(super) fn take(&self) -> Turn<'_> {
+        #[cfg(test)]
+        self.takes.fetch_add(1, SeqCst);
         #[cfg(debug_assertions)]
         assert_ne!(
             self.holder.load(SeqCst),
@@ -364,6 +405,18 @@ impl File {
     #[cfg(test)]
     pub(super) fn free(&self) -> bool {
         self.turn.try_lock().is_some()
+    }
+
+    /// Takes of this file's turn since the test last cleared them.
+    #[cfg(test)]
+    pub(super) fn takes(&self) -> usize {
+        self.takes.load(SeqCst)
+    }
+
+    /// Starts this test's count of turn takes again.
+    #[cfg(test)]
+    pub(super) fn clear_takes(&self) {
+        self.takes.store(0, SeqCst);
     }
 
     /// The turn where it is free, with nothing applied. `None` where a
@@ -932,8 +985,15 @@ impl MemoryStore {
         }
         let Behind { leases, ring } = &mut *turn.behind;
         let mut one = OneLoad::default();
-        while let Some((gateway, lease, said)) = ring.take() {
-            self.apply_frame(at, leases, (gateway, lease), said, &mut one);
+        while let Some((gateway, lease, word)) = ring.take() {
+            let key = (gateway, lease);
+            match word {
+                Word::Said(said) => self.apply_frame(at, leases, key, said, &mut one),
+                #[cfg(feature = "controller")]
+                Word::TakenBack(issue, reason) => {
+                    self.apply_taken_back(at, leases, key, issue, reason, &mut one);
+                }
+            }
         }
         true
     }
@@ -1008,9 +1068,38 @@ impl MemoryStore {
     /// between its looks, so a slow decision costs its waiting hands no
     /// core.
     pub fn hand(&self, hand: &Hand, lease: LeaseId, said: Said) {
+        self.hand_word(hand, lease, Word::Said(said));
+    }
+
+    /// Hands the file `lease`'s id names the take-back of `issue`, one
+    /// issue of a decode call, under `reason`: the word of a `Decide`
+    /// stream for an answer of that call that does not leave. It goes the
+    /// way of [`Self::hand`], so whoever may act at the file applies it,
+    /// and no stage hears it beside its decider at work. Where that issue
+    /// still stands the side returns to chosen and its engine hears the
+    /// decode side's release. Where the side moved since, by a dispatch, a
+    /// repeat's take-back or a later issue, nothing moves and nothing is
+    /// told.
+    #[cfg(feature = "controller")]
+    #[cold]
+    pub(crate) fn hand_taken_back(
+        &self,
+        hand: &Hand,
+        lease: LeaseId,
+        issue: super::DecodeIssue,
+        reason: crate::lease::ReleaseReason,
+    ) {
+        self.hand_word(hand, lease, Word::TakenBack(issue, reason));
+    }
+
+    /// [`Self::hand`] for either word of the ring, laid into it: a frame's
+    /// word keeps the loop the served hand was, and the door's own word
+    /// pays its copy on a path few answers take.
+    #[inline(always)]
+    fn hand_word(&self, hand: &Hand, lease: LeaseId, word: Word) {
         let at = self.file_of(lease);
         let mut looks = 0_u32;
-        while !self.try_hand(at, hand, lease, said) {
+        while !self.try_hand_word(at, hand, lease, word) {
             looks = looks.saturating_add(1);
             if looks <= FULL_RING_YIELDS {
                 thread::yield_now();
@@ -1030,8 +1119,15 @@ impl MemoryStore {
     /// door's two callers would otherwise move it out of line under it.
     #[inline(always)]
     pub(crate) fn try_hand(&self, at: usize, hand: &Hand, lease: LeaseId, said: Said) -> bool {
+        self.try_hand_word(at, hand, lease, Word::Said(said))
+    }
+
+    /// [`Self::try_hand`] for either word of the ring, inlined with it: a
+    /// frame's word is the one the served hand and the door write.
+    #[inline(always)]
+    fn try_hand_word(&self, at: usize, hand: &Hand, lease: LeaseId, word: Word) -> bool {
         let file = &self.files[at];
-        let frame = (hand.gateway, lease, said);
+        let frame = (hand.gateway, lease, word);
         loop {
             match file.shown.hands.write(frame) {
                 Ok(()) => break,
@@ -1065,18 +1161,10 @@ impl MemoryStore {
     /// record held as the frame found it.
     fn apply_frame(&self, at: usize, leases: &mut Leases, key: Key, said: Said, one: &mut OneLoad) {
         let found = match said {
-            Said::Dispatched(dispatch, when) => {
-                let found = leases.found(&key);
-                leases.dispatched(self.slots(), &key, dispatch, when);
-                // The side the frame names is told where it waited for
-                // this dispatch.
-                found.filter(|found| waits(found, dispatch.side))
-            }
-            Said::Completed(outcome) => {
-                let found = leases.found(&key);
-                leases.completed(&key, &outcome);
-                found
-            }
+            Said::Dispatched(dispatch, when) => leases
+                .dispatched(self.slots(), &key, dispatch, when)
+                .filter(|found| takes_dispatch(found, dispatch.side)),
+            Said::Completed(outcome) => leases.end_side(&key, outcome.side, LeaseState::Completed),
             Said::Released(side, reason) => leases.released(&key, side, reason),
         };
         if let Some(found) = found {

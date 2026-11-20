@@ -26,8 +26,10 @@ use crate::{
         Passthrough, PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
     },
     framework::{Filter, Picker, Scorer},
+    reports::Reports,
     sent::SentCredit,
-    spec::{SpecError, SCORERS},
+    signals::{column_named, SignalColumn},
+    spec::{Needs, SpecError, SCORERS},
 };
 
 /// Builds one stage: once at its registration, then once for each place a
@@ -37,6 +39,12 @@ type Factory<T> = Box<dyn Fn() -> Box<T> + Send + Sync>;
 type ScorerFactory =
     dyn Fn(&mut StageBuild<'_>) -> Result<Box<dyn Scorer>, StageError> + Send + Sync;
 type ScorerBuild = Build<dyn Scorer, Box<ScorerFactory>>;
+pub(crate) type FilterFactory =
+    dyn Fn(&mut StageBuild<'_>) -> Result<Box<dyn Filter>, StageError> + Send + Sync;
+type FilterBuild = Build<dyn Filter, Box<FilterFactory>>;
+pub(crate) type PickerFactory =
+    dyn Fn(&mut StageBuild<'_>) -> Result<Box<dyn Picker>, StageError> + Send + Sync;
+type PickerBuild = Build<dyn Picker, Box<PickerFactory>>;
 
 /// How a held name becomes a stage.
 enum Build<T: ?Sized, F = Infallible> {
@@ -67,37 +75,90 @@ pub struct StageBuild<'a> {
     profile: &'a str,
     sent_ttl_ms: Option<u32>,
     sent: &'a mut Option<Arc<SentCredit>>,
+    reports: Reports,
+    /// The document's signals, resolved, in name order.
+    signals: &'a [SignalColumn],
+    resolved_signal: bool,
 }
 
 impl<'a> StageBuild<'a> {
-    pub(crate) fn new(
+    /// The stage `build` makes under a context of its own, held to its own
+    /// word on the signal cells: its needs (`needs`) set them exactly where
+    /// its factory resolved a signal ([`Self::signal_column`]). A stage
+    /// that kept a column and does not say so would be handed no cells and
+    /// read no value, in silence. One that says so and kept none would
+    /// have a host hand cells nothing reads. The one maker of a context: a
+    /// stage of any kind a factory builds comes through here.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the context's parts, the factory and the stage's own word on its needs"
+    )]
+    pub(crate) fn built<S: ?Sized>(
         written: &'a Map<String, Value>,
         profile: &'a str,
         sent_ttl_ms: Option<u32>,
         sent: &'a mut Option<Arc<SentCredit>>,
-    ) -> Self {
-        Self {
+        reports: Reports,
+        signals: &'a [SignalColumn],
+        build: impl FnOnce(&mut Self) -> Result<Box<S>, StageError>,
+        needs: impl FnOnce(&S) -> Needs,
+    ) -> Result<Box<S>, StageError> {
+        let mut context = Self {
             written,
             profile,
             sent_ttl_ms,
             sent,
+            reports,
+            signals,
+            resolved_signal: false,
+        };
+        let stage = build(&mut context)?;
+        Self::held_to_cells(
+            context.resolved_signal,
+            needs(&stage),
+            "resolve one or leave the need unset",
+        )?;
+        Ok(stage)
+    }
+
+    /// A stage's own word on the signal cells, held to what its build
+    /// resolved. `resolved` says whether a factory resolved a signal under
+    /// its context. It is false for a stage the catalog built with no
+    /// context: that stage resolved no column of this document, so it
+    /// declares no cells. `remedy` ends the refusal of such a need with
+    /// what the stage's author can do, which differs by how the stage is
+    /// registered.
+    pub(crate) fn held_to_cells(
+        resolved: bool,
+        needs: Needs,
+        remedy: &'static str,
+    ) -> Result<(), StageError> {
+        match (resolved, needs.signal_cells) {
+            (true, false) => Err(StageError::other(
+                "the stage keeps a signal's column: its needs must set signal_cells",
+            )),
+            (false, true) => Err(StageError::other(format!(
+                "the stage's needs set signal_cells and its build resolved no signal: {remedy}"
+            ))),
+            _ => Ok(()),
         }
     }
 }
 
 impl StageBuild<'_> {
     /// Reads the parameters into `T`. A bare name supplies an empty map.
-    /// The validator removes the scorer's `weight`, so it appears in
-    /// neither `T`'s input nor [`Self::written`]. Derive
+    /// The validator removes a scorer's `weight`, so it appears in
+    /// neither `T`'s input nor [`Self::written`]; a filter's map and a
+    /// picker's are handed whole. Derive
     /// `#[serde(deny_unknown_fields)]` on `T`: otherwise a misspelled
     /// parameter is ignored and its default runs.
     pub fn params<T: DeserializeOwned>(&self) -> Result<T, StageError> {
         serde_json::from_value(Value::Object(self.written.clone())).map_err(StageError::from)
     }
 
-    /// The document's parameter map with `weight` removed, the keys of
-    /// every map in order: the order of the canonical bytes, whatever
-    /// order the document wrote them in.
+    /// The document's parameter map, a scorer's with `weight` removed,
+    /// the keys of every map in order: the order of the canonical bytes,
+    /// whatever order the document wrote them in.
     pub fn written(&self) -> &Map<String, Value> {
         self.written
     }
@@ -106,6 +167,30 @@ impl StageBuild<'_> {
     /// its tally under that profile's `sent_ttl_ms`.
     pub fn sent(&mut self) -> Arc<SentCredit> {
         profile_sent(self.sent, self.profile, self.sent_ttl_ms)
+    }
+
+    /// The view's reading of a row's load report, for a stage that reads
+    /// one: a report older than the document's `view.max_report_age_ms`
+    /// reads as none, as it does for the built-in stages. A stage that
+    /// reads `row.load` itself sees the report at any age. The value is
+    /// `Copy`, and asking for it makes nothing.
+    pub fn reports(&self) -> Reports {
+        self.reports
+    }
+
+    /// The column of a signal the document declares, by its name. A name
+    /// the document does not declare is refused at the stage's entry. A
+    /// stage that keeps a column says so in its needs
+    /// ([`Needs::signal_cells`](crate::Needs::signal_cells)), and a stage
+    /// that keeps none does not: the validator refuses either mismatch, so
+    /// a host hands the cells to the profiles that read them and to no
+    /// other.
+    pub fn signal_column(&mut self, name: &str) -> Result<SignalColumn, StageError> {
+        let column = column_named(self.signals, name).ok_or_else(|| {
+            StageError::other(format!("{name} is not a signal the document declares"))
+        })?;
+        self.resolved_signal = true;
+        Ok(column.clone())
     }
 }
 
@@ -229,26 +314,17 @@ pub enum CatalogError {
 /// build's; a host adds its own under new names and hands the catalog to
 /// the validator ([`crate::PolicySpec::validate_in`]).
 pub struct Catalog {
-    filters: Vec<(&'static str, Factory<dyn Filter>)>,
+    filters: Vec<(&'static str, FilterBuild)>,
     scorers: Vec<(&'static str, ScorerBuild)>,
-    pickers: Vec<(&'static str, Build<dyn Picker>)>,
+    pickers: Vec<(&'static str, PickerBuild)>,
     /// Whether the host makes the lifecycle's calls: a stage that needs
     /// them ([`crate::Lifecycle::needs_lifecycle`]) is in no other build.
     lifecycle: bool,
-    /// Whether the host records the prefixes it sent each worker: a
-    /// prefix-affinity source that reads them, alone or merged with the
-    /// index, is in no other build.
-    sent_prefixes: bool,
 }
 
-/// The factory of a built-in that takes no parameter.
-fn factory<T: ?Sized + 'static>(build: fn() -> Box<T>) -> Factory<T> {
-    Box::new(build)
-}
-
-/// A built-in its factory builds.
-fn of<T: ?Sized + 'static>(build: fn() -> Box<T>) -> Build<T> {
-    Build::Factory(factory(build))
+/// A built-in that takes no parameter: its factory builds it.
+fn of<T: ?Sized + 'static, F>(build: fn() -> Box<T>) -> Build<T, F> {
+    Build::Factory(Box::new(build))
 }
 
 impl Catalog {
@@ -258,11 +334,11 @@ impl Catalog {
     pub fn builtin() -> Self {
         Self {
             filters: vec![
-                ("healthy", factory(|| Box::new(Healthy))),
-                ("not-overloaded", factory(|| Box::new(NotOverloaded))),
-                ("has-capacity", factory(|| Box::new(HasCapacity))),
-                ("has-room", factory(|| Box::new(HasRoom))),
-                ("not-tried", factory(|| Box::new(NotTried))),
+                ("healthy", of(|| Box::new(Healthy))),
+                ("not-overloaded", of(|| Box::new(NotOverloaded))),
+                ("has-capacity", of(|| Box::new(HasCapacity))),
+                ("has-room", of(|| Box::new(HasRoom))),
+                ("not-tried", of(|| Box::new(NotTried))),
             ],
             // Every scorer takes its weight, and most take more: each is
             // built from its typed parameters.
@@ -282,7 +358,6 @@ impl Catalog {
                 ("best-with-temperature", Build::Typed),
             ],
             lifecycle: true,
-            sent_prefixes: true,
         }
     }
 
@@ -300,34 +375,48 @@ impl Catalog {
         self.lifecycle
     }
 
-    /// The catalog of a host that records no prefix it sent: the validator
-    /// refuses a prefix-affinity source that reads them, by its field, as
-    /// not in this build.
-    #[cfg(any(test, feature = "controller"))]
-    pub(crate) fn without_sent_prefixes(mut self) -> Self {
-        self.sent_prefixes = false;
-        self
-    }
-
-    /// Whether the host records the prefixes it sent each worker.
-    pub(crate) fn records_sent_prefixes(&self) -> bool {
-        self.sent_prefixes
-    }
-
     /// Adds a filter under `name`: a document names it as it names a
-    /// built-in. Refused when the name is held or is not the filter's own.
+    /// built-in. It takes no parameter: a map written under its name is
+    /// refused. Refused when the name is held or is not the filter's own.
+    /// Built with no context, the filter resolves no signal: validation
+    /// refuses one whose needs set `signal_cells`
+    /// ([`Self::filter_with`] resolves one).
     pub fn filter<F>(&mut self, name: &'static str, factory: F) -> Result<&mut Self, CatalogError>
     where
         F: Fn() -> Box<dyn Filter> + Send + Sync + 'static,
     {
         self.admit(StageKind::Filter, name, || factory().name())?;
-        self.filters.push((name, Box::new(factory)));
+        self.filters.push((name, Build::Factory(Box::new(factory))));
+        Ok(self)
+    }
+
+    /// Adds a filter that reads parameters under `name`: a document writes
+    /// `{ name: { .. } }`, and a bare name supplies an empty map. Returns
+    /// [`CatalogError::Held`] when any stage already holds the name.
+    ///
+    /// The factory runs once for each place the document names the filter
+    /// at every validation, including a start, an apply, and a dry run.
+    /// It must have no effect outside the filter it returns.
+    pub fn filter_with<F>(
+        &mut self,
+        name: &'static str,
+        build: F,
+    ) -> Result<&mut Self, CatalogError>
+    where
+        F: Fn(&mut StageBuild<'_>) -> Result<Box<dyn Filter>, StageError> + Send + Sync + 'static,
+    {
+        if let Some(held) = self.held(name) {
+            return Err(CatalogError::Held { name, held });
+        }
+        self.filters.push((name, Build::With(Box::new(build))));
         Ok(self)
     }
 
     /// Adds a scorer under `name`; a document gives it a weight, `{ name:
     /// { weight } }`, or names it bare at weight one. Refused when the name
-    /// is held or is not the scorer's own.
+    /// is held or is not the scorer's own. Built with no context, the
+    /// scorer resolves no signal: validation refuses one whose needs set
+    /// `signal_cells` ([`Self::scorer_with`] resolves one).
     pub fn scorer<F>(&mut self, name: &'static str, factory: F) -> Result<&mut Self, CatalogError>
     where
         F: Fn() -> Box<dyn Scorer> + Send + Sync + 'static,
@@ -359,14 +448,39 @@ impl Catalog {
         Ok(self)
     }
 
-    /// Adds a picker under `name`. Refused when the name is held or is not
-    /// the picker's own.
+    /// Adds a picker under `name`. It takes no parameter: a map written
+    /// under its name is refused. Refused when the name is held or is not
+    /// the picker's own. Built with no context, the picker resolves no
+    /// signal: validation refuses one whose needs set `signal_cells`
+    /// ([`Self::picker_with`] resolves one).
     pub fn picker<F>(&mut self, name: &'static str, factory: F) -> Result<&mut Self, CatalogError>
     where
         F: Fn() -> Box<dyn Picker> + Send + Sync + 'static,
     {
         self.admit(StageKind::Picker, name, || factory().name())?;
         self.pickers.push((name, Build::Factory(Box::new(factory))));
+        Ok(self)
+    }
+
+    /// Adds a picker that reads parameters under `name`: a document writes
+    /// `pick: { name: { .. } }`, and a bare name supplies an empty map.
+    /// Returns [`CatalogError::Held`] when any stage already holds the name.
+    ///
+    /// The factory runs once for each profile that names the picker at
+    /// every validation, including a start, an apply, and a dry run. It
+    /// must have no effect outside the picker it returns.
+    pub fn picker_with<F>(
+        &mut self,
+        name: &'static str,
+        build: F,
+    ) -> Result<&mut Self, CatalogError>
+    where
+        F: Fn(&mut StageBuild<'_>) -> Result<Box<dyn Picker>, StageError> + Send + Sync + 'static,
+    {
+        if let Some(held) = self.held(name) {
+            return Err(CatalogError::Held { name, held });
+        }
+        self.pickers.push((name, Build::With(Box::new(build))));
         Ok(self)
     }
 
@@ -422,12 +536,9 @@ impl Catalog {
         Ok(())
     }
 
-    /// The filter a document names, built for one engine.
-    pub(crate) fn find_filter(&self, name: &str) -> Option<Box<dyn Filter>> {
-        self.filters
-            .iter()
-            .find(|(held, _)| *held == name)
-            .map(|(_, factory)| factory())
+    /// The filter a document names, or how the validator builds it.
+    pub(crate) fn find_filter(&self, name: &str) -> Option<Found<dyn Filter, &FilterFactory>> {
+        find(&self.filters, name, Box::as_ref)
     }
 
     /// The scorer a document names, or how the validator builds it.
@@ -435,9 +546,9 @@ impl Catalog {
         find(&self.scorers, name, Box::as_ref)
     }
 
-    /// The picker a document names, as [`Self::find_scorer`].
-    pub(crate) fn find_picker(&self, name: &str) -> Option<Found<dyn Picker>> {
-        find(&self.pickers, name, |&never| match never {})
+    /// The picker a document names, or how the validator builds it.
+    pub(crate) fn find_picker(&self, name: &str) -> Option<Found<dyn Picker, &PickerFactory>> {
+        find(&self.pickers, name, Box::as_ref)
     }
 }
 
@@ -465,7 +576,6 @@ impl fmt::Debug for Catalog {
             .field("scorers", &self.scorers().collect::<Vec<_>>())
             .field("pickers", &self.pickers().collect::<Vec<_>>())
             .field("lifecycle", &self.lifecycle)
-            .field("sent_prefixes", &self.sent_prefixes)
             .finish()
     }
 }
@@ -480,7 +590,7 @@ mod tests {
     use super::{Catalog, CatalogError, Found, StageKind};
     use crate::{
         builtins::target_of,
-        spec::{ScoreSpec, FILTERS, PICKERS, SCORERS},
+        spec::{PickSpec, ScoreSpec, FILTERS, PICKERS, SCORERS},
         Candidate, Constraints, Engine, Filter, Health, Lifecycle, Picker, PolicySpec, PoolFacts,
         RequestFacts, Scorer, Scratch, SpecError, Targets, TieBand, WorkerId,
     };
@@ -1133,7 +1243,10 @@ profiles:
     fn each_stock_stage_answers_the_name_it_is_held_under() {
         let stock = Catalog::builtin();
         for name in FILTERS {
-            let filter = stock.find_filter(name).expect("a stock filter");
+            // Every stock filter is built by its factory.
+            let Some(Found::Built(filter)) = stock.find_filter(name) else {
+                panic!("{name}: a stock filter takes no parameter");
+            };
             assert_eq!(filter.name(), name);
         }
         for name in PICKERS {
@@ -1141,6 +1254,7 @@ profiles:
                 Found::Built(picker) => assert_eq!(picker.name(), name),
                 // The one picker the validator builds from its parameters.
                 Found::Typed => assert_eq!(name, "best-with-temperature"),
+                Found::With(_) => panic!("{name}: no stock picker reads a map of its own"),
             }
         }
         // Every scorer is the validator's to build.
@@ -1601,5 +1715,636 @@ bindings: [{{ profile: before }}]
             error.to_string(),
             "profiles.default.score[0].high-id.spread = 17 is not a parameter of a scorer added in code, which takes its weight alone"
         );
+    }
+
+    const FREE_PATH: &str = "profiles.default.filter[1].min-free";
+    const FREE_FIELD: &str = "profiles.default.filter[1].min-free.slots";
+
+    /// Keeps the workers with `slots` of their eight request slots free.
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MinFree {
+        slots: u32,
+    }
+
+    impl Filter for MinFree {
+        fn name(&self) -> &'static str {
+            "min-free"
+        }
+
+        fn keep(&self, _: &RequestFacts<'_>, candidate: &Candidate, _: &Constraints<'_>) -> bool {
+            candidate.in_flight.saturating_add(self.slots) <= 8
+        }
+    }
+
+    fn free_catalog() -> Catalog {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter_with("min-free", |build| {
+                let rule: MinFree = build.params()?;
+                if rule.slots == 0 {
+                    return Err(crate::StageError::bad("slots", rule.slots, "above zero"));
+                }
+                Ok(Box::new(rule))
+            })
+            .expect("a free name");
+        catalog
+    }
+
+    fn filter_document(filter: &str) -> PolicySpec {
+        let version = crate::API_VERSION;
+        serde_yaml::from_str(&format!(
+            "apiVersion: {version}\nprofiles:\n  default:\n    filter: {filter}\n    pick: random\n"
+        ))
+        .expect("a well-formed document")
+    }
+
+    #[test]
+    fn a_filter_keeps_the_rows_its_typed_parameter_says() {
+        let catalog = free_catalog();
+        let busy = |in_flight| Candidate {
+            in_flight,
+            ..Candidate::default()
+        };
+        for (slots, kept, cut) in [(2, 6, 7), (5, 3, 4)] {
+            let filter = format!("[healthy, {{ min-free: {{ slots: {slots} }} }}]");
+            let engine = filter_document(&filter)
+                .validate_in(&catalog, &[])
+                .expect("the filter reads its slots");
+            let filters = &engine.profiles()[0].filters;
+            assert!(filters
+                .iter()
+                .map(|filter| filter.name())
+                .eq(["healthy", "min-free"]));
+            let keeps = |row: Candidate| {
+                filters[1].keep(&RequestFacts::default(), &row, &Constraints::default())
+            };
+            assert!(keeps(busy(kept)), "{slots} free at {kept} in flight");
+            assert!(!keeps(busy(cut)), "{slots} free at {cut} in flight");
+        }
+    }
+
+    #[test]
+    fn a_bare_filter_name_builds_from_an_empty_map() {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter_with("odd-ids", |build| {
+                assert!(build.written().is_empty());
+                let typed: serde_json::Map<String, serde_json::Value> = build.params()?;
+                assert!(typed.is_empty());
+                Ok(Box::new(OddIds))
+            })
+            .expect("a free name");
+        for filter in ["[odd-ids]", "[{ odd-ids: {} }]"] {
+            let engine = filter_document(filter)
+                .validate_in(&catalog, &[])
+                .expect("the filter needs no parameters");
+            assert_eq!(engine.profiles()[0].filters[0].name(), "odd-ids");
+        }
+    }
+
+    /// A filter's factory reads its parameters in the one order a scorer's
+    /// does, whatever order the document wrote their keys in, at every
+    /// depth: two files that are one document by their digest hand the
+    /// factory the same map. A filter has no weight, so the map is handed
+    /// whole.
+    #[test]
+    fn a_filters_factory_reads_its_whole_map_in_key_order() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heard = Arc::clone(&seen);
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter_with("odd-ids", move |build| {
+                let written = serde_json::to_string(build.written()).expect("serializes");
+                heard.lock().expect("no panic under the lock").push(written);
+                Ok(Box::new(OddIds))
+            })
+            .expect("a free name");
+        let one = filter_document(
+            "[{ odd-ids: { weight: 2, slots: 500, zones: [{ unit: 17, flat: 3 }] } }]",
+        );
+        let other = filter_document(
+            "[{ odd-ids: { zones: [{ flat: 3, unit: 17 }], slots: 500, weight: 2 } }]",
+        );
+        assert_eq!(
+            one.digest().expect("digests"),
+            other.digest().expect("digests")
+        );
+        one.validate_in(&catalog, &[]).expect("validates");
+        other.validate_in(&catalog, &[]).expect("validates");
+        let seen = seen.lock().expect("no panic under the lock");
+        assert_eq!(seen[0], seen[1], "two orders of one map");
+        assert_eq!(
+            seen[0],
+            r#"{"slots":500,"weight":2,"zones":[{"flat":3,"unit":17}]}"#
+        );
+    }
+
+    #[test]
+    fn whatever_stands_under_a_filter_that_takes_no_parameter_is_refused_by_its_name() {
+        // `odd-ids` is registered with no parameter, and the stock's
+        // filters take none.
+        let catalog = catalog();
+        let refused = |filter: &str| {
+            filter_document(filter)
+                .validate_in(&catalog, &[])
+                .expect_err("refused")
+        };
+        for (filter, path, value) in [
+            (
+                "[{ odd-ids: { slots: 2 } }]",
+                "profiles.default.filter[0].odd-ids",
+                r#"{"slots":2}"#,
+            ),
+            (
+                "[healthy, { healthy: {} }]",
+                "profiles.default.filter[1].healthy",
+                "{}",
+            ),
+            (
+                "[healthy, odd-ids, { not-tried: null }]",
+                "profiles.default.filter[2].not-tried",
+                "null",
+            ),
+        ] {
+            let error = refused(filter);
+            assert_eq!(
+                error,
+                SpecError::BadField {
+                    path: path.into(),
+                    value: value.into(),
+                    reason: "left out: this filter takes no parameter, write its bare name",
+                }
+            );
+            assert_eq!(error.field_path(), path);
+        }
+        assert_eq!(
+            refused("[{ odd-ids: { slots: 2 } }]").to_string(),
+            r#"profiles.default.filter[0].odd-ids = {"slots":2} is not left out: this filter takes no parameter, write its bare name"#
+        );
+        // A name no catalog holds is unknown, whatever stands under it.
+        assert_eq!(
+            refused("[{ absent: { slots: 2 } }]"),
+            SpecError::UnknownFilter {
+                profile: "default".into(),
+                name: "absent".into(),
+            }
+        );
+    }
+
+    /// A built-in's parameters are its struct's. An entry that carries
+    /// `has-room` as a filter added in code, which only a document built in
+    /// code can, is refused at the entry by what it is. The catalog holds
+    /// the name for its bare form, and the refusal names no bare form.
+    #[test]
+    fn a_built_in_rules_name_under_an_added_entry_is_refused_by_what_it_is() {
+        let mut built_in_code = filter_document("[healthy]");
+        for profile in built_in_code.profiles.values_mut() {
+            profile.filter.push(crate::spec::FilterSpec::Added {
+                name: "has-room".into(),
+                written: serde_json::json!({ "used": { "load.running": 1 }, "capacity": 10 }),
+            });
+        }
+        assert_eq!(
+            built_in_code.validate_in(&catalog(), &[]).map(|_| ()),
+            Err(SpecError::BadField {
+                path: "profiles.default.filter[1]".into(),
+                value: "has-room".into(),
+                reason: "a filter added in code: a built-in's parameters are typed",
+            })
+        );
+    }
+
+    #[test]
+    fn a_filters_factory_refuses_a_value_at_its_field() {
+        let catalog = free_catalog();
+        let refused = |filter: &str| {
+            filter_document(filter)
+                .validate_in(&catalog, &[])
+                .expect_err("the factory refuses the parameters")
+        };
+        let error = refused("[healthy, { min-free: { slots: 0 } }]");
+        assert_eq!(
+            error,
+            SpecError::BadField {
+                path: FREE_FIELD.into(),
+                value: "0".into(),
+                reason: "above zero",
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("{FREE_FIELD} = 0 is not above zero")
+        );
+        assert_eq!(error.field_path(), FREE_FIELD);
+        // What the factory's type does not read is refused at the entry in
+        // the type's own words. A bare name supplies an empty map.
+        for (filter, message) in [
+            (
+                "[healthy, { min-free: { slots: 2, spare: 17 } }]",
+                "unknown field `spare`",
+            ),
+            ("[healthy, { min-free: { slots: 'many' } }]", "invalid type"),
+            ("[healthy, min-free]", "missing field `slots`"),
+        ] {
+            let SpecError::BadStage { path, reason } = refused(filter) else {
+                panic!("{filter}");
+            };
+            assert_eq!(path, FREE_PATH);
+            assert!(reason.contains(message), "{reason}");
+        }
+        // What stands under the name is a map.
+        for (filter, value) in [
+            ("[healthy, { min-free: [17] }]", "[17]"),
+            ("[healthy, { min-free: null }]", "null"),
+        ] {
+            assert_eq!(
+                refused(filter),
+                SpecError::BadField {
+                    path: FREE_PATH.into(),
+                    value: value.into(),
+                    reason: "a map of the filter's parameters",
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_filter_that_answers_another_name_is_refused_at_its_entry() {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter_with("min-free", |_| Ok(Box::new(OddIds)))
+            .expect("a free name");
+        assert_eq!(
+            filter_document("[healthy, min-free]")
+                .validate_in(&catalog, &[])
+                .expect_err("the name disagrees"),
+            SpecError::BadStage {
+                path: FREE_PATH.into(),
+                reason: r#"filter registered as "min-free" answers the name "odd-ids""#.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_filters_factory_runs_once_an_entry_and_never_under_a_held_name() {
+        let mut catalog = free_catalog();
+        let called = Arc::new(AtomicUsize::new(0));
+        let counted = |called: &Arc<AtomicUsize>| {
+            let calls = Arc::clone(called);
+            move |_: &mut crate::StageBuild<'_>| -> Result<Box<dyn Filter>, crate::StageError> {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::new(OddIds))
+            }
+        };
+        for (name, held) in [
+            ("healthy", StageKind::Filter),
+            ("least-requests", StageKind::Scorer),
+            ("best", StageKind::Picker),
+            ("min-free", StageKind::Filter),
+        ] {
+            assert_eq!(
+                catalog.filter_with(name, counted(&called)).map(|_| ()),
+                Err(CatalogError::Held { name, held })
+            );
+        }
+        assert_eq!(catalog.filters().count(), FILTERS.len() + 1);
+        catalog
+            .filter_with("odd-ids", counted(&called))
+            .expect("a free name");
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        let named = filter_document("[odd-ids, healthy, odd-ids]");
+        for expected in [2, 4] {
+            named.validate_in(&catalog, &[]).expect("validates");
+            assert_eq!(called.load(Ordering::Relaxed), expected);
+        }
+    }
+
+    const NTH_PATH: &str = "profiles.default.pick.nth";
+    const NTH_FIELD: &str = "profiles.default.pick.nth.place";
+
+    /// Picks the survivor at `place` among those the filters left, in the
+    /// list's order.
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Nth {
+        place: u32,
+    }
+
+    impl Lifecycle for Nth {}
+
+    impl Picker for Nth {
+        fn name(&self) -> &'static str {
+            "nth"
+        }
+
+        fn pick(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            _: &[f32],
+            _: TieBand,
+            out: &mut Targets,
+        ) {
+            if let Some(&row) = kept.get(self.place as usize) {
+                out.push(target_of(&candidates[row as usize]));
+            }
+        }
+    }
+
+    fn nth_catalog() -> Catalog {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .picker_with("nth", |build| {
+                let rule: Nth = build.params()?;
+                if rule.place > 3 {
+                    return Err(crate::StageError::bad("place", rule.place, "at most 3"));
+                }
+                Ok(Box::new(rule))
+            })
+            .expect("a free name");
+        catalog
+    }
+
+    fn pick_document(pick: &str) -> PolicySpec {
+        let version = crate::API_VERSION;
+        serde_yaml::from_str(&format!(
+            "apiVersion: {version}\nprofiles:\n  default:\n    filter: [healthy]\n    pick: {pick}\n"
+        ))
+        .expect("a well-formed document")
+    }
+
+    #[test]
+    fn a_picker_picks_by_its_typed_parameter() {
+        let catalog = nth_catalog();
+        for place in [0_u64, 2, 3] {
+            let engine = pick_document(&format!("{{ nth: {{ place: {place} }} }}"))
+                .validate_in(&catalog, &[])
+                .expect("the picker reads its place");
+            assert_eq!(engine.profiles()[0].picker.name(), "nth");
+            assert_eq!(pick(&engine), Some(WorkerId(place + 1)), "place {place}");
+        }
+    }
+
+    #[test]
+    fn a_bare_picker_name_builds_from_an_empty_map() {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .picker_with("worst", |build| {
+                assert!(build.written().is_empty());
+                let typed: serde_json::Map<String, serde_json::Value> = build.params()?;
+                assert!(typed.is_empty());
+                Ok(Box::new(Worst))
+            })
+            .expect("a free name");
+        for pick in ["worst", "{ worst: {} }"] {
+            let engine = pick_document(pick)
+                .validate_in(&catalog, &[])
+                .expect("the picker needs no parameters");
+            assert_eq!(engine.profiles()[0].picker.name(), "worst");
+        }
+    }
+
+    /// A picker's factory reads its parameters in the one order a filter's
+    /// does, whatever order the document wrote their keys in, at every
+    /// depth: two files that are one document by their digest hand the
+    /// factory the same map, whole.
+    #[test]
+    fn a_pickers_factory_reads_its_whole_map_in_key_order() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heard = Arc::clone(&seen);
+        let mut catalog = Catalog::builtin();
+        catalog
+            .picker_with("worst", move |build| {
+                let written = serde_json::to_string(build.written()).expect("serializes");
+                heard.lock().expect("no panic under the lock").push(written);
+                Ok(Box::new(Worst))
+            })
+            .expect("a free name");
+        let one =
+            pick_document("{ worst: { weight: 2, place: 500, zones: [{ unit: 17, flat: 3 }] } }");
+        let other =
+            pick_document("{ worst: { zones: [{ flat: 3, unit: 17 }], place: 500, weight: 2 } }");
+        assert_eq!(
+            one.digest().expect("digests"),
+            other.digest().expect("digests")
+        );
+        one.validate_in(&catalog, &[]).expect("validates");
+        other.validate_in(&catalog, &[]).expect("validates");
+        let seen = seen.lock().expect("no panic under the lock");
+        assert_eq!(seen[0], seen[1], "two orders of one map");
+        assert_eq!(
+            seen[0],
+            r#"{"place":500,"weight":2,"zones":[{"flat":3,"unit":17}]}"#
+        );
+    }
+
+    #[test]
+    fn whatever_stands_under_a_picker_that_takes_no_parameter_is_refused_by_its_name() {
+        // `worst` is registered with no parameter, and the stock's pickers
+        // named here take none.
+        let catalog = catalog();
+        let refused = |pick: &str| {
+            pick_document(pick)
+                .validate_in(&catalog, &[])
+                .expect_err("refused")
+        };
+        for (pick, path, value) in [
+            (
+                "{ worst: { place: 2 } }",
+                "profiles.default.pick.worst",
+                r#"{"place":2}"#,
+            ),
+            ("{ random: {} }", "profiles.default.pick.random", "{}"),
+            (
+                "{ round-robin: null }",
+                "profiles.default.pick.round-robin",
+                "null",
+            ),
+        ] {
+            let error = refused(pick);
+            assert_eq!(
+                error,
+                SpecError::BadField {
+                    path: path.into(),
+                    value: value.into(),
+                    reason: "left out: this picker takes no parameter, write its bare name",
+                }
+            );
+            assert_eq!(error.field_path(), path);
+        }
+        assert_eq!(
+            refused("{ worst: { place: 2 } }").to_string(),
+            r#"profiles.default.pick.worst = {"place":2} is not left out: this picker takes no parameter, write its bare name"#
+        );
+        // A name no catalog holds is unknown, whatever stands under it.
+        assert_eq!(
+            refused("{ absent: { place: 2 } }"),
+            SpecError::UnknownPicker {
+                profile: "default".into(),
+                name: "absent".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_pickers_factory_refuses_a_value_at_its_field() {
+        let catalog = nth_catalog();
+        let refused = |pick: &str| {
+            pick_document(pick)
+                .validate_in(&catalog, &[])
+                .expect_err("the factory refuses the parameters")
+        };
+        let error = refused("{ nth: { place: 9 } }");
+        assert_eq!(
+            error,
+            SpecError::BadField {
+                path: NTH_FIELD.into(),
+                value: "9".into(),
+                reason: "at most 3",
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("{NTH_FIELD} = 9 is not at most 3")
+        );
+        assert_eq!(error.field_path(), NTH_FIELD);
+        // What the factory's type does not read is refused at the entry in
+        // the type's own words. A bare name supplies an empty map.
+        for (pick, message) in [
+            ("{ nth: { place: 2, spare: 17 } }", "unknown field `spare`"),
+            ("{ nth: { place: 'far' } }", "invalid type"),
+            ("nth", "missing field `place`"),
+        ] {
+            let SpecError::BadStage { path, reason } = refused(pick) else {
+                panic!("{pick}");
+            };
+            assert_eq!(path, NTH_PATH);
+            assert!(reason.contains(message), "{reason}");
+        }
+        // What stands under the name is a map.
+        for (pick, value) in [("{ nth: [17] }", "[17]"), ("{ nth: null }", "null")] {
+            assert_eq!(
+                refused(pick),
+                SpecError::BadField {
+                    path: NTH_PATH.into(),
+                    value: value.into(),
+                    reason: "a map of the picker's parameters",
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_picker_that_answers_another_name_is_refused_at_its_entry() {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .picker_with("nth", |_| Ok(Box::new(Worst)))
+            .expect("a free name");
+        assert_eq!(
+            pick_document("nth")
+                .validate_in(&catalog, &[])
+                .expect_err("the name disagrees"),
+            SpecError::BadStage {
+                path: NTH_PATH.into(),
+                reason: r#"picker registered as "nth" answers the name "worst""#.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_pickers_factory_runs_once_a_profile_and_never_under_a_held_name() {
+        let mut catalog = nth_catalog();
+        let called = Arc::new(AtomicUsize::new(0));
+        let counted = |called: &Arc<AtomicUsize>| {
+            let calls = Arc::clone(called);
+            move |_: &mut crate::StageBuild<'_>| -> Result<Box<dyn Picker>, crate::StageError> {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::new(Worst))
+            }
+        };
+        for (name, held) in [
+            ("healthy", StageKind::Filter),
+            ("least-requests", StageKind::Scorer),
+            ("best", StageKind::Picker),
+            ("nth", StageKind::Picker),
+        ] {
+            assert_eq!(
+                catalog.picker_with(name, counted(&called)).map(|_| ()),
+                Err(CatalogError::Held { name, held })
+            );
+        }
+        assert_eq!(catalog.pickers().count(), PICKERS.len() + 1);
+        catalog
+            .picker_with("worst", counted(&called))
+            .expect("a free name");
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        let named = pick_document("worst");
+        for expected in [1, 2] {
+            named.validate_in(&catalog, &[]).expect("validates");
+            assert_eq!(called.load(Ordering::Relaxed), expected);
+        }
+    }
+
+    #[test]
+    fn an_added_pick_entry_is_written_as_it_was_read() {
+        let read = pick_document("{ nth: { place: 2 } }");
+        let again = serde_json::to_value(&read).expect("serializes");
+        assert_eq!(
+            again["profiles"]["default"]["pick"].to_string(),
+            r#"{"nth":{"place":2}}"#
+        );
+        assert_eq!(
+            serde_json::from_value::<PolicySpec>(again).expect("parses again"),
+            read
+        );
+        // The typed built-ins and a bare name beside it, each through YAML.
+        for pick in [
+            "{ nth: { place: 2 } }",
+            "best",
+            "{ best: { sample: 2 } }",
+            "random",
+        ] {
+            let read = pick_document(pick);
+            let yaml = serde_yaml::to_string(&read).expect("writes YAML");
+            assert_eq!(
+                serde_yaml::from_str::<PolicySpec>(&yaml).expect("reads YAML"),
+                read,
+                "{pick}"
+            );
+        }
+    }
+
+    /// Only a document built in code holds a typed built-in's name under an
+    /// added entry: the reader reads that key into its parameter struct.
+    /// The refusal says what the entry is, as a scorer's does.
+    #[test]
+    fn a_typed_built_ins_name_under_an_added_entry_is_refused_by_what_it_is() {
+        for (name, written) in [
+            ("best", serde_json::json!({ "sample": 2 })),
+            (
+                "best-with-temperature",
+                serde_json::json!({ "temperature": 0.5 }),
+            ),
+        ] {
+            let mut document = pick_document("random");
+            let profile = document.profiles.get_mut("default").expect("the profile");
+            profile.pick = PickSpec::Added {
+                name: name.into(),
+                written,
+            };
+            assert_eq!(
+                document
+                    .validate_in(&Catalog::builtin(), &[])
+                    .expect_err("refused"),
+                SpecError::BadField {
+                    path: format!("profiles.default.pick.{name}"),
+                    value: name.into(),
+                    reason: "a picker added in code: a built-in's parameters are typed",
+                },
+                "{name}"
+            );
+        }
     }
 }

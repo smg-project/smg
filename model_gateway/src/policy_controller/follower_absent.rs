@@ -2,10 +2,7 @@
 //! build for. Startup refuses a controller's address there, so nothing here
 //! runs: it keeps the gateway's other modules one text for every target.
 
-use std::sync::Arc;
-
-use smg_policy_controller::store::MemoryStore;
-
+use super::feed::Feed;
 use crate::config::RouterConfig;
 
 /// What the follower has reached.
@@ -31,13 +28,21 @@ impl Settings {
 pub(crate) struct Follower;
 
 impl Follower {
-    pub(crate) fn start(_settings: Settings, _store: Arc<MemoryStore>) -> Self {
+    pub(crate) fn start(_settings: Settings, _feed: Feed) -> Self {
         Self
     }
 
+    #[expect(
+        clippy::unused_self,
+        reason = "the follower reads its task's progress; nothing is read here"
+    )]
     pub(crate) fn followed(&self) -> Followed {
         Followed::Nothing
     }
 
+    #[expect(
+        clippy::unused_async,
+        reason = "the follower's stop awaits its task; nothing runs here"
+    )]
     pub(crate) async fn stop(self) {}
 }
