@@ -1788,6 +1788,7 @@ pub(crate) mod tests {
             now,
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         let mut out = ViewBuffers::default();
         // A registration is in force at its window's publication: the case

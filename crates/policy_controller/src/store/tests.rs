@@ -2861,6 +2861,7 @@ fn in_flight_for(store: &MemoryStore, gateway: GatewayId) -> Vec<(WorkerId, u32)
         now: Instant::now(),
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let mut out = ViewBuffers::default();
     store.deciding(|world| {
@@ -3112,6 +3113,7 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
         now,
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let mut out = ViewBuffers::default();
     store
@@ -3142,6 +3144,7 @@ fn held_count(world: &World, gateway: GatewayId, now: Instant) -> u32 {
         now,
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let mut out = ViewBuffers::default();
     let view = world
@@ -3304,6 +3307,7 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
         now: Instant::now(),
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let mut out = ViewBuffers::default();
     store
@@ -3503,6 +3507,7 @@ fn a_count_is_written_on_its_own_workers_row_past_another_gateways_local_row() {
         now,
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     store.build_view("m", Role::Single, &ask, &mut built);
     assert!(built.candidates.iter().all(|row| row.in_flight == 0));
@@ -5415,6 +5420,7 @@ fn in_flight_once(store: &MemoryStore, out: &mut ViewBuffers) -> u32 {
         now: Instant::now(),
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     store.deciding(|world| {
         if let Some(built) = world.build("m", Role::Single, &ask, &mut *out) {

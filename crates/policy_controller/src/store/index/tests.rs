@@ -113,6 +113,7 @@ mod sent_prefixes {
                 now,
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             world.build(MODEL, Role::Single, &ask, &mut view);
             if let Some(wires) = wires {
@@ -149,6 +150,7 @@ mod sent_prefixes {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             world.build(MODEL, Role::Single, &ask, &mut view);
             let naming = Naming {
@@ -2354,6 +2356,7 @@ mod named {
                 now: at,
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let built = world
                 .build(MODEL, Role::Single, &ask, &mut view)
@@ -2544,6 +2547,7 @@ mod named {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let built = world
                 .build(MODEL, Role::Single, &ask, &mut view)
@@ -2772,6 +2776,7 @@ mod named {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let built = world.build(MODEL, Role::Single, &ask, &mut view);
             let naming = Naming {
@@ -3033,6 +3038,7 @@ mod named {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let built = world
                 .build(MODEL, Role::Single, &ask, &mut view)
@@ -3536,6 +3542,7 @@ mod named {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             world
                 .build(MODEL, Role::Single, &ask, &mut view)
@@ -3647,6 +3654,7 @@ mod named {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let built = world
                 .build(MODEL, Role::Single, &ask, &mut view)

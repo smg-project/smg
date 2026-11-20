@@ -1584,6 +1584,7 @@ pub(crate) mod tests {
                     now: self.script.taken,
                     pinned: None,
                     affinity: false,
+                    signal_cells: false,
                 };
                 let mut view = ViewBuffers::default();
                 let built = world.build(&wire.model, Role::Single, &ask, &mut view);
@@ -5040,6 +5041,7 @@ pub(crate) mod tests {
                     now: at,
                     pinned: None,
                     affinity: false,
+                    signal_cells: false,
                 };
                 let built = world
                     .build(MODEL, Role::Single, &ask, &mut view)
@@ -5700,6 +5702,7 @@ pub(crate) mod tests {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let built = world
                 .build_pair(MODEL, &ask, &mut rows)

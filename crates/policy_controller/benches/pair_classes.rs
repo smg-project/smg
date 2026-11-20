@@ -311,6 +311,7 @@ fn serving(fleet: &[WorkerFacts]) -> (MemoryStore, Ask) {
         now: opened + Duration::from_secs(1),
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     (store, ask)
 }
@@ -332,6 +333,7 @@ fn sizes() {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let mut out = ViewBuffers::default();
             let rows = store_of(&fleet, mode)

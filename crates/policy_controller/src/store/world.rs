@@ -112,6 +112,7 @@ use crate::{
     demands::DemandFacts,
     framework::{Engine, OverloadThresholds, PairPools, PairTable},
     lease::{Lifecycle, Signal},
+    signals::{SignalCell, SignalCells},
     spec::{AppliedSpec, IndexKind, Listed, Pairing},
     store::{
         encoding::{EncodeClasses, EncodeHandoff, EncodeMember},
@@ -165,6 +166,20 @@ pub struct Ask {
     /// ([`Needs::affinity`](crate::Needs::affinity)): the build fills it
     /// then, and leaves it empty otherwise.
     pub affinity: bool,
+    /// Whether the profile's stages declared the signal cells
+    /// ([`Needs::signal_cells`](crate::Needs::signal_cells)): the build
+    /// hands them then, and none otherwise.
+    pub signal_cells: bool,
+}
+
+impl Ask {
+    /// Whether the ask takes a column at all. The two flags are read as
+    /// one word: a view or a build makes one test for a profile that asks
+    /// for neither column, as most do.
+    #[inline]
+    fn any_column(&self) -> bool {
+        (u16::from(self.affinity) | (u16::from(self.signal_cells) << 8)) != 0
+    }
 }
 
 /// What a decision brings to the naming of its rows ([`World::name`]).
@@ -212,6 +227,21 @@ pub struct ViewBuffers {
     /// ([`World::view`]): a row's first read is kept here, so a decision
     /// reads one count a row.
     pub kept: KeptCounts,
+    /// The signal cells of the rows a build wrote here, in the rows' order,
+    /// under an ask that takes them ([`Ask::signal_cells`]); a view names
+    /// the cells a decision reads ([`PoolView::signal_cells`]).
+    pub signal_cells: SignalCells,
+}
+
+impl ViewBuffers {
+    /// The signal cells of the rows a build wrote here ([`World::build`]):
+    /// `None` where its ask took none and under a generation that declares
+    /// no signal. A view ([`World::view`]) names its own cells
+    /// ([`PoolView::signal_cells`]): one that lends its rows writes none
+    /// here, and these stay those of the build before.
+    pub fn cells(&self) -> Option<&SignalCells> {
+        (self.signal_cells.signals() != 0).then_some(&self.signal_cells)
+    }
 }
 
 /// Narrows a built view by the gateway's wires and subset hint. Returns
@@ -232,6 +262,7 @@ fn narrow_view<T>(
     if subset == Some(0) {
         view.candidates.clear();
         view.affinity.clear();
+        view.signal_cells.refill(0);
         if let Some(column) = column {
             column.clear();
         }
@@ -244,6 +275,7 @@ fn narrow_view<T>(
     let dialed = |row: &Candidate| row.wire_modes.intersects(wires);
     // Each column follows the rows before the rows move.
     retain_column(&view.candidates, &mut view.affinity, dialed);
+    retain_cells(&view.candidates, &mut view.signal_cells, dialed);
     if let Some(column) = column {
         retain_column(&view.candidates, column, dialed);
     }
@@ -260,6 +292,68 @@ fn narrow_view<T>(
 fn retain_column<T>(rows: &[Candidate], column: &mut Vec<T>, dialed: impl Fn(&Candidate) -> bool) {
     let mut beside = rows.iter();
     column.retain(|_| beside.next().is_some_and(&dialed));
+}
+
+/// The signal cells follow the rows as a column does: a kept row's cells
+/// move to its new position, so a read by that position answers the row's
+/// own value. One test where the build wrote no cell.
+fn retain_cells(rows: &[Candidate], cells: &mut SignalCells, dialed: impl Fn(&Candidate) -> bool) {
+    let Some(mut kept) = KeptCells::of(cells, rows.len()) else {
+        return;
+    };
+    for (at, row) in rows.iter().enumerate() {
+        if dialed(row) {
+            kept.keep(at);
+        }
+    }
+    kept.end();
+}
+
+/// The signal cells of a view's rows through a narrowing in place, for
+/// every routine that narrows a built view: each kept row's cells move
+/// behind the cells kept so far, so a read by the row's new position
+/// answers the row's own value.
+pub(crate) struct KeptCells<'a> {
+    column: &'a mut Vec<SignalCell>,
+    signals: usize,
+    kept: usize,
+}
+
+impl<'a> KeptCells<'a> {
+    /// The cells a build wrote for `rows` rows; `None` where it wrote no
+    /// cell. Cells that do not fit the rows are dropped: cells of other
+    /// rows answer no row, so every read is no value.
+    pub(crate) fn of(cells: &'a mut SignalCells, rows: usize) -> Option<Self> {
+        let signals = cells.signals();
+        if signals == 0 {
+            return None;
+        }
+        let fits = cells.fits(rows);
+        let column = cells.cells_mut();
+        if !fits {
+            column.clear();
+            return None;
+        }
+        Some(Self {
+            column,
+            signals,
+            kept: 0,
+        })
+    }
+
+    /// Keeps the cells of the row at `at`, at the next kept row's place.
+    /// Rows are kept in ascending order.
+    pub(crate) fn keep(&mut self, at: usize) {
+        let signals = self.signals;
+        self.column
+            .copy_within(at * signals..(at + 1) * signals, self.kept * signals);
+        self.kept += 1;
+    }
+
+    /// Ends the narrowing: the cells past the kept rows leave.
+    pub(crate) fn end(self) {
+        self.column.truncate(self.kept * self.signals);
+    }
 }
 
 /// The buffers a host keeps across pair decisions: both sides' views and
@@ -291,9 +385,8 @@ impl PairBuffers {
             decodes: &self.decode.candidates,
             prefill_affinity: &self.prefill.affinity,
             decode_affinity: &self.decode.affinity,
-            // The store keeps no signal cells yet: its views hand none.
-            prefill_signal_cells: None,
-            decode_signal_cells: None,
+            prefill_signal_cells: self.prefill.cells(),
+            decode_signal_cells: self.decode.cells(),
             table: PairTable::new(&self.ends, &self.listed),
         }
     }
@@ -344,6 +437,7 @@ impl PairBuffers {
         for side in [&mut self.prefill, &mut self.decode] {
             side.candidates.clear();
             side.affinity.clear();
+            side.signal_cells.refill(0);
         }
         self.ends.clear();
         self.listed.clear();
@@ -379,8 +473,7 @@ impl EncodePairBuffers {
             facts: &self.facts,
             prefill_classes: &self.prefill_classes,
             affinity: &self.encode.affinity,
-            // The store keeps no signal cells yet: its views hand none.
-            signal_cells: None,
+            signal_cells: self.encode.cells(),
         };
         (self.pair.pools(), encode)
     }
@@ -491,6 +584,12 @@ pub struct PoolView<'a> {
     /// rows and the candidates stand at the pool's own positions: a pool
     /// that holds a host-local row hands none.
     pub engines: Engines<'a>,
+    /// The rows' signal cells: what
+    /// [`RequestFacts::signal_cells`](crate::RequestFacts::signal_cells)
+    /// takes. The publication's own block where the pool was lent, the
+    /// decision's written copy otherwise. `None` for an ask that takes
+    /// none and under a generation that declares no signal.
+    pub signal_cells: Option<&'a SignalCells>,
     /// What the view read beside the rows.
     pub built: Built,
 }
@@ -1033,6 +1132,11 @@ pub struct World {
     samples_decisions: bool,
     /// Each pool's standing in its model's index, at the pool's index.
     indexes: Arc<[Option<Arc<PoolIndex>>]>,
+    /// Each pool's signal cells as this publication left them, at the
+    /// pool's index: one cell a row a signal the generation declares, in
+    /// the rows' order. No list under a generation that declares none. One
+    /// list for every world until a pool's cells move.
+    cells: Arc<[Arc<SignalCells>]>,
 }
 
 impl std::fmt::Debug for World {
@@ -1278,7 +1382,9 @@ impl World {
     /// decision reads one publication, and its date restores nothing the
     /// publication dropped. The health sink's own answer keeps its compare.
     /// Under `ask.affinity` the column holds one entry per candidate with
-    /// the worker's age since admission.
+    /// the worker's age since admission. Under `ask.signal_cells` the
+    /// buffers hold the rows' signal cells, each row's at its position
+    /// here ([`ViewBuffers::cells`]).
     ///
     /// A row's in-flight count is not written here: every decision moves
     /// the count of the leases on file, so no publication carries it, and
@@ -1304,6 +1410,7 @@ impl World {
             out.candidates.clear();
             out.affinity.clear();
             out.stalled.clear();
+            out.signal_cells.refill(0);
             return None;
         };
         self.build_at(index, ask, out)
@@ -1318,6 +1425,9 @@ impl World {
         out.candidates.clear();
         out.affinity.clear();
         out.stalled.clear();
+        // What reads these buffers past the build knows no ask: cells an
+        // earlier build wrote are not this one's.
+        out.signal_cells.refill(0);
         let (rows, shape) = (self.rows.get(index)?, self.derived.pools.get(index)?);
         Some(self.written(index, rows, shape, ask, out))
     }
@@ -1347,14 +1457,19 @@ impl World {
         if let Some(row) = ask.pinned.and_then(|id| row_of_id(&mut out.candidates, id)) {
             row.session_hit = true;
         }
-        if ask.affinity {
-            let admitted = &shape.admitted_micros;
-            for (from, to) in Segments::of(&shape.locals, ask.gateway, admitted.len()) {
-                out.affinity
-                    .extend(admitted[from..to].iter().map(|&admitted| AffinityFacts {
-                        admitted_age_ms: age_ms(now_micros, admitted),
-                        ..AffinityFacts::default()
-                    }));
+        if ask.any_column() {
+            if ask.affinity {
+                let admitted = &shape.admitted_micros;
+                for (from, to) in Segments::of(&shape.locals, ask.gateway, admitted.len()) {
+                    out.affinity
+                        .extend(admitted[from..to].iter().map(|&admitted| AffinityFacts {
+                            admitted_age_ms: age_ms(now_micros, admitted),
+                            ..AffinityFacts::default()
+                        }));
+                }
+            }
+            if ask.signal_cells {
+                self.write_cells(index, shape, ask, rows.len(), &mut out.signal_cells);
             }
         }
         // The asking gateway's run among the gateways that hold a veto in
@@ -1385,6 +1500,31 @@ impl World {
         }
     }
 
+    /// The signal cells of the pool at `index`, written into `out` for the
+    /// rows the asking gateway reaches, in the order [`World::build`]
+    /// writes those rows: a row's cells stand at its new position. No cell
+    /// under a generation that declares no signal.
+    fn write_cells(
+        &self,
+        index: usize,
+        shape: &PoolShape,
+        ask: &Ask,
+        rows: usize,
+        out: &mut SignalCells,
+    ) {
+        let Some(block) = self.cells.get(index) else {
+            out.refill(0);
+            return;
+        };
+        let signals = block.signals();
+        let (held, cells) = (block.cells(), out.refill(signals));
+        for (from, to) in Segments::of(&shape.locals, ask.gateway, rows) {
+            if let Some(held) = held.get(from * signals..to * signals) {
+                cells.extend_from_slice(held);
+            }
+        }
+    }
+
     /// One decision's view of the pool serving `model` in `role`; `None`,
     /// with the buffers cleared, when no member serves it.
     ///
@@ -1398,7 +1538,9 @@ impl World {
     /// apart: where the build writes a row both bits, the view names the
     /// row twice. The pinned worker's row is handed as one more than its
     /// position. Under `ask.affinity` the column is filled as the build
-    /// fills it. A row's report age stays what the report carried when it
+    /// fills it. Under `ask.signal_cells` the publication's own block of
+    /// cells is lent beside its rows, and nothing is copied.
+    /// A row's report age stays what the report carried when it
     /// was recorded. The report age limit uses the decision's instant less
     /// the row's sample instant on either form of the row.
     ///
@@ -1438,6 +1580,7 @@ impl World {
                 affinity: &out.affinity,
                 in_flight: None,
                 engines: shape.engines(index as u32),
+                signal_cells: if ask.signal_cells { out.cells() } else { None },
                 built,
             });
         }
@@ -1456,12 +1599,18 @@ impl World {
             .pinned
             .and_then(|id| rows.binary_search_by_key(&id, |row| row.id).ok())
             .map_or(0, |at| at as u32 + 1);
-        if ask.affinity {
-            let admitted = shape.admitted_micros.iter();
-            out.affinity.extend(admitted.map(|&admitted| AffinityFacts {
-                admitted_age_ms: age_ms(now_micros, admitted),
-                ..AffinityFacts::default()
-            }));
+        let mut signal_cells = None;
+        if ask.any_column() {
+            if ask.affinity {
+                let admitted = shape.admitted_micros.iter();
+                out.affinity.extend(admitted.map(|&admitted| AffinityFacts {
+                    admitted_age_ms: age_ms(now_micros, admitted),
+                    ..AffinityFacts::default()
+                }));
+            }
+            if ask.signal_cells {
+                signal_cells = self.cells.get(index).map(|block| &**block);
+            }
         }
         // A view a veto masks is the asking gateway's own list, as a copy
         // a veto masks is.
@@ -1477,6 +1626,7 @@ impl World {
             affinity: &out.affinity,
             in_flight: Some(self.derived.counts.lend(&shape.booked, &mut out.kept)),
             engines: shape.engines(index as u32),
+            signal_cells,
             built: Built {
                 pool: index as u32,
                 pool_size: rows.len() as u32,
@@ -1578,6 +1728,7 @@ impl World {
     ) -> Option<(Built, Built)> {
         out.encode.candidates.clear();
         out.encode.affinity.clear();
+        out.encode.signal_cells.refill(0);
         out.facts.clear();
         out.prefill_classes.clear();
         let pair = self.build_pair(model, ask, &mut out.pair);
@@ -2411,6 +2562,12 @@ struct Working {
     /// The thresholds the standing generation's binding hands this pool;
     /// `None` when no binding matches it or its block is switched off.
     binding: Option<OverloadThresholds>,
+    /// The rows' signal cells, row after row: one cell a signal the
+    /// standing generation declares, and none under a generation that
+    /// declares none.
+    cells: Vec<SignalCell>,
+    /// A cell was written since the last publication.
+    cells_dirty: bool,
 }
 
 /// One engine as the overload verdict reads it: the ranks of one
@@ -2481,6 +2638,54 @@ fn ranked_at(
         .map(|&(_, group, heard)| (group, heard))
 }
 
+/// What the load table holds of one rank, as a membership build and an
+/// applied generation read it: its load sample, and its signal cells under
+/// the standing generation's columns. A closure reads the samples of a
+/// table that keeps no cell.
+pub(super) trait OnFile {
+    /// The rank's load sample.
+    fn sample(&self, id: WorkerId, rank: u16) -> Option<LoadSample>;
+
+    /// The rank's signal cells, one a signal the standing generation
+    /// declares; `None` where no value was written for the rank.
+    fn cells(&self, id: WorkerId, rank: u16) -> Option<&[SignalCell]> {
+        let _ = (id, rank);
+        None
+    }
+}
+
+impl<F: Fn(WorkerId, u16) -> Option<LoadSample>> OnFile for F {
+    fn sample(&self, id: WorkerId, rank: u16) -> Option<LoadSample> {
+        self(id, rank)
+    }
+}
+
+/// The signal cells of `rows`, row after row, as the table holds them:
+/// `signals` cells a row, and cells of no value for a rank with none on
+/// file.
+fn cells_beside(rows: &[Candidate], signals: usize, on_file: &impl OnFile) -> Vec<SignalCell> {
+    let mut cells = Vec::with_capacity(rows.len() * signals);
+    for row in rows {
+        let held = on_file.cells(row.id, row.dp_rank);
+        match held.filter(|held| held.len() == signals) {
+            Some(held) => cells.extend_from_slice(held),
+            None => cells.resize(cells.len() + signals, SignalCell::NONE),
+        }
+    }
+    cells
+}
+
+/// Writes `cells` over `over` when the writer holds the last reference to
+/// it, by the rule a pool's rows are written over ([`written_over`]).
+/// Whether it did.
+fn cells_over(over: &mut Arc<SignalCells>, cells: &[SignalCell], signals: usize) -> bool {
+    let Some(over) = Arc::get_mut(over) else {
+        return false;
+    };
+    over.refill(signals).extend_from_slice(cells);
+    true
+}
+
 /// The build the membership writes since the last one left owed.
 #[derive(Clone, Copy)]
 struct Owed {
@@ -2528,7 +2733,20 @@ pub(super) struct Writer {
     /// that publication alone: a pool of their length with no spare to
     /// write over takes them, and the publication frees the rest.
     unlisted: Vec<Arc<[Candidate]>>,
-    /// How many times a publication allocated a pool's rows.
+    /// Each pool's signal cells as the last publication left them
+    /// ([`World::cells`]): one list for every world until a pool's cells
+    /// move, and no list under a generation that declares no signal.
+    cells: Arc<[Arc<SignalCells>]>,
+    /// Each pool's spare cells: the block it published before its last,
+    /// kept for its next publication to write over, as its rows' spare is.
+    /// A block some world still lists is let go and stays that world's: a
+    /// world is freed by a write ([`Self::replaced`]), so no decision
+    /// frees a block.
+    cell_spares: Vec<Option<Arc<SignalCells>>>,
+    /// A write moved a pool's cells since the last publication: the one
+    /// word a publication tests for them.
+    cells_moved: bool,
+    /// How many times a publication allocated a pool's rows or its cells.
     allocations: u64,
     /// How many times the pools were built from the membership.
     builds: u64,
@@ -2656,6 +2874,9 @@ impl Writer {
             working: Vec::new(),
             held: Vec::new(),
             unlisted: Vec::new(),
+            cells: Arc::default(),
+            cell_spares: Vec::new(),
+            cells_moved: false,
             allocations: 0,
             builds: 0,
             worlds: Vec::new(),
@@ -2719,6 +2940,7 @@ impl Writer {
             #[cfg(feature = "controller")]
             samples_decisions: self.spec.engine().explain_sample() != 0,
             indexes: Arc::clone(&self.indexes),
+            cells: Arc::clone(&self.cells),
         })
     }
 
@@ -2770,7 +2992,7 @@ impl Writer {
         spec: Arc<AppliedSpec>,
         epoch: u64,
         members: impl Iterator<Item = (&'a WorkerRow, Slot, LeaderBits)>,
-        sample_of: impl Fn(WorkerId, u16) -> Option<LoadSample>,
+        on_file: impl OnFile,
     ) -> Result<(Arc<World>, Option<Arc<AppliedSpec>>), StaleGeneration> {
         let standing = self.spec.generation();
         if spec.generation() <= standing {
@@ -2787,7 +3009,7 @@ impl Writer {
                 // No member's fields are carried into other lists.
                 self.listed.clear();
             }
-            self.rebuild(epoch, members, sample_of, Classes::Derive)
+            self.rebuild(epoch, members, on_file, Classes::Derive)
         } else {
             if relisted {
                 self.list(members);
@@ -2795,8 +3017,9 @@ impl Writer {
             self.bind();
             // A generation of the standing mode comes with no membership
             // write: the receipts are read from the samples as the rows
-            // stand.
-            self.hear_again(sample_of);
+            // stand, and the cells under the generation's own columns.
+            self.hear_again(&on_file);
+            self.read_cells(&on_file);
             self.judge_every();
             // A generation may rule a pool's warming rows by other numbers,
             // or rule none, and it may turn a pool's record of sent prefixes.
@@ -3182,7 +3405,7 @@ impl Writer {
     /// applied generation judges by, since a record's write keeps the
     /// receipts only while an engine has a threshold. A membership write
     /// reads them in its own walk.
-    fn hear_again(&mut self, sample_of: impl Fn(WorkerId, u16) -> Option<LoadSample>) {
+    fn hear_again(&mut self, on_file: &impl OnFile) {
         for (heard, at) in self.heard.iter_mut().zip(&self.engine_rows) {
             if !at.rank {
                 continue;
@@ -3191,9 +3414,104 @@ impl Writer {
                 .working
                 .get(at.pool as usize)
                 .and_then(|pool| pool.rows.get(at.row as usize))
-                .and_then(|row| sample_of(row.id, row.dp_rank));
+                .and_then(|row| on_file.sample(row.id, row.dp_rank));
             *heard = sample.map_or(0, |sample| micros(self.origin, sample.received_at));
         }
+    }
+
+    /// Every pool's signal cells read from the table under the standing
+    /// generation's columns, and published whole with the next world: for
+    /// a membership build, whose rows are new, and for an applied
+    /// generation, whose columns may be other ones. One test where neither
+    /// the standing generation nor the one before declares a signal.
+    fn read_cells(&mut self, on_file: &impl OnFile) {
+        let signals = self.spec.signal_columns().len();
+        if signals == 0 && self.cells.is_empty() {
+            return;
+        }
+        self.cells_moved = false;
+        self.cell_spares.clear();
+        self.cell_spares.resize(self.working.len(), None);
+        for pool in &mut self.working {
+            pool.cells_dirty = false;
+            pool.cells = if signals == 0 {
+                Vec::new()
+            } else {
+                cells_beside(&pool.rows, signals, on_file)
+            };
+        }
+        self.cells = if signals == 0 {
+            Arc::default()
+        } else {
+            let block = |pool: &Working| Arc::new(SignalCells::new(pool.cells.clone(), signals));
+            self.working.iter().map(block).collect()
+        };
+    }
+
+    /// Write one value into the cells of member `id`'s rows at `rank`,
+    /// under `column`. Whether a row took it: none does for a member with
+    /// no place yet and for one whose rows stand at another rank, and the
+    /// build that gives the rank its row reads the value from the table.
+    pub(super) fn fold_signal(
+        &mut self,
+        id: WorkerId,
+        rank: u16,
+        column: usize,
+        cell: SignalCell,
+    ) -> bool {
+        let signals = self.spec.signal_columns().len();
+        let Self {
+            places, working, ..
+        } = self;
+        let mut folded = false;
+        for place in places_of(places, id) {
+            let Some(pool) = working.get_mut(place.pool as usize) else {
+                continue;
+            };
+            let row = place.row as usize;
+            if pool.rows.get(row).is_none_or(|row| row.dp_rank != rank) {
+                continue;
+            }
+            if let Some(held) = pool.cells.get_mut(row * signals + column) {
+                *held = cell;
+                pool.cells_dirty = true;
+                folded = true;
+            }
+        }
+        self.cells_moved |= folded;
+        folded
+    }
+
+    /// Member `id`'s rows hold no value any more: its cells left the table
+    /// with its load samples. Whether a row held one.
+    pub(super) fn forget_signals(&mut self, id: WorkerId) -> bool {
+        let signals = self.spec.signal_columns().len();
+        let Self {
+            places, working, ..
+        } = self;
+        let mut forgot = false;
+        for place in places_of(places, id) {
+            let Some(pool) = working.get_mut(place.pool as usize) else {
+                continue;
+            };
+            let from = place.row as usize * signals;
+            let Some(held) = pool.cells.get_mut(from..from + signals) else {
+                continue;
+            };
+            if held.iter().any(|cell| !cell.is_none()) {
+                held.fill(SignalCell::NONE);
+                pool.cells_dirty = true;
+                forgot = true;
+            }
+        }
+        self.cells_moved |= forgot;
+        forgot
+    }
+
+    /// The standing generation: the one every world is published under
+    /// until the next is applied.
+    pub(super) fn spec(&self) -> &AppliedSpec {
+        &self.spec
     }
 
     /// Every ready rank is heard once a `period` from here on: a judgment
@@ -3362,7 +3680,7 @@ impl Writer {
         &mut self,
         epoch: u64,
         members: impl Iterator<Item = (&'a WorkerRow, Slot, LeaderBits)>,
-        sample_of: impl Fn(WorkerId, u16) -> Option<LoadSample>,
+        on_file: impl OnFile,
         classes: Classes,
     ) -> Arc<World> {
         // A build takes in every membership write: none stays owed.
@@ -3443,7 +3761,7 @@ impl Writer {
                 ids.push(member.id);
             }
             let facts = &member.facts;
-            let sample = sample_of(member.id, facts.dp_rank);
+            let sample = on_file.sample(member.id, facts.dp_rank);
             // The ranks of a data-parallel engine share its key. A
             // single-rank worker's engine is its own key, which no other
             // row has: it is an engine alone, and no key is looked up.
@@ -3654,6 +3972,9 @@ impl Writer {
                         Vec::new()
                     },
                     binding: None,
+                    // Read at this write's end, once every pool stands.
+                    cells: Vec::new(),
+                    cells_dirty: false,
                 });
                 indexes[side] = Some(index);
             }
@@ -3877,6 +4198,8 @@ impl Writer {
             pool.dirty = false;
             self.published.push(Arc::from(pool.rows.as_slice()));
         }
+        // Every pool's rows are new, and so are their cells.
+        self.read_cells(&on_file);
         self.index_pools(&before, classes);
         // Every pool's rows are new: each count is taken again, by the one
         // pass over a pool's rows that a membership write pays for it.
@@ -4179,7 +4502,7 @@ impl Writer {
         at: Option<Instant>,
         epoch: u64,
         members: impl Iterator<Item = (&'a WorkerRow, Slot, LeaderBits)>,
-        sample_of: impl Fn(WorkerId, u16) -> Option<LoadSample>,
+        on_file: impl OnFile,
     ) -> Option<Arc<World>> {
         let owed = self.owed.take()?;
         if let Some(at) = at {
@@ -4190,7 +4513,7 @@ impl Writer {
                 self.vetoes = Arc::new(vetoes);
             }
         }
-        Some(self.rebuild(epoch, members, sample_of, owed.classes))
+        Some(self.rebuild(epoch, members, on_file, owed.classes))
     }
 
     /// The end of the window `last` opened; `None` for a window so long
@@ -4271,11 +4594,48 @@ impl Writer {
             // One allocation: the counts go straight into their shared list.
             self.unreported = self.working.iter().map(|pool| pool.unreported).collect();
         }
+        if mem::take(&mut self.cells_moved) {
+            self.publish_cells();
+        }
         // Rows no world lists and no pool took are freed here, by a write.
         self.unlisted.clear();
         self.waiting = false;
         self.publications += 1;
         self.world()
+    }
+
+    /// Each pool whose cells a write moved since the last publication takes
+    /// a new block, whole, as its rows do: the pool's working cells written
+    /// over its spare where no world lists the spare any more, and over a
+    /// new block, which is counted, where one does. The worlds take one
+    /// new list of the blocks, in one allocation.
+    fn publish_cells(&mut self) {
+        let signals = self.spec.signal_columns().len();
+        let Self {
+            working,
+            cells,
+            cell_spares,
+            allocations,
+            ..
+        } = self;
+        debug_assert_eq!(cells.len(), working.len());
+        let pools = working.iter_mut().zip(cell_spares.iter_mut());
+        let blocks = pools.zip(cells.iter()).map(|((pool, spare), standing)| {
+            if !pool.cells_dirty {
+                return Arc::clone(standing);
+            }
+            pool.cells_dirty = false;
+            let over = spare
+                .take()
+                .and_then(|mut over| cells_over(&mut over, &pool.cells, signals).then_some(over));
+            let next = over.unwrap_or_else(|| {
+                *allocations += 1;
+                Arc::new(SignalCells::new(pool.cells.clone(), signals))
+            });
+            *spare = Some(Arc::clone(standing));
+            next
+        });
+        *cells = blocks.collect();
     }
 
     /// How many worlds the writer published: the first world, made with

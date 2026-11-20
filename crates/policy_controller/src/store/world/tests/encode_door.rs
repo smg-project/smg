@@ -6,8 +6,9 @@ use super::{
     *,
 };
 use crate::{
-    store::{world::EncodePairBuffers, EncodeHandoff, EncodeOffer},
-    EncodeItems, EncodePlaced, EncoderFacts, Identity,
+    spec::{AcrossRanks, SignalSpec},
+    store::{world::EncodePairBuffers, EncodeHandoff, EncodeOffer, SignalSink, Taken},
+    EncodeItems, EncodePlaced, EncoderFacts, Identity, SignalCells,
 };
 
 /// A worker of the model that pairs over one transport and states `offer`
@@ -516,4 +517,106 @@ fn a_write_that_leaves_a_models_encoders_and_prefills_carries_the_encoders_facts
         !Arc::ptr_eq(&before, &stated()),
         "a prefill joined: carried"
     );
+}
+
+/// Each row's one value in `cells`, by worker, in the rows' order.
+fn values_of(rows: &[Candidate], cells: Option<&SignalCells>) -> Vec<(WorkerId, Option<f64>)> {
+    let value = |row: &Candidate| {
+        let held = cells?.row(row.position)?.first()?;
+        (!held.is_none()).then_some(held.value)
+    };
+    rows.iter().map(|row| (row.id, value(row))).collect()
+}
+
+#[test]
+fn the_encode_door_hands_each_pool_the_cells_of_its_own_rows() {
+    let store = MemoryStore::new();
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = 1;
+    let depth = SignalSpec {
+        unit: "items".to_owned(),
+        max_age_ms: None,
+        across_ranks: AcrossRanks::default(),
+    };
+    document.signals.insert("depth".to_owned(), depth);
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    store.apply(spec).expect("the first generation");
+    let now = Instant::now();
+    // One value a worker, each its own: the wire each speaks is the one
+    // difference, so a gateway's wires cut one row out of each pool.
+    let mut stated = Vec::new();
+    for (key, role, wires) in [
+        ("grpc://e1:9000", Role::Encode, WireModes::HTTP),
+        ("grpc://e2:9000", Role::Encode, WireModes::GRPC),
+        ("grpc://e3:9000", Role::Encode, WireModes::GRPC),
+        ("grpc://p1:9000", Role::Prefill, WireModes::HTTP),
+        ("grpc://p2:9000", Role::Prefill, WireModes::GRPC),
+        ("grpc://p3:9000", Role::Prefill, WireModes::GRPC),
+        ("grpc://d1:9000", Role::Decode, WireModes::HTTP),
+        ("grpc://d2:9000", Role::Decode, WireModes::GRPC),
+        ("grpc://d3:9000", Role::Decode, WireModes::GRPC),
+    ] {
+        let offer = if role == Role::Decode {
+            EncodeOffer::default()
+        } else {
+            push_on("c1")
+        };
+        let facts = WorkerFacts {
+            wire_modes: wires,
+            ..door_facts(key, role, offer)
+        };
+        let id = store.upsert(facts).id();
+        stated.push((id, role, wires));
+    }
+    store.publish_now();
+    for (value, &(id, ..)) in (1u32..).zip(&stated) {
+        let depth = store.signal_column("depth");
+        let taken = store.signal_value(id, 0, &depth, "items", f64::from(value), now);
+        assert_eq!(taken, Taken::Written);
+    }
+    // What each pool's rows should read: every worker of the role, and
+    // those of it a wire dials.
+    let expected = |role: Role, wires: Option<WireModes>| {
+        let mut of_role: Vec<_> = (1u32..)
+            .zip(&stated)
+            .filter(|(_, row)| row.1 == role && wires.is_none_or(|wires| row.2 == wires))
+            .map(|(value, row)| (row.0, Some(f64::from(value))))
+            .collect();
+        of_role.sort_by_key(|&(id, _)| id);
+        of_role
+    };
+    let asked = Ask {
+        signal_cells: true,
+        ..ask(now)
+    };
+    let mut out = EncodePairBuffers::default();
+    let built = store
+        .build_encode_pair(MODEL, &asked, &mut out)
+        .expect("both sides of the pair hold a member");
+    let read = |out: &EncodePairBuffers| {
+        let (pools, encode) = out.pools();
+        [
+            values_of(pools.prefills, pools.prefill_signal_cells),
+            values_of(pools.decodes, pools.decode_signal_cells),
+            values_of(encode.encoders, encode.signal_cells),
+        ]
+    };
+    let roles = [Role::Prefill, Role::Decode, Role::Encode];
+    assert_eq!(read(&out), roles.map(|role| expected(role, None)));
+    // The gateway's wires cut the first row of each pool: the rows left
+    // move up and read their own values still.
+    out.narrow(Some(WireModes::GRPC), None, &built);
+    let dialed = roles.map(|role| expected(role, Some(WireModes::GRPC)));
+    assert_eq!(read(&out), dialed);
+    assert!(dialed.iter().all(|pool| pool.len() == 2));
+    // An ask that takes no cells is handed none, in every pool.
+    let built = store.build_encode_pair(MODEL, &ask(now), &mut out);
+    assert!(built.is_some());
+    let (pools, encode) = out.pools();
+    let handed = [
+        pools.prefill_signal_cells,
+        pools.decode_signal_cells,
+        encode.signal_cells,
+    ];
+    assert!(handed.iter().all(Option::is_none));
 }

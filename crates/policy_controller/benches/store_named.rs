@@ -177,6 +177,7 @@ fn decide(
             now,
             pinned: None,
             affinity: !named,
+            signal_cells: false,
         };
         // The rows where their publication left them: lent, the door of a
         // pool every gateway reaches whole.

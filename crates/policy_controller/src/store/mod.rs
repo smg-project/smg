@@ -77,6 +77,7 @@ pub mod memory;
 pub mod pairing;
 pub mod reservations;
 pub mod sessions;
+pub mod signals;
 pub mod workers;
 pub mod world;
 
@@ -103,6 +104,7 @@ pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts, Watch};
 pub use pairing::{PairClasses, PairingDescriptor};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};
+pub use signals::{SignalSink, Taken};
 pub use workers::{
     identity, identity_of, token, HealthPolicy, Maker, MembershipChange, MembershipTail, Overload,
     ProviderKey, Reachability, Signals, Unmade, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,

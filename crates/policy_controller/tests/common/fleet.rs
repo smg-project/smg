@@ -1663,6 +1663,7 @@ impl Harness {
             now: Instant::now(),
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         if self
             .store
@@ -2150,6 +2151,7 @@ impl Embedded {
             now: Instant::now(),
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         let mut out = ViewBuffers::default();
         self.store.deciding(|world| {

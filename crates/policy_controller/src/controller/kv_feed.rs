@@ -529,6 +529,7 @@ mod tests {
                         now: Instant::now(),
                         pinned: None,
                         affinity: false,
+                        signal_cells: false,
                     };
                     let mut view = ViewBuffers::default();
                     let built = world

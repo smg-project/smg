@@ -744,6 +744,46 @@ profiles:
 }
 
 #[test]
+fn a_signal_declares_how_several_ranks_make_one_value_and_the_sum_is_left_unwritten() {
+    use smg_policy_controller::spec::AcrossRanks;
+
+    let declaring = |across: &str| {
+        document(&format!(
+            "apiVersion: smg.policy/v1\nsignals:\n  depth: {{ unit: items{across} }}\nprofiles: {{ p: {{ pick: random }} }}\n"
+        ))
+    };
+    let across = |document: &PolicySpec| {
+        let applied = AppliedSpec::validate(document).expect("validates");
+        applied.signal_columns()[0].across_ranks()
+    };
+    // Left out, a report of several ranks is summed.
+    let plain = declaring("");
+    assert_eq!(across(&plain), AcrossRanks::Sum);
+    for (word, declared) in [
+        ("sum", AcrossRanks::Sum),
+        ("max", AcrossRanks::Max),
+        ("min", AcrossRanks::Min),
+        ("mean", AcrossRanks::Mean),
+    ] {
+        let written = declaring(&format!(", across_ranks: {word}"));
+        assert_eq!(across(&written), declared, "{word}");
+        let read: PolicySpec =
+            serde_json::from_str(&serde_json::to_string(&written).expect("JSON"))
+                .expect("its own JSON");
+        assert_eq!(read, written, "{word}");
+        // The sum written out is the document that leaves it out: one
+        // canonical form and one digest. Any other word moves both.
+        let same = written.digest().expect("a digest").to_string()
+            == plain.digest().expect("a digest").to_string();
+        assert_eq!(same, declared == AcrossRanks::Sum, "{word}");
+    }
+    let unknown = serde_yaml::from_str::<PolicySpec>(
+        "apiVersion: smg.policy/v1\nsignals:\n  depth: { unit: items, across_ranks: median }\nprofiles: { p: { pick: random } }\n",
+    );
+    assert!(unknown.is_err(), "a word that is no reduction");
+}
+
+#[test]
 fn a_host_refills_its_cells_in_place_and_the_next_decision_reads_them() {
     let rows = rows(&[31, 32]);
     // A row's cells in the order of the names: `free`, then `pending`.

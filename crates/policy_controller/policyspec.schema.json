@@ -211,11 +211,40 @@
           "format": "uint32",
           "minimum": 1,
           "maximum": 3599999
+        },
+        "across_ranks": {
+          "description": "How one row's value is made where its report holds several ranks.\nAbsent: the sum.",
+          "$ref": "#/$defs/AcrossRanks"
         }
       },
       "additionalProperties": false,
       "required": [
         "unit"
+      ]
+    },
+    "AcrossRanks": {
+      "description": "How one row's value is made where its report holds several ranks: a\nworker of several data-parallel ranks that stands as one row. Where\neach rank is a row of its own, nothing is reduced.",
+      "oneOf": [
+        {
+          "description": "The ranks' values added: an amount each rank holds a part of.",
+          "type": "string",
+          "const": "sum"
+        },
+        {
+          "description": "The largest of the ranks' values.",
+          "type": "string",
+          "const": "max"
+        },
+        {
+          "description": "The smallest of the ranks' values.",
+          "type": "string",
+          "const": "min"
+        },
+        {
+          "description": "The mean of the ranks' values.",
+          "type": "string",
+          "const": "mean"
+        }
       ]
     },
     "ProfileSpec": {

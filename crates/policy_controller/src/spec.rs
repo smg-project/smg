@@ -783,7 +783,9 @@ pub struct ResidentWorkParams {
     pub request_tokens: u32,
 }
 
-const COST_PARAMETER_LIMIT: f64 = 1e15;
+/// The largest magnitude of a cost rule's parameter. The signal sink holds
+/// a value it takes to the same bound.
+pub(crate) const COST_PARAMETER_LIMIT: f64 = 1e15;
 const RELATIVE_MARGIN_LIMIT: f64 = 1e6;
 
 /// The least-cost scorer: a sum of a row's fields times their coefficients,
@@ -2219,6 +2221,28 @@ pub struct SignalSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = MAX_REPORT_AGE_MS))]
     pub max_age_ms: Option<u32>,
+    /// How one row's value is made where its report holds several ranks.
+    /// Absent: the sum.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub across_ranks: AcrossRanks,
+}
+
+/// How one row's value is made where its report holds several ranks: a
+/// worker of several data-parallel ranks that stands as one row. Where
+/// each rank is a row of its own, nothing is reduced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AcrossRanks {
+    /// The ranks' values added: an amount each rank holds a part of.
+    #[default]
+    Sum,
+    /// The largest of the ranks' values.
+    Max,
+    /// The smallest of the ranks' values.
+    Min,
+    /// The mean of the ranks' values.
+    Mean,
 }
 
 /// The most signals one document declares.
@@ -2762,7 +2786,9 @@ fn resolve_signals(signals: &BTreeMap<String, SignalSpec>) -> Arc<[SignalColumn]
     signals
         .iter()
         .zip(0u16..)
-        .map(|((name, spec), column)| SignalColumn::new(name, &spec.unit, column, spec.max_age_ms))
+        .map(|((name, spec), column)| {
+            SignalColumn::new(name, &spec.unit, column, spec.max_age_ms).across(spec.across_ranks)
+        })
         .collect()
 }
 
@@ -5203,6 +5229,12 @@ impl AppliedSpec {
     /// Empty for a document that declares none and for the unbound start.
     pub fn signal_columns(&self) -> &[SignalColumn] {
         &self.signal_columns
+    }
+
+    /// [`Self::signal_columns`] as the list is shared: what the store's
+    /// signal sink hands a report's conversion.
+    pub(crate) fn shared_signal_columns(&self) -> Arc<[SignalColumn]> {
+        Arc::clone(&self.signal_columns)
     }
 
     /// Marks the unbound start of a replica whose start's document waits
@@ -8896,6 +8928,7 @@ mod tests {
         let held = SignalSpec {
             unit: "tokens".to_owned(),
             max_age_ms: None,
+            across_ranks: AcrossRanks::default(),
         };
         let signals = BTreeMap::from([("held".to_owned(), held)]);
         let mut profiles = base.profiles.clone();
@@ -9012,6 +9045,7 @@ mod tests {
                 SignalSpec {
                     unit: "tokens".to_owned(),
                     max_age_ms: Some(4_000),
+                    across_ranks: AcrossRanks::Max,
                 },
             )]),
             plans: PlansSpec {

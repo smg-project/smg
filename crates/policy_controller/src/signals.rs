@@ -19,11 +19,15 @@
 //! a profile whose stages read a signal, and for no other.
 
 use crate::{
-    spec::MAX_SIGNALS,
+    spec::{AcrossRanks, MAX_SIGNALS},
     view::{Candidate, RequestFacts},
 };
 
 /// One value and when it was sampled, in microseconds on the host's clock.
+///
+/// A value is finite and of magnitude at most 1e15. The store's sink takes
+/// no other. A host that hands cells it built passes no sink, and holds
+/// its values to the same bound itself.
 #[derive(Clone, Copy, Debug)]
 pub struct SignalCell {
     pub value: f64,
@@ -119,6 +123,11 @@ impl SignalCells {
         self.signals as usize
     }
 
+    /// The cells, row after row.
+    pub(crate) fn cells(&self) -> &[SignalCell] {
+        &self.cells
+    }
+
     /// The cells of the row at `position`, in the columns' order: `None`
     /// for a row outside the cells.
     pub(crate) fn row(&self, position: u32) -> Option<&[SignalCell]> {
@@ -133,8 +142,8 @@ impl SignalCells {
     }
 }
 
-/// One declared signal, resolved: its column's number, its unit and its
-/// maximum age.
+/// One declared signal, resolved: its column's number, its unit, its
+/// maximum age and how a report of several ranks makes one row's value.
 #[derive(Clone, Debug)]
 pub struct SignalColumn {
     name: Box<str>,
@@ -143,6 +152,7 @@ pub struct SignalColumn {
     /// The maximum age, [`u64::MAX`] where the document writes none: a
     /// read then compares one age either way.
     max_age_micros: u64,
+    across_ranks: AcrossRanks,
 }
 
 impl SignalColumn {
@@ -152,7 +162,14 @@ impl SignalColumn {
             unit: unit.into(),
             column,
             max_age_micros: max_age_ms.map_or(u64::MAX, |ms| u64::from(ms) * 1000),
+            across_ranks: AcrossRanks::default(),
         }
+    }
+
+    /// The column under the reduction its signal declares.
+    pub(crate) fn across(mut self, across_ranks: AcrossRanks) -> Self {
+        self.across_ranks = across_ranks;
+        self
     }
 
     /// The signal's name, as the document declares it.
@@ -163,6 +180,12 @@ impl SignalColumn {
     /// The unit the document declares for the signal's values.
     pub fn unit(&self) -> &str {
         &self.unit
+    }
+
+    /// How one row's value is made where its report holds several ranks,
+    /// as the document declares it.
+    pub fn across_ranks(&self) -> AcrossRanks {
+        self.across_ranks
     }
 
     /// The row's value at this decision: `None` where the facts hand no

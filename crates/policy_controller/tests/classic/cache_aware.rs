@@ -408,6 +408,7 @@ impl Served {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let read = world
                 .view(MODEL, Role::Single, &ask, false, view)

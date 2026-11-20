@@ -329,6 +329,7 @@ impl Bed {
             now,
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         self.store
             .build_view(MODEL, Role::Single, &ask, &mut out)
