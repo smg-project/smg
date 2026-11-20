@@ -9,7 +9,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use smg_policy_controller::{
     store::{Maker, MemoryStore, WorkerFacts},
-    worker_host::{Membership, Objects, Refused, StoreDoor, Wrote},
+    worker_host::{Membership, Objects, Refused, Remover, Standing, StoreDoor, Wrote},
 };
 
 use crate::routers::{
@@ -101,12 +101,12 @@ impl Membership for FeedDoor {
         self.write(|door| door.found(maker, url, state))
     }
 
-    fn drained(&self, maker: &Maker, url: &str) -> Result<Wrote, Refused> {
-        self.write(|door| door.drained(maker, url))
+    fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
+        self.write(|door| door.drained(by, url, seen))
     }
 
-    fn gone(&self, maker: &Maker, url: &str) -> Result<Wrote, Refused> {
-        self.write(|door| door.gone(maker, url))
+    fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
+        self.write(|door| door.gone(by, url, seen))
     }
 }
 

@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use smg_policy_controller::{
     store::{HealthPolicy, Maker, MemoryStore, WorkerFacts, WorkersStore},
     view::{Role, WireModes, WorkerId},
-    worker_host::{Membership, Refused, StoreDoor, Wrote},
+    worker_host::{Membership, Refused, Remover, Standing, StoreDoor, Wrote},
 };
 use smg_worker::registry::event::WorkerEvent;
 
@@ -181,10 +181,10 @@ async fn a_drained_row_takes_no_decision_and_a_gone_row_leaves_the_registry() {
     assert_eq!(before.id(), row);
     drop(before);
 
-    assert_eq!(
-        feed.door.drained(&Maker::Control, URL),
-        Ok(Wrote::Draining(row))
-    );
+    let object = feed.objects.object(row).expect("the row has an object");
+    let seen = feed.objects.standing(&object).expect("the object's row");
+    let by = Remover::Maker(&Maker::Control);
+    assert_eq!(feed.door.drained(by, URL, seen), Ok(Wrote::Draining(row)));
     let drained = host
         .place(&ask(b"next"), Instant::now())
         .await
@@ -192,10 +192,7 @@ async fn a_drained_row_takes_no_decision_and_a_gone_row_leaves_the_registry() {
     assert!(matches!(drained, Unplaced::Shed { .. }), "{drained:?}");
     assert!(registry.get_by_url(URL).is_some());
 
-    assert_eq!(
-        feed.door.gone(&Maker::Control, URL),
-        Ok(Wrote::Removed(row))
-    );
+    assert_eq!(feed.door.gone(by, URL, seen), Ok(Wrote::Removed(row)));
     assert!(registry.get_by_url(URL).is_none());
     assert!(feed.objects.object(row).is_none());
 }
@@ -255,11 +252,12 @@ fn the_registry_tells_of_a_registration_before_the_store_publishes_it() {
 #[test]
 fn a_membership_write_holds_the_feed_turn_through_its_listener() {
     let calls = Arc::new(AtomicUsize::new(0));
+    let store = Arc::new(MemoryStore::default());
     let door = Arc::new_cyclic(|door: &Weak<FeedDoor>| {
         let door = Weak::clone(door);
         let calls = Arc::clone(&calls);
         FeedDoor {
-            door: StoreDoor::new(Arc::new(MemoryStore::default())).telling(move || {
+            door: StoreDoor::new(Arc::clone(&store)).telling(move || {
                 let door = door.upgrade().expect("the caller holds the door");
                 assert!(door.turn.try_lock().is_none());
                 calls.fetch_add(1, Ordering::Relaxed);
@@ -268,7 +266,12 @@ fn a_membership_write_holds_the_feed_turn_through_its_listener() {
         }
     });
     let row = register(&*door).expect("the worker registers");
-    assert_eq!(door.drained(&Maker::Control, URL), Ok(Wrote::Draining(row)));
-    assert_eq!(door.gone(&Maker::Control, URL), Ok(Wrote::Removed(row)));
+    let seen = Standing {
+        row,
+        revision: store.get(row).expect("the worker's row").revision,
+    };
+    let by = Remover::Maker(&Maker::Control);
+    assert_eq!(door.drained(by, URL, seen), Ok(Wrote::Draining(row)));
+    assert_eq!(door.gone(by, URL, seen), Ok(Wrote::Removed(row)));
     assert_eq!(calls.load(Ordering::Relaxed), 3);
 }
