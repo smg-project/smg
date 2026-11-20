@@ -235,6 +235,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         "qwen3-vl-235b-a22b-thinking",
         GenerationPrompt::AlwaysOpensTheThought,
     ),
+    ("taskmem", GenerationPrompt::AlwaysOpensTheThought),
+    ("egm-8b", GenerationPrompt::AlwaysOpensTheThought),
+    ("egm-4b-sft", GenerationPrompt::AlwaysOpensTheThought),
     // Qwen3-Omni: the Qwen3 template over audio and video content too, so the same syntax and
     // the same switch; both checkpoints leave the thought to the model.
     (
@@ -260,6 +263,27 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("qwen3.5-0.8b", GenerationPrompt::Plain),
     // Qwen3.5-2B's opens the thought only when the request asks for it.
     ("qwen3.5-2b", GenerationPrompt::OpensTheThoughtWhenAsked),
+    ("tmax-2b", GenerationPrompt::OpensTheThoughtWhenAsked),
+    (
+        "singguard-nsfa-0.8b",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "qwen3.5-0.8b-text-only",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "lighton-rerank-pw-2b",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "lighton-rerank-lw-2b",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "intern-decision-0.8b",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
     ("qwen3.5-4b", GenerationPrompt::OpensTheThought),
     ("qwen3.5-9b", GenerationPrompt::OpensTheThought),
     // UserRepGen-4B is a member of the Qwen3.5-9B group: its group's sets replay through the table
@@ -269,6 +293,7 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("qwen3.5-35b-a3b", GenerationPrompt::OpensTheThought),
     ("qwen3.5-122b-a10b", GenerationPrompt::OpensTheThought),
     ("qwen3.6-27b", GenerationPrompt::OpensTheThought),
+    ("tmax-27b", GenerationPrompt::OpensTheThought),
     ("qwen3.6-35b-a3b", GenerationPrompt::OpensTheThought),
     ("qwen3.8-27b", GenerationPrompt::OpensTheThought),
     ("qwen3.8-flash-next", GenerationPrompt::OpensTheThought),
@@ -467,6 +492,8 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ),
     ("hermes-4-14b", GenerationPrompt::Plain),
     ("granite-4.1-3b", GenerationPrompt::Plain),
+    ("granite-guardian-4.1-8b", GenerationPrompt::Plain),
+    ("granite-4.0-h-3b-ar", GenerationPrompt::Plain),
     ("granite-switch-4.1-8b", GenerationPrompt::Plain),
     ("ai21-jamba2-3b", GenerationPrompt::Plain),
     ("step-3.5-flash", GenerationPrompt::AlwaysOpensTheThought),
@@ -514,6 +541,7 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         "seed-oss-36b-instruct",
         GenerationPrompt::ModelWritesTheThought,
     ),
+    ("seed-oss-36b-base", GenerationPrompt::ModelWritesTheThought),
     // Keyed arguments, each family under its own markers; the prompt opens the thought, Hy4's
     // whatever the request says.
     ("hy4-preview", GenerationPrompt::AlwaysOpensTheThought),
@@ -548,6 +576,7 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // assistant turn without a thinking field, so bellwether records five of its sixteen common
     // cases, the reasoning ones and the thinking-on call.
     ("k2-horizon-36b", GenerationPrompt::AlwaysOpensTheThought),
+    ("k2-horizon-7b", GenerationPrompt::AlwaysOpensTheThought),
     // The Jais 3 line (two groups: the dense checkpoints under the 32B, the MoVA one on its own
     // tokenizer) writes K2-Horizon's shape on a template of its own: the thought opened by the
     // prompt whatever `enable_thinking` says (`reasoning_effort` picks the tag, `<ifm|think>` by
@@ -585,10 +614,14 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Python calls: Olmo 3 has no thought; LFM2.5's template adds nothing to the turn opener in
     // either thinking setting (its render set), and the model writes `<think>` itself or not.
     ("olmo-3-7b-instruct", GenerationPrompt::Plain),
+    ("olmo-hybrid-instruct-dpo-7b", GenerationPrompt::Plain),
     ("lfm2.5-1.2b-instruct", GenerationPrompt::ModelDecides),
+    ("lfm2.5-350m", GenerationPrompt::ModelDecides),
+    ("lfm2-24b-a2b", GenerationPrompt::ModelDecides),
     // LFM2.5-24B-A2B's template opens the thought in the prompt whatever the request says (`<think>`
     // after the assistant header, no newline, in both thinking settings of its render set).
     ("lfm2.5-24b-a2b", GenerationPrompt::AlwaysOpensTheThought),
+    ("lfm2.5-2.6b", GenerationPrompt::AlwaysOpensTheThought),
     // Llama 4's list stands bare in the turn after the content, every value between double
     // quotes; the template has no thought and ends the generation prompt with the opener and two
     // newlines, which the shared tail does not write and the replay does not need.
@@ -599,6 +632,7 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ),
     // A bare JSON list of calls, or content; no thought.
     ("llama-xlam-2-8b-fc-r", GenerationPrompt::Plain),
+    ("llama-xlam-2-70b-fc-r", GenerationPrompt::Plain),
     // The Mistral list behind `[TOOL_CALLS]`; Mistral Small 3's template renders no tool call,
     // so its recorded sets hold content alone, and no thought.
     ("mistral-small-24b-instruct-2501", GenerationPrompt::Plain),
@@ -623,15 +657,32 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // colgrep-agent-2B (a MiniCPM5-2B fine-tune) writes the MiniCPM5-2B base template: the same
     // prompt shapes, the model writing its own `<think>`.
     ("colgrep-agent-2b", GenerationPrompt::ModelWritesTheThought),
+    ("minicpm5-2b-sft", GenerationPrompt::ModelWritesTheThought),
+    ("minicpm5-2b-base", GenerationPrompt::ModelWritesTheThought),
     // dots3: the model writes its own `<think>`, as Qwen3 does; thinking off closes it in the
     // prompt.
     ("dots3-note-prev", GenerationPrompt::ModelWritesTheThought),
     // Laguna writes GLM 4.5's spelling (a newline after the name, each key and each value) under
     // its own turn opener; its prompt ends in the thought's opener or its closer alone.
     ("laguna-xs.2", GenerationPrompt::MarkerAlone),
-    // Gemma 4: the prompt is the turn's opener alone, whatever the request says (the template opens
-    // the thought channel only after a tool response); the model writes `<|channel>thought` or not.
+    // Gemma 4 E-series: the prompt is the turn's opener alone, whatever the request says (the
+    // template opens the thought channel only after a tool response); the model writes
+    // `<|channel>thought` or not.
     ("gemma-4-e4b-it", GenerationPrompt::ModelDecides),
+    (
+        "gemma-4-e2b-it-qat-q4-0-unquantized",
+        GenerationPrompt::ModelDecides,
+    ),
+    // The larger template closes an empty thought after the turn opener unless the request turns
+    // thinking on; in that setting it leaves the prompt at the opener.
+    (
+        "gemma-4-26b-a4b-it",
+        GenerationPrompt::ClosesTheThoughtUnlessAsked,
+    ),
+    (
+        "gemma-4-12b-it",
+        GenerationPrompt::ClosesTheThoughtUnlessAsked,
+    ),
     // OTel-2.0-LLM-31B-IT (a Gemma 4 stack) writes Gemma 4's template with a comment block added at
     // the generation prompt and nothing else: the prompt is the turn's opener alone; the model
     // writes `<|channel>thought` or not.
@@ -646,12 +697,67 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // template writes the thought.
     ("agentcpm-explore", GenerationPrompt::ModelWritesTheThought),
     (
+        "ultravox-v0-6-qwen-3-32b",
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    ("sera-8b", GenerationPrompt::ModelWritesTheThought),
+    ("scicore-mol", GenerationPrompt::ModelWritesTheThought),
+    ("rubicon-preview", GenerationPrompt::ModelWritesTheThought),
+    (
+        "qwen3-nemotron-8b-brrm",
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "qwen3-nemotron-32b-rlbff",
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "qwen3-8b-djinnsdf-dolci",
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "privasis-cleaner-4b",
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    ("mathform-8b", GenerationPrompt::ModelWritesTheThought),
+    (
+        "marco-deepresearch-8b",
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    ("magenticbrain", GenerationPrompt::ModelWritesTheThought),
+    ("isaac-0.2-1b", GenerationPrompt::ModelWritesTheThought),
+    (
+        "internvl3-5-8b-instruct",
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "internvl3-5-30b-a3b-instruct",
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "fun-asr-nano-2512-vllm",
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "finetuned-reworded-qwen3-4b-public",
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
         "ai21-jamba-reasoning-3b",
         GenerationPrompt::AlwaysOpensTheThought,
     ),
     ("astabrief-8b", GenerationPrompt::ModelWritesTheThought),
     ("baichuan-m3-235b", GenerationPrompt::AlwaysOpensTheThought),
     ("caprl-qwen3vl-4b", GenerationPrompt::Plain),
+    ("zwz-4b", GenerationPrompt::Plain),
+    ("unirg-cxr", GenerationPrompt::Plain),
+    ("ui-venus-1.5-2b", GenerationPrompt::Plain),
+    ("spatial-ssrl-qwen3vl-4b", GenerationPrompt::Plain),
+    ("sage-mm-qwen3-vl-8b-sft", GenerationPrompt::Plain),
+    ("sage-mm-qwen3-vl-4b-sft-rl", GenerationPrompt::Plain),
+    ("recon2reason-reasoning-4b", GenerationPrompt::Plain),
+    ("gelab-zero-4b-preview", GenerationPrompt::Plain),
+    ("cosmos3-super", GenerationPrompt::Plain),
     ("caprl-video-4b", GenerationPrompt::Plain),
     ("contextpilot-14b", GenerationPrompt::ModelWritesTheThought),
     ("falcon-h1r-7b", GenerationPrompt::ModelDecides),
@@ -674,6 +780,24 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // request turns thinking off.
     ("arex-2", GenerationPrompt::OpensTheThought),
     ("arex-base", GenerationPrompt::OpensTheThought),
+    ("vista-9b", GenerationPrompt::OpensTheThought),
+    ("ui-mate-9b", GenerationPrompt::OpensTheThought),
+    ("singguard-nsfa-4b", GenerationPrompt::OpensTheThought),
+    (
+        "qwen3.5-35b-a3b-text-only",
+        GenerationPrompt::OpensTheThought,
+    ),
+    ("qwen-image-2.1-pe-t2i", GenerationPrompt::OpensTheThought),
+    ("qwen-image-2.1-pe-i2i", GenerationPrompt::OpensTheThought),
+    ("pi-mem-35b-a3b", GenerationPrompt::OpensTheThought),
+    ("lighton-rerank-pw-4b", GenerationPrompt::OpensTheThought),
+    ("lighton-rerank-lw-4b", GenerationPrompt::OpensTheThought),
+    (
+        "ising-calibration-1-35b-a3b",
+        GenerationPrompt::OpensTheThought,
+    ),
+    ("intern-decision-4b", GenerationPrompt::OpensTheThought),
+    ("huatuogpt-3-9b", GenerationPrompt::OpensTheThought),
     ("arex-turbo", GenerationPrompt::OpensTheThought),
     ("cosmos3-edge", GenerationPrompt::OpensTheThought),
     (
@@ -758,6 +882,7 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // LFM2.5's Python calls under d1's template, which adds nothing to the turn opener in either
     // thinking setting; the model writes `<think>` itself or not.
     ("d1-3b", GenerationPrompt::ModelDecides),
+    ("lfm2.5-vl-3b", GenerationPrompt::ModelDecides),
     // Mistral: `[THINK]` and `[/THINK]` the model's own, `[TOOL_CALLS]name[ARGS]{…}` per call; the
     // prompt ends at `[/INST]` whatever the request says. The instruct templates have no thought.
     ("devstral-2-123b-instruct-2512", GenerationPrompt::Plain),
@@ -798,12 +923,23 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // thought in the prompt under its own opener; AReaL-SEA and the tau2 SFT open it whatever the
     // request says; the boba-2 line and the tau2 user SFT leave it to the model.
     ("areal-boba-2-14b", GenerationPrompt::ModelWritesTheThought),
+    ("huatuogpt-3-8b", GenerationPrompt::ModelWritesTheThought),
+    ("sera-32b", GenerationPrompt::ModelWritesTheThought),
+    ("sdar-30b-a3b-chat", GenerationPrompt::ModelWritesTheThought),
+    ("qwen3-8b-abc", GenerationPrompt::ModelWritesTheThought),
+    ("qwen3-32b-aworld", GenerationPrompt::ModelWritesTheThought),
+    ("januscoder-14b", GenerationPrompt::ModelWritesTheThought),
     ("areal-boba-2-32b", GenerationPrompt::ModelWritesTheThought),
     ("areal-boba-2-8b", GenerationPrompt::ModelWritesTheThought),
     (
         "areal-sea-235b-a22b",
         GenerationPrompt::AlwaysOpensTheThought,
     ),
+    ("scithinker-4b", GenerationPrompt::AlwaysOpensTheThought),
+    ("scithinker-30b", GenerationPrompt::AlwaysOpensTheThought),
+    ("qwen3-8b-fr", GenerationPrompt::AlwaysOpensTheThought),
+    ("dr-venus-4b-sft", GenerationPrompt::AlwaysOpensTheThought),
+    ("dr-venus-4b-rl", GenerationPrompt::AlwaysOpensTheThought),
     (
         "areal-tau2-telecom-sft-30b",
         GenerationPrompt::AlwaysOpensTheThought,
@@ -820,14 +956,60 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("a.x-4.0", GenerationPrompt::Plain),
     ("a.x-4.0-light", GenerationPrompt::Plain),
     ("baichuanmed-ocr-7b", GenerationPrompt::Plain),
+    ("x-reasoner-7b", GenerationPrompt::Plain),
+    ("vilasr", GenerationPrompt::Plain),
+    ("vebrain", GenerationPrompt::Plain),
+    ("ui-venus-ground-7b", GenerationPrompt::Plain),
+    ("ui-tars-1.5-7b", GenerationPrompt::Plain),
+    ("skycaptioner-v1", GenerationPrompt::Plain),
+    ("scalecua-7b", GenerationPrompt::Plain),
+    ("scalecua-3b", GenerationPrompt::Plain),
+    ("mmsearch-r1-7b-0807", GenerationPrompt::Plain),
+    ("mimo-7b-sft", GenerationPrompt::Plain),
+    ("jedi-3b-1080p", GenerationPrompt::Plain),
     (
         "bytedance-seed-oss-36b-alternate-tokenizer",
         GenerationPrompt::Plain,
     ),
+    ("hermes-4-70b", GenerationPrompt::Plain),
+    ("hermes-4-405b", GenerationPrompt::Plain),
+    ("hermes-4.3-36b-centralized", GenerationPrompt::Plain),
+    ("hermes-4.3-36b", GenerationPrompt::Plain),
     ("caller", GenerationPrompt::Plain),
+    ("arcee-blitz-caller-beta", GenerationPrompt::Plain),
     ("caprl-3b", GenerationPrompt::Plain),
     ("caprl-eval-3b", GenerationPrompt::Plain),
     ("cogalign-internvl2-5-mpo-4b", GenerationPrompt::Plain),
+    ("xrouter", GenerationPrompt::Plain),
+    ("video-xl-2-stage3", GenerationPrompt::Plain),
+    ("video-xl-2", GenerationPrompt::Plain),
+    ("tar-7b", GenerationPrompt::Plain),
+    ("tar-1.5b", GenerationPrompt::Plain),
+    ("swerankllm-small", GenerationPrompt::Plain),
+    ("swerankllm-large", GenerationPrompt::Plain),
+    ("swe-fixer-retriever-7b", GenerationPrompt::Plain),
+    ("swe-dev-7b", GenerationPrompt::Plain),
+    ("swe-dev-32b", GenerationPrompt::Plain),
+    (
+        "stage2-internvideo2-1b-qwen2-5-7b-tome16-mlp",
+        GenerationPrompt::Plain,
+    ),
+    ("skywork-swe-32b", GenerationPrompt::Plain),
+    ("shieldagent", GenerationPrompt::Plain),
+    ("setox-qwen2.5-3b", GenerationPrompt::Plain),
+    ("points-reader", GenerationPrompt::Plain),
+    ("ovis2-4b", GenerationPrompt::Plain),
+    ("nextcoder-7b", GenerationPrompt::Plain),
+    ("nextcoder-14b", GenerationPrompt::Plain),
+    ("moirai-agent", GenerationPrompt::Plain),
+    ("locateanything-3b", GenerationPrompt::Plain),
+    ("if-critic-14b", GenerationPrompt::Plain),
+    ("harc-qwen2.5-7b-instruct", GenerationPrompt::Plain),
+    ("game-rl-internvl3-8b", GenerationPrompt::Plain),
+    ("fleming-vl-8b", GenerationPrompt::Plain),
+    ("fare-8b", GenerationPrompt::Plain),
+    ("eagle2-2b", GenerationPrompt::Plain),
+    ("bagel-7b-mot", GenerationPrompt::Plain),
     ("crispers-7b-v1", GenerationPrompt::Plain),
     ("ernie-image-aes", GenerationPrompt::Plain),
     // Qwen 3.5's tagged calls, the thought opened in the prompt and closed there when the
@@ -843,6 +1025,13 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         "llama-3-1-nemotron-ultra-253b-cpt-v1",
         GenerationPrompt::Plain,
     ),
+    ("ultravox-v0-6-llama-3-3-70b", GenerationPrompt::Plain),
+    ("ultravox-v0-5-llama-3-1-8b", GenerationPrompt::Plain),
+    ("rlpr-llama3.1-8b-inst", GenerationPrompt::Plain),
+    ("meta-llama-3.1-8b-instruct-fp8", GenerationPrompt::Plain),
+    ("llamathought-eurus-matheval", GenerationPrompt::Plain),
+    ("himed-8b", GenerationPrompt::Plain),
+    ("harc-llama-3.1-8b-instruct", GenerationPrompt::Plain),
     (
         "llama-3.1-nemotron-8b-ultralong-1m-instruct",
         GenerationPrompt::Plain,
@@ -866,6 +1055,7 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Llama 3.2's own template: the same one call alone, `parameters` naming the arguments, no
     // thought; the model's `<|python_tag|>`, which the template never writes, is dropped.
     ("llama-3.2-1b-instruct", GenerationPrompt::Plain),
+    ("llama-3.2-1b-instruct-fp8", GenerationPrompt::Plain),
     ("llama-3.2-11b-vision-instruct", GenerationPrompt::Plain),
     // Llama 3.1 8B/70B/405B Instruct and Llama 3.3 70B Instruct: one template, byte for byte the
     // one the Nemotron Ultra CPT, UltraLong and Safety Guard rows above carry. bellwether records
@@ -1071,6 +1261,9 @@ enum GenerationPrompt {
     /// otherwise `<think>\n\n</think>\n\n`, and the output starts in content. The reverse of
     /// [`Self::OpensTheThought`]'s default, so a request without the switch gets no thought.
     OpensTheThoughtWhenAsked,
+    /// The larger Gemma 4 template: `<|channel>thought\n<channel|>` unless the request turns
+    /// thinking on, when it writes nothing after the turn opener.
+    ClosesTheThoughtUnlessAsked,
     /// Hy V3 (Hy-Memory): `<think>` (the thought opened, no newline) when the request's
     /// `reasoning_effort` is `low` or `high`, so the output starts inside the thought; otherwise
     /// (`no_think`, the template's default) `<think></think>`, and the output starts in content.
@@ -1151,6 +1344,8 @@ impl GenerationPrompt {
             (Self::OpensTheThoughtByEffort, _) => format!("{open}{close}"),
             (Self::OpensTheThoughtWhenAsked, _) if request.thinking_on() => opened,
             (Self::OpensTheThoughtWhenAsked, _) => closed,
+            (Self::ClosesTheThoughtUnlessAsked, _) if request.thinking_on() => String::new(),
+            (Self::ClosesTheThoughtUnlessAsked, _) => format!("{open}{close}"),
             (Self::MarkerAlone, _) if request.thinking_on() => open.to_string(),
             (Self::MarkerAlone, _) => close.to_string(),
         }
@@ -1164,6 +1359,7 @@ impl GenerationPrompt {
             self,
             Self::Plain
                 | Self::OpensTheThoughtWhenAsked
+                | Self::ClosesTheThoughtUnlessAsked
                 | Self::OpensTheThoughtByEffort
                 | Self::MarkerAlone
         )
@@ -1195,6 +1391,14 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
         "<|start_of_role|>assistant<|end_of_role|>",
     ),
     (
+        "granite-guardian-4.1-8b",
+        "<|start_of_role|>assistant<|end_of_role|>",
+    ),
+    (
+        "granite-4.0-h-3b-ar",
+        "<|start_of_role|>assistant<|end_of_role|>",
+    ),
+    (
         "granite-switch-4.1-8b",
         "<|start_of_role|>assistant<|end_of_role|>",
     ),
@@ -1208,7 +1412,27 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
         "<|start_header_id|>assistant<|end_header_id|>",
     ),
     (
+        "hermes-4-70b",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "hermes-4-405b",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "hermes-4.3-36b-centralized",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "hermes-4.3-36b",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
         "llama-3.2-1b-instruct",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.2-1b-instruct-fp8",
         "<|start_header_id|>assistant<|end_header_id|>",
     ),
     (
@@ -1226,6 +1450,31 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
     ("exaone-4.5-33b", "<|assistant|>"),
     (
         "llama-3-1-nemotron-ultra-253b-cpt-v1",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "ultravox-v0-6-llama-3-3-70b",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "ultravox-v0-5-llama-3-1-8b",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "rlpr-llama3.1-8b-inst",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "meta-llama-3.1-8b-instruct-fp8",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llamathought-eurus-matheval",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    ("himed-8b", "<|start_header_id|>assistant<|end_header_id|>"),
+    (
+        "harc-llama-3.1-8b-instruct",
         "<|start_header_id|>assistant<|end_header_id|>",
     ),
     (
@@ -4166,6 +4415,39 @@ fn a_v3_2_rows_generation_prompt_closes_the_thought_unless_the_request_turns_thi
                 .iter()
                 .all(|known| known.id != REASONING_PROBE.id),
             "{slug} ({prompt:?}): the reasoning probe is among the listed differences"
+        );
+    }
+}
+
+#[test]
+fn larger_gemma4_rows_generation_prompt_closes_the_thought_unless_thinking_is_on() {
+    let request = |text: &str| -> Request { serde_json::from_str(text).expect("a request") };
+    let table = Table::Gemma4;
+    let (open, close) = table.think_markers();
+    let closed = format!("{open}{close}");
+    for slug in ["gemma-4-12b-it", "gemma-4-26b-a4b-it"] {
+        let prompt = MODELS
+            .iter()
+            .find_map(|(row, prompt)| (*row == slug).then_some(*prompt))
+            .expect("the recorded row");
+        for unasked in [
+            "{}",
+            "{\"chat_template_kwargs\": null}",
+            "{\"chat_template_kwargs\": {\"enable_thinking\": false}}",
+        ] {
+            assert_eq!(
+                prompt.tail_for(&request(unasked), table),
+                closed,
+                "{slug} ({prompt:?}): the prompt's tail for the request {unasked}"
+            );
+        }
+        assert_eq!(
+            prompt.tail_for(
+                &request("{\"chat_template_kwargs\": {\"enable_thinking\": true}}"),
+                table
+            ),
+            "",
+            "{slug} ({prompt:?}): the prompt's tail when thinking is on"
         );
     }
 }
