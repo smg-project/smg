@@ -16,6 +16,7 @@ use super::{
 use crate::{
     store::{
         membership::{self, NotMaker, Past},
+        pairing::PairingDescriptor,
         HealthSink, Laid, Maker, MembershipChange, MemoryStore, WorkerFacts, WorkerPatch,
         WorkerRow, WorkerStatus, WorkersStore,
     },
@@ -666,12 +667,16 @@ fn refresh_stated(
         return Err(Refused::NotLabelsAlone);
     }
     // The row holds its descriptor as the pairing rule reads it. A stated
-    // one that differs is read the same way before it counts as moved.
+    // one that differs is read the same way before it counts as moved: its
+    // blanks are dropped. One that reports nothing is none on either side,
+    // as the rule reads a row that has no descriptor.
     let held = row.facts.pairing.as_ref();
     if let Some(descriptor) = pairing.as_mut().filter(|said| held != Some(&**said)) {
         Arc::make_mut(descriptor).normalize();
     }
-    let pairing_moved = pairing != row.facts.pairing;
+    let reports = |said: &Arc<PairingDescriptor>| **said != PairingDescriptor::default();
+    pairing = pairing.filter(reports);
+    let pairing_moved = pairing.as_ref() != held.filter(|held| reports(held));
     if labels == row.facts.labels && !pairing_moved {
         return Ok(Wrote::Unmoved(row.id));
     }
@@ -1855,7 +1860,9 @@ pub(super) mod tests {
     /// they derive. A descriptor that moved is laid in place, with a label
     /// or by itself, and the row keeps its id, its maker and every other
     /// fact. One that differs from the row's by its blanks alone is the
-    /// row's. Another fact beside a moved descriptor is refused, and
+    /// row's. One that reports nothing is none, stated or held: it
+    /// withdraws a row's descriptor and writes nothing over a row with
+    /// none. Another fact beside a moved descriptor is refused, and
     /// nothing is written.
     #[test]
     fn a_refresh_lays_the_pairing_its_labels_derive() {
@@ -1900,16 +1907,30 @@ pub(super) mod tests {
         assert_eq!(equal, Ok(Wrote::Unmoved(row.id)));
         assert_eq!(store.by_key(URL).as_ref(), Some(&moved));
 
-        // The descriptor moves by itself, then is withdrawn.
-        let wrote = refresh(&moved, version("3"), "silver");
-        assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
-        let again = store.by_key(URL).expect("the row of the second refresh");
-        assert_eq!(again.facts.pairing, version("3"));
-        assert_eq!(again.facts.labels, moved.facts.labels);
-        let wrote = refresh(&again, None, "silver");
-        assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
-        let bare = store.by_key(URL).expect("the row of the third refresh");
-        assert_eq!(bare.facts.pairing, None);
+        // The descriptor moves by itself, then is withdrawn: by none, and
+        // by one that reports nothing, which the row holds as none.
+        let empty = || Some(Arc::new(PairingDescriptor::default()));
+        let mut bare = moved.clone();
+        for withdrawn in [None, version(" ")] {
+            let wrote = refresh(&bare, version("3"), "silver");
+            assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
+            let again = store.by_key(URL).expect("the row of a moved descriptor");
+            assert_eq!(again.facts.pairing, version("3"));
+            assert_eq!(again.facts.labels, moved.facts.labels);
+            let wrote = refresh(&again, withdrawn, "silver");
+            assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
+            bare = store
+                .by_key(URL)
+                .expect("the row of a withdrawn descriptor");
+            assert_eq!(bare.facts.pairing, None);
+        }
+
+        // Over a row with none, one that reports nothing writes nothing.
+        for nothing in [empty(), version(" ")] {
+            let unmoved = refresh(&bare, nothing, "silver");
+            assert_eq!(unmoved, Ok(Wrote::Unmoved(row.id)));
+            assert_eq!(store.by_key(URL).as_ref(), Some(&bare));
+        }
 
         // Another fact beside a moved descriptor is outside the scope.
         let stray = refresh_stated(&door, standing(&bare), URL, &|standing| {
@@ -1920,6 +1941,22 @@ pub(super) mod tests {
         });
         assert_eq!(stray, Err(Refused::NotLabelsAlone));
         assert_eq!(store.by_key(URL).as_ref(), Some(&bare));
+
+        // A row may hold one that reports nothing, as a registration states
+        // it. It reads as a row with none.
+        let laid = door.found(&Maker::Control, Expect::Anything, URL, &|standing| {
+            let mut facts = standing.expect("the standing row").clone();
+            facts.pairing = empty();
+            facts
+        });
+        assert_eq!(laid, Ok(Wrote::InPlace(row.id)));
+        let held = store.by_key(URL).expect("the row of the registration");
+        assert_eq!(held.facts.pairing, empty());
+        for nothing in [None, empty()] {
+            let unmoved = refresh(&held, nothing, "silver");
+            assert_eq!(unmoved, Ok(Wrote::Unmoved(row.id)));
+            assert_eq!(store.by_key(URL).as_ref(), Some(&held));
+        }
     }
 
     #[test]
