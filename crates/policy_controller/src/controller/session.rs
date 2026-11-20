@@ -187,6 +187,9 @@ fn refusal(refused: Refused) -> Status {
         Refused::AnotherSubject => Status::already_exists(
             "Hello's gateway id collides with another present gateway's in the controller's key: use another id",
         ),
+        Refused::Exhausted => {
+            Status::resource_exhausted("the controller cannot start another session")
+        }
         Refused::Full { ceiling } => Status::resource_exhausted(format!(
             "the controller holds its ceiling of {ceiling} present gateways: say Hello again later"
         )),
@@ -1659,6 +1662,12 @@ mod tests {
         assert_eq!(
             collides.message(),
             "Hello's gateway id collides with another present gateway's in the controller's key: use another id"
+        );
+        let exhausted = refusal(Refused::Exhausted);
+        assert_eq!(exhausted.code(), Code::ResourceExhausted);
+        assert_eq!(
+            exhausted.message(),
+            "the controller cannot start another session"
         );
         let full = refusal(Refused::Full { ceiling: 7 });
         assert_eq!(full.code(), Code::ResourceExhausted);

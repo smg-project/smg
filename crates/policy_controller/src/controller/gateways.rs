@@ -147,6 +147,8 @@ pub(crate) enum Vetoed {
 pub(crate) enum Refused {
     /// A gateway of another subject is present under the same key.
     AnotherSubject,
+    /// The table has numbered every session it can.
+    Exhausted,
     /// The table holds its ceiling of rows and this `Hello` would make a
     /// new one.
     Full { ceiling: usize },
@@ -444,11 +446,13 @@ impl Gateways {
     ///
     /// # Errors
     ///
-    /// The fence no longer shows `term`: no seat is taken, no session is
-    /// superseded and nothing is let go. Or a gateway of another subject
-    /// is present under the key, or the row would be a new one past the
-    /// table's ceiling. A row whose period is over counts until the
-    /// sweep's next pass, a tenth of the period at most.
+    /// The table has numbered every session it can: it is asked first, and
+    /// nothing is read or changed. The fence no longer shows `term`: no seat
+    /// is taken, no session is superseded and nothing is let go. Or a
+    /// gateway of another subject is present under the key, or the row
+    /// would be a new one past the table's ceiling. A row whose period is
+    /// over counts until the sweep's next pass, a tenth of the period at
+    /// most.
     pub(crate) fn welcome(
         self: &Arc<Self>,
         gateway: GatewayId,
@@ -457,6 +461,9 @@ impl Gateways {
         now: Instant,
     ) -> Result<Seat, Refused> {
         let mut table = self.table.lock();
+        let Some(session) = table.sessions.checked_add(1) else {
+            return Err(Refused::Exhausted);
+        };
         let shown = self.fence.leader_term(now);
         self.observe(&mut table, shown, now);
         // The seat is taken under the term this read shows or not at all:
@@ -501,8 +508,7 @@ impl Gateways {
             }
             _ => {}
         }
-        table.sessions += 1;
-        let session = table.sessions;
+        table.sessions = session;
         let row = table.rows.entry(gateway).or_insert_with(|| Row {
             subject: subject.to_owned(),
             session: 0,
@@ -1451,6 +1457,29 @@ pub(crate) mod tests {
         assert!(gateways.presence(A, later).is_some(), "its session stands");
         assert_eq!(gateways.sweep(later), 0);
         drop(third);
+    }
+
+    #[test]
+    fn the_session_counter_never_wraps_or_reuses_zero() {
+        let (_elector, _store, gateways, t0) = leading(GRACE);
+        gateways.table.lock().sessions = u64::MAX - 1;
+        let stands = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        assert_eq!(stands.session, u64::MAX);
+
+        let attempted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gateways.welcome(A, "gateway-a", TERM, t0)
+        }));
+        assert!(attempted.is_ok(), "counter exhaustion must not panic");
+        assert!(
+            matches!(attempted.expect("checked above"), Err(Refused::Exhausted)),
+            "an exhausted counter refuses the Hello"
+        );
+        assert!(!stands.replaced(), "the standing session is not superseded");
+        let table = gateways.table.lock();
+        let row = table.rows.get(&A).expect("the standing row");
+        assert_eq!(table.sessions, u64::MAX);
+        assert_eq!(row.session, u64::MAX);
+        assert!(row.gone.is_none(), "the row's session still stands");
     }
 
     /// The seat is the table's own read of the fence: a replica that
