@@ -2760,6 +2760,22 @@ class TestPolicyController:
         assert keywords["policy_controller"] == "on"
         assert keywords["policy_spec"] == "routing.yaml"
 
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("policy_controller_address", "controller:30100"),
+            ("policy_controller_tls_ca_cert", "ca.pem"),
+            ("policy_controller_tls_cert", "cert.pem"),
+            ("policy_controller_tls_key", "key.pem"),
+        ],
+    )
+    def test_a_controller_link_option_parses_and_reaches_the_native_constructor(self, field, value):
+        flag = field.replace("_", "-")
+        assert getattr(RouterArgs(), field) is None
+        assert getattr(parse_router_args([f"--{flag}", value]), field) == value
+        assert getattr(_prefixed([f"--router-{flag}", value]), field) == value
+        assert _rust_router_kwargs(**{field: value})[field] == value
+
     def test_an_omitted_policy_stays_unset_through_parsing_and_keyword_conversion(self):
         assert parse_router_args([]).policy is None
         assert _prefixed([]).policy is None

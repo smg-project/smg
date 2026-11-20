@@ -549,6 +549,12 @@ class RouterArgs:
     pd_pairing_mode: str = "lenient"
     policy: str | None = None
     policy_controller: str = "off"
+    # The policy controller this gateway follows, as host:port, and the PEM
+    # files of the connection to it
+    policy_controller_address: str | None = None
+    policy_controller_tls_ca_cert: str | None = None
+    policy_controller_tls_cert: str | None = None
+    policy_controller_tls_key: str | None = None
     policy_spec: str | None = None
     postgres_db_url: str | None = None
     # The bound on one Postgres history-store call (pool wait, connect and the
@@ -979,6 +985,33 @@ class RouterArgs:
                 " Settings that change the default routing document must agree with the"
                 " file. Omit --policy to use the file's policy."
             ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}policy-controller-address",
+            metavar="host:port",
+            default=RouterArgs.policy_controller_address,
+            help=(
+                "Follow workers from the policy controller's gateway listener"
+                " (requires --policy-controller on)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}policy-controller-tls-ca-cert",
+            metavar="path",
+            default=RouterArgs.policy_controller_tls_ca_cert,
+            help="PEM certificate authority file for the controller connection.",
+        )
+        routing_group.add_argument(
+            f"--{prefix}policy-controller-tls-cert",
+            metavar="path",
+            default=RouterArgs.policy_controller_tls_cert,
+            help="PEM client certificate file for the controller connection.",
+        )
+        routing_group.add_argument(
+            f"--{prefix}policy-controller-tls-key",
+            metavar="path",
+            default=RouterArgs.policy_controller_tls_key,
+            help="PEM client private key file for the controller connection.",
         )
         routing_group.add_argument(
             f"--{prefix}encode-policy",
