@@ -404,6 +404,10 @@ impl SpecFile {
             Seen::Unreadable(error) => Err(SpecRejected::Unreadable(error.clone())),
             Seen::File(identity) => {
                 let Some(document) = read(identity) else {
+                    // A failed open or descriptor mismatch observed movement.
+                    // Require two fresh matching looks even if the old inode
+                    // returns without a visible timestamp change.
+                    self.moved = None;
                     return self.settling(lead.is_some());
                 };
                 let after = look(&self.path);
@@ -1164,6 +1168,46 @@ pub(crate) mod tests {
         assert_eq!(bed.answered().2, RANDOM.as_bytes());
     }
 
+    /// A descriptor that contradicts the settled identity requires a fresh
+    /// pair of matching looks, even when that same identity returns.
+    #[test]
+    fn a_failed_descriptor_read_requires_fresh_matching_watch_looks() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let mut file = bed.start();
+        replace(&bed.path, RANDOM.as_bytes());
+        let standing = look(&bed.path);
+        assert_eq!(file.poll_looking(|_| standing.clone()), Look::Settling);
+
+        let mut reads = 0;
+        let failed = file.poll_reading(
+            |_| standing.clone(),
+            |_| {
+                reads += 1;
+                None
+            },
+        );
+        assert_eq!(failed, Look::Settling);
+        assert_eq!(reads, 1, "the settled descriptor was attempted");
+        assert_eq!((bed.rejected(), bed.generation()), (0, 1));
+        assert_eq!(bed.answered().2, LEAST_LOAD.as_bytes());
+
+        assert_eq!(
+            file.poll_reading(
+                |_| standing.clone(),
+                |_| panic!("a failed descriptor requires a fresh settling poll"),
+            ),
+            Look::Settling,
+        );
+        assert_eq!((bed.rejected(), bed.generation()), (0, 1));
+        assert_eq!(bed.answered().2, LEAST_LOAD.as_bytes());
+        assert_eq!(
+            file.poll_reading(|_| standing.clone(), read),
+            Look::Read(Ok(Applied::Generation(2))),
+        );
+        assert_eq!(bed.answered().2, RANDOM.as_bytes());
+        assert_eq!(bed.rejected(), 0);
+    }
+
     /// A file is read whole or not at all. At the start one that moved
     /// under its read is read again, and one that moves under every read
     /// refuses the start; under the watch the bytes read while it moved are
@@ -1235,6 +1279,7 @@ pub(crate) mod tests {
         fs::write(&bed.path, RANDOM).expect("the transient replacement");
         let mut looks = 0;
         let unexpected_reads = AtomicUsize::new(0);
+        let mut read_attempts = 0;
 
         let started = SpecFile::start_reading(
             bed.path.clone(),
@@ -1250,11 +1295,21 @@ pub(crate) mod tests {
                     _ => look(path),
                 }
             },
-            |identity| read_counting_unexpected(identity, &unexpected_reads),
+            |identity| {
+                read_attempts += 1;
+                let document = read_counting_unexpected(identity, &unexpected_reads);
+                if read_attempts == 1 {
+                    assert!(
+                        document.is_none(),
+                        "the transient descriptor is not accepted"
+                    );
+                }
+                document
+            },
         );
 
         assert!(started.is_ok(), "the standing file starts after the retry");
-        assert!(looks >= 4, "the transient read is retried");
+        assert!(read_attempts >= 2, "the transient read is retried");
         assert_eq!(unexpected_reads.load(Ordering::Relaxed), 0);
         assert_eq!(bed.answered().2, LEAST_LOAD.as_bytes());
     }
