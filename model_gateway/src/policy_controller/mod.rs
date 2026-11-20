@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use smg_policy_controller::{
     store::{MemoryStore, StaleGeneration},
-    Catalog, PolicySpec, SpecError,
+    Catalog, SpecError,
 };
 use tracing::info;
 
@@ -81,18 +81,17 @@ pub(crate) enum StartError {
     Stale(#[from] StaleGeneration),
 }
 
-/// [`start_with`] as the stock gateway starts: no stages of a host, and the
-/// document in force. The cases start their stores through it.
+/// [`start_with`] as the stock gateway starts: no stages of a host. The
+/// cases start their stores through it.
 #[cfg(test)]
 pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, StartError> {
-    start_with(config, None, RouterConfig::policy_document_in_force)
+    start_with(config, None)
 }
 
-/// The controller's store for this process, holding the policy document
-/// `document` gives as its one generation: a gateway hands the document in
-/// force ([`RouterConfig::policy_document_in_force`]). `None` where the
-/// classic policies decide: nothing is constructed then, and `document` is
-/// not called.
+/// The controller's store for this process, holding the policy document in
+/// force ([`RouterConfig::policy_document_in_force`]) as its one generation.
+/// `None` where the classic policies decide: nothing is constructed then,
+/// and no document is read.
 ///
 /// `stages` is the catalog of a host's own stages. The stock gateway hands
 /// none, and the document is then checked over the stock stages alone.
@@ -104,12 +103,11 @@ pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, S
 pub(crate) fn start_with(
     config: &RouterConfig,
     stages: Option<Catalog>,
-    document: impl FnOnce(&RouterConfig) -> Result<PolicySpec, PolicyDocumentError>,
 ) -> Result<Option<Arc<MemoryStore>>, StartError> {
     if !config.policy_controller {
         return Ok(None);
     }
-    let document = document(config)?;
+    let document = config.policy_document_in_force()?;
     let generation = config.hosted_policy_in(&document, stages.as_ref())?;
     let store = MemoryStore::new();
     store.apply(generation)?;
