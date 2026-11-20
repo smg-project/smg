@@ -99,20 +99,38 @@ fn the_committed_schema_admits_a_filter_by_its_name_and_by_its_name_with_paramet
         defs["ProfileSpec"]["properties"]["filter"]["items"]["$ref"],
         "#/$defs/FilterSpec"
     );
-    // A bare name is any string: a host adds names. A name with parameters
-    // is one key mapped to a map.
+    // A bare name is any string: a host adds names. A built-in with
+    // parameters has a schema of its own. A host's name with parameters
+    // is one key, no built-in's, mapped to a map.
     assert_eq!(
         defs["FilterSpec"]["anyOf"],
         serde_json::json!([
             { "type": "string" },
+            { "$ref": "#/$defs/FilterStage" },
             {
                 "type": "object",
                 "minProperties": 1,
                 "maxProperties": 1,
+                "propertyNames": { "not": { "const": "has-room" } },
                 "additionalProperties": { "type": "object" }
             }
         ])
     );
+    // The rule of `has-room`: its two required parts, no other key, and
+    // the names it may sum.
+    let rule = &defs["HasRoomParams"];
+    assert_eq!(rule["required"], serde_json::json!(["used", "capacity"]));
+    assert_eq!(rule["additionalProperties"], false);
+    let names = rule["properties"]["used"]["propertyNames"]["enum"]
+        .as_array()
+        .expect("the names the rule may sum");
+    for name in [
+        "load.resident_tokens",
+        "request.prompt_tokens",
+        "sent.tokens",
+    ] {
+        assert!(names.iter().any(|listed| listed == name), "{name}");
+    }
 }
 
 /// Every object schema under `root` either lists its properties and refuses

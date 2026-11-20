@@ -188,6 +188,272 @@ impl Filter for HasRoom {
     }
 }
 
+/// Asks `$rule.$method` with the three flags of a report's sum
+/// ([`Coefficients::add_report`]) settled from the names the rule reads. A
+/// flag left on for a name it does not read would drop a row for a value
+/// nobody named.
+macro_rules! by_names {
+    ($rule:expr, $method:ident($($arg:expr),*)) => {
+        match ($rule.resident, $rule.waiting, $rule.kv_or_running) {
+            (false, false, false) => $rule.$method::<false, false, false>($($arg),*),
+            (false, false, true) => $rule.$method::<false, false, true>($($arg),*),
+            (false, true, false) => $rule.$method::<false, true, false>($($arg),*),
+            (false, true, true) => $rule.$method::<false, true, true>($($arg),*),
+            (true, false, false) => $rule.$method::<true, false, false>($($arg),*),
+            (true, false, true) => $rule.$method::<true, false, true>($($arg),*),
+            (true, true, false) => $rule.$method::<true, true, false>($($arg),*),
+            (true, true, true) => $rule.$method::<true, true, true>($($arg),*),
+        }
+    };
+}
+
+/// `has-room` by a rule the document writes: a row has room where what it
+/// holds is at most its capacity less the headroom. What a row holds is the
+/// sum of the rule's named fields times their coefficients, in name order.
+/// A row that lacks a named value has no room. Soft and row-wise, as the
+/// host's bit is: where no row has room the list stands.
+#[derive(Debug)]
+pub(crate) struct HasRoomRule {
+    terms: Coefficients,
+    /// The coefficient of the request's size: zero where the rule does not
+    /// name it.
+    request_tokens: f64,
+    /// The capacity less the headroom.
+    bound: f64,
+    /// Whether a term reads the row's count in flight.
+    in_flight: bool,
+    /// Whether a term reads the row's report.
+    loads: bool,
+    // The optional values of a report, each tested where the rule names it.
+    resident: bool,
+    waiting: bool,
+    kv_or_running: bool,
+    /// The profile's count of sends, where a term reads it.
+    sent: Option<Arc<SentCredit>>,
+}
+
+impl HasRoomRule {
+    pub(crate) const NAME: &str = "has-room";
+    /// The request's size among the rule's fields. Every request states it.
+    pub(crate) const REQUEST_TOKENS: &str = "request.prompt_tokens";
+
+    pub(crate) fn new(
+        terms: &[(Term, f64)],
+        request_tokens: f64,
+        capacity: f64,
+        headroom: f64,
+        sent: Option<Arc<SentCredit>>,
+    ) -> Self {
+        let coefficients = Coefficients::of(terms);
+        Self {
+            request_tokens,
+            bound: (1.0 - headroom) * capacity,
+            in_flight: coefficients.in_flight != 0.0,
+            loads: terms.iter().any(|&(term, _)| term.reads_load()),
+            resident: coefficients.resident_tokens != 0.0,
+            waiting: coefficients.waiting_uncached_tokens != 0.0,
+            kv_or_running: coefficients.names_kv_or_running(),
+            terms: coefficients,
+            sent,
+        }
+    }
+
+    /// The request's part of what a row holds: its size times the rule's
+    /// coefficient. Every row of a pass is handed the same, so a pass works
+    /// it once.
+    #[inline(always)]
+    fn asked(&self, facts: &RequestFacts<'_>) -> f64 {
+        f64::from(facts.prompt_tokens) * self.request_tokens
+    }
+
+    /// Whether a row has room, by its report as `load` hands it and its
+    /// sends as `sent` counts them: the stated tokens and the requests, the
+    /// count's two-number read. The sum runs in name order: the count
+    /// in flight, the report's fields, the request's part as `asked`
+    /// ([`Self::asked`]), the sends.
+    #[inline(always)]
+    fn fits<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
+        &self,
+        asked: f64,
+        facts: &RequestFacts<'_>,
+        row: &Candidate,
+        load: Option<&LoadRow>,
+        sent: impl FnOnce() -> (u64, u64),
+    ) -> bool {
+        let mut used = 0.0;
+        if self.in_flight {
+            used += f64::from(facts.in_flight(row)) * self.terms.in_flight;
+        }
+        if self.loads {
+            // A row with no report, or with one that lacks a named value,
+            // has no room.
+            let Some(sum) = load.and_then(|report| {
+                self.terms
+                    .add_report::<RESIDENT, WAITING, KV_OR_RUNNING>(used, report, true)
+            }) else {
+                return false;
+            };
+            used = sum;
+        }
+        used += asked;
+        if self.sent.is_some() {
+            let (tokens, requests) = sent();
+            used += requests as f64 * self.terms.sent_requests;
+            used += tokens as f64 * self.terms.sent_tokens;
+        }
+        used <= self.bound
+    }
+
+    /// [`Filter::keep`] of one row, by the report `load` hands.
+    fn keep_with(&self, facts: &RequestFacts<'_>, row: &Candidate, load: Option<&LoadRow>) -> bool {
+        let sent = || {
+            self.sent
+                .as_ref()
+                .map_or((0, 0), |sent| sent.reads(facts).counts(row))
+        };
+        by_names!(self, fits(self.asked(facts), facts, row, load, sent))
+    }
+
+    /// One pass over the kept rows, in one loop with the test in it: the
+    /// request's part is worked once, and the profile's sends are read
+    /// through one load of its tally. The rows that fit are written over
+    /// the list's front, in the list's order.
+    #[inline(always)]
+    fn rows<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &mut Vec<u32>,
+        load: impl Fn(&Candidate) -> Option<&LoadRow>,
+    ) {
+        let asked = self.asked(facts);
+        let sends = self.sent.as_ref().map(|sent| sent.reads(facts));
+        let mut held = 0;
+        for at in 0..kept.len() {
+            let i = kept[at];
+            let row = &candidates[i as usize];
+            let sent = || sends.as_ref().map_or((0, 0), |sends| sends.counts(row));
+            let fits =
+                self.fits::<RESIDENT, WAITING, KV_OR_RUNNING>(asked, facts, row, load(row), sent);
+            kept[held] = i;
+            held += usize::from(fits);
+        }
+        kept.truncate(held);
+    }
+
+    /// [`Filter::retain`], by the report `load` hands of each row: the
+    /// flags are settled once a pass.
+    fn retain_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &mut Vec<u32>,
+        load: impl Fn(&Candidate) -> Option<&LoadRow>,
+    ) {
+        by_names!(self, rows(facts, candidates, kept, load));
+    }
+}
+
+impl Filter for HasRoomRule {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    // Soft: it turns no request away, so a late report can only place a
+    // request elsewhere.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
+    fn row_wise(&self) -> bool {
+        true
+    }
+
+    fn soft(&self) -> bool {
+        true
+    }
+
+    // A report ends the sends before it, so the sends need the reports
+    // though no term may read one.
+    fn needs(&self) -> Needs {
+        Needs {
+            loads: self.loads || self.sent.is_some(),
+            ..Needs::default()
+        }
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
+        self.keep_with(facts, c, c.load.as_ref())
+    }
+
+    fn retain(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        _: &Constraints<'_>,
+        kept: &mut Vec<u32>,
+    ) {
+        self.retain_with(facts, candidates, kept, |row| row.load.as_ref());
+    }
+}
+
+/// [`HasRoomRule`] under the view's report age limit: a report past the
+/// limit reads as none, by the cutoff the scorers read under.
+#[derive(Debug)]
+struct HasRoomWithin {
+    rule: HasRoomRule,
+    max_age_ms: u64,
+}
+
+impl Filter for HasRoomWithin {
+    fn name(&self) -> &'static str {
+        self.rule.name()
+    }
+
+    fn refuses_by_reports(&self) -> bool {
+        self.rule.refuses_by_reports()
+    }
+
+    fn row_wise(&self) -> bool {
+        self.rule.row_wise()
+    }
+
+    fn soft(&self) -> bool {
+        self.rule.soft()
+    }
+
+    fn needs(&self) -> Needs {
+        self.rule.needs()
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
+        let cutoff = ReportCutoff::new(facts.now_micros, self.max_age_ms);
+        self.rule.keep_with(facts, c, cutoff.load(c))
+    }
+
+    fn retain(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        _: &Constraints<'_>,
+        kept: &mut Vec<u32>,
+    ) {
+        let cutoff = ReportCutoff::new(facts.now_micros, self.max_age_ms);
+        self.rule
+            .retain_with(facts, candidates, kept, |row| cutoff.load(row));
+    }
+}
+
+/// The rule as a profile's filter: under the view's report age limit where
+/// the document sets one and a term reads a report, and as it stands
+/// otherwise. So a document with no limit runs no test of an age.
+pub(crate) fn has_room_rule(rule: HasRoomRule, max_age_ms: Option<u64>) -> Box<dyn Filter> {
+    match max_age_ms.filter(|_| rule.loads) {
+        Some(max_age_ms) => Box::new(HasRoomWithin { rule, max_age_ms }),
+        None => Box::new(rule),
+    }
+}
+
 /// Not tried by an earlier attempt and not excluded by the host. Soft: the
 /// engines a retry already tried step aside while another remains.
 #[derive(Debug)]

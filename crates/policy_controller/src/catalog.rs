@@ -39,7 +39,7 @@ type Factory<T> = Box<dyn Fn() -> Box<T> + Send + Sync>;
 type ScorerFactory =
     dyn Fn(&mut StageBuild<'_>) -> Result<Box<dyn Scorer>, StageError> + Send + Sync;
 type ScorerBuild = Build<dyn Scorer, Box<ScorerFactory>>;
-type FilterFactory =
+pub(crate) type FilterFactory =
     dyn Fn(&mut StageBuild<'_>) -> Result<Box<dyn Filter>, StageError> + Send + Sync;
 type FilterBuild = Build<dyn Filter, Box<FilterFactory>>;
 
@@ -1843,14 +1843,14 @@ bindings: [{{ profile: before }}]
                 SpecError::BadField {
                     path: path.into(),
                     value: value.into(),
-                    reason: "left out under a filter that takes no parameter",
+                    reason: "left out: this filter takes no parameter, write its bare name",
                 }
             );
             assert_eq!(error.field_path(), path);
         }
         assert_eq!(
             refused("[{ odd-ids: { slots: 2 } }]").to_string(),
-            r#"profiles.default.filter[0].odd-ids = {"slots":2} is not left out under a filter that takes no parameter"#
+            r#"profiles.default.filter[0].odd-ids = {"slots":2} is not left out: this filter takes no parameter, write its bare name"#
         );
         // A name no catalog holds is unknown, whatever stands under it.
         assert_eq!(
