@@ -6108,6 +6108,139 @@ mod tests {
         assert_eq!(first_of(&shadow), Some(rows[0].id));
     }
 
+    /// The reading holds both pins the live decision read. The key's first
+    /// pin is unhealthy, the live decision fails over to the second, and
+    /// the shadow fails over to it too: with the second pin lost it would
+    /// place the key on an unpinned worker by its own stages.
+    #[test]
+    fn shadow_fails_over_to_the_second_pin_the_live_decision_read() {
+        let engine = with_shadow(least_requests_profile(), Some(SESSIONS));
+        let mut rows = [candidate(0, 13), candidate(1, 3), candidate(2, 1)];
+        let facts = keyed_at(61, 71);
+        let key = facts.session();
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        engine.sessions().lookup(key, facts.now_micros, &SESSIONS);
+        for row in [&rows[1], &rows[0]] {
+            engine
+                .sessions()
+                .dispatched(key, SessionVerdict::Respill, row.id);
+        }
+        assert_eq!(engine.sessions().pins(key), Some([rows[0].id, rows[1].id]));
+        rows[0].health.healthy = false;
+        let live = engine.decide_keeping(&facts, &pool, &rows, &cx, &mut scratch);
+        assert_eq!(first_of(&live), Some(rows[1].id));
+        let shadow = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("a shadow decision");
+        assert_eq!(first_of(&shadow), Some(rows[1].id));
+    }
+
+    /// A reading is of one request: its key, its clock and its seed.
+    /// Another request of the same key at the same clock takes none of
+    /// it. Its shadow reads the pins as they stand, the worker the first
+    /// request's commit pinned, where the reading held no pin.
+    #[test]
+    fn shadow_of_a_request_of_another_seed_takes_no_reading() {
+        let engine = with_shadow(by_sessions(), Some(SESSIONS));
+        let mut busy = candidate(1, 3);
+        busy.active_sessions = 17;
+        let rows = [candidate(0, 13), busy];
+        let facts = keyed_at(61, 71);
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let live = engine.decide_keeping(&facts, &pool, &rows, &cx, &mut scratch);
+        assert_eq!(commit(&engine, &facts, &live, 0), rows[1].id);
+        let next = RequestFacts { seed: 1, ..facts };
+        let shadow = engine
+            .shadow(&next, &pool, &rows, &cx, &mut scratch)
+            .expect("a shadow decision");
+        assert_eq!(first_of(&shadow), Some(rows[1].id));
+    }
+
+    /// The reading holds a miss too. The host told the live decision no
+    /// pin of record, and would name one to a later question. The shadow
+    /// asks no second time: it places the key by its own stages.
+    #[test]
+    fn shadow_keeps_the_live_decisions_miss_of_a_pin_of_record() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct Later {
+            asked: AtomicUsize,
+            pin: WorkerId,
+        }
+
+        impl crate::PinSource for Later {
+            fn pinned(&self, _: Session, _: Option<u64>) -> Option<WorkerId> {
+                (self.asked.fetch_add(1, Ordering::Relaxed) != 0).then_some(self.pin)
+            }
+        }
+
+        let engine = with_shadow(by_sessions(), Some(SESSIONS));
+        let mut busy = candidate(1, 3);
+        busy.active_sessions = 17;
+        let rows = [candidate(0, 13), busy];
+        let facts = keyed_at(61, 71);
+        let pool = PoolFacts::default();
+        let pins = Later {
+            asked: AtomicUsize::new(0),
+            pin: rows[1].id,
+        };
+        let cx = Constraints {
+            pins: Some(&pins),
+            ..Constraints::default()
+        };
+        let mut scratch = Scratch::new();
+        let live = engine.decide_keeping(&facts, &pool, &rows, &cx, &mut scratch);
+        assert_eq!(commit(&engine, &facts, &live, 0), rows[1].id);
+        let shadow = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("a shadow decision");
+        assert_eq!(pins.asked.load(Ordering::Relaxed), 1);
+        assert_eq!(first_of(&shadow), Some(rows[0].id));
+    }
+
+    /// The reading holds the host's pin of record as the host told it,
+    /// whether or not the live filters keep its worker. Here they drop it
+    /// and the live decision claims another. The shadow, whose filters
+    /// keep that worker, follows the record and asks the host no second
+    /// time.
+    #[test]
+    fn shadow_follows_a_pin_of_record_the_live_filters_left_out() {
+        let live_stages = Profile {
+            filters: vec![Box::new(Healthy), Box::new(NotOverloaded)],
+            ..least_requests_profile()
+        };
+        let engine = Engine::new(
+            vec![live_stages, least_requests_profile()],
+            vec![Binding {
+                shadow: Some(1),
+                sessions: Some(SESSIONS),
+                ..single_binding()
+            }],
+            23,
+            Needs::default(),
+        );
+        let mut rows = [candidate(0, 13), candidate(1, 3)];
+        rows[0].health.overloaded = true;
+        let facts = keyed_at(61, 71);
+        let pool = PoolFacts::default();
+        let pins = Stored::of(61, rows[0].id);
+        let cx = Constraints {
+            pins: Some(&pins),
+            ..Constraints::default()
+        };
+        let mut scratch = Scratch::new();
+        let live = engine.decide_keeping(&facts, &pool, &rows, &cx, &mut scratch);
+        assert_eq!(commit(&engine, &facts, &live, 0), rows[1].id);
+        let shadow = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("a shadow decision");
+        assert_eq!(first_of(&shadow), Some(rows[0].id));
+        assert_eq!(pins.asked().len(), 1);
+    }
+
     /// The shadow's entry takes its inputs as the live one does: a debug
     /// build stops on a list of the key's counts out of its rows' order.
     #[cfg(debug_assertions)]
