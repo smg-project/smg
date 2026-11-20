@@ -235,6 +235,14 @@ pub(crate) struct Seat {
     gateway: GatewayId,
     session: u64,
     superseded: Arc<Replaced>,
+    #[cfg(test)]
+    drop_pause: Option<Arc<DropPause>>,
+}
+
+#[cfg(test)]
+struct DropPause {
+    gone: std::sync::Barrier,
+    swept: std::sync::Barrier,
 }
 
 impl Row {
@@ -311,7 +319,8 @@ impl Seat {
     /// The session ended at `now`, where a case names the instant.
     #[cfg(test)]
     pub(crate) fn end(self, now: Instant) {
-        self.gateways.gone(self.gateway, self.session, now);
+        self.gateways
+            .gone(self.gateway, self.session, &self.superseded, now);
     }
 }
 
@@ -319,7 +328,12 @@ impl Drop for Seat {
     fn drop(&mut self) {
         // A no-op after `end`: the row's period started there.
         self.gateways
-            .gone(self.gateway, self.session, Instant::now());
+            .gone(self.gateway, self.session, &self.superseded, Instant::now());
+        #[cfg(test)]
+        if let Some(pause) = &self.drop_pause {
+            pause.gone.wait();
+            pause.swept.wait();
+        }
     }
 }
 
@@ -521,6 +535,8 @@ impl Gateways {
             gateway,
             session,
             superseded,
+            #[cfg(test)]
+            drop_pause: None,
         })
     }
 
@@ -855,20 +871,21 @@ impl Gateways {
 
     /// The session `session` of `gateway` ended at `now`: its grace period
     /// starts, unless a newer session stands or the period already runs.
-    fn gone(&self, gateway: GatewayId, session: u64, now: Instant) {
+    fn gone(&self, gateway: GatewayId, session: u64, superseded: &Arc<Replaced>, now: Instant) {
         let mut table = self.table.lock();
-        let deadline = table.rows.get_mut(&gateway).and_then(|row| {
+        let Some(deadline) = table.rows.get_mut(&gateway).map(|row| {
+            // The seat releases its Arc after this call. Removing its weak
+            // entry here makes its end and the new deadline one locked step.
+            row.replaced
+                .retain(|replaced| !std::ptr::eq(replaced.as_ptr(), Arc::as_ptr(superseded)));
             if row.session == session && row.gone.is_none() {
                 row.gone = Some(now);
-                self.deadline(row, now)
-            } else {
-                let first = row.gone.and_then(|gone| gone.checked_add(self.grace));
-                row.deadline.into_iter().chain(first).min()
             }
-        });
-        if deadline.is_some() {
-            Self::set_deadline(&mut table, gateway, deadline);
-        }
+            self.deadline(row, now)
+        }) else {
+            return;
+        };
+        Self::set_deadline(&mut table, gateway, deadline);
     }
 }
 
@@ -881,7 +898,7 @@ pub(crate) mod tests {
 
     use tokio::{sync::watch, task::JoinSet, time::timeout};
 
-    use super::{over_kinds, Gateways, Refused, Seat, Vetoed, KINDS_MAX, VETOES_MAX};
+    use super::{over_kinds, DropPause, Gateways, Refused, Seat, Vetoed, KINDS_MAX, VETOES_MAX};
     use crate::{
         controller::lifecycle::{
             self,
@@ -1179,6 +1196,29 @@ pub(crate) mod tests {
         assert_eq!(gateways.sweep(t0 + GRACE), 1);
     }
 
+    #[test]
+    fn a_replaced_sessions_end_and_due_sweep_cleanup_atomically() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        store.issue(lease(A, 1, t0)).expect("a lease");
+        let mut replaced = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        welcomed(&gateways, A, "gateway-a", TERM, t0).end(t0);
+        assert!(replaced.replaced());
+
+        let pause = Arc::new(DropPause {
+            gone: std::sync::Barrier::new(2),
+            swept: std::sync::Barrier::new(2),
+        });
+        replaced.drop_pause = Some(Arc::clone(&pause));
+        let ending = std::thread::spawn(move || drop(replaced));
+        pause.gone.wait();
+        let let_go = gateways.sweep(t0 + GRACE);
+        pause.swept.wait();
+        ending.join().expect("the session ends");
+
+        assert_eq!(let_go, 1, "the next due sweep lets the gateway go");
+        assert_eq!(store.live(A), 0, "the gateway's lease is released");
+    }
+
     /// A replaced session that never ends holds its gateway's row for one
     /// period more and no longer: the gateway is let go two periods after
     /// its last session ended, whatever still runs.
@@ -1206,7 +1246,7 @@ pub(crate) mod tests {
             drop(stands);
             stands = newer;
         }
-        assert_eq!(gateways.noted(A), 1, "the session the last Hello replaced");
+        assert_eq!(gateways.noted(A), 0, "no ended session remains");
         drop(stands);
     }
 
