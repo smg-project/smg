@@ -819,8 +819,9 @@ async fn sequential_prefill_side(
     // The prefill phase ends at the drain; recorded by the executor only once
     // decode is established.
     let done = Instant::now();
-    // A placed pair's prefill ends here for the controller too: it reads
-    // the prefill worker free while the decode runs.
+    // One prefill phase of a placed pair ends here for the controller too.
+    // The side ends with the dispatch's last phase, and the controller then
+    // reads the prefill worker free while the decode runs.
     if let Some(placement) = placement {
         let prompt_tokens = u32::try_from(sides.prompt_tokens).unwrap_or(u32::MAX);
         placement.prefill_ended(prompt_tokens, done);

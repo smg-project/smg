@@ -532,10 +532,9 @@ impl DispatchContext {
     /// Both workers stay booked through the gate's wait, as the prefill's
     /// admission slot does. A shed at the gate drops the placement: each
     /// side ends as cancelled, on a worker that was sent nothing. By then
-    /// the commit has written the key's pin under a sessions rule, and the
-    /// stages have heard a dispatch. A span the router states runs from the
-    /// send, which the guards read after the gate. A cancelled side's span
-    /// is the lease's own, and it runs from this commit.
+    /// the stages have heard a dispatch. A span the router states runs from
+    /// the send, which the guards read after the gate. A cancelled side's
+    /// span is the lease's own, and it runs from this commit.
     pub(crate) async fn admit(
         &mut self,
         sub_requests: usize,
@@ -1221,8 +1220,14 @@ impl Placement {
             duration_micros: self.micros_to(now),
         };
         let placed = held.placed();
-        if placed.decode().is_some() {
+        let side_ended = placed.decode().is_some();
+        if side_ended {
             placed.completed(end, now);
+        }
+        drop(held);
+        #[cfg(test)]
+        if side_ended {
+            self.ends.lock().push(end);
         }
     }
 
@@ -2665,6 +2670,13 @@ mod tests {
         assert_eq!(live_sides(&store, lease), (true, true));
         placement.prefill_ended(11, sent);
         assert_eq!(live_sides(&store, lease), (false, true));
+        // The side's one end reports the prompt tokens of every phase.
+        let ends = placement.ends();
+        let ends = ends.lock();
+        let [end] = ends.as_slice() else {
+            panic!("expected one end, got {ends:?}");
+        };
+        assert_eq!((end.tokens_in, end.tokens_out), (23, 0));
     }
 
     #[tokio::test]
