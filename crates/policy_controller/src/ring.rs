@@ -165,7 +165,10 @@ impl Fence {
 /// within [`FENCE`], fenced against relearning from a stale view.
 #[derive(Debug, Default)]
 pub struct Ring {
-    /// The members, by the index the entries name them by.
+    /// The members in the order of their ids, by the index the entries
+    /// name them by. A pool's rows stand in that order too, so a ring of
+    /// one pool names each member by its row's position, through joins
+    /// and removals.
     members: Vec<WorkerId>,
     index: FxHashMap<WorkerId, u32>,
     /// `(position, member index)`, sorted by position.
@@ -232,40 +235,80 @@ impl Ring {
 
     /// Add every member not yet in the ring, in one merge: the fresh
     /// positions of all of them sorted once and merged once into the
-    /// entries, so a pool the ring never saw costs one pass. Returns how
-    /// many joined.
+    /// entries, so a pool the ring never saw costs one pass. The joiners
+    /// take their places among the members by id, and the members behind
+    /// a joiner are renamed in the same passes. Returns how many joined.
     pub fn add_many(&mut self, members: impl IntoIterator<Item = (WorkerId, u32)>) -> usize {
-        let mut fresh: Vec<(u64, u32)> = Vec::new();
-        let mut joined = 0;
-        for (id, key) in members {
-            if self.index.contains_key(&id) {
-                continue;
-            }
-            let member = self.members.len() as u32;
-            self.members.push(id);
-            self.index.insert(id, member);
-            fresh.extend((0..VIRTUAL_NODES).map(|vnode| (position(key, vnode), member)));
-            joined += 1;
-        }
-        if joined == 0 {
+        let mut joiners: Vec<(WorkerId, u32)> = members
+            .into_iter()
+            .filter(|(id, _)| !self.index.contains_key(id))
+            .collect();
+        if joiners.is_empty() {
             return 0;
         }
+        // An id named twice joins once, under the key named first.
+        joiners.sort_by_key(|&(id, _)| id);
+        joiners.dedup_by_key(|&mut (id, _)| id);
+        let stood = mem::take(&mut self.members);
+        self.members.reserve(stood.len() + joiners.len());
+        // Each standing member's new index, in the order they stood in.
+        let mut to = Vec::with_capacity(stood.len());
+        let mut fresh: Vec<(u64, u32)> = Vec::with_capacity(joiners.len() * VIRTUAL_NODES as usize);
+        let mut waiting = joiners.iter().peekable();
+        for id in stood {
+            while let Some(&(joiner, key)) = waiting.next_if(|&&(joiner, _)| joiner < id) {
+                self.join(joiner, key, &mut fresh);
+            }
+            to.push(self.members.len() as u32);
+            self.members.push(id);
+        }
+        for &(joiner, key) in waiting {
+            self.join(joiner, key, &mut fresh);
+        }
+        // A member ahead of the first joiner keeps its index.
+        let ahead = to
+            .iter()
+            .zip(0..)
+            .take_while(|&(&at, stood)| at == stood)
+            .count();
+        for (at, &id) in self.members.iter().enumerate().skip(ahead) {
+            self.index.insert(id, at as u32);
+        }
+        // A mark follows its member.
+        if !self.shown_by.is_empty() {
+            let mut marks = vec![NO_POOL; self.members.len()];
+            for (&mark, &at) in self.shown_by.iter().zip(&to) {
+                marks[at as usize] = mark;
+            }
+            self.shown_by = marks;
+        }
         fresh.sort_unstable();
+        // The renaming keeps the standing entries' order: a member's new
+        // index rises with its old one.
+        let renamed = |&(position, member): &(u64, u32)| (position, to[member as usize]);
         let mut merged = Vec::with_capacity(self.entries.len() + fresh.len());
         let (mut i, mut j) = (0, 0);
         while i < self.entries.len() && j < fresh.len() {
-            if self.entries[i] <= fresh[j] {
-                merged.push(self.entries[i]);
+            let entry = renamed(&self.entries[i]);
+            if entry <= fresh[j] {
+                merged.push(entry);
                 i += 1;
             } else {
                 merged.push(fresh[j]);
                 j += 1;
             }
         }
-        merged.extend_from_slice(&self.entries[i..]);
+        merged.extend(self.entries[i..].iter().map(renamed));
         merged.extend_from_slice(&fresh[j..]);
         self.entries = merged;
-        joined
+        joiners.len()
+    }
+
+    /// One joiner takes the next index and its key's positions.
+    fn join(&mut self, id: WorkerId, key: u32, fresh: &mut Vec<(u64, u32)>) {
+        let member = self.members.len() as u32;
+        self.members.push(id);
+        fresh.extend((0..VIRTUAL_NODES).map(|vnode| (position(key, vnode), member)));
     }
 
     /// [`Ring::add_many`] for the members a decision's view carries at `now`:
@@ -396,17 +439,21 @@ impl Ring {
         let Some(gone) = self.index.remove(&id) else {
             return false;
         };
-        self.entries.retain(|&(_, member)| member != gone);
-        let last = (self.members.len() - 1) as u32;
-        self.members.swap_remove(gone as usize);
-        if gone != last {
-            let moved = self.members[gone as usize];
-            self.index.insert(moved, gone);
-            for entry in &mut self.entries {
-                if entry.1 == last {
-                    entry.1 = gone;
-                }
+        // The members behind the leaver close the gap in their order.
+        // Each entry is read once: dropped with the leaver, or renamed
+        // where its member stood behind it.
+        self.members.remove(gone as usize);
+        let mut kept = 0;
+        for at in 0..self.entries.len() {
+            let (position, member) = self.entries[at];
+            if member != gone {
+                self.entries[kept] = (position, member - u32::from(member > gone));
+                kept += 1;
             }
+        }
+        self.entries.truncate(kept);
+        for at in self.index.values_mut() {
+            *at -= u32::from(*at > gone);
         }
         true
     }
@@ -435,7 +482,7 @@ impl Ring {
     /// Remove at `now` every member `keep` does not hold, fencing each. One
     /// leaver goes as [`Ring::remove`] takes it. Several go in one pass:
     /// each entry is read once, dropped with its member or renamed to its
-    /// member's new index, where a removal apiece reads every entry twice
+    /// member's new index, where a removal apiece reads every entry once
     /// for each leaver.
     fn prune(&mut self, keep: &FxHashSet<WorkerId>, now: Instant) {
         /// The mark of a member that leaves, in place of its new index.
@@ -804,9 +851,9 @@ fn walk_pool<const BY: u8>(
             continue;
         }
         let id = ring.members().get(member as usize);
-        // A ring that learned one pool in its rows' order names a member
-        // by its row's position: the row there is read first, its id
-        // compared.
+        // A ring of one pool names a member by its row's position: the
+        // members and the rows both stand in the order of their ids. The
+        // row there is read first, its id compared.
         let row = id.and_then(|id| match candidates.get(member as usize) {
             Some(row) if row.id == *id => Some(member as usize),
             _ => candidates.binary_search_by_key(id, |row| row.id).ok(),
@@ -1151,6 +1198,78 @@ mod tests {
         assert!(ring.entries.iter().all(|&(_, m)| (m as usize) < ring.len()));
         assert_eq!(ring.entries.len(), 3 * VIRTUAL_NODES as usize);
         assert!(ring.entries.windows(2).all(|w| w[0] <= w[1]), "sorted");
+    }
+
+    /// The ring holds `standing` in the order of their ids, each under its
+    /// index, and owns every key as a ring that learned them at once does.
+    fn stands_in_order(ring: &Ring, standing: &[u64]) {
+        let mut ids: Vec<WorkerId> = standing.iter().map(|&id| WorkerId(id)).collect();
+        ids.sort();
+        assert_eq!(ring.members(), ids);
+        for (at, &id) in ids.iter().enumerate() {
+            assert_eq!(ring.member_index(id), Some(at as u32), "{id:?}");
+        }
+        assert_eq!(ring.entries.len(), ids.len() * VIRTUAL_NODES as usize);
+        assert!(ring.entries.windows(2).all(|pair| pair[0] <= pair[1]));
+        let mut at_once = Ring::new();
+        at_once.add_many(ids.iter().map(|&id| (id, key_of(id))));
+        for key in 1..=500 {
+            assert_eq!(owner_of(ring, key), owner_of(&at_once, key), "key {key}");
+        }
+    }
+
+    #[test]
+    fn the_members_stand_in_the_order_of_their_ids_through_joins_and_removals() {
+        let now = Instant::now();
+        let mut ring = Ring::new();
+        let joiners = |ids: &[u64]| -> Vec<(WorkerId, u32)> {
+            ids.iter()
+                .map(|&id| (WorkerId(id), key_of(WorkerId(id))))
+                .collect()
+        };
+        assert_eq!(ring.add_many(joiners(&[1_004, 1_002, 1_006, 1_002])), 3);
+        stands_in_order(&ring, &[1_002, 1_004, 1_006]);
+        // One joiner between two members, then one ahead of them all and
+        // one behind.
+        assert!(ring.add(WorkerId(1_003), 1_003));
+        stands_in_order(&ring, &[1_002, 1_003, 1_004, 1_006]);
+        assert_eq!(ring.add_many(joiners(&[1_007, 1_001])), 2);
+        stands_in_order(&ring, &[1_001, 1_002, 1_003, 1_004, 1_006, 1_007]);
+        // A leaver from the middle, the front and the end, then two at once.
+        for (gone, left) in [
+            (1_004, &[1_001, 1_002, 1_003, 1_006, 1_007][..]),
+            (1_001, &[1_002, 1_003, 1_006, 1_007][..]),
+            (1_007, &[1_002, 1_003, 1_006][..]),
+        ] {
+            assert!(ring.remove(WorkerId(gone), now));
+            stands_in_order(&ring, left);
+        }
+        ring.retain_only(&[WorkerId(1_003)], now);
+        stands_in_order(&ring, &[1_003]);
+    }
+
+    #[test]
+    fn a_mark_follows_its_member_when_a_joiner_takes_a_place_ahead_of_it() {
+        let now = Instant::now();
+        let mut ring = Ring::new();
+        let rows = |ids: &[u64]| -> Vec<(WorkerId, u32)> {
+            ids.iter()
+                .map(|&id| (WorkerId(id), key_of(WorkerId(id))))
+                .collect()
+        };
+        // The second pool's rows join ahead of and between the first's.
+        let pools = [rows(&[1_002, 1_004]), rows(&[1_001, 1_003])];
+        for (number, pool) in pools.iter().enumerate() {
+            ring.show(1, number as u32, true, pool.iter().copied(), now);
+        }
+        let (marks, many) = ring.marks();
+        assert!(!many, "no member is a row of both pools");
+        for (number, pool) in pools.iter().enumerate() {
+            for &(id, _) in pool {
+                let member = ring.member_index(id).expect("a member");
+                assert_eq!(marks[member as usize], number as u32, "{id:?}");
+            }
+        }
     }
 
     #[test]
