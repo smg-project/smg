@@ -1107,7 +1107,14 @@ const ONEOFS: &[(&str, &str, &str, &[&str])] = &[
             "relabelled",
             "needs",
             "snapshot_required",
+            "ranks",
         ],
+    ),
+    (
+        CONTROLLER_PROTO,
+        "RankRow",
+        "made",
+        &["registered", "replaced", "removed", "relabelled"],
     ),
     (
         CONTROLLER_PROTO,

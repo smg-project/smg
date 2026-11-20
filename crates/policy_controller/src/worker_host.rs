@@ -124,7 +124,9 @@ pub(crate) use door::tests::{
     check_one_row, check_provider, check_rank_rows, check_refresh, FindOne, Rows,
 };
 #[cfg(feature = "controller")]
-pub(crate) use door::{drain, lay, lay_one, refresh, stating, take, Stated, Turn};
+pub(crate) use door::{
+    drain, lay, lay_one, lay_ready, refresh, stating, take, Ready, Stated, Turn,
+};
 pub use door::{Expect, Membership, Over, Refused, Remover, StoreDoor, Wrote};
 pub use found::facts;
 pub use health::HealthAdapter;
