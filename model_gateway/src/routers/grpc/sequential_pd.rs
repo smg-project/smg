@@ -41,7 +41,7 @@ use crate::{
                 retire_pd_side, PdSides, PrefillBound, PrefillWait, Retirement, SideDispatch,
                 StreamResult,
             },
-            context::{ClientSelection, ExecutionResult, PdTiming, WorkerSelection},
+            context::{ClientSelection, ExecutionResult, PdTiming, Placement, WorkerSelection},
             multimodal::worker_language_model_only,
             proto_wrapper::{
                 FirstItem, PrefillCachedTokens, PrefillTicket, ProtoGenerateRequest,
@@ -596,6 +596,7 @@ pub(crate) async fn execute_sequential_pd(
     model: &str,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    placement: Option<&Placement>,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -624,6 +625,7 @@ pub(crate) async fn execute_sequential_pd(
         prefill_request,
         prefill_client.clone(),
         prefill_guard,
+        placement,
     )
     .await?;
 
@@ -642,6 +644,7 @@ pub(crate) async fn execute_sequential_pd(
         decode_request,
         decode_client.clone(),
         handed_off,
+        placement,
     )
     .await?;
     // Decode established: record the success-only PD metrics here.
@@ -694,6 +697,7 @@ async fn sequential_prefill_side(
     prefill_request: ProtoGenerateRequest,
     mut prefill_client: BackendClient,
     prefill_guard: PrefillLoadGuard,
+    placement: Option<&Placement>,
 ) -> Result<PrefillHarvest, Response> {
     let workers = sides.workers;
     debug!(
@@ -719,6 +723,10 @@ async fn sequential_prefill_side(
     // above was read before the booking.
     let prefill_ticket =
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
+    // A pair the policy controller placed says its prefill's dispatch here.
+    if let Some(placement) = placement {
+        placement.sent(PdSide::Prefill, prefill_start);
+    }
     let prefill_stream = dispatch_prefill_within(
         PrefillWait {
             bound: bound.clone(),
@@ -944,6 +952,7 @@ async fn sequential_decode_side(
     decode_request: ProtoGenerateRequest,
     mut decode_client: BackendClient,
     handed_off: bool,
+    placement: Option<&Placement>,
 ) -> Result<(ProtoStream, Instant), Response> {
     let workers = sides.workers;
     // Send request to decode
@@ -974,6 +983,10 @@ async fn sequential_decode_side(
     } else {
         None
     };
+    // A pair the policy controller placed says its decode's dispatch here.
+    if let Some(placement) = placement {
+        placement.sent(PdSide::Decode, decode_sent);
+    }
     let decode_worker = workers.decode_worker().cloned();
     let decode_stream = dispatch_decode_within(
         decode_bound,

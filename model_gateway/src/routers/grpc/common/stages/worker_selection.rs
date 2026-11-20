@@ -12,6 +12,7 @@ use axum::{
 };
 use futures::{future::Either, FutureExt};
 use openai_protocol::common::CachePartition;
+use smg_policy_controller::{lease::ReleaseReason, view::Phase};
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 use tracing::{debug, error, warn};
 
@@ -64,6 +65,10 @@ use crate::{
 
 /// Result type for PD worker pair selection: (prefill, decode, runtime_type)
 type PdWorkerPair = (Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType);
+
+/// A pair attempt's workers, with the controller's placement where it
+/// placed them.
+type PdAttempt = (PdWorkerPair, Option<Placed>);
 
 /// The candidate predicate of a request carrying media references with no
 /// pipeline pin: only workers that process them themselves. The stage
@@ -592,8 +597,8 @@ impl WorkerSelectionStage {
 
     /// The mode's pick over the gathered inputs: the single worker that
     /// meets every demand with any controller placement, or the pair
-    /// admitted within the queue budget with its prefill slot and any
-    /// encode assignments.
+    /// admitted within the queue budget with its prefill slot, any encode
+    /// assignments and any controller placement.
     async fn pick(
         &self,
         ctx: &RequestContext,
@@ -607,7 +612,18 @@ impl WorkerSelectionStage {
         let accepts_refs = |worker: &dyn Worker| media.accepts_refs(worker);
         let placement = inputs.placement(inputs.media_refs.then_some(&accepts_refs));
         let sticky_key = ctx.state.sticky_key.as_deref();
-        match self.mode {
+        // Under a host the controller places no encode stage yet: a request
+        // with encode items is refused by name, and one with none is a pair.
+        let mode = match self.mode {
+            WorkerSelectionMode::EncodePrefillDecode if self.host.is_some() => {
+                if inputs.media_refs || inputs.intermediate.is_some() {
+                    return Err(policy_controller::refused("encode items"));
+                }
+                WorkerSelectionMode::PrefillDecode
+            }
+            mode => mode,
+        };
+        match mode {
             WorkerSelectionMode::Regular => {
                 let (worker, placed) = self
                     .select_regular_attempt(
@@ -619,27 +635,28 @@ impl WorkerSelectionStage {
                             candidate_filter: None,
                             ..placement
                         },
-                        RegularAttempt::First(ctx),
+                        Attempt::First(ctx),
                     )
                     .await?;
                 Ok((WorkerSelection::Single { worker }, None, placed))
             }
             WorkerSelectionMode::PrefillDecode => {
-                let (pair, guard) = self
+                let ((pair, placed), guard) = self
                     .admit_selection_within_budget(
                         ctx,
                         accepted,
-                        self.admit_pd_pair(
+                        self.select_pd_attempt(
                             model_id,
                             placement,
                             sticky_key,
                             wire,
                             media,
                             inputs.demand,
+                            Attempt::First(ctx),
                         ),
                     )
                     .await?;
-                Ok((disaggregated(pair), Some(guard), None))
+                Ok((disaggregated(pair), Some(guard), placed))
             }
             WorkerSelectionMode::EncodePrefillDecode => {
                 let hashes = if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
@@ -797,7 +814,7 @@ impl WorkerSelectionStage {
                         media,
                         wire,
                         inputs,
-                        RegularAttempt::Retry(ctx),
+                        Attempt::Retry(ctx),
                     )
                     .await?;
                 (WorkerSelection::Single { worker }, placed)
@@ -813,8 +830,8 @@ impl WorkerSelectionStage {
                     candidate_filter: Some(&pinned),
                     tried: &[],
                 };
-                let (pair, guard) = self
-                    .admit_pd_pair(
+                let ((pair, placed), guard) = self
+                    .select_pd_attempt(
                         model_id,
                         inputs,
                         ctx.sticky_key.as_deref(),
@@ -832,10 +849,11 @@ impl WorkerSelectionStage {
                         )
                         .with_media_refs(media_refs, ctx.wire.pipeline)
                         .with_context(context_requirements),
+                        Attempt::Retry(ctx),
                     )
                     .await?;
                 ctx.pd_prefill_guard = Some(guard);
-                (disaggregated(pair), None)
+                (disaggregated(pair), placed)
             }
         };
 
@@ -1107,13 +1125,13 @@ fn pair_admitted_by(
         })
 }
 
-/// The request state still available when a regular attempt selects.
-enum RegularAttempt<'a> {
+/// The request state still available when an attempt selects.
+enum Attempt<'a> {
     First(&'a RequestContext),
     Retry(&'a DispatchContext),
 }
 
-impl<'a> RegularAttempt<'a> {
+impl<'a> Attempt<'a> {
     /// The facts still available for the controller's ask, under the
     /// gateway's own `id` for it and with the prompt's `hashes`. Nothing a
     /// client sent names an ask. The request's headers and its own `rid`
@@ -1165,18 +1183,20 @@ fn retry_media(ctx: &DispatchContext) -> MediaDemands {
     }
 }
 
-/// The regular route's rule at the controller's commit, built from the
-/// classic selection's own rules: the regular pool's match, the request's
-/// wire, and on a retry the ledger's admit. The controller reads none of
-/// them, so a target one of them refuses is passed over like one the
-/// gateway cannot send to. A demand the controller keeps ahead of its
+/// The route's rule for a worker of `pool`, built from the classic
+/// selection's own rules: the pool's match, the request's wire, and on a
+/// retry the ledger's admit. The controller reads none of them. At a
+/// regular commit a target one of them refuses is passed over like one the
+/// gateway cannot send to. A pair's commit takes no rule, so the stage asks
+/// it of the pair it was handed. A demand the controller keeps ahead of its
 /// stages takes this function's place once a request can state it.
 fn on_route<'a>(
+    pool: RoutingPool,
     wire: Option<WireConstraint>,
     ledger: Option<&'a AttemptLedger>,
 ) -> impl Fn(&dyn Worker) -> bool + Send + Sync + 'a {
     move |worker| {
-        RoutingPool::GrpcPipelineRegular.matches(worker)
+        pool.matches(worker)
             && WireConstraint::admits(wire, worker)
             && ledger.is_none_or(|ledger| ledger.admits(worker))
     }
@@ -1780,24 +1800,27 @@ impl WorkerSelectionStage {
         )
     }
 
-    /// The name of a shape of regular attempt the controller does not place
-    /// yet, or none. The store builds the candidates and reads none of these
-    /// demands. The commit's rule only passes a target over, and a demand
-    /// few workers meet could end the asks with no worker. So these shapes
-    /// are refused by name until a request can state them.
+    /// The name of a shape of attempt the controller does not place yet, or
+    /// none: a `media` input, a `context` demand a window of `pools` binds,
+    /// a retry under a decoding rule. The store builds the candidates and
+    /// reads none of these demands. The commit's rule only passes a target
+    /// over, and a demand few workers meet could end the asks with no
+    /// worker. So these shapes are refused by name until a request can state
+    /// them.
     fn undecided(
         &self,
         model_id: &str,
         context: ContextRequirements,
-        media: MediaDemands,
+        pools: &[RoutingPool],
+        media: bool,
         retry_under_rule: bool,
     ) -> Option<&'static str> {
-        if media != MediaDemands::NONE {
+        if media {
             return Some("media input");
         }
         let demand = context.left_by(
             &self.worker_registry.get_routing_snapshot(model_id),
-            &[RoutingPool::GrpcPipelineRegular],
+            pools,
             model_id,
         );
         if !demand.binds_nobody() {
@@ -1811,16 +1834,26 @@ impl WorkerSelectionStage {
     /// attempt: the refusal must not stand where a worker's failure does.
     /// The classic selection answers every retry itself.
     pub(crate) fn places_retry(&self, ctx: &DispatchContext) -> bool {
-        self.host.is_none()
-            || self.mode != WorkerSelectionMode::Regular
-            || self
-                .undecided(
-                    &ctx.model_id,
-                    ctx.routing.context_requirements,
-                    retry_media(ctx),
-                    ctx.constraint_decided_on.is_some(),
-                )
-                .is_none()
+        if self.host.is_none() {
+            return true;
+        }
+        let media = retry_media(ctx) != MediaDemands::NONE;
+        let (prefill_pool, decode_pool) = PdWire::Grpc.pools();
+        let (pools, media): (&[RoutingPool], bool) = match self.mode {
+            WorkerSelectionMode::Regular => (&[RoutingPool::GrpcPipelineRegular], media),
+            WorkerSelectionMode::PrefillDecode | WorkerSelectionMode::EncodePrefillDecode => (
+                &[prefill_pool, decode_pool],
+                media || ctx.routing.decode_needs_vision,
+            ),
+        };
+        self.undecided(
+            &ctx.model_id,
+            ctx.routing.context_requirements,
+            pools,
+            media,
+            ctx.constraint_decided_on.is_some(),
+        )
+        .is_none()
     }
 
     /// Place a regular attempt through the configured host or the classic policies.
@@ -1831,7 +1864,7 @@ impl WorkerSelectionStage {
         media: MediaDemands,
         wire: Option<WireConstraint>,
         inputs: PlacementInputs<'_>,
-        attempt: RegularAttempt<'_>,
+        attempt: Attempt<'_>,
     ) -> Result<(Arc<dyn Worker>, Option<Placed>), Response> {
         let no_worker = || self.context_selection_failure(model_id, wire, media, context);
         let Some(host) = self.host.as_ref() else {
@@ -1854,8 +1887,10 @@ impl WorkerSelectionStage {
         };
 
         let under_rule =
-            matches!(attempt, RegularAttempt::Retry(ctx) if ctx.constraint_decided_on.is_some());
-        if let Some(shape) = self.undecided(model_id, context, media, under_rule) {
+            matches!(attempt, Attempt::Retry(ctx) if ctx.constraint_decided_on.is_some());
+        let pools = [RoutingPool::GrpcPipelineRegular];
+        let media_input = media != MediaDemands::NONE;
+        if let Some(shape) = self.undecided(model_id, context, &pools, media_input, under_rule) {
             return Err(policy_controller::refused(shape));
         }
 
@@ -1865,13 +1900,116 @@ impl WorkerSelectionStage {
         };
         let hashes = host.hashes(model_id, &prompt);
         let id = host::mark();
-        let rule = on_route(wire, attempt.ledger());
+        let rule = on_route(RoutingPool::GrpcPipelineRegular, wire, attempt.ledger());
         let ask = attempt.ask(model_id, &id, &hashes);
         let placed = host
             .place_where(&ask, rule, Instant::now())
             .await
             .map_err(|unplaced| unplaced.answer(model_id))?;
         Ok((Arc::clone(placed.worker()), Some(placed)))
+    }
+
+    /// A pair attempt's workers with the prefill's admission guard: placed
+    /// by the policy controller where the stage holds a host, else selected
+    /// by [`Self::admit_pd_pair`] with the same arguments as before.
+    ///
+    /// Returned as a future, as [`Self::admit_within_budget`] is: the
+    /// arguments move into the one arm that runs and are kept once. The
+    /// hosted arm is boxed: its future is the larger by some four hundred
+    /// bytes, and by value it would size the stage's future for every
+    /// request, placed or not.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pair's selection threads every input the classic placement consumes"
+    )]
+    fn select_pd_attempt<'a>(
+        &'a self,
+        model_id: &'a str,
+        inputs: PlacementInputs<'a>,
+        sticky_key: Option<&'a str>,
+        wire: Option<WireConstraint>,
+        media: MediaDemands,
+        demand: PairDemands,
+        attempt: Attempt<'a>,
+    ) -> impl Future<Output = Result<(PdAttempt, PrefillLoadGuard), Response>> + 'a {
+        match self.host.as_deref() {
+            Some(host) => Either::Left(Box::pin(self.place_pd_pair(
+                host, model_id, inputs, sticky_key, wire, media, demand, attempt,
+            ))),
+            None => Either::Right(
+                self.admit_pd_pair(model_id, inputs, sticky_key, wire, media, demand)
+                    .map(|admitted| admitted.map(|(pair, guard)| ((pair, None), guard))),
+            ),
+        }
+    }
+
+    /// A pair attempt placed by the controller through `host`, with the
+    /// prefill's admission guard. The checks ahead of the ask are the
+    /// regular helper's, in the pair's words. The ask states the prefill
+    /// phase, and the prompt's size is its hashes' count. The pair's
+    /// runtime is its prefill worker's.
+    ///
+    /// The host's pair commit takes no rule of the route. So a pair the
+    /// route cannot send to is given up as a failed commit and refused, as
+    /// the regular helper refuses an attempt no target holds.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pair's selection threads every input the classic placement consumes"
+    )]
+    async fn place_pd_pair(
+        &self,
+        host: &Host,
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        sticky_key: Option<&str>,
+        wire: Option<WireConstraint>,
+        media: MediaDemands,
+        demand: PairDemands,
+        attempt: Attempt<'_>,
+    ) -> Result<(PdAttempt, PrefillLoadGuard), Response> {
+        let (prefill_pool, decode_pool) = PdWire::Grpc.pools();
+        let under_rule =
+            matches!(attempt, Attempt::Retry(ctx) if ctx.constraint_decided_on.is_some());
+        let media_input =
+            media != MediaDemands::NONE || demand.prefill || demand.decode || demand.refs;
+        let pools = [prefill_pool, decode_pool];
+        if let Some(shape) =
+            self.undecided(model_id, demand.context, &pools, media_input, under_rule)
+        {
+            return Err(policy_controller::refused(shape));
+        }
+
+        let prompt = host::Prompt {
+            tokens: inputs.tokens,
+            namespace: inputs.cache_namespace,
+        };
+        let hashes = host.hashes(model_id, &prompt);
+        let id = host::mark();
+        let ledger = attempt.ledger();
+        let ask = Ask {
+            phase: Phase::Prefill,
+            ..attempt.ask(model_id, &id, &hashes)
+        };
+        let (mut placed, guard) = host
+            .place_pair(&ask, self.prefill_admission.as_deref(), sticky_key)
+            .await
+            .map_err(|unplaced| unplaced.answer(model_id))?;
+        let prefill = Arc::clone(placed.worker());
+        let runtime = prefill.metadata().spec.runtime_type;
+        let holds = |pool, worker: &dyn Worker| on_route(pool, wire, ledger)(worker);
+        let decode = placed
+            .decode()
+            .filter(|decode| {
+                holds(prefill_pool, prefill.as_ref())
+                    && holds(decode_pool, decode.as_ref())
+                    && decode.metadata().spec.runtime_type == runtime
+            })
+            .cloned();
+        let Some(decode) = decode else {
+            placed.released(ReleaseReason::CommitFailed, Instant::now());
+            return Err(host::Unplaced::NoTargetHolds.answer(model_id));
+        };
+        Ok((((prefill, decode, runtime), Some(placed)), guard))
     }
 
     /// One attempt's single worker from the regular pool. One snapshot

@@ -1098,20 +1098,26 @@ impl fmt::Debug for Placed {
 pub(crate) struct Held {
     /// Dropped first: a report still owed is said while the load stands.
     placed: Placed,
-    /// The load of the placement's worker, given back at the drop.
+    /// The load of the worker the response is read from, given back at the
+    /// drop.
     #[expect(dead_code, reason = "held for its drop alone")]
     guard: WorkerLoadGuard,
 }
 
 impl Held {
-    /// The placement beside the load guard `guard` makes of its worker. The
-    /// guard is asked of the placement's own worker, so the two do not name
-    /// two workers, and neither is dropped ahead of its turn.
+    /// The placement beside the load guard `guard` makes of the worker its
+    /// response is read from: a single's worker, a pair's decode. The guard
+    /// is asked of the placement's own worker, so the two do not name two
+    /// workers, and neither is dropped ahead of its turn.
+    ///
+    /// A pair's prefill holds its load by the admission guard
+    /// [`Host::place_pair`] hands back apart. Its router gives that one up
+    /// when the prefill phase ends, ahead of the response.
     pub(crate) fn new(
         placed: Placed,
         guard: impl FnOnce(&Arc<dyn Worker>) -> WorkerLoadGuard,
     ) -> Self {
-        let guard = guard(placed.worker());
+        let guard = guard(placed.decode().unwrap_or_else(|| placed.worker()));
         Self { placed, guard }
     }
 

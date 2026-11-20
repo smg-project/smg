@@ -14,7 +14,7 @@ use smg_policy_controller::{
     view::{Role, WorkerId},
     AppliedSpec, PolicySpec,
 };
-use smg_worker::identity::basic::Worker;
+use smg_worker::identity::basic::{Worker, WorkerType};
 
 use super::Host;
 use crate::{
@@ -143,6 +143,63 @@ pub(crate) fn bed_with<'a>(
             .register(Arc::clone(&worker))
             .expect("the worker registers");
         workers.push(worker);
+    }
+    store.publish_now();
+    (Host::at_keys(Arc::clone(&store), registry), store, workers)
+}
+
+/// A store under the pair presets with one ready row a URL, the prefills'
+/// then the decodes', a registry with one worker a row, and the host over
+/// the two. The workers come back in the rows' order. The rows report no
+/// capacity and no room, so each side keeps the two filters that read
+/// neither.
+pub(crate) fn pair_bed(prefills: &[&str], decodes: &[&str]) -> Bed {
+    let store = Arc::new(MemoryStore::new());
+    let mut document =
+        PolicySpec::pair_presets("least_load", "least_load").expect("the pair presets");
+    for profile in document.profiles.values_mut() {
+        profile.filter = vec!["healthy".into(), "not-tried".into()];
+    }
+    let applied = AppliedSpec::validate(&document).expect("the presets validate");
+    store.apply(applied).expect("the store takes the presets");
+    let registry = Arc::new(WorkerRegistry::new());
+    let mut workers = Vec::new();
+    let sides = [
+        (prefills, Role::Prefill, WorkerType::Prefill),
+        (decodes, Role::Decode, WorkerType::Decode),
+    ];
+    for (urls, role, worker_type) in sides {
+        for &url in urls {
+            let facts = WorkerFacts {
+                key: url.to_string(),
+                engine: url.to_string(),
+                incarnation: 1,
+                role,
+                models: vec![MODEL.to_string()],
+                dp_size: 1,
+                max_running: Some(64),
+                ..WorkerFacts::default()
+            };
+            let id = store.upsert(facts).id();
+            store.publish_now();
+            let row = WorkersStore::get(&*store, id).expect("the row");
+            if row.status != RowStatus::Ready {
+                store
+                    .set_status(id, RowStatus::Ready, row.revision)
+                    .expect("the row stands");
+            }
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new(MODEL))
+                    .worker_type(worker_type)
+                    .status(WorkerStatus::Ready)
+                    .build(),
+            );
+            registry
+                .register(Arc::clone(&worker))
+                .expect("the worker registers");
+            workers.push(worker);
+        }
     }
     store.publish_now();
     (Host::at_keys(Arc::clone(&store), registry), store, workers)
