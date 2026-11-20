@@ -94,6 +94,9 @@ pub(crate) use hashes::{Hashes, Prompt};
 /// crate's own name for the one gateway that decides in its own process.
 const GATEWAY: GatewayId = GatewayId::LOCAL;
 
+/// The code of an answer that tells the controller's absence.
+const CONTROLLER_UNAVAILABLE: &str = "policy_controller_unavailable";
+
 /// The asks of one attempt: the first, and two more that name the targets
 /// the gateway could not send to.
 const ASKS: usize = 3;
@@ -533,14 +536,14 @@ impl Unplaced {
             } => return placement::policy_declined(model, emptied_by),
             Self::Refused(_) => hinted(
                 error::service_unavailable(
-                    "policy_controller_unavailable",
+                    CONTROLLER_UNAVAILABLE,
                     "The policy controller made no decision for this request",
                 ),
                 0,
             ),
             Self::Unanswered(_) => hinted(
                 error::service_unavailable(
-                    "policy_controller_unavailable",
+                    CONTROLLER_UNAVAILABLE,
                     "The policy controller gave no decision for this request",
                 ),
                 0,
@@ -569,6 +572,21 @@ fn hinted(mut response: Response, secs: u32) -> Response {
         .headers_mut()
         .insert(RETRY_AFTER, HeaderValue::from(secs.max(1)));
     response
+}
+
+/// The answer to a request that came ahead of the first snapshot of the
+/// controller this gateway follows. The gateway holds no worker yet, so
+/// the request reads the controller's absence with the retry hint, as an
+/// ask the controller leaves unanswered before a fleet does
+/// ([`Unplaced::answer`]).
+pub(crate) fn awaiting_fleet() -> Response {
+    hinted(
+        error::service_unavailable(
+            CONTROLLER_UNAVAILABLE,
+            "The gateway holds no worker yet: its policy controller has told no snapshot",
+        ),
+        0,
+    )
 }
 
 /// A pick awaiting commit, with its targets and lease.
@@ -650,6 +668,13 @@ impl Host {
             linked: Some(linked),
             ..Self::new(store, objects)
         }
+    }
+
+    /// Whether the controller this gateway follows has told a fleet: its
+    /// first whole snapshot stands. None where the gateway follows no
+    /// controller.
+    pub(crate) fn fleet_told(&self) -> Option<bool> {
+        self.linked.as_ref().map(|linked| linked.fleet())
     }
 
     /// An attempt's prompt hashes for `model`, under the generation in force.

@@ -37,7 +37,9 @@
 //! Under a controller's address the host asks that controller for each
 //! decision, over the one link the follower holds. Where the controller
 //! gives no answer, the host decides at the door of this process
-//! ([`host::Host::linked`]).
+//! ([`host::Host::linked`]). Until that controller's first snapshot the
+//! gateway holds no worker, and a request a router would place is
+//! answered as the controller's absence ([`gate`]).
 //!
 //! Under a controller's address a follower keeps the store's worker rows
 //! as that controller's watch tells them ([`follower`]). The gateway then
@@ -77,6 +79,7 @@ pub(crate) mod follower;
     expect(dead_code, reason = "the gateway holds the feed for membership writes")
 )]
 pub(crate) mod feed;
+pub(crate) mod gate;
 #[cfg_attr(
     not(test),
     expect(

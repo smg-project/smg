@@ -99,7 +99,7 @@ use crate::{
         logging::LoggingConfig, metrics, metrics::PrometheusConfig, metrics_server, otel_trace,
         runtime_metrics,
     },
-    policy_controller::{follower::Follower, operators},
+    policy_controller::{follower::Follower, gate::FleetGate, operators},
     routers::{
         common::realtime::ws::RealtimeQueryParams,
         error as route_error,
@@ -1382,6 +1382,10 @@ pub fn build_apps(
     let wasm_layer = (app_state.context.router_config.enable_wasm
         && app_state.context.wasm_manager.is_some())
     .then(|| axum::middleware::from_fn_with_state(app_state.clone(), middleware::wasm_middleware));
+    // A gateway that follows a controller holds no worker until that
+    // controller's first snapshot. Until then a request a router would
+    // place is answered as the controller's absence.
+    let fleet_gate = FleetGate::of(app_state.context.policy_host.as_ref());
 
     // The protection of the typed routes as ONE stack: axum boxes the routes
     // once per `route_layer` call and a request clones the boxed stack at
@@ -1391,7 +1395,8 @@ pub fn build_apps(
     // as the builder reads: the Messages envelope (a refusal by any layer
     // inside, authentication, admission, the body timeout, leaves in the
     // envelope as well); the wasm hooks; the serving auth; the tenant
-    // resolution; the admission; then the keep-alive every SSE stream of
+    // resolution; the fleet gate of a gateway that follows a controller;
+    // the admission; then the keep-alive every SSE stream of
     // these routes carries through an upstream silence (a comment; the
     // Messages API's ping event), written between frames, nothing while
     // frames flow; the per-request buffer-vs-stream decision for typed-JSON
@@ -1448,6 +1453,7 @@ pub fn build_apps(
                 .layer(InertLayer(wasm_layer.clone()))
                 .layer(InertLayer(serving_auth_layer.clone()))
                 .layer(tenant_resolution_state.clone().layer())
+                .layer(InertLayer(fleet_gate.clone()))
                 .layer(InertLayer(priority_admission.clone()))
                 .layer(InertLayer(legacy_limit.clone()))
                 .layer(
@@ -1484,6 +1490,7 @@ pub fn build_apps(
                 .layer(InertLayer(wasm_layer))
                 .layer(InertLayer(serving_auth_layer.clone()))
                 .layer(tenant_resolution_state.clone().layer())
+                .layer(InertLayer(fleet_gate.clone()))
                 .layer(InertLayer(priority_admission.clone()))
                 .layer(InertLayer(legacy_limit.clone())),
         );
@@ -1499,6 +1506,7 @@ pub fn build_apps(
             tower::ServiceBuilder::new()
                 .layer(InertLayer(serving_auth_layer.clone()))
                 .layer(tenant_resolution_state.clone().layer())
+                .layer(InertLayer(fleet_gate.clone()))
                 .layer(InertLayer(priority_admission.clone()))
                 .layer(InertLayer(legacy_limit.clone())),
         );
@@ -1514,6 +1522,7 @@ pub fn build_apps(
             tower::ServiceBuilder::new()
                 .layer(InertLayer(serving_auth_layer.clone()))
                 .layer(tenant_resolution_state.layer())
+                .layer(InertLayer(fleet_gate))
                 .layer(InertLayer(priority_admission))
                 .layer(InertLayer(legacy_limit)),
         );
@@ -4016,6 +4025,97 @@ mod tests {
         })
         .await
         .expect("both routers report the first snapshot within five seconds");
+    }
+
+    /// Until its controller's first snapshot a gateway that follows one
+    /// holds no worker. A request a router would place then reads the
+    /// controller's absence with a retry hint, not a model nobody serves.
+    /// A stored route places nothing and is answered by its handler.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_request_ahead_of_the_first_snapshot_reads_the_controllers_absence() {
+        use axum::body::{to_bytes, Body};
+        use smg_policy_controller::controller::Scope;
+        use tokio::{sync::oneshot, time};
+        use tower::ServiceExt;
+
+        use crate::policy_controller::follower::tests::bind_controller;
+
+        time::timeout(Duration::from_secs(5), async {
+            let controller = bind_controller().await;
+            let config = ServerConfig::minimal(RouterConfig {
+                policy_controller: true,
+                policy_controller_address: Some(
+                    controller
+                        .addresses()
+                        .of(Scope::Gateway)
+                        .unwrap()
+                        .to_string(),
+                ),
+                ..Default::default()
+            });
+            let context = Arc::new(
+                AppContext::from_config(config.router_config.clone(), 10, None, None)
+                    .await
+                    .unwrap(),
+            );
+            let probes = start_observability(&config, &context, None).await.unwrap();
+            let app = worker_test_app(context.clone(), probes);
+            let answered = |request: http::request::Builder, body: &'static str| {
+                let app = app.clone();
+                async move {
+                    let response = app.oneshot(request.body(Body::from(body)).unwrap());
+                    let response = response.await.unwrap();
+                    let (parts, body) = response.into_parts();
+                    let body = to_bytes(body, 4096).await.unwrap();
+                    (parts, String::from_utf8(body.to_vec()).unwrap())
+                }
+            };
+            let chat = || {
+                let request = http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json");
+                answered(
+                    request,
+                    r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+                )
+            };
+
+            // The controller is bound and serves nothing: no snapshot yet.
+            let (parts, body) = chat().await;
+            assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert_eq!(parts.headers[http::header::RETRY_AFTER], "1");
+            assert!(body.contains("policy_controller_unavailable"), "{body}");
+            // A stored response is read with no worker.
+            let stored = http::Request::builder().uri("/v1/responses/resp_none");
+            let (parts, body) = answered(stored, "").await;
+            assert_ne!(parts.status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+            let (stop, stopped) = oneshot::channel::<()>();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the case stops and joins the controller"
+            )]
+            let serving = spawn(controller.serve(async {
+                let _ = stopped.await;
+            }));
+            // The first snapshot tells an empty fleet, and the gate opens:
+            // the request reaches the routers, and this bed mounts none.
+            let (parts, body) = loop {
+                let (parts, body) = chat().await;
+                if parts.status != StatusCode::SERVICE_UNAVAILABLE {
+                    break (parts, body);
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            };
+            assert_eq!(parts.status, StatusCode::NOT_FOUND, "{body}");
+            assert!(!body.contains("policy_controller_unavailable"), "{body}");
+            stop.send(()).unwrap();
+            serving.await.unwrap().unwrap();
+        })
+        .await
+        .expect("the gate opens at the first snapshot within five seconds");
     }
 
     fn file_discovery() -> RuntimeDiscoveryConfig {
