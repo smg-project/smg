@@ -43,7 +43,9 @@ use crate::{
         feed::signal_tests::{stages, SINGLE, SLOTS},
         host::Ask,
     },
-    routers::grpc::backend_client::{get_backend_client, BackendConnector, BasicWorkerBuilder},
+    routers::grpc::backend_client::{
+        get_backend_client, BackendConnector, BasicWorkerBuilder, Fronted,
+    },
     workflow::{
         data::{WorkerRegistrationMode, WorkerUpdateWorkflowData, WorkerWorkflowData},
         steps::{
@@ -221,7 +223,16 @@ fn registration(app: &Arc<AppContext>, url: &str) -> WorkflowContext<WorkerWorkf
 }
 
 async fn register_grpc(app: &Arc<AppContext>, url: &str) -> Arc<dyn Worker> {
-    let mut context = registration(app, url);
+    register_grpc_from(app, url, registration(app, url)).await
+}
+
+/// [`register_grpc`] over `context`, a registration of `url` its case set
+/// up.
+async fn register_grpc_from(
+    app: &Arc<AppContext>,
+    url: &str,
+    mut context: WorkflowContext<WorkerWorkflowData>,
+) -> Arc<dyn Worker> {
     context.data.worker_kind = Some(WorkerKind::Local);
     DetectConnectionModeStep
         .execute(&mut context)
@@ -286,16 +297,21 @@ fn update_context(app: &Arc<AppContext>) -> WorkflowContext<WorkerUpdateWorkflow
     WorkflowContext::new(WorkflowInstanceId::new(), data)
 }
 
+/// The worker's connection is the gateway's front, and the host's own
+/// stands in it.
 async fn assert_host_connection(worker: &dyn Worker) {
     let connection = worker.engine_connection().await.unwrap().unwrap();
-    assert!(connection.downcast_arc::<HostConnection>().is_some());
+    let fronted = connection.downcast_arc::<Fronted>().unwrap();
+    let front = Arc::clone(fronted.front());
+    assert!(front.downcast_arc::<HostConnection>().is_some());
 }
 
 #[tokio::test]
 async fn registration_probes_and_connects_through_the_host() {
-    let connector: Arc<dyn EngineConnector> = Arc::new(HostConnector);
-    let app = gateway(Extensions::new().connector(Arc::clone(&connector))).await;
-    assert!(Arc::ptr_eq(&app.engine_connector(), &connector));
+    let app = gateway(Extensions::new().connector(Arc::new(HostConnector))).await;
+    // The context's connector is the gateway's wrap of the host's.
+    let wrap = format!("{:?}", app.engine_connector());
+    assert_eq!(wrap, "Fronting(HostConnector)");
     let worker = register_grpc(&app, HOST_URL).await;
     assert_eq!(worker.model_id(), MODEL_ID);
     assert_host_connection(worker.as_ref()).await;
@@ -310,8 +326,8 @@ async fn an_imported_worker_connects_through_the_host() {
 
 #[tokio::test]
 async fn workers_built_or_rebuilt_by_the_gateway_carry_the_host_connector() {
-    let connector: Arc<dyn EngineConnector> = Arc::new(HostConnector);
-    let app = gateway(Extensions::new().connector(Arc::clone(&connector))).await;
+    let app = gateway(Extensions::new().connector(Arc::new(HostConnector))).await;
+    let connector = app.engine_connector();
     let local = build_local(&app).await;
     let external = build_external(&app).await;
     assert_host_connection(local.as_ref()).await;
@@ -334,6 +350,8 @@ async fn workers_built_or_rebuilt_by_the_gateway_carry_the_host_connector() {
         &connector
     ));
     assert_host_connection(rebuilt.as_ref()).await;
+    // The gateway's client has no wire for this worker's runtime: the
+    // request path refuses it by name, and dials nothing.
     assert!(matches!(
         get_backend_client(rebuilt.as_ref()).await,
         Err(WorkerError::ConnectionFailed { reason, .. })
@@ -383,14 +401,140 @@ async fn stock_startup_uses_the_stock_connector_on_each_path() {
 #[tokio::test]
 async fn the_host_can_delegate_a_stock_engine_to_the_stock_connector() {
     let (url, _) = mock_grpc_engine().await;
-    let connector: Arc<dyn EngineConnector> = Arc::new(HostConnector);
-    let app = gateway(Extensions::new().connector(Arc::clone(&connector))).await;
+    let app = gateway(Extensions::new().connector(Arc::new(HostConnector))).await;
     let worker = register_grpc(&app, &url).await;
+    let connector = app.engine_connector();
     assert!(Arc::ptr_eq(&worker.engine_connector().unwrap(), &connector));
+    // The gateway's client the host delegated to passes the wrap as it is.
+    let connection = worker.engine_connection().await.unwrap().unwrap();
+    assert!(connection.downcast_arc::<Fronted>().is_none());
     let client = get_backend_client(worker.as_ref()).await.unwrap().unwrap();
     assert!(EngineConnection::health_check(client.as_ref())
         .await
         .unwrap());
+}
+
+/// A host's own connection that holds the gateway's client: it answers the
+/// load call itself and hands every other call to that client.
+struct OwnLoads(Arc<dyn EngineConnection>);
+
+#[async_trait]
+impl EngineConnection for OwnLoads {
+    fn carries_admin_calls(&self) -> bool {
+        self.0.carries_admin_calls()
+    }
+
+    fn is_alive(&self) -> bool {
+        self.0.is_alive()
+    }
+
+    async fn health_answer(&self) -> Result<HealthAnswer, tonic::Status> {
+        self.0.health_answer().await
+    }
+
+    async fn model_labels(&self) -> Result<HashMap<String, String>, tonic::Status> {
+        self.0.model_labels().await
+    }
+
+    async fn server_labels(&self) -> Result<HashMap<String, String>, tonic::Status> {
+        self.0.server_labels().await
+    }
+
+    async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
+        HostConnection::default().get_loads().await
+    }
+
+    async fn flush_cache(&self, timeout_s: f32) -> Result<AdminAnswer, tonic::Status> {
+        self.0.flush_cache(timeout_s).await
+    }
+
+    async fn start_profile(&self, options: &ProfileOptions) -> Result<AdminAnswer, tonic::Status> {
+        self.0.start_profile(options).await
+    }
+
+    async fn stop_profile(&self) -> Result<AdminAnswer, tonic::Status> {
+        self.0.stop_profile().await
+    }
+
+    async fn subscribe_kv_events(
+        &self,
+        start_seq: u64,
+    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status> {
+        self.0.subscribe_kv_events(start_seq).await
+    }
+
+    async fn subscribe_load_records(
+        &self,
+    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status> {
+        self.0.subscribe_load_records().await
+    }
+}
+
+/// A host whose connector returns its own connection for each gRPC engine
+/// and knows nothing of a front.
+#[derive(Debug)]
+struct OwnLoadsConnector;
+
+#[async_trait]
+impl EngineConnector for OwnLoadsConnector {
+    async fn connect_grpc(
+        &self,
+        url: &str,
+        runtime: RuntimeType,
+    ) -> Result<Arc<dyn EngineConnection>, String> {
+        let stock = BackendConnector::shared()
+            .connect_grpc(url, runtime)
+            .await?;
+        Ok(Arc::new(OwnLoads(stock)))
+    }
+
+    async fn connect_zmq(&self, link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
+        BackendConnector::shared().connect_zmq(link).await
+    }
+
+    async fn dial_grpc(&self, url: &str, timeout: Duration) -> Result<(), String> {
+        BackendConnector::shared().dial_grpc(url, timeout).await
+    }
+}
+
+/// A gRPC worker on a host's own connection, with the host's connector as
+/// it is: the worker registers through it, is polled through the host's
+/// connection and is sent to through the gateway's client behind the
+/// gateway's front. The load port publishes the host's report, and the
+/// engine answers through the client the request path reads.
+#[tokio::test]
+async fn a_worker_on_a_hosts_connection_is_polled_through_it_and_sent_to_through_the_gateways_client(
+) {
+    let (url, _) = mock_grpc_engine().await;
+    let app = gateway(Extensions::new().connector(Arc::new(OwnLoadsConnector))).await;
+    // The engine listens and the registration's probes dial it: they get
+    // time enough on a loaded host.
+    let mut registering = registration(&app, &url);
+    registering.data.config.health.timeout_secs = Some(30);
+    let worker = register_grpc_from(&app, &url, registering).await;
+    let connection = worker.engine_connection().await.unwrap().unwrap();
+    let fronted = connection.downcast_arc::<Fronted>().unwrap();
+    let front = Arc::clone(fronted.front());
+    assert!(front.downcast_arc::<OwnLoads>().is_some());
+
+    let client = get_backend_client(worker.as_ref()).await.unwrap().unwrap();
+    assert!(EngineConnection::health_check(client.as_ref())
+        .await
+        .unwrap());
+
+    let monitor = app.worker_monitor.as_ref().unwrap();
+    let mut reader = monitor.subscribe();
+    let key = WorkerGroupKey {
+        model_id: worker.model_id().into(),
+        worker_type: *worker.worker_type(),
+        connection_mode: *worker.connection_mode(),
+    };
+    poll_group_once_for_test(monitor, &key, Duration::from_secs(11), Instant::now()).await;
+    let snapshot = reader.borrow_and_update();
+    let report = snapshot.get(worker.url()).unwrap();
+    assert_eq!(report.loads.len(), 1);
+    assert_eq!(report.loads[0].num_running_reqs, 37);
+    assert_eq!(report.loads[0].num_waiting_reqs, 29);
 }
 
 #[tokio::test]

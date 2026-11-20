@@ -1287,15 +1287,18 @@ async fn a_starts_context_holds_the_feed_where_it_holds_the_store() -> Case {
 /// Under a controller's address the gateway probes no worker, so a row's
 /// status is its worker's. Elsewhere a worker's status is the gateway's own
 /// to write, and a row's change leaves it. On both paths the worker dials
-/// through the connector the gateway was started with.
+/// through the gateway's wrap of the connector the gateway was started
+/// with: the context's connector, which asks the handed one.
 #[tokio::test]
 async fn a_rows_status_is_its_workers_under_a_controllers_address_alone() -> Case {
+    use smg_worker::workflow::WorkflowHost as _;
+
     const URL: &str = "http://worker:8000";
     let socket = tokio::net::TcpSocket::new_v4()?;
     socket.bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     let address = socket.local_addr()?.to_string();
-    // A connector of the case's own: each path's worker holds the one
-    // handed over, and no stock one by name.
+    // A connector of the case's own: each path's worker holds the
+    // gateway's wrap of the one handed over, and no stock one by name.
     let handed: Arc<dyn EngineConnector> = Arc::new(BackendConnector);
     let mut dials_through_it = Vec::new();
     for following in [false, true] {
@@ -1333,7 +1336,9 @@ async fn a_rows_status_is_its_workers_under_a_controllers_address_alone() -> Cas
         let connector = worker
             .engine_connector()
             .ok_or("the worker has no connector")?;
-        dials_through_it.push(Arc::ptr_eq(&connector, &handed));
+        let wrap = context.engine_connector();
+        assert_eq!(format!("{wrap:?}"), "Fronting(BackendConnector)");
+        dials_through_it.push(Arc::ptr_eq(&connector, &wrap));
         assert!(!worker.is_healthy());
         let revision = store.get(row).ok_or("the row left")?.revision;
         store
