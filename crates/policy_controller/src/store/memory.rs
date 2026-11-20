@@ -4042,7 +4042,7 @@ impl Leases {
         if issue.is_some_and(|issue| issue.0 != count) {
             return None;
         }
-        let found = self.found(key);
+        let found = self.records.get(key).map(|held| self.sides(key, held));
         self.put_back(key).then_some(found).flatten()
     }
 
