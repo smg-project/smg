@@ -8,11 +8,7 @@ use smg_worker::{
     settings::UnhealthyRemovalScope,
 };
 
-use super::{
-    found::{facts, stated},
-    kv_feed::asks_events,
-    Standing,
-};
+use super::{found::paired, kv_feed::asks_events, Standing};
 use crate::{
     store::{
         membership::{self, NotMaker, Past},
@@ -177,8 +173,10 @@ pub trait Membership: Send + Sync + 'static {
     /// worker its registration built, over what it expects to stand. A
     /// row's URL is its worker's, and its facts are the ones the worker
     /// states over the standing row ([`facts`]), by the
-    /// write's verb. The engine is the one the rows' own facts state, so no
-    /// caller names it another way.
+    /// write's verb. A door whose rows hold a pairing descriptor states the
+    /// one the worker derived at its build in place of the standing row's.
+    /// The engine is the one the rows' own facts state, so no caller names
+    /// it another way.
     ///
     /// A registration is held whole: each row to the rule of
     /// [`found`](Self::found), the rows together to the engine's full
@@ -207,6 +205,8 @@ pub trait Membership: Send + Sync + 'static {
     /// against that object. Every door reads the verb: a replacement by id
     /// states its thresholds whole, and any other write keeps the standing
     /// row's where a built worker states none.
+    ///
+    /// [`facts`]: super::facts
     fn found_rows(
         &self,
         maker: &Maker,
@@ -263,6 +263,8 @@ pub trait Membership: Send + Sync + 'static {
     /// then, or none. It asks ahead of the row's guard, so a worker that
     /// left reads as moved there. A door that keeps no object has nothing
     /// to hold it against.
+    ///
+    /// [`facts`]: super::facts
     fn refreshed(
         &self,
         seen: Standing,
@@ -317,16 +319,24 @@ const RANKS: Refused = Refused::Past(Past {
     why: "a registration states every rank of one engine under its own URL",
 });
 
+/// How a door reads the facts a built worker states over the row that
+/// stands under its URL, by the write's verb. A door whose rows hold a
+/// pairing descriptor reads the worker's own with them ([`paired`]). A door
+/// whose log carries none reads the facts alone, and the row keeps the
+/// descriptor that stands.
+pub(crate) type Reading = fn(&dyn Worker, Option<&WorkerFacts>, Option<Over<'_>>) -> WorkerFacts;
+
 /// The rows `built` states, handed to `write`: each worker's URL, and its
-/// facts over the row that stands there, by the write's verb ([`stated`]).
+/// facts over the row that stands there, as the door reads them (`read`).
 pub(crate) fn stating<T>(
     built: &[Arc<dyn Worker>],
     over: Option<Over<'_>>,
+    read: Reading,
     write: impl FnOnce(&[Stated<'_>]) -> T,
 ) -> T {
     let states: Vec<_> = built
         .iter()
-        .map(|worker| move |standing: Option<&WorkerFacts>| stated(worker.as_ref(), standing, over))
+        .map(|worker| move |standing: Option<&WorkerFacts>| read(worker.as_ref(), standing, over))
         .collect();
     let rows: Vec<_> = built
         .iter()
@@ -701,14 +711,17 @@ pub(crate) fn take(
 /// the door holds its turn: its labels, and the pairing descriptor they
 /// derive. The row's other facts are the test of the refresh's scope and
 /// are not written: the door states a row's event signal at its
-/// registration, and a refresh leaves it as it stands.
+/// registration, and a refresh leaves it as it stands. The worker is read
+/// as the door reads one (`read`), under no verb: a door whose log carries
+/// no descriptor keeps the standing one, so its refresh moves labels alone.
 pub(crate) fn refresh(
     turn: &impl Turn,
     seen: Standing,
     built: &dyn Worker,
+    read: Reading,
 ) -> Result<Wrote, Refused> {
     refresh_stated(turn, seen, built.url(), &|standing| {
-        facts(built, Some(standing))
+        read(built, Some(standing), None)
     })
 }
 
@@ -779,6 +792,8 @@ fn refresh_stated(
 
 /// The membership door over a store alone, for a host with no election or
 /// log. A host shares one door for its store so its writes share a turn.
+/// Its rows hold a pairing descriptor: a write of a built worker states the
+/// one the worker derived at its build.
 pub struct StoreDoor {
     store: Arc<MemoryStore>,
     base: u64,
@@ -864,7 +879,7 @@ impl Membership for StoreDoor {
     }
 
     // This door has no holder. The rows take the facts alone, by the
-    // write's verb.
+    // write's verb, each with its worker's own pairing descriptor.
     fn found_rows(
         &self,
         maker: &Maker,
@@ -872,7 +887,7 @@ impl Membership for StoreDoor {
         built: &[Arc<dyn Worker>],
         over: Option<Over<'_>>,
     ) -> Result<Vec<Wrote>, Refused> {
-        stating(built, over, |rows| self.rows(maker, expect, rows))
+        stating(built, over, paired, |rows| self.rows(maker, expect, rows))
     }
 
     fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
@@ -890,7 +905,10 @@ impl Membership for StoreDoor {
         built: &Arc<dyn Worker>,
         _: &Arc<dyn Worker>,
     ) -> Result<Wrote, Refused> {
-        self.call(|| refresh(self, seen, built.as_ref()), Wrote::changed)
+        self.call(
+            || refresh(self, seen, built.as_ref(), paired),
+            Wrote::changed,
+        )
     }
 }
 
@@ -909,7 +927,7 @@ pub(super) mod tests {
         identity::{basic::Worker, builder::BasicWorkerBuilder},
         model_card::ModelCard,
         settings::UnhealthyRemovalScope,
-        worker::{HealthCheckConfig, WorkerType},
+        worker::{HealthCheckConfig, RuntimeType, WorkerType},
     };
 
     use super::{
@@ -919,10 +937,10 @@ pub(super) mod tests {
     use crate::{
         demands::{DemandFacts, Demands},
         door::{
-            tests::{request, GATEWAY, MODEL},
+            tests::{pair_request, request, GATEWAY, MODEL},
             Door,
         },
-        spec::{AppliedSpec, PolicySpec},
+        spec::{AppliedSpec, Pairing, PolicySpec},
         store::{
             index::indexed_under,
             membership::{self, Past},
@@ -931,6 +949,7 @@ pub(super) mod tests {
             WorkerStatus, WorkersStore,
         },
         view::{Role, WireModes, WorkerId},
+        worker_host::facts,
     };
 
     const URL: &str = "http://worker:8000";
@@ -2112,6 +2131,111 @@ pub(super) mod tests {
             assert_eq!(unmoved, Ok(Wrote::Unmoved(row.id)));
             assert_eq!(store.by_key(URL).as_ref(), Some(&held));
         }
+    }
+
+    /// A worker of a runtime that names its transfer backend by a label, at
+    /// `url` in `role`, of `version`.
+    fn partner(url: &str, role: WorkerType, version: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            <BasicWorkerBuilder>::new(url)
+                .model(ModelCard::new(MODEL))
+                .worker_type(role)
+                .runtime_type(RuntimeType::Sglang)
+                .label("disaggregation_transfer_backend", "nixl")
+                .label("version", version)
+                .build(),
+        )
+    }
+
+    /// The store's door holds a pairing descriptor in its rows, so it states
+    /// the one a built worker derived, at a registration and at a refresh.
+    /// A holder still takes the object for the row's, since the table keeps
+    /// the row's own descriptor, and the same registration again writes
+    /// nothing. A refresh that moves the version label moves the
+    /// descriptor, and under the strict rule the next decision reads it:
+    /// the pair's request finds no pair, by name, and is placed again once
+    /// the prefill follows.
+    #[test]
+    fn the_stores_door_states_the_pairing_its_worker_derived() {
+        const DECODE: &str = "http://decode:8000";
+        let (store, door) = door();
+        let mut strict =
+            PolicySpec::pair_presets("least_load", "least_load").expect("the pair presets");
+        strict.generation = 1;
+        strict.plans.pd_pair.pairing = Pairing::Strict;
+        for side in ["prefill", "decode"] {
+            let profile = strict.profiles.get_mut(side).expect("the side's profile");
+            profile
+                .filter
+                .retain(|stage| !matches!(stage.name(), "has-capacity" | "has-room"));
+        }
+        store
+            .apply(AppliedSpec::validate(&strict).expect("the document validates"))
+            .expect("the first generation");
+        let prefill = partner(URL, WorkerType::Prefill, "1");
+        let decode = partner(DECODE, WorkerType::Decode, "1");
+        // Each row is laid, and a check's word makes it ready.
+        let ready = |built: &Arc<dyn Worker>| {
+            let wrote = door.found_built(&Maker::Control, Expect::Nothing, built, None);
+            assert!(wrote.is_ok(), "{wrote:?}");
+            let laid = store.by_key(built.url()).expect("the registered row");
+            let _ = store.set_status(laid.id, WorkerStatus::Ready, laid.revision);
+            store.by_key(built.url()).expect("the ready row")
+        };
+        let first = ready(&prefill);
+        let row = ready(&decode);
+        let said = row.facts.pairing.as_deref().expect("a descriptor");
+        assert_eq!(said.transport.as_deref(), Some("nixl"));
+        assert_eq!(said.version.as_deref(), Some("1"));
+        assert_eq!(facts(decode.as_ref(), Some(&row.facts)), row.facts);
+        let again = door.found_built(&Maker::Control, Expect::Anything, &decode, None);
+        assert_eq!(again, Ok(Wrote::Unmoved(row.id)));
+        let pairs = || {
+            store.publish_now();
+            store.with_world(|world| {
+                let classes = world.pairs(MODEL).expect("both pools hold a worker");
+                let refused = classes.refusal(WireModes::HTTP);
+                (
+                    classes.pairs(),
+                    refused.map(|refusal| refusal.mismatches.clone()),
+                )
+            })
+        };
+        // A pair's request, decided over the rows as they stand: the
+        // prefill and its decode, or nobody.
+        let policy = Door::new(Arc::clone(&store));
+        let placed = |id: &'static [u8]| {
+            store.publish_now();
+            let mut asked = pair_request(id);
+            asked.constraints.wire_modes = WireModes::HTTP;
+            let decided = policy.decide(GATEWAY, &asked, Instant::now());
+            let decided = decided.expect("a decision");
+            let target = decided.decision.pick()?.targets.first()?;
+            Some((target.id, target.pair.map(|pair| pair.decode_id)))
+        };
+        assert_eq!(pairs(), (1, None));
+        assert_eq!(placed(b"first"), Some((first.id, Some(row.id))));
+
+        // The decode comes back on another version: no pair, by name.
+        let rebuilt = partner(DECODE, WorkerType::Decode, "2");
+        let wrote = door.refreshed(standing(&row), &rebuilt, &decode);
+        assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
+        let moved = store.by_key(DECODE).expect("the refreshed row");
+        let version = moved
+            .facts
+            .pairing
+            .as_deref()
+            .and_then(|said| said.version.as_deref());
+        assert_eq!(version, Some("2"));
+        assert_eq!(pairs(), (0, Some(vec!["version".to_owned()])));
+        assert_eq!(placed(b"second"), None);
+
+        // The prefill follows, and the same request is placed again.
+        let followed = partner(URL, WorkerType::Prefill, "2");
+        let wrote = door.refreshed(standing(&first), &followed, &prefill);
+        assert_eq!(wrote, Ok(Wrote::InPlace(first.id)));
+        assert_eq!(pairs(), (1, None));
+        assert_eq!(placed(b"third"), Some((first.id, Some(row.id))));
     }
 
     #[test]
