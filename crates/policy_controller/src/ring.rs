@@ -1249,6 +1249,15 @@ mod tests {
     }
 
     #[test]
+    fn an_id_named_twice_joins_under_the_key_named_first() {
+        let mut twice = Ring::new();
+        assert_eq!(twice.add_many([(WorkerId(9), 1), (WorkerId(9), 2)]), 1);
+        let mut once = Ring::new();
+        assert_eq!(once.add_many([(WorkerId(9), 1)]), 1);
+        assert_eq!(twice.entries, once.entries);
+    }
+
+    #[test]
     fn a_mark_follows_its_member_when_a_joiner_takes_a_place_ahead_of_it() {
         let now = Instant::now();
         let mut ring = Ring::new();
