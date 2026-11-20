@@ -911,11 +911,12 @@ impl Deciding {
     }
 
     /// A decode call its gateway asks again, holding no answer to the
-    /// first: the side that call issued ends here, where no dispatch named
-    /// it ([`MemoryStore::end_issued_decode`]). It ends ahead of the
-    /// repeat's own decision and whatever its answer, and a pick of the
-    /// repeat issues the side anew. Counted as a request asked again, by
-    /// whether a side was ended.
+    /// first: the side that call issued returns to chosen here, where no
+    /// dispatch named it ([`MemoryStore::end_issued_decode`]). It returns
+    /// ahead of the repeat's own decision, so whatever the repeat answers
+    /// the first pick's dispatch books the side, and a pick of the repeat
+    /// issues it anew. Counted as a request asked again, by whether an
+    /// issue was taken back.
     #[cold]
     fn decode_asked_again(&self, gateway: GatewayId, lease: LeaseId) {
         let Reads { store, counts, .. } = &self.reads;
@@ -1117,9 +1118,8 @@ fn pair(
 /// names the decode side of `lease` (`DecideRequest.decode_of`): decided over
 /// the held prefill's partners ([`decode_in`]) and, for a pick, issued
 /// under the lease's id ([`issue_decode`]). The lease filed is the decode
-/// side's, and what its issue replaced is laid in `undo`. A repeat issues
-/// a side its own ending left. Out of line: no other request carries a
-/// part of it.
+/// side's, and its issue's count is laid in `undo`. Out of line: no other
+/// request carries a part of it.
 ///
 /// # Errors
 ///
@@ -1134,10 +1134,9 @@ fn decode_side(
     own: &Part,
     undo: &mut Option<DecodeIssue>,
 ) -> Result<(Decision, Result<Option<Lease>, LeaseRefused>), DecodeRefused> {
-    let asked = (lease, taken.request.again());
-    let (decision, booking) = decode_in(world, store, taken, asked, buffers, own)?;
+    let (decision, booking) = decode_in(world, store, taken, lease, buffers, own)?;
     let filed = booking
-        .map(|booking| issue_decode(store, world, taken, asked, &decision, booking))
+        .map(|booking| issue_decode(store, world, taken, lease, &decision, booking))
         .transpose()?;
     let lease = filed.map(|(lease, issue)| {
         *undo = Some(issue);
@@ -7290,8 +7289,8 @@ pub(crate) mod tests {
     }
 
     /// A repeat of the call frees the lost issue and issues the side anew
-    /// under the same lease id. The word ends the side the first call
-    /// issued, ahead of the repeat's own decision, and the engine hears
+    /// under the same lease id. The word takes back the first call's
+    /// issue, ahead of the repeat's own decision, and the engine hears
     /// that issue's release as abandoned.
     #[tokio::test]
     async fn a_repeat_of_the_call_frees_the_lost_issue_and_issues_the_side_anew() {
@@ -7324,28 +7323,37 @@ pub(crate) mod tests {
         assert_eq!(asked_again(&bed), [0, 1]);
     }
 
-    /// A repeat that sheds leaves the side ended: the ending is ahead of
-    /// the repeat's decision, whatever its answer. A frame without the word
-    /// is then refused as standing, and a repeat issues the side anew.
+    /// A repeat that sheds leaves the side chosen, as its first decision
+    /// filed it: the word took the lost issue back ahead of the repeat's
+    /// decision, whatever its answer. The gateway then sends the decode its
+    /// first pick named, and that dispatch books the side.
     #[tokio::test]
-    async fn a_repeat_that_sheds_leaves_the_side_ended() {
-        let (mut bed, _, prefill) = later_bed();
+    async fn a_repeat_that_sheds_leaves_the_side_chosen_for_the_first_picks_dispatch() {
+        let (mut bed, told, prefill) = later_bed();
         let (id, [chosen, other], _) = held(&mut bed).await;
         let store = Arc::clone(&bed.store);
+        let lease = LeaseId(id);
+        let filed = store.sides(GATEWAY, lease);
         bed.ask(call(1, id)).await;
         assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 1, 1]);
+        assert_ne!(store.sides(GATEWAY, lease), filed);
         let repeat = again(constrained(call(1, id), 0, Some(0)));
         let answer = bed.ask(repeat).await;
         assert!(matches!(outcome(&answer), Outcome::Shed(_)), "{answer:?}");
-        let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
-        assert_eq!(decode_on_file(&bed, id), (abandoned, other));
+        // The lease stands as its first decision filed it, both its parts:
+        // the first pick's targets and the lease's dispatch deadline.
+        assert_eq!(store.sides(GATEWAY, lease), filed);
         assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 1, 0]);
-        assert_eq!(busy(&bed.ask(call(1, id)).await), Reason::DecodeStands);
-        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 1, 0]);
-        let answer = bed.ask(again(call(1, id))).await;
-        assert_eq!(sides_of(&answer), [(id, proto::Side::Decode, 0)]);
-        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 1, 1]);
-        assert_eq!(asked_again(&bed), [1, 1]);
+        let abandoned = Some(ReleaseReason::Abandoned);
+        assert_eq!(told.lock().last(), Some(&(Side::Decode, other, abandoned)));
+        assert_eq!(asked_again(&bed), [0, 1]);
+        // The first pick's decode goes out: its dispatch books the side.
+        let leases: &dyn LeasesStore = store.as_ref();
+        let at = bed.script.taken;
+        assert!(leases.dispatched(GATEWAY, lease, sent(Side::Decode), at));
+        let sent_to = (LeaseState::Dispatched { at }, chosen);
+        assert_eq!(decode_on_file(&bed, id), sent_to);
+        assert_eq!(pair_counts(&store, [prefill, chosen, other]), [2, 2, 0]);
     }
 
     /// A repeat on a side still chosen is a first call: no call issued the
@@ -7427,9 +7435,9 @@ pub(crate) mod tests {
     }
 
     /// An undo undoes its own issue alone, under one reading of the clock.
-    /// Where the word ended that issue, and where a repeat issued the side
-    /// since, the first call's undo moves nothing and frees nothing: the
-    /// place counts the side's issues, and an undo names its own.
+    /// Where the word took that issue back, and where a repeat issued the
+    /// side since, the first call's undo moves nothing and frees nothing:
+    /// the place counts the side's issues, and an undo names its own.
     #[tokio::test]
     async fn an_undo_behind_a_repeats_issue_moves_nothing() {
         let (mut bed, _, prefill) = later_bed();

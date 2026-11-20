@@ -455,12 +455,14 @@ message DecideRequest {
   // Busy before a decider takes it (no credit, a full queue, a budget of 0)
   // ends nothing: the earlier lease waits out its dispatch deadline.
   //
-  // Beside decode_of the word reaches one side. It ends the decode side of
-  // the lease that field names, where a call issued it and no dispatch named
-  // it, and nothing else: no search by the id's fingerprint is run for a
-  // frame that carries decode_of, with the word or without. The ending is
-  // ahead of the decision, whatever its answer, and a pick of the same frame
-  // issues the side anew.
+  // Beside decode_of the word reaches one side. It takes back the issue of
+  // the decode side of the lease that field names, where a call issued it
+  // and no dispatch named it, and nothing else: no search by the id's
+  // fingerprint is run for a frame that carries decode_of, with the word or
+  // without. The side is chosen again and holds the first decision's decode
+  // targets, ahead of the decision and whatever its answer. A pick of the
+  // same frame issues it anew. Where the frame brings no pick, a Dispatched
+  // that names a target of the first decision books the side.
   bool again = 4;
   // This pair's decode is sent after its prefill has run. The decision names
   // the decode targets and issues the prefill side alone: the decode side is

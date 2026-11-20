@@ -2043,7 +2043,7 @@ fn a_call_issues_the_chosen_side_afresh_and_books_it_once() {
     let mut heard = None;
     assert!(store.unlocked());
     let (issued, _) = store
-        .issue_decided_decode(gateway, id, (decode, None), now, false, |lease| {
+        .issue_decided_decode(gateway, id, (decode, None), now, |lease| {
             assert!(!store.unlocked(), "the issue is told under the turn");
             heard = Some(*lease);
         })

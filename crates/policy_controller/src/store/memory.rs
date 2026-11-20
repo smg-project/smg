@@ -3514,26 +3514,23 @@ struct HeldDecode {
     /// How many calls issued the side. An undo names the count it issued
     /// under, so it undoes its own issue alone.
     issues: u8,
-    /// Whether its gateway's repeat ended the side's issue: a repeat alone
-    /// issues it anew.
-    ended_by_repeat: bool,
 }
 
-/// What one issue of a chosen decode side replaced, for a caller that may
-/// undo it ([`MemoryStore::unissue_decode`]): the side and the lease's
-/// dispatch deadline as they stood, and the count of the side's issues with
-/// this one.
+/// One issue of a chosen decode side, for a caller that may undo it
+/// ([`MemoryStore::unissue_decode`]): the count of the side's issues with
+/// this one. What the issue replaced stays with the side's place
+/// ([`Decodes::keep`]).
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(
     not(feature = "controller"),
     expect(dead_code, reason = "the served door alone undoes an issue")
 )]
-pub(crate) struct DecodeIssue {
-    before: DecodeSide,
-    deadline: Instant,
-    ended_by_repeat: bool,
-    count: u8,
-}
+pub(crate) struct DecodeIssue(u8);
+
+/// What an issue of a chosen decode side replaced: the side and the
+/// lease's dispatch deadline as they stood.
+#[cfg(feature = "controller")]
+type Replaced = (DecodeSide, Instant);
 
 impl HeldDecode {
     /// `side` as a door files it with `booked`, the slot of its worker's
@@ -3546,7 +3543,6 @@ impl HeldDecode {
             booked,
             filed_chosen,
             issues: 0,
-            ended_by_repeat: false,
         }
     }
 }
@@ -3560,6 +3556,11 @@ impl HeldDecode {
 struct Decodes {
     places: Vec<Option<(Key, HeldDecode)>>,
     free: Vec<u32>,
+    /// What the last issue of a chosen side replaced, by the side's place
+    /// and under its lease's key. A decode call's issue alone lays one: the
+    /// list is empty where no pair asks its decode later.
+    #[cfg(feature = "controller")]
+    replaced: Vec<Option<(Key, Replaced)>>,
 }
 
 impl Decodes {
@@ -3605,6 +3606,32 @@ impl Decodes {
         let (_, decode) = place.take_if(|(owner, _)| *owner == *key)?;
         self.free.push(at);
         Some(decode)
+    }
+
+    /// Keeps `replaced`, what an issue replaced of the side in the place
+    /// `at` of the lease under `key`, until that side is put back. A place
+    /// no side stands in keeps nothing.
+    #[cfg(feature = "controller")]
+    fn keep(&mut self, at: u32, key: Key, replaced: Replaced) {
+        let at = at as usize;
+        if at >= self.places.len() {
+            return;
+        }
+        if self.replaced.len() <= at {
+            self.replaced.resize(at + 1, None);
+        }
+        if let Some(place) = self.replaced.get_mut(at) {
+            *place = Some((key, replaced));
+        }
+    }
+
+    /// Takes what the last issue replaced of the side in the place `at`,
+    /// where that record is the lease's under `key`.
+    #[cfg(feature = "controller")]
+    fn kept(&mut self, at: u32, key: &Key) -> Option<Replaced> {
+        let place = self.replaced.get_mut(at as usize)?;
+        let (_, replaced) = place.take_if(|(owner, _)| *owner == *key)?;
+        Some(replaced)
     }
 }
 
@@ -3771,20 +3798,15 @@ impl Leases {
     }
 
     /// The place a decode call can issue into, while its prefill is held:
-    /// a side still chosen, and for a `repeat` a side the repeat's ending
-    /// left ([`Self::end_issued_decode`]).
-    fn chosen_decode(
-        &mut self,
-        key: &Key,
-        repeat: bool,
-    ) -> Result<(&mut Held, &mut HeldDecode), DecodeRefused> {
+    /// a side still chosen. A side a repeat's ending put back is one.
+    fn chosen_decode(&mut self, key: &Key) -> Result<(&mut Held, &mut HeldDecode), DecodeRefused> {
         let held = self.records.get_mut(key).ok_or(DecodeRefused::NoLease)?;
         let found = held
             .record
             .decode
             .and_then(|_| self.decodes.get_mut(held.decode, key))
             .ok_or(DecodeRefused::NotChosen)?;
-        if !(found.side.state.is_chosen() || (repeat && found.ended_by_repeat)) {
+        if !found.side.state.is_chosen() {
             return Err(if found.filed_chosen {
                 DecodeRefused::DecodeStands
             } else {
@@ -3797,48 +3819,35 @@ impl Leases {
         Ok((held, found))
     }
 
-    /// Ends the decode side under `key` where a call issued it and no
-    /// dispatch named it: its booking and its key's are freed, and it
-    /// stands released as abandoned, for a repeat alone to issue anew. The
-    /// lease comes back as the call found it, both its parts; `None` where
-    /// no such side stands, and nothing moves.
+    /// How many calls issued the decode side under `key`, where a call
+    /// issued it and no dispatch named it: `None` for any other side.
     #[cfg(feature = "controller")]
-    fn end_issued_decode(&mut self, key: &Key) -> Option<Sides> {
+    fn issued_decode(&self, key: &Key) -> Option<u8> {
         let held = self.records.get(key)?;
-        let at = held.decode;
-        let decode = self.decodes.get_mut(at, key)?;
-        if !(decode.filed_chosen && decode.side.state.is_issued()) {
-            return None;
-        }
-        decode.ended_by_repeat = true;
-        let found = self.found(key);
-        let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
-        self.end_side(key, Side::Decode, abandoned);
-        found
+        let decode = self.decodes.get(held.decode, key)?;
+        (decode.filed_chosen && decode.side.state.is_issued()).then_some(decode.issues)
     }
 
-    /// Undoes `issue`, one issue of the decode side under `key`, where the
-    /// side still waits under it: the booking and the key's are freed, and
-    /// the side and the lease's dispatch deadline stand as that issue found
-    /// them. A lease whose prefill ended since leaves the file here: no
-    /// later event ends a side that is not live. `false` where the side
-    /// moved since, by a dispatch, an ending or a later issue: nothing
-    /// moves then.
+    /// Puts the decode side under `key` back as its last issue found it:
+    /// the side and the lease's dispatch deadline stand as they stood, and
+    /// the booking and the key's are freed. A lease whose prefill ended
+    /// since leaves the file here: no later event ends a side that is not
+    /// live. `false` where no issue's record stands for the side, and
+    /// nothing moves.
     #[cfg(feature = "controller")]
-    fn unissue_decode(&mut self, key: &Key, issue: DecodeIssue) -> bool {
+    fn put_back(&mut self, key: &Key) -> bool {
         let Some(held) = self.records.get_mut(key) else {
+            return false;
+        };
+        let Some((before, deadline)) = self.decodes.kept(held.decode, key) else {
             return false;
         };
         let Some(decode) = self.decodes.get_mut(held.decode, key) else {
             return false;
         };
-        if !(decode.issues == issue.count && decode.side.state.is_issued()) {
-            return false;
-        }
         let side_key = keyed_decode(held.keyed, &decode.side);
-        decode.side = issue.before;
-        decode.ended_by_repeat = issue.ended_by_repeat;
-        held.record.dispatch_deadline = issue.deadline;
+        decode.side = before;
+        held.record.dispatch_deadline = deadline;
         let ended = !held.record.state.is_live() && !decode.side.state.is_live();
         if let Some(booked) = decode.booked.take() {
             self.counts.free(booked);
@@ -3852,38 +3861,58 @@ impl Leases {
         true
     }
 
+    /// Returns the decode side under `key` to chosen where a call issued
+    /// it and no dispatch named it ([`Self::put_back`]). The side holds
+    /// the first pick's targets again: that pick's dispatch books it, and
+    /// a later call issues it anew. The lease comes back as the call found
+    /// it, both its parts; `None` where no such side stands, and nothing
+    /// moves.
+    #[cfg(feature = "controller")]
+    fn end_issued_decode(&mut self, key: &Key) -> Option<Sides> {
+        self.issued_decode(key)?;
+        let found = self.found(key);
+        self.put_back(key).then_some(found).flatten()
+    }
+
+    /// Undoes `issue`, one issue of the decode side under `key`, where the
+    /// side still waits under it ([`Self::put_back`]). `false` where the
+    /// side moved since, by a dispatch, a repeat's ending or a later issue:
+    /// nothing moves then.
+    #[cfg(feature = "controller")]
+    fn unissue_decode(&mut self, key: &Key, issue: DecodeIssue) -> bool {
+        self.issued_decode(key) == Some(issue.0) && self.put_back(key)
+    }
+
     /// Replaces a chosen decode side in its place while the prefill is
-    /// held, and for a `repeat` a side the repeat's ending left. The side's
-    /// lease comes with what the issue replaced, for its undo.
+    /// held. What the issue replaced is kept with the place, for its undo
+    /// and for a repeat's ending. The side's lease comes with the issue's
+    /// count.
     fn issue_decode(
         &mut self,
         key: Key,
         mut decode: DecodeSide,
         booked: Option<Slot>,
         now: Instant,
-        repeat: bool,
     ) -> Result<(crate::Lease, DecodeIssue), DecodeRefused> {
-        let (held, found) = self.chosen_decode(&key, repeat)?;
-        let issue = DecodeIssue {
-            before: found.side,
-            deadline: held.record.dispatch_deadline,
-            ended_by_repeat: found.ended_by_repeat,
-            count: found.issues.wrapping_add(1),
-        };
+        let (held, found) = self.chosen_decode(&key)?;
+        #[cfg(feature = "controller")]
+        let kept = (held.decode, (found.side, held.record.dispatch_deadline));
+        let count = found.issues.wrapping_add(1);
         decode.state = LeaseState::issued(decode.state.session_ttl_micros());
         decode.target_index = 0;
         let laid = HeldDecode {
             side: decode,
             booked,
-            issues: issue.count,
-            ended_by_repeat: false,
+            issues: count,
             ..*found
         };
         *found = laid;
         held.record.dispatch_deadline = now + DISPATCH_TTL;
         let (record, keyed) = (held.record, held.keyed);
+        #[cfg(feature = "controller")]
+        self.decodes.keep(kept.0, key, kept.1);
         self.decode_laid(key, &record, &laid, keyed);
-        Ok((decode.lease(&record.lease), issue))
+        Ok((decode.lease(&record.lease), DecodeIssue(count)))
     }
 
     /// The keys of `gateway`'s leases on file.
@@ -4427,31 +4456,31 @@ impl MemoryStore {
         self.issue_minted(record, booked, Some((side, decode)), false, issued)
     }
 
-    /// [`LeasesStore::issue_decode`] with the slot from the decision's world,
-    /// and for a `repeat` on a side the repeat's ending left
-    /// ([`Self::end_issued_decode`]). The `issued` callback hears the decode
-    /// lease under the file's turn. The lease comes with what the issue
-    /// replaced, for a caller that may undo it ([`Self::unissue_decode`]).
+    /// [`LeasesStore::issue_decode`] with the slot from the decision's world.
+    /// The `issued` callback hears the decode lease under the file's turn.
+    /// The lease comes with the issue's count, for a caller that may undo
+    /// it ([`Self::unissue_decode`]).
     pub(crate) fn issue_decided_decode(
         &self,
         gateway: GatewayId,
         lease: LeaseId,
         (decode, booked): (DecodeSide, Option<Slot>),
         now: Instant,
-        repeat: bool,
         issued: impl FnOnce(&crate::Lease),
     ) -> Result<(crate::Lease, DecodeIssue), DecodeRefused> {
         let mut leases = self.turn_of(self.file_of(lease));
-        let (lease, issue) = leases.issue_decode((gateway, lease), decode, booked, now, repeat)?;
+        let (lease, issue) = leases.issue_decode((gateway, lease), decode, booked, now)?;
         issued(&lease);
         Ok((lease, issue))
     }
 
-    /// Ends the decode side of `gateway`'s lease `lease` where a call
-    /// issued it and no dispatch named it, for a gateway that asks that
-    /// call again and holds no answer to it: no dispatch will name the
-    /// side the lost answer carried. The side is released as abandoned
-    /// with its engine told, and a repeat alone issues it anew. `false`
+    /// Returns the decode side of `gateway`'s lease `lease` to chosen
+    /// where a call issued it and no dispatch named it, for a gateway that
+    /// asks that call again and holds no answer to it: no dispatch will
+    /// name the side the lost answer carried. The lost issue is released
+    /// as abandoned with its engine told, and the side holds the first
+    /// pick's targets again. That pick's dispatch books it whatever the
+    /// repeat answers, and a pick of the repeat issues it anew. `false`
     /// where no such side stands: one still chosen, one a dispatch named,
     /// one that ended.
     #[cfg(feature = "controller")]
@@ -4492,10 +4521,9 @@ impl MemoryStore {
         &self,
         gateway: GatewayId,
         lease: LeaseId,
-        repeat: bool,
     ) -> Result<WorkerId, DecodeRefused> {
         self.turn_of(self.file_of(lease))
-            .chosen_decode(&(gateway, lease), repeat)
+            .chosen_decode(&(gateway, lease))
             .map(|(held, _)| held.record.target)
     }
 
@@ -4944,7 +4972,7 @@ impl LeasesStore for MemoryStore {
         now: Instant,
     ) -> Result<(), DecodeRefused> {
         let booked = self.slots().of(decode.target);
-        self.issue_decided_decode(gateway, lease, (decode, booked), now, false, |_| ())
+        self.issue_decided_decode(gateway, lease, (decode, booked), now, |_| ())
             .map(|_| ())
     }
 

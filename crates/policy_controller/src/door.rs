@@ -1183,11 +1183,11 @@ pub(crate) fn decode_in<A: Asked>(
     world: &World,
     store: &MemoryStore,
     taken: &Taken<'_, A>,
-    (lease, repeat): (LeaseId, bool),
+    lease: LeaseId,
     buffers: &mut Buffers<A::Lists>,
     own: &Part,
 ) -> Result<(Decision, Option<DecodeBooking>), DecodeRefused> {
-    let prefill = store.held_prefill(taken.gateway, lease, repeat)?;
+    let prefill = store.held_prefill(taken.gateway, lease)?;
     let Buffers {
         pair,
         scratch,
@@ -1238,7 +1238,7 @@ pub(crate) fn decode_in<A: Asked>(
 /// under one hold of the file. The side is on file when the engine hears:
 /// a stage that panics there is held and counted, as under a report, and
 /// the caller still gets the pick the file holds. The side's lease comes
-/// with what the issue replaced, for a door that may undo it.
+/// with its issue's count, for a door that may undo it.
 ///
 /// # Errors
 ///
@@ -1247,12 +1247,12 @@ pub(crate) fn issue_decode<A: Asked>(
     store: &MemoryStore,
     world: &World,
     taken: &Taken<'_, A>,
-    (lease, repeat): (LeaseId, bool),
+    lease: LeaseId,
     decision: &Decision,
     booking: DecodeBooking,
 ) -> Result<(Lease, DecodeIssue), DecodeRefused> {
     let spec = world.spec();
-    store.issue_decided_decode(taken.gateway, lease, booking, taken.now, repeat, |lease| {
+    store.issue_decided_decode(taken.gateway, lease, booking, taken.now, |lease| {
         // The lease keeps the generation of its first decision, and the
         // engine of that generation alone hears its words ([`issuing`]).
         // Behind a reload the engine of this instant decided the side and
@@ -3359,12 +3359,10 @@ impl Door {
         lease: LeaseId,
     ) -> Result<Decided, Refused> {
         let store = &*self.store;
-        // In process no answer is lost: a call is never a repeat.
-        let asked = (lease, false);
-        let (decision, booking) = decode_in(world, store, taken, asked, buffers, &self.parts[at])
+        let (decision, booking) = decode_in(world, store, taken, lease, buffers, &self.parts[at])
             .map_err(Refused::Decode)?;
         let lease = booking
-            .map(|booking| issue_decode(store, world, taken, asked, &decision, booking))
+            .map(|booking| issue_decode(store, world, taken, lease, &decision, booking))
             .transpose()
             .map_err(Refused::Decode)?
             .map(|(lease, _)| lease);
