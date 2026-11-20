@@ -39,9 +39,10 @@ use crate::{
     affinity::{blocks_within, Gates, KvPressure, PrefixAffinity, WarmupSlice},
     bucket::Bucket,
     builtins::{
-        has_room_rule, with_report_age, FewestSessions, HasRoomRule, LeastCost, LeastCostSent,
-        LeastLoad, LeastRequests, ResidentWork, SampledBest, SessionAffinity,
-        DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
+        has_room_rule, with_report_age, FewestSessions, HasRoomRule, HasRoomSignals, LeastCost,
+        LeastCostSent, LeastCostSignals, LeastLoad, LeastRequests, ResidentWork, SampledBest,
+        SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS,
+        DEFAULT_THROUGHPUT,
     },
     catalog::{profile_sent, Catalog, FilterFactory, Found, PickerFactory, StageBuild},
     framework::{
@@ -52,8 +53,8 @@ use crate::{
     routing_key::KeySources,
     sent::SentCredit,
     sessions::SessionRule,
-    signals::SignalColumn,
-    terms::Term,
+    signals::{column_named, SignalColumn},
+    terms::{signal_named, Term, SIGNAL_FAMILY},
     view::{threshold_permille, HashKind, Phase, MAX_REPORT_AGE_MS},
 };
 
@@ -798,10 +799,16 @@ pub struct LeastCostParams {
     #[schemars(extend("exclusiveMinimum" = 0, "maximum" = COST_PARAMETER_LIMIT))]
     pub weight: f32,
     /// Field names and their coefficients. At least one field is required.
+    /// A name written `signal.<name>` reads a signal the document declares.
     #[serde(deserialize_with = "keyed_once")]
     #[schemars(extend(
         "minProperties" = 1,
-        "propertyNames" = { "enum": Term::NAMES.map(|(name, _)| name) },
+        "propertyNames" = {
+            "anyOf": [
+                { "enum": Term::NAMES.map(|(name, _)| name) },
+                { "pattern": signal_pattern() }
+            ]
+        },
         "additionalProperties" = {
             "type": "number",
             "format": "double",
@@ -811,11 +818,13 @@ pub struct LeastCostParams {
         }
     ))]
     pub terms: BTreeMap<String, f64>,
-    /// How far above the least cost a row still ties for the top score.
-    #[serde(default)]
+    /// How far above the least cost a row still ties for the top score: the
+    /// map of its two parts, or a bare number, the absolute margin.
+    #[serde(default, deserialize_with = "absolute_or_parts")]
+    #[schemars(with = "AbsoluteOrParts")]
     pub margin: CostMargin,
     /// What a row costs when a named value is missing. Required for terms
-    /// that read a report.
+    /// that read a report or a signal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unreported: Option<Unreported>,
 }
@@ -891,6 +900,69 @@ pub struct CostMargin {
     /// A share of the magnitude of the least cost.
     #[schemars(extend("minimum" = 0, "maximum" = RELATIVE_MARGIN_LIMIT))]
     pub relative: f64,
+}
+
+/// Reads a margin as a document writes it. A bare number is the absolute
+/// margin, and a map is read part by part.
+fn absolute_or_parts<'de, D: Deserializer<'de>>(deserializer: D) -> Result<CostMargin, D::Error> {
+    struct MarginVisitor;
+
+    impl<'de> Visitor<'de> for MarginVisitor {
+        type Value = CostMargin;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a number, the absolute margin, or a map of `absolute` and `relative`")
+        }
+
+        fn visit_f64<E: de::Error>(self, absolute: f64) -> Result<CostMargin, E> {
+            Ok(CostMargin {
+                absolute,
+                ..CostMargin::default()
+            })
+        }
+
+        fn visit_i64<E: de::Error>(self, absolute: i64) -> Result<CostMargin, E> {
+            self.visit_f64(absolute as f64)
+        }
+
+        fn visit_u64<E: de::Error>(self, absolute: u64) -> Result<CostMargin, E> {
+            self.visit_f64(absolute as f64)
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<CostMargin, A::Error> {
+            CostMargin::deserialize(de::value::MapAccessDeserializer::new(map))
+        }
+    }
+
+    deserializer.deserialize_any(MarginVisitor)
+}
+
+/// The schema of a margin's two forms in a document. It holds no value.
+enum AbsoluteOrParts {}
+
+impl JsonSchema for AbsoluteOrParts {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        "AbsoluteOrParts".into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "anyOf": [
+                {
+                    "description": "The absolute margin, in cost units.",
+                    "type": "number",
+                    "format": "double",
+                    "minimum": 0,
+                    "maximum": COST_PARAMETER_LIMIT
+                },
+                generator.subschema_for::<CostMargin>()
+            ]
+        })
+    }
 }
 
 /// The `best` picker's parameters.
@@ -1052,13 +1124,20 @@ impl FilterStage {
 #[serde(expecting = "a rule with `used` and `capacity`, or the bare name `has-room`")]
 pub struct HasRoomParams {
     /// What a worker holds: field names and their coefficients, summed. At
-    /// least one field of the worker is required under a capacity that is a
-    /// number: the request's size alone reads nothing of a worker there.
-    /// A worker that lacks a named value has no room.
+    /// least one is required. A name written `signal.<name>` reads a signal
+    /// the document declares. Under a capacity that is a number, a field
+    /// or a signal of the worker is required: the request's size alone
+    /// reads nothing of a worker there. A worker that lacks a named value
+    /// has no room.
     #[serde(deserialize_with = "keyed_once")]
     #[schemars(extend(
         "minProperties" = 1,
-        "propertyNames" = { "enum": room_fields() },
+        "propertyNames" = {
+            "anyOf": [
+                { "enum": room_fields() },
+                { "pattern": signal_pattern() }
+            ]
+        },
         "additionalProperties" = {
             "type": "number",
             "format": "double",
@@ -1068,12 +1147,25 @@ pub struct HasRoomParams {
         }
     ))]
     pub used: BTreeMap<String, f64>,
-    /// What a worker can hold, in the units of `used`.
+    /// What a worker can hold, in the units of `used`: a number, or a
+    /// signal the document declares. A worker whose capacity reads zero or
+    /// less has no room.
     pub capacity: Capacity,
     /// The share of the capacity kept free: from 0 to under 1.
     #[serde(default)]
     #[schemars(extend("minimum" = 0, "exclusiveMaximum" = 1))]
     pub headroom: f64,
+}
+
+/// The schema's pattern of a signal's name as a sum writes it: the
+/// family's name before the signal names' own pattern
+/// ([`SIGNAL_NAME_PATTERN`]), which is written once.
+fn signal_pattern() -> String {
+    format!(
+        "^{}{}",
+        SIGNAL_FAMILY.replace('.', r"\."),
+        SIGNAL_NAME_PATTERN.trim_start_matches('^')
+    )
 }
 
 /// The names `has-room` may sum: every term's, and the request's size.
@@ -1085,12 +1177,13 @@ fn room_fields() -> Vec<&'static str> {
 }
 
 /// What a worker can hold: a number above zero in the units of `used`, or
-/// the name of a field that holds one. No field of this build holds a
-/// capacity, so a name is read and refused.
+/// the name of a signal that holds one, written `signal.<name>`. No field
+/// of this build holds a capacity, so any other name is read and refused.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Capacity {
     Fixed(f64),
+    /// A name as the document writes it: a declared signal's.
     Field(String),
 }
 
@@ -1111,7 +1204,7 @@ impl<'de> Deserialize<'de> for Capacity {
             type Value = Capacity;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a number, or the name of a field that holds one")
+                f.write_str("a number, or a declared signal written signal.<name>")
             }
 
             fn visit_f64<E: de::Error>(self, capacity: f64) -> Result<Capacity, E> {
@@ -1142,10 +1235,10 @@ impl JsonSchema for Capacity {
 
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
         json_schema!({
-            "description": "What a worker can hold: a number above zero in the units of `used`, or the name of a field that holds one. No field of this build holds a capacity.",
+            "description": "What a worker can hold: a number above zero in the units of `used`, or a signal the document declares, written `signal.<name>`.",
             "anyOf": [
                 { "type": "number", "format": "double", "exclusiveMinimum": 0 },
-                { "type": "string" }
+                { "type": "string", "pattern": signal_pattern() }
             ]
         })
     }
@@ -2792,6 +2885,33 @@ fn resolve_signals(signals: &BTreeMap<String, SignalSpec>) -> Arc<[SignalColumn]
         .collect()
 }
 
+/// What a term's written name reads: a field of this build, or a signal
+/// the document declares.
+enum Named {
+    Field(Term),
+    Signal(SignalColumn),
+}
+
+/// The term `name` in the map `terms` of the stage at `at`. A name of the
+/// signal family (`signal.<name>`) reads a signal the document declares,
+/// and any other name a field of this build. A name that reads neither is
+/// refused at the map, by the name as written.
+fn named_term(
+    signals: &[SignalColumn],
+    at: &At,
+    terms: &str,
+    name: &str,
+) -> Result<Named, SpecError> {
+    match signal_named(name) {
+        Some(signal) => column_named(signals, signal)
+            .map(|column| Named::Signal(column.clone()))
+            .ok_or_else(|| at.bad(terms, name, "a signal the document declares")),
+        None => Term::named(name)
+            .map(Named::Field)
+            .ok_or_else(|| at.bad(terms, name, "a field this build reads")),
+    }
+}
+
 /// The first two keys that overlap, in the keys' order: the first key with
 /// a partner after it, and the first such partner. A `prefix*` and a
 /// `*suffix` of one literal length overlap: they match a common model and
@@ -2942,9 +3062,11 @@ fn check_stage(stage: &ScoreStage, at: &At) -> Result<(), SpecError> {
     }
 }
 
-/// Check the cost parameters while resolving the field names into readers.
+/// Check the cost parameters while resolving the field names into readers
+/// and the signals' names into their columns.
 fn least_cost_of(
     p: &LeastCostParams,
+    signals: &[SignalColumn],
     sent: impl FnOnce() -> Arc<SentCredit>,
     max_age_ms: Option<u64>,
     at: &At,
@@ -2961,9 +3083,9 @@ fn least_cost_of(
         return Err(at.bad("terms", "{}", "at least one field with its coefficient"));
     }
     let mut terms = Vec::new();
+    let mut signal_terms = Vec::new();
     for (name, &coefficient) in &p.terms {
-        let term =
-            Term::named(name).ok_or_else(|| at.bad("terms", name, "a field this build reads"))?;
+        let term = named_term(signals, at, "terms", name)?;
         if coefficient == 0.0
             || !(-COST_PARAMETER_LIMIT..=COST_PARAMETER_LIMIT).contains(&coefficient)
         {
@@ -2973,7 +3095,10 @@ fn least_cost_of(
                 "a finite number other than zero, of magnitude at most 1e15",
             ));
         }
-        terms.push((term, coefficient));
+        match term {
+            Named::Field(term) => terms.push((term, coefficient)),
+            Named::Signal(signal) => signal_terms.push((signal, coefficient)),
+        }
     }
     if !(0.0..=COST_PARAMETER_LIMIT).contains(&p.margin.absolute) {
         return Err(at
@@ -2998,15 +3123,25 @@ fn least_cost_of(
     }
     let reads_sent = terms.iter().any(|&(term, _)| term.reads_sent());
     let scorer = LeastCost::new(terms.into_boxed_slice(), p.margin, p.unreported);
-    if scorer.needs().loads && p.unreported.is_none() {
+    // A row with no fresh value for a named signal is unreported for the
+    // scorer, as a row with no report is: the document says what such a
+    // row costs.
+    if (scorer.needs().loads || !signal_terms.is_empty()) && p.unreported.is_none() {
         return Err(at.bad(
             "unreported", "null",
-            "what a row with no report costs, which a term that reads a report needs: over-least or missing-as-zero",
+            "what a row with no report, or with no fresh value of a signal, costs, which a term that reads a report or a signal needs: over-least or missing-as-zero",
         ));
     }
-    // Only a term that reads sends makes the profile's count, and the
-    // scorer that adds it.
-    Ok(if reads_sent {
+    // Only a term that reads sends makes the profile's count, and only a
+    // term that reads a signal the scorer that adds one.
+    Ok(if !signal_terms.is_empty() {
+        let scorer = LeastCostSignals::new(
+            scorer,
+            reads_sent.then(sent),
+            signal_terms.into_boxed_slice(),
+        );
+        with_report_age(scorer, max_age_ms)
+    } else if reads_sent {
         with_report_age(LeastCostSent::new(scorer, sent()), max_age_ms)
     } else {
         with_report_age(scorer, max_age_ms)
@@ -3120,6 +3255,7 @@ fn scorer_of(
     stage: &ScoreStage,
     gates: Gates,
     view: &ViewSpec,
+    signals: &[SignalColumn],
     sent: impl FnOnce() -> Arc<SentCredit>,
     at: &At,
 ) -> Result<Resolved<Box<dyn Scorer>>, SpecError> {
@@ -3169,7 +3305,7 @@ fn scorer_of(
             ResidentWork::new(p.request_tokens),
             max_age,
         )),
-        ScoreStage::LeastCost(p) => Resolved::Built(least_cost_of(p, sent, max_age, at)?),
+        ScoreStage::LeastCost(p) => Resolved::Built(least_cost_of(p, signals, sent, max_age, at)?),
     })
 }
 
@@ -3407,18 +3543,21 @@ fn filtered<'a>(
 fn filter_of(
     stage: &FilterStage,
     view: &ViewSpec,
+    signals: &[SignalColumn],
     sent: impl FnOnce() -> Arc<SentCredit>,
     at: &At,
 ) -> Result<Box<dyn Filter>, SpecError> {
     match stage {
-        FilterStage::HasRoom(p) => has_room_of(p, sent, view.max_report_age_ms, at),
+        FilterStage::HasRoom(p) => has_room_of(p, signals, sent, view.max_report_age_ms, at),
     }
 }
 
 /// Check the rule's parameters while resolving the field names into
-/// readers. Only a term that reads sends makes the profile's count.
+/// readers and the signals' names into their columns. Only a term that
+/// reads sends makes the profile's count.
 fn has_room_of(
     p: &HasRoomParams,
+    signals: &[SignalColumn],
     sent: impl FnOnce() -> Arc<SentCredit>,
     max_age_ms: Option<u64>,
     at: &At,
@@ -3427,13 +3566,13 @@ fn has_room_of(
         return Err(at.bad("used", "{}", "at least one field with its coefficient"));
     }
     let mut terms = Vec::new();
+    let mut signal_terms = Vec::new();
     let mut request_tokens = 0.0;
     for (name, &coefficient) in &p.used {
         let term = if name == HasRoomRule::REQUEST_TOKENS {
             None
         } else {
-            let named = Term::named(name);
-            Some(named.ok_or_else(|| at.bad("used", name, "a field this build reads"))?)
+            Some(named_term(signals, at, "used", name)?)
         };
         if coefficient == 0.0
             || !(-COST_PARAMETER_LIMIT..=COST_PARAMETER_LIMIT).contains(&coefficient)
@@ -3445,29 +3584,41 @@ fn has_room_of(
             ));
         }
         match term {
-            Some(term) => terms.push((term, coefficient)),
+            Some(Named::Field(term)) => terms.push((term, coefficient)),
+            Some(Named::Signal(signal)) => signal_terms.push((signal, coefficient)),
             None => request_tokens = coefficient,
         }
     }
-    let capacity = match &p.capacity {
-        Capacity::Fixed(capacity) if capacity.is_finite() && *capacity > 0.0 => *capacity,
+    // Under a signal's capacity the rule's own bound is that of a capacity
+    // of one: a row's value scales it.
+    let (capacity, capacity_signal) = match &p.capacity {
+        Capacity::Fixed(capacity) if capacity.is_finite() && *capacity > 0.0 => (*capacity, None),
         Capacity::Fixed(capacity) => {
             return Err(at.bad("capacity", capacity, "a finite number above zero"));
         }
-        // No field of this build holds a capacity.
-        Capacity::Field(name) => {
-            return Err(at.bad("capacity", name, "a field this build reads"));
-        }
+        // A name is a declared signal's: no field of this build holds a
+        // capacity.
+        Capacity::Field(name) => match signal_named(name) {
+            Some(signal) => {
+                let column = column_named(signals, signal)
+                    .ok_or_else(|| at.bad("capacity", name, "a signal the document declares"))?;
+                (1.0, Some(column.clone()))
+            }
+            None => {
+                return Err(at.bad("capacity", name, "a declared signal, written signal.<name>"))
+            }
+        },
     };
     // Under a capacity that is a number, the request's size alone is one
     // answer for every row: such a rule reads nothing of a worker, and it
-    // keeps every row or steps aside. A capacity read of each worker would
-    // make it a rule, so the capacity is settled first.
-    if terms.is_empty() {
+    // keeps every row or steps aside. A signal in the sum reads a worker,
+    // and so does a capacity read of each worker, so both are settled
+    // first.
+    if terms.is_empty() && signal_terms.is_empty() && capacity_signal.is_none() {
         return Err(at.bad(
             "used",
             HasRoomRule::REQUEST_TOKENS,
-            "at least one field of the worker beside the request's size",
+            "at least one field or signal of the worker beside the request's size",
         ));
     }
     if !(0.0..1.0).contains(&p.headroom) {
@@ -3481,7 +3632,18 @@ fn has_room_of(
         p.headroom,
         reads_sent.then(sent),
     );
-    Ok(has_room_rule(rule, max_age_ms))
+    // The signal form is a type of its own: a rule that names no signal
+    // is built as it is with no signal declared.
+    Ok(if signal_terms.is_empty() && capacity_signal.is_none() {
+        has_room_rule(rule, max_age_ms)
+    } else {
+        Box::new(HasRoomSignals::new(
+            rule,
+            signal_terms.into_boxed_slice(),
+            capacity_signal,
+            max_age_ms,
+        ))
+    })
 }
 
 /// What a score entry stands for.
@@ -3707,7 +3869,7 @@ fn check_profile(
             Filtered::Typed(stage) => {
                 let stage_at = At::new(format!("{}.filter[{index}].{}", at.0, stage.name()));
                 let count = || profile_sent(&mut sent, name, p.sent_ttl_ms);
-                filter_of(stage, view, count, &stage_at)?
+                filter_of(stage, view, from.signals, count, &stage_at)?
             }
         };
         filters.push(filter);
@@ -3729,7 +3891,7 @@ fn check_profile(
         check_stage(&stage, &stage_at)?;
         check_prefix_depth(&stage, gates, view, &stage_at)?;
         let count = || profile_sent(&mut sent, name, p.sent_ttl_ms);
-        match scorer_of(&stage, gates, view, count, &stage_at)? {
+        match scorer_of(&stage, gates, view, from.signals, count, &stage_at)? {
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
                 depth.deepen(read);
@@ -7305,6 +7467,7 @@ mod tests {
             &stage,
             Gates::of(None, None, None),
             &spec.view,
+            &[],
             || panic!("no term reads sends"),
             &At::new("profiles.p.score[0].least-cost"),
         )

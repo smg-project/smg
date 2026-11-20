@@ -11,6 +11,10 @@ use smg_policy_controller::{
     Catalog, PolicySpec,
 };
 
+/// A signal's name as a sum writes it: `signal.` before a name of the
+/// signal names' own pattern.
+const SIGNAL_TERM: &str = r"^signal\.[a-z][a-z0-9_]{0,62}$";
+
 fn schema_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("policyspec.schema.json")
 }
@@ -53,18 +57,23 @@ fn the_committed_schema_admits_least_cost_with_terms_and_a_margin() {
     let params = &defs["LeastCostParams"];
     assert_eq!(params["required"], serde_json::json!(["terms"]));
     let terms = &params["properties"]["terms"];
+    // A name is one of the closed list, or a declared signal's behind the
+    // family's name.
     assert_eq!(
-        terms["propertyNames"]["enum"],
+        terms["propertyNames"]["anyOf"],
         serde_json::json!([
-            "candidate.in_flight",
-            "load.active_kv_permille",
-            "load.kv_usage_permille",
-            "load.queued",
-            "load.resident_tokens",
-            "load.running",
-            "load.waiting_uncached_tokens",
-            "sent.requests",
-            "sent.tokens",
+            { "enum": [
+                "candidate.in_flight",
+                "load.active_kv_permille",
+                "load.kv_usage_permille",
+                "load.queued",
+                "load.resident_tokens",
+                "load.running",
+                "load.waiting_uncached_tokens",
+                "sent.requests",
+                "sent.tokens",
+            ] },
+            { "pattern": SIGNAL_TERM }
         ])
     );
     let coefficient = &terms["additionalProperties"];
@@ -72,7 +81,10 @@ fn the_committed_schema_admits_least_cost_with_terms_and_a_margin() {
     assert_eq!(coefficient["minimum"], -1e15);
     assert_eq!(coefficient["maximum"], 1e15);
     assert_eq!(coefficient["not"]["const"], 0);
-    assert_eq!(params["properties"]["margin"]["$ref"], "#/$defs/CostMargin");
+    let margin = &params["properties"]["margin"]["anyOf"];
+    assert_eq!(margin[0]["type"], "number");
+    assert_eq!(margin[0]["minimum"], 0);
+    assert_eq!(margin[1]["$ref"], "#/$defs/CostMargin");
     assert_eq!(defs["CostMargin"]["properties"]["absolute"]["default"], 0.0);
     assert_eq!(defs["CostMargin"]["properties"]["relative"]["default"], 0.0);
     assert_eq!(
@@ -166,7 +178,8 @@ fn the_committed_schema_admits_a_filter_by_its_name_and_by_its_name_with_paramet
     let rule = &defs["HasRoomParams"];
     assert_eq!(rule["required"], serde_json::json!(["used", "capacity"]));
     assert_eq!(rule["additionalProperties"], false);
-    let names = rule["properties"]["used"]["propertyNames"]["enum"]
+    let names = &rule["properties"]["used"]["propertyNames"]["anyOf"];
+    let listed = names[0]["enum"]
         .as_array()
         .expect("the names the rule may sum");
     for name in [
@@ -174,8 +187,11 @@ fn the_committed_schema_admits_a_filter_by_its_name_and_by_its_name_with_paramet
         "request.prompt_tokens",
         "sent.tokens",
     ] {
-        assert!(names.iter().any(|listed| listed == name), "{name}");
+        assert!(listed.iter().any(|listed| listed == name), "{name}");
     }
+    // A signal's name is summed too, and a signal may hold the capacity.
+    assert_eq!(names[1]["pattern"], SIGNAL_TERM);
+    assert_eq!(defs["Capacity"]["anyOf"][1]["pattern"], SIGNAL_TERM);
 }
 
 /// Every object schema under `root` either lists its properties and refuses

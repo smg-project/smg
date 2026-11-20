@@ -196,14 +196,106 @@ impl SignalColumn {
     #[inline]
     pub fn read(&self, facts: &RequestFacts<'_>, row: &Candidate) -> Option<f64> {
         let cell = facts.signal_cells?.cell(row.position, self.column)?;
+        fresh(cell, self.oldest(facts))
+    }
+
+    /// The oldest sample instant a decision still reads of the signal: one
+    /// value for every row of a decision, where an age is a subtraction a
+    /// row. A pass takes it once.
+    #[inline]
+    pub(crate) fn oldest(&self, facts: &RequestFacts<'_>) -> u64 {
+        facts.now_micros.saturating_sub(self.max_age_micros)
+    }
+
+    /// The value among one row's cells ([`SignalCells::row`]), for a pass
+    /// that took [`Self::oldest`] once: `None` where the row holds no
+    /// value, or one sampled before that instant.
+    #[inline]
+    pub(crate) fn among(&self, cells: &[SignalCell], oldest: u64) -> Option<f64> {
+        fresh(cells.get(usize::from(self.column))?, oldest)
+    }
+}
+
+/// The cell's value, where it holds one sampled at or after `oldest`.
+#[inline]
+fn fresh(cell: &SignalCell, oldest: u64) -> Option<f64> {
+    debug_assert!(
+        cell.is_none() || cell.value.is_finite(),
+        "a signal's value is finite: no source states another"
+    );
+    (!cell.is_none() && cell.sampled_at_micros >= oldest).then_some(cell.value)
+}
+
+/// The column of the signal `name` among a document's resolved columns,
+/// which stand in name order. The one search behind every stage that
+/// names a signal: a registered stage's context and the typed stages ask
+/// here.
+pub(crate) fn column_named<'a>(
+    signals: &'a [SignalColumn],
+    name: &str,
+) -> Option<&'a SignalColumn> {
+    let at = signals
+        .binary_search_by(|column| column.name().cmp(name))
+        .ok()?;
+    signals.get(at)
+}
+
+/// A signal a sum prices: its column, resolved where the stage is built,
+/// and its coefficient.
+pub(crate) type SignalTerm = (SignalColumn, f64);
+
+/// One pass's reads of the signals a stage sums. Once a pass: the facts'
+/// cells, and each term's oldest instant still read. Once a row: the
+/// row's cells ([`Self::row`]). A term is then an index, a test and a
+/// multiply and add.
+pub(crate) struct SignalSums<'a> {
+    cells: Option<&'a SignalCells>,
+    terms: &'a [SignalTerm],
+    /// Each term's oldest instant still read, in the terms' order.
+    oldest: [u64; MAX_SIGNALS],
+}
+
+impl<'a> SignalSums<'a> {
+    #[inline(always)]
+    pub(crate) fn new(facts: &RequestFacts<'a>, terms: &'a [SignalTerm]) -> Self {
         debug_assert!(
-            cell.is_none() || cell.value.is_finite(),
-            "a signal's value is finite: no source states another"
+            terms.len() <= MAX_SIGNALS,
+            "a sum names a declared signal once"
         );
-        // The oldest sample instant still read: one value for every row
-        // of a decision, where an age is a subtraction a row.
-        let oldest = facts.now_micros.saturating_sub(self.max_age_micros);
-        (!cell.is_none() && cell.sampled_at_micros >= oldest).then_some(cell.value)
+        let mut oldest = [0; MAX_SIGNALS];
+        for (oldest, (signal, _)) in oldest.iter_mut().zip(terms) {
+            *oldest = signal.oldest(facts);
+        }
+        Self {
+            cells: facts.signal_cells,
+            terms,
+            oldest,
+        }
+    }
+
+    /// The row's cells: `None` where the facts hand no cells, and for a
+    /// row outside them.
+    #[inline(always)]
+    pub(crate) fn row(&self, row: &Candidate) -> Option<&'a [SignalCell]> {
+        self.cells?.row(row.position)
+    }
+
+    /// `sum` with each term's value times its coefficient added, in the
+    /// terms' order, and whether every term had a fresh value. A term
+    /// with none adds nothing.
+    #[inline(always)]
+    pub(crate) fn add(&self, mut sum: f64, cells: Option<&[SignalCell]>) -> (f64, bool) {
+        let Some(cells) = cells else {
+            return (sum, self.terms.is_empty());
+        };
+        let mut whole = true;
+        for ((signal, coefficient), &oldest) in self.terms.iter().zip(&self.oldest) {
+            match signal.among(cells, oldest) {
+                Some(value) => sum += value * coefficient,
+                None => whole = false,
+            }
+        }
+        (sum, whole)
     }
 }
 

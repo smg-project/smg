@@ -315,6 +315,33 @@ fn a_send_takes_room_until_a_report_or_the_profiles_limit_ends_it() {
 }
 
 #[test]
+fn a_sends_request_and_its_tokens_each_take_room_by_their_own_coefficient() {
+    let policy =
+        policy(r#"{"has-room":{"used":{"sent.requests":100,"sent.tokens":1},"capacity":250}}"#);
+    let rows = [row(0, 0), row(1, 0)];
+    let send = || {
+        let lease = Lease {
+            issued_micros: NOW + 1,
+            tokens: 50,
+            ..Lease::default()
+        };
+        let target = Target {
+            id: rows[0].id,
+            ..Target::default()
+        };
+        policy.on_dispatched(&lease, &target, Side::Single, 0);
+    };
+    // One send of 50 tokens holds 100 and 50 of the 250. Under the
+    // request's coefficient its tokens alone would hold 5,000.
+    send();
+    assert_eq!(kept(&policy, 0, &request(0), &rows), [0, 1]);
+    // Two hold 200 and 100. Under the tokens' coefficient the two requests
+    // would hold 2, and the row would stay.
+    send();
+    assert_eq!(kept(&policy, 0, &request(0), &rows), [1]);
+}
+
+#[test]
 fn the_rule_ahead_of_a_hard_filter_decides_as_the_rule_behind_it() {
     let ahead = policy(&format!(r#"{RESIDENT},"healthy""#));
     let behind = policy(&format!(r#""healthy",{RESIDENT}"#));
@@ -359,15 +386,15 @@ fn each_part_of_the_rule_is_refused_at_its_path() {
             r#"{"used":{"request.prompt_tokens":1},"capacity":10}"#,
             "used",
             "request.prompt_tokens",
-            "at least one field of the worker beside the request's size",
+            "at least one field or signal of the worker beside the request's size",
         ),
-        // The capacity is settled first: under one read by a field's name
-        // the refusal is the capacity's, which this build does not read.
+        // The capacity is settled first: under a name that is no signal's
+        // the refusal is the capacity's.
         (
             r#"{"used":{"request.prompt_tokens":1},"capacity":"load.capacity"}"#,
             "capacity",
             "load.capacity",
-            "a field this build reads",
+            "a declared signal, written signal.<name>",
         ),
         (
             r#"{"used":{"load.nothing":1},"capacity":10}"#,
@@ -399,12 +426,12 @@ fn each_part_of_the_rule_is_refused_at_its_path() {
             "-3",
             "a finite number above zero",
         ),
-        // No field of this build holds a capacity.
+        // No field of this build holds a capacity: a name is a signal's.
         (
             r#"{"used":{"load.running":1},"capacity":"load.capacity"}"#,
             "capacity",
             "load.capacity",
-            "a field this build reads",
+            "a declared signal, written signal.<name>",
         ),
         (
             r#"{"used":{"load.running":1},"capacity":10,"headroom":1}"#,
@@ -461,7 +488,7 @@ fn a_rule_that_leaves_a_part_out_is_refused_at_the_parse() {
         ),
         (
             r#"{"used":{"load.running":1},"capacity":true}"#,
-            "a number, or the name of a field that holds one",
+            "a number, or a declared signal written signal.<name>",
         ),
     ] {
         let error = serde_json::from_str::<PolicySpec>(&format!(
