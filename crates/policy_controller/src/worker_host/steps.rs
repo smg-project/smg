@@ -377,13 +377,17 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
                     continue;
                 }
             };
-            let Some(current) = registry
-                .get(&id)
-                .filter(|current| current.revision() == revision)
-            else {
-                skipped(url, "the worker moved after selection");
+            // Gone between the two reads: the job's, as a worker gone
+            // ahead of them.
+            let Some(current) = registry.get(&id) else {
+                skipped(url, "no worker stands in the registry");
+                kept.push(Arc::clone(worker));
                 continue;
             };
+            if current.revision() != revision {
+                skipped(url, "the worker moved after selection");
+                continue;
+            }
             // An object no row stands for is not the store's: the job keeps
             // it for the host's own steps.
             let Some(seen) = self.objects.standing_of(&id, &current) else {
@@ -451,14 +455,15 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
                 skipped(url, "no worker stands in the registry");
                 continue;
             };
-            let Some(current) = registry
-                .get(&id)
-                .filter(|current| Arc::ptr_eq(current, worker))
-            else {
+            let Some(current) = registry.get(&id) else {
+                skipped(url, "no worker stands in the registry");
+                continue;
+            };
+            if !Arc::ptr_eq(&current, worker) {
                 skipped(url, "the worker moved while draining");
                 standing.push(url.to_owned());
                 continue;
-            };
+            }
             let Some(seen) = self.objects.standing_of(&id, &current) else {
                 skipped(url, "no row stands for this object");
                 continue;
@@ -884,7 +889,39 @@ mod tests {
         // The removal's guard names the row that left: the new one stays.
         f.remove().execute(&mut removal).await.expect("skipped");
         assert!(removal.data.removed_workers.is_empty());
+        assert!(removal.data.worker_urls.is_empty());
         assert_eq!(f.store.by_key(URL), Some(anew));
+    }
+
+    /// The door answers that the row left, under an object the holder has
+    /// not dropped yet: the worker stays the job's at either step.
+    #[tokio::test]
+    async fn a_removal_keeps_a_worker_whose_row_left_before_the_holder_followed() {
+        let f = Fixture::new();
+        let built = worker(URL, "model");
+        let maker = Maker::Control;
+        let by = Remover::Maker(&maker);
+        for at_the_drain in [true, false] {
+            f.seed(&maker, built.as_ref()).expect("registered");
+            let live = f.host.registry.get_by_url(URL).expect("the held worker");
+            let id = f.host.registry.get_id_by_url(URL).expect("its id");
+            let seen = f.objects.standing_of(&id, &live).expect("its row");
+            let mut removal = f.removal(WorkerJobAsker::Api, vec![Arc::clone(&live)]);
+            if !at_the_drain {
+                f.drain().execute(&mut removal).await.expect("drained");
+                assert_eq!(removal.data.drained_workers.len(), 1);
+            }
+            f.door.gone(by, URL, seen).expect("the row left");
+            if at_the_drain {
+                f.drain().execute(&mut removal).await.expect("skipped");
+                assert!(removal.data.drained_workers.is_empty());
+            } else {
+                f.remove().execute(&mut removal).await.expect("skipped");
+                assert!(removal.data.removed_workers.is_empty());
+            }
+            assert_eq!(removal.data.worker_urls, [URL]);
+            f.objects.follow(&*f.store);
+        }
     }
 
     #[tokio::test]
