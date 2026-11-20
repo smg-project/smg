@@ -764,6 +764,16 @@ impl GrammarStart {
 
 const REDACTED_API_KEY: &str = "<redacted>";
 
+/// An address that carries no rank, in its redacted form. One the parser
+/// refuses, as it refuses an `@` and digits at the end, is written as a
+/// marker and never raw.
+fn redacted_unranked(address: &str) -> String {
+    Endpoint::parse(address).map_or_else(
+        |_| "<unparsable address>".to_string(),
+        |address| address.redacted(),
+    )
+}
+
 /// Core worker identity and configuration.
 ///
 /// The single canonical representation of "what is a worker". Used as the
@@ -955,20 +965,14 @@ impl std::fmt::Debug for WorkerSpec {
         } = self;
 
         // An address prints in its redacted form: its userinfo can carry
-        // a credential. A rank is read out of the address alone that a
-        // registration wrote beside its base: in any other, an `@` and
-        // digits at the end are a userinfo and a host, and read as a rank
-        // they would print the userinfo.
-        let unranked = |address: &str| {
-            Endpoint::parse(address).map_or_else(
-                |_| "<unparsable address>".to_string(),
-                |address| address.redacted(),
-            )
-        };
-        let url = if dp_base_url.is_some() {
+        // a credential. A rank is read out of the address alone that is
+        // its base, an `@` and digits: in any other, an `@` and digits at
+        // the end are a userinfo and a host, and read as a rank they would
+        // print the userinfo.
+        let url = if self.url_is_ranked() {
             Endpoint::redacted_str(url)
         } else {
-            unranked(url.as_str())
+            redacted_unranked(url)
         };
         f.debug_struct("WorkerSpec")
             .field("url", &url)
@@ -983,7 +987,10 @@ impl std::fmt::Debug for WorkerSpec {
             .field("api_key", &api_key.is_some().then_some(REDACTED_API_KEY))
             .field("bootstrap_port", bootstrap_port)
             .field("bootstrap_host", bootstrap_host)
-            .field("dp_base_url", &dp_base_url.as_deref().map(unranked))
+            .field(
+                "dp_base_url",
+                &dp_base_url.as_deref().map(redacted_unranked),
+            )
             .field("dp_rank", dp_rank)
             .field("dp_size", dp_size)
             .field("kv_connector", kv_connector)
@@ -1039,6 +1046,40 @@ impl WorkerSpec {
             multimodal_shm_min_bytes: None,
             zmq_handshake_address: None,
             overload: OverloadUpdate::default(),
+        }
+    }
+
+    /// Whether [`Self::url`] carries a rank: it is the spec's base
+    /// ([`Self::dp_base_url`]), an `@` and digits, as a registration writes
+    /// a rank's address beside its base. In any other address an `@` and
+    /// digits at the end are a userinfo and a host, and no rank is read
+    /// out of it.
+    pub fn url_is_ranked(&self) -> bool {
+        self.dp_base_url
+            .as_deref()
+            .and_then(|base| self.url.strip_prefix(base))
+            .and_then(|rest| rest.strip_prefix('@'))
+            .is_some_and(|rank| {
+                !rank.is_empty() && rank.bytes().all(|digit| digit.is_ascii_digit())
+            })
+    }
+
+    /// [`Self::url`] as a request's success path shows it: the registered
+    /// string byte for byte where it holds no userinfo, query or fragment,
+    /// and its redacted form otherwise ([`Endpoint::redacted_url`]). A
+    /// rank is read out of the address by the spec's own fields alone
+    /// ([`Self::url_is_ranked`]). An address that ends in an `@` and
+    /// digits beside no such base is a userinfo before a host: it is
+    /// written as a marker, never raw.
+    pub fn redacted_url(&self) -> String {
+        if self.url_is_ranked() {
+            return Endpoint::redacted_url(&self.url);
+        }
+        match Endpoint::parse(&self.url) {
+            Ok(address) if !address.has_credentials() && !self.url.contains(['?', '#']) => {
+                self.url.clone()
+            }
+            _ => redacted_unranked(&self.url),
         }
     }
 }
@@ -2708,13 +2749,69 @@ mod debug_tests {
             assert!(!text.contains("pebble"), "{text}");
         }
 
-        // A base carries no rank, and the address written beside it does.
-        spec.url = "http://worker:8000@1".to_string();
+        // A base carries no rank, and the address built from it does: the
+        // base, an `@` and digits.
+        spec.url = "http://cedar@worker:8000@1".to_string();
+        spec.dp_base_url = Some("http://cedar@worker:8000".to_string());
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(!text.contains("cedar"), "{text}");
+            assert!(
+                text.contains(r#"url: "http://***@worker:8000@1""#),
+                "{text}"
+            );
+            assert!(text.contains(r#""http://***@worker:8000""#), "{text}");
+        }
+
+        // A base that itself ends in an `@` and digits reads as no rank.
+        spec.url = "http://cedar@8001@1".to_string();
         spec.dp_base_url = Some("http://cedar@8001".to_string());
         for text in [format!("{spec:?}"), format!("{spec:#?}")] {
             assert!(!text.contains("cedar"), "{text}");
-            assert!(text.contains(r#"url: "http://worker:8000@1""#), "{text}");
         }
+    }
+
+    #[test]
+    fn a_base_beside_an_address_that_is_not_its_rank_prints_no_userinfo() {
+        // A base is set and the address is not that base with a rank: the
+        // `@` and the digits at its end are a userinfo and a numeric host.
+        let mut spec = WorkerSpec::new("http://pebble@2130706433");
+        spec.dp_base_url = Some("http://other:8000".to_string());
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(!text.contains("pebble"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_spec_ranks_the_address_that_is_its_base_and_digits_alone() {
+        let mut spec = WorkerSpec::new("http://worker:8000@1");
+        // No base: no rank is read, and the address is no plain one.
+        assert!(!spec.url_is_ranked());
+        assert_eq!(spec.redacted_url(), "<unparsable address>");
+        spec.dp_base_url = Some("http://worker:8000".to_string());
+        assert!(spec.url_is_ranked());
+        assert_eq!(spec.redacted_url(), "http://worker:8000@1");
+        // The base, an `@` and digits, and nothing else.
+        for url in [
+            "http://worker:8000",
+            "http://worker:8000@",
+            "http://worker:8000@1a",
+            "http://worker:80001@1",
+            "http://other:8000@1",
+        ] {
+            spec.url = url.to_string();
+            assert!(!spec.url_is_ranked(), "{url}");
+        }
+        // A base with a userinfo is masked, and its rank is kept.
+        spec.url = "http://cedar@worker:8000@12".to_string();
+        spec.dp_base_url = Some("http://cedar@worker:8000".to_string());
+        assert!(spec.url_is_ranked());
+        assert_eq!(spec.redacted_url(), "http://***@worker:8000@12");
+        // A plain address is the registered string, byte for byte.
+        let plain = WorkerSpec::new("http://Worker:8080/");
+        assert_eq!(plain.redacted_url(), "http://Worker:8080/");
+        // A userinfo before a host of digits is masked as a marker.
+        let token = WorkerSpec::new("http://pebble@2130706433");
+        assert!(!token.redacted_url().contains("pebble"));
     }
 
     #[test]

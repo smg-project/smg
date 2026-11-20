@@ -423,7 +423,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
         let metadata = WorkerMetadata {
             overload: OverloadThresholds::resolve(&self.spec.overload, self.overload_defaults),
             pd_pairing: PdPairing::derive(&self.spec),
-            redacted_url: Endpoint::redacted_url(&self.spec.url),
+            redacted_url: self.spec.redacted_url(),
             decoding: DecodingLabels::of(&self.spec),
             spec: Arc::new(self.spec),
             health_config,
@@ -579,6 +579,20 @@ mod tests {
             .build();
         assert_eq!(with_secret.url(), "http://user:secret@worker:8080@2");
         assert_eq!(with_secret.redacted_url(), "http://***@worker:8080@2");
+    }
+
+    /// A rank is read out of an address by its spec's own fields alone. An
+    /// address that ends in an `@` and digits beside no base, or beside a
+    /// base it is not built from, is a userinfo before a host: it is
+    /// rendered as a marker, never raw.
+    #[test]
+    fn the_rendered_url_reads_no_rank_out_of_an_address_its_spec_does_not_rank() {
+        let alone = BasicWorkerBuilder::new("http://pebble@2130706433").build();
+        assert!(!alone.redacted_url().contains("pebble"));
+        let mut spec = WorkerSpec::new("http://pebble@2130706433");
+        spec.dp_base_url = Some("http://other:8000".to_string());
+        let beside = BasicWorkerBuilder::from_spec(spec).build();
+        assert!(!beside.redacted_url().contains("pebble"));
     }
 
     #[test]
