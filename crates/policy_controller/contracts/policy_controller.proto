@@ -909,13 +909,18 @@ message WorkerSpec {
   // (WorkerEvent.ranks). Every rule holds before the first write: a
   // refusal of a rank or of the group writes nothing. A lead lost between
   // two ranks is UNAVAILABLE and leaves the ranks written before it: a
-  // MODE_UPSERT lays the rest, and a MODE_ADD meets them as ALREADY_EXISTS.
+  // MODE_UPSERT lays the rest, and so does the same MODE_ADD called again.
   // At most 64: INVALID_ARGUMENT above, and above 1 where the controller's
   // build lays no ranks.
   //
   // The modes hold for the engine. MODE_ADD: ALREADY_EXISTS where a row
   // stands under a rank's URL or the engine stands in another form (its
-  // plain row, or ranks the registration does not state). MODE_REPLACE:
+  // plain row, or ranks the registration does not state). One standing is
+  // the add's own: where every rank that stands is this caller's with
+  // equal facts and a rank is absent, the call lays the absent ranks and
+  // answers each standing rank `relabelled`, the row unmoved. An engine
+  // whose every rank stands is ALREADY_EXISTS, with equal facts too: an add
+  // whose answer was lost reads the rows (WatchWorkers). MODE_REPLACE:
   // NOT_FOUND unless every stated rank stands; each is its next
   // incarnation. MODE_UPSERT lays each rank over what stands. Under REPLACE
   // and UPSERT the engine's rows that the registration does not state leave

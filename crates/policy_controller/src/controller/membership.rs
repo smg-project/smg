@@ -34,10 +34,11 @@
 //! registration does not state, and writes. Every rule holds before the
 //! first write, so a refusal of a rank or of the group writes nothing. A
 //! lead lost between two ranks refuses there and leaves the ranks written
-//! before it: an upsert lays the rest, and an add meets them. The answer
-//! tells what the call made of each rank, then each row that left, at the
-//! place of the call's last write. A registration of one rank for an
-//! engine that stands as ranks is refused: a plain row beside its ranks
+//! before it: an upsert lays the rest, and so does the same add called
+//! again, where each rank that stands is its maker's with equal facts. The
+//! answer tells what the call made of each rank, then each row that left,
+//! at the place of the call's last write. A registration of one rank for
+//! an engine that stands as ranks is refused: a plain row beside its ranks
 //! would be the engine twice. A build without the worker host lays no
 //! ranks and refuses a width above one.
 //!
@@ -607,9 +608,11 @@ impl Door {
                 return Err(invalid(NO_HANDSHAKE));
             }
             let laid = match (mode, &standing) {
-                (Mode::Add, Some(row)) => return Err(stands(row)),
                 (Mode::Replace, None) => return Err(absent()),
                 (_, None) => None,
+                // An add asks its maker of no row: the group's rule says
+                // which standing ranks are the same add's.
+                (Mode::Add, Some(row)) => Some((row.id, row.laid(&facts))),
                 (mode, Some(row)) => {
                     made_by(row, maker)?;
                     let laid = if mode == Mode::Replace {
@@ -633,8 +636,14 @@ impl Door {
             term: admitted,
             laid: RefCell::new(Vec::new()),
         };
-        let wrote = lay_ready(&turn, maker, mode == Mode::Add, ready)
-            .map_err(|refusal| refused(&refusal))?;
+        let wrote = lay_ready(&turn, maker, mode == Mode::Add, ready).map_err(|refusal| {
+            // An add refused where a rank it states stands names that row,
+            // as a call of one row does.
+            match (&refusal, stood.iter().flatten().next()) {
+                (HostRefused::Stands, Some(row)) => stands(row),
+                _ => refused(&refusal),
+            }
+        })?;
         let (epoch, at) = (self.store.epoch(), self.place());
         let mut laid = turn.laid.into_inner().into_iter();
         let mut rows = Vec::with_capacity(wrote.len());
@@ -1590,8 +1599,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// The modes hold for the engine. An add is refused where a rank stands
-    /// or the engine stands in another form. A replacement wants every
+    /// The modes hold for the engine. An add is refused where its ranks
+    /// stand or the engine stands in another form. A replacement wants every
     /// stated rank and makes each its next life. An upsert lays each rank,
     /// and the engine's rows it does not state leave with it.
     #[cfg(feature = "worker-host")]
@@ -1933,6 +1942,87 @@ pub(crate) mod tests {
                 .map(|row| row.facts.dp_size)
         };
         assert_eq!((width(0), width(1), width(2)), (Some(2), Some(2), Some(3)));
+    }
+
+    /// A door whose lead was lost behind the first of an add's three ranks
+    /// and came back under a later term: the next leader's door, over the
+    /// row the first attempt left.
+    #[cfg(feature = "worker-host")]
+    fn led_again_behind_a_lost_add() -> (Arc<MemoryStore>, Door) {
+        let (_, feed) = journaled_from(&LeasePlace::Process, 0);
+        let journal = Arc::new(LosesTheLead {
+            log: Arc::clone(&feed.log),
+            holds: AtomicUsize::new(0),
+        });
+        let store = Arc::new(MemoryStore::journaled(journal).with_deciders(1));
+        store::LeasesStore::set_term(store.as_ref(), TERM);
+        let door = Door::based(Arc::clone(&store), Arc::clone(&feed.log), 0);
+        let lost = door
+            .register(&operator(), under(TERM), &ask(wide(URL, 3), Mode::Add))
+            .expect_err("the lead was lost at the second rank");
+        assert_eq!(
+            (lost.code(), lost.message()),
+            (Code::Unavailable, super::LEADS_NO_TERM)
+        );
+        assert_eq!((store.epoch(), store.snapshot().1.len()), (1, 1));
+        store::LeasesStore::set_term(store.as_ref(), TERM + 2);
+        (store, door)
+    }
+
+    /// An add that lost its lead behind its first rank is the same add at
+    /// the next leader's door. The rank it wrote answers unmoved, the
+    /// others are registered, and each rank has its one row. Called once
+    /// more, the engine stands whole: the add is refused by the first
+    /// rank's row.
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn an_add_called_again_behind_a_lost_lead_lays_the_ranks_it_left() {
+        use proto::rank_row::Made;
+        let (store, door) = led_again_behind_a_lost_add();
+        let first = store.by_key(&format!("{URL}@0")).expect("the first rank");
+        let add = || door.register(&operator(), under(TERM + 2), &ask(wide(URL, 3), Mode::Add));
+
+        let told = add().expect("the same add");
+        let made = made_of(&told);
+        assert!(
+            matches!(
+                made.as_slice(),
+                [Made::Relabelled(stood), Made::Registered(_), Made::Registered(_)]
+                    if stood.id == first.id.0
+            ),
+            "{made:?}"
+        );
+        assert_eq!(store.by_key(&format!("{URL}@0")).as_ref(), Some(&first));
+        assert_eq!((store.epoch(), store.snapshot().1.len()), (3, 3));
+
+        let whole = add().expect_err("the engine stands whole");
+        assert_eq!(whole.code(), Code::AlreadyExists);
+        assert_eq!(
+            whole.message(),
+            format!(
+                "the URL is registered as worker {:016x} at revision {}",
+                first.id.0, first.revision
+            )
+        );
+        assert_eq!(store.epoch(), 3);
+    }
+
+    /// The same add with another label than the standing rank's is refused
+    /// by that rank's row and writes nothing: an add lays the rest by what
+    /// stands alone.
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn an_add_called_again_with_another_label_is_refused_and_writes_nothing() {
+        let (store, door) = led_again_behind_a_lost_add();
+        let labelled = proto::WorkerSpec {
+            labels: [("tier".to_owned(), "gold".to_owned())].into(),
+            ..wide(URL, 3)
+        };
+        let refused = door
+            .register(&operator(), under(TERM + 2), &ask(labelled, Mode::Add))
+            .expect_err("the first rank stands with other labels");
+        assert_eq!(refused.code(), Code::AlreadyExists);
+        assert_eq!((store.epoch(), store.snapshot().1.len()), (1, 1));
     }
 
     /// A registration states at most 64 ranks. At the bound, with every rank
