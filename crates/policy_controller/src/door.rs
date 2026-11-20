@@ -559,14 +559,7 @@ pub(crate) fn encode_pair_in<A: Asked>(
         |rows, engine, model, mut ask, wires, subset| {
             if !items.keys.is_empty() {
                 // The prefill binding names the encode profile for the pair.
-                let encode =
-                    engine
-                        .binding(model, Phase::Prefill)
-                        .and_then(|binding| match binding.plan {
-                            Plan::Epd { encode } => engine.profiles().get(usize::from(encode)),
-                            Plan::Single | Plan::PdPair => None,
-                        });
-                ask.affinity |= encode.is_some_and(|profile| profile.needs().affinity);
+                ask.affinity |= engine.pair_encode_needs(model).affinity;
             }
             let built = world.build_encode_pair(model, &ask, rows)?;
             // Counts follow the build's row order until narrowing moves it.
@@ -2566,9 +2559,7 @@ pub(crate) mod tests {
         ready(store, encode_facts(key, role, connector))
     }
 
-    fn encode_door() -> Result<Door, Box<dyn Error>> {
-        let store = Arc::new(MemoryStore::new());
-        encode_member(&store, "grpc://d0:8000", Role::Decode, "c0");
+    fn encode_document() -> Result<PolicySpec, Box<dyn Error>> {
         let mut document =
             PolicySpec::epd_presets("consistent_hashing", "least_load", "least_load")?;
         for side in ["prefill", "decode"] {
@@ -2586,7 +2577,13 @@ pub(crate) mod tests {
             .get_mut("encode")
             .ok_or("missing encode profile")?;
         encode.score.push("prefix-affinity".into());
-        store.apply(AppliedSpec::validate(&document)?)?;
+        Ok(document)
+    }
+
+    fn encode_door() -> Result<Door, Box<dyn Error>> {
+        let store = Arc::new(MemoryStore::new());
+        encode_member(&store, "grpc://d0:8000", Role::Decode, "c0");
+        store.apply(AppliedSpec::validate(&encode_document()?)?)?;
         Ok(Door::new(store))
     }
 
@@ -4921,26 +4918,36 @@ pub(crate) mod tests {
         assert_eq!(door.faults(), 0);
     }
 
-    /// A picker that holds a decision's scope and panics where it is
-    /// asked what it needs, once armed.
+    /// A picker that holds a decision's scope and panics once armed: where
+    /// it picks, or else where it is asked what it needs.
     #[derive(Debug)]
-    struct Needy(Arc<AtomicBool>);
+    struct Armed {
+        armed: Arc<AtomicBool>,
+        at_pick: bool,
+    }
 
-    impl Lifecycle for Needy {}
+    impl Armed {
+        fn called(&self, at_pick: bool) {
+            let fires = self.at_pick == at_pick && self.armed.load(Ordering::Relaxed);
+            assert!(!fires, "the case's own panic");
+        }
+    }
 
-    impl DecisionScope for Needy {
+    impl Lifecycle for Armed {}
+
+    impl DecisionScope for Armed {
         fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
 
         fn close(&self) {}
     }
 
-    impl Picker for Needy {
+    impl Picker for Armed {
         fn name(&self) -> &'static str {
-            "needy"
+            "armed"
         }
 
         fn needs(&self) -> Needs {
-            assert!(!self.0.load(Ordering::Relaxed), "the case's own panic");
+            self.called(false);
             Needs::default()
         }
 
@@ -4953,6 +4960,7 @@ pub(crate) mod tests {
             band: TieBand,
             out: &mut Targets,
         ) {
+            self.called(true);
             Random.pick(facts, candidates, kept, scores, band, out);
         }
 
@@ -4970,8 +4978,11 @@ pub(crate) mod tests {
         let door = Door::new(Arc::clone(&store));
         let armed = Arc::new(AtomicBool::new(false));
         let stage = Arc::clone(&armed);
-        picking(&store, 2, "needy", move || {
-            Box::new(Needy(Arc::clone(&stage)))
+        picking(&store, 2, "armed", move || {
+            Box::new(Armed {
+                armed: Arc::clone(&stage),
+                at_pick: false,
+            })
         });
         armed.store(true, Ordering::Relaxed);
         for id in [b"r-1", b"r-2"] {
@@ -4979,5 +4990,72 @@ pub(crate) mod tests {
             assert!(decided.is_ok(), "{:?}", decided.err());
         }
         assert_eq!(door.faults(), 0);
+    }
+
+    /// So with the encode profile of a pair: a request with encode items
+    /// reads the answer kept at the build.
+    #[test]
+    fn an_encode_profiles_stage_is_asked_what_it_needs_at_the_build_alone(
+    ) -> Result<(), Box<dyn Error>> {
+        let (door, _) = push_fleet()?;
+        let armed = Arc::new(AtomicBool::new(false));
+        let stage = Arc::clone(&armed);
+        let mut catalog = Catalog::builtin();
+        catalog.picker("armed", move || {
+            Box::new(Armed {
+                armed: Arc::clone(&stage),
+                at_pick: false,
+            })
+        })?;
+        let mut document = encode_document()?;
+        document.generation = 2;
+        let encode = document.profiles.get_mut("encode");
+        encode.ok_or("missing encode profile")?.pick = "armed".into();
+        let digest = document.digest()?;
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])?;
+        door.store().apply(spec)?;
+        armed.store(true, Ordering::Relaxed);
+        let mut placed = EncodePlaced::new();
+        for id in [b"r-1", b"r-2"] {
+            let asked = pair_request(id);
+            let decided =
+                door.decide_encode_pair(GATEWAY, &asked, items(), &mut placed, Instant::now());
+            assert!(decided.is_ok(), "{:?}", decided.err());
+        }
+        assert_eq!(door.faults(), 0);
+        Ok(())
+    }
+
+    /// A decision that panics after its caller left its own seat for the
+    /// model's costs its request alone, and the seat it left is at rest.
+    #[test]
+    fn a_stage_that_panics_at_the_models_seat_costs_its_request_alone() {
+        // The model's seat is not the first, where the calling thread
+        // sits.
+        let files = (2..=8).find(|&files| decider_of(MODEL, files) != 0);
+        let files = files.expect("the model names a later file under some count");
+        let store = fleet(files);
+        let door = Door::new(Arc::clone(&store));
+        seated(0);
+        let (own, _) = leased(&door, b"r-0", 7);
+        let armed = Arc::new(AtomicBool::new(false));
+        let stage = Arc::clone(&armed);
+        picking(&store, 2, "armed", move || {
+            Box::new(Armed {
+                armed: Arc::clone(&stage),
+                at_pick: true,
+            })
+        });
+        armed.store(true, Ordering::Relaxed);
+        // The first request under the generation leaves the caller's own
+        // seat for the model's. The next reads the door's word.
+        for id in [b"r-1", b"r-2"] {
+            let refused = door.decide(GATEWAY, &request(id, 7), Instant::now());
+            assert_eq!(refused.err(), Some(Refused::Faulted));
+        }
+        assert_eq!(door.faults(), 2);
+        // What is said of the lease on file at the caller's own seat is
+        // applied at once: no thread is left at work there.
+        assert_eq!(report(&door, own, gone()), 0, "applied at once");
     }
 }
