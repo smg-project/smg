@@ -40,7 +40,7 @@ pub(crate) use crate::store::world::narrow;
 use crate::{
     counts::Slot,
     decider::Decider,
-    decision::{Decision, Shed, ShedReason, Target, Trace},
+    decision::{Decision, Pair, Pick, Shed, ShedReason, Target, Targets, Trace},
     demands::{DemandFacts, Demands},
     framework::{
         release, EncodeItems, EncodePlaced, Engine, Plan, Scratch, KEEPS_DECIDERS,
@@ -883,8 +883,10 @@ pub(crate) fn issue<A: Asked>(
 /// Issues the two leases of a pair's pick, [`issue`] for a pair: a lease a
 /// side under the one id the store mints, one record and one write of the
 /// file, each side booking the count beside its own pool's row, and the
-/// engine told once a side, the prefill's first. `Ok` is the prefill
-/// side's lease, then the decode side's.
+/// engine told once a side it issues, the prefill's first. A decode side
+/// filed chosen is told at its own issue: a decode call's, or else its
+/// dispatch ([`issued_at_dispatch`]). `Ok` is the prefill side's lease,
+/// then the decode side's.
 ///
 /// # Errors
 ///
@@ -1465,7 +1467,9 @@ pub(crate) struct Viewed<'a> {
 /// A dispatch is told on the target its report names by index,
 /// as the record holds the pick, and the lease told names that index:
 /// the record was read before the door wrote it. A report that names no
-/// target of the pick tells nothing.
+/// target of the pick tells nothing. A pair's decode side that stood
+/// chosen is told its issue first ([`issued_at_dispatch`]): no call
+/// issued it, and it goes out as the first pick's.
 ///
 /// A pair's lease is told by side: a dispatch on the side its frame names,
 /// with that side's lease and on that side's worker, and an end once a
@@ -1560,6 +1564,14 @@ fn tell(store: &MemoryStore, world: &World, found: &Sides, said: Said) {
             }
             pinned(store, &lease, stood, engine, id, at);
             if let Some(engine) = engine {
+                // A decode side no call issued goes out as the first
+                // pick's, and this dispatch books it: the stages hear its
+                // issue first, as they hear every side's.
+                let lease = if stood.is_chosen() {
+                    issued_at_dispatch(engine, found, &lease, id, dispatch.since_decision_micros)
+                } else {
+                    lease
+                };
                 engine.dispatched_stages(
                     &lease,
                     &target,
@@ -1579,6 +1591,68 @@ fn tell(store: &MemoryStore, world: &World, found: &Sides, said: Said) {
                 found.each_ending(side, |lease| engine.on_released(lease, reason));
             }
         }
+    }
+}
+
+/// Tells `engine`'s stages the issue of a pair's decode side that no call
+/// issued, at its dispatch on the worker `sent`. The side goes out as the
+/// first pick's and the store books it at this dispatch, so the dispatch
+/// is the side's issue too: a stage that books at an issue books the
+/// worker that serves, as it does at a decode call's issue.
+///
+/// The stages hear the pair's pick as the lease's record keeps it: every
+/// target's two workers and their ranks, with no position and no trace
+/// beside the generation. The lease told names the target the dispatch
+/// took and `sent` as the worker it books. It is dated at the dispatch,
+/// `since_decision_micros` behind the pair's first decision, and never
+/// at that decision: a stage that dates its bookings by its issues reads
+/// one far behind its newest as a clock that went back.
+///
+/// Returns the lease the dispatch's own word carries, which names `sent`
+/// as the worker its issue booked.
+fn issued_at_dispatch(
+    engine: &Engine,
+    found: &Sides,
+    lease: &Lease,
+    sent: WorkerId,
+    since_decision_micros: u32,
+) -> Lease {
+    let named = |index| {
+        let prefill = found.target_of(Side::Prefill, index)?;
+        Some((prefill, found.target_of(Side::Decode, index)?))
+    };
+    let mut targets = Targets::new();
+    for ((id, dp_rank), (decode_id, decode_dp_rank)) in (0..=u8::MAX).map_while(named) {
+        targets.push(Target {
+            id,
+            dp_rank,
+            pair: Some(Pair {
+                decode_id,
+                decode_dp_rank,
+                ..Pair::default()
+            }),
+            ..Target::default()
+        });
+    }
+    let decision = Decision::Pick(Pick {
+        targets,
+        trace: Trace {
+            generation: lease.generation,
+            ..Trace::default()
+        },
+        ..Pick::default()
+    });
+    let issued = Lease {
+        booked: sent,
+        issued_micros: lease
+            .issued_micros
+            .saturating_add(u64::from(since_decision_micros)),
+        ..*lease
+    };
+    engine.on_decision_issued(&issued, &decision);
+    Lease {
+        booked: sent,
+        ..*lease
     }
 }
 
@@ -3979,6 +4053,114 @@ pub(crate) mod tests {
         assert!(called.expect("a decode").decision.pick().is_some());
         // The pool's size as its facts say it, and the rows read.
         assert_eq!(shown.lock().as_slice(), [(2, 2)]);
+    }
+
+    /// A pair's decode asked later and sent with no decode call goes out
+    /// as the first pick's, here on its second target. The stages hear the
+    /// side's issue ahead of its dispatch, as they hear every side's: the
+    /// pick as the lease's record keeps it, under a lease that names the
+    /// target taken and is dated at the dispatch. The dispatch's own word
+    /// then names that worker as the one the issue booked.
+    #[test]
+    fn a_decode_sent_with_no_call_is_told_issued_ahead_of_its_dispatch() {
+        /// A word of the decode side: its name, the lease's target index,
+        /// the worker the lease books, the lease's instant and the decodes
+        /// the word names.
+        type Word = (&'static str, u8, WorkerId, u64, Vec<WorkerId>);
+
+        #[derive(Debug)]
+        struct Hears(Arc<Mutex<Vec<Word>>>);
+
+        impl Lifecycle for Hears {
+            fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
+                if lease.side == Side::Decode {
+                    let named = decodes_of(decision);
+                    let word = ("issued", lease.target_index, lease.booked);
+                    let mut heard = self.0.lock();
+                    heard.push((word.0, word.1, word.2, lease.issued_micros, named));
+                }
+            }
+
+            fn on_dispatched(&self, lease: &Lease, target: &Target, side: Side, _: u32) {
+                if side == Side::Decode {
+                    let word = ("dispatched", lease.target_index, lease.booked);
+                    let mut heard = self.0.lock();
+                    heard.push((word.0, word.1, word.2, lease.issued_micros, vec![target.id]));
+                }
+            }
+        }
+
+        impl Picker for Hears {
+            fn name(&self) -> &'static str {
+                "hears-decode"
+            }
+
+            fn pick(
+                &self,
+                facts: &RequestFacts<'_>,
+                rows: &[Candidate],
+                kept: &[u32],
+                scores: &[f32],
+                band: TieBand,
+                out: &mut Targets,
+            ) {
+                Best.pick(facts, rows, kept, scores, band, out);
+            }
+        }
+
+        /// The decode each target of a pick names, in the pick's order.
+        fn decodes_of(decision: &Decision) -> Vec<WorkerId> {
+            let targets = decision
+                .pick()
+                .into_iter()
+                .flat_map(|pick| pick.targets.iter());
+            targets
+                .filter_map(|target| target.pair)
+                .map(|pair| pair.decode_id)
+                .collect()
+        }
+
+        let store = pair_fleet(1, 2).expect("one prefill and two decodes");
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&heard);
+        let mut catalog = Catalog::builtin();
+        let added = catalog.picker("hears-decode", move || Box::new(Hears(Arc::clone(&kept))));
+        added.expect("a free picker name");
+        let mut document = PolicySpec::pair_presets("least_load", "least_load").expect("a spec");
+        document.generation = 2;
+        for profile in document.profiles.values_mut() {
+            profile.filter.clear();
+        }
+        let decode = document.profiles.get_mut("decode");
+        decode.expect("the decode profile").pick = "hears-decode".into();
+        let digest = document.digest().expect("a digest");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+        let applied = store.apply(spec.expect("a valid spec"));
+        applied.expect("a later generation");
+        let door = Door::new(store);
+        let now = Instant::now();
+        let asked = later_request(b"pair");
+        let first = door.decide(GATEWAY, &asked, now).expect("a pair");
+        let decodes = decodes_of(&first.decision);
+        assert_eq!(decodes.len(), 2, "a decode a target");
+        let leased = first.lease.expect("a lease").lease;
+        door.report(GATEWAY, leased.id, pair_dispatch(Side::Prefill, now));
+        // The side is chosen, not issued: no word of it yet.
+        assert_eq!(heard.lock().as_slice(), []);
+        let sent = Dispatch {
+            side: Side::Decode,
+            target_index: 1,
+            since_decision_micros: 250,
+        };
+        door.report(GATEWAY, leased.id, Said::Dispatched(sent, now));
+        let issued = leased.issued_micros;
+        assert_eq!(
+            heard.lock().as_slice(),
+            [
+                ("issued", 1, decodes[1], issued + 250, decodes.clone()),
+                ("dispatched", 1, decodes[1], issued, vec![decodes[1]]),
+            ]
+        );
     }
 
     #[test]

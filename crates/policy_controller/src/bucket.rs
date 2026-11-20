@@ -2129,6 +2129,56 @@ mod tests {
         assert_eq!(loads(&scorer), (vec![300, 300, 300], 900));
     }
 
+    /// A pair's decode that goes out with no decode call is told issued at
+    /// its dispatch, on the target the dispatch took, and then dispatched
+    /// as booked there, as a store tells both words: no position, the
+    /// issue dated at the dispatch. One booking stands on the worker that
+    /// serves, whichever target was taken.
+    #[test]
+    fn a_decode_issued_at_its_dispatch_is_booked_once_on_the_target_taken() {
+        for taken in [0_u8, 1] {
+            let scorer = scorer(NEVER, 1.5, 5);
+            let pool = pool(3);
+            led(&scorer, &pool, 0, SECOND);
+            // Each target names the one prefill, the first row, with
+            // another decode: the second row, then the third.
+            let target = |decode: usize| Target {
+                id: pool[0].id,
+                pair: Some(Pair {
+                    decode_id: pool[decode].id,
+                    ..Pair::default()
+                }),
+                ..Target::default()
+            };
+            let mut targets = Targets::new();
+            targets.push(target(1));
+            targets.push(target(2));
+            let decision = Decision::Pick(Pick {
+                targets,
+                ..Pick::default()
+            });
+            let serves = 1 + usize::from(taken);
+            let lease = |issued_micros: u64| Lease {
+                side: Side::Decode,
+                target_index: taken,
+                booked: pool[serves].id,
+                tokens: 300,
+                issued_micros,
+                ..Lease::default()
+            };
+            scorer.on_decision_issued(&lease(SECOND + 250), &decision);
+            let sent = Target {
+                id: pool[serves].id,
+                ..Target::default()
+            };
+            scorer.on_dispatched(&lease(SECOND), &sent, Side::Decode, 250);
+            let mut booked = vec![0, 0, 0];
+            booked[serves] = 300;
+            assert_eq!(loads(&scorer), (booked, 300), "target {taken}");
+            assert_eq!(last_booked_at(&scorer), Some(SECOND + 250));
+        }
+    }
+
     /// A pair's decode side as the store files it. The lease the store
     /// derives for the side names the side's own worker as the one its
     /// issue booked: a dispatch on another rank of that worker leaves the
