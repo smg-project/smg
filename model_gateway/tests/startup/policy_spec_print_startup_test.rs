@@ -46,14 +46,26 @@ fn the_print_is_the_document_alone_on_stdout_and_a_zero_exit() {
 
 #[test]
 fn a_setting_no_document_says_is_one_sentence_on_stderr_and_a_failing_exit() {
-    let answer = print(&["--routing-key-override"]).expect("the binary runs");
+    let answer = print(&["--dp-minimum-tokens-scheduler"]).expect("the binary runs");
     assert_eq!(answer.status.code(), Some(1));
     assert_eq!(text(&answer.stdout), "");
     assert_eq!(
         text(&answer.stderr),
-        "error: routing_key_override.enabled = true: the controller holds no recorded form of \
-         the sticky sessions' rule yet\n"
+        "error: dp_minimum_tokens_scheduler = true: the document has no rank policy: under the \
+         controller a rank is a candidate of the profile\n"
     );
+}
+
+#[test]
+fn the_sticky_override_prints_the_bindings_session_rule() {
+    let answer = print(&["--routing-key-override"]).expect("the binary runs");
+    assert_eq!(answer.status.code(), Some(0), "{}", text(&answer.stderr));
+    assert_eq!(text(&answer.stderr), "");
+    let document: PolicySpec =
+        serde_yaml::from_slice(&answer.stdout).expect("stdout is a document and nothing else");
+    let binding = document.bindings.first().expect("the document's binding");
+    assert!(binding.sessions.is_some(), "the override's rule");
+    assert!(binding.routing_key.is_some(), "the key's sources");
 }
 
 #[test]

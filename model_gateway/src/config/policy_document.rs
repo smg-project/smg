@@ -1017,14 +1017,15 @@ impl Bound {
         // written into it. The override's rule starts from the document's
         // defaults instead: two requests of a key on its worker place the
         // next again, a cap the manual preset lifts.
-        let preset = match binding.sessions.take() {
-            Some(rule) => Some(rule),
-            None => serde_json::from_value(Value::Object(serde_json::Map::new())).ok(),
+        let preset: SessionsSpec = if self.overridden {
+            serde_json::from_value(Value::Object(serde_json::Map::new()))
+                .map_err(|error| SpecError::NoCanonicalForm(error.to_string()))?
+        } else {
+            binding.sessions.take().ok_or(PolicyDocumentError::NoPart {
+                policy: ruled_by,
+                part: "session rule",
+            })?
         };
-        let preset = preset.ok_or(PolicyDocumentError::NoPart {
-            policy: ruled_by,
-            part: "session rule",
-        })?;
         // Once both of a key's pins are routable again, the latest worker
         // leads under the override's `delegate` and the first owner under
         // every other assignment, as on the classic line.
@@ -2680,5 +2681,30 @@ mod tests {
         let pairs_alone = clash.policy_document();
         assert!(pairs_alone.is_ok(), "{pairs_alone:?}");
         assert_eq!(many_routers(clash).policy_document(), pairs_alone);
+    }
+
+    #[test]
+    fn many_routers_keep_the_overrides_rule_beside_pairs_the_hash_ring_keys() {
+        // Under round robin the override's rule places single workers, and
+        // the hash ring keeps the pairs by its own key: both families have
+        // a document, and the rule stands on the single binding alone.
+        let mut both = RouterConfig {
+            mode: pair_mode(
+                Some(PolicyConfig::ConsistentHashing),
+                Some(PolicyConfig::ConsistentHashing),
+            ),
+            ..config(PolicyConfig::RoundRobin)
+        };
+        both.routing_key_override.enabled = true;
+        both.routing_key_override.headers = vec![MANUAL_SESSION_HEADER.to_string()];
+        let both = many_routers(both);
+        let document = both.policy_document().expect("a document of both families");
+        assert_eq!(document.bindings.len(), 2);
+        let pair = document.bindings.first().expect("the pair binding");
+        assert!(pair.sessions.is_none() && pair.routing_key.is_some());
+        let single = document.bindings.last().expect("the single binding");
+        assert!(single.sessions.is_some() && single.routing_key.is_some());
+        assert_eq!(document.view.headers, [MANUAL_SESSION_HEADER]);
+        assert_eq!(both.hosted_policy(&document).err(), None);
     }
 }
