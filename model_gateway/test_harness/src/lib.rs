@@ -31,7 +31,7 @@ use std::{
     env,
     future::Future,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock, PoisonError, Weak},
 };
 
 use llm_tokenizer::{mock::MockTokenizer, registry::TokenizerRegistry, traits::Tokenizer};
@@ -53,7 +53,7 @@ use smg::{
         grpc::backend_client::BasicWorkerBuilder,
         RouterFactory, RouterTrait,
     },
-    server::start_worker_loops,
+    server::{start_worker_loops, WorkerLoops},
     workflow::Job,
 };
 use smg_data_connector::{
@@ -468,13 +468,38 @@ pub fn policy_controller_leg() -> bool {
     *LEG.get_or_init(|| env::var_os(POLICY_CONTROLLER_LEG).is_some_and(|leg| leg == "1"))
 }
 
+/// The worker loops of each hosted context the harness built, by the
+/// context: kept for the process's life, or until a fixture takes them
+/// ([`take_worker_loops`]). A test's runtime ends the tasks of the loops
+/// nobody took. The context is named by a `Weak`, which holds its address
+/// while the entry stands: no later context is taken for it.
+static WORKER_LOOPS: Mutex<Vec<(Weak<AppContext>, WorkerLoops)>> = Mutex::new(Vec::new());
+
 /// Start the loops of a context that hosts the policy controller, as the
 /// server's start does behind its workflow engines: the health checks on
 /// the feed's sink, the load monitor's events, the store's publications
-/// and the workers' cache events. The handles are kept for the process's
-/// life, and a test's runtime ends their tasks.
-pub(crate) fn keep_worker_loops(app_context: &AppContext) {
-    let _kept = Box::leak(Box::new(start_worker_loops(app_context)));
+/// and the workers' cache events. The harness keeps the handles by the
+/// context. A test may drop its context and keep the gateway it built on
+/// it, so the context's end ends no loop.
+pub(crate) fn keep_worker_loops(app_context: &Arc<AppContext>) {
+    let loops = start_worker_loops(app_context);
+    WORKER_LOOPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((Arc::downgrade(app_context), loops));
+}
+
+/// The worker loops the harness started for `app_context`, for a fixture
+/// that ends them itself: the context's health loop is then the one loop
+/// that probes its workers, and the fixture starts none beside it. `None`
+/// for a context on the classic policies, and for loops taken before.
+pub fn take_worker_loops(app_context: &Arc<AppContext>) -> Option<WorkerLoops> {
+    let wanted = Arc::downgrade(app_context);
+    let mut kept = WORKER_LOOPS.lock().unwrap_or_else(PoisonError::into_inner);
+    let at = kept
+        .iter()
+        .position(|(context, _)| context.ptr_eq(&wanted))?;
+    Some(kept.swap_remove(at).1)
 }
 
 /// Shared `AppContext` construction tail for the `create_test_context_*`

@@ -2320,7 +2320,18 @@ fn serve_listeners(
 pub struct WorkerLoops {
     _cache_events: Option<CacheEvents>,
     _publications: Option<AbortOnDropHandle<()>>,
-    _health: Option<WorkerManager>,
+    health: Option<WorkerManager>,
+}
+
+impl WorkerLoops {
+    /// End the health loop and wait for its end: no probe runs behind this
+    /// call. The other loops run on until the drop. A host that assembles a
+    /// gateway by hand stops its probes here.
+    pub async fn stop_health_checks(&mut self) {
+        if let Some(mut health) = self.health.take() {
+            health.shutdown().await;
+        }
+    }
 }
 
 /// Start the loops that keep the workers of `app_context`, in the start's
@@ -2359,7 +2370,7 @@ pub fn start_worker_loops(app_context: &AppContext) -> WorkerLoops {
     WorkerLoops {
         _cache_events: cache_events,
         _publications: publications,
-        _health: health,
+        health,
     }
 }
 

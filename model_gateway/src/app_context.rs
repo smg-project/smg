@@ -17,7 +17,7 @@ use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
 use smg_policy_controller::{
     store::{Maker, MemoryStore},
-    worker_host::Expect,
+    worker_host::{Expect, Over},
     Catalog,
 };
 use smg_worker::{
@@ -39,7 +39,7 @@ use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, info};
 
 use crate::{
-    admin::worker_service::WorkerService,
+    admin::worker_service::{stands_as_row, WorkerService},
     config::{ParserChoice, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
@@ -324,35 +324,74 @@ impl AppContext {
     /// gateway's workers: the registry, or the door of the policy
     /// controller's store where the gateway decides in its own process.
     /// The store then holds the worker's row and its holder lays this
-    /// object in the registry, as a registration's own write does. A host
-    /// that assembles a gateway by hand registers here where it would
-    /// write the registry. `None` where the address is taken or the door
-    /// refuses the worker.
+    /// object in the registry, as a registration's own write does. The row
+    /// is a control call's, whatever the worker's labels name: no discovery
+    /// provider changes or removes it. A worker of the external runtime
+    /// stays outside the store, as its registration leaves it, and the
+    /// registry takes it. A host that assembles a gateway by hand registers
+    /// here where it would write the registry. `None` where the address is
+    /// taken or the door refuses the worker.
     pub fn register_built(&self, worker: Arc<dyn Worker>) -> Option<WorkerId> {
-        let Some(feed) = self.door_feed() else {
+        let feed = self.door_feed().filter(|_| stands_as_row(worker.as_ref()));
+        let Some(feed) = feed else {
             return self.worker_registry.register(worker);
         };
-        let url = worker.url().to_owned();
-        feed.door
+        if let Err(refused) = feed
+            .door
             .found_built(&Maker::Control, Expect::Nothing, &worker, None)
-            .ok()?;
-        self.worker_registry.get_id_by_url(&url)
+        {
+            tracing::warn!(
+                url = %worker.redacted_url(),
+                ?refused,
+                "the policy store's door refused a built worker"
+            );
+            return None;
+        }
+        self.worker_registry.get_id_by_url(worker.url())
     }
 
     /// Lay `worker` in the place of the worker that stands at its address,
-    /// with the writer of [`Self::register_built`]. `false` where no worker
-    /// stands there or the door refuses this one.
+    /// with the writer of [`Self::register_built`]. Under the door it
+    /// replaces the row that worker stands for, over that object: a worker
+    /// that left, drains or was replaced in between refuses it, as a
+    /// missing id does in the registry. A worker of the external runtime
+    /// replaces one the registry holds alone. `false` where no worker of
+    /// its kind stands there or the writer refuses this one.
     pub fn replace_built(&self, worker: Arc<dyn Worker>) -> bool {
-        let Some(id) = self.worker_registry.get_id_by_url(worker.url()) else {
+        let registry = &self.worker_registry;
+        let Some(id) = registry.get_id_by_url(worker.url()) else {
             return false;
         };
-        match self.door_feed() {
-            Some(feed) => feed
-                .door
-                .found_built(&Maker::Control, Expect::Anything, &worker, None)
-                .is_ok(),
-            None => self.worker_registry.replace(&id, worker),
+        let Some(feed) = self.door_feed() else {
+            return registry.replace(&id, worker);
+        };
+        if !stands_as_row(worker.as_ref()) {
+            return feed.objects.standing(&id).is_none() && registry.replace(&id, worker);
         }
+        // The row behind the standing object, at the revision the holder
+        // built that object from: none where the registry holds that
+        // worker alone.
+        let row = registry.get(&id).and_then(|found| {
+            let standing = feed.objects.standing_of(&id, &found)?;
+            Some((found, standing))
+        });
+        let Some((found, standing)) = row else {
+            return false;
+        };
+        let replaced = feed.door.found_built(
+            &Maker::Control,
+            Expect::Seen(standing),
+            &worker,
+            Some(Over::Replaced(&found)),
+        );
+        if let Err(refused) = &replaced {
+            tracing::warn!(
+                url = %worker.redacted_url(),
+                ?refused,
+                "the policy store's door refused a built worker's replacement"
+            );
+        }
+        replaced.is_ok()
     }
 
     /// Create AppContext from config with all components initialized
@@ -1627,6 +1666,93 @@ mod tests {
             .get_default_policy();
         let cache_aware = as_cache_aware(policy.as_ref()).expect("default policy is cache-aware");
         assert!(!cache_aware.has_load_receiver_for_test());
+    }
+
+    /// A context that hosts the policy controller, with no worker.
+    async fn hosted_context() -> AppContext {
+        let config = RouterConfig {
+            policy_controller: true,
+            ..Default::default()
+        };
+        AppContext::from_config(config, 10, None, None)
+            .await
+            .expect("the context")
+    }
+
+    /// A built worker's replacement names the row behind the worker it
+    /// replaces. The door lays it over a standing row and refuses it over
+    /// a draining one, whose removal wins. A worker that left is not
+    /// registered anew.
+    #[tokio::test]
+    async fn under_the_door_a_built_workers_replacement_is_held_against_its_row() {
+        use smg_policy_controller::worker_host::Remover;
+
+        const URL: &str = "http://worker:8000";
+        let hosted = hosted_context().await;
+        let registry = &hosted.worker_registry;
+        let feed = hosted.door_feed().expect("the feed");
+        let built = || -> Arc<dyn Worker> { Arc::new(BasicWorkerBuilder::new(URL).build()) };
+
+        let id = hosted
+            .register_built(built())
+            .expect("the door registers the worker");
+        let second = built();
+        assert!(hosted.replace_built(Arc::clone(&second)));
+        let stands = registry.get(&id).expect("the row's object");
+        assert!(Arc::ptr_eq(&stands, &second));
+
+        let by = Remover::Maker(&Maker::Control);
+        let seen = feed.objects.standing(&id).expect("the row");
+        feed.door.drained(by, URL, seen).expect("the row drains");
+        assert!(
+            !hosted.replace_built(built()),
+            "a draining row's removal wins"
+        );
+        let seen = feed.objects.standing(&id).expect("the draining row");
+        feed.door.gone(by, URL, seen).expect("the row leaves");
+        assert!(!hosted.replace_built(built()));
+        assert!(registry.get_by_url(URL).is_none());
+    }
+
+    /// Under the door a worker of the external runtime has no row, as its
+    /// registration leaves it: the registry holds it alone and takes its
+    /// replacement. Neither kind of worker takes the other's place.
+    #[tokio::test]
+    async fn under_the_door_a_built_external_worker_stays_outside_the_store() {
+        use smg_worker::identity::basic::RuntimeType;
+
+        const URL: &str = "http://provider:8000";
+        const ROW: &str = "http://worker:8000";
+        let hosted = hosted_context().await;
+        let registry = &hosted.worker_registry;
+        let feed = hosted.door_feed().expect("the feed");
+        let external = |url: &str| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .runtime_type(RuntimeType::External)
+                    .build(),
+            )
+        };
+        let local =
+            |url: &str| -> Arc<dyn Worker> { Arc::new(BasicWorkerBuilder::new(url).build()) };
+
+        let id = hosted
+            .register_built(external(URL))
+            .expect("the registry takes the worker");
+        assert!(feed.objects.standing(&id).is_none(), "no row stands for it");
+        let second = external(URL);
+        assert!(hosted.replace_built(Arc::clone(&second)));
+        assert!(!hosted.replace_built(local(URL)));
+        let stands = registry.get(&id).expect("the object");
+        assert!(Arc::ptr_eq(&stands, &second));
+
+        let row = hosted
+            .register_built(local(ROW))
+            .expect("the door registers the worker");
+        let laid = registry.get(&row).expect("the row's object");
+        assert!(!hosted.replace_built(external(ROW)));
+        let stands = registry.get(&row).expect("the row's object");
+        assert!(Arc::ptr_eq(&stands, &laid));
     }
 
     /// Every policy gets the monitor: a cache-aware one for its indexes, any

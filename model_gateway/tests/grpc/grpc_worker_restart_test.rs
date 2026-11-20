@@ -30,6 +30,7 @@ use smg::{
     config::{RetryConfig, RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
     routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory, RouterTrait},
+    server::WorkerLoops,
     tenant::TenantKey,
 };
 use smg_worker::{
@@ -151,8 +152,28 @@ async fn build_router(
     port: u16,
     breaker_failures: u32,
     retries: Option<RetryConfig>,
-) -> (Box<dyn RouterTrait>, Arc<dyn Worker>, WorkerManager) {
+) -> (Box<dyn RouterTrait>, Arc<dyn Worker>, Probes) {
     build_router_with(port, breaker_failures, retries, 1, PROBE_INTERVAL).await
+}
+
+/// The health loop that probes the fixture's worker, for a case to stop.
+enum Probes {
+    /// The fixture's own loop over the registry, on the classic policies.
+    Classic(WorkerManager),
+    /// The context's own loops, under the policy controller: their health
+    /// loop writes through the controller's feed, and the fixture starts no
+    /// second loop beside it.
+    Hosted(WorkerLoops),
+}
+
+impl Probes {
+    /// Ends the probes: none runs once this returns.
+    async fn shutdown(&mut self) {
+        match self {
+            Self::Classic(manager) => manager.shutdown().await,
+            Self::Hosted(loops) => loops.stop_health_checks().await,
+        }
+    }
 }
 
 /// [`build_router`] with the worker promoted on `success_threshold` passing
@@ -169,7 +190,7 @@ async fn build_router_with(
     retries: Option<RetryConfig>,
     success_threshold: u32,
     probe_interval: Duration,
-) -> (Box<dyn RouterTrait>, Arc<dyn Worker>, WorkerManager) {
+) -> (Box<dyn RouterTrait>, Arc<dyn Worker>, Probes) {
     let builder = RouterConfig::builder()
         .mode(RoutingMode::Regular {
             worker_urls: vec![],
@@ -213,18 +234,26 @@ async fn build_router_with(
     app_context
         .register_built(worker.clone())
         .expect("register the worker");
-    let manager = WorkerManager::start(
-        app_context.worker_registry.clone(),
-        WorkerManagerConfig {
-            default_check_interval_secs: probe_interval.as_secs(),
-            remove_unhealthy: smg::config::UnhealthyRemovalScope::Disabled,
-        },
-        None,
+    let probes = match common::take_worker_loops(&app_context) {
+        Some(loops) => Probes::Hosted(loops),
+        None => Probes::Classic(WorkerManager::start(
+            app_context.worker_registry.clone(),
+            WorkerManagerConfig {
+                default_check_interval_secs: probe_interval.as_secs(),
+                remove_unhealthy: smg::config::UnhealthyRemovalScope::Disabled,
+            },
+            None,
+        )),
+    };
+    assert_eq!(
+        matches!(probes, Probes::Hosted(_)),
+        common::policy_controller_leg(),
+        "the context's own loops probe the worker where it hosts the policy controller"
     );
     let router = RouterFactory::create_router(&app_context)
         .await
         .expect("gRPC router");
-    (router, worker, manager)
+    (router, worker, probes)
 }
 
 /// The engine is killed under traffic (the breaker opens, the probes demote
@@ -236,7 +265,7 @@ async fn a_restarted_worker_is_routable_when_its_probes_pass_again() {
     let address = RefusedAddress::reserve_shared();
     let port = address.port();
     let engine = MockEngine::start(&address);
-    let (router, worker, mut manager) = build_router(port, 1, None).await;
+    let (router, worker, mut probes) = build_router(port, 1, None).await;
 
     // Pending until the first probe passes; then it serves.
     common::wait_until("the worker's first promotion", RECOVERY_BOUND, || {
@@ -309,7 +338,7 @@ async fn a_restarted_worker_is_routable_when_its_probes_pass_again() {
     );
 
     engine.kill().await;
-    manager.shutdown().await;
+    probes.shutdown().await;
 }
 
 /// Under a success threshold of two reads, a worker the gateway kept through
@@ -330,7 +359,7 @@ async fn a_kept_worker_returns_within_one_interval_under_a_success_threshold_of_
     let address = RefusedAddress::reserve_shared();
     let port = address.port();
     let engine = MockEngine::start(&address);
-    let (router, worker, mut manager) = build_router_with(port, 1, None, 2, INTERVAL).await;
+    let (router, worker, mut probes) = build_router_with(port, 1, None, 2, INTERVAL).await;
 
     // Two passing probes an interval apart: the registration's promotion.
     common::wait_until("the worker's first promotion", RECOVERY_BOUND, || {
@@ -408,7 +437,7 @@ async fn a_kept_worker_returns_within_one_interval_under_a_success_threshold_of_
     );
 
     engine.kill().await;
-    manager.shutdown().await;
+    probes.shutdown().await;
 }
 
 /// A peer on the engine's address that takes every call as far as the
@@ -509,7 +538,7 @@ async fn a_transport_reset_on_the_last_attempt_is_answered_like_the_attempts_bef
     let port = address.port();
     let engine = MockEngine::start(&address);
     // The breaker outlasts the attempts: every one of them reaches the worker.
-    let (router, worker, mut manager) = build_router(
+    let (router, worker, mut probes) = build_router(
         port,
         ATTEMPTS + 1,
         Some(RetryConfig {
@@ -528,7 +557,7 @@ async fn a_transport_reset_on_the_last_attempt_is_answered_like_the_attempts_bef
     assert_eq!(request_status(router.as_ref()).await, 200);
     // No probe runs from here on: the worker stays routable, and the
     // request's own attempts alone meet the reset.
-    manager.shutdown().await;
+    probes.shutdown().await;
 
     engine.kill().await;
     let peer = ResettingPeer::start(&address);

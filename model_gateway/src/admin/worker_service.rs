@@ -313,7 +313,7 @@ fn discovery_provider(worker: &dyn Worker) -> Option<&String> {
 
 /// Whether `worker` is a row where a local worker is one: every worker but
 /// a provider's, which stays outside the store.
-fn stands_as_row(worker: &dyn Worker) -> bool {
+pub(crate) fn stands_as_row(worker: &dyn Worker) -> bool {
     worker.metadata().spec.runtime_type != RuntimeType::External
 }
 

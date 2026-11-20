@@ -6,20 +6,10 @@
 # listed here by its full name while that leg does not pass it, under a line
 # that says why. A change that makes a case pass takes its line out.
 
-# The controller does not decide a request whose size binds a worker's context window:
-# the request is refused by name, 501.
-grpc::decisions_grpc_test::scoring_context_boundary_accepts_below_and_rejects_at_limit
-grpc::grpc_context_length_test::pd_batched_completion_is_bounded_per_prompt
-grpc::grpc_context_length_test::pd_budget_is_bound_by_the_decode_window_not_the_prefill_window
-grpc::grpc_context_length_test::pd_is_bounded_by_the_tighter_side
-grpc::grpc_context_length_test::pd_over_long_prompt_is_a_400_not_a_prefill_failure
-grpc::grpc_context_length_test::pd_over_long_streaming_prompt_is_a_json_400
-grpc::grpc_context_length_test::regular_budget_beyond_the_window_is_a_400_on_every_route
-grpc::grpc_context_length_test::regular_over_long_chat_prompt_is_a_400
-grpc::grpc_context_length_test::regular_over_long_prompt_is_a_400
+# The controller does not route by context window: a request over the window of some
+# of the model's workers and not of all is refused by name, 501.
 grpc::grpc_context_routing_test::batch_uses_longest_prompt_with_absent_or_zero_output_budget
 grpc::grpc_context_routing_test::capacity_and_availability_are_distinct
-grpc::grpc_context_routing_test::pd_capacity_is_checked_over_compatible_pairs
 grpc::grpc_context_routing_test::pd_filters_both_context_windows
 grpc::grpc_context_routing_test::regular_routes_by_exact_context_without_retries
 grpc::grpc_context_routing_test::unknown_window_remains_eligible
@@ -35,9 +25,6 @@ grpc_pd::grpc_pd_pairing_off_runtime_test::pairing_off_serves_a_pair_on_one_runt
 
 # A pair the controller places writes no row into the request's decision record.
 grpc_pd::grpc_pd_pair_trace_test::a_traced_pair_names_both_picks
-
-# A text prompt shorter than one hash window has no key for the ring.
-routing::prefix_hash_test::prefix_hash_tests::test_repeated_prompt_pins_to_one_worker
 
 # Under min_group the count of a worker's keys is not kept, so first keys are not
 # spread evenly.
@@ -94,9 +81,15 @@ a_decode_workers_own_500_fails_over_to_the_free_decode_worker_on_both_shapes
 grpc_pd::grpc_pd_decode_start_cancelled_test::a_decode_start_the_worker_cancelled_is_retried_on_another_decode_worker
 grpc_pd::grpc_pd_prefill_silence_test::the_request_is_retried_on_another_prefill_worker_and_never_on_the_silent_one_again
 
-# Not read to its cause yet: the case waits for a Ready worker, or for a removal,
-# past its bound.
+# Under the controller a worker whose health checks are on serves once its probes
+# pass: with the default threshold of two that is one check interval, 60 s, after
+# its registration. The classic serves it at its registration. The case waits 20 s
+# for a Ready worker, and passes with the threshold at one.
 discovery::file_discovery_test::an_in_place_edit_updates_the_worker_in_place
 discovery::k8s_discovery_test::kv_annotation_edit_on_a_live_pod_updates_its_worker_in_place
 discovery::k8s_discovery_test::ready_pod_becoming_unready_removes_all_workers_and_recovers
+
+# By design: the controller's store tells a provider's worker by the row's maker,
+# where the classic reads the worker's label. The case registers its leftover worker
+# by hand, which makes a control call's row that no discovery provider removes.
 discovery::k8s_discovery_test::zombie_worker_removed_and_manual_worker_kept
