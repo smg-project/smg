@@ -177,8 +177,11 @@ impl RouterConfig {
         if given.generation == 0 {
             given.generation = 1;
         }
+        // The default configuration of this gateway's kind: a provider mode
+        // has a document under the multi-router setting alone.
         let plain = RouterConfig {
             mode: self.mode.with_defaults(),
+            enable_igw: self.enable_igw,
             ..RouterConfig::default()
         }
         .policy_document()?;
@@ -341,9 +344,9 @@ type Side<'a> = (&'static str, &'a PolicyConfig);
 /// The presets the mode's policies name, as one document, with its
 /// profiles: one named for the policy under the regular mode, one a side
 /// under the pair and the encode modes. A provider mode of a multi-router
-/// gateway reads as the regular mode: the document says the policy of the
-/// self-hosted routers beside the provider's. The pools of a mode are the
-/// gateway's and are not read.
+/// gateway reads as the regular mode: the document says the policy of its
+/// self-hosted workers. The pools of a mode are the gateway's and are not
+/// read.
 fn presets(config: &RouterConfig) -> Result<(PolicySpec, Vec<Side<'_>>), PolicyDocumentError> {
     let (mode, main) = (&config.mode, &config.policy);
     let (prefill, decode) = (mode.get_prefill_policy(main), mode.get_decode_policy(main));

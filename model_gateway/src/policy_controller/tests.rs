@@ -520,6 +520,36 @@ fn a_provider_mode_of_a_multi_router_gateway_starts_the_store() -> Case {
 }
 
 #[test]
+fn a_provider_mode_of_a_multi_router_gateway_runs_a_given_document() -> Case {
+    // The compare of a given document with the routing settings reads the
+    // multi-router setting too. Without it a provider mode has no document
+    // to compare with, and the start would stop whatever was given.
+    for mode in provider_modes() {
+        let mut document = PolicySpec::preset("round_robin")?;
+        document.generation = 2;
+        let digest = document.digest()?;
+        let config = running(
+            RouterConfig {
+                mode,
+                enable_igw: true,
+                ..RouterConfig::default()
+            },
+            document,
+        );
+        let store = start(&config)?.ok_or("the given document started no store")?;
+        let world = store.world();
+        assert_eq!(world.spec().generation(), 2);
+        assert_eq!(
+            world.spec().digest(),
+            Some(digest),
+            "the {} mode",
+            config.mode_type()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn a_controller_address_beside_a_provider_mode_stops_the_start() -> Case {
     // Nothing of such a gateway is placed through a controller. The
     // validator refuses the address by name. A context built over a
