@@ -6323,6 +6323,90 @@ mod tests {
         assert_eq!(first_of(&shadow), Some(rows[1].id));
     }
 
+    /// A write back that wins is no end of it: another request's pin can
+    /// stand behind the record by the time of the claim. The record leads
+    /// the pins, so the live decision's sight is that worker alone. Its
+    /// lifted placement names a third worker, its claim finds the other
+    /// request's pin standing, and it follows that pin. The shadow takes
+    /// the claim's answer and agrees: without it, it keeps the placement.
+    /// The other request's pin joins at the host's ask, the last seam one
+    /// thread has before the write back.
+    #[test]
+    fn shadow_takes_the_claims_answer_behind_a_write_back_that_won() {
+        /// Pins of record whose ask lets another request write the record
+        /// back first and commit on a worker of its own: under the original
+        /// recovery that worker joins the pins behind the record.
+        #[derive(Debug)]
+        struct Behind<'a> {
+            engine: &'a Engine,
+            rule: SessionRule,
+            stored: WorkerId,
+            behind: WorkerId,
+            /// The key's pins as the table held them when the host answered.
+            seen: Mutex<Option<[WorkerId; 2]>>,
+        }
+
+        impl crate::PinSource for Behind<'_> {
+            fn pinned(&self, key: Session, _: Option<u64>) -> Option<WorkerId> {
+                let sessions = self.engine.sessions();
+                let _ = sessions.restore(key, 10, &self.rule, self.stored);
+                sessions.dispatched(key, SessionVerdict::Pinned, self.behind);
+                *self.seen.lock().expect("the fixture's own lock") = sessions.pins(key);
+                Some(self.stored)
+            }
+        }
+
+        let rule = SessionRule {
+            recovery: Recovery::Original,
+            ..SESSIONS
+        };
+        let stages = || Profile {
+            filters: vec![Box::new(Healthy), Box::new(NotOverloaded)],
+            ..least_requests_profile()
+        };
+        let mut engine = Engine::new(
+            vec![stages(), stages()],
+            vec![Binding {
+                shadow: Some(1),
+                sessions: Some(rule),
+                ..single_binding()
+            }],
+            23,
+            Needs::default(),
+        );
+        engine.places_by_key(0);
+        engine.places_by_key(1);
+        let mut rows = [candidate(0, 13), candidate(1, 1), candidate(2, 3)];
+        rows[0].health.overloaded = true;
+        let facts = keyed_at(61, 71);
+        let pool = PoolFacts::default();
+        let racing = Behind {
+            engine: &engine,
+            rule,
+            stored: rows[0].id,
+            behind: rows[2].id,
+            seen: Mutex::new(None),
+        };
+        let cx = Constraints {
+            pins: Some(&racing),
+            ..Constraints::default()
+        };
+        let mut scratch = Scratch::new();
+        let live = engine.decide_keeping(&facts, &pool, &rows, &cx, &mut scratch);
+        assert_eq!(
+            *racing.seen.lock().expect("the fixture's own lock"),
+            Some([rows[0].id, rows[2].id])
+        );
+        assert_eq!(first_of(&live), Some(rows[2].id));
+        let shadow = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("a shadow decision");
+        assert_eq!(
+            crate::decision::ShadowKind::of(&live, &shadow),
+            crate::decision::ShadowKind::Agreed
+        );
+    }
+
     /// A kept key's decision writes the host's pin back behind its lifted
     /// pass, where the standing pass left the recorded worker out. That
     /// write back can lose to another first request of the key too. The
