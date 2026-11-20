@@ -13,13 +13,13 @@ pub use external::{
     group_models_into_cards, infer_model_type_from_id, CreateExternalWorkersStep,
     DiscoverModelsStep, ModelInfo, ModelsResponse,
 };
-pub(crate) use local::WORKER_KEY_UNSUPPORTED;
 pub use local::{
     create_worker_removal_workflow, create_worker_removal_workflow_data,
     create_worker_update_workflow, create_worker_update_workflow_data, FindWorkerToUpdateStep,
     ReleaseTokenizerStep, RemoveFromPolicyRegistryStep, UpdatePoliciesForWorkerStep,
     UpdateRemainingPoliciesStep, UpdateWorkerPropertiesStep,
 };
+pub(crate) use local::{worker_removal_line, WORKER_KEY_UNSUPPORTED};
 use local::{
     CheckLocalWorkerStep, DiscoverZmqLabelsStep, EnsureHarmonyEncodingStep, RefuseWorkerKeyStep,
     SubmitTokenizerJobStep, CHECK_LOCAL_WORKER_STEP, REFUSE_WORKER_KEY_STEP, ZMQ_LABELS_STEP,

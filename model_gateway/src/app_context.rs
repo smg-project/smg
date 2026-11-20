@@ -26,7 +26,7 @@ use smg_worker::{
     },
     health::liveness,
     settings::RegistrationSettings,
-    workflow::{WorkerKind, WorkflowHost},
+    workflow::{find_workers_by_url, WorkerKind, WorkflowHost},
 };
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
@@ -299,6 +299,18 @@ impl AppContext {
     /// own API key on no such worker, at start-up or from discovery.
     pub(crate) fn registers_at_door(&self, spec: &WorkerSpec) -> bool {
         self.policy_feed.is_some() && stated_kind(spec) != Some(WorkerKind::External)
+    }
+
+    /// Whether a row of the policy controller's store stands for a worker
+    /// `url` selects. The holder is then the one writer of that worker's
+    /// object in the registry.
+    pub(crate) fn holds_row_at(&self, url: &str) -> bool {
+        self.policy_feed.as_ref().is_some_and(|feed| {
+            find_workers_by_url(&self.worker_registry, url)
+                .iter()
+                .filter_map(|worker| self.worker_registry.get_id_by_url(worker.url()))
+                .any(|id| feed.objects.standing(&id).is_some())
+        })
     }
 
     /// Create AppContext from config with all components initialized
@@ -658,14 +670,14 @@ impl AppContextBuilder {
         }
 
         // Create WorkerService from the already-built components. Under a
-        // feed a local worker is a row, and a row holds no API key.
+        // feed a local worker is a row of the store.
         let worker_service = WorkerService::new(
             worker_registry.clone(),
             worker_job_queue.clone(),
             router_config.clone(),
         );
         let worker_service = Arc::new(if self.policy_feed.is_some() {
-            worker_service.refusing_worker_keys()
+            worker_service.with_local_workers_as_rows()
         } else {
             worker_service
         });

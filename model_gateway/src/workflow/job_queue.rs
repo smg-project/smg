@@ -31,11 +31,11 @@ use crate::{
     workflow::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
-        create_worker_removal_workflow, create_worker_removal_workflow_data,
-        create_worker_update_workflow_data, create_worker_workflow_data,
-        note_tokenizer_load_outcome, note_tokenizer_removed, registered_entries, registered_in,
-        McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
-        WasmModuleConfigRequest, WasmModuleRemovalRequest, WorkerRegistrationMode, WorkflowEngines,
+        create_worker_removal_workflow_data, create_worker_update_workflow_data,
+        create_worker_workflow_data, note_tokenizer_load_outcome, note_tokenizer_removed,
+        registered_entries, registered_in, McpServerConfigRequest, TokenizerConfigRequest,
+        TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
+        WorkerRegistrationMode, WorkflowEngines,
     },
 };
 
@@ -323,6 +323,19 @@ fn add_worker_in_flight(queue: &JobQueue, url: &str) -> bool {
     })
 }
 
+/// Under the policy controller a row's object is the holder's to write, and
+/// the update line writes the registry by hand. It leaves a row's worker
+/// alone, and this is the job's answer. `None` where the line runs.
+fn left_to_the_store(context: &AppContext, url: &str) -> Option<String> {
+    context.holds_row_at(url).then(|| {
+        format!(
+            "{} is a row of the policy controller's store, which the update line does not \
+             write yet",
+            Job::workflow_label(url)
+        )
+    })
+}
+
 /// The workflow engines, or the refusal a job answers while they are not
 /// built yet.
 fn workflow_engines(context: &AppContext) -> Result<&WorkflowEngines, String> {
@@ -459,18 +472,11 @@ fn take_mark(marks: &DashSet<WorkerId>, own_id: Option<&WorkerId>) -> bool {
     own_id.is_some_and(|id| marks.remove(id).is_some())
 }
 
-/// How long a removal job waits for its run. A job that gave up earlier
-/// would report a failure and free the URL while its run went on to remove
-/// the worker.
-fn removal_wait() -> Duration {
-    run_bound(&create_worker_removal_workflow())
-}
-
 /// The longest a run of `workflow` spends in its steps: each step's bound
 /// times its attempts, added up. A step counts at least once: the engine
 /// runs it once even under a policy of no attempts. The backoff between
 /// attempts is not counted.
-fn run_bound<D: WorkflowData>(workflow: &WorkflowDefinition<D>) -> Duration {
+pub(crate) fn run_bound<D: WorkflowData>(workflow: &WorkflowDefinition<D>) -> Duration {
     workflow
         .steps
         .iter()
@@ -640,6 +646,9 @@ impl JobHost for AppContext {
                 }
             }
             Job::UpdateWorker { url, update, asker } => {
+                if let Some(left) = left_to_the_store(context, url) {
+                    return Err(left);
+                }
                 let engines = workflow_engines(context)?;
 
                 let workflow_data = create_worker_update_workflow_data(
@@ -660,6 +669,10 @@ impl JobHost for AppContext {
                 .await
             }
             Job::RefreshWorkerLabels { url, asker } => {
+                // A refresh is the health loop's follow-up: it ends well.
+                if let Some(left) = left_to_the_store(context, url) {
+                    return Ok(left);
+                }
                 let engines = workflow_engines(context)?;
 
                 let mut workflow_data = create_worker_update_workflow_data(
@@ -716,7 +729,11 @@ impl JobHost for AppContext {
                 // Another kept job can take the URL as soon as it is released.
                 engines
                     .worker_removal
-                    .wait_for_completion(instance_id, &Job::workflow_label(url), removal_wait())
+                    .wait_for_completion(
+                        instance_id,
+                        &Job::workflow_label(url),
+                        engines.worker_removal_wait,
+                    )
                     .await
             }
             Job::AddWasmModule { config } => {
@@ -1086,6 +1103,7 @@ mod tests {
     use crate::{
         app_context::testing::create_test_app_context,
         wasm::{WasmModuleDescriptor, WasmModuleType},
+        workflow::create_worker_removal_workflow,
     };
 
     type QueueTest<'a> = queue::testing::QueueTest<'a, AppContext>;
@@ -1756,6 +1774,120 @@ mod tests {
         let store = hosted.policy_store.as_ref().expect("the store");
         let row = store.by_key(&url).expect("the worker's row");
         assert_eq!(row.status, RowStatus::Ready);
+    }
+
+    /// A gateway that decides by the policy controller, its queue recording
+    /// and its engines live, with one start-up worker registered through
+    /// its job: the context, the worker's URL, the registration job and
+    /// the queue's reader, which keeps the queue open.
+    async fn a_hosted_gateway_with_a_row() -> (Arc<AppContext>, String, Job, impl FnMut() -> Job) {
+        let url = format!("http://{}", a_registering_engine().await);
+        let mut config = RouterConfig::builder()
+            .mode(RoutingMode::Regular {
+                worker_urls: vec![url.clone()],
+            })
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .build_unchecked();
+        config.policy_controller = true;
+        config.health_check.disable_health_check = true;
+        config.health_check.drain_settle_secs = 0;
+        let hosted = AppContext::from_config(config.clone(), 30, None, None)
+            .await
+            .expect("the context");
+        let hosted = Arc::new(hosted);
+        let (queue, next_job) = recording_for_tests(&hosted);
+        hosted.worker_job_queue.set(queue).unwrap();
+        let engines = WorkflowEngines::with_feed(&config, hosted.policy_feed.as_ref());
+        assert!(hosted.workflow_engines.set(engines).is_ok());
+        let registration = Job::AddWorker {
+            config: Box::new(WorkerSpec::new(&url)),
+            registration_mode: WorkerRegistrationMode::Upsert,
+            asker: WorkerJobAsker::Startup,
+        };
+        let done = execute_job(&registration, &hosted, &DashSet::new(), None).await;
+        assert!(done.is_ok(), "{done:?}");
+        (hosted, url, registration, next_job)
+    }
+
+    /// Under the policy controller the update line leaves a row's worker
+    /// alone: it writes the registry by hand, and a row's object is the
+    /// holder's to write. A label refresh ends well and an update job fails,
+    /// each by the same sentence. The registry keeps the object the holder
+    /// laid, so the removal behind them still takes the worker.
+    #[tokio::test]
+    async fn under_the_policy_controller_the_update_line_leaves_a_rows_worker_alone() {
+        let (hosted, url, _, _jobs) = a_hosted_gateway_with_a_row().await;
+        let registry = &hosted.worker_registry;
+        let laid = registry.get_by_url(&url).expect("the row's object");
+        let marks = DashSet::new();
+        let refresh = Job::RefreshWorkerLabels {
+            url: url.clone(),
+            asker: WorkerJobAsker::Health,
+        };
+        let labels: WorkerUpdateRequest =
+            serde_json::from_value(serde_json::json!({"labels": {"tier": "a"}}))
+                .expect("an update");
+        let update = Job::UpdateWorker {
+            url: url.clone(),
+            update: Box::new(labels),
+            asker: WorkerJobAsker::Api,
+        };
+
+        let refreshed = execute_job(&refresh, &hosted, &marks, None).await;
+        let updated = execute_job(&update, &hosted, &marks, None).await;
+        let left = "is a row of the policy controller's store";
+        assert!(
+            refreshed.as_ref().is_ok_and(|text| text.contains(left)),
+            "{refreshed:?}"
+        );
+        assert!(
+            updated.as_ref().is_err_and(|text| text.contains(left)),
+            "{updated:?}"
+        );
+        let stands = registry.get_by_url(&url).expect("the worker");
+        assert!(Arc::ptr_eq(&stands, &laid));
+
+        let removal = Job::RemoveWorker {
+            url: url.clone(),
+            expected_revisions: None,
+            asker: WorkerJobAsker::Startup,
+        };
+        let removed = execute_job(&removal, &hosted, &marks, None).await;
+        assert!(removed.is_ok(), "{removed:?}");
+        assert!(registry.get_by_url(&url).is_none(), "the worker stayed");
+    }
+
+    /// Under the policy controller a removed worker registers again. The
+    /// removal takes its row at the store's door and the holder drops its
+    /// object, so the next registration at the address writes a new row and
+    /// the holder lays a new object.
+    #[tokio::test]
+    async fn under_the_policy_controller_a_removed_worker_registers_again() {
+        use smg_policy_controller::store::{WorkerStatus as RowStatus, WorkersStore};
+
+        let (hosted, url, registration, _jobs) = a_hosted_gateway_with_a_row().await;
+        let store = hosted.policy_store.as_ref().expect("the store");
+        let registry = &hosted.worker_registry;
+        let marks = DashSet::new();
+        let first = registry.get_by_url(&url).expect("the row's object");
+
+        let removal = Job::RemoveWorker {
+            url: url.clone(),
+            expected_revisions: None,
+            asker: WorkerJobAsker::Startup,
+        };
+        let removed = execute_job(&removal, &hosted, &marks, None).await;
+        assert!(removed.is_ok(), "{removed:?}");
+        assert!(store.by_key(&url).is_none(), "the row stayed");
+        assert!(registry.get_by_url(&url).is_none(), "the object stayed");
+
+        let again = execute_job(&registration, &hosted, &marks, None).await;
+        assert!(again.is_ok(), "{again:?}");
+        let row = store.by_key(&url).expect("the worker's row");
+        assert_eq!(row.status, RowStatus::Ready);
+        let second = registry.get_by_url(&url).expect("the row's object");
+        assert!(!Arc::ptr_eq(&first, &second));
     }
 
     /// The registration workflows the store holds that have not ended.
@@ -3871,16 +4003,35 @@ mod tests {
         );
     }
 
-    /// The wait counts every step: the selection and the registry removal,
-    /// 10 seconds each, the settle bound, then the policy cleanup under the
-    /// workflow's default of 300 seconds and a 10 second tokenizer release.
-    #[test]
-    fn a_removal_job_waits_for_the_bound_of_every_step() {
+    /// The wait counts every step of the line the engines installed. The
+    /// classic line: the selection and the registry removal, 10 seconds
+    /// each, the settle bound, then the policy cleanup under the workflow's
+    /// default of 300 seconds and a 10 second tokenizer release. The line at
+    /// the store's door: two settle bounds, six steps of 10 seconds and the
+    /// cache cleanup's 300.
+    #[tokio::test]
+    async fn a_removal_job_waits_for_the_bound_of_every_step() {
+        use smg_policy_controller::store::MemoryStore;
         use smg_worker::workflow::SETTLE_STEP_TIMEOUT;
 
+        use crate::{
+            policy_controller::feed::feed, routers::grpc::backend_client::BackendConnector,
+        };
+
+        let config = RouterConfig::default();
         assert_eq!(
-            removal_wait(),
+            WorkflowEngines::new(&config).worker_removal_wait,
             SETTLE_STEP_TIMEOUT + Duration::from_secs(330)
+        );
+        let registry = Arc::new(WorkerRegistry::new());
+        let feed = feed(
+            &Arc::new(MemoryStore::default()),
+            &registry,
+            BackendConnector::shared(),
+        );
+        assert_eq!(
+            WorkflowEngines::with_feed(&config, Some(&feed)).worker_removal_wait,
+            SETTLE_STEP_TIMEOUT * 2 + Duration::from_secs(360)
         );
     }
 

@@ -10,7 +10,9 @@ use wfaas::{EventSubscriber, InMemoryStore, WorkflowEngine};
 use super::{
     create_mcp_registration_workflow, create_tokenizer_registration_workflow,
     create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
-    create_worker_removal_workflow, create_worker_update_workflow, steps::worker_registration_line,
+    create_worker_update_workflow,
+    job_queue::run_bound,
+    steps::{worker_registration_line, worker_removal_line},
     McpWorkflowData, TokenizerWorkflowData, WasmRegistrationWorkflowData, WasmRemovalWorkflowData,
     WorkerRemovalWorkflowData, WorkerUpdateWorkflowData,
 };
@@ -64,6 +66,10 @@ pub struct WorkflowEngines {
     pub worker_registration: Arc<WorkerRegistrationEngine>,
     /// Engine for worker removal workflows
     pub worker_removal: Arc<WorkerRemovalEngine>,
+    /// How long a removal job waits for its run: the bound of the installed
+    /// removal line ([`run_bound`]). A job that gave up earlier would report
+    /// a failure and free the URL while its run went on to remove the worker.
+    pub(crate) worker_removal_wait: Duration,
     /// Engine for worker update workflows
     pub worker_update: Arc<WorkerUpdateEngine>,
     /// Engine for MCP server registration workflows
@@ -84,7 +90,7 @@ impl WorkflowEngines {
         Self::with_feed(router_config, None)
     }
 
-    /// [`Self::new`], with the worker registration writing at the door of
+    /// [`Self::new`], with the two worker workflows writing at the door of
     /// `feed` where one stands: a local worker of such a gateway is a row
     /// of the policy controller's store. Every other engine is the same.
     #[expect(
@@ -98,10 +104,14 @@ impl WorkflowEngines {
             .register_workflow(worker_registration_line(router_config, feed))
             .expect("worker_registration workflow should be valid");
 
-        // Create worker removal engine
+        // Create worker removal engine. A health check's removal at the
+        // door reads the scope the health settings state.
+        let door = feed.map(|feed| (feed, router_config.unhealthy_removal_scope()));
+        let removal = worker_removal_line(door);
+        let worker_removal_wait = run_bound(&removal);
         let worker_removal = WorkflowEngine::new();
         worker_removal
-            .register_workflow(create_worker_removal_workflow())
+            .register_workflow(removal)
             .expect("worker_removal workflow should be valid");
 
         // Create worker update engine
@@ -136,6 +146,7 @@ impl WorkflowEngines {
         let engines = Self {
             worker_registration: Arc::new(worker_registration),
             worker_removal: Arc::new(worker_removal),
+            worker_removal_wait,
             worker_update: Arc::new(worker_update),
             mcp: Arc::new(mcp),
             tokenizer: Arc::new(tokenizer),
