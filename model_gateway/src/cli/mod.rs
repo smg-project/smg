@@ -308,9 +308,10 @@ struct RoutingArgs {
     worker_startup_check_interval: u64,
 
     // ==================== Routing Policy ====================
-    /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
-    policy: String,
+    /// Load balancing policy to use. Defaults to cache_aware. With a policy
+    /// document and no --policy, the document decides.
+    #[arg(long, value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
+    policy: Option<String>,
 
     /// Minimum matched-prefix share (0.0-1.0) before cache-aware routing
     /// pins a request to a worker already holding that prefix; below it the
@@ -660,6 +661,29 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
     worker_warmup_divert_every: u64,
 
+    /// Choose off for the classic routing policies or on for the policy
+    /// controller. With on, the routing flags keep their meaning through a
+    /// policy document. Requests the controller cannot decide are refused
+    /// by name without using the classic policies
+    #[arg(
+        long,
+        value_parser = ["on", "off"],
+        default_value = "off",
+        help_heading = "Routing Policy"
+    )]
+    policy_controller: String,
+
+    /// Run this policy document in place of the one the routing flags mean.
+    /// Settings that change the default routing document must agree with the
+    /// file. Omit --policy to use the file's policy
+    #[arg(
+        long,
+        value_name = "FILE",
+        help_heading = "Routing Policy",
+        conflicts_with = "print_policy_spec"
+    )]
+    policy_spec: Option<String>,
+
     /// Print the policy document these routing flags mean, as YAML, and
     /// exit. The routing part of the line is read and checked as a start
     /// checks it: the routing flags, the discovery flags and the tenant
@@ -673,10 +697,7 @@ struct RoutingArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     print_policy_spec: bool,
 
-    #[arg(long, hide = true)]
-    policy_controller: bool,
-
-    /// Follow workers from the policy controller's gateway listener (requires --policy-controller).
+    /// Follow workers from the policy controller's gateway listener (requires --policy-controller on).
     #[arg(long, value_name = "host:port", help_heading = "Policy Controller")]
     policy_controller_address: Option<String>,
 
@@ -2127,6 +2148,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "smg",
             "--policy-controller",
+            "on",
             "--policy-controller-address",
             "controller:30100",
             "--policy-controller-tls-ca-cert",
@@ -2163,6 +2185,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "smg",
             "--policy-controller",
+            "on",
             "--policy-controller-address",
             "controller:30100",
         ])
@@ -2183,6 +2206,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "smg",
             "--policy-controller",
+            "on",
             "--policy-controller-address",
             "controller:30100",
             "--discovery-provider",
@@ -2198,6 +2222,127 @@ mod tests {
             error.contains("--policy-controller-address") && error.contains("--discovery-provider"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn the_switch_flows_into_router_config() {
+        use clap::error::ErrorKind;
+
+        for (flags, enabled) in [
+            (&[][..], false),
+            (&["--policy-controller", "on"][..], true),
+            (&["--policy-controller", "off"][..], false),
+        ] {
+            let config = cli_args_from(flags)
+                .to_router_config(vec![], vec![])
+                .expect("the routing configuration");
+            assert_eq!(config.policy_controller, enabled, "{flags:?}");
+        }
+        let refusal = Cli::try_parse_from(["smg", "--policy-controller", "other"])
+            .expect_err("the switch takes only on and off");
+        assert_eq!(refusal.kind(), ErrorKind::InvalidValue);
+        assert!(refusal.to_string().contains("--policy-controller"));
+    }
+
+    fn policy_file(
+        name: &str,
+    ) -> Result<
+        (tempfile::NamedTempFile, smg_policy_controller::PolicySpec),
+        Box<dyn std::error::Error>,
+    > {
+        let file = tempfile::NamedTempFile::new()?;
+        let document = smg_policy_controller::PolicySpec::preset(name)?;
+        serde_yaml::to_writer(file.as_file(), &document)?;
+        Ok((file, document))
+    }
+
+    #[test]
+    fn the_plain_start_takes_the_document() {
+        let (file, document) = policy_file("round_robin").expect("a policy document file");
+        let path = file.path().to_str().expect("a UTF-8 path");
+        let config = cli_args_from(&["--policy-controller", "on", "--policy-spec", path])
+            .to_router_config(vec![], vec![])
+            .expect("the routing configuration");
+        assert_eq!(config.policy_spec_path.as_deref(), Some(path));
+        assert_eq!(config.policy_spec.as_ref(), Some(&document));
+        assert_eq!(config.policy_document_in_force(), Ok(document));
+    }
+
+    #[test]
+    fn a_set_flag_that_disagrees_is_refused_by_name() {
+        use crate::config::PolicyDocumentError;
+
+        let (file, _) = policy_file("least_load").expect("a policy document file");
+        let path = file.path().to_str().expect("a UTF-8 path");
+        for policy in ["round_robin", "cache_aware"] {
+            let config = cli_args_from(&[
+                "--policy-controller",
+                "on",
+                "--policy-spec",
+                path,
+                "--policy",
+                policy,
+            ])
+            .to_router_config(vec![], vec![])
+            .expect("the routing configuration");
+            let refusal = config
+                .policy_document_in_force()
+                .expect_err("the policies disagree");
+            assert!(
+                matches!(&refusal, PolicyDocumentError::Disagree { at, .. } if at == &format!("profiles.{policy}")),
+                "{refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_set_flag_that_agrees_takes_the_document() {
+        let (file, document) = policy_file("round_robin").expect("a policy document file");
+        let path = file.path().to_str().expect("a UTF-8 path");
+        let config = cli_args_from(&[
+            "--policy-controller",
+            "on",
+            "--policy-spec",
+            path,
+            "--policy",
+            "round_robin",
+        ])
+        .to_router_config(vec![], vec![])
+        .expect("the routing configuration");
+        assert!(matches!(config.policy, PolicyConfig::RoundRobin));
+        assert_eq!(config.policy_document_in_force(), Ok(document));
+    }
+
+    #[test]
+    fn a_line_with_no_document_builds_cache_aware_as_before() {
+        for (flags, threshold) in [(&[][..], 0.3), (&["--cache-threshold", "0.7"][..], 0.7)] {
+            let config = cli_args_from(flags)
+                .to_router_config(vec![], vec![])
+                .expect("the routing configuration");
+            assert!(
+                matches!(config.policy, PolicyConfig::CacheAware { cache_threshold, .. }
+                    if (cache_threshold - threshold).abs() < f32::EPSILON),
+                "{flags:?}: {:?}",
+                config.policy
+            );
+        }
+    }
+
+    #[test]
+    fn the_print_flag_refuses_a_document_beside_it() {
+        use clap::error::ErrorKind;
+
+        let line = [
+            "smg",
+            "--print-policy-spec",
+            "--policy-spec",
+            "routing.yaml",
+        ];
+        let refusal = Cli::try_parse_from(line).expect_err("the print and input flags conflict");
+        assert_eq!(refusal.kind(), ErrorKind::ArgumentConflict);
+        let message = refusal.to_string();
+        assert!(message.contains("--print-policy-spec"));
+        assert!(message.contains("--policy-spec"));
     }
 
     /// The CLI preserves independent role thresholds and rounds percentages up.

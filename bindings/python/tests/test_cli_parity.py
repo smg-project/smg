@@ -52,7 +52,6 @@ def test_the_executable_registers_its_allocator_before_running_the_command_line(
 # Flags of the Rust CLI the launcher does not take, with the reason.
 CLI_ONLY = {
     "--disable-audit-logging": "the launcher's switch is --control-plane-audit-enabled",
-    "--policy-controller": "the binary's hidden setting; the launcher starts no controller mode yet",
     "--policy-controller-address": "the binary follows a controller; the launcher takes the mode once it serves",
     "--policy-controller-tls-ca-cert": "rides --policy-controller-address",
     "--policy-controller-tls-cert": "rides --policy-controller-address",
@@ -579,6 +578,40 @@ def test_the_launcher_encode_policy_choices_are_the_cli_choices(launcher):
     cli_choices = re.findall(r'"([a-z_]+)"', attribute.group(1).split("value_parser", 1)[1])
     assert cli_choices == ["random", "round_robin", "consistent_hashing"]
     assert list(launcher["--encode-policy"].choices) == cli_choices
+
+
+def test_the_launcher_policy_controller_choices_are_the_cli_choices(launcher):
+    attribute = re.search(
+        r"value_parser\s*=\s*\[([^\]]+)\][^\]]*\)\]\s*policy_controller: String,",
+        cli_source(),
+    )
+    assert attribute, "the CLI's --policy-controller choices are missing"
+    assert list(launcher["--policy-controller"].choices) == re.findall(
+        r'"([a-z]+)"', attribute.group(1)
+    )
+
+
+def test_the_launchers_leave_policy_unset_and_describe_the_same_default(rust, launcher):
+    option = launcher["--policy"]
+    assert rust.flags["--policy"] is option.default is None
+    assert constructor_defaults()["policy"] == ("None", None)
+
+    declaration = re.search(
+        r"(?P<help>(?:^[ \t]*/// [^\n]+\n)+)"
+        r"\s*#\[arg\((?P<attribute>[^\n]+)\)\]\n\s*policy: Option<String>,",
+        CLI_MODULE.read_text(),
+        re.MULTILINE,
+    )
+    assert declaration, "the CLI's --policy declaration moved"
+    choices = re.search(r"value_parser\s*=\s*\[([^\]]+)\]", declaration["attribute"])
+    assert choices, "the CLI's --policy choices are missing"
+    assert sorted(option.choices) == sorted(re.findall(r'"([a-z_]+)"', choices[1]))
+    cli_help = " ".join(line.split("/// ", 1)[1] for line in declaration["help"].splitlines())
+    default_help = (
+        "Defaults to cache_aware. With a policy document and no --policy, the document decides."
+    )
+    assert cli_help.endswith(default_help)
+    assert option.help.endswith(default_help)
 
 
 @pytest.mark.parametrize("use_router_prefix", [False, True])

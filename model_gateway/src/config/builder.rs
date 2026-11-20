@@ -70,6 +70,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Choose the policy controller for the whole process when `on`.
+    pub fn policy_controller(mut self, on: bool) -> Self {
+        self.config.policy_controller = on;
+        self
+    }
+
     pub fn cache_boundaries(mut self, boundaries: Vec<usize>) -> Self {
         self.config.cache_boundaries = boundaries;
         self
@@ -928,6 +934,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Load the policy document from this path during `build()`.
+    pub fn maybe_policy_spec_path(mut self, path: Option<impl Into<String>>) -> Self {
+        self.config.policy_spec_path = path.map(Into::into);
+        self
+    }
+
     // ==================== Build ====================
 
     pub fn build(self) -> ConfigResult<RouterConfig> {
@@ -940,8 +952,8 @@ impl RouterConfigBuilder {
 
     /// The configuration of a builder that holds the routing part alone,
     /// checked by the validator's routing rules alone. No file is read: no
-    /// certificate, no key and no MCP configuration. What
-    /// `--print-policy-spec` converts.
+    /// certificate, no key, no MCP configuration and no policy document.
+    /// What `--print-policy-spec` converts.
     pub fn build_routing(self) -> ConfigResult<RouterConfig> {
         let config: RouterConfig = self.into();
         ConfigValidator::validate_routing(&config)?;
@@ -957,6 +969,7 @@ impl RouterConfigBuilder {
 
         // Read MCP config from path if provided
         self = self.read_mcp_config()?;
+        self = self.read_policy_spec()?;
 
         let config: RouterConfig = self.into();
         if validate {
@@ -1032,6 +1045,21 @@ impl RouterConfigBuilder {
 
         Ok(self)
     }
+
+    fn read_policy_spec(mut self) -> ConfigResult<Self> {
+        if let Some(path) = &self.config.policy_spec_path {
+            let text =
+                std::fs::read_to_string(path).map_err(|error| ConfigError::ValidationFailed {
+                    reason: format!("{path}: could not read the policy document ({error})"),
+                })?;
+            self.config.policy_spec = Some(serde_yaml::from_str(&text).map_err(|error| {
+                ConfigError::ValidationFailed {
+                    reason: format!("{path}: {error}"),
+                }
+            })?);
+        }
+        Ok(self)
+    }
 }
 
 fn cert_and_key<'a>(
@@ -1071,7 +1099,71 @@ impl RouterConfig {
 mod tests {
     use std::collections::HashMap;
 
+    use smg_policy_controller::PolicySpec;
+    use tempfile::tempdir;
+
     use super::*;
+
+    #[test]
+    fn a_document_that_cannot_be_read_stops_the_build_by_its_path() {
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join("missing.yaml");
+        let path = path.to_str().expect("a UTF-8 path");
+        let io_error = std::fs::read_to_string(path).expect_err("the file is absent");
+        let refusal = RouterConfig::builder()
+            .policy_controller(true)
+            .maybe_policy_spec_path(Some(path))
+            .build()
+            .expect_err("an unreadable file is refused");
+        assert!(matches!(
+            refusal,
+            ConfigError::ValidationFailed { reason } if reason.contains(path)
+                && reason.contains(&io_error.to_string())
+        ));
+    }
+
+    #[test]
+    fn a_document_the_reader_refuses_stops_the_build_in_its_words() {
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join("invalid.yaml");
+        let path = path.to_str().expect("a UTF-8 path");
+        let text = "apiVersion: smg.policy/v1\nprofiles: {}\nunknown: true\n";
+        std::fs::write(path, text).expect("the document is written");
+        let read_error = serde_yaml::from_str::<PolicySpec>(text).expect_err("unknown field");
+        let refusal = RouterConfig::builder()
+            .policy_controller(true)
+            .maybe_policy_spec_path(Some(path))
+            .build()
+            .expect_err("an invalid document is refused");
+        assert!(matches!(
+            refusal,
+            ConfigError::ValidationFailed { reason } if reason.contains(path)
+                && reason.contains(&read_error.to_string())
+        ));
+    }
+
+    #[test]
+    fn a_document_with_the_switch_off_is_refused() {
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join("routing.yaml");
+        let path = path.to_str().expect("a UTF-8 path");
+        std::fs::write(
+            path,
+            "apiVersion: smg.policy/v1\nprofiles: {default: {pick: random}}\n",
+        )
+        .expect("the document is written");
+        let refusal = RouterConfig::builder()
+            .igw(true)
+            .maybe_policy_spec_path(Some(path))
+            .build()
+            .expect_err("the document needs the controller");
+        assert!(matches!(
+            refusal,
+            ConfigError::InvalidValue { field, value, reason }
+                if field == "policy_spec" && value == path
+                    && reason == "a policy document is run by the policy controller: set --policy-controller on"
+        ));
+    }
 
     /// Test complex routing mode helper method
     #[test]

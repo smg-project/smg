@@ -48,6 +48,11 @@ ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file", "slurm", "consul"]
 
 
+def _policy_name(policy: str | None) -> str:
+    """Name the policy used without a document when the flag is unset."""
+    return "cache_aware" if policy is None else policy
+
+
 def _parse_int_csv(value: str) -> list[int]:
     """Parse a comma-separated integer list (mirrors the CLI value_delimiter)."""
     return [int(item) for item in value.split(",") if item]
@@ -542,7 +547,9 @@ class RouterArgs:
     # How strictly a prefill is paired with a decode on their KV transfer
     # protocol: off, lenient or strict
     pd_pairing_mode: str = "lenient"
-    policy: str = "cache_aware"
+    policy: str | None = None
+    policy_controller: str = "off"
+    policy_spec: str | None = None
     postgres_db_url: str | None = None
     # The bound on one Postgres history-store call (pool wait, connect and the
     # operation included)
@@ -946,11 +953,31 @@ class RouterArgs:
         routing_group.add_argument(
             f"--{prefix}policy",
             type=str,
-            default=RouterArgs.policy,
-            choices=COMMON_POLICY_CHOICES,
+            default=None,
+            choices=PREFILL_POLICY_CHOICES,
             help=(
                 "Load balancing policy to use. In PD mode, this is used for both prefill and decode"
-                " unless overridden"
+                " unless overridden. Defaults to cache_aware."
+                " With a policy document and no --policy, the document decides."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}policy-controller",
+            choices=["on", "off"],
+            default=RouterArgs.policy_controller,
+            help=(
+                "Choose off for the classic routing policies or on for the policy controller."
+                " Requests the controller cannot decide are refused by name."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}policy-spec",
+            metavar="FILE",
+            default=RouterArgs.policy_spec,
+            help=(
+                "Run a policy document with the policy controller."
+                " Settings that change the default routing document must agree with the"
+                " file. Omit --policy to use the file's policy."
             ),
         )
         routing_group.add_argument(
@@ -3424,20 +3451,23 @@ class RouterArgs:
                 logger.info(f"Using --encode-policy '{self.encode_policy}' for encode nodes.")
 
         if self.pd_disaggregation:
+            if self.policy is None and self.policy_spec is not None:
+                return
+            policy = _policy_name(self.policy)
             # Warn about policy usage in PD mode
-            if self.prefill_policy and self.decode_policy and self.policy:
+            if self.prefill_policy and self.decode_policy and policy:
                 logger.warning(
                     "Both --prefill-policy and --decode-policy are specified. "
                     "The main --policy flag will be ignored for PD mode."
                 )
-            elif self.prefill_policy and not self.decode_policy and self.policy:
+            elif self.prefill_policy and not self.decode_policy and policy:
                 logger.info(
                     f"Using --prefill-policy '{self.prefill_policy}' for prefill nodes "
-                    f"and --policy '{self.policy}' for decode nodes."
+                    f"and --policy '{policy}' for decode nodes."
                 )
-            elif self.decode_policy and not self.prefill_policy and self.policy:
+            elif self.decode_policy and not self.prefill_policy and policy:
                 logger.info(
-                    f"Using --policy '{self.policy}' for prefill nodes "
+                    f"Using --policy '{policy}' for prefill nodes "
                     f"and --decode-policy '{self.decode_policy}' for decode nodes."
                 )
 

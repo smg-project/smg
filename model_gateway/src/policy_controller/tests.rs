@@ -15,6 +15,7 @@ use openai_protocol::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
+use smg_policy_controller::PolicySpec;
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType};
 
 use super::{start, undecided::ROUTER_TYPE, StartError};
@@ -60,17 +61,55 @@ fn the_store_starts_with_the_document_the_routing_configuration_means() -> Case 
 }
 
 #[test]
+fn the_store_starts_on_the_given_document() -> Case {
+    let mut document = PolicySpec::preset("round_robin")?;
+    document.generation = 2;
+    let digest = document.digest()?;
+    let config = picked(RouterConfig {
+        policy_spec: Some(document),
+        ..RouterConfig::default()
+    });
+    let store = start(&config)?.ok_or("the controller was picked and no store started")?;
+    let world = store.world();
+    assert_eq!(world.spec().generation(), 2);
+    assert_eq!(world.spec().digest(), Some(digest));
+    Ok(())
+}
+
+#[test]
+fn a_start_whose_flags_and_document_disagree_is_refused_by_name() -> Case {
+    let config = picked(RouterConfig {
+        policy: PolicyConfig::RoundRobin,
+        policy_spec: Some(PolicySpec::preset("random")?),
+        ..RouterConfig::default()
+    });
+    let refusal = start(&config)
+        .err()
+        .ok_or("the start took a document that disagrees with the flags")?;
+    assert!(matches!(refusal, StartError::Document(_)), "{refusal:?}");
+    let message = refusal.to_string();
+    assert!(
+        message.contains("disagree at profiles.round_robin:"),
+        "{message}"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_setting_no_document_says_stops_the_start_by_its_name() -> Case {
     let mut config = picked(RouterConfig::default());
     config.routing_key_override.enabled = true;
-    let refusal = start(&config)
-        .err()
-        .ok_or("the start took a setting no document says")?;
-    assert!(matches!(refusal, StartError::Document(_)), "{refusal:?}");
-    assert_eq!(
-        refusal.to_string(),
-        "routing_key_override.enabled = true: the controller holds no recorded form of the sticky sessions' rule yet"
-    );
+    for supplied in [None, Some(PolicySpec::preset("round_robin")?)] {
+        config.policy_spec = supplied;
+        let refusal = start(&config)
+            .err()
+            .ok_or("the start took a setting no document says")?;
+        assert!(matches!(refusal, StartError::Document(_)), "{refusal:?}");
+        assert_eq!(
+            refusal.to_string(),
+            "routing_key_override.enabled = true: the controller holds no recorded form of the sticky sessions' rule yet"
+        );
+    }
     Ok(())
 }
 

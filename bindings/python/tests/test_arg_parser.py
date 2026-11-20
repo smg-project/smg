@@ -6,6 +6,7 @@ without starting actual router instances.
 """
 
 import argparse
+import logging
 import re
 import sys
 from types import SimpleNamespace
@@ -71,7 +72,7 @@ class TestRouterArgs:
         # Test basic defaults
         assert args.host == "0.0.0.0"
         assert args.port == 30000
-        assert args.policy == "cache_aware"
+        assert args.policy is None
         assert args.worker_urls == []
         assert args.pd_disaggregation is False
         assert args.prefill_urls == []
@@ -2733,6 +2734,93 @@ class TestPdPairingMode:
 
     def test_reaches_the_rust_router(self):
         assert _rust_router_kwargs(pd_pairing_mode="strict")["pd_pairing_mode"] == "strict"
+
+
+class TestPolicyController:
+    def test_the_switch_and_document_have_defaults(self):
+        for args in (RouterArgs(), parse_router_args([])):
+            assert args.policy_controller == "off"
+            assert args.policy_spec is None
+
+    @pytest.mark.parametrize("value", ["on", "off"])
+    def test_the_switch_parses_each_choice(self, value):
+        assert parse_router_args(["--policy-controller", value]).policy_controller == value
+        assert _prefixed(["--router-policy-controller", value]).policy_controller == value
+
+    def test_an_unknown_switch_value_is_refused(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--policy-controller", "other"])
+
+    def test_the_document_path_survives_parsing(self):
+        assert parse_router_args(["--policy-spec", "routing.yaml"]).policy_spec == "routing.yaml"
+        assert _prefixed(["--router-policy-spec", "routing.yaml"]).policy_spec == "routing.yaml"
+
+    def test_the_switch_and_document_reach_the_native_constructor(self):
+        keywords = _rust_router_kwargs(policy_controller="on", policy_spec="routing.yaml")
+        assert keywords["policy_controller"] == "on"
+        assert keywords["policy_spec"] == "routing.yaml"
+
+    def test_an_omitted_policy_stays_unset_through_parsing_and_keyword_conversion(self):
+        assert parse_router_args([]).policy is None
+        assert _prefixed([]).policy is None
+        assert _rust_router_kwargs()["policy"] is None
+        assert _prefixed(["--router-policy", "cache_aware"]).policy == "cache_aware"
+
+    @pytest.mark.parametrize(
+        ("policies", "message"),
+        [
+            (
+                {"prefill_policy": "random"},
+                "Using --prefill-policy 'random' for prefill nodes and --policy 'cache_aware' for decode nodes.",
+            ),
+            (
+                {"decode_policy": "random"},
+                "Using --policy 'cache_aware' for prefill nodes and --decode-policy 'random' for decode nodes.",
+            ),
+            (
+                {"prefill_policy": "random", "decode_policy": "random"},
+                "Both --prefill-policy and --decode-policy are specified. "
+                "The main --policy flag will be ignored for PD mode.",
+            ),
+        ],
+    )
+    def test_pd_policy_messages_use_the_default_without_a_document(self, caplog, policies, message):
+        args = RouterArgs(pd_disaggregation=True, **policies)
+        with caplog.at_level(logging.INFO):
+            args._validate_router_args()
+            assert caplog.messages == [message]
+            caplog.clear()
+            args.policy_spec = "routing.yaml"
+            args._validate_router_args()
+            assert caplog.messages == []
+
+    @pytest.mark.parametrize(
+        ("flags", "policy"),
+        [
+            ([], "passthrough"),
+            (["--router-policy-controller", "on", "--router-policy-spec", "routing.yaml"], None),
+            (
+                [
+                    "--router-policy-controller",
+                    "on",
+                    "--router-policy-spec",
+                    "routing.yaml",
+                    "--router-policy",
+                    "cache_aware",
+                ],
+                "cache_aware",
+            ),
+        ],
+    )
+    def test_single_worker_serve_preserves_the_policy_when_given_a_document(self, flags, policy):
+        from smg.serve import ServeOrchestrator
+
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        args = parser.parse_args(flags)
+        args.data_parallel_size = 1
+        with patch("smg.serve.BACKEND_LAUNCHERS", {"worker": object}):
+            assert ServeOrchestrator("worker", args, [])._build_router_args().policy == policy
 
 
 class TestPowerOfTwoLoadMetric:

@@ -7,10 +7,13 @@ including validation of configuration parameters and their interactions.
 
 import inspect
 import re
+import subprocess
+import sys
+from textwrap import dedent
 from unittest.mock import MagicMock, patch
 
 import pytest
-from smg.launch_router import RouterArgs, launch_router
+from smg.launch_router import RouterArgs, launch_router, parse_router_args
 from smg.router import Router, build_control_plane_auth_config, policy_from_str
 from smg.smg_rs import PolicyType
 from smg.smg_rs import Router as _Router
@@ -607,9 +610,100 @@ class TestControlPlaneAuthHalfJwt:
         assert build_control_plane_auth_config({}) is None
 
 
+@pytest.fixture
+def policy_document(tmp_path):
+    def write(policy, *, kind=None):
+        path = tmp_path / "routing.yaml"
+        yaml = (
+            "apiVersion: smg.policy/v1\n"
+            "generation: 1\n"
+            "profiles:\n"
+            f"  {policy}:\n"
+            "    filter: [healthy, not-overloaded, not-tried]\n"
+            f"    pick: {policy.replace('_', '-')}\n"
+            "bindings:\n"
+            "  - match: {model: '*'}\n"
+            f"    profile: {policy}\n"
+        )
+        if kind is not None:
+            yaml += f"kind: {kind}\n"
+        path.write_text(yaml)
+        return path
+
+    return write
+
+
+class TestPolicyDocument:
+    """A missing storage hook stops an accepted start before anything binds."""
+
+    @staticmethod
+    def assert_start_refusal(path, reason, *flags):
+        # Each start installs a process-wide metrics recorder.
+        code = dedent("""
+            import sys
+            from pathlib import Path
+
+            from smg.launch_router import parse_router_args
+            from smg.router import Router
+
+            path = Path(sys.argv[1])
+            args = parse_router_args(
+                ["--policy-controller", "on", "--policy-spec", str(path), *sys.argv[2:]]
+            )
+            args.storage_hook_wasm_path = str(path.with_name("missing.wasm"))
+            Router.from_args(args).start()
+            """)
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(path), *flags],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 1, result.stderr
+        assert f"RuntimeError: {reason}" in result.stderr, result.stderr
+
+    @pytest.mark.parametrize(
+        "mode",
+        [(), ("--pd-disaggregation",), ("--epd-disaggregation",)],
+        ids=["regular", "pd", "epd"],
+    )
+    def test_the_plain_start_takes_the_document(self, policy_document, mode):
+        path = policy_document("round_robin", kind="PolicySpec")
+        self.assert_start_refusal(path, 'the document carries kind "PolicySpec"', *mode)
+
+    @pytest.mark.parametrize("policy", ["round_robin", "cache_aware"])
+    def test_a_set_flag_that_disagrees_is_refused_by_name(self, policy_document, policy):
+        path = policy_document("random")
+        self.assert_start_refusal(
+            path,
+            f"the routing flags and the policy document disagree at profiles.{policy}:",
+            "--policy",
+            policy,
+        )
+
+    def test_a_set_flag_that_agrees_takes_the_document(self, policy_document):
+        path = policy_document("round_robin")
+        self.assert_start_refusal(
+            path, "failed to read WASM storage hook", "--policy", "round_robin"
+        )
+
+    def test_a_line_with_no_document_builds_cache_aware_as_before(self, tmp_path):
+        args = parse_router_args(["--cache-threshold", "2"])
+        args.storage_hook_wasm_path = str(tmp_path / "missing.wasm")
+        with pytest.raises(ValueError, match="cache_threshold"):
+            Router.from_args(args).start()
+        with pytest.raises(ValueError, match="cache_threshold"):
+            _Router(
+                worker_urls=[],
+                cache_threshold=2,
+                storage_hook_wasm_path=args.storage_hook_wasm_path,
+            ).start()
+
+
 class TestKeywordOnlyParametersOfTheCliFlags:
     """The parameters behind the CLI's --engine-metrics, --grouped-dp-sticky,
-    --pd-pairing-mode, --runtime-worker-threads, --webrtc-bind-addr and
+    --pd-pairing-mode, --policy-controller, --policy-spec, --runtime-worker-threads, --webrtc-bind-addr and
     --webrtc-stun-server are keyword-only (no positional slot to keep) with the
     CLI's defaults, and a value the CLI refuses is refused before anything starts."""
 
@@ -621,12 +715,15 @@ class TestKeywordOnlyParametersOfTheCliFlags:
             "engine_metrics",
             "grouped_dp_sticky",
             "pd_pairing_mode",
+            "policy_controller",
+            "policy_spec",
             "runtime_worker_threads",
             "webrtc_bind_addr",
             "webrtc_stun_server",
         ):
             assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
         assert params["engine_metrics"].default is False
+        assert params["policy_spec"].default is None
         assert params["runtime_worker_threads"].default is None
         assert params["webrtc_bind_addr"].default is None
         assert params["webrtc_stun_server"].default is None
@@ -638,6 +735,23 @@ class TestKeywordOnlyParametersOfTheCliFlags:
     def test_an_unknown_grouped_dp_pinning_is_refused(self):
         with pytest.raises(ValueError, match="grouped_dp_sticky"):
             _Router(worker_urls=["http://w:8000"], grouped_dp_sticky="round_robin").start()
+
+    def test_an_unknown_policy_controller_value_is_refused(self):
+        with pytest.raises(ValueError, match=r"policy_controller.*other.*expected 'on' or 'off'"):
+            _Router(worker_urls=["http://w:8000"], policy_controller="other").start()
+
+    def test_a_document_path_reaches_the_configuration(self, tmp_path):
+        path = tmp_path / "routing.yaml"
+        path.write_text("apiVersion: smg.policy/v1\nprofiles: {default: {pick: random}}\n")
+        options = {
+            "worker_urls": ["http://w:8000"],
+            "policy_spec": str(path),
+            "retry_initial_backoff_ms": 0,
+        }
+        with pytest.raises(ValueError, match=r"policy_spec.*" + re.escape(str(path))):
+            _Router(**options).start()
+        with pytest.raises(ValueError, match=r"retry\.initial_backoff_ms"):
+            _Router(**options, policy_controller="on").start()
 
     def test_zero_runtime_threads_is_refused(self):
         with pytest.raises(ValueError, match="runtime_worker_threads"):

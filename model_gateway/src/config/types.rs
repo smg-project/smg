@@ -9,6 +9,7 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 pub use smg_data_connector::{
     HistoryBackend, MemoryConfig, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
+use smg_policy_controller::PolicySpec;
 use smg_service_discovery::Roles;
 pub use smg_service_discovery::{
     deserialize_discovery, ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig,
@@ -668,6 +669,13 @@ pub struct RouterConfig {
     /// PEM client private key file for the controller connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_controller_tls_key: Option<String>,
+    /// Path to the policy document the controller runs in place of the one
+    /// the routing settings mean. Requires the policy controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_spec_path: Option<String>,
+    /// Loaded from `policy_spec_path` during config creation.
+    #[serde(skip)]
+    pub policy_spec: Option<PolicySpec>,
 }
 
 /// Capacity threshold for one PD role.
@@ -2088,6 +2096,8 @@ impl Default for RouterConfig {
             policy_controller_tls_ca_cert: None,
             policy_controller_tls_cert: None,
             policy_controller_tls_key: None,
+            policy_spec_path: None,
+            policy_spec: None,
             server_cert: None,
             server_key: None,
             server_key_path: None,
@@ -2235,6 +2245,30 @@ mod tests {
             assert_eq!(serialized[name], value);
         }
         assert_eq!(serialized["policy_controller"], true);
+    }
+
+    #[test]
+    fn a_document_path_round_trips_and_its_document_does_not() {
+        let config = RouterConfig::default();
+        let form = serde_json::to_value(&config).expect("a config serializes");
+        assert!(form.get("policy_spec_path").is_none());
+        let restored: RouterConfig = serde_json::from_value(form).expect("a config without a path");
+        assert!(restored.policy_spec_path.is_none());
+
+        let config = RouterConfig {
+            policy_controller: true,
+            policy_spec_path: Some("routing.yaml".to_owned()),
+            policy_spec: Some(config.policy_document().expect("the default document")),
+            ..config
+        };
+        let mut form = serde_json::to_value(&config).expect("a config with a document serializes");
+        assert_eq!(form["policy_spec_path"], "routing.yaml");
+        assert!(form.get("policy_spec").is_none());
+        form["policy_spec"] =
+            serde_json::to_value(config.policy_spec).expect("a document serializes");
+        let restored: RouterConfig = serde_json::from_value(form).expect("a config with a path");
+        assert_eq!(restored.policy_spec_path.as_deref(), Some("routing.yaml"));
+        assert!(restored.policy_spec.is_none());
     }
 
     /// The mode is in the gateway's start-up lines: a worker URL's secret is

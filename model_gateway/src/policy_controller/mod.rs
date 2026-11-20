@@ -7,7 +7,7 @@
 //! default.
 //!
 //! At this step the setting starts the store and hands it the policy
-//! document the routing configuration means. Without a controller's address
+//! document in force. Without a controller's address
 //! nothing feeds the store yet, and no code of the controller decides. So
 //! the server answers with one refusing router in the gateway object's
 //! place ([`router`]). No gateway
@@ -61,7 +61,8 @@ use undecided::Undecided;
 /// Why the controller's store did not start.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StartError {
-    /// The routing configuration holds a setting no policy document says.
+    /// The routing configuration holds a setting no policy document says, or
+    /// one that disagrees with the document a user gave.
     #[error(transparent)]
     Document(#[from] PolicyDocumentError),
     /// The gateway's check of a document it hosts refuses this one: this
@@ -74,19 +75,19 @@ pub(crate) enum StartError {
     Stale(#[from] StaleGeneration),
 }
 
-/// The controller's store for this process, holding the policy document the
-/// routing configuration means as its one generation. `None` where the
-/// classic policies decide: nothing is constructed then.
+/// The controller's store for this process, holding the policy document in
+/// force ([`RouterConfig::policy_document_in_force`]) as its one generation.
+/// `None` where the classic policies decide: nothing is constructed then.
 ///
-/// A configuration the document cannot say, and a document the gateway's
-/// check of a hosted document refuses ([`RouterConfig::hosted_policy`]),
-/// stop the start by name. Neither is served by the classic policies in
-/// silence.
+/// A configuration the document cannot say, a routing setting that disagrees
+/// with a given document, and a document the gateway's check of a hosted
+/// document refuses ([`RouterConfig::hosted_policy`]), stop the start by
+/// name. None of them is served by the classic policies in silence.
 pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, StartError> {
     if !config.policy_controller {
         return Ok(None);
     }
-    let document = config.policy_document()?;
+    let document = config.policy_document_in_force()?;
     let generation = config.hosted_policy(&document)?;
     let store = MemoryStore::new();
     store.apply(generation)?;

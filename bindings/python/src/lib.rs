@@ -519,7 +519,7 @@ impl PyPostgresConfig {
 struct Router {
     // The constructor's positional parameters, in their order.
     worker_urls: Vec<String>,
-    policy: PolicyType,
+    policy: Option<PolicyType>,
     host: String,
     port: u16,
     // The keyword-only parameters, in alphabetical order, as the `#[pyo3(signature)]`
@@ -658,6 +658,8 @@ struct Router {
     pd_admission_wait_secs: u64,
     pd_disaggregation: bool,
     pd_pairing_mode: String,
+    policy_controller: String,
+    policy_spec: Option<String>,
     postgres_config: Option<PyPostgresConfig>,
     power_of_two_load_metric: String,
     prefill_expected_workers: Option<usize>,
@@ -1049,6 +1051,18 @@ impl Router {
             })
     }
 
+    fn parse_policy_controller(&self) -> Result<bool, config::ConfigError> {
+        match self.policy_controller.as_str() {
+            "on" => Ok(true),
+            "off" => Ok(false),
+            other => Err(config::ConfigError::invalid_value(
+                "policy_controller",
+                other,
+                "expected 'on' or 'off'",
+            )),
+        }
+    }
+
     fn parse_assignment_mode(
         &self,
         default: config::ManualAssignmentMode,
@@ -1281,7 +1295,11 @@ impl Router {
             }
         };
 
-        let policy = convert_policy(&self.policy)?;
+        let policy = match self.policy.as_ref() {
+            Some(policy) => convert_policy(policy)?,
+            None if self.policy_spec.is_some() => config::RouterConfig::default().policy,
+            None => convert_policy(&PolicyType::CacheAware)?,
+        };
 
         let discovery = if self.service_discovery {
             Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
@@ -1395,6 +1413,7 @@ impl Router {
 
         let pd_pairing_mode = self.parse_pd_pairing_mode()?;
         let grouped_dp_sticky = self.parse_grouped_dp_sticky()?;
+        let policy_controller = self.parse_policy_controller()?;
 
         config::RouterConfig::builder()
             .mode(mode)
@@ -1525,6 +1544,8 @@ impl Router {
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
+            .policy_controller(policy_controller)
+            .maybe_policy_spec_path(self.policy_spec.as_ref())
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .enable_wasm(self.enable_wasm)
             .dp_aware(self.dp_aware)
@@ -1591,7 +1612,7 @@ impl Router {
     #[new]
     #[pyo3(signature = (
         worker_urls,
-        policy = PolicyType::CacheAware,
+        policy = None,
         host = String::from("0.0.0.0"),
         port = 30000,
         // Every other parameter is keyword-only, in alphabetical order (the struct's
@@ -1721,6 +1742,8 @@ impl Router {
         pd_admission_wait_secs = 30,
         pd_disaggregation = false,
         pd_pairing_mode = String::from("lenient"),
+        policy_controller = String::from("off"),
+        policy_spec = None,
         postgres_config = None,
         power_of_two_load_metric = String::from("expected_wait"),
         prefill_expected_workers = None,
@@ -1820,7 +1843,7 @@ impl Router {
     /// Store launcher settings; configuration validation runs before the server starts.
     fn new(
         worker_urls: Vec<String>,
-        policy: PolicyType,
+        policy: Option<PolicyType>,
         host: String,
         port: u16,
         // Keyword-only, in the signature's order (pyo3 wants the two orders to agree).
@@ -1948,6 +1971,8 @@ impl Router {
         pd_admission_wait_secs: u64,
         pd_disaggregation: bool,
         pd_pairing_mode: String,
+        policy_controller: String,
+        policy_spec: Option<String>,
         postgres_config: Option<PyPostgresConfig>,
         power_of_two_load_metric: String,
         prefill_expected_workers: Option<usize>,
@@ -2226,6 +2251,8 @@ impl Router {
             pd_admission_wait_secs,
             pd_disaggregation,
             pd_pairing_mode,
+            policy_controller,
+            policy_spec,
             postgres_config,
             power_of_two_load_metric,
             prefill_expected_workers,
