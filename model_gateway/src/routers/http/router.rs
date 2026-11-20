@@ -537,7 +537,7 @@ impl Router {
             // The state the attempts share; `TypedAttempt` names each piece.
             let tried = parking_lot::Mutex::new(Vec::new());
             let tried_rows = parking_lot::Mutex::new(Vec::new());
-            let ledger = AttemptLedger::default();
+            let ledger = AttemptLedger::of(self.host.is_some());
             let attempt = TypedAttempt {
                 headers,
                 lease: &lease,

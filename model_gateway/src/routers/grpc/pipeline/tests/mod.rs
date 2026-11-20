@@ -3182,6 +3182,43 @@ async fn a_placed_retry_is_not_shed_by_the_workers_overload_flag() {
     }
 }
 
+/// A placed request's definitive failure still moves to the other worker
+/// where that worker's object reads overloaded. Under a host the retry
+/// window reads a worker's status and breaker, and the retry's placement
+/// answers for the veto. Each engine sees the request once, and the second
+/// answer stands.
+#[tokio::test]
+async fn a_placed_requests_definitive_failure_moves_on_past_the_overload_flag() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let mut workers = Vec::new();
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            fail_internal: true,
+            seen_request_ids: Arc::clone(&ids),
+            ..Default::default()
+        })
+        .await;
+        workers.push(register_worker_with_breaker(&registry, port, 5));
+        seen.push(ids);
+    }
+    let (deps, _store) = placed_deps(&registry, &workers);
+    for worker in &workers {
+        assert!(registry.set_worker_overloaded(worker, true));
+    }
+
+    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+        .expect("completion pipeline");
+    let components = components(registry).await;
+    let response = run_completion(pipeline, components, &fast_retry_config(5)).await;
+
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    for ids in &seen {
+        assert_eq!(calls_seen(ids), 1, "each engine sees the request once");
+    }
+}
+
 #[tokio::test]
 async fn a_placed_harmony_responses_iteration_completes_its_lease() {
     let (ctx, store, row) = placed_harmony_responses_context().await;

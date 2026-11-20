@@ -1636,7 +1636,7 @@ impl RequestContext {
             cache_trace: None,
             parser,
             attempt: 0,
-            ledger: AttemptLedger::default(),
+            ledger: AttemptLedger::of(self.state.placed.is_some()),
             tried: Vec::new(),
             tried_rows: Box::default(),
             model_id,
