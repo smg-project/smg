@@ -11,7 +11,10 @@ use crate::{
 };
 
 /// What the deciding host sent a row that no report of the row reflects.
+/// The type is open to further numbers: code outside the crate reads its
+/// fields, and matches them with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Sent {
     /// The number of sends.
     pub requests: u32,
@@ -45,7 +48,9 @@ pub struct Sent {
 #[derive(Debug)]
 pub struct SentCredit {
     pub(crate) credits: Credits,
-    ttl_micros: Option<u64>,
+    /// The profile's time limit, `u64::MAX` where it sets none: no clock
+    /// reaches a cutoff that far back.
+    ttl_micros: u64,
     /// The profile's name: the count of a later document's profile of
     /// this name takes over this one's entries.
     pub(crate) profile: String,
@@ -55,7 +60,7 @@ impl SentCredit {
     pub(crate) fn new(profile: &str, ttl_ms: Option<u32>) -> Self {
         Self {
             credits: Credits::default(),
-            ttl_micros: ttl_ms.map(|ms| u64::from(ms) * 1000),
+            ttl_micros: ttl_ms.map_or(u64::MAX, |ms| u64::from(ms) * 1000),
             profile: profile.to_owned(),
         }
     }
@@ -91,6 +96,13 @@ impl SentCredit {
         self.credits.membership(change, |_| {});
     }
 
+    /// Whether the profile sets a time limit on its sends. A pass over a
+    /// count with none compares no cutoff.
+    #[inline(always)]
+    pub(crate) fn limited(&self) -> bool {
+        self.ttl_micros != u64::MAX
+    }
+
     /// One row's sends.
     pub fn read(&self, facts: &RequestFacts<'_>, row: &Candidate) -> Sent {
         self.reads(facts).of(row)
@@ -101,9 +113,7 @@ impl SentCredit {
     pub fn reads<'a>(&'a self, facts: &RequestFacts<'_>) -> SentReads<'a> {
         SentReads {
             tally: self.credits.tally.load(),
-            cutoff: self
-                .ttl_micros
-                .map_or(0, |ttl| facts.now_micros.saturating_sub(ttl)),
+            cutoff: facts.now_micros.saturating_sub(self.ttl_micros),
             credit: PhantomData,
         }
     }
@@ -121,32 +131,61 @@ pub struct SentReads<'a> {
 impl SentReads<'_> {
     /// The sends since the later of the row's sample and the time cutoff.
     /// A row without a report has a sample instant of zero.
+    ///
+    /// Inlined into its caller's row loop: the three numbers come back in
+    /// no memory, and a stage that reads two of them pays for two.
+    #[inline(always)]
     pub fn of(&self, row: &Candidate) -> Sent {
-        let sent = self.since(row, row.load.map_or(0, |_| row.load_sampled_at_micros));
-        // The count of sends of no stated size is read apart from the
-        // other two: beside a send that lands between the reads it is
-        // held to the sends counted.
-        Sent {
-            unsized_requests: sent.unsized_requests.min(sent.requests),
-            ..sent
-        }
-    }
-
-    /// [`Self::of`] for a row that holds a report, in a stage's row loop.
-    /// The count of sends of no stated size is as its word stands: beside
-    /// a send that lands between the reads it may differ by that send.
-    #[inline(always)]
-    pub(crate) fn reported(&self, row: &Candidate) -> Sent {
-        debug_assert!(row.load.is_some(), "the row holds a report");
-        self.since(row, row.load_sampled_at_micros)
-    }
-
-    #[inline(always)]
-    fn since(&self, row: &Candidate, sample_micros: u64) -> Sent {
         self.tally
             .get(&(row.id, row.dp_rank))
             .map_or_else(Sent::default, |since| {
-                since.sent_through(sample_micros.max(self.cutoff))
+                let sample = row.load.map_or(0, |_| row.load_sampled_at_micros);
+                let sent = since.sent_through(sample.max(self.cutoff));
+                // The count of sends of no stated size is read apart from
+                // the other two: beside a send that lands between the
+                // reads it is held to the sends counted.
+                Sent {
+                    unsized_requests: sent.unsized_requests.min(sent.requests),
+                    ..sent
+                }
+            })
+    }
+
+    /// The stated tokens and the requests of [`Self::of`], in that order:
+    /// the read of a pass that prices no send of unstated size. The third
+    /// number's word is not read.
+    #[inline(always)]
+    pub(crate) fn counts(&self, row: &Candidate) -> (u64, u64) {
+        self.tally
+            .get(&(row.id, row.dp_rank))
+            .map_or((0, 0), |since| {
+                let sample = row.load.map_or(0, |_| row.load_sampled_at_micros);
+                since.credit_through(sample.max(self.cutoff))
+            })
+    }
+
+    /// [`Self::of`] for a row that holds a report, in a stage's row loop.
+    /// `TIMED` is whether the count sets a time limit
+    /// ([`SentCredit::limited`]), settled once a pass: a pass over a count
+    /// with none compares no cutoff. The count of sends of no stated size
+    /// is as its word stands: beside a send that lands between the reads
+    /// it may differ by that send.
+    #[inline(always)]
+    pub(crate) fn reported<const TIMED: bool>(&self, row: &Candidate) -> Sent {
+        debug_assert!(row.load.is_some(), "the row holds a report");
+        debug_assert!(
+            TIMED || self.cutoff == 0,
+            "a count with no limit has no cutoff"
+        );
+        self.tally
+            .get(&(row.id, row.dp_rank))
+            .map_or_else(Sent::default, |since| {
+                let sample = row.load_sampled_at_micros;
+                since.sent_through(if TIMED {
+                    sample.max(self.cutoff)
+                } else {
+                    sample
+                })
             })
     }
 }

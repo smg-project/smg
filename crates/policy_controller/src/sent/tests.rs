@@ -987,6 +987,7 @@ fn a_registered_filter_reads_the_sends_of_its_profile() {
         Sent {
             requests: 2,
             tokens: 2 * u64::from(TOKENS),
+            ..Sent::default()
         }
     );
 }

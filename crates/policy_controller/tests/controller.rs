@@ -1663,14 +1663,11 @@ async fn a_served_dispatch_feeds_a_registered_scorer_without_lifecycle_hooks() {
                     if let Some(dispatched) = first {
                         assert_ne!(target, dispatched);
                         let seen = seen.lock().expect("the scores");
-                        assert!(seen.contains(&(
-                            dispatched,
-                            Sent {
-                                requests: 1,
-                                tokens: u64::from(TOKENS),
-                                ..Sent::default()
-                            }
-                        )));
+                        assert!(seen.iter().any(|&(id, sent)| {
+                            id == dispatched
+                                && (sent.requests, sent.tokens, sent.unsized_requests)
+                                    == (1, u64::from(TOKENS), 0)
+                        }));
                         assert!(seen.contains(&(target, Sent::default())));
                     } else {
                         first = Some(target);
