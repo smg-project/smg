@@ -76,14 +76,17 @@
 //!
 //! # What the module does not hold
 //!
-//! It builds no registry, no engine and no task. The host builds the
-//! registry and hands it in, and calls [`Objects::follow`] where the store
-//! moved. It names nothing of the controller.
+//! It builds no registry and no engine. The host builds the registry and
+//! hands it in, and calls [`Objects::follow`] where the store moved.
+//! [`KvFeed::run`], its follow of the cache events, is a future the host
+//! drives. The collector under it starts a task for each worker it streams
+//! and ends them at the stop. It names nothing of the controller.
 
 mod door;
 mod found;
 mod health;
 mod kv;
+mod kv_feed;
 mod lead;
 mod loads;
 mod object;
@@ -98,6 +101,7 @@ pub use door::{Membership, Refused, Remover, StoreDoor, Wrote};
 pub use found::facts;
 pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, NoFeed, Unfed};
+pub use kv_feed::KvFeed;
 pub use lead::{Lead, SoleLead};
 pub use loads::LoadAdapter;
 pub use object::object;

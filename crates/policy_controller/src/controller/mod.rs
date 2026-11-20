@@ -45,7 +45,7 @@ pub mod election;
 mod floor;
 mod gateways;
 mod generations;
-#[cfg(feature = "worker-host")]
+#[cfg(all(test, feature = "worker-host"))]
 mod kv_feed;
 mod lifecycle;
 mod membership;
@@ -105,6 +105,8 @@ use self::{
     spec_store::SpecStore,
     standby::{Lag, Standby},
 };
+#[cfg(feature = "worker-host")]
+use crate::worker_host::{KvFeed, Members};
 use crate::{
     catalog::Catalog,
     elector::{Elector, Fence},
@@ -162,7 +164,7 @@ pub struct Controller {
     #[cfg(feature = "worker-host")]
     workers: Arc<worker_objects::WorkerObjects>,
     #[cfg(feature = "worker-host")]
-    kv_feed: kv_feed::KvFeed,
+    kv_feed: KvFeed<Members>,
     /// Worker discovery, where the configuration names a provider: one task
     /// of the serve, which runs the provider while this replica leads.
     #[cfg(feature = "discovery")]
@@ -464,7 +466,7 @@ impl Controller {
             woken,
         ));
         #[cfg(feature = "worker-host")]
-        let kv_feed = kv_feed::KvFeed::new(Arc::clone(&journal.0), workers.holder());
+        let kv_feed = KvFeed::new(Arc::clone(&journal.0), workers.holder());
         let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),

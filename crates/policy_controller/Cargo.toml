@@ -206,11 +206,13 @@ kubernetes = ["dep:k8s-openapi", "dep:kube", "tokio/rt"]
 worker-host = [
     "dep:async-trait",
     "dep:smg-worker",
+    "dep:tokio",
     "dep:tracing",
     "dep:wfaas",
     "smg-grpc-client?/engine-port",
     "smg-worker/runtime",
     "smg-worker/workflow",
+    "tokio/macros",
 ]
 
 # Worker discovery on the leading controller, over the replica's worker
