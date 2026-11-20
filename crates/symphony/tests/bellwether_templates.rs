@@ -1563,6 +1563,88 @@ fn modes(format: &Format, reasoning_open: bool) -> [Grammar; 4] {
     grammars
 }
 
+/// Inside a value written as text, the tagged tables' tag takes none of the tags the table reads
+/// in a call: a value that goes on over the next parameter's tag is refused where that tag would
+/// stand. The opener ends the value at its word, whatever follows it, while a bare less-than sign
+/// remains part of the value.
+#[test]
+fn a_tagged_value_stops_before_the_next_parameters_opening_word() {
+    const CLOSED: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    // The first value is not closed before the next parameter's tag; it is closed late, and the
+    // required member comes once more.
+    const RUN_ON: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon\n<parameter=days>\n3\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    const MISSPELLED_SIGN: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon\n<parameter>days>\n3\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    const SPLIT_OPENER: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon <parameters>\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    const LESS_THAN: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon < Paris\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    let tools = [Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "forecast".to_string(),
+            description: None,
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {"location": {"type": "string"}, "days": {"type": "integer"}},
+                "required": ["location", "days"],
+            })),
+            strict: None,
+            extra: Default::default(),
+        },
+    }];
+    let format = symphony::formats::Table::Qwen3Tagged.format();
+    for start in [
+        GrammarStart::Unknown,
+        GrammarStart::Either,
+        GrammarStart::AfterReasoning,
+        GrammarStart::FirstToken,
+    ] {
+        for (reasoning_open, thought_closed) in [(false, false), (true, false), (false, true)] {
+            let before = match (reasoning_open, thought_closed, start) {
+                (true, _, GrammarStart::FirstToken) => "\nNo tool fits.\n</think>\n\n",
+                (true, ..) | (false, false, GrammarStart::AfterReasoning) => "\n\n",
+                _ => "",
+            };
+            for one_call in [true, false] {
+                let tag = format
+                    .grammar_for(
+                        &tools,
+                        Options {
+                            at_least_one: true,
+                            reasoning_open,
+                            thought_closed,
+                            one_call,
+                            start,
+                        },
+                    )
+                    .expect("a tag");
+                let what = format!(
+                    "{start:?}, thought open {reasoning_open}, closed {thought_closed}, one call \
+                     {one_call}"
+                );
+                assert!(
+                    accepts(&tag, &format!("{before}{CLOSED}")),
+                    "{what}: every value closed"
+                );
+                assert!(
+                    !accepts(&tag, &format!("{before}{RUN_ON}")),
+                    "{what}: a value over the next parameter's tag"
+                );
+                assert!(
+                    !accepts(&tag, &format!("{before}{SPLIT_OPENER}")),
+                    "{what}: the opener's word in the plural"
+                );
+                assert!(
+                    !accepts(&tag, &format!("{before}{MISSPELLED_SIGN}")),
+                    "{what}: the opener's word with its sign misspelled"
+                );
+                assert!(
+                    accepts(&tag, &format!("{before}{LESS_THAN}")),
+                    "{what}: a value that holds a tag's first character"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn muse_glimmers_tags_take_what_its_chat_template_writes() {
     let Some((word, _)) = classes() else {
@@ -1703,9 +1785,10 @@ fn qwen3_5s_tags_take_what_its_chat_template_writes() {
 fn qwen3_5s_tag_is_the_tagged_tables_where_their_layouts_agree() {
     // The registry's Qwen 3.5 table writes the same calls by hand: the same trigger, the same
     // begin and end for every tool, and each parameter's tag, close and newline. The values
-    // differ only where the hand-written tag allows a spelling the chat template does not write:
-    // a newline on either side of a value that is not text, which the template always writes, and
-    // JSON's `true` beside Python's words. A string's text holds the same markers.
+    // differ where the hand-written tag allows a spelling the chat template does not write: a
+    // newline on either side of a value that is not text, which the template always writes, and
+    // JSON's `true` beside Python's words. The hand-written tag also ends string text at the opener
+    // of a call and at a parameter opening word, where the template-generated tag does not.
     let Some((word, space)) = classes() else {
         return;
     };
@@ -1737,7 +1820,8 @@ fn qwen3_5s_tag_is_the_tagged_tables_where_their_layouts_agree() {
     let newline = json!({"type": "optional", "content": {"type": "const_string", "value": "\n"}});
     let alpha = (&shaped["tags"][0], &tagged["tags"][0]);
     // `s`, a string: the tag, the text, the close and the newline, alike but for the text's
-    // markers, which leave out the opener of a call that would be text inside the value.
+    // markers, which leave out the opener of a call and the parameter opening word, both of which
+    // the hand-written tag excludes.
     assert_eq!(
         parameter(alpha.0, 0),
         json!({"type": "sequence", "elements": [
