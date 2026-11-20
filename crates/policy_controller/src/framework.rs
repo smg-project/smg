@@ -5118,6 +5118,76 @@ impl Engine {
             None => shed(ShedReason::NoEndpoints, "partners", prefill_pick.trace),
         }
     }
+
+    /// Decides the decode side for a held prefill. The model's pair binding
+    /// runs its decode profile over that prefill's partners in `pools`.
+    /// Each picked target names the held prefill and one of those decodes.
+    /// A missing prefill is shed under `prefill-gone`.
+    pub fn decide_decode(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        pools: PairPools<'_>,
+        prefill: WorkerId,
+        decode_cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Decision {
+        let bare = Trace {
+            seed: facts.seed,
+            generation: pool.generation,
+            ..Trace::default()
+        };
+        if carries_a_column(facts) {
+            return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
+        }
+        let Some((decodes, mut decode_facts)) = pools.side(PairSide::Decode, facts) else {
+            return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
+        };
+        let Some(binding) = self.pair_binding(facts.model) else {
+            return shed(ShedReason::PolicyDeclined, "binding", bare);
+        };
+        let index = binding.decode_profile.unwrap_or(binding.profile);
+        let Some(profile) = self.profiles.get(usize::from(index)) else {
+            return shed(ShedReason::PolicyDeclined, "binding", bare);
+        };
+        let shown = self.marks[usize::from(index)].scoped();
+        if shown && !decode_cx.stalled.is_empty() {
+            return rows_not_written(bare);
+        }
+        let Some(prefill) = pools.prefills.iter().find(|row| row.id == prefill) else {
+            return shed(ShedReason::NoEndpoints, "prefill-gone", bare);
+        };
+        // This call has one draw sequence, seeded by its own request.
+        decode_facts.seed = facts.seed;
+        let _opened = shown.then(|| profile.open(&decode_facts, decodes, pool));
+        let decision = run_profile(
+            profile,
+            index,
+            &decode_facts,
+            pool,
+            Set::side(decodes, Some(pools.table.of(&prefill.pair_class)), None),
+            decode_cx,
+            &mut scratch.decode,
+        );
+        let Decision::Pick(pick) = decision else {
+            return decision;
+        };
+        // Each target names the held prefill with one decode, as the
+        // targets of a pair's first decision do.
+        let held = target_of(prefill);
+        let mut targets = Targets::new();
+        for decode in pick.targets.iter() {
+            targets.push(Target {
+                pair: Some(Pair {
+                    decode_position: decode.position,
+                    decode_id: decode.id,
+                    decode_dp_rank: decode.dp_rank,
+                }),
+                ..held
+            });
+        }
+        Decision::Pick(Pick { targets, ..pick })
+    }
 }
 
 #[inline(never)]
@@ -9207,6 +9277,10 @@ mod tests {
         decodes
     }
 
+    fn first_decode(decision: &Decision) -> Option<u32> {
+        Some(decision.pick()?.targets.first()?.pair?.decode_position)
+    }
+
     /// The reason and the stage of a shed.
     fn shed_of(decision: &Decision) -> Option<(ShedReason, &'static str)> {
         match decision {
@@ -9222,6 +9296,249 @@ mod tests {
             1,
             Needs::default(),
         )
+    }
+
+    #[test]
+    fn a_decode_decided_alone_is_picked_among_the_partners_of_its_prefill() {
+        let engine = strict_pair_engine();
+        let mut prefills = classed_rows(&[1, 2]);
+        prefills[1].dp_rank = 5;
+        let mut decodes = classed_rows(&[1, 2, 1]);
+        decodes[2].dp_rank = 3;
+        let (ends, classes) = table_of(&[&[2], &[1]]);
+        let decision = engine.decide_decode(
+            &request(7),
+            &PoolFacts::default(),
+            PairPools {
+                prefills: &prefills,
+                decodes: &decodes,
+                table: PairTable::new(&ends, &classes),
+                ..PairPools::default()
+            },
+            prefills[1].id,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        let targets = &decision
+            .pick()
+            .expect("partners of the held prefill")
+            .targets;
+        assert_eq!(decodes_of(&decision), [0, 2]);
+        for target in targets.iter() {
+            assert_eq!(
+                (target.id, target.position, target.dp_rank),
+                (prefills[1].id, 1, 5)
+            );
+            let pair = target.pair.expect("a decode at each target");
+            let row = &decodes[pair.decode_position as usize];
+            assert_eq!((pair.decode_id, pair.decode_dp_rank), (row.id, row.dp_rank));
+        }
+    }
+
+    #[test]
+    fn a_decode_that_joined_since_is_picked() {
+        let engine = Engine::new(
+            vec![least_requests_profile()],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        );
+        let prefills = classed_rows(&[1]);
+        let mut decodes = classed_rows(&[1, 1]);
+        let mut scratch = Scratch::new();
+        let facts = request(7);
+        let pool = PoolFacts::default();
+        let cx = Constraints::default();
+        let old = engine.decide_pair(
+            &facts,
+            &pool,
+            PairPools {
+                prefills: &prefills,
+                decodes: &decodes[..1],
+                ..PairPools::default()
+            },
+            &cx,
+            &cx,
+            &mut scratch,
+        );
+        assert_eq!(decodes_of(&old), [0]);
+        decodes[0].in_flight = 7;
+        let new = engine.decide_decode(
+            &facts,
+            &pool,
+            PairPools {
+                prefills: &prefills,
+                decodes: &decodes,
+                ..PairPools::default()
+            },
+            prefills[0].id,
+            &cx,
+            &mut scratch,
+        );
+        assert_eq!(first_decode(&new), Some(1));
+        assert_eq!(new.trace().seed, facts.seed);
+    }
+
+    #[test]
+    fn a_prefill_that_left_is_shed_by_name() {
+        let engine = strict_pair_engine();
+        let prefills = classed_rows(&[1]);
+        let decodes = classed_rows(&[1]);
+        let facts = request(7);
+        let decision = engine.decide_decode(
+            &facts,
+            &PoolFacts {
+                generation: 8,
+                ..PoolFacts::default()
+            },
+            PairPools {
+                prefills: &prefills,
+                decodes: &decodes,
+                ..PairPools::default()
+            },
+            WorkerId(987),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        assert_eq!(
+            shed_of(&decision),
+            Some((ShedReason::NoEndpoints, "prefill-gone"))
+        );
+        assert_eq!(
+            (decision.trace().seed, decision.trace().generation),
+            (facts.seed, 8)
+        );
+    }
+
+    #[test]
+    fn a_decode_decided_alone_runs_no_prefill_stage() {
+        let engine = Engine::new(
+            vec![strict_profile(), least_requests_profile()],
+            vec![Binding {
+                decode_profile: Some(1),
+                ..pair_binding()
+            }],
+            1,
+            Needs::default(),
+        );
+        let mut prefills = classed_rows(&[1]);
+        prefills[0].health.healthy = false;
+        let mut decodes = classed_rows(&[1, 1]);
+        decodes[0].in_flight = 7;
+        let facts = request(7);
+        assert_eq!(
+            shed_of(&decide_pair(&engine, &prefills, &decodes)),
+            Some((ShedReason::NoEndpoints, "healthy"))
+        );
+        let decision = engine.decide_decode(
+            &facts,
+            &PoolFacts::default(),
+            PairPools {
+                prefills: &prefills,
+                decodes: &decodes,
+                // This column is only read by prefill stages.
+                prefill_affinity: &held(&[0, 0]),
+                ..PairPools::default()
+            },
+            prefills[0].id,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        let pick = decision.pick().expect("the decode runs on its own");
+        assert_eq!(first_decode(&decision), Some(1));
+        assert_eq!(pick.session_verdict, SessionVerdict::None);
+    }
+
+    #[test]
+    fn a_decode_call_checks_the_decode_view_and_binding() {
+        #[derive(Debug)]
+        struct Shown(Arc<Mutex<Vec<Phase>>>);
+
+        impl Lifecycle for Shown {}
+
+        impl DecisionScope for Shown {
+            fn open(&self, facts: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {
+                if let Ok(mut phases) = self.0.lock() {
+                    phases.push(facts.phase);
+                }
+            }
+
+            fn close(&self) {}
+        }
+
+        impl Filter for Shown {
+            fn name(&self) -> &'static str {
+                "shown"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn scope(&self) -> Option<&dyn DecisionScope> {
+                Some(self)
+            }
+        }
+
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let engine = Engine::new(
+            vec![Profile {
+                filters: vec![Box::new(Shown(Arc::clone(&phases)))],
+                ..least_requests_profile()
+            }],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        );
+        let prefills = classed_rows(&[1]);
+        let decodes = classed_rows(&[1]);
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes: &decodes,
+            ..PairPools::default()
+        };
+        let facts = request(3);
+        let cx = Constraints::default();
+        let decide = |engine: &Engine,
+                      facts: &RequestFacts<'_>,
+                      pools: PairPools<'_>,
+                      cx: &Constraints<'_>| {
+            engine.decide_decode(
+                facts,
+                &PoolFacts::default(),
+                pools,
+                prefills[0].id,
+                cx,
+                &mut Scratch::new(),
+            )
+        };
+        let column = held(&[1, 2]);
+        let bad_pool = PairPools {
+            decode_affinity: &column,
+            ..pools
+        };
+        let bad_req = RequestFacts {
+            affinity: &column[..1],
+            ..facts
+        };
+        let mask = Constraints {
+            stalled: &[0],
+            ..cx
+        };
+        for (decision, stage) in [
+            (decide(&engine, &bad_req, pools, &cx), "affinity-column"),
+            (decide(&engine, &facts, bad_pool, &cx), "affinity-column"),
+            (decide(&strict_engine(), &facts, pools, &cx), "binding"),
+            (decide(&engine, &facts, pools, &mask), "written-rows"),
+        ] {
+            assert_eq!(
+                shed_of(&decision),
+                Some((ShedReason::PolicyDeclined, stage))
+            );
+        }
+        assert!(phases.lock().expect("the phases shown").is_empty());
+        assert!(decide(&engine, &facts, pools, &cx).pick().is_some());
+        assert_eq!(*phases.lock().expect("the phases shown"), [Phase::Decode]);
     }
 
     #[test]

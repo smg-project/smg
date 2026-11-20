@@ -3075,10 +3075,12 @@ fn waits(found: &Sides, side: Side) -> bool {
 /// Whether a dispatch moves `side` of the lease `found`
 /// ([`Leases::dispatched_side`]): a side that waits for it, or a pair's
 /// decode side still chosen, which its dispatch books. A handed frame's
-/// dispatch is told by this.
+/// dispatch is told by this. A record's own state is never chosen, so a
+/// single's dispatch and a prefill's read one state: a pair's decode side
+/// alone is asked the second.
 fn takes_dispatch(found: &Sides, side: Side) -> bool {
-    let side = found.side(side);
-    side.is_some_and(|(_, state)| state.is_issued() || state.is_chosen())
+    waits(found, side)
+        || (side == Side::Decode && found.decode.is_some_and(|decode| decode.state.is_chosen()))
 }
 
 /// `record`, of a lease the dispatch deadline's end took, as that end
@@ -3201,19 +3203,13 @@ impl Leases {
         }
     }
 
-    /// Replaces a chosen decode side in its place while the prefill is held.
-    fn issue_decode(
-        &mut self,
-        key: Key,
-        mut decode: DecodeSide,
-        booked: Option<Slot>,
-        now: Instant,
-    ) -> Result<crate::Lease, DecodeRefused> {
-        let held = self.records.get_mut(&key).ok_or(DecodeRefused::NoLease)?;
+    /// The place a decode call can issue into, while its prefill is held.
+    fn chosen_decode(&mut self, key: &Key) -> Result<(&mut Held, &mut HeldDecode), DecodeRefused> {
+        let held = self.records.get_mut(key).ok_or(DecodeRefused::NoLease)?;
         let found = held
             .record
             .decode
-            .and_then(|_| self.decodes.get_mut(held.decode, &key))
+            .and_then(|_| self.decodes.get_mut(held.decode, key))
             .ok_or(DecodeRefused::NotChosen)?;
         if !found.side.state.is_chosen() {
             return Err(if found.filed_chosen {
@@ -3225,7 +3221,18 @@ impl Leases {
         if !matches!(held.record.state, LeaseState::Dispatched { .. }) {
             return Err(DecodeRefused::PrefillNotHeld);
         }
+        Ok((held, found))
+    }
 
+    /// Replaces a chosen decode side in its place while the prefill is held.
+    fn issue_decode(
+        &mut self,
+        key: Key,
+        mut decode: DecodeSide,
+        booked: Option<Slot>,
+        now: Instant,
+    ) -> Result<crate::Lease, DecodeRefused> {
+        let (held, found) = self.chosen_decode(&key)?;
         decode.state = LeaseState::issued(decode.state.session_ttl_micros());
         decode.target_index = 0;
         let laid = HeldDecode {
@@ -3745,8 +3752,8 @@ impl MemoryStore {
     /// store mints: [`Self::issue_decided`] for `record`, the prefill
     /// part, with `side`, the decode side, laid beside it under the same
     /// hold of the turn. `booked` holds the slots of the counts the sides
-    /// book, the prefill's first. `issued` is told once a side, the
-    /// prefill's first; `Ok` is the prefill side's lease.
+    /// book, the prefill's first. `issued` hears the prefill and then the
+    /// decode if it was issued. `Ok` is the prefill side's lease.
     ///
     /// # Errors
     ///
@@ -3776,6 +3783,20 @@ impl MemoryStore {
         let lease = leases.issue_decode((gateway, lease), decode, booked, now)?;
         issued(&lease);
         Ok(lease)
+    }
+
+    /// The prefill worker of the lease a decode call names, where the
+    /// lease still takes a decode side: its prefill is dispatched and held
+    /// and its decode side is chosen. The call reads this before it
+    /// decides, and its issue tests the same again under its own turn.
+    pub(crate) fn held_prefill(
+        &self,
+        gateway: GatewayId,
+        lease: LeaseId,
+    ) -> Result<WorkerId, DecodeRefused> {
+        self.turn_of(self.file_of(lease))
+            .chosen_decode(&(gateway, lease))
+            .map(|(held, _)| held.record.target)
     }
 
     /// The one issue behind the doors: a single's lease with no `pair`,
@@ -3834,11 +3855,10 @@ impl MemoryStore {
             leases.decode_laid(key, &record, &side, keyed);
         }
         // The file's write and its tell under one hold of the turn: the
-        // lease is told issued before any holder can end it. A pair's is
-        // told once a side, the prefill's first: its two leases share the
-        // id the store minted.
+        // lease is told issued before any holder can end it. The decode
+        // is told after the prefill when both are issued together.
         issued(&record.lease);
-        if let Some((side, _)) = pair {
+        if let Some((side, _)) = pair.filter(|(side, _)| side.state.is_issued()) {
             issued(&side.lease(&record.lease));
         }
         // A second lease is looked for where a first one was ended: a
