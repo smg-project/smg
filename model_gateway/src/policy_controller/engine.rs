@@ -34,6 +34,7 @@
 //! stall vetoes are the controller's, read from its rows.
 
 use std::{
+    borrow::Cow,
     cell::Cell,
     fmt,
     sync::{
@@ -203,14 +204,21 @@ pub(crate) struct Ask<'a> {
     /// route that narrows nothing states none, and its ask is decided over
     /// the pool. A followed controller's engine reads nothing here.
     pub among: Option<&'a Arc<[Arc<dyn Worker>]>>,
+    /// The snapshot of the model's workers the route read for this attempt,
+    /// where it read one for a rule of its own. The engine of this process
+    /// decides the attempt's first ask over the pool's list in it, so a
+    /// request reads the registry once. A route that read none states none,
+    /// and the ask reads the registry. A followed controller's engine reads
+    /// nothing here.
+    pub snapshot: Option<&'a Arc<ModelWorkerSnapshot>>,
 }
 
 impl<'a> Ask<'a> {
     /// An ask for `model` under the request's `id` that states no other
     /// fact: a single request of no stated prompt size, not streamed, no
     /// input of a routing key, no media, no stated wire, nothing tried, no
-    /// stated attempt, no hashes, no second ask of a decode, no pool and no
-    /// narrowed list.
+    /// stated attempt, no hashes, no second ask of a decode, no pool, no
+    /// narrowed list and no snapshot.
     pub(crate) const fn of(id: &'a [u8], model: &'a str) -> Self {
         Self {
             id,
@@ -228,6 +236,7 @@ impl<'a> Ask<'a> {
             hashes: None,
             pool: None,
             among: None,
+            snapshot: None,
         }
     }
 
@@ -1415,11 +1424,14 @@ impl PolicyEngine {
     /// calling thread, three asks at most.
     ///
     /// Each ask reads the list the registry publishes for the ask's pool
-    /// once: the membership a classic arm reads. What the engine keeps of
-    /// the list stands in the snapshot's cell beside it, made by the list's
-    /// first ask. An ask that states no pool is decided over no worker. An
-    /// ask that states the workers it may take ([`Ask::among`]) is decided
-    /// over them alone, and the registry is not read for it.
+    /// once: the membership a classic arm reads. An attempt's first ask
+    /// reads it in the snapshot its route read, where the ask states one
+    /// ([`Ask::snapshot`]), so such a request reads the registry once. What
+    /// the engine keeps of the list stands in the snapshot's cell beside
+    /// it, made by the list's first ask. An ask that states no pool is
+    /// decided over no worker. An ask that states the workers it may take
+    /// ([`Ask::among`]) is decided over them alone, and the registry is not
+    /// read for it.
     ///
     /// The engine answers one of two things ([`Decided`]). A place is a
     /// worker of the list and nothing else: no stage of the document takes
@@ -1458,11 +1470,16 @@ impl PolicyEngine {
             // handed: a place reads no clock.
             let started = if first { now } else { Instant::now() };
             let among = ruled.as_ref().or(ask.among);
+            // The model's workers as the registry lists them: the snapshot
+            // the route read, where the attempt's first ask states one,
+            // else one read here.
+            let listed = || match ask.snapshot.filter(|_| first) {
+                Some(stated) => Cow::Borrowed(stated),
+                None => Cow::Owned(registry.get_routing_snapshot(ask.model)),
+            };
             let snapshot = match among {
                 Some(_) => None,
-                None => ask
-                    .pool
-                    .map(|pool| (registry.get_routing_snapshot(ask.model), pool)),
+                None => ask.pool.map(|pool| (listed(), pool)),
             };
             let kept = snapshot
                 .as_ref()
@@ -1851,6 +1868,7 @@ impl KeptAsk {
             // of a regular route.
             pool: None,
             among: None,
+            snapshot: None,
         }
     }
 }

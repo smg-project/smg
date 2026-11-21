@@ -2078,10 +2078,14 @@ impl WorkerSelectionStage {
         // Where the engine of this process decides, a demand of the request
         // is the route's own rule, as in the selection with no policy
         // engine: the pool is narrowed by it first, and the engine decides
-        // over the workers that are left. A followed controller reads no
-        // such demand, so there the shape is refused by name.
-        let among = if policy_engine.in_process() {
-            self.narrowed_regular(model_id, context, media, wire, &inputs)
+        // over the workers that are left. One read of the registry serves
+        // the rule and the ask. A followed controller reads no such demand,
+        // so there the shape is refused by name.
+        let snapshot = policy_engine
+            .in_process()
+            .then(|| self.worker_registry.get_routing_snapshot(model_id));
+        let among = if let Some(snapshot) = &snapshot {
+            self.narrowed_regular(snapshot, model_id, context, media, wire, &inputs)
         } else {
             let under_rule =
                 matches!(attempt, Attempt::Retry(ctx) if ctx.constraint_decided_on.is_some());
@@ -2117,6 +2121,7 @@ impl WorkerSelectionStage {
             wires: route_wires(wire),
             pool: Some(RoutingPool::GrpcPipelineRegular),
             among: among.as_ref(),
+            snapshot: snapshot.as_ref(),
             ..attempt.ask(model_id, &id, &hashes)
         };
         let placed = policy_engine
@@ -2356,35 +2361,40 @@ impl WorkerSelectionStage {
         then(rule)
     }
 
-    /// The workers of the regular pool one attempt may use, where its rule
-    /// refuses one of them: the pool's part on `wire` that the attempt's
-    /// rule accepts ([`Self::with_regular_rule`], with the retained plan's
-    /// media pins on a retry), narrowed by the placement's own step
-    /// ([`placement::accepted_by`]). Where the model's policy keeps an
-    /// explicit target of `headers` ([`Self::strict_target`]), the one
+    /// The workers of `snapshot`'s regular pool one attempt may use, where
+    /// its rule refuses one of them: the pool's part on `wire` that the
+    /// attempt's rule accepts ([`Self::with_regular_rule`], with the
+    /// retained plan's media pins on a retry), narrowed by the placement's
+    /// own step ([`placement::accepted_by`]). Where the model's policy keeps
+    /// an explicit target of `headers` ([`Self::strict_target`]), the one
     /// worker it names among them ([`placement::targeted`]). `None` where
-    /// nothing narrows the pool: it stands as the registry lists it. An
-    /// empty list says no worker of the pool may take the request.
+    /// nothing narrows the pool: it stands as the registry lists it, and
+    /// its list is not touched. An empty list says no worker of the pool
+    /// may take the request.
     ///
     /// The policy engine of this process decides over these workers alone,
     /// so a demand of the request narrows before the policy runs, as in the
     /// selection with no policy engine.
     fn narrowed_regular(
         &self,
+        snapshot: &ModelWorkerSnapshot,
         model_id: &str,
         context: ContextRequirements,
         media: MediaDemands,
         wire: Option<WireConstraint>,
         inputs: &PlacementInputs<'_>,
     ) -> Option<Arc<[Arc<dyn Worker>]>> {
-        let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let media = media.with_wire(wire);
         let admits = inputs.candidate_filter;
-        Self::with_regular_rule(&snapshot, model_id, context, media, admits, |rule| {
+        Self::with_regular_rule(snapshot, model_id, context, media, admits, |rule| {
+            let keeps_target = self.strict_target(model_id, inputs.headers);
+            if rule.is_none() && wire.is_none() && !keeps_target {
+                return None;
+            }
             let pool = Arc::clone(snapshot.pool(RoutingPool::GrpcPipelineRegular));
             let on_wire = placement::Candidates::of(pool, wire);
             let accepted = placement::accepted_by(on_wire.as_slice(), rule);
-            if self.strict_target(model_id, inputs.headers) {
+            if keeps_target {
                 let candidates = accepted.as_deref().unwrap_or(on_wire.as_slice());
                 if let Some(target) = placement::targeted(candidates, inputs.headers) {
                     return Some(target.into_iter().collect());
