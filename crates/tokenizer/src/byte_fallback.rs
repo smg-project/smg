@@ -138,7 +138,9 @@ impl PieceTable {
         let index = id as usize;
         // The offsets are the ends of whole pieces: a slice of the text
         // checks its two boundaries, where a conversion reads every byte.
-        &self.text[self.offsets[index]..self.offsets[index + 1]]
+        self.text
+            .get(self.offsets[index]..self.offsets[index + 1])
+            .unwrap_or_default()
     }
 
     /// The text of `ids` as the vocabulary's decoder chain renders it.
