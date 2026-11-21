@@ -310,12 +310,28 @@ pub(crate) fn start_in_process(
 /// `routing_key` or `sessions` otherwise than the settings' own document
 /// does, a binding that names a `shadow`, a pair binding that names some
 /// models and a second pair binding would each start with a rule no code
-/// runs, and the gateway would run the settings' value in silence.
+/// runs, and the gateway would run the settings' value in silence. So
+/// would a binding of some models that covers a side's phase, in a
+/// gateway that places pairs: the side's policy places those models'
+/// pair requests, whatever that binding says.
 fn rule_not_run(config: &RouterConfig, document: &PolicySpec) -> Result<(), StartError> {
-    use smg_policy_controller::document::{BindingSpec, PlanName};
+    use smg_policy_controller::{
+        document::{BindingSpec, PlanName},
+        engine::Phase,
+    };
+
+    use crate::config::RoutingMode;
 
     const BY_SETTINGS: &str = "the gateway's placement runs the routing settings' own";
     const ONE_A_SIDE: &str = "one policy places each side of a pair, for every model";
+    const SINGLE_ALONE: &str = "one policy places each side of a pair, for every model: \
+                                a binding of some models holds single requests alone (`phase: [single]`)";
+    // A pair mode, and a gateway of many routers, which mounts every family.
+    let places_pairs = config.enable_igw
+        || matches!(
+            config.mode,
+            RoutingMode::PrefillDecode { .. } | RoutingMode::EncodePrefillDecode { .. }
+        );
     // What the routing settings say of a binding's own rules: the one
     // binding of their document.
     let settings = config.policy_document()?;
@@ -350,6 +366,11 @@ fn rule_not_run(config: &RouterConfig, document: &PolicySpec) -> Result<(), Star
                 return Err(refused("plan", "an earlier binding plans the pair"));
             }
             pair_planned = true;
+        } else if places_pairs
+            && binding.matcher.model != "*"
+            && binding.matcher.phase != [Phase::Single]
+        {
+            return Err(refused("match.phase", SINGLE_ALONE));
         }
     }
     Ok(())

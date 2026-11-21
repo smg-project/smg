@@ -3,10 +3,13 @@
 
 use std::error::Error;
 
-use smg_policy_controller::document::{OverloadSpec, PlanName, PolicySpec, ShadowSpec};
+use smg_policy_controller::{
+    document::{OverloadSpec, PlanName, PolicySpec, ShadowSpec},
+    engine::Phase,
+};
 
 use super::start_in_process;
-use crate::config::RouterConfig;
+use crate::config::{RouterConfig, RoutingMode};
 
 type Case = Result<(), Box<dyn Error>>;
 
@@ -145,5 +148,49 @@ fn a_supplied_pair_binding_names_every_model_and_stands_alone() -> Case {
         refusal(&supplied(document))?,
         not_run(2, "*", "plan", "an earlier binding plans the pair")
     );
+    Ok(())
+}
+
+/// A side's policy places the pair requests of every model. In a gateway
+/// that places pairs, a binding of some models would be passed by for
+/// those models' pair requests: the start refuses it unless it holds
+/// single requests alone. A gateway that places no pair starts under it.
+#[test]
+fn a_binding_of_some_models_holds_single_requests_in_a_gateway_that_places_pairs() -> Case {
+    let two_bindings = |phase: Vec<Phase>| -> Result<PolicySpec, Box<dyn Error>> {
+        let mut document = PolicySpec::preset("round_robin")?;
+        let mut named = document.bindings[0].clone();
+        named.matcher.model = "alpha-*".to_owned();
+        named.matcher.phase = phase;
+        document.bindings.insert(0, named);
+        Ok(document)
+    };
+    let pair_mode = |document: PolicySpec| RouterConfig {
+        mode: RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: None,
+        },
+        ..supplied(document)
+    };
+    let many_routers = |document: PolicySpec| RouterConfig {
+        enable_igw: true,
+        ..supplied(document)
+    };
+    let held = "one policy places each side of a pair, for every model: \
+                a binding of some models holds single requests alone (`phase: [single]`)";
+
+    // No pair is placed: the binding decides its models' requests.
+    assert!(start_in_process(&supplied(two_bindings(vec![])?), None)?.is_some());
+    let gateways: [&dyn Fn(PolicySpec) -> RouterConfig; 2] = [&pair_mode, &many_routers];
+    for places_pairs in gateways {
+        assert_eq!(
+            refusal(&places_pairs(two_bindings(vec![])?))?,
+            not_run(1, "alpha-*", "match.phase", held)
+        );
+        let single = two_bindings(vec![Phase::Single])?;
+        assert!(start_in_process(&places_pairs(single), None)?.is_some());
+    }
     Ok(())
 }
