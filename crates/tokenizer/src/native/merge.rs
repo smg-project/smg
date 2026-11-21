@@ -1105,21 +1105,23 @@ impl<const N: usize> ShortMerge<N> {
     }
 
     /// Merges until no live pair is a merge, and appends the ids to `ids`.
+    /// The first round keeps its least key: no scan of the keys follows it.
     #[inline(always)]
     fn run(mut self, table: &MergeTable, ids: &mut Vec<u32>) {
         let pairs = self.n.saturating_sub(1);
+        let mut best = NO_KEY;
         for at in 0..pairs {
             let merge = table.merge_of(self.symbols[at], self.symbols[at + 1]);
-            self.set_pair(at, merge);
+            best = best.min(self.set_pair(at, merge));
         }
-        self.settle(table, pairs, ids);
+        self.settle(table, best, ids);
     }
 
-    /// Merges from the `pairs` of the first round until no live pair is a
-    /// merge, and appends the ids to `ids`.
+    /// Merges from `best`, the least key of the first round, until no live
+    /// pair is a merge, and appends the ids to `ids`. It borrows the state:
+    /// taken by value, the state was copied here.
     #[inline(always)]
-    fn settle(mut self, table: &MergeTable, pairs: usize, ids: &mut Vec<u32>) {
-        let mut best = self.least(pairs);
+    fn settle(&mut self, table: &MergeTable, mut best: i32, ids: &mut Vec<u32>) {
         while best != NO_KEY {
             best = self.merge_at(table, (best as u32 & SHORT_KEY_MASK) as usize);
         }
