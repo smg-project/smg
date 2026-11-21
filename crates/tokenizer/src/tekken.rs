@@ -527,6 +527,32 @@ mod tests {
         );
     }
 
+    /// The reader skips `token_str`: a byte that is not UTF-8 there does not
+    /// stop the load; in a field it reads, the file is refused.
+    #[test]
+    fn a_file_that_is_not_utf8_where_the_reader_skips_still_loads() {
+        let text = testing::minimal();
+        let dir = testing::dir_with(&text);
+        let path = dir.path().join(FILE_NAME);
+        let whole = read(&path).unwrap().ranks;
+
+        let mut bytes = text.clone().into_bytes();
+        bytes[text.find("\"token_str\":\"A\"").unwrap() + 13] = 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(read(&path).unwrap().ranks, whole);
+
+        let mut bytes = text.clone().into_bytes();
+        bytes[text.find("\"token_bytes\":\"QQ==\"").unwrap() + 15] = 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        let Err(error) = read(&path) else {
+            panic!("a token whose bytes are not UTF-8 loaded");
+        };
+        assert!(
+            format!("{error:#}").contains("is not a tekken vocabulary file"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn the_reader_refuses_a_file_whose_layout_breaks_the_rules() {
         let refused = |text: String, reason: &str| {

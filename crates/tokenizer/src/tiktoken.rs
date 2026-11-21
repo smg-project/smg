@@ -2076,6 +2076,21 @@ mod tests {
     }
 
     #[test]
+    fn a_rank_line_that_is_not_one_space_reads_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.tiktoken");
+        std::fs::write(&path, "IQ==\t0\nIg==  1\nIw== 2 extra\n").unwrap();
+        let encoder = load_tiktoken_bpe(path.to_str().unwrap()).unwrap();
+        assert_eq!(encoder.get(&vec![0x21u8]), Some(&0));
+        assert_eq!(encoder.get(&vec![0x22u8]), Some(&1));
+        assert_eq!(encoder.get(&vec![0x23u8]), Some(&2));
+
+        std::fs::write(&path, " 0\n").unwrap();
+        let error = load_tiktoken_bpe(path.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.to_string(), "missing rank in tiktoken file");
+    }
+
+    #[test]
     fn test_build_vocab_map() {
         let mut encoder = FxHashMap::default();
         encoder.insert(b"hello".to_vec(), 42u32);
