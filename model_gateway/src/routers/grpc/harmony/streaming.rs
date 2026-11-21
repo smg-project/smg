@@ -1430,9 +1430,20 @@ impl ResponsesDecode {
         let (analysis_opt, commentary_opt, final_text_extracted) =
             HarmonyParserAdapter::parse_messages(&messages);
         self.tool_calls.clone_from(&commentary_opt);
-        // If no tool calls found, check for incomplete commentary in parser state
+        // If no tool calls found, check for incomplete commentary in parser state.
+        // A call that ended behind its header is read for a client tool alone:
+        // the loop would run a server tool on arguments the model never wrote.
         if self.tool_calls.is_none() {
-            self.tool_calls = self.parser.extract_incomplete_commentary();
+            let client_tool = self
+                .calls
+                .get(&0)
+                .is_some_and(|open| open.response_format.is_none());
+            self.tool_calls = self.parser.extract_incomplete_commentary().filter(|calls| {
+                client_tool
+                    || calls
+                        .iter()
+                        .any(|call| call.function.arguments.as_deref() != Some(""))
+            });
         }
         debug!(
             "Tool call extraction: completed_msgs={}, tool_calls={}, has_analysis={}, final_text_len={}",
