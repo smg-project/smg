@@ -1022,11 +1022,6 @@ impl AppContextBuilder {
         if config.policy_controller_address.is_none() {
             self.in_process = policy_controller::start_in_process(config, stages)
                 .map_err(|refusal| refusal.to_string())?;
-            // A registry built ahead of this step is built again, with
-            // the engine.
-            if self.in_process.is_some() && self.policy_registry.is_some() {
-                self = self.with_policy_registry(config);
-            }
             return Ok(self);
         }
         let started =
@@ -1060,8 +1055,11 @@ impl AppContextBuilder {
     }
 
     /// Create policy registry: the classic one, whose policies ask the
-    /// policy engine where the gateway decides in its own process
-    /// ([`Self::with_policy_controller`]).
+    /// policy engine where the gateway decides in its own process. The
+    /// policy controller's step comes first
+    /// ([`Self::with_policy_controller`]): it leaves the engine this
+    /// registry is built with, and a registry built ahead of it would be
+    /// built without one.
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
         let policy = config.policy.clone();
         let routing_key_override = config.routing_key_override.clone();
