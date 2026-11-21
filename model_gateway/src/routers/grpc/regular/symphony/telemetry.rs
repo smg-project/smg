@@ -1444,8 +1444,8 @@ mod tests {
         assert_eq!(
             tally.first,
             Some(FirstRun {
-                reason: "stray_closing_tag",
-                why: "a closing tag that names nothing open",
+                reason: "tag_out_of_place",
+                why: "a tag where the call's syntax has none",
                 at: "</think>At once:<tool_call>f".len(),
                 bytes: "</arg_key>".len(),
             })

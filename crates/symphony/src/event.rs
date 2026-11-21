@@ -215,9 +215,9 @@ malformed_reasons! {
     UnknownTool => "a call to a function the request did not declare",
     /// Text where the call's syntax has only tags: between a tag and the next, outside a value.
     TextBetweenTags => "text between a call's tags",
-    /// A tag of the syntax where it has no place, with a member the call does not get behind
-    /// it: a parameter tag before the function's, a value's tag with no key before it. A
-    /// closing tag that names nothing open is not one: [`Self::StrayClosingTag`].
+    /// A tag of the syntax where it has no place: a value's close with no value open, a
+    /// parameter tag before the function's. The XML syntax alone names a closing tag that
+    /// names nothing open by a reason of its own, [`Self::StrayClosingTag`].
     TagOutOfPlace => "a tag where the call's syntax has none",
     /// A tag another tag, or the call's end, cut short before it closed.
     TagCutShort => "a tag that another tag or the call's end cut short",
@@ -285,12 +285,14 @@ malformed_reasons! {
     /// JSON. The marker is the model's own end of the call, so the value's bytes are complete, as
     /// at the stop. The event carries no bytes and stands before the closing quote.
     OpenAtTheMarker => "a string value left open at the call's closing marker",
-    /// A closing tag that names nothing open, where the syntax has the next member's tag, the
-    /// next call or a close: between a call's members, or, for a syntax that reads tags there
-    /// (the XML one), between a block's calls with no text before it since the last call. The
-    /// tag is ignored: it carries no member, the call it stands in or beside is as whole after
-    /// it as before, and what follows is read where it stands. The event carries no bytes and
-    /// stands before the tag's own, which leave as `Dropped { MalformedCall }`, never content.
+    /// A closing tag of the XML syntax that names nothing open, where the syntax has the next
+    /// member's tag, the next call or a close: between a call's members, or between a block's
+    /// calls with no text before it since the last call. The tag is ignored: it carries no
+    /// member, the call it stands in or beside is as whole after it as before, and what
+    /// follows is read where it stands. The event carries no bytes and stands before the
+    /// tag's own, which leave as `Dropped { MalformedCall }`, never content. Only the XML
+    /// syntax gives the reason: the other syntaxes of tags count a closing tag between a
+    /// call's members as a tag out of its place ([`Self::TagOutOfPlace`]).
     StrayClosingTag => "a closing tag that names nothing open",
     /// An element of the XML syntax that the closing tag of an element around it, or the
     /// call's own closing marker, found open: the model left the element's own close out, and
@@ -349,8 +351,9 @@ impl MalformedReason {
     ///   and [`OpenAtTheParentsClose`](Self::OpenAtTheParentsClose): the syntax closed what the
     ///   model left open, and every byte the model wrote is in the call. Whether the model
     ///   ended the call itself is [`CallEnd`]'s to say, on the call's end.
-    /// - [`StrayClosingTag`](Self::StrayClosingTag): a closing tag that names nothing open is
-    ///   ignored; it carries no member, and the call beside it is whole without it.
+    /// - [`StrayClosingTag`](Self::StrayClosingTag): a closing tag of the XML syntax that
+    ///   names nothing open is ignored; it carries no member, and the call beside it is whole
+    ///   without it.
     /// - [`MisnamedClosingTag`](Self::MisnamedClosingTag): the syntax read a closing tag of
     ///   another name as a value's own close; the call closes whole with the value it read.
     /// - [`OpenAtTheNextParameter`](Self::OpenAtTheNextParameter): the syntax ended a string
@@ -363,10 +366,16 @@ impl MalformedReason {
     /// Every other reason loses one. [`TextBetweenCalls`](Self::TextBetweenCalls) names text
     /// where a call should begin and prose beside whole calls alike, and is classed as losing
     /// one for both: prose inside a call block is no part of a block the syntax reads whole.
+    /// [`TagOutOfPlace`](Self::TagOutOfPlace) is classed as losing one for every tag it names:
+    /// a tag with a member the call does not get behind it, and the bare closing tag between
+    /// a call's members that the keyed and the Qwen tagged syntaxes count under it and close
+    /// the call past. The reason does not tell the two apart, so of those two syntaxes it
+    /// says a call was lost where that call is whole; the XML syntax gives the tag a reason
+    /// of its own ([`StrayClosingTag`](Self::StrayClosingTag)), which loses none.
     ///
     /// The bytes a syntax refuses leave as `Dropped { MalformedCall }` behind the `Malformed`
     /// event of no bytes that gives the reason, so the reason is the word on whether a call was
-    /// lost: the stray closing tag's bytes are dropped so too, and lose none.
+    /// lost: the XML syntax's stray closing tag is dropped so too, and loses none.
     ///
     /// The match names every reason, so a reason added to the crate is classed here before the
     /// crate builds.

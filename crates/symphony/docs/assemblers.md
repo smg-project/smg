@@ -434,9 +434,10 @@ What the syntax says, and what the assembler does with it:
   parameter tags written without their `<`). The keyed, Qwen tagged and XML assemblers apply the
   same rule (their sections): no assembler of this module closes a call its syntax refused bytes
   in, with one reading of their own: a bare closing tag between members carries no member the
-  client could lose, so there it is ignored, counted under a reason of its own
-  (`StrayClosingTag`, which says no call lost its bytes) at no cost to the call, where this
-  assembler reads it as any tag out of its place.
+  client could lose, so there it is refused and counted but costs the call nothing, where this
+  assembler reads it as any tag out of its place. The keyed and Qwen tagged assemblers count it
+  as a tag out of its place all the same (`TagOutOfPlace`); the XML assembler alone counts it
+  under a reason of its own (`StrayClosingTag`, which says no call lost its bytes).
 - **Every byte of the call lands in exactly one event.**
 
 ## The XML assembler (`tagged::xml`)

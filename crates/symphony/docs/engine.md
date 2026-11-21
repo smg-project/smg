@@ -161,8 +161,11 @@ is a later step).
   change. One that fails its request on a call the model did not finish reads it there, beside
   `MalformedReason::loses_a_call` for a call the syntax could not read whole: the reason is the
   word on that, on every refusal, since the bytes a syntax refuses leave as
-  `Dropped { MalformedCall }` whether a call lost them or not (a closing tag that names nothing
-  open is dropped so, and costs no call anything). A block that named no call
+  `Dropped { MalformedCall }` whether a call lost them or not (a closing tag of the XML syntax
+  that names nothing open is dropped so, and costs no call anything). One reason says more
+  than happened: the keyed and Qwen tagged syntaxes count a bare closing tag between a call's
+  members as a tag out of its place (`TagOutOfPlace`), a reason that loses a call, and close
+  the call whole past it. A block that named no call
   has no end to carry the word: the output's end that found it open refuses its bytes in that
   last step, before the `Finish`. An invoke of the XML syntax that the output ended in before
   any byte of its name holds no byte to refuse, and says the same reason by a `Malformed` event

@@ -1087,12 +1087,12 @@ impl Engine {
         }
     }
 
-    /// A closing tag between a block's calls, with no text before it since the last call: it
-    /// names nothing open, since no call is, and is ignored as a syntax ignores one between a
-    /// call's members. It is counted by a
-    /// `Malformed { StrayClosingTag }` event of no bytes, and its own bytes leave as a malformed
-    /// call's, never content. The run the stay held before it is the template's spacing around
-    /// a tag, dropped as at any tag.
+    /// A closing tag between a block's calls of the XML syntax, with no text before it since
+    /// the last call: it names nothing open, since no call is, and is ignored as that syntax
+    /// ignores one between a call's members. It is counted by a
+    /// `Malformed { StrayClosingTag }` event of no bytes, the reason the XML syntax alone
+    /// gives, and its own bytes leave as a malformed call's, never content. The run the stay
+    /// held before it is the template's spacing around a tag, dropped as at any tag.
     fn stray_close(&mut self, tag: String, out: &mut Events) {
         self.end_stay(out);
         out.push(Event::Malformed {
