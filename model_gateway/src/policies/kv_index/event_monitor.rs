@@ -29,6 +29,7 @@
 use std::{fmt, sync::Arc};
 
 use dashmap::{mapref::entry::Entry, DashMap};
+use smg_policy_controller::engine::{CacheIndex, CacheIndexes};
 use smg_worker::{
     identity::{basic::Worker, endpoint::Endpoint},
     load::monitor::WorkerMonitor,
@@ -39,6 +40,7 @@ use smg_worker::{
 use tracing::{error, warn};
 
 use super::index_backend::KvIndex;
+use crate::policies::normalize_model_key;
 
 mod admission;
 #[cfg(test)]
@@ -331,6 +333,21 @@ impl KvEventMonitor {
                 tokens: block_size,
                 from_events: false,
             });
+    }
+}
+
+/// The policy engine's reads of the monitor, where it decides in the
+/// gateway's own process: a model's index and its block size, each read
+/// where the engine reads a list of workers, never once a request.
+impl CacheIndexes for KvEventMonitor {
+    fn index(&self, model: &str) -> Option<Arc<dyn CacheIndex>> {
+        let index = self.get_indexer(normalize_model_key(model))?;
+        Some(index as Arc<dyn CacheIndex>)
+    }
+
+    fn block_size(&self, model: &str) -> Option<u32> {
+        let tokens = Self::block_size(self, normalize_model_key(model))?;
+        u32::try_from(tokens).ok().filter(|&tokens| tokens > 0)
     }
 }
 

@@ -1340,8 +1340,26 @@ impl PolicyRegistry {
     /// Whether `worker`'s stream carries its KV events into its model's
     /// index: what the policy that places requests on it reads
     /// ([`Self::policy_for_worker`]).
+    ///
+    /// Where the gateway keeps the policy engine in its own process, the
+    /// engine's document says it too: the profile that decides the worker's
+    /// model at the worker's phase reads cache events or it does not
+    /// (`Needs::events`). Either word starts the stream. A stream that
+    /// carried load records alone under such a profile would leave the
+    /// model's index empty, and every request would read as held by nobody
+    /// with no error to show it.
     pub(crate) fn worker_needs_kv_events(&self, worker: &dyn Worker) -> bool {
-        self.policy_for_worker(worker).needs_kv_events()
+        let by_engine = self.policy_engine.as_ref().is_some_and(|asked| {
+            let phase = match worker.worker_type() {
+                WorkerType::Prefill => Phase::Prefill,
+                WorkerType::Decode => Phase::Decode,
+                WorkerType::Encode => Phase::Encode,
+                WorkerType::Regular => Phase::Single,
+            };
+            let engine = asked.engine.spec().engine();
+            engine.needs_for(worker.model_id(), phase).events
+        });
+        by_engine || self.policy_for_worker(worker).needs_kv_events()
     }
 
     /// Initialize cache-aware policy with workers if applicable

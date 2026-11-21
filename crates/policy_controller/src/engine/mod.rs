@@ -47,6 +47,10 @@ pub use framework::{
 };
 pub use pair_classes::PartnerClasses;
 #[cfg(feature = "in-process")]
+pub use policy_engine::overlap::{
+    self, Affinity, CacheIndex, CacheIndexes, PoolAffinity, PrefixRead,
+};
+#[cfg(feature = "in-process")]
 pub use policy_engine::pair::{prefills_full, PairAdmission, PairLists};
 #[cfg(feature = "in-process")]
 pub use policy_engine::{PolicyEngine, PoolMembers};
