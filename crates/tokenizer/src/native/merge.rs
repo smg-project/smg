@@ -481,10 +481,16 @@ impl MergeTable {
             }
             let before = splits.len();
             for cut in 1..token.len() {
-                if let (Some(&left), Some(&right)) =
-                    (ranks.get(&token[..cut]), ranks.get(&token[cut..]))
-                {
-                    splits.push((left, right, rank));
+                let (left, right) = token.split_at(cut);
+                // The longer half is less often a token than the shorter: it
+                // is looked up first, and the shorter only where it is one.
+                let halves = if left.len() < right.len() {
+                    ranks.get(right).and_then(|b| Some((ranks.get(left)?, b)))
+                } else {
+                    ranks.get(left).and_then(|a| Some((a, ranks.get(right)?)))
+                };
+                if let Some((&a, &b)) = halves {
+                    splits.push((a, b, rank));
                 }
             }
             if splits.len() == before {
