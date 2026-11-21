@@ -340,6 +340,13 @@ impl Preformed {
                 }
             }
         }
+        // A pair stands in many tokens: one found again in the slot its
+        // last occurrence went through leaves before the sort.
+        let mut last = [u64::MAX; 1 << 12];
+        pairs.retain(|&pair| {
+            let slot = &mut last[bigram_bit(pair, last.len())];
+            std::mem::replace(slot, pair) != pair
+        });
         pairs.sort_unstable();
         pairs.dedup();
         let bits = (pairs.len() * BIGRAM_BITS_PER_PAIR)
@@ -472,8 +479,11 @@ fn one_char(bytes: &[u8]) -> Option<char> {
 /// The whole character at the start of `bytes` and its length, if one is
 /// there.
 fn whole_char(bytes: &[u8]) -> Option<(u32, usize)> {
+    if bytes[0] < 0x80 {
+        return Some((u32::from(bytes[0]), 1));
+    }
     let len = char_len(bytes[0]);
-    if bytes[0] >= 0x80 && len == 1 || len > bytes.len() {
+    if len == 1 || len > bytes.len() {
         return None;
     }
     let c = one_char(&bytes[..len])?;
