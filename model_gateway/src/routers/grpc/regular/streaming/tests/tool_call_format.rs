@@ -33,6 +33,7 @@ use super::{
     },
 };
 use crate::{
+    middleware::ReportedRefusal,
     rate_limit::{test_support::RecordingBackend, UsageSettlement},
     routers::{
         common::rate_limit_cell::{RateLimitCell, RateLimitOutcome},
@@ -1347,6 +1348,58 @@ async fn a_failed_requests_reservation_is_settled_with_the_engines_counts() {
     cell.close_unsettled().await;
     assert_eq!(backend.settlements(), settled);
     assert_eq!(backend.closes(), 0);
+}
+
+/// The whole (non-streamed) answer a request fails on was completed by the
+/// engine all the same: the chat stage tells a placed dispatch that the answer
+/// ended whole, with its token counts, before it answers the 400, as the
+/// stream that fails the same way does. The lease takes its first end, so the
+/// failed attempt's release that follows changes nothing. And the 400 says
+/// that its line is written: the stage wrote the one WARN, and the layers
+/// above it log no ERROR for an outcome that is the model's.
+#[tokio::test]
+async fn a_placed_dispatch_of_a_whole_answer_that_fails_is_told_the_answer_ended_whole() {
+    let output = format!("{BEFORE}{CUT_CALL}");
+    let tokens = output.chars().count() as u32;
+    let mut answer = complete_with_prompt(0, "length", 11);
+    if let Some(proto::generate_response::Response::Complete(complete)) = &mut answer.response {
+        complete.output_ids = output.chars().map(u32::from).collect();
+        complete.completion_tokens = tokens;
+    }
+    let (stream, server) = scripted_stream(vec![answer], "0").await;
+    let (mut ctx, store) = placed_stream_context(stream, dispatch(M3)).await;
+    ctx.streaming = false;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    ctx.response.stop_decoder = Some(utils::create_stop_decoder(
+        &tokenizer, None, None, false, false, false,
+    ));
+    let placement = ctx
+        .load_guards
+        .as_ref()
+        .and_then(context::LoadGuards::placement)
+        .expect("the placement")
+        .clone();
+    let answered =
+        ChatResponseProcessingStage::new(response_processor(), Arc::new(processor(true)))
+            .process_result(&mut ctx, ResponseSpec::Chat(Box::new(spec(true, false))))
+            .await;
+    server.abort();
+    let Err(response) = answered else {
+        panic!("the request's failure");
+    };
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_end(
+        &placement.ends(),
+        &store,
+        200,
+        TransportClass::Ok,
+        11,
+        tokens,
+    );
+    assert!(
+        response.extensions().get::<ReportedRefusal>().is_some(),
+        "the stage wrote the failure's line"
+    );
 }
 
 /// Another wire with the same output ends as before: the M3 table under a
