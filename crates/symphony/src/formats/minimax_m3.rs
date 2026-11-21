@@ -2058,83 +2058,91 @@ mod tests {
     }
 
     /// A closing tag behind the separator that names nothing open, inside an element that
-    /// holds text: it stands for the element's own close, misnamed, and the value is the text
-    /// before it, typed as the tool declares it. The element's own close after it, and any
-    /// closing tag that names nothing open between elements, is ignored. Each slip is counted
-    /// by one `Malformed { StrayClosingTag }` event of no bytes, no reason says a call was
-    /// lost, and the call closes whole.
+    /// holds text: the table reads it as the element's own close under another name, and the
+    /// value is the text before it, typed as the tool declares it
+    /// (`Malformed { MisnamedClosingTag }`, of no bytes). The element's own close after it,
+    /// and any closing tag that names nothing open between elements, is ignored
+    /// (`Malformed { StrayClosingTag }`, its bytes refused). No reason says a call was lost,
+    /// and the call closes whole.
     #[test]
     fn a_closing_tag_that_names_nothing_open_closes_a_value_and_is_ignored_between_elements() {
+        let misnamed = MalformedReason::MisnamedClosingTag;
         let stray = MalformedReason::StrayClosingTag;
         for (function, body, written, slips, ignored) in [
             (
                 "get_weather",
                 "<city>Paris</town>",
                 value!({"city": "Paris"}),
-                1,
+                vec![misnamed],
                 "",
             ),
             (
                 "get_weather",
                 "<city>Paris</town></city>",
                 value!({"city": "Paris"}),
-                2,
+                vec![misnamed, stray],
                 "</city>",
             ),
             (
                 "get_weather",
                 "<city>Paris</city></town>",
                 value!({"city": "Paris"}),
-                1,
+                vec![stray],
                 "</town>",
             ),
-            ("get_weather", "<days>3</day>", value!({"days": 3}), 1, ""),
+            (
+                "get_weather",
+                "<days>3</day>",
+                value!({"days": 3}),
+                vec![misnamed],
+                "",
+            ),
             (
                 "get_weather",
                 "<days>3</day></days>",
                 value!({"days": 3}),
-                2,
+                vec![misnamed, stray],
                 "</days>",
             ),
             (
                 "get_weather",
                 "<days>3</days></day>",
                 value!({"days": 3}),
-                1,
+                vec![stray],
                 "</day>",
             ),
             (
                 "typed",
                 "<o><k>v</key><q>7</q></o>",
                 value!({"o": {"k": "v", "q": 7}}),
-                1,
+                vec![misnamed],
                 "",
             ),
             (
                 "typed",
                 "<o><k>v</k></k></o>",
                 value!({"o": {"k": "v"}}),
-                1,
+                vec![stray],
                 "</k>",
             ),
             (
                 "typed",
                 "<list><item>x</item></item><item>y</item></list>",
                 value!({"list": ["x", "y"]}),
-                1,
+                vec![stray],
                 "</item>",
             ),
             (
                 "get_weather",
                 "<city>Paris</city></call>\n",
                 value!({"city": "Paris"}),
-                1,
+                vec![stray],
                 "</call>",
             ),
         ] {
             let events = read_past_a_slip(&block_of(function, body));
             assert_eq!(arguments(&events), written, "{body}");
-            assert_eq!(reported(&events), vec![stray; slips], "{body}");
+            assert_eq!(reported(&events), slips, "{body}");
             assert!(losses(&events).is_empty(), "{body}");
             assert_eq!(refused(&events), ignored, "{body}");
             assert_eq!(endings(&events), [(0, CallEnd::Closed)], "{body}");
@@ -2150,12 +2158,91 @@ mod tests {
             matches!(
                 &events[at..at + 2],
                 [
-                    Event::Malformed { text, why: MalformedReason::StrayClosingTag },
+                    Event::Malformed { text, why: MalformedReason::MisnamedClosingTag },
                     Event::ToolCallArguments { json, source, .. }
                 ] if text.text.is_empty() && json == "\"" && source.text == "</town>"
             ),
             "{events:#?}"
         );
+    }
+
+    /// The reading has a cost, written down here. The table takes a closing tag behind the
+    /// separator for structure, because the template writes the separator before every tag it
+    /// writes and never inside a value. A model that writes the separator before a closing tag
+    /// inside a value, as the value's own text, has the value end there. Where text follows,
+    /// it is text between elements: refused, and the call gets no close, so a driver that asks
+    /// is told a call was lost. Where only closing tags follow, they are ignored and the call
+    /// closes whole with the shorter value, under `MisnamedClosingTag` alone: the one shape
+    /// this reading delivers changed. Without the separator the same tags are the value's
+    /// text, and so is a pair of tags the value opened and closed behind separators.
+    #[test]
+    fn a_closing_tag_behind_the_separator_inside_a_value_ends_the_value_there() {
+        let edit = || {
+            declared(
+                "edit",
+                value!({"type": "object", "properties": {
+                    "content": {"type": "string"}, "old_string": {"type": "string"}}}),
+            )
+        };
+        let call = |body: &str| {
+            format!(
+                "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"edit\">{}\
+                 ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+                body.replace('^', SEPARATOR)
+            )
+        };
+        let read = |body: &str| run_with(edit(), "", &[&call(body)]);
+
+        // Text after the tag: the value ends at the tag, the text is refused, no close.
+        let events = read("^<content>line one^</p>line two^</content>");
+        assert_eq!(
+            bytes(&events),
+            call("^<content>line one^</p>line two^</content>")
+        );
+        assert_eq!(arguments_of(&events, 0), r#"{"content": "line one""#);
+        assert_eq!(
+            reported(&events),
+            [
+                MalformedReason::MisnamedClosingTag,
+                MalformedReason::TextBetweenTags,
+                MalformedReason::TextBetweenTags,
+                MalformedReason::StrayClosingTag,
+            ]
+        );
+        assert_eq!(losses(&events), [MalformedReason::TextBetweenTags; 2]);
+        assert_eq!(refused(&events), "line two</content>");
+
+        // Only closing tags after it: the call closes whole, with the value cut to nothing.
+        let events = read("^<old_string>^</ul>\n^</nav>^</old_string>");
+        assert_eq!(arguments(&events), value!({"old_string": ""}));
+        assert_eq!(
+            reported(&events),
+            [
+                MalformedReason::MisnamedClosingTag,
+                MalformedReason::StrayClosingTag,
+                MalformedReason::StrayClosingTag,
+            ]
+        );
+        assert!(losses(&events).is_empty());
+        assert_eq!(refused(&events), "</nav></old_string>");
+        assert_eq!(endings(&events), [(0, CallEnd::Closed)]);
+
+        // The same bytes without the separator before the inner tags are the value, whole.
+        let events = read("^<old_string></ul>\n</nav>^</old_string>");
+        assert_eq!(arguments(&events), value!({"old_string": "</ul>\n</nav>"}));
+        assert!(reported(&events).is_empty(), "{events:#?}");
+        let events = read("^<content>line one</p>line two^</content>");
+        assert_eq!(
+            arguments(&events),
+            value!({"content": "line one</p>line two"})
+        );
+        // And a pair the value opened and closed behind separators is its text too.
+        let events = read("^<content>^<p>line one^</p>line two^</content>");
+        assert_eq!(
+            arguments(&events),
+            value!({"content": "<p>line one</p>line two"})
+        );
+        assert!(reported(&events).is_empty(), "{events:#?}");
     }
 
     /// The end of an invoke closes what the model left open in it, whichever end it is: the
@@ -2200,7 +2287,7 @@ mod tests {
             (
                 block_of("typed", "<i>5</x><b>true</b><n>2.5"),
                 vec![value!({"i": 5, "b": true, "n": 2.5})],
-                vec![MalformedReason::StrayClosingTag, open_element],
+                vec![MalformedReason::MisnamedClosingTag, open_element],
             ),
             // The block's closing tag.
             (

@@ -128,7 +128,7 @@ pub(super) trait TaggedAssembler {
 /// the model left out: for an element the closing tag of an element around it, or the call's
 /// closing marker, found open (`why` = [`MalformedReason::OpenAtTheParentsClose`]), and for one
 /// a closing tag that names nothing open closed
-/// (`why` = [`MalformedReason::StrayClosingTag`]).
+/// (`why` = [`MalformedReason::MisnamedClosingTag`]).
 pub(crate) fn left_open(why: MalformedReason, out: &mut Events) {
     out.push(Event::Malformed {
         text: Text::uncounted(String::new()),

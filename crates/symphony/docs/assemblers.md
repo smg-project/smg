@@ -492,7 +492,11 @@ What the syntax says, and what the assembler does with it:
   container the model went back to. One `Malformed { OpenAtTheParentsClose }` event of no
   bytes stands before the first fragment, and nothing is refused. Nothing open: the tag stands
   for the element's own close, misnamed, and closes it the same way behind one
-  `Malformed { StrayClosingTag }` event of no bytes (`Assembler::close_left_open`). Two closing
+  `Malformed { MisnamedClosingTag }` event of no bytes (`Assembler::close_left_open`). That
+  one is a reading of what the model meant, with a reason of its own so its rate can be
+  counted: had the model written the separator and a closing tag as part of the value, the
+  value ends there, the text after it is refused as text between elements, and where nothing
+  but closing tags follows the call closes whole with the shorter value. Two closing
   tags behind a separator stay the element's text: one that pairs with an opening tag the value
   took as its text behind a separator (tags the model is writing inside a declared string),
   and any closing tag but its own once a value held for its close has the start of a tag in

@@ -646,7 +646,7 @@ impl Assembler {
         match around {
             Some(at) => self.close_through(at, &bytes, out),
             None if self.between_elements() => self.refuse_stray_close(&bytes, out),
-            None => self.close_left_open(MalformedReason::StrayClosingTag, &bytes, out),
+            None => self.close_left_open(MalformedReason::MisnamedClosingTag, &bytes, out),
         }
     }
 
@@ -705,7 +705,7 @@ impl Assembler {
 
     /// The innermost element, which holds text or nothing yet, closed where the model wrote no
     /// close of its own for it: by a closing tag that names nothing open (`why` is
-    /// `StrayClosingTag`, and the tag's `bytes` stand for the element's own close), by the
+    /// `MisnamedClosingTag`, and the tag's `bytes` stand for the element's own close), by the
     /// closing tag of an element around it, or by the call's closing marker
     /// (`OpenAtTheParentsClose`, no bytes). The element is written as its own closing tag
     /// would write it ([`Self::close_element`]): its text as its value, by its declared type,
