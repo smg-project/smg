@@ -25,7 +25,9 @@ use crate::{
             TieBand, DRAW_BOUND,
         },
         terms::{Coefficients, Term},
-        view::{Candidate, Constraints, LoadRow, PoolFacts, ReportCutoff, RequestFacts, WorkerId},
+        view::{
+            Candidate, Constraints, LoadRow, Phase, PoolFacts, ReportCutoff, RequestFacts, WorkerId,
+        },
     },
     load::signals::{SignalColumn, SignalSums, SignalTerm},
     policies::cache_aware::WarmRule,
@@ -813,14 +815,48 @@ impl RowTests {
         Some(Self(tests))
     }
 
-    /// Whether the set is the two tests of a row's health bits, with or
-    /// without the test of the rows tried, and holds no other: a caller
-    /// that tests a worker as the worker tests itself for routing, and
-    /// steps past the tried workers itself, then drops no test of the
-    /// profile.
-    pub(crate) fn health_alone(self) -> bool {
-        let both = Self::HEALTHY | Self::NOT_OVERLOADED;
-        self.0 & both == both && self.0 & !(both | Self::NOT_TRIED) == 0
+    /// The empty set.
+    pub(crate) const fn none() -> Self {
+        Self(0)
+    }
+
+    /// The set with `other`'s tests added.
+    pub(crate) const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// The tests a placement pass that asks for one pick holds itself at a
+    /// place of `phase`, so that the pick leaves them to the pass: the
+    /// test of the workers a retry tried at every place, the prefill
+    /// window's at a prefill place and the decode rooms' at a decode
+    /// place. The two windows are bits a host supplies, and such a pass
+    /// is the host: it narrows a side's candidates by them before it asks.
+    pub(crate) const fn held_by_a_pass(phase: Phase) -> Self {
+        let side = match phase {
+            Phase::Prefill => Self::HAS_CAPACITY,
+            Phase::Decode => Self::HAS_ROOM,
+            Phase::Single | Phase::Encode => 0,
+        };
+        Self(Self::NOT_TRIED | side)
+    }
+
+    /// Whether every test of the set is a test of a row's health bits or
+    /// one of `held`.
+    pub(crate) const fn health_or(self, held: Self) -> bool {
+        self.0 & !(Self::HEALTHY | Self::NOT_OVERLOADED | held.0) == 0
+    }
+
+    /// The test of a row's health bits the set leaves out, by its filter's
+    /// name. A caller that tests a worker as the worker tests itself for
+    /// routing asks both, so it would add the one left out.
+    pub(crate) fn health_test_left_out(self) -> Option<&'static str> {
+        if self.0 & Self::HEALTHY == 0 {
+            Some(Healthy.name())
+        } else if self.0 & Self::NOT_OVERLOADED == 0 {
+            Some(NotOverloaded.name())
+        } else {
+            None
+        }
     }
 
     /// The set as one decision asks it: without the overload test where
@@ -3794,7 +3830,7 @@ impl Picker for CountFirst {
 
 /// How many turns of the pool one pick takes at the most past a turn that
 /// lands on a refused worker, before its caller reads the pool whole
-/// ([`live_turns`]). The number is this rule's own, set by its own run: a
+/// ([`pool_turns`]). The number is this rule's own, set by its own run: a
 /// wasted turn is one read of a worker and one step of the rotation, so the
 /// turns add nine reads at the most to a pass they do not save.
 const TURNS_AHEAD: usize = 8;
@@ -3810,7 +3846,7 @@ const ROWS_A_TURN: usize = 32;
 /// The turns of the pool one pick takes over a pool of `rows` workers
 /// before its caller reads the pool whole: its own, and one past a refused
 /// worker for each [`ROWS_A_TURN`] workers, [`TURNS_AHEAD`] at the most.
-pub(crate) fn live_turns(rows: usize) -> usize {
+pub(crate) fn pool_turns(rows: usize) -> usize {
     1 + (rows / ROWS_A_TURN).min(TURNS_AHEAD)
 }
 

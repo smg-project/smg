@@ -36,11 +36,12 @@ use crate::{
     Draw,
 };
 
+mod alone;
 mod encode;
 mod engines;
-mod live;
 mod vetoed;
 
+pub use alone::{AloneProfile, InTheWay, Place};
 pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
 use engines::{run_engines, run_owned};
 use vetoed::AllVetoed;
@@ -635,25 +636,30 @@ pub trait Picker: Lifecycle + Debug {
     }
 
     /// Whether the picker places a request over a pool's workers by itself
-    /// ([`Picker::pick_live`]): its own rule is its whole pick, and it
+    /// ([`Picker::pick_alone`]): its own rule is its whole pick, and it
     /// reads no row, no score and no count. A caller that keeps a worker's
     /// health on the worker and holds every other rule of a placement
     /// itself asks such a picker for one pick and nothing else of a
-    /// decision ([`Engine::picks_live`]). The default is no. The engine
-    /// reads it where such a caller asks for a profile, not at a decision.
-    fn picks_live(&self) -> bool {
+    /// decision ([`Engine::place_for`]). The default is no. The engine reads
+    /// it where such a caller asks for a place's profile, not at a
+    /// decision.
+    fn picks_alone(&self) -> bool {
         false
     }
 
     /// One pick over `pool` by the picker's own rule alone
-    /// ([`Picker::picks_live`]). `keep` asks the caller's test of the
+    /// ([`Picker::picks_alone`]). `keep` asks the caller's test of the
     /// worker at a position of the pool: one read of that worker. `Some`
     /// is the position picked, which `keep` kept. `None` where the rule's
     /// own bound ran out before a worker was kept, as a rotation's turns
     /// past a refused worker do: the caller then reads the pool whole and
     /// asks [`Picker::pick_among`] of the workers that pass. The default
     /// picks nobody.
-    fn pick_live(&self, pool: &LivePool<'_>, keep: &mut dyn FnMut(usize) -> bool) -> Option<usize> {
+    fn pick_alone(
+        &self,
+        pool: &PoolWord<'_>,
+        keep: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<usize> {
         let _ = (pool, keep);
         None
     }
@@ -669,9 +675,9 @@ pub trait Picker: Lifecycle + Debug {
 }
 
 /// A pool as a picker that places over its workers by itself is handed it
-/// ([`Picker::pick_live`]).
+/// ([`Picker::pick_alone`]): its size and its own word.
 #[derive(Clone, Copy, Debug)]
-pub struct LivePool<'a> {
+pub struct PoolWord<'a> {
     /// How many workers the pool holds, in an order that stands for as long
     /// as the pool does.
     pub rows: usize,

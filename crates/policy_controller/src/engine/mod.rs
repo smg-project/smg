@@ -34,13 +34,13 @@ pub use door::{
     SHADOW_ROWS,
 };
 pub use framework::{
-    Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
-    Front, LivePool, Narrowed, OverloadThresholds, PairPools, PairSide, PairTable, PairTableError,
-    Picker, Plan, Profile, Scorer, Scratch, Spread, TieBand, Unit, Weighted, DRAW_BOUND, DRAW_FROM,
-    RANK_FROM,
+    AloneProfile, Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts,
+    Engine, Filter, Front, InTheWay, Narrowed, OverloadThresholds, PairPools, PairSide, PairTable,
+    PairTableError, Picker, Place, Plan, PoolWord, Profile, Scorer, Scratch, Spread, TieBand, Unit,
+    Weighted, DRAW_BOUND, DRAW_FROM, RANK_FROM,
 };
 #[cfg(feature = "in-process")]
-pub use policy_engine::{LiveProfile, PolicyEngine, PoolMembers};
+pub use policy_engine::{PolicyEngine, PoolMembers};
 pub use prompt_hashes::{HashSeeds, PromptHashes};
 pub use sticky_sessions::{
     Forgets, Pins, SessionRule, SessionTable, SessionVerdict, ABSENCE_MICROS,

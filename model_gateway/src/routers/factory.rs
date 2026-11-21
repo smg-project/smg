@@ -17,7 +17,7 @@ use super::{
 use crate::{
     app_context::AppContext,
     config::{PolicyConfig, RoutingMode},
-    policies::{DPRankLoadPolicy, MinimumTokensPolicy, PolicyFactory},
+    policies::{DPRankLoadPolicy, MinimumTokensPolicy, Side},
     policy_controller,
 };
 
@@ -217,13 +217,17 @@ impl RouterFactory {
         if ctx.policy_engine.is_some() {
             return;
         }
-        let prefill_policy =
-            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
-        let decode_policy =
-            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
-
-        ctx.policy_registry.set_prefill_policy(prefill_policy);
-        ctx.policy_registry.set_decode_policy(decode_policy);
+        // The registry builds each side's policy: it is the one place that
+        // knows whether a policy engine is asked.
+        let registry = &ctx.policy_registry;
+        registry.set_side_policy(
+            Side::Prefill,
+            prefill_policy_config.unwrap_or(main_policy_config),
+        );
+        registry.set_side_policy(
+            Side::Decode,
+            decode_policy_config.unwrap_or(main_policy_config),
+        );
     }
 
     /// Register the encode/prefill/decode policies for a gRPC EPD deployment.
@@ -241,10 +245,10 @@ impl RouterFactory {
             return;
         }
         let default_encode_policy = PolicyConfig::ConsistentHashing;
-        let encode_policy = PolicyFactory::create_from_config(
+        ctx.policy_registry.set_side_policy(
+            Side::Encode,
             encode_policy_config.unwrap_or(&default_encode_policy),
         );
-        ctx.policy_registry.set_encode_policy(encode_policy);
         Self::set_pd_policies(
             prefill_policy_config,
             decode_policy_config,

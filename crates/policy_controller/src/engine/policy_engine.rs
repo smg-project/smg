@@ -13,13 +13,17 @@
 //!   pool's own word. The gateway keeps the value beside the list it was
 //!   made from, for as long as that list stands. No worker is read for it
 //!   and nothing of a worker is copied.
+//! - **Once a place.** The gateway builds one policy for each place it
+//!   places for: a model and a phase. [`PolicyEngine::place`] finds the
+//!   place's profile by the document's own bindings, there and at no
+//!   request.
 //! - **Once a request.** [`PolicyEngine::pick`] asks for one pick over the
 //!   pool, under a profile the engine picks by its picker alone
-//!   ([`PolicyEngine::live_profile`]). The pick turns the pool's own word
-//!   and reads the worker the turn lands on, as that worker tests itself
-//!   for routing: no row, no table, no request fact, no lock, and nothing
-//!   allocated. A list nothing is kept of (a part of a pool, as the pass
-//!   narrowed it) is passed over once ([`PolicyEngine::pick_among`]).
+//!   ([`Place::Alone`]). The pick turns the pool's own word and reads the
+//!   worker the turn lands on, by the pass's own test of a worker: no
+//!   row, no table, no request fact, no lock, and nothing allocated. A
+//!   list nothing is kept of (a part of a pool, as the pass narrowed it)
+//!   is passed over once ([`PolicyEngine::pick_among`]).
 //!
 //! The engine keeps no worker list, no health and no count of requests in
 //! flight. What it keeps is its stages' own: a rotation.
@@ -36,7 +40,10 @@ use std::{
 use rustc_hash::FxHasher;
 use smg_worker::{identity::basic::Worker, runtime::RoutingState};
 
-use super::framework::{LivePool, Picker};
+use super::{
+    framework::{AloneProfile, Picker, Place, PoolWord},
+    view::Phase,
+};
 use crate::document::spec::AppliedSpec;
 
 /// The engine of one policy document, for a gateway that decides in its own
@@ -73,12 +80,6 @@ pub struct PoolMembers {
 #[derive(Debug)]
 #[repr(align(128))]
 struct OwnWord(AtomicU64);
-
-/// A profile of the document one pick of whose picker is the profile's
-/// whole decision ([`PolicyEngine::live_profile`]), by its place in the
-/// document.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LiveProfile(u16);
 
 impl PoolMembers {
     /// The workers of the pool: the list the value was made from.
@@ -121,21 +122,23 @@ impl PolicyEngine {
         }
     }
 
-    /// The profile named `name` in the document, where one pick of its
-    /// picker over a pool's workers is the profile's whole decision
-    /// ([`Engine::picks_live`]). `None` where the document holds no profile
-    /// of the name, or one whose decision is more than that pick.
+    /// What the document holds for one place the gateway builds a policy
+    /// for, `model` at `phase` ([`Engine::place_for`]). The first binding that
+    /// matches names the place's profile. The answer is that profile where
+    /// one pick of its picker is its whole decision ([`Place::Alone`]),
+    /// the stage of it that asks more where it is not
+    /// ([`Place::NotYet`]), and [`Place::Unbound`] where no binding names
+    /// the model for the phase. A policy that serves every model is asked
+    /// for with the empty model id, which the bindings of every model
+    /// alone match.
     ///
-    /// [`Engine::picks_live`]: super::framework::Engine::picks_live
+    /// Asked where the gateway builds the place's policy, and at no
+    /// request: a policy's name finds nothing here.
+    ///
+    /// [`Engine::place_for`]: super::framework::Engine::place_for
     #[must_use]
-    pub fn live_profile(&self, name: &str) -> Option<LiveProfile> {
-        let engine = self.spec.engine();
-        let at = engine
-            .profiles()
-            .iter()
-            .position(|profile| profile.name == name)?;
-        let index = u16::try_from(at).ok()?;
-        engine.picks_live(index).then_some(LiveProfile(index))
+    pub fn place(&self, model: &str, phase: Phase) -> Place<'_> {
+        self.spec.engine().place_for(model, phase)
     }
 
     /// One pick under `profile` over `members`, the value this engine made
@@ -147,60 +150,45 @@ impl PolicyEngine {
     /// request may take, what a retry skips, and what becomes of a pool no
     /// worker of which passes. The picker turns the pool's own word, kept
     /// in `members`, and the worker a turn lands on is read once and tested
-    /// as the worker tests itself for routing: every veto, or every veto
-    /// but the overload one where the caller lifted it (`overload_lifted`).
-    /// No row is read, no table looked up, no lock taken and nothing
+    /// by `admits`, the caller's own test of a worker's read: the one its
+    /// pass asks of every candidate, so the rule of a lifted veto has one
+    /// home. No row is read, no table looked up, no lock taken and nothing
     /// allocated. Where the picker's turns all land on refused workers the
     /// pool is passed over once, as [`Self::pick_among`] passes over a list.
     #[must_use]
     pub fn pick(
         &self,
-        profile: LiveProfile,
+        profile: AloneProfile,
         members: &PoolMembers,
-        overload_lifted: bool,
+        admits: impl Fn(RoutingState) -> bool + Copy,
     ) -> Option<usize> {
         let picker = self.picker_of(profile)?;
-        let workers = &*members.workers;
-        let word = &members.rotation.0;
-        if overload_lifted {
-            pick_by(
-                picker,
-                workers,
-                word,
-                RoutingState::eligible_ignoring_overload,
-            )
-        } else {
-            pick_by(picker, workers, word, RoutingState::eligible)
-        }
+        pick_by(picker, &members.workers, &members.rotation.0, admits)
     }
 
     /// One pick under `profile` among `workers`, a list this engine keeps
     /// nothing of (a part of a pool, as a caller narrowed it): the place in
     /// `workers` of the worker picked. `None` where no worker passes.
     ///
-    /// The list is passed over once, a read and the worker's own test each,
-    /// and the picker picks among the workers that pass: a rotation turns
+    /// The list is passed over once, a read and the caller's test
+    /// (`admits`) each, and the picker picks among the workers that pass: a
+    /// rotation turns
     /// the one their set keeps, named by the workers' handles. The list of
     /// them is the calling thread's own: nothing is allocated after a
     /// thread's first picks.
     #[must_use]
     pub fn pick_among(
         &self,
-        profile: LiveProfile,
+        profile: AloneProfile,
         workers: &[Arc<dyn Worker>],
-        overload_lifted: bool,
+        admits: impl Fn(RoutingState) -> bool + Copy,
     ) -> Option<usize> {
-        let picker = self.picker_of(profile)?;
-        if overload_lifted {
-            among(picker, workers, RoutingState::eligible_ignoring_overload)
-        } else {
-            among(picker, workers, RoutingState::eligible)
-        }
+        among(self.picker_of(profile)?, workers, admits)
     }
 
     /// The picker of `profile`.
     #[inline]
-    fn picker_of(&self, profile: LiveProfile) -> Option<&dyn Picker> {
+    fn picker_of(&self, profile: AloneProfile) -> Option<&dyn Picker> {
         let profiles = self.spec.engine().profiles();
         Some(profiles.get(usize::from(profile.0))?.picker.as_ref())
     }
@@ -215,11 +203,11 @@ fn pick_by(
     word: &AtomicU64,
     admits: impl Fn(RoutingState) -> bool + Copy,
 ) -> Option<usize> {
-    let pool = LivePool {
+    let pool = PoolWord {
         rows: workers.len(),
         word,
     };
-    let picked = picker.pick_live(&pool, &mut |at| {
+    let picked = picker.pick_alone(&pool, &mut |at| {
         workers
             .get(at)
             .is_some_and(|worker| admits(worker.routing_state()))
@@ -292,7 +280,7 @@ mod tests {
     use smg_worker::{runtime::StallReason, test_support::ready_worker};
 
     use super::*;
-    use crate::document::spec::PolicySpec;
+    use crate::{document::spec::PolicySpec, engine::framework::InTheWay};
 
     const MODEL: &str = "model-a";
 
@@ -310,6 +298,26 @@ mod tests {
         (0..workers)
             .map(|at| ready_worker(&format!("http://worker-{at}:8000"), MODEL))
             .collect()
+    }
+
+    /// The profile of the model's single placements, which the engine picks
+    /// alone.
+    fn alone(engine: &PolicyEngine) -> AloneProfile {
+        match engine.place(MODEL, Phase::Single) {
+            Place::Alone(profile) => profile,
+            other => panic!("not picked alone: {other:?}"),
+        }
+    }
+
+    /// Round robin's preset with `filter` added to its profile's filters.
+    fn round_robin_with(filter: &str) -> PolicyEngine {
+        let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+        let profile = document
+            .profiles
+            .get_mut("round_robin")
+            .expect("the preset's profile");
+        profile.filter.push(filter.into());
+        engine_of(&document)
     }
 
     /// The value made of a pool holds the shared list itself, and making it
@@ -333,29 +341,47 @@ mod tests {
         );
     }
 
-    /// A side of a pair holds a test the pick would drop: the prefill side's
-    /// admission, the decode side's room. Neither side's profile is one a
-    /// pick decides, whatever its picker.
+    /// A place is found by the document's bindings, a model and a phase. A
+    /// profile's name finds nothing: a document that names its profile
+    /// anything is answered as the preset is. A model no binding names is
+    /// unbound, and so is a policy that serves every model (the empty id)
+    /// under a document that binds some models only.
     #[test]
-    fn a_profile_with_a_test_beyond_health_is_not_picked_alone() {
-        let mut document =
-            PolicySpec::pair_presets("round_robin", "round_robin").expect("built-in presets");
-        document.generation = 1;
+    fn a_place_is_found_by_its_model_and_phase() {
+        let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+        let profile = document
+            .profiles
+            .remove("round_robin")
+            .expect("the preset's profile");
+        document.profiles.insert("anything".to_string(), profile);
+        document.bindings[0].profile = Some("anything".to_string());
+        document.bindings[0].matcher.model = "served-*".to_string();
         let engine = engine_of(&document);
-        assert!(engine.live_profile("prefill").is_none());
-        assert!(engine.live_profile("decode").is_none());
-        assert!(engine.live_profile("round_robin").is_none(), "not held");
+        assert!(matches!(
+            engine.place("served-a", Phase::Single),
+            Place::Alone(_)
+        ));
+        assert_eq!(engine.place("other", Phase::Single), Place::Unbound);
+        assert_eq!(engine.place("", Phase::Single), Place::Unbound);
+        // The preset binds every model, the empty id among them.
+        let every = preset("round_robin");
+        assert_eq!(
+            every.place("", Phase::Single),
+            every.place(MODEL, Phase::Single)
+        );
+        assert!(matches!(every.place("", Phase::Single), Place::Alone(_)));
     }
 
-    /// The profiles one pick decides: the picker places by itself, no stage
-    /// scores, and the filters hold both tests of a worker's health. Round
-    /// robin's preset is one. A profile the document does not hold is none,
-    /// and no other preset is one yet.
+    /// The places one pick decides: the picker places by itself, no stage
+    /// scores, and the filters are the two tests of a worker's health.
+    /// Round robin's preset is one. No other preset is one yet, and each
+    /// names its own profile and the stage of it that asks more.
     #[test]
-    fn a_live_profile_is_one_its_picker_decides_alone() {
-        let engine = preset("round_robin");
-        assert!(engine.live_profile("round_robin").is_some());
-        assert!(engine.live_profile("least_load").is_none(), "not held");
+    fn a_place_is_picked_alone_where_its_picker_decides_by_itself() {
+        assert!(matches!(
+            preset("round_robin").place(MODEL, Phase::Single),
+            Place::Alone(_)
+        ));
         for name in [
             "random",
             "passthrough",
@@ -367,7 +393,88 @@ mod tests {
             "cache_aware",
             "bucket",
         ] {
-            assert!(preset(name).live_profile(name).is_none(), "{name}");
+            let engine = preset(name);
+            let Place::NotYet { profile, stage } = engine.place(MODEL, Phase::Single) else {
+                panic!("{name} is picked alone");
+            };
+            assert_eq!(profile, name);
+            assert!(!stage.to_string().is_empty(), "{name}: {stage}");
+        }
+        assert_eq!(
+            preset("random").place(MODEL, Phase::Single),
+            Place::NotYet {
+                profile: "random",
+                stage: InTheWay::Picker("random"),
+            }
+        );
+        assert!(matches!(
+            preset("least_load").place(MODEL, Phase::Single),
+            Place::NotYet {
+                stage: InTheWay::Scorer(_),
+                ..
+            }
+        ));
+    }
+
+    /// A side of a pair holds one test beyond a worker's health: the prefill
+    /// side its window's slot, the decode side its room. A gateway's pass
+    /// holds each at its own side's place and at no other. So each side's
+    /// profile is picked alone at its own place, and the same filter stands
+    /// in the way at every other place.
+    #[test]
+    fn a_pairs_side_is_picked_alone_at_its_own_place_only() {
+        let mut document =
+            PolicySpec::pair_presets("round_robin", "round_robin").expect("built-in presets");
+        document.generation = 1;
+        let engine = engine_of(&document);
+        assert!(matches!(
+            engine.place(MODEL, Phase::Prefill),
+            Place::Alone(_)
+        ));
+        assert!(matches!(
+            engine.place(MODEL, Phase::Decode),
+            Place::Alone(_)
+        ));
+        // The pair plan has no side for a single request.
+        assert_eq!(engine.place(MODEL, Phase::Single), Place::Unbound);
+
+        for (filter, own) in [
+            ("has-capacity", Phase::Prefill),
+            ("has-room", Phase::Decode),
+        ] {
+            let engine = round_robin_with(filter);
+            for phase in [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode] {
+                let place = engine.place(MODEL, phase);
+                if phase == own {
+                    assert!(matches!(place, Place::Alone(_)), "{filter} at {phase:?}");
+                } else {
+                    let stage = InTheWay::Filter(filter);
+                    let profile = "round_robin";
+                    assert_eq!(place, Place::NotYet { profile, stage }, "{phase:?}");
+                }
+            }
+        }
+    }
+
+    /// A pick tests a worker's health whole, as the pass does. A profile
+    /// that leaves one of the two health tests out would gain it by the
+    /// pick, so it is not picked alone, and the answer names the test.
+    #[test]
+    fn a_profile_without_a_health_test_is_not_picked_alone() {
+        for (at, left_out) in [(0, "healthy"), (1, "not-overloaded")] {
+            let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+            let profile = document
+                .profiles
+                .get_mut("round_robin")
+                .expect("the preset's profile");
+            assert_eq!(profile.filter[at].name(), left_out);
+            profile.filter.remove(at);
+            let stage = InTheWay::NoFilter(left_out);
+            let profile = "round_robin";
+            assert_eq!(
+                engine_of(&document).place(MODEL, Phase::Single),
+                Place::NotYet { profile, stage }
+            );
         }
     }
 
@@ -377,11 +484,13 @@ mod tests {
     fn a_pick_turns_the_pools_own_rotation() {
         for workers in [1, 2, 3, 8, 16, 64] {
             let engine = preset("round_robin");
-            let profile = engine.live_profile("round_robin").expect("picked alone");
+            let profile = alone(&engine);
             let members = engine.pool_members(&pool(workers));
-            let first = engine.pick(profile, &members, false).expect("a worker");
+            let first = engine
+                .pick(profile, &members, RoutingState::eligible)
+                .expect("a worker");
             for step in 1..2 * workers {
-                let at = engine.pick(profile, &members, false);
+                let at = engine.pick(profile, &members, RoutingState::eligible);
                 assert_eq!(at, Some((first + step) % workers), "{workers} workers");
             }
         }
@@ -392,15 +501,22 @@ mod tests {
     #[test]
     fn each_pool_turns_its_own_word() {
         let engine = preset("round_robin");
-        let profile = engine.live_profile("round_robin").expect("picked alone");
+        let profile = alone(&engine);
         let (one, other) = (pool(5), pool(5));
         let (one, other) = (engine.pool_members(&one), engine.pool_members(&other));
-        let first = engine.pick(profile, &one, false).expect("a worker");
-        let apart = engine.pick(profile, &other, false).expect("a worker");
+        let first = engine
+            .pick(profile, &one, RoutingState::eligible)
+            .expect("a worker");
+        let apart = engine
+            .pick(profile, &other, RoutingState::eligible)
+            .expect("a worker");
         for step in 1..=10 {
-            assert_eq!(engine.pick(profile, &one, false), Some((first + step) % 5));
             assert_eq!(
-                engine.pick(profile, &other, false),
+                engine.pick(profile, &one, RoutingState::eligible),
+                Some((first + step) % 5)
+            );
+            assert_eq!(
+                engine.pick(profile, &other, RoutingState::eligible),
                 Some((apart + step) % 5)
             );
         }
@@ -415,11 +531,13 @@ mod tests {
     #[test]
     fn a_pick_keeps_exact_shares_past_workers_not_ready() {
         let engine = preset("round_robin");
-        let profile = engine.live_profile("round_robin").expect("picked alone");
+        let profile = alone(&engine);
         let shares = |members: &PoolMembers, picks: usize| {
             let mut times = vec![0usize; members.workers().len()];
             for _ in 0..picks {
-                times[engine.pick(profile, members, false).expect("a worker")] += 1;
+                times[engine
+                    .pick(profile, members, RoutingState::eligible)
+                    .expect("a worker")] += 1;
             }
             times
         };
@@ -474,28 +592,41 @@ mod tests {
     #[test]
     fn a_pick_tests_a_worker_as_the_worker_tests_itself() {
         let engine = preset("round_robin");
-        let profile = engine.live_profile("round_robin").expect("picked alone");
+        let profile = alone(&engine);
         let list = pool(4);
         list[0].set_status(WorkerStatus::NotReady);
         list[1].set_overloaded(true);
         list[2].set_stall(Some(StallReason::Wedged));
         let members = engine.pool_members(&list);
         for _ in 0..8 {
-            assert_eq!(engine.pick(profile, &members, false), Some(3));
+            assert_eq!(
+                engine.pick(profile, &members, RoutingState::eligible),
+                Some(3)
+            );
         }
         let lifted: BTreeSet<usize> = (0..8)
-            .filter_map(|_| engine.pick(profile, &members, true))
+            .filter_map(|_| {
+                engine.pick(profile, &members, RoutingState::eligible_ignoring_overload)
+            })
             .collect();
         assert_eq!(lifted, BTreeSet::from([1, 3]));
 
         list[3].set_overloaded(true);
-        assert_eq!(engine.pick(profile, &members, false), None);
-        assert_eq!(engine.pick_among(profile, &list, false), None);
-        assert!(engine.pick(profile, &members, true).is_some());
+        assert_eq!(engine.pick(profile, &members, RoutingState::eligible), None);
+        assert_eq!(
+            engine.pick_among(profile, &list, RoutingState::eligible),
+            None
+        );
+        assert!(engine
+            .pick(profile, &members, RoutingState::eligible_ignoring_overload)
+            .is_some());
         // A pool that holds no worker.
         let empty = engine.pool_members(&pool(0));
-        assert_eq!(engine.pick(profile, &empty, false), None);
-        assert_eq!(engine.pick_among(profile, &[], false), None);
+        assert_eq!(engine.pick(profile, &empty, RoutingState::eligible), None);
+        assert_eq!(
+            engine.pick_among(profile, &[], RoutingState::eligible),
+            None
+        );
     }
 
     /// A list the engine keeps nothing of is passed over once, and the
@@ -504,7 +635,7 @@ mod tests {
     #[test]
     fn a_pick_among_a_list_turns_the_rotation_of_the_workers_that_pass() {
         let engine = preset("round_robin");
-        let profile = engine.live_profile("round_robin").expect("picked alone");
+        let profile = alone(&engine);
         let list = pool(9);
         // A part of the pool, as a caller narrows it: every third worker
         // left out, and one of the others not ready.
@@ -515,7 +646,9 @@ mod tests {
         part[2].set_status(WorkerStatus::NotReady);
         let mut times = [0usize; 6];
         for _ in 0..5 * 7 {
-            times[engine.pick_among(profile, &part, false).expect("a worker")] += 1;
+            times[engine
+                .pick_among(profile, &part, RoutingState::eligible)
+                .expect("a worker")] += 1;
         }
         assert_eq!(times, [7, 7, 0, 7, 7, 7]);
     }

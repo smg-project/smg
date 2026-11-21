@@ -1,8 +1,11 @@
 //! A classic policy object that asks the policy engine.
 //!
 //! Where the gateway keeps the policy engine in its own process, the policy
-//! registry hands out this object in the place of the classic policy of a
-//! name. Everything around the pick then runs as it runs for that policy:
+//! registry hands out this object in the place of a classic policy: for a
+//! model's requests, or for a side of a pair. The registry finds the
+//! place's profile once, by the engine's own bindings, where it builds the
+//! place's policy. Everything around the pick then runs as it runs for the
+//! classic policy of that place:
 //! the placement's pass with its candidate rules, the routing-key override,
 //! the fallback for a pool every worker of which is vetoed, the selection
 //! counter under the classic policy's name, and what the registry asks a
@@ -21,7 +24,7 @@
 
 use std::{any::Any, sync::Arc};
 
-use smg_policy_controller::engine::{LiveProfile, PolicyEngine};
+use smg_policy_controller::engine::{AloneProfile, PolicyEngine};
 use smg_worker::identity::basic::Worker;
 
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
@@ -30,10 +33,11 @@ use super::{LoadBalancingPolicy, SelectWorkerInfo};
 /// profile of the engine's document and in the name of one classic policy.
 ///
 /// Built for a profile whose whole decision is one pick of its picker over
-/// workers that pass the health tests ([`PolicyEngine::live_profile`]): the
-/// object tests a worker's availability itself, as the classic policy of
-/// its name does, so the placement hands it the snapshot's list whole and a
-/// pick reads the workers it asks about and no other.
+/// the workers the pass admits ([`PolicyEngine::place`]): the object tests
+/// a worker's availability itself, by the pass's own test, so the placement
+/// hands it the snapshot's list whole and a pick reads the workers it asks
+/// about and no other. The classic policy's name only labels the object:
+/// the selection counter counts under it, and no profile is found by it.
 ///
 /// The object stands on cache lines of its own. The placement takes a
 /// count of its policy at each request and drops it, so the count's line
@@ -43,22 +47,20 @@ use super::{LoadBalancingPolicy, SelectWorkerInfo};
 #[repr(align(128))]
 pub struct EnginePolicy {
     engine: Arc<PolicyEngine>,
-    profile: LiveProfile,
+    profile: AloneProfile,
     name: &'static str,
 }
 
 impl EnginePolicy {
-    /// The object that stands for the classic policy `name` and decides by
-    /// the profile named `profile` in `engine`'s document. `None` where the
-    /// document holds no such profile, or one whose decision is more than
-    /// one pick of its picker: the caller builds the classic policy.
-    pub fn of(engine: &Arc<PolicyEngine>, profile: &str, name: &'static str) -> Option<Self> {
-        let profile = engine.live_profile(profile)?;
-        Some(Self {
+    /// The object that decides by `profile`, which `engine` found for the
+    /// place the object is built for ([`PolicyEngine::place`]), under the
+    /// label `name`: the name of the classic policy of that place.
+    pub fn of(engine: &Arc<PolicyEngine>, profile: AloneProfile, name: &'static str) -> Self {
+        Self {
             engine: Arc::clone(engine),
             profile,
             name,
-        })
+        }
     }
 }
 
@@ -76,13 +78,13 @@ impl LoadBalancingPolicy for EnginePolicy {
                 let members = cell.get_or_init(|| Box::new(self.engine.pool_members(named.list)));
                 return self
                     .engine
-                    .pick(self.profile, members, info.overload_lifted);
+                    .pick(self.profile, members, |state| info.admits(state));
             }
         }
         // Workers nothing is kept of (a narrowed list, a part of a pair's
         // list): one read of each, and the pick among those that pass.
         self.engine
-            .pick_among(self.profile, workers, info.overload_lifted)
+            .pick_among(self.profile, workers, |state| info.admits(state))
     }
 
     fn name(&self) -> &'static str {
@@ -96,19 +98,29 @@ impl LoadBalancingPolicy for EnginePolicy {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Barrier, thread};
+    use std::{collections::HashMap, sync::Barrier, thread, time::Duration};
 
     use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
     use smg_policy_controller::document::{AppliedSpec, PolicySpec};
-    use smg_worker::test_support::{no_health_check, render_with_recorder};
+    use smg_worker::{
+        identity::basic::{ConnectionMode, RuntimeType, WorkerType},
+        test_support::{no_health_check, render_with_recorder},
+    };
 
     use super::*;
     use crate::{
         config::{PolicyConfig, RoutingKeyOverrideConfig},
-        policies::{policy_filters_unavailable_workers, PolicyRegistry, RoundRobinPolicy},
+        policies::{
+            policy_filters_unavailable_workers, DocumentOrigin, PolicyRegistry, RoundRobinPolicy,
+            Side,
+        },
         routers::{
             common::{
-                placement::{select_single, PlacementInputs},
+                pair_index::PdWire,
+                placement::{select_pair, select_single, PlacementInputs},
+                prefill_admission::{
+                    PrefillAdmission, PrefillAdmissionAttempt, PrefillSelectionContext,
+                },
                 snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
             },
             grpc::backend_client::BasicWorkerBuilder,
@@ -121,16 +133,94 @@ mod tests {
         serde_json::from_value(serde_json::json!({ "type": name })).expect("a policy's name")
     }
 
-    /// A registry whose policies ask the engine of the preset `name`.
+    /// A registry whose policies ask the engine of the preset `name`, the
+    /// document a gateway's settings make for that policy.
     fn asking(name: &str) -> PolicyRegistry {
-        let mut document = PolicySpec::preset(name).expect("a built-in preset");
-        document.generation = 1;
-        let spec = AppliedSpec::validate(&document).expect("the preset validates");
+        let document = PolicySpec::preset(name).expect("a built-in preset");
+        asking_under(&document, name, DocumentOrigin::Settings)
+    }
+
+    /// A registry whose default policy is `name` and whose policies ask the
+    /// engine of `document`.
+    fn asking_under(document: &PolicySpec, name: &str, origin: DocumentOrigin) -> PolicyRegistry {
+        let spec = AppliedSpec::validate(document).expect("the document validates");
         PolicyRegistry::with_policy_engine(
             config(name),
             RoutingKeyOverrideConfig::default(),
             Arc::new(PolicyEngine::new(spec)),
+            origin,
         )
+    }
+
+    /// Least load's preset with one more binding ahead of its own: the
+    /// models `alpha-*` are placed by a profile of round robin's stages,
+    /// named for nothing a policy is named.
+    fn two_bindings() -> PolicySpec {
+        let mut document = PolicySpec::preset("least_load").expect("a built-in preset");
+        let turns = PolicySpec::preset("round_robin").expect("a built-in preset");
+        let profile = turns.profiles["round_robin"].clone();
+        document.profiles.insert("by-turns".to_string(), profile);
+        let mut named = document.bindings[0].clone();
+        named.matcher.model = "alpha-*".to_string();
+        named.profile = Some("by-turns".to_string());
+        document.bindings.insert(0, named);
+        document
+    }
+
+    /// The workers of one side of a pair fleet, in their order.
+    type Workers = Vec<Arc<dyn Worker>>;
+
+    /// A pair fleet on the gRPC wire: `prefills` prefill workers and
+    /// `decodes` decode workers of one model, each list in its order. A
+    /// decode reports a running window of two rooms, so the rooms count in
+    /// a decode's pick.
+    fn pair_fleet(prefills: usize, decodes: usize) -> (WorkerRegistry, Workers, Workers) {
+        let registry = WorkerRegistry::new();
+        let side = |name: &str, worker_type: WorkerType, count: usize| -> Workers {
+            (0..count)
+                .map(|at| {
+                    let mut labels = HashMap::new();
+                    if worker_type == WorkerType::Decode {
+                        labels.insert("max_running_requests".to_string(), "2".to_string());
+                    }
+                    let worker: Arc<dyn Worker> = Arc::new(
+                        BasicWorkerBuilder::new(format!("grpc://{name}-{at}:9000"))
+                            .model(ModelCard::new(MODEL))
+                            .worker_type(worker_type)
+                            .connection_mode(ConnectionMode::Grpc)
+                            .runtime_type(RuntimeType::Vllm)
+                            .labels(labels)
+                            .health_config(no_health_check())
+                            .build(),
+                    );
+                    worker.set_status(WorkerStatus::Ready);
+                    assert!(registry.register(Arc::clone(&worker)).is_some());
+                    worker
+                })
+                .collect()
+        };
+        let prefill = side("prefill", WorkerType::Prefill, prefills);
+        let decode = side("decode", WorkerType::Decode, decodes);
+        (registry, prefill, decode)
+    }
+
+    /// A pair gateway's registry under round robin on both sides, its side
+    /// policies built by the registry and asking the engine of the pair
+    /// document those settings make.
+    fn asking_for_a_pair() -> PolicyRegistry {
+        let document =
+            PolicySpec::pair_presets("round_robin", "round_robin").expect("built-in presets");
+        let policies = asking_under(&document, "round_robin", DocumentOrigin::Settings);
+        policies.set_side_policy(Side::Prefill, &PolicyConfig::RoundRobin);
+        policies.set_side_policy(Side::Decode, &PolicyConfig::RoundRobin);
+        policies
+    }
+
+    /// The place of `worker` in `side`.
+    fn place_in(side: &[Arc<dyn Worker>], worker: &Arc<dyn Worker>) -> usize {
+        side.iter()
+            .position(|member| Arc::ptr_eq(member, worker))
+            .expect("a worker of the side")
     }
 
     fn fleet(workers: usize) -> (Arc<WorkerRegistry>, Vec<Arc<dyn Worker>>) {
@@ -449,5 +539,193 @@ mod tests {
             !rendered.contains("smg_policy_decisions_total{"),
             "the object counts no decision of its own"
         );
+    }
+
+    /// A place of the registry is a model and a phase, and the engine finds
+    /// its profile by its document's bindings: a model is placed by the
+    /// binding that names it, whatever the profile is called. The default
+    /// policy serves every model, so a binding of some models does not name
+    /// its place.
+    #[test]
+    fn a_model_is_placed_by_the_binding_that_names_it() {
+        let policies = asking_under(&two_bindings(), "least_load", DocumentOrigin::Supplied);
+        // Every model's binding holds a profile that scores: the classic
+        // policy of the default's name, until the engine picks it.
+        let default = policies.get_default_policy();
+        assert_eq!(default.name(), "least_load");
+        assert!(!default.as_any().is::<EnginePolicy>());
+        // A model the first binding names: the object, under the default's
+        // label, and its own object.
+        let alpha = policies.on_worker_added("alpha-1", None);
+        assert!(alpha.as_any().is::<EnginePolicy>());
+        assert_eq!(alpha.name(), "least_load");
+        // Any other model: the default policy itself.
+        let beta = policies.on_worker_added("beta-1", None);
+        assert!(Arc::ptr_eq(&beta, &default));
+    }
+
+    /// Where a worker's `policy` label and a binding disagree: under a
+    /// supplied document the binding places the model, and under the
+    /// document the settings make the label chooses, as ever.
+    #[test]
+    fn a_supplied_documents_binding_places_a_labelled_model() {
+        let supplied = asking_under(&two_bindings(), "least_load", DocumentOrigin::Supplied);
+        let bound = supplied.on_worker_added("alpha-1", Some("random"));
+        assert!(bound.as_any().is::<EnginePolicy>());
+        // A model the bindings leave to a profile the engine does not pick
+        // yet keeps its label's classic policy.
+        let other = supplied.on_worker_added("beta-1", Some("random"));
+        assert_eq!(other.name(), "random");
+
+        let settings = asking_under(&two_bindings(), "least_load", DocumentOrigin::Settings);
+        let labelled = settings.on_worker_added("alpha-1", Some("random"));
+        assert_eq!(labelled.name(), "random");
+        assert!(!labelled.as_any().is::<EnginePolicy>());
+        // No label: the model's own place, under either origin.
+        let plain = settings.on_worker_added("alpha-2", None);
+        assert!(plain.as_any().is::<EnginePolicy>());
+    }
+
+    /// A model no binding of a supplied document names is placed by the
+    /// classic default policy.
+    #[test]
+    fn a_model_no_binding_names_is_placed_by_the_classic_default() {
+        let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+        document.bindings[0].matcher.model = "alpha-*".to_string();
+        let policies = asking_under(&document, "round_robin", DocumentOrigin::Supplied);
+        let default = policies.get_default_policy();
+        assert!(default.as_any().is::<RoundRobinPolicy>());
+        let unbound = policies.on_worker_added("beta-1", None);
+        assert!(Arc::ptr_eq(&unbound, &default));
+        let bound = policies.on_worker_added("alpha-1", None);
+        assert!(bound.as_any().is::<EnginePolicy>());
+    }
+
+    /// The registry builds a pair's side policies, from the side and the
+    /// side's settings: each side's place is the side's phase, and its
+    /// profile is the pair document's own, whatever it is called. With no
+    /// engine the same call builds the classic policy.
+    #[test]
+    fn the_registry_builds_a_pairs_sides_by_their_places() {
+        let policies = asking_for_a_pair();
+        for side in [policies.get_prefill_policy(), policies.get_decode_policy()] {
+            assert!(side.as_any().is::<EnginePolicy>());
+            assert_eq!(side.name(), "round_robin");
+        }
+        // The pair document plans no single request: the classic policy.
+        assert!(policies
+            .get_default_policy()
+            .as_any()
+            .is::<RoundRobinPolicy>());
+        // No side was set for the encode phase: its fallback, the classic
+        // policy of its own name.
+        assert_eq!(policies.get_encode_policy().name(), "consistent_hashing");
+
+        let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        classic.set_side_policy(Side::Prefill, &PolicyConfig::RoundRobin);
+        classic.set_side_policy(Side::Decode, &config("random"));
+        assert!(classic
+            .get_prefill_policy()
+            .as_any()
+            .is::<RoundRobinPolicy>());
+        assert_eq!(classic.get_decode_policy().name(), "random");
+    }
+
+    /// The prefill side's profile holds the test of a free slot of the
+    /// prefill window, and the object drops it: the pass holds it. Under
+    /// prefill admission a prefill at its bound leaves the candidates before
+    /// the side's object is asked, so the object never picks it. With no
+    /// admission the pass asks nothing of the window, and neither does the
+    /// object.
+    #[test]
+    fn the_pass_holds_the_prefill_window_ahead_of_the_prefill_sides_object() {
+        let (registry, prefills, _decodes) = pair_fleet(3, 2);
+        let policies = asking_for_a_pair();
+        let pairs = registry
+            .get_routing_snapshot(MODEL)
+            .pd_pairs(PdWire::Grpc, policies.pd_pairing_mode());
+        // One request in flight on the second prefill, and a bound of one.
+        prefills[1].increment_load();
+        let admission = PrefillAdmission::new(1, 0, Duration::ZERO);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a runtime");
+        let mut taken = [0usize; 3];
+        for _ in 0..8 {
+            let admitted = runtime.block_on(admission.admit(
+                None,
+                |capacity: &PrefillSelectionContext<'_>| {
+                    let inputs = PlacementInputs::default();
+                    let wire = None;
+                    match select_pair(
+                        &registry,
+                        &policies,
+                        MODEL,
+                        &pairs,
+                        wire,
+                        Some(capacity),
+                        inputs,
+                    ) {
+                        Ok(pair) => {
+                            taken[place_in(&prefills, &pair.prefill)] += 1;
+                            capacity.select(pair.prefill, ())
+                        }
+                        Err(_) => PrefillAdmissionAttempt::Unavailable,
+                    }
+                },
+            ));
+            // The admitted request is let go at once.
+            drop(admitted);
+        }
+        assert_eq!(taken, [4, 0, 4], "the prefill at its bound takes nothing");
+
+        // With no admission the window is nobody's test: every prefill
+        // takes its turn.
+        let mut taken = [0usize; 3];
+        for _ in 0..9 {
+            let inputs = PlacementInputs::default();
+            let pair = select_pair(&registry, &policies, MODEL, &pairs, None, None, inputs)
+                .expect("a pair");
+            taken[place_in(&prefills, &pair.prefill)] += 1;
+        }
+        assert_eq!(taken, [3, 3, 3]);
+    }
+
+    /// The decode side's profile holds the test of a free decode room, and
+    /// the object drops it: the pass holds it. A decode whose rooms are all
+    /// claimed leaves the candidates before the side's object is asked,
+    /// while a sibling has a room. With every decode full the pass leaves
+    /// the list as it is, and the object picks among them all.
+    #[test]
+    fn the_pass_holds_the_decode_rooms_ahead_of_the_decode_sides_object() {
+        let (registry, _prefills, decodes) = pair_fleet(2, 3);
+        let policies = asking_for_a_pair();
+        let pairs = registry
+            .get_routing_snapshot(MODEL)
+            .pd_pairs(PdWire::Grpc, policies.pd_pairing_mode());
+        let decode_of = |policies: &PolicyRegistry| {
+            let inputs = PlacementInputs::default();
+            let pair = select_pair(&registry, policies, MODEL, &pairs, None, None, inputs)
+                .expect("a pair");
+            place_in(&decodes, &pair.decode)
+        };
+        // Both rooms of the second decode are claimed, and the others each
+        // report a window with a free room.
+        assert!(decodes[1].try_admit_pd(2, 2), "both rooms claimed");
+        assert!(decodes[0].try_admit_pd(1, 2) && decodes[2].try_admit_pd(1, 2));
+        let mut taken = [0usize; 3];
+        for _ in 0..8 {
+            taken[decode_of(&policies)] += 1;
+        }
+        assert_eq!(taken, [4, 0, 4], "the full decode takes nothing");
+
+        // Every decode full: the list stands, and each takes its turn.
+        assert!(decodes[0].try_admit_pd(1, 2) && decodes[2].try_admit_pd(1, 2));
+        let mut taken = [0usize; 3];
+        for _ in 0..9 {
+            taken[decode_of(&policies)] += 1;
+        }
+        assert_eq!(taken, [3, 3, 3]);
     }
 }

@@ -74,7 +74,7 @@ pub use passthrough::PassthroughPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
-pub use registry::PolicyRegistry;
+pub use registry::{DocumentOrigin, PolicyRegistry, Side};
 pub use round_robin::RoundRobinPolicy;
 // The periodic task lives beside the worker runtime. The path it had here is
 // kept: the policies name it.

@@ -240,7 +240,7 @@ pub mod bench_support {
     use crate::{
         config::{RouterConfig, RoutingKeyOverrideConfig},
         observability::cache_trace,
-        policies::{EnginePolicy, PolicyRegistry},
+        policies::{DocumentOrigin, EnginePolicy, PolicyRegistry},
         routers::common::{
             pair_index::{PdPairIndex, PdWire},
             snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
@@ -269,6 +269,7 @@ pub mod bench_support {
             config.policy.clone(),
             RoutingKeyOverrideConfig::default(),
             policy_engine_of(config)?,
+            DocumentOrigin::Settings,
         );
         if policies.get_default_policy().as_any().is::<EnginePolicy>() {
             Ok(policies)

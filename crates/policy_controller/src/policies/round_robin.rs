@@ -11,11 +11,11 @@ use crate::{
     document::spec::ProfileSpec,
     engine::{
         decision::{Targets, MAX_TARGETS},
-        framework::{LivePool, Picker, TieBand, DRAW_BOUND},
+        framework::{Picker, PoolWord, TieBand, DRAW_BOUND},
         view::{Candidate, ModelFingerprint, PoolFacts, RequestFacts},
     },
     policies::standard_filters,
-    stages::builtins::{live_turns, push_drawn, target_of},
+    stages::builtins::{pool_turns, push_drawn, target_of},
     tracking::lease::Lifecycle,
     Draw,
 };
@@ -224,22 +224,26 @@ impl Picker for RoundRobin {
     }
 
     // Its rotation is its whole rule, and a pool's own word counts it.
-    fn picks_live(&self) -> bool {
+    fn picks_alone(&self) -> bool {
         true
     }
 
     /// The pool's own turn by the pool's own word: one step of the word and
     /// one read of the worker the turn lands on. A turn that lands on a
     /// refused worker takes the pool's next turn, as many turns as the
-    /// pool's size earns (`live_turns`), and the first worker kept is the
+    /// pool's size earns (`pool_turns`), and the first worker kept is the
     /// pick. No table is looked up: the caller keeps the pool's rotation
     /// beside the pool.
-    fn pick_live(&self, pool: &LivePool<'_>, keep: &mut dyn FnMut(usize) -> bool) -> Option<usize> {
+    fn pick_alone(
+        &self,
+        pool: &PoolWord<'_>,
+        keep: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<usize> {
         let rows = pool.rows;
         if rows == 0 {
             return None;
         }
-        for _ in 0..live_turns(rows) {
+        for _ in 0..pool_turns(rows) {
             let turn = pool.word.fetch_add(1, Ordering::Relaxed) as usize % rows;
             if keep(turn) {
                 return Some(turn);
