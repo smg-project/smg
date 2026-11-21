@@ -438,12 +438,13 @@ impl StopSequenceDecoder {
                 |byte: &u8| (self.rules.starts[usize::from(byte >> 6)] >> (byte & 63)) & 1 == 1;
             let may_stop = text.iter().position(starts).is_some_and(|first| {
                 (first..text.len()).any(|at| {
-                    patterns.iter().any(|pattern| {
-                        text[at..]
-                            .iter()
-                            .zip(pattern.as_bytes())
-                            .all(|(a, b)| a == b)
-                    })
+                    starts(&text[at])
+                        && patterns.iter().any(|pattern| {
+                            text[at..]
+                                .iter()
+                                .zip(pattern.as_bytes())
+                                .all(|(a, b)| a == b)
+                        })
                 })
             });
             if !may_stop {
@@ -1146,6 +1147,25 @@ mod tests {
         let out = decoder.process_token(3).unwrap();
         assert_eq!(out, SequenceDecoderOutput::Text("Hello test".to_string()));
         assert_eq!(decoder.flush(), SequenceDecoderOutput::Held);
+    }
+
+    #[test]
+    fn a_stop_that_begins_past_the_first_candidate_byte_is_held() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        // In "Hello" the first 'l' ("llo") disagrees with the stop; the second
+        // ("lo") agrees as far as the text goes and must be held.
+        let config = StopSequenceConfig::default().with_stop_sequence("lo world");
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        assert_eq!(
+            decoder.process_token(1).unwrap(),
+            SequenceDecoderOutput::Text("Hel".to_string())
+        );
+        assert_eq!(
+            decoder.process_token(2).unwrap(),
+            SequenceDecoderOutput::Stopped
+        );
+        assert_eq!(decoder.matched_stop(), Some("lo world"));
     }
 
     #[test]
