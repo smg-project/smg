@@ -773,8 +773,8 @@ mod tests {
     }
 
     /// `tile_blocks` against the canvas read pixel by pixel: the image's byte
-    /// inside it, black (0) beyond it, no stale byte in a full tile behind a
-    /// partial one (no pixel byte here is 0).
+    /// inside it, black (0) beyond it, no stale byte in a partial tile behind a
+    /// full one (no pixel byte here is 0).
     #[test]
     fn the_tile_blocks_are_the_canvas_pixel_by_pixel() {
         let (width, height, tile, (rows, columns)) = (7, 7, 3, (3, 4));
