@@ -251,6 +251,14 @@ impl LlavaProcessor {
         Ok(())
     }
 
+    /// The side of the square target: the configured size, else the model's
+    /// image size.
+    fn target_side(&self) -> u32 {
+        self.transforms
+            .target_size
+            .map_or(self.image_size, |(h, _w)| h)
+    }
+
     /// Process a single image through the LLaVA 1.5 pipeline.
     ///
     /// The processing flow depends on `self.aspect_ratio`:
@@ -260,11 +268,7 @@ impl LlavaProcessor {
         let transforms = &self.transforms;
         let filter = transforms.filter;
 
-        // Get target size from config or use default
-        let target_size = transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.image_size);
+        let target_size = self.target_side();
 
         // Get crop size (may be different from target_size)
         let crop_size = transforms.crop_size.map(|(h, _w)| h).unwrap_or(target_size);
@@ -378,11 +382,7 @@ impl VisionPreProcessor for LlavaProcessor {
     fn calculate_num_tokens(&self, _width: u32, _height: u32) -> Result<usize, TransformError> {
         // For LLaVA 1.5, token count is based on processed image size and patch size
         let patch_size = self.patch_size;
-        let image_size = self
-            .transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.image_size);
+        let image_size = self.target_side();
 
         let patches_per_side = image_size / patch_size;
         Ok((patches_per_side * patches_per_side) as usize)
@@ -393,11 +393,7 @@ impl VisionPreProcessor for LlavaProcessor {
     }
 
     fn get_processed_size(&self) -> Option<(u32, u32)> {
-        let size = self
-            .transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.image_size);
+        let size = self.target_side();
         Some((size, size))
     }
 }
@@ -470,11 +466,8 @@ impl LlavaNextProcessor {
     /// The crop `divide_to_samples` steps by: `crop_size`, else the square
     /// target.
     fn sample_crop(&self) -> (u32, u32) {
-        let transforms = &self.base.transforms;
-        let target = transforms
-            .target_size
-            .map_or(self.base.image_size, |(h, _w)| h);
-        transforms.crop_size.unwrap_or((target, target))
+        let target = self.base.target_side();
+        self.base.transforms.crop_size.unwrap_or((target, target))
     }
 
     /// Create a new LLaVA-NeXT processor with default settings.
@@ -566,11 +559,7 @@ impl LlavaNextProcessor {
         let transforms = &self.base.transforms;
         let filter = transforms.filter;
 
-        // Get target size for patches
-        let target_size = transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.base.image_size);
+        let target_size = self.base.target_side();
 
         // Resize patch to target size (a crop of that size stays as it is)
         let resized = if transforms.do_resize {
@@ -617,12 +606,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
         let mut item_sizes = Vec::with_capacity(images.len());
 
         let filter = self.base.transforms.filter;
-        let target_size = self
-            .base
-            .transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.base.image_size);
+        let target_size = self.base.target_side();
         let crop_size = self.sample_crop();
 
         for image in images {
@@ -670,12 +654,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
         let original_size = (width, height);
 
         // Use effective geometry from config, falling back to base defaults.
-        let image_size = self
-            .base
-            .transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.base.image_size);
+        let image_size = self.base.target_side();
         let patch_size = self.base.patch_size;
 
         // Base feature tokens (from original resized image through ViT).
@@ -725,12 +704,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
     fn get_processed_size(&self) -> Option<(u32, u32)> {
         // LLaVA-NeXT has variable output size based on crops
         // Return the base patch size
-        let size = self
-            .base
-            .transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.base.image_size);
+        let size = self.base.target_side();
         Some((size, size))
     }
 }
