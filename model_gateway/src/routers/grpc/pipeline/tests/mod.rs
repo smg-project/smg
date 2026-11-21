@@ -4393,6 +4393,49 @@ async fn a_request_that_completes_before_the_request_timeout_is_unchanged() {
     assert_eq!(worker.load(), 0);
 }
 
+/// A streamed Harmony Responses request to a silent worker ends at the
+/// deadline with an `error` event under the timeout's code, the one the 504
+/// and the other streams name.
+#[tokio::test]
+async fn a_harmony_responses_stream_to_a_silent_worker_names_the_request_timeout() {
+    let port = spawn_stub(GatedScheduler {
+        frame_gap: Some(Duration::from_secs(3600)),
+        ..Default::default()
+    })
+    .await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    register_worker(&worker_registry, port, WorkerType::Regular);
+    let deps = PipelineDeps::pair(
+        worker_registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    )
+    .with_request_timeout(REQUEST_TIMEOUT);
+    let ctx = responses_context_with_deps(Endpoint::Harmony, Mode::Regular, &deps, 0).await;
+    let response = serve_harmony_responses_stream(
+        &ctx,
+        Arc::unwrap_or_clone(responses_request(false)),
+        anonymous(),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = tokio::time::timeout(
+        CASE_CAP,
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("the request timeout ends the body")
+    .expect("drain body");
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("\"code\":\"call_upstream_timeout\""),
+        "the event names the timeout as the 504 does: {body}"
+    );
+}
+
 /// A worker whose process is gone refuses the dial under the next call. The
 /// client's answer is that failure without the worker's address; the
 /// gateway's own line names the worker.

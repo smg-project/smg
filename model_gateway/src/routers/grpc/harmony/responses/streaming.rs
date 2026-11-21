@@ -354,10 +354,10 @@ async fn execute_mcp_tool_loop_streaming(
                 settle_iteration(&reservation, load_guards.as_ref(), counts).await;
                 result
             }
-            Err(err_msg) => {
+            Err(error) => {
                 reservation.close_unsettled().await;
                 emitter
-                    .emit_error(&err_msg, Some("processing_error"), tx)
+                    .emit_error(&error.message, Some(error.code), tx)
                     .await;
                 return;
             }
@@ -669,10 +669,10 @@ async fn execute_without_mcp_streaming(
             settle_iteration(&reservation, load_guards.as_ref(), counts).await;
             result
         }
-        Err(err_msg) => {
+        Err(error) => {
             reservation.close_unsettled().await;
             emitter
-                .emit_error(&err_msg, Some("processing_error"), tx)
+                .emit_error(&error.message, Some(error.code), tx)
                 .await;
             return;
         }
