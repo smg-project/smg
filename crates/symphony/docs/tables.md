@@ -1052,6 +1052,28 @@ whether the model ever writes a message to a recipient the table has no row for 
 framing today); and whether `commentary` should reach the client as content or as a channel of its
 own, which the API has no place for.
 
+## gpt-oss (`gpt_oss`)
+
+The Harmony format writes a turn as messages: a header closed by `<|message|>`, a body, and
+`<|end|>`, `<|call|>` or `<|return|>`. The header names a channel after `<|channel|>` and, for a
+call, the recipient `to=functions.NAME`, before the channel or after it, then an optional
+`<|constrain|>json`. What the table says:
+
+- **A recipient makes the call, not the channel.** `to=functions.` opens a call wherever the header
+  holds it, on the commentary channel or the analysis channel, and the name runs to the next space
+  or marker, so a name with a dash or a dot is read whole.
+- **Everything between two messages is framing.** The headers, `<|start|>assistant` and a channel
+  the table does not name are dropped; the body of an unnamed channel is content.
+- **A preamble and the model's own tools are the thought.** A commentary message with no recipient
+  and a message to `python`, `browser` or `container` read as reasoning, as the gateway's Harmony
+  pipeline reads them; every thought of a turn is kept, in order.
+- **The stop closes the last call.** `<|call|>` and `<|return|>` are stop tokens the stop decoder
+  hides; a `<|start|>` inside a call's body ends the call where it stands.
+
+What it leaves open: the registry does not list the table, since it has no layout yet and so
+writes no structural tag for a forced call or a JSON answer; the gateway's Harmony pipeline serves
+the family until both are there.
+
 ## Kimi K2 (`kimi_k2`)
 
 What this table says beyond the DeepSeek V3.1 one, whose rows it has (a thought, content, a
