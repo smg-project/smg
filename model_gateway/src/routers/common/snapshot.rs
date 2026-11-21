@@ -163,7 +163,14 @@ pub(crate) struct ModelLabels {
 /// Multi-role selection (PD/EPD) must derive every role from ONE snapshot: two
 /// separate registry lookups can straddle a concurrent membership change and
 /// pair workers that never coexisted.
+///
+/// A snapshot stands on cache lines of its own, apart from the count of its
+/// handles. Every request takes a handle of its model's snapshot and drops
+/// it, so the count's line is one every caller writes, and a selection
+/// borrows its pool from the snapshot: a field beside the count would be
+/// read from that line all through the selection.
 #[derive(Debug)]
+#[repr(align(128))]
 pub struct ModelWorkerSnapshot {
     all: WorkerSnapshot,
     pools: [LazyRoutingPool; RoutingPool::COUNT],
