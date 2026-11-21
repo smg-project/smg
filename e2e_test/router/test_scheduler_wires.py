@@ -21,6 +21,7 @@ import time
 
 import httpx
 import pytest
+from infra.constants import effective_parser
 from infra.streams import collect_streamed_chat
 
 _MODEL = "RedHatAI/Llama-3.2-1B-Instruct-FP8"
@@ -184,15 +185,15 @@ class _SchedulerWireTurns:
         assert call.name == "add"
         assert json.loads(call.arguments) == {"a": 3, "b": 5}
 
-        # Under a named choice the legacy path constrains the engine to the
-        # function's parameters object (a json_schema in this wire's field of
-        # the request, which the mock does not enforce) and names the call
-        # itself: the scripted answer is that object. The legacy path reads
-        # this checkpoint because Symphony's registry has no table for the
-        # FP8 repository and the class names no --tool-call-parser; a table
-        # for it would constrain to the list holding the call instead (see
-        # test_function_call_specific).
-        mock_answers.enqueue(json.dumps(_ADD_CALL["parameters"]))
+        # Under a named choice Symphony's json table, this checkpoint's under
+        # the default, takes the list holding the call; the legacy path takes
+        # the function's parameters object and names the call itself. The mock
+        # enforces neither (see test_function_call_specific).
+        mock_answers.enqueue(
+            json.dumps([_ADD_CALL])
+            if effective_parser() == "symphony"
+            else json.dumps(_ADD_CALL["parameters"])
+        )
         forced = client.chat.completions.create(
             model=model,
             messages=_TOOL_QUESTION,

@@ -638,6 +638,29 @@ mod tests {
         }
     }
 
+    /// A checkpoint that bellwether records with the parse cases or the chat template of a group
+    /// the registry already reads has a row of its own on that group's table, with the group's
+    /// turn opener and text after the thought's close, or stands under the group's `also`. One of
+    /// each, with the group it reads like; the README test holds every row to the registry.
+    #[test]
+    fn a_checkpoint_recorded_like_a_group_reads_like_that_group() {
+        for (model, group) in [
+            (
+                "RedHatAI/Llama-3.2-1B-Instruct-FP8",
+                "meta-llama/Llama-3.2-1B-Instruct",
+            ),
+            ("arcee-ai/arcee-blitz-caller-beta", "arcee-ai/Caller"),
+            (
+                "fixie-ai/turntaking-pretraining-it-multilingual-3c",
+                "meta-llama/Llama-3.1-8B-Instruct",
+            ),
+        ] {
+            let format = for_model(group);
+            assert!(format.is_some(), "{group}: not in the registry");
+            assert_eq!(for_model(model), format, "{model}: {group}");
+        }
+    }
+
     #[test]
     fn a_model_the_registry_does_not_know_resolves_to_none() {
         for model in [
