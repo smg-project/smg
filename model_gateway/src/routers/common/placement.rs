@@ -36,8 +36,8 @@ use crate::{
     },
     policies::{
         as_consistent_hashing, policy_filters_unavailable_workers, policy_reads_hash_ring,
-        CacheNamespace, LoadBalancingPolicy, NamedList, PolicyRegistry, SelectWorkerInfo,
-        WorkerRole,
+        CacheNamespace, ConsistentHashingPolicy, LoadBalancingPolicy, NamedList, PolicyRegistry,
+        SelectWorkerInfo, WorkerRole,
     },
     routers::{
         common::{
@@ -102,6 +102,33 @@ impl WireConstraint {
 pub(crate) fn strict_target(policy: &dyn LoadBalancingPolicy, headers: Option<&HeaderMap>) -> bool {
     as_consistent_hashing(policy).is_some()
         && header_utils::extract_target_worker(headers).is_some()
+}
+
+/// The worker an explicit target holds a request to, among `candidates`, as
+/// the consistent hashing policy finds it
+/// ([`ConsistentHashingPolicy::target_among`]): the header's number counts
+/// the candidates that are available when the request arrives. `None` where
+/// the request names no worker, and where no candidate is available: such a
+/// pool is steered without a reading of the header. `Some(None)` is a miss,
+/// and the request moves to no other worker.
+///
+/// For a route that narrows its candidates to the target ahead of a policy
+/// engine, where [`strict_target`] holds.
+pub(crate) fn targeted(
+    candidates: &[Arc<dyn Worker>],
+    headers: Option<&HeaderMap>,
+) -> Option<Option<Arc<dyn Worker>>> {
+    header_utils::extract_target_worker(headers)?;
+    let available: Vec<Arc<dyn Worker>> = candidates
+        .iter()
+        .filter(|worker| worker.is_available())
+        .cloned()
+        .collect();
+    if available.is_empty() {
+        return None;
+    }
+    let target = ConsistentHashingPolicy::target_among(&available, headers)?;
+    Some(target.and_then(|place| available.get(place).cloned()))
 }
 
 /// The policy half of [`strict_target`] read off a pair's settings: the
@@ -174,7 +201,7 @@ pub(crate) enum Candidates {
 impl Candidates {
     /// `pool` whole, or its part on `wire` when a retry pins the retained
     /// plan's runtime and transport.
-    fn of(pool: Arc<[Arc<dyn Worker>]>, wire: Option<WireConstraint>) -> Self {
+    pub(crate) fn of(pool: Arc<[Arc<dyn Worker>]>, wire: Option<WireConstraint>) -> Self {
         match wire {
             None => Self::Shared(pool),
             Some(_) => Self::Pinned(
@@ -361,6 +388,27 @@ pub(crate) fn candidates(
     Candidates::of(registry.get_routing_pool(model_id, pool), wire)
 }
 
+/// The part of `candidates` a request's `filter` accepts, in their order,
+/// where it refuses one of them. `None` where no filter is stated or it
+/// refuses nobody (a media or context demand every worker meets): the
+/// candidates stay as they were drawn and nothing is collected. Each
+/// candidate is asked once.
+///
+/// The one narrowing by a request's own rule. The selection hands its policy
+/// what is left, and a route whose policy engine decides in the gateway's
+/// own process states it as the workers that engine decides over.
+#[inline]
+pub(crate) fn accepted_by(
+    candidates: &[Arc<dyn Worker>],
+    filter: Option<CandidateFilter<'_>>,
+) -> Option<Vec<Arc<dyn Worker>>> {
+    let accepts = filter?;
+    let first = candidates.iter().position(|w| !accepts(w.as_ref()))?;
+    let (passed, rest) = candidates.split_at(first);
+    let rest = rest[1..].iter().filter(|w| accepts(w.as_ref()));
+    Some(passed.iter().chain(rest).cloned().collect())
+}
+
 /// Pick one worker for `model_id` from `pool`, or `None` when nothing is
 /// selectable. Records the selection metric under the chosen worker's own
 /// transport label.
@@ -496,27 +544,11 @@ fn select_pass(
     let policy = policies.get_policy_or_default(model_id);
 
     // The per-request predicate applies to every entry point, so a caller
-    // that sets it can never dispatch to a worker it rejects. Each candidate
-    // is asked once. A predicate that refuses nobody (a media or context
-    // demand every worker meets) leaves the candidates as they were drawn:
-    // nothing is collected, and the pool keeps its name.
-    let refused = inputs.candidate_filter.and_then(|accepts| {
-        let first = candidates.iter().position(|w| !accepts(w.as_ref()))?;
-        Some((accepts, first))
-    });
-    let accepted;
-    let candidates: &[Arc<dyn Worker>] = match refused {
-        Some((accepts, first)) => {
-            let (passed, rest) = candidates.split_at(first);
-            accepted = passed
-                .iter()
-                .chain(rest[1..].iter().filter(|w| accepts(w.as_ref())))
-                .cloned()
-                .collect::<Vec<_>>();
-            &accepted
-        }
-        None => candidates,
-    };
+    // that sets it can never dispatch to a worker it rejects. A predicate
+    // that refuses nobody leaves the candidates as they were drawn, and the
+    // pool keeps its name.
+    let accepted = accepted_by(candidates, inputs.candidate_filter);
+    let candidates = accepted.as_deref().unwrap_or(candidates);
 
     let mut info = SelectWorkerInfo {
         request_text: inputs.text,
