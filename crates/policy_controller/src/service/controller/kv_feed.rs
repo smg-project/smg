@@ -36,10 +36,12 @@ mod tests {
             Controller,
         },
         store::{
-            Ask, GatewayId, KvEventSink as _, Maker, MemoryStore, Named, Naming, Signals,
+            Ask, GatewayId, KvEventSink as _, MemoryStore, Named, Naming, Registrant, Signals,
             ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
         },
-        worker_host::{Expect, KvFeed, Members, Membership as _, Objects, StoreDoor},
+        worker_host::{
+            KvFeed, Members, MembershipWriter as _, Objects, Precondition, StoreMembershipWriter,
+        },
     };
 
     const MODEL: &str = "m";
@@ -221,9 +223,9 @@ mod tests {
         f.store
             .apply(AppliedSpec::validate(&spec).expect("the preset validates"))
             .expect("the first generation");
-        let door = StoreDoor::new(Arc::clone(&f.store));
+        let door = StoreMembershipWriter::new(Arc::clone(&f.store));
         f.check(async {
-            door.found(&Maker::Control, Expect::Nothing, FIRST, &|_| {
+            door.found(&Registrant::Control, Precondition::Absent, FIRST, &|_| {
                 facts(FIRST, WireModes::GRPC, false)
             })
             .expect("registered");

@@ -582,7 +582,7 @@ mod tests {
                     },
                     Clock, Counts, Deciders, Job, Reads,
                 },
-                election::{LeasePlace, Standing},
+                election::{ElectionObservation, LeasePlace},
                 gateways::{tests::PATIENT, Seat},
                 principal::{tests::told, Layer, ENTRY},
                 replication::journaled_for,
@@ -618,7 +618,7 @@ mod tests {
     /// preset as generation 1, and deciders on the case's clock.
     struct Bed {
         elector: Elector,
-        standing: watch::Sender<Standing>,
+        standing: watch::Sender<ElectionObservation>,
         shared: Arc<Shared>,
         script: Arc<Script>,
         /// The members serving the cases' model in the single role, ready.
@@ -669,7 +669,7 @@ mod tests {
         // The election's report tells the store the term of each take: a
         // lease is minted under the store's own term.
         store.set_term(1);
-        let (standing, stood) = watch::channel(Standing {
+        let (standing, stood) = watch::channel(ElectionObservation {
             holder: IDENTITY.to_owned(),
             term: 1,
             looked: true,
@@ -699,7 +699,7 @@ mod tests {
             &elector,
             stood.clone(),
             (Arc::clone(&store), feed),
-            Arc::new(crate::stages::Catalog::builtin()),
+            Arc::new(crate::stages::StageRegistry::builtin()),
             deciders,
         )
         .expect("the deciders start");
@@ -773,7 +773,7 @@ mod tests {
             let tick = self.elector.tick(self.now()).expect("the take");
             assert_eq!(tick, Tick::Acquired { term });
             self.shared.store.set_term(term);
-            self.standing.send_replace(Standing {
+            self.standing.send_replace(ElectionObservation {
                 holder: IDENTITY.to_owned(),
                 term,
                 looked: true,
@@ -1445,7 +1445,7 @@ mod tests {
         stream.send(frame(4, 4)).await;
         let answer = stream.answer().await;
         assert_eq!((busy(&answer), answer.term), (Reason::NotLeader, 1));
-        bed.standing.send_replace(Standing {
+        bed.standing.send_replace(ElectionObservation {
             holder: "controller-1@10.0.0.8:30100".to_owned(),
             term: 4,
             looked: true,

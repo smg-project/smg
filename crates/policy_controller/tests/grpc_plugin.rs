@@ -54,8 +54,8 @@ use smg_policy_controller::{
         shared::OpenDecisions,
     },
     service::proto,
-    stages::{Best, Healthy, LeastRequests},
-    tracking::{Lease, Lifecycle, Membership, ReleaseReason, Side, Signal},
+    stages::{Best, Healthy, LeastRequests, Lifecycle},
+    tracking::{Lease, Membership, ReleaseReason, Side, Signal},
 };
 use support::{
     grpc_plugin::{eventually, Behaviour, Gate, ServerTls, TestPlugin, ALL, FILTER, PICK, SCORE},

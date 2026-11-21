@@ -64,11 +64,11 @@ pub enum SessionVerdict {
 
 /// The pins of one key: the preferred worker first, the failover second;
 /// `WorkerId(0)` is an empty slot.
-pub type Pins = [WorkerId; 2];
+pub type SessionPins = [WorkerId; 2];
 
 /// When a table forgets a key it holds, on the decision clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Forgets {
+pub enum SessionExpiry {
     /// At this instant: the key's rule has a TTL.
     At(u64),
     /// At no instant: the key's rule has no TTL.
@@ -92,7 +92,7 @@ pub(crate) enum Claim {
     /// It names the worker the decision follows ([`Claim::standing`]) and
     /// the pins the key held: a shadow reads those against its own pins
     /// and its own pick.
-    Standing(WorkerId, Pins),
+    Standing(WorkerId, SessionPins),
 }
 
 impl Claim {
@@ -105,7 +105,11 @@ impl Claim {
     /// The pins are read in place: a claim that is taken loads no pin it
     /// does not test.
     #[inline(always)]
-    pub(crate) fn standing(held: &Pins, seen: &Pins, target: WorkerId) -> Option<WorkerId> {
+    pub(crate) fn standing(
+        held: &SessionPins,
+        seen: &SessionPins,
+        target: WorkerId,
+    ) -> Option<WorkerId> {
         if held == seen {
             return None;
         }
@@ -120,7 +124,7 @@ impl Claim {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Entry {
-    pins: Pins,
+    pins: SessionPins,
     /// The instant the key's pins expire on the decision clock; `u64::MAX`
     /// under a rule without a TTL, and `0` until a decision reads the key.
     expires_at_micros: u64,
@@ -197,7 +201,7 @@ pub(crate) fn shard_of(key: u64) -> usize {
 
 /// How long a worker that left keeps its pins where no rule says a TTL:
 /// four hours, the TTL a rule takes where its document names none.
-pub const ABSENCE_MICROS: u64 = 14_400 * 1_000_000;
+pub const ABSENT_WORKER_PIN_TTL_MICROS: u64 = 14_400 * 1_000_000;
 
 /// The most workers a table holds as absent ([`SessionTable::left`]): past
 /// it the one that left first is forgotten at once, so the list is bounded
@@ -264,7 +268,7 @@ impl SessionTable {
             next_pass_micros: AtomicU64::new(if sweep_micros == 0 { u64::MAX } else { 0 }),
             sweep_micros,
             absent: Mutex::new(Vec::new()),
-            absence_micros: ABSENCE_MICROS,
+            absence_micros: ABSENT_WORKER_PIN_TTL_MICROS,
             renamed: RwLock::new(FxHashMap::default()),
             renamed_len: AtomicUsize::new(0),
         }
@@ -297,7 +301,7 @@ impl SessionTable {
     /// Always inlined: the keyed decision has two forms, and a second caller
     /// would otherwise move this out of line under the first.
     #[inline(always)]
-    pub(crate) fn lookup(&self, key: Session, now_micros: u64, rule: &SessionRule) -> Pins {
+    pub(crate) fn lookup(&self, key: Session, now_micros: u64, rule: &SessionRule) -> SessionPins {
         let key = key.get();
         self.sweep_if_due(now_micros);
         let mut shard = self.shard(key).lock();
@@ -324,7 +328,7 @@ impl SessionTable {
     /// Always inlined: the keyed decision has two forms, and a second caller
     /// would otherwise move this out of line under the first.
     #[inline(always)]
-    pub(crate) fn claim(&self, key: Session, seen: Pins, target: WorkerId) -> Claim {
+    pub(crate) fn claim(&self, key: Session, seen: SessionPins, target: WorkerId) -> Claim {
         let key = key.get();
         if key == 0 || target == WorkerId(0) {
             return Claim::Standing(target, seen);
@@ -355,7 +359,7 @@ impl SessionTable {
         now_micros: u64,
         rule: &SessionRule,
         worker: WorkerId,
-    ) -> Pins {
+    ) -> SessionPins {
         let key = key.get();
         if key == 0 || worker == WorkerId(0) {
             return [WorkerId(0); 2];
@@ -678,20 +682,20 @@ impl SessionTable {
     }
 
     /// The pins of `key`, for tests and dumps.
-    pub fn pins(&self, key: Session) -> Option<Pins> {
+    pub fn pins(&self, key: Session) -> Option<SessionPins> {
         let key = key.get();
         self.shard(key).lock().get(&key).map(|e| e.pins)
     }
 
     /// What a host keeps of `key` beside its own pin of record: the pins,
     /// and when the table forgets the key.
-    pub fn held(&self, key: Session) -> Option<(Pins, Forgets)> {
+    pub fn held(&self, key: Session) -> Option<(SessionPins, SessionExpiry)> {
         let key = key.get();
         self.shard(key).lock().get(&key).map(|entry| {
             let forgets = match entry.expires_at_micros {
-                0 => Forgets::Unread,
-                u64::MAX => Forgets::Never,
-                at => Forgets::At(at),
+                0 => SessionExpiry::Unread,
+                u64::MAX => SessionExpiry::Never,
+                at => SessionExpiry::At(at),
             };
             (entry.pins, forgets)
         })
@@ -827,7 +831,7 @@ mod tests {
         table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
         assert_eq!(
             table.held(s(1)),
-            Some(([WorkerId(1), WorkerId(0)], Forgets::At(1_050)))
+            Some(([WorkerId(1), WorkerId(0)], SessionExpiry::At(1_050)))
         );
         let for_ever = SessionRule {
             ttl_micros: None,
@@ -838,12 +842,12 @@ mod tests {
         table.dispatched(s(2), SessionVerdict::Pinned, WorkerId(2));
         assert_eq!(
             table.held(s(2)),
-            Some(([WorkerId(2), WorkerId(0)], Forgets::Never))
+            Some(([WorkerId(2), WorkerId(0)], SessionExpiry::Never))
         );
         table.dispatched(s(3), SessionVerdict::Pinned, WorkerId(3));
         assert_eq!(
             table.held(s(3)),
-            Some(([WorkerId(3), WorkerId(0)], Forgets::Unread))
+            Some(([WorkerId(3), WorkerId(0)], SessionExpiry::Unread))
         );
     }
 
@@ -869,7 +873,7 @@ mod tests {
 
         assert_eq!(
             table.held(s(7)),
-            Some(([WorkerId(1), WorkerId(0)], Forgets::At(2_000)))
+            Some(([WorkerId(1), WorkerId(0)], SessionExpiry::At(2_000)))
         );
         assert_eq!(
             table.claim(s(7), [WorkerId(1), WorkerId(0)], WorkerId(2)),

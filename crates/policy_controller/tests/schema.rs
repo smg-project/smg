@@ -10,7 +10,7 @@ use smg_policy_controller::{
     document::{
         PolicySpec, MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS, MAX_SIGNALS, MAX_ZONES,
     },
-    stages::Catalog,
+    stages::StageRegistry,
 };
 
 /// A signal's name as a sum writes it: `signal.` before a name of the
@@ -115,7 +115,7 @@ fn the_committed_schema_admits_a_scorer_and_a_picker_by_any_name() {
     let committed = fs::read_to_string(schema_path()).expect("the committed schema");
     let schema: Value = serde_json::from_str(&committed).expect("a JSON schema");
     let defs = &schema["$defs"];
-    let scorers: Vec<&str> = Catalog::builtin().scorers().collect();
+    let scorers: Vec<&str> = StageRegistry::builtin().scorers().collect();
     // The open string lists the stock names a document writes bare, and
     // enforces none.
     let bare: Vec<&str> = scorers
@@ -123,7 +123,7 @@ fn the_committed_schema_admits_a_scorer_and_a_picker_by_any_name() {
         .copied()
         .filter(|name| !matches!(*name, "resident-work" | "least-cost"))
         .collect();
-    let pickers: Vec<&str> = Catalog::builtin()
+    let pickers: Vec<&str> = StageRegistry::builtin()
         .pickers()
         .filter(|name| *name != "best-with-temperature")
         .collect();
@@ -170,7 +170,7 @@ fn the_committed_schema_admits_a_filter_by_its_name_and_by_its_name_with_paramet
     // are listed as examples. A built-in with parameters has a schema of
     // its own. A host's name with parameters is one key, no built-in's,
     // mapped to a map.
-    let filters: Vec<&str> = Catalog::builtin().filters().collect();
+    let filters: Vec<&str> = StageRegistry::builtin().filters().collect();
     assert_eq!(
         filters,
         [
@@ -313,7 +313,7 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
     // The catalog's pickers are a table of its own, so a picker in one and
     // not in the other fails here. Its scorers are the list the schema
     // reads, so the literals are what pins a published spelling.
-    let stock = Catalog::builtin();
+    let stock = StageRegistry::builtin();
     let scorers: Vec<&str> = stock
         .scorers()
         .filter(|name| !matches!(*name, "resident-work" | "least-cost"))

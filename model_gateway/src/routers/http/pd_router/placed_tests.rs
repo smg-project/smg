@@ -499,7 +499,7 @@ async fn decode_arrivals_over(
     let (policy_engine, store, _) = bed;
     let mut document = PolicySpec::pair_presets("least_load", "least_load")?;
     document.plans.pd_pair.decode = picked;
-    document.generation = store.with_world(|world| world.spec().generation()) + 1;
+    document.generation = store.with_snapshot(|world| world.spec().generation()) + 1;
     store
         .apply(AppliedSpec::validate(&document)?)
         .map_err(|stale| format!("{stale:?}"))?;
@@ -568,7 +568,7 @@ async fn a_decode_its_prefill_was_told_is_booked_at_the_prefills_send() -> Case 
     let (policy_engine, store, _) = bed;
     let mut document = PolicySpec::pair_presets("least_load", "least_load")?;
     document.plans.pd_pair.decode = DecodePick::AfterPrefill;
-    document.generation = store.with_world(|world| world.spec().generation()) + 1;
+    document.generation = store.with_snapshot(|world| world.spec().generation()) + 1;
     store
         .apply(AppliedSpec::validate(&document)?)
         .map_err(|stale| format!("{stale:?}"))?;

@@ -22,12 +22,12 @@ use wfaas::{
 };
 
 use super::{
-    facts, found::engine_of, Credentials, Expect, KeptCredential, Membership, Objects, Over,
-    Refused, Remover, Standing, Wrote,
+    facts, found::engine_of, Credentials, KeptCredential, MembershipWriteOutcome, MembershipWriter,
+    Objects, Over, Precondition, Refused, Remover, RowRevision,
 };
 use crate::{
     engine::view::WorkerId,
-    store::{Maker, Unmade, WorkersStore},
+    store::{Registrant, Unmade, WorkersStore},
 };
 
 /// The provider name used by the host's own discovery source.
@@ -45,10 +45,10 @@ pub enum Unasked {
 }
 
 /// The maker a job registers as, using the address as written in its spec.
-pub fn maker_of(asker: &WorkerJobAsker, address: &str) -> Result<Maker, Unasked> {
+pub fn maker_of(asker: &WorkerJobAsker, address: &str) -> Result<Registrant, Unasked> {
     match asker {
-        WorkerJobAsker::Api | WorkerJobAsker::Startup => Ok(Maker::Control),
-        WorkerJobAsker::Discovery => Ok(Maker::provider(DISCOVERY, address)?),
+        WorkerJobAsker::Api | WorkerJobAsker::Startup => Ok(Registrant::Control),
+        WorkerJobAsker::Discovery => Ok(Registrant::provider(DISCOVERY, address)?),
         WorkerJobAsker::Health => Err(Unasked::Health),
     }
 }
@@ -56,7 +56,7 @@ pub fn maker_of(asker: &WorkerJobAsker, address: &str) -> Result<Maker, Unasked>
 /// Who asks for a job's removal at the door.
 pub fn remover_of(asker: &WorkerJobAsker, scope: UnhealthyRemovalScope) -> Remover<'static> {
     match asker {
-        WorkerJobAsker::Api | WorkerJobAsker::Startup => Remover::Maker(&Maker::Control),
+        WorkerJobAsker::Api | WorkerJobAsker::Startup => Remover::Maker(&Registrant::Control),
         WorkerJobAsker::Discovery => Remover::Provider(DISCOVERY),
         WorkerJobAsker::Health => Remover::Health(scope),
     }
@@ -71,7 +71,7 @@ pub const REMOVE_WORKERS_AT_DOOR_STEP: &str = "remove_workers_at_door";
 
 /// Write the workers the preceding steps created in one registration.
 pub struct WriteWorkersAtDoor<G> {
-    door: Arc<dyn Membership>,
+    door: Arc<dyn MembershipWriter>,
     objects: Arc<Objects<G>>,
     keeping: Option<Keeping>,
 }
@@ -98,14 +98,14 @@ pub struct NoKeeper;
 
 /// Mark the rows that still stand for the workers this removal names.
 pub struct DrainWorkersAtDoor<G> {
-    door: Arc<dyn Membership>,
+    door: Arc<dyn MembershipWriter>,
     objects: Arc<Objects<G>>,
     scope: UnhealthyRemovalScope,
 }
 
 /// Remove the rows of the workers that drained and are still held.
 pub struct RemoveWorkersAtDoor<G> {
-    door: Arc<dyn Membership>,
+    door: Arc<dyn MembershipWriter>,
     objects: Arc<Objects<G>>,
     scope: UnhealthyRemovalScope,
 }
@@ -124,7 +124,7 @@ pub struct RemoveWorkersAtDoor<G> {
 /// turn, and the job's mode is what it expects to stand. An upsert expects
 /// anything. A create-only job expects nothing of the engine: tried again
 /// behind a lost lead, it lays the ranks the lead left unwritten
-/// ([`Expect::Nothing`]). A replacement by id expects the row
+/// ([`Precondition::Absent`]). A replacement by id expects the row
 /// behind the registry's worker of that id, read through `objects` at the
 /// revision the job names.
 ///
@@ -134,7 +134,7 @@ pub struct RemoveWorkersAtDoor<G> {
 pub fn registration_at_door<H: WorkflowHost>(
     settings: &RegistrationSettings,
     gates: RegistrationGates,
-    door: Arc<dyn Membership>,
+    door: Arc<dyn MembershipWriter>,
     objects: Arc<Objects<H::Generation>>,
     behind: &[&'static str],
 ) -> WorkflowDefinition<WorkerRegistrationWorkflowData<H>> {
@@ -163,7 +163,7 @@ pub fn registration_at_door<H: WorkflowHost>(
 pub fn registration_at_door_keeping<H: WorkflowHost>(
     settings: &RegistrationSettings,
     gates: RegistrationGates,
-    door: Arc<dyn Membership>,
+    door: Arc<dyn MembershipWriter>,
     objects: Arc<Objects<H::Generation>>,
     store: Arc<dyn WorkersStore>,
     behind: &[&'static str],
@@ -184,7 +184,7 @@ pub fn registration_at_door_keeping<H: WorkflowHost>(
 fn registration_line<H: WorkflowHost>(
     settings: &RegistrationSettings,
     gates: RegistrationGates,
-    door: Arc<dyn Membership>,
+    door: Arc<dyn MembershipWriter>,
     objects: Arc<Objects<H::Generation>>,
     keeping: Option<Keeping>,
     behind: &[&'static str],
@@ -222,7 +222,7 @@ fn registration_line<H: WorkflowHost>(
 /// refuses the asker and the job drained nothing, the drain step fails with
 /// the door's sentence.
 pub fn removal_at_door<H: WorkflowHost>(
-    door: Arc<dyn Membership>,
+    door: Arc<dyn MembershipWriter>,
     objects: Arc<Objects<H::Generation>>,
     scope: UnhealthyRemovalScope,
 ) -> WorkflowDefinition<WorkerRemovalWorkflowData<H>> {
@@ -299,7 +299,7 @@ fn replaced<G: Generation>(
     workers: &[Arc<dyn Worker>],
     worker_id: &str,
     expected_revision: u64,
-) -> WorkflowResult<(Standing, Arc<dyn Worker>)> {
+) -> WorkflowResult<(RowRevision, Arc<dyn Worker>)> {
     let [worker] = workers else {
         return Err(failed(
             WRITE_WORKERS_AT_DOOR_STEP,
@@ -346,8 +346,8 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
             .map_err(|why| failed(WRITE_WORKERS_AT_DOOR_STEP, why.to_string()))?;
         // A replacement by id names the worker it replaces beside the row.
         let (expect, over) = match &data.registration_mode {
-            WorkerRegistrationMode::Upsert => (Expect::Anything, None),
-            WorkerRegistrationMode::CreateOnly => (Expect::Nothing, None),
+            WorkerRegistrationMode::Upsert => (Precondition::Any, None),
+            WorkerRegistrationMode::CreateOnly => (Precondition::Absent, None),
             WorkerRegistrationMode::ReplaceById {
                 worker_id,
                 expected_revision,
@@ -360,7 +360,7 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
                     worker_id,
                     *expected_revision,
                 )?;
-                (Expect::Seen(standing), Some(held))
+                (Precondition::AtRevision(standing), Some(held))
             }
         };
         self.write_at_door(&maker, expect, workers, over.as_ref().map(Over::Replaced))?;
@@ -395,15 +395,15 @@ impl<G: Generation> WriteWorkersAtDoor<G> {
     /// binds every row the door answered.
     fn write_at_door(
         &self,
-        maker: &Maker,
-        expect: Expect,
+        maker: &Registrant,
+        expect: Precondition,
         workers: &[Arc<dyn Worker>],
         over: Option<Over<'_>>,
-    ) -> WorkflowResult<Vec<Wrote>> {
+    ) -> WorkflowResult<Vec<MembershipWriteOutcome>> {
         let first = workers.first();
         // The refusal names the engine as the rows' facts state it.
         let engine = first.map_or("", |worker| engine_of(worker.as_ref()));
-        let write = || -> WorkflowResult<Vec<Wrote>> {
+        let write = || -> WorkflowResult<Vec<MembershipWriteOutcome>> {
             // Kept ahead of the write: the holder may build a row's object
             // inside the door's turn.
             let kept = match first {
@@ -447,7 +447,7 @@ impl<G: Generation> WriteWorkersAtDoor<G> {
         &self,
         worker: &dyn Worker,
         kept: Option<KeptCredential>,
-        wrote: Option<&[Wrote]>,
+        wrote: Option<&[MembershipWriteOutcome]>,
     ) {
         let (Some(keeping), Some(kept)) = (&self.keeping, kept) else {
             return;
@@ -471,11 +471,13 @@ impl<G: Generation> WriteWorkersAtDoor<G> {
 
 /// The row a registration's write stands on: the new one of a replacement.
 /// A removal's answers name no such row.
-fn written_row(wrote: &Wrote) -> Option<WorkerId> {
+fn written_row(wrote: &MembershipWriteOutcome) -> Option<WorkerId> {
     match *wrote {
-        Wrote::Registered(row) | Wrote::InPlace(row) | Wrote::Unmoved(row) => Some(row),
-        Wrote::Another { new, .. } => Some(new),
-        Wrote::Draining(_) | Wrote::Removed(_) => None,
+        MembershipWriteOutcome::Registered(row)
+        | MembershipWriteOutcome::InPlace(row)
+        | MembershipWriteOutcome::Unmoved(row) => Some(row),
+        MembershipWriteOutcome::Another { new, .. } => Some(new),
+        MembershipWriteOutcome::Draining(_) | MembershipWriteOutcome::Removed(_) => None,
     }
 }
 
@@ -507,7 +509,7 @@ fn skipped(url: &str, why: &str) {
 #[derive(Debug, PartialEq, Eq)]
 enum Left {
     /// The door wrote.
-    Wrote(Wrote),
+    Wrote(MembershipWriteOutcome),
     /// No row stands under the URL: the worker is gone and stays the job's.
     Gone,
     /// The row moved under the asker: another registration stands there,
@@ -517,7 +519,11 @@ enum Left {
     Refused(String),
 }
 
-fn removal_answer(step: &str, url: &str, answer: Result<Wrote, Refused>) -> WorkflowResult<Left> {
+fn removal_answer(
+    step: &str,
+    url: &str,
+    answer: Result<MembershipWriteOutcome, Refused>,
+) -> WorkflowResult<Left> {
     let refused = |why: String| {
         warn!(worker_url = %Endpoint::redacted_str(url), why, "Worker left alone");
         Left::Refused(why)
@@ -616,7 +622,9 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
                 self.door.drained(by, url, seen),
             )?;
             match answer {
-                Left::Wrote(Wrote::Draining(_) | Wrote::Unmoved(_)) => {
+                Left::Wrote(
+                    MembershipWriteOutcome::Draining(_) | MembershipWriteOutcome::Unmoved(_),
+                ) => {
                     data.drained_workers.push(current);
                     kept.push(Arc::clone(worker));
                 }
@@ -692,7 +700,9 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
                 self.door.gone(by, url, seen),
             )?;
             match answer {
-                Left::Wrote(Wrote::Removed(_)) => data.removed_workers.push(current),
+                Left::Wrote(MembershipWriteOutcome::Removed(_)) => {
+                    data.removed_workers.push(current);
+                }
                 Left::Wrote(_) => {
                     return Err(failed(
                         REMOVE_WORKERS_AT_DOOR_STEP,
@@ -757,10 +767,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        store::{Maker, MemoryStore, Overload, Unmade, WorkerFacts, WorkerStatus, WorkersStore},
+        store::{
+            MemoryStore, Overload, Registrant, Unmade, WorkerFacts, WorkerStatus, WorkersStore,
+        },
         worker_host::{
-            facts, Expect, Members, Membership, Objects, Over, Refused, Remover, Standing,
-            StoreDoor, Wrote,
+            facts, Members, MembershipWriteOutcome, MembershipWriter, Objects, Over, Precondition,
+            Refused, Remover, RowRevision, StoreMembershipWriter,
         },
     };
 
@@ -821,7 +833,7 @@ mod tests {
     struct Fixture {
         host: Arc<Host>,
         store: Arc<MemoryStore>,
-        door: Arc<dyn Membership>,
+        door: Arc<dyn MembershipWriter>,
         objects: Arc<Objects<Members>>,
     }
 
@@ -830,7 +842,7 @@ mod tests {
             let registry = Arc::new(WorkerRegistry::new());
             let objects = Arc::new(Objects::new(Arc::clone(&registry)));
             let store = Arc::new(MemoryStore::default());
-            let door = Arc::new(StoreDoor::new(Arc::clone(&store)));
+            let door = Arc::new(StoreMembershipWriter::new(Arc::clone(&store)));
             let host = Arc::new(Host {
                 registry,
                 settings: RegistrationSettings {
@@ -907,10 +919,14 @@ mod tests {
             WorkflowContext::new(WorkflowInstanceId::new(), data)
         }
 
-        fn seed(&self, maker: &Maker, worker: &dyn Worker) -> Result<Wrote, Refused> {
+        fn seed(
+            &self,
+            maker: &Registrant,
+            worker: &dyn Worker,
+        ) -> Result<MembershipWriteOutcome, Refused> {
             let answer = self
                 .door
-                .found(maker, Expect::Anything, worker.url(), &|old| {
+                .found(maker, Precondition::Any, worker.url(), &|old| {
                     facts(worker, old)
                 })?;
             self.objects.follow(&*self.store);
@@ -1058,7 +1074,7 @@ mod tests {
         f.write().execute(&mut cx).await.expect("written");
         let row = f.store.by_key(URL).expect("the worker's one row");
         assert_eq!((row.facts.dp_rank, row.facts.dp_size), (0, 4));
-        assert_eq!(f.store.snapshot().1.len(), 1);
+        assert_eq!(f.store.all_rows().1.len(), 1);
         f.objects.follow(&*f.store);
         let held = f
             .host
@@ -1098,15 +1114,15 @@ mod tests {
         for asker in [Api, Startup] {
             assert_eq!(
                 maker_of(&asker, URL).expect("a control maker"),
-                Maker::Control
+                Registrant::Control
             );
             assert!(matches!(
                 remover_of(&asker, SCOPE),
-                Remover::Maker(Maker::Control)
+                Remover::Maker(Registrant::Control)
             ));
         }
         assert_eq!(DISCOVERY, "discovery");
-        let discovered = Maker::provider("discovery", URL).expect("a provider and key");
+        let discovered = Registrant::provider("discovery", URL).expect("a provider and key");
         assert_eq!(
             maker_of(&Discovery, URL).expect("the discovery maker"),
             discovered
@@ -1140,7 +1156,7 @@ mod tests {
             StepResult::Success
         );
 
-        let maker = Maker::provider("discovery", URL).expect("the spec's address is the key");
+        let maker = Registrant::provider("discovery", URL).expect("the spec's address is the key");
         for (url, worker) in urls.into_iter().zip(workers) {
             let row = f.store.by_key(url).expect("the row for this worker");
             let expected = WorkerFacts {
@@ -1180,7 +1196,7 @@ mod tests {
     async fn a_registration_of_equal_facts_writes_nothing_and_succeeds() {
         let f = Fixture::new();
         let worker = worker(URL, "model");
-        f.seed(&Maker::Control, worker.as_ref())
+        f.seed(&Registrant::Control, worker.as_ref())
             .expect("registered");
         let standing = f.store.by_key(URL);
         let epoch = f.store.epoch();
@@ -1202,7 +1218,7 @@ mod tests {
     async fn a_row_already_draining_counts_as_drained_once_and_is_taken() {
         let f = Fixture::new();
         let worker = worker(URL, "model");
-        f.seed(&Maker::Control, worker.as_ref())
+        f.seed(&Registrant::Control, worker.as_ref())
             .expect("registered");
         let live = f.host.registry.get_by_url(URL).expect("the held worker");
         let mut removal = f.removal(WorkerJobAsker::Api, vec![Arc::clone(&live)]);
@@ -1226,7 +1242,7 @@ mod tests {
     async fn a_worker_found_again_while_its_removal_settles_is_registered_anew_and_stays() {
         let f = Fixture::new();
         let worker = worker(URL, "model");
-        f.seed(&Maker::Control, worker.as_ref())
+        f.seed(&Registrant::Control, worker.as_ref())
             .expect("registered");
         let live = f.host.registry.get_by_url(URL).expect("the held worker");
         let mut removal = f.removal(WorkerJobAsker::Api, vec![live]);
@@ -1261,7 +1277,7 @@ mod tests {
     async fn a_removal_keeps_a_worker_whose_row_left_before_the_holder_followed() {
         let f = Fixture::new();
         let built = worker(URL, "model");
-        let maker = Maker::Control;
+        let maker = Registrant::Control;
         let by = Remover::Maker(&maker);
         for at_the_drain in [true, false] {
             f.seed(&maker, built.as_ref()).expect("registered");
@@ -1326,41 +1342,51 @@ mod tests {
 
     struct Shut(Refused);
 
-    impl Membership for Shut {
+    impl MembershipWriter for Shut {
         fn found(
             &self,
-            _: &Maker,
-            _: Expect,
+            _: &Registrant,
+            _: Precondition,
             _: &str,
             _: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-        ) -> Result<Wrote, Refused> {
+        ) -> Result<MembershipWriteOutcome, Refused> {
             Err(self.0.clone())
         }
 
         fn found_rows(
             &self,
-            _: &Maker,
-            _: Expect,
+            _: &Registrant,
+            _: Precondition,
             _: &[Arc<dyn Worker>],
             _: Option<Over<'_>>,
-        ) -> Result<Vec<Wrote>, Refused> {
+        ) -> Result<Vec<MembershipWriteOutcome>, Refused> {
             Err(self.0.clone())
         }
 
-        fn drained(&self, _: Remover<'_>, _: &str, _: Standing) -> Result<Wrote, Refused> {
+        fn drained(
+            &self,
+            _: Remover<'_>,
+            _: &str,
+            _: RowRevision,
+        ) -> Result<MembershipWriteOutcome, Refused> {
             Err(self.0.clone())
         }
 
-        fn gone(&self, _: Remover<'_>, _: &str, _: Standing) -> Result<Wrote, Refused> {
+        fn gone(
+            &self,
+            _: Remover<'_>,
+            _: &str,
+            _: RowRevision,
+        ) -> Result<MembershipWriteOutcome, Refused> {
             Err(self.0.clone())
         }
 
         fn refreshed(
             &self,
-            _: Standing,
+            _: RowRevision,
             _: &Arc<dyn Worker>,
             _: &Arc<dyn Worker>,
-        ) -> Result<Wrote, Refused> {
+        ) -> Result<MembershipWriteOutcome, Refused> {
             Err(self.0.clone())
         }
     }
@@ -1369,11 +1395,13 @@ mod tests {
     async fn a_door_that_does_not_lead_fails_a_removal_step_with_no_second_attempt() {
         let f = Fixture::new();
         let built = worker(URL, "model");
-        f.seed(&Maker::Control, built.as_ref()).expect("registered");
+        f.seed(&Registrant::Control, built.as_ref())
+            .expect("registered");
         let live = f.host.registry.get_by_url(URL).expect("the held worker");
         let mut removal = f.removal(WorkerJobAsker::Api, vec![Arc::clone(&live)]);
 
-        let door: Arc<dyn Membership> = Arc::new(Shut(Refused::NotLeading("follower".to_owned())));
+        let door: Arc<dyn MembershipWriter> =
+            Arc::new(Shut(Refused::NotLeading("follower".to_owned())));
         let drain = DrainWorkersAtDoor {
             door: Arc::clone(&door),
             ..f.drain()
@@ -1484,7 +1512,7 @@ mod tests {
     #[tokio::test]
     async fn a_keeping_write_the_door_refuses_keeps_nothing() {
         let (f, credentials) = Fixture::keeping();
-        let discovered = Maker::provider(DISCOVERY, URL).expect("a provider");
+        let discovered = Registrant::provider(DISCOVERY, URL).expect("a provider");
         f.seed(&discovered, worker(URL, "model").as_ref())
             .expect("registered");
 
@@ -1555,32 +1583,32 @@ mod tests {
     /// way, has the holder follow, and then refuses. So the holder builds
     /// the row's object while the registration is in flight.
     struct MovedUnder {
-        door: Arc<dyn Membership>,
+        door: Arc<dyn MembershipWriter>,
         objects: Arc<Objects<Members>>,
         store: Arc<MemoryStore>,
     }
 
-    impl Membership for MovedUnder {
+    impl MembershipWriter for MovedUnder {
         fn found(
             &self,
-            _: &Maker,
-            _: Expect,
+            _: &Registrant,
+            _: Precondition,
             _: &str,
             _: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-        ) -> Result<Wrote, Refused> {
+        ) -> Result<MembershipWriteOutcome, Refused> {
             Err(Refused::Moved)
         }
 
         fn found_rows(
             &self,
-            maker: &Maker,
-            _: Expect,
+            maker: &Registrant,
+            _: Precondition,
             built: &[Arc<dyn Worker>],
             _: Option<Over<'_>>,
-        ) -> Result<Vec<Wrote>, Refused> {
+        ) -> Result<Vec<MembershipWriteOutcome>, Refused> {
             for built in built {
                 self.door
-                    .found(maker, Expect::Anything, built.url(), &|standing| {
+                    .found(maker, Precondition::Any, built.url(), &|standing| {
                         let mut moved = standing.cloned().expect("the row stands");
                         moved.labels.insert("moved".to_owned(), "under".to_owned());
                         moved
@@ -1590,20 +1618,30 @@ mod tests {
             Err(Refused::Moved)
         }
 
-        fn drained(&self, _: Remover<'_>, _: &str, _: Standing) -> Result<Wrote, Refused> {
+        fn drained(
+            &self,
+            _: Remover<'_>,
+            _: &str,
+            _: RowRevision,
+        ) -> Result<MembershipWriteOutcome, Refused> {
             Err(Refused::Moved)
         }
 
-        fn gone(&self, _: Remover<'_>, _: &str, _: Standing) -> Result<Wrote, Refused> {
+        fn gone(
+            &self,
+            _: Remover<'_>,
+            _: &str,
+            _: RowRevision,
+        ) -> Result<MembershipWriteOutcome, Refused> {
             Err(Refused::Moved)
         }
 
         fn refreshed(
             &self,
-            _: Standing,
+            _: RowRevision,
             _: &Arc<dyn Worker>,
             _: &Arc<dyn Worker>,
-        ) -> Result<Wrote, Refused> {
+        ) -> Result<MembershipWriteOutcome, Refused> {
             Err(Refused::Moved)
         }
     }
@@ -1707,8 +1745,8 @@ mod tests {
 
         let error = write
             .write_at_door(
-                &Maker::Control,
-                Expect::Seen(seen),
+                &Registrant::Control,
+                Precondition::AtRevision(seen),
                 &stale[..1],
                 Some(Over::Replaced(&over)),
             )
@@ -1775,7 +1813,7 @@ mod tests {
             StepResult::Success
         );
         let row = f.store.by_key(URL).expect("the added row");
-        assert_eq!(row.maker, Maker::Control);
+        assert_eq!(row.maker, Registrant::Control);
 
         let epoch = f.store.epoch();
         let error = write.execute(&mut cx).await.expect_err("the URL stands");
@@ -1816,20 +1854,20 @@ mod tests {
             .execute(&mut cx)
             .await
             .expect("the first rank laid");
-        assert_eq!(f.store.snapshot().1.len(), 2);
+        assert_eq!(f.store.all_rows().1.len(), 2);
 
         // Two free ranks are added whole.
         let f = Fixture::new();
         let mut cx = f.registration(WorkerJobAsker::Api, ranked_workers(2));
         cx.data.registration_mode = WorkerRegistrationMode::CreateOnly;
         f.write().execute(&mut cx).await.expect("two ranks added");
-        assert_eq!(f.store.snapshot().1.len(), 2);
+        assert_eq!(f.store.all_rows().1.len(), 2);
     }
 
     #[tokio::test]
     async fn a_replacement_by_id_is_laid_over_the_row_behind_that_worker() {
         let f = Fixture::new();
-        f.seed(&Maker::Control, worker(URL, "model").as_ref())
+        f.seed(&Registrant::Control, worker(URL, "model").as_ref())
             .expect("registered");
         let id = f.host.registry.get_id_by_url(URL).expect("the worker's id");
         let revision = f.host.registry.get(&id).expect("the worker").revision();
@@ -1902,7 +1940,7 @@ mod tests {
         let live = f.host.registry.get(&id).expect("the worker");
         let seen = f.objects.standing_of(&id, &live).expect("its row");
         f.door
-            .drained(Remover::Maker(&Maker::Control), URL, seen)
+            .drained(Remover::Maker(&Registrant::Control), URL, seen)
             .expect("draining");
         let mut cx = f.registration(WorkerJobAsker::Api, vec![relabelled()]);
         cx.data.registration_mode = by_id(id.as_str(), live.revision());
@@ -1959,7 +1997,12 @@ mod tests {
         let seen = f.objects.standing_of(&id, &live).expect("its row");
         let over = Some(Over::Updated(&live));
         f.door
-            .found_built(&Maker::Control, Expect::Seen(seen), &limited(None), over)
+            .found_built(
+                &Registrant::Control,
+                Precondition::AtRevision(seen),
+                &limited(None),
+                over,
+            )
             .expect("updated");
         assert_eq!(pair(), eight);
 
@@ -1987,13 +2030,13 @@ mod tests {
     #[tokio::test]
     async fn a_worker_registered_anew_between_a_steps_reads_is_told_from_one_gone() {
         let f = Fixture::new();
-        f.seed(&Maker::Control, worker(URL, "model").as_ref())
+        f.seed(&Registrant::Control, worker(URL, "model").as_ref())
             .expect("registered");
         let first = f.host.registry.get_id_by_url(URL).expect("its id");
         assert!(matches!(held(&f.host.registry, &first, URL), Held::Is(_)));
 
         // Other models: the URL's next life, under a new id.
-        f.seed(&Maker::Control, worker(URL, "other").as_ref())
+        f.seed(&Registrant::Control, worker(URL, "other").as_ref())
             .expect("registered anew");
         let second = f.host.registry.get_id_by_url(URL).expect("the new id");
         assert_ne!(first, second);
@@ -2002,7 +2045,7 @@ mod tests {
         let live = f.host.registry.get(&second).expect("the worker");
         let seen = f.objects.standing_of(&second, &live).expect("its row");
         f.door
-            .gone(Remover::Maker(&Maker::Control), URL, seen)
+            .gone(Remover::Maker(&Registrant::Control), URL, seen)
             .expect("removed");
         f.objects.follow(&*f.store);
         assert!(matches!(held(&f.host.registry, &second, URL), Held::Gone));
@@ -2087,7 +2130,7 @@ mod tests {
     #[tokio::test]
     async fn a_removal_leaves_a_worker_its_pins_do_not_name() {
         let f = Fixture::new();
-        f.seed(&Maker::Control, worker(URL, "model").as_ref())
+        f.seed(&Registrant::Control, worker(URL, "model").as_ref())
             .expect("registered");
         let live = f.host.registry.get_by_url(URL).expect("the held worker");
         let row = f.store.by_key(URL);
@@ -2105,7 +2148,7 @@ mod tests {
     #[tokio::test]
     async fn a_removal_pinned_at_another_revision_of_the_object_leaves_the_row() {
         let f = Fixture::new();
-        f.seed(&Maker::Control, worker(URL, "model").as_ref())
+        f.seed(&Registrant::Control, worker(URL, "model").as_ref())
             .expect("registered");
         let id = f.host.registry.get_id_by_url(URL).expect("the object id");
         let live = f.host.registry.get(&id).expect("the held worker");
@@ -2130,7 +2173,8 @@ mod tests {
             .registry
             .register(Arc::clone(&live))
             .expect("an object without a row");
-        let door: Arc<dyn Membership> = Arc::new(Shut(Refused::NotLeading("follower".to_owned())));
+        let door: Arc<dyn MembershipWriter> =
+            Arc::new(Shut(Refused::NotLeading("follower".to_owned())));
         let drain = DrainWorkersAtDoor {
             door: Arc::clone(&door),
             ..f.drain()
@@ -2230,12 +2274,15 @@ mod tests {
     async fn a_removal_leaves_a_row_that_moved_and_drops_its_worker_from_the_job() {
         let f = Fixture::new();
         let built = worker(URL, "model");
-        f.seed(&Maker::Control, built.as_ref()).expect("registered");
+        f.seed(&Registrant::Control, built.as_ref())
+            .expect("registered");
         let live = f.host.registry.get_by_url(URL).expect("the held worker");
         f.door
-            .found(&Maker::Control, Expect::Anything, URL, &|old| WorkerFacts {
-                priority: 5,
-                ..facts(built.as_ref(), old)
+            .found(&Registrant::Control, Precondition::Any, URL, &|old| {
+                WorkerFacts {
+                    priority: 5,
+                    ..facts(built.as_ref(), old)
+                }
             })
             .expect("the row moved in place");
         let row = f.store.by_key(URL);
@@ -2259,7 +2306,7 @@ mod tests {
     /// drained, the refused one leaves the job.
     #[tokio::test]
     async fn a_removal_the_door_refuses_its_asker_fails_with_the_doors_sentence() {
-        let provider = Maker::provider("discovery", URL).expect("a provider's maker");
+        let provider = Registrant::provider("discovery", URL).expect("a provider's maker");
         for (maker, asker, said) in [
             (
                 provider.clone(),
@@ -2267,7 +2314,7 @@ mod tests {
                 "the row is provider discovery's: its worker is changed at the provider's source",
             ),
             (
-                Maker::Control,
+                Registrant::Control,
                 WorkerJobAsker::Health,
                 "the row's maker is outside the health removal scope",
             ),
@@ -2290,7 +2337,7 @@ mod tests {
 
         let f = Fixture::new();
         let other = "http://other:8000";
-        f.seed(&Maker::Control, worker(URL, "model").as_ref())
+        f.seed(&Registrant::Control, worker(URL, "model").as_ref())
             .expect("registered");
         f.seed(&provider, worker(other, "model").as_ref())
             .expect("registered");
@@ -2305,16 +2352,19 @@ mod tests {
     async fn a_worker_registered_again_while_it_drains_is_not_taken() {
         let f = Fixture::new();
         let built = worker(URL, "model");
-        f.seed(&Maker::Control, built.as_ref()).expect("registered");
+        f.seed(&Registrant::Control, built.as_ref())
+            .expect("registered");
         let live = f.host.registry.get_by_url(URL).expect("the held worker");
         let mut removal = f.removal(WorkerJobAsker::Api, vec![live]);
         f.drain().execute(&mut removal).await.expect("drained");
         assert_eq!(removal.data.drained_workers.len(), 1);
 
         f.door
-            .found(&Maker::Control, Expect::Anything, URL, &|old| WorkerFacts {
-                priority: 5,
-                ..facts(built.as_ref(), old)
+            .found(&Registrant::Control, Precondition::Any, URL, &|old| {
+                WorkerFacts {
+                    priority: 5,
+                    ..facts(built.as_ref(), old)
+                }
             })
             .expect("registered again");
         f.objects.follow(&*f.store);

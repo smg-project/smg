@@ -571,7 +571,7 @@ pub(crate) mod tests {
             },
             elector::{Elector, Tick},
         },
-        stages::Catalog,
+        stages::StageRegistry,
         store::MemoryStore,
     };
 
@@ -593,7 +593,7 @@ pub(crate) mod tests {
         let path = dir.path().join("policy.yaml");
         fs::write(&path, document).expect("the file");
         let store = Arc::new(MemoryStore::new());
-        let catalog = Arc::new(Catalog::builtin());
+        let catalog = Arc::new(StageRegistry::builtin());
         let generations = Arc::new(Generations::validating(store, catalog, validate));
         Bed {
             dir,
@@ -1987,7 +1987,7 @@ pub(crate) mod tests {
         fn faulting_once(
             document: &PolicySpec,
             digest: Digest,
-            catalog: &Catalog,
+            catalog: &StageRegistry,
             denied_headers: &[&str],
         ) -> Result<AppliedSpec, SpecError> {
             let passed = PASSES.with(|passes| passes.replace(passes.get() + 1));
@@ -1998,13 +1998,13 @@ pub(crate) mod tests {
         let path = dir.path().join("policy.yaml");
         fs::write(&path, LEAST_LOAD).expect("the file");
         let store = Arc::new(MemoryStore::new());
-        let catalog = Arc::new(Catalog::builtin());
+        let catalog = Arc::new(StageRegistry::builtin());
         let door = Arc::new(Generations::validating(
             Arc::clone(&store),
             catalog,
             faulting_once,
         ));
-        let awaits = || store.world().spec().awaits_document();
+        let awaits = || store.snapshot().spec().awaits_document();
         let mut elector = election();
         door.under(elector.fence());
         let mut file = SpecFile::start_deferred(path, Arc::clone(&door)).expect("a file that runs");
@@ -2312,7 +2312,7 @@ pub(crate) mod tests {
         fn entered_under(
             document: &PolicySpec,
             digest: Digest,
-            catalog: &Catalog,
+            catalog: &StageRegistry,
             denied_headers: &[&str],
         ) -> Result<AppliedSpec, SpecError> {
             if let Some(door) = DOOR.with(|door| door.borrow_mut().take()) {

@@ -2,8 +2,9 @@
 //! in its `profile()`, and holds the stages and state written for the policy.
 //!
 //! A `profile()` names its stages by their catalog names, and the
-//! [`Catalog`](crate::stages::Catalog) maps each name to its type. Every
-//! profile starts with the three filters of `standard_filters`, in this file.
+//! [`StageRegistry`](crate::stages::StageRegistry) maps each name to its type.
+//! Every profile starts with the three filters of `standard_filters`, in this
+//! file.
 //!
 //! A stage written for one policy can serve another. `power_of_two` and
 //! `cache_aware` score with [`least_load::LeastLoad`]. `prefix_hash` scores

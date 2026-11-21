@@ -552,8 +552,8 @@ mod tests {
         engine::view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
         store::{
             Ask, GatewayId, LoadSample, LoadSource, MemoryStore, Overload,
-            PollMode as StorePollMode, Taken, ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus,
-            WorkersStore,
+            PollMode as StorePollMode, SignalWriteOutcome, ViewBuffers, WorkerFacts, WorkerPatch,
+            WorkerStatus, WorkersStore,
         },
         worker_host::{object, Members, SoleLead},
     };
@@ -644,7 +644,7 @@ mod tests {
             unit: &str,
             value: f64,
             sampled_at: Instant,
-        ) -> Taken {
+        ) -> SignalWriteOutcome {
             self.memory
                 .signal_value(id, rank, column, unit, value, sampled_at)
         }
@@ -732,7 +732,7 @@ mod tests {
             };
             self.store
                 .memory
-                .world()
+                .snapshot()
                 .build(MODEL, Role::Single, &ask, &mut out)
                 .expect("the pool");
             out.candidates

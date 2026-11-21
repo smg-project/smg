@@ -57,11 +57,11 @@
 //! same traits over the structures it already holds.
 //!
 //! A decision reads none of the tables behind those traits. The store
-//! derives a [`World`] from them (every pool as whole candidate rows) and
-//! publishes it by pointer swap: [`world`] holds the read side and the
-//! build of one decision's view. Every world is published under the
-//! generation the store holds, which [`MemoryStore::apply`] alone replaces:
-//! a decision reads its rows and its engine in one load.
+//! derives a [`StoreSnapshot`] from them (every pool as whole candidate rows)
+//! and publishes it by pointer swap: [`snapshot`] holds the read side and the
+//! build of one decision's view. Every world is published under the generation
+//! the store holds, which [`MemoryStore::apply`] alone replaces: a decision
+//! reads its rows and its engine in one load.
 //!
 //! [`LoadRow`]: crate::engine::view::LoadRow
 
@@ -78,8 +78,8 @@ pub mod pairing;
 pub mod reservations;
 pub mod sessions;
 pub mod signals;
+pub mod snapshot;
 pub mod workers;
-pub mod world;
 
 #[cfg(test)]
 mod tests;
@@ -106,15 +106,15 @@ pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts, Watch};
 pub use pairing::{PairClasses, PairingDescriptor};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};
-pub use signals::{SignalSink, Taken};
-pub use workers::{
-    identity, identity_of, token, HealthPolicy, Maker, MembershipChange, MembershipTail, Overload,
-    ProviderKey, Reachability, Signals, Unmade, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
-    WorkersStore,
-};
-pub use world::{
+pub use signals::{SignalSink, SignalWriteOutcome};
+pub use snapshot::{
     Ask, Built, EncodePairBuffers, Naming, OutsideLists, PairBuffers, PoolView, StaleGeneration,
-    ViewBuffers, World, PUBLISH_WINDOW,
+    StoreSnapshot, ViewBuffers, PUBLISH_WINDOW,
+};
+pub use workers::{
+    identity, identity_of, token, HealthPolicy, MembershipChange, MembershipTail, Overload,
+    ProviderKey, Reachability, Registrant, Signals, Unmade, WorkerFacts, WorkerPatch, WorkerRow,
+    WorkerStatus, WorkersStore,
 };
 
 /// The verified identity of a gateway: the fingerprint of the subject its

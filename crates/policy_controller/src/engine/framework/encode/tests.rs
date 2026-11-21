@@ -17,7 +17,7 @@ use crate::{
         Pick,
     },
     load::signals::{SignalCell, SignalCells, SignalColumn},
-    tracking::counts::tests::Lent,
+    tracking::in_flight::tests::Lent,
 };
 
 /// The `epd` plan with every side taking the row that holds fewer requests.

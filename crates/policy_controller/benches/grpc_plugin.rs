@@ -46,8 +46,8 @@ use smg_policy_controller::{
         },
         shared::OpenDecisions,
     },
-    stages::{Best, Healthy, LeastRequests},
-    tracking::{Lease, Lifecycle, Side},
+    stages::{Best, Healthy, LeastRequests, Lifecycle},
+    tracking::{Lease, Side},
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];

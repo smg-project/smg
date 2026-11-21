@@ -26,9 +26,9 @@ use std::{
 use smg_policy_controller::{
     document::Needs,
     engine::{
-        Binding, Candidate, Constraints, Decider, Decision, Engine, Health, Identity, PairPools,
-        Pick, Plan, PoolFacts, Profile, RequestFacts, Scorer as _, Scratch, ShedReason, Target,
-        Weighted, WorkerId,
+        Binding, Candidate, Constraints, Decision, DecisionSlot, Engine, Health, Identity,
+        PairPools, Pick, Plan, PoolFacts, Profile, RequestFacts, Scorer as _, Scratch, ShedReason,
+        Target, Weighted, WorkerId,
     },
     plugins::{
         shared::OpenDecisions,
@@ -38,8 +38,8 @@ use smg_policy_controller::{
         },
     },
     policies::power_of_two::PowerOfTwo,
-    stages::{Best, Healthy, LeastRequests, SessionAffinity},
-    tracking::{Lease, Lifecycle, Side},
+    stages::{Best, Healthy, LeastRequests, Lifecycle, SessionAffinity},
+    tracking::{Lease, Side},
     Draw,
 };
 use support::wasm_guest::{self as guest, canonical, counter, mode};
@@ -4132,7 +4132,7 @@ impl LeftLent {
             scope
                 .spawn(|| {
                     left.place.get_or_default().set(true);
-                    let _turn = Decider::new(1).enter();
+                    let _turn = DecisionSlot::new(1).enter();
                     decide(&left.engine, &left.candidates, 1)
                 })
                 .join()
@@ -4156,7 +4156,7 @@ impl LeftLent {
     /// its catch-up made.
     fn heard_as_decider_1(&self) -> u64 {
         let before = self.plugin.stats().observed;
-        let _turn = Decider::new(1).enter();
+        let _turn = DecisionSlot::new(1).enter();
         assert!(
             matches!(decide(&self.engine, &self.candidates, 1), Decision::Pick(_)),
             "decider 1 decides"
@@ -4190,7 +4190,7 @@ fn a_thread_under_no_name_gives_back_the_state_its_place_was_left_with() {
     let pair = || {
         LeftLent::by_a_thread_that_exited("left-lent").taken(|left| {
             let own = left.plugin.is_warm();
-            let _turn = Decider::new(1).enter();
+            let _turn = DecisionSlot::new(1).enter();
             (own, left.plugin.is_warm())
         })
     };
@@ -4333,7 +4333,7 @@ fn a_hold_is_checked_by_the_open_that_reaches_the_bring_behind_an_open_breaker()
         let engine = pair_engine(vec![prefill, decode], 1);
         let (shared, paired) = left.taken(|left| {
             let before = left.plugin.stats();
-            let _turn = Decider::new(1).enter();
+            let _turn = DecisionSlot::new(1).enter();
             let _ = pair_decide(&engine);
             let after = left.plugin.stats();
             (
@@ -4375,7 +4375,7 @@ fn an_event_told_under_the_same_name_in_a_place_left_lent_reaches_the_state_at_r
         let before = left.two_turns_then_two_members();
         let (shared, told) = left.taken(|left| {
             let before = left.plugin.stats().observed;
-            let _turn = Decider::new(1).enter();
+            let _turn = DecisionSlot::new(1).enter();
             left.engine
                 .on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
             left.plugin.stats().observed - before
@@ -4415,7 +4415,7 @@ fn a_named_warm_up_leaves_the_state_at_its_deciders_rest() {
         let plugin = &plugin;
         scope.spawn(move || {
             {
-                let _turn = Decider::new(1).enter();
+                let _turn = DecisionSlot::new(1).enter();
                 plugin.warm().expect("decider 1 warms");
             }
             warmed.send(()).expect("the case waits for the warm-up");
@@ -4425,7 +4425,7 @@ fn a_named_warm_up_leaves_the_state_at_its_deciders_rest() {
         first_warmed.recv().expect("the first thread warmed");
         let warm = scope
             .spawn(move || {
-                let _turn = Decider::new(1).enter();
+                let _turn = DecisionSlot::new(1).enter();
                 plugin.is_warm()
             })
             .join();
@@ -8405,7 +8405,7 @@ fn a_named_deciders_instance_is_its_names_on_whichever_thread_acts_as_it() {
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    let _turn = Decider::new(number).enter();
+                    let _turn = DecisionSlot::new(number).enter();
                     if dispatch {
                         engine.on_dispatched(
                             &Lease::default(),
@@ -8468,7 +8468,7 @@ fn a_threads_own_instance_stands_aside_while_it_acts_as_a_named_decider() {
     dispatch();
     assert_eq!(pick(), Some(101), "the thread's own instance heard it");
     {
-        let _turn = Decider::new(5).enter();
+        let _turn = DecisionSlot::new(5).enter();
         assert_eq!(pick(), Some(100), "the named decider's heard nothing");
         dispatch();
         dispatch();
@@ -8602,7 +8602,7 @@ fn a_named_pair_decision_keeps_its_instance_to_the_plugins_last_close() {
             std::thread::scope(|scope| {
                 scope
                     .spawn(|| {
-                        let _turn = Decider::new(4).enter();
+                        let _turn = DecisionSlot::new(4).enter();
                         pair()
                     })
                     .join()
@@ -8643,7 +8643,7 @@ fn a_membership_told_once_reaches_every_deciders_instance_before_it_decides() {
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    let _turn = Decider::new(number).enter();
+                    let _turn = DecisionSlot::new(number).enter();
                     pick_ids(&decide(&engine, &pool(4), 1)).first().copied()
                 })
                 .join()
@@ -8930,7 +8930,7 @@ fn a_thread_whose_first_instance_the_close_rebuilt_hears_what_it_tells_in_a_try(
 #[derive(Clone, Copy, Debug)]
 enum Inside {
     /// Acts as another decider and warms the plugin there.
-    WarmsAs(Decider),
+    WarmsAs(DecisionSlot),
     /// Ends the thread's name and tells a dispatch under none.
     TellsUnderNoName,
     /// Hands the membership feed one worker that comes.
@@ -8938,7 +8938,7 @@ enum Inside {
     /// Moves the case's own clock to a time, in microseconds.
     MovesTheClock(&'static AtomicU64, u64),
     /// Lets another thread take a whole turn as a decider, and exit.
-    TurnsElsewhereAs(Decider),
+    TurnsElsewhereAs(DecisionSlot),
 }
 
 thread_local! {
@@ -9042,8 +9042,8 @@ fn a_thread_that_turns_to_another_name_gives_the_held_one_back_first() {
         mode::COUNT_DISPATCHES,
     );
     let plain = Arc::new(plugin_engine(&plugin));
-    let turning = engine_that(&plugin, &plain, Inside::WarmsAs(Decider::new(6)));
-    let first = Decider::new(5);
+    let turning = engine_that(&plugin, &plain, Inside::WarmsAs(DecisionSlot::new(6)));
+    let first = DecisionSlot::new(5);
     {
         let _turn = first.enter();
         for _ in 0..2 {
@@ -9090,7 +9090,7 @@ fn a_thread_whose_name_ends_gives_the_held_decider_back_before_it_acts_as_itself
     let pick = |seed| pick_ids(&decide(&plain, &pool(4), seed)).first().copied();
     // The thread is a decider of its own: its instance heard nothing.
     assert_eq!(pick(1), Some(100));
-    let first = Decider::new(5);
+    let first = DecisionSlot::new(5);
     HELD_NAME.set(Some(first.enter()));
     for _ in 0..2 {
         plain.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
@@ -9098,7 +9098,7 @@ fn a_thread_whose_name_ends_gives_the_held_decider_back_before_it_acts_as_itself
     // The plugin's scope brings the first decider's instance. The host's
     // scope then ends the name and tells a dispatch under none.
     let _ = decide(&ending, &pool(4), 2);
-    assert_eq!(Decider::acting(), None, "the scope ended the name");
+    assert_eq!(DecisionSlot::acting(), None, "the scope ended the name");
     assert_eq!(pick(3), Some(101), "the thread's own instance heard it");
     let as_first = std::thread::scope(|scope| {
         scope
@@ -9129,7 +9129,7 @@ fn both_opens_of_a_pair_decide_on_the_instance_its_bring_brought() {
         mode::COUNT_DISPATCHES,
     );
     let plain = Arc::new(plugin_engine(&plugin));
-    let first = Decider::new(5);
+    let first = DecisionSlot::new(5);
     // The first side's profile: the plugin's scope opens and brings the
     // decider's instance, then the host's scope lets another thread take a
     // turn as that decider. The second side's open follows it.
@@ -9371,7 +9371,7 @@ fn a_thread_that_acted_under_a_name_alone_only_tells_under_none() {
         scope
             .spawn(|| {
                 {
-                    let _turn = Decider::new(3).enter();
+                    let _turn = DecisionSlot::new(3).enter();
                     let _ = decide(&engine, &pool(4), 1);
                 }
                 let decided = plugin.stats();
@@ -9409,7 +9409,7 @@ fn a_named_deciders_latency_window_is_one_on_whichever_thread_acts_as_it() {
     // A cold decision's `init` is slow by its own fuel. A warm decision
     // brings the ring once and gives it back once.
     let decide_as_eight = |seed: u64, cold: bool| {
-        let _turn = Decider::new(8).enter();
+        let _turn = DecisionSlot::new(8).enter();
         if cold {
             plugin.forget_instance();
         }
@@ -9479,7 +9479,7 @@ fn a_warm_up_that_asks_first_warms_every_named_decider() {
     );
     assert!(plugin.is_warm(), "the thread that loaded, by the load's");
     for name in 0..3 {
-        let _turn = Decider::new(name).enter();
+        let _turn = DecisionSlot::new(name).enter();
         assert!(!plugin.is_warm(), "decider {name} holds none yet");
         plugin.warm().expect("it warms");
         assert!(plugin.is_warm(), "decider {name} holds its own");

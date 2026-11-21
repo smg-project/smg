@@ -11,7 +11,8 @@ use smg_policy_controller::{
         Candidate, Constraints, Decision, Engine, Health, LoadRow, PoolFacts, RequestFacts,
         Scratch, Target, WorkerId,
     },
-    tracking::{Lease, Lifecycle, Side},
+    stages::Lifecycle,
+    tracking::{Lease, Side},
 };
 
 const NOW: u64 = 1_000_000;

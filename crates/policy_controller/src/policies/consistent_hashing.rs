@@ -60,11 +60,8 @@ use crate::{
         prefix_hash::{prefix_key, Prefix},
         standard_filters,
     },
-    stages::fence::Fence,
-    tracking::{
-        counts::with_counts,
-        lease::{Lifecycle, Membership},
-    },
+    stages::{lifecycle::Lifecycle, retired_workers::RetiredWorkers},
+    tracking::{in_flight::with_counts, lease::Membership},
     Draw,
 };
 
@@ -120,9 +117,9 @@ pub enum Probe<T> {
 
 /// The ring: its members, each at [`VIRTUAL_NODES`] sorted positions hashed
 /// from the member's stable key and indexed by the handle id; the ids pruned
-/// within [`FENCE`], fenced against relearning from a stale view.
+/// within [`RETIRED_WORKER_TTL`], fenced against relearning from a stale view.
 ///
-/// [`FENCE`]: crate::stages::FENCE
+/// [`RETIRED_WORKER_TTL`]: crate::stages::RETIRED_WORKER_TTL
 #[derive(Debug, Default)]
 pub struct Ring {
     /// The members in the order of their ids, by the index the entries
@@ -133,10 +130,10 @@ pub struct Ring {
     index: FxHashMap<WorkerId, u32>,
     /// `(position, member index)`, sorted by position.
     entries: Vec<(u64, u32)>,
-    /// The ids pruned within [`FENCE`].
+    /// The ids pruned within [`RETIRED_WORKER_TTL`].
     ///
-    /// [`FENCE`]: crate::stages::FENCE
-    fence: Fence,
+    /// [`RETIRED_WORKER_TTL`]: crate::stages::RETIRED_WORKER_TTL
+    fence: RetiredWorkers,
     /// The pools shown whole ([`Ring::show`]) under `shown_epoch`, by their
     /// host's number in rising order, each with whether it may be walked:
     /// its rows stood in the order of their ids, and each was a member
@@ -274,10 +271,10 @@ impl Ring {
     }
 
     /// [`Ring::add_many`] for the members a decision's view carries at `now`:
-    /// an id the lifecycle pruned within [`FENCE`] is left out, since the
-    /// view may be older than the pruning. Returns how many joined.
+    /// an id the lifecycle pruned within [`RETIRED_WORKER_TTL`] is left out,
+    /// since the view may be older than the pruning. Returns how many joined.
     ///
-    /// [`FENCE`]: crate::stages::FENCE
+    /// [`RETIRED_WORKER_TTL`]: crate::stages::RETIRED_WORKER_TTL
     pub fn learn(
         &mut self,
         members: impl IntoIterator<Item = (WorkerId, u32)>,
@@ -383,10 +380,10 @@ impl Ring {
         }
     }
 
-    /// Whether `id` was pruned within [`FENCE`] of `now` and is fenced
-    /// against relearning.
+    /// Whether `id` was pruned within [`RETIRED_WORKER_TTL`] of `now` and is
+    /// fenced against relearning.
     ///
-    /// [`FENCE`]: crate::stages::FENCE
+    /// [`RETIRED_WORKER_TTL`]: crate::stages::RETIRED_WORKER_TTL
     pub fn is_retired(&self, id: WorkerId, now: Instant) -> bool {
         self.fence.is_retired(id, now)
     }
@@ -397,10 +394,10 @@ impl Ring {
         self.forget_shown();
     }
 
-    /// Remove a member at `now`, fencing its id for [`FENCE`]; `false` when
-    /// it was none.
+    /// Remove a member at `now`, fencing its id for [`RETIRED_WORKER_TTL`];
+    /// `false` when it was none.
     ///
-    /// [`FENCE`]: crate::stages::FENCE
+    /// [`RETIRED_WORKER_TTL`]: crate::stages::RETIRED_WORKER_TTL
     pub fn remove(&mut self, id: WorkerId, now: Instant) -> bool {
         self.fence.retire(id, now);
         self.forget_shown();
@@ -1026,7 +1023,8 @@ mod tests {
             view,
             view::{fold_block, Health, Identity},
         },
-        stages::fence::FENCE,
+        stages::retired_workers::RETIRED_WORKER_TTL,
+        tracking::prefix_predictor,
     };
 
     fn ids(n: u64) -> Vec<WorkerId> {
@@ -1470,22 +1468,22 @@ mod tests {
     }
 
     /// The fence lapses: a handle at a reused address carrying a pruned id
-    /// joins from its view once [`FENCE`] has passed, and a stale view
-    /// within the window relearns nothing.
+    /// joins from its view once [`RETIRED_WORKER_TTL`] has passed, and a stale
+    /// view within the window relearns nothing.
     #[test]
     fn the_fence_lapses_after_its_window_and_a_reused_id_joins_from_the_view() {
         let mut ring = ring_of(4);
         let t0 = Instant::now();
         let id = WorkerId(1_002);
         assert!(ring.remove(id, t0));
-        let soon = t0 + FENCE / 2;
+        let soon = t0 + RETIRED_WORKER_TTL / 2;
         assert!(ring.is_retired(id, soon));
         assert_eq!(
             ring.learn([(id, key_of(id))], soon),
             0,
             "fenced within the window"
         );
-        let later = t0 + FENCE;
+        let later = t0 + RETIRED_WORKER_TTL;
         assert!(!ring.is_retired(id, later), "the fence has lapsed");
         assert_eq!(
             ring.learn([(id, key_of(id))], later),
@@ -1495,8 +1493,8 @@ mod tests {
         assert!(ring.contains(id));
         // A second retirement fences it afresh, from its own instant.
         assert!(ring.remove(id, later));
-        assert!(ring.is_retired(id, later + FENCE / 2));
-        assert!(!ring.is_retired(id, later + FENCE));
+        assert!(ring.is_retired(id, later + RETIRED_WORKER_TTL / 2));
+        assert!(!ring.is_retired(id, later + RETIRED_WORKER_TTL));
     }
 
     /// An id retired twice inside one window stays fenced until its last
@@ -1508,16 +1506,16 @@ mod tests {
         let id = WorkerId(1_002);
         assert!(ring.remove(id, t0));
         // The removal of an id the ring no longer holds retires it again.
-        let again = t0 + FENCE / 2;
+        let again = t0 + RETIRED_WORKER_TTL / 2;
         assert!(!ring.remove(id, again));
-        let first_lapsed = t0 + FENCE;
+        let first_lapsed = t0 + RETIRED_WORKER_TTL;
         assert_eq!(
             ring.learn([(id, key_of(id))], first_lapsed),
             0,
             "the later retirement stands"
         );
         assert!(ring.is_retired(id, first_lapsed));
-        let both_lapsed = again + FENCE;
+        let both_lapsed = again + RETIRED_WORKER_TTL;
         assert_eq!(ring.learn([(id, key_of(id))], both_lapsed), 1);
         assert!(ring.contains(id));
         // Many ids retired at one instant lapse together and each is
@@ -1527,8 +1525,14 @@ mod tests {
             ring.remove(gone, both_lapsed);
         }
         let pool = many.iter().map(|&gone| (gone, key_of(gone)));
-        assert_eq!(ring.learn(pool.clone(), both_lapsed + FENCE / 2), 0);
-        assert_eq!(ring.learn(pool, both_lapsed + FENCE), many.len());
+        assert_eq!(
+            ring.learn(pool.clone(), both_lapsed + RETIRED_WORKER_TTL / 2),
+            0
+        );
+        assert_eq!(
+            ring.learn(pool, both_lapsed + RETIRED_WORKER_TTL),
+            many.len()
+        );
     }
 
     /// An id the feed names and the ring prunes again is fenced by the
@@ -1542,12 +1546,15 @@ mod tests {
         ring.admit(id);
         assert!(!ring.is_retired(id, t0), "named again");
         assert_eq!(ring.learn([(id, key_of(id))], t0), 1);
-        let again = t0 + FENCE / 2;
+        let again = t0 + RETIRED_WORKER_TTL / 2;
         assert!(ring.remove(id, again));
-        let first_lapsed = t0 + FENCE;
+        let first_lapsed = t0 + RETIRED_WORKER_TTL;
         assert_eq!(ring.learn([(id, key_of(id))], first_lapsed), 0);
         assert!(ring.is_retired(id, first_lapsed));
-        assert_eq!(ring.learn([(id, key_of(id))], again + FENCE), 1);
+        assert_eq!(
+            ring.learn([(id, key_of(id))], again + RETIRED_WORKER_TTL),
+            1
+        );
     }
 
     /// Two retirements of one id told out of order: the later instant holds
@@ -1557,14 +1564,20 @@ mod tests {
         let mut ring = ring_of(4);
         let t0 = Instant::now();
         let id = WorkerId(1_002);
-        let later = t0 + FENCE / 2;
+        let later = t0 + RETIRED_WORKER_TTL / 2;
         assert!(ring.remove(id, later));
         // The earlier instant arrives second and takes nothing from the
         // fence.
         assert!(!ring.remove(id, t0));
-        assert!(ring.is_retired(id, t0 + FENCE), "the earlier instant won");
-        assert_eq!(ring.learn([(id, key_of(id))], t0 + FENCE), 0);
-        assert_eq!(ring.learn([(id, key_of(id))], later + FENCE), 1);
+        assert!(
+            ring.is_retired(id, t0 + RETIRED_WORKER_TTL),
+            "the earlier instant won"
+        );
+        assert_eq!(ring.learn([(id, key_of(id))], t0 + RETIRED_WORKER_TTL), 0);
+        assert_eq!(
+            ring.learn([(id, key_of(id))], later + RETIRED_WORKER_TTL),
+            1
+        );
     }
 
     /// Two ids retired out of their clocks' order: each lapses at its own
@@ -1574,14 +1587,14 @@ mod tests {
     fn a_retirement_told_behind_a_later_one_lapses_at_its_own_instant() {
         let t0 = Instant::now();
         let (late, early) = (WorkerId(1), WorkerId(2));
-        let mut fence = Fence::default();
-        fence.retire(late, t0 + FENCE / 2);
+        let mut fence = RetiredWorkers::default();
+        fence.retire(late, t0 + RETIRED_WORKER_TTL / 2);
         fence.retire(early, t0);
         for now in [
-            t0 + FENCE / 2,
-            t0 + FENCE,
-            t0 + FENCE + FENCE / 4,
-            t0 + FENCE + FENCE / 2,
+            t0 + RETIRED_WORKER_TTL / 2,
+            t0 + RETIRED_WORKER_TTL,
+            t0 + RETIRED_WORKER_TTL + RETIRED_WORKER_TTL / 4,
+            t0 + RETIRED_WORKER_TTL + RETIRED_WORKER_TTL / 2,
         ] {
             fence.expire(now);
             for id in [late, early] {
@@ -1630,8 +1643,8 @@ mod tests {
         }
         // Each leaver's fence lapses as a removal's does.
         let pool = all.iter().map(|&id| (id, key_of(id)));
-        assert_eq!(at_once.learn(pool.clone(), now + FENCE / 2), 0);
-        assert_eq!(at_once.learn(pool, now + FENCE), 8);
+        assert_eq!(at_once.learn(pool.clone(), now + RETIRED_WORKER_TTL / 2), 0);
+        assert_eq!(at_once.learn(pool, now + RETIRED_WORKER_TTL), 8);
         // One leaver goes as a removal takes it.
         let mut one = ring_of(3);
         one.retain_only(&[WorkerId(1_000), WorkerId(1_002)], now);
@@ -1775,7 +1788,7 @@ mod tests {
             ..hashed(&hashes)
         };
         let mut keys = Vec::new();
-        crate::predictor::Predictor::fold_into(&mut keys, facts.namespace_seed, &hashes);
+        prefix_predictor::PrefixPredictor::fold_into(&mut keys, facts.namespace_seed, &hashes);
         assert_eq!(prefix_key(64, Gates::default(), &facts), keys[3]);
         assert_eq!(keys_of(&levelled(None), &facts), [keys[3]]);
     }
@@ -1837,7 +1850,7 @@ mod tests {
     /// owner passed over leaves the decision scored as a keyless one, and
     /// an owner that keeps its key leaves it scored as with no rule.
     fn keeps(rule: &ConsistentHash, loads: &[u32]) -> bool {
-        use crate::tracking::counts::tests::Lent;
+        use crate::tracking::in_flight::tests::Lent;
         let plain = ConsistentHash::new(None);
         let mut pool: Vec<Candidate> = (0..loads.len() as u32).map(|i| candidate(i, 0)).collect();
         let ranks = scored(&plain, &keyed(5), &pool);

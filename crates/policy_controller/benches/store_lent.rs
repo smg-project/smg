@@ -166,7 +166,7 @@ fn view_cells(c: &mut Criterion, name: &str, beside: Beside, pin: bool) {
         });
         group.bench_with_input(BenchmarkId::new("lent", n), &n, |b, _| {
             b.iter(|| {
-                store.with_world(|world| {
+                store.with_snapshot(|world| {
                     let view = world.view(MODEL, Role::Single, black_box(&ask), false, &mut out);
                     let view = view.expect("the pool");
                     let held = world.held(&view, &ask, &mut holds);
@@ -220,7 +220,7 @@ fn decide_cells(c: &mut Criterion) {
                 built_engine.decide(&facts, &built.pool_facts(), &out.candidates, &cx, scratch)
             };
             let mut over_lent = |seed: u64, out: &mut ViewBuffers, scratch: &mut Scratch| {
-                store.with_world(|world| {
+                store.with_snapshot(|world| {
                     let view = world.view(MODEL, Role::Single, black_box(&ask), false, out);
                     let view = view.expect("the pool");
                     let facts = RequestFacts {
@@ -280,7 +280,7 @@ fn least_cost_lent(c: &mut Criterion) {
         |b, _| {
             b.iter(|| {
                 seed = seed.wrapping_add(1);
-                store.with_world(|world| {
+                store.with_snapshot(|world| {
                     let view = world
                         .view(MODEL, Role::Single, black_box(&ask), false, &mut out)
                         .expect("the pool");

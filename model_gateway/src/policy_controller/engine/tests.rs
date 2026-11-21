@@ -41,15 +41,13 @@ use smg_policy_controller::{
         fingerprint, Candidate, Decision, Identity, LoadRow, MediaCounts, Phase, Picker, Refused,
         RequestFacts, Role, Shed, ShedReason, Target, Targets, TieBand, Trace, WireModes, WorkerId,
     },
-    stages::Catalog,
+    stages::{Lifecycle, StageRegistry},
     store::{
         Ask as StoreAsk, BatchOutcome, HealthSink, KvEventSink, LeaseState, LeasesStore, LoadSink,
         LoadSource, MemoryStore, PairBuffers, PairingDescriptor, SessionsStore, WorkerFacts,
         WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    tracking::{
-        Lease, LeaseId, Lifecycle, Membership, Outcome, ReleaseReason, Side, TransportClass,
-    },
+    tracking::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
 };
 use smg_worker::{
     health::circuit_breaker::CircuitBreakerConfig,
@@ -823,7 +821,7 @@ async fn a_returning_prefix_lands_on_the_worker_that_holds_it() {
         .hashes(&store, MODEL);
         let now = Instant::now();
         // Give plain asks a lower-load choice while affinity can still win.
-        for row in store.snapshot().1 {
+        for row in store.all_rows().1 {
             store.record(
                 row.id,
                 0,
@@ -900,7 +898,7 @@ async fn a_returning_prompt_lands_on_the_worker_it_was_sent_to() {
             .expect("a worker")
             .id();
         // Every other row reports less load: the record alone brings it back.
-        for row in store.snapshot().1 {
+        for row in store.all_rows().1 {
             let running = u32::from(row.id == sent);
             let load = LoadRow {
                 running,
@@ -1674,7 +1672,7 @@ fn pair_spec(
     for binding in &mut document.bindings {
         binding.routing_key = key.cloned();
     }
-    let mut catalog = Catalog::builtin();
+    let mut catalog = StageRegistry::builtin();
     let prefill = PairPicker {
         name: "ordered-prefill",
         limit: 4,
@@ -1821,7 +1819,7 @@ impl PairBed {
     }
 
     fn counts(&self, ids: &[WorkerId]) -> Option<Vec<u32>> {
-        self.store.with_world(|world| {
+        self.store.with_snapshot(|world| {
             let ask = StoreAsk {
                 gateway: GATEWAY,
                 now: Instant::now(),

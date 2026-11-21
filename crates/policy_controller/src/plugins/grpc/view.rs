@@ -22,7 +22,7 @@ use crate::{
     },
     service::proto,
     tracking::{
-        counts::with_counts,
+        in_flight::with_counts,
         lease::{wire, Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal},
     },
 };
@@ -693,7 +693,7 @@ mod tests {
         since, since_of, Answer, Invalid, FILTER, PICK, SCORE,
     };
     use crate::{
-        engine::{door, view::WorkerId},
+        engine::{store_backed_engine, view::WorkerId},
         tracking::lease::Membership,
     };
 
@@ -1056,7 +1056,7 @@ mod tests {
             document::spec::Needs,
             engine::view::{Candidate, PoolFacts, RequestFacts},
             plugins::shared::config::Exposure,
-            tracking::counts::tests::Lent,
+            tracking::in_flight::tests::Lent,
         };
 
         let mut rows: Vec<Candidate> = (0..)
@@ -1203,7 +1203,7 @@ mod tests {
             engine::decision::ShedReason, plugins::shared::config::Exposure, tracking::lease::Lease,
         };
 
-        let shed = door::shed(ShedReason::NoEndpoints, "wires", 0, 0);
+        let shed = store_backed_engine::shed(ShedReason::NoEndpoints, "wires", 0, 0);
         let decision = super::decision(&shed, &Lease::default(), &Exposure::default());
         assert_eq!(
             decision.trace.expect("a trace").encode_to_vec(),

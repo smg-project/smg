@@ -1,5 +1,5 @@
 //! The controller's policy source and replica over the operators' door
-//! ([`SpecDoor`]).
+//! ([`DocumentManager`]).
 //!
 //! A replica that follows a leader has one writer at this door, the log
 //! ([`Generations::following`]): it runs each generation its leader applied,
@@ -76,13 +76,13 @@ pub(crate) use crate::document::operator::{
 use crate::{
     document::{
         operator::{
-            above, over_bound, Checked, DryRun, Enforced, Held, Line, SpecDoor,
+            above, over_bound, Checked, DocumentManager, DryRun, Enforced, Held, Line,
             Unanswered as DoorUnanswered,
         },
         spec::{AppliedSpec, Digest},
     },
     service::{elector::Fence, proto},
-    stages::catalog::Catalog,
+    stages::registry::StageRegistry,
     store::{MemoryStore, Position},
 };
 
@@ -154,7 +154,7 @@ impl From<DoorUnanswered> for Unanswered {
 
 /// The controller's spec source, with its replica's admissions.
 pub(crate) struct Generations {
-    door: SpecDoor,
+    door: DocumentManager,
     /// The start's document of a replica under a shared lease, in its
     /// source's form, from the start that passed it until the replica's
     /// first lead applies it or refuses it, or a followed generation
@@ -184,16 +184,16 @@ pub(crate) struct Generations {
 }
 
 impl Deref for Generations {
-    type Target = SpecDoor;
+    type Target = DocumentManager;
 
-    fn deref(&self) -> &SpecDoor {
+    fn deref(&self) -> &DocumentManager {
         &self.door
     }
 }
 
 impl Generations {
-    pub(crate) fn new(store: Arc<MemoryStore>, catalog: Arc<Catalog>) -> Self {
-        Self::over(SpecDoor::new(store, catalog, Vec::new()))
+    pub(crate) fn new(store: Arc<MemoryStore>, catalog: Arc<StageRegistry>) -> Self {
+        Self::over(DocumentManager::new(store, catalog, Vec::new()))
     }
 
     /// [`Generations::new`] with the validator as its argument: a case
@@ -201,13 +201,18 @@ impl Generations {
     #[cfg(test)]
     pub(crate) fn validating(
         store: Arc<MemoryStore>,
-        catalog: Arc<Catalog>,
+        catalog: Arc<StageRegistry>,
         validate: Validate,
     ) -> Self {
-        Self::over(SpecDoor::validating(store, catalog, Vec::new(), validate))
+        Self::over(DocumentManager::validating(
+            store,
+            catalog,
+            Vec::new(),
+            validate,
+        ))
     }
 
-    fn over(door: SpecDoor) -> Self {
+    fn over(door: DocumentManager) -> Self {
         Self {
             door,
             deferred: Mutex::new(None),
@@ -223,7 +228,7 @@ impl Generations {
     /// the lead that shows now ([`Generations::apply_under`]). A refusal
     /// applies nothing and the running generation stays; what a refusal
     /// means is its source's to say: a start refuses to start, and a source
-    /// that keeps running counts it ([`SpecDoor::reject`]).
+    /// that keeps running counts it ([`DocumentManager::reject`]).
     pub(crate) fn apply(&self, document: Vec<u8>, format: Format) -> Result<Applied, SpecRejected> {
         self.apply_under(self.lead(), document, format)
     }
@@ -296,7 +301,7 @@ impl Generations {
         self.door.bind_store(dir, || self.deferred.lock().is_some())
     }
 
-    /// [`SpecDoor::dry_run`] off the runtime's workers, one at a time. A
+    /// [`DocumentManager::dry_run`] off the runtime's workers, one at a time. A
     /// document at the bound validates for tens of milliseconds and holds
     /// tens of mebibytes, and the size bound budgets one pass beside an
     /// apply's: a second call waits its turn, in the order the calls came,
@@ -334,7 +339,7 @@ impl Generations {
             .unwrap_or_else(|join| Err(Unanswered::Unended(join)))
     }
 
-    /// [`SpecDoor::enforce`] off the runtime's workers, behind the write
+    /// [`DocumentManager::enforce`] off the runtime's workers, behind the write
     /// calls that came first: an apply validates for tens of milliseconds
     /// and syncs its file. No more calls wait than [`WRITES_WAITING`]: one
     /// past them is refused. A document over the bound and a guard longer
@@ -366,7 +371,7 @@ impl Generations {
         .await
     }
 
-    /// [`SpecDoor::roll_back`] off the runtime's workers, in the write
+    /// [`DocumentManager::roll_back`] off the runtime's workers, in the write
     /// calls' turn ([`Generations::in_turn`]).
     pub(crate) async fn roll_back_in_turn(
         self: &Arc<Self>,
@@ -410,7 +415,7 @@ impl Generations {
     }
 
     /// `GetPolicySpec`: the standing generation's document from memory
-    /// ([`SpecDoor::document`]), or, under a spec store, a generation on
+    /// ([`DocumentManager::document`]), or, under a spec store, a generation on
     /// file, read from its file off the runtime's workers and answered with
     /// the digest and the time it is listed under. It takes no lock an
     /// apply holds: the read waits on no validation and on no file's sync.
@@ -500,7 +505,7 @@ impl Generations {
         // start says so, where the start of a store with no source sheds
         // by the binding.
         if standing.0 == 0 {
-            self.store.world().spec().mark_document_awaited();
+            self.store.snapshot().spec().mark_document_awaited();
         }
         drop(applying);
         Ok(())
@@ -1091,7 +1096,7 @@ pub(crate) mod tests {
     fn stalling<G: Gated>(
         document: &PolicySpec,
         digest: Digest,
-        catalog: &Catalog,
+        catalog: &StageRegistry,
         denied_headers: &[&str],
     ) -> Result<AppliedSpec, SpecError> {
         let gate = G::gate();
@@ -1544,7 +1549,7 @@ pub(crate) mod tests {
         // does.
         let needs = first.needs.map(wire::needs_diff).expect("the diff");
         assert_eq!(needs.before, Some(proto::NeedsSummary::default()));
-        let runs = wire::needs_summary(needs_rows(store.world().spec().engine()));
+        let runs = wire::needs_summary(needs_rows(store.snapshot().spec().engine()));
         assert_eq!(needs.after, Some(runs));
 
         // A JSON document is on file under its own form.
@@ -1907,7 +1912,7 @@ pub(crate) mod tests {
         let (dir, store, generations) = stored();
         let (_, first) = enforce(&generations, LEAST_LOAD).expect("it runs");
         let (_, second) = enforce(&generations, RANDOM).expect("it runs");
-        let ran = wire::needs_summary(needs_rows(store.world().spec().engine()));
+        let ran = wire::needs_summary(needs_rows(store.snapshot().spec().engine()));
 
         let back = generations.roll_back(1).expect("on file");
         assert_eq!(back.standing, (2, Some(second)));
@@ -1917,7 +1922,7 @@ pub(crate) mod tests {
         assert_eq!(on_file, LEAST_LOAD.as_bytes());
         let needs = back.needs.map(wire::needs_diff).expect("the diff");
         assert_eq!(needs.before, Some(ran));
-        let runs = wire::needs_summary(needs_rows(store.world().spec().engine()));
+        let runs = wire::needs_summary(needs_rows(store.snapshot().spec().engine()));
         assert_eq!(needs.after, Some(runs));
 
         for same in [3, 1] {
@@ -2231,7 +2236,7 @@ pub(crate) mod tests {
             Some(2)
         );
 
-        let door = SpecDoor::new(Arc::new(MemoryStore::new()), stock(), Vec::new());
+        let door = DocumentManager::new(Arc::new(MemoryStore::new()), stock(), Vec::new());
         assert_eq!(
             door.apply(RANDOM.into(), Format::Yaml),
             Ok(Applied::Generation(1))
@@ -2442,7 +2447,7 @@ pub(crate) mod tests {
         fn ending(
             document: &PolicySpec,
             digest: Digest,
-            catalog: &Catalog,
+            catalog: &StageRegistry,
             denied_headers: &[&str],
         ) -> Result<AppliedSpec, SpecError> {
             let left = LEAD.with_borrow_mut(|lead| lead.as_mut().map(Elector::release));
@@ -2475,7 +2480,7 @@ pub(crate) mod tests {
         fn counting(
             document: &PolicySpec,
             digest: Digest,
-            catalog: &Catalog,
+            catalog: &StageRegistry,
             denied_headers: &[&str],
         ) -> Result<AppliedSpec, SpecError> {
             PASSES.with(|passes| passes.set(passes.get() + 1));
@@ -2503,7 +2508,7 @@ pub(crate) mod tests {
     /// take's road or by a followed generation's.
     #[test]
     fn the_unbound_start_awaits_a_deferred_document_alone() {
-        let awaits = |store: &MemoryStore| store.world().spec().awaits_document();
+        let awaits = |store: &MemoryStore| store.snapshot().spec().awaits_document();
         let (store, alone) = generations();
         assert!(!awaits(&store), "no source");
         yaml(&alone, RANDOM).expect("a valid document");
@@ -2582,7 +2587,7 @@ pub(crate) mod tests {
         fn faulting_again(
             document: &PolicySpec,
             digest: Digest,
-            catalog: &Catalog,
+            catalog: &StageRegistry,
             denied_headers: &[&str],
         ) -> Result<AppliedSpec, SpecError> {
             let passed = PASSES.with(|passes| passes.replace(passes.get() + 1));
@@ -2668,7 +2673,7 @@ pub(crate) mod tests {
         fn ending(
             document: &PolicySpec,
             digest: Digest,
-            catalog: &Catalog,
+            catalog: &StageRegistry,
             denied_headers: &[&str],
         ) -> Result<AppliedSpec, SpecError> {
             if PASSES.with(|passes| passes.replace(passes.get() + 1)) == 1 {
@@ -2704,7 +2709,7 @@ pub(crate) mod tests {
         fn retaking(
             document: &PolicySpec,
             digest: Digest,
-            catalog: &Catalog,
+            catalog: &StageRegistry,
             denied_headers: &[&str],
         ) -> Result<AppliedSpec, SpecError> {
             if PASSES.with(|passes| passes.replace(passes.get() + 1)) == 0 {

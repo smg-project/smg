@@ -23,7 +23,7 @@ use smg_policy_controller::{
         AppliedSpec, BindingSpec, OverloadSpec, PolicySpec, SpecError, API_VERSION, PRESETS,
     },
     engine::{Constraints, Engine, LoadRow, RequestFacts, Role, Scratch, SignalSource, WorkerId},
-    stages::Catalog,
+    stages::StageRegistry,
     store::{
         Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts,
         WorkerStatus, WorkersStore, PUBLISH_WINDOW,
@@ -233,7 +233,7 @@ fn lent_agrees(
             &Constraints::default(),
             &mut one,
         );
-        let over_lent = store.with_world(|world| {
+        let over_lent = store.with_snapshot(|world| {
             let view = world
                 .view(MODEL, Role::Single, &ask, false, &mut out)
                 .expect("the pool");
@@ -291,7 +291,7 @@ fn each_built_in_alone_answers_over_lent_rows_as_over_written_rows() {
     // built-in that read the stalled bit, the session bit or the report's
     // age off the row, and not what stands beside a lent row, would answer
     // two ways.
-    let catalog = Catalog::builtin();
+    let catalog = StageRegistry::builtin();
     let filters = catalog.filters().map(|name| ("filter", name));
     let scorers = catalog.scorers().map(|name| ("score", name));
     let pickers = catalog.pickers().map(|name| ("pick", name));
@@ -393,13 +393,13 @@ fn a_decision_that_straddles_a_write_frees_nothing() {
         for turn in 0..3u32 {
             // The decision holds its load across the write: it is the last
             // reader of the world the write replaces.
-            let freed = store.with_world(|world| {
+            let freed = store.with_snapshot(|world| {
                 let view = world
                     .view(MODEL, Role::Single, &ask, false, &mut out)
                     .expect("the pool");
                 let rows = view.candidates.len();
                 write(kind, kind as u32 * 3 + turn);
-                let standing = store.world();
+                let standing = store.snapshot();
                 assert!(!std::ptr::eq(world, &*standing), "write {kind} published");
                 drop(standing);
                 assert_eq!(view.candidates.len(), rows, "the rows it holds stand");
@@ -479,7 +479,7 @@ fn a_period_told_before_any_window_shows_its_judgment_and_frees_nothing() {
         signal_cells: false,
     };
     let (mut out, mut after) = (ViewBuffers::default(), ViewBuffers::default());
-    let freed = store.with_world(|world| {
+    let freed = store.with_snapshot(|world| {
         // Under no period the cool rank's old sample counts: the mean of
         // the two is under the threshold.
         let view = world
@@ -490,7 +490,7 @@ fn a_period_told_before_any_window_shows_its_judgment_and_frees_nothing() {
         // The telling ends that sample and the hot rank is judged alone.
         // No window ever opened, so the judgment is shown at once.
         assert!(store.heard_every(Duration::from_secs(10)));
-        let standing = store.world();
+        let standing = store.snapshot();
         assert!(!std::ptr::eq(world, &*standing), "the telling published");
         let judged = standing
             .view(MODEL, Role::Single, &ask, false, &mut after)

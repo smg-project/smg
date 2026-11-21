@@ -8,8 +8,7 @@ use crate::{
         view::{Candidate, PoolFacts, RequestFacts},
     },
     policies::standard_filters,
-    stages::pickers::target_of,
-    tracking::lease::Lifecycle,
+    stages::{lifecycle::Lifecycle, pickers::target_of},
     Draw,
 };
 

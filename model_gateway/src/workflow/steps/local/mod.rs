@@ -330,8 +330,8 @@ mod tests {
         worker::{HealthCheckConfig, WorkerStatus},
     };
     use smg_policy_controller::{
-        store::{Maker, MemoryStore, WorkerStatus as RowStatus, WorkersStore},
-        worker_host::{facts, Expect, Remover, DISCOVERY, DRAIN_WORKERS_AT_DOOR_STEP},
+        store::{MemoryStore, Registrant, WorkerStatus as RowStatus, WorkersStore},
+        worker_host::{facts, Precondition, Remover, DISCOVERY, DRAIN_WORKERS_AT_DOOR_STEP},
     };
     use smg_worker::{
         identity::basic::{ConnectionMode, Worker},
@@ -687,7 +687,7 @@ mod tests {
         let first = built("m", "a");
         let wrote = feed
             .door
-            .found_built(&Maker::Control, Expect::Anything, &first, None);
+            .found_built(&Registrant::Control, Precondition::Any, &first, None);
         assert!(wrote.is_ok(), "{wrote:?}");
 
         let second = built("m", "b");
@@ -711,7 +711,7 @@ mod tests {
         );
         assert!(stands(&second));
 
-        let by = Remover::Maker(&Maker::Control);
+        let by = Remover::Maker(&Registrant::Control);
         let drained = feed.door.drained(by, url, seen());
         assert!(drained.is_ok(), "{drained:?}");
         let leaving = step.refresh(seen(), &built("m", "c"), &second);
@@ -796,11 +796,11 @@ mod tests {
             "http://theirs:8000",
             "https://provider.example/v1",
         );
-        let found_by = Maker::provider(DISCOVERY, theirs).unwrap();
-        for (maker, url) in [(Maker::Control, ours), (found_by, theirs)] {
+        let found_by = Registrant::provider(DISCOVERY, theirs).unwrap();
+        for (maker, url) in [(Registrant::Control, ours), (found_by, theirs)] {
             let worker = built(url);
             feed.door
-                .found(&maker, Expect::Anything, url, &|standing| {
+                .found(&maker, Precondition::Any, url, &|standing| {
                     facts(worker.as_ref(), standing)
                 })
                 .unwrap();
@@ -923,7 +923,7 @@ mod tests {
                 .build(),
         );
         feed.door
-            .found(&Maker::Control, Expect::Anything, url, &|standing| {
+            .found(&Registrant::Control, Precondition::Any, url, &|standing| {
                 facts(built.as_ref(), standing)
             })
             .unwrap();
@@ -979,8 +979,8 @@ mod tests {
             );
             feed.door
                 .found(
-                    &Maker::Control,
-                    Expect::Anything,
+                    &Registrant::Control,
+                    Precondition::Any,
                     ranked.url(),
                     &|standing| facts(ranked.as_ref(), standing),
                 )

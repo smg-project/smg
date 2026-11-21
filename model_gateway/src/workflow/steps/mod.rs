@@ -338,7 +338,7 @@ mod tests {
     use openai_protocol::worker::WorkerStatus;
     use serde_json::{json, Value};
     use smg_policy_controller::store::{
-        Maker, MemoryStore, WorkerStatus as RowStatus, WorkersStore,
+        MemoryStore, Registrant, WorkerStatus as RowStatus, WorkersStore,
     };
     use smg_worker::{
         identity::basic::{BasicWorker, Worker},
@@ -1020,7 +1020,7 @@ mod tests {
         assert_eq!(built.len(), 2);
         let object = registry.get_by_url(&url).expect("the row's object");
         assert!(built.iter().any(|built| Arc::ptr_eq(built, &object)));
-        assert_eq!(store.snapshot().1.len(), 1);
+        assert_eq!(store.all_rows().1.len(), 1);
         assert_eq!(feed.objects.unhanded(), 0);
     }
 
@@ -1056,7 +1056,7 @@ mod tests {
 
         let row = store.by_key(&url).expect("the worker's row");
         assert_eq!(row.status, RowStatus::Ready);
-        assert_eq!(row.maker, Maker::Control);
+        assert_eq!(row.maker, Registrant::Control);
 
         let object = registry.get_by_url(&url).expect("the row's object");
         assert_eq!(feed.objects.object(row.id), registry.get_id_by_url(&url));

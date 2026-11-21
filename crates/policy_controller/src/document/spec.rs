@@ -42,11 +42,10 @@ use crate::{
             Binding, Engine, Filter, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted,
         },
         sticky_sessions::SessionRule,
-        terms::{signal_named, Term, SIGNAL_FAMILY},
         view::{blocks_within, threshold_permille, HashKind, Phase, MAX_REPORT_AGE_MS},
     },
     load::{
-        reports::Reports,
+        load_report_reader::LoadReportReader,
         signals::{column_named, SignalColumn},
     },
     policies::{
@@ -57,16 +56,17 @@ use crate::{
         least_load::LeastLoad,
     },
     stages::{
-        catalog::{profile_sent, Catalog, FilterFactory, Found, PickerFactory, StageBuild},
+        cost_terms::{signal_named, CostTerm, SIGNAL_FAMILY},
         filters::{has_room_rule, HasRoomRule, HasRoomSignals},
         pickers::SampledBest,
+        registry::{profile_sent, FilterFactory, Found, PickerFactory, StageBuild, StageRegistry},
         scorers::{
             with_report_age, FewestSessions, LeastCost, LeastCostSent, LeastCostSignals,
             LeastRequests, ResidentWork, SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT,
             DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
         },
     },
-    tracking::sent::SentCredit,
+    tracking::dispatch_credit::DispatchCredit,
 };
 
 pub const API_VERSION: &str = "smg.policy/v1";
@@ -177,7 +177,7 @@ pub const PICKERS: [&str; 9] = [
 
 /// The stock build's catalog: what [`PolicySpec::validate`] resolves a
 /// stage name in.
-static STOCK: LazyLock<Catalog> = LazyLock::new(Catalog::builtin);
+static STOCK: LazyLock<StageRegistry> = LazyLock::new(StageRegistry::builtin);
 
 /// A sampling picker compares its draws by the profile's scorers, so it
 /// needs at least one.
@@ -835,7 +835,7 @@ pub struct LeastCostParams {
         "minProperties" = 1,
         "propertyNames" = {
             "anyOf": [
-                { "enum": Term::NAMES.map(|(name, _)| name) },
+                { "enum": CostTerm::NAMES.map(|(name, _)| name) },
                 { "pattern": signal_pattern() }
             ]
         },
@@ -1199,7 +1199,7 @@ fn signal_pattern() -> String {
 
 /// The names `has-room` may sum: every term's, and the request's size.
 fn room_fields() -> Vec<&'static str> {
-    let mut names: Vec<_> = Term::NAMES.iter().map(|&(name, _)| name).collect();
+    let mut names: Vec<_> = CostTerm::NAMES.iter().map(|&(name, _)| name).collect();
     names.push(HasRoomRule::REQUEST_TOKENS);
     names.sort_unstable();
     names
@@ -2968,7 +2968,7 @@ fn resolve_signals(signals: &BTreeMap<String, SignalSpec>) -> Arc<[SignalColumn]
 /// What a term's written name reads: a field of this build, or a signal
 /// the document declares.
 enum Named {
-    Field(Term),
+    Field(CostTerm),
     Signal(SignalColumn),
 }
 
@@ -2986,7 +2986,7 @@ fn named_term(
         Some(signal) => column_named(signals, signal)
             .map(|column| Named::Signal(column.clone()))
             .ok_or_else(|| at.bad(terms, name, "a signal the document declares")),
-        None => Term::named(name)
+        None => CostTerm::named(name)
             .map(Named::Field)
             .ok_or_else(|| at.bad(terms, name, "a field this build reads")),
     }
@@ -3147,7 +3147,7 @@ fn check_stage(stage: &ScoreStage, at: &At) -> Result<(), SpecError> {
 fn least_cost_of(
     p: &LeastCostParams,
     signals: &[SignalColumn],
-    sent: impl FnOnce() -> Arc<SentCredit>,
+    sent: impl FnOnce() -> Arc<DispatchCredit>,
     max_age_ms: Option<u64>,
     at: &At,
 ) -> Result<Box<dyn Scorer>, SpecError> {
@@ -3336,7 +3336,7 @@ fn scorer_of(
     gates: Gates,
     view: &ViewSpec,
     signals: &[SignalColumn],
-    sent: impl FnOnce() -> Arc<SentCredit>,
+    sent: impl FnOnce() -> Arc<DispatchCredit>,
     at: &At,
 ) -> Result<Resolved<Box<dyn Scorer>>, SpecError> {
     let max_age = view.max_report_age_ms;
@@ -3401,7 +3401,7 @@ fn picker_of(
     at: &At,
     from: StageInputs<'_>,
     sent_ttl_ms: Option<u32>,
-    sent: &mut Option<Arc<SentCredit>>,
+    sent: &mut Option<Arc<DispatchCredit>>,
 ) -> Result<Resolved<Box<dyn Picker>>, SpecError> {
     let named = pick.name();
     let path = || format!("{}.pick.{named}", at.0);
@@ -3409,7 +3409,7 @@ fn picker_of(
     // picker has no weight: the map is the factory's whole.
     let made = |build: &PickerFactory,
                 mut params: serde_json::Map<String, serde_json::Value>,
-                sent: &mut Option<Arc<SentCredit>>| {
+                sent: &mut Option<Arc<DispatchCredit>>| {
         in_key_order(&mut params);
         let picker = StageBuild::built(
             &params,
@@ -3523,8 +3523,8 @@ fn no_cells_without_a_context(
 /// out, and the document's signals, resolved, which it answers from.
 #[derive(Clone, Copy)]
 struct StageInputs<'a> {
-    catalog: &'a Catalog,
-    reports: Reports,
+    catalog: &'a StageRegistry,
+    reports: LoadReportReader,
     signals: &'a [SignalColumn],
 }
 
@@ -3548,7 +3548,7 @@ fn filtered<'a>(
     index: usize,
     from: StageInputs<'_>,
     sent_ttl_ms: Option<u32>,
-    sent: &mut Option<Arc<SentCredit>>,
+    sent: &mut Option<Arc<DispatchCredit>>,
 ) -> Result<Filtered<'a>, SpecError> {
     let name = entry.name();
     let path = || format!("{}.filter[{index}].{name}", at.0);
@@ -3556,7 +3556,7 @@ fn filtered<'a>(
     // A filter has no weight: the map is the factory's whole.
     let made = |build: &FilterFactory,
                 mut params: serde_json::Map<String, serde_json::Value>,
-                sent: &mut Option<Arc<SentCredit>>| {
+                sent: &mut Option<Arc<DispatchCredit>>| {
         in_key_order(&mut params);
         let filter = StageBuild::built(
             &params,
@@ -3632,7 +3632,7 @@ fn filter_of(
     stage: &FilterStage,
     view: &ViewSpec,
     signals: &[SignalColumn],
-    sent: impl FnOnce() -> Arc<SentCredit>,
+    sent: impl FnOnce() -> Arc<DispatchCredit>,
     at: &At,
 ) -> Result<Box<dyn Filter>, SpecError> {
     match stage {
@@ -3646,7 +3646,7 @@ fn filter_of(
 fn has_room_of(
     p: &HasRoomParams,
     signals: &[SignalColumn],
-    sent: impl FnOnce() -> Arc<SentCredit>,
+    sent: impl FnOnce() -> Arc<DispatchCredit>,
     max_age_ms: Option<u64>,
     at: &At,
 ) -> Result<Box<dyn Filter>, SpecError> {
@@ -3752,7 +3752,7 @@ fn scored(
     at: &At,
     from: StageInputs<'_>,
     sent_ttl_ms: Option<u32>,
-    sent: &mut Option<Arc<SentCredit>>,
+    sent: &mut Option<Arc<DispatchCredit>>,
 ) -> Result<Scored, SpecError> {
     let name = entry.name();
     let Some(found) = from.catalog.find_scorer(name) else {
@@ -3941,7 +3941,7 @@ fn check_profile(
     from: StageInputs<'_>,
     deferred: &mut Deferred,
     depth: &mut HashDepth,
-    sent_credits: &mut Vec<Arc<SentCredit>>,
+    sent_credits: &mut Vec<Arc<DispatchCredit>>,
 ) -> Result<Option<(Profile, bool)>, SpecError> {
     let catalog = from.catalog;
     let gates = gates_of(p, view);
@@ -4837,11 +4837,11 @@ impl PolicySpec {
     /// honour (a stage, a plan, a matcher or a binding rule of a later step)
     /// is then refused by name as [`SpecError::NotInBuild`], and so is a
     /// stage that needs the lifecycle's calls
-    /// ([`crate::tracking::Lifecycle::needs_lifecycle`]) under the standalone
+    /// ([`crate::stages::Lifecycle::needs_lifecycle`]) under the standalone
     /// controller, which makes the membership call alone.
     pub fn validate_in(
         &self,
-        catalog: &Catalog,
+        catalog: &StageRegistry,
         denied_headers: &[&str],
     ) -> Result<Engine, SpecError> {
         let (engine, _, _) = self.built(catalog, denied_headers)?;
@@ -4853,7 +4853,7 @@ impl PolicySpec {
     /// resolved.
     fn built(
         &self,
-        catalog: &Catalog,
+        catalog: &StageRegistry,
         denied_headers: &[&str],
     ) -> Result<(Engine, HashDepth, Arc<[SignalColumn]>), SpecError> {
         if let Some(kind) = &self.kind {
@@ -4900,7 +4900,7 @@ impl PolicySpec {
         // signal's column from the document's, resolved once.
         let from = StageInputs {
             catalog,
-            reports: Reports::new(self.view.max_report_age_ms),
+            reports: LoadReportReader::new(self.view.max_report_age_ms),
             signals: &signal_columns,
         };
         for (name, profile) in &self.profiles {
@@ -5185,9 +5185,9 @@ fn index_matching<'a>(
 ///
 /// One invariant: **a decision reads its rows, its engine and its number
 /// in one load.** A store publishes every world under one of these
-/// ([`World::spec`](crate::store::World::spec)), so no reader pairs one
-/// generation's engine with rows published under another. The number is the
-/// engine's own, the document's `generation` line: there is no second
+/// ([`StoreSnapshot::spec`](crate::store::StoreSnapshot::spec)), so no reader
+/// pairs one generation's engine with rows published under another. The number
+/// is the engine's own, the document's `generation` line: there is no second
 /// holder.
 ///
 /// A document becomes one by validation alone ([`AppliedSpec::validate`]):
@@ -5260,7 +5260,7 @@ impl AppliedSpec {
     /// generation whose number is above the standing one.
     pub fn validate_in(
         document: &PolicySpec,
-        catalog: &Catalog,
+        catalog: &StageRegistry,
         denied_headers: &[&str],
     ) -> Result<Self, SpecError> {
         let built = document.built(catalog, denied_headers)?;
@@ -5275,7 +5275,7 @@ impl AppliedSpec {
     pub(crate) fn validate_digested(
         document: &PolicySpec,
         digest: Digest,
-        catalog: &Catalog,
+        catalog: &StageRegistry,
         denied_headers: &[&str],
     ) -> Result<Self, SpecError> {
         let built = document.built(catalog, denied_headers)?;
@@ -5616,7 +5616,7 @@ mod tests {
     use super::*;
     use crate::{
         engine::{Candidate, Constraints, Filter, PoolFacts, RequestFacts, Targets, TieBand},
-        tracking::Lifecycle,
+        stages::Lifecycle,
     };
 
     #[test]
@@ -5699,7 +5699,7 @@ mod tests {
     fn an_applied_generation_reads_block_hashes_as_deep_as_its_stages_do() {
         use HashKind::{Text, Token};
 
-        use crate::engine::door::tests::sent_prefixes::use_sent_prefixes;
+        use crate::engine::store_backed_engine::tests::sent_prefixes::use_sent_prefixes;
         let preset = |name: &str| {
             let mut document = PolicySpec::preset(name).expect("a preset of this build");
             document.generation = 1;
@@ -5740,8 +5740,9 @@ mod tests {
         #[cfg(feature = "controller")]
         {
             let digest = keyed.digest().expect("the document digests");
-            let applied = AppliedSpec::validate_digested(&keyed, digest, &Catalog::builtin(), &[])
-                .expect("the preset validates");
+            let applied =
+                AppliedSpec::validate_digested(&keyed, digest, &StageRegistry::builtin(), &[])
+                    .expect("the preset validates");
             assert_eq!(applied.block_hashes_read(Token, 0), 8);
         }
         // A stage with no depth of its own reads to the view's cap.
@@ -5845,7 +5846,7 @@ mod tests {
 
     #[test]
     fn a_stage_that_names_no_depth_reads_the_block_hashes_to_the_cap() {
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .filter("hashing-filter", || Box::new(ReadsHashes("hashing-filter")))
             .and_then(|catalog| {
@@ -6182,7 +6183,7 @@ mod tests {
             }
         }
 
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .filter("scoped-filter", || Box::new(Scoped))
             .and_then(|catalog| catalog.scorer("scoped-scorer", || Box::new(Scoped)))
@@ -7383,11 +7384,11 @@ mod tests {
         let spec = spec_with_score(
             r#"{"least-cost":{"terms":{"load.running":7},"unreported":"missing-as-zero"}}"#,
         );
-        let catalog = Catalog::builtin();
+        let catalog = StageRegistry::builtin();
         let entry = &spec.profiles["p"].score[0];
         let from = StageInputs {
             catalog: &catalog,
-            reports: Reports::new(None),
+            reports: LoadReportReader::new(None),
             signals: &[],
         };
         let Scored::Typed(stage) = scored(
@@ -9283,7 +9284,7 @@ mod tests {
             }
         }
 
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .scorer(SCORER, || Box::new(PreferIdle))
             .expect("a free scorer name");
@@ -9329,7 +9330,7 @@ mod tests {
     #[test]
     fn validate_in_refuses_headers_the_host_denies() {
         let document = spec_with_view(r#"{"headers":["x-private-context"]}"#);
-        let catalog = Catalog::builtin();
+        let catalog = StageRegistry::builtin();
         let denied = ["X-Private-Context"];
         let expected = SpecError::DeniedHeader {
             path: "view.headers[0]".into(),
@@ -9350,7 +9351,7 @@ mod tests {
     fn validate_in_preserves_the_stock_generation_digest_and_depth() {
         let mut document = spec_with_score(r#"{"consistent-hash":{"prefix_tokens":143}}"#);
         document.generation = 47;
-        let catalog = Catalog::builtin();
+        let catalog = StageRegistry::builtin();
         let applied = AppliedSpec::validate_in(&document, &catalog, &[])
             .expect("a stock scorer validates in the stock catalog");
         let stock = AppliedSpec::validate_with(&document, &[]).expect("a stock scorer validates");
@@ -9368,7 +9369,7 @@ mod tests {
         use crate::store::{MemoryStore, StaleGeneration};
 
         let document = spec_with_view("{}");
-        let catalog = Catalog::builtin();
+        let catalog = StageRegistry::builtin();
         let validate = |document: &PolicySpec| {
             AppliedSpec::validate_in(document, &catalog, &[]).expect("the document validates")
         };
@@ -9390,7 +9391,7 @@ mod tests {
                 offered: 0,
             })
         );
-        assert_eq!(store.world().spec().generation(), standing);
+        assert_eq!(store.snapshot().spec().generation(), standing);
     }
 
     /// A digest handed on is the generation's, as given: the door's apply
@@ -9404,8 +9405,9 @@ mod tests {
             .digest()
             .expect("a digest");
         assert_ne!(document.digest(), Ok(handed));
-        let applied = AppliedSpec::validate_digested(&document, handed, &Catalog::builtin(), &[])
-            .expect("a preset validates");
+        let applied =
+            AppliedSpec::validate_digested(&document, handed, &StageRegistry::builtin(), &[])
+                .expect("a preset validates");
         assert_eq!(applied.digest(), Some(handed));
     }
 
@@ -9418,8 +9420,9 @@ mod tests {
         let mut document = PolicySpec::preset("least_load").expect("a preset");
         document.plans.pd_pair.pairing = Pairing::Strict;
         let digest = document.digest().expect("a digest");
-        let handed = AppliedSpec::validate_digested(&document, digest, &Catalog::builtin(), &[])
-            .expect("a preset validates");
+        let handed =
+            AppliedSpec::validate_digested(&document, digest, &StageRegistry::builtin(), &[])
+                .expect("a preset validates");
         assert_eq!(handed.pairing(), Pairing::Strict);
         let own = AppliedSpec::validate(&document).expect("a preset validates");
         assert_eq!(own.pairing(), Pairing::Strict);
@@ -9469,7 +9472,7 @@ mod tests {
     fn every_catalog_stage_reads_a_lent_count_as_a_rows_own() {
         use crate::{
             engine::{view::Identity, Health, PoolFacts, Scratch, WorkerId},
-            tracking::counts::tests::Lent,
+            tracking::in_flight::tests::Lent,
         };
         let sessions = r#""score":["fewest-sessions"]"#;
         let scored = |pick: &str| format!(r#"{{{sessions},"pick":{pick}}}"#);

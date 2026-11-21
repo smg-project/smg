@@ -9,20 +9,20 @@ use std::{
 
 use super::{
     identity, identity_of,
-    leases::{Counts, Slot, DISPATCH_TTL},
+    leases::{Counts, WorkerSlot, DISPATCH_TTL},
     Ask, AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeRefused, DecodeSide,
     Dispatch, GatewayId, Hand, HealthSink, HealthWrite, Journal, Kinds, KvEvent, KvEventSink,
     LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSample, LoadSink, LoadSource,
     MembershipChange, MembershipTail, MemoryStore, Picked, Pin, PollMode, Position, Reachability,
     ReservationKind, ReservationStore, ResyncReason, Said, SequenceHash, SessionsStore, Sides,
-    Signals, SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, Watch, WorkerFacts, WorkerPatch,
-    WorkerRow, WorkerStatus, WorkersStore, World,
+    Signals, SnapshotChunk, StoreSnapshot, StoredBlock, VetoWrite, ViewBuffers, Watch, WorkerFacts,
+    WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
 };
 use crate::{
     document::spec,
     engine::{
-        decider::Decider,
         decision::{self, Target, Targets},
+        decision_slot::DecisionSlot,
         demands::DemandFacts,
         sticky_sessions::{self, SessionVerdict},
         view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
@@ -202,10 +202,10 @@ fn a_write_under_a_moved_revision_is_refused_and_never_reaches_a_successor() {
 fn a_watcher_tails_the_changes_after_its_epoch_and_snapshots_again_past_the_log() {
     let store = MemoryStore::new();
     let workers: &dyn WorkersStore = &store;
-    let (epoch, rows) = workers.snapshot();
+    let (epoch, rows) = workers.all_rows();
     assert_eq!((epoch, rows.len()), (0, 0));
     let a = workers.upsert(facts("http://a:8000", 1)).id();
-    let (epoch, rows) = workers.snapshot();
+    let (epoch, rows) = workers.all_rows();
     assert_eq!((epoch, rows.len()), (1, 1));
     let b = workers.upsert(facts("http://b:8000", 1)).id();
     assert_eq!(
@@ -232,7 +232,7 @@ fn a_watcher_tails_the_changes_after_its_epoch_and_snapshots_again_past_the_log(
         MembershipTail::SnapshotRequired,
         "a watcher past the log snapshots again"
     );
-    let (head, rows) = workers.snapshot();
+    let (head, rows) = workers.all_rows();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].id, a, "the snapshot is ordered by key");
     assert!(matches!(
@@ -254,7 +254,7 @@ fn snapshot_sort_does_not_hold_the_workers_lock() {
     let (cloned, resume) = store.pause_snapshot_after_clone();
 
     let snapshot_store = Arc::clone(&store);
-    let snapshot = std::thread::spawn(move || WorkersStore::snapshot(snapshot_store.as_ref()));
+    let snapshot = std::thread::spawn(move || WorkersStore::all_rows(snapshot_store.as_ref()));
     cloned
         .recv_timeout(PATIENCE)
         .expect("snapshot reached the sort");
@@ -800,10 +800,10 @@ fn a_replaced_incarnation_leaves_the_old_id_without_rows_and_the_new_id_starts_e
 
 #[test]
 fn a_new_row_takes_its_maker_and_a_standing_row_keeps_it() {
-    use super::Maker;
+    use super::Registrant;
 
     let store = MemoryStore::new();
-    let found = Maker::provider("cluster", "pods/a").expect("a whole maker");
+    let found = Registrant::provider("cluster", "pods/a").expect("a whole maker");
     let id = store
         .upsert_by(facts("http://w:8000", 1), found.clone())
         .id();
@@ -823,24 +823,25 @@ fn a_new_row_takes_its_maker_and_a_standing_row_keeps_it() {
     // A row the plain write makes is a control call's.
     let by_hand = store.upsert(facts("http://x:8000", 1)).id();
     let held = WorkersStore::get(&store, by_hand).expect("the row");
-    assert_eq!(held.maker, Maker::Control);
+    assert_eq!(held.maker, Registrant::Control);
 }
 
 #[test]
 fn a_providers_maker_is_made_inside_the_rules_of_its_two_parts() {
-    use super::{Maker, Unmade};
+    use super::{Registrant, Unmade};
 
-    let Ok(Maker::Provider(found)) = Maker::provider("cluster", "pods/a") else {
+    let Ok(Registrant::Provider(found)) = Registrant::provider("cluster", "pods/a") else {
         panic!("a maker of both parts is made");
     };
     assert_eq!((found.provider(), found.key()), ("cluster", "pods/a"));
     // Each part at its bound is taken, and the key is its provider's own
     // text, blanks and all.
-    let name = "p".repeat(Maker::NAME_BYTES);
-    let key = "k ".repeat(Maker::KEY_BYTES / 2);
-    assert!(Maker::provider(name.as_str(), key.as_str()).is_ok());
+    let name = "p".repeat(Registrant::NAME_BYTES);
+    let key = "k ".repeat(Registrant::KEY_BYTES / 2);
+    assert!(Registrant::provider(name.as_str(), key.as_str()).is_ok());
     // The part that breaks its rule is named, the name's rules first.
-    let unmade = |provider: &str, key: &str| Maker::provider(provider, key).expect_err("no maker");
+    let unmade =
+        |provider: &str, key: &str| Registrant::provider(provider, key).expect_err("no maker");
     // An empty name is refused in its own words, ahead of the token's.
     assert_eq!(
         unmade("", "pods/a"),
@@ -1774,7 +1775,7 @@ fn the_tick_ends_the_absence_of_a_key_that_stays_away() {
     let sessions: &dyn SessionsStore = &store;
     sessions.pin(11, a, Instant::now(), None);
     let key = Session::from_raw(21);
-    let world = store.world();
+    let world = store.snapshot();
     let table = world.spec().engine().sessions();
     table.dispatched(key, SessionVerdict::Pinned, a);
     let revision = WorkersStore::get(&store, a).expect("the row").revision;
@@ -1829,7 +1830,7 @@ fn a_followed_key_registered_again_as_the_worker_it_was_takes_its_pins() {
     let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
     // The follower's engine holds a pin of its own.
     let key = Session::from_raw(21);
-    let world = follower.world();
+    let world = follower.snapshot();
     let table = world.spec().engine().sessions();
     table.dispatched(key, SessionVerdict::Pinned, a);
     let held = || table.pins(key).map(|pins| pins[0]);
@@ -1940,7 +1941,7 @@ fn a_snapshot_moves_the_pins_of_the_rows_it_drops() {
         let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
         // The follower's engine holds a pin of its own.
         let key = Session::from_raw(21);
-        let world = follower.world();
+        let world = follower.snapshot();
         let table = world.spec().engine().sessions();
         table.dispatched(key, SessionVerdict::Pinned, a);
         let held = || table.pins(key).map(|pins| pins[0]);
@@ -2633,7 +2634,7 @@ fn a_pair_s_decode_side_is_told_issued_on_the_decode_worker() {
     record.lease.booked = p;
     decode.session = Session::from_raw(41);
     decode.tokens = 24;
-    let world = store.world();
+    let world = store.snapshot();
     let slots = [world.booked_of(p), world.booked_of(d)];
     let heard = RefCell::new(Vec::new());
     let prefill = store
@@ -2823,7 +2824,7 @@ fn a_pair_filed_with_its_decode_side_alone_waiting_is_due_at_its_deadline() {
     assert_eq!(booked(&store, &[p, d]), [1, 1]);
     // An issue past the deadline ends the side that waits.
     let later = now + Duration::from_secs(2);
-    let world = store.world();
+    let world = store.snapshot();
     store
         .issue_decided(booking(gateway, 0, p, later), world.booked_of(p), |_| ())
         .expect("minted under the store's term");
@@ -2869,7 +2870,7 @@ fn the_dispatch_deadline_ends_each_side_that_waits_and_a_dispatched_side_stands(
     // An issue past the deadline ends what waits and tells of each side
     // it ended, the prefill's first.
     let later = now + Duration::from_secs(2);
-    let world = store.world();
+    let world = store.snapshot();
     store.tell_through(heard);
     drop(told_sides());
     store
@@ -2950,7 +2951,7 @@ fn a_pair_issued_under_a_rule_with_a_ttl_stands_and_ends_as_any_pair() {
     // An issue past the deadline ends the decode side that waits, and
     // the dispatched sides stand.
     let later = now + Duration::from_secs(2);
-    let world = store.world();
+    let world = store.snapshot();
     store
         .issue_decided(booking(gateway, 0, p, later), world.booked_of(p), |_| ())
         .expect("minted under the store's term");
@@ -3321,7 +3322,7 @@ fn a_restore_tells_each_end_under_the_decider_whose_file_holds_its_lease() {
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&store, 1);
     store.tell_through(heard);
-    let (now, world) = (Instant::now(), store.world());
+    let (now, world) = (Instant::now(), store.snapshot());
     let issue = || {
         let record = booking(GatewayId(1), 0, a, now);
         let issued = store.issue_decided(record, world.booked_of(a), |_| ());
@@ -3330,7 +3331,7 @@ fn a_restore_tells_each_end_under_the_decider_whose_file_holds_its_lease() {
     // One lease issued by a thread that acts as the fourth decider, one by
     // a thread that names none: the first file's.
     let named = {
-        let _acting = Decider::new(3).enter();
+        let _acting = DecisionSlot::new(3).enter();
         issue()
     };
     let unnamed = issue();
@@ -3339,14 +3340,14 @@ fn a_restore_tells_each_end_under_the_decider_whose_file_holds_its_lease() {
     let leader = MemoryStore::new();
     assert_eq!(ready(&leader, "http://a:1"), a);
     assert!(store.restore_from(leader.cut(Kinds::All)));
-    let mut ended: Vec<(u64, Option<Decider>)> = told()
+    let mut ended: Vec<(u64, Option<DecisionSlot>)> = told()
         .into_iter()
         .map(|(record, _)| record.lease.id.0)
         .zip(told_by())
         .collect();
     ended.sort_unstable();
-    let first = Some(Decider::new(0));
-    let mut issued = [(named.0, Some(Decider::new(3))), (unnamed.0, first)];
+    let first = Some(DecisionSlot::new(0));
+    let mut issued = [(named.0, Some(DecisionSlot::new(3))), (unnamed.0, first)];
     issued.sort_unstable();
     assert_eq!(ended, issued);
 }
@@ -3362,7 +3363,7 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     let leases: &dyn LeasesStore = &store;
     leases.set_term(1);
     leases.issue(lease).expect("filed");
-    let slot = store.world().booked_of(id).expect("the member's slot");
+    let slot = store.snapshot().booked_of(id).expect("the member's slot");
     let sessions: &dyn SessionsStore = &store;
     sessions.pin(1, id, now, None);
     store.gateway_veto(gateway, id, Some(now + Duration::from_secs(60)));
@@ -3390,7 +3391,7 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     assert_eq!(leases.live(gateway), 1);
     assert_eq!(leases.get(gateway, lease.lease.id), Some(lease));
     assert_eq!(leases.term(), 1);
-    assert_eq!(store.world().booked_of(id), Some(slot));
+    assert_eq!(store.snapshot().booked_of(id), Some(slot));
     assert_eq!(in_flight(&store), [(id, 1)]);
     assert_eq!(
         sessions.lookup(1),
@@ -3432,7 +3433,7 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
 
 /// The count in a one-member world held across a snapshot. Its slot still
 /// reads the live count after the worker leaves the current world.
-fn held_count(world: &World, gateway: GatewayId, now: Instant) -> u32 {
+fn held_count(world: &StoreSnapshot, gateway: GatewayId, now: Instant) -> u32 {
     let ask = Ask {
         gateway,
         now,
@@ -3452,7 +3453,7 @@ fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_ends_on_its_own_count(
     let store = MemoryStore::new();
     let left = publisher(&store, "http://a:1", 0);
     store.publish_now();
-    let before = store.world();
+    let before = store.snapshot();
     let slot = before.booked_of(left).expect("the leaver's slot");
     let (gateway, now) = (GatewayId(1), Instant::now());
     let lease = booking(gateway, 1, left, now);
@@ -3474,7 +3475,7 @@ fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_ends_on_its_own_count(
     assert!(store.watch_from(source.cut(Kinds::All)));
     assert_eq!(leases.get(gateway, lease.lease.id), Some(lease));
     assert_eq!(held_count(&before, gateway, now), 1);
-    assert_ne!(store.world().booked_of(joined), Some(slot));
+    assert_ne!(store.snapshot().booked_of(joined), Some(slot));
     assert_eq!(in_flight(&store), [(joined, 0)]);
     assert!(WorkersStore::by_key(&store, "http://a:1").is_none());
     assert!(!store.vetoed(gateway, left, now));
@@ -3501,7 +3502,7 @@ fn a_watch_snapshot_gives_a_new_incarnation_its_own_count() {
     let store = MemoryStore::new();
     let key = "http://a:1";
     let old = ready(&store, key);
-    let before = store.world();
+    let before = store.snapshot();
     let (gateway, now) = (GatewayId(1), Instant::now());
     let lease = booking(gateway, 1, old, now);
     let leases: &dyn LeasesStore = &store;
@@ -3529,8 +3530,7 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
             view::{Candidate, RequestFacts},
             Scorer, TieBand,
         },
-        stages::Catalog,
-        tracking::Lifecycle,
+        stages::{Lifecycle, StageRegistry},
     };
 
     #[derive(Debug)]
@@ -3565,7 +3565,7 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
     let store = MemoryStore::new();
     let id = ready(&store, "http://a:1");
     let heard = Arc::new(Mutex::new(Vec::new()));
-    let mut catalog = Catalog::builtin();
+    let mut catalog = StageRegistry::builtin();
     let events = Arc::clone(&heard);
     catalog
         .scorer("heard", move || Box::new(Heard(Arc::clone(&events))))
@@ -3592,7 +3592,7 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
     assert!(store.publish_due().is_some(), "a build is owed");
     heard.lock().expect("the stage heard").clear();
     assert!(store.watch_from(cut));
-    assert_eq!(store.world().epoch(), epoch);
+    assert_eq!(store.snapshot().epoch(), epoch);
     assert_eq!(store.epoch(), epoch);
     assert_eq!(store.history(), 1);
     assert_eq!(
@@ -3629,7 +3629,7 @@ fn a_watch_snapshot_the_journal_refuses_changes_nothing() {
     let id = ready(&store, "http://a:1");
     store.set_term(3);
     let before = store.cut(Kinds::Watched);
-    let world = store.world();
+    let world = store.snapshot();
     let source = MemoryStore::new();
     ready(&source, "http://b:1");
     let mut cut = source.cut(Kinds::Watched);
@@ -3641,7 +3641,7 @@ fn a_watch_snapshot_the_journal_refuses_changes_nothing() {
         (before.at, before.epoch, before.rows)
     );
     assert_eq!(store.history(), 0);
-    assert!(Arc::ptr_eq(&store.world(), &world));
+    assert!(Arc::ptr_eq(&store.snapshot(), &world));
     assert_eq!(in_flight(&store), [(id, 0)]);
 }
 
@@ -3821,7 +3821,7 @@ fn a_count_is_found_by_its_slot_in_whichever_piece_holds_it() {
     let counts = Counts::default();
     // The first piece holds 1,024 cells and the second 2,048: one slot
     // more stands in the third.
-    let slots: Vec<Slot> = (0..3_073).map(|_| counts.claim()).collect();
+    let slots: Vec<WorkerSlot> = (0..3_073).map(|_| counts.claim()).collect();
     for &slot in &slots {
         counts.book(slot);
     }
@@ -3836,15 +3836,15 @@ fn a_count_is_found_by_its_slot_in_whichever_piece_holds_it() {
             counts.book(slots[at]);
         }
     }
-    counts.book(Slot::NONE);
+    counts.book(WorkerSlot::NONE);
     let ends = marked.iter().rev().map(|&at| slots[at]);
-    let run: Vec<Slot> = ends.chain([Slot::NONE, slots[2]]).collect();
+    let run: Vec<WorkerSlot> = ends.chain([WorkerSlot::NONE, slots[2]]).collect();
     assert_eq!(
         counts.of(&run).collect::<Vec<_>>(),
         [6, 5, 4, 3, 2, 1, 0, 0]
     );
     // A lease that leaves gives one back, and a count at zero stays there.
-    for slot in [slots[1_024], slots[2], Slot::NONE] {
+    for slot in [slots[1_024], slots[2], WorkerSlot::NONE] {
         counts.free(slot);
     }
     let read: Vec<u32> = counts.of(&[slots[1_024], slots[2]]).collect();
@@ -4176,25 +4176,28 @@ fn a_world_names_a_member_in_no_pool_until_it_leaves() {
         ..facts("http://b:1", 1)
     };
     let owed = store.upsert(bare).id();
-    assert!(store.world().booked_of(pooled).is_some());
+    assert!(store.snapshot().booked_of(pooled).is_some());
     assert!(
-        store.world().unpooled_of(owed).is_none(),
+        store.snapshot().unpooled_of(owed).is_none(),
         "inside its window"
     );
     store.publish_now();
     assert!(
-        store.world().unpooled_of(owed).is_some(),
+        store.snapshot().unpooled_of(owed).is_some(),
         "named, in no pool"
     );
-    assert!(store.world().booked_of(owed).is_none(), "no pool lists it");
     assert!(
-        store.world().unpooled_of(pooled).is_none(),
+        store.snapshot().booked_of(owed).is_none(),
+        "no pool lists it"
+    );
+    assert!(
+        store.snapshot().unpooled_of(pooled).is_none(),
         "a pool lists it"
     );
     let revision = WorkersStore::get(&store, owed).expect("the row").revision;
     assert!(store.remove(owed, revision).is_some());
-    assert!(store.world().unpooled_of(owed).is_none(), "it left");
-    assert!(store.world().booked_of(pooled).is_some());
+    assert!(store.snapshot().unpooled_of(owed).is_none(), "it left");
+    assert!(store.snapshot().booked_of(pooled).is_some());
 }
 
 /// A generation of the standing pairing mode builds no membership: the
@@ -4211,10 +4214,10 @@ fn a_generation_that_builds_no_membership_still_names_a_member_in_no_pool() {
     };
     let owed = store.upsert(bare).id();
     store.publish_now();
-    assert!(store.world().unpooled_of(owed).is_some());
+    assert!(store.snapshot().unpooled_of(owed).is_some());
     store.apply(manual_ruled(2, 60, 30)).expect("generation 2");
     assert!(
-        store.world().unpooled_of(owed).is_some(),
+        store.snapshot().unpooled_of(owed).is_some(),
         "the generation built no membership"
     );
 }
@@ -4528,7 +4531,7 @@ fn a_decode_side_is_on_file_for_each_record_that_carries_the_mark_and_for_no_oth
     read("the last side's release", &filed);
     // A decision's issue, a pair's and a single's, under ids the store
     // mints; a release of the pair whole.
-    let world = store.world();
+    let world = store.snapshot();
     let slots = [world.booked_of(p), world.booked_of(d0)];
     let (record, side) = pair(0, p, &[d0], now);
     let decided = store.issue_decided_pair(record, side, slots, |_| ());
@@ -4751,7 +4754,7 @@ fn a_lease_counts_for_its_key_by_its_issue_and_not_by_its_verdict() {
     let (gateway, now) = (GatewayId(1), Instant::now());
     leases.set_term(1);
     let key = Session::from_raw(41);
-    let world = store.world();
+    let world = store.snapshot();
     let decided = |session, verdict| {
         let mut record = keyed(0, a, session, now);
         record.lease.session_verdict = verdict;
@@ -4868,7 +4871,7 @@ fn the_store_mints_a_decisions_lease_under_its_own_term_alone() {
     let a = ready(&store, "http://a:1");
     let leases: &dyn LeasesStore = &store;
     let (gateway, now) = (GatewayId(1), Instant::now());
-    let world = store.world();
+    let world = store.snapshot();
     let decided = |term: u64| {
         let record = LeaseRecord {
             term,
@@ -4930,7 +4933,7 @@ fn a_rise_keeps_the_table_of_a_term_whose_lease_is_on_file() {
         term: 3,
         ..booking(gateway, 0, a, now)
     };
-    let booked = store.world().booked_of(a);
+    let booked = store.snapshot().booked_of(a);
     let issued = store.issue_decided(record, booked, |_| ());
     issued.expect("minted under the store's term");
     leases.set_term(4);
@@ -4976,18 +4979,18 @@ thread_local! {
     /// both parts of each lease.
     static TOLD: RefCell<Vec<(Sides, Said)>> = const { RefCell::new(Vec::new()) };
     /// The decider each of those tells named, in the same order.
-    static TOLD_BY: RefCell<Vec<Option<Decider>>> = const { RefCell::new(Vec::new()) };
+    static TOLD_BY: RefCell<Vec<Option<DecisionSlot>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A teller that keeps its word for [`told`]: the record a frame found on
 /// file and what the frame said, and for [`told_by`] the decider named.
-fn heard(_: &MemoryStore, _: &World, found: &Sides, said: Said, by: Option<Decider>) {
+fn heard(_: &MemoryStore, _: &StoreSnapshot, found: &Sides, said: Said, by: Option<DecisionSlot>) {
     TOLD.with(|told| told.borrow_mut().push((*found, said)));
     TOLD_BY.with(|told| told.borrow_mut().push(by));
 }
 
 /// The deciders [`heard`] was told since the last call, taken.
-fn told_by() -> Vec<Option<Decider>> {
+fn told_by() -> Vec<Option<DecisionSlot>> {
     TOLD_BY.with(|told| std::mem::take(&mut *told.borrow_mut()))
 }
 
@@ -5024,7 +5027,7 @@ fn issued_in(
         state,
         ..booking(GatewayId(1), 0, target, at)
     };
-    let world = store.world();
+    let world = store.snapshot();
     store.tell_through(heard);
     let before = told_sides();
     let lease = store
@@ -5370,7 +5373,7 @@ thread_local! {
 /// A teller that keeps the epoch of the world each tell is handed. Its
 /// first tell publishes a later world before it returns, so a word told
 /// behind it under the same load reads the earlier epoch.
-fn under(store: &MemoryStore, world: &World, _: &Sides, _: Said, _: Option<Decider>) {
+fn under(store: &MemoryStore, world: &StoreSnapshot, _: &Sides, _: Said, _: Option<DecisionSlot>) {
     UNDER.with_borrow_mut(|under| under.push(world.epoch()));
     if LATER.replace(false) {
         ready(store, "http://b:1");
@@ -5388,7 +5391,7 @@ fn under_bed(leases: u64, now: Instant) -> (Arc<MemoryStore>, WorkerId, Vec<Leas
     LeasesStore::set_term(&*store, 1);
     let ids = (0..leases).map(|_| LeaseId(1 << 32 | issued_at(&store, a, now).0));
     let ids = ids.collect();
-    let first = store.world().epoch();
+    let first = store.snapshot().epoch();
     (store, a, ids, first)
 }
 
@@ -5668,7 +5671,7 @@ fn a_place_applies_what_waits_at_the_other_files_whose_threads_wait() {
         let (heard_of, go) = (heard_of, go);
         let store = &store;
         scope.spawn(move || {
-            let _acting = Decider::new(1).enter();
+            let _acting = DecisionSlot::new(1).enter();
             let ids: Vec<_> = (0..2).map(|_| issued_at(store, a, now).0).collect();
             let mut place = store.at_work();
             assert_eq!(place.look(), Watch::Quiet, "two leases stand on its file");
@@ -5685,7 +5688,7 @@ fn a_place_applies_what_waits_at_the_other_files_whose_threads_wait() {
                 "what waited is its own as it leaves"
             );
         });
-        let _acting = Decider::new(0).enter();
+        let _acting = DecisionSlot::new(0).enter();
         let place = store.at_work();
         let ids = heard_of.recv_timeout(PATIENCE).expect("the watch stands");
         let hand = Hand::new(GatewayId(1));
@@ -5718,7 +5721,7 @@ fn a_places_apply_takes_no_turn_at_a_file_that_shows_no_watch() {
         static PLACE: RefCell<Option<AtWork>> = const { RefCell::new(None) };
         static TOLD: Cell<u32> = const { Cell::new(0) };
     }
-    fn under(_: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
+    fn under(_: &MemoryStore, _: &StoreSnapshot, _: &Sides, _: Said, _: Option<DecisionSlot>) {
         PLACE.with_borrow(|place| place.as_ref().expect("the case's place").apply_waiting());
         TOLD.set(TOLD.get() + 1);
     }
@@ -5729,10 +5732,10 @@ fn a_places_apply_takes_no_turn_at_a_file_that_shows_no_watch() {
     LeasesStore::set_term(&*store, 1);
     // A lease on the second file, issued as its decider.
     let lease = {
-        let _acting = Decider::new(1).enter();
+        let _acting = DecisionSlot::new(1).enter();
         issued_at(&store, a, now).0
     };
-    let _acting = Decider::new(0).enter();
+    let _acting = DecisionSlot::new(0).enter();
     PLACE.set(Some(store.at_work()));
     // The second file shows no watch and no thread works there: the hand
     // applies in place, and the tell runs under that file's turn.
@@ -5818,7 +5821,7 @@ fn a_places_apply_reads_behind_a_watchs_frames_beside_a_job_that_begins() {
     std::thread::scope(|scope| {
         let (store, word, lease, left) = (&store, &word, &lease, &left);
         scope.spawn(move || {
-            let _acting = Decider::new(1).enter();
+            let _acting = DecisionSlot::new(1).enter();
             let mut place = store.at_work();
             // Waits for the case's word, with `pause` between its reads;
             // `false` where the case left. The wait for its job is one
@@ -5853,7 +5856,7 @@ fn a_places_apply_reads_behind_a_watchs_frames_beside_a_job_that_begins() {
             }
         });
         let _leaves = Leaves(left);
-        let _acting = Decider::new(0).enter();
+        let _acting = DecisionSlot::new(0).enter();
         let place = store.at_work();
         let hand = Hand::new(GatewayId(1));
         let wait_for = |wanted: u64| {
@@ -5916,14 +5919,14 @@ fn a_places_apply_at_the_other_files_measured() {
         let others = if watched { 1..files } else { 0..0 };
         let _watches: Vec<AtWork> = others
             .map(|other| {
-                let _acting = Decider::new(other).enter();
+                let _acting = DecisionSlot::new(other).enter();
                 let mut place = store.at_work();
                 issued_at(&store, a, now);
                 assert_ne!(place.look(), Watch::Ended, "a lease stands on the file");
                 place
             })
             .collect();
-        let _acting = Decider::new(0).enter();
+        let _acting = DecisionSlot::new(0).enter();
         let place = store.at_work();
         let since = Instant::now();
         for _ in 0..CALLS {
@@ -5954,7 +5957,7 @@ fn the_frames_of_a_take_are_told_under_one_world() {
     store.hand(&hand, ids[0], GONE);
     store.hand(&hand, ids[1], GONE);
     at_work.apply();
-    let later = store.world().epoch();
+    let later = store.snapshot().epoch();
     assert!(later > first);
     assert_eq!(UNDER.take(), [first, first], "one load for the take");
     store.hand(&hand, ids[2], GONE);
@@ -5973,7 +5976,7 @@ fn the_leases_an_issue_ends_are_told_under_one_world() {
     // issue ends two, and the one behind it the third.
     let late = now + Duration::from_secs(6);
     issued_at(&store, a, late);
-    let later = store.world().epoch();
+    let later = store.snapshot().epoch();
     assert!(later > first);
     assert_eq!(
         UNDER.take(),
@@ -5992,7 +5995,7 @@ fn the_leases_a_sweep_ends_in_a_file_are_told_under_one_world() {
     let (store, _, ids, first) = under_bed(3, now);
     let ended = LeasesStore::expire(&*store, now + Duration::from_secs(6));
     assert_eq!(ended.len(), ids.len());
-    assert!(store.world().epoch() > first);
+    assert!(store.snapshot().epoch() > first);
     assert_eq!(
         UNDER.take(),
         [first, first, first],
@@ -6016,7 +6019,7 @@ fn an_issues_frames_and_its_ends_are_told_under_a_load_each() {
     // issue applies the handed frame, then ends that lease.
     issued_at(&store, a, now + Duration::from_secs(6));
     drop(at_work);
-    let later = store.world().epoch();
+    let later = store.snapshot().epoch();
     assert!(later > first);
     assert_eq!(UNDER.take(), [first, later], "a load for each run");
 }
@@ -6028,7 +6031,7 @@ fn a_thread_at_work_does_not_wait_for_a_held_turn_before_its_reads() {
     let store = Arc::new(MemoryStore::new());
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&*store, 1);
-    let (t0, world) = (Instant::now(), store.world());
+    let (t0, world) = (Instant::now(), store.snapshot());
     let (began, working) = mpsc::sync_channel(1);
     let (look, asked) = mpsc::sync_channel::<()>(1);
     let (reached, parked) = mpsc::sync_channel(1);
@@ -6137,7 +6140,13 @@ fn a_streams_end_applies_what_it_handed() {
 #[test]
 #[should_panic(expected = "taken first or not at all")]
 fn a_tell_that_takes_a_door_of_the_leases_is_refused_in_a_debug_build() {
-    fn takes_a_door(store: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
+    fn takes_a_door(
+        store: &MemoryStore,
+        _: &StoreSnapshot,
+        _: &Sides,
+        _: Said,
+        _: Option<DecisionSlot>,
+    ) {
         let _live = LeasesStore::live(store, GatewayId(1));
     }
     let store = MemoryStore::new();
@@ -6145,7 +6154,7 @@ fn a_tell_that_takes_a_door_of_the_leases_is_refused_in_a_debug_build() {
     LeasesStore::set_term(&store, 1);
     store.tell_through(takes_a_door);
     let record = booking(GatewayId(1), 0, a, Instant::now());
-    let issued = store.issue_decided(record, store.world().booked_of(a), |_| ());
+    let issued = store.issue_decided(record, store.snapshot().booked_of(a), |_| ());
     let hand = Hand::new(GatewayId(1));
     store.hand(&hand, issued.expect("minted").id, GONE);
 }
@@ -6159,7 +6168,7 @@ fn a_tell_that_takes_a_door_of_the_leases_is_refused_in_a_debug_build() {
 fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
     static HEARD: AtomicUsize = AtomicUsize::new(0);
-    fn counted(_: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
+    fn counted(_: &MemoryStore, _: &StoreSnapshot, _: &Sides, _: Said, _: Option<DecisionSlot>) {
         HEARD.fetch_add(1, SeqCst);
     }
     const ROUNDS: usize = 100_000;
@@ -6177,7 +6186,7 @@ fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&*store, 1);
     store.tell_through(counted);
-    let (gateway, now, world) = (GatewayId(1), Instant::now(), store.world());
+    let (gateway, now, world) = (GatewayId(1), Instant::now(), store.snapshot());
     let marks = [const { AtomicUsize::new(0) }; 4];
     let lease = AtomicU64::new(0);
     let (mut short, mut ran) = (0_usize, 0_usize);
@@ -6258,7 +6267,7 @@ fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
 fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     static HEARD: AtomicUsize = AtomicUsize::new(0);
-    fn counted(_: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
+    fn counted(_: &MemoryStore, _: &StoreSnapshot, _: &Sides, _: Said, _: Option<DecisionSlot>) {
         HEARD.fetch_add(1, SeqCst);
     }
     let store = Arc::new(MemoryStore::new());
@@ -6269,7 +6278,7 @@ fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
     let first = store
         .issue_decided(
             booking(gateway, 0, a, now),
-            store.world().booked_of(a),
+            store.snapshot().booked_of(a),
             |_| (),
         )
         .expect("minted under the store's term");
@@ -6298,7 +6307,7 @@ fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
         // Another holder is parked under the turn, in an issue's hook.
         scope.spawn(move || {
             let record = booking(gateway, 0, a, now);
-            let issued = store.issue_decided(record, store.world().booked_of(a), |_| {
+            let issued = store.issue_decided(record, store.snapshot().booked_of(a), |_| {
                 reached.send(()).expect("the case hears the issue");
                 word.recv_timeout(PATIENCE)
                     .expect("the case lets the issuer go");
@@ -6329,7 +6338,7 @@ fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
 #[test]
 fn the_store_is_printed_from_under_its_leases_turn() {
     thread_local!(static PRINTED: RefCell<String> = const { RefCell::new(String::new()) });
-    fn prints(store: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
+    fn prints(store: &MemoryStore, _: &StoreSnapshot, _: &Sides, _: Said, _: Option<DecisionSlot>) {
         PRINTED.with(|printed| *printed.borrow_mut() = format!("{store:?}"));
     }
     let store = MemoryStore::new();
@@ -6337,7 +6346,7 @@ fn the_store_is_printed_from_under_its_leases_turn() {
     LeasesStore::set_term(&store, 1);
     store.tell_through(prints);
     let record = booking(GatewayId(1), 0, a, Instant::now());
-    let issued = store.issue_decided(record, store.world().booked_of(a), |_| ());
+    let issued = store.issue_decided(record, store.snapshot().booked_of(a), |_| ());
     let hand = Hand::new(GatewayId(1));
     store.hand(&hand, issued.expect("minted").id, GONE);
     let under = PRINTED.with(|printed| printed.borrow().clone());
@@ -6371,7 +6380,7 @@ fn frames_handed_from_other_threads_are_all_applied_whoever_is_at_work() {
         }
         // The deciding thread: at work for two rounds of three, away for
         // the third, so both the thread at work and the hands apply.
-        let world = store.world();
+        let world = store.snapshot();
         for round in 0..ROUNDS {
             let _at_work = (round % 3 != 0).then(|| store.at_work());
             for stream in &streams {
@@ -6396,7 +6405,7 @@ fn frames_handed_from_other_threads_are_all_applied_whoever_is_at_work() {
 fn a_leases_events_are_told_under_its_files_decider() {
     let issue = |store: &MemoryStore, a| {
         let record = booking(GatewayId(1), 0, a, Instant::now());
-        let issued = store.issue_decided(record, store.world().booked_of(a), |_| ());
+        let issued = store.issue_decided(record, store.snapshot().booked_of(a), |_| ());
         issued.expect("minted under the store's term").id
     };
     let store = MemoryStore::new().with_deciders(4);
@@ -6406,7 +6415,7 @@ fn a_leases_events_are_told_under_its_files_decider() {
     // One lease issued by a thread that acts as the fourth decider, one by
     // a thread that names none: the first file's.
     let fourth = {
-        let _acting = Decider::new(3).enter();
+        let _acting = DecisionSlot::new(3).enter();
         issue(&store, a)
     };
     let first = issue(&store, a);
@@ -6414,13 +6423,16 @@ fn a_leases_events_are_told_under_its_files_decider() {
     let hand = Hand::new(GatewayId(1));
     store.hand(&hand, fourth, GONE);
     store.hand(&hand, first, GONE);
-    assert_eq!(told_by(), [Some(Decider::new(3)), Some(Decider::new(0))]);
+    assert_eq!(
+        told_by(),
+        [Some(DecisionSlot::new(3)), Some(DecisionSlot::new(0))]
+    );
     let plain = MemoryStore::new();
     let a = ready(&plain, "http://a:1");
     LeasesStore::set_term(&plain, 1);
     plain.tell_through(heard);
     let named = {
-        let _acting = Decider::new(3).enter();
+        let _acting = DecisionSlot::new(3).enter();
         issue(&plain, a)
     };
     plain.hand(&Hand::new(GatewayId(1)), named, GONE);
@@ -6445,14 +6457,20 @@ fn told_across(store: &MemoryStore, lease: LeaseId, said: Option<Said>) {
 
 #[test]
 fn a_lease_is_told_issued_before_any_holder_ends_it() {
-    fn ended(store: &MemoryStore, _: &World, found: &Sides, said: Said, _: Option<Decider>) {
+    fn ended(
+        store: &MemoryStore,
+        _: &StoreSnapshot,
+        found: &Sides,
+        said: Said,
+        _: Option<DecisionSlot>,
+    ) {
         told_across(store, found.record.lease.id, Some(said));
     }
     let store = MemoryStore::new();
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&store, 1);
     store.tell_through(ended);
-    let (t0, world) = (Instant::now(), store.world());
+    let (t0, world) = (Instant::now(), store.snapshot());
     let issue = |at: Instant, parked: &dyn Fn()| {
         let record = LeaseRecord {
             dispatch_deadline: t0 + Duration::from_millis(1),
@@ -6507,8 +6525,8 @@ fn a_lease_is_told_issued_before_any_holder_ends_it() {
 /// decider's name, while another decider's turn is held.
 #[test]
 fn a_decider_issues_into_its_own_file_and_a_leases_id_names_it() {
-    static NAMES: Mutex<Vec<(LeaseId, Option<Decider>)>> = Mutex::new(Vec::new());
-    fn named(_: &MemoryStore, _: &World, found: &Sides, _: Said, by: Option<Decider>) {
+    static NAMES: Mutex<Vec<(LeaseId, Option<DecisionSlot>)>> = Mutex::new(Vec::new());
+    fn named(_: &MemoryStore, _: &StoreSnapshot, found: &Sides, _: Said, by: Option<DecisionSlot>) {
         let mut names = NAMES.lock().expect("no case fails under it");
         names.push((found.record.lease.id, by));
     }
@@ -6519,9 +6537,9 @@ fn a_decider_issues_into_its_own_file_and_a_leases_id_names_it() {
     store.tell_through(named);
     let (gateway, now) = (GatewayId(1), Instant::now());
     let issue = |decider: u8| {
-        let _acting = Decider::new(decider).enter();
+        let _acting = DecisionSlot::new(decider).enter();
         let record = booking(gateway, 0, a, now);
-        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
+        let lease = store.issue_decided(record, store.snapshot().booked_of(a), |_| ());
         lease.expect("minted under the store's term").id
     };
     let (second, third) = (issue(1), issue(2));
@@ -6538,9 +6556,9 @@ fn a_decider_issues_into_its_own_file_and_a_leases_id_names_it() {
         let store = &store;
         // The third decider holds its own turn, parked in an issue's hook.
         scope.spawn(move || {
-            let _acting = Decider::new(2).enter();
+            let _acting = DecisionSlot::new(2).enter();
             let record = booking(gateway, 0, a, now);
-            let issued = store.issue_decided(record, store.world().booked_of(a), |_| {
+            let issued = store.issue_decided(record, store.snapshot().booked_of(a), |_| {
                 reached.send(()).expect("the case hears the issue");
                 word.recv_timeout(PATIENCE)
                     .expect("the case lets the issuer go");
@@ -6557,7 +6575,10 @@ fn a_decider_issues_into_its_own_file_and_a_leases_id_names_it() {
     });
     store.hand(&Hand::new(gateway), third, GONE);
     let names = NAMES.lock().expect("no case fails under it");
-    let (second, third) = ((second, Decider::new(1)), (third, Decider::new(2)));
+    let (second, third) = (
+        (second, DecisionSlot::new(1)),
+        (third, DecisionSlot::new(2)),
+    );
     assert_eq!(*names, [second, third].map(|(lease, by)| (lease, Some(by))));
     drop(names);
     assert_eq!(LeasesStore::live(&*store, gateway), 1);
@@ -6670,7 +6691,7 @@ fn no_thread_acts_at_a_file_beside_the_thread_at_work() {
 fn a_decider_takes_up_its_work_behind_a_hand_that_tells_at_its_file() {
     type Ends = (mpsc::SyncSender<()>, mpsc::Receiver<()>);
     static ENDS: Mutex<Option<Ends>> = Mutex::new(None);
-    fn parks(_: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
+    fn parks(_: &MemoryStore, _: &StoreSnapshot, _: &Sides, _: Said, _: Option<DecisionSlot>) {
         let ends = ENDS.lock().expect("no case fails under it").take();
         if let Some((reached, word)) = ends {
             reached.send(()).expect("the case hears the tell");
@@ -6685,9 +6706,9 @@ fn a_decider_takes_up_its_work_behind_a_hand_that_tells_at_its_file() {
     let (gateway, now) = (GatewayId(1), Instant::now());
     // A lease on the second decider's file.
     let lease = {
-        let _acting = Decider::new(1).enter();
+        let _acting = DecisionSlot::new(1).enter();
         let record = booking(gateway, 0, a, now);
-        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
+        let lease = store.issue_decided(record, store.snapshot().booked_of(a), |_| ());
         lease.expect("minted under the store's term").id
     };
     let (reached, parked) = mpsc::sync_channel(1);
@@ -6708,7 +6729,7 @@ fn a_decider_takes_up_its_work_behind_a_hand_that_tells_at_its_file() {
         told.expect("the hand's tell");
         // The file's decider takes up its work behind that turn.
         scope.spawn(move || {
-            let _acting = Decider::new(1).enter();
+            let _acting = DecisionSlot::new(1).enter();
             let at_work = store.at_work();
             began.send(()).expect("the case waits for the seat");
             drop(at_work);
@@ -6787,8 +6808,8 @@ fn a_full_ring_stops_its_hand_until_the_thread_at_work_applied() {
 /// decider. A file whose decider is at work is left to it.
 #[test]
 fn the_sweep_ends_a_resting_files_due_leases_under_its_deciders_name() {
-    static NAMES: Mutex<Vec<(LeaseId, Option<Decider>)>> = Mutex::new(Vec::new());
-    fn named(_: &MemoryStore, _: &World, found: &Sides, _: Said, by: Option<Decider>) {
+    static NAMES: Mutex<Vec<(LeaseId, Option<DecisionSlot>)>> = Mutex::new(Vec::new());
+    fn named(_: &MemoryStore, _: &StoreSnapshot, found: &Sides, _: Said, by: Option<DecisionSlot>) {
         let mut names = NAMES.lock().expect("no case fails under it");
         names.push((found.record.lease.id, by));
     }
@@ -6798,9 +6819,9 @@ fn the_sweep_ends_a_resting_files_due_leases_under_its_deciders_name() {
     store.tell_through(named);
     let (gateway, now) = (GatewayId(1), Instant::now());
     let issue = |decider: u8| {
-        let _acting = Decider::new(decider).enter();
+        let _acting = DecisionSlot::new(decider).enter();
         let record = booking(gateway, 0, a, now);
-        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
+        let lease = store.issue_decided(record, store.snapshot().booked_of(a), |_| ());
         lease.expect("minted under the store's term").id
     };
     let (first, second) = (issue(0), issue(1));
@@ -6821,7 +6842,7 @@ fn the_sweep_ends_a_resting_files_due_leases_under_its_deciders_name() {
         let store = &store;
         // The first decider is at work: the sweep leaves its file to it.
         scope.spawn(move || {
-            let _acting = Decider::new(0).enter();
+            let _acting = DecisionSlot::new(0).enter();
             let _at_work = store.at_work();
             began.send(()).expect("the case waits for the seat");
             asked
@@ -6836,7 +6857,10 @@ fn the_sweep_ends_a_resting_files_due_leases_under_its_deciders_name() {
     });
     assert_eq!(ended(&store), [first]);
     let names = NAMES.lock().expect("no case fails under it");
-    let told = [(second, Decider::new(1)), (first, Decider::new(0))];
+    let told = [
+        (second, DecisionSlot::new(1)),
+        (first, DecisionSlot::new(0)),
+    ];
     assert_eq!(*names, told.map(|(lease, by)| (lease, Some(by))));
     drop(names);
     assert_eq!(in_flight(&store), [(a, 0)]);
@@ -6851,9 +6875,9 @@ fn a_gateways_doors_reach_its_leases_in_every_file() {
     LeasesStore::set_term(&store, 1);
     let (ours, theirs, now) = (GatewayId(1), GatewayId(2), Instant::now());
     let issue = |decider: u8, gateway| {
-        let _acting = Decider::new(decider).enter();
+        let _acting = DecisionSlot::new(decider).enter();
         let record = booking(gateway, 0, a, now);
-        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
+        let lease = store.issue_decided(record, store.snapshot().booked_of(a), |_| ());
         lease.expect("minted under the store's term").id
     };
     let leases = [issue(0, ours), issue(1, ours), issue(2, ours)];
@@ -6885,7 +6909,7 @@ fn a_followed_terms_start_raises_every_file_and_starts_the_blocks_under_it() {
     term.set_term(3);
     let (gateway, now) = (GatewayId(1), Instant::now());
     let issue = |decider: u8, under: u64| {
-        let _acting = Decider::new(decider).enter();
+        let _acting = DecisionSlot::new(decider).enter();
         standby.issue_decided(lease(gateway, 0, under, now), None, |_| ())
     };
     issue(1, 3).expect("minted under the term the standby stood at");
@@ -6910,8 +6934,8 @@ fn a_followed_terms_start_raises_every_file_and_starts_the_blocks_under_it() {
 /// same block.
 #[test]
 fn a_lease_of_the_term_before_is_found_in_its_file_behind_a_rise() {
-    static NAMES: Mutex<Vec<(LeaseId, Option<Decider>)>> = Mutex::new(Vec::new());
-    fn named(_: &MemoryStore, _: &World, found: &Sides, _: Said, by: Option<Decider>) {
+    static NAMES: Mutex<Vec<(LeaseId, Option<DecisionSlot>)>> = Mutex::new(Vec::new());
+    fn named(_: &MemoryStore, _: &StoreSnapshot, found: &Sides, _: Said, by: Option<DecisionSlot>) {
         let mut names = NAMES.lock().expect("no case fails under it");
         names.push((found.record.lease.id, by));
     }
@@ -6921,12 +6945,12 @@ fn a_lease_of_the_term_before_is_found_in_its_file_behind_a_rise() {
     store.tell_through(named);
     let (gateway, now) = (GatewayId(1), Instant::now());
     let issue = |decider: u8, term: u64| {
-        let _acting = Decider::new(decider).enter();
+        let _acting = DecisionSlot::new(decider).enter();
         let record = LeaseRecord {
             target: a,
             ..lease(gateway, 0, term, now)
         };
-        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
+        let lease = store.issue_decided(record, store.snapshot().booked_of(a), |_| ());
         lease.expect("minted under the store's term").id
     };
     // The third decider claims the first block of term 1, the second
@@ -6940,7 +6964,10 @@ fn a_lease_of_the_term_before_is_found_in_its_file_behind_a_rise() {
     store.hand(&hand, before, GONE);
     store.hand(&hand, after, GONE);
     let names = NAMES.lock().expect("no case fails under it");
-    let told = [(before, Decider::new(2)), (after, Decider::new(1))];
+    let told = [
+        (before, DecisionSlot::new(2)),
+        (after, DecisionSlot::new(1)),
+    ];
     assert_eq!(*names, told.map(|(lease, by)| (lease, Some(by))));
     drop(names);
     assert_eq!(LeasesStore::live(&store, gateway), 0);
@@ -6983,12 +7010,12 @@ fn a_door_files_no_id_whose_file_a_claim_would_name_anew() {
     // The second decider claims the first block of term 3: an id of that
     // block names its file, and the doors file it there.
     let minted = {
-        let _acting = Decider::new(1).enter();
+        let _acting = DecisionSlot::new(1).enter();
         let record = LeaseRecord {
             target: a,
             ..lease(gateway, 0, 3, now)
         };
-        let issued = store.issue_decided(record, store.world().booked_of(a), |_| ());
+        let issued = store.issue_decided(record, store.snapshot().booked_of(a), |_| ());
         issued.expect("minted under the store's term").id
     };
     assert_eq!(minted, LeaseId(3 << 32 | 1));
@@ -7016,7 +7043,7 @@ fn a_door_that_waited_behind_a_claim_files_its_id_where_the_claim_named_it() {
     let store = MemoryStore::new().with_deciders(2);
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&store, 3);
-    let (store, booked) = (&store, store.world().booked_of(a));
+    let (store, booked) = (&store, store.snapshot().booked_of(a));
     let record = LeaseRecord {
         target: a,
         ..lease(gateway, 0, 3, now)
@@ -7030,7 +7057,7 @@ fn a_door_that_waited_behind_a_claim_files_its_id_where_the_claim_named_it() {
         // The first decider claims the first block and is parked under its
         // turn, in its issue's tell.
         scope.spawn(move || {
-            let _acting = Decider::new(0).enter();
+            let _acting = DecisionSlot::new(0).enter();
             let issued = store.issue_decided(record, booked, |_| {
                 reached.send(()).expect("the case hears the tell");
                 word.recv().expect("the case lets the issuer go");
@@ -7042,7 +7069,7 @@ fn a_door_that_waited_behind_a_claim_files_its_id_where_the_claim_named_it() {
         let door = scope.spawn(move || LeasesStore::issue(store, by_hand));
         std::thread::sleep(Duration::from_millis(200));
         // The second decider claims the second block, the id's.
-        let _acting = Decider::new(1).enter();
+        let _acting = DecisionSlot::new(1).enter();
         let second = store.issue_decided(record, booked, |_| ());
         go.send(()).expect("the issuer holds the other end");
         let filed = door.join().expect("the door returns");
@@ -7086,9 +7113,9 @@ fn the_first_leases_of_the_most_deciders_are_far_below_the_terms_mark() {
     LeasesStore::set_term(&store, 1);
     let (gateway, now) = (GatewayId(1), Instant::now());
     let first = |decider: u8| {
-        let _acting = Decider::new(decider).enter();
+        let _acting = DecisionSlot::new(decider).enter();
         let record = booking(gateway, 0, a, now);
-        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
+        let lease = store.issue_decided(record, store.snapshot().booked_of(a), |_| ());
         lease.expect("minted under the store's term").id.0 & 0xffff_ffff
     };
     let counters: Vec<u64> = (0..=u8::MAX).map(first).collect();
@@ -7105,7 +7132,7 @@ fn the_first_leases_of_the_most_deciders_are_far_below_the_terms_mark() {
 fn the_files_laid_for_deciders_keep_the_word_and_the_fault_count() {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     static HEARD: AtomicUsize = AtomicUsize::new(0);
-    fn counted(_: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
+    fn counted(_: &MemoryStore, _: &StoreSnapshot, _: &Sides, _: Said, _: Option<DecisionSlot>) {
         HEARD.fetch_add(1, SeqCst);
     }
     let store = MemoryStore::new();
@@ -7117,7 +7144,7 @@ fn the_files_laid_for_deciders_keep_the_word_and_the_fault_count() {
     LeasesStore::set_term(&store, 1);
     let (gateway, now) = (GatewayId(1), Instant::now());
     let record = booking(gateway, 0, a, now);
-    let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
+    let lease = store.issue_decided(record, store.snapshot().booked_of(a), |_| ());
     let lease = lease.expect("minted under the store's term").id;
     store.hand(&Hand::new(gateway), lease, GONE);
     assert_eq!(HEARD.load(SeqCst), 1, "told through the word given before");
@@ -7145,7 +7172,7 @@ fn a_store_with_a_lease_on_a_later_file_is_not_laid_again() {
     {
         // A thread that acts as the fourth decider files on the fourth
         // file: the first file stays empty.
-        let (_acting, world) = (Decider::new(3).enter(), store.world());
+        let (_acting, world) = (DecisionSlot::new(3).enter(), store.snapshot());
         let record = booking(GatewayId(1), 0, a, Instant::now());
         let issued = store.issue_decided(record, world.booked_of(a), |_| ());
         issued.expect("minted under the store's term");

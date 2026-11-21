@@ -4,7 +4,7 @@
 
 use std::{collections::hash_map::RandomState, fmt, hash::BuildHasher};
 
-use super::workers::{Maker, WorkerFacts, WorkerRow, WorkerStatus};
+use super::workers::{Registrant, WorkerFacts, WorkerRow, WorkerStatus};
 
 /// A write of a row by a caller that did not make it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,20 +51,20 @@ impl WorkerRow {
     }
 
     /// Whether `caller` made the row. Check before writing a standing row.
-    pub fn made_by(&self, caller: &Maker) -> Result<(), NotMaker<'_>> {
+    pub fn made_by(&self, caller: &Registrant) -> Result<(), NotMaker<'_>> {
         if self.maker == *caller {
             return Ok(());
         }
         Err(match (&self.maker, caller) {
-            (Maker::Control, _) => NotMaker::Control,
-            (Maker::Provider(found), Maker::Provider(own))
+            (Registrant::Control, _) => NotMaker::Control,
+            (Registrant::Provider(found), Registrant::Provider(own))
                 if found.provider() == own.provider() =>
             {
                 NotMaker::AnotherKey {
                     provider: found.provider(),
                 }
             }
-            (Maker::Provider(found), _) => NotMaker::Provider {
+            (Registrant::Provider(found), _) => NotMaker::Provider {
                 provider: found.provider(),
             },
         })
@@ -134,7 +134,7 @@ impl WorkerFacts {
 
     /// An upper bound on the row's wire size. A row within [`Self::ROW_BYTES`]
     /// fits a controller's frame, including when a host writes it in process.
-    pub fn weight(&self, maker: &Maker) -> usize {
+    pub fn weight(&self, maker: &Registrant) -> usize {
         let text = |value: &str| value.len() + Self::FRAME;
         let mut bytes =
             Self::NUMBERS + 2 * text(&self.key) + text(&self.engine) + text(&self.engine_kind);
@@ -153,14 +153,14 @@ impl WorkerFacts {
                 bytes += text(value);
             }
         }
-        if let Maker::Provider(found) = maker {
+        if let Registrant::Provider(found) = maker {
             bytes += text(found.provider()) + text(found.key());
         }
         bytes
     }
 
     /// Check each fact's own bound, then the size of the row with its maker.
-    pub fn bounded(&self, maker: &Maker) -> Result<(), Past> {
+    pub fn bounded(&self, maker: &Registrant) -> Result<(), Past> {
         let past = |fact, why| Err(Past { fact, why });
         if self.key.is_empty() {
             return past("key", "a registration names its worker's URL");
@@ -281,16 +281,16 @@ mod tests {
             demands::DemandFacts,
             view::{Role, WireModes, WorkerId},
         },
-        store::{Maker, Unmade, WorkerFacts, WorkerRow, WorkerStatus},
+        store::{Registrant, Unmade, WorkerFacts, WorkerRow, WorkerStatus},
     };
 
     #[test]
     fn the_rows_maker_passes_and_any_other_caller_is_told_who_made_it() -> Result<(), Unmade> {
         let callers = [
-            Maker::Control,
-            Maker::provider("pool", "first")?,
-            Maker::provider("pool", "second")?,
-            Maker::provider("other", "first")?,
+            Registrant::Control,
+            Registrant::provider("pool", "first")?,
+            Registrant::provider("pool", "second")?,
+            Registrant::provider("other", "first")?,
         ];
         let control = Err((
             NotMaker::Control,
@@ -305,9 +305,9 @@ mod tests {
             "the row is provider pool's: its worker is changed at the provider's source",
         ));
         for (maker, expected) in [
-            (Maker::Control, [Ok(()), control, control, control]),
+            (Registrant::Control, [Ok(()), control, control, control]),
             (
-                Maker::provider("pool", "first")?,
+                Registrant::provider("pool", "first")?,
                 [provider, Ok(()), another_key, provider],
             ),
         ] {
@@ -495,7 +495,7 @@ mod tests {
                 },
             ),
         ];
-        let maker = Maker::Control;
+        let maker = Registrant::Control;
         for (fact, bound, why, set) in limits {
             let mut facts = stated();
             set(&mut facts, bound);
@@ -599,10 +599,10 @@ mod tests {
             .into(),
             ..stated()
         };
-        assert_eq!(facts.weight(&Maker::Control), 270);
+        assert_eq!(facts.weight(&Registrant::Control), 270);
         facts.signals.scrape_interval_ms = 1;
-        assert_eq!(facts.weight(&Maker::Control), 279);
-        assert_eq!(facts.weight(&Maker::provider("pool", "work")?), 297);
+        assert_eq!(facts.weight(&Registrant::Control), 279);
+        assert_eq!(facts.weight(&Registrant::provider("pool", "work")?), 297);
         Ok(())
     }
 
@@ -611,7 +611,7 @@ mod tests {
         use super::Past;
 
         let mut facts = stated();
-        let maker = Maker::Control;
+        let maker = Registrant::Control;
         facts.models = (0..129).map(|id| id.to_string()).collect();
         assert_eq!(facts.bounded(&maker), Ok(()));
 
@@ -630,7 +630,7 @@ mod tests {
         );
         facts.models[62].pop();
         assert_eq!(
-            facts.bounded(&Maker::provider("pool", "work").expect("a maker")),
+            facts.bounded(&Registrant::provider("pool", "work").expect("a maker")),
             Err(Past {
                 fact: "row",
                 why: "a row is at most 16384 bytes on the wire",

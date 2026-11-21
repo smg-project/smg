@@ -27,15 +27,16 @@ use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec, PRESETS},
     engine::{
-        AffinityFacts, Candidate, Constraints, Door, Engine, Health, LoadRow, NamedAffinity,
-        NamedHolder, PairPools, PoolFacts, Request, RequestFacts, Role, Scratch, SignalSource,
-        Target, WireModes, WorkerId,
+        AffinityFacts, Candidate, Constraints, Engine, Health, LoadRow, NamedAffinity, NamedHolder,
+        PairPools, PoolFacts, Request, RequestFacts, Role, Scratch, SignalSource,
+        StoreBackedEngine, Target, WireModes, WorkerId,
     },
+    stages::Lifecycle,
     store::{
         Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, PairBuffers,
         PairingDescriptor, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    tracking::{Handle, Lease, Lifecycle, Outcome, Side, TransportClass},
+    tracking::{DecisionGuard, Lease, Outcome, Side, TransportClass},
 };
 
 #[global_allocator]
@@ -698,7 +699,7 @@ fn a_pair_build_with_its_table_allocates_nothing_after_the_first() {
         (2, 64)
     );
     // Each prefill class lists its transport's decodes and the silent ones.
-    let world = store.world();
+    let world = store.snapshot();
     let classes = world.pairs("m").expect("the model's classes");
     assert_eq!((classes.classes(), classes.entries()), (2, 4));
     assert_eq!(pools.table.validate(), Ok(()));
@@ -852,12 +853,12 @@ fn a_lent_view_from_the_store_after_the_first_allocates_nothing() {
             };
             // The first view sizes the host's buffers: the mask and the
             // column.
-            store.with_world(|world| {
+            store.with_snapshot(|world| {
                 let first = world.view("m", Role::Single, &ask, false, &mut out);
                 assert!(first.is_some());
             });
             let (read, allocations) = allocations_during(|| {
-                store.with_world(|world| {
+                store.with_snapshot(|world| {
                     let view = world
                         .view("m", Role::Single, &ask, false, &mut out)
                         .expect("the pool");
@@ -888,7 +889,7 @@ fn a_request_held_from_its_decision_to_its_completion_allocates_nothing() {
         document.generation = 1;
         let spec = AppliedSpec::validate(&document).expect("the preset validates");
         store.apply(spec).expect("the first generation");
-        let door = Door::new(Arc::new(store));
+        let door = StoreBackedEngine::new(Arc::new(store));
         let now = opened + Duration::from_secs(1);
         let request = Request {
             id: b"held",
@@ -899,7 +900,7 @@ fn a_request_held_from_its_decision_to_its_completion_allocates_nothing() {
             constraints: Constraints::default(),
         };
         let serve = || {
-            let decided = Handle::decide(&door, GatewayId(1), &request, now);
+            let decided = DecisionGuard::decide(&door, GatewayId(1), &request, now);
             let mut handle = decided.expect("a decision");
             let target = handle.take(0).expect("a pick over the pool");
             handle.dispatched(now);

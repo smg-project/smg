@@ -11,8 +11,7 @@ use smg_policy_controller::{
     document::Needs,
     engine::{Candidate, RequestFacts, Scorer, TieBand},
     service::controller,
-    stages::{Catalog, CatalogError},
-    tracking::Lifecycle,
+    stages::{Lifecycle, StageRegistry, StageRegistryError},
 };
 
 /// The process's allocator, the one the stock controller's binary registers,
@@ -114,14 +113,14 @@ impl Scorer for Pack {
 
 /// The stock build's stages and this file's scorer, under the name a policy
 /// document writes.
-fn stages() -> Result<Catalog, CatalogError> {
-    let mut stages = Catalog::builtin();
+fn stages() -> Result<StageRegistry, StageRegistryError> {
+    let mut stages = StageRegistry::builtin();
     stages.scorer("pack", || Box::new(Pack))?;
     Ok(stages)
 }
 
 /// The crate's command line and run loop over this build's stages.
-fn main() -> Result<ExitCode, CatalogError> {
+fn main() -> Result<ExitCode, StageRegistryError> {
     Ok(controller::run(stages()?))
 }
 
@@ -334,7 +333,7 @@ mod tests {
         /// The first target of one decision by the engine the store stands
         /// under: the generation a controller applied to it.
         fn pick_standing(&self) -> Option<WorkerId> {
-            let world = self.store.world();
+            let world = self.store.snapshot();
             self.pick(world.spec().engine())
         }
 
@@ -495,7 +494,7 @@ mod tests {
         // The start's own door: the document is judged over the stages the
         // bind was handed and applied to the controller's store.
         own.spec_file(POLICY_FILE).await.expect("the document runs");
-        assert_eq!(own.store().world().spec().generation(), 1);
+        assert_eq!(own.store().snapshot().spec().generation(), 1);
         // The controller's store, fed as its ingestion feeds it. Its workers
         // name no threshold of their own: the document's defaults stand.
         let mut fleet = Fleet::over(own.store(), Overload::default());

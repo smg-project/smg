@@ -82,13 +82,13 @@ use crate::{
         view::{Candidate, HashKind, NamedAffinity, NamedHolder, Role, WorkerId},
         warm_up::{WarmRule, Warming},
     },
-    predictor::Predictor,
     store::{
         kv_events::{Admission, BatchFacts, BatchOutcome, KvCursor, RankCursor, ResyncReason},
+        snapshot::Naming,
         workers::WorkerRow,
-        world::Naming,
         GatewayId,
     },
+    tracking::prefix_predictor::PrefixPredictor,
     Draw,
 };
 
@@ -488,8 +488,8 @@ fn below(draw: &mut Draw, under: u32) -> u32 {
 }
 
 /// The rows a naming wrote in the affinity column's place
-/// ([`World::name`](crate::store::World::name)), with the naming's own
-/// buffers: a host keeps it across decisions beside its view.
+/// ([`StoreSnapshot::name`](crate::store::StoreSnapshot::name)), with the
+/// naming's own buffers: a host keeps it across decisions beside its view.
 #[derive(Debug, Default)]
 pub struct Named {
     /// The rows that hold a leading part of the request, ascending by row.
@@ -571,7 +571,7 @@ impl Named {
 /// a record's guard when it needs all three. A decision takes a record's
 /// guard alone.
 pub(super) struct Predicted {
-    record: RwLock<Predictor>,
+    record: RwLock<PrefixPredictor>,
     /// The record's bound as the last pool set it: a pool's build takes
     /// the record's guard, which the deciders hold, only where it moved.
     bound: AtomicUsize,
@@ -638,7 +638,7 @@ impl Predicted {
         }
     }
 
-    fn sweep(&self, record: &mut Predictor) {
+    fn sweep(&self, record: &mut PrefixPredictor) {
         if self.sweeping.load(Ordering::Relaxed) && record.sweep(Self::SWEEP) < Self::SWEEP {
             self.sweeping.store(false, Ordering::Relaxed);
         }
@@ -1532,7 +1532,7 @@ impl Predicted {
         usable: &dyn Fn(WorkerId) -> bool,
         named: &mut Named,
     ) -> u32 {
-        Predictor::fold_into(&mut named.keys, naming.namespace_seed, naming.block_hashes);
+        PrefixPredictor::fold_into(&mut named.keys, naming.namespace_seed, naming.block_hashes);
         let tick = (naming.now_micros >> 20) as u16;
         let record = self.record.read();
         let deepest = record.deepest_among(&named.keys, usable);
@@ -1834,7 +1834,7 @@ impl Table {
         self.predicted
             .retain(|_, predicted| predicted.strong_count() != 0);
         let predicted = Arc::new(Predicted {
-            record: RwLock::new(Predictor::new(bound)),
+            record: RwLock::new(PrefixPredictor::new(bound)),
             bound: AtomicUsize::new(bound),
             sweeping: AtomicBool::new(false),
             #[cfg(test)]

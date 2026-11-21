@@ -3,7 +3,7 @@
 //! another would do, with nothing applied, and `GET /policy/snapshot` tells
 //! the worker rows the controller's store holds.
 //!
-//! The three stand on the policy crate's operators' door ([`SpecDoor`])
+//! The three stand on the policy crate's operators' door ([`DocumentManager`])
 //! and its snapshot of the rows, which the start leaves in the context
 //! beside the controller's store. Under the classic policies none stands,
 //! and each route refuses by one code that names the setting. Nothing is
@@ -31,8 +31,9 @@ use serde::{Deserialize, Serialize};
 use smg_policy_controller::{
     document::{
         operator::{
-            snapshot::{self, Asked, Rows},
-            Document, DryRun, Format, NeedsRow, SpecDoor, Turn, Unanswered, MAX_DOCUMENT_BYTES,
+            snapshot::{self, Rows, WorkerRowsQuery},
+            Document, DocumentManager, DryRun, Format, NeedsRow, Turn, Unanswered,
+            MAX_DOCUMENT_BYTES,
         },
         Digest, Needs,
     },
@@ -62,14 +63,14 @@ const SNAPSHOT_ROWS: usize = 1_024;
 /// The operators' door over the controller's store, and the store for its
 /// rows, each call behind the turn of its kind.
 pub(crate) struct Operators {
-    door: Arc<SpecDoor>,
+    door: Arc<DocumentManager>,
     store: Arc<MemoryStore>,
     dry_runs: Turn,
     snapshots: Turn,
 }
 
 impl Operators {
-    pub(crate) fn new(store: Arc<MemoryStore>, door: Arc<SpecDoor>) -> Self {
+    pub(crate) fn new(store: Arc<MemoryStore>, door: Arc<DocumentManager>) -> Self {
         Self {
             door,
             store,
@@ -398,7 +399,7 @@ pub(crate) async fn snapshot(
         let (rows, serving) = store.rows_serving(&asked.models, asked.limit);
         serde_json::to_vec(&Snapshot {
             page: snapshot::told(&asked, Rows::Told(rows, serving), now),
-            generation: store.world().spec().generation(),
+            generation: store.snapshot().spec().generation(),
         })
     })
     .await;
@@ -417,17 +418,17 @@ pub(crate) async fn snapshot(
 
 /// What `query` asks, or the refusal of a key by its name. The models pass
 /// the policy crate's check of a snapshot's list, the one a served snapshot
-/// reads ([`Asked::refused`]). A `limit` is at least one: a served call
-/// reads zero as no limit, and this route keeps its cap. A `limit` past the
-/// cap is the cap, and an empty id between commas is no id.
-fn asked(query: &SnapshotQuery) -> Result<Asked, String> {
+/// reads ([`WorkerRowsQuery::refused`]). A `limit` is at least one: a served
+/// call reads zero as no limit, and this route keeps its cap. A `limit` past
+/// the cap is the cap, and an empty id between commas is no id.
+fn asked(query: &SnapshotQuery) -> Result<WorkerRowsQuery, String> {
     let models = query.models.as_deref().unwrap_or_default().split(',');
     let models: Vec<String> = models
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .map(str::to_owned)
         .collect();
-    if let Some(why) = Asked::refused(&models) {
+    if let Some(why) = WorkerRowsQuery::refused(&models) {
         return Err(format!("models: {why}"));
     }
     if query.limit == Some(0) {
@@ -435,7 +436,7 @@ fn asked(query: &SnapshotQuery) -> Result<Asked, String> {
             "limit: a snapshot tells at least one row, and {SNAPSHOT_ROWS} where none is named"
         ));
     }
-    Ok(Asked {
+    Ok(WorkerRowsQuery {
         models,
         limit: query.limit.unwrap_or(SNAPSHOT_ROWS).min(SNAPSHOT_ROWS),
     })

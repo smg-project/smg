@@ -2798,8 +2798,8 @@ async fn a_link_refuses_a_frame_out_of_the_calls_ranges_and_stands() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_handle_over_a_link_ends_each_lease_on_the_worker_that_served() {
     use smg_policy_controller::{
-        engine::{Door, Request, RequestFacts},
-        tracking::{Handle, Outcome, Side, TransportClass},
+        engine::{Request, RequestFacts, StoreBackedEngine},
+        tracking::{DecisionGuard, Outcome, Side, TransportClass},
     };
 
     const GATEWAY: &str = "fleet-handle";
@@ -2818,7 +2818,10 @@ async fn a_handle_over_a_link_ends_each_lease_on_the_worker_that_served() {
                 constraints: Default::default(),
             };
             let started = Instant::now();
-            let held = Box::pin(Handle::<&Door>::asked(&link, &asked, started, ROOM)).await;
+            let held = Box::pin(DecisionGuard::<&StoreBackedEngine>::asked(
+                &link, &asked, started, ROOM,
+            ))
+            .await;
             let mut handle = held.expect("the controller's decision");
             let taken = handle.take(0).expect("a picked worker");
             let alternate = handle.decision().pick().expect("a pick").targets.as_slice()[1];
@@ -2934,7 +2937,7 @@ async fn the_client_at_a_replica_that_does_not_lead_is_told_the_leader() {
 /// What a watcher's store holds of its controller's workers, by id: each
 /// row's facts, status and revision.
 fn watched(watcher: &Watcher) -> Vec<(WorkerId, WorkerFacts, WorkerStatus, u64)> {
-    let (_, mut rows) = WorkersStore::snapshot(&**watcher.store());
+    let (_, mut rows) = WorkersStore::all_rows(&**watcher.store());
     rows.sort_by_key(|row| row.id.0);
     rows.into_iter()
         .map(|row| (row.id, row.facts, row.status, row.revision))
@@ -3221,8 +3224,7 @@ mod hosted {
             shared::OpenDecisions,
             wasm::{self, PluginSpec, WasmScorer},
         },
-        stages::Catalog,
-        tracking::Lifecycle,
+        stages::{Lifecycle, StageRegistry},
     };
 
     use super::{
@@ -3388,7 +3390,7 @@ mod hosted {
             spec.connect_micros = 5_000_000;
             let served = grpc::Plugin::load(&runtime, spec).expect("the served plugin loads");
 
-            let mut catalog = Catalog::builtin();
+            let mut catalog = StageRegistry::builtin();
             catalog
                 .scorer(NAMESPACED, || Box::new(OfNamespace))
                 .expect("a free name");
@@ -3666,9 +3668,9 @@ mod embedded {
 
     use smg_policy_controller::{
         document::PolicySpec,
-        engine::{fingerprint, Constraints, Door, Request, RequestFacts, WorkerId},
+        engine::{fingerprint, Constraints, Request, RequestFacts, StoreBackedEngine, WorkerId},
         store::{GatewayId, HealthSink, LeaseState, LeasesStore},
-        tracking::{Handle, Outcome, ReleaseReason, Side, TransportClass},
+        tracking::{DecisionGuard, Outcome, ReleaseReason, Side, TransportClass},
     };
 
     use super::{
@@ -3733,7 +3735,7 @@ mod embedded {
             .await
             .expect("a probe turn reads the fleet ready");
             let store = Arc::clone(fleet.store());
-            let door = Door::new(Arc::clone(&store));
+            let door = StoreBackedEngine::new(Arc::clone(&store));
             let live = || LeasesStore::live(store.as_ref(), gateway);
             let booked = |fleet: &Embedded| -> Vec<u32> {
                 let rows = fleet.read(MODEL, gateway);
@@ -3746,7 +3748,7 @@ mod embedded {
             let ids: [&[u8]; 3] = [b"held-0", b"held-1", b"held-2"];
             let mut held = Vec::new();
             for id in ids {
-                let decided = Handle::decide(&door, gateway, &asked(id), Instant::now());
+                let decided = DecisionGuard::decide(&door, gateway, &asked(id), Instant::now());
                 let mut handle = decided.expect("a decision");
                 let target = handle.take(0).expect("a pick over the fleet");
                 let engine = fleet.engine_of(target.id);
@@ -3773,7 +3775,7 @@ mod embedded {
             assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
 
             // A commit that refuses every target releases the lease.
-            let decided = Handle::decide(&door, gateway, &asked(b"refused"), Instant::now());
+            let decided = DecisionGuard::decide(&door, gateway, &asked(b"refused"), Instant::now());
             let mut handle = decided.expect("a decision");
             assert_eq!(live(), 1, "the issue files the lease");
             handle.released(ReleaseReason::CommitFailed, Instant::now());
@@ -3782,7 +3784,7 @@ mod embedded {
 
             // A client that leaves before the dispatch: a host that knows
             // says so.
-            let decided = Handle::decide(&door, gateway, &asked(b"left"), Instant::now());
+            let decided = DecisionGuard::decide(&door, gateway, &asked(b"left"), Instant::now());
             let mut handle = decided.expect("a decision");
             assert_eq!(live(), 1);
             handle.released(ReleaseReason::ClientGone, Instant::now());
@@ -3791,7 +3793,7 @@ mod embedded {
 
             // A request its host lets go with no word: the lease is given
             // up where the handle is dropped.
-            let decided = Handle::decide(&door, gateway, &asked(b"dropped"), Instant::now());
+            let decided = DecisionGuard::decide(&door, gateway, &asked(b"dropped"), Instant::now());
             assert_eq!((decided.is_ok(), live()), (true, 1));
             drop(decided);
             assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
@@ -3801,7 +3803,7 @@ mod embedded {
             // dispatch: the lease ends as cancelled, no completion of
             // class ok.
             let then = Instant::now();
-            let decided = Handle::decide(&door, gateway, &asked(b"second"), then);
+            let decided = DecisionGuard::decide(&door, gateway, &asked(b"second"), then);
             let mut handle = decided.expect("a decision");
             let first = handle.take(0).expect("a pick over the fleet");
             let second = handle.take(1).expect("a rotation offers a second target");
@@ -3838,7 +3840,7 @@ mod embedded {
             // An engine dies under a held decision: the send fails, and
             // the completion its host says with no dispatch ends the
             // lease on the dead engine.
-            let decided = Handle::decide(&door, gateway, &asked(b"dead"), Instant::now());
+            let decided = DecisionGuard::decide(&door, gateway, &asked(b"dead"), Instant::now());
             let mut handle = decided.expect("a decision");
             let target = handle.take(0).expect("a pick over the fleet");
             let engine = fleet.engine_of(target.id).expect("a row of the fleet");

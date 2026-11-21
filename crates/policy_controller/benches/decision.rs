@@ -41,7 +41,8 @@ use smg_policy_controller::{
         Constraints, Decision, Identity, Lifted, ModelFingerprint, PoolFacts, RequestFacts,
         Scratch, Target,
     },
-    tracking::{Lease, Lifecycle, Side},
+    stages::Lifecycle,
+    tracking::{Lease, Side},
 };
 
 fn view_build(c: &mut Criterion) {

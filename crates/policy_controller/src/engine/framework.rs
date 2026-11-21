@@ -13,7 +13,7 @@ use crate::{
             MAX_TARGETS, TRACE_TOP,
         },
         prefix_pass::forget_prefix_pass,
-        sticky_sessions::{self, Claim, Forgets, SessionRule, SessionTable, SessionVerdict},
+        sticky_sessions::{self, Claim, SessionExpiry, SessionRule, SessionTable, SessionVerdict},
         view::{
             mean_in_flight, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PoolFacts,
             ReportCutoff, RequestFacts, WorkerId,
@@ -24,12 +24,13 @@ use crate::{
     policies::random::Random,
     stages::{
         filters::RowTests,
+        lifecycle::Lifecycle,
         pickers::{target_of, Best},
         scorers::{FewestSessions, LeastRequests},
     },
     tracking::{
-        lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
-        sent::SentCredit,
+        dispatch_credit::DispatchCredit,
+        lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     },
     Draw,
 };
@@ -2990,7 +2991,7 @@ pub struct Engine {
     /// One tally per profile that reads sends, in the order of the
     /// profiles' names: a later engine finds a profile's by its name
     /// ([`Engine::succeed`]).
-    pub(crate) sent_credits: Vec<Arc<SentCredit>>,
+    pub(crate) sent_credits: Vec<Arc<DispatchCredit>>,
 }
 
 /// A stage that keeps a number of the reports, by its place in the engine.
@@ -3423,12 +3424,12 @@ fn shortest_sweep(bindings: &[Binding]) -> u64 {
 
 /// How long a worker that left keeps its pins in the session table
 /// ([`SessionTable::left`]): the longest TTL among the bindings' sessions
-/// rules, a rule with none counting as [`ABSENCE_MICROS`], which is the
-/// time too where no binding has a rule.
+/// rules, a rule with none counting as [`ABSENT_WORKER_PIN_TTL_MICROS`], which
+/// is the time too where no binding has a rule.
 ///
-/// [`ABSENCE_MICROS`]: crate::engine::sticky_sessions::ABSENCE_MICROS
+/// [`ABSENT_WORKER_PIN_TTL_MICROS`]: crate::engine::sticky_sessions::ABSENT_WORKER_PIN_TTL_MICROS
 fn absence(bindings: &[Binding]) -> u64 {
-    let stated = sticky_sessions::ABSENCE_MICROS;
+    let stated = sticky_sessions::ABSENT_WORKER_PIN_TTL_MICROS;
     let rules = bindings.iter().filter_map(|b| b.sessions.as_ref());
     let longest = rules.map(|rule| rule.ttl_micros.unwrap_or(stated));
     longest.max().unwrap_or(stated)
@@ -5288,8 +5289,8 @@ impl Engine {
             found.pins
         } else {
             match self.sessions.held(key) {
-                Some((pins, Forgets::At(at))) if facts.now_micros < at => pins,
-                Some((pins, Forgets::Never)) if facts.now_micros < u64::MAX => pins,
+                Some((pins, SessionExpiry::At(at))) if facts.now_micros < at => pins,
+                Some((pins, SessionExpiry::Never)) if facts.now_micros < u64::MAX => pins,
                 _ => [WorkerId(0); 2],
             }
         };
@@ -6492,7 +6493,7 @@ mod tests {
             pickers::{self, Best, CountFirst},
             scorers::{self, LeastRequests},
         },
-        tracking::counts::tests::Lent,
+        tracking::in_flight::tests::Lent,
     };
 
     fn candidate(position: u32, in_flight: u32) -> Candidate {
@@ -8261,7 +8262,7 @@ mod tests {
     fn a_shadow_of_other_filters_is_named_rows_of_its_own_under_a_sample() {
         use crate::{
             document::spec::{BestParams, PickStage, ProfileSpec, ShadowSpec},
-            stages::catalog::Catalog,
+            stages::registry::StageRegistry,
         };
         /// A filter that is shown the whole view: the default word. The
         /// engine asks its profile's filters of no row ahead of a naming.
@@ -8277,7 +8278,7 @@ mod tests {
             }
         }
         type Turn<'a> = &'a dyn Fn(&mut ProfileSpec);
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         let added = catalog.filter("whole", || Box::new(Whole));
         added.expect("a free name");
         let rows = |sample: u32, both: Turn<'_>, shadow: Turn<'_>| {
@@ -17327,8 +17328,8 @@ mod tests {
     /// parameters is not of this build yet.
     #[test]
     fn a_ranked_decision_is_the_weighted_sums_under_every_picker() {
-        use crate::stages::catalog::{Catalog, Found};
-        let catalog = Catalog::builtin();
+        use crate::stages::registry::{Found, StageRegistry};
+        let catalog = StageRegistry::builtin();
         let build = |name: &str| match catalog.find_picker(name) {
             Some(Found::Built(picker)) => Some(picker),
             Some(Found::Typed | Found::With(_)) => None,

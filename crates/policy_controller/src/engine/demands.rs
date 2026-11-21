@@ -12,8 +12,8 @@
 //! fact a pairing plan reads too. The rest
 //! ([`WorkerFacts::demand_facts`](crate::store::WorkerFacts::demand_facts))
 //! stand in a column beside its pool's rows, one entry a row
-//! ([`World::demand_facts`](crate::store::World::demand_facts)): the
-//! candidate row carries none of them. The crate compares what the two
+//! ([`StoreSnapshot::demand_facts`](crate::store::StoreSnapshot::demand_facts)):
+//! the candidate row carries none of them. The crate compares what the two
 //! sides state and derives nothing: it names no label and no runtime.
 //!
 //! A request that demands nothing reads no column and pays one test.
@@ -30,7 +30,7 @@
 //! pool is shed under the last of those: where a host cuts a pool one
 //! demand after another, that is the demand that took its last worker.
 
-use crate::engine::{door, framework, view::Role};
+use crate::engine::{framework, store_backed_engine, view::Role};
 
 /// Where a request's media by reference may be processed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -218,7 +218,7 @@ impl Unmet {
     #[must_use]
     pub const fn stage(self) -> &'static str {
         match self {
-            Self::Runtime => door::WIRES,
+            Self::Runtime => store_backed_engine::WIRES,
             Self::Vision => framework::VISION,
             Self::References => REFERENCES,
             Self::Pipeline => PIPELINE,

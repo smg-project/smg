@@ -13,7 +13,7 @@ use smg_policy_controller::{
     document::{operator::Turn, PolicySpec},
     engine::WireModes,
     store::{
-        EncodeOffer, GatewayId, Maker, Overload, PairingDescriptor, Reachability, WorkerFacts,
+        EncodeOffer, GatewayId, Overload, PairingDescriptor, Reachability, Registrant, WorkerFacts,
         WorkersStore,
     },
 };
@@ -558,7 +558,7 @@ async fn a_snapshots_page_is_as_the_openapi_document_gives_it() -> Case {
         },
         ..serving("http://stated.example", &["m"])
     };
-    store.upsert_by(stated, Maker::provider("finder", "http://host/x")?);
+    store.upsert_by(stated, Registrant::provider("finder", "http://host/x")?);
     let (status, _, page) = answered(&app(state)?, snapshot("")?).await?;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(page["rows"].as_array().map(Vec::len), Some(2));

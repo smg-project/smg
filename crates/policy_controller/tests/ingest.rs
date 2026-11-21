@@ -22,13 +22,11 @@ use openai_protocol::worker::RuntimeType;
 use smg_policy_controller::{
     document::{AppliedSpec, BindingSpec, OverloadSpec, PolicySpec},
     engine::{Role, SignalSource, WireModes, WorkerId},
-    service::{
-        controller::{Config, Controller, Election, Listener, Scope},
-        ingest::{
-            loads::{LoadDriver, LoadDriverConfig, LoadProbe, ReadError, Target},
-            probe::EngineProbe,
-        },
+    load::ingest::{
+        loads::{LoadDriver, LoadDriverConfig, LoadProbe, ReadError, Target},
+        probe::EngineProbe,
     },
+    service::controller::{Config, Controller, Election, Listener, Scope},
     store::{LoadSink, LoadSource, MemoryStore, Signals, WorkerFacts, WorkerStatus, WorkersStore},
 };
 use tokio::{

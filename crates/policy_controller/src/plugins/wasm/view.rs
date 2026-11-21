@@ -20,7 +20,7 @@ use crate::{
     },
     plugins::shared::shown_hashes,
     tracking::{
-        counts::with_counts,
+        in_flight::with_counts,
         lease::{
             Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass,
         },
@@ -1219,7 +1219,7 @@ mod tests {
     /// table, the rows themselves reading zero.
     #[test]
     fn both_fills_give_a_row_the_count_its_request_reads() {
-        use crate::tracking::counts::tests::Lent;
+        use crate::tracking::in_flight::tests::Lent;
         let mut rows = [Candidate::default(), candidate_row(), Candidate::default()];
         for (row, position) in rows.iter_mut().zip(0..) {
             row.position = position;

@@ -7,11 +7,11 @@ use crate::{
     document::spec::Needs,
     engine::{
         framework::Filter,
-        terms::{Coefficients, Term},
         view::{Candidate, Constraints, LoadRow, ReportCutoff, RequestFacts},
     },
     load::signals::{SignalColumn, SignalSums, SignalTerm},
-    tracking::sent::{SentCounts, SentCredit},
+    stages::cost_terms::{Coefficients, CostTerm},
+    tracking::dispatch_credit::{DispatchCounts, DispatchCredit},
 };
 
 /// Ready, breaker closed, not stalled, not draining.
@@ -202,7 +202,7 @@ pub(crate) struct HasRoomRule {
     waiting: bool,
     kv_or_running: bool,
     /// The profile's count of sends, where a term reads it.
-    sent: Option<Arc<SentCredit>>,
+    sent: Option<Arc<DispatchCredit>>,
 }
 
 impl HasRoomRule {
@@ -211,11 +211,11 @@ impl HasRoomRule {
     pub(crate) const REQUEST_TOKENS: &str = "request.prompt_tokens";
 
     pub(crate) fn new(
-        terms: &[(Term, f64)],
+        terms: &[(CostTerm, f64)],
         request_tokens: f64,
         capacity: f64,
         headroom: f64,
-        sent: Option<Arc<SentCredit>>,
+        sent: Option<Arc<DispatchCredit>>,
     ) -> Self {
         let coefficients = Coefficients::of(terms);
         Self {
@@ -241,13 +241,13 @@ impl HasRoomRule {
 
     /// Whether a row has room, by its report as `load` hands it and its
     /// sends as `sent` counts them: the requests and the stated tokens
-    /// ([`SentReads::counts`]), or `None` where the rule reads no count.
-    /// The sum runs in name order: the count in flight, the report's
+    /// ([`DispatchCreditPass::counts`]), or `None` where the rule reads no
+    /// count. The sum runs in name order: the count in flight, the report's
     /// fields, the request's part as `asked` ([`Self::asked`]), the sends.
-    /// `within` says whether that sum is within the row's bound: the
-    /// rule's own test, or the signal form's behind its signals.
+    /// `within` says whether that sum is within the row's bound: the rule's own
+    /// test, or the signal form's behind its signals.
     ///
-    /// [`SentReads::counts`]: crate::tracking::sent::SentReads::counts
+    /// [`DispatchCreditPass::counts`]: crate::tracking::dispatch_credit::DispatchCreditPass::counts
     #[inline(always)]
     fn fits_with<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
         &self,
@@ -255,7 +255,7 @@ impl HasRoomRule {
         facts: &RequestFacts<'_>,
         row: &Candidate,
         load: Option<&LoadRow>,
-        sent: impl FnOnce() -> Option<SentCounts>,
+        sent: impl FnOnce() -> Option<DispatchCounts>,
         within: impl FnOnce(f64) -> bool,
     ) -> bool {
         let mut used = 0.0;
@@ -288,7 +288,7 @@ impl HasRoomRule {
         facts: &RequestFacts<'_>,
         row: &Candidate,
         load: Option<&LoadRow>,
-        sent: impl FnOnce() -> Option<SentCounts>,
+        sent: impl FnOnce() -> Option<DispatchCounts>,
     ) -> bool {
         self.fits_with::<RESIDENT, WAITING, KV_OR_RUNNING>(asked, facts, row, load, sent, |used| {
             used <= self.bound
@@ -304,7 +304,7 @@ impl HasRoomRule {
         let sent = || {
             self.sent
                 .as_ref()
-                .map_or_else(SentCounts::default, |sent| sent.reads(facts).counts(row))
+                .map_or_else(DispatchCounts::default, |sent| sent.pass(facts).counts(row))
         };
         let asked = self.asked(facts);
         by_names!(
@@ -331,7 +331,7 @@ impl HasRoomRule {
         let sends = self
             .sent
             .as_ref()
-            .map(|sent| sent.reads(facts))
+            .map(|sent| sent.pass(facts))
             .filter(|sends| sends.holds_any());
         let mut held = 0;
         for at in 0..kept.len() {
@@ -522,7 +522,7 @@ impl HasRoomSignals {
         let sent = || {
             rule.sent
                 .as_ref()
-                .map_or_else(SentCounts::default, |sent| sent.reads(facts).counts(row))
+                .map_or_else(DispatchCounts::default, |sent| sent.pass(facts).counts(row))
         };
         let asked = rule.asked(facts);
         by_names!(
@@ -562,7 +562,7 @@ impl HasRoomSignals {
             .rule
             .sent
             .as_ref()
-            .map(|sent| sent.reads(facts))
+            .map(|sent| sent.pass(facts))
             .filter(|sends| sends.holds_any());
         match &sends {
             Some(sends) => self.rows_by::<RESIDENT, WAITING, KV_OR_RUNNING>(
@@ -592,7 +592,7 @@ impl HasRoomSignals {
         candidates: &[Candidate],
         kept: &mut Vec<u32>,
         load: impl Fn(&Candidate) -> Option<&LoadRow>,
-        sent: impl Fn(&Candidate) -> Option<SentCounts>,
+        sent: impl Fn(&Candidate) -> Option<DispatchCounts>,
     ) {
         let rule = &self.rule;
         let asked = rule.asked(facts);

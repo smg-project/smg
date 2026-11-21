@@ -40,11 +40,12 @@ use smg_policy_controller::{
         AffinityFacts, Candidate, Constraints, Decision, Engine, HashKind, Health, LoadRow, Phase,
         PoolFacts, RequestFacts, Role, Scratch, ShedReason, SignalSource, Target, WorkerId,
     },
+    stages::Lifecycle,
     store::{
         Ask, BatchFacts, BatchOutcome, GatewayId, KvEvent, KvEventSink, MemoryStore, Named, Naming,
         Signals, StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
     },
-    tracking::{Lease, Lifecycle, Side, TransportClass},
+    tracking::{Lease, Side, TransportClass},
 };
 
 use crate::{same_outcome, Outcome, Recorded, Replayed};

@@ -32,15 +32,15 @@ mod sent_prefixes {
     use crate::{
         document::{spec, spec::AffinitySource},
         engine::{
-            door::tests::sent_prefixes::{applied, merged, use_sent_prefixes},
+            store_backed_engine::tests::sent_prefixes::{applied, merged, use_sent_prefixes},
             view,
             view::{Candidate, Role, WireModes},
         },
-        predictor::Predictor,
         store::{
             index::{seam, Predicted},
             Ask, GatewayId, Kinds, Named, Naming, Position, Reachability, ViewBuffers,
         },
+        tracking::prefix_predictor::PrefixPredictor,
     };
 
     type Case = Result<(), Box<dyn std::error::Error>>;
@@ -83,7 +83,7 @@ mod sent_prefixes {
 
     fn keys(hashes: &[u64]) -> Vec<u64> {
         let mut keys = Vec::new();
-        Predictor::fold_into(&mut keys, 0, hashes);
+        PrefixPredictor::fold_into(&mut keys, 0, hashes);
         keys
     }
 
@@ -1220,7 +1220,7 @@ fn admitted(store: &MemoryStore, key: &str) -> WorkerId {
 /// the pools are walked.
 #[test]
 fn a_write_that_moves_no_member_walks_no_pool() {
-    use crate::engine::door::tests::sent_prefixes::{applied, merged};
+    use crate::engine::store_backed_engine::tests::sent_prefixes::{applied, merged};
 
     let store = MemoryStore::new();
     admitted(&store, "a");
@@ -2797,7 +2797,7 @@ mod named {
 
     /// [`named_under_a_kept_world_each`], each naming then held to a test
     /// that refuses the rows of `refused` where it names some
-    /// ([`World::name_kept`](crate::store::World::name_kept)).
+    /// ([`StoreSnapshot::name_kept`](crate::store::StoreSnapshot::name_kept)).
     fn named_under_a_kept_world_less(
         store: &MemoryStore,
         request: &[u64],

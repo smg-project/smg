@@ -252,7 +252,7 @@ pub(crate) fn report_loads(store: &MemoryStore, busy: &str, idle: &str) -> Insta
 /// The requests the store counts in flight on `row`, a row of [`MODEL`]'s
 /// pair pools.
 pub(crate) fn pair_in_flight(store: &MemoryStore, row: WorkerId) -> u32 {
-    store.with_world(|world| {
+    store.with_snapshot(|world| {
         let ask = StoreAsk {
             gateway: GATEWAY,
             now: Instant::now(),

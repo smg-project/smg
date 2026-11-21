@@ -28,8 +28,8 @@ use smg_policy_controller::{
     document::PolicySpec,
     engine::{Candidate, Constraints, Engine, PoolFacts, RequestFacts, Scratch, Target},
     policies::power_of_two::PowerOfTwoMetric,
-    stages::Catalog,
-    tracking::{Lease, Lifecycle, Side},
+    stages::{Lifecycle, StageRegistry},
+    tracking::{Lease, Side},
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -146,7 +146,7 @@ fn forms(c: &mut Criterion) {
 }
 
 fn least_cost(c: &mut Criterion) {
-    if !Catalog::builtin()
+    if !StageRegistry::builtin()
         .scorers()
         .any(|name| name == "least-cost")
     {

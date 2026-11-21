@@ -34,7 +34,7 @@ use smg_worker::{
     worker::WorkerStatus as ObjectStatus,
 };
 
-use super::{object::status, Lead, Objects, Standing};
+use super::{object::status, Lead, Objects, RowRevision};
 use crate::store::{HealthSink as StoreHealthSink, HealthWrite, LeaderBits};
 
 /// The health sink for a replica that keeps its workers in the store.
@@ -112,7 +112,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
         &self,
         worker_id: &ObjectId,
         revision: u64,
-        write_row: impl FnOnce(&S, Standing) -> HealthWrite,
+        write_row: impl FnOnce(&S, RowRevision) -> HealthWrite,
     ) -> HealthWrite {
         self.fenced(worker_id, revision, |store, standing, _| {
             let write = write_row(store, standing);
@@ -129,7 +129,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
         &self,
         worker_id: &ObjectId,
         revision: u64,
-        write_row: impl FnOnce(&S, Standing, &dyn Worker) -> (HealthWrite, Option<ObjectStatus>),
+        write_row: impl FnOnce(&S, RowRevision, &dyn Worker) -> (HealthWrite, Option<ObjectStatus>),
     ) -> HealthWrite {
         if !self.leads() {
             return HealthWrite::Stale;

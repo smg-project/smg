@@ -48,7 +48,7 @@ use smg_mesh::{
     ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
     PreparedMeshServer,
 };
-use smg_policy_controller::stages::Catalog;
+use smg_policy_controller::stages::StageRegistry;
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
@@ -1159,7 +1159,7 @@ impl ServerConfig {
 /// What a host binary adds to the gateway at startup.
 #[non_exhaustive]
 pub struct Extensions {
-    stages: Option<Catalog>,
+    stages: Option<StageRegistry>,
     connector: Option<Arc<dyn EngineConnector>>,
 }
 
@@ -1173,10 +1173,10 @@ impl Extensions {
     }
 
     /// Set the catalog of stages a policy document may name. Start with
-    /// [`Catalog::builtin`] and register the host's stages on it. The
+    /// [`StageRegistry::builtin`] and register the host's stages on it. The
     /// catalog is read only when startup selects the policy controller.
     #[must_use]
-    pub fn stages(mut self, stages: Catalog) -> Self {
+    pub fn stages(mut self, stages: StageRegistry) -> Self {
         self.stages = Some(stages);
         self
     }
@@ -4085,8 +4085,8 @@ mod tests {
 
         use smg_policy_controller::{
             engine::{Role, WireModes},
-            store::{Ask, GatewayId, HealthPolicy, Maker, ViewBuffers, WorkerFacts},
-            worker_host::Expect,
+            store::{Ask, GatewayId, HealthPolicy, Registrant, ViewBuffers, WorkerFacts},
+            worker_host::Precondition,
         };
         use smg_worker::runtime::StallReason;
 
@@ -4132,7 +4132,9 @@ mod tests {
             ..WorkerFacts::default()
         };
         feed.door
-            .found(&Maker::Control, Expect::Nothing, URL, &|_| stated.clone())
+            .found(&Registrant::Control, Precondition::Absent, URL, &|_| {
+                stated.clone()
+            })
             .expect("the worker registers");
         let worker = context
             .worker_registry

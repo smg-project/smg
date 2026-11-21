@@ -27,7 +27,8 @@ use smg_policy_controller::{
             WasmPicker, WasmScorer, World,
         },
     },
-    tracking::{Lease, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
+    stages::Lifecycle,
+    tracking::{Lease, Outcome, ReleaseReason, Side, TransportClass},
 };
 
 /// What the example's build line writes.

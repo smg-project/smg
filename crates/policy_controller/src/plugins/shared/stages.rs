@@ -23,9 +23,9 @@ use crate::{
         framework::{DecisionScope, Filter, Picker, Scorer, TieBand},
         view::{Candidate, Constraints, RequestFacts},
     },
-    stages::pickers::Best,
+    stages::{lifecycle::Lifecycle, pickers::Best},
     tracking::lease::{
-        EventKind, EventSet, Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,
+        EventKind, EventSet, Lease, Membership, Outcome, ReleaseReason, Side, Signal,
     },
 };
 
@@ -424,10 +424,10 @@ mod tests {
             view::{Candidate, Health, Phase, PoolFacts, RequestFacts, WorkerId},
         },
         plugins::shared::config::Failure,
-        stages::catalog::Catalog,
+        stages::{lifecycle::Lifecycle, registry::StageRegistry},
         tracking::lease::{
-            EventKind, EventSet, Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side,
-            Signal, TransportClass,
+            EventKind, EventSet, Lease, Membership, Outcome, ReleaseReason, Side, Signal,
+            TransportClass,
         },
     };
 
@@ -698,7 +698,7 @@ mod tests {
     fn a_profile_that_holds_a_plugins_stage_is_named_no_rows() {
         // The sample of the profile that decides, and the cap a host names
         // its rows under.
-        let named = |catalog: &Catalog, stages: &str| {
+        let named = |catalog: &StageRegistry, stages: &str| {
             let document: PolicySpec = serde_json::from_str(&format!(
                 r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{{{stages},"pick":{{"best":{{"sample":16}}}}}}}}}}"#
             ))
@@ -711,11 +711,11 @@ mod tests {
                 engine.named_for("m", Phase::Single),
             )
         };
-        let stock = Catalog::builtin();
+        let stock = StageRegistry::builtin();
         assert_eq!(named(&stock, r#""score":["prefix-affinity"]"#), (16, 16));
         // A catalog holds a name once, whatever the stage's kind: one a
         // shape.
-        let mut filtering = Catalog::builtin();
+        let mut filtering = StageRegistry::builtin();
         filtering
             .filter("quiet", || {
                 Box::new(PluginFilter::new(Arc::new(Quiet::default()), None))
@@ -723,7 +723,7 @@ mod tests {
             .expect("a free name, the stage's own");
         let filtered = r#""filter":["quiet"],"score":["prefix-affinity"]"#;
         assert_eq!(named(&filtering, filtered), (0, 0));
-        let mut scoring = Catalog::builtin();
+        let mut scoring = StageRegistry::builtin();
         scoring
             .scorer("quiet", || {
                 Box::new(PluginScorer::new(Arc::new(Quiet::default()), None))
@@ -836,7 +836,7 @@ mod tests {
     fn a_document_naming_a_plugin_that_hears_is_refused_where_the_host_makes_no_call() {
         let catalog_of = |listed: EventSet| {
             let plugin = Told::listing(listed);
-            let mut catalog = Catalog::builtin();
+            let mut catalog = StageRegistry::builtin();
             catalog
                 .scorer("told", move || {
                     Box::new(PluginScorer::new(Arc::clone(&plugin), None))

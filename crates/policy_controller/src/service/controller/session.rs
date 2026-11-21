@@ -638,7 +638,7 @@ mod tests {
         service::{
             controller::{
                 config::Scope,
-                election::{LeasePlace, Said, Standing},
+                election::{ElectionObservation, LeasePlace, Said},
                 floor::{FLOORS_SPENT_MAX, FLOOR_BELIEVED, FLOOR_REACH},
                 gateways::{
                     tests::{lease, PATIENT},
@@ -669,7 +669,7 @@ mod tests {
     /// candidate's fence, with the election's writer in the case's hand.
     struct Bed {
         elector: Elector,
-        standing: watch::Sender<Standing>,
+        standing: watch::Sender<ElectionObservation>,
         shared: Arc<Shared>,
         addr: SocketAddr,
         /// Aborted at its drop, at the case's end.
@@ -688,14 +688,14 @@ mod tests {
         hello_deadline: Option<Duration>,
     ) -> Bed {
         let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let mut shared = Shared::new(
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
             stood,
             journaled_for(&LeasePlace::Process, 0, 2),
-            Arc::new(crate::stages::Catalog::builtin()),
+            Arc::new(crate::stages::StageRegistry::builtin()),
             2,
         )
         .expect("the deciders start");
@@ -753,7 +753,7 @@ mod tests {
         /// One step of the election as a session sees it: the look is
         /// published.
         fn step(&self, holder: &str, term: u64) {
-            self.standing.send_replace(Standing {
+            self.standing.send_replace(ElectionObservation {
                 holder: holder.to_owned(),
                 term,
                 looked: true,

@@ -51,7 +51,7 @@ use super::{
     config::Scope,
     decide::{self, Streams},
     deciders::{self, Deciders, Reads},
-    election::{self, split_identity, Running, Standing},
+    election::{self, split_identity, ElectionObservation, Running},
     floor::Floors,
     gateways::Gateways,
     generations::{
@@ -70,7 +70,7 @@ use crate::{
         operator::{DryRun, Enforced, NeedsRow, Turn, Unanswered as DoorUnanswered},
         spec::Digest,
     },
-    engine::{door::DecisionRecord, framework::Engine},
+    engine::{framework::Engine, store_backed_engine::DecisionRecord},
     service::{
         elector::{Elector, Fence},
         proto::{
@@ -79,7 +79,7 @@ use crate::{
         },
         replication::Unled,
     },
-    stages::catalog::Catalog,
+    stages::registry::StageRegistry,
     store::MemoryStore,
 };
 
@@ -155,7 +155,7 @@ pub(crate) struct Shared {
     /// The controller's one fence: the judge of "leader" at every answer.
     pub(crate) fence: Arc<Fence>,
     /// The election's last sight of the lease.
-    pub(crate) standing: watch::Receiver<Standing>,
+    pub(crate) standing: watch::Receiver<ElectionObservation>,
     /// The controller's store: what the calls feed and read, and the run
     /// loop's drivers with them.
     pub(crate) store: Arc<MemoryStore>,
@@ -230,9 +230,9 @@ impl Shared {
         controller_id: String,
         address: String,
         elector: &Elector,
-        standing: watch::Receiver<Standing>,
+        standing: watch::Receiver<ElectionObservation>,
         (store, feed): (Arc<MemoryStore>, Feed),
-        catalog: Arc<Catalog>,
+        catalog: Arc<StageRegistry>,
         deciders: usize,
     ) -> io::Result<Self> {
         let gateways = Arc::new(Gateways::new(
@@ -294,7 +294,7 @@ impl Shared {
     pub(crate) fn elect(
         &self,
         mut elector: Elector,
-        standing: watch::Sender<Standing>,
+        standing: watch::Sender<ElectionObservation>,
     ) -> io::Result<Running> {
         // At a take the door is its source's again, and a replica that
         // deferred its start's document applies it at its first one, behind
@@ -1142,13 +1142,13 @@ mod tests {
 
     use super::{unanswered, Call, RpcStatus, Service, Shared};
     use crate::{
-        engine::door::TERM_MARK,
+        engine::store_backed_engine::TERM_MARK,
         service::{
             controller,
             controller::{
                 config::Scope,
                 deciders::{tests as bed, Job},
-                election::{self, LeasePlace, Standing},
+                election::{self, ElectionObservation, LeasePlace},
                 gateways::tests::PATIENT,
                 generations::{tests::LEAST_LOAD, Format, Unanswered},
                 principal::{
@@ -1167,7 +1167,7 @@ mod tests {
             },
             proto::{self, busy::Reason, policy_controller_server::PolicyController},
         },
-        stages::catalog::Catalog,
+        stages::registry::StageRegistry,
         store::{Kinds, LeasesStore, Position, WorkersStore},
         tracking::lease::{LeaseId, ReleaseReason},
     };
@@ -1178,7 +1178,7 @@ mod tests {
 
     /// A candidate over a lease of its own, the election's writer and one
     /// listener's service over that candidate's fence.
-    fn service(scopes: &[Scope]) -> (Elector, watch::Sender<Standing>, Service) {
+    fn service(scopes: &[Scope]) -> (Elector, watch::Sender<ElectionObservation>, Service) {
         let elector = Elector::new(
             Box::new(MemoryLease::new()),
             IDENTITY,
@@ -1190,24 +1190,27 @@ mod tests {
 
     /// The same over a candidate alone over its lease: its take leads at
     /// once, by the clock a call reads.
-    fn service_alone(scopes: &[Scope]) -> (Elector, watch::Sender<Standing>, Service) {
+    fn service_alone(scopes: &[Scope]) -> (Elector, watch::Sender<ElectionObservation>, Service) {
         let elector = Elector::alone(IDENTITY, PATIENT).expect("the settings are in order");
         over(elector, scopes)
     }
 
     /// The election's writer and one listener's service over the fence of
     /// `elector`, handed back beside them.
-    fn over(elector: Elector, scopes: &[Scope]) -> (Elector, watch::Sender<Standing>, Service) {
-        over_in(elector, scopes, Catalog::builtin())
+    fn over(
+        elector: Elector,
+        scopes: &[Scope],
+    ) -> (Elector, watch::Sender<ElectionObservation>, Service) {
+        over_in(elector, scopes, StageRegistry::builtin())
     }
 
     /// [`over`]'s service, its documents naming the stages of `catalog`.
     fn over_in(
         elector: Elector,
         scopes: &[Scope],
-        catalog: Catalog,
-    ) -> (Elector, watch::Sender<Standing>, Service) {
-        let (standing, stood) = watch::channel(Standing::default());
+        catalog: StageRegistry,
+    ) -> (Elector, watch::Sender<ElectionObservation>, Service) {
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let shared = Arc::new(
             Shared::new(
                 ID.to_owned(),
@@ -1264,7 +1267,7 @@ mod tests {
             renew_deadline: Duration::from_millis(400),
         };
         let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let (store, feed) = journaled_from(&LeasePlace::Process, 0);
         let shared = Shared::new(
             ID.to_owned(),
@@ -1272,7 +1275,7 @@ mod tests {
             &elector,
             stood,
             (Arc::clone(&store), feed),
-            Arc::new(Catalog::builtin()),
+            Arc::new(StageRegistry::builtin()),
             1,
         )
         .expect("the decider starts");
@@ -1351,7 +1354,7 @@ mod tests {
             renew_deadline: Duration::from_millis(400),
         };
         let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let (store, feed) = journaled_from(&LeasePlace::Process, 0);
         let shared = Shared::new(
             ID.to_owned(),
@@ -1359,7 +1362,7 @@ mod tests {
             &elector,
             stood,
             (store, feed),
-            Arc::new(Catalog::builtin()),
+            Arc::new(StageRegistry::builtin()),
             1,
         )
         .expect("the decider starts");
@@ -1393,7 +1396,7 @@ mod tests {
             renew_deadline: Duration::from_millis(400),
         };
         let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let (store, feed) = journaled_from(&LeasePlace::Process, 0);
         let shared = Shared::new(
             ID.to_owned(),
@@ -1401,7 +1404,7 @@ mod tests {
             &elector,
             stood,
             (store, feed),
-            Arc::new(Catalog::builtin()),
+            Arc::new(StageRegistry::builtin()),
             1,
         )
         .expect("the decider starts");
@@ -1410,18 +1413,18 @@ mod tests {
             .generations
             .defer(LEAST_LOAD.into(), Format::Yaml)
             .expect("a valid document");
-        assert_eq!(shared.store.world().spec().generation(), 0);
+        assert_eq!(shared.store.snapshot().spec().generation(), 0);
 
         let mut running = shared.elect(elector, standing).expect("a thread");
         let stands = async {
-            while shared.store.world().spec().generation() == 0 {
+            while shared.store.snapshot().spec().generation() == 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         };
         tokio::time::timeout(Duration::from_secs(20), stands)
             .await
             .expect("the first take applies the start's document within 20 s");
-        assert_eq!(shared.store.world().spec().generation(), 1);
+        assert_eq!(shared.store.snapshot().spec().generation(), 1);
         assert_eq!(shared.fence.term(), 1, "under its first term");
 
         running.stop();
@@ -1459,7 +1462,7 @@ mod tests {
             }
         }
         .expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let (store, feed) = journaled_from(&LeasePlace::Process, 0);
         let shared = Shared::new(
             ID.to_owned(),
@@ -1467,7 +1470,7 @@ mod tests {
             &elector,
             stood,
             (Arc::clone(&store), feed),
-            Arc::new(Catalog::builtin()),
+            Arc::new(StageRegistry::builtin()),
             1,
         )
         .expect("the decider starts");
@@ -1485,7 +1488,7 @@ mod tests {
             let other = Elector::new(Box::new(FileLease::new(&lease)), other, settings)
                 .expect("the settings are in order");
             let fence = other.fence();
-            let (standing, mut stood) = watch::channel(Standing::default());
+            let (standing, mut stood) = watch::channel(ElectionObservation::default());
             let store = journaled_from(&LeasePlace::Process, 0).0;
             let running = election::start(other, store, standing).expect("a thread");
             let follows = stood.wait_for(|standing| standing.holder == IDENTITY);
@@ -1586,7 +1589,7 @@ mod tests {
         };
         let elector = Elector::new(Box::new(FileLease::new(&path)), IDENTITY, settings)
             .expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let (store, feed) = journaled_for(&LeasePlace::Process, 0, 2);
         let shared = Arc::new(
             Shared::new(
@@ -1595,7 +1598,7 @@ mod tests {
                 &elector,
                 stood,
                 (Arc::clone(&store), feed),
-                Arc::new(Catalog::builtin()),
+                Arc::new(StageRegistry::builtin()),
                 2,
             )
             .expect("the deciders start"),
@@ -1659,8 +1662,8 @@ mod tests {
             .expect("the election thread ends within 20 s of its stop");
     }
 
-    fn saw(holder: &str, term: u64) -> Standing {
-        Standing {
+    fn saw(holder: &str, term: u64) -> ElectionObservation {
+        ElectionObservation {
             holder: holder.to_owned(),
             term,
             looked: true,
@@ -2160,7 +2163,7 @@ mod tests {
             settings,
         )
         .expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let (store, feed) = journaled_for(&LeasePlace::Process, 0, 2);
         let service = Service::new(
             vec![Scope::Gateway],
@@ -2171,7 +2174,7 @@ mod tests {
                     &elector,
                     stood,
                     (store, feed),
-                    Arc::new(Catalog::builtin()),
+                    Arc::new(StageRegistry::builtin()),
                     2,
                 )
                 .expect("the deciders start"),
@@ -2254,7 +2257,7 @@ mod tests {
 
         // The answer reads the fence, never the standing: a standing that
         // lags the take still answers as the leader.
-        standing.send_replace(Standing::default());
+        standing.send_replace(ElectionObservation::default());
         assert_eq!(service.leader_info(taken), answer(ID, ADDRESS, 1, true));
     }
 
@@ -2318,7 +2321,7 @@ mod tests {
         // term seen.
         standing.send_replace(saw("", 5));
         assert_eq!(service.leader_info(now), answer("", "", 5, false));
-        standing.send_replace(Standing {
+        standing.send_replace(ElectionObservation {
             holder: String::new(),
             term: 5,
             looked: false,
@@ -2432,12 +2435,15 @@ mod tests {
     /// A control listener's service over an election no case outlasts (an
     /// hour's deadline), with no spec source: the leader where `leads`,
     /// else a follower whose last look saw `controller-1` hold the lease.
-    fn electing(leads: bool) -> (Elector, watch::Sender<Standing>, Service) {
-        electing_in(leads, Catalog::builtin())
+    fn electing(leads: bool) -> (Elector, watch::Sender<ElectionObservation>, Service) {
+        electing_in(leads, StageRegistry::builtin())
     }
 
     /// [`electing`]'s service, its documents naming the stages of `catalog`.
-    fn electing_in(leads: bool, catalog: Catalog) -> (Elector, watch::Sender<Standing>, Service) {
+    fn electing_in(
+        leads: bool,
+        catalog: StageRegistry,
+    ) -> (Elector, watch::Sender<ElectionObservation>, Service) {
         let hour = Duration::from_secs(3600);
         let settings = ElectionSettings {
             duration: 2 * hour,
@@ -2692,7 +2698,7 @@ mod tests {
 
     /// [`electing`]'s service, its spec source a file's document:
     /// `LEAST_LOAD`, applied as generation 1.
-    fn sourced(leads: bool) -> (Elector, watch::Sender<Standing>, Service) {
+    fn sourced(leads: bool) -> (Elector, watch::Sender<ElectionObservation>, Service) {
         let (elector, standing, control) = electing(leads);
         control
             .shared
@@ -2839,7 +2845,7 @@ mod tests {
         }
 
         const FIELD: &str = "profiles.default.filter[1].min-free.slots";
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .filter_with("min-free", |build| {
                 let rule: MinFree = build.params()?;
@@ -3268,7 +3274,14 @@ mod tests {
 
     /// [`electing`]'s service, its spec source a store over a new, empty
     /// directory, handed back beside it.
-    fn stored(leads: bool) -> (tempfile::TempDir, Elector, watch::Sender<Standing>, Service) {
+    fn stored(
+        leads: bool,
+    ) -> (
+        tempfile::TempDir,
+        Elector,
+        watch::Sender<ElectionObservation>,
+        Service,
+    ) {
         let dir = tempfile::tempdir().expect("a temp dir");
         let (elector, standing, control) = electing(leads);
         let opened = SpecStore::open(dir.path().to_owned()).expect("the directory opens");

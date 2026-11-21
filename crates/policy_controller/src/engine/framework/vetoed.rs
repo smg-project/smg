@@ -589,11 +589,12 @@ mod tests {
         policies::{consistent_hashing::ConsistentHash, manual::Manual},
         stages::{
             filters::{Healthy, NotOverloaded},
+            lifecycle::Lifecycle,
             pickers::Best,
         },
         tracking::{
-            counts::tests::Lent,
-            lease::{Lease, Lifecycle, Side},
+            in_flight::tests::Lent,
+            lease::{Lease, Side},
         },
     };
 

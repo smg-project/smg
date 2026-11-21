@@ -13,7 +13,8 @@ use smg_policy_controller::{
         SignalSource, WorkerId,
     },
     policies::power_of_two::PowerOfTwoMetric,
-    tracking::{Lease, Lifecycle, Side},
+    stages::Lifecycle,
+    tracking::{Lease, Side},
 };
 
 use crate::{Outcome, Recorded, Replayed};

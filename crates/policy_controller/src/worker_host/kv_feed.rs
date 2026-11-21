@@ -35,7 +35,7 @@ use tokio::{
 use super::{KvHost, Objects};
 use crate::{
     engine::{view::WireModes, Engine},
-    store::{index::indexed_under, world::phase_of, MemoryStore, WorkerFacts, WorkersStore},
+    store::{index::indexed_under, snapshot::phase_of, MemoryStore, WorkerFacts, WorkersStore},
 };
 
 /// A host's cache-event collector and the worker objects it follows.

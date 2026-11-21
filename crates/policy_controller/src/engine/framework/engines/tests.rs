@@ -21,9 +21,10 @@ use crate::{
     },
     stages::{
         filters::NotOverloaded,
+        lifecycle::Lifecycle,
         pickers::{Best, CountFirst, SampledBest},
     },
-    tracking::lease::{Lifecycle, Membership},
+    tracking::lease::Membership,
     Draw,
 };
 

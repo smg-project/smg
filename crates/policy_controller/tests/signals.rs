@@ -12,8 +12,7 @@ use smg_policy_controller::{
         RequestFacts, Scorer, Scratch, Targets, TieBand, WorkerId,
     },
     load::{SignalCell, SignalCells, SignalColumn},
-    stages::{Catalog, StageBuild},
-    tracking::Lifecycle,
+    stages::{Lifecycle, StageBuild, StageRegistry},
 };
 
 /// The decisions' instant on the host's clock.
@@ -73,9 +72,9 @@ impl Scorer for ReadsTwo {
 }
 
 /// The stock stages and `reads-two`, which records into `seen`.
-fn catalog(seen: &Arc<Mutex<Vec<Read>>>) -> Catalog {
+fn catalog(seen: &Arc<Mutex<Vec<Read>>>) -> StageRegistry {
     let seen = Arc::clone(seen);
-    let mut catalog = Catalog::builtin();
+    let mut catalog = StageRegistry::builtin();
     catalog
         .scorer_with("reads-two", move |build: &mut StageBuild<'_>| {
             let names: Names = build.params()?;
@@ -489,7 +488,7 @@ impl Scorer for Mismatched {
 #[test]
 fn a_stage_whose_needs_and_build_disagree_on_the_signal_cells_is_refused() {
     let refusal = |declares: bool, resolves: bool| {
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .scorer_with("mismatched", move |build: &mut StageBuild<'_>| {
                 if resolves {
@@ -585,7 +584,7 @@ impl Picker for Declares {
 #[test]
 fn a_stage_built_with_no_context_that_declares_the_signal_cells_is_refused() {
     // Whether the validated engine declares the cells, or the refusal.
-    let validated = |catalog: &Catalog, text: &str| {
+    let validated = |catalog: &StageRegistry, text: &str| {
         document(text)
             .validate_in(catalog, &[])
             .map(|engine| engine.needs().signal_cells)
@@ -602,7 +601,7 @@ fn a_stage_built_with_no_context_that_declares_the_signal_cells_is_refused() {
         }
     };
     for declares in [true, false] {
-        let mut scorers = Catalog::builtin();
+        let mut scorers = StageRegistry::builtin();
         scorers
             .scorer("mismatched", move || Box::new(Mismatched { declares }))
             .expect("a free name");
@@ -619,7 +618,7 @@ fn a_stage_built_with_no_context_that_declares_the_signal_cells_is_refused() {
             );
         }
 
-        let mut filters = Catalog::builtin();
+        let mut filters = StageRegistry::builtin();
         filters
             .filter("declares", move || Box::new(Declares { declares }))
             .expect("a free name");
@@ -636,7 +635,7 @@ fn a_stage_built_with_no_context_that_declares_the_signal_cells_is_refused() {
             )
         );
 
-        let mut pickers = Catalog::builtin();
+        let mut pickers = StageRegistry::builtin();
         pickers
             .picker("declares", move || Box::new(Declares { declares }))
             .expect("a free name");
@@ -687,7 +686,7 @@ impl Filter for AtMost {
 #[test]
 fn a_registered_filter_resolves_a_signal_and_is_held_to_its_need() {
     let validated = |declares: bool| {
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .filter_with("at-most", move |build: &mut StageBuild<'_>| {
                 Ok(Box::new(AtMost {
@@ -827,7 +826,7 @@ fn the_default_cells_read_no_value() {
 #[test]
 fn a_picker_built_under_a_context_is_held_to_its_word_on_the_cells() {
     let refusal = |declares: bool, resolves: bool| {
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .picker_with("declares", move |build: &mut StageBuild<'_>| {
                 if resolves {

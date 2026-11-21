@@ -450,7 +450,7 @@ mod tests {
     /// What two stores must agree on: the epoch, and each row's id, facts,
     /// status and revision. An admission instant crosses as an age.
     fn held(store: &MemoryStore) -> (u64, Vec<(WorkerId, WorkerFacts, WorkerStatus, u64)>) {
-        let (epoch, mut rows) = WorkersStore::snapshot(store);
+        let (epoch, mut rows) = WorkersStore::all_rows(store);
         rows.sort_by_key(|row| row.id.0);
         let rows = rows
             .into_iter()

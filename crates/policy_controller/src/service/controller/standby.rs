@@ -30,7 +30,7 @@ use tonic::{
 use tracing::{info, warn};
 
 use super::{
-    election::Standing,
+    election::ElectionObservation,
     generations::Generations,
     principal::ENTRY,
     replication::BEAT,
@@ -536,7 +536,7 @@ impl Streak {
 /// Waits `wait` at most between two streams. A wait for the lease to be
 /// read again (`lease`) ends at the election's next step; a streak's wait
 /// ends at the step that names another holder.
-async fn pause(steps: &mut watch::Receiver<Standing>, lease: bool, wait: Duration) {
+async fn pause(steps: &mut watch::Receiver<ElectionObservation>, lease: bool, wait: Duration) {
     let holder = steps.borrow_and_update().holder.clone();
     let moved = async {
         while steps.changed().await.is_ok() {
@@ -686,7 +686,11 @@ impl Standby {
     /// lease's sake: with [`Next::Turn`] once the lease names another
     /// holder, another term of the same one or this replica, with
     /// [`Next::Lease`] once the election is gone.
-    async fn turned(&self, steps: &mut watch::Receiver<Standing>, leader: &Leader) -> Next {
+    async fn turned(
+        &self,
+        steps: &mut watch::Receiver<ElectionObservation>,
+        leader: &Leader,
+    ) -> Next {
         loop {
             if steps.changed().await.is_err() {
                 return Next::Lease;
@@ -996,7 +1000,7 @@ mod tests {
             proto::policy_controller_server::{PolicyController, PolicyControllerServer},
             replication::{Entry, Event},
         },
-        stages::catalog,
+        stages::registry,
         store::{LoadSink, LoadSource, WorkerFacts, WorkerStatus, WorkersStore},
     };
 
@@ -1518,7 +1522,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_streaks_wait_ends_at_the_step_that_names_another_holder() {
-        let stands = |holder: &str, term| Standing {
+        let stands = |holder: &str, term| ElectionObservation {
             holder: holder.to_owned(),
             term,
             looked: true,
@@ -1860,8 +1864,8 @@ mod tests {
 
         /// What the election saw: this leader holds the lease as `id`
         /// under `term`.
-        fn holds(&self, id: &str, term: u64) -> Standing {
-            Standing {
+        fn holds(&self, id: &str, term: u64) -> ElectionObservation {
+            ElectionObservation {
                 holder: format!("{id}@{}", self.addr),
                 term,
                 looked: true,
@@ -1874,13 +1878,16 @@ mod tests {
     /// A replica that follows: its candidate, its election's writer and
     /// its loop, which dials the port of `bed` and holds a stream quiet
     /// for `quiet` at most.
-    fn standing_by(bed: &Bed, quiet: Duration) -> (Elector, watch::Sender<Standing>, Standby) {
+    fn standing_by(
+        bed: &Bed,
+        quiet: Duration,
+    ) -> (Elector, watch::Sender<ElectionObservation>, Standby) {
         let elector = Elector::alone(OWN, ElectionSettings::default())
             .expect("the default settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let journal = journaled(&LeasePlace::File("shared".into()), 1);
         let (id, address) = ("standby-0".to_owned(), "127.0.0.1:1".to_owned());
-        let catalog = Arc::new(crate::stages::Catalog::builtin());
+        let catalog = Arc::new(crate::stages::StageRegistry::builtin());
         let shared = Shared::new(id, address, &elector, stood, journal, catalog, 1)
             .expect("the deciders start");
         let mut standby = Standby::new(Arc::new(shared), bed.addr.port());
@@ -2599,7 +2606,7 @@ mod tests {
         // election's next step it dials nobody.
         let took = elector.tick(Instant::now());
         assert!(matches!(took, Ok(Tick::Acquired { .. })), "{took:?}");
-        let own = Standing {
+        let own = ElectionObservation {
             holder: OWN.to_owned(),
             term: 4,
             looked: true,
@@ -2730,7 +2737,7 @@ mod tests {
         // lead is forgotten.
         let took = elector.tick(Instant::now());
         assert!(matches!(took, Ok(Tick::Acquired { .. })), "{took:?}");
-        standing.send_replace(Standing {
+        standing.send_replace(ElectionObservation {
             holder: OWN.to_owned(),
             term: 3,
             looked: true,
@@ -2907,7 +2914,7 @@ mod tests {
 
     /// The stock door over a replica's store.
     fn door((store, _): &Replica) -> Arc<Generations> {
-        let catalog = Arc::new(catalog::Catalog::builtin());
+        let catalog = Arc::new(registry::StageRegistry::builtin());
         Arc::new(Generations::new(Arc::clone(store), catalog))
     }
 

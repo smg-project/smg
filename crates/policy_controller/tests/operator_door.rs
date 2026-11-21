@@ -4,10 +4,10 @@ use std::{error::Error, sync::Arc, time::Instant};
 
 use smg_policy_controller::{
     document::operator::{
-        snapshot::{told, Asked, Rows},
-        Applied, Format, SpecDoor, SpecRejected, Unanswered, MAX_DOCUMENT_BYTES,
+        snapshot::{told, Rows, WorkerRowsQuery},
+        Applied, DocumentManager, Format, SpecRejected, Unanswered, MAX_DOCUMENT_BYTES,
     },
-    stages::Catalog,
+    stages::StageRegistry,
     store::{MemoryStore, StaleGeneration, WorkerFacts, WorkersStore},
 };
 
@@ -16,7 +16,11 @@ const START: &[u8] = br#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"p
 #[test]
 fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
     let store = Arc::new(MemoryStore::new());
-    let door = SpecDoor::new(Arc::clone(&store), Arc::new(Catalog::builtin()), Vec::new());
+    let door = DocumentManager::new(
+        Arc::clone(&store),
+        Arc::new(StageRegistry::builtin()),
+        Vec::new(),
+    );
     let changed = br#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"score":["least-load"],"pick":"best"}}}"#;
     assert_eq!(door.status(), None);
 
@@ -72,7 +76,7 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
             ..WorkerFacts::default()
         });
     }
-    let asked = Asked {
+    let asked = WorkerRowsQuery {
         models: vec!["served".to_owned()],
         limit: 1,
     };
@@ -84,7 +88,7 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
     assert_eq!(row.facts.key, "grpc://b:8000");
     assert!(page.truncated);
 
-    let asked = Asked { limit: 2, ..asked };
+    let asked = WorkerRowsQuery { limit: 2, ..asked };
     let page = told(
         &asked,
         Rows::Shared(Arc::new(
@@ -103,7 +107,7 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
 #[test]
 fn a_host_reads_a_refusal_as_an_error() {
     let store = Arc::new(MemoryStore::new());
-    let door = SpecDoor::new(store, Arc::new(Catalog::builtin()), Vec::new());
+    let door = DocumentManager::new(store, Arc::new(StageRegistry::builtin()), Vec::new());
     let guarded: Box<dyn Error> = Box::new(
         door.dry_run("another digest", START, Format::Json)
             .expect_err("no digest stands"),
@@ -136,7 +140,7 @@ fn a_host_reads_a_refusal_as_an_error() {
 #[test]
 fn a_host_counts_each_document_it_cannot_apply() {
     let store = Arc::new(MemoryStore::new());
-    let door = SpecDoor::new(store, Arc::new(Catalog::builtin()), Vec::new());
+    let door = DocumentManager::new(store, Arc::new(StageRegistry::builtin()), Vec::new());
     let json = Format::named("json").expect("a form's name");
     let unread = door.apply(b"[".to_vec(), json);
     assert!(
@@ -163,7 +167,7 @@ fn a_host_counts_each_document_it_cannot_apply() {
 #[test]
 fn a_null_under_a_built_in_rule_is_told_both_forms_at_its_path() {
     let store = Arc::new(MemoryStore::new());
-    let door = SpecDoor::new(store, Arc::new(Catalog::builtin()), Vec::new());
+    let door = DocumentManager::new(store, Arc::new(StageRegistry::builtin()), Vec::new());
     let json = br#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"random","filter":[{"has-room":null}]}}}"#;
     let yaml = b"apiVersion: smg.policy/v1\nprofiles:\n  p:\n    pick: random\n    filter:\n    - has-room:\n";
     for (format, bytes) in [
@@ -192,7 +196,7 @@ fn a_null_under_a_built_in_rule_is_told_both_forms_at_its_path() {
 #[test]
 fn an_unknown_parameter_of_a_built_in_rule_is_refused_at_its_own_path() {
     let store = Arc::new(MemoryStore::new());
-    let door = SpecDoor::new(store, Arc::new(Catalog::builtin()), Vec::new());
+    let door = DocumentManager::new(store, Arc::new(StageRegistry::builtin()), Vec::new());
     let json = br#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"random","filter":[{"has-room":{"arp":0,"used":{"load.running":1},"capacity":10}}]}}}"#;
     let yaml = b"apiVersion: smg.policy/v1\nprofiles:\n  p:\n    pick: random\n    filter:\n    - has-room: {arp: 0, used: {load.running: 1}, capacity: 10}\n";
     for (format, bytes) in [

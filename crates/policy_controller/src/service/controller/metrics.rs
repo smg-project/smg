@@ -27,8 +27,8 @@ use super::{
     readiness::{Sample, State},
 };
 use crate::{
-    service::ingest::loads::{Failures, Stats},
-    store::{StoreCounts, Taken},
+    load::ingest::loads::{Failures, Stats},
+    store::{SignalWriteOutcome, StoreCounts},
 };
 
 /// `1` for the controller's state (`starting`, `leader`, `syncing`,
@@ -124,8 +124,8 @@ pub const OVERLOAD_FLIPS_TOTAL: &str = "smg_policy_controller_overload_flips_tot
 pub const LIFECYCLE_FAULTS_TOTAL: &str = "smg_policy_controller_lifecycle_faults_total";
 
 /// Writes to the store's signal sink, by `outcome`: what became of each
-/// ([`Taken`]). A value under a column the document in force does not
-/// continue counts `undeclared`, and one in another unit than its column's
+/// ([`SignalWriteOutcome`]). A value under a column the document in force does
+/// not continue counts `undeclared`, and one in another unit than its column's
 /// `wrong_unit`.
 pub const SIGNAL_WRITES_TOTAL: &str = "smg_policy_controller_signal_writes_total";
 
@@ -145,8 +145,8 @@ pub(crate) struct Metrics {
     outside: [Gauge; 2],
     overload_flips: Counter,
     lifecycle_faults: Counter,
-    /// The signal sink's writes, in the order of [`Taken::EACH`].
-    signal_writes: [Counter; Taken::EACH.len()],
+    /// The signal sink's writes, in the order of [`SignalWriteOutcome::EACH`].
+    signal_writes: [Counter; SignalWriteOutcome::EACH.len()],
     /// Held from a scrape's sample of the state to the end of its render:
     /// the gauges are written from one sample and read back whole.
     scrape: Mutex<()>,
@@ -378,7 +378,7 @@ impl Metrics {
             recorder.register_counter(&Key::from_name(OVERLOAD_FLIPS_TOTAL), &metadata);
         let lifecycle_faults =
             recorder.register_counter(&Key::from_name(LIFECYCLE_FAULTS_TOTAL), &metadata);
-        let signal_writes = Taken::EACH.map(|taken| {
+        let signal_writes = SignalWriteOutcome::EACH.map(|taken| {
             let outcome = Label::new("outcome", taken.label());
             let key = Key::from_parts(SIGNAL_WRITES_TOTAL, vec![outcome]);
             recorder.register_counter(&key, &metadata)
@@ -568,12 +568,10 @@ mod tests {
         SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
     };
     use crate::{
-        service::{
-            controller::{
-                deciders::Counts,
-                readiness::{Sample, State},
-            },
-            ingest::loads::Stats,
+        load::ingest::loads::Stats,
+        service::controller::{
+            deciders::Counts,
+            readiness::{Sample, State},
         },
         store::OutsideLists,
     };
@@ -718,7 +716,7 @@ mod tests {
     fn the_load_counters_render_the_drivers_counts() {
         use std::sync::atomic::Ordering;
 
-        use crate::service::ingest::loads::ReadError;
+        use crate::load::ingest::loads::ReadError;
 
         let metrics = Metrics::new();
         let stats = Stats::default();
@@ -976,7 +974,7 @@ mod tests {
 
         let generations = Arc::new(Generations::new(
             Arc::new(MemoryStore::new()),
-            Arc::new(crate::stages::Catalog::builtin()),
+            Arc::new(crate::stages::StageRegistry::builtin()),
         ));
         metrics.spec(Arc::clone(&generations));
         let series = |generation: u64, applied: u64, rejected: u64| {

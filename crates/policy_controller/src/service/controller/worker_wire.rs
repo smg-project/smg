@@ -25,9 +25,9 @@ use crate::{
         replication::{Entry, Event as Written},
     },
     store::{
-        membership::blank, GatewayId, HealthPolicy, LoadSample, LoadSource, Maker,
-        MembershipChange, Overload, Position, Reachability, Signals, Unmade, WorkerFacts,
-        WorkerPatch, WorkerRow, WorkerStatus,
+        membership::blank, GatewayId, HealthPolicy, LoadSample, LoadSource, MembershipChange,
+        Overload, Position, Reachability, Registrant, Signals, Unmade, WorkerFacts, WorkerPatch,
+        WorkerRow, WorkerStatus,
     },
 };
 
@@ -141,10 +141,10 @@ pub(crate) fn row(row: &WorkerRow) -> proto::WorkerRow {
 
 /// The wire's maker of a row's: none for a control call's row, so a row
 /// that crosses with no field reads as one.
-fn maker(by: &Maker) -> Option<proto::Maker> {
+fn maker(by: &Registrant) -> Option<proto::Maker> {
     match by {
-        Maker::Control => None,
-        Maker::Provider(found) => Some(proto::Maker {
+        Registrant::Control => None,
+        Registrant::Provider(found) => Some(proto::Maker {
             provider: found.provider().to_owned(),
             key: found.key().to_owned(),
         }),
@@ -367,9 +367,9 @@ fn fits(
 
 /// The bytes a row's maker takes on the wire, under the contract's field
 /// numbers: none for a control call's row.
-fn maker_weight(maker: &Maker) -> usize {
+fn maker_weight(maker: &Registrant) -> usize {
     use prost::encoding::{encoded_len_varint, key_len};
-    let Maker::Provider(found) = maker else {
+    let Registrant::Provider(found) = maker else {
         return 0;
     };
     // A length's own bytes, and a text under its tag: neither of a maker's
@@ -452,7 +452,7 @@ pub(crate) fn wire_reach(
 pub(crate) fn room(
     facts: &WorkerFacts,
     labels: &BTreeMap<String, String>,
-    maker: &Maker,
+    maker: &Registrant,
     path: &'static str,
 ) -> Result<(), Refused> {
     let bytes = maker_weight(maker);
@@ -725,8 +725,8 @@ pub(crate) fn told_row(told: &proto::WorkerRow, now: Instant) -> Result<WorkerRo
         ..WorkerFacts::default()
     };
     let maker = match &told.maker {
-        None => Maker::Control,
-        Some(by) => match Maker::provider(by.provider.clone(), by.key.clone()) {
+        None => Registrant::Control,
+        Some(by) => match Registrant::provider(by.provider.clone(), by.key.clone()) {
             Ok(maker) => maker,
             Err(Unmade::Provider(why)) => return Err(refused("row.maker.provider", why)),
             Err(Unmade::Key(why)) => return Err(refused("row.maker.key", why)),
@@ -1301,8 +1301,8 @@ mod tests {
             replication::{Entry, Event as Written},
         },
         store::{
-            identity, GatewayId, HealthPolicy, LoadSample, LoadSource, Maker, MembershipChange,
-            Overload, Position, Reachability, Signals, WorkerFacts, WorkerRow, WorkerStatus,
+            identity, GatewayId, HealthPolicy, LoadSample, LoadSource, MembershipChange, Overload,
+            Position, Reachability, Registrant, Signals, WorkerFacts, WorkerRow, WorkerStatus,
         },
     };
 
@@ -2686,9 +2686,9 @@ mod tests {
         );
 
         let makers = [
-            Maker::Control,
-            Maker::provider("p", "k").expect("the shortest maker"),
-            Maker::provider(text(128), text(2_048)).expect("the widest maker"),
+            Registrant::Control,
+            Registrant::provider("p", "k").expect("the shortest maker"),
+            Registrant::provider(text(128), text(2_048)).expect("the widest maker"),
         ];
         for long in [false, true] {
             let sized = |least, most| text(if long { most } else { least });
@@ -2846,7 +2846,7 @@ mod tests {
     #[test]
     fn a_row_crosses_with_its_maker() {
         use super::{maker_weight, room};
-        use crate::store::{Maker, Unmade};
+        use crate::store::{Registrant, Unmade};
 
         let now = Instant::now();
         // A control call's row says no maker, and a row that says none
@@ -2855,11 +2855,11 @@ mod tests {
         let told = row(&by_hand);
         assert_eq!(told.maker, None);
         let back = told_row(&told, now).expect("the row");
-        assert_eq!(back.maker, Maker::Control);
+        assert_eq!(back.maker, Registrant::Control);
         // A provider's row crosses whole: its name and its key for the
         // worker.
         let found = WorkerRow {
-            maker: Maker::provider("cluster", "pods/a").expect("a whole maker"),
+            maker: Registrant::provider("cluster", "pods/a").expect("a whole maker"),
             ..full()
         };
         let told = row(&found);
@@ -2874,7 +2874,7 @@ mod tests {
         // side of a length's second byte, and a row holds them inside its
         // bound.
         for bytes in [1, 110, 127, 128, 300] {
-            let maker = Maker::provider("cluster", "k".repeat(bytes)).expect("a whole maker");
+            let maker = Registrant::provider("cluster", "k".repeat(bytes)).expect("a whole maker");
             let with = WorkerRow {
                 maker: maker.clone(),
                 ..full()
@@ -2882,9 +2882,9 @@ mod tests {
             let grown = row(&with).encoded_len() - row(&by_hand).encoded_len();
             assert_eq!(maker_weight(&maker), grown, "a key of {bytes}");
         }
-        assert_eq!(maker_weight(&Maker::Control), 0);
+        assert_eq!(maker_weight(&Registrant::Control), 0);
         let brim = facts(&weighing(ROW_BYTES), None).expect("a row at its bound");
-        assert!(room(&brim, &brim.labels, &Maker::Control, "spec").is_ok());
+        assert!(room(&brim, &brim.labels, &Registrant::Control, "spec").is_ok());
         assert_eq!(
             room(&brim, &brim.labels, &found.maker, "spec").map_err(|refused| refused.path),
             Err("spec")
@@ -2905,8 +2905,8 @@ mod tests {
         assert!(row(&widest).encoded_len() <= ROW_BYTES);
         // A maker that breaks a part's rule is refused by that part's path,
         // in the words of the routine that makes one: no leader makes it.
-        let wide = "p".repeat(Maker::NAME_BYTES + 1);
-        let long = "k".repeat(Maker::KEY_BYTES + 1);
+        let wide = "p".repeat(Registrant::NAME_BYTES + 1);
+        let long = "k".repeat(Registrant::KEY_BYTES + 1);
         for (provider, key, path) in [
             ("", "pods/a", "row.maker.provider"),
             ("cluster", "", "row.maker.key"),
@@ -2926,7 +2926,7 @@ mod tests {
             };
             let refusal = told_row(&broken, now).expect_err("refused");
             let (Unmade::Provider(why) | Unmade::Key(why)) =
-                Maker::provider(provider, key).expect_err("no maker");
+                Registrant::provider(provider, key).expect_err("no maker");
             assert_eq!((refusal.path, refusal.why), (path, why));
         }
     }

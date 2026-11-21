@@ -97,7 +97,7 @@ pub use self::{
     tls::TlsError,
 };
 use self::{
-    election::Standing,
+    election::ElectionObservation,
     principal::Layer,
     readiness::Phase,
     service::{Service, Shared},
@@ -108,14 +108,12 @@ use self::{
 #[cfg(feature = "worker-host")]
 use crate::worker_host::{KvFeed, Members};
 use crate::{
-    service::{
-        elector::{Elector, Fence},
-        ingest::{
-            loads::{LoadDriver, LoadDriverConfig},
-            probe::EngineProbe,
-        },
+    load::ingest::{
+        loads::{LoadDriver, LoadDriverConfig},
+        probe::EngineProbe,
     },
-    stages::catalog::Catalog,
+    service::elector::{Elector, Fence},
+    stages::registry::StageRegistry,
     store::{MemoryStore, WorkersStore},
 };
 
@@ -142,7 +140,7 @@ pub struct Controller {
     config: Config,
     /// The stages a policy document may name, fixed at the bind: the stock
     /// build's, or the host's own.
-    catalog: Arc<Catalog>,
+    catalog: Arc<StageRegistry>,
     phase: watch::Sender<Phase>,
     readiness: Readiness,
     metrics: Arc<metrics::Metrics>,
@@ -151,7 +149,7 @@ pub struct Controller {
     /// This replica's candidate: the election thread steps it once served.
     elector: Elector,
     /// The election's sight of the lease, written by its thread.
-    standing: watch::Sender<Standing>,
+    standing: watch::Sender<ElectionObservation>,
     /// What every listener's instance of the service reads; the store is
     /// its field, the run loop's drivers read the same one.
     shared: Arc<Shared>,
@@ -345,7 +343,7 @@ pub enum Error {
 impl Controller {
     /// [`Controller::bind_with`] over the stock build's stages.
     pub async fn bind(config: Config) -> Result<Self, Error> {
-        Self::bind_with(config, Catalog::builtin()).await
+        Self::bind_with(config, StageRegistry::builtin()).await
     }
 
     /// Validates the configuration, installs the process crypto provider,
@@ -354,13 +352,13 @@ impl Controller {
     /// and no lease is taken, so a refusal arrives before a client can
     /// connect. A policy document names the stages `catalog` holds: the
     /// stock build's and the ones the host added. One that needs the
-    /// lifecycle's calls ([`crate::tracking::Lifecycle::needs_lifecycle`]) is refused
-    /// as not in this build: the controller makes the membership call, and a
-    /// stage hears a lease's issue, its dispatch, completion and release at
-    /// its gateway's word and its end at the dispatch deadline or where its
-    /// answer does not leave here, and not yet the end of a lease whose
-    /// gateway was let go.
-    pub async fn bind_with(config: Config, catalog: Catalog) -> Result<Self, Error> {
+    /// lifecycle's calls ([`crate::stages::Lifecycle::needs_lifecycle`]) is
+    /// refused as not in this build: the controller makes the membership call,
+    /// and a stage hears a lease's issue, its dispatch, completion and release
+    /// at its gateway's word and its end at the dispatch deadline or where its
+    /// answer does not leave here, and not yet the end of a lease whose gateway
+    /// was let go.
+    pub async fn bind_with(config: Config, catalog: StageRegistry) -> Result<Self, Error> {
         config.validate()?;
         tls::install_crypto_provider();
         // The stages a policy document may name in this build, the host's
@@ -455,7 +453,7 @@ impl Controller {
             renew_deadline = ?settings.renew_deadline,
             "election"
         );
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let steps = stood.clone();
         // What a watched write wakes beside the feed: the follower of the
         // replica's worker objects, where the build has one.
@@ -609,7 +607,7 @@ impl Controller {
     /// The stages a policy document may name in this controller, fixed at
     /// the bind: a spec file's document is validated against them
     /// ([`Controller::spec_file`]).
-    pub fn catalog(&self) -> &Catalog {
+    pub fn catalog(&self) -> &StageRegistry {
         &self.catalog
     }
 
@@ -1373,7 +1371,7 @@ mod tests {
     use super::{
         config::tests::valid,
         deciders::tests as bed,
-        election::{self, Standing},
+        election::{self, ElectionObservation},
         following,
         membership::tests::Logged,
         principal::Layer,
@@ -1385,16 +1383,14 @@ mod tests {
     #[cfg(feature = "worker-host")]
     use crate::store::{HealthPolicy, WorkerFacts, WorkerStatus, WorkersStore};
     use crate::{
-        engine::door::TERM_MARK,
-        service::{
-            elector::{
-                ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease,
-                Tick, Written,
-            },
-            ingest::{
-                loads::{LoadProbe, ReadError},
-                probe::unbuildable,
-            },
+        engine::store_backed_engine::TERM_MARK,
+        load::ingest::{
+            loads::{LoadProbe, ReadError},
+            probe::unbuildable,
+        },
+        service::elector::{
+            ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease, Tick,
+            Written,
         },
         store::Kinds,
     };
@@ -1924,7 +1920,7 @@ mod tests {
     async fn the_role_is_told_at_each_change_and_as_left_at_the_stop() {
         let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
             .expect("the default settings are in order");
-        let (steps, stepped) = watch::channel(Standing::default());
+        let (steps, stepped) = watch::channel(ElectionObservation::default());
         let (phase, readiness) =
             readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (stop, stopped) = watch::channel(false);
@@ -1949,18 +1945,18 @@ mod tests {
             elector.tick(Instant::now()),
             Ok(Tick::Acquired { .. })
         ));
-        steps.send_replace(Standing::default());
+        steps.send_replace(ElectionObservation::default());
         told_as(true).await;
         // The lease let go with no stop: told at the next step.
         assert!(elector.release().expect("a release"));
-        steps.send_replace(Standing::default());
+        steps.send_replace(ElectionObservation::default());
         told_as(false).await;
         // Taken again, then the stop: the replica left, and the teller ends.
         assert!(matches!(
             elector.tick(Instant::now()),
             Ok(Tick::Acquired { .. })
         ));
-        steps.send_replace(Standing::default());
+        steps.send_replace(ElectionObservation::default());
         told_as(true).await;
         stop.send_replace(true);
         told_as(false).await;
@@ -1983,7 +1979,7 @@ mod tests {
         };
         let mut elector = Elector::alone("controller-0@127.0.0.1:1", settings)
             .expect("the settings are in order");
-        let (steps, stepped) = watch::channel(Standing::default());
+        let (steps, stepped) = watch::channel(ElectionObservation::default());
         let (phase, readiness) =
             readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (_stop, stopped) = watch::channel(false);
@@ -2014,7 +2010,7 @@ mod tests {
             renewed += settings.renew_deadline - Duration::from_millis(10);
             assert!(matches!(elector.tick(renewed), Ok(Tick::Renewed { .. })));
         }
-        steps.send_replace(Standing::default());
+        steps.send_replace(ElectionObservation::default());
         told_as(true).await;
         // No renewal and no step from here: the clock closes the fence one
         // renew deadline after the last renewal, and the teller says so.
@@ -2040,7 +2036,7 @@ mod tests {
         }
         let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
             .expect("the default settings are in order");
-        let (steps, stepped) = watch::channel(Standing::default());
+        let (steps, stepped) = watch::channel(ElectionObservation::default());
         let (phase, readiness) =
             readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (_stop, stopped) = watch::channel(false);
@@ -2053,12 +2049,12 @@ mod tests {
             elector.tick(Instant::now()),
             Ok(Tick::Acquired { .. })
         ));
-        steps.send_replace(Standing::default());
+        steps.send_replace(ElectionObservation::default());
         told_as(&mut role, true).await;
         // Three steps under the standing leader, each taken by the teller:
         // turns of the runtime and no clock.
         for _ in 0..3 {
-            steps.send_replace(Standing::default());
+            steps.send_replace(ElectionObservation::default());
             for _ in 0..100 {
                 tokio::task::yield_now().await;
             }
@@ -2069,7 +2065,7 @@ mod tests {
         );
         // The teller took those steps: the one after the lead's loss is told.
         assert!(elector.release().expect("a release"));
-        steps.send_replace(Standing::default());
+        steps.send_replace(ElectionObservation::default());
         told_as(&mut role, false).await;
     }
 
@@ -2086,7 +2082,7 @@ mod tests {
         }
         let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
             .expect("the default settings are in order");
-        let (steps, stepped) = watch::channel(Standing::default());
+        let (steps, stepped) = watch::channel(ElectionObservation::default());
         let (phase, readiness) =
             readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (_stop, stopped) = watch::channel(false);
@@ -2099,7 +2095,7 @@ mod tests {
             elector.tick(Instant::now()),
             Ok(Tick::Acquired { .. })
         ));
-        steps.send_replace(Standing::default());
+        steps.send_replace(ElectionObservation::default());
         let first = elector.fence().term();
         names(&mut role, first).await;
         // The release and the take with nothing awaited between them: the
@@ -2111,7 +2107,7 @@ mod tests {
         ));
         let second = elector.fence().term();
         assert_ne!(second, first, "a take is another term");
-        steps.send_replace(Standing::default());
+        steps.send_replace(ElectionObservation::default());
         names(&mut role, second).await;
     }
 
@@ -2122,7 +2118,7 @@ mod tests {
     /// leads here.
     struct Unstepped {
         elector: Elector,
-        steps: watch::Sender<Standing>,
+        steps: watch::Sender<ElectionObservation>,
         phase: watch::Sender<Phase>,
         /// The role's word, as a watch admitted now holds it.
         watch: watch::Receiver<Option<u64>>,
@@ -2143,7 +2139,7 @@ mod tests {
                 settings,
             )
             .expect("the settings are in order");
-            let (steps, stepped) = watch::channel(Standing::default());
+            let (steps, stepped) = watch::channel(ElectionObservation::default());
             let (phase, readiness) =
                 readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
             let (stop, stopped) = watch::channel(false);
@@ -2171,7 +2167,7 @@ mod tests {
                     Tick::Renewed { term: 1 }
                 );
             }
-            steps.send_replace(Standing::default());
+            steps.send_replace(ElectionObservation::default());
             let mut first = role.clone();
             first.changed().await.expect("the teller tells the step");
             assert!(first.borrow().is_none());
@@ -2219,7 +2215,7 @@ mod tests {
     async fn a_watch_admitted_before_the_role_was_told_as_leading_hears_the_loss_of_its_lead() {
         let mut serve = Unstepped::new().await;
         assert!(serve.elector.release().expect("a release"));
-        serve.steps.send_replace(Standing::default());
+        serve.steps.send_replace(ElectionObservation::default());
         serve.hears("the lead's loss").await;
     }
 
@@ -2379,7 +2375,7 @@ mod tests {
         let bound = Duration::from_secs(1);
         let lag = Arc::new(Lag::new(bound));
         lag.follow();
-        let (_standing, stepped) = watch::channel(Standing::default());
+        let (_standing, stepped) = watch::channel(ElectionObservation::default());
         let (phase, role) = readiness::channel(elector.fence(), stepped, Arc::clone(&lag));
         phase.send_replace(Phase::Serving);
         let (reporter, _server) = health_reporter();

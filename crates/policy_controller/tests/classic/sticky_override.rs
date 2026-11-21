@@ -14,7 +14,8 @@ use smg_policy_controller::{
         Candidate, Constraints, Engine, Health, Identity, PoolFacts, RequestFacts, Scratch,
         WorkerId,
     },
-    tracking::{Lease, Lifecycle, Side},
+    stages::Lifecycle,
+    tracking::{Lease, Side},
 };
 
 use crate::{Outcome, Recorded, Replayed};

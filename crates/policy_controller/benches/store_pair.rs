@@ -97,7 +97,7 @@ fn pair_builds(store: &MemoryStore, ask: &Ask, owned: bool, n: usize, iters: u64
     let mut out = PairBuffers::default();
     let one = |out: &mut PairBuffers| {
         if owned {
-            store.world().build_pair(MODEL, black_box(ask), out)
+            store.snapshot().build_pair(MODEL, black_box(ask), out)
         } else {
             store.build_pair(MODEL, black_box(ask), out)
         }

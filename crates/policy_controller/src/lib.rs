@@ -34,12 +34,12 @@
 //!   scorer owns its ring ([`policies::consistent_hashing`]), fed by the
 //!   membership hooks. The
 //!   prefixes sent to a model's workers without cache events are kept by
-//!   the sent-prefix predictor ([`predictor`]). A profile that reads sent
+//!   the sent-prefix predictor ([`tracking`]). A profile that reads sent
 //!   prefixes reads that record at the naming through the in-process door.
-//! - 4.5, the stages in code ([`stages`]): the [`Catalog`] of the stages a
-//!   build knows by name, the stock build's and the ones a host registers.
-//!   A document names either kind the same way, and the validator resolves
-//!   every name once ([`PolicySpec::validate_in`]).
+//! - 4.5, the stages in code ([`stages`]): the [`StageRegistry`] of the stages
+//!   a build knows by name, the stock build's and the ones a host registers. A
+//!   document names either kind the same way, and the validator resolves every
+//!   name once ([`PolicySpec::validate_in`]).
 //! - 4.6, the schema ([`document`]): [`PolicySpec`] (`apiVersion: smg.policy/v1`,
 //!   no `kind`), its validator and the [`Needs`] summary the host reads at
 //!   apply, before any request exists. A binding names where a request's
@@ -55,8 +55,8 @@
 //!   ([`store::index`]), which no decision reads yet. A
 //!   gateway in the embedded mode implements the same traits over its own
 //!   structures. The store publishes what a decision reads
-//!   ([`store::World`]: every pool as whole candidate rows) and builds one
-//!   decision's view from it through no lock; the service that calls the
+//!   ([`store::StoreSnapshot`]: every pool as whole candidate rows) and builds
+//!   one decision's view from it through no lock; the service that calls the
 //!   build is a later step.
 //! - 10, the election ([`service::elector`]): one [`service::elector::Elector`] over a
 //!   [`service::elector::LeaseBackend`] (the lease file and the in-process record
@@ -83,21 +83,21 @@
 //!   the metrics parser. The load driver and the worker host's load adapter
 //!   share the `load_report` conversion.
 //!
-//! - Behind the `operator` feature, `document::operator::SpecDoor` applies a
-//!   host's start document and serves its status, document and dry run.
-//!   The feature also serves worker snapshots over the host's store.
+//! - Behind the `operator` feature, `document::operator::DocumentManager`
+//!   applies a host's start document and serves its status, document and dry
+//!   run. The feature also serves worker snapshots over the host's store.
 //! - The door ([`engine`]): the order of one decision's calls, written once
-//!   for every host. A host that embeds the engine asks [`engine::Door`],
-//!   which runs the order on the caller's thread over a
-//!   [`store::MemoryStore`]: the lease is filed at the issue, the host says
-//!   what became of it ([`engine::Door::report`]), itself or through a
-//!   handle, and its timer calls the door's clock ([`engine::Door::sweep`]).
-//!   The standalone controller runs the same order on its deciders'
-//!   threads.
+//!   for every host. A host that embeds the engine asks
+//!   [`engine::StoreBackedEngine`], which runs the order on the caller's thread
+//!   over a [`store::MemoryStore`]: the lease is filed at the issue, the host
+//!   says what became of it ([`engine::StoreBackedEngine::report`]), itself or
+//!   through a handle, and its timer calls the door's clock
+//!   ([`engine::StoreBackedEngine::sweep`]). The standalone controller runs the
+//!   same order on its deciders' threads.
 //! - The handle ([`tracking`]): one decision held until its request ends.
-//!   A host that holds a [`tracking::Handle`] says the target it took, the
-//!   dispatch, and the completion or the release. The handle reports to
-//!   the in-process door or, with the `client` feature, over a link.
+//!   A host that holds a [`tracking::DecisionGuard`] says the target it took,
+//!   the dispatch, and the completion or the release. The handle reports to the
+//!   in-process door or, with the `client` feature, over a link.
 //! - Behind the `controller` feature, the standalone controller
 //!   (`controller`): the listeners with their credentialed scopes, the
 //!   health service on each, the admin endpoints, readiness, the drain and
@@ -154,17 +154,18 @@
 //! [`Shed`]: engine::Shed
 //! [`Queue`]: engine::Queue
 //! [`Lease`]: tracking::Lease
-//! [`Lifecycle`]: tracking::Lifecycle
+//! [`Lifecycle`]: stages::Lifecycle
 //! [`Profile`]: engine::Profile
 //! [`Filter`]: engine::Filter
 //! [`Scorer`]: engine::Scorer
 //! [`Picker`]: engine::Picker
 //! [`Plan`]: engine::Plan
 //! [`Engine`]: engine::Engine
-//! [`Catalog`]: stages::Catalog
+//! [`StageRegistry`]: stages::StageRegistry
 //! [`PolicySpec::validate_in`]: document::PolicySpec::validate_in
 //! [`PolicySpec`]: document::PolicySpec
 //! [`Needs`]: document::Needs
+//!
 
 #[cfg(any(feature = "ingest", feature = "operator"))]
 mod address;
@@ -173,7 +174,6 @@ pub mod engine;
 pub mod load;
 pub mod plugins;
 pub mod policies;
-pub mod predictor;
 pub mod service;
 pub mod stages;
 pub mod store;

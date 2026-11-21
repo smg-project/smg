@@ -1092,7 +1092,7 @@ mod tests {
             proto::replication_event::Event as Sent,
             replication,
         },
-        stages::catalog,
+        stages::registry,
         store::{
             LeasesStore, LoadSample, LoadSink, LoadSource, MembershipChange, WorkerFacts,
             WorkerRow, WorkersStore,
@@ -2545,7 +2545,7 @@ mod tests {
 
     /// The stock door over the leader's store.
     fn door(leader: &Leader) -> Arc<Generations> {
-        let catalog = Arc::new(catalog::Catalog::builtin());
+        let catalog = Arc::new(registry::StageRegistry::builtin());
         Arc::new(Generations::new(Arc::clone(&leader.store), catalog))
     }
 

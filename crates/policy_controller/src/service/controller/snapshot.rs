@@ -60,7 +60,7 @@ use tonic::Status;
 use super::{generations::Generations, watch_workers, wire};
 use crate::{
     document::operator::{
-        snapshot::{self, Asked as RowsAsked, Rows},
+        snapshot::{self, Rows, WorkerRowsQuery},
         Turn,
     },
     service::proto::{self, snapshot_request::Slice},
@@ -138,13 +138,13 @@ pub(super) async fn in_turn<T: Send + 'static>(
 /// What a snapshot's caller asked for, once the request holds this build's
 /// rules ([`asked`]).
 #[derive(Debug)]
-pub(crate) struct Asked {
+pub(crate) struct SnapshotQuery {
     workers: bool,
     spec: bool,
-    rows: RowsAsked,
+    rows: WorkerRowsQuery,
 }
 
-impl Asked {
+impl SnapshotQuery {
     /// The refusal of the spec slice, by its name, where the controller was
     /// given no spec source (`bound` says whether it was). The handler
     /// reads it ahead of the turn, as it reads each rule of the request: a
@@ -162,7 +162,7 @@ impl Asked {
 /// caller's error. A slice this build does not serve, and identifiers in
 /// clear, are this build's: `UNIMPLEMENTED`. The models are held to a
 /// watch's bounds: the list is read at each row.
-pub(crate) fn asked(request: proto::SnapshotRequest) -> Result<Asked, Status> {
+pub(crate) fn asked(request: proto::SnapshotRequest) -> Result<SnapshotQuery, Status> {
     let mut named = 0;
     for &number in &request.slices {
         match Slice::try_from(number) {
@@ -190,16 +190,16 @@ pub(crate) fn asked(request: proto::SnapshotRequest) -> Result<Asked, Status> {
             names(served)
         )));
     }
-    if let Some(why) = RowsAsked::refused(&request.models) {
+    if let Some(why) = WorkerRowsQuery::refused(&request.models) {
         return Err(Status::invalid_argument(format!("models: {why}")));
     }
     if request.plain_identifiers {
         return Err(Status::unimplemented(PLAIN));
     }
-    Ok(Asked {
+    Ok(SnapshotQuery {
         workers: named & bit(Slice::Workers) != 0,
         spec: named & bit(Slice::Spec) != 0,
-        rows: RowsAsked {
+        rows: WorkerRowsQuery {
             models: request.models,
             // Zero leaves the bound of a page's bytes alone.
             limit: match request.limit {
@@ -218,7 +218,7 @@ pub(crate) fn asked(request: proto::SnapshotRequest) -> Result<Asked, Status> {
 /// call let in while it runs shares the copy. Any other call that is alone
 /// with no watch open reads the rows it may tell and keeps nothing.
 pub(crate) fn read(
-    asked: &Asked,
+    asked: &SnapshotQuery,
     turn: &Turn,
     feed: &watch_workers::Feed,
     watchers: &watch_workers::Watchers,
@@ -239,12 +239,12 @@ pub(crate) fn read(
 /// `term`: the header, then each slice asked. The rows are `read`'s, which
 /// is called where the worker rows are asked and never else. The spec slice
 /// of a controller with no spec source is refused ahead of the turn
-/// ([`Asked::sourced`]), and the take keeps its own read of the source,
+/// ([`SnapshotQuery::sourced`]), and the take keeps its own read of the source,
 /// before a row is copied. The header's generation is the spec slice's own
 /// where that slice is told: one read. The answer names no place of the
 /// log, no id table and no document: it is no base a standby starts from.
 pub(crate) fn taken(
-    asked: &Asked,
+    asked: &SnapshotQuery,
     term: u64,
     controller_id: &str,
     read: impl FnOnce() -> Rows,
@@ -278,7 +278,7 @@ pub(crate) fn taken(
 }
 
 /// A controller page keeps its bound on the encoded rows' bytes.
-fn rows(asked: &RowsAsked, read: Rows, now: Instant) -> (Vec<proto::WorkerRow>, bool) {
+fn rows(asked: &WorkerRowsQuery, read: Rows, now: Instant) -> (Vec<proto::WorkerRow>, bool) {
     snapshot::told_with(asked, read, now, true, |row| {
         let told = wire::snapshot_row(&row, now);
         let framed = message::encoded_len(1, &told);
@@ -302,7 +302,8 @@ mod tests {
     use tonic::Code;
 
     use super::{
-        asked, in_turn, served, taken, Asked, Rows, RowsAsked, Turn, SLICES, SNAPSHOTS_WAITING,
+        asked, in_turn, served, taken, Rows, SnapshotQuery, Turn, WorkerRowsQuery, SLICES,
+        SNAPSHOTS_WAITING,
     };
     use crate::{
         address::UNPARSABLE,
@@ -315,21 +316,25 @@ mod tests {
             },
             proto::{self, snapshot_request::Slice},
         },
-        stages::catalog::Catalog,
+        stages::registry::StageRegistry,
         store::{Cut, Kinds, MemoryStore, WorkerFacts, WorkerRow, WorkersStore},
     };
 
     /// The rows slice alone: every model, no limit.
-    const ROWS: Asked = Asked {
+    const ROWS: SnapshotQuery = SnapshotQuery {
         workers: true,
         spec: false,
-        rows: RowsAsked {
+        rows: WorkerRowsQuery {
             models: Vec::new(),
             limit: usize::MAX,
         },
     };
 
-    fn rows(cut: &[WorkerRow], asked: &Asked, now: Instant) -> (Vec<proto::WorkerRow>, bool) {
+    fn rows(
+        cut: &[WorkerRow],
+        asked: &SnapshotQuery,
+        now: Instant,
+    ) -> (Vec<proto::WorkerRow>, bool) {
         let cut = Arc::new(Cut {
             rows: cut.to_vec(),
             at: Default::default(),
@@ -590,7 +595,7 @@ mod tests {
     /// call's row names no maker.
     #[test]
     fn a_makers_key_is_told_without_its_userinfo() {
-        use crate::store::Maker;
+        use crate::store::Registrant;
 
         let store = MemoryStore::new();
         register(&store, &url(1), "model-a");
@@ -601,7 +606,7 @@ mod tests {
         };
         let told = |row: &WorkerRow| page(row).maker.map(|maker| maker.key);
         assert_eq!(told(&row), None, "a control call's row names no maker");
-        row.maker = Maker::provider(
+        row.maker = Registrant::provider(
             "pool",
             "http://operator-name:s3cret-word@pool.example/pods/a",
         )
@@ -630,7 +635,7 @@ mod tests {
             ("operator-name:s3cret-word@", UNPARSABLE),
             ("http://pool.example/pods/a@node-3", UNPARSABLE),
         ] {
-            row.maker = Maker::provider("pool", key).expect("a whole maker");
+            row.maker = Registrant::provider("pool", key).expect("a whole maker");
             assert_eq!(told(&row).as_deref(), Some(reads), "the key {key}");
         }
     }
@@ -649,8 +654,8 @@ mod tests {
         let told = |limit| {
             let (page, truncated) = rows(
                 &cut.rows,
-                &Asked {
-                    rows: RowsAsked { limit, ..ROWS.rows },
+                &SnapshotQuery {
+                    rows: WorkerRowsQuery { limit, ..ROWS.rows },
                     ..ROWS
                 },
                 now,
@@ -681,7 +686,7 @@ mod tests {
         assert_eq!((page.len(), truncated), (1, true));
         assert!(page[0].url.starts_with("grpc://0."));
         // A lone call's own read is held to the same bytes.
-        let asked = RowsAsked {
+        let asked = WorkerRowsQuery {
             models: Vec::new(),
             limit: 3,
         };
@@ -716,8 +721,8 @@ mod tests {
         }
         let cut = store.cut(Kinds::Watched);
         let told = |limit| {
-            let asked = Asked {
-                rows: RowsAsked {
+            let asked = SnapshotQuery {
+                rows: WorkerRowsQuery {
                     models: vec!["model-b".to_owned(), "model-c".to_owned()],
                     limit,
                 },
@@ -758,8 +763,8 @@ mod tests {
         ];
         for models in filters {
             for limit in [0, 1, 2, 3, 5, 6, usize::MAX] {
-                let asked = Asked {
-                    rows: RowsAsked {
+                let asked = SnapshotQuery {
+                    rows: WorkerRowsQuery {
                         models: models.clone(),
                         limit,
                     },
@@ -784,8 +789,8 @@ mod tests {
     fn a_controller_with_no_spec_source_serves_its_rows_and_refuses_the_spec_slice() {
         let store = Arc::new(MemoryStore::new());
         let id = register(&store, &url(5), "model-a");
-        let generations = Generations::new(Arc::clone(&store), Arc::new(Catalog::builtin()));
-        let take = |asked: &Asked| {
+        let generations = Generations::new(Arc::clone(&store), Arc::new(StageRegistry::builtin()));
+        let take = |asked: &SnapshotQuery| {
             taken(
                 asked,
                 3,
@@ -796,7 +801,7 @@ mod tests {
             )
         };
 
-        let refused = take(&Asked { spec: true, ..ROWS }).expect_err("refused");
+        let refused = take(&SnapshotQuery { spec: true, ..ROWS }).expect_err("refused");
         assert_eq!(
             (refused.code(), refused.message()),
             (
@@ -807,7 +812,7 @@ mod tests {
 
         // The handler reads the source ahead of the turn, in the same
         // words, and asks nothing of a request for the rows alone.
-        let ahead = Asked { spec: true, ..ROWS }
+        let ahead = SnapshotQuery { spec: true, ..ROWS }
             .sourced(false)
             .expect_err("refused");
         assert_eq!(
@@ -815,7 +820,7 @@ mod tests {
             (refused.code(), refused.message())
         );
         assert!(ROWS.sourced(false).is_ok());
-        assert!(Asked { spec: true, ..ROWS }.sourced(true).is_ok());
+        assert!(SnapshotQuery { spec: true, ..ROWS }.sourced(true).is_ok());
 
         let answer = take(&ROWS).expect("the rows");
         assert_eq!(
@@ -847,11 +852,11 @@ mod tests {
     fn the_header_names_the_generation_the_spec_slice_tells() {
         let store = Arc::new(MemoryStore::new());
         register(&store, &url(5), "model-a");
-        let generations = Generations::new(Arc::clone(&store), Arc::new(Catalog::builtin()));
+        let generations = Generations::new(Arc::clone(&store), Arc::new(StageRegistry::builtin()));
         generations
             .apply(LEAST_LOAD.into(), Format::Yaml)
             .expect("a valid document");
-        let status = Asked {
+        let status = SnapshotQuery {
             workers: false,
             spec: true,
             ..ROWS
@@ -1085,7 +1090,7 @@ mod tests {
 
     #[test]
     fn plain_snapshot_rows_map_to_the_previous_wire_rows() {
-        use crate::document::operator::snapshot::{told, Asked as RowsAsked, Rows as ReadRows};
+        use crate::document::operator::snapshot::{told, Rows as ReadRows, WorkerRowsQuery};
 
         let store = MemoryStore::new();
         for (key, model) in [
@@ -1100,7 +1105,7 @@ mod tests {
         let now = Instant::now() + Duration::from_secs(1);
         for models in [Vec::new(), vec!["a".to_owned()], vec!["none".to_owned()]] {
             for limit in [0, 1, 2, 3, usize::MAX] {
-                let asked = RowsAsked {
+                let asked = WorkerRowsQuery {
                     models: models.clone(),
                     limit,
                 };

@@ -1161,7 +1161,7 @@ async fn the_pair_stage_keeps_its_ask_for_a_decode_that_waits() {
         let document = PolicySpec::pair_presets("least_load", "least_load");
         let mut document = document.expect("the pair presets");
         document.plans.pd_pair.decode = DecodePick::AfterPrefill;
-        document.generation = store.with_world(|world| world.spec().generation()) + 1;
+        document.generation = store.with_snapshot(|world| world.spec().generation()) + 1;
         let applied = AppliedSpec::validate(&document).expect("the document validates");
         store.apply(applied).expect("a later generation");
         // The other decode reports a deep queue: the first decision names

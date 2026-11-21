@@ -645,7 +645,7 @@ fn publish(c: &mut Criterion, fixtures: &mut [Fixture]) {
                         if reader {
                             // The last publication's world takes the place
                             // of the one three publications back.
-                            kept[(turn % 2) as usize] = Some(fixture.store.world());
+                            kept[(turn % 2) as usize] = Some(fixture.store.snapshot());
                         }
                         let due = opened + PUBLISH_WINDOW;
                         fixture.window.set(due);

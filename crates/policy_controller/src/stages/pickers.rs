@@ -11,7 +11,8 @@ use crate::{
         framework::{top_drawn, top_pass, Narrowed, Picker, TieBand, DRAW_BOUND},
         view::{Candidate, PoolFacts, RequestFacts},
     },
-    tracking::{counts::with_counts, lease::Lifecycle},
+    stages::lifecycle::Lifecycle,
+    tracking::in_flight::with_counts,
     Draw,
 };
 

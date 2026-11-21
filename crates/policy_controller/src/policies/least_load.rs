@@ -24,11 +24,14 @@ use crate::{
         view::{Candidate, LoadRow, RequestFacts, WorkerId},
     },
     policies::standard_filters,
-    stages::scorers::{normalize_costs, ReadsLoad, PENDING, TIE_EPSILON_SECS},
+    stages::{
+        lifecycle::Lifecycle,
+        scorers::{normalize_costs, ReadsLoad, PENDING, TIE_EPSILON_SECS},
+    },
     tracking::{
-        counts::with_counts,
-        lease::{Lease, Lifecycle, Membership, Side},
-        sent::{SentCredit, SentReads},
+        dispatch_credit::{DispatchCredit, DispatchCreditPass},
+        in_flight::with_counts,
+        lease::{Lease, Membership, Side},
     },
 };
 
@@ -53,7 +56,7 @@ pub struct LeastLoad {
     pub default_throughput: f32,
     /// The count of sends the stage reads: its profile's where a document
     /// built the stage, one of its own elsewhere.
-    sent: Arc<SentCredit>,
+    sent: Arc<DispatchCredit>,
     /// Whether the count is the stage's own. The stage's hooks feed its
     /// own count. The engine feeds a profile's.
     feeds: bool,
@@ -68,7 +71,7 @@ impl LeastLoad {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
-                Arc::new(SentCredit::new("", None)),
+                Arc::new(DispatchCredit::new("", None)),
             )
         }
     }
@@ -80,7 +83,7 @@ impl LeastLoad {
         kv_pressure_weight: f32,
         mean_prefill_tokens: u32,
         default_throughput: f32,
-        sent: Arc<SentCredit>,
+        sent: Arc<DispatchCredit>,
     ) -> Self {
         Self {
             kv_pressure_weight,
@@ -270,7 +273,7 @@ impl LeastLoad {
 
     /// Writes each reporting row's credit work and marks each row without
     /// a report, and says how many report. `TIMED` is whether the count
-    /// sets a time limit ([`SentCredit::limited`]): the pass of a count
+    /// sets a time limit ([`DispatchCredit::limited`]): the pass of a count
     /// with none reads each row by its sample alone.
     #[inline(always)]
     fn credit_pass<const TIMED: bool>(
@@ -280,7 +283,7 @@ impl LeastLoad {
         rows: &[u32],
         out: &mut [f32],
         load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
-        sends: &SentReads<'_>,
+        sends: &DispatchCreditPass<'_>,
     ) -> usize {
         let mean = u64::from(self.mean_prefill_tokens);
         let mut reporting = 0usize;
@@ -322,7 +325,7 @@ impl LeastLoad {
         // report is marked and costed after the peer baseline is known. No
         // allocation.
         let reporting = if self.sent.limited() {
-            let sends = self.sent.reads(facts);
+            let sends = self.sent.pass(facts);
             self.credit_pass::<true>(facts, candidates, rows, out, load, &sends)
         } else {
             let sends = self.sent.reads_unlimited();

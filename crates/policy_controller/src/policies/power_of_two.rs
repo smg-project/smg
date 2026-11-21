@@ -9,8 +9,10 @@ use crate::{
         view::{Candidate, PoolFacts, RequestFacts},
     },
     policies::standard_filters,
-    stages::pickers::{below_band, draw_kept, target_of},
-    tracking::lease::Lifecycle,
+    stages::{
+        lifecycle::Lifecycle,
+        pickers::{below_band, draw_kept, target_of},
+    },
     Draw,
 };
 

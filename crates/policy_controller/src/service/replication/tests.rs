@@ -1684,11 +1684,11 @@ fn a_followed_row_keeps_the_instant_it_was_admitted_at() {
 
 #[test]
 fn a_followed_row_keeps_the_maker_its_leader_wrote() {
-    use crate::store::Maker;
+    use crate::store::Registrant;
 
     let (standby, followed) = journaled(64);
     let at = |seq| Position { seq, term: 1 };
-    let found = Maker::provider("cluster", "pods/a").expect("a whole maker");
+    let found = Registrant::provider("cluster", "pods/a").expect("a whole maker");
     let row = WorkerRow {
         id: identity("http://a:8000", 1),
         facts: facts("http://a:8000", 1),
@@ -1829,7 +1829,7 @@ fn a_followed_relabel_carries_the_pair_classes_unless_the_offer_moved() {
         assert_eq!(before, pair_rows(&leader), "{what}");
         // The world is kept, so its classes stand where they are: one
         // address in a later world is those classes carried.
-        let world = standby.world();
+        let world = standby.snapshot();
         let derived = world.pairs("m").expect("the model's classes");
         // A row told again with a fact no pair reads moves no class.
         leader.upsert(WorkerFacts {
@@ -1837,7 +1837,7 @@ fn a_followed_relabel_carries_the_pair_classes_unless_the_offer_moved() {
             ..first()
         });
         follow();
-        let carried = standby.world();
+        let carried = standby.snapshot();
         let pairs = carried.pairs("m").expect("the model's classes");
         assert!(std::ptr::eq(derived, pairs), "{what}: derived again");
         assert_eq!(pair_rows(&standby), before, "{what}");
@@ -1845,7 +1845,7 @@ fn a_followed_relabel_carries_the_pair_classes_unless_the_offer_moved() {
         leader.upsert(facts);
         follow();
         assert_eq!(pair_rows(&standby), pair_rows(&leader), "{what}");
-        let (ours, theirs) = (standby.world(), leader.world());
+        let (ours, theirs) = (standby.snapshot(), leader.snapshot());
         assert_eq!(ours.pairs("m"), theirs.pairs("m"), "{what}");
         assert_ne!(pair_rows(&standby), before, "{what}: the classes moved");
     }
@@ -1869,7 +1869,7 @@ fn a_standbys_pair_classes_follow_each_membership_write_and_a_restore() {
         leader.publish_now();
         standby.publish_now();
         assert_eq!(pair_rows(&standby), pair_rows(&leader), "{what}");
-        let (ours, theirs) = (standby.world(), leader.world());
+        let (ours, theirs) = (standby.snapshot(), leader.snapshot());
         assert_eq!(ours.pairs("m"), theirs.pairs("m"), "{what}");
         pair_rows(&standby)
     };
@@ -1902,7 +1902,7 @@ fn a_standbys_pair_classes_follow_each_membership_write_and_a_restore() {
     assert_ne!(pair_rows(&other), fewer);
     assert!(other.restore_from(leader.cut(Kinds::All)));
     assert_eq!(pair_rows(&other), fewer);
-    let (ours, theirs) = (other.world(), leader.world());
+    let (ours, theirs) = (other.snapshot(), leader.snapshot());
     assert_eq!(ours.pairs("m"), theirs.pairs("m"));
 }
 
@@ -1983,7 +1983,7 @@ fn a_standby_follows_a_generation_at_its_leaders_place() {
         assert!(adopting.landed(), "{entry:?}");
     }
     assert_eq!(all(&log), entries, "the leader's history, place by place");
-    assert_eq!(standby.world().spec().generation(), 5);
+    assert_eq!(standby.snapshot().spec().generation(), 5);
     assert_eq!(log.followed(), Some(1), "it leads nothing by it");
 
     // A generation the store refuses tells nothing: its guard does not
@@ -2002,5 +2002,5 @@ fn a_standby_follows_a_generation_at_its_leaders_place() {
     standby.follow_generation_place(next, 5);
     assert!(adopting.landed());
     assert_eq!(generations(&log).last(), Some(&(next, 5)));
-    assert_eq!(standby.world().spec().generation(), 5);
+    assert_eq!(standby.snapshot().spec().generation(), 5);
 }

@@ -179,7 +179,7 @@ mod tests {
 
         /// Each row of the store with its id and its revision, by key.
         fn rows(&self) -> Vec<(String, WorkerId, u64)> {
-            let (_, rows) = self.store.snapshot();
+            let (_, rows) = self.store.all_rows();
             rows.into_iter()
                 .map(|row| (row.facts.key, row.id, row.revision))
                 .collect()

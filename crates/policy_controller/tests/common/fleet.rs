@@ -76,7 +76,7 @@ use smg_policy_controller::{
             Side, Welcome,
         },
     },
-    stages::Catalog,
+    stages::StageRegistry,
     store::{
         Ask, BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, Kinds, KvCursor,
         KvEvent, KvEventSink, LaneCounts, LeaseState, MembershipChange, MembershipTail,
@@ -1003,7 +1003,7 @@ impl Replica {
     /// Binds and serves a controller named `id`. Replicas given one `lease`
     /// file elect over it; with none the controller leads itself.
     pub async fn start(id: &str, lease: Option<&Path>) -> Result<Self, String> {
-        Self::start_over(id, lease, Catalog::builtin(), None).await
+        Self::start_over(id, lease, StageRegistry::builtin(), None).await
     }
 
     /// As [`Replica::start`], over the stages `catalog` holds, a host's own
@@ -1014,7 +1014,7 @@ impl Replica {
     pub async fn start_over(
         id: &str,
         lease: Option<&Path>,
-        catalog: Catalog,
+        catalog: StageRegistry,
         spec: Option<&Path>,
     ) -> Result<Self, String> {
         Self::serve(id, lease, loopback().ip(), 0, false, (Some(catalog), spec)).await
@@ -1048,7 +1048,7 @@ impl Replica {
         ip: IpAddr,
         port: u16,
         standbys: bool,
-        (catalog, spec): (Option<Catalog>, Option<&Path>),
+        (catalog, spec): (Option<StageRegistry>, Option<&Path>),
     ) -> Result<Self, String> {
         let listener = |name: &str, scopes: &[Scope], port: u16| Listener {
             name: name.to_owned(),
@@ -1092,7 +1092,7 @@ impl Replica {
             } else {
                 port
             };
-            let catalog = host.take().unwrap_or_else(Catalog::builtin);
+            let catalog = host.take().unwrap_or_else(StageRegistry::builtin);
             let bound = bounded(
                 "the controller binds its listeners",
                 ROOM,
@@ -1231,7 +1231,7 @@ impl Harness {
     /// controller reads and applies itself. The case applies no generation
     /// in its own process beside it.
     #[cfg(feature = "wasm")]
-    pub async fn start_hosting(catalog: Catalog, spec: &Path) -> Result<Self, String> {
+    pub async fn start_hosting(catalog: StageRegistry, spec: &Path) -> Result<Self, String> {
         let replica = Replica::start_over("fleet-controller", None, catalog, Some(spec)).await?;
         Self::around(replica).await
     }

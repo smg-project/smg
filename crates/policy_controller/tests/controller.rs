@@ -1483,7 +1483,7 @@ async fn rss_idle_and_with_a_thousand_workers_in_the_store() {
         // The fleet arrived inside one window: its one build, asked here so
         // the figure holds the world a decision reads.
         store.publish_now();
-        let (_, rows) = store.snapshot();
+        let (_, rows) = store.all_rows();
         assert_eq!(rows.len(), 1_000);
         let fed = vm_rss_kib();
         let mut out = std::io::stdout();
@@ -1503,14 +1503,14 @@ async fn a_served_dispatch_feeds_a_registered_scorer_without_lifecycle_hooks() {
         document::API_VERSION,
         engine::{Candidate, Scorer, TieBand},
         service::proto::{Dispatched, Side},
-        stages::Catalog,
-        tracking::{Lifecycle, Sent, SentCredit},
+        stages::{Lifecycle, StageRegistry},
+        tracking::{CreditedDispatches, DispatchCredit},
     };
 
     #[derive(Debug)]
     struct SentScore {
-        sent: Arc<SentCredit>,
-        seen: Arc<Mutex<Vec<(WorkerId, Sent)>>>,
+        sent: Arc<DispatchCredit>,
+        seen: Arc<Mutex<Vec<(WorkerId, CreditedDispatches)>>>,
     }
 
     impl Lifecycle for SentScore {}
@@ -1527,7 +1527,7 @@ async fn a_served_dispatch_feeds_a_registered_scorer_without_lifecycle_hooks() {
             kept: &[u32],
             out: &mut [f32],
         ) -> TieBand {
-            let reads = self.sent.reads(facts);
+            let reads = self.sent.pass(facts);
             let mut seen = self.seen.lock().expect("the scores");
             seen.clear();
             for (&index, score) in kept.iter().zip(out) {
@@ -1546,7 +1546,7 @@ async fn a_served_dispatch_feeds_a_registered_scorer_without_lifecycle_hooks() {
     const PATIENCE: Duration = Duration::from_secs(12);
 
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let mut catalog = Catalog::builtin();
+    let mut catalog = StageRegistry::builtin();
     let scores = Arc::clone(&seen);
     catalog
         .scorer_with("sent-score", move |build| {
@@ -1678,7 +1678,7 @@ async fn a_served_dispatch_feeds_a_registered_scorer_without_lifecycle_hooks() {
                                 && (sent.requests, sent.tokens, sent.unsized_requests)
                                     == (1, u64::from(TOKENS), 0)
                         }));
-                        assert!(seen.contains(&(target, Sent::default())));
+                        assert!(seen.contains(&(target, CreditedDispatches::default())));
                     } else {
                         first = Some(target);
                         let lease_id = answer.leases[0].id;

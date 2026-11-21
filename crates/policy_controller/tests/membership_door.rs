@@ -620,7 +620,7 @@ async fn the_store_holds_the_rows_the_door_answered() {
 
         // The store's rows are the rows the answers told, in the snapshot's
         // order (by key).
-        let (epoch, rows) = store.snapshot();
+        let (epoch, rows) = store.all_rows();
         assert_eq!(epoch, unchecked.membership_epoch);
         let told = [row_of(&checked), row_of(&unchecked)];
         assert_eq!(rows.len(), 2);

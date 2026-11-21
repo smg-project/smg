@@ -346,9 +346,9 @@ mod tests {
     use crate::{
         document::operator::test_support::Logged,
         engine::view::WorkerId,
+        load::ingest::probe::install_crypto_provider,
         service::{
             controller::{config::tests::valid, Controller, Scope, State, PRINCIPAL_ENTRY},
-            ingest::probe::install_crypto_provider,
             proto::{self, policy_controller_client::PolicyControllerClient, worker_event::Event},
         },
         store::{MemoryStore, WorkerStatus, WorkersStore},
@@ -413,7 +413,7 @@ mod tests {
     }
 
     fn rows(store: &MemoryStore) -> Vec<(WorkerId, String, WorkerStatus)> {
-        let (_, rows) = store.snapshot();
+        let (_, rows) = store.all_rows();
         let mut rows: Vec<_> = rows
             .into_iter()
             .map(|row| (row.id, row.facts.key, row.status))

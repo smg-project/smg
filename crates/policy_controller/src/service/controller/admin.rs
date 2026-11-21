@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use super::{deciders::Counts, metrics::Metrics, readiness::Readiness, PROTOCOL_PACKAGE};
-use crate::{service::ingest::loads::Stats, store::MemoryStore};
+use crate::{load::ingest::loads::Stats, store::MemoryStore};
 
 /// What `/version` answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -124,12 +124,10 @@ mod tests {
             AppliedSpec, PolicySpec,
         },
         engine::view::{LoadRow, Role},
-        service::{
-            controller::{
-                metrics::Metrics,
-                readiness::{tests::fenced, Phase},
-            },
-            ingest::loads::Stats,
+        load::ingest::loads::Stats,
+        service::controller::{
+            metrics::Metrics,
+            readiness::{tests::fenced, Phase},
         },
         store::{LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkersStore},
     };

@@ -74,7 +74,7 @@ pub trait SignalSink: Send + Sync {
         unit: &str,
         value: f64,
         sampled_at: Instant,
-    ) -> Taken;
+    ) -> SignalWriteOutcome;
 }
 
 /// The largest magnitude of a value the sink takes: the bound a cost
@@ -86,7 +86,7 @@ pub(crate) const VALUE_MAGNITUDE_LIMIT: f64 = spec::COST_PARAMETER_LIMIT;
 /// What became of a write to the signal sink.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Taken {
+pub enum SignalWriteOutcome {
     /// The value is on file and is shown with the next publication.
     Written,
     /// The document in force does not continue the column the value was
@@ -104,7 +104,7 @@ pub enum Taken {
     Older,
 }
 
-impl Taken {
+impl SignalWriteOutcome {
     /// Every outcome, in the order of the store's counts
     /// ([`StoreCounts::signal_writes`](super::StoreCounts::signal_writes)).
     pub const EACH: [Self; 6] = [
@@ -144,16 +144,16 @@ impl Taken {
 /// The writes to a sink by what became of each: one count an outcome, read
 /// and written with no lock.
 #[derive(Debug, Default)]
-pub(crate) struct Writes([AtomicU64; Taken::EACH.len()]);
+pub(crate) struct Writes([AtomicU64; SignalWriteOutcome::EACH.len()]);
 
 impl Writes {
     /// One more write that came to `taken`.
-    pub(crate) fn count(&self, taken: Taken) {
+    pub(crate) fn count(&self, taken: SignalWriteOutcome) {
         self.0[taken.place()].fetch_add(1, Relaxed);
     }
 
-    /// The counts as they stand, in the order of [`Taken::EACH`].
-    pub(crate) fn read(&self) -> [u64; Taken::EACH.len()] {
+    /// The counts as they stand, in the order of [`SignalWriteOutcome::EACH`].
+    pub(crate) fn read(&self) -> [u64; SignalWriteOutcome::EACH.len()] {
         std::array::from_fn(|at| self.0[at].load(Relaxed))
     }
 }

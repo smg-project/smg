@@ -42,14 +42,14 @@
 //! keeps its own place and takes its predecessor's load and bookings, and
 //! the predecessor's place leaves as a removed worker's does. A pruned
 //! worker is fenced for a while
-//! ([`FENCE`](crate::stages::fence::FENCE)): a view
-//! captured before its leave still shows it, and a decision over such a
+//! ([`RETIRED_WORKER_TTL`](crate::stages::retired_workers::RETIRED_WORKER_TTL)):
+//! a view captured before its leave still shows it, and a decision over such a
 //! view lists it nowhere, seats it nowhere and places the others. The feed
-//! naming the worker again lifts the fence at once. A worker that left a
-//! model is not fenced: it serves on, and the fence names no model, so a
-//! view older than the word may list it there again. All of it is soft
-//! state, which a new process learns again within one window, and so does
-//! a newly applied document, whose generation builds its own scorer.
+//! naming the worker again lifts the fence at once. A worker that left a model
+//! is not fenced: it serves on, and the fence names no model, so a view older
+//! than the word may list it there again. All of it is soft state, which a new
+//! process learns again within one window, and so does a newly applied
+//! document, whose generation builds its own scorer.
 //!
 //! A model's partition stands behind its own guard. A decision finds its
 //! model's by the name's hash, in a map replaced whole at a model's first
@@ -80,8 +80,8 @@ use crate::{
         view::{Candidate, Phase, RequestFacts, WorkerId},
     },
     policies::standard_filters,
-    stages::fence::Fence,
-    tracking::lease::{Lease, Lifecycle, Membership, Side},
+    stages::{lifecycle::Lifecycle, retired_workers::RetiredWorkers},
+    tracking::lease::{Lease, Membership, Side},
 };
 
 /// How the `bucket` policy is composed: its filters, its scorers and its
@@ -150,7 +150,7 @@ pub struct Bucket {
     /// under none, and no partition's guard is taken under it. A decision
     /// holds it for the one pass that lists its view's rows and for nothing
     /// after.
-    fence: Mutex<Fence>,
+    fence: Mutex<RetiredWorkers>,
 }
 
 /// One model's partition behind its guard, shared with the workers' index.
@@ -247,7 +247,7 @@ impl Bucket {
             partitions: ArcSwap::from_pointee(FxHashMap::default()),
             listed: ArcSwap::from_pointee(FxHashMap::default()),
             relisting: Mutex::new(()),
-            fence: Mutex::new(Fence::default()),
+            fence: Mutex::new(RetiredWorkers::default()),
         }
     }
 
@@ -1022,7 +1022,7 @@ mod tests {
             view::{self, Health},
             Constraints, PoolFacts, Scratch,
         },
-        stages::{fence::FENCE, Catalog},
+        stages::{retired_workers::RETIRED_WORKER_TTL, StageRegistry},
     };
 
     const SECOND: u64 = 1_000_000;
@@ -2549,8 +2549,8 @@ mod tests {
 
     #[test]
     fn a_host_that_makes_no_lifecycle_call_refuses_the_stage_and_the_preset() {
-        let served = Catalog::builtin();
-        let unserved = Catalog::builtin().without_lifecycle();
+        let served = StageRegistry::builtin();
+        let unserved = StageRegistry::builtin().without_lifecycle();
         let named: PolicySpec = serde_json::from_str(
             r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["bucket"],"pick":"best"}}}"#,
         )
@@ -3013,7 +3013,9 @@ mod tests {
         // A leave as the membership call makes it, dated half a fence back.
         let (scorer, pool) = booked(NEVER, 1.5, &[100, 40]);
         let gone = pool[1].id;
-        let half = now.checked_sub(FENCE / 2).expect("half a fence back");
+        let half = now
+            .checked_sub(RETIRED_WORKER_TTL / 2)
+            .expect("half a fence back");
         scorer.fence.lock().retire(gone, half);
         of(&scorer, "m").lock().remove(gone);
         led(&scorer, &pool, 0, 2 * SECOND);
@@ -3021,7 +3023,9 @@ mod tests {
 
         // The same leave a whole fence back: the id may be a new worker's.
         let (scorer, pool) = booked(NEVER, 1.5, &[100, 40]);
-        let whole = now.checked_sub(FENCE).expect("a whole fence back");
+        let whole = now
+            .checked_sub(RETIRED_WORKER_TTL)
+            .expect("a whole fence back");
         scorer.fence.lock().retire(gone, whole);
         of(&scorer, "m").lock().remove(gone);
         led(&scorer, &pool, 0, 2 * SECOND);

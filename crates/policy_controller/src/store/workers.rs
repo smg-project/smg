@@ -214,7 +214,7 @@ impl WorkerFacts {
 /// changes nothing of the row there. Two makers are one where they agree
 /// whole.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum Maker {
+pub enum Registrant {
     /// A control call. Any caller of the control scope changes the row.
     #[default]
     Control,
@@ -224,7 +224,7 @@ pub enum Maker {
     Provider(Arc<ProviderKey>),
 }
 
-impl Maker {
+impl Registrant {
     /// The bytes of a provider's name: a label key's bound.
     pub const NAME_BYTES: usize = WorkerFacts::LABEL_KEY_BYTES;
     /// The bytes of a provider's key for one worker: a URL's bound.
@@ -291,7 +291,7 @@ pub enum Unmade {
 }
 
 /// A provider's name with its own key for one worker, each inside its rule:
-/// [`Maker::provider`] alone makes one.
+/// [`Registrant::provider`] alone makes one.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ProviderKey {
     provider: String,
@@ -325,7 +325,7 @@ pub struct WorkerRow {
     /// When the row was created on the host's clock.
     pub admitted_at: Instant,
     /// Who made the row.
-    pub maker: Maker,
+    pub maker: Registrant,
 }
 
 /// The mutable facts of a row a patch may change (`PatchWorker`; today the
@@ -437,9 +437,9 @@ pub trait WorkersStore: Send + Sync {
     /// with another incarnation is `Replaced` (the old id leaves with its
     /// state); the same key and incarnation refresh the facts in place
     /// (`Resized` when the data-parallel width moved, else `Relabelled`).
-    /// A new key's row is a control call's ([`Maker::Control`]).
+    /// A new key's row is a control call's ([`Registrant::Control`]).
     fn upsert(&self, facts: WorkerFacts) -> MembershipChange {
-        self.upsert_by(facts, Maker::Control)
+        self.upsert_by(facts, Registrant::Control)
     }
 
     /// [`Self::upsert`] from `maker`: a new key's row is made by it. A row
@@ -451,7 +451,7 @@ pub trait WorkersStore: Send + Sync {
     /// life of a key with a number no life of the key had: the membership
     /// doors do ([`life`](super::membership::life)), and a row they made
     /// never comes back under its id.
-    fn upsert_by(&self, facts: WorkerFacts, maker: Maker) -> MembershipChange;
+    fn upsert_by(&self, facts: WorkerFacts, maker: Registrant) -> MembershipChange;
 
     /// Change a row's mutable facts; `None` when the row is gone or
     /// `revision` moved.
@@ -479,7 +479,7 @@ pub trait WorkersStore: Send + Sync {
     fn epoch(&self) -> u64;
 
     /// Every row with the epoch it stands at.
-    fn snapshot(&self) -> (u64, Vec<WorkerRow>);
+    fn all_rows(&self) -> (u64, Vec<WorkerRow>);
 
     /// The changes after `epoch`, or the instruction to snapshot again.
     fn changes_since(&self, epoch: u64) -> MembershipTail;

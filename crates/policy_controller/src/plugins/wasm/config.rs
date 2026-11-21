@@ -122,8 +122,8 @@ pub struct PluginSpec {
     /// The kinds of lifecycle event the module's `observe` is called with,
     /// none by default: a row that lists none is never told. A row that
     /// lists any has the plugin's scorer and picker say they need the
-    /// lifecycle's calls ([`crate::tracking::Lifecycle::needs_lifecycle`]). Bound as
-    /// a filter alone a plugin hears nothing, whatever this lists: the
+    /// lifecycle's calls ([`crate::stages::Lifecycle::needs_lifecycle`]). Bound
+    /// as a filter alone a plugin hears nothing, whatever this lists: the
     /// engine forwards the lifecycle to scorers and pickers.
     pub observes: EventSet,
     pub failure: Failure,

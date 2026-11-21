@@ -44,11 +44,8 @@ use crate::{
         warm_up::WarmRule,
     },
     policies::standard_filters,
-    stages::scorers::ReadsLoad,
-    tracking::{
-        counts::with_counts,
-        lease::{Lifecycle, Membership},
-    },
+    stages::{lifecycle::Lifecycle, scorers::ReadsLoad},
+    tracking::{in_flight::with_counts, lease::Membership},
     Draw,
 };
 
@@ -1311,7 +1308,7 @@ mod tests {
             prefix_pass::forget_prefix_pass,
             view::{Health, LoadRow, NamedHolder},
         },
-        tracking::counts::tests::Lent,
+        tracking::in_flight::tests::Lent,
     };
 
     /// A row and its entry of the affinity column, as a case writes a pool.

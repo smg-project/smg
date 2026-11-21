@@ -1136,7 +1136,7 @@ pub(crate) mod tests {
         assert_eq!((first.workers.len(), first.last), (PAGE, false));
         assert_eq!((second.workers.len(), second.last), (2, true));
         // Every row of the store once, by registration key.
-        let (_, rows) = leader.store.snapshot();
+        let (_, rows) = leader.store.all_rows();
         let mut keys: Vec<String> = rows.into_iter().map(|row| row.facts.key).collect();
         keys.sort();
         let paged: Vec<String> = first

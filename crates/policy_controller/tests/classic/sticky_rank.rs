@@ -164,7 +164,7 @@ impl Bed {
             (&self.engine, &mut self.out, &mut self.scratch, self.seed);
         // The rows as the store lends them, with the pool's engines beside
         // them: the door a host decides through.
-        self.store.with_world(|world| {
+        self.store.with_snapshot(|world| {
             let view = world.view(MODEL, Role::Single, &ask, false, out)?;
             let facts = RequestFacts {
                 model: MODEL,

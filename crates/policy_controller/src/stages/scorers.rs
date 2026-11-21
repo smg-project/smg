@@ -23,15 +23,18 @@ use crate::{
     engine::{
         decision::{Decision, Overlap, Target},
         framework::{DecisionScope, Front, Scorer, Spread, TieBand},
-        terms::{Coefficients, Term},
         view::{Candidate, LoadRow, PoolFacts, ReportCutoff, RequestFacts, WorkerId},
         warm_up::WarmRule,
     },
     load::signals::{SignalSums, SignalTerm},
+    stages::{
+        cost_terms::{Coefficients, CostTerm},
+        lifecycle::Lifecycle,
+    },
     tracking::{
-        counts::{with_counts, LentCounts, Pieces, Slot},
-        lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
-        sent::{Sent, SentCounts, SentCredit},
+        dispatch_credit::{CreditedDispatches, DispatchCounts, DispatchCredit},
+        in_flight::{with_counts, LentCounts, Pieces, WorkerSlot},
+        lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     },
 };
 
@@ -428,7 +431,7 @@ pub(crate) struct SinceReport {
 /// one the tally let go, and one whose cell another entry was told.
 #[derive(Debug, PartialEq, Eq)]
 struct Told {
-    slot: Slot,
+    slot: WorkerSlot,
     sampled_at_micros: u64,
     row: Option<LoadRow>,
 }
@@ -445,7 +448,7 @@ impl Told {
 impl Default for Told {
     fn default() -> Self {
         Self {
-            slot: Slot::NONE,
+            slot: WorkerSlot::NONE,
             sampled_at_micros: 0,
             row: None,
         }
@@ -514,14 +517,14 @@ impl HeldCredit {
         requests: 0,
     };
 
-    /// The pair a stage reads ([`SentReads::counts`]). The requests are
-    /// the word's low [`REQUEST_BITS`] bits, so the narrower type cuts
-    /// none of them.
+    /// The pair a stage reads ([`DispatchCreditPass::counts`]). The requests
+    /// are the word's low [`REQUEST_BITS`] bits, so the narrower type cuts none
+    /// of them.
     ///
-    /// [`SentReads::counts`]: crate::tracking::sent::SentReads::counts
+    /// [`DispatchCreditPass::counts`]: crate::tracking::dispatch_credit::DispatchCreditPass::counts
     #[inline(always)]
-    pub(crate) const fn counts(self) -> SentCounts {
-        SentCounts {
+    pub(crate) const fn counts(self) -> DispatchCounts {
+        DispatchCounts {
             requests: self.requests as u32,
             tokens: self.tokens,
         }
@@ -737,12 +740,12 @@ impl SinceReport {
     /// so no read finds more dispatches of no tokens than dispatches
     /// across a release, on any target.
     #[inline(always)]
-    pub(crate) fn sent_through(&self, through_micros: u64) -> Sent {
+    pub(crate) fn sent_through(&self, through_micros: u64) -> CreditedDispatches {
         if self.reaches(through_micros) {
             self.release_through(through_micros);
         }
         let held = self.held.load(Ordering::Acquire);
-        Sent {
+        CreditedDispatches {
             requests: (held & REQUEST_MASK) as u32,
             tokens: held >> REQUEST_BITS,
             unsized_requests: u32::from(self.unsized_held.load(Ordering::Relaxed)),
@@ -1084,7 +1087,7 @@ pub struct ResidentWork {
 }
 
 /// The entry bound to each slot's cell.
-type Bound = FxHashMap<Slot, Arc<SinceReport>>;
+type Bound = FxHashMap<WorkerSlot, Arc<SinceReport>>;
 
 /// A member's resident work as one number: the cost of the report its
 /// stage was told and of its credit, with no request beyond the two, and
@@ -1328,7 +1331,7 @@ impl ResidentWork {
     /// behind a dispatch it reflects or a later sample.
     #[cold]
     #[inline(never)]
-    fn settle(&self, cell: Option<&Kept>, since: &SinceReport, row: &Candidate, slot: Slot) {
+    fn settle(&self, cell: Option<&Kept>, since: &SinceReport, row: &Candidate, slot: WorkerSlot) {
         let told = since.told.lock();
         let kept_of = since.kept_of.load(Ordering::Relaxed);
         if kept_of != u64::MAX {
@@ -1369,7 +1372,7 @@ impl ResidentWork {
         tally: &FxHashMap<RankKey, Arc<SinceReport>>,
         cell: Option<&Kept>,
         row: &Candidate,
-        slot: Slot,
+        slot: WorkerSlot,
     ) {
         if let Some(since) = tally.get(&(row.id, row.dp_rank)) {
             self.settle(cell, since, row, slot);
@@ -1413,7 +1416,7 @@ impl ResidentWork {
             if let Some(former) = former.filter(|former| !Arc::ptr_eq(former, since)) {
                 let mut theirs = former.told.lock();
                 cell.keep_none_through(theirs.sampled_at_micros);
-                theirs.slot = Slot::NONE;
+                theirs.slot = WorkerSlot::NONE;
                 former.kept_of.store(u64::MAX, Ordering::Release);
             }
             told.slot = word.slot;
@@ -1491,7 +1494,7 @@ impl ResidentWork {
     fn release(&self, since: &SinceReport, row: &Candidate) -> HeldCredit {
         let held = since.release_through(row.load_sampled_at_micros);
         if since.keeps_before(row.load_sampled_at_micros) {
-            self.settle(None, since, row, Slot::NONE);
+            self.settle(None, since, row, WorkerSlot::NONE);
         }
         SinceReport::credit_of(held)
     }
@@ -1757,7 +1760,7 @@ impl LeastCost {
     pub(crate) const NAME: &str = "least-cost";
 
     pub(crate) fn new(
-        terms: Box<[(Term, f64)]>,
+        terms: Box<[(CostTerm, f64)]>,
         margin: CostMargin,
         unreported: Option<Unreported>,
     ) -> Self {
@@ -1983,11 +1986,11 @@ impl ReadsLoad for LeastCost {
 #[derive(Debug)]
 pub(crate) struct LeastCostSent {
     cost: LeastCost,
-    sent: Arc<SentCredit>,
+    sent: Arc<DispatchCredit>,
 }
 
 impl LeastCostSent {
-    pub(crate) fn new(cost: LeastCost, sent: Arc<SentCredit>) -> Self {
+    pub(crate) fn new(cost: LeastCost, sent: Arc<DispatchCredit>) -> Self {
         Self { cost, sent }
     }
 }
@@ -2045,7 +2048,7 @@ impl ReadsLoad for LeastCostSent {
             // takes none. The sends move the ends of the sums, so the ends
             // are taken here and the walk's are dropped.
             let terms = &self.cost.terms;
-            let sends = self.sent.reads(facts);
+            let sends = self.sent.pass(facts);
             let mut bounds = CostBounds::EMPTY;
             for (&row, cost) in kept.iter().zip(costs.iter_mut()) {
                 if let RowCost::Sum(sum) = cost {
@@ -2071,14 +2074,14 @@ impl ReadsLoad for LeastCostSent {
 pub(crate) struct LeastCostSignals {
     cost: LeastCost,
     /// The profile's count of sends, where a term reads it.
-    sent: Option<Arc<SentCredit>>,
+    sent: Option<Arc<DispatchCredit>>,
     signals: Box<[SignalTerm]>,
 }
 
 impl LeastCostSignals {
     pub(crate) fn new(
         cost: LeastCost,
-        sent: Option<Arc<SentCredit>>,
+        sent: Option<Arc<DispatchCredit>>,
         signals: Box<[SignalTerm]>,
     ) -> Self {
         Self {
@@ -2145,7 +2148,7 @@ impl ReadsLoad for LeastCostSignals {
             // of the sums, so the ends are taken here and the walk's are
             // dropped.
             let terms = &self.cost.terms;
-            let sends = self.sent.as_ref().map(|sent| sent.reads(facts));
+            let sends = self.sent.as_ref().map(|sent| sent.pass(facts));
             // Once a pass: the facts' cells and each signal's oldest
             // instant still read. Once a row: the row's cells.
             let signals = SignalSums::new(facts, &self.signals);
@@ -2296,7 +2299,7 @@ pub(crate) mod tests {
         },
         stages::pickers::{target_of, Best, CountFirst},
         tracking::{
-            counts::tests::{Lent, RUN_READERS},
+            in_flight::tests::{Lent, RUN_READERS},
             lease::{EventKind, TransportClass},
         },
         Draw,
@@ -2560,7 +2563,7 @@ pub(crate) mod tests {
         ("load.waiting_uncached_tokens", 2.75),
     ];
 
-    fn cost_by_term(terms: &[(Term, f64)], row: &Candidate, price: Option<f64>) -> RowCost {
+    fn cost_by_term(terms: &[(CostTerm, f64)], row: &Candidate, price: Option<f64>) -> RowCost {
         let mut sum = 0.0;
         for &(term, coefficient) in terms {
             if let Some(value) = term.read(row.load.as_ref(), row.in_flight) {
@@ -2620,7 +2623,7 @@ pub(crate) mod tests {
                 .iter()
                 .enumerate()
                 .filter(|(bit, _)| mask & (1 << bit) != 0)
-                .map(|(_, &(name, coefficient))| (Term::named(name).unwrap(), coefficient))
+                .map(|(_, &(name, coefficient))| (CostTerm::named(name).unwrap(), coefficient))
                 .collect();
             for price in [None, Some(1.5), Some(-0.0)] {
                 let rule = price.map_or(Unreported::MissingAsZero, |request_cost| {
@@ -2672,7 +2675,7 @@ pub(crate) mod tests {
             let terms = params
                 .terms
                 .iter()
-                .map(|(name, &coefficient)| (Term::named(name).unwrap(), coefficient))
+                .map(|(name, &coefficient)| (CostTerm::named(name).unwrap(), coefficient))
                 .collect();
             let stage = LeastCost::new(terms, params.margin, params.unreported);
             let want = f64::from(value) * -2.5;
@@ -2693,8 +2696,8 @@ pub(crate) mod tests {
     #[test]
     fn lent_and_written_rows_score_alike_with_one_lent_reader() {
         let terms = [
-            (Term::InFlight, 3.5),
-            (Term::named("load.queued").unwrap(), 6.0),
+            (CostTerm::InFlight, 3.5),
+            (CostTerm::named("load.queued").unwrap(), 6.0),
         ];
         let stage = LeastCost::new(
             Box::new(terms),
@@ -2723,8 +2726,8 @@ pub(crate) mod tests {
     fn the_sum_and_the_missing_report_price_share_one_count() {
         let stage = LeastCost::new(
             Box::new([
-                (Term::InFlight, 2.0),
-                (Term::named("load.queued").unwrap(), 3.0),
+                (CostTerm::InFlight, 2.0),
+                (CostTerm::named("load.queued").unwrap(), 3.0),
             ]),
             CostMargin::default(),
             Some(Unreported::OverLeast { request_cost: 4.0 }),
@@ -3270,12 +3273,12 @@ pub(crate) mod tests {
     }
 
     /// The number a stage keeps of `row`, where it keeps the row's report.
-    fn kept_of(stage: &ResidentWork, slot: Slot, row: &Candidate) -> Option<(f32, u32)> {
+    fn kept_of(stage: &ResidentWork, slot: WorkerSlot, row: &Candidate) -> Option<(f32, u32)> {
         stage.kept.cell(slot).and_then(|cell| cell.read(row))
     }
 
     /// Tells `stage` the report `row` holds, as a host tells it.
-    fn tell(stage: &ResidentWork, slot: Slot, row: &Candidate) {
+    fn tell(stage: &ResidentWork, slot: WorkerSlot, row: &Candidate) {
         stage.on_signal(&Signal::Load {
             worker: row.id,
             dp_rank: row.dp_rank,
@@ -3295,7 +3298,7 @@ pub(crate) mod tests {
 
     /// Tells `stage` the report `row` holds and decides under it once, as
     /// a host shows the world it told.
-    fn shown<'a>(stage: &ResidentWork, lent: &'a Lent<'a>, slot: Slot, row: &Candidate) {
+    fn shown<'a>(stage: &ResidentWork, lent: &'a Lent<'a>, slot: WorkerSlot, row: &Candidate) {
         tell(stage, slot, row);
         decide(stage, lent, row);
     }
@@ -4248,7 +4251,7 @@ pub(crate) mod tests {
         };
         let mut world: Vec<Candidate> = (0..ROWS as u32).map(|at| candidate(at, 0)).collect();
         let mut counts = [0u32; ROWS];
-        let slots: Vec<Slot> = {
+        let slots: Vec<WorkerSlot> = {
             let mut rows = world.clone();
             let lent = Lent::take(&mut rows);
             rows.iter().map(|row| lent.slot_of(row)).collect()

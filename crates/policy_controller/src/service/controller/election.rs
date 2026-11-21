@@ -355,7 +355,7 @@ pub(crate) async fn elector(election: &Election, identity: String) -> Result<Ele
 
 /// What the election's last step saw of the lease.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct Standing {
+pub(crate) struct ElectionObservation {
     /// The lease's holder, `controller-id@host:port`; empty when the lease
     /// is free, when the last look failed, and when it read a term under
     /// the highest this replica saw: no write stored that holder under
@@ -518,7 +518,7 @@ impl Said {
 pub(crate) fn start(
     elector: Elector,
     store: Arc<MemoryStore>,
-    standing: watch::Sender<Standing>,
+    standing: watch::Sender<ElectionObservation>,
 ) -> io::Result<Running> {
     let (words, heard) = mpsc::channel();
     let (end, ended) = oneshot::channel();
@@ -556,12 +556,12 @@ pub(crate) fn start(
 fn run_loop(
     elector: &mut Elector,
     store: &MemoryStore,
-    standing: &watch::Sender<Standing>,
+    standing: &watch::Sender<ElectionObservation>,
     words: &mpsc::Receiver<Word>,
-) -> Standing {
+) -> ElectionObservation {
     let period = elector.settings().renew_period;
     let deadline = elector.settings().renew_deadline;
-    let mut seen = Standing::default();
+    let mut seen = ElectionObservation::default();
     let mut following = String::new();
     let mut streak = Streak::default();
     let mut leading = false;
@@ -740,7 +740,11 @@ fn run_loop(
 }
 
 /// Publishes the standing after the release at the run loop's end.
-fn publish_end(elector: &Elector, standing: &watch::Sender<Standing>, mut seen: Standing) {
+fn publish_end(
+    elector: &Elector,
+    standing: &watch::Sender<ElectionObservation>,
+    mut seen: ElectionObservation,
+) {
     seen.holder.clear();
     // The stop's release may read the lease again, and the elector counts
     // that record's term as at any step: the last standing reads it here.
@@ -753,7 +757,7 @@ fn publish_end(elector: &Elector, standing: &watch::Sender<Standing>, mut seen: 
 fn run(
     mut elector: Elector,
     store: &MemoryStore,
-    standing: &watch::Sender<Standing>,
+    standing: &watch::Sender<ElectionObservation>,
     words: &mpsc::Receiver<Word>,
 ) {
     let seen = run_loop(&mut elector, store, standing, words);
@@ -1001,8 +1005,8 @@ mod tests {
     use tokio::sync::watch;
 
     use super::{
-        dialable, elector, identity, run, split_identity, start, Election, LeaseError, LeasePlace,
-        Running, Said, Standing, Word,
+        dialable, elector, identity, run, split_identity, start, Election, ElectionObservation,
+        LeaseError, LeasePlace, Running, Said, Word,
     };
     use crate::{
         service::{
@@ -1279,7 +1283,7 @@ mod tests {
         let candidate = Elector::new(Box::new(lease.clone()), "a@127.0.0.1:1", settings)
             .expect("the settings are in order");
         let fence = candidate.fence();
-        let (standing, _stood) = watch::channel(Standing::default());
+        let (standing, _stood) = watch::channel(ElectionObservation::default());
         let mut running =
             start(candidate, Arc::new(MemoryStore::new()), standing).expect("a thread");
         until("the take", || fence.leader_term(Instant::now()) == Some(1));
@@ -1356,7 +1360,7 @@ mod tests {
         )
         .expect("the settings are in order");
         let fence = candidate.fence();
-        let (standing, _stood) = watch::channel(Standing::default());
+        let (standing, _stood) = watch::channel(ElectionObservation::default());
         let running = start(candidate, Arc::new(MemoryStore::new()), standing).expect("a thread");
         thread::sleep(Duration::from_millis(100));
         until("the take", || fence.leader_term(Instant::now()) == Some(2));
@@ -1386,7 +1390,7 @@ mod tests {
         let candidate = Elector::new(Box::new(lease.clone()), "a@127.0.0.1:1", settings)
             .expect("the settings are in order");
         let fence = candidate.fence();
-        let (standing, _stood) = watch::channel(Standing::default());
+        let (standing, _stood) = watch::channel(ElectionObservation::default());
         let mut running =
             start(candidate, Arc::new(MemoryStore::new()), standing).expect("a thread");
         until("the take", || fence.leader_term(Instant::now()) == Some(1));
@@ -1613,8 +1617,8 @@ mod tests {
         .expect("the settings are in order");
         let (leader_fence, follower_fence) = (leader.fence(), follower.fence());
         let fences = [&*leader_fence, &*follower_fence];
-        let (leader_standing, _led) = watch::channel(Standing::default());
-        let (follower_standing, mut followed) = watch::channel(Standing::default());
+        let (leader_standing, _led) = watch::channel(ElectionObservation::default());
+        let (follower_standing, mut followed) = watch::channel(ElectionObservation::default());
         let leading =
             start(leader, Arc::new(MemoryStore::new()), leader_standing).expect("a thread");
         wait_for("the take", fences, || {
@@ -1647,7 +1651,7 @@ mod tests {
         }
         assert_eq!(
             *followed.borrow(),
-            Standing {
+            ElectionObservation {
                 holder: String::new(),
                 term: 1,
                 looked: true,
@@ -1692,7 +1696,7 @@ mod tests {
         };
         let follower = Elector::new(Box::new(lease.clone()), "b@127.0.0.1:2", settings)
             .expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let running = start(follower, Arc::new(MemoryStore::new()), standing).expect("a thread");
         until("the first look", || stood.borrow().holder == first.holder);
         assert_eq!(stood.borrow().term, 5);
@@ -1788,7 +1792,7 @@ mod tests {
 
     /// Waits through `count` more looks at the least: the loop publishes once
     /// a look.
-    fn looks(stood: &mut watch::Receiver<Standing>, count: u32) {
+    fn looks(stood: &mut watch::Receiver<ElectionObservation>, count: u32) {
         stood.borrow_and_update();
         let mut seen = 0;
         until("the looks", || {
@@ -1821,7 +1825,7 @@ mod tests {
         };
         let follower = Elector::new(Box::new(lease.clone()), "b@127.0.0.1:2", settings)
             .expect("the settings are in order");
-        let (standing, mut stood) = watch::channel(Standing::default());
+        let (standing, mut stood) = watch::channel(ElectionObservation::default());
         // The loop itself, on a thread of the case's own under a subscriber
         // that keeps its lines. A second subscriber stays registered beside
         // it: with one alone a line is on or off by the thread that reaches
@@ -1902,7 +1906,7 @@ mod tests {
             }
             let candidate = Elector::new(Box::new(MemoryLease::new()), name, settings)
                 .expect("the settings are in order");
-            let (standing, stood) = watch::channel(Standing::default());
+            let (standing, stood) = watch::channel(ElectionObservation::default());
             let writer = lines.clone();
             let subscriber = tracing_subscriber::fmt()
                 .with_ansi(false)
@@ -1996,7 +2000,7 @@ mod tests {
         let candidate =
             Elector::new(Box::new(store), identity, settings).expect("the settings are in order");
         let fence = candidate.fence();
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let running = start(candidate, Arc::new(MemoryStore::new()), standing).expect("a thread");
         until("the take", || {
             fence.leader_term(Instant::now()) == Some(1) && stood.borrow().holder == identity
@@ -2112,7 +2116,7 @@ mod tests {
         };
         let candidate = Elector::new(Box::new(store), "a@127.0.0.1:1", settings)
             .expect("the settings are in order");
-        let (standing, _stood) = watch::channel(Standing::default());
+        let (standing, _stood) = watch::channel(ElectionObservation::default());
         let running = start(candidate, Arc::new(MemoryStore::new()), standing).expect("a thread");
         until("the take and four renewals", || began.lock().len() >= 5);
         let began = began.lock().clone();
@@ -2143,7 +2147,7 @@ mod tests {
         _beside: tracing::Dispatch,
     }
 
-    fn looping(elector: Elector, standing: watch::Sender<Standing>) -> Looping {
+    fn looping(elector: Elector, standing: watch::Sender<ElectionObservation>) -> Looping {
         let lines = Logged(Arc::new(Mutex::new(Vec::new())));
         let writer = lines.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2204,7 +2208,7 @@ mod tests {
         let store = Losable::default();
         let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", settings)
             .expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let leading = looping(holder, standing);
         until("the take", || stood.borrow().holder == "a@127.0.0.1:1");
         // Another candidate's record is stored over the holder's.
@@ -2232,7 +2236,7 @@ mod tests {
 
         let follower = Elector::new(Box::new(store.clone()), "c@127.0.0.1:3", settings)
             .expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let following = looping(follower, standing);
         until("the first look", || stood.borrow().looked);
         let (moved, text) = following.stopped_with(MOVED);
@@ -2242,7 +2246,7 @@ mod tests {
         // of a move.
         let quiet = Elector::new(Box::new(MemoryLease::new()), "d@127.0.0.1:4", settings)
             .expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let released = looping(quiet, standing);
         until("the take", || stood.borrow().holder == "d@127.0.0.1:4");
         let (moved, text) = released.stopped_with(MOVED);
@@ -2260,7 +2264,7 @@ mod tests {
         let store = Losable::default();
         let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", unhurried())
             .expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let leading = looping(holder, standing);
         until("the take", || stood.borrow().holder == "a@127.0.0.1:1");
         assert_eq!(stood.borrow().term, 1);
@@ -2274,7 +2278,7 @@ mod tests {
         assert_eq!(released, 1, "{text}");
         assert_eq!(
             *stood.borrow(),
-            Standing {
+            ElectionObservation {
                 holder: String::new(),
                 term: 9,
                 looked: true,
@@ -2314,7 +2318,7 @@ mod tests {
         };
         let leader = Elector::new(Box::new(store), "a@127.0.0.1:1", settings)
             .expect("the settings are in order");
-        let (standing, _stood) = watch::channel(Standing::default());
+        let (standing, _stood) = watch::channel(ElectionObservation::default());
         let looping = looping(leader, standing);
         // Waits until `more` more writes began: all but the last of them
         // have landed by then.
@@ -2467,7 +2471,7 @@ mod tests {
         };
         let follower = Elector::new(Box::new(store.clone()), "b@127.0.0.1:2", settings)
             .expect("the settings are in order");
-        let (standing, mut stood) = watch::channel(Standing::default());
+        let (standing, mut stood) = watch::channel(ElectionObservation::default());
         let looping = looping(follower, standing);
         until("the first look", || stood.borrow().holder == held.holder);
 
@@ -2566,7 +2570,7 @@ mod tests {
         let taker = Elector::new(Box::new(lease.clone()), "a@127.0.0.1:1", patient)
             .expect("the settings are in order");
         let fence = taker.fence();
-        let (standing, mut stood) = watch::channel(Standing::default());
+        let (standing, mut stood) = watch::channel(ElectionObservation::default());
         let inside = looping(taker, standing);
         until("the take", || stood.borrow().holder == "a@127.0.0.1:1");
         looks(&mut stood, 5);
@@ -2580,7 +2584,7 @@ mod tests {
         let taker = Elector::new(Box::new(lease.clone()), "a@127.0.0.1:1", settings)
             .expect("the settings are in order");
         let fence = taker.fence();
-        let (standing, _stood) = watch::channel(Standing::default());
+        let (standing, _stood) = watch::channel(ElectionObservation::default());
         let outlived = looping(taker, standing);
         until("the fence's opening", || {
             fence.leader_term(Instant::now()) == Some(1)
@@ -2628,7 +2632,7 @@ mod tests {
         let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", settings)
             .expect("the settings are in order");
         let fence = holder.fence();
-        let (standing, mut stood) = watch::channel(Standing::default());
+        let (standing, mut stood) = watch::channel(ElectionObservation::default());
         let looping = looping(holder, standing);
         until("the fence's opening", || {
             fence.leader_term(Instant::now()) == Some(1)
@@ -2677,7 +2681,7 @@ mod tests {
         let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", settings)
             .expect("the settings are in order");
         let fence = holder.fence();
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let looping = looping(holder, standing);
         until("the fence's opening", || {
             fence.leader_term(Instant::now()) == Some(1)
@@ -2711,7 +2715,7 @@ mod tests {
         let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", brisk())
             .expect("the settings are in order");
         let fence = holder.fence();
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let looping = looping(holder, standing);
         until("the first lead", || {
             fence.leader_term(Instant::now()) == Some(1)
@@ -2737,7 +2741,7 @@ mod tests {
         });
         assert_eq!(
             *stood.borrow(),
-            Standing {
+            ElectionObservation {
                 holder: String::new(),
                 term: 9,
                 looked: true,
@@ -2757,7 +2761,7 @@ mod tests {
         let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", brisk())
             .expect("the settings are in order");
         let fence = holder.fence();
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let looping = looping(holder, standing);
         until("the first lead", || {
             fence.leader_term(Instant::now()) == Some(1)
@@ -2784,7 +2788,7 @@ mod tests {
         });
         assert_eq!(
             *stood.borrow(),
-            Standing {
+            ElectionObservation {
                 holder: String::new(),
                 term: 9,
                 looked: true,
@@ -2809,7 +2813,7 @@ mod tests {
         });
         let follower = Elector::new(Box::new(store.clone()), "b@127.0.0.1:2", brisk())
             .expect("the settings are in order");
-        let (standing, mut stood) = watch::channel(Standing::default());
+        let (standing, mut stood) = watch::channel(ElectionObservation::default());
         let looping = looping(follower, standing);
         until("the holder is followed", || stood.borrow().term == 3);
         store.fail_writes(true);
@@ -2823,7 +2827,7 @@ mod tests {
         looks(&mut stood, 2);
         assert_eq!(
             *stood.borrow(),
-            Standing {
+            ElectionObservation {
                 holder: String::new(),
                 term: 9,
                 looked: true,
@@ -2851,7 +2855,7 @@ mod tests {
         let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", brisk())
             .expect("the settings are in order");
         let fence = holder.fence();
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let looping = looping(holder, standing);
         until("the first lead", || {
             fence.leader_term(Instant::now()) == Some(1)
@@ -2877,7 +2881,7 @@ mod tests {
         until("the step that read both", || stood.borrow().term == 9);
         assert_eq!(
             *stood.borrow(),
-            Standing {
+            ElectionObservation {
                 holder: String::new(),
                 term: 9,
                 looked: true,
@@ -2921,8 +2925,8 @@ mod tests {
         let follower = Elector::new(Box::new(store.clone()), standby, settings)
             .expect("the settings are in order");
         let (leader_fence, follower_fence) = (leader.fence(), follower.fence());
-        let (leader_standing, led) = watch::channel(Standing::default());
-        let (follower_standing, followed) = watch::channel(Standing::default());
+        let (leader_standing, led) = watch::channel(ElectionObservation::default());
+        let (follower_standing, followed) = watch::channel(ElectionObservation::default());
         let leading =
             start(leader, Arc::new(MemoryStore::new()), leader_standing).expect("a thread");
         until("the take", || {
@@ -3067,7 +3071,7 @@ mod tests {
         let candidate = Elector::new(Box::new(store), "a@127.0.0.1:1", settings)
             .expect("the settings are in order");
         let fence = candidate.fence();
-        let (standing, _stood) = watch::channel(Standing::default());
+        let (standing, _stood) = watch::channel(ElectionObservation::default());
         let running = start(candidate, Arc::new(MemoryStore::new()), standing).expect("a thread");
         until("the take", || fence.leader_term(Instant::now()) == Some(1));
         let stopped = Instant::now();
@@ -3174,8 +3178,8 @@ mod tests {
         let fences = [&*first_fence, &*second_fence];
         let (first_store, second_store) =
             (Arc::new(MemoryStore::new()), Arc::new(MemoryStore::new()));
-        let (first_standing, first_stood) = watch::channel(Standing::default());
-        let (second_standing, second_stood) = watch::channel(Standing::default());
+        let (first_standing, first_stood) = watch::channel(ElectionObservation::default());
+        let (second_standing, second_stood) = watch::channel(ElectionObservation::default());
 
         // The first takes the free lease at its first step: the term is in
         // its store and its standing names itself.
@@ -3218,7 +3222,7 @@ mod tests {
         assert_eq!(first_fence.leader_term(Instant::now()), None);
         assert_eq!(
             *first_stood.borrow(),
-            Standing {
+            ElectionObservation {
                 holder: String::new(),
                 term: 1,
                 looked: true,
@@ -3272,8 +3276,8 @@ mod tests {
         let (first_fence, second_fence) = (first.fence(), second.fence());
         let fences = [&*first_fence, &*second_fence];
         let second_store = Arc::new(MemoryStore::new());
-        let (first_standing, first_stood) = watch::channel(Standing::default());
-        let (second_standing, second_stood) = watch::channel(Standing::default());
+        let (first_standing, first_stood) = watch::channel(ElectionObservation::default());
+        let (second_standing, second_stood) = watch::channel(ElectionObservation::default());
         let first_running =
             start(first, Arc::new(MemoryStore::new()), first_standing).expect("a thread");
         wait_for("the first lead", fences, || {
@@ -3298,7 +3302,7 @@ mod tests {
         });
         wait_for("the replica that left follows the taker", fences, || {
             *first_stood.borrow()
-                == Standing {
+                == ElectionObservation {
                     holder: "b@127.0.0.1:2".to_owned(),
                     term: 8,
                     looked: true,
@@ -3320,7 +3324,7 @@ mod tests {
         let elector =
             Elector::alone("a@127.0.0.1:1", unhurried()).expect("the settings are in order");
         let fence = elector.fence();
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let looping = looping(elector, standing);
         until("the first lead", || {
             fence.leader_term(Instant::now()) == Some(1)
@@ -3355,7 +3359,7 @@ mod tests {
     fn a_replica_another_can_follow_takes_no_step_at_the_word_to_leave() {
         let elector = Elector::new(Box::new(MemoryLease::new()), "a@127.0.0.1:1", unhurried())
             .expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let looping = looping(elector, standing);
         until("the first take", || {
             stood.borrow().holder == "a@127.0.0.1:1"
@@ -3382,7 +3386,7 @@ mod tests {
         // that it leads.
         let elector = Elector::alone("a@127.0.0.1:1", brisk()).expect("the settings are in order");
         let fence = elector.fence();
-        let (standing, mut stood) = watch::channel(Standing::default());
+        let (standing, mut stood) = watch::channel(ElectionObservation::default());
         let looping = looping(elector, standing);
         until("the first lead", || {
             fence.leader_term(Instant::now()) == Some(1)
@@ -3405,7 +3409,7 @@ mod tests {
     fn a_hand_over_planned_under_a_term_the_replica_left_releases_nothing() {
         let elector = Elector::alone("a@127.0.0.1:1", brisk()).expect("the settings are in order");
         let fence = elector.fence();
-        let (standing, mut stood) = watch::channel(Standing::default());
+        let (standing, mut stood) = watch::channel(ElectionObservation::default());
         let running = start(elector, Arc::new(MemoryStore::new()), standing).expect("a thread");
         until("the first lead", || {
             fence.leader_term(Instant::now()) == Some(1)
@@ -3436,7 +3440,7 @@ mod tests {
         let elector = Elector::new(Box::new(lease.clone()), "a@127.0.0.1:1", settings)
             .expect("the settings are in order");
         let fence = elector.fence();
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let looping = looping(elector, standing);
         until("the first lead", || {
             fence.leader_term(Instant::now()) == Some(1)
@@ -3453,7 +3457,7 @@ mod tests {
             .expect("the loop runs");
         until("the leave", || {
             *stood.borrow()
-                == Standing {
+                == ElectionObservation {
                     holder: String::new(),
                     term: 7,
                     looked: true,
@@ -3507,7 +3511,7 @@ mod tests {
         let elector = Elector::new(Box::new(lease.clone()), "a@127.0.0.1:1", brisk())
             .expect("the settings are in order");
         let fence = elector.fence();
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let looping = looping(elector, standing);
         until("the first lead", || {
             fence.leader_term(Instant::now()) == Some(1)
@@ -3535,7 +3539,7 @@ mod tests {
         );
         until("the record that ran out names nobody", || {
             *stood.borrow()
-                == Standing {
+                == ElectionObservation {
                     holder: String::new(),
                     term: 8,
                     looked: true,
@@ -3560,7 +3564,7 @@ mod tests {
         let elector = Elector::new(Box::new(lease.clone()), "a@127.0.0.1:1", brisk())
             .expect("the settings are in order");
         let fence = elector.fence();
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let looping = looping(elector, standing);
         until("the first lead", || {
             fence.leader_term(Instant::now()) == Some(1)
@@ -3584,7 +3588,7 @@ mod tests {
         );
         until("the term read in the release is counted", || {
             *stood.borrow()
-                == Standing {
+                == ElectionObservation {
                     holder: String::new(),
                     term: 8,
                     looked: true,
@@ -3606,7 +3610,7 @@ mod tests {
         });
         assert_eq!(
             *stood.borrow(),
-            Standing {
+            ElectionObservation {
                 holder: String::new(),
                 term: 8,
                 looked: true,
@@ -3630,7 +3634,7 @@ mod tests {
         assert_eq!(lease.write(None, &free).expect("a write"), Written::Done);
         let follower = Elector::new(Box::new(lease.clone()), "b@127.0.0.1:2", brisk())
             .expect("the settings are in order");
-        let (standing, mut stood) = watch::channel(Standing::default());
+        let (standing, mut stood) = watch::channel(ElectionObservation::default());
         let looping = looping(follower, standing);
         until("the term read in the release", || stood.borrow().term == 3);
         looping
@@ -3641,7 +3645,7 @@ mod tests {
         looks(&mut stood, 5);
         assert_eq!(
             *stood.borrow(),
-            Standing {
+            ElectionObservation {
                 holder: String::new(),
                 term: 9,
                 looked: true
@@ -3657,7 +3661,7 @@ mod tests {
         // it waits its turn, and no line says a record is gone.
         let elector = Elector::new(Box::new(MemoryLease::new()), "a@127.0.0.1:1", brisk())
             .expect("the settings are in order");
-        let (standing, _stood) = watch::channel(Standing::default());
+        let (standing, _stood) = watch::channel(ElectionObservation::default());
         let looping = looping(elector, standing);
         until("the line of the take", || {
             looping.said("took a lease with no holder to wait for")
@@ -3679,7 +3683,7 @@ mod tests {
         let elector = Elector::new(Box::new(MemoryLease::new()), "a@127.0.0.1:1", brisk())
             .expect("the settings are in order");
         let fence = elector.fence();
-        let (standing, mut stood) = watch::channel(Standing::default());
+        let (standing, mut stood) = watch::channel(ElectionObservation::default());
         let looping = looping(elector, standing);
         until("the first lead", || {
             fence.leader_term(Instant::now()) == Some(1)
@@ -3695,7 +3699,7 @@ mod tests {
         assert_eq!(fence.leader_term(Instant::now()), Some(1));
         assert_eq!(
             *stood.borrow(),
-            Standing {
+            ElectionObservation {
                 holder: "a@127.0.0.1:1".to_owned(),
                 term: 1,
                 looked: true
@@ -3721,7 +3725,7 @@ mod tests {
         let follower = Elector::new(Box::new(lease.clone()), "b@127.0.0.1:2", brisk())
             .expect("the settings are in order");
         let fence = follower.fence();
-        let (standing, mut stood) = watch::channel(Standing::default());
+        let (standing, mut stood) = watch::channel(ElectionObservation::default());
         let looping = looping(follower, standing);
         until("the first look", || stood.borrow().holder == held.holder);
 
@@ -3733,7 +3737,7 @@ mod tests {
             .expect("the loop runs");
         until("the term counted", || {
             *stood.borrow()
-                == Standing {
+                == ElectionObservation {
                     holder: String::new(),
                     term: 9,
                     looked: true,
@@ -3780,7 +3784,7 @@ mod tests {
         assert_eq!(lease.write(None, &held).expect("a write"), Written::Done);
         let follower = Elector::new(Box::new(lease), "b@127.0.0.1:2", unhurried())
             .expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let looping = looping(follower, standing);
         until("the first look", || stood.borrow().holder == held.holder);
         looping
@@ -3790,7 +3794,7 @@ mod tests {
         until("the term said", || stood.borrow().term == 9);
         assert_eq!(
             *stood.borrow(),
-            Standing {
+            ElectionObservation {
                 holder: String::new(),
                 term: 9,
                 looked: true,
@@ -3809,7 +3813,7 @@ mod tests {
         let store = Losable::default();
         let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", unhurried())
             .expect("the settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let looping = looping(holder, standing);
         until("the take", || stood.borrow().holder == "a@127.0.0.1:1");
         store.ahead([Ahead::Write(LeaseRecord {
@@ -3823,7 +3827,7 @@ mod tests {
         until("the word taken", || stood.borrow().holder.is_empty());
         assert_eq!(
             *stood.borrow(),
-            Standing {
+            ElectionObservation {
                 holder: String::new(),
                 term: 9,
                 looked: true,
@@ -3846,7 +3850,7 @@ mod tests {
         let elector = Elector::new(Box::new(store), "a@127.0.0.1:1", brisk())
             .expect("the settings are in order");
         let fence = elector.fence();
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let looping = looping(elector, standing);
         until("the first lead", || {
             fence.leader_term(Instant::now()) == Some(1)
@@ -3882,7 +3886,7 @@ mod tests {
         let elector = Elector::new(Box::new(MemoryLease::new()), "a@127.0.0.1:1", brisk())
             .expect("the settings are in order");
         let fence = elector.fence();
-        let (standing, _stood) = watch::channel(Standing::default());
+        let (standing, _stood) = watch::channel(ElectionObservation::default());
         let running = start(elector, Arc::new(MemoryStore::new()), standing).expect("a thread");
         until("the first lead", || {
             fence.leader_term(Instant::now()) == Some(1)
@@ -3904,7 +3908,7 @@ mod tests {
     fn a_term_said_at_the_door_is_the_handles_word() {
         let elector = Elector::alone("a@127.0.0.1:1", brisk()).expect("the settings are in order");
         let fence = elector.fence();
-        let (standing, _stood) = watch::channel(Standing::default());
+        let (standing, _stood) = watch::channel(ElectionObservation::default());
         let running = start(elector, Arc::new(MemoryStore::new()), standing).expect("a thread");
         until("the first lead", || {
             fence.leader_term(Instant::now()) == Some(1)
@@ -3943,7 +3947,7 @@ mod tests {
             ElectionSettings::default(),
         )
         .expect("the settings are in order");
-        let (standing, _stood) = watch::channel(Standing::default());
+        let (standing, _stood) = watch::channel(ElectionObservation::default());
         let running = start(elector, Arc::new(MemoryStore::new()), standing).expect("a thread");
         let refused = running
             .door()

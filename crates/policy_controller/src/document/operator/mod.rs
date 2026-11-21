@@ -1,12 +1,12 @@
 //! In-process calls over the policy document and the store it runs on.
 //!
-//! A host applies its start's document through [`SpecDoor::apply`]. It can
-//! read the running document and status and check another document with a
-//! dry run. Without a spec store, an enforce and a rollback are refused.
-//! The calls run on the caller's thread.
+//! A host applies its start's document through [`DocumentManager::apply`]. It
+//! can read the running document and status and check another document with a
+//! dry run. Without a spec store, an enforce and a rollback are refused. The
+//! calls run on the caller's thread.
 
 mod answers;
-mod door;
+mod document_manager;
 pub(crate) mod reader;
 pub mod snapshot;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -23,13 +23,13 @@ pub use answers::{
     Unanswered,
 };
 #[cfg(all(test, feature = "controller"))]
-pub(crate) use door::needs_rows;
-pub use door::SpecDoor;
+pub(crate) use document_manager::needs_rows;
+pub use document_manager::DocumentManager;
 #[cfg(all(test, feature = "controller"))]
-pub(crate) use door::Validate;
+pub(crate) use document_manager::Validate;
 #[cfg(feature = "controller")]
-pub(crate) use door::{above, over_bound, Checked, Held, Line};
+pub(crate) use document_manager::{above, over_bound, Checked, Held, Line};
 #[cfg(feature = "controller")]
-pub(crate) use door::{DRY_RUNS_WAITING, WRITES_WAITING};
+pub(crate) use document_manager::{DRY_RUNS_WAITING, WRITES_WAITING};
 pub use reader::{Format, MAX_DOCUMENT_BYTES};
 pub use turn::Turn;

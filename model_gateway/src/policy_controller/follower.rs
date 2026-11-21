@@ -249,7 +249,7 @@ pub(crate) mod tests {
     }
 
     fn rows(store: &MemoryStore) -> Vec<(WorkerId, String, WorkerStatus)> {
-        let (_, rows) = store.snapshot();
+        let (_, rows) = store.all_rows();
         let mut rows: Vec<_> = rows
             .into_iter()
             .map(|row| (row.id, row.facts.key, row.status))

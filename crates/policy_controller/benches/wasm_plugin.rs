@@ -46,15 +46,15 @@ use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criteri
 use smg_policy_controller::{
     document::{Needs, MAX_BLOCK_HASHES},
     engine::{
-        Binding, Constraints, Decider, Engine, Plan, PoolFacts, Profile, RequestFacts, Scratch,
-        Target, Weighted, WorkerId,
+        Binding, Constraints, DecisionSlot, Engine, Plan, PoolFacts, Profile, RequestFacts,
+        Scratch, Target, Weighted, WorkerId,
     },
     plugins::{
         shared::OpenDecisions,
         wasm::{EventSet, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
     },
-    stages::{Best, Healthy, LeastRequests},
-    tracking::{Lease, Lifecycle, Membership, Side},
+    stages::{Best, Healthy, LeastRequests, Lifecycle},
+    tracking::{Lease, Membership, Side},
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -508,7 +508,7 @@ fn decide_named(c: &mut Criterion) {
             ..PoolFacts::default()
         };
         let cx = Constraints::default();
-        let turn = Decider::new(0).enter();
+        let turn = DecisionSlot::new(0).enter();
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::new(world, n), &n, |b, _| {
             let mut seed = 0u64;

@@ -10,28 +10,23 @@
 //! So does the warm-up ruling: a stage applies it, and a host names a pool's
 //! warming rows by it.
 
-pub(crate) mod decider;
 pub(crate) mod decision;
+pub(crate) mod decision_slot;
 pub(crate) mod demands;
-pub(crate) mod door;
 pub(crate) mod framework;
 pub(crate) mod prefix_pass;
 pub(crate) mod prompt_hashes;
 pub(crate) mod sticky_sessions;
-pub(crate) mod terms;
+pub(crate) mod store_backed_engine;
 pub(crate) mod view;
 pub(crate) mod warm_up;
 
-pub use decider::{Acting, Decider};
 pub use decision::{
     Decision, Lifted, Overlap, OverlapSource, Pair, Pick, Queue, ShadowKind, Shed, ShedReason,
     Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
+pub use decision_slot::{Acting, DecisionSlot};
 pub use demands::{DemandFacts, Demands, References, Unmet};
-pub use door::{
-    Decided, DecisionRecord, Door, Explained, Leased, Maker, Names, Refused, Request, Swept,
-    SHADOW_ROWS,
-};
 pub use framework::{
     Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
     Front, Narrowed, OverloadThresholds, PairPools, PairSide, PairTable, PairTableError, Picker,
@@ -40,7 +35,12 @@ pub use framework::{
 };
 pub use prompt_hashes::{HashSeeds, PromptHashes};
 pub use sticky_sessions::{
-    Forgets, Pins, SessionRule, SessionTable, SessionVerdict, ABSENCE_MICROS,
+    SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
+    ABSENT_WORKER_PIN_TTL_MICROS,
+};
+pub use store_backed_engine::{
+    Decided, DecisionRecord, Explained, Leased, Names, Refused, Request, RequestFromSnapshot,
+    StoreBackedEngine, Swept, SHADOW_ROWS,
 };
 pub use view::{
     fingerprint, key_of_session, permille, AffinityFacts, Candidate, Constraints, Engines,

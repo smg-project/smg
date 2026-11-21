@@ -91,10 +91,10 @@
 //! A pair is one request, one answer, one id and two sides. The request
 //! that enters a pair plan at its prefill is decided once, by the engine's
 //! pair entry over both pools of one publication
-//! ([`crate::engine::door::pair_in`]), and its pick is issued a lease a side under
-//! one id ([`issue`]): one record on file and one write, each side booking
-//! its own worker's count and living by its own frames. Both leases are
-//! credits: nothing reserves a decode room yet.
+//! ([`crate::engine::store_backed_engine::pair_in`]), and its pick is issued a
+//! lease a side under one id ([`issue`]): one record on file and one write,
+//! each side booking its own worker's count and living by its own frames. Both
+//! leases are credits: nothing reserves a decode room yet.
 //!
 //! One lease stands for a request its gateway asks again. A gateway whose
 //! stream ended with a request unanswered sends it again and says so
@@ -133,10 +133,10 @@
 //! filter of the catalog reads them, and no profile picks a member its
 //! gateway cannot dial. The candidates the wires take are counted, and a
 //! decision whose pool has rows and whose gateway shares a wire with none
-//! of them is shed under [`WIRES`](crate::engine::door::WIRES). One whose gateway
-//! hints a subset of 0, a decision over no candidates, is shed under
-//! [`SUBSET_HINT`](crate::engine::door::SUBSET_HINT). A positive hint is read by
-//! no stage yet.
+//! of them is shed under [`WIRES`](crate::engine::store_backed_engine::WIRES).
+//! One whose gateway hints a subset of 0, a decision over no candidates, is
+//! shed under [`SUBSET_HINT`](crate::engine::store_backed_engine::SUBSET_HINT).
+//! A positive hint is read by no stage yet.
 //!
 //! What this build has no decision for is answered `Busy` with no reason,
 //! and its gateway decides it locally at once: a shed is a policy's word
@@ -184,31 +184,32 @@ use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use super::{
-    election::Standing,
+    election::ElectionObservation,
     lifecycle,
     wire::{self, Checked, Lists},
 };
 use crate::{
     engine::{
-        decider::Decider,
         decision::Decision,
-        door::{
-            decide_in, decider_of, decode_in, entry, issue, issue_decode, issue_pair, issuing,
-            pair_in, past_mark, summed, Asked, Buffers, DecisionRecord, Entry, Part, SampleCount,
-            Samples, StorePins, Taken,
-        },
+        decision_slot::DecisionSlot,
         framework::{release, Engine},
+        store_backed_engine::{
+            decide_in, decider_of, decode_in, entry, issue, issue_decode, issue_pair, issuing,
+            pair_in, past_mark, summed, Buffers, DecisionCall, DecisionRecord, Entry, Part,
+            RequestForm, SampleCount, Samples, StorePins,
+        },
         view::fingerprint,
     },
     service::{
         elector::{term_said, Fence},
         proto::{self, busy::Reason},
     },
+    stages::lifecycle::Lifecycle,
     store::{
         leases::DISPATCH_TTL, AtWork, DecodeIssue, DecodeRefused, GatewayId, LeaseRefused,
-        MemoryStore, Watch, World,
+        MemoryStore, StoreSnapshot, Watch,
     },
-    tracking::lease::{Lease, LeaseId, Lifecycle, ReleaseReason},
+    tracking::lease::{Lease, LeaseId, ReleaseReason},
 };
 
 /// What the deciders and the streams count on the controller's own side,
@@ -360,7 +361,7 @@ impl Shared {
         (index, deciders): (usize, usize),
         count: &mut SampleCount,
         engine: &Engine,
-        taken: &Taken<'_, Checked>,
+        taken: &DecisionCall<'_, Checked>,
         order: impl FnOnce() -> Answered,
     ) -> Answered {
         let answer = order()?;
@@ -391,7 +392,7 @@ pub(crate) struct Reads {
     pub(crate) fence: Arc<Fence>,
     /// The election's last sight of the lease, for the term a `Busy`
     /// carries.
-    pub(crate) standing: watch::Receiver<Standing>,
+    pub(crate) standing: watch::Receiver<ElectionObservation>,
     pub(crate) clock: Clock,
     pub(crate) counts: Arc<Counts>,
 }
@@ -465,13 +466,13 @@ impl Drop for Unwound {
 
 impl Deciders {
     /// Starts `deciders` threads, each behind a queue of `depth` requests:
-    /// at least one thread and at most `Decider::COUNT`, and a queue of at
+    /// at least one thread and at most `DecisionSlot::COUNT`, and a queue of at
     /// least one. Refused over a store whose files were laid for another
     /// count of deciders.
     pub(crate) fn start(deciders: usize, depth: usize, reads: &Reads) -> io::Result<Self> {
         // A decider issues into a file of its own: the store was made for
         // this count of deciders, or its one file would have two writers.
-        let deciders = deciders.clamp(1, Decider::COUNT);
+        let deciders = deciders.clamp(1, DecisionSlot::COUNT);
         if reads.store.deciders() != deciders {
             let files = "the store's files of leases are not one a decider";
             return Err(io::Error::new(io::ErrorKind::InvalidInput, files));
@@ -491,7 +492,7 @@ impl Deciders {
                     marked: None,
                     shared: Arc::clone(&shared),
                     working: None,
-                    name: u8::try_from(index).ok().map(Decider::new),
+                    name: u8::try_from(index).ok().map(DecisionSlot::new),
                 };
                 watched(index, &told, move || decider.run(&jobs)).map(|_running| queue)
             })
@@ -625,8 +626,8 @@ struct Deciding {
     /// on its watch while a lease stands on the file.
     working: Option<AtWork>,
     /// Its name among the host's deciders, which its thread acts as while
-    /// it decides ([`Decider::enter`]): none past the names a host gives.
-    name: Option<Decider>,
+    /// it decides ([`DecisionSlot::enter`]): none past the names a host gives.
+    name: Option<DecisionSlot>,
 }
 
 impl Deciding {
@@ -652,7 +653,7 @@ impl Deciding {
             };
             // The thread acts as its decider for this job: a local, so the
             // name is let go where the job ends.
-            let _acting = self.name.map(Decider::enter);
+            let _acting = self.name.map(DecisionSlot::enter);
             // Its seat is at the file its name finds. It says it works and
             // takes its turn before its first decision.
             match &mut self.working {
@@ -900,7 +901,7 @@ impl Deciding {
         gateway: GatewayId,
         received: Instant,
         now: Instant,
-    ) -> Result<(u64, Taken<'a, Checked>), Reason> {
+    ) -> Result<(u64, DecisionCall<'a, Checked>), Reason> {
         let Reads { fence, counts, .. } = &self.reads;
         let term = fence.leader_term(now).ok_or(Reason::NotLeader)?;
         if request.says_more() {
@@ -918,7 +919,7 @@ impl Deciding {
                 }
             }
         }
-        let taken = Taken::at(request, gateway, received, now);
+        let taken = DecisionCall::at(request, gateway, received, now);
         Ok((term, taken.ok_or(Reason::BudgetGoneOnArrival)?))
     }
 
@@ -980,7 +981,7 @@ impl Deciding {
         // One load of the world for the decision and for its lease: the
         // lease books the count that load laid beside its target's row,
         // and the engine told of it is the one that decided.
-        let mut order = |world: &World| {
+        let mut order = |world: &StoreSnapshot| {
             // The lease, for a pick: filed under the first read's term and
             // at its instant, and the engine told, before the read that
             // lets the answer leave. That read judges the store's write
@@ -1124,10 +1125,10 @@ impl Deciding {
 #[inline(never)]
 fn pair(
     store: &MemoryStore,
-    world: &World,
-    taken: &Taken<'_, Checked>,
+    world: &StoreSnapshot,
+    taken: &DecisionCall<'_, Checked>,
     term: u64,
-    buffers: &mut Buffers<<Checked as Asked>::Lists>,
+    buffers: &mut Buffers<<Checked as RequestForm>::Lists>,
     own: &Part,
     decode: &mut Option<Lease>,
 ) -> (Decision, Result<Option<Lease>, LeaseRefused>) {
@@ -1158,10 +1159,10 @@ fn pair(
 #[inline(never)]
 fn decode_side(
     store: &MemoryStore,
-    world: &World,
-    taken: &Taken<'_, Checked>,
+    world: &StoreSnapshot,
+    taken: &DecisionCall<'_, Checked>,
     lease: LeaseId,
-    buffers: &mut Buffers<<Checked as Asked>::Lists>,
+    buffers: &mut Buffers<<Checked as RequestForm>::Lists>,
     own: &Part,
     undo: &mut Option<DecodeIssue>,
 ) -> Result<(Decision, Result<Option<Lease>, LeaseRefused>), DecodeRefused> {
@@ -1196,7 +1197,7 @@ const fn busy_of(refused: DecodeRefused) -> Reason {
 /// or issued anew by another hand, and nothing is told of it here.
 fn take_back(
     store: &MemoryStore,
-    world: &World,
+    world: &StoreSnapshot,
     gateway: GatewayId,
     lease: &Lease,
     issue: DecodeIssue,
@@ -1209,7 +1210,7 @@ fn take_back(
     }
 }
 
-impl<'a> Taken<'a, Checked> {
+impl<'a> DecisionCall<'a, Checked> {
     /// `request` as its decider takes it at `now`; `None` when its budget
     /// is gone. The budget counts from the frame's receipt: what the queue
     /// used of it is not the decision's. Under one microsecond left is
@@ -1270,7 +1271,7 @@ impl<'a> Taken<'a, Checked> {
 /// ended by another hand, and nothing is told of it here.
 fn give_up(
     store: &MemoryStore,
-    world: &World,
+    world: &StoreSnapshot,
     gateway: GatewayId,
     lease: &Lease,
     decode: Option<&Lease>,
@@ -1305,19 +1306,19 @@ pub(crate) mod tests {
     };
 
     use super::{
-        decode_side, watched, Buffers, Clock, Counts, Deciders, Deciding, Job, Part, Reads,
-        Refused, Taken, LOOK_CAP, LOOK_FLOOR, PARTS,
+        decode_side, watched, Buffers, Clock, Counts, Deciders, Deciding, DecisionCall, Job, Part,
+        Reads, Refused, LOOK_CAP, LOOK_FLOOR, PARTS,
     };
     use crate::{
         document::spec::{self, AppliedSpec, PolicySpec},
         engine::{
-            decider::Decider,
             decision::{Decision, Overlap, OverlapSource, Pick, Targets},
-            door::{
-                self, cut_reach, keeps_a_row, narrow, pair_in, tests::pair_counts, Asked, Door,
-                Request, TERM_MARK,
-            },
+            decision_slot::DecisionSlot,
             framework::{DecisionScope, Filter, Picker, Scratch, TieBand},
+            store_backed_engine::{
+                self, cut_reach, keeps_a_row, narrow, pair_in, tests::pair_counts, Request,
+                RequestForm, StoreBackedEngine, TERM_MARK,
+            },
             view::{
                 self, fingerprint, AffinityFacts, Candidate, Constraints, PoolFacts, RequestFacts,
                 Role, WireModes, WorkerId,
@@ -1326,7 +1327,7 @@ pub(crate) mod tests {
         policies::{power_of_two::PowerOfTwoMetric, random::Random},
         service::{
             controller::{
-                election::Standing,
+                election::ElectionObservation,
                 gateways::{
                     tests::{GRACE, PATIENT},
                     Gateways, Vetoed,
@@ -1337,13 +1338,13 @@ pub(crate) mod tests {
             elector::{Elector, Tick, TERM_CEILING},
             proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome},
         },
-        stages::{catalog::Catalog, pickers::Best},
+        stages::{lifecycle::Lifecycle, pickers::Best, registry::StageRegistry},
         store::{
             leases::DISPATCH_TTL, Ask, Built, DecodeIssue, Dispatch, GatewayId, HealthSink,
-            LeaseState, LeasesStore, MemoryStore, Said, ViewBuffers, WorkerFacts, WorkerStatus,
-            WorkersStore, World,
+            LeaseState, LeasesStore, MemoryStore, Said, StoreSnapshot, ViewBuffers, WorkerFacts,
+            WorkerStatus, WorkersStore,
         },
-        tracking::lease::{Lease, LeaseId, Lifecycle, ReleaseReason, Side},
+        tracking::lease::{Lease, LeaseId, ReleaseReason, Side},
     };
 
     /// How long a case waits for a decider before it fails.
@@ -1358,9 +1359,9 @@ pub(crate) mod tests {
 
     /// The door's hand for a decider of one form: a case's function of the
     /// view decides alike over rows the store named and over any other.
-    fn hand<A: Asked, R>(
-        world: &World,
-        taken: &Taken<'_, A>,
+    fn hand<A: RequestForm, R>(
+        world: &StoreSnapshot,
+        taken: &DecisionCall<'_, A>,
         buffers: &mut Buffers<A::Lists>,
         undialed: &AtomicU64,
         decide: impl FnOnce(
@@ -1371,7 +1372,7 @@ pub(crate) mod tests {
             &mut Scratch,
         ) -> R,
     ) -> (R, Option<Built>) {
-        door::hand(world, taken, buffers, undialed, decide)
+        store_backed_engine::hand(world, taken, buffers, undialed, decide)
     }
 
     /// Waits until what a handed frame changes shows, [`PATIENCE`] at
@@ -1449,7 +1450,7 @@ pub(crate) mod tests {
     /// A store, a candidate of its election and the deciders over both.
     struct Bed {
         elector: Elector,
-        standing: watch::Sender<Standing>,
+        standing: watch::Sender<ElectionObservation>,
         store: Arc<MemoryStore>,
         script: Arc<Script>,
         /// What the bed's deciders read, for a decider of the case's own.
@@ -1479,7 +1480,7 @@ pub(crate) mod tests {
         name: &'static str,
         picker: impl Fn() -> Box<dyn Picker> + Send + Sync + 'static,
     ) -> AppliedSpec {
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog.picker(name, picker).expect("a free name");
         let mut document = PolicySpec::preset("random").expect("a preset of this build");
         let profile = document.profiles.get_mut("random");
@@ -1583,7 +1584,7 @@ pub(crate) mod tests {
             let script = Arc::clone(&script);
             Arc::new(move || script.read())
         };
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let reads = Reads {
             store: Arc::clone(&store),
             fence: elector.fence(),
@@ -1840,7 +1841,7 @@ pub(crate) mod tests {
         fleet(&beside);
         let applied = beside.apply(preset("random", 1));
         applied.expect("above the unbound start");
-        let door = Door::new(Arc::clone(&beside));
+        let door = StoreBackedEngine::new(Arc::clone(&beside));
         let first_on_file = |store: &MemoryStore, lease: u64| {
             let record = LeasesStore::get(store, GATEWAY, LeaseId(lease));
             record.map(|record| record.target)
@@ -2425,7 +2426,7 @@ pub(crate) mod tests {
     /// `told`.
     pub(crate) fn hearing(told: &Arc<Mutex<Calls>>, generation: u64) -> AppliedSpec {
         let kept = Arc::clone(told);
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .picker("told", move || Box::new(Told(Arc::clone(&kept))))
             .expect("a free name");
@@ -2506,7 +2507,7 @@ pub(crate) mod tests {
         let (reached, at_issue) = std_mpsc::sync_channel(1);
         let (word, go) = std_mpsc::sync_channel(1);
         let (kept, go) = (Arc::clone(&told), Arc::new(Mutex::new(go)));
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .picker("waits", move || {
                 Box::new(Waits {
@@ -3140,7 +3141,7 @@ pub(crate) mod tests {
     async fn a_frame_handed_while_a_decider_decides_is_applied_by_that_decider() {
         let told = Arc::new(Mutex::new(Vec::new()));
         let kept = Arc::clone(&told);
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .picker("told", move || Box::new(Told(Arc::clone(&kept))))
             .expect("a free name");
@@ -3180,15 +3181,15 @@ pub(crate) mod tests {
     /// The `random` picker, keeping the decider its thread acts as at each
     /// call of a lease's issue and release.
     #[derive(Debug)]
-    struct Named(Arc<Mutex<Vec<Option<Decider>>>>);
+    struct Named(Arc<Mutex<Vec<Option<DecisionSlot>>>>);
 
     impl Lifecycle for Named {
         fn on_decision_issued(&self, _: &Lease, _: &Decision) {
-            self.0.lock().push(Decider::acting());
+            self.0.lock().push(DecisionSlot::acting());
         }
 
         fn on_released(&self, _: &Lease, _: ReleaseReason) {
-            self.0.lock().push(Decider::acting());
+            self.0.lock().push(DecisionSlot::acting());
         }
     }
 
@@ -3217,7 +3218,7 @@ pub(crate) mod tests {
     async fn a_decision_and_its_leases_events_act_as_the_leases_decider() {
         let named = Arc::new(Mutex::new(Vec::new()));
         let kept = Arc::clone(&named);
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .picker("named", move || Box::new(Named(Arc::clone(&kept))))
             .expect("a free name");
@@ -3235,8 +3236,8 @@ pub(crate) mod tests {
         let gone = Said::Released(None, ReleaseReason::ClientGone);
         bed.store.hand(&hand, LeaseId(lease_of(&answer).id), gone);
         settled(|| named.lock().len() >= 2).await;
-        assert_eq!(*named.lock(), [Some(Decider::new(0)); 2]);
-        assert_eq!(Decider::acting(), None);
+        assert_eq!(*named.lock(), [Some(DecisionSlot::new(0)); 2]);
+        assert_eq!(DecisionSlot::acting(), None);
     }
 
     /// The `random` picker, keeping the name of the thread each release of
@@ -3509,13 +3510,13 @@ pub(crate) mod tests {
         member: WorkerId,
     ) -> crate::store::AtWork {
         use crate::{
-            engine::decider::Decider,
+            engine::decision_slot::DecisionSlot,
             store::{Hand, Said, Watch},
             tracking::lease::ReleaseReason,
         };
 
         let now = Instant::now();
-        let _acting = Decider::new(1).enter();
+        let _acting = DecisionSlot::new(1).enter();
         let mut place = store.at_work();
         let issue = |request| {
             let record = crate::store::LeaseRecord {
@@ -3530,7 +3531,7 @@ pub(crate) mod tests {
                 dispatch_deadline: now + DISPATCH_TTL,
                 state: LeaseState::ISSUED,
             };
-            let booked = store.world().booked_of(member);
+            let booked = store.snapshot().booked_of(member);
             let issued = store.issue_decided(record, booked, |_| ());
             issued.expect("minted under the store's term").id
         };
@@ -3548,7 +3549,7 @@ pub(crate) mod tests {
     /// turn at it.
     #[test]
     fn a_decision_whose_stages_refuse_by_no_report_applies_nothing_at_the_other_files() {
-        use crate::{engine::decider::Decider, store::Watch};
+        use crate::{engine::decision_slot::DecisionSlot, store::Watch};
 
         const SPOKEN: &str = "model-http";
         let store = Arc::new(MemoryStore::new().with_deciders(2));
@@ -3560,11 +3561,11 @@ pub(crate) mod tests {
         let mut watch = a_frame_under_the_second_files_watch(&store, member);
         // The first file's decision, its place lent, under the preset's
         // stages: each says it refuses by no report.
-        let _acting = Decider::new(0).enter();
+        let _acting = DecisionSlot::new(0).enter();
         let place = store.at_work();
         let request = checked(frame_for(SPOKEN, 1, 1));
         let now = Instant::now();
-        let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+        let taken = DecisionCall::at(&request, GATEWAY, now, now).expect("budget is left");
         let taken = taken.placed(Some(&place));
         let mut buffers = Buffers::default();
         let handed = store.deciding(|world| {
@@ -3592,11 +3593,11 @@ pub(crate) mod tests {
     /// and the frame waits for its file's look.
     #[test]
     fn a_pairs_decision_applies_what_waits_where_a_stage_of_either_side_may_refuse() {
-        use crate::{engine::decider::Decider, store::Watch};
+        use crate::{engine::decision_slot::DecisionSlot, store::Watch};
 
         let waited = |prefill: &str, decode: &str| {
             let rows = Arc::new(Mutex::new(Vec::new()));
-            let mut catalog = Catalog::builtin();
+            let mut catalog = StageRegistry::builtin();
             let counted = move || -> Box<dyn Picker> {
                 let rows = Arc::clone(&rows);
                 Box::new(Counted(Seen { rows }))
@@ -3629,11 +3630,11 @@ pub(crate) mod tests {
                 .expect("above the unbound start");
             LeasesStore::set_term(&*store, 1);
             let mut watch = a_frame_under_the_second_files_watch(&store, singles[0]);
-            let _acting = Decider::new(0).enter();
+            let _acting = DecisionSlot::new(0).enter();
             let place = store.at_work();
             let request = checked(phased(frame(1, 7), proto::Phase::Prefill));
             let now = Instant::now() + Duration::from_secs(3);
-            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let taken = DecisionCall::at(&request, GATEWAY, now, now).expect("budget is left");
             let taken = taken.placed(Some(&place));
             let mut buffers = Buffers::default();
             let own = Part::default();
@@ -3931,7 +3932,7 @@ pub(crate) mod tests {
     async fn a_decision_reads_the_leases_count_beside_the_rows_its_store_lends() {
         let rows = Arc::new(Mutex::new(Vec::new()));
         let kept = Arc::clone(&rows);
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         let seen = move || -> Box<dyn Picker> {
             let rows = Arc::clone(&kept);
             Box::new(Seen { rows })
@@ -4094,7 +4095,7 @@ pub(crate) mod tests {
         let answer = bed.ask(frame(1, 1)).await;
         assert_eq!((busy(&answer), answer.term), (Reason::NotLeader, 0));
         // The election saw another replica hold the lease under term 4.
-        bed.standing.send_replace(Standing {
+        bed.standing.send_replace(ElectionObservation {
             holder: "controller-1@10.0.0.8:30100".to_owned(),
             term: 4,
             looked: true,
@@ -4219,7 +4220,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_decision_leaves_under_the_fences_term_while_the_election_has_seen_a_later_one() {
         let mut bed = leading([]);
-        bed.standing.send_replace(Standing {
+        bed.standing.send_replace(ElectionObservation {
             holder: "controller-1@10.0.0.8:30100".to_owned(),
             term: 4,
             looked: true,
@@ -4307,7 +4308,7 @@ pub(crate) mod tests {
         let read = |frame: proto::DecideRequest| {
             let request = checked(frame);
             let now = Instant::now();
-            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let taken = DecisionCall::at(&request, GATEWAY, now, now).expect("budget is left");
             let mut buffers = Buffers::default();
             let handed = store.deciding(|world| {
                 hand(
@@ -4363,7 +4364,7 @@ pub(crate) mod tests {
         let engines = |frame: proto::DecideRequest| {
             let request = checked(frame);
             let now = Instant::now();
-            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let taken = DecisionCall::at(&request, GATEWAY, now, now).expect("budget is left");
             let (mut buffers, undialed) = (Buffers::default(), AtomicU64::new(0));
             store.deciding(|world| {
                 let handed = hand(
@@ -4424,7 +4425,7 @@ pub(crate) mod tests {
             }
         }
 
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .filter("shown", || Box::new(Shown))
             .expect("a free name");
@@ -4447,7 +4448,7 @@ pub(crate) mod tests {
         // buffers.
         let decided = || {
             let request = checked(frame(1, 1));
-            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let taken = DecisionCall::at(&request, GATEWAY, now, now).expect("budget is left");
             let mut buffers = Buffers::default();
             let (stalled, masked, picked) = store.deciding(|world| {
                 hand(
@@ -4522,7 +4523,7 @@ pub(crate) mod tests {
                 form: Some(proto::identity::Form::Hash(17)),
             });
             let request = checked(keyed);
-            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let taken = DecisionCall::at(&request, GATEWAY, now, now).expect("budget is left");
             let mut buffers = Buffers::default();
             store.deciding(|world| {
                 hand(
@@ -4613,7 +4614,7 @@ pub(crate) mod tests {
                 frame
             };
             let request = checked(frame);
-            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let taken = DecisionCall::at(&request, GATEWAY, now, now).expect("budget is left");
             let mut buffers = Buffers::default();
             let counts = store.deciding(|world| {
                 hand(
@@ -4696,7 +4697,7 @@ pub(crate) mod tests {
         late: &[WorkerId],
     ) -> (Vec<(WorkerId, u32)>, Option<WorkerId>) {
         let request = checked(frame);
-        let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+        let taken = DecisionCall::at(&request, GATEWAY, now, now).expect("budget is left");
         let mut buffers = Buffers::default();
         store.deciding(|world| {
             hand(
@@ -4859,7 +4860,7 @@ pub(crate) mod tests {
         // Received so long before `now` that this much of the budget is
         // left when the decider takes it.
         let received = now - (BUDGET - Duration::from_micros(1_234));
-        let taken = Taken::at(&request, gateway, received, now).expect("budget is left");
+        let taken = DecisionCall::at(&request, gateway, received, now).expect("budget is left");
         let mut buffers = Buffers::default();
         store.deciding(|world| {
             hand(
@@ -5072,7 +5073,7 @@ pub(crate) mod tests {
             facts.hash_kind = proto::HashKind::Token.into();
             let request = checked(frame);
             let now = Instant::now() + Duration::from_secs(3);
-            let taken = Taken::at(&request, gateway, now, now).expect("budget is left");
+            let taken = DecisionCall::at(&request, gateway, now, now).expect("budget is left");
             let mut buffers = Buffers::default();
             store.deciding(|world| {
                 let none = AtomicU64::new(0);
@@ -5164,7 +5165,7 @@ pub(crate) mod tests {
             facts.hash_kind = proto::HashKind::Token.into();
             let frame = constrained(frame, u32::from(WireModes::GRPC.bits()), None);
             let request = checked(frame);
-            let taken = Taken::at(&request, GATEWAY, at, at).expect("budget is left");
+            let taken = DecisionCall::at(&request, GATEWAY, at, at).expect("budget is left");
             let mut buffers = Buffers::default();
             store.deciding(|world| {
                 let none = AtomicU64::new(0);
@@ -5288,7 +5289,7 @@ pub(crate) mod tests {
             facts.hash_kind = proto::HashKind::Token.into();
             let request = checked(frame);
             let now = Instant::now() + Duration::from_secs(3);
-            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let taken = DecisionCall::at(&request, GATEWAY, now, now).expect("budget is left");
             let mut buffers = Buffers::default();
             store.deciding(|world| {
                 let none = AtomicU64::new(0);
@@ -5428,10 +5429,11 @@ pub(crate) mod tests {
             facts.block_hashes = vec![block];
             facts.hash_kind = proto::HashKind::Token.into();
             let request = checked(frame);
-            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let taken = DecisionCall::at(&request, GATEWAY, now, now).expect("budget is left");
             let mut buffers = Buffers::default();
-            let (decision, _) = store
-                .deciding(|world| door::decide_in(world, &taken, &mut buffers, &Part::default()));
+            let (decision, _) = store.deciding(|world| {
+                store_backed_engine::decide_in(world, &taken, &mut buffers, &Part::default())
+            });
             let pick = *decision.pick().expect("a pick over eight ready members");
             // The same rows at the engine's plain entry: no stage is asked.
             let plain = store.deciding(|world| {
@@ -5520,7 +5522,7 @@ pub(crate) mod tests {
             facts.block_hashes = vec![1, 2];
             facts.hash_kind = proto::HashKind::Token.into();
             let request = checked(frame);
-            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let taken = DecisionCall::at(&request, GATEWAY, now, now).expect("budget is left");
             let mut buffers = Buffers::default();
             let (named, by_named, by_column) = store.deciding(|world| {
                 let engine = world.spec().engine();
@@ -5793,7 +5795,7 @@ pub(crate) mod tests {
             .expect("above the unbound start");
         let request = checked(phased(frame(1, 7), proto::Phase::Prefill));
         let now = Instant::now() + Duration::from_secs(3);
-        let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+        let taken = DecisionCall::at(&request, GATEWAY, now, now).expect("budget is left");
         let mut buffers = Buffers::default();
         let own = Part::default();
         let decision = store.deciding(|world| pair_in(world, &taken, &mut buffers, &own).0);
@@ -5929,7 +5931,7 @@ pub(crate) mod tests {
     /// `told`.
     fn hearing_pairs(told: &Arc<Mutex<Calls>>) -> AppliedSpec {
         let kept = Arc::clone(told);
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .picker("told", move || Box::new(Told(Arc::clone(&kept))))
             .expect("a free name");
@@ -6191,7 +6193,7 @@ pub(crate) mod tests {
             .into_iter()
             .map(|frame| {
                 let request = checked(frame);
-                let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+                let taken = DecisionCall::at(&request, GATEWAY, now, now).expect("budget is left");
                 let mut buffers = Buffers::default();
                 bed.store.deciding(|world| {
                     hand(
@@ -6348,7 +6350,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_request_ahead_of_the_starts_document_is_no_decision() {
         let mut bed = bed(None, true, (2, 8), []);
-        bed.store.world().spec().mark_document_awaited();
+        bed.store.snapshot().spec().mark_document_awaited();
         let answer = bed.ask(frame(1, 1)).await;
         assert_eq!(
             (busy(&answer), answer.request_id.as_slice(), answer.term),
@@ -7086,7 +7088,7 @@ pub(crate) mod tests {
         edit: impl FnOnce(&mut PolicySpec),
     ) -> AppliedSpec {
         let kept = Arc::clone(told);
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .picker("told-sides", move || Box::new(ToldSides(Arc::clone(&kept))))
             .expect("a free name");
@@ -7509,7 +7511,7 @@ pub(crate) mod tests {
     fn issued_by_hand(bed: &Bed, frame: proto::DecideRequest) -> DecodeIssue {
         let request = checked(frame);
         let now = bed.script.taken;
-        let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+        let taken = DecisionCall::at(&request, GATEWAY, now, now).expect("budget is left");
         let (mut buffers, mut undo) = (Buffers::default(), None);
         let part = Part::default();
         let lease = request.decode_of().expect("a decode call's frame");

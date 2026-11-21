@@ -7,7 +7,7 @@
 //! into the spec's declared lists (zones, engine kinds, connectors, labels,
 //! headers) are the same positions here.
 
-use crate::{load::signals, tracking::counts};
+use crate::{load::signals, tracking::in_flight};
 
 /// The stable identity of a candidate: a hash of the registration key and the
 /// incarnation, never a URL. A same-URL replacement is a new id.
@@ -836,7 +836,7 @@ pub(crate) fn mean_in_flight(
     if rows.is_empty() {
         return 0.0;
     }
-    let sum: u64 = crate::tracking::counts::with_counts!(facts, |counts| rows
+    let sum: u64 = crate::tracking::in_flight::with_counts!(facts, |counts| rows
         .iter()
         .map(|&i| u64::from(counts(&candidates[i as usize])))
         .sum());
@@ -951,7 +951,7 @@ pub struct RequestFacts<'a> {
     /// the count itself. A pair takes none: a position is a place in one
     /// pool, and a pair's rows carry what counts their host wrote.
     /// In-process only.
-    pub lent_in_flight: Option<&'a counts::LentCounts<'a>>,
+    pub lent_in_flight: Option<&'a in_flight::LentCounts<'a>>,
     /// The rows that carry requests of this request's session key, each
     /// with its count, where the host did not write the count into the
     /// rows ([`Candidate::session_in_flight`]): a host that keeps the
@@ -1238,7 +1238,7 @@ pub struct Constraints<'a> {
     /// pair's request that states a demand, under the stage `wires`,
     /// whatever its sides state. In-process only: this protocol version
     /// states no demand, and a handle refuses a request that states one
-    /// before it sends it over a link (`Handle::asked`).
+    /// before it sends it over a link (`DecisionGuard::asked`).
     pub demands: crate::engine::Demands,
     /// The rows a standing veto of this host masks, by position, in order,
     /// where the host did not write them into the rows: a view of a
@@ -1400,7 +1400,7 @@ pub struct PoolFacts<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tracking::counts::tests::Lent;
+    use crate::tracking::in_flight::tests::Lent;
 
     /// One reader, two feeds: a row's requests in flight are the lent count
     /// at the row's position where the host lends a table, whatever the

@@ -11,11 +11,12 @@ use smg_policy_controller::{
         NamedAffinity, NamedHolder, PairPools, Phase, PoolFacts, RequestFacts, Role, Scratch,
         Target, WorkerId,
     },
+    stages::Lifecycle,
     store::{
         Ask, GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
         WorkersStore,
     },
-    tracking::{Lease, Lifecycle, Membership, Side},
+    tracking::{Lease, Membership, Side},
 };
 
 const LIMIT_MS: u64 = 27;
@@ -471,7 +472,7 @@ fn check_view_limit(limit_ms: u64) {
             affinity: false,
             signal_cells: false,
         };
-        store.with_world(|world| {
+        store.with_snapshot(|world| {
             let mut buffers = ViewBuffers::default();
             let view = world
                 .view("m", Role::Single, &ask, written, &mut buffers)
