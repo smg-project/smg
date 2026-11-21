@@ -379,10 +379,12 @@ impl Filter for HasRoomRule {
     }
 
     // A report ends the sends before it, so the sends need the reports
-    // though no term may read one.
+    // though no term may read one. A rule that names the request's size
+    // needs it counted.
     fn needs(&self) -> Needs {
         Needs {
             loads: self.loads || self.sent.is_some(),
+            prompt_size: self.request_tokens != 0.0,
             ..Needs::default()
         }
     }

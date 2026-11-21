@@ -30,7 +30,12 @@
 //!   table, the dispatch credit, a pool's turn) moves under an atomic or a
 //!   lock no decision holds across its stages.
 
+#[cfg(feature = "in-process")]
+use std::sync::Arc;
 use std::time::Instant;
+
+#[cfg(feature = "in-process")]
+use smg_worker::load::state::LoadSnapshot;
 
 use super::{
     decision::{Decision, Pick, ShadowKind, Survivors, Target, Targets, Trace},
@@ -90,6 +95,18 @@ pub trait RequestMaker {
     #[cfg(feature = "in-process")]
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::None
+    }
+
+    /// The load reports of the host's workers, as the host holds them for
+    /// this decision: its load monitor's snapshot, borrowed once. An engine
+    /// that decides over its host's lists reads each worker's report there,
+    /// and every record of one decision in the one snapshot. A host hands
+    /// it where the document reads reports
+    /// ([`Needs::loads`](crate::document::spec::Needs::loads)); under no
+    /// snapshot a record carries no report.
+    #[cfg(feature = "in-process")]
+    fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
+        None
     }
 }
 

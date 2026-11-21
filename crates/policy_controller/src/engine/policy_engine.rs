@@ -511,7 +511,7 @@ impl DecisionEngine for PolicyEngine {
             let later = request.constraints.decode_later;
             let decided = match (request.facts.phase, maker.workers()) {
                 (Phase::Single, WorkerLists::Single(members)) => {
-                    single::decide(self, &mut request, members, now)
+                    single::decide(self, &mut request, members, maker.loads(), now)
                 }
                 // A pair is decided at its prefill, over its host's two
                 // lists.
@@ -923,15 +923,30 @@ mod tests {
     }
 
     /// Every request of a document is decided whole where each of its
-    /// places is picked alone or is an affinity profile the host feeds:
-    /// round robin asks nothing of a host, and the default policy asks for
-    /// everything its stages declare. A host that feeds less, a pair's plan
-    /// and a profile that reads no affinity are not decided so.
+    /// places is picked alone or its stages read nothing the host does not
+    /// feed. Round robin asks nothing of a host. Random and passthrough
+    /// read a worker's record and no more. Least load reads the workers'
+    /// reports, and the default policy who holds the prompt beside them.
+    /// A host that feeds less than a profile declares, a profile that
+    /// reads a hash ring, one under a sessions rule and a pair's plan are
+    /// not decided so.
     #[test]
     fn a_document_is_decided_whole_where_each_place_is_picked_alone_or_fed() {
         let whole = |engine: &PolicyEngine, fed: Needs| engine.spec().engine().single_and_fed(fed);
         let nothing = Needs::default();
-        assert!(whole(&preset("round_robin"), nothing));
+        for name in ["round_robin", "random", "passthrough"] {
+            assert!(whole(&preset(name), nothing), "{name}");
+        }
+        for name in ["power_of_two", "least_load", "bucket"] {
+            let engine = preset(name);
+            let declared = engine.spec().engine().needs_for(MODEL, Phase::Single);
+            assert!(!declared.affinity && !declared.ring, "{name}");
+            assert!(whole(&engine, declared), "{name}");
+        }
+        assert!(
+            !whole(&preset("least_load"), nothing),
+            "its scorer reads reports"
+        );
         let default = preset("cache_aware");
         let declared = default.spec().engine().needs_for(MODEL, Phase::Single);
         assert!(declared.affinity && declared.loads && declared.sent_prefixes);
@@ -942,8 +957,11 @@ mod tests {
             ..declared
         };
         assert!(!whole(&default, unfed), "its load stages read reports");
-        // A scorer that reads no affinity is not this rule's to let through.
-        assert!(!whole(&preset("least_load"), declared));
+        // A ring is no part of what the default policy's host feeds, and a
+        // sessions rule is decided by no whole pass here yet.
+        for name in ["consistent_hashing", "prefix_hash", "manual"] {
+            assert!(!whole(&preset(name), declared), "{name}");
+        }
         let mut pair =
             PolicySpec::pair_presets("round_robin", "round_robin").expect("built-in presets");
         pair.generation = 1;

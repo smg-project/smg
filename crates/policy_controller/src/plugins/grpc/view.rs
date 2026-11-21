@@ -1019,6 +1019,7 @@ mod tests {
             text: true,
             token_hashes: false,
             text_hashes: false,
+            prompt_size: true,
             loads: true,
             events: true,
             sent_prefixes: true,

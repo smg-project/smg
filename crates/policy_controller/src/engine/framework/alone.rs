@@ -165,14 +165,13 @@ impl Engine {
     ///
     /// - one pick of its picker decides it ([`Self::not_alone`]), which
     ///   asks nothing of the host;
-    /// - its stages read who holds the request's prompt
-    ///   ([`Needs::affinity`]) and declare nothing a host must feed outside
-    ///   `fed` ([`Needs::within`]): the whole pass of a gateway's own
-    ///   process names that profile its rows from the gateway's own data.
+    /// - its stages declare nothing a host must feed outside `fed`
+    ///   ([`Needs::within`]): the whole pass of a gateway's own process
+    ///   decides it over records written from the gateway's own data.
     ///
-    /// A host that feeds nothing has every place of such a document picked
-    /// alone. The set of places grows with what a whole pass is proven to
-    /// decide from a host's own data.
+    /// A host that feeds nothing still has decided whole a place whose
+    /// stages read a worker's record and nothing more. The set of places
+    /// grows with what a host feeds a whole decision.
     #[must_use]
     pub fn single_and_fed(&self, fed: Needs) -> bool {
         let single = |entry: &super::Entry| {
@@ -183,7 +182,7 @@ impl Engine {
                 return true;
             }
             let needs = self.profile_needs.get(usize::from(index));
-            needs.is_some_and(|needs| needs.affinity && needs.within(fed))
+            needs.is_some_and(|needs| needs.within(fed))
         };
         self.bindings.iter().all(single) && self.places().all(decided)
     }

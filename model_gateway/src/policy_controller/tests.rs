@@ -847,25 +847,21 @@ fn the_gateways_tenant_header_is_denied_with_a_host_catalog() -> Case {
 
 /// A host's stages reach the start through the context: a document that
 /// holds a host's own scorer is read over the host's catalog, where the
-/// stock start does not know the scorer. In its own process the engine does
-/// not decide by a scorer yet, so the start that knows the scorer stops at
-/// it by name, as it stops at a stock scorer.
+/// stock start does not know the scorer. The scorer asks nothing this
+/// process does not feed a whole decision, so the start that knows it takes
+/// the document, and the routers ask the context's engine object.
 #[tokio::test]
 async fn a_hosts_catalog_and_document_reach_the_start_through_the_context() -> Case {
     let config = running(quiet(), scorer_document(&quiet(), SCORER)?);
 
     let stages = Some(host_stages()?);
-    let refusal =
+    let context =
         AppContext::from_config_with_extensions(config.clone(), 30, None, None, stages, None)
-            .await
-            .err();
-    assert_eq!(
-        refusal,
-        Some(format!(
-            "the policy document's profile `random` is not decided in this process yet: \
-             it holds the scorer `{SCORER}` (binding `*`, phase single)"
-        ))
-    );
+            .await?;
+    let started = context.in_process.as_ref().ok_or("the start's engine")?;
+    assert!(started.decides_whole());
+    assert!(started.written.contains(SCORER));
+    assert!(context.policy_engine.is_some());
 
     // The stock start holds no stage of a host, and says so by name.
     let refusal = AppContext::from_config(config, 30, None, None).await.err();
@@ -1317,11 +1313,12 @@ async fn a_starts_context_holds_the_policy_engine_where_it_holds_the_store() -> 
     );
     stop_follower(&hosted).await?;
 
-    // With the setting off, and in process, the context holds neither.
-    for config in [quiet(), picked(quiet())] {
+    // With the setting off the context holds neither. In process it holds
+    // the policy engine, over the engine of this process, and no store.
+    for (config, in_process) in [(quiet(), false), (picked(quiet()), true)] {
         let context = AppContext::from_config(config, 30, None, None).await?;
         assert!(context.policy_store.is_none());
-        assert!(context.policy_engine.is_none());
+        assert_eq!(context.policy_engine.is_some(), in_process);
     }
     Ok(())
 }

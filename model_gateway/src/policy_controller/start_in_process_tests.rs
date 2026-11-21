@@ -6,8 +6,8 @@ use std::{error::Error, sync::Arc};
 
 use smg_policy_controller::{
     document::{
-        DecodePick, IndexKind, IndexSpec, Needs, OverloadSpec, Pairing, PlanName, PolicySpec,
-        ShadowSpec, PRESETS,
+        DecodePick, IndexKind, IndexSpec, OverloadSpec, Pairing, PlanName, PolicySpec, ShadowSpec,
+        PRESETS,
     },
     engine::Phase,
     stages::StageRegistry,
@@ -155,16 +155,17 @@ fn a_document_the_gateway_does_not_run_is_answered_as_a_start_under_it() -> Case
             .map(|refused| refused.to_string())
     };
 
-    // A place the engine does not decide in this process yet.
-    let scored = PolicySpec::preset("least_load")?;
-    let words = answer(&running, &scored).ok_or("a scorer was taken")?;
+    // A place the engine does not decide in this process yet: one that
+    // places by a hash ring.
+    let ringed = PolicySpec::preset("consistent_hashing")?;
+    let words = answer(&running, &ringed).ok_or("a hash ring was taken")?;
     assert!(
         words.starts_with(
-            "the policy document's profile `least_load` is not decided in this process yet"
+            "the policy document's profile `consistent_hashing` is not decided in this process yet"
         ),
         "{words}"
     );
-    assert_eq!(words, refusal(&supplied(scored))?);
+    assert_eq!(words, refusal(&supplied(ringed))?);
 
     // A rule nothing runs.
     let mut ruled = PolicySpec::preset("round_robin")?;
@@ -689,10 +690,14 @@ fn a_hash_index_is_refused_by_its_key_whoever_wrote_the_document() -> Case {
 }
 
 /// The routers ask the engine for every request of a document it decides
-/// whole. Round robin's is one: each of its places is picked alone. The
-/// default policy's is not yet: its profile reads who holds the prompt,
-/// which this process feeds a whole decision, and the workers' load
-/// reports, which it does not hand one yet. Nothing else stands between.
+/// whole from what this process feeds. Round robin's is one: each of its
+/// places is picked alone. The default policy's is one: its profile reads
+/// who holds the prompt and the workers' load reports, and this process
+/// feeds a whole decision both. So is every policy whose stages read a
+/// worker's record, its report or the prompt's size. A policy that places
+/// by a hash ring or by a header of the request is not yet: the routers
+/// keep their classic pass under it, and a supplied document of it is
+/// refused by its first stage that asks more than a pick.
 #[test]
 fn the_engine_decides_whole_what_this_process_feeds() -> Case {
     let started = |policy: PolicyConfig| -> Result<InProcess, Box<dyn Error>> {
@@ -705,42 +710,52 @@ fn the_engine_decides_whole_what_this_process_feeds() -> Case {
     };
     assert!(started(PolicyConfig::RoundRobin)?.decides_whole());
     let default = started(PolicyConfig::cache_aware(0.3, 64, 1.5, 120, 67_108_864))?;
-    assert!(!default.decides_whole());
+    assert!(default.decides_whole());
     let declared = default
         .engine
         .spec()
         .engine()
         .needs_for("a-model", Phase::Single);
     assert!(declared.affinity && declared.loads);
-    let with_reports = Needs {
-        loads: true,
-        ..fed()
-    };
-    assert!(declared.within(with_reports));
-    assert!(default.engine.spec().engine().single_and_fed(with_reports));
+    assert!(declared.within(fed()));
+    // Of every routing policy, the engine decides whole all but the three
+    // that place by a hash ring or by a header of the request.
+    for policy in policies() {
+        let name = policy.name();
+        let classic = matches!(name, "consistent_hashing" | "prefix_hash" | "manual");
+        assert_eq!(started(policy)?.decides_whole(), !classic, "{name}");
+    }
+    // The bucket stage places by the prompt's size and says so, and this
+    // process counts the size: a route that would send a body on unread
+    // reads it under this document.
+    let bucket = policies()
+        .into_iter()
+        .find(|policy| policy.name() == "bucket");
+    let bucket = started(bucket.ok_or("the bucket policy")?)?;
+    let declared = bucket
+        .engine
+        .spec()
+        .engine()
+        .needs_for("a-model", Phase::Single);
+    assert!(declared.prompt_size && declared.within(fed()));
 
-    // A supplied document whose profile reads who holds the prompt and no
-    // report is decided whole, so it starts: the prefix stage by itself.
-    // The warm-up slice reads a report beside it, so a profile that keeps
-    // the slice is refused by the first stage that asks more than a pick.
-    let mut held = PolicySpec::preset("cache_aware")?;
-    let profile = held.profiles.get_mut("cache_aware").ok_or("the profile")?;
-    profile
-        .score
-        .retain(|score| score.name() == "prefix-affinity");
-    let started = start_in_process(&supplied(held), None)?.ok_or("an engine")?;
-    assert!(started.decides_whole());
-    let mut loaded = PolicySpec::preset("cache_aware")?;
-    let profile = loaded
-        .profiles
-        .get_mut("cache_aware")
-        .ok_or("the profile")?;
-    profile
-        .score
-        .retain(|score| matches!(score.name(), "warmup-slice" | "prefix-affinity"));
-    let refused = refusal(&supplied(loaded))?;
+    // A supplied document whose profile reads who holds the prompt is
+    // decided whole, so it starts: the prefix stage by itself, and the
+    // warm-up slice beside it, which reads a report. One that places by a
+    // hash ring is refused by the first stage that asks more than a pick.
+    for kept in [
+        &["prefix-affinity"][..],
+        &["warmup-slice", "prefix-affinity"][..],
+    ] {
+        let mut held = PolicySpec::preset("cache_aware")?;
+        let profile = held.profiles.get_mut("cache_aware").ok_or("the profile")?;
+        profile.score.retain(|score| kept.contains(&score.name()));
+        let started = start_in_process(&supplied(held), None)?.ok_or("an engine")?;
+        assert!(started.decides_whole(), "{kept:?}");
+    }
+    let refused = refusal(&supplied(PolicySpec::preset("consistent_hashing")?))?;
     assert!(
-        refused.starts_with("the policy document's profile `cache_aware` is not decided"),
+        refused.starts_with("the policy document's profile `consistent_hashing` is not decided"),
         "{refused}"
     );
     Ok(())

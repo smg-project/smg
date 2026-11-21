@@ -1080,6 +1080,7 @@ impl AppContextBuilder {
                 routing_key_override,
                 Arc::clone(&started.engine),
                 started.origin,
+                started.decides_whole(),
             ),
             None => PolicyRegistry::with_override(policy, routing_key_override),
         };
@@ -1156,6 +1157,11 @@ impl AppContextBuilder {
             conditional,
         ));
         policy_registry.set_load_receiver(Some(monitor.subscribe()));
+        // The engine of this process reads the same feed where it decides
+        // the requests whole.
+        if let Some(policy_engine) = &self.policy_engine {
+            policy_engine.read_loads(monitor.subscribe());
+        }
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
@@ -1392,9 +1398,12 @@ mod tests {
 
     /// A document its operator supplied has no setting behind a place. One
     /// whose every place the engine picks by itself starts, and its
-    /// bindings place the models. One that holds a place the engine does
-    /// not decide in this process yet is refused at the start, by the
-    /// profile, the stage of it that asks more, the binding and the phase.
+    /// bindings place the models. So does one whose place the engine
+    /// decides by its whole pass from what this process feeds it: the
+    /// routers ask the context's engine object. One that holds a place the
+    /// engine does not decide in this process yet is refused at the start,
+    /// by the profile, the stage of it that asks more, the binding and the
+    /// phase.
     #[tokio::test]
     async fn a_supplied_document_starts_where_the_engine_picks_each_of_its_places() {
         // A document that names no number: the first of its gateway.
@@ -1421,12 +1430,21 @@ mod tests {
         assert_eq!(started.origin, DocumentOrigin::Supplied);
         assert_eq!(started.engine.spec().generation(), 1);
 
-        let started = AppContext::from_config(supplied("least_load"), 10, None, None).await;
+        // A place that scores by load reports: the whole pass reads them
+        // in the load monitor's snapshot.
+        let context = AppContext::from_config(supplied("least_load"), 10, None, None)
+            .await
+            .unwrap();
+        assert!(context.policy_engine.is_some());
+
+        // A place that reads a hash ring, which this process does not feed
+        // a whole decision yet.
+        let started = AppContext::from_config(supplied("consistent_hashing"), 10, None, None).await;
         let Err(refused) = started else {
             panic!("the start is not refused");
         };
         assert!(
-            refused.contains("profile `least_load` is not decided in this process yet"),
+            refused.contains("profile `consistent_hashing` is not decided in this process yet"),
             "{refused}"
         );
         assert!(refused.contains("it holds the scorer `"), "{refused}");
@@ -1461,18 +1479,20 @@ mod tests {
     /// the setting off is: the same storage, and the same objects handed to
     /// the same places. Under one configuration, the setting off against
     /// on: the context holds and leaves out the same parts, but for what
-    /// the start left (the policy engine, and what the control plane's
-    /// policy routes read of its document); and a classic policy is handed
-    /// the load feed and the cache-event monitor under both. The worker
-    /// workflows read nothing of the context: the server builds the one
-    /// line of each under both.
+    /// the start left (the policy engine, the engine object the routers
+    /// ask, and what the control plane's policy routes read of its
+    /// document); and a classic policy is handed the load feed and the
+    /// cache-event monitor under both. The worker workflows read nothing
+    /// of the context: the server builds the one line of each under both.
     #[tokio::test]
     async fn a_context_in_process_is_built_as_with_the_setting_off() {
         use crate::policies::as_cache_aware;
 
-        // Cache-aware is a policy the engine does not pick by itself yet:
-        // the classic policy of the setting decides under both, with what
-        // a context hands a classic policy.
+        // Cache-aware is a policy the engine does not pick by itself: the
+        // registry keeps the classic policy of the setting under both,
+        // with what a context hands a classic policy. With the setting on
+        // the engine decides its requests whole, so the context holds the
+        // engine object the routers ask, and no other part besides.
         let built = |policy_controller: bool| async move {
             let config = RouterConfig {
                 policy_controller,
@@ -1484,7 +1504,12 @@ mod tests {
         };
         let (off, on) = (built(false).await, built(true).await);
 
-        assert_eq!(parts(&off), parts(&on));
+        let with_the_engine_object: Vec<_> = parts(&off)
+            .into_iter()
+            .map(|(part, held)| (part, held || part == "policy_engine"))
+            .collect();
+        assert_eq!(with_the_engine_object, parts(&on));
+        assert!(off.policy_engine.is_none());
         assert!(off.in_process.is_none());
         assert!(on.in_process.is_some());
         assert!(off.policy_operators.is_none());
@@ -1496,6 +1521,34 @@ mod tests {
                 as_cache_aware(policy.as_ref()).expect("the classic cache-aware policy");
             assert!(cache_aware.has_load_receiver_for_test());
             assert!(cache_aware.kv_event_monitor_is_set_for_test());
+        }
+    }
+
+    /// The engine object is handed the load monitor's feed, the one a
+    /// classic policy reads, once the monitor is built: it keeps the feed
+    /// where its document reads load reports, and no feed under a document
+    /// that reads none.
+    #[tokio::test]
+    async fn the_engine_object_is_handed_the_load_feed_its_document_reads() {
+        let built = |policy: PolicyConfig| async move {
+            let config = RouterConfig {
+                policy_controller: true,
+                ..config_with_policy(policy)
+            };
+            AppContext::from_config(config, 10, None, None)
+                .await
+                .expect("a context")
+        };
+        let least_load = PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.15,
+            mean_prefill_tokens: 1024,
+            default_throughput: 2000.0,
+        };
+        for (policy, reads) in [(least_load, true), (PolicyConfig::RoundRobin, false)] {
+            let context = built(policy).await;
+            assert!(context.worker_monitor.is_some());
+            let policy_engine = context.policy_engine.as_ref().expect("the engine object");
+            assert_eq!(policy_engine.reads_loads(), reads);
         }
     }
 

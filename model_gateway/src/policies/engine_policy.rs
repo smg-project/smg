@@ -141,14 +141,27 @@ mod tests {
     }
 
     /// A registry whose default policy is `name` and whose policies ask the
-    /// engine of `document`.
+    /// engine of `document`. No router stands over it that asks the engine
+    /// for a whole decision.
     fn asking_under(document: &PolicySpec, name: &str, origin: DocumentOrigin) -> PolicyRegistry {
+        asking_as(document, name, origin, false)
+    }
+
+    /// [`asking_under`], with whether the routers ask the engine for each
+    /// request's whole decision under `document`.
+    fn asking_as(
+        document: &PolicySpec,
+        name: &str,
+        origin: DocumentOrigin,
+        whole: bool,
+    ) -> PolicyRegistry {
         let spec = AppliedSpec::validate(document).expect("the document validates");
         PolicyRegistry::with_policy_engine(
             config(name),
             RoutingKeyOverrideConfig::default(),
             Arc::new(PolicyEngine::new(spec)),
             origin,
+            whole,
         )
     }
 
@@ -617,6 +630,7 @@ mod tests {
             },
             Arc::new(PolicyEngine::new(spec)),
             DocumentOrigin::Supplied,
+            false,
         );
         let policy = policies.get_default_policy();
         assert!(policy.as_any().is::<EnginePolicy>());
@@ -747,6 +761,35 @@ mod tests {
                 }
             }
             Ok(())
+        });
+    }
+
+    /// A policy the engine does not pick by itself is decided by the
+    /// engine's whole pass where the routers ask the engine for each
+    /// request, and the log says so in the classic line's place. Where they
+    /// do not, the classic policy decides it and the line says that.
+    #[test]
+    #[tracing_test::traced_test]
+    fn the_log_says_the_engine_decides_by_its_whole_pass_where_the_routers_ask_it() {
+        let document = PolicySpec::preset("least_load").expect("a built-in preset");
+        asking_as(&document, "least_load", DocumentOrigin::Settings, true);
+        let document = PolicySpec::preset("power_of_two").expect("a built-in preset");
+        asking_as(&document, "power_of_two", DocumentOrigin::Settings, false);
+        logs_assert(|lines: &[&str]| {
+            let said = |words: &str| lines.iter().filter(|line| line.contains(words)).count();
+            let whole = said(
+                "Policy `least_load` of every model (single requests): the policy engine decides \
+                 it by its whole pass (the profile `least_load`)",
+            );
+            let classic = said(
+                "Policy `power_of_two` of every model (single requests): the classic policy \
+                 decides it, the policy engine does not pick the profile `power_of_two` by itself",
+            );
+            let wrong = said("Policy `least_load` of every model (single requests): the classic");
+            match (whole, classic, wrong) {
+                (1, 1, 0) => Ok(()),
+                counts => Err(format!("{counts:?} lines")),
+            }
         });
     }
 

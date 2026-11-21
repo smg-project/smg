@@ -212,6 +212,16 @@ pub struct Needs {
     /// place. A stage that reads a prefix by either kind sets this beside
     /// `token_hashes`.
     pub text_hashes: bool,
+    /// The request's size
+    /// ([`RequestFacts::prompt_tokens`](crate::engine::RequestFacts::prompt_tokens)).
+    /// A stage that places by it declares this. A host that reads every
+    /// request's prompt counts it and states it always. A host that can
+    /// send a request on without reading its prompt reads the prompt where
+    /// this is declared, and may state zero where it is not: a stage that
+    /// read the size undeclared there would place every request as an
+    /// empty one, with no error.
+    #[serde(default)]
+    pub prompt_size: bool,
     /// Load reports per worker.
     pub loads: bool,
     /// KV events into an index. A stage that declares this beside
@@ -292,6 +302,7 @@ impl Needs {
             (self.text, fed.text),
             (self.token_hashes, fed.token_hashes),
             (self.text_hashes, fed.text_hashes),
+            (self.prompt_size, fed.prompt_size),
             (self.loads, fed.loads),
             (self.events, fed.events),
             (self.sent_prefixes, fed.sent_prefixes),
@@ -313,6 +324,7 @@ impl Needs {
             text: self.text || other.text,
             token_hashes: self.token_hashes || other.token_hashes,
             text_hashes: self.text_hashes || other.text_hashes,
+            prompt_size: self.prompt_size || other.prompt_size,
             loads: self.loads || other.loads,
             events: self.events || other.events,
             sent_prefixes: self.sent_prefixes || other.sent_prefixes,
@@ -6312,6 +6324,9 @@ mod tests {
             assert_eq!(engine.needs().token_hashes, hashes, "{name}");
             assert_eq!(engine.needs().text_hashes, hashes, "{name}");
             assert!(!engine.needs().text, "{name}");
+            // The request's size is counted where a stage places by it: a
+            // host that sends a request on unread reads it for that stage.
+            assert_eq!(engine.needs().prompt_size, name == "bucket", "{name}");
             // The affinity stage's source is left out: it reads each worker
             // by what it has, its cache events or the prefixes sent to it.
             assert_eq!(engine.needs().events, name == "cache_aware", "{name}");
