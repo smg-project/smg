@@ -129,8 +129,8 @@ pub(super) fn tagged(
 /// worker's grammar compiler takes ([`tagged`]). A registry table's tag that opens with free
 /// text, the prefix an open thought takes on workers that name no one start for the grammar
 /// ([`opens_with_free_text`]), comes marked ([`Prepared::OpensWithFreeText`]): text that owes
-/// nothing at its end does not hold the model to the call, so preparation gives the older
-/// registry's schema in the tag's place where that schema can be built ([`Prepared::held_by`]).
+/// nothing at its end does not hold the model to the call, so preparation gives the call's
+/// JSON schema in the tag's place where that schema can be built ([`Prepared::held_by`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "the table, the request's ask, where the prompt and the engine leave the model, \
@@ -194,14 +194,14 @@ fn opens_with_free_text(grammar: &Grammar) -> bool {
     }
 }
 
-/// Whether `schema`, the older registry's JSON schema for a forced call to `tools`, keeps what
+/// Whether `schema`, the JSON schema preparation builds for a forced call to `tools`, keeps what
 /// every reference in the tools' parameters points at: each is a local one (`#` and a JSON
-/// pointer) whose target in `schema` is its target in the tool's own parameters. The registry
+/// pointer) whose target in `schema` is its target in the tool's own parameters. Preparation
 /// writes a named function's parameters as they are, and for a list of tools one schema that
 /// nests each tool's parameters and lifts their `$defs` to its root, where a reference to
 /// anything else (an entry of `definitions`, the tool's own root) points nowhere or at another
 /// value. A schema that loses a target is not sent in a tag's place ([`Prepared::held_by`]).
-/// A constraint of another kind, which the registry does not give with no parser named, is
+/// A constraint of another kind, which preparation's `forced_call_schema` never gives, is
 /// taken as it is.
 pub(crate) fn keeps_references(schema: &ToolConstraint, tools: &[Tool]) -> bool {
     let ToolConstraint::JsonSchema(schema) = schema else {
@@ -328,7 +328,7 @@ pub(crate) fn grammar_start_from(start: WorkerGrammarStart) -> GrammarStart {
 /// token stands beside one that does not, since no one tag fits both (the answer keeps the
 /// prefix a forced call takes: [`Format::answer_grammar_for`]); unknown when none says, and
 /// when workers that start after their reasoning parser stand beside ones that do not say,
-/// since the unknown start's tags fit both (a forced call's tag, or the older registry's schema
+/// since the unknown start's tags fit both (a forced call's tag, or the call's JSON schema
 /// where the table's tag would open with free text; an answer's schema alone).
 pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
     let mut starts = workers
@@ -912,12 +912,13 @@ pub(crate) enum Prepared {
         first_token: bool,
         /// The table built it (its tag for the forced call, `calls_tag`), so the table reads
         /// the response with its own markers whatever the constraint's kind; `false` for the
-        /// older registry's, whose JSON the table reads with its forced call, and for the
-        /// request's own schema where no table reads ([`WorkerConstraint::table`]).
+        /// older registry's and the forced call's JSON schema, whose JSON the table reads with its
+        /// forced call, and for the request's own schema where no table reads
+        /// ([`WorkerConstraint::table`]).
         table: bool,
     },
     /// A forced call's tag a registry table built that opens with free text ([`calls_tag`]),
-    /// which does not hold the model to the call. Preparation gives the older registry's schema
+    /// which does not hold the model to the call. Preparation gives the call's JSON schema
     /// in its place, or keeps the tag as the table's own where that schema cannot be built
     /// ([`Self::held_by`]).
     OpensWithFreeText {
@@ -936,7 +937,7 @@ pub(crate) enum Prepared {
 
 impl Prepared {
     /// What holds a forced call where the table's tag opens with free text
-    /// ([`Self::OpensWithFreeText`]): the constraint `schema` gives, the older registry's JSON
+    /// ([`Self::OpensWithFreeText`]): the constraint `schema` gives, the forced call's JSON
     /// schema, which holds the model to the call wherever the engine starts the grammar; or the
     /// table's own tag where `schema` gives none, so that a request that schema cannot spell is
     /// served, not refused. Anything else stays as found, and `schema` is not asked.
@@ -978,9 +979,9 @@ impl Prepared {
 }
 
 impl From<Option<ToolConstraint>> for Prepared {
-    /// The older registry's constraint, as it built it (or the request's own schema where no
-    /// table reads): request building shapes it for the worker and says whether it led the
-    /// tag; no table built it.
+    /// The older registry's constraint, as it built it (or a forced call's JSON schema in a
+    /// tag's place, or the request's own schema where no table reads): request building shapes
+    /// it for the worker and says whether it led the tag; no table built it.
     fn from(constraint: Option<ToolConstraint>) -> Self {
         constraint.map_or(Self::None, |constraint| Self::Constraint {
             constraint,
@@ -1544,7 +1545,7 @@ mod tests {
     /// the thought closed first from the first token, the schema alone (the request's own, no
     /// tag) when the worker does not say, and for the calls the free-text prefix, marked as
     /// such, when the model's workers name different starts or none: free text owes the call
-    /// nothing, so preparation gives the older registry's schema in the tag's place. The
+    /// nothing, so preparation gives the call's JSON schema in the tag's place. The
     /// answer's tag derives for the selected worker, whatever start the pool names.
     #[test]
     fn the_workers_grammar_start_shapes_what_precedes_a_tables_answer_and_calls() {
@@ -1747,7 +1748,7 @@ mod tests {
         );
     }
 
-    /// The older registry's schema keeps a reference when its target there is its target in the
+    /// A forced call's JSON schema keeps a reference when its target there is its target in the
     /// tool's own parameters: any local reference of a named function, whose parameters are the
     /// schema; a `$defs` entry under the one schema for a list of tools, which lifts those and
     /// nothing else. A reference to an entry of `definitions` or to the tool's own root under
