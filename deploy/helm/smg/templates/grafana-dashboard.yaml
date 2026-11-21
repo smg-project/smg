@@ -88,7 +88,7 @@ data:
               "legendFormat": "5xx (edge)"
             },
             {
-              "expr": "(sum(rate(smg_router_request_errors_total{namespace=~\"$namespace\", job=~\"$job\", error_type!~\"validation_error|no_workers|rate_limit_error|constraint_error\"}[5m])) or vector(0)) / sum(rate(smg_router_requests_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
+              "expr": "(sum(rate(smg_router_request_errors_total{namespace=~\"$namespace\", job=~\"$job\", error_type!~\"validation_error|no_workers|rate_limit_error|constraint_error|invalid_tool_call_format\"}[5m])) or vector(0)) / sum(rate(smg_router_requests_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
               "legendFormat": "router errors"
             }
           ],
