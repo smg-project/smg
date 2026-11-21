@@ -195,6 +195,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - A reasoning output item without `content`, as the public API writes it (`id`, `summary` and
   `encrypted_content`), parses, with no content. The crate refused the item, and any Response
   carrying it, with ``missing field `content` ``. An item the gateway writes is unchanged.
+- A Messages cache breakpoint keeps its `ttl` (`{"type": "ephemeral", "ttl": "1h"}`), and an image
+  block its `transformations`, when the request is written back for an upstream, as the public API
+  takes them. The unit `CacheControl::Ephemeral` dropped the `ttl`, so a 1h breakpoint reached the
+  upstream as the 5m default, and `ImageBlock` dropped `transformations`, so `oversized_image:
+  error` was lost. Breaking: `CacheControl::Ephemeral` is a struct variant with `ttl:
+  Option<String>`, and `ImageBlock` gains `transformations: Option<Value>`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and

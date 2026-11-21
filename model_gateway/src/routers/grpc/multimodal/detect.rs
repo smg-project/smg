@@ -441,6 +441,7 @@ mod tests {
                     data: payload.into(),
                 },
                 cache_control: None,
+                transformations: None,
             })]),
         }];
         let InputContent::Blocks(blocks) = &messages[0].content else {
@@ -518,6 +519,7 @@ mod tests {
                 data: data.to_string().into(),
             },
             cache_control: None,
+            transformations: None,
         };
         let messages = vec![InputMessage {
             role: Role::User,
@@ -581,6 +583,7 @@ mod tests {
                     data: "AAAA".to_string().into(),
                 },
                 cache_control: None,
+                transformations: None,
             })]),
         }];
         match &media_plan_messages(&messages).parts()[0] {
