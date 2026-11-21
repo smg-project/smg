@@ -438,6 +438,12 @@ pub(crate) const MM_SECONDS_BUCKETS: &[f64] = &[
 pub(crate) const MM_MEDIA_PER_REQUEST_BUCKETS: &[f64] =
     &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 16.0, 32.0, 64.0];
 
+/// Buckets of the images a request carries: dense where most requests land,
+/// and starting at 0, the bucket a request without media is counted in.
+pub(crate) const MM_REQUEST_IMAGES_BUCKETS: &[f64] = &[
+    0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0, 30.0, 50.0, 100.0, 200.0,
+];
+
 /// The `modality` label of a media series.
 fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
     match modality {
@@ -1011,6 +1017,10 @@ pub(crate) fn init_metrics() {
         "smg_mm_media_per_request",
         "Media items a generation request carried, by model and modality, counted before any refusal or limit (a refused request counts; a token count does not)"
     );
+    describe_histogram!(
+        "smg_mm_request_images",
+        "Images a generation request carried, by model and the source class of its media (none, inline, remote, hybrid: inline is a data: URL or carried bytes, remote a fetched URL, read over every modality), observed once per request that reaches media resolution, a request without media included (0 under none)"
+    );
     describe_counter!(
         "smg_mm_media_items_total",
         "Media items generation requests carried, by model, modality and source (url, data_url, inline, read as the fetch reads them), counted before any refusal or limit"
@@ -1271,6 +1281,7 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     let mm_processing_matcher = Matcher::Full(String::from("smg_mm_processing_seconds"));
     let mm_fetch_matcher = Matcher::Full(String::from("smg_mm_media_fetch_seconds"));
     let mm_per_request_matcher = Matcher::Full(String::from("smg_mm_media_per_request"));
+    let mm_request_images_matcher = Matcher::Full(String::from("smg_mm_request_images"));
 
     HashMap::from([
         (duration_matcher, duration_bucket.clone()),
@@ -1307,6 +1318,10 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
         (
             mm_per_request_matcher,
             MM_MEDIA_PER_REQUEST_BUCKETS.to_vec(),
+        ),
+        (
+            mm_request_images_matcher,
+            MM_REQUEST_IMAGES_BUCKETS.to_vec(),
         ),
     ])
 }
@@ -1871,6 +1886,22 @@ impl Metrics {
                 .increment(*items as u64);
             }
         }
+    }
+
+    /// The images one generation request carried, by the source class of its
+    /// media (`none`, `inline`, `remote`, `hybrid`, read over every
+    /// modality). Observed once per request that reaches media resolution, a
+    /// request without media included (`images` 0, class `none`), so the
+    /// family's count is the requests and its 0 bucket the ones without an
+    /// image.
+    pub fn record_mm_request_images(model_id: &str, source_class: &'static str, images: usize) {
+        let model = intern_model_label(model_id);
+        histogram!(
+            "smg_mm_request_images",
+            "model" => model,
+            "source_class" => source_class
+        )
+        .record(images as f64);
     }
 
     /// One media fetch, as the tracker reports it: its time by outcome, and
