@@ -1345,13 +1345,19 @@ impl<G: Generation> WorkerRegistry<G> {
 
         if let Some(record) = import {
             if !self.import_rebuild_wanted(worker_id, record) {
+                drop(_guard);
+                self.forget_lock_of_missing(worker_id, lock);
                 return false;
             }
         }
 
         let old_worker = match self.workers.get(worker_id) {
             Some(entry) => entry.clone(),
-            None => return false,
+            None => {
+                drop(_guard);
+                self.forget_lock_of_missing(worker_id, lock);
+                return false;
+            }
         };
 
         // Each replacement bumps the revision (see `inherit_shared_state_from`
@@ -1643,7 +1649,11 @@ impl<G: Generation> WorkerRegistry<G> {
 
         let _guard = lock.lock();
 
-        let worker = self.workers.get(worker_id)?.clone();
+        let Some(worker) = self.workers.get(worker_id).map(|entry| entry.clone()) else {
+            drop(_guard);
+            self.forget_lock_of_missing(worker_id, lock);
+            return None;
+        };
         if expected_revision.is_some_and(|revision| worker.revision() != revision) {
             return None;
         }
@@ -1889,6 +1899,8 @@ impl<G: Generation> WorkerRegistry<G> {
                 .get(worker_id)
                 .map(|entry| condition(entry.value()));
             if holds != Some(true) {
+                drop(_guard);
+                self.forget_lock_of_missing(worker_id, lock);
                 return None;
             }
         }
@@ -1899,6 +1911,8 @@ impl<G: Generation> WorkerRegistry<G> {
                     worker_id = %worker_id.as_str(),
                     "Aborting removal: worker origin changed before the lock was acquired"
                 );
+                drop(_guard);
+                self.forget_lock_of_missing(worker_id, lock);
                 return None;
             }
         }
@@ -1979,8 +1993,27 @@ impl<G: Generation> WorkerRegistry<G> {
 
             Some(worker)
         } else {
+            drop(_guard);
+            self.forget_lock_of_missing(worker_id, lock);
             None
         }
+    }
+
+    /// Gives up `lock`, the mutation lock of `worker_id` that a call has
+    /// released, and takes its entry out of the map when no worker stands
+    /// under the id and no other call holds it. Only the removal that finds
+    /// a worker drops its entry, so one a later call makes would stay.
+    fn forget_lock_of_missing(&self, worker_id: &WorkerId, lock: Arc<parking_lot::Mutex<()>>) {
+        // Dropped first: of several late calls the last one out then finds
+        // the map's reference alone.
+        drop(lock);
+        if self.workers.contains_key(worker_id) {
+            return;
+        }
+        // References are made under the map's entry lock only, so the map's
+        // alone means no call holds this lock or waits on it.
+        self.worker_mutation_locks
+            .remove_if(worker_id, |_, current| Arc::strong_count(current) == 1);
     }
 
     /// Remove a worker by URL.
