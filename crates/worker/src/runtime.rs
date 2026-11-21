@@ -864,6 +864,11 @@ impl WorkerRuntime {
         Arc::clone(&self.contact_wake)
     }
 
+    #[cfg(test)]
+    pub(super) fn contact_stamp_ms_for_test(&self) -> u64 {
+        self.last_contact_ms.load(Ordering::Relaxed)
+    }
+
     pub fn contact_age(&self) -> Duration {
         Self::age_of(self.last_contact_ms.load(Ordering::Relaxed))
     }

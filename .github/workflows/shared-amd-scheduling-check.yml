@@ -23,10 +23,12 @@ jobs:
           AMD_LEGS_ENABLED: ${{ vars.SMG_RUN_AMD_LEGS == 'true' }}
           AMD_PRS_ENABLED: ${{ vars.SMG_RUN_AMD_ON_PRS == 'true' }}
           AMD_PR_BENCHMARK_ENABLED: ${{ vars.SMG_RUN_AMD_PR_BENCHMARK == 'true' }}
+          AMD_PR_BENCHMARK_NATIVE_V1_ENABLED: ${{ vars.SMG_RUN_AMD_PR_BENCHMARK_NATIVE_V1 == 'true' }}
         run: |
           echo "SMG_RUN_AMD_LEGS effective true: $AMD_LEGS_ENABLED"
           echo "SMG_RUN_AMD_ON_PRS effective true: $AMD_PRS_ENABLED"
           echo "SMG_RUN_AMD_PR_BENCHMARK effective true: $AMD_PR_BENCHMARK_ENABLED"
+          echo "SMG_RUN_AMD_PR_BENCHMARK_NATIVE_V1 effective true: $AMD_PR_BENCHMARK_NATIVE_V1_ENABLED"
           echo "Host admission must enforce Router 05:00-06:30 UTC for every AMD event."
       - uses: actions/checkout@v7
       - name: Exercise lease holder using isolated temporary locks

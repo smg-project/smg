@@ -303,7 +303,7 @@ pub(crate) async fn execute_plan(
         workers,
         ctx.sticky_key.as_deref(),
         sub_requests,
-        ctx.placed.take(),
+        ctx.placed.take().map(|placed| *placed),
         Instant::now(),
     );
     ctx.load_guards = Some(LoadGuards::admitted(admission, guards));

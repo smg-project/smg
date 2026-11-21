@@ -139,10 +139,7 @@ def gateway_with_mcp_config_grpc(require_brave_server, mcp_config_file):
     logger.info("Launching gRPC gateway with MCP config: %s", mcp_config_file)
 
     # Start a gRPC worker
-    try:
-        workers = start_workers("openai/gpt-oss-20b", engine, mode=ConnectionMode.GRPC, count=1)
-    except Exception as e:
-        pytest.skip(f"gRPC worker not available: {e}")
+    workers = start_workers("openai/gpt-oss-20b", engine, mode=ConnectionMode.GRPC, count=1)
 
     gateway = None
     try:

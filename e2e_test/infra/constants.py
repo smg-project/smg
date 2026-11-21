@@ -3,8 +3,11 @@
 import os
 import shutil
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
+from types import MappingProxyType
 
 
 class ConnectionMode(StrEnum):
@@ -89,6 +92,7 @@ ENV_PARSER = "E2E_PARSER"  # The gateway's --parser for a lane — see get_parse
 ENV_STARTUP_TIMEOUT = (
     "E2E_STARTUP_TIMEOUT"  # Floor on every startup wait — see effective_startup_timeout
 )
+ENV_STARTUP_PROFILE = "E2E_STARTUP_PROFILE"  # Declared worker startup profile
 ENV_GPU_OFFSET = "E2E_GPU_OFFSET"  # First GPU index a lane's workers take — see get_gpu_offset
 ENV_GPU_VENDOR = "E2E_GPU_VENDOR"  # The GPU vendor a lane runs on — see get_gpu_vendor
 # A tracing filter for the Rust servicer in every worker a lane starts (the worker
@@ -455,6 +459,285 @@ def effective_startup_timeout(spec_timeout: int) -> int:
     An explicitly larger per-model bound is never shrunk.
     """
     return max(spec_timeout, get_startup_timeout() or 0)
+
+
+# Fixed per pytest process; the model is absent because a lane starts many models.
+_STARTUP_PROFILE_CONTEXT: tuple[str, ...] | None = None
+_STARTUP_PROFILE_SELECTION: tuple[str, object, str] | None = None
+
+
+@dataclass(frozen=True)
+class StartupProfile:
+    """Declared startup bounds and lane identity.
+
+    ``max_floor`` caps ``E2E_STARTUP_TIMEOUT`` and is also the frozen
+    gateway readiness wait for non-ZMQ wires. Four-GPU workers retain
+    their 1200/600s waits beside the separate 60s gateway bound.
+    """
+
+    models: Mapping[str, tuple[int, int]]
+    lane: tuple[tuple[str, str], ...]
+    max_floor: int
+    modes: frozenset[ConnectionMode]
+    gpu_multiplier: int
+    test_dir: str = "e2e_test/chat_completions"
+
+
+_STARTUP_PROFILES = MappingProxyType(
+    {
+        "original1-vllm-chat-legacy": StartupProfile(
+            models=MappingProxyType(
+                {
+                    "Qwen/Qwen3-30B-A3B": (300, 1),
+                    "Qwen/Qwen3-4B-Instruct-2507": (300, 1),
+                    "Qwen/Qwen3-VL-8B-Instruct": (300, 1),
+                    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": (300, 1),
+                    "meta-llama/Llama-3.1-8B-Instruct": (300, 1),
+                    "meta-llama/Llama-3.2-1B-Instruct": (300, 1),
+                    "mistralai/Mistral-7B-Instruct-v0.3": (300, 1),
+                    "openai/gpt-oss-20b": (300, 1),
+                }
+            ),
+            lane=(
+                ("E2E_ENGINE", "vllm"),
+                (ENV_RUNTIME, "vllm"),
+                (ENV_GPU_VENDOR, "amd"),
+                ("E2E_GPU_TIER", "1"),
+                (ENV_CONNECTION_MODE, ""),
+                (ENV_ZMQ_ENGINE_COUNT, ""),
+                ("E2E_MIN_SELECTED", "202"),
+                (ENV_PARSER, "legacy"),
+                ("E2E_SAMPLING_PROFILE", "original1"),
+                (ENV_VLLM_SERVICER_IMPL, ""),
+                (ENV_STARTUP_TIMEOUT, ""),
+            ),
+            max_floor=60,
+            modes=frozenset({ConnectionMode.HTTP, ConnectionMode.GRPC}),
+            gpu_multiplier=1,
+        ),
+        "vllm-zmq1-chat": StartupProfile(
+            models=MappingProxyType(
+                {
+                    "Qwen/Qwen3-30B-A3B": (300, 1),
+                    "Qwen/Qwen3-4B-Instruct-2507": (300, 1),
+                    "Qwen/Qwen3-VL-8B-Instruct": (300, 1),
+                    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": (300, 1),
+                    "meta-llama/Llama-3.1-8B-Instruct": (300, 1),
+                    "meta-llama/Llama-3.2-1B-Instruct": (300, 1),
+                    "mistralai/Mistral-7B-Instruct-v0.3": (300, 1),
+                    "openai/gpt-oss-20b": (300, 1),
+                }
+            ),
+            lane=(
+                ("E2E_ENGINE", "vllm"),
+                (ENV_RUNTIME, "vllm"),
+                (ENV_GPU_VENDOR, "amd"),
+                ("E2E_GPU_TIER", "1"),
+                (ENV_CONNECTION_MODE, "zmq"),
+                (ENV_ZMQ_ENGINE_COUNT, "1"),
+                ("E2E_MIN_SELECTED", "202"),
+                (ENV_PARSER, ""),
+                ("E2E_SAMPLING_PROFILE", ""),
+            ),
+            max_floor=300,
+            modes=frozenset({ConnectionMode.ZMQ}),
+            gpu_multiplier=1,
+        ),
+        "vllm-zmq-dp2-chat": StartupProfile(
+            models=MappingProxyType(
+                {
+                    "Qwen/Qwen3-30B-A3B": (300, 1),
+                    "Qwen/Qwen3-4B-Instruct-2507": (300, 1),
+                    "Qwen/Qwen3-VL-8B-Instruct": (300, 1),
+                    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": (300, 1),
+                    "meta-llama/Llama-3.1-8B-Instruct": (300, 1),
+                    "meta-llama/Llama-3.2-1B-Instruct": (300, 1),
+                    "mistralai/Mistral-7B-Instruct-v0.3": (300, 1),
+                    "openai/gpt-oss-20b": (300, 1),
+                }
+            ),
+            lane=(
+                ("E2E_ENGINE", "vllm"),
+                (ENV_RUNTIME, "vllm"),
+                (ENV_GPU_VENDOR, "amd"),
+                ("E2E_GPU_TIER", "1"),
+                (ENV_CONNECTION_MODE, "zmq"),
+                (ENV_ZMQ_ENGINE_COUNT, "2"),
+                ("E2E_MIN_SELECTED", "202"),
+            ),
+            max_floor=300,
+            modes=frozenset({ConnectionMode.ZMQ}),
+            gpu_multiplier=2,
+        ),
+        "vllm-4gpu-chat": StartupProfile(
+            models=MappingProxyType(
+                {
+                    "meta-llama/Llama-4-Scout-17B-16E-Instruct": (1200, 4),
+                    "openai/gpt-oss-120b": (600, 4),
+                }
+            ),
+            lane=(
+                ("E2E_ENGINE", "vllm"),
+                (ENV_RUNTIME, "vllm"),
+                (ENV_GPU_VENDOR, "amd"),
+                ("E2E_GPU_TIER", "4"),
+                (ENV_CONNECTION_MODE, ""),
+                (ENV_ZMQ_ENGINE_COUNT, ""),
+                ("E2E_MIN_SELECTED", "32"),
+            ),
+            max_floor=60,
+            modes=frozenset({ConnectionMode.HTTP, ConnectionMode.GRPC}),
+            gpu_multiplier=1,
+        ),
+        "vllm-mooncake-pd2": StartupProfile(
+            models=MappingProxyType(
+                {
+                    "meta-llama/Llama-3.1-8B-Instruct": (300, 1),
+                    "meta-llama/Llama-3.2-1B-Instruct": (300, 1),
+                    "Qwen/Qwen3-VL-8B-Instruct": (300, 1),
+                    "microsoft/Phi-3.5-vision-instruct": (300, 1),
+                }
+            ),
+            lane=(
+                ("E2E_ENGINE", "vllm"),
+                (ENV_RUNTIME, "vllm"),
+                (ENV_GPU_VENDOR, "amd"),
+                ("E2E_GPU_TIER", "2"),
+                (ENV_CONNECTION_MODE, ""),
+                (ENV_ZMQ_ENGINE_COUNT, ""),
+                ("E2E_MIN_SELECTED", "15"),
+                ("E2E_VLLM_KV_BACKEND", "mooncake"),
+                ("E2E_KV_BACKEND", ""),
+                ("E2E_VLLM_EXTRA_KV_BACKENDS", ""),
+                ("E2E_MM_PROCESSING", ""),
+                ("E2E_VLLM_SERVICER_IMPL", ""),
+                ("E2E_PARSER", ""),
+            ),
+            max_floor=60,
+            modes=frozenset({ConnectionMode.GRPC}),
+            gpu_multiplier=1,
+            test_dir="e2e_test/router",
+        ),
+    }
+)
+
+
+def _startup_profile_declaration() -> tuple[str, StartupProfile] | None:
+    profile = os.environ.get(ENV_STARTUP_PROFILE, "").strip()
+    if not profile:
+        return None
+    if profile not in _STARTUP_PROFILES:
+        raise ValueError(f"{ENV_STARTUP_PROFILE}={profile!r} is not a declared startup profile")
+    return profile, _STARTUP_PROFILES[profile]
+
+
+def validate_startup_profile_selection(config, items=None) -> None:
+    """Bind the actual parsed pytest selection, never TEST_DIRS/FILTER claims.
+
+    Configuration rejects restricted invocation before fixtures can allocate.
+    Collection finish checks the surviving item paths and the existing hook
+    enforces its declared minimum. Direct worker calls require this binding.
+    """
+    global _STARTUP_PROFILE_SELECTION
+    declaration = _startup_profile_declaration()
+    if declaration is None:
+        return
+    profile, spec = declaration
+    expected = (Path(__file__).resolve().parents[2] / spec.test_dir).resolve()
+    args = config.args
+    if len(args) != 1 or "::" in args[0]:
+        raise ValueError(f"{profile} requires the unfiltered pytest directory {spec.test_dir!r}")
+    selected = (Path(config.invocation_params.dir) / args[0]).resolve()
+    if selected != expected:
+        raise ValueError(f"{profile} pytest path={str(selected)!r}; want {str(expected)!r}")
+    restricted = (
+        "keyword",
+        "markexpr",
+        "deselect",
+        "ignore_glob",
+        "lf",
+        "stepwise",
+        "stepwise_skip",
+        "pyargs",
+    )
+    for option in restricted:
+        value = config.getoption(option, default=None)
+        if value:
+            raise ValueError(f"{profile} requires unfiltered pytest selection; {option}={value!r}")
+    for ignored in config.getoption("ignore", default=None) or ():
+        path = (Path(config.invocation_params.dir) / ignored).resolve()
+        if path == expected or path in expected.parents or expected in path.parents:
+            raise ValueError(f"{profile} cannot ignore its declared chat selection: {ignored!r}")
+    if items is not None:
+        for item in items:
+            if expected not in Path(item.path).resolve().parents:
+                raise ValueError(
+                    f"{profile} collected an item outside {spec.test_dir!r}: {item.nodeid}"
+                )
+    key = (profile, str(expected))
+    if _STARTUP_PROFILE_SELECTION is not None:
+        old_profile, _config, old_path = _STARTUP_PROFILE_SELECTION
+        if (old_profile, old_path) != key:
+            raise ValueError(f"{ENV_STARTUP_PROFILE} pytest selection changed within this process")
+    _STARTUP_PROFILE_SELECTION = (profile, config, str(expected))
+
+
+def get_startup_profile() -> str | None:
+    """An opt-in declared profile, with validated selection before allocation."""
+    global _STARTUP_PROFILE_CONTEXT
+    declaration = _startup_profile_declaration()
+    if declaration is None:
+        context: tuple[str, ...] = ("",)
+        profile = None
+    else:
+        profile, spec = declaration
+        proof = _STARTUP_PROFILE_SELECTION
+        if proof is None or proof[0] != profile:
+            raise ValueError(
+                f"{profile} requires validated pytest chat selection before worker setup"
+            )
+        validate_startup_profile_selection(proof[1])
+        lane = tuple(os.environ.get(key, "").strip() for key, _value in spec.lane)
+        mismatched = [
+            f"{key}={actual!r} (want {expected!r})"
+            for (key, expected), actual in zip(spec.lane, lane)
+            if actual != expected
+        ]
+        if mismatched:
+            raise ValueError(
+                f"{ENV_STARTUP_PROFILE}={profile!r} lane mismatch: {', '.join(mismatched)}"
+            )
+        floor = get_startup_timeout()
+        if floor is not None and floor > spec.max_floor:
+            raise ValueError(f"{ENV_STARTUP_TIMEOUT} would extend {profile}'s frozen wait")
+        context = (profile, *lane, str(floor))
+    if _STARTUP_PROFILE_CONTEXT is not None and context != _STARTUP_PROFILE_CONTEXT:
+        raise ValueError(f"{ENV_STARTUP_PROFILE} lane context changed within this process")
+    _STARTUP_PROFILE_CONTEXT = context
+    return profile
+
+
+def startup_profile_definition() -> StartupProfile | None:
+    profile = get_startup_profile()
+    return None if profile is None else _STARTUP_PROFILES[profile]
+
+
+def profile_startup_timeout(model_id: str, tp: int) -> int | None:
+    """The frozen model bound shared by worker health and ZMQ gateway waits.
+
+    Native warm-up remains inside SERVING. Unknown models/TP never fall back
+    to ordinary bounds; a profile cannot add env or gateway headroom.
+    """
+    profile = get_startup_profile()
+    if profile is None:
+        return None
+    entry = _STARTUP_PROFILES[profile].models.get(model_id)
+    if entry is None:
+        raise ValueError(f"{profile} has no frozen startup contract for {model_id!r}")
+    bound, expected_tp = entry
+    if type(tp) is not int or tp != expected_tp:
+        raise ValueError(f"{profile} requires TP{expected_tp} for {model_id!r}; got {tp!r}")
+    return bound
 
 
 ENV_VLLM_KV_BACKEND = "E2E_VLLM_KV_BACKEND"

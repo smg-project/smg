@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import struct
 import time
 from array import array
@@ -52,7 +53,10 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import zmq
 
-from smg_grpc_servicer.sglang.compat import SchedulerOutputAdapter
+from smg_grpc_servicer.sglang.compat import (
+    SchedulerOutputAdapter,
+    normalize_multimodal_processor_output,
+)
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.hidden_states import new_hidden_rows
 from smg_grpc_servicer.sglang.mm_defaults import encoder_dtype
@@ -693,6 +697,8 @@ def decode_request_frames(frames: list[bytes], traces: RequestTraces | None = No
     type_byte = bytes(frames[0])
     if type_byte == REQ_TYPE_ADD:
         request = _request_decoder().decode(frames)
+        if getattr(request, "mm_inputs", None) is not None:
+            request.mm_inputs = normalize_multimodal_processor_output(request.mm_inputs)
         if traces is not None and len(frames) > 2:
             traces.attach(request, request_meta(frames[-1]).get(TRACE_HEADERS_KEY))
         return [request]
@@ -761,6 +767,8 @@ class MsgpackSendSocket:
         # consumed (the wire carries each output's new rows).
         self.hidden_rows = HiddenStateRows()
         self.output_adapter = SchedulerOutputAdapter()
+        # Capture the opt-in once for this scheduler sender's lifetime.
+        self._qwenvl_request_diagnostic = os.environ.get("SMG_QWENVL_REQUEST_DIAGNOSTIC") == "1"
 
     def attach(
         self,
@@ -859,15 +867,22 @@ class MsgpackSendSocket:
         )
 
         if isinstance(output, BatchTokenIDOutput):
-            self._send_slim(
-                BatchTokenIDSlimOutput.from_full(
-                    output,
-                    engine_index=self.engine_index,
-                    hidden_rows=self.hidden_rows.column(output),
-                    output_adapter=self.output_adapter,
-                    **self._load_tail(),
-                )
+            slim = BatchTokenIDSlimOutput.from_full(
+                output,
+                engine_index=self.engine_index,
+                hidden_rows=self.hidden_rows.column(output),
+                output_adapter=self.output_adapter,
+                **self._load_tail(),
             )
+            self._send_slim(slim)
+            # A diagnostic failure must never enter the relay-abort handler.
+            if self._qwenvl_request_diagnostic:
+                try:
+                    from smg_grpc_servicer.sglang.zmq_plugin import trace_qwenvl_output
+
+                    trace_qwenvl_output(slim)
+                except Exception:
+                    pass
             self.traces.finish_batch(output.rids, getattr(output, "finished_reasons", None) or [])
         elif isinstance(output, BatchEmbeddingOutput):
             self._send_slim(

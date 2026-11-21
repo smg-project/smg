@@ -855,7 +855,8 @@ fn a_plugin_scorer_under_a_two_draw_picker_scores_the_two_drawn() {
             assert_eq!(ids.len(), 2, "{name}, seed {seed}: the two drawn");
             assert!(
                 ids[0] > ids[1],
-                "{name}, seed {seed}: the fewer in flight leads, {ids:?}"
+                "{name}, seed {seed}: the fewer in flight leads, {ids:?}; plugin stats: {:?}; decision: {decision:?}",
+                plugin.stats()
             );
             let Some(pick) = decision.pick() else {
                 panic!("a pick, not {decision:?}")

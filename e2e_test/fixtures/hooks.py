@@ -27,6 +27,7 @@ from infra import (
     get_servicer_impl,
     get_zmq_engine_count,
 )
+from infra.constants import get_startup_profile, validate_startup_profile_selection
 from infra.worker_pool import get_pool
 
 from .markers import model_id_for_engine, resolve_class_marker
@@ -66,7 +67,10 @@ def pytest_runtest_makereport(item: pytest.Item, call):
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Register custom markers."""
+    """Register custom markers and validate an opt-in startup selection."""
+    validate_startup_profile_selection(config)
+    if os.environ.get("E2E_STARTUP_PROFILE", "").strip():
+        get_startup_profile()
     config.addinivalue_line(
         "markers",
         "engine(*names): engines this test runs on (sglang, vllm, trtllm)",
@@ -543,6 +547,9 @@ class _SelectionReporter:
             # collection error that pytest reports after this hook. A floor
             # exit here would replace that error's own message and exit code.
             return
+        if os.environ.get("E2E_STARTUP_PROFILE", "").strip():
+            validate_startup_profile_selection(session.config, session.items)
+            get_startup_profile()
         _enforce_selection_floor(len(session.items))
 
 

@@ -3776,7 +3776,7 @@ pub(in crate::routers::grpc) async fn placed_stream_context(
     let (placed, store) = place_worker().await;
     let mut ctx = dispatch_context(placed);
     let sent = Instant::now();
-    ctx.load_guards = Some(dispatched(ctx.placed.take().expect("a placement"), sent));
+    ctx.load_guards = Some(dispatched(*ctx.placed.take().expect("a placement"), sent));
     ctx.dispatch = Some(dispatch);
     ctx.streaming = true;
     ctx.tokenizer = Some(Arc::new(CharacterTokenizer::default()));

@@ -658,7 +658,7 @@ impl RequestPipeline {
                 acquire_clients(
                     workers,
                     &dctx.model_id,
-                    self.rechecks_overload(dctx.placed.as_ref()),
+                    self.rechecks_overload(dctx.placed.as_deref()),
                 )
                 .await?,
             );

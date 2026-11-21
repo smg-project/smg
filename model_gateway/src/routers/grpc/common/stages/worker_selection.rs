@@ -886,7 +886,7 @@ impl WorkerSelectionStage {
         };
 
         ctx.workers = Some(workers);
-        ctx.placed = placed;
+        ctx.placed = placed.map(Box::new);
         Ok(())
     }
 

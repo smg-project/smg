@@ -14,6 +14,8 @@ BASELINE = (
     "e2e_test/infra/test_epd_cmd_builders.py",
 )
 COMPONENTS = (
+    ("scripts/ci_sglang_mxfp4_numeric.py", "scripts/tests/test_ci_sglang_mxfp4_numeric.py"),
+    ("scripts/ci_sglang_mxfp4_fallback.py", "scripts/tests/test_ci_sglang_mxfp4_fallback.py"),
     ("e2e_test/infra/cloud_credentials.py", "e2e_test/infra/test_cloud_credentials.py"),
     ("scripts/ci/validate_pr_benchmark.py", "scripts/ci/tests/test_validate_pr_benchmark.py"),
     ("scripts/ci_responses_evidence.py", "scripts/tests/test_ci_responses_evidence.py"),
@@ -36,11 +38,28 @@ COMPONENTS = (
 # that brings the suite, and both paths must exist: a suite the tree lacks is an
 # error, not a notice, so a deleted or renamed suite is noticed at once.
 REGRESSIONS = (
+    ("e2e_test/infra/worker.py", "e2e_test/infra/test_worker_env.py"),
     ("e2e_test/infra/worker.py", "e2e_test/infra/test_worker_grpc_health.py"),
+    ("scripts/ci_reap_job_processes.py", "scripts/tests/test_ci_reap_job_processes.py"),
     ("e2e_test/infra/gateway.py", "e2e_test/infra/test_cloud_mcp_readiness.py"),
     (
         "e2e_test/benchmarks/nightly_summarize.py",
         "scripts/tests/test_nightly_summary_errors.py",
+    ),
+    ("e2e_test/infra/worker.py", "e2e_test/infra/test_startup_timeout.py"),
+    ("e2e_test/infra/worker.py", "e2e_test/infra/test_parallel_start.py"),
+    ("e2e_test/responses/conftest.py", "e2e_test/fixtures/test_responses_startup.py"),
+    (
+        ".github/workflows/e2e-gpu-job.yml",
+        "scripts/tests/test_ci_final_environment_scope.py",
+    ),
+    (
+        ".github/workflows/e2e-gpu-job.yml",
+        "scripts/tests/test_ci_e2e_log_pump_lifetime.py",
+    ),
+    (
+        "scripts/ci_verify_sglang_rocm_cohort.py",
+        "scripts/tests/test_ci_engine_http_dependencies.py",
     ),
     ("scripts/bfcl/run_ab.py", "scripts/tests/test_bfcl_run_ab.py"),
     (".github/workflows/nightly-bfcl.yml", "scripts/tests/test_bfcl_score_caller.py"),
