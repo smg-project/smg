@@ -116,8 +116,17 @@ pub const UNANSWERED: [(&str, &str); 12] = [
     ),
     ("step3", "Step 3's calls and thought: no table"),
     ("sarashina", "Sarashina's calls: no table"),
-    ("cohere", "Command R and Command A's calls: no table"),
-    ("cohere_cmd", "Command R and Command A's thought: no table"),
+    (
+        "cohere",
+        "Command A's and Command R v01's calls, which the registry reads with the command table; \
+         the legacy parser also takes a bare object between the action markers, which the table \
+         reports malformed: no alias yet",
+    ),
+    (
+        "cohere_cmd",
+        "Command A's thought, which the registry reads with the command table: no alias while \
+         cohere has none",
+    ),
 ];
 
 #[cfg(test)]

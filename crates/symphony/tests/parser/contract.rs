@@ -348,6 +348,10 @@ fn llama_nemotron() -> Box<dyn Parser> {
     ))
 }
 
+fn command() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Command.format(), Declared::default()))
+}
+
 fn function_gemma() -> Box<dyn Parser> {
     Box::new(Engine::new(
         Table::FunctionGemma.format(),
@@ -1087,6 +1091,12 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::LlamaNemotron),
     },
     Subject {
+        name: "command",
+        new: command,
+        outputs: COMMAND_OUTPUTS,
+        table: Some(Table::Command),
+    },
+    Subject {
         name: "function gemma",
         new: function_gemma,
         outputs: FUNCTION_GEMMA_OUTPUTS,
@@ -1590,6 +1600,18 @@ const MISTRAL_OUTPUTS: &[&str] = &[
     // A trailing comma and a value left out, at a call its object's brace closes.
     "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\", }",
     "[TOOL_CALLS]get_weather[ARGS]{\"city\": ,}[TOOL_CALLS]get_stock_price[ARGS]{}",
+];
+
+/// Command's turn: the thought, the list of calls and the answer, each between its own markers;
+/// an answer with no marker, the list cut, and prose where the list should be.
+const COMMAND_OUTPUTS: &[&str] = &[
+    "<|START_THINKING|>The user asks about Paris.<|END_THINKING|><|START_ACTION|>[\n    \
+     {\"tool_call_id\": \"0\", \"tool_name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}},\n    \
+     {\"tool_call_id\": \"1\", \"tool_name\": \"get_stock_price\", \"parameters\": {}}\n]<|END_ACTION|>",
+    "<|START_THINKING|>No tool is needed.<|END_THINKING|><|START_RESPONSE|>Hello!<|END_RESPONSE|>",
+    "Hello!",
+    "<|START_ACTION|>[\n    {\"tool_call_id\": \"0\", \"tool_name\": \"get_weather\", \"parameters\": {\"city\": \"Par",
+    "<|START_ACTION|>not a list<|END_ACTION|>",
 ];
 
 /// Llama Nemotron's calls: one JSON list between `<TOOLCALL>` and `</TOOLCALL>`, content before
