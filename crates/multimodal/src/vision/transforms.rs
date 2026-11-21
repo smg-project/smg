@@ -2557,6 +2557,16 @@ fn pil_resample_both<const C: usize>(
 /// Pillow-exact BICUBIC resize (RGB8), matching
 /// `PIL.Image.resize(.., BICUBIC)`.
 pub fn resize_bicubic_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
+    resize_pil_image(image, out_w, out_h, PilResizeFilter::Bicubic)
+}
+
+/// `image` as RGB8, resized the way Pillow resizes it with `filter`.
+fn resize_pil_image(
+    image: &DynamicImage,
+    out_w: u32,
+    out_h: u32,
+    filter: PilResizeFilter,
+) -> DynamicImage {
     let rgb = image.to_rgb8();
     let (in_w, in_h) = rgb.dimensions();
     let output = resize_pil_bytes::<3>(
@@ -2565,7 +2575,7 @@ pub fn resize_bicubic_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> Dynam
         in_h,
         out_w,
         out_h,
-        PilResizeFilter::Bicubic,
+        filter,
         KernelQuantization::Pillow,
     );
     #[expect(
@@ -2728,24 +2738,7 @@ fn mul_div_255(value: u8, alpha: u8) -> u8 {
 /// Pillow-exact LANCZOS resize (RGB8), matching
 /// `PIL.Image.resize(.., LANCZOS)`.
 pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let rgb = image.to_rgb8();
-    let (in_w, in_h) = rgb.dimensions();
-    let output = resize_pil_bytes::<3>(
-        rgb.as_raw(),
-        in_w,
-        in_h,
-        out_w,
-        out_h,
-        PilResizeFilter::Lanczos,
-        KernelQuantization::Pillow,
-    );
-    #[expect(
-        clippy::expect_used,
-        reason = "output is exactly out_w*out_h*3 bytes by construction"
-    )]
-    DynamicImage::ImageRgb8(
-        RgbImage::from_raw(out_w, out_h, output).expect("pil resize buffer size"),
-    )
+    resize_pil_image(image, out_w, out_h, PilResizeFilter::Lanczos)
 }
 
 /// Pillow-exact BILINEAR resize (RGB8), matching
