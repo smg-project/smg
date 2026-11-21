@@ -678,3 +678,44 @@ async fn the_load_feed_holds_the_value_a_stock_grpc_polls_answer_states_by_name(
         }
     }
 }
+
+/// A worker learned from a peer registers through no workflow. The policy
+/// registry builds a model's own policy at a local registration and keeps
+/// it while a local worker serves the model, so a model that only peers'
+/// workers serve has none: the placement reads the default policy for it.
+/// With the policy controller picked and no controller's address that is as
+/// with the setting off.
+#[tokio::test]
+async fn a_model_only_a_peers_worker_serves_is_placed_by_the_default_policy() {
+    for picked in [false, true] {
+        let router = RouterConfig {
+            policy_controller: picked,
+            policy: PolicyConfig::RoundRobin,
+            ..RouterConfig::default()
+        };
+        let host = Extensions::new().connector(Arc::new(HostConnector));
+        let app = build_app_context(&ServerConfig::minimal(router), host)
+            .await
+            .unwrap();
+        assert_eq!(app.in_process.is_some(), picked);
+        let worker = import_worker(&app);
+        // The model the peer's worker serves, as its specification names it.
+        let model = worker.model_id().to_owned();
+        assert!(!app.worker_registry.serves_model_locally(&model));
+
+        let policies = &app.policy_registry;
+        assert!(policies.get_policy(&model).is_none(), "picked {picked}");
+        let read = policies.get_policy_or_default(&model);
+        assert!(Arc::ptr_eq(&read, &policies.get_default_policy()));
+        let placed = select_single(
+            &app.worker_registry,
+            policies,
+            &model,
+            RoutingPool::GrpcPipelineRegular,
+            None,
+            PlacementInputs::default(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&placed, &worker), "picked {picked}");
+    }
+}
