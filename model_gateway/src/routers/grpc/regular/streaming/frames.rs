@@ -17,7 +17,8 @@ use serde_json::json;
 use tracing::error;
 
 use crate::routers::grpc::{
-    proto_wrapper::ProtoOutputLogProbs, regular::responses::TextValueReader, spec::ChatResponseSpec,
+    proto_wrapper::ProtoOutputLogProbs, regular::responses::TextValueReader,
+    spec::ChatResponseSpec, wire::Wire,
 };
 
 /// The frame buffer as serde's sink: every write is one `extend_from_slice`,
@@ -96,7 +97,7 @@ pub(crate) struct ChatChunkFrame {
     head: Vec<u8>,
     // Set where the reader is the Responses stage: a bare text delta goes to
     // it as the text, with no JSON written here and read back there.
-    pub(crate) text_values: Option<TextValueReader>,
+    text_values: Option<TextValueReader>,
 }
 
 impl ChatChunkFrame {
@@ -124,6 +125,15 @@ impl ChatChunkFrame {
         }
     }
 
+    /// The frame with the reader of its text values, for a stream of `wire`.
+    /// A wire that re-slices its stream (`sse_rechunk`) reads it as SSE
+    /// events cut at blank lines: a value would be held, cut inside its
+    /// text, and pass unsliced, so such a stream stays JSON.
+    pub(crate) fn with_text_values(mut self, reader: Option<TextValueReader>, wire: Wire) -> Self {
+        self.text_values = reader.filter(|_| wire.rechunk_policy().is_none());
+        self
+    }
+
     /// Append `data: {...}\n\n` for `choice` (and `usage`, or the `null`
     /// placeholder when `emit_usage_null`) to `buffer`.
     pub(crate) fn write_chunk<C: Serialize>(
@@ -144,7 +154,11 @@ impl ChatChunkFrame {
     /// so its constant text is written as literals and serde writes the index
     /// and the text alone, instead of walking the five keys and the two nulls
     /// of the struct on every token. The bytes are those [`Self::write_chunk`]
-    /// writes for the same choice (pinned by test).
+    /// writes for the same choice (pinned by test). Where the frame holds a
+    /// reader of text values and no usage rides, the delta is written as a
+    /// value for `chat_frame_events` instead (`ChatChunkView::text_value`
+    /// says its form): no index, as such a stream has one choice, and no
+    /// `usage: null` placeholder.
     pub(crate) fn write_text_delta(
         &self,
         buffer: &mut BytesMut,

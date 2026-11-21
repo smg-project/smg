@@ -3714,13 +3714,13 @@ impl<'a> ChatStream<'a> {
             );
         }
 
-        let mut chunk_frame = ChatChunkFrame::new(
+        let chunk_frame = ChatChunkFrame::new(
             &dispatch.request_id,
             model,
             dispatch.created,
             dispatch.weight_version.as_deref(),
-        );
-        chunk_frame.text_values = spec.text_values;
+        )
+        .with_text_values(spec.text_values, spec.wire);
 
         Self {
             processor,

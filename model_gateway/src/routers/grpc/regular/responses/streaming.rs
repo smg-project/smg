@@ -1576,6 +1576,7 @@ mod tests {
             assert_responses_api_usage, namespace_test_request, responses_api_test_usage,
         },
         regular::streaming::frames::{ChatChunkFrame, TextDelta},
+        wire::Wire,
     };
 
     /// Runs chat SSE frames through the Responses transform as an unstored
@@ -2680,11 +2681,12 @@ mod tests {
     /// A frame whose bare text deltas the chat stage wrote as values reads as
     /// the frame that carries them as JSON chunks: the same events in the same
     /// order, a text that holds the tag byte, a blank line or an escape whole.
+    /// A wire that re-slices its stream is written the JSON frame.
     #[test]
     fn a_frame_of_text_values_reads_as_its_json_frame() {
-        let mut frame = ChatChunkFrame::new("chat_test", "test-model", 0, None);
-        let mut written = |reader| {
-            frame.text_values = reader;
+        let written = |reader, wire| {
+            let frame = ChatChunkFrame::new("chat_test", "test-model", 0, None)
+                .with_text_values(reader, wire);
             let mut buffer = BytesMut::new();
             buffer.extend_from_slice(chat_event(json!({"role": "assistant"}), None).as_bytes());
             for (field, text) in [
@@ -2699,8 +2701,9 @@ mod tests {
             buffer.extend_from_slice(b"data: [DONE]\n\n");
             String::from_utf8(buffer.to_vec()).unwrap()
         };
-        let json = written(None);
-        let values = written(Some(TextValueReader(())));
+        let json = written(None, Wire::OpenAi);
+        let values = written(Some(TextValueReader(())), Wire::OpenAi);
+        assert_eq!(written(Some(TextValueReader(())), Wire::Minimax), json);
         // Four values, and the tag byte the last text holds.
         assert_eq!(values.matches('\u{1}').count(), 5);
         let reads = |frame: &str| -> Vec<String> {
