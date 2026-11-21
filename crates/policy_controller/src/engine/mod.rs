@@ -32,8 +32,8 @@ pub use decision::{
     Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
 #[cfg(feature = "in-process")]
-pub use decision_engine::HostWorkers;
-pub use decision_engine::{DecisionEngine, RequestMaker};
+pub use decision_engine::WorkerLists;
+pub use decision_engine::{DecisionEngine, HeldDecision, RequestMaker};
 pub use decision_slot::{DecisionSlot, DecisionSlotGuard};
 pub use demands::{DemandFacts, Demands, References, UnmetDemand};
 pub use framework::{

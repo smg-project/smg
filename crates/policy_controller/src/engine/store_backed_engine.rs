@@ -2958,6 +2958,13 @@ pub struct DecideOutcome {
     /// a pair this is the prefill side. `None` for a decision that
     /// picks no worker.
     pub lease: Option<Leased>,
+    /// A pair's session under the decode phase: the decode side's lease
+    /// carries it, and it cannot be told from the prefill side's. A guard
+    /// lends it back with each word
+    /// ([`HeldDecision`](super::decision_engine::HeldDecision)).
+    /// [`Session::NONE`] for a single, for a pair with no key, and from an
+    /// engine whose file of leases holds the decode side whole.
+    pub decode_session: Session,
 }
 
 impl DecideOutcome {
@@ -3878,7 +3885,11 @@ impl StoreBackedEngine {
                 let (decision, booking) = decide_in(world, taken, buffers, &self.parts[at]);
                 let lease =
                     self.file::<PLAIN>(world, term, taken, &buffers.named, &decision, booking)?;
-                Ok(DecideOutcome { decision, lease })
+                Ok(DecideOutcome {
+                    decision,
+                    lease,
+                    decode_session: Session::NONE,
+                })
             }
             Entry::Pair => self.pair(world, at, term, taken, buffers),
             Entry::Side => Err(DecisionRefused::PairSide),
@@ -4070,7 +4081,11 @@ impl StoreBackedEngine {
             count.fetch_add(1, Ordering::Relaxed);
             due.said = Some(shadow);
         }
-        Ok(DecideOutcome { decision, lease })
+        Ok(DecideOutcome {
+            decision,
+            lease,
+            decode_session: Session::NONE,
+        })
     }
 
     /// A pair's order: decided for both sides and, for a pick, issued a
@@ -4110,6 +4125,7 @@ impl StoreBackedEngine {
                 lease,
                 due: taken.due(),
             }),
+            decode_session: Session::NONE,
         })
     }
 
@@ -4215,6 +4231,7 @@ impl StoreBackedEngine {
                 lease,
                 due: taken.due(),
             }),
+            decode_session: Session::NONE,
         })
     }
 }

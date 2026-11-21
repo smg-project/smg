@@ -8,12 +8,13 @@
 //! [`DecisionGuard`](crate::tracking::DecisionGuard) holds a decision of
 //! either, and a host's own object asks either, through [`DecisionEngine`].
 //!
-//! **What a guard hands back.** A guard holds the lease as its decision
-//! issued it and the target its host took, and hands both with each word
-//! ([`DecisionEngine::say`], [`DecisionEngine::decide_decode_under`]). An
-//! engine with a file of its leases finds its record by the lease's id. An
+//! **What a guard lends.** A guard lends its engine one view of the
+//! decision it holds, with each word and with a pair's decode call
+//! ([`HeldDecision`]): the pick, the lease as issued, the target its host
+//! took and that target's place in the pick. An engine with a file of its
+//! leases finds its record by the lease's id and reads nothing else. An
 //! engine with none needs no table to find one: every fact a stage is told
-//! of a request is in the lease and the target.
+//! of a request is in the view.
 //!
 //! **What an engine holds to**, whatever it decides over:
 //!
@@ -32,13 +33,13 @@
 use std::time::Instant;
 
 use super::{
-    decision::{ShadowKind, Target},
+    decision::{Decision, ShadowKind, Target},
     framework::{EncodeItems, EncodePlaced},
     prompt_hashes::{HashSeeds, PromptHashes},
     store_backed_engine::{
         self, DecideOutcome, DecisionRefused, Request, StoreBackedEngine, SweepOutcome,
     },
-    view::WireModes,
+    view::{Session, WireModes},
 };
 use crate::{
     document::AppliedSpec,
@@ -74,8 +75,8 @@ pub trait RequestMaker {
     /// that hands none. An engine that reads its own rows asks for none,
     /// and a host of such an engine states none.
     #[cfg(feature = "in-process")]
-    fn workers(&self) -> HostWorkers<'_> {
-        HostWorkers::None
+    fn workers(&self) -> WorkerLists<'_> {
+        WorkerLists::None
     }
 }
 
@@ -95,7 +96,7 @@ impl RequestMaker for Request<'_> {
 /// with no lookup by id.
 #[cfg(feature = "in-process")]
 #[derive(Clone, Copy, Debug, Default)]
-pub enum HostWorkers<'a> {
+pub enum WorkerLists<'a> {
     /// The host hands no list.
     #[default]
     None,
@@ -106,6 +107,48 @@ pub enum HostWorkers<'a> {
         prefill: &'a super::policy_engine::PoolMembers,
         decode: &'a super::policy_engine::PoolMembers,
     },
+}
+
+/// What a guard holds of its decision, lent to its engine for one word
+/// ([`DecisionEngine::say`]) or for a pair's decode call
+/// ([`DecisionEngine::decide_decode_under`]). It is read before the word
+/// moves the guard.
+///
+/// An engine that keeps no file of its leases tells its stages of a request
+/// from this alone, by one rule: a side's later word is told under the
+/// lease that side was issued under, field for field, but for the two a
+/// dispatch moves, its `target_index` and the worker it books. The lease
+/// here is a single's or the prefill side's. The decode side's differs
+/// from it in its side, in the worker it books (the decode of the pick's
+/// first target where the side was issued with its prefill, the decode of
+/// the target taken where it stood chosen) and in its session
+/// ([`Self::decode_session`]). A decode issued later is dated at its
+/// issue, the decode call's instant or its dispatch's, and its later words
+/// bear the first decision's instant, which is this lease's
+/// ([`Lifecycle::on_decision_issued`](crate::stages::Lifecycle::on_decision_issued)).
+#[derive(Clone, Copy, Debug)]
+pub struct HeldDecision<'a> {
+    /// The pick the guard holds: the first decision's, or a decode call's
+    /// once one picked.
+    pub decision: &'a Decision,
+    /// The lease as its decision issued it: a single's, or the prefill
+    /// side's of a pair.
+    pub lease: &'a Lease,
+    /// A pair's session under the decode phase
+    /// ([`DecideOutcome::decode_session`]): the one value of the decode
+    /// side's lease that the prefill side's does not give.
+    pub decode_session: Session,
+    /// The place in the pick of the target taken. An end and a release
+    /// carry no index of their own.
+    pub index: u8,
+    /// The target its host took: the pick's first, or the one a take moved
+    /// to. A pair's decode is in it.
+    pub target: &'a Target,
+    /// A pair's decode side stood chosen until this word: its request
+    /// stated the later decode, no decode call picked it, and nothing was
+    /// issued for it. The side's dispatch said under this is its issue
+    /// too, dated at the word's instant.
+    pub decode_chosen: bool,
 }
 
 /// An engine a host asks for whole decisions and tells of each lease.
@@ -147,10 +190,11 @@ pub trait DecisionEngine {
 
     /// A pair's decode, decided again behind its prefill's dispatch: among
     /// the decodes of the prefill the host holds, as they stand at `now`.
-    /// `lease` is the pair's lease as its first decision issued it and
-    /// `prefill` the target its host took: the guard that holds the first
-    /// decision hands both. A pick issues the decode side under the
-    /// lease's id.
+    /// `held` is the view of the guard that holds the first decision: the
+    /// pair's lease as issued, and the target its host took, which names
+    /// the held prefill. The guard asks only where its prefill is
+    /// dispatched and not ended and its decode stands chosen. A pick
+    /// issues the decode side under the lease's id.
     ///
     /// # Errors
     ///
@@ -159,8 +203,7 @@ pub trait DecisionEngine {
         &self,
         gateway: GatewayId,
         maker: &impl RequestMaker,
-        lease: &Lease,
-        prefill: &Target,
+        held: &HeldDecision<'_>,
         now: Instant,
     ) -> Result<DecideOutcome, DecisionRefused>;
 
@@ -173,11 +216,10 @@ pub trait DecisionEngine {
         &self,
         gateway: GatewayId,
         request: &Request<'_>,
-        lease: &Lease,
-        prefill: &Target,
+        held: &HeldDecision<'_>,
         now: Instant,
     ) -> Result<DecideOutcome, DecisionRefused> {
-        self.decide_decode_under(gateway, request, lease, prefill, now)
+        self.decide_decode_under(gateway, request, held, now)
     }
 
     /// One decision for a pair with the encode `items` of its request: the
@@ -197,11 +239,12 @@ pub trait DecisionEngine {
     ) -> Result<DecideOutcome, DecisionRefused>;
 
     /// What the host says of a lease at `now`: a side's dispatch, a side's
-    /// end, or a release. `lease` is the lease as its decision issued it,
-    /// and `target` the target its host took, a pair's decode among it. The
-    /// word names its side. Whoever applies the word tells the stages of
-    /// the engine that issued the lease, once.
-    fn say(&self, gateway: GatewayId, lease: &Lease, target: &Target, said: Said, now: Instant);
+    /// end, or a release. `held` is the guard's view of the decision at the
+    /// word. The word names its side. Whoever applies the word tells the
+    /// stages of the engine that issued the lease, once. A decode that
+    /// stood chosen ([`HeldDecision::decode_chosen`]) goes out with no
+    /// decode call: its dispatch tells the side's issue first.
+    fn say(&self, gateway: GatewayId, held: &HeldDecision<'_>, said: Said, now: Instant);
 
     /// One pass of the engine's clock at `now`, about once a second: what
     /// lives past its end is ended, and what was told of it is said.
@@ -265,11 +308,10 @@ impl DecisionEngine for StoreBackedEngine {
         &self,
         gateway: GatewayId,
         maker: &impl RequestMaker,
-        lease: &Lease,
-        _: &Target,
+        held: &HeldDecision<'_>,
         now: Instant,
     ) -> Result<DecideOutcome, DecisionRefused> {
-        Self::decide_decode_under(self, gateway, maker, lease.id, now)
+        Self::decide_decode_under(self, gateway, maker, held.lease.id, now)
     }
 
     #[inline]
@@ -277,11 +319,10 @@ impl DecisionEngine for StoreBackedEngine {
         &self,
         gateway: GatewayId,
         request: &Request<'_>,
-        lease: &Lease,
-        _: &Target,
+        held: &HeldDecision<'_>,
         now: Instant,
     ) -> Result<DecideOutcome, DecisionRefused> {
-        Self::decide_decode(self, gateway, request, lease.id, now)
+        Self::decide_decode(self, gateway, request, held.lease.id, now)
     }
 
     #[inline]
@@ -296,17 +337,19 @@ impl DecisionEngine for StoreBackedEngine {
         Self::decide_encode_pair(self, gateway, request, items, placed, now)
     }
 
-    // The file finds the lease's record by its id. A completion is also
-    // written on the served worker's row, for the health precedence.
+    // The file finds the lease's record by its id, and holds whatever
+    // else the view lends. A completion is also written on the served
+    // worker's row, for the health precedence.
     #[inline]
-    fn say(&self, gateway: GatewayId, lease: &Lease, _: &Target, said: Said, now: Instant) {
+    fn say(&self, gateway: GatewayId, held: &HeldDecision<'_>, said: Said, now: Instant) {
+        let lease = held.lease.id;
         match said {
             Said::Completed(outcome) => {
                 store_backed_engine::completed(self.store(), gateway, &outcome, now, |said| {
-                    self.report(gateway, lease.id, said);
+                    self.report(gateway, lease, said);
                 });
             }
-            Said::Dispatched(..) | Said::Released(..) => self.report(gateway, lease.id, said),
+            Said::Dispatched(..) | Said::Released(..) => self.report(gateway, lease, said),
         }
     }
 
