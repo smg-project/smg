@@ -249,13 +249,14 @@ line and exit without them; `encode_cost` (`ENCODE_BENCH_TOKENIZERS`, `ENCODE_BE
 `RUSTFLAGS="-C llvm-args=-enable-machine-outliner=never -C llvm-args=-align-all-functions=6"` (every function on a 64-byte
 boundary, the placement rule the gate file describes), so a pair built without them can read differently. On a pull request
 the workflow builds the pull request's bench binary and the base branch's (the merge commit's first parent) with
-`scripts/bench_gate.py build --gates .github/bench-gates/tokenizer.toml --out <binary> -- cargo bench -p smg --features tokenizers-v1 --bench tokenizer_benchmark --no-run`
+`scripts/bench_gate.py build --gates .github/bench-gates/tokenizer.toml --out <binary> -- cargo bench -p smg --bench tokenizer_benchmark --no-run`
 (`--out` is the path the built executable is copied to; the base with `--sources-from <head>`, so the two differ in the
 measured code alone), then runs them interleaved and compares them with
 `scripts/bench_gate.py run --gates .github/bench-gates/tokenizer.toml --base <binary> --pr <binary> --out <dir> --cwd model_gateway`
 (`--out` is the directory for `results.json` and `gate.md`); the job fails on a gated regression. A push to `main`, the
-weekly schedule and a manual dispatch run the single `cargo bench -p smg --features tokenizers-v1 --bench tokenizer_benchmark`
-without the gate.
+weekly schedule and a manual dispatch run the single `cargo bench -p smg --bench tokenizer_benchmark`
+without the gate. Both are the default build, so the encode rows measure the encoder a default build ships; with the
+`tokenizers-v1` feature the opt-in pipeline would serve this bench's encodes.
 
 ### Against other implementations
 

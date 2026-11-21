@@ -1,4 +1,4 @@
-# Regression gate for `cargo bench -p smg --features tokenizers-v1 --bench tokenizer_benchmark`,
+# Regression gate for `cargo bench -p smg --bench tokenizer_benchmark`,
 # run by .github/workflows/benchmark-tokenizer.yml on pull requests through scripts/bench_gate.py.
 #
 # The gate runs the single-threaded gateway-path groups: the native encoder (encode_throughput,
@@ -34,6 +34,10 @@
 #
 # Every job uploads bench-gate/results.json with the raw per-run medians of both sides; the hosted
 # runner's own spread can be read from those and the thresholds tightened once it is known.
+#
+# The table was recorded while this gate's command carried `--features tokenizers-v1`. Under that
+# feature the opt-in pipeline serves this bench's encodes, so whether the spreads of the two encode
+# rows hold for the native encoder the gate builds now is still to be read from results.json.
 
 #
 # Placement. The workflow's benchmark job builds its binaries, the gate's pair and the summary
