@@ -318,6 +318,66 @@ fn holding<T>(pass: impl FnOnce() -> Result<T, SpecRejected>) -> Result<T, SpecR
     })
 }
 
+/// A dry run's answer over the generation `standing`, by a document's own
+/// `pass` against it: the caller's guard against that generation, the pass,
+/// then the rule of the store's entry in its own words (a number at or
+/// under the standing one is refused by naming it), and what a host must
+/// feed before and after. The pass reads the document by its caller's rule
+/// and validator. Nothing is applied, held or counted.
+fn dry_run_with(
+    standing: &AppliedSpec,
+    expected: &str,
+    pass: impl FnOnce((u64, Option<Digest>)) -> Result<Checked, SpecRejected>,
+) -> Result<DryRun, EnforceRefused> {
+    let stands = guard(standing, expected)?;
+    let mut needs = None;
+    let would_run = pass(stands).and_then(|Checked { digest, next, .. }| {
+        let before = needs_rows(standing.engine());
+        let Some(next) = next else {
+            // The standing document again: the feed stands.
+            needs = Some((before.clone(), before));
+            return Ok((stands.0, digest));
+        };
+        let offered = next.generation();
+        above(stands.0, offered)?;
+        needs = Some((before, needs_rows(next.engine())));
+        Ok((offered, digest))
+    });
+    Ok(DryRun {
+        standing: stands,
+        would_run,
+        needs,
+    })
+}
+
+/// What an apply of `document` would do against `standing`, with nothing
+/// applied: the dry run of a host that runs a document and keeps no store
+/// for it. `standing` is the generation that host runs, `stages` the ones
+/// it validated that generation over, and `denied_headers` the header names
+/// it denies a document's view.
+///
+/// It answers as [`DocumentManager::dry_run`] does where no spec store is
+/// bound. `expected` guards the call with the digest its caller read as
+/// standing, and an empty one guards nothing. The document's own pass runs with
+/// its fault held, and its `generation` line is a claim of any number above the
+/// standing one. The answer tells the number an apply would run the document
+/// under and what a host must feed before and after. It reserves no number and
+/// counts nothing.
+pub fn dry_run_against(
+    standing: &AppliedSpec,
+    stages: &StageRegistry,
+    denied_headers: &[&str],
+    expected: &str,
+    document: &[u8],
+    format: Format,
+) -> Result<DryRun, EnforceRefused> {
+    let validator: (Validate, &StageRegistry, &[&str]) =
+        (AppliedSpec::validate_digested, stages, denied_headers);
+    dry_run_with(standing, expected, |stands| {
+        holding(|| check(validator, stands, document, format, Line::Claim))
+    })
+}
+
 /// A source with no further admission uses the store's own publication.
 fn publish_local(store: &MemoryStore, spec: AppliedSpec) -> Result<bool, StaleGeneration> {
     store.apply(spec).map(|()| true)
@@ -599,26 +659,8 @@ impl DocumentManager {
             let _one_side = self.binding.lock();
             (self.store.snapshot(), self.line())
         };
-        let standing = guard(world.spec(), expected)?;
-        let mut needs = None;
-        let would_run = self.pass(standing, document, format, rule).and_then(
-            |Checked { digest, next, .. }| {
-                let before = needs_rows(world.spec().engine());
-                let Some(next) = next else {
-                    // The standing document again: the feed stands.
-                    needs = Some((before.clone(), before));
-                    return Ok((standing.0, digest));
-                };
-                let offered = next.generation();
-                above(standing.0, offered)?;
-                needs = Some((before, needs_rows(next.engine())));
-                Ok((offered, digest))
-            },
-        );
-        Ok(DryRun {
-            standing,
-            would_run,
-            needs,
+        dry_run_with(world.spec(), expected, |standing| {
+            self.pass(standing, document, format, rule)
         })
     }
 

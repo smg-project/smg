@@ -31,7 +31,7 @@ use crate::{
     tracking::{
         dispatch_credit::{DispatchCredit, DispatchCreditPass},
         in_flight::with_counts,
-        lease::{Lease, Membership, Side},
+        lease::{EventKind, EventSet, Lease, Membership, Side},
     },
 };
 
@@ -389,6 +389,15 @@ impl Lifecycle for LeastLoad {
     fn on_membership(&self, change: &Membership<'_>) {
         if self.feeds {
             self.sent.membership(change);
+        }
+    }
+
+    /// The dispatch, where the stage feeds its own count of sends.
+    fn hears(&self) -> EventSet {
+        if self.feeds {
+            EventSet::NONE.with(EventKind::Dispatched)
+        } else {
+            EventSet::NONE
         }
     }
 }

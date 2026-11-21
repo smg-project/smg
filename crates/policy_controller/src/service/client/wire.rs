@@ -171,7 +171,12 @@ pub(crate) fn decided(
         None if told.leases.is_empty() => None,
         None => return Err(unread("leases", "only a pick carries a lease")),
     };
-    Ok(store_backed_engine::DecideOutcome { decision, lease })
+    // A controller's file of leases holds the decode side whole.
+    Ok(store_backed_engine::DecideOutcome {
+        decision,
+        lease,
+        decode_session: Session::NONE,
+    })
 }
 
 fn targets(told: &[proto::Target]) -> Result<Targets, Unread> {

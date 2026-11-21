@@ -89,13 +89,32 @@ impl WarmUpRule {
         scratch: &mut Vec<u32>,
         out: &mut Vec<(u32, u64)>,
     ) -> WarmUpState {
+        self.list_warming_rows_grown(sizes, sizes, admitted, now, scratch, out)
+    }
+
+    /// [`Self::list_warming_rows`] for a host whose index may hold blocks of
+    /// a row from before its admission: `growth` holds what each row's index
+    /// gained since the row was admitted, which a young row is short of,
+    /// and `sizes` what it holds, which thinness is read from. A worker
+    /// that came back under its address keeps the blocks its last run
+    /// stored until its first events say otherwise, so its size alone would
+    /// end a warm-up that has not begun.
+    pub fn list_warming_rows_grown(
+        &self,
+        sizes: &[u32],
+        growth: &[u32],
+        admitted: &[u64],
+        now: u64,
+        scratch: &mut Vec<u32>,
+        out: &mut Vec<(u32, u64)>,
+    ) -> WarmUpState {
         out.clear();
-        let young = |size: u32, admitted: u64| self.is_young(now.saturating_sub(admitted), size);
+        let young = |grown: u32, admitted: u64| self.is_young(now.saturating_sub(admitted), grown);
         let any_indexed = sizes.iter().any(|&size| size > 0);
-        let youngs = sizes
+        let youngs = growth
             .iter()
             .zip(admitted)
-            .filter(|&(&size, &admitted)| young(size, admitted))
+            .filter(|&(&grown, &admitted)| young(grown, admitted))
             .count();
         if !any_indexed && youngs == 0 {
             return WarmUpState::default();
@@ -107,10 +126,10 @@ impl WarmUpRule {
         } else {
             0
         };
-        let rows = (0u32..).zip(sizes.iter().zip(admitted));
         out.extend(
-            rows.clone()
-                .filter(|&(_, (&size, _))| self.is_thin(size, level))
+            (0u32..)
+                .zip(sizes)
+                .filter(|&(_, &size)| self.is_thin(size, level))
                 .map(|(row, _)| (row, u64::MAX)),
         );
         if !out.is_empty() {
@@ -121,7 +140,9 @@ impl WarmUpRule {
         }
         let window = self.window_micros;
         out.extend(
-            rows.filter(|&(_, (&size, &admitted))| young(size, admitted))
+            (0u32..)
+                .zip(growth.iter().zip(admitted))
+                .filter(|&(_, (&grown, &admitted))| young(grown, admitted))
                 .map(|(row, (_, &admitted))| (row, admitted.saturating_add(window))),
         );
         // A fleet that is all young has nobody to catch up to, until the

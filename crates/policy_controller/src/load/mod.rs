@@ -3,12 +3,12 @@
 
 #[cfg(feature = "ingest")]
 pub mod ingest;
-#[cfg(any(feature = "ingest", feature = "worker-host"))]
+#[cfg(any(feature = "ingest", feature = "worker-host", feature = "in-process"))]
 pub(crate) mod load_report;
 pub(crate) mod load_report_reader;
 pub(crate) mod signals;
 
-#[cfg(any(feature = "ingest", feature = "worker-host"))]
+#[cfg(any(feature = "ingest", feature = "worker-host", feature = "in-process"))]
 pub use load_report::{load_row, signal_values, LoadReportRanks, RankValues};
 pub use load_report_reader::{LoadReportPass, LoadReportReader};
 pub use signals::{SignalCell, SignalCells, SignalColumn};

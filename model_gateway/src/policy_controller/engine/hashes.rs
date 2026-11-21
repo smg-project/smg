@@ -1,9 +1,6 @@
 //! The prompt facts an attempt keeps for its asks to the controller.
 
-use smg_policy_controller::{
-    engine::{HashSeeds, PromptHashes},
-    store::MemoryStore,
-};
+use smg_policy_controller::engine::{HashSeeds, PromptHashes};
 
 use crate::policies::CacheNamespace;
 
@@ -31,14 +28,19 @@ impl<'a> Prompt<'a> {
         }
     }
 
-    /// The prompt's hashes for `model`, under the generation in force
-    /// ([`MemoryStore::prompt_hashes`]): its token ids' where the router
-    /// tokenized it, else its text's, else none.
+    /// The prompt's hashes as `hash` makes them of what the prompt holds:
+    /// its token ids where the router tokenized it, else its text, under
+    /// the seeds. The policy engine hands the hashing of the generation in
+    /// force
+    /// ([`DecisionEngine::prompt_hashes`](smg_policy_controller::engine::DecisionEngine::prompt_hashes)).
     ///
     /// The seeds are the cache partition's. A request with no partition is
     /// hashed under the plain seeds, less the leading ids that carry a
     /// partition's marker.
-    pub(super) fn hashes(&self, store: &MemoryStore, model: &str) -> PromptHashes {
+    pub(super) fn hashed(
+        &self,
+        hash: impl FnOnce(Option<&[u32]>, Option<&str>, HashSeeds) -> PromptHashes,
+    ) -> PromptHashes {
         let seeds = self
             .namespace
             .map_or(HashSeeds::PLAIN, |namespace| HashSeeds {
@@ -56,7 +58,18 @@ impl<'a> Prompt<'a> {
             Some(_) => self.tokens,
             None => self.tokens.map(CacheNamespace::unpartitioned_tokens),
         };
-        store.prompt_hashes(model, tokens, self.text, seeds)
+        hash(tokens, self.text, seeds)
+    }
+
+    /// The prompt's hashes for `model` under the generation in force in
+    /// `store`.
+    #[cfg(test)]
+    pub(super) fn hashes(
+        &self,
+        store: &smg_policy_controller::store::MemoryStore,
+        model: &str,
+    ) -> PromptHashes {
+        self.hashed(|tokens, text, seeds| store.prompt_hashes(model, tokens, text, seeds))
     }
 }
 
@@ -193,7 +206,11 @@ mod tests {
             .ask(&ask, &[], Instant::now())
             .await
             .expect("a decision");
-        assert_eq!(policy_engine.door.hashes_cut(), 0);
+        let door = policy_engine
+            .door
+            .followed()
+            .expect("the engine over the store");
+        assert_eq!(door.hashes_cut(), 0);
 
         let mut document = PolicySpec::preset("random").expect("the preset");
         document.generation += 1;

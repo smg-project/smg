@@ -707,6 +707,28 @@ impl Picker for CountFirst {
     }
 }
 
+/// How many turns of the pool one pick takes at the most past a turn that
+/// lands on a refused worker, before its caller reads the pool whole
+/// ([`pool_turns`]). The number is this rule's own, set by its own run: a
+/// wasted turn is one read of a worker and one step of the rotation, so the
+/// turns add nine reads at the most to a pass they do not save.
+const TURNS_AHEAD: usize = 8;
+
+/// The workers of a pool that earn a pick one turn past a refused worker.
+/// A turn that misses costs its own steps whatever the pool holds, and the
+/// whole pass it may save costs a read a worker. So a small pool, whose
+/// pass is short, goes to the pass at once, and a larger pool takes one
+/// more turn for each this many workers it holds, [`TURNS_AHEAD`] at the
+/// most.
+const ROWS_A_TURN: usize = 32;
+
+/// The turns of the pool one pick takes over a pool of `rows` workers
+/// before its caller reads the pool whole: its own, and one past a refused
+/// worker for each [`ROWS_A_TURN`] workers, [`TURNS_AHEAD`] at the most.
+pub(crate) fn pool_turns(rows: usize) -> usize {
+    1 + (rows / ROWS_A_TURN).min(TURNS_AHEAD)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

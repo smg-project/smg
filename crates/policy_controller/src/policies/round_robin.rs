@@ -11,13 +11,13 @@ use crate::{
     document::spec::ProfileSpec,
     engine::{
         decision::{Targets, MAX_TARGETS},
-        framework::{Picker, TieBand, DRAW_BOUND},
+        framework::{Picker, PoolWord, TieBand, DRAW_BOUND},
         view::{Candidate, ModelFingerprint, PoolFacts, RequestFacts},
     },
     policies::standard_filters,
     stages::{
         lifecycle::Lifecycle,
-        pickers::{push_drawn, target_of},
+        pickers::{pool_turns, push_drawn, target_of},
     },
     Draw,
 };
@@ -225,6 +225,40 @@ impl Picker for RoundRobin {
 
     fn draws_first(&self) -> bool {
         true
+    }
+
+    // Its rotation is its whole rule, and a pool's own word counts it.
+    fn picks_alone(&self) -> bool {
+        true
+    }
+
+    /// The pool's own turn by the pool's own word: one step of the word and
+    /// one read of the worker the turn lands on. A turn that lands on a
+    /// refused worker takes the pool's next turn, as many turns as the
+    /// pool's size earns (`pool_turns`), and the first worker kept is the
+    /// pick. No table is looked up: the caller keeps the pool's rotation
+    /// beside the pool.
+    fn pick_alone(
+        &self,
+        pool: &PoolWord<'_>,
+        keep: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<usize> {
+        let rows = pool.rows;
+        if rows == 0 {
+            return None;
+        }
+        for _ in 0..pool_turns(rows) {
+            let turn = pool.word.fetch_add(1, Ordering::Relaxed) as usize % rows;
+            if keep(turn) {
+                return Some(turn);
+            }
+        }
+        None
+    }
+
+    /// The set's own turn, in the table every rotation of a set lives in.
+    fn pick_among(&self, set: u64, passed: usize) -> usize {
+        self.advance(set) as usize % passed.max(1)
     }
 
     /// The pool's own turn: the row the pool's rotation lands on is the pick

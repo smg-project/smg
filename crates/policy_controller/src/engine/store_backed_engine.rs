@@ -44,6 +44,7 @@ use crate::{
     document::spec::AppliedSpec,
     engine::{
         decision::{Decision, Pair, Pick, ShadowKind, Shed, ShedReason, Target, Targets, Trace},
+        decision_engine::RequestMaker,
         decision_slot::DecisionSlot,
         demands::{self, DemandFacts, Demands},
         framework::{
@@ -2878,29 +2879,9 @@ impl RequestForm for Request<'_> {
     }
 }
 
-/// A request its host makes from the snapshot the engine decides under
-/// ([`StoreBackedEngine::decide_under`]). What the host reads of the applied
-/// document to state the request, the sources of its routing key for one
-/// ([`AppliedSpec::key_sources_for`]), is then of the same load as the engine
-/// and the rows.
-///
-/// The wire contract's `SnapshotRequest` is another thing: the operator's
-/// call that reads the store's worker rows.
-pub trait RequestFromSnapshot {
-    /// The model of the request. The door takes its seat by it, ahead of
-    /// the load: the request [`RequestFromSnapshot::make`] makes names this
-    /// model.
-    fn model(&self) -> &str;
-    /// The request, made from the world its decision is made under. It is
-    /// made inside the door's hold of its seat: a maker that waits holds
-    /// up the seat's other requests, and one that asks the door again can
-    /// wait on the seat it holds.
-    fn make<'w>(&'w self, world: &'w StoreSnapshot) -> Request<'w>;
-}
-
 /// A request as the door's order takes it up under the world it loaded:
 /// one its host stated ahead of the load ([`Request`]), or one its host
-/// makes from that world ([`RequestFromSnapshot`]).
+/// makes under that world's document ([`RequestMaker`]).
 trait Stated {
     /// The model the request is for. The door takes its seat by it, ahead
     /// of the load.
@@ -2953,16 +2934,16 @@ impl<S: Stated> Stated for Called<'_, S> {
     }
 }
 
-/// A [`RequestFromSnapshot`]'s request, as the door's order takes it up.
+/// A [`RequestMaker`]'s request, as the door's order takes it up.
 struct Made<'m, M>(&'m M);
 
-impl<M: RequestFromSnapshot> Stated for Made<'_, M> {
+impl<M: RequestMaker> Stated for Made<'_, M> {
     fn model(&self) -> &str {
         self.0.model()
     }
 
     fn under<R>(&self, world: &StoreSnapshot, order: impl FnOnce(&Request<'_>) -> R) -> R {
-        let request = self.0.make(world);
+        let request = self.0.make(world.spec());
         debug_assert_eq!(request.facts.model, self.0.model(), "the seat's model");
         order(&request)
     }
@@ -2977,6 +2958,13 @@ pub struct DecideOutcome {
     /// a pair this is the prefill side. `None` for a decision that
     /// picks no worker.
     pub lease: Option<Leased>,
+    /// A pair's session under the decode phase: the decode side's lease
+    /// carries it, and it cannot be told from the prefill side's. A guard
+    /// lends it back with each word
+    /// ([`HeldDecision`](super::decision_engine::HeldDecision)).
+    /// [`Session::NONE`] for a single, for a pair with no key, and from an
+    /// engine whose file of leases holds the decode side whole.
+    pub decode_session: Session,
 }
 
 impl DecideOutcome {
@@ -3332,7 +3320,7 @@ impl StoreBackedEngine {
 
     /// [`StoreBackedEngine::decide`] for a request its host makes from the
     /// world the door decides under. `maker` is handed that world behind the
-    /// door's load ([`RequestFromSnapshot::make`]), once for each run of the
+    /// door's load ([`RequestMaker::make`]), once for each run of the
     /// order: a load an apply moved to another decider is dropped before it
     /// asks. It is asked again where the order runs a second time behind a
     /// lease the store refused.
@@ -3345,7 +3333,7 @@ impl StoreBackedEngine {
     pub fn decide_under(
         &self,
         gateway: GatewayId,
-        maker: &impl RequestFromSnapshot,
+        maker: &impl RequestMaker,
         now: Instant,
     ) -> Result<DecideOutcome, DecisionRefused> {
         let (decided, _) = self.decide_under_stated(gateway, maker, now)?;
@@ -3358,7 +3346,7 @@ impl StoreBackedEngine {
     pub(crate) fn decide_under_stated(
         &self,
         gateway: GatewayId,
-        maker: &impl RequestFromSnapshot,
+        maker: &impl RequestMaker,
         now: Instant,
     ) -> Result<(DecideOutcome, bool), DecisionRefused> {
         let made = Made(maker);
@@ -3431,7 +3419,7 @@ impl StoreBackedEngine {
     }
 
     /// [`StoreBackedEngine::decide_decode`] for a request its host makes from
-    /// the world the call decides under ([`RequestFromSnapshot::make`]). The
+    /// the world the call decides under ([`RequestMaker::make`]). The
     /// sources of the request's routing key and the decode profile that reads
     /// the key are then of one load, across a reload that lands beside the
     /// call.
@@ -3444,7 +3432,7 @@ impl StoreBackedEngine {
     pub fn decide_decode_under(
         &self,
         gateway: GatewayId,
-        maker: &impl RequestFromSnapshot,
+        maker: &impl RequestMaker,
         lease: LeaseId,
         now: Instant,
     ) -> Result<DecideOutcome, DecisionRefused> {
@@ -3897,7 +3885,11 @@ impl StoreBackedEngine {
                 let (decision, booking) = decide_in(world, taken, buffers, &self.parts[at]);
                 let lease =
                     self.file::<PLAIN>(world, term, taken, &buffers.named, &decision, booking)?;
-                Ok(DecideOutcome { decision, lease })
+                Ok(DecideOutcome {
+                    decision,
+                    lease,
+                    decode_session: Session::NONE,
+                })
             }
             Entry::Pair => self.pair(world, at, term, taken, buffers),
             Entry::Side => Err(DecisionRefused::PairSide),
@@ -4089,7 +4081,11 @@ impl StoreBackedEngine {
             count.fetch_add(1, Ordering::Relaxed);
             due.said = Some(shadow);
         }
-        Ok(DecideOutcome { decision, lease })
+        Ok(DecideOutcome {
+            decision,
+            lease,
+            decode_session: Session::NONE,
+        })
     }
 
     /// A pair's order: decided for both sides and, for a pick, issued a
@@ -4129,6 +4125,7 @@ impl StoreBackedEngine {
                 lease,
                 due: taken.due(),
             }),
+            decode_session: Session::NONE,
         })
     }
 
@@ -4234,6 +4231,7 @@ impl StoreBackedEngine {
                 lease,
                 due: taken.due(),
             }),
+            decode_session: Session::NONE,
         })
     }
 }
@@ -4542,8 +4540,8 @@ pub(crate) mod tests {
     use parking_lot::Mutex;
 
     use super::{
-        decider_of, pinned, DecisionRefused, Request, RequestFromSnapshot, StoreBackedEngine,
-        StoreSnapshot, SweepOutcome, DISPATCH_TTL, LAST_SLOT, ON_SAMPLE_READ, TERM_MARK,
+        decider_of, pinned, DecisionRefused, Request, RequestMaker, StoreBackedEngine,
+        SweepOutcome, DISPATCH_TTL, LAST_SLOT, ON_SAMPLE_READ, TERM_MARK,
     };
     use crate::{
         document::spec::{AppliedSpec, Needs, PolicySpec},
@@ -5188,13 +5186,13 @@ pub(crate) mod tests {
         id: &'t [u8],
     }
 
-    impl RequestFromSnapshot for Reads<'_> {
+    impl RequestMaker for Reads<'_> {
         fn model(&self) -> &str {
             MODEL
         }
 
-        fn make<'w>(&'w self, world: &'w StoreSnapshot) -> Request<'w> {
-            self.handed.set(world.spec().generation());
+        fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+            self.handed.set(spec.generation());
             if let Some(generation) = self.applies {
                 let later = self.store.apply(preset("random", generation));
                 later.expect("a later generation");
@@ -6097,13 +6095,13 @@ pub(crate) mod tests {
         /// Says the generation it was handed, then applies the next one.
         struct Reloads<'t>(&'t MemoryStore, Cell<u64>);
 
-        impl RequestFromSnapshot for Reloads<'_> {
+        impl RequestMaker for Reloads<'_> {
             fn model(&self) -> &str {
                 MODEL
             }
 
-            fn make<'w>(&'w self, world: &'w StoreSnapshot) -> Request<'w> {
-                let handed = world.spec().generation();
+            fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+                let handed = spec.generation();
                 self.1.set(handed);
                 let document = PolicySpec::pair_presets("least_load", "least_load");
                 let mut document = document.expect("a spec");
@@ -6138,12 +6136,12 @@ pub(crate) mod tests {
         go: Mutex<mpsc::Receiver<()>>,
     }
 
-    impl RequestFromSnapshot for Stands {
+    impl RequestMaker for Stands {
         fn model(&self) -> &str {
             MODEL
         }
 
-        fn make<'w>(&'w self, _: &'w StoreSnapshot) -> Request<'w> {
+        fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
             self.stood.send(()).expect("the case waits for the seat");
             let word = self.go.lock().recv_timeout(PATIENCE);
             word.expect("the case sends the caller on");

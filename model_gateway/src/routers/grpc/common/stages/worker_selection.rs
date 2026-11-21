@@ -1223,7 +1223,10 @@ fn pair_admitted_by(
         })
 }
 
-/// A shape of attempt the controller does not place yet.
+/// A shape of attempt a followed controller does not place yet. Where the
+/// policy engine of this process decides, a regular attempt of any of them
+/// is placed: the route narrows its workers by the shape
+/// ([`WorkerSelectionStage::narrowed_regular`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Shape {
     /// A media input.
@@ -1976,10 +1979,10 @@ impl WorkerSelectionStage {
             }
     }
 
-    /// The shape of an attempt the controller does not place yet, or none:
-    /// a `media` input, a `context` demand a window of `pools` binds, an
-    /// explicit target in `headers` the classic would keep, a retry under a
-    /// decoding rule. The store builds the candidates and reads none of
+    /// The shape of an attempt a followed controller does not place yet, or
+    /// none: a `media` input, a `context` demand a window of `pools` binds,
+    /// an explicit target in `headers` the classic would keep, a retry under
+    /// a decoding rule. The store builds the candidates and reads none of
     /// these demands. The commit's rule only passes a target over, and a
     /// demand few workers meet could end the asks with no worker. So these
     /// shapes are refused by name until a request can state them, but for a
@@ -2010,12 +2013,15 @@ impl WorkerSelectionStage {
         retry_under_rule.then_some(Shape::RetryUnderRule)
     }
 
-    /// Whether a retry of `ctx` can be placed at all. Under the controller's
-    /// policy engine a retry of a shape the stage refuses by name has no next
-    /// attempt: the refusal must not stand where a worker's failure does.
-    /// The classic selection answers every retry itself.
+    /// Whether a retry of `ctx` can be placed at all. Under a followed
+    /// controller's policy engine a retry of a shape the stage refuses by
+    /// name has no next attempt: the refusal must not stand where a worker's
+    /// failure does. The classic selection answers every retry itself, and
+    /// so does the stage over the policy engine of this process, which
+    /// refuses no shape.
     pub(crate) fn places_retry(&self, ctx: &DispatchContext) -> bool {
-        if self.policy_engine.is_none() {
+        let followed = |engine: &Arc<PolicyEngine>| !engine.in_process();
+        if !self.policy_engine.as_ref().is_some_and(followed) {
             return true;
         }
         let media = retry_media(ctx) != MediaDemands::NONE;
@@ -2069,23 +2075,42 @@ impl WorkerSelectionStage {
                 .ok_or_else(no_worker);
         };
 
-        let under_rule =
-            matches!(attempt, Attempt::Retry(ctx) if ctx.constraint_decided_on.is_some());
-        let pools = [RoutingPool::GrpcPipelineRegular];
-        let media_input = media != MediaDemands::NONE;
-        let shape = self.undecided(
-            model_id,
-            context,
-            &pools,
-            media_input,
-            inputs.headers,
-            under_rule,
-        );
-        if let Some(shape) = shape {
-            return Err(shape.refusal(|| {
-                let capable = self.capable_regular(model_id, wire, media.with_wire(wire));
-                unheld_by(&capable, context, model_id)
-            }));
+        // Where the engine of this process decides, a demand of the request
+        // is the route's own rule, as in the selection with no policy
+        // engine: the pool is narrowed by it first, and the engine decides
+        // over the workers that are left. One read of the registry serves
+        // the rule and the ask. A followed controller reads no such demand,
+        // so there the shape is refused by name.
+        let snapshot = policy_engine
+            .in_process()
+            .then(|| self.worker_registry.get_routing_snapshot(model_id));
+        let among = if let Some(snapshot) = &snapshot {
+            self.narrowed_regular(snapshot, model_id, context, media, wire, &inputs)
+        } else {
+            let under_rule =
+                matches!(attempt, Attempt::Retry(ctx) if ctx.constraint_decided_on.is_some());
+            let pools = [RoutingPool::GrpcPipelineRegular];
+            let media_input = media != MediaDemands::NONE;
+            let shape = self.undecided(
+                model_id,
+                context,
+                &pools,
+                media_input,
+                inputs.headers,
+                under_rule,
+            );
+            if let Some(shape) = shape {
+                return Err(shape.refusal(|| {
+                    let capable = self.capable_regular(model_id, wire, media.with_wire(wire));
+                    unheld_by(&capable, context, model_id)
+                }));
+            }
+            None
+        };
+        // No worker of the pool may take the request: the answer of the
+        // selection with no policy engine, and no ask is made.
+        if among.as_deref().is_some_and(<[_]>::is_empty) {
+            return Err(no_worker());
         }
 
         let prompt = engine::Prompt::of(inputs.tokens, inputs.cache_namespace);
@@ -2094,6 +2119,9 @@ impl WorkerSelectionStage {
         let rule = on_route(RoutingPool::GrpcPipelineRegular, wire, attempt.ledger());
         let ask = Ask {
             wires: route_wires(wire),
+            pool: Some(RoutingPool::GrpcPipelineRegular),
+            among: among.as_ref(),
+            snapshot: snapshot.as_ref(),
             ..attempt.ask(model_id, &id, &hashes)
         };
         let placed = policy_engine
@@ -2284,30 +2312,96 @@ impl WorkerSelectionStage {
         tried: &[String],
     ) -> Option<Arc<dyn Worker>> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
-        let context = context.left_by(&snapshot, &[RoutingPool::GrpcPipelineRegular], model_id);
+        Self::with_regular_rule(&snapshot, model_id, context, media, admits, |rule| {
+            self.select_single_worker_for_attempt(
+                &snapshot,
+                model_id,
+                text,
+                tokens,
+                headers,
+                rid_key,
+                cache_namespace,
+                wire,
+                rule,
+                tried,
+            )
+        })
+    }
+
+    /// One regular attempt's rule for a candidate of `snapshot`'s regular
+    /// pool, handed to `then`: what the pool's windows leave of the context
+    /// demand, the media demands, and `admits`. `None` where nothing can
+    /// refuse a worker.
+    ///
+    /// Every regular attempt is narrowed by this one rule. The selection
+    /// with no policy engine hands it to its placement as the candidate
+    /// filter. Where the policy engine of this process decides, the route
+    /// narrows the pool by it and the engine decides over what is left
+    /// ([`Self::narrowed_regular`]).
+    fn with_regular_rule<R>(
+        snapshot: &ModelWorkerSnapshot,
+        model_id: &str,
+        context: ContextRequirements,
+        media: MediaDemands,
+        admits: Option<CandidateFilter<'_>>,
+        then: impl FnOnce(Option<CandidateFilter<'_>>) -> R,
+    ) -> R {
+        let context = context.left_by(snapshot, &[RoutingPool::GrpcPipelineRegular], model_id);
         let accepts = |worker: &dyn Worker| {
             admits.is_none_or(|admits| admits(worker))
                 && media.accepts(worker)
                 && context.admits(worker, model_id)
         };
-        let candidate_filter: Option<CandidateFilter<'_>> =
+        let rule: Option<CandidateFilter<'_>> =
             if admits.is_none() && media == MediaDemands::NONE && context.binds_nobody() {
                 None
             } else {
                 Some(&accepts)
             };
-        self.select_single_worker_for_attempt(
-            &snapshot,
-            model_id,
-            text,
-            tokens,
-            headers,
-            rid_key,
-            cache_namespace,
-            wire,
-            candidate_filter,
-            tried,
-        )
+        then(rule)
+    }
+
+    /// The workers of `snapshot`'s regular pool one attempt may use, where
+    /// its rule refuses one of them: the pool's part on `wire` that the
+    /// attempt's rule accepts ([`Self::with_regular_rule`], with the
+    /// retained plan's media pins on a retry), narrowed by the placement's
+    /// own step ([`placement::accepted_by`]). Where the model's policy keeps
+    /// an explicit target of `headers` ([`Self::strict_target`]), the one
+    /// worker it names among them ([`placement::targeted`]). `None` where
+    /// nothing narrows the pool: it stands as the registry lists it, and
+    /// its list is not touched. An empty list says no worker of the pool
+    /// may take the request.
+    ///
+    /// The policy engine of this process decides over these workers alone,
+    /// so a demand of the request narrows before the policy runs, as in the
+    /// selection with no policy engine.
+    fn narrowed_regular(
+        &self,
+        snapshot: &ModelWorkerSnapshot,
+        model_id: &str,
+        context: ContextRequirements,
+        media: MediaDemands,
+        wire: Option<WireConstraint>,
+        inputs: &PlacementInputs<'_>,
+    ) -> Option<Arc<[Arc<dyn Worker>]>> {
+        let media = media.with_wire(wire);
+        let admits = inputs.candidate_filter;
+        Self::with_regular_rule(snapshot, model_id, context, media, admits, |rule| {
+            let keeps_target = self.strict_target(model_id, inputs.headers);
+            if rule.is_none() && wire.is_none() && !keeps_target {
+                return None;
+            }
+            let pool = Arc::clone(snapshot.pool(RoutingPool::GrpcPipelineRegular));
+            let on_wire = placement::Candidates::of(pool, wire);
+            let accepted = placement::accepted_by(on_wire.as_slice(), rule);
+            if keeps_target {
+                let candidates = accepted.as_deref().unwrap_or(on_wire.as_slice());
+                if let Some(target) = placement::targeted(candidates, inputs.headers) {
+                    return Some(target.into_iter().collect());
+                }
+            }
+            accepted.map(Arc::from)
+        })
     }
 
     /// A first attempt's selection over a snapshot drawn here, under the
@@ -2386,7 +2480,8 @@ impl WorkerSelectionStage {
             &self.worker_registry,
             &self.policy_registry,
             model_id,
-            Arc::clone(snapshot.pool(RoutingPool::GrpcPipelineRegular)),
+            snapshot,
+            RoutingPool::GrpcPipelineRegular,
             wire,
             PlacementInputs {
                 text,
@@ -2939,6 +3034,7 @@ impl SelectionBench {
 
 #[cfg(test)]
 mod tests {
+    mod in_process;
     mod lora;
     mod policy_controller;
 

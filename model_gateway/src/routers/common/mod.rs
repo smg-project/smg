@@ -63,6 +63,7 @@ pub use smg_external_router::header_utils;
 pub(crate) mod kv_transfer;
 pub use smg_external_router::{mcp_utils, openai_bridge};
 pub mod overload;
+pub(crate) mod pair_classes;
 pub(crate) mod pair_index;
 pub mod pd_admission;
 pub(crate) mod pd_failure;
@@ -223,22 +224,510 @@ pub(crate) fn attach_sized_body(
 /// and whether the process captures every request's cache trace.
 #[cfg(any(test, feature = "test-util"))]
 pub mod bench_support {
-    use std::sync::Arc;
+    use std::{
+        future::Future,
+        pin::pin,
+        sync::Arc,
+        task::{Context, Poll, Waker},
+        time::Instant,
+    };
 
-    use smg_worker::identity::basic::Worker;
+    use axum::http::{HeaderMap, HeaderValue};
+    use rand::RngExt;
+    use smg_policy_controller::{
+        engine::{
+            decide, Constraints, DecisionClock, Identity, Live, Phase, PolicyEngine, RequestFacts,
+            WireModes,
+        },
+        stages::Lifecycle,
+        tracking::{Lease, Outcome, Side as EngineSide, TransportClass},
+    };
+    use smg_worker::{
+        identity::basic::{Worker, WorkerLoadGuard},
+        load::state::LoadReceiver,
+    };
 
     use super::{
         attempt_ledger::AttemptLedger,
+        overload,
         placement::{select_pair, select_single, PlacementInputs},
     };
     use crate::{
+        config::RouterConfig,
         observability::cache_trace,
-        policies::PolicyRegistry,
+        policies::{EnginePolicy, PolicyRegistry, Side},
+        policy_controller::{
+            engine::{mark, Ask, End, PolicyEngine as EngineObjectOf, Prompt},
+            start_in_process,
+        },
         routers::common::{
             pair_index::{PdPairIndex, PdWire},
             snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
         },
     };
+
+    /// The route a request is placed on: the pool its router places over.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Route {
+        /// The regular HTTP router.
+        Http,
+        /// The gRPC pipeline's regular selection stage.
+        Grpc,
+    }
+
+    impl Route {
+        /// The pool the route's router places a single request over.
+        fn pool(self) -> RoutingPool {
+            match self {
+                Self::Http => RoutingPool::HttpRegular,
+                Self::Grpc => RoutingPool::GrpcPipelineRegular,
+            }
+        }
+    }
+
+    /// Bytes the calling thread has allocated since it started, by the
+    /// allocator's own count of the thread: a free does not subtract.
+    /// `None` in a build that links no such count.
+    pub fn thread_allocated_bytes() -> Option<u64> {
+        #[cfg(all(
+            feature = "jemalloc-stats",
+            not(target_env = "msvc"),
+            not(target_env = "musl")
+        ))]
+        {
+            tikv_jemalloc_ctl::thread::allocatedp::read()
+                .ok()
+                .map(|allocated| allocated.get())
+        }
+        #[cfg(not(all(
+            feature = "jemalloc-stats",
+            not(target_env = "msvc"),
+            not(target_env = "musl")
+        )))]
+        {
+            None
+        }
+    }
+
+    /// The worker a route placed a request on, as a number a bench compares
+    /// with another request's: the place of the worker's object in memory,
+    /// which stands for as long as the worker is registered. Nothing else is
+    /// read of it.
+    fn placed_on(worker: &Arc<dyn Worker>) -> usize {
+        Arc::as_ptr(worker).addr()
+    }
+
+    /// Hands the classic policies the load feed the monitor would publish.
+    pub fn attach_loads(policies: &PolicyRegistry, loads: Option<LoadReceiver>) {
+        policies.set_load_receiver(loads);
+    }
+
+    /// Sets a pair gateway's side policies on `policies` as the router
+    /// factory sets them at the start: each side's own policy of `config`,
+    /// or its main policy.
+    pub fn set_pair_sides(policies: &PolicyRegistry, config: &RouterConfig) {
+        let main = &config.policy;
+        policies.set_side_policy(Side::Prefill, config.mode.get_prefill_policy(main));
+        policies.set_side_policy(Side::Decode, config.mode.get_decode_policy(main));
+    }
+
+    /// The classic policy registry of `config`'s policy, its policies
+    /// asking the policy engine of the document in force under `config`,
+    /// built as a gateway's start builds both under the setting, whatever
+    /// `config` says of the setting: [`route_classic`] then runs the
+    /// classic placement, and the pass asks the policy object that asks the
+    /// engine where it asks a classic policy. Under a pair mode the
+    /// registry holds a pair's two side policies ([`set_pair_sides`]), and
+    /// [`route_pair`] runs the classic pair placement over them.
+    ///
+    /// # Errors
+    ///
+    /// A configuration no policy document says, a document the engine
+    /// refuses, and a policy the engine does not pick by itself: the
+    /// registry would hand out the classic policy, and a cell named for
+    /// the object would time that one.
+    pub fn policies_asking_the_engine(config: &RouterConfig) -> Result<PolicyRegistry, String> {
+        let picked = RouterConfig {
+            policy_controller: true,
+            ..config.clone()
+        };
+        let started = start_in_process(&picked, None)
+            .map_err(|refused| refused.to_string())?
+            .ok_or("this configuration places its requests by no routing policy")?;
+        let whole = started.decides_whole();
+        let policies = PolicyRegistry::with_policy_engine(
+            config.policy.clone(),
+            config.routing_key_override.clone(),
+            started.engine,
+            started.origin,
+            whole,
+        );
+        let asked = if config.mode.is_pd_mode() {
+            set_pair_sides(&policies, config);
+            [policies.get_prefill_policy(), policies.get_decode_policy()]
+                .iter()
+                .all(|side| side.as_any().is::<EnginePolicy>())
+        } else {
+            policies.get_default_policy().as_any().is::<EnginePolicy>()
+        };
+        if asked {
+            Ok(policies)
+        } else {
+            Err(format!(
+                "the policy engine does not pick `{}` by itself: the registry builds the classic policy",
+                config.policy.name()
+            ))
+        }
+    }
+
+    /// The gateway's own policy engine object, over the engine a gateway's
+    /// start builds for `config`'s policy under the setting, whatever
+    /// `config` says of the setting, and over `registry`'s lists: what the
+    /// routers ask where the engine decides every request of the document
+    /// whole.
+    pub struct EngineObject(EngineObjectOf);
+
+    impl EngineObject {
+        /// The object a gateway's start builds for `config` over `registry`,
+        /// handed `loads`, the load feed the monitor would publish, as the
+        /// start hands it the monitor's.
+        ///
+        /// # Errors
+        ///
+        /// A configuration no policy document says, a document the engine
+        /// refuses, and a policy the engine does not decide whole yet: the
+        /// routers would keep their classic placement pass, and a cell
+        /// named for the object would time that one.
+        pub fn of(
+            config: &RouterConfig,
+            registry: &Arc<WorkerRegistry>,
+            loads: Option<LoadReceiver>,
+        ) -> Result<Self, String> {
+            let picked = RouterConfig {
+                policy_controller: true,
+                ..config.clone()
+            };
+            let started = start_in_process(&picked, None)
+                .map_err(|refused| refused.to_string())?
+                .ok_or("this configuration places its requests by no routing policy")?;
+            if !started.decides_whole() {
+                return Err(format!(
+                    "the policy engine does not decide `{}` whole yet: the routers keep their classic placement pass",
+                    config.policy.name()
+                ));
+            }
+            let object = EngineObjectOf::own(started.engine, Arc::clone(registry));
+            if let Some(loads) = loads {
+                object.read_loads(loads);
+            }
+            Ok(Self(object))
+        }
+
+        /// How many times the reports of `model`'s workers on `route` were
+        /// converted for the engine's records: once for each load snapshot
+        /// a decision converted the list under. Zero for a pool no request
+        /// was routed over, and under a document that reads no report.
+        pub fn conversions(registry: &WorkerRegistry, model: &str, route: Route) -> u64 {
+            registry
+                .get_routing_snapshot(model)
+                .pool_members_cell(route.pool())
+                .get()
+                .map_or(0, |members| members.conversions())
+        }
+    }
+
+    /// One request's routing by the gateway's engine object on `route`, as
+    /// a regular router's arm runs it: the prompt's hashes, the ask over
+    /// the route's pool and the commit of the first target the gateway can
+    /// send to, the dispatch-time read of the chosen worker's overload
+    /// veto, the dispatch's word, the worker's load guard from the send to
+    /// the request's end, and the end's word. The worker the request went
+    /// to ([`placed_on`]), and `None` where it had no worker.
+    ///
+    /// What [`route_classic`] does under a classic policy, with the engine
+    /// deciding the whole request through the object the routers hold: no
+    /// classic policy and no classic placement pass runs.
+    pub fn route_engine(
+        registry: &WorkerRegistry,
+        object: &EngineObject,
+        model: &str,
+        route: Route,
+        tokens: Option<&[u32]>,
+    ) -> Option<usize> {
+        let (pool, wires) = match route {
+            Route::Http => (RoutingPool::HttpRegular, WireModes::NONE),
+            Route::Grpc => (
+                RoutingPool::GrpcPipelineRegular,
+                WireModes::GRPC.union(WireModes::ZMQ),
+            ),
+        };
+        let hashes = object.0.hashes(model, &Prompt::of(tokens, None));
+        let id = mark();
+        let ask = Ask {
+            wires,
+            hashes: Some(&hashes),
+            pool: Some(pool),
+            ..Ask::of(&id, model)
+        };
+        let now = Instant::now();
+        // The engine of this process decides on the calling thread: the
+        // arm's future is ready at its first poll.
+        let placing = pin!(object
+            .0
+            .place_where(&ask, |worker| pool.matches(worker), now));
+        let Poll::Ready(Ok(mut placed)) = placing.poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            return None;
+        };
+        let shed = overload::shed_if_worker_overloaded(
+            placed.worker().as_ref(),
+            model,
+            registry.overload_shed_enabled(),
+        );
+        if shed.is_some() {
+            return None;
+        }
+        placed.dispatched(now);
+        let guard = WorkerLoadGuard::with_key(Arc::clone(placed.worker()), None);
+        drop(guard);
+        placed.completed(
+            End {
+                status: 200,
+                class: TransportClass::Ok,
+                ttft_micros: 0,
+                tokens_in: 0,
+                tokens_out: 0,
+                duration_micros: 0,
+            },
+            now,
+        );
+        Some(placed_on(placed.worker()))
+    }
+
+    /// One request's routing under the classic policies on `route`: the
+    /// placement over the route's own pool, the dispatch-time read of the
+    /// chosen worker's overload veto, and the worker's load guard from the
+    /// send to the request's end, whose drop tells the model's policy.
+    /// `headers` are the request's, where it carries any: a routing key is
+    /// read from them as a router reads it, for the placement and for the
+    /// load guard. The worker the request went to ([`placed_on`]), and
+    /// `None` where it had no worker.
+    pub fn route_classic(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model: &str,
+        route: Route,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+    ) -> Option<usize> {
+        let pool = route.pool();
+        let inputs = PlacementInputs {
+            tokens,
+            headers,
+            ..Default::default()
+        };
+        let worker = select_single(registry, policies, model, pool, None, inputs)?;
+        let shed = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            model,
+            registry.overload_shed_enabled(),
+        );
+        if shed.is_some() {
+            return None;
+        }
+        let went = placed_on(&worker);
+        let guard = WorkerLoadGuard::with_key(worker, policies.sticky_key(headers, None));
+        drop(guard);
+        Some(went)
+    }
+
+    /// One request's routing through a pair gateway's classic placement
+    /// on the gRPC wire: the pair index of the model's snapshot, the pair
+    /// placed over it by the registry's two side policies, and each side's
+    /// load guard from the send to the request's end. The prefill worker
+    /// the request went to ([`placed_on`]), and `None` where it had no
+    /// pair.
+    pub fn route_pair(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model: &str,
+        tokens: Option<&[u32]>,
+    ) -> Option<usize> {
+        let pairs = registry
+            .get_routing_snapshot(model)
+            .pd_pairs(PdWire::Grpc, policies.pd_pairing_mode());
+        let inputs = PlacementInputs {
+            tokens,
+            ..Default::default()
+        };
+        let pair = select_pair(registry, policies, model, &pairs, None, None, inputs).ok()?;
+        let went = placed_on(&pair.prefill);
+        let prefill = WorkerLoadGuard::with_key(pair.prefill, policies.sticky_key(None, None));
+        let decode = WorkerLoadGuard::with_key(pair.decode, policies.sticky_key(None, None));
+        drop((prefill, decode));
+        Some(went)
+    }
+
+    /// The policy engine of one routing policy, asked for its whole
+    /// decision over records written from the gateway's own data: the
+    /// engine of the document the routing settings give for the policy, its
+    /// clock, and the load feed the monitor would publish.
+    pub struct EngineOverRecords {
+        engine: Arc<PolicyEngine>,
+        clock: DecisionClock,
+        loads: Option<LoadReceiver>,
+    }
+
+    impl EngineOverRecords {
+        /// The engine a gateway's start builds for `config`'s policy under
+        /// the setting, whatever `config` says of the setting, reading the
+        /// workers' reports from `loads`.
+        ///
+        /// # Errors
+        ///
+        /// A configuration no policy document says, and a document the
+        /// engine refuses.
+        pub fn of(config: &RouterConfig, loads: Option<LoadReceiver>) -> Result<Self, String> {
+            let picked = RouterConfig {
+                policy_controller: true,
+                ..config.clone()
+            };
+            let started = start_in_process(&picked, None)
+                .map_err(|refused| refused.to_string())?
+                .ok_or("this configuration places its requests by no routing policy")?;
+            Ok(Self {
+                engine: started.engine,
+                clock: DecisionClock::new(),
+                loads,
+            })
+        }
+
+        /// How many times the reports of `model`'s workers on `route` were
+        /// converted for the engine's records: once for each load snapshot
+        /// a decision wrote every record under. Zero for a pool no request
+        /// was routed over.
+        pub fn conversions(&self, registry: &WorkerRegistry, model: &str, route: Route) -> u64 {
+            registry
+                .get_routing_snapshot(model)
+                .pool_members_cell(route.pool())
+                .get()
+                .map_or(0, |members| {
+                    members
+                        .records(self.engine.spec(), &self.clock)
+                        .conversions()
+                })
+        }
+    }
+
+    /// One request's routing by the policy engine's whole decision on
+    /// `route`, over records written for this decision from the route's own
+    /// pool as the registry lists it, the worker objects and the load
+    /// snapshot: the decision, the word of its issue, its dispatch and its
+    /// end to the engine's stages, the dispatch-time read of the chosen
+    /// worker's overload veto, and the worker's load guard from the send to
+    /// the request's end. `headers` are the request's, where it carries
+    /// any: its routing key is read from them by the sources its binding
+    /// names, as a router's ask reads it. The worker the request went to
+    /// ([`placed_on`]), and `None` where it had no worker.
+    ///
+    /// What [`route_classic`] does under a classic policy, with the engine
+    /// deciding: no classic policy and no classic placement pass runs.
+    pub fn route_records(
+        registry: &WorkerRegistry,
+        engine: &EngineOverRecords,
+        model: &str,
+        route: Route,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+    ) -> Option<usize> {
+        let pool = route.pool();
+        // The decision's instant is read before its snapshot is borrowed: a
+        // decision that began later holds a snapshot no older.
+        let now = Instant::now();
+        let snapshot = registry.get_routing_snapshot(model);
+        let workers = snapshot.pool(pool);
+        let members = snapshot
+            .pool_members_cell(pool)
+            .get_or_init(|| Box::new(engine.engine.pool_members(workers)));
+        let spec = engine.engine.spec();
+        let records = members.records(spec, &engine.clock);
+        // Borrowed once a decision, as a classic policy borrows it.
+        let loads = engine.loads.as_ref().map(|loads| loads.borrow().clone());
+        // The request's two keys by the sources its binding names: its
+        // routing key from the first source that holds a value, and its
+        // client's key where it carries no routing key.
+        let (key, client_key) = match spec.key_sources_for(model, Phase::Single) {
+            Some(sources) => {
+                let header = |name: &str| headers?.get(name).map(HeaderValue::as_bytes);
+                match sources.derive(header, None) {
+                    Some(derived) => (derived.key, 0),
+                    None => (Identity::NONE, sources.derive_client(header)),
+                }
+            }
+            None => (Identity::NONE, 0),
+        };
+        let mut facts = RequestFacts {
+            model,
+            phase: Phase::Single,
+            prompt_tokens: tokens
+                .map_or(0, |tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX)),
+            session_key: key,
+            client_key,
+            seed: rand::rng().random(),
+            ..RequestFacts::default()
+        };
+        let live = Live::at(spec.engine(), &engine.clock, now, loads.as_ref(), key.plain);
+        let decision = decide(
+            spec.engine(),
+            records,
+            workers,
+            &live,
+            &mut facts,
+            &Constraints::default(),
+        );
+        let pick = decision.pick()?;
+        let target = pick.targets.first()?;
+        let worker = workers.get(target.position as usize)?;
+        // The engine's stages hear the request as a gateway's guard tells
+        // it: its issue and its dispatch here, its end below.
+        let stages = spec.engine();
+        let lease = Lease {
+            side: EngineSide::Single,
+            booked: target.id,
+            generation: spec.generation(),
+            session: facts.session(),
+            session_verdict: pick.session_verdict,
+            issued_micros: facts.now_micros,
+            tokens: facts.prompt_tokens,
+            ..Lease::default()
+        };
+        stages.on_decision_issued(&lease, &decision);
+        stages.on_dispatched(&lease, target, EngineSide::Single, 0);
+        let shed = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            model,
+            registry.overload_shed_enabled(),
+        );
+        if shed.is_some() {
+            return None;
+        }
+        let guard = WorkerLoadGuard::with_key(Arc::clone(worker), key.plain);
+        drop(guard);
+        stages.on_completed(
+            &lease,
+            &Outcome {
+                side: EngineSide::Single,
+                served: target.id,
+                status: 200,
+                class: TransportClass::Ok,
+                ttft_micros: 0,
+                tokens_in: facts.prompt_tokens,
+                tokens_out: 0,
+                duration_micros: 0,
+            },
+        );
+        Some(placed_on(worker))
+    }
 
     /// Whether a process switch captures every request's cache trace
     /// (`SMG_CACHE_TRACE=1` or `SMG_CACHE_TRACE_HEADER=1`). A benchmark cell

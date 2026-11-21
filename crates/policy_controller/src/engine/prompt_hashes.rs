@@ -175,8 +175,20 @@ impl PromptHashes {
         facts.hash_kind = self.kind;
         facts.block_size = self.block_size;
         facts.namespace_seed = self.namespace_seed;
-        if facts.prompt_tokens == 0 {
-            facts.prompt_tokens = self.prompt_tokens;
+        facts.prompt_tokens = self.prompt_tokens_or(facts.prompt_tokens);
+    }
+
+    /// The size in tokens of a prompt whose request states `stated`: the
+    /// stated size, and the hashing's own count where it states none (`0`).
+    /// What [`Self::write_to`] leaves in a request's facts, for a caller
+    /// that states the size with no request made.
+    #[inline]
+    #[must_use]
+    pub fn prompt_tokens_or(&self, stated: u32) -> u32 {
+        if stated == 0 {
+            self.prompt_tokens
+        } else {
+            stated
         }
     }
 }

@@ -253,6 +253,32 @@ impl EventSet {
         set
     };
 
+    /// The four kinds told of one lease: its issue, its dispatch, its
+    /// completion and its release.
+    pub const LEASE: Self = Self::NONE
+        .with(EventKind::Issued)
+        .with(EventKind::Dispatched)
+        .with(EventKind::Completed)
+        .with(EventKind::Released);
+
+    /// The set with `kind` in it.
+    #[must_use]
+    pub const fn with(self, kind: EventKind) -> Self {
+        Self(self.0 | kind.bit())
+    }
+
+    /// The kinds either set holds.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Whether the two sets hold a kind in common.
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
     /// The set of these kinds.
     pub fn of(kinds: impl IntoIterator<Item = EventKind>) -> Self {
         let mut set = Self::NONE;

@@ -34,7 +34,7 @@ use crate::{
     tracking::{
         dispatch_credit::{CreditedDispatches, DispatchCounts, DispatchCredit},
         in_flight::{with_counts, Pieces, PoolInFlightCounts, WorkerSlot},
-        lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
+        lease::{EventKind, EventSet, Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     },
 };
 
@@ -128,6 +128,10 @@ impl<S: ReadsLoad> Lifecycle for WithLoadReportAgeLimit<S> {
 
     fn needs_lifecycle(&self) -> bool {
         self.stage.needs_lifecycle()
+    }
+
+    fn hears(&self) -> EventSet {
+        self.stage.hears()
     }
 }
 
@@ -1677,6 +1681,11 @@ impl Lifecycle for ResidentWork {
 
     fn keeps_loads(&self) -> bool {
         true
+    }
+
+    /// The dispatch: a credit is counted from it.
+    fn hears(&self) -> EventSet {
+        EventSet::NONE.with(EventKind::Dispatched)
     }
 }
 

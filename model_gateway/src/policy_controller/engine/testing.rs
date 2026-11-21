@@ -34,7 +34,7 @@ type Bed = (PolicyEngine, Arc<MemoryStore>, Vec<Arc<dyn Worker>>);
 /// The id of the lease `placed` holds: a router's case reads the lease's
 /// sides in the store by it.
 pub(crate) fn lease_of(placed: &Placed) -> LeaseId {
-    placed.handle.lease().expect("a lease").lease.id
+    placed.lease().expect("a lease").lease.id
 }
 
 /// The store a start makes under the controller with one ready row a URL,

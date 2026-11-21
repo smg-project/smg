@@ -18,7 +18,7 @@ use crate::{
     },
     plugins::shared::{
         config::{Exposure, Reveal},
-        shown_hashes,
+        shown_hashes, shown_size,
     },
     service::proto,
     tracking::{
@@ -224,7 +224,7 @@ fn request(facts: &RequestFacts<'_>, exposure: &Exposure, needs: Needs) -> proto
         priority: facts.priority,
         streaming: facts.streaming,
         max_output_tokens: facts.max_output_tokens,
-        prompt_tokens: facts.prompt_tokens,
+        prompt_tokens: shown_size(facts, needs),
         block_hashes: shown_hashes(facts, needs).to_vec(),
         hash_kind: hash_kind(facts.hash_kind),
         session_key: session_identity(facts, exposure.session_key),
@@ -1019,6 +1019,7 @@ mod tests {
             text: true,
             token_hashes: false,
             text_hashes: false,
+            prompt_size: true,
             loads: true,
             events: true,
             sent_prefixes: true,
@@ -1045,6 +1046,51 @@ mod tests {
             held[..most],
             "the first of a longer list"
         );
+    }
+
+    /// A frame carries the request's size for a row that declares it, and
+    /// zero for a row that does not, whatever else it declares. A plugin
+    /// that reads the size undeclared reads zero at once: of a request its
+    /// host read whole as of one its host sent on unread.
+    #[test]
+    fn a_frame_carries_the_requests_size_its_row_declares() {
+        use crate::{
+            document::spec::Needs,
+            engine::view::{PoolFacts, RequestFacts},
+            plugins::shared::config::Exposure,
+        };
+
+        let sent = |needs: Needs| {
+            let facts = RequestFacts {
+                model: "m",
+                prompt_tokens: 512,
+                ..RequestFacts::default()
+            };
+            super::decide(
+                1,
+                &facts,
+                &[],
+                &PoolFacts::default(),
+                &Exposure::default(),
+                needs,
+            )
+            .request
+            .expect("a frame carries its request")
+            .prompt_tokens
+        };
+        let sized = Needs {
+            prompt_size: true,
+            ..Needs::default()
+        };
+        let other = Needs {
+            token_hashes: true,
+            text_hashes: true,
+            loads: true,
+            ..Needs::default()
+        };
+        assert_eq!(sent(sized), 512);
+        assert_eq!(sent(other), 0);
+        assert_eq!(sent(Needs::default()), 0);
     }
 
     /// The frame carries each candidate's requests in flight as the
