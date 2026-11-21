@@ -21,6 +21,11 @@ pub struct AloneProfile(pub(crate) u16);
 pub enum Place<'a> {
     /// No binding names the model for the phase.
     Unbound,
+    /// A binding names the model for the phase, and its plan has no side
+    /// for it: a single request under a pair's plan, an encode request
+    /// under a plan that names no encode side. A caller that places
+    /// requests of that phase for the model has no profile for them.
+    NoSide,
     /// The place's profile is decided by one pick of its picker over the
     /// workers the caller hands: the caller asks that pick and nothing else.
     Alone(AloneProfile),
@@ -98,8 +103,14 @@ impl Engine {
     /// [`Picker::pick_alone`]: super::Picker::pick_alone
     #[must_use]
     pub fn place_for(&self, model: &str, phase: Phase) -> Place<'_> {
-        let Some((_, index, profile)) = self.resolve(model, phase) else {
+        let Some(entry) = self.entry(model, phase) else {
             return Place::Unbound;
+        };
+        let Some(index) = profile_index(&entry.binding, phase) else {
+            return Place::NoSide;
+        };
+        let Some(profile) = self.profiles.get(usize::from(index)) else {
+            return Place::NoSide;
         };
         match self.in_the_way(index, profile, phase) {
             None => Place::Alone(AloneProfile(index)),

@@ -591,18 +591,46 @@ mod tests {
     }
 
     /// A model no binding of a supplied document names is placed by the
-    /// classic default policy.
+    /// classic policies, as with the setting off: its workers' label first,
+    /// the default policy otherwise. Each such model is counted once where
+    /// it gets its first worker. A model a pair binding names is not one
+    /// of them: its requests are a pair's, which the side policies place.
     #[test]
-    fn a_model_no_binding_names_is_placed_by_the_classic_default() {
-        let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
-        document.bindings[0].matcher.model = "alpha-*".to_string();
-        let policies = asking_under(&document, "round_robin", DocumentOrigin::Supplied);
-        let default = policies.get_default_policy();
-        assert!(default.as_any().is::<RoundRobinPolicy>());
-        let unbound = policies.on_worker_added("beta-1", None);
-        assert!(Arc::ptr_eq(&unbound, &default));
-        let bound = policies.on_worker_added("alpha-1", None);
-        assert!(bound.as_any().is::<EnginePolicy>());
+    fn a_model_no_binding_names_is_placed_by_the_classic_policies_and_counted() {
+        const UNBOUND: &str = "smg_policy_unbound_models_total";
+        let rendered = render_with_recorder(|| {
+            let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+            document.bindings[0].matcher.model = "alpha-*".to_string();
+            let policies = asking_under(&document, "round_robin", DocumentOrigin::Supplied);
+            let default = policies.get_default_policy();
+            assert!(default.as_any().is::<RoundRobinPolicy>());
+            let unbound = policies.on_worker_added("beta-1", None);
+            assert!(Arc::ptr_eq(&unbound, &default));
+            // A later worker of the model finds its policy in place.
+            policies.on_worker_added("beta-1", None);
+            let labelled = policies.on_worker_added("beta-2", Some("random"));
+            assert_eq!(labelled.name(), "random");
+            let bound = policies.on_worker_added("alpha-1", None);
+            assert!(bound.as_any().is::<EnginePolicy>());
+        });
+        let counted = rendered
+            .lines()
+            .find(|line| line.starts_with(UNBOUND))
+            .expect("the unbound models are counted");
+        assert!(counted.ends_with(" 2"), "{counted}");
+
+        let rendered = render_with_recorder(|| {
+            let pair =
+                PolicySpec::pair_presets("round_robin", "round_robin").expect("built-in presets");
+            let policies = asking_under(&pair, "round_robin", DocumentOrigin::Supplied);
+            let default = policies.get_default_policy();
+            let paired = policies.on_worker_added(MODEL, None);
+            assert!(Arc::ptr_eq(&paired, &default));
+        });
+        assert!(
+            !rendered.lines().any(|line| line.starts_with(UNBOUND)),
+            "a pair binding names the model"
+        );
     }
 
     /// The registry builds a pair's side policies, from the side and the

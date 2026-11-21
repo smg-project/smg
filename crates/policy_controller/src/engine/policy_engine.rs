@@ -127,10 +127,11 @@ impl PolicyEngine {
     /// matches names the place's profile. The answer is that profile where
     /// one pick of its picker is its whole decision ([`Place::Alone`]),
     /// the stage of it that asks more where it is not
-    /// ([`Place::NotAlone`]), and [`Place::Unbound`] where no binding names
-    /// the model for the phase. A policy that serves every model is asked
-    /// for with the empty model id, which the bindings of every model
-    /// alone match.
+    /// ([`Place::NotAlone`]), [`Place::Unbound`] where no binding names
+    /// the model for the phase, and [`Place::NoSide`] where the binding
+    /// that names it plans no request of the phase. A policy that serves
+    /// every model is asked for with the empty model id, which the
+    /// bindings of every model alone match.
     ///
     /// Asked where the gateway builds the place's policy, and at no
     /// request: a policy's name finds nothing here.
@@ -447,8 +448,11 @@ mod tests {
             engine.place(MODEL, Phase::Decode),
             Place::Alone(_)
         ));
-        // The pair plan has no side for a single request.
-        assert_eq!(engine.place(MODEL, Phase::Single), Place::Unbound);
+        // The pair plan has no side for a single request, and none for an
+        // encode one: a binding names the model, so the place is not
+        // unbound.
+        assert_eq!(engine.place(MODEL, Phase::Single), Place::NoSide);
+        assert_eq!(engine.place(MODEL, Phase::Encode), Place::NoSide);
 
         for (filter, own) in [
             ("has-capacity", Phase::Prefill),

@@ -995,11 +995,16 @@ impl PolicyRegistry {
                     };
                     return Self::engine_object(asked, profile, name, &place);
                 }
-                (Place::Unbound, _) if supplied => warn!(
-                    "Model {model_id}: no binding of the policy document names it, \
-                     the classic policies place it"
-                ),
-                (Place::Unbound | Place::NotAlone { .. }, _) => {}
+                (Place::Unbound, _) if supplied => {
+                    warn!(
+                        "Model {model_id}: no binding of the policy document names it, \
+                         the classic policies place it"
+                    );
+                    Metrics::record_policy_unbound_model();
+                }
+                // A binding that plans no single request names the model: a
+                // pair's, whose requests the side policies place.
+                (Place::Unbound | Place::NoSide | Place::NotAlone { .. }, _) => {}
             }
         }
 
@@ -1093,6 +1098,14 @@ impl PolicyRegistry {
                 info!(
                     "Policy `{name}` of {place}: the classic policy decides it, \
                      no binding of the policy document names the place"
+                );
+                PolicyFactory::create_from_config(config)
+            }
+            Place::NoSide => {
+                info!(
+                    "Policy `{name}` of {place}: the classic policy decides it, \
+                     the binding of the policy document that names the place plans no {} request",
+                    phase.name()
                 );
                 PolicyFactory::create_from_config(config)
             }
