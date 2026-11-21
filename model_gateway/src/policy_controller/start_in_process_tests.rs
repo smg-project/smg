@@ -5,13 +5,13 @@
 use std::{error::Error, sync::Arc};
 
 use smg_policy_controller::{
-    document::{OverloadSpec, PlanName, PolicySpec, ShadowSpec},
+    document::{DecodePick, OverloadSpec, Pairing, PlanName, PolicySpec, ShadowSpec},
     engine::Phase,
     stages::Catalog,
 };
 
 use super::{start_in_process, would_start};
-use crate::config::{PolicyConfig, RouterConfig, RoutingMode};
+use crate::config::{PdPairingMode, PolicyConfig, RouterConfig, RoutingMode};
 
 type Case = Result<(), Box<dyn Error>>;
 
@@ -219,6 +219,58 @@ fn a_supplied_pair_binding_names_every_model_and_stands_alone() -> Case {
     assert_eq!(
         refusal(&supplied(document))?,
         not_run(2, "*", "plan", "an earlier binding plans the pair")
+    );
+    Ok(())
+}
+
+/// The document's own rules, apart from its bindings. The placement pairs
+/// by the routing settings' mode and picks a pair's decode with its
+/// prefill, and no decision is kept for explain: a supplied document that
+/// states one of them otherwise is refused by the field. A pair plan's rule
+/// in a document that plans no pair has no request, and states nothing.
+#[test]
+fn a_supplied_documents_own_rules_stop_the_start_by_field() -> Case {
+    let pair = || PolicySpec::pair_presets("round_robin", "round_robin");
+    let stated = |field: &str, because: &str| {
+        format!(
+            "the policy document states `{field}`, which is not run in this process yet: {because}"
+        )
+    };
+
+    let mut document = pair()?;
+    document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+    assert_eq!(
+        refusal(&supplied(document))?,
+        stated(
+            "plans.pd-pair.decode",
+            "a pair's decode is picked with its prefill"
+        )
+    );
+
+    let mut document = pair()?;
+    document.plans.pd_pair.pairing = Pairing::Strict;
+    assert_eq!(
+        refusal(&supplied(document.clone()))?,
+        stated("plans.pd-pair.pairing", BY_SETTINGS)
+    );
+    // The mode the routing settings state is the one the placement runs.
+    let strict = RouterConfig {
+        pd_pairing_mode: PdPairingMode::Strict,
+        ..supplied(document)
+    };
+    assert!(start_in_process(&strict, None)?.is_some());
+
+    // No binding plans a pair: the pair plan's rules have no request.
+    let mut document = PolicySpec::preset("round_robin")?;
+    document.plans.pd_pair.pairing = Pairing::Strict;
+    document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+    assert!(start_in_process(&supplied(document), None)?.is_some());
+
+    let mut document = PolicySpec::preset("round_robin")?;
+    document.explain.sample = 8;
+    assert_eq!(
+        refusal(&supplied(document))?,
+        stated("explain.sample", "no decision is kept for explain")
     );
     Ok(())
 }

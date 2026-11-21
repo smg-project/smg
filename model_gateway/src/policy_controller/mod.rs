@@ -152,6 +152,16 @@ pub(crate) enum StartError {
         field: &'static str,
         because: &'static str,
     },
+    /// The document its operator supplied states a rule of its own, apart
+    /// from its bindings, that nothing in this process would run
+    /// ([`rule_not_run`]): the start names the field.
+    #[error(
+        "the policy document states `{field}`, which is not run in this process yet: {because}"
+    )]
+    FieldNotRun {
+        field: &'static str,
+        because: &'static str,
+    },
 }
 
 /// What a start in this process leaves it ([`start_in_process`]): the
@@ -366,13 +376,20 @@ fn engine_for(
 /// would a binding of some models that covers a side's phase, in a
 /// gateway that places pairs: the side's policy places those models'
 /// pair requests, whatever that binding says.
+///
+/// The document's own rules stand beside its bindings'. The placement
+/// pairs a prefill with a decode by the routing settings' mode and picks a
+/// pair's decode with its prefill, and nothing here keeps a decision for
+/// explain. So a pair plan's `pairing` other than the settings' mode, a
+/// pair plan's `decode: after-prefill` and an `explain.sample` other than
+/// zero are refused by the field ([`StartError::FieldNotRun`]).
 fn rule_not_run(config: &RouterConfig, document: &PolicySpec) -> Result<(), StartError> {
     use smg_policy_controller::{
-        document::{BindingSpec, PlanName},
+        document::{BindingSpec, DecodePick, Pairing, PlanName},
         engine::Phase,
     };
 
-    use crate::config::RoutingMode;
+    use crate::config::{PdPairingMode, RoutingMode};
 
     const BY_SETTINGS: &str = "the gateway's placement runs the routing settings' own";
     const ONE_A_SIDE: &str = "one policy places each side of a pair, for every model";
@@ -424,6 +441,28 @@ fn rule_not_run(config: &RouterConfig, document: &PolicySpec) -> Result<(), Star
         {
             return Err(refused("match.phase", SINGLE_ALONE));
         }
+    }
+    // The document's own rules. A pair plan's rules have a request only
+    // where a binding plans the pair.
+    let stated = |field, because| StartError::FieldNotRun { field, because };
+    if pair_planned {
+        let by_settings = match config.pd_pairing_mode {
+            PdPairingMode::Off => Pairing::Off,
+            PdPairingMode::Lenient => Pairing::Lenient,
+            PdPairingMode::Strict => Pairing::Strict,
+        };
+        if document.plans.pd_pair.pairing != by_settings {
+            return Err(stated("plans.pd-pair.pairing", BY_SETTINGS));
+        }
+        if document.plans.pd_pair.decode != DecodePick::WithPrefill {
+            return Err(stated(
+                "plans.pd-pair.decode",
+                "a pair's decode is picked with its prefill",
+            ));
+        }
+    }
+    if document.explain.sample != 0 {
+        return Err(stated("explain.sample", "no decision is kept for explain"));
     }
     Ok(())
 }
