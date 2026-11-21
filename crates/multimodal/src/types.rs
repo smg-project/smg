@@ -230,7 +230,7 @@ pub struct ImageFrame {
     minimax_sglang_resize: bool,
     /// The orientation tag the header read found, for the decode to apply
     /// without a second parse of the header.
-    header_orientation: Option<image::metadata::Orientation>,
+    pub(crate) header_orientation: Option<image::metadata::Orientation>,
 }
 
 /// Decoded audio payload captured by the media connector.
@@ -547,9 +547,9 @@ impl ImageFrame {
     /// Hand the decode the orientation tag the header read found.
     pub(crate) fn with_header_orientation(
         mut self,
-        orientation: image::metadata::Orientation,
+        orientation: Option<image::metadata::Orientation>,
     ) -> Self {
-        self.header_orientation = Some(orientation);
+        self.header_orientation = orientation;
         self
     }
 

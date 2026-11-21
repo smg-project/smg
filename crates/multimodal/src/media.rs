@@ -994,7 +994,7 @@ impl MediaConnector {
         Ok(Arc::new(
             ImageFrame::encoded(bytes, detail, source, hash, size, max_long_side_pixel)
                 .with_transparency(transparency)
-                .with_header_orientation(orientation),
+                .with_header_orientation(Some(orientation)),
         ))
     }
 
