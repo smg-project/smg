@@ -3,7 +3,15 @@
 //! requests each) and the RAII guard that holds a request's load, keyed or
 //! not, until the request ends.
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
+
+use dashmap::mapref::entry::Entry;
 
 use crate::{
     identity::{basic::Worker, endpoint::Endpoint},
@@ -13,6 +21,9 @@ use crate::{
 pub struct WorkerRoutingKeyLoad {
     url: String,
     active_routing_keys: dashmap::DashMap<String, usize>,
+    /// How many keys the map holds. The map's own length locks every shard
+    /// (four a CPU), and every keyed request reads the count twice.
+    active_keys: AtomicUsize,
 }
 
 impl WorkerRoutingKeyLoad {
@@ -20,11 +31,12 @@ impl WorkerRoutingKeyLoad {
         Self {
             url: url.into(),
             active_routing_keys: dashmap::DashMap::new(),
+            active_keys: AtomicUsize::new(0),
         }
     }
 
     pub fn value(&self) -> usize {
-        self.active_routing_keys.len()
+        self.active_keys.load(Ordering::Relaxed)
     }
 
     /// In-flight requests for one routing key.
@@ -40,12 +52,15 @@ impl WorkerRoutingKeyLoad {
         // the key's first request, after the lookup has let its shard go.
         match self.active_routing_keys.get_mut(routing_key) {
             Some(mut count) => *count += 1,
-            None => {
-                *self
-                    .active_routing_keys
-                    .entry(routing_key.to_string())
-                    .or_insert(0) += 1;
-            }
+            None => match self.active_routing_keys.entry(routing_key.to_string()) {
+                Entry::Occupied(mut count) => *count.get_mut() += 1,
+                Entry::Vacant(slot) => {
+                    // Counted under the key's shard lock, so the key's
+                    // removal can never be counted first.
+                    self.active_keys.fetch_add(1, Ordering::Relaxed);
+                    slot.insert(1);
+                }
+            },
         }
         self.update_metrics();
     }
@@ -56,13 +71,17 @@ impl WorkerRoutingKeyLoad {
         // request. What the count was is kept for the warnings, which are
         // written once the shard is released.
         let mut before = None;
-        self.active_routing_keys
+        let removed = self
+            .active_routing_keys
             .remove_if_mut(routing_key, |_, count| {
                 let was = *count;
                 before = Some(was);
                 *count = was.saturating_sub(1);
                 was == 1
             });
+        if removed.is_some() {
+            self.active_keys.fetch_sub(1, Ordering::Relaxed);
+        }
         match before {
             Some(1..) => {}
             Some(0) => {
@@ -254,6 +273,51 @@ mod tests {
         load.decrement("key-1");
         assert_eq!(load.value(), 0);
         assert_eq!(load.active_routing_keys.len(), 0);
+    }
+
+    #[test]
+    fn test_worker_routing_key_load_value_takes_no_shard_lock() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let load = WorkerRoutingKeyLoad::new("http://test:8000");
+        load.increment("key1");
+
+        // A held entry keeps its shard locked, as a request on another
+        // thread does while it counts itself in.
+        let held = load.active_routing_keys.get_mut("key1");
+        let (tx, rx) = mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| tx.send(load.value()));
+            let read = rx.recv_timeout(Duration::from_secs(10));
+            drop(held);
+            assert_eq!(read, Ok(1));
+        });
+    }
+
+    #[test]
+    fn test_worker_routing_key_load_count_matches_map_after_churn() {
+        use std::thread;
+
+        let load = WorkerRoutingKeyLoad::new("http://test:8000");
+        load.increment("held");
+
+        // Eight threads count four shared keys in and out, so a key's
+        // first request races another's and a removal races a re-insert.
+        thread::scope(|scope| {
+            for thread_index in 0..8 {
+                let load = &load;
+                scope.spawn(move || {
+                    for round in 0..2_000 {
+                        let key = format!("key{}", (round + thread_index) % 4);
+                        load.increment(&key);
+                        load.decrement(&key);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(load.value(), 1);
+        assert_eq!(load.active_routing_keys.len(), 1);
     }
 
     #[test]
