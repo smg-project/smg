@@ -1,11 +1,17 @@
 //! The prompt facts an attempt keeps for its asks to the controller.
 
-use smg_policy_controller::engine::{HashSeeds, PromptHashes};
+use std::fmt;
+
+use smg_policy_controller::engine::{HashSeeds, PromptHashes, PromptLent};
 
 use crate::policies::CacheNamespace;
 
-/// What an attempt states of its prompt, for the cache index.
-#[derive(Clone, Copy, Debug, Default)]
+/// What an attempt states of its prompt: what its hashes are made of, for
+/// the cache index, and what the engine of this process is lent
+/// ([`Ask::prompt`](super::Ask::prompt)). Its `Debug` prints sizes alone,
+/// as the lent prompt's does: an ask that is printed shows no token id and
+/// no text of a request.
+#[derive(Clone, Copy, Default)]
 pub(crate) struct Prompt<'a> {
     /// The prompt's token ids, where the router tokenized it.
     pub tokens: Option<&'a [u32]>,
@@ -14,6 +20,16 @@ pub(crate) struct Prompt<'a> {
     pub text: Option<&'a str>,
     /// The request's cache partition, where it has one.
     pub namespace: Option<CacheNamespace>,
+}
+
+impl fmt::Debug for Prompt<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Prompt")
+            .field("tokens", &self.tokens.map(<[u32]>::len))
+            .field("text_bytes", &self.text.map(str::len))
+            .field("partitioned", &self.namespace.is_some())
+            .finish()
+    }
 }
 
 impl<'a> Prompt<'a> {
@@ -25,6 +41,16 @@ impl<'a> Prompt<'a> {
             tokens,
             text: None,
             namespace,
+        }
+    }
+
+    /// The prompt as the engine of this process is lent it: the same three
+    /// facts, borrowed for one decision.
+    pub(super) const fn lent(&self) -> PromptLent<'a> {
+        PromptLent {
+            tokens: self.tokens,
+            text: self.text,
+            namespace: self.namespace,
         }
     }
 

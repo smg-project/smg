@@ -511,6 +511,54 @@ async fn a_pool_with_no_ready_worker_leaves_the_attempt_none() {
     }
 }
 
+/// An ask's maker lends the engine the prompt its route stated, fact for
+/// fact, and lends none where the route stated none. The ask is printed by
+/// the prompt's sizes: no token id and no text of the request.
+#[test]
+fn a_maker_lends_the_prompt_its_ask_states() {
+    let tokens = [11_u32, 12, 13];
+    let prompt = Prompt {
+        tokens: Some(&tokens),
+        text: Some("the request's own words"),
+        namespace: None,
+    };
+    let lends = |ask: &Ask<'_>| {
+        let made = Made {
+            ask,
+            missed: &[],
+            members: None,
+            loads: None,
+            source: Cell::new(None),
+        };
+        // The loan ends with the maker: its facts are copied out to read.
+        made.prompt().map(|lent| {
+            (
+                lent.tokens.map(<[u32]>::to_vec),
+                lent.text.map(str::to_owned),
+                lent.namespace.is_some(),
+            )
+        })
+    };
+    let id = mark();
+    let stated = Ask {
+        prompt: Some(&prompt),
+        ..Ask::of(&id, MODEL)
+    };
+    let words = "the request's own words".to_owned();
+    assert_eq!(
+        lends(&stated),
+        Some((Some(tokens.to_vec()), Some(words), false))
+    );
+    assert_eq!(lends(&Ask::of(&id, MODEL)), None);
+
+    let printed = format!("{stated:?}");
+    assert!(
+        printed.contains("Prompt { tokens: Some(3), text_bytes: Some(23), partitioned: false }"),
+        "{printed}"
+    );
+    assert!(!printed.contains("own words"), "{printed}");
+}
+
 /// The place in `workers` of the worker a regular attempt with the prompt
 /// `tokens` is placed on.
 async fn placed_on(
@@ -518,11 +566,13 @@ async fn placed_on(
     workers: &[Arc<dyn Worker>],
     tokens: &[u32],
 ) -> usize {
-    let hashes = policy_engine.hashes(MODEL, &Prompt::of(Some(tokens), None));
+    let prompt = Prompt::of(Some(tokens), None);
+    let hashes = policy_engine.hashes(MODEL, &prompt);
     let id = mark();
     let ask = Ask {
         pool: Some(RoutingPool::HttpRegular),
         hashes: Some(&hashes),
+        prompt: Some(&prompt),
         ..Ask::of(&id, MODEL)
     };
     let placed = policy_engine.place(&ask, Instant::now()).await;

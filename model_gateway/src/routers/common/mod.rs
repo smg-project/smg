@@ -461,11 +461,13 @@ pub mod bench_support {
                 WireModes::GRPC.union(WireModes::ZMQ),
             ),
         };
-        let hashes = object.0.hashes(model, &Prompt::of(tokens, None));
+        let prompt = Prompt::of(tokens, None);
+        let hashes = object.0.hashes(model, &prompt);
         let id = mark();
         let ask = Ask {
             wires,
             hashes: Some(&hashes),
+            prompt: Some(&prompt),
             pool: Some(pool),
             ..Ask::of(&id, model)
         };
