@@ -19,7 +19,10 @@ use llm_tokenizer::{
 };
 use serde::{Deserialize, Serialize};
 use smg_grpc_client::{tokenizer_bundle, tokenizer_bundle::StreamBundle};
-use smg_worker::identity::basic::{ConnectionMode, Worker};
+use smg_worker::{
+    identity::basic::{ConnectionMode, Worker},
+    worker::WorkerStatus,
+};
 use tracing::{debug, error, info, warn};
 use wfaas::{
     BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId, StepResult,
@@ -525,24 +528,38 @@ fn try_load_multimodal_config(tokenizer_dir: &std::path::Path) -> Option<Multimo
     ))
 }
 
-/// Fetch a tokenizer from a healthy gRPC worker when local loading fails.
+/// Lists the model's ready gRPC workers, then its pending ones. A newly
+/// registered worker can serve its tokenizer before health checks promote it.
+fn tokenizer_workers(registry: &WorkerRegistry, model_id: &str) -> Vec<Arc<dyn Worker>> {
+    let mut ready = Vec::new();
+    let mut pending = Vec::new();
+    for worker in registry.get_by_model(model_id).iter() {
+        if *worker.connection_mode() != ConnectionMode::Grpc {
+            continue;
+        }
+        match worker.status() {
+            WorkerStatus::Ready => ready.push(Arc::clone(worker)),
+            WorkerStatus::Pending => pending.push(Arc::clone(worker)),
+            WorkerStatus::NotReady | WorkerStatus::Failed | WorkerStatus::Draining => {}
+        }
+    }
+    ready.extend(pending);
+    ready
+}
+
+/// Fetch a tokenizer from a serving gRPC worker when local loading fails,
+/// trying sources in the order returned by [`tokenizer_workers`].
 async fn fetch_tokenizer_from_worker(
     app_context: &AppContext,
     tokenizer_id: &str,
     model_id: &str,
     chat_template_path: Option<&str>,
 ) -> Result<Arc<dyn Tokenizer>, String> {
-    let workers = app_context.worker_registry.get_workers_filtered(
-        Some(model_id),
-        None,
-        Some(ConnectionMode::Grpc),
-        None,
-        true,
-    );
+    let workers = tokenizer_workers(&app_context.worker_registry, model_id);
 
     if workers.is_empty() {
         return Err(format!(
-            "No healthy gRPC worker available to fetch tokenizer for model '{model_id}'"
+            "No ready or pending gRPC worker available to fetch tokenizer for model '{model_id}'"
         ));
     }
 
@@ -582,7 +599,7 @@ async fn fetch_tokenizer_from_worker(
 
     let failures_summary = failures.join("; ");
     Err(format!(
-        "Failed to fetch tokenizer for model '{model_id}' from {worker_count} healthy gRPC worker(s): {failures_summary}"
+        "Failed to fetch tokenizer for model '{model_id}' from {worker_count} ready or pending gRPC worker(s): {failures_summary}"
     ))
 }
 
@@ -759,6 +776,24 @@ mod tests {
         app_context::testing::app_context_for_tests, config::RouterConfig,
         routers::grpc::backend_client::BasicWorkerBuilder,
     };
+
+    #[test]
+    fn tokenizer_sources_prefer_ready_and_skip_unhealthy_workers() {
+        use WorkerStatus::{Draining, Failed, NotReady, Pending, Ready};
+
+        let registry = WorkerRegistry::new();
+        for status in [Failed, Pending, Draining, NotReady, Ready] {
+            let worker = BasicWorkerBuilder::new(format!("grpc://{status}:30000"))
+                .model(ModelCard::new("m"))
+                .connection_mode(ConnectionMode::Grpc)
+                .status(status)
+                .build();
+            registry.register(Arc::new(worker)).unwrap();
+        }
+        let workers = tokenizer_workers(&registry, "m");
+        let statuses: Vec<_> = workers.iter().map(|worker| worker.status()).collect();
+        assert_eq!(statuses, [Ready, Pending]);
+    }
 
     #[test]
     fn worker_tokenizer_bundle_preserves_configured_template() {
