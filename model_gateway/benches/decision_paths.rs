@@ -56,6 +56,18 @@
 //! template's head is, and the rest are the prompt's own. `1`, the default,
 //! sends one prompt over and over.
 //!
+//! `--grow N` makes each caller hold a conversation: every request carries
+//! the conversation so far and `N` tokens more, from 1,024 tokens up to
+//! 2,048, and then the caller begins another behind the head every prompt
+//! shares. `0`, the default, sends the prompts in turn. The result line
+//! then counts the turns that carried a conversation on (`turns`) and those
+//! placed on the worker the turn before went to (`returned`), with their
+//! share (`return_rate`): what a policy that places by the prompt's prefix
+//! holds a conversation to. A policy with no memory of the prompt returns
+//! by chance, one turn in the fleet's size, and by its load reports where
+//! the cell publishes them: a cell read for this column also runs with
+//! `--reports false`.
+//!
 //! `--publish-ms N` publishes the fleet's reports again, as a new load
 //! snapshot, every `N` milliseconds while the callers run: the load monitor
 //! publishes pushed reports at most once in 20 milliseconds. `0`, the
@@ -91,7 +103,7 @@ use std::{
     collections::HashMap,
     hint::black_box,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Barrier,
     },
     thread,
@@ -175,6 +187,9 @@ struct Cell {
     /// the callers run; `0` for the one publication before the first
     /// request.
     publish_ms: u64,
+    /// The tokens a request adds to its caller's conversation; `0` for the
+    /// prompts in turn.
+    grow: usize,
 }
 
 fn cell() -> Cell {
@@ -194,6 +209,7 @@ fn cell() -> Cell {
         keys: 0,
         prompts: 1,
         publish_ms: 0,
+        grow: 0,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -226,6 +242,7 @@ fn cell() -> Cell {
             "--keys" => cell.keys = value.parse().unwrap(),
             "--prompts" => cell.prompts = value.parse().unwrap(),
             "--publish-ms" => cell.publish_ms = value.parse().unwrap(),
+            "--grow" => cell.grow = value.parse().unwrap(),
             other => panic!("no flag {other}"),
         }
     }
@@ -376,8 +393,10 @@ fn reports(fleet: &[Arc<dyn Worker>]) -> Vec<(Arc<dyn Worker>, WorkerLoadRespons
 
 /// A path's one routing call, shared by the callers: the request's tokens
 /// and its turn among its caller's requests, which names its model and its
-/// routing key.
-type Routing = Box<dyn Fn(&[u32], u64) -> bool + Send + Sync>;
+/// routing key. It hands back the worker the request went to, as a number
+/// a caller compares with its last request's, and `None` where the request
+/// had no worker.
+type Routing = Box<dyn Fn(&[u32], u64) -> Option<usize> + Send + Sync>;
 
 /// The header a routing key travels in.
 const ROUTING_KEY: &str = "x-smg-routing-key";
@@ -413,6 +432,53 @@ fn prompts(prompts: usize) -> Vec<Vec<u32>> {
                 .collect()
         })
         .collect()
+}
+
+/// A caller's conversation under `--grow`: every request carries the
+/// conversation so far and the tokens its turn adds. Past its full length
+/// the caller begins a new conversation behind the head every prompt shares.
+struct Conversation {
+    tokens: Vec<u32>,
+    len: usize,
+    /// The last token made: each is one more, from a start of the caller's
+    /// own, so no two callers' conversations hold the same block.
+    last: u32,
+    grow: usize,
+}
+
+impl Conversation {
+    /// A conversation's tokens at its first request, and at its last.
+    const BEGINS: usize = 1_024;
+    const FULL: usize = 2_048;
+
+    fn new(caller: u32, grow: usize) -> Self {
+        Self {
+            tokens: vec![0; Self::FULL],
+            len: 0,
+            last: (caller + 1) << 22,
+            grow,
+        }
+    }
+
+    /// The next request's tokens, and whether the request carries the
+    /// caller's last one on: `false` for a conversation's first request.
+    fn turn(&mut self) -> (&[u32], bool) {
+        let begins = self.len == 0 || self.len + self.grow > Self::FULL;
+        let (from, to) = if begins {
+            for (at, token) in self.tokens.iter_mut().enumerate().take(PROMPT_HEAD) {
+                *token = at as u32;
+            }
+            (PROMPT_HEAD, Self::BEGINS)
+        } else {
+            (self.len, self.len + self.grow)
+        };
+        for token in &mut self.tokens[from..to] {
+            self.last = self.last.wrapping_add(1);
+            *token = self.last;
+        }
+        self.len = to;
+        (&self.tokens[..to], !begins)
+    }
 }
 
 /// Who decides a cell's requests: the classic placement over a registry's
@@ -550,6 +616,10 @@ fn build(cell: &Cell) -> Built {
         !(pair && cell.keys != 0),
         "a pair cell sends no routing key"
     );
+    assert!(
+        !(cell.grow > 0 && cell.models > 1),
+        "a growing conversation is one model's"
+    );
     let keys = keyed_headers(cell.keys);
     let routing: Routing = Box::new(move |tokens, turn| {
         let model = &models[(turn % models.len() as u64) as usize];
@@ -592,7 +662,7 @@ fn main() {
     let warm = (cell.workers as u64 * 8).max(4_096) * cell.models.max(1) as u64;
     for turn in 0..warm {
         assert!(
-            routing(tokens_at(turn), turn),
+            routing(tokens_at(turn), turn).is_some(),
             "a fleet with a ready worker takes every request"
         );
     }
@@ -610,6 +680,8 @@ fn main() {
     let allocated = AtomicU64::new(0);
     let publications = AtomicU64::new(0);
     let published = AtomicBool::new(false);
+    let callers = AtomicU32::new(0);
+    let (turns, returned) = (AtomicU64::new(0), AtomicU64::new(0));
     let converted_before = conversions();
     let mut wall = Duration::ZERO;
     thread::scope(|scope| {
@@ -628,6 +700,12 @@ fn main() {
         }
         for _ in 0..cell.callers {
             scope.spawn(|| {
+                // A caller's own conversation, where the cell's requests
+                // grow, and the worker its last request went to.
+                let caller = callers.fetch_add(1, Ordering::Relaxed);
+                let mut conversation =
+                    (cell.grow > 0).then(|| Conversation::new(caller, cell.grow));
+                let mut last = None;
                 for turn in 0..CALLER_WARM * cell.models.max(1) as u64 {
                     black_box(routing(black_box(tokens_at(turn)), turn));
                 }
@@ -640,11 +718,23 @@ fn main() {
                     let allocated_before = thread_allocated_bytes();
                     let started = Instant::now();
                     let mut took_placed = 0u64;
-                    for turn in 0..decisions {
-                        took_placed += u64::from(black_box(routing(
-                            black_box(tokens_at(turn)),
-                            black_box(turn),
-                        )));
+                    if let Some(conversation) = &mut conversation {
+                        let (mut carried, mut back) = (0u64, 0u64);
+                        for turn in 0..decisions {
+                            let (tokens, carries) = conversation.turn();
+                            let went = black_box(routing(black_box(tokens), black_box(turn)));
+                            took_placed += u64::from(went.is_some());
+                            carried += u64::from(carries);
+                            back += u64::from(carries && went == last);
+                            last = went;
+                        }
+                        turns.fetch_add(carried, Ordering::Relaxed);
+                        returned.fetch_add(back, Ordering::Relaxed);
+                    } else {
+                        for turn in 0..decisions {
+                            let went = routing(black_box(tokens_at(turn)), black_box(turn));
+                            took_placed += u64::from(black_box(went).is_some());
+                        }
                     }
                     let took = started.elapsed();
                     if let (Some(before), Some(after)) =
@@ -683,8 +773,14 @@ fn main() {
     let per_second = total as f64 / wall.as_secs_f64();
     let nanos = busy.as_nanos() as f64 / total as f64;
     let allocated_each = allocated.into_inner() as f64 / total as f64;
+    let (turns, returned) = (turns.into_inner(), returned.into_inner());
+    let return_rate = if turns == 0 {
+        0.0
+    } else {
+        returned as f64 / turns as f64
+    };
     println!(
-        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} keys={} prompts={} publish_ms={} publications={} conversions={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
+        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} conversions={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
         cell.path,
         cell.route,
         cell.policy,
@@ -698,6 +794,10 @@ fn main() {
         cell.pair,
         cell.keys,
         cell.prompts,
+        cell.grow,
+        turns,
+        returned,
+        return_rate,
         cell.publish_ms,
         publications.into_inner(),
         conversions() - converted_before,

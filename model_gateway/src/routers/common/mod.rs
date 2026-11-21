@@ -309,6 +309,14 @@ pub mod bench_support {
         }
     }
 
+    /// The worker a route placed a request on, as a number a bench compares
+    /// with another request's: the place of the worker's object in memory,
+    /// which stands for as long as the worker is registered. Nothing else is
+    /// read of it.
+    fn placed_on(worker: &Arc<dyn Worker>) -> usize {
+        Arc::as_ptr(worker).addr()
+    }
+
     /// Hands the classic policies the load feed the monitor would publish.
     pub fn attach_loads(policies: &PolicyRegistry, loads: Option<LoadReceiver>) {
         policies.set_load_receiver(loads);
@@ -433,8 +441,8 @@ pub mod bench_support {
     /// the route's pool and the commit of the first target the gateway can
     /// send to, the dispatch-time read of the chosen worker's overload
     /// veto, the dispatch's word, the worker's load guard from the send to
-    /// the request's end, and the end's word. `false` where the request had
-    /// no worker.
+    /// the request's end, and the end's word. The worker the request went
+    /// to ([`placed_on`]), and `None` where it had no worker.
     ///
     /// What [`route_classic`] does under a classic policy, with the engine
     /// deciding the whole request through the object the routers hold: no
@@ -445,7 +453,7 @@ pub mod bench_support {
         model: &str,
         route: Route,
         tokens: Option<&[u32]>,
-    ) -> bool {
+    ) -> Option<usize> {
         let (pool, wires) = match route {
             Route::Http => (RoutingPool::HttpRegular, WireModes::NONE),
             Route::Grpc => (
@@ -469,7 +477,7 @@ pub mod bench_support {
             .place_where(&ask, |worker| pool.matches(worker), now));
         let Poll::Ready(Ok(mut placed)) = placing.poll(&mut Context::from_waker(Waker::noop()))
         else {
-            return false;
+            return None;
         };
         let shed = overload::shed_if_worker_overloaded(
             placed.worker().as_ref(),
@@ -477,7 +485,7 @@ pub mod bench_support {
             registry.overload_shed_enabled(),
         );
         if shed.is_some() {
-            return false;
+            return None;
         }
         placed.dispatched(now);
         let guard = WorkerLoadGuard::with_key(Arc::clone(placed.worker()), None);
@@ -493,7 +501,7 @@ pub mod bench_support {
             },
             now,
         );
-        true
+        Some(placed_on(placed.worker()))
     }
 
     /// One request's routing under the classic policies on `route`: the
@@ -502,7 +510,8 @@ pub mod bench_support {
     /// send to the request's end, whose drop tells the model's policy.
     /// `headers` are the request's, where it carries any: a routing key is
     /// read from them as a router reads it, for the placement and for the
-    /// load guard. `false` where the request had no worker.
+    /// load guard. The worker the request went to ([`placed_on`]), and
+    /// `None` where it had no worker.
     pub fn route_classic(
         registry: &WorkerRegistry,
         policies: &PolicyRegistry,
@@ -510,40 +519,40 @@ pub mod bench_support {
         route: Route,
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
-    ) -> bool {
+    ) -> Option<usize> {
         let pool = route.pool();
         let inputs = PlacementInputs {
             tokens,
             headers,
             ..Default::default()
         };
-        let Some(worker) = select_single(registry, policies, model, pool, None, inputs) else {
-            return false;
-        };
+        let worker = select_single(registry, policies, model, pool, None, inputs)?;
         let shed = overload::shed_if_worker_overloaded(
             worker.as_ref(),
             model,
             registry.overload_shed_enabled(),
         );
         if shed.is_some() {
-            return false;
+            return None;
         }
+        let went = placed_on(&worker);
         let guard = WorkerLoadGuard::with_key(worker, policies.sticky_key(headers, None));
         drop(guard);
-        true
+        Some(went)
     }
 
     /// One request's routing through a pair gateway's classic placement
     /// on the gRPC wire: the pair index of the model's snapshot, the pair
     /// placed over it by the registry's two side policies, and each side's
-    /// load guard from the send to the request's end. `false` where the
-    /// request had no pair.
+    /// load guard from the send to the request's end. The prefill worker
+    /// the request went to ([`placed_on`]), and `None` where it had no
+    /// pair.
     pub fn route_pair(
         registry: &WorkerRegistry,
         policies: &PolicyRegistry,
         model: &str,
         tokens: Option<&[u32]>,
-    ) -> bool {
+    ) -> Option<usize> {
         let pairs = registry
             .get_routing_snapshot(model)
             .pd_pairs(PdWire::Grpc, policies.pd_pairing_mode());
@@ -551,13 +560,12 @@ pub mod bench_support {
             tokens,
             ..Default::default()
         };
-        let Ok(pair) = select_pair(registry, policies, model, &pairs, None, None, inputs) else {
-            return false;
-        };
+        let pair = select_pair(registry, policies, model, &pairs, None, None, inputs).ok()?;
+        let went = placed_on(&pair.prefill);
         let prefill = WorkerLoadGuard::with_key(pair.prefill, policies.sticky_key(None, None));
         let decode = WorkerLoadGuard::with_key(pair.decode, policies.sticky_key(None, None));
         drop((prefill, decode));
-        true
+        Some(went)
     }
 
     /// The policy engine of one routing policy, asked for its whole
@@ -619,8 +627,8 @@ pub mod bench_support {
     /// worker's overload veto, and the worker's load guard from the send to
     /// the request's end. `headers` are the request's, where it carries
     /// any: its routing key is read from them by the sources its binding
-    /// names, as a router's ask reads it. `false` where the request had no
-    /// worker.
+    /// names, as a router's ask reads it. The worker the request went to
+    /// ([`placed_on`]), and `None` where it had no worker.
     ///
     /// What [`route_classic`] does under a classic policy, with the engine
     /// deciding: no classic policy and no classic placement pass runs.
@@ -631,7 +639,7 @@ pub mod bench_support {
         route: Route,
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
-    ) -> bool {
+    ) -> Option<usize> {
         let pool = route.pool();
         // The decision's instant is read before its snapshot is borrowed: a
         // decision that began later holds a snapshot no older.
@@ -677,15 +685,9 @@ pub mod bench_support {
             &mut facts,
             &Constraints::default(),
         );
-        let Some(pick) = decision.pick() else {
-            return false;
-        };
-        let Some(target) = pick.targets.first() else {
-            return false;
-        };
-        let Some(worker) = workers.get(target.position as usize) else {
-            return false;
-        };
+        let pick = decision.pick()?;
+        let target = pick.targets.first()?;
+        let worker = workers.get(target.position as usize)?;
         // The engine's stages hear the request as a gateway's guard tells
         // it: its issue and its dispatch here, its end below.
         let stages = spec.engine();
@@ -707,7 +709,7 @@ pub mod bench_support {
             registry.overload_shed_enabled(),
         );
         if shed.is_some() {
-            return false;
+            return None;
         }
         let guard = WorkerLoadGuard::with_key(Arc::clone(worker), key.plain);
         drop(guard);
@@ -724,7 +726,7 @@ pub mod bench_support {
                 duration_micros: 0,
             },
         );
-        true
+        Some(placed_on(worker))
     }
 
     /// Whether a process switch captures every request's cache trace
