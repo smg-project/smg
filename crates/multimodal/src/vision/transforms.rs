@@ -2560,19 +2560,19 @@ pub fn resize_bicubic_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> Dynam
     resize_pil_image(image, out_w, out_h, PilResizeFilter::Bicubic)
 }
 
-/// `image` as RGB8, resized the way Pillow resizes it with `filter`.
+/// `image` as RGB8 (read where it stands when it already is), resized the
+/// way Pillow resizes it with `filter`.
 fn resize_pil_image(
     image: &DynamicImage,
     out_w: u32,
     out_h: u32,
     filter: PilResizeFilter,
 ) -> DynamicImage {
-    let rgb = image.to_rgb8();
-    let (in_w, in_h) = rgb.dimensions();
+    let (in_w, in_h, rgb) = rgb_bytes(image);
     let output = resize_pil_bytes::<3>(
-        rgb.as_raw(),
-        in_w,
-        in_h,
+        &rgb,
+        in_w as u32,
+        in_h as u32,
         out_w,
         out_h,
         filter,
@@ -2748,23 +2748,7 @@ pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> Dynam
 /// interpolation, and so what an image processor that resizes the decoded
 /// image before converting it to a tensor runs.
 pub fn resize_bilinear_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let (in_w, in_h, rgb) = rgb_bytes(image);
-    let output = resize_pil_bytes::<3>(
-        &rgb,
-        in_w as u32,
-        in_h as u32,
-        out_w,
-        out_h,
-        PilResizeFilter::Bilinear,
-        KernelQuantization::Pillow,
-    );
-    #[expect(
-        clippy::expect_used,
-        reason = "output is exactly out_w*out_h*3 bytes by construction"
-    )]
-    DynamicImage::ImageRgb8(
-        RgbImage::from_raw(out_w, out_h, output).expect("pil resize buffer size"),
-    )
+    resize_pil_image(image, out_w, out_h, PilResizeFilter::Bilinear)
 }
 
 /// `data` (`in_w` x `in_h` interleaved pixels of `C` channels) resampled to
