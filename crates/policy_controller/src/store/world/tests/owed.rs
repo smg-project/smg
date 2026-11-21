@@ -13,11 +13,11 @@ use super::{
     stalled, status, view, Classes, ViewBuffers, ASKER, MODEL, PUBLISH_WINDOW,
 };
 use crate::{
+    engine::view::{Role, WorkerId},
     store::{
         HealthSink, Kinds, LoadSink, LoadSource, MemoryStore, Position, WorkerFacts, WorkerStatus,
         WorkersStore,
     },
-    view::{Role, WorkerId},
 };
 
 fn worker(index: usize) -> WorkerFacts {

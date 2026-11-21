@@ -108,12 +108,16 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     affinity::WarmRule,
-    counts::{Counts, KeptCounts, LentCounts, Slot},
-    demands::DemandFacts,
-    framework::{Engine, OverloadThresholds, PairPools, PairTable},
-    lease::{Lifecycle, Signal},
-    signals::{SignalCell, SignalCells},
-    spec::{AppliedSpec, IndexKind, Listed, Pairing},
+    document::spec::{AppliedSpec, IndexKind, Listed, Pairing},
+    engine::{
+        demands::DemandFacts,
+        framework::{Engine, OverloadThresholds, PairPools, PairTable},
+        view::{
+            fingerprint, AffinityFacts, Candidate, Engines, HashKind, Health, NamedHolder,
+            OverloadRegime, Phase, PoolFacts, Role, WireModes, WorkerId,
+        },
+    },
+    load::signals::{SignalCell, SignalCells},
     store::{
         encoding::{EncodeClasses, EncodeHandoff, EncodeMember},
         health::LeaderBits,
@@ -123,9 +127,9 @@ use crate::{
         workers::{Overload, Reachability, WorkerFacts, WorkerRow, WorkerStatus},
         GatewayId,
     },
-    view::{
-        fingerprint, AffinityFacts, Candidate, Engines, HashKind, Health, NamedHolder,
-        OverloadRegime, Phase, PoolFacts, Role, WireModes, WorkerId,
+    tracking::{
+        counts::{Counts, KeptCounts, LentCounts, Slot},
+        lease::{Lifecycle, Signal},
     },
     EncodePool, EncoderFacts,
 };
@@ -1928,7 +1932,7 @@ impl World {
     /// Holds the holders just named for `view` ([`World::name`] or
     /// [`World::name_cut`], by the same `naming`, into `named`) to the
     /// test the decision's pass asks of a row
-    /// ([`Engine::keeps_for`](crate::framework::Engine::keeps_for)), where
+    /// ([`Engine::keeps_for`](crate::engine::framework::Engine::keeps_for)), where
     /// they fill the naming's cap. A naming shorter than its cap holds
     /// every holder the index has, and one under no cap names them all: no
     /// lookup made again reads another, so neither is asked anything and
@@ -3126,7 +3130,7 @@ impl Writer {
     /// binding the pool is decided under, which is the first to match its
     /// model and its role's phase, or the model's pair binding for a
     /// decode pool
-    /// ([`Engine::pool_binding`](crate::framework::Engine::pool_binding)).
+    /// ([`Engine::pool_binding`](crate::engine::framework::Engine::pool_binding)).
     /// Whether any pool has a pair.
     fn bind(&mut self) -> bool {
         let Self {
@@ -4960,7 +4964,7 @@ fn put_read(
 /// `spec`, by the pool's model and its role's phase: as a request of that
 /// phase asked alone resolves its profile, not by the pair binding a decode
 /// pool's thresholds take
-/// ([`Engine::pool_binding`](crate::framework::Engine::pool_binding)). The
+/// ([`Engine::pool_binding`](crate::engine::framework::Engine::pool_binding)). The
 /// hand names rows for such a request alone; a pair's sides read their
 /// columns. `None` where the profile's warm-up stages rule by different
 /// numbers: it is named no rows.
@@ -4972,7 +4976,7 @@ fn ruling_of(spec: &AppliedSpec, model: &str, rows: &[Candidate]) -> Option<Warm
 /// The tree's placement bound for a pool that keeps a record of sent
 /// prefixes: its profile reads them, or its binding's shadow does where
 /// that profile is named no row
-/// ([`Engine::pool_record_for`](crate::framework::Engine::pool_record_for)).
+/// ([`Engine::pool_record_for`](crate::engine::framework::Engine::pool_record_for)).
 fn predict_of(
     spec: &AppliedSpec,
     kv: &KvTables,

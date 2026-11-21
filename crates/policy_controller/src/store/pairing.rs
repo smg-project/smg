@@ -46,9 +46,11 @@ use std::{
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::{
-    framework::PairTable,
-    spec::Pairing,
-    view::{WireModes, WorkerId},
+    document::spec::Pairing,
+    engine::{
+        framework::PairTable,
+        view::{WireModes, WorkerId},
+    },
 };
 
 #[cfg(test)]

@@ -23,9 +23,9 @@ use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    lease::{LeaseId, Lifecycle, Membership, Outcome, ReleaseReason, Side, TransportClass},
-    signals::{SignalCell, SignalColumn},
-    spec::AppliedSpec,
+    document::spec::AppliedSpec,
+    engine::view::{LoadRow, Role, Session, WorkerId, REPORT_CLOCK_HISTORY_MS},
+    load::signals::{SignalCell, SignalColumn},
     store::{
         health::{HealthSink, HealthWrite, LeaderBits, VetoWrite},
         index::{indexed_under, KvEvent, KvTables, LaneCounts, LaneWriter},
@@ -50,7 +50,9 @@ use crate::{
         },
         GatewayId,
     },
-    view::{LoadRow, Role, Session, WorkerId, REPORT_CLOCK_HISTORY_MS},
+    tracking::lease::{
+        LeaseId, Lifecycle, Membership, Outcome, ReleaseReason, Side, TransportClass,
+    },
 };
 
 mod blocks;
@@ -4870,7 +4872,7 @@ impl MemoryStore {
 impl MemoryStore {
     /// The store with a file of leases a decider, for a host that decides
     /// on `deciders` threads and names them
-    /// ([`crate::decider::Decider`]): each decider issues into its own
+    /// ([`crate::engine::decider::Decider`]): each decider issues into its own
     /// file under its own turn, and a lease's events are told under the
     /// name of the decider whose file it is on. The files start empty,
     /// under the store's term, and keep the word to the engine and the
@@ -5319,7 +5321,11 @@ impl LeasesStore for MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{decider::Decider, lease::Lease, store::leases::Picked, view::WorkerId};
+    use crate::{
+        engine::{decider::Decider, view::WorkerId},
+        store::leases::Picked,
+        tracking::lease::Lease,
+    };
 
     #[test]
     fn the_lease_sweep_takes_only_a_file_with_a_due_lease() {

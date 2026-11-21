@@ -1640,6 +1640,10 @@ class CountingServer(FakeServer):
         return count
 
 
+# A wait timed on a large monotonic clock can come out a rounding step under its bound.
+_CLOCK_SLACK = 1e-6
+
+
 def _drain_time(server, engine, drain_secs, linger_secs=0.0):
     async def run():
         loop = asyncio.get_running_loop()
@@ -1664,7 +1668,11 @@ def test_drain_waits_for_in_flight_streams_and_ends_when_they_finish():
 
 
 def test_drain_lingers_after_the_last_stream_within_the_bound():
-    assert 0.2 <= _drain_time(CountingServer([0]), FakeEngine(), 30.0, linger_secs=0.2) < 1.0
+    assert (
+        0.2 - _CLOCK_SLACK
+        <= _drain_time(CountingServer([0]), FakeEngine(), 30.0, linger_secs=0.2)
+        < 1.0
+    )
     # The linger never stretches the bound.
     assert _drain_time(CountingServer([1, 0]), FakeEngine(), 0.05, linger_secs=5.0) < 0.5
 
@@ -1685,14 +1693,14 @@ def test_the_linger_ends_when_the_engine_exits(caplog):
 
     with caplog.at_level(logging.WARNING, logger=rust_lifecycle.logger.name):
         failed, elapsed = asyncio.run(run())
-    assert failed and 0.1 <= elapsed < 1.0
+    assert failed and 0.1 - _CLOCK_SLACK <= elapsed < 1.0
     assert "Engine exited with code -9 during drain" in caplog.text
 
 
 def test_drain_stops_at_the_bound_and_warns_with_the_streams_it_cuts(caplog):
     with caplog.at_level(logging.WARNING, logger=rust_lifecycle.logger.name):
         elapsed = _drain_time(CountingServer([3]), FakeEngine(), drain_secs=0.1)
-    assert 0.1 <= elapsed < 1.0
+    assert 0.1 - _CLOCK_SLACK <= elapsed < 1.0
     assert "3 request(s) still in flight" in caplog.text
 
 
@@ -1703,7 +1711,7 @@ def test_drain_ends_when_the_engine_exits():
 
 
 def test_drain_without_an_in_flight_count_waits_the_whole_bound():
-    assert 0.1 <= _drain_time(FakeServer(), FakeEngine(), drain_secs=0.1) < 1.0
+    assert 0.1 - _CLOCK_SLACK <= _drain_time(FakeServer(), FakeEngine(), drain_secs=0.1) < 1.0
 
 
 class UnreadableAfter(CountingServer):
@@ -1731,7 +1739,7 @@ def test_drain_waits_out_the_bound_when_the_count_turns_unreadable(caplog, fails
     server = UnreadableAfter([2, 2], fails=fails)
     with caplog.at_level(logging.WARNING, logger=rust_lifecycle.logger.name):
         elapsed = _drain_time(server, FakeEngine(), drain_secs=0.3)
-    assert 0.3 <= elapsed < 1.0
+    assert 0.3 - _CLOCK_SLACK <= elapsed < 1.0
     assert "became unreadable during the drain" in caplog.text
     assert "waiting out the remaining" in caplog.text
 
@@ -1830,7 +1838,7 @@ def test_supervise_passes_its_linger_to_the_drain():
         await task
         return time.monotonic() - started
 
-    assert 0.3 <= asyncio.run(run()) < 1.0
+    assert 0.3 - _CLOCK_SLACK <= asyncio.run(run()) < 1.0
 
 
 @pytest.mark.parametrize(

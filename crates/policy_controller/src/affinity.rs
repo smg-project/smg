@@ -26,15 +26,21 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    builtins::ReadsLoad,
-    counts::with_counts,
-    decision::{Overlap, OverlapSource},
-    framework::{Front, Scorer, Spread, TieBand},
-    lease::{Lifecycle, Membership},
-    spec::{AffinitySource, KvPressureParams, Needs, PrefixAffinityParams, WarmupSliceParams},
-    view::{
-        mean_in_flight, AffinityFacts, Candidate, Feed, HashKind, LoadRow, NamedAffinity, Phase,
-        RequestFacts, Walk, WorkerId, TEXT_BYTES_PER_TOKEN,
+    document::spec::{
+        AffinitySource, KvPressureParams, Needs, PrefixAffinityParams, WarmupSliceParams,
+    },
+    engine::{
+        decision::{Overlap, OverlapSource},
+        framework::{Front, Scorer, Spread, TieBand},
+        view::{
+            mean_in_flight, AffinityFacts, Candidate, Feed, HashKind, LoadRow, NamedAffinity,
+            Phase, RequestFacts, Walk, WorkerId, TEXT_BYTES_PER_TOKEN,
+        },
+    },
+    stages::builtins::ReadsLoad,
+    tracking::{
+        counts::with_counts,
+        lease::{Lifecycle, Membership},
     },
     Draw,
 };
@@ -1456,9 +1462,9 @@ impl ReadsLoad for WarmupSlice {
 mod tests {
     use super::*;
     use crate::{
-        counts::tests::Lent,
-        spec::SpillParams,
-        view::{Health, LoadRow, NamedHolder},
+        document::spec::SpillParams,
+        engine::view::{Health, LoadRow, NamedHolder},
+        tracking::counts::tests::Lent,
     };
 
     /// A row and its entry of the affinity column, as a case writes a pool.
@@ -2616,7 +2622,7 @@ mod tests {
     /// and the two read the same scores.
     #[test]
     fn behind_a_draw_the_stages_search_the_rows_named_and_keep_no_cursor() {
-        use crate::view::LOOKS_BEHIND;
+        use crate::engine::view::LOOKS_BEHIND;
         let pool: Vec<Held> = (0..6).map(|row| candidate(row, 2, 0)).collect();
         let pool = rows(&pool);
         // A draw's order. The holders are shallow, so the slice takes the
@@ -3082,7 +3088,7 @@ mod tests {
     /// order does, and the two divert to the same row.
     #[test]
     fn behind_a_draw_a_diverted_hit_searches_the_rows_named_and_keeps_no_cursor() {
-        use crate::view::LOOKS_BEHIND;
+        use crate::engine::view::LOOKS_BEHIND;
         // Rows 1 and 4 hold the request deep. Of the thin rows 3 and 0 are
         // busier than the holders, so the entry of each is read, and row 2
         // takes the hit.

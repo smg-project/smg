@@ -6,12 +6,12 @@ use kv_index::{salt::request_content_hashes_with_seed, XXH3_SEED};
 use llm_multimodal::MediaContentPart;
 use serde_json::Value;
 use smg_policy_controller::{
-    spec::{DecodePick, KeySourceSpec, RoutingKeySpec},
+    document::spec::{DecodePick, KeySourceSpec, RoutingKeySpec},
+    engine::view::{fingerprint, LoadRow, WorkerId},
     store::{
         BatchOutcome, GatewayId, KvEventSink, LeasesStore, LoadSink, LoadSource, MemoryStore,
         WorkersStore,
     },
-    view::{fingerprint, LoadRow, WorkerId},
     worker_host, AppliedSpec, PolicySpec,
 };
 

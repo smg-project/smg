@@ -130,11 +130,11 @@ use smg_worker::{
 
 use super::Objects;
 use crate::{
+    engine::view::WorkerId,
     store::{
         self, ApplyError, ChainBlockMap, KvEvent, LaneWriter, SequenceHash, StoredBlock,
         WorkerGroups,
     },
-    view::WorkerId,
 };
 
 /// The worker crate's KV event port over a store's KV event sink.
@@ -930,11 +930,11 @@ mod tests {
 
     use super::*;
     use crate::{
+        engine::view::Role,
         store::{
             Ask, GatewayId, KvEventSink as _, MemoryStore, Named, Naming, Signals, ViewBuffers,
             WorkerFacts, WorkersStore,
         },
-        view::Role,
         worker_host::Members,
     };
 

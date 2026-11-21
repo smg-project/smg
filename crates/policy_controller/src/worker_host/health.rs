@@ -212,11 +212,11 @@ mod tests {
 
     use super::*;
     use crate::{
+        engine::view::Role,
         store::{
             membership::life, Ask, GatewayId, HealthPolicy, MemoryStore, ViewBuffers, WorkerFacts,
             WorkerPatch, WorkerStatus as RowStatus, WorkersStore,
         },
-        view::Role,
         worker_host::{object, Members, SoleLead},
     };
 

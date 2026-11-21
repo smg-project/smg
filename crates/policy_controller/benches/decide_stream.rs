@@ -236,21 +236,25 @@ use std::{
 
 use kv_index::{request_prefix_hashes, ContentHash};
 use smg_policy_controller::{
-    controller::{Config, Controller, Election, Listener, Scope, State},
-    door::{self, Door},
-    handle::Handle,
-    lease::{self, TransportClass},
-    proto::{
-        completed::Class, controller_frame, decide_answer::Answer, decision::Outcome,
-        gateway_frame::Frame, policy_controller_client::PolicyControllerClient, Completed,
-        ControllerFrame, DecideRequest, Decision, Dispatched, GatewayFrame, Hello,
-        Phase as WirePhase, RequestFacts as WireFacts, Side,
+    document::spec::ShadowSpec,
+    engine::door::{self, Door},
+    service::{
+        controller::{Config, Controller, Election, Listener, Scope, State},
+        proto::{
+            completed::Class, controller_frame, decide_answer::Answer, decision::Outcome,
+            gateway_frame::Frame, policy_controller_client::PolicyControllerClient, Completed,
+            ControllerFrame, DecideRequest, Decision, Dispatched, GatewayFrame, Hello,
+            Phase as WirePhase, RequestFacts as WireFacts, Side,
+        },
     },
-    spec::ShadowSpec,
     store::{
         Ask, BatchFacts, BatchOutcome, GatewayId, Hand, KvEvent, KvEventSink, LeaseRecord,
         LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore, Picked, Said, Signals,
         StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+    },
+    tracking::{
+        handle::Handle,
+        lease::{self, TransportClass},
     },
     AppliedSpec, Constraints, Lease, LeaseId, LoadRow, PolicySpec, PoolFacts, ReleaseReason,
     RequestFacts, Role, Scratch, WorkerId,

@@ -15,10 +15,12 @@
 use std::sync::Arc;
 
 use smg_policy_controller::{
-    plugins::OpenDecisions,
-    wasm::{
-        EventKind, EventSet, Failure, LoadError, Plugin, PluginSpec, Runtime, WasmFilter,
-        WasmPicker, WasmScorer, World,
+    plugins::{
+        shared::OpenDecisions,
+        wasm::{
+            EventKind, EventSet, Failure, LoadError, Plugin, PluginSpec, Runtime, WasmFilter,
+            WasmPicker, WasmScorer, World,
+        },
     },
     Binding, Candidate, Constraints, Decision, Engine, Health, Lease, Lifecycle, Needs, Outcome,
     Plan, PoolFacts, Profile, ReleaseReason, RequestFacts, Scratch, ShedReason, Side,

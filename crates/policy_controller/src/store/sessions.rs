@@ -7,8 +7,8 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
 use crate::{
+    engine::view::{Session, WorkerId},
     sessions::{shard_of, SHARDS},
-    view::{Session, WorkerId},
 };
 
 /// A session's pin.

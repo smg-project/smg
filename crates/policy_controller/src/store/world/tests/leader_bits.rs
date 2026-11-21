@@ -9,12 +9,12 @@ use super::{
     ASKER, MODEL,
 };
 use crate::{
-    spec::Pairing,
+    document::spec::Pairing,
+    engine::view::{Role, WorkerId},
     store::{
         GatewayId, HealthSink, HealthWrite, Kinds, LeaderBits, MemoryStore, VetoWrite, ViewBuffers,
         WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
     },
-    view::{Role, WorkerId},
 };
 
 /// A gateway that asks beside [`ASKER`].

@@ -17,7 +17,7 @@ rewrites it; the test fails on any other difference).
 
 Section numbers are the policy controller design's. The in-process form of
 every view, decision and lifecycle message is the crate's own type in
-`src/view.rs`, `src/decision.rs` and `src/lease.rs`, field for field and in
+`src/engine/view.rs`, `src/engine/decision.rs` and `src/tracking/lease.rs`, field for field and in
 the same order; a wire message is that record without the fields the host
 keeps for itself (a candidate's position and sample instant, a request's host
 clock, a lease's issue instant), and each file's comments name them.

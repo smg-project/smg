@@ -277,9 +277,11 @@ mod tests {
 
     use super::{base, Laid, NotMaker, HALF};
     use crate::{
-        demands::DemandFacts,
+        engine::{
+            demands::DemandFacts,
+            view::{Role, WireModes, WorkerId},
+        },
         store::{Maker, Unmade, WorkerFacts, WorkerRow, WorkerStatus},
-        view::{Role, WireModes, WorkerId},
     };
 
     #[test]

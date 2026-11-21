@@ -31,11 +31,11 @@ use super::{
     object::{builder, dial_address, status, unchecked},
 };
 use crate::{
+    engine::view::{LoadRow, WorkerId},
     store::{
         MembershipChange, MembershipTail, MemoryStore, Overload, Reachability, WorkerFacts,
         WorkerRow, WorkersStore,
     },
-    view::{LoadRow, WorkerId},
 };
 
 /// What a host keeps of a registry's generation when it derives nothing
@@ -1177,7 +1177,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        spec::{BindingSpec, Match, OverloadSpec},
+        document::spec::{BindingSpec, Match, OverloadSpec},
         store::{
             GatewayId, HealthSink, Kinds, LoadSink as _, LoadSource, Maker, MemoryStore,
             WorkerFacts, WorkerPatch, WorkerStatus,

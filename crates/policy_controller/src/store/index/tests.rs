@@ -11,12 +11,12 @@ use super::{
     INDEX_WORKERS,
 };
 use crate::{
+    engine::view::WorkerId,
     store::{
         kv_events::{RankCursor, GAP_CLEAR_THRESHOLD},
         BatchFacts, BatchOutcome, KvEventSink, MemoryStore, ResyncReason, Signals, SnapshotChunk,
         WorkerFacts, WorkersStore,
     },
-    view::WorkerId,
 };
 
 const MODEL: &str = "m";
@@ -30,14 +30,17 @@ mod sent_prefixes {
 
     use super::*;
     use crate::{
-        door::tests::sent_prefixes::{applied, merged, use_sent_prefixes},
+        document::{spec, spec::AffinitySource},
+        engine::{
+            door::tests::sent_prefixes::{applied, merged, use_sent_prefixes},
+            view,
+            view::{Candidate, Role, WireModes},
+        },
         predictor::Predictor,
-        spec::AffinitySource,
         store::{
             index::{seam, Predicted},
             Ask, GatewayId, Kinds, Named, Naming, Position, Reachability, ViewBuffers,
         },
-        view::{Candidate, Role, WireModes},
     };
 
     type Case = Result<(), Box<dyn std::error::Error>>;
@@ -957,7 +960,9 @@ mod sent_prefixes {
 
     #[test]
     fn a_stage_that_reads_cache_events_keeps_the_index_holders_first() -> Case {
-        use crate::spec::{BestParams, PickStage, PolicySpec, PrefixAffinityParams, ScoreStage};
+        use crate::document::spec::{
+            BestParams, PickStage, PolicySpec, PrefixAffinityParams, ScoreStage,
+        };
 
         let store = MemoryStore::new();
         let sent = plain(&store, "sent", WireModes::GRPC, Reachability::Any);
@@ -976,7 +981,7 @@ mod sent_prefixes {
             profile.score.push(second.into());
         }
         let spec = applied(&document)?;
-        let cap = spec.engine().named_for(MODEL, crate::view::Phase::Single);
+        let cap = spec.engine().named_for(MODEL, view::Phase::Single);
         assert_eq!(cap, 1);
         store.apply(spec)?;
         publish(&store, indexed);
@@ -1097,7 +1102,7 @@ mod sent_prefixes {
         let mut smaller = merged(2)?;
         smaller.index.insert(
             MODEL.into(),
-            crate::spec::IndexSpec {
+            spec::IndexSpec {
                 max_size: 16,
                 ..Default::default()
             },
@@ -1144,7 +1149,7 @@ mod sent_prefixes {
         let mut smaller = merged(2)?;
         smaller.index.insert(
             MODEL.into(),
-            crate::spec::IndexSpec {
+            spec::IndexSpec {
                 max_size: 16,
                 ..Default::default()
             },
@@ -1215,7 +1220,7 @@ fn admitted(store: &MemoryStore, key: &str) -> WorkerId {
 /// the pools are walked.
 #[test]
 fn a_write_that_moves_no_member_walks_no_pool() {
-    use crate::door::tests::sent_prefixes::{applied, merged};
+    use crate::engine::door::tests::sent_prefixes::{applied, merged};
 
     let store = MemoryStore::new();
     admitted(&store, "a");
@@ -2534,12 +2539,12 @@ mod named {
 
     use super::{admitted, batch, chain, publisher, stored, MODEL};
     use crate::{
+        engine::view::{Candidate, LoadRow, Role, WireModes, WorkerId},
         store::{
             index::{seam, PoolIndex},
             Ask, BatchOutcome, GatewayId, KvEventSink, LoadSink, LoadSource, MemoryStore, Named,
             Naming, Reachability, Signals, ViewBuffers, WorkerFacts, WorkerRow, WorkersStore,
         },
-        view::{Candidate, LoadRow, Role, WireModes, WorkerId},
         AppliedSpec, PolicySpec,
     };
 
@@ -4213,7 +4218,7 @@ mod named {
     /// them again, and one whose stage holds another number rules by it.
     #[test]
     fn a_generation_rules_the_warming_rows_from_its_apply() {
-        use crate::spec::{Pairing, ScoreSpec, ScoreStage};
+        use crate::document::spec::{Pairing, ScoreSpec, ScoreStage};
 
         let store = MemoryStore::new();
         store.apply(sampled(1)).expect("above the unbound start");

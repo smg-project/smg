@@ -48,7 +48,7 @@ use axum::{
 use k8s_openapi::api::coordination::v1::Lease;
 use kube::{core::Status, Client, Config};
 use parking_lot::Mutex;
-use smg_policy_controller::elector::{
+use smg_policy_controller::service::elector::{
     ElectionSettings, Elector, KubernetesLease, Tick, TERM_ANNOTATION,
 };
 

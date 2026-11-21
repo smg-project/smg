@@ -9,9 +9,9 @@ use super::{
     REPORT_PERIOD,
 };
 use crate::{
-    spec::{BindingSpec, OverloadSpec, Pairing},
+    document::spec::{BindingSpec, OverloadSpec, Pairing},
+    engine::view::Role,
     store::{LoadSink, LoadSource, MemoryStore, WorkersStore},
-    view::Role,
     AppliedSpec, PolicySpec,
 };
 
