@@ -5,10 +5,7 @@
 
 use std::collections::HashMap;
 
-use image::imageops::FilterType;
 use serde::{Deserialize, Deserializer, Serialize};
-
-use super::transforms;
 
 /// Struct to represent patch_size as dict {"height": x, "width": y}
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -434,31 +431,6 @@ impl PreProcessorConfig {
         })
     }
 
-    /// Get the interpolation filter for resizing.
-    pub fn get_filter(&self) -> FilterType {
-        transforms::pil_to_filter(self.resampling)
-    }
-
-    /// Check if normalization should be applied.
-    pub fn should_normalize(&self) -> bool {
-        self.do_normalize.unwrap_or(true)
-    }
-
-    /// Check if rescaling should be applied.
-    pub fn should_rescale(&self) -> bool {
-        self.do_rescale.unwrap_or(false)
-    }
-
-    /// Check if resizing should be applied.
-    pub fn should_resize(&self) -> bool {
-        self.do_resize.unwrap_or(true)
-    }
-
-    /// Check if center cropping should be applied.
-    pub fn should_center_crop(&self) -> bool {
-        self.do_center_crop.unwrap_or(false)
-    }
-
     /// Get rescale factor with default.
     pub fn get_rescale_factor(&self) -> f64 {
         self.rescale_factor.unwrap_or(1.0 / 255.0)
@@ -527,9 +499,9 @@ mod tests {
 
         let config = PreProcessorConfig::from_json(json).unwrap();
 
-        assert!(config.should_normalize());
-        assert!(config.should_center_crop());
-        assert!(config.should_resize());
+        assert_eq!(config.do_normalize, Some(true));
+        assert_eq!(config.do_center_crop, Some(true));
+        assert_eq!(config.do_resize, Some(true));
         assert_eq!(config.resampling, Some(3));
 
         let (h, w) = config.get_target_size().unwrap();
@@ -585,12 +557,6 @@ mod tests {
         // Should use CLIP defaults when not specified
         let mean = config.get_image_mean();
         assert!((mean[0] - PreProcessorConfig::CLIP_MEAN[0]).abs() < 1e-6);
-
-        // Default behaviors
-        assert!(config.should_normalize()); // true by default
-        assert!(!config.should_rescale()); // false by default
-        assert!(config.should_resize()); // true by default
-        assert!(!config.should_center_crop()); // false by default
     }
 
     #[test]
@@ -608,13 +574,6 @@ mod tests {
             };
             assert_eq!(config.is_image_only_processor_type(), expected);
         }
-    }
-
-    #[test]
-    fn test_filter_conversion() {
-        let json = r#"{"resampling": 3}"#;
-        let config = PreProcessorConfig::from_json(json).unwrap();
-        assert!(matches!(config.get_filter(), FilterType::CatmullRom));
     }
 
     #[test]
