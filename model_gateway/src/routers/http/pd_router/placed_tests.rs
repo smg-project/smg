@@ -5,20 +5,23 @@ use std::{collections::HashSet, error::Error, time::Duration};
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    document::spec::DecodePick,
-    engine::view::{LoadRow, Role, WireModes, TEXT_BYTES_PER_TOKEN},
+    document::spec::{DecodePick, KeySourceSpec, RoutingKeySpec},
+    engine::view::{
+        Candidate, Identity, LoadRow, Phase, RequestFacts, Role, WireModes, TEXT_BYTES_PER_TOKEN,
+    },
     store::{
         GatewayId, HealthSink, LeasesStore, LoadSink, LoadSource, MemoryStore, PairingDescriptor,
-        WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
+        SessionsStore, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
     },
-    AppliedSpec, PolicySpec,
+    AppliedSpec, Catalog, Lifecycle, Picker, PolicySpec, Target, Targets, TieBand,
 };
 use smg_worker::identity::basic::{ConnectionMode, MORIIO_CONNECTOR};
 
 use super::{
     tests::{
-        create_test_pd_router, spawn_cut_body_stub, spawn_delayed_stub, spawn_recording_stub,
-        spawn_stub,
+        create_test_pd_router, spawn_choice_decode_stub_with_model, spawn_cut_body_stub,
+        spawn_delayed_stub, spawn_moriio_prefill_stub, spawn_recording_stub, spawn_stub,
+        StubHandoff,
     },
     *,
 };
@@ -1156,4 +1159,234 @@ async fn a_pair_is_placed_past_more_pairs_of_another_wire_than_an_attempt_asks()
         assert_eq!(live(&store, 0).await, 0);
     }
     Ok(())
+}
+
+/// Records the key the real pair decision received. The bed has one decode,
+/// so no random tie or particular UUID can make a wrong routing key pass.
+#[derive(Clone, Debug)]
+struct ChoiceRoutingKey {
+    seen: Arc<std::sync::Mutex<Vec<(Phase, u64)>>>,
+}
+
+impl Lifecycle for ChoiceRoutingKey {}
+
+impl Picker for ChoiceRoutingKey {
+    fn name(&self) -> &'static str {
+        "test-moriio-choice-routing-key"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        _: &[f32],
+        _: TieBand,
+        out: &mut Targets,
+    ) {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((facts.phase, facts.session_key.hash));
+        for &at in kept.iter().take(1) {
+            let row = &candidates[at as usize];
+            out.push(Target {
+                position: row.position,
+                id: row.id,
+                dp_rank: row.dp_rank,
+                pair: None,
+            });
+        }
+    }
+}
+
+/// Child transport ids are private, while placement retains the parent's
+/// rid-derived key. A single-plan sessions rule is not valid on a pair:
+/// seed the persistent decode pin that session-affinity reads instead.
+async fn hosted_moriio_choices_keep_parent_key(fault: Option<&'static str>) -> Case {
+    const RID: &str = "conversation_t3";
+    const KEY: &str = "conversation";
+    let (prefill, prefill_seen) = spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+    let (decode, decode_seen) = spawn_choice_decode_stub_with_model(fault, MODEL).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let shaped = |url: &str, worker: BasicWorkerBuilder| {
+        let worker = worker
+            .runtime_type(RuntimeType::Vllm)
+            .kv_connector(MORIIO_CONNECTOR)
+            .label("moriio_mode", "read")
+            .label(
+                "moriio_host",
+                if url == prefill {
+                    "10.0.0.1"
+                } else {
+                    "10.0.0.2"
+                },
+            )
+            .zmq_request_timeout(Duration::from_secs(3));
+        let worker = if url == decode {
+            worker
+                .label("moriio_notify_port", "62005")
+                .label("tp_size", "4")
+        } else {
+            worker
+        };
+        (worker, WireModes::HTTP)
+    };
+    let (policy_engine, store, workers) =
+        pair_bed_of(shaped, Arc::clone(&registry), &[&prefill], &[&decode]);
+    // The provisional parent and a child cannot coexist at capacity one.
+    // Successful child dispatch therefore proves the parent's release.
+    for url in [&prefill, &decode] {
+        let mut facts = store.by_key(url).ok_or("the pair's row")?.facts;
+        facts.max_running = Some(1);
+        store.upsert(facts);
+    }
+    let observed: Arc<std::sync::Mutex<Vec<(Phase, u64)>>> = Arc::default();
+    let picker = ChoiceRoutingKey {
+        seen: Arc::clone(&observed),
+    };
+    let mut catalog = Catalog::builtin();
+    catalog.picker(picker.name(), move || Box::new(picker.clone()))?;
+    let mut document = PolicySpec::pair_presets("least_load", "least_load")?;
+    document.generation = store.with_world(|world| world.spec().generation()) + 1;
+    document.bindings[0].routing_key = Some(RoutingKeySpec {
+        sources: vec![KeySourceSpec {
+            rid: true,
+            ..KeySourceSpec::default()
+        }],
+        strip_lineage: true,
+    });
+    let profile = document
+        .profiles
+        .get_mut("decode")
+        .ok_or("decode profile")?;
+    profile.score = vec!["session-affinity".into()];
+    profile.pick = "test-moriio-choice-routing-key".into();
+    store
+        .apply(AppliedSpec::validate_in(&document, &catalog, &[])?)
+        .map_err(|stale| format!("{stale:?}"))?;
+    let session = |key: &str| {
+        RequestFacts {
+            model: MODEL,
+            phase: Phase::Decode,
+            session_key: Identity::plain(key),
+            ..RequestFacts::default()
+        }
+        .session()
+        .get()
+    };
+    let decode_id = store.by_key(&decode).ok_or("decode row")?.id;
+    SessionsStore::pin(&*store, session(KEY), decode_id, Instant::now(), None);
+    store.publish_now();
+    let mut router = router(registry, policy_engine);
+    router.retry_config.max_retries = 0;
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": MODEL,
+        "rid": RID,
+        "request_id": RID,
+        "messages": [{"role": "user", "content": "hi"}],
+        "n": 3,
+        "max_tokens": 16,
+        "temperature": 0.8,
+    }))?;
+    let response = router
+        .route_chat(None, &meta, Arc::new(request), MODEL)
+        .await;
+    let expected = if fault.is_some() {
+        StatusCode::BAD_GATEWAY
+    } else {
+        StatusCode::OK
+    };
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    assert_eq!(status, expected, "{}", String::from_utf8_lossy(&bytes));
+    let count = if fault.is_some() { 2 } else { 3 };
+    if fault.is_none() {
+        let reply: Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(reply["choices"].as_array().ok_or("choices")?.len(), 3);
+    }
+    let prefills = prefill_seen.lock().map_err(|e| e.to_string())?.clone();
+    let decodes = decode_seen.lock().map_err(|e| e.to_string())?.clone();
+    assert_eq!(prefills.len(), count);
+    assert_eq!(
+        decodes.len(),
+        count,
+        "no child after a failed second choice"
+    );
+    let mut child_ids = HashSet::new();
+    let mut transfers = HashSet::new();
+    for ((_, prefill), (_, decode)) in prefills.iter().zip(&decodes) {
+        assert_eq!(prefill["n"], 1);
+        assert_eq!(decode["n"], 1);
+        assert_eq!(prefill["request_id"], decode["request_id"]);
+        assert_eq!(decode["test_header_id"], decode["request_id"]);
+        let id = decode["request_id"].as_str().ok_or("child request id")?;
+        assert_ne!(id, RID);
+        assert!(child_ids.insert(id), "siblings share a transport id");
+        let transfer = decode
+            .pointer("/kv_transfer_params/transfer_id")
+            .and_then(Value::as_str)
+            .ok_or("child transfer id")?;
+        assert_eq!(prefill["kv_transfer_params"]["transfer_id"], transfer);
+        assert!(transfers.insert(transfer), "siblings share a KV handoff");
+        assert!(
+            SessionsStore::lookup(&*store, session(id)).is_none(),
+            "a private child UUID became a persistent routing pin"
+        );
+    }
+    assert_eq!(live(&store, 0).await, 0, "a choice left a pair lease live");
+    for worker in workers.iter().flatten() {
+        assert_eq!(worker.load(), 0, "a choice left its worker load guard live");
+    }
+    assert_eq!(
+        SessionsStore::len(&*store),
+        1,
+        "only the parent's pin may persist"
+    );
+    assert_eq!(
+        SessionsStore::lookup(&*store, session(KEY)).map(|pin| pin.worker),
+        Some(decode_id),
+        "the parent's affinity pin changed"
+    );
+    let keys = observed.lock().map_err(|e| e.to_string())?;
+    let parent_key = Identity::plain(KEY).hash;
+    assert_ne!(
+        parent_key, 0,
+        "the explicit parent RID must have a routing key"
+    );
+    assert_eq!(
+        keys.first().copied(),
+        Some((Phase::Decode, parent_key)),
+        "the parent must derive its explicit RID before fanout",
+    );
+    assert!(
+        keys.len() > count,
+        "parent and children must ask for placement"
+    );
+    assert!(
+        keys.iter()
+            .all(|&(_, key)| key == Identity::plain(KEY).hash),
+        "every child must retain the parent's routing key, observed: {keys:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn hosted_moriio_choices_preserve_parent_routing_key_and_release_parent_placement() -> Case {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        hosted_moriio_choices_keep_parent_key(None),
+    )
+    .await?
+}
+
+#[tokio::test]
+async fn hosted_moriio_second_child_failure_preserves_parent_routing_key_and_releases_leases(
+) -> Case {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        hosted_moriio_choices_keep_parent_key(Some("http")),
+    )
+    .await?
 }

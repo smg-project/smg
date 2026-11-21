@@ -1063,7 +1063,6 @@ impl PDRouter {
             );
             let mut child_context = context.clone();
             child_context.headers = Some(child_headers.clone());
-            child_context.rid = Some(&child_id);
             // Keep the request's exclusions from attempts before this fanout.
             // A successful child does not close a worker's retry window; a
             // failed child ends the fanout before any sibling is selected.
@@ -6775,7 +6774,7 @@ mod tests {
 
     /// What the MoRI-IO producer stub answers a prefill side with.
     #[derive(Debug, Clone, Copy)]
-    enum StubHandoff {
+    pub(super) enum StubHandoff {
         /// The handoff a vLLM 0.30 producer returns, under the minted id.
         Minted,
         /// The same handoff under another request's transfer id.
@@ -6802,7 +6801,7 @@ mod tests {
     }
 
     /// A MoRI-IO producer stub that records each request it answers.
-    async fn spawn_moriio_prefill_stub(handoff: StubHandoff) -> (String, Seen) {
+    pub(super) async fn spawn_moriio_prefill_stub(handoff: StubHandoff) -> (String, Seen) {
         let seen: Seen = Arc::default();
         let log = Arc::clone(&seen);
         let app = axum::Router::new().fallback(axum::routing::any(move |req: Request| {
@@ -6874,6 +6873,13 @@ mod tests {
     }
 
     async fn spawn_choice_decode_stub(fault: Option<&'static str>) -> (String, Seen) {
+        spawn_choice_decode_stub_with_model(fault, "m").await
+    }
+
+    pub(super) async fn spawn_choice_decode_stub_with_model(
+        fault: Option<&'static str>,
+        model: &'static str,
+    ) -> (String, Seen) {
         let seen: Seen = Arc::default();
         let log = Arc::clone(&seen);
         let app = axum::Router::new().fallback(axum::routing::any(move |req: Request| {
@@ -6898,6 +6904,7 @@ mod tests {
                     log.len()
                 };
                 let mut reply = choice_reply(&body, &route);
+                reply["model"] = json!(model);
                 if index == 2 {
                     match fault {
                         Some("raw") => return (StatusCode::OK, "not JSON").into_response(),
