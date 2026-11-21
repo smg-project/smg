@@ -556,8 +556,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     "ec_transfer_params": ec_transfer_params,
                 }
             tokenization_kwargs = self._tokenization_kwargs_from_proto(request.sampling_params)
-            # The parser must start in the same thinking mode as the rendered prompt.
             generate_kwargs = {}
+            # This constraint covers the whole completion, including any reasoning.
+            if (
+                request.sampling_params.grammar_from_first_token
+                and request.sampling_params.WhichOneof("constraint") is not None
+            ):
+                generate_kwargs["reasoning_ended"] = True
+            # The parser must start in the same thinking mode as the rendered prompt.
             if hasattr(request, "chat_template_kwargs_json") and request.HasField(
                 "chat_template_kwargs_json"
             ):

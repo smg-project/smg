@@ -225,13 +225,27 @@ async def test_encoder_only_validates_connector_specific_handles(consumer, conne
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mode", [None, "enabled", "disabled", "adaptive", "", "{", "[]", "null", "true"]
+    "mode,first_token,constrained",
+    [
+        *(
+            (mode, False, False)
+            for mode in (None, "enabled", "disabled", "adaptive", "", "{", "[]", "null", "true")
+        ),
+        ("enabled", True, True),
+        (None, True, False),
+        (None, False, True),
+    ],
 )
-async def test_reasoning_template_kwargs_reach_engine_or_fail_before_submission(mode):
-    """The Python handler preserves parser state and rejects non-object kwargs."""
+async def test_reasoning_options_reach_engine_or_fail_before_submission(
+    mode, first_token, constrained
+):
+    """The Python handler preserves the parser options and grammar start on the request."""
     request = pb.GenerateRequest(
         request_id="thinking-test", tokenized=pb.TokenizedInput(input_ids=[1, 2])
     )
+    request.sampling_params.grammar_from_first_token = first_token
+    if constrained:
+        request.sampling_params.structural_tag = '{"format":{"type":"const_string","value":"x"}}'
     invalid = mode in ("", "{", "[]", "null", "true")
     if mode is not None:
         request.chat_template_kwargs_json = mode if invalid else json.dumps({"thinking_mode": mode})
@@ -271,3 +285,7 @@ async def test_reasoning_template_kwargs_reach_engine_or_fail_before_submission(
         assert len(seen) == 1
         expected = {"chat_template_kwargs": {"thinking_mode": mode}} if mode else None
         assert seen[0].get("reasoning_parser_kwargs") == expected
+        if first_token and constrained:
+            assert seen[0]["reasoning_ended"] is True
+        else:
+            assert "reasoning_ended" not in seen[0]

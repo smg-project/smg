@@ -893,11 +893,18 @@ pub(crate) enum PreparationOutput {
     Harmony {
         token_ids: Vec<u32>,
         selection_text: String,
-        tool_constraints: Option<(String, String)>,
+        tool_constraints: Option<HarmonyConstraint>,
         /// Request with response_format cleared (when converted to structural tag)
         modified_request: Option<Box<ChatCompletionRequest>>,
         harmony_stop_ids: Vec<u32>,
     },
+}
+
+/// SMG builds an entire assistant-turn constraint for vLLM. Other engines and
+/// caller-supplied structural tags keep their original activation behavior.
+pub(crate) struct HarmonyConstraint {
+    pub tag: String,
+    pub vllm_first_token_tag: Option<String>,
 }
 
 /// One tokenized completion prompt.

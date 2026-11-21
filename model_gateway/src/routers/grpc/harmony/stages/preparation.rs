@@ -9,7 +9,7 @@ use openai_protocol::{
     common::{ResponseFormat, Tool, ToolChoice},
     responses::ResponsesRequest,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use tracing::{error, warn};
 
 use super::super::HarmonyBuilder;
@@ -17,7 +17,7 @@ use crate::routers::{
     error,
     grpc::{
         common::{responses::utils::extract_tools_from_response_tools, stages::PipelineStage},
-        context::{PreparationOutput, RequestContext, RequestType},
+        context::{HarmonyConstraint, PreparationOutput, RequestContext, RequestType},
         utils,
     },
 };
@@ -191,11 +191,10 @@ impl HarmonyPreparationStage {
                 .map_err(|e| *e)?
         };
 
-        let text_constraint = if let Some(text_config) = &request.text {
-            Self::generate_text_format_constraint(text_config).map_err(|e| *e)?
-        } else {
-            None
-        };
+        let text_constraint = request
+            .text
+            .as_ref()
+            .and_then(Self::generate_text_format_constraint);
 
         if tool_constraint.is_some() && text_constraint.is_some() {
             warn!(
@@ -238,50 +237,26 @@ impl HarmonyPreparationStage {
     /// Returns None if text.format is not specified or is "text".
     fn generate_text_format_constraint(
         text_config: &openai_protocol::responses::TextConfig,
-    ) -> Result<Option<(String, String)>, Box<Response>> {
+    ) -> Option<HarmonyConstraint> {
         use openai_protocol::responses::TextFormat;
 
-        let Some(format) = &text_config.format else {
-            return Ok(None);
+        let schema = match text_config.format.as_ref()? {
+            TextFormat::Text => return None,
+            TextFormat::JsonObject => Cow::Owned(json!({"type": "object"})),
+            TextFormat::JsonSchema { schema, .. } => Cow::Borrowed(schema),
         };
-
-        match format {
-            TextFormat::Text => Ok(None),
-            TextFormat::JsonObject => {
-                let tag = build_text_format_structural_tag(&serde_json::json!({"type": "object"}))
-                    .map_err(|e| {
-                        error!(
-                            function = "generate_text_format_constraint",
-                            error = %e,
-                            "Failed to build text format structural tag for JsonObject"
-                        );
-                        Box::new(error::internal_error("build_text_format_tag_failed", e))
-                    })?;
-                Ok(Some(("structural_tag".to_string(), tag)))
-            }
-            TextFormat::JsonSchema { schema, .. } => {
-                let tag = build_text_format_structural_tag(schema).map_err(|e| {
-                    error!(
-                        function = "generate_text_format_constraint",
-                        error = %e,
-                        "Failed to build text format structural tag for JsonSchema"
-                    );
-                    Box::new(error::internal_error("build_text_format_tag_failed", e))
-                })?;
-                Ok(Some(("structural_tag".to_string(), tag)))
-            }
-        }
+        Some(build_json_constraint(&schema))
     }
 
     /// Generate Harmony structural tag for Chat Completions response_format
     ///
     /// Converts response_format (json_object, json_schema) to structural tag that constrains
-    /// the final channel. Uses the same `build_text_format_structural_tag` as the Responses API.
+    /// the final channel. Uses the same Harmony framing as the Responses API.
     /// A `structural_tag` response_format is the request's own tag, passed on as it arrived.
     /// Returns None if response_format is not specified or is "text".
     fn generate_response_format_constraint(
         response_format: Option<&ResponseFormat>,
-    ) -> Result<Option<(String, String)>, Box<Response>> {
+    ) -> Result<Option<HarmonyConstraint>, Box<Response>> {
         let Some(format) = response_format else {
             return Ok(None);
         };
@@ -299,19 +274,14 @@ impl HarmonyPreparationStage {
                         e.to_string(),
                     ))
                 })?;
-                return Ok(Some(("structural_tag".to_string(), tag)));
+                return Ok(Some(HarmonyConstraint {
+                    tag,
+                    vllm_first_token_tag: None,
+                }));
             }
         };
 
-        let tag = build_text_format_structural_tag(&schema).map_err(|e| {
-            error!(
-                function = "generate_response_format_constraint",
-                error = %e,
-                "Failed to build structural tag for response_format"
-            );
-            Box::new(error::internal_error("build_response_format_tag_failed", e))
-        })?;
-        Ok(Some(("structural_tag".to_string(), tag)))
+        Ok(Some(build_json_constraint(&schema)))
     }
 
     /// Generate Harmony structural tag for tool constraints
@@ -321,7 +291,7 @@ impl HarmonyPreparationStage {
     fn generate_tool_call_constraint(
         tools: &[Tool],
         tool_choice: Option<&ToolChoice>,
-    ) -> Result<Option<(String, String)>, Box<Response>> {
+    ) -> Result<Option<HarmonyConstraint>, Box<Response>> {
         let Some(choice) = tool_choice.filter(|choice| choice.forces_call()) else {
             return Ok(None);
         };
@@ -329,20 +299,19 @@ impl HarmonyPreparationStage {
             ToolChoice::Function { function, .. } => Some(function.name.as_str()),
             _ => None,
         };
-        let tag = Self::build_tool_call_structural_tag(tools, function)?;
-        Ok(Some(("structural_tag".to_string(), tag)))
+        Self::build_tool_call_constraint(tools, function).map(Some)
     }
 
     /// Build Harmony structural tag for tool calling constraints
     ///
-    /// Supports both reasoning-enabled and reasoning-disabled modes:
-    /// - With reasoning: triggers on `<|start|>assistant<|channel|>commentary` (waits for analysis)
-    /// - Without reasoning: triggers on `<|channel|>commentary` (goes directly to commentary)
-    fn build_tool_call_structural_tag(
+    /// vLLM receives a whole-turn grammar with optional reasoning before a
+    /// mandatory tool call. Other backends keep the existing triggered tags.
+    fn build_tool_call_constraint(
         tools: &[Tool],
         specific_function: Option<&str>,
-    ) -> Result<String, Box<Response>> {
+    ) -> Result<HarmonyConstraint, Box<Response>> {
         let mut tags = Vec::new();
+        let mut calls = Vec::new();
 
         // Filter tools if specific function requested
         let tools_to_use: Vec<&Tool> = if let Some(func_name) = specific_function {
@@ -374,6 +343,16 @@ impl HarmonyPreparationStage {
         for tool in tools_to_use {
             let tool_name = &tool.function.name;
             let params_schema = tool.function.parameters_schema();
+            for constrain in ["", "<|constrain|>json"] {
+                calls.push(json!({
+                    "type": "tag",
+                    "begin": format!("<|channel|>commentary to=functions.{tool_name}{constrain}<|message|>"),
+                    "content": {"type": "json_schema", "json_schema": params_schema},
+                    // Some vLLM tokenizers handle <|call|> as a stop, so it
+                    // must also be possible to complete the grammar first.
+                    "end": ["<|call|>", ""],
+                }));
+            }
 
             // Pattern 1: For reasoning-enabled mode (with analysis channel before commentary)
             tags.push(json!({
@@ -408,32 +387,54 @@ impl HarmonyPreparationStage {
             }
         });
 
-        serde_json::to_string(&structural_tag).map_err(|e| {
-            error!(
-                function = "generate_tool_call_constraint",
-                error = %e,
-                "Failed to serialize structural tag"
-            );
-            Box::new(error::internal_error(
-                "serialize_structural_tag_failed",
-                format!("Failed to serialize structural tag: {e}"),
-            ))
+        Ok(HarmonyConstraint {
+            tag: structural_tag.to_string(),
+            vllm_first_token_tag: Some(vllm_harmony_tag(json!({
+                "type": "or",
+                "elements": calls,
+            }))),
         })
     }
 }
 
-/// Build Harmony structural tag for structured output (JSON schema constraint)
-///
-/// Creates a structural tag that handles the full Harmony channel flow:
-/// 1. `<|channel|>analysis` trigger → reasoning content (any_text) until `<|end|>`
-/// 2. Free text (allows `<|start|>assistant` between messages)
-/// 3. `<|channel|>final` trigger → JSON content constrained to schema
-///
-/// Both triggers are needed so xgrammar's `at_least_one` mode allows the analysis
-/// channel tokens (otherwise xgrammar blocks all non-trigger-prefix tokens).
-///
-/// This is used for the Responses API text.format field (json_object or json_schema).
-fn build_text_format_structural_tag(schema: &serde_json::Value) -> Result<String, String> {
+/// The initial assistant role is supplied by the Harmony prompt. After any
+/// analysis or preamble, require a fresh assistant header before the result.
+fn vllm_harmony_tag(output: Value) -> String {
+    let preamble = |begin: &str| {
+        // The empty alternative is supported by older XGrammar workers too.
+        json!({
+            "type": "or",
+            "elements": [
+                {
+                    "type": "sequence",
+                    "elements": [
+                        {
+                            "type": "tag",
+                            "begin": begin,
+                            "content": {"type": "any_text"},
+                            "end": "<|end|>",
+                        },
+                        {"type": "const_string", "value": "<|start|>assistant"},
+                    ],
+                },
+                {"type": "const_string", "value": ""},
+            ],
+        })
+    };
+    json!({
+        "format": {
+            "type": "sequence",
+            "elements": [
+                preamble("<|channel|>analysis<|message|>"),
+                preamble("<|channel|>commentary<|message|>"),
+                output,
+            ],
+        },
+    })
+    .to_string()
+}
+
+fn build_json_constraint(schema: &Value) -> HarmonyConstraint {
     let structural_tag = json!({
         "format": {
             "type": "triggered_tags",
@@ -460,8 +461,17 @@ fn build_text_format_structural_tag(schema: &serde_json::Value) -> Result<String
         }
     });
 
-    serde_json::to_string(&structural_tag)
-        .map_err(|e| format!("Failed to serialize structural tag for structured output: {e}"))
+    HarmonyConstraint {
+        tag: structural_tag.to_string(),
+        vllm_first_token_tag: Some(vllm_harmony_tag(json!({
+            "type": "tag",
+            "begin": "<|channel|>final<|message|>",
+            "content": {"type": "json_schema", "json_schema": schema},
+            // The final return token is a normal engine stop. Let the grammar
+            // complete after the JSON so the matcher can accept that stop.
+            "end": "",
+        }))),
+    }
 }
 
 #[cfg(test)]
@@ -479,9 +489,37 @@ mod tests {
         routers::grpc::regular::stages::testing::components,
     };
 
+    #[test]
+    fn vllm_harmony_forced_tool_keeps_reasoning_and_limits_the_recipient() {
+        let tools: Vec<Tool> = serde_json::from_value(json!([
+            {"type": "function", "function": {"name": "a", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "b", "parameters": {"type": "object"}}},
+        ]))
+        .expect("valid tools");
+        let constraint = HarmonyPreparationStage::build_tool_call_constraint(&tools, Some("b"))
+            .expect("valid tool constraint");
+        let grammar: Value =
+            serde_json::from_str(&constraint.vllm_first_token_tag.expect("vLLM tag"))
+                .expect("valid grammar JSON");
+        let parts = grammar["format"]["elements"].as_array().expect("sequence");
+        assert_eq!(
+            parts[0]["elements"][0]["elements"][0]["begin"],
+            "<|channel|>analysis<|message|>"
+        );
+        let calls = parts[2]["elements"].as_array().expect("call formats");
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            assert!(call["begin"]
+                .as_str()
+                .expect("call header")
+                .starts_with("<|channel|>commentary to=functions.b<|"));
+            assert_eq!(call["end"], json!(["<|call|>", ""]));
+        }
+    }
+
     /// A `structural_tag` response format is the engine's constraint as the
     /// client sent it, key for key, with no channel framing around it; a JSON
-    /// format takes the framing (`build_text_format_structural_tag`), and
+    /// format gets Harmony framing, and
     /// `text` constrains nothing.
     #[test]
     fn a_structural_tag_response_format_is_the_constraint_as_sent() {
@@ -494,12 +532,14 @@ mod tests {
             "format": {"type": "json_schema", "json_schema": {"type": "object"}}
         });
         let format: ResponseFormat = serde_json::from_value(sent.clone()).expect("a tag");
-        let (kind, tag) = constraint(&format).expect("a constraint");
-        assert_eq!(kind, "structural_tag");
-        assert_eq!(serde_json::from_str::<Value>(&tag).expect("the tag"), sent);
-        let (kind, tag) = constraint(&ResponseFormat::JsonObject).expect("a constraint");
-        assert_eq!(kind, "structural_tag");
-        let framed: Value = serde_json::from_str(&tag).expect("the tag");
+        let raw = constraint(&format).expect("a constraint");
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw.tag).expect("the tag"),
+            sent
+        );
+        assert!(raw.vllm_first_token_tag.is_none());
+        let generated = constraint(&ResponseFormat::JsonObject).expect("a constraint");
+        let framed: Value = serde_json::from_str(&generated.tag).expect("the tag");
         assert_eq!(
             framed["format"]["tags"][1]["begin"],
             "<|channel|>final<|constrain|>json<|message|>"
@@ -508,7 +548,17 @@ mod tests {
             framed["format"]["tags"][1]["content"]["json_schema"],
             json!({"type": "object"})
         );
-        assert_eq!(constraint(&ResponseFormat::Text), None);
+        let vllm: Value = serde_json::from_str(&generated.vllm_first_token_tag.expect("vLLM tag"))
+            .expect("the tag");
+        assert_eq!(vllm["format"]["elements"][0]["elements"][1]["value"], "");
+        let final_format = &vllm["format"]["elements"][2];
+        assert_eq!(final_format["begin"], "<|channel|>final<|message|>");
+        assert_eq!(
+            final_format["content"]["json_schema"],
+            json!({"type": "object"})
+        );
+        assert_eq!(final_format["end"], "");
+        assert!(constraint(&ResponseFormat::Text).is_none());
     }
 
     /// A Responses request that forces a tool call and also asks for a JSON text format brings
