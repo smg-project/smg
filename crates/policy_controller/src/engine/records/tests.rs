@@ -464,10 +464,13 @@ fn assert_drawn_as_written(
             matches!(whole, Decision::Shed(_))
         );
     }
-    // A draw converts no list's reports: where every decision was a draw's,
-    // the list holds what it held.
+    // A draw converts the list's reports once its thread has paid for
+    // them, and at most once a snapshot: where every decision was a
+    // draw's, a list that held its rows was not converted again. The picks
+    // above are the whole write's on both sides of a conversion.
     if draws as u64 == seeds {
-        assert_eq!(drawn_pool.conversions(), u64::from(converted));
+        assert!(drawn_pool.conversions() <= 1);
+        assert!(!converted || drawn_pool.conversions() == 1);
     }
     draws
 }
@@ -776,6 +779,111 @@ fn a_decision_that_meets_a_conversion_under_way_converts_nothing_and_waits_for_n
     assert!(held(&pool).is_some_and(|converted| converted.is_of(&loads)));
     assert_eq!(pool.conversions(), 1);
     assert!(Claim::take(&pool.converting).is_some(), "given back");
+}
+
+/// One draw of `spec`'s engine over `pool` under `loads`, by `seed`.
+fn drawn(
+    spec: &AppliedSpec,
+    clock: &DecisionClock,
+    pool: &PoolRecords,
+    workers: &[Arc<dyn Worker>],
+    loads: &Arc<LoadSnapshot>,
+    seed: u64,
+) -> Decision {
+    let live = Live::at(spec.engine(), clock, Instant::now(), Some(loads), None);
+    let mut facts = RequestFacts { seed, ..single() };
+    decide(
+        spec.engine(),
+        pool,
+        workers,
+        &live,
+        &mut facts,
+        &Constraints::default(),
+    )
+}
+
+/// A draw converts the list's reports once its thread has paid for them. A
+/// pick of two looks two reports up at each decision, so 32 decisions pay
+/// the 64 records of the list, and the decision behind them converts. From
+/// there each draw that holds the snapshot copies the list's rows, and a
+/// new snapshot starts the count again.
+#[test]
+fn a_draw_converts_the_lists_reports_once_its_thread_paid_for_them() {
+    let (spec, clock) = (applied("power_of_two"), DecisionClock::new());
+    let workers = fleet(64);
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let queued: Vec<i32> = (0..64).map(|at| at * 10).collect();
+    for snapshot in 1..=2 {
+        let (loads, _) = reports(&queued, Duration::from_millis(5));
+        let before = snapshot - 1;
+        for seed in 1..=32 {
+            let decision = drawn(&spec, &clock, &pool, &workers, &loads, seed);
+            assert_eq!(decision.pick().expect("a pick").targets.len(), 2);
+            assert_eq!(pool.conversions(), before, "decision {seed}");
+        }
+        let _ = drawn(&spec, &clock, &pool, &workers, &loads, 33);
+        assert_eq!(pool.conversions(), snapshot, "the decision behind them");
+        assert!(held(&pool).is_some_and(|rows| rows.is_of(&loads)));
+        for seed in 34..=200 {
+            let _ = drawn(&spec, &clock, &pool, &workers, &loads, seed);
+        }
+        assert_eq!(pool.conversions(), snapshot, "the rows are copied");
+    }
+}
+
+/// A thread that draws over two lists in turn counts each one's look-ups
+/// apart: neither count is lost to the other, and each list is converted
+/// behind its own length of look-ups.
+#[test]
+fn a_thread_that_draws_over_two_lists_in_turn_converts_both() {
+    let (spec, clock) = (applied("power_of_two"), DecisionClock::new());
+    let workers = fleet(64);
+    let pools = [
+        PoolRecords::new(&workers, &spec, &clock),
+        PoolRecords::new(&workers, &spec, &clock),
+    ];
+    let queued: Vec<i32> = (0..64).map(|at| at * 10).collect();
+    let (loads, _) = reports(&queued, Duration::from_millis(5));
+    for seed in 1..=32 {
+        for pool in &pools {
+            let _ = drawn(&spec, &clock, pool, &workers, &loads, seed);
+            assert_eq!(pool.conversions(), 0, "decision {seed}");
+        }
+    }
+    for pool in &pools {
+        let _ = drawn(&spec, &clock, pool, &workers, &loads, 33);
+        assert_eq!(pool.conversions(), 1);
+    }
+}
+
+/// A thread whose count is reached while another decision converts starts
+/// its count again: it converts nothing and waits for nothing, writes its
+/// own records, and pays the list's length again before it asks the claim.
+#[test]
+fn a_draw_whose_claim_fails_starts_its_count_again() {
+    let (spec, clock) = (applied("power_of_two"), DecisionClock::new());
+    let workers = fleet(64);
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let queued: Vec<i32> = (0..64).map(|at| at * 10).collect();
+    let (loads, _) = reports(&queued, Duration::from_millis(5));
+    for seed in 1..=32 {
+        let _ = drawn(&spec, &clock, &pool, &workers, &loads, seed);
+    }
+    // Another decision holds the list's claim when this thread's count is
+    // reached.
+    let claim = Claim::take(&pool.converting).expect("the claim is free");
+    let decision = drawn(&spec, &clock, &pool, &workers, &loads, 33);
+    assert_eq!(decision.pick().expect("a pick").targets.len(), 2);
+    assert!(held(&pool).is_none() && pool.conversions() == 0);
+    drop(claim);
+    // The count began again at that decision, which looked two reports up:
+    // 31 more decisions pay the list, and the one behind them converts.
+    for seed in 34..=64 {
+        let _ = drawn(&spec, &clock, &pool, &workers, &loads, seed);
+        assert_eq!(pool.conversions(), 0, "decision {seed}");
+    }
+    let _ = drawn(&spec, &clock, &pool, &workers, &loads, 65);
+    assert_eq!(pool.conversions(), 1);
 }
 
 #[test]

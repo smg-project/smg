@@ -20,8 +20,10 @@
 //!   holds the snapshot. One decision that writes every record of a list
 //!   under a snapshot converts the list's reports, and the list keeps
 //!   those rows for the decisions behind it that hold the same snapshot
-//!   ([`Reported`]). A decision that holds another snapshot never reads
-//!   them: it reads its own snapshot's reports.
+//!   ([`Reported`]). A draw, which writes a few records, converts them
+//!   once its thread has paid as much in single look-ups as the
+//!   conversion costs ([`Paid`]). A decision that holds another snapshot
+//!   never reads the rows: it reads its own snapshot's reports.
 //! - **Once a decision.** What a worker object says is read where the
 //!   gateway keeps it, at the decision's instant ([`Live`]): ready,
 //!   breaker, overload, stall, requests in flight. So is the age of the
@@ -42,7 +44,7 @@
 //! and by no other.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::BTreeMap,
     ptr,
     sync::{
@@ -718,7 +720,8 @@ impl PoolRecords {
     /// The worker's report is read from the list's rows where the list
     /// holds those of the decision's snapshot, and by one look-up of the
     /// worker's address in the snapshot where it does not. A read of one
-    /// record converts no other worker's report.
+    /// record converts no other worker's report, until its thread has
+    /// paid a conversion's worth of such look-ups ([`Paid`]).
     #[must_use]
     pub fn read(
         &self,
@@ -756,30 +759,161 @@ impl Drop for Claim<'_> {
     }
 }
 
+/// How many lists a thread keeps its count of look-ups for ([`Paid`]).
+const COUNTED_LISTS: usize = 8;
+
+/// What one thread paid in single look-ups for one list under one load
+/// snapshot: how many records it wrote by looking a worker's report up and
+/// converting it, because the list held no rows of that snapshot.
+///
+/// **The rule.** A draw writes the few records it asks about, so the first
+/// draw under a new snapshot must not convert the whole list: under a
+/// policy that reads two records one request would pay for every worker.
+/// But a look-up costs several times what a converted row costs to copy.
+/// So a thread counts its look-ups, and when it has written as many
+/// records by look-up under one snapshot as the list holds, its next draw
+/// over that list converts the list's reports, by the list's one claim
+/// ([`PoolRecords::convert`]). From there every draw that holds the
+/// snapshot copies its rows.
+///
+/// **The bound is a thread's.** A thread pays at most a list's length of
+/// look-ups before it converts, which is never more than twice what the
+/// cheaper of "convert at once" and "never convert" would have cost it.
+/// The count is not shared: each thread that draws over a list pays up to
+/// that much under each snapshot before one of them converts, and the
+/// rows one thread leaves serve them all. A thread whose claim fails,
+/// because another thread converts or the list already holds rows no
+/// older, starts its count again and writes its own records meanwhile.
+///
+/// **Where it lives.** In a fixed table of the calling thread, one place a
+/// list, found by the list's place in memory: a thread that draws over
+/// several lists in turn counts each one's look-ups apart. A thread that
+/// draws over more than [`COUNTED_LISTS`] lists in turn loses the count of
+/// the list it paid least for. No count is written by two threads, and
+/// nothing is allocated.
+#[derive(Clone, Copy, Debug)]
+struct Paid {
+    /// The list, by the place of its records in memory; `0` for a place
+    /// no list holds.
+    list: usize,
+    /// The snapshot the look-ups were made in, by its place in memory.
+    snapshot: usize,
+    /// The records written by look-up under that snapshot.
+    records: u32,
+}
+
+impl Paid {
+    const NONE: Self = Self {
+        list: 0,
+        snapshot: 0,
+        records: 0,
+    };
+
+    /// What the calling thread has paid for `pool` under `loads`.
+    fn so_far(pool: &PoolRecords, loads: &Arc<LoadSnapshot>) -> u32 {
+        let (list, snapshot) = (ptr::from_ref(pool).addr(), Arc::as_ptr(loads).addr());
+        PAID.with(|paid| {
+            paid.iter()
+                .map(Cell::get)
+                .find(|paid| paid.list == list && paid.snapshot == snapshot)
+                .map_or(0, |paid| paid.records)
+        })
+    }
+
+    /// Counts `records` more look-ups of the calling thread for `pool`
+    /// under `loads`. A count of another snapshot of the list starts
+    /// again, and a list the table holds no place for takes the place of
+    /// the list the thread paid least for.
+    fn count(pool: &PoolRecords, loads: &Arc<LoadSnapshot>, records: u32) {
+        let (list, snapshot) = (ptr::from_ref(pool).addr(), Arc::as_ptr(loads).addr());
+        PAID.with(|paid| {
+            let place = paid
+                .iter()
+                .find(|place| place.get().list == list)
+                .or_else(|| paid.iter().min_by_key(|place| place.get().records));
+            let Some(place) = place else {
+                return;
+            };
+            let held = place.get();
+            let before = if held.list == list && held.snapshot == snapshot {
+                held.records
+            } else {
+                0
+            };
+            place.set(Self {
+                list,
+                snapshot,
+                records: before.saturating_add(records),
+            });
+        });
+    }
+
+    /// Starts the calling thread's count for `pool` again.
+    fn start_again(pool: &PoolRecords) {
+        let list = ptr::from_ref(pool).addr();
+        PAID.with(|paid| {
+            if let Some(place) = paid.iter().find(|place| place.get().list == list) {
+                place.set(Self::NONE);
+            }
+        });
+    }
+}
+
+thread_local! {
+    /// What the calling thread paid in look-ups for the lists it last drew
+    /// over ([`Paid`]).
+    static PAID: [Cell<Paid>; COUNTED_LISTS] =
+        const { [const { Cell::new(Paid::NONE) }; COUNTED_LISTS] };
+}
+
 /// One decision's writes of single records of a list: a draw's, and a
 /// read of one worker.
 ///
 /// It holds the list's rows for the decision where they are of the
-/// decision's snapshot ([`Reported`]), read once.
+/// decision's snapshot ([`Reported`]), read once. Where the list holds
+/// none, each record is written by a look-up of its worker's report, and
+/// the look-ups are counted for the calling thread at the decision's end
+/// ([`Paid`]).
 struct Singly<'a> {
+    pool: &'a PoolRecords,
     workers: &'a [Arc<dyn Worker>],
     live: &'a Live<'a>,
     /// The list's rows, where they are of the decision's snapshot.
     held: Option<Held>,
+    /// The records this decision wrote by a look-up of a report.
+    looked_up: Cell<u32>,
 }
 
 impl<'a> Singly<'a> {
-    fn new(pool: &PoolRecords, workers: &'a [Arc<dyn Worker>], live: &'a Live<'a>) -> Self {
+    fn new(pool: &'a PoolRecords, workers: &'a [Arc<dyn Worker>], live: &'a Live<'a>) -> Self {
         let held = live.loads.and_then(|loads| {
+            let of_its_snapshot = |held: &Held| {
+                held.as_deref()
+                    .is_some_and(|reported| reported.is_of(loads))
+            };
             let held = pool.reported.load();
-            held.as_deref()
-                .is_some_and(|reported| reported.is_of(loads))
-                .then_some(held)
+            if of_its_snapshot(&held) {
+                return Some(held);
+            }
+            // The list holds no rows of this snapshot. A thread that has
+            // paid a conversion's worth of look-ups under it converts now.
+            if (Paid::so_far(pool, loads) as usize) < pool.len() {
+                return None;
+            }
+            match pool.convert(workers, loads, live, &held) {
+                Some(_) => Some(pool.reported.load()).filter(of_its_snapshot),
+                None => {
+                    Paid::start_again(pool);
+                    None
+                }
+            }
         });
         Self {
+            pool,
             workers,
             live,
             held,
+            looked_up: Cell::new(0),
         }
     }
 
@@ -808,7 +942,19 @@ impl<'a> Singly<'a> {
             None => {
                 *row = *fixed;
                 self.live.write(worker.as_ref(), row);
+                self.looked_up.set(self.looked_up.get() + 1);
             }
+        }
+    }
+}
+
+impl Drop for Singly<'_> {
+    /// Counts the decision's look-ups for its thread, where it made any
+    /// in a snapshot.
+    fn drop(&mut self) {
+        let looked_up = self.looked_up.get();
+        if let (Some(loads), true) = (self.live.loads, looked_up > 0) {
+            Paid::count(self.pool, loads, looked_up);
         }
     }
 }
