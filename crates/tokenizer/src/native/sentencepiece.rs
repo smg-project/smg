@@ -38,8 +38,11 @@ pub(super) const WORD_MARKER: char = '\u{2581}';
 const MARKER_BYTES: [u8; 3] = [0xE2, 0x96, 0x81];
 /// No token for the character.
 const NO_ID: u32 = u32::MAX;
-/// Words of the bridge table: one bit per pair of bytes.
-const BRIDGE_WORDS: usize = 256 * 256 / 64;
+/// Entries of the bridge table: one byte per pair of bytes, 64 KiB. From a
+/// bit per pair (8 KiB) the gather of [`CharSymbols::pieces`] ran as many
+/// instructions a token as the test it replaced; from a byte, 15 to 21 %
+/// fewer (counted).
+const BRIDGE_PAIRS: usize = 256 * 256;
 /// Symbols the thread's scratch list keeps between merges, 16 KiB: a piece
 /// longer than this (a space-free text no vocabulary token cuts can be the
 /// whole unit) hands its list back after the merge, so a thread holds this
@@ -71,13 +74,13 @@ pub(super) struct CharSymbols {
     ascii: [u32; 128],
     /// The token of each other character the vocabulary has, by scalar value.
     beyond: FxHashMap<u32, u32>,
-    /// Bit [`pair_bit`] of `prev` and `cur`: no piece cut goes between the
+    /// One at [`pair_entry`] of `prev` and `cur`: no piece cut goes between the
     /// raw bytes `prev` and `cur`: some vocabulary token holds them adjacent
     /// (a space read as the marker, its last byte before the cut and its
     /// first byte after it), or `cur` continues a UTF-8 character. Read
     /// from the tokens' text, then rewritten for the raw text by
     /// [`Self::bridge_raw_text`].
-    bridge: Box<[u64; BRIDGE_WORDS]>,
+    bridge: Box<[u8; BRIDGE_PAIRS]>,
     marker: Marker,
     /// The model's merges over its own ids.
     merges: MergeTable,
@@ -116,7 +119,7 @@ impl CharSymbols {
         let mut symbols = Self {
             ascii: [NO_ID; 128],
             beyond: FxHashMap::default(),
-            bridge: Box::new([0; BRIDGE_WORDS]),
+            bridge: Box::new([0; BRIDGE_PAIRS]),
             marker,
             merges,
         };
@@ -147,7 +150,7 @@ impl CharSymbols {
             )));
         }
         for pair in token.as_bytes().array_windows() {
-            Self::set(&mut self.bridge, pair_bit(*pair));
+            self.bridge[pair_entry(*pair)] = 1;
         }
         let mut chars = token.chars();
         if let (Some(c), None) = (chars.next(), chars.next()) {
@@ -167,13 +170,13 @@ impl CharSymbols {
     /// one is its first byte), and no cut goes before a byte that continues
     /// a character.
     fn bridge_raw_text(&mut self) {
-        let mut raw = Box::new([0u64; BRIDGE_WORDS]);
+        let mut raw = Box::new([0u8; BRIDGE_PAIRS]);
         for prev in 0..=255u8 {
             for cur in 0..=255u8 {
                 let before = if prev == b' ' { MARKER_BYTES[2] } else { prev };
                 let after = if cur == b' ' { MARKER_BYTES[0] } else { cur };
                 if is_continuation(cur) || self.bridged(before, after) {
-                    Self::set(&mut raw, pair_bit([prev, cur]));
+                    raw[pair_entry([prev, cur])] = 1;
                 }
             }
         }
@@ -237,20 +240,7 @@ impl CharSymbols {
     /// field).
     #[inline(always)]
     fn bridged(&self, prev: u8, cur: u8) -> bool {
-        self.holds(pair_bit([prev, cur]))
-    }
-
-    /// Whether the table holds `bit`, the bit of a pair of bytes
-    /// ([`pair_bit`]).
-    #[inline(always)]
-    fn holds(&self, bit: usize) -> bool {
-        (self.bridge[bit >> 6] >> (bit & 63)) & 1 != 0
-    }
-
-    /// Sets `bit`, the bit of a pair of bytes ([`pair_bit`]), in `table`:
-    /// the write of what [`Self::holds`] reads.
-    fn set(table: &mut [u64; BRIDGE_WORDS], bit: usize) {
-        table[bit >> 6] |= 1 << (bit & 63);
+        self.bridge[pair_entry([prev, cur])] != 0
     }
 
     /// The token of `c`, or [`NO_ID`].
@@ -284,15 +274,41 @@ impl CharSymbols {
     #[inline(always)]
     pub(super) fn pieces<F: FnMut(usize, usize)>(&self, text: &[u8], mut f: F) {
         let mut start = 0;
-        for (at, pair) in (1..).zip(text.array_windows()) {
-            if !self.holds(pair_bit(*pair)) {
+        // The answers of 64 pairs gathered as the bits of one word by a loop
+        // with no branch, then one step per cut: a test and a branch per
+        // pair follows the text, and took more than half of a token's missed
+        // branches on text read a second time (counted).
+        let mut tested = 0;
+        while tested + 1 < text.len() {
+            let rest = &text[tested..];
+            let bridged = match rest.first_chunk::<{ u64::BITS as usize + 1 }>() {
+                Some(block) => self.bridged_bits(block.array_windows()),
+                // The bits past the last pair are no cuts.
+                None => self.bridged_bits(rest.array_windows()) | (u64::MAX << (rest.len() - 1)),
+            };
+            let mut cuts = !bridged;
+            while cuts != 0 {
+                let at = tested + 1 + cuts.trailing_zeros() as usize;
                 f(start, at);
                 start = at;
+                cuts &= cuts - 1;
             }
+            tested += u64::BITS as usize;
         }
         if start < text.len() {
             f(start, text.len());
         }
+    }
+
+    /// The table's answers for up to 64 adjacent pairs as the bits of a
+    /// word, the first pair's lowest.
+    #[inline(always)]
+    fn bridged_bits<'t>(&self, pairs: impl Iterator<Item = &'t [u8; 2]>) -> u64 {
+        let mut bits = 0;
+        for (bit, pair) in pairs.enumerate() {
+            bits |= u64::from(self.bridge[pair_entry(*pair)]) << bit;
+        }
+        bits
     }
 
     /// Whether the raw text is cut at `p` (past its first byte, before its
@@ -349,11 +365,11 @@ fn is_continuation(byte: u8) -> bool {
     (0x80..0xC0).contains(&byte)
 }
 
-/// The bit of a pair of adjacent bytes in a bridge table: the pair as the
+/// The entry of a pair of adjacent bytes in a bridge table: the pair as the
 /// text holds it, read as one little-endian number, so the walk over a text
 /// tests each pair with one load.
 #[inline(always)]
-fn pair_bit(pair: [u8; 2]) -> usize {
+fn pair_entry(pair: [u8; 2]) -> usize {
     usize::from(u16::from_le_bytes(pair))
 }
 

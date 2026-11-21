@@ -6896,6 +6896,32 @@ fn a_long_sentencepiece_text_encodes_the_same_on_the_pool_as_in_one_piece() {
     }
 }
 
+/// The walk tests the pairs of a text 64 at a time: under every alignment
+/// of the text to those blocks the pieces end at its cuts, the cut between
+/// the last pair of a block and the first of the next too.
+#[test]
+fn the_sentencepiece_pieces_end_at_every_cut_under_each_alignment_to_a_block() {
+    let mut state = 0x0B10_C5EA_4064_5EEDu64;
+    let model = ModelWrapper::BPE(sentencepiece_model(&mut state));
+    let chars = CharSymbols::from_model(&model, Marker::Never, None).expect("the path takes it");
+    let text = random_text(&mut state, 200, &[]);
+    let mut cuts_between_blocks = 0;
+    for from in 0..64 {
+        let text = &text.as_bytes()[from..];
+        let mut pieces = Vec::new();
+        chars.pieces(text, |start, end| pieces.push((start, end)));
+        let mut cut = Vec::new();
+        let mut start = 0;
+        for end in (1..=text.len()).filter(|&p| p == text.len() || chars.cuts_at(text, p)) {
+            cut.push((start, end));
+            start = end;
+        }
+        assert_eq!(pieces, cut, "from byte {from}");
+        cuts_between_blocks += usize::from(chars.cuts_at(text, 65));
+    }
+    assert!(cuts_between_blocks > 0);
+}
+
 #[test]
 fn a_tiktoken_vocabulary_outside_the_path_declines() {
     let mut state = 0x1234_5678_9ABC_DEF1u64;
