@@ -307,6 +307,29 @@ pub trait Scorer: Lifecycle + Debug {
         false
     }
 
+    /// [`Self::own`] for a host that reads a row when it is asked about
+    /// one, and writes none ahead of the decision: the scorer names the
+    /// rows it meets by their places in the pool, which holds `rows` of
+    /// them, asks `keep` about each, once, and writes to `out` the places
+    /// of the rows it hands out, the pick first and its alternates behind
+    /// it, each one kept by `keep` and none twice. Returns how many it
+    /// wrote. They are the rows [`Self::own`] hands out over the same
+    /// pool, in its order. `0` where it places nothing by itself, as
+    /// [`Self::own`] says `false`: the profile's run over the whole pool
+    /// decides. A scorer that places by a ring walks the ring its host
+    /// lent ([`RequestFacts::ring`]) and places nothing where none is
+    /// lent. It reads no value of the seed's stream. The default places
+    /// nothing.
+    fn own_by_place(
+        &self,
+        _facts: &RequestFacts<'_>,
+        _rows: usize,
+        _keep: &mut dyn FnMut(u32) -> bool,
+        _out: &mut [u32; MAX_TARGETS],
+    ) -> usize {
+        0
+    }
+
     /// How this scorer's values lie ([`ScoreSpread`]), asked once when the
     /// engine is built. A scorer that writes levels is a rank where its weight
     /// outweighs every stage behind it: a plain decision then asks those stages

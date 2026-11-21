@@ -7,8 +7,15 @@
 //! membership change is a new list, and takes a new ring. So a reader takes
 //! no lock: it holds the ring whole, behind one pointer.
 //!
+//! The host lends a list's ring to each decision of that list
+//! ([`RequestFacts::ring`]). The consistent-hash scorer then places by it,
+//! and its own ring ([`Ring`]) learns nothing of the decision.
+//!
 //! A member is named by its row's place in the list: a walk hands out places,
 //! and its caller reads the row there with no search for it.
+//!
+//! [`RequestFacts::ring`]: crate::engine::RequestFacts::ring
+//! [`Ring`]: super::Ring
 
 use std::fmt;
 
@@ -131,7 +138,8 @@ impl PoolRing {
 
     /// Whether every row of the list has an id of its own. Where two share
     /// one, a walk cannot say which of them a member is, and hands out
-    /// nothing ([`Self::walk`]).
+    /// nothing ([`Self::walk`]): such a list is placed by the scorer's pass
+    /// over its rows, which takes the last of them the filters keep.
     #[must_use]
     pub fn is_distinct(&self) -> bool {
         self.stands_for.is_empty()
@@ -156,7 +164,7 @@ impl PoolRing {
     /// The rows at the ring's positions clockwise from the key's, once
     /// around: the one source of a walk's order. A row stands at every one
     /// of its positions, so a walk meets it more than once.
-    fn around(&self, key: u64) -> impl Iterator<Item = u32> + '_ {
+    pub(super) fn around(&self, key: u64) -> impl Iterator<Item = u32> + '_ {
         let start = self.start(key_position(key));
         let (before, from) = self.entries.split_at(start);
         from.iter().chain(before).map(|&(_, row)| row)
@@ -216,6 +224,36 @@ impl PoolRing {
             }
         }
         0
+    }
+
+    /// Fills `slots`, a slot a row of the list, with the index among `kept`
+    /// of each row kept, and the mark of a free slot for every other.
+    /// `kept` names rows by their places, ascending. Two rows of one id
+    /// share the slot of the first of them, and the last of them kept takes
+    /// it, as in the scorer's own ring.
+    pub(super) fn fill(&self, kept: &[u32], slots: &mut Vec<u32>) {
+        slots.clear();
+        if self.is_distinct() {
+            // Every row kept: each row's slot is its own place.
+            if kept.len() == self.len() {
+                slots.extend(0..self.rows);
+                return;
+            }
+            slots.resize(self.len(), FREE);
+            for (at, &row) in (0u32..).zip(kept) {
+                if let Some(slot) = slots.get_mut(row as usize) {
+                    *slot = at;
+                }
+            }
+        } else {
+            slots.resize(self.len(), FREE);
+            for (at, &row) in (0u32..).zip(kept) {
+                let member = self.stands_for.get(row as usize);
+                if let Some(slot) = member.and_then(|&member| slots.get_mut(member as usize)) {
+                    *slot = at;
+                }
+            }
+        }
     }
 }
 
