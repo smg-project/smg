@@ -40,7 +40,7 @@ enum Piece {
 pub(crate) struct PieceTable {
     /// `offsets[id]..offsets[id + 1]` indexes `text` for token `id`.
     offsets: Vec<usize>,
-    text: Vec<u8>,
+    text: String,
     piece: Vec<Piece>,
     /// The chain ends in `Strip(" ", 1, 0)`: one leading space of the whole
     /// text goes.
@@ -92,7 +92,7 @@ impl PieceTable {
         let ids = max_id as usize + 1;
         let mut offsets = Vec::with_capacity(ids + 1);
         offsets.push(0);
-        let mut text = Vec::with_capacity(ids * 4);
+        let mut text = String::with_capacity(ids * 4);
         let mut piece = Vec::with_capacity(ids);
         for id in 0..=max_id {
             let kind = match token_of(tokenizer, listing, id) {
@@ -101,13 +101,11 @@ impl PieceTable {
                     Some(byte) => Piece::Byte(byte),
                     None => {
                         for ch in token.chars() {
-                            let ch = if replaces_marker && ch == WORD_MARKER {
+                            text.push(if replaces_marker && ch == WORD_MARKER {
                                 ' '
                             } else {
                                 ch
-                            };
-                            let mut buf = [0u8; 4];
-                            text.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                            });
                         }
                         if added.is_special_token(&token) {
                             Piece::Special
@@ -138,9 +136,9 @@ impl PieceTable {
 
     fn text_of(&self, id: TokenIdType) -> &str {
         let index = id as usize;
-        // The table holds what `encode_utf8` wrote: valid UTF-8 per piece.
-        std::str::from_utf8(&self.text[self.offsets[index]..self.offsets[index + 1]])
-            .unwrap_or_default()
+        // The offsets are the ends of whole pieces: a slice of the text
+        // checks its two boundaries, where a conversion reads every byte.
+        &self.text[self.offsets[index]..self.offsets[index + 1]]
     }
 
     /// The text of `ids` as the vocabulary's decoder chain renders it.
@@ -153,7 +151,9 @@ impl PieceTable {
                 Piece::Special if skip_special_tokens => {}
                 Piece::Byte(byte) => run.push(byte),
                 Piece::Text | Piece::Special => {
-                    close_run(&mut out, &mut run);
+                    if !run.is_empty() {
+                        close_run(&mut out, &mut run);
+                    }
                     out.push_str(self.text_of(id));
                 }
             }
