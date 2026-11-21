@@ -120,7 +120,7 @@ falls back to its default.
 | `SMG_AUDIO_MAX_INPUT_BYTES` | 256 MiB | The same for one audio clip. |
 | `SMG_IMAGE_MAX_COUNT`, `SMG_VIDEO_MAX_COUNT`, `SMG_AUDIO_MAX_COUNT` | the model family's own limit | How many images, videos or audio clips one request may carry. It replaces the family's limit, up or down, and never enables a modality the family does not serve. |
 | `SMG_VIDEO_DECODE_BACKEND` | `auto` | The video decoder: `auto`, `opencv` or `ffmpeg` (see Media decoding). `opencv` needs the `opencv-video` feature. Any other value fails every video decode with an error that names it. |
-| `SMG_VIDEO_PROCESS_TIMEOUT_SECS` | 30 | The time one decoder may spend on a clip, in seconds; a fraction is allowed. Under `auto` with the `opencv-video` feature, a clip OpenCV fails on, a timeout included, gets the same budget again in `ffmpeg`. |
+| `SMG_VIDEO_PROCESS_TIMEOUT_SECS` | 30 | The time one decoder run may spend on a clip, in seconds; a fraction is allowed. With the `opencv-video` feature, a clip the buffered OpenCV pass fails on, a timeout included, gets the same budget again in OpenCV from a temporary file, and under `auto` once more in `ffmpeg`. |
 | `SMG_VIDEO_MAX_DECODED_BYTES` | 1 GiB | The most bytes the decoded frames of one clip may take. |
 | `SMG_VIDEO_MAX_DECODE_PIXELS` | 10^12 | The most pixels one video decode may run through: the source frames it has to decode, times the clip's width and height. A decode past it is refused before a decoder starts. |
 | `SMG_AUDIO_DECODE_BACKEND` | `auto` | The audio decoder: `auto` (the in-process decoder first, then `ffmpeg`), `symphonia` or `ffmpeg`. Any other value fails every audio decode with an error that names it. |
