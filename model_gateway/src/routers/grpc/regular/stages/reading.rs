@@ -41,7 +41,8 @@ use crate::{
 /// What preparation found for the response.
 pub(crate) struct Prepared {
     /// The constraint for what the request asks, before its worker is known:
-    /// the table's tag for a forced call, else the older registry's; a JSON
+    /// the table's tag for a forced call, the call's JSON schema where that
+    /// tag opens with free text, else the older registry's; a JSON
     /// answer's tag as it derives for a worker's start, or its schema itself
     /// where no table reads a Messages request's answer; or why the table
     /// cannot constrain the request. Request building decides on the selected
@@ -423,8 +424,8 @@ pub(crate) struct Decided {
 /// retry re-selects only workers that decide alike
 /// (`utils::WorkerDecoding::decides_alike`); what the request asked for suits
 /// any worker. Then Symphony's assignment, taken while the rendered prompt is
-/// still here (`regular::symphony::assign`): it reads the older registry's
-/// constraint by its kind, before any shaping for the worker, and the table's
+/// still here (`regular::symphony::assign`): it reads a constraint no table
+/// built by its kind, before any shaping for the worker, and the table's
 /// by its origin (`WorkerConstraint::table`), and the state records the parser
 /// that reads the response, Symphony when a table takes the request and
 /// legacy otherwise, for the response's header. `declared` is the tools the
@@ -482,9 +483,10 @@ pub(crate) fn decide(
         ctx.state.constraint_decided_on = Some(decoding);
     }
     // The constraint as the request carries it; Symphony's assignment below
-    // reads the older registry's alone (a `json_schema` pair there is the
-    // older registry's forced call, which the table reads with its forced
-    // call), never the table's, whatever kind the backend's spelling gave it.
+    // reads one no table built alone (a `json_schema` pair there is a forced
+    // call's schema, the older registry's or `forced_call_schema`'s, which the
+    // table reads with its forced call), never the table's, whatever kind the
+    // backend's spelling gave it.
     let tabled = decided.constraint.map(|constraint| constraint.to_tuple());
     let registry = if decided.table { None } else { tabled.as_ref() };
     let provider = ctx

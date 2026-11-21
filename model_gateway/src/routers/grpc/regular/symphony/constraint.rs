@@ -890,9 +890,10 @@ pub(super) fn auto_tag(
 }
 
 /// The constraint preparation finds for what a request asks, before its worker is known
-/// ([`constraint_for`]): a forced call's tag, the table's or the older registry's; a JSON answer's
-/// tag as it derives for a worker's start; or why the table cannot constrain the request. Request
-/// building decides on the selected worker ([`worker_constraint`]).
+/// ([`constraint_for`]): a forced call's tag, the table's or the older registry's, or the call's
+/// JSON schema where the table's tag opens with free text; a JSON answer's tag as it derives for
+/// a worker's start; or why the table cannot constrain the request. Request building decides on
+/// the selected worker ([`worker_constraint`]).
 pub(crate) type PreparedConstraint = Result<Prepared, SymphonyError>;
 
 /// What preparation found for a request's constraint, before its worker is known.
@@ -902,12 +903,13 @@ pub(crate) enum Prepared {
     None,
     /// A constraint every worker takes as it is: a forced call's tag, the table's built for the
     /// start the model's workers name together ([`grammar_start_of`]) or the older registry's,
-    /// which request building shapes for the worker (`utils::tool_constraints_for_worker`).
+    /// which request building shapes for the worker (`utils::tool_constraints_for_worker`), or
+    /// the call's JSON schema where the table's tag opens with free text ([`Self::held_by`]).
     Constraint {
         constraint: ToolConstraint,
         /// The table built it for an engine that starts the grammar at the first token (the
         /// thought, closed, ahead of the calls), the start the model's workers name together.
-        /// The older registry's is shaped for the worker at request building, which says then
+        /// One no table built is shaped for the worker at request building, which says then
         /// whether it led the tag; here it is `false` ([`WorkerConstraint::first_token`]).
         first_token: bool,
         /// The table built it (its tag for the forced call, `calls_tag`), so the table reads
@@ -1095,15 +1097,15 @@ pub(crate) struct WorkerConstraint {
     /// for a pool that starts there ([`Prepared::Constraint`]). The engine's request says so
     /// where its dialect has a switch for the gate behind a reasoning parser, so an engine that
     /// gates its grammars there starts this one at once; a constraint shaped for another start,
-    /// or none, starts where the engine does. Never the older registry's constraint: request
+    /// or none, starts where the engine does. Never a constraint no table built: request
     /// building shapes that one for the worker and says whether it led the tag.
     pub first_token: bool,
     /// The table built the constraint (the whole turn's grammar, the `auto` tag, a JSON
     /// answer's tag, a forced call's), so the table reads the response whatever the
-    /// constraint's kind, which a backend's spelling may change; `false` for the older
-    /// registry's forced call, which the table reads with its forced call, and where nothing
-    /// constrains.
-    /// Symphony's assignment reads the older registry's by its kind alone
+    /// constraint's kind, which a backend's spelling may change; `false` for a forced call's
+    /// constraint no table built (the older registry's, or the call's JSON schema in a tag's
+    /// place), which the table reads with its forced call, and where nothing constrains.
+    /// Symphony's assignment reads one no table built by its kind alone
     /// (`regular::symphony::assign_for`).
     pub table: bool,
 }
@@ -1272,7 +1274,7 @@ pub(crate) fn worker_constraint(
     let start = grammar_start_from(decoding.start);
     let vocabulary = decoding.vocabulary;
     // A tag derived here is shaped for the selected worker's start; a prepared constraint says
-    // for itself whether the table built it for the first token, and the older registry's is
+    // for itself whether the table built it for the first token, and one no table built is
     // shaped and spoken for at request building (`utils::tool_constraints_for_worker`).
     let derived_for_first_token =
         |tag: &Option<ToolConstraint>| tag.is_some() && start == GrammarStart::FirstToken;
