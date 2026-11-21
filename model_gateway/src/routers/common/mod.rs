@@ -223,8 +223,14 @@ pub(crate) fn attach_sized_body(
 /// and whether the process captures every request's cache trace.
 #[cfg(any(test, feature = "test-util"))]
 pub mod bench_support {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Instant};
 
+    use rand::RngExt;
+    use smg_policy_controller::{
+        engine::{decide, Constraints, DecisionClock, Phase, PolicyEngine, RequestFacts},
+        stages::Lifecycle,
+        tracking::{Lease, Outcome, Side as EngineSide, TransportClass},
+    };
     use smg_worker::{
         identity::basic::{Worker, WorkerLoadGuard},
         load::state::LoadReceiver,
@@ -376,6 +382,134 @@ pub mod bench_support {
         let prefill = WorkerLoadGuard::with_key(pair.prefill, policies.sticky_key(None, None));
         let decode = WorkerLoadGuard::with_key(pair.decode, policies.sticky_key(None, None));
         drop((prefill, decode));
+        true
+    }
+
+    /// The policy engine of one routing policy, asked for its whole
+    /// decision over records written from the gateway's own data: the
+    /// engine of the document the routing settings give for the policy, its
+    /// clock, and the load feed the monitor would publish.
+    pub struct EngineOverRecords {
+        engine: Arc<PolicyEngine>,
+        clock: DecisionClock,
+        loads: Option<LoadReceiver>,
+    }
+
+    impl EngineOverRecords {
+        /// The engine a gateway's start builds for `config`'s policy under
+        /// the setting, whatever `config` says of the setting, reading the
+        /// workers' reports from `loads`.
+        ///
+        /// # Errors
+        ///
+        /// A configuration no policy document says, and a document the
+        /// engine refuses.
+        pub fn of(config: &RouterConfig, loads: Option<LoadReceiver>) -> Result<Self, String> {
+            let picked = RouterConfig {
+                policy_controller: true,
+                ..config.clone()
+            };
+            let started = start_in_process(&picked, None)
+                .map_err(|refused| refused.to_string())?
+                .ok_or("this configuration places its requests by no routing policy")?;
+            Ok(Self {
+                engine: started.engine,
+                clock: DecisionClock::new(),
+                loads,
+            })
+        }
+    }
+
+    /// One request's routing by the policy engine's whole decision on
+    /// `route`, over records written for this decision from the route's own
+    /// pool as the registry lists it, the worker objects and the load
+    /// snapshot: the decision, the word of its issue, its dispatch and its
+    /// end to the engine's stages, the dispatch-time read of the chosen
+    /// worker's overload veto, and the worker's load guard from the send to
+    /// the request's end. `false` where the request had no worker.
+    ///
+    /// What [`route_classic`] does under a classic policy, with the engine
+    /// deciding: no classic policy and no classic placement pass runs.
+    pub fn route_records(
+        registry: &WorkerRegistry,
+        engine: &EngineOverRecords,
+        model: &str,
+        route: Route,
+        tokens: Option<&[u32]>,
+    ) -> bool {
+        let pool = match route {
+            Route::Http => RoutingPool::HttpRegular,
+            Route::Grpc => RoutingPool::GrpcPipelineRegular,
+        };
+        let snapshot = registry.get_routing_snapshot(model);
+        let workers = snapshot.pool(pool);
+        let members = snapshot
+            .pool_members_cell(pool)
+            .get_or_init(|| Box::new(engine.engine.pool_members(workers)));
+        let spec = engine.engine.spec();
+        let records = members.records(spec, &engine.clock);
+        // Borrowed once a decision, as a classic policy borrows it.
+        let loads = engine.loads.as_ref().map(|loads| loads.borrow().clone());
+        let mut facts = RequestFacts {
+            model,
+            phase: Phase::Single,
+            prompt_tokens: tokens
+                .map_or(0, |tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX)),
+            seed: rand::rng().random(),
+            ..RequestFacts::default()
+        };
+        let decision = decide(
+            spec.engine(),
+            records,
+            workers,
+            loads.as_deref(),
+            &engine.clock,
+            Instant::now(),
+            &mut facts,
+            &Constraints::default(),
+        );
+        let Some(target) = decision.pick().and_then(|pick| pick.targets.first()) else {
+            return false;
+        };
+        let Some(worker) = workers.get(target.position as usize) else {
+            return false;
+        };
+        // The engine's stages hear the request as a gateway's guard tells
+        // it: its issue and its dispatch here, its end below.
+        let stages = spec.engine();
+        let lease = Lease {
+            side: EngineSide::Single,
+            booked: target.id,
+            generation: spec.generation(),
+            issued_micros: facts.now_micros,
+            tokens: facts.prompt_tokens,
+            ..Lease::default()
+        };
+        stages.on_decision_issued(&lease, &decision);
+        stages.on_dispatched(&lease, target, EngineSide::Single, 0);
+        let shed = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            model,
+            registry.overload_shed_enabled(),
+        );
+        if shed.is_some() {
+            return false;
+        }
+        let guard = WorkerLoadGuard::with_key(Arc::clone(worker), None);
+        drop(guard);
+        stages.on_completed(
+            &lease,
+            &Outcome {
+                side: EngineSide::Single,
+                served: target.id,
+                status: 200,
+                class: TransportClass::Ok,
+                ttft_micros: 0,
+                tokens_in: facts.prompt_tokens,
+                tokens_out: 0,
+                duration_micros: 0,
+            },
+        );
         true
     }
 

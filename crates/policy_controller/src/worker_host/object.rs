@@ -100,12 +100,7 @@ pub(super) fn unchecked(row: &WorkerRow) -> BasicWorkerBuilder {
 
 /// The store's role for a worker object.
 pub(super) fn role(worker_type: WorkerType) -> Role {
-    match worker_type {
-        WorkerType::Regular => Role::Single,
-        WorkerType::Prefill => Role::Prefill,
-        WorkerType::Decode => Role::Decode,
-        WorkerType::Encode => Role::Encode,
-    }
+    Role::from(worker_type)
 }
 
 /// The address the row's object dials, as written. A row that names no

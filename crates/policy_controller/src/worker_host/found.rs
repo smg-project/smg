@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use smg_worker::{
     identity::basic::Worker,
-    worker::{ConnectionMode, HealthCheckConfig, WorkerSpec},
+    worker::{HealthCheckConfig, WorkerSpec},
 };
 
 use super::{membership_writer::Over, object::role};
@@ -47,11 +47,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
         engine: engine_of(worker).to_owned(),
         incarnation: standing.incarnation,
         role: role(spec.worker_type),
-        wire_modes: match spec.connection_mode {
-            ConnectionMode::Http => WireModes::HTTP,
-            ConnectionMode::Grpc => WireModes::GRPC,
-            ConnectionMode::Zmq => WireModes::ZMQ,
-        },
+        wire_modes: WireModes::from(spec.connection_mode),
         engine_kind: if spec.runtime_type.is_specified() {
             spec.runtime_type.as_str().to_owned()
         } else {
