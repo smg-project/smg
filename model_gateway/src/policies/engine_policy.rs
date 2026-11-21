@@ -635,6 +635,46 @@ mod tests {
         assert_eq!(classic.get_decode_policy().name(), "random");
     }
 
+    /// The log says who decides each policy the registry builds and keeps,
+    /// once: the default at the start, a side where it is first set (a
+    /// gateway of many routers asks for it from each of its pair routers),
+    /// the encode fallback at its first read, and a model's policy that
+    /// its workers' label names.
+    #[test]
+    #[tracing_test::traced_test]
+    fn the_log_says_once_who_decides_each_policy_the_registry_keeps() {
+        const LINES: [&str; 5] = [
+            "Policy `round_robin` of every model (single requests): the classic policy decides it",
+            "Policy `round_robin` of every model (prefill requests): the policy engine decides it",
+            "Policy `round_robin` of every model (decode requests): the policy engine decides it",
+            "Policy `consistent_hashing` of every model (encode requests): the classic policy decides it",
+            "Policy `random` of model asked-model (single requests): the classic policy decides it, \
+             its workers' policy label names it",
+        ];
+        let policies = asking_for_a_pair();
+        let prefill = policies.get_prefill_policy();
+        for _ in 0..2 {
+            policies.set_side_policy(Side::Prefill, &PolicyConfig::RoundRobin);
+        }
+        assert!(Arc::ptr_eq(&prefill, &policies.get_prefill_policy()));
+        let encode = policies.get_encode_policy();
+        assert!(Arc::ptr_eq(&encode, &policies.get_encode_policy()));
+        policies.on_worker_added(MODEL, Some("random"));
+
+        logs_assert(|lines: &[&str]| {
+            for line in LINES {
+                let written = lines
+                    .iter()
+                    .filter(|written| written.contains(line))
+                    .count();
+                if written != 1 {
+                    return Err(format!("{written} lines say: {line}"));
+                }
+            }
+            Ok(())
+        });
+    }
+
     /// The prefill side's profile holds the test of a free slot of the
     /// prefill window, and the object drops it: the pass holds it. Under
     /// prefill admission a prefill at its bound leaves the candidates before

@@ -271,7 +271,8 @@ pub(crate) fn start_in_process(
         }
     }
     info!(
-        "The policy controller is picked for this gateway: its engine decides in this process, over the gateway's own worker data"
+        "The policy controller is picked for this gateway and runs in this process, over the gateway's own worker data: \
+         the policy engine decides each policy whose line says so"
     );
     Ok(Some(InProcess {
         engine,

@@ -12,7 +12,7 @@ use http::{header::HeaderName, HeaderMap};
 use openai_protocol::UNKNOWN_MODEL_ID;
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxBuildHasher;
-use smg_policy_controller::engine::{Phase, Place, PolicyEngine};
+use smg_policy_controller::engine::{AloneProfile, Phase, Place, PolicyEngine};
 use smg_worker::{
     identity::{
         basic::{RequestCompletionSink, Worker, WorkerType},
@@ -227,6 +227,10 @@ pub struct PolicyRegistry {
     /// Encode policy for EPD mode (set once at startup, lock-free reads via OnceLock)
     encode_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
 
+    /// The encode policy of a gateway that set none
+    /// ([`Self::get_encode_policy`]), built at its first read and kept.
+    encode_fallback: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
+
     /// Optional KV event monitor for event-driven cache-aware routing.
     /// When set, new CacheAwarePolicy instances are injected with this monitor.
     kv_event_monitor: Arc<RwLock<Option<Arc<KvEventMonitor>>>>,
@@ -370,6 +374,7 @@ impl PolicyRegistry {
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
             encode_policy: Arc::new(OnceLock::new()),
+            encode_fallback: Arc::new(OnceLock::new()),
             kv_event_monitor: Arc::new(RwLock::new(None)),
             load_rx: Arc::new(RwLock::new(None)),
             mesh_tree_sync: Arc::new(RwLock::new(None)),
@@ -988,8 +993,7 @@ impl PolicyRegistry {
                         model: model_id,
                         phase: Phase::Single,
                     };
-                    info!("Policy `{name}` of {place}: the policy engine decides it");
-                    return Arc::new(EnginePolicy::of(&asked.engine, profile, name));
+                    return Self::engine_object(asked, profile, name, &place);
                 }
                 (Place::Unbound, _) if supplied => warn!(
                     "Model {model_id}: no binding of the policy document names it, \
@@ -1028,6 +1032,17 @@ impl PolicyRegistry {
                 Phase::Single,
             )
         } else if let Some(policy) = PolicyFactory::create_by_name(policy_type) {
+            if self.policy_engine.is_some() {
+                let place = Placed {
+                    model: model_id,
+                    phase: Phase::Single,
+                };
+                info!(
+                    "Policy `{}` of {place}: the classic policy decides it, \
+                     its workers' policy label names it",
+                    policy.name()
+                );
+            }
             policy
         } else {
             warn!("Unknown policy type '{}', using default", policy_type);
@@ -1043,16 +1058,17 @@ impl PolicyRegistry {
     }
 
     /// The policy of one place, `model` at `phase`, whose classic policy is
-    /// `config`: the one function of this registry that builds a policy.
+    /// `config`.
     ///
     /// With no engine it is the classic policy (PolicyFactory's). With one,
     /// the engine finds the place's profile by its document's bindings
     /// ([`PolicyEngine::place`]), here and at no request. Where one pick of
     /// that profile's picker is its whole decision, the policy is the
-    /// object that asks the engine ([`EnginePolicy`]), and `config`'s name
-    /// only labels it. Where the engine does not pick the profile so yet,
-    /// or no binding names the place, it is the classic policy. The log
-    /// says which, once for each policy built with an engine asked.
+    /// object that asks the engine ([`Self::engine_object`]), and
+    /// `config`'s name only labels it. Where the engine does not pick the
+    /// profile so yet, or no binding names the place, it is the classic
+    /// policy. The log says which: one line for each policy this registry
+    /// builds and keeps with an engine asked.
     fn policy_at(
         asked: Option<&AskedEngine>,
         config: &PolicyConfig,
@@ -1065,10 +1081,7 @@ impl PolicyRegistry {
         let name = config.name();
         let place = Placed { model, phase };
         match asked.engine.place(model, phase) {
-            Place::Alone(profile) => {
-                info!("Policy `{name}` of {place}: the policy engine decides it");
-                Arc::new(EnginePolicy::of(&asked.engine, profile, name))
-            }
+            Place::Alone(profile) => Self::engine_object(asked, profile, name, &place),
             Place::NotAlone { profile, stage } => {
                 info!(
                     "Policy `{name}` of {place}: the classic policy decides it, \
@@ -1086,11 +1099,34 @@ impl PolicyRegistry {
         }
     }
 
+    /// The object that asks the engine under `profile`, which the engine
+    /// found for `place`, labelled `name`: the one site that builds it, and
+    /// the one line that says the engine decides a policy.
+    fn engine_object(
+        asked: &AskedEngine,
+        profile: AloneProfile,
+        name: &'static str,
+        place: &Placed<'_>,
+    ) -> Arc<dyn LoadBalancingPolicy> {
+        info!("Policy `{name}` of {place}: the policy engine decides it");
+        Arc::new(EnginePolicy::of(&asked.engine, profile, name))
+    }
+
     /// Builds the policy of a pair's `side` from the side's own `config`
     /// and sets it, once at startup, as [`Self::set_prefill_policy`] sets
     /// a policy handed whole. The registry keeps one policy a side, so the
-    /// side's place is every model at the side's phase.
+    /// side's place is every model at the side's phase. A gateway of many
+    /// routers asks this once from each of its pair routers: the first
+    /// policy set stands, and a later call builds nothing.
     pub fn set_side_policy(&self, side: Side, config: &PolicyConfig) {
+        let kept = match side {
+            Side::Prefill => &self.prefill_policy,
+            Side::Decode => &self.decode_policy,
+            Side::Encode => &self.encode_policy,
+        };
+        if kept.get().is_some() {
+            return;
+        }
         let policy = Self::policy_at(
             self.policy_engine.as_ref(),
             config,
@@ -1190,17 +1226,21 @@ impl PolicyRegistry {
     /// Get the encode policy for EPD mode. Falls back to consistent_hashing so
     /// repeated multimodal items keep stable affinity even when the main policy is
     /// load-oriented or random. The fallback is built as every policy of
-    /// this registry is; a gateway's start sets the encode policy of a
-    /// deployment that has an encode side, so no request of it comes here.
+    /// this registry is, at its first read, and kept; a gateway's start
+    /// sets the encode policy of a deployment that has an encode side, so
+    /// no request of it comes here.
     pub fn get_encode_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
-        self.encode_policy.get().map(Arc::clone).unwrap_or_else(|| {
+        if let Some(policy) = self.encode_policy.get() {
+            return Arc::clone(policy);
+        }
+        Arc::clone(self.encode_fallback.get_or_init(|| {
             Self::policy_at(
                 self.policy_engine.as_ref(),
                 &PolicyConfig::ConsistentHashing,
                 EVERY_MODEL,
                 Phase::Encode,
             )
-        })
+        }))
     }
 
     /// Whether any registered policy (default or per-model) routes on
