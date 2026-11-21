@@ -482,8 +482,9 @@ fn lookup_block(body: &str) -> String {
 /// What the M3 table reads past a slip of the model's is a whole call, and is
 /// delivered under the contract as outside it: a closing tag that names
 /// nothing open (a value's close misnamed, a second close, one between two
-/// invokes), and an element left open where the element around it, the
-/// invoke, the block or the next invoke ends. The stream ends with the
+/// invokes), an element left open where the element around it, the invoke,
+/// the block or the next invoke ends, and a string whose close is missing
+/// before the next parameter's tag. The stream ends with the
 /// `tool_calls` finish, the arguments read as JSON, and the whole answer is
 /// the same call.
 #[tokio::test]
@@ -496,6 +497,14 @@ async fn a_call_the_table_reads_past_a_slip_is_delivered() {
         (lookup_block("<days>3</day>"), json!({"days": 3})),
         (lookup_block("<days>3"), json!({"days": 3})),
         (lookup_block("<city>Paris"), paris.clone()),
+        (
+            lookup_block("<city>Paris<days>3</days>"),
+            json!({"city": "Paris", "days": 3}),
+        ),
+        (
+            lookup_block("<city>Paris, </b>France</city>"),
+            json!({"city": "Paris, France"}),
+        ),
         (
             lookup_block("<where><city>Paris</city><zip></where>"),
             json!({"where": {"city": "Paris", "zip": ""}}),
@@ -558,8 +567,9 @@ async fn a_call_the_table_reads_past_a_slip_is_delivered() {
 /// What the table cannot read past still fails the request. The end of the
 /// output closes nothing for the model: the element the invoke's closing tag
 /// would have closed is an incomplete call where the output ends in it, at
-/// the model's stop and at the limit. Text between a call's elements, and a
-/// tag cut short there, are malformed structure.
+/// the model's stop and at the limit. Text between a call's elements, a tag
+/// cut short there, and a string ended at the next parameter's tag whose own
+/// closing tag then came, are malformed structure.
 #[tokio::test]
 async fn what_the_table_cannot_read_past_still_fails_the_request() {
     let open = "<tool_call>\n<invoke name=\"lookup\"><days>3".replace('<', "]<]minimax[>[<");
@@ -579,6 +589,7 @@ async fn what_the_table_cannot_read_past_still_fails_the_request() {
         "<city>Paris</city> and <days>3</days>",
         "<city>Paris</city><da",
         "<days>3<b</day>",
+        "<city>Paris<days>3</days></city>",
     ] {
         let output = lookup_block(body);
         let failure = InvalidToolCallFormat::new(UnreadableCall::Malformed, false);
