@@ -20,7 +20,10 @@ use smg_worker::identity::{basic::Worker, error::WorkerError};
 
 use crate::routers::common::{
     request_to_value, serialize_json_sized,
-    sglang_fields::{is_stripped_sglang_default, strip_default_sglang_fields, SGLANG_FIELDS},
+    sglang_fields::{
+        is_stripped_sglang_default, may_carry_stripped_sglang_default, strip_default_sglang_fields,
+        SGLANG_FIELDS,
+    },
 };
 
 #[derive(Debug)]
@@ -65,20 +68,12 @@ fn serialize_request_body_impl<T: Serialize>(
 ) -> Result<Vec<u8>, RequestBodyError> {
     let bytes = serialize_json_sized(typed_req, raw_len).map_err(RequestBodyError::Serialize)?;
 
-    // With no alias and no worker edit only the strip can change an object,
-    // and it removes a field written `"name":null`, `"name":true` or
-    // `"name":false`: a body with none of them goes out unparsed.
+    // With no alias and no worker edit only the strip can change an object:
+    // a body it would leave alone goes out unparsed.
     if canonical_model.is_none()
         && !worker.mutates_request()
         && bytes.first() == Some(&b'{')
-        && !(strip_defaults
-            && memchr::memchr_iter(b':', &bytes).any(|colon| {
-                matches!(bytes.get(colon + 1), Some(b'n' | b't' | b'f'))
-                    && bytes[..colon].strip_suffix(b"\"").is_some_and(|key| {
-                        let name = &key[memchr::memrchr(b'"', key).map_or(0, |quote| quote + 1)..];
-                        SGLANG_FIELDS.iter().any(|field| field.as_bytes() == name)
-                    })
-            }))
+        && !(strip_defaults && may_carry_stripped_sglang_default(&bytes))
     {
         return Ok(bytes);
     }
