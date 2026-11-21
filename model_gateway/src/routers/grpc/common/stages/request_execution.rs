@@ -1905,7 +1905,11 @@ fn parallel_side_failed_first(
 /// While the prefill side is still dispatching, the decode side's first item
 /// is pulled ahead and held for its reader as it was: output is a handoff of
 /// `handoff_to`'s, the prefill worker the side's silence rule judges (see
-/// [`liveness::prefill_side_reprieve`]).
+/// [`liveness::prefill_side_reprieve`]). While the decode side is still
+/// dispatching, the prefill stream's first item is pulled ahead the same
+/// way: a failure there is the side's answer at once
+/// ([`PdDispatchOutcome::FailedFirst`]), anything else is held for its
+/// reader.
 async fn dispatch_pd_sides(
     mut prefill: SideDispatch,
     mut decode: SideDispatch,
@@ -1945,7 +1949,9 @@ async fn dispatch_pd_sides(
         // decode answer (and the item a servicer that holds its headers
         // sends with it) landing in the wakeup of the prefill side's
         // deadline is credited before the side is judged. Each comes once,
-        // so neither starves the prefill side.
+        // so neither starves the prefill side. Last, the first item of a
+        // prefill stream that is held: a decode answer landing in the
+        // wakeup of its failure is still taken first.
         let step = tokio::select! {
             biased;
             failure = encode_dispatch_failed(encode.as_mut().map(|race| &mut race.watch)),
@@ -1961,8 +1967,9 @@ async fn dispatch_pd_sides(
                 result => DispatchStep::Prefill(result),
             },
             // A held prefill stream means the decode call is still pending.
-            error = prefill_failed_ahead(prefill_result.as_mut().and_then(|r| r.as_mut().ok()))
-                => DispatchStep::Alone(PdSide::Prefill, error),
+            error = prefill_failed_ahead(prefill_result.as_mut().and_then(|r| r.as_mut().ok())),
+                if matches!(prefill_result, Some(Ok(_))) =>
+                    DispatchStep::Alone(PdSide::Prefill, error),
         };
 
         match step {
@@ -2849,7 +2856,8 @@ pub(crate) mod tests {
     use crate::routers::{
         common::{attempt_ledger::FailedSide, retry::is_retryable_response},
         grpc::{
-            backend_client::BasicWorkerBuilder, regular::streaming::tests::eof::scripted_stream,
+            backend_client::BasicWorkerBuilder,
+            regular::streaming::tests::eof::{complete, scripted_stream},
         },
     };
 
@@ -3594,24 +3602,39 @@ pub(crate) mod tests {
     }
 
     /// A prefill whose call returned a stream that fails at its first item
-    /// is answered the same way: the decode call is not waited for.
+    /// (the call's status, or an engine's error finish) is answered the same
+    /// way: the decode call is not waited for. A first item that is a
+    /// response fails nothing: it stays held for its reader.
     #[tokio::test]
     async fn a_prefill_stream_that_fails_at_once_answers_without_waiting_for_the_decode_call() {
-        let (stream, _server) = scripted_stream(Vec::new(), "13").await;
-        let prefill: SideDispatch = Box::pin(async { Ok(stream) });
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(5),
-            dispatch_pd_sides(prefill, never_answers(), None, None),
-        )
-        .await
-        .expect("the prefill's failure must not wait on the decode call");
+        for (first, status) in [(Vec::new(), "13"), (vec![complete(0, "error")], "0")] {
+            let (stream, _server) = scripted_stream(first, status).await;
+            let prefill: SideDispatch = Box::pin(async { Ok(stream) });
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                dispatch_pd_sides(prefill, never_answers(), None, None),
+            )
+            .await
+            .expect("the prefill's failure must not wait on the decode call");
 
-        match outcome {
-            PdDispatchOutcome::FailedFirst { side, error, .. } => {
-                assert_eq!(side, PdSide::Prefill);
-                assert_eq!(error.code(), tonic::Code::Internal);
+            match outcome {
+                PdDispatchOutcome::FailedFirst { side, error, .. } => {
+                    assert_eq!(side, PdSide::Prefill);
+                    assert_eq!(error.code(), tonic::Code::Internal);
+                }
+                PdDispatchOutcome::Both(..) => panic!("expected a fail-fast outcome"),
             }
-            PdDispatchOutcome::Both(..) => panic!("expected a fail-fast outcome"),
+        }
+
+        let (stream, _server) = scripted_stream(vec![complete(0, "stop")], "0").await;
+        let prefill: SideDispatch = Box::pin(async { Ok(stream) });
+        let decode = answers_after(Duration::from_millis(200));
+        match dispatch_pd_sides(prefill, decode, None, None).await {
+            PdDispatchOutcome::Both(Ok(mut prefill), _) => {
+                assert!(prefill.holds_item_ahead(), "the response stays held");
+                assert!(matches!(prefill.next().await, Some(Ok(_))));
+            }
+            _ => panic!("a response must not fail the dispatch"),
         }
     }
 
