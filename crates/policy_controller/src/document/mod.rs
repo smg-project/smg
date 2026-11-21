@@ -10,8 +10,8 @@ pub(crate) mod spec;
 
 pub use routing_key::{strip_lineage, DerivedKey, KeySource, KeySources};
 pub use routing_settings::{
-    LoadMetricSetting, ModeSettings, PolicyDocumentError, PolicySettings,
-    RoutingKeyOverrideSettings, RoutingSettings,
+    LoadMetricSetting, ModeSettings, PolicySettings, RoutingKeyOverrideSettings, RoutingSettings,
+    RoutingSettingsError,
 };
 pub use spec::{
     AcrossRanks, AdmissionSpec, AffinitySource, AppliedSpec, Assignment, BestParams,

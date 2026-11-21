@@ -20,7 +20,7 @@ use openai_protocol::{
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    document::{operator::SpecRejected, AppliedSpec, PolicyDocumentError, PolicySpec, SpecError},
+    document::{operator::SpecRejected, AppliedSpec, PolicySpec, RoutingSettingsError, SpecError},
     engine::{Candidate, RequestFacts, Role, Scorer, TieBand, WireModes, WorkerId},
     stages::{Catalog, CatalogError},
     store::{WorkerFacts, WorkerStatus as RowStatus, WorkersStore},
@@ -658,7 +658,7 @@ fn host_stages() -> Result<Catalog, CatalogError> {
     Ok(stages)
 }
 
-fn scorer_document(config: &RouterConfig, name: &str) -> Result<PolicySpec, PolicyDocumentError> {
+fn scorer_document(config: &RouterConfig, name: &str) -> Result<PolicySpec, RoutingSettingsError> {
     let mut document = config.policy_document()?;
     let profile = document
         .profiles

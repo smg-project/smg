@@ -1,6 +1,6 @@
 //! The policy document a gateway's routing settings mean: [`RoutingSettings`],
 //! the types it is made of, and why some settings have no document
-//! ([`PolicyDocumentError`]).
+//! ([`RoutingSettingsError`]).
 
 use serde::Serialize;
 use serde_json::Value;
@@ -76,7 +76,7 @@ use crate::{
 /// # What is refused
 ///
 /// A setting that decides a placement and has no place in the document is
-/// refused by its name ([`PolicyDocumentError::Unsaid`]). It is never left
+/// refused by its name ([`RoutingSettingsError::UnsupportedSetting`]). It is never left
 /// out in silence.
 ///
 /// # What is left out
@@ -383,12 +383,12 @@ static ENCODE_DEFAULT: PolicySettings = PolicySettings::ConsistentHashing;
 /// The encode side's profile, by its name in a document of three sides.
 const ENCODE_SIDE: &str = "encode";
 
-/// Why a routing configuration has no policy document to run.
+/// Why a set of routing settings has no policy document to run.
 #[derive(Debug, PartialEq, thiserror::Error)]
-pub enum PolicyDocumentError {
+pub enum RoutingSettingsError {
     /// A setting decides a placement and the document has no place for it.
     #[error("{setting} = {value}: {reason}")]
-    Unsaid {
+    UnsupportedSetting {
         /// The setting, as the configuration spells its field.
         setting: &'static str,
         /// Its value, as it reads.
@@ -410,12 +410,13 @@ pub enum PolicyDocumentError {
         policy: &'static str,
         part: &'static str,
     },
-    /// A failure to produce or validate a policy document.
+    /// The document's own error: a preset that does not build, or a supplied
+    /// document that does not validate.
     #[error(transparent)]
-    Preset(#[from] SpecError),
+    Document(#[from] SpecError),
     /// The flags change the default document and differ from the supplied one.
     #[error("the routing flags and the policy document disagree at {at}: the flags mean {flags}, the document says {document}")]
-    Disagree {
+    Disagreement {
         /// Where the documents first differ, in their own field names.
         at: String,
         /// The value from the routing flags.
@@ -425,12 +426,12 @@ pub enum PolicyDocumentError {
     },
 }
 
-fn unsaid(
+fn unsupported(
     setting: &'static str,
     value: impl ToString,
     reason: &'static str,
-) -> PolicyDocumentError {
-    PolicyDocumentError::Unsaid {
+) -> RoutingSettingsError {
+    RoutingSettingsError::UnsupportedSetting {
         setting,
         value: value.to_string(),
         reason,
@@ -444,14 +445,14 @@ impl RoutingSettings {
     /// A pure function of the settings. The document is not validated
     /// here: the controller validates a document where it is applied, and
     /// names there a stage its build does not run yet.
-    pub fn policy_document(&self) -> Result<PolicySpec, PolicyDocumentError> {
-        refuse_unsaid(self)?;
+    pub fn policy_document(&self) -> Result<PolicySpec, RoutingSettingsError> {
+        refuse_unsupported(self)?;
         if let Some(both) = both_families(self)? {
             match written(self, both) {
                 // A setting the other family's policy reads and no document
                 // says leaves that family out. The document then plans the
                 // configuration's own family alone.
-                Err(PolicyDocumentError::Unsaid { .. }) => {}
+                Err(RoutingSettingsError::UnsupportedSetting { .. }) => {}
                 said => return said,
             }
         }
@@ -475,7 +476,7 @@ impl RoutingSettings {
     pub fn policy_document_in_force(
         &self,
         defaults: &Self,
-    ) -> Result<PolicySpec, PolicyDocumentError> {
+    ) -> Result<PolicySpec, RoutingSettingsError> {
         let mut said = self.policy_document()?;
         let Some(given) = &self.policy_spec else {
             return Ok(said);
@@ -484,7 +485,7 @@ impl RoutingSettings {
         // document names its own key sources: where they are not that key,
         // the pin would split a conversation the document keeps together.
         if let Some(pin) = self.grouped_dp_sticky {
-            return Err(unsaid(
+            return Err(unsupported(
                 "grouped_dp_sticky",
                 pin,
                 "beside a supplied document the pin would read the gateway's own key, which that document's key sources need not be",
@@ -523,7 +524,7 @@ impl RoutingSettings {
         // A field the reader accepts to report a validation error can be
         // absent from the written form. Let the document name that error.
         given.validate()?;
-        Err(PolicyDocumentError::Disagree {
+        Err(RoutingSettingsError::Disagreement {
             at: "document".to_owned(),
             flags: flags.to_string(),
             document: document.to_string(),
@@ -564,7 +565,7 @@ fn first_difference(
     flags: Option<&Value>,
     document: Option<&Value>,
     at: String,
-) -> Option<PolicyDocumentError> {
+) -> Option<RoutingSettingsError> {
     match (flags, document) {
         (Some(Value::Object(flags)), Some(Value::Object(document))) => flags
             .keys()
@@ -591,7 +592,7 @@ fn first_difference(
             let written = |value: Option<&Value>| {
                 value.map_or_else(|| "nothing".to_owned(), Value::to_string)
             };
-            Some(PolicyDocumentError::Disagree {
+            Some(RoutingSettingsError::Disagreement {
                 at,
                 flags: written(flags),
                 document: written(document),
@@ -601,9 +602,9 @@ fn first_difference(
 }
 
 /// The settings that decide a placement today and that no document says.
-fn refuse_unsaid(config: &RoutingSettings) -> Result<(), PolicyDocumentError> {
+fn refuse_unsupported(config: &RoutingSettings) -> Result<(), RoutingSettingsError> {
     if config.dp_minimum_tokens_scheduler {
-        return Err(unsaid(
+        return Err(unsupported(
             "dp_minimum_tokens_scheduler",
             true,
             "the document has no rank policy: under the controller a rank is a candidate of the profile",
@@ -623,10 +624,10 @@ type Planned<'a> = (PolicySpec, Vec<Vec<Side<'a>>>);
 /// under the pair and the encode modes. A provider mode of a multi-router
 /// gateway reads as the regular mode: the document says the policy of its
 /// self-hosted workers.
-fn presets(config: &RoutingSettings) -> Result<Planned<'_>, PolicyDocumentError> {
+fn presets(config: &RoutingSettings) -> Result<Planned<'_>, RoutingSettingsError> {
     let (mode, main) = (&config.mode, &config.policy);
     let (prefill, decode) = (mode.prefill_policy(main), mode.decode_policy(main));
-    let regular = || -> Result<_, PolicyDocumentError> {
+    let regular = || -> Result<_, RoutingSettingsError> {
         Ok((PolicySpec::preset(main.name())?, vec![(main.name(), main)]))
     };
     let (document, sides) = match mode {
@@ -674,7 +675,7 @@ fn presets(config: &RoutingSettings) -> Result<Planned<'_>, PolicyDocumentError>
 /// side of a pair. The manual policy is that one: its picker leaves the
 /// placement to the binding's session rule, and a rule runs under the single
 /// plan alone.
-fn both_families(config: &RoutingSettings) -> Result<Option<Planned<'_>>, PolicyDocumentError> {
+fn both_families(config: &RoutingSettings) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
     let (mode, main) = (&config.mode, &config.policy);
     let pairs = match mode {
         ModeSettings::Regular | ModeSettings::Provider(_) => {
@@ -716,7 +717,7 @@ fn both_families(config: &RoutingSettings) -> Result<Option<Planned<'_>>, Policy
 fn written<'a>(
     config: &'a RoutingSettings,
     (mut document, bindings): Planned<'a>,
-) -> Result<PolicySpec, PolicyDocumentError> {
+) -> Result<PolicySpec, RoutingSettingsError> {
     // A plan of several sides runs the pair: the pairing mode is its rule.
     if bindings.iter().any(|sides| sides.len() > 1) {
         document.plans.pd_pair.pairing = config.pd_pairing_mode;
@@ -729,7 +730,7 @@ fn written<'a>(
                 document
                     .profiles
                     .get_mut(side)
-                    .ok_or_else(|| PolicyDocumentError::NoPart {
+                    .ok_or_else(|| RoutingSettingsError::NoPart {
                         policy: policy.name(),
                         part: "profile",
                     })?;
@@ -746,7 +747,7 @@ fn written<'a>(
     }
     shared.write(&mut document)?;
     if document.bindings.is_empty() || document.bindings.len() != bound.len() {
-        return Err(PolicyDocumentError::NoPart {
+        return Err(RoutingSettingsError::NoPart {
             policy: config.policy.name(),
             part: "binding",
         });
@@ -761,8 +762,8 @@ fn written<'a>(
     Ok(document)
 }
 
-fn provider_mode(mode: &'static str) -> PolicyDocumentError {
-    unsaid(
+fn provider_mode(mode: &'static str) -> RoutingSettingsError {
+    unsupported(
         "mode",
         mode,
         "a provider mode places its requests by no routing policy",
@@ -776,7 +777,7 @@ fn write_policy<'a>(
     config: &RoutingSettings,
     profile: &mut ProfileSpec,
     shared: &mut Shared<'a>,
-) -> Result<(), PolicyDocumentError> {
+) -> Result<(), RoutingSettingsError> {
     let name = policy.name();
     match policy {
         PolicySettings::Random
@@ -799,7 +800,7 @@ fn write_policy<'a>(
             let form = PolicySpec::power_of_two(metric)?
                 .profiles
                 .remove(name)
-                .ok_or(PolicyDocumentError::NoPart {
+                .ok_or(RoutingSettingsError::NoPart {
                     policy: name,
                     part: "profile",
                 })?;
@@ -909,7 +910,7 @@ fn write_policy<'a>(
             selection_accounting_ttl_ms,
         } => {
             if let Some(named) = selection_policy.as_deref() {
-                return Err(unsaid(
+                return Err(unsupported(
                     "selection_policy",
                     named,
                     "the document names a picker, and no selection policy but the default",
@@ -1012,8 +1013,8 @@ fn restage(
     stage: &'static str,
     bare: f32,
     written: impl FnOnce(f32) -> ScoreStage,
-) -> Result<(), PolicyDocumentError> {
-    let missing = PolicyDocumentError::NoStage { policy, stage };
+) -> Result<(), RoutingSettingsError> {
+    let missing = RoutingSettingsError::NoStage { policy, stage };
     let Some(entry) = profile.score.iter_mut().find(|entry| entry.name() == stage) else {
         return Err(missing);
     };
@@ -1033,12 +1034,12 @@ fn unless<T: PartialEq>(value: T, silent: T) -> Option<T> {
 }
 
 /// A number of the configuration in the document's width.
-fn narrow<T, U>(setting: &'static str, value: U) -> Result<T, PolicyDocumentError>
+fn narrow<T, U>(setting: &'static str, value: U) -> Result<T, RoutingSettingsError>
 where
     T: TryFrom<U>,
     U: Copy + ToString,
 {
-    T::try_from(value).map_err(|_| unsaid(setting, value, "past the document's range"))
+    T::try_from(value).map_err(|_| unsupported(setting, value, "past the document's range"))
 }
 
 /// A balance threshold in the document's width. One past the width lands as
@@ -1050,10 +1051,10 @@ fn threshold(value: usize) -> u32 {
 
 /// Seconds of a session rule in the document's width. The rule reads its
 /// largest value as for ever, so a setting that large has no place in it.
-fn seconds(setting: &'static str, secs: u64) -> Result<u32, PolicyDocumentError> {
+fn seconds(setting: &'static str, secs: u64) -> Result<u32, RoutingSettingsError> {
     narrow(setting, secs).and_then(|narrowed: u32| {
         unless(narrowed, u32::MAX).ok_or_else(|| {
-            unsaid(
+            unsupported(
                 setting,
                 secs,
                 "the document reads this many seconds as for ever",
@@ -1095,9 +1096,9 @@ fn share<T: PartialEq + Serialize>(
     held: &mut Option<T>,
     value: T,
     setting: &'static str,
-) -> Result<(), PolicyDocumentError> {
+) -> Result<(), RoutingSettingsError> {
     match held {
-        Some(held) if *held != value => Err(unsaid(
+        Some(held) if *held != value => Err(unsupported(
             setting,
             format!("{} and {}", spelled(held), spelled(&value)),
             "two sides name two values and the document holds one for every side",
@@ -1111,7 +1112,7 @@ fn share<T: PartialEq + Serialize>(
 
 impl Shared<'_> {
     /// Writes what the sides named into the places the document holds once.
-    fn write(self, document: &mut PolicySpec) -> Result<(), PolicyDocumentError> {
+    fn write(self, document: &mut PolicySpec) -> Result<(), RoutingSettingsError> {
         if let Some(block_size) = self.block_size {
             document.view.block_size = unless(
                 narrow("block_size", block_size)?,
@@ -1159,7 +1160,7 @@ impl Bound {
         sides: usize,
         binding: &mut BindingSpec,
         view_headers: &mut Vec<String>,
-    ) -> Result<(), PolicyDocumentError> {
+    ) -> Result<(), RoutingSettingsError> {
         let Some((eviction_interval_secs, max_idle_secs, assignment_mode)) = self.manual else {
             // A binding names its key's sources once: what its keyed sides
             // read, or nothing, over whatever its presets wrote.
@@ -1171,13 +1172,13 @@ impl Bound {
             return Ok(());
         };
         if self.manual_sides != sides {
-            return Err(unsaid(
+            return Err(unsupported(
                 "policy",
                 "manual",
                 "the manual policy places by the binding's one session rule, so every side of a plan is manual or none is",
             ));
         }
-        let key = one_list(self.keys)?.ok_or(PolicyDocumentError::NoPart {
+        let key = one_list(self.keys)?.ok_or(RoutingSettingsError::NoPart {
             policy: "manual",
             part: "key sources",
         })?;
@@ -1235,7 +1236,7 @@ impl Bound {
             ttl_s,
             sweep_s,
             assignment: assignment_mode,
-            ..preset.ok_or(PolicyDocumentError::NoPart {
+            ..preset.ok_or(RoutingSettingsError::NoPart {
                 policy: "manual",
                 part: "session rule",
             })?
@@ -1251,7 +1252,7 @@ impl Bound {
 /// side that names them.
 fn one_list(
     keys: Vec<(&'static str, RoutingKeySpec)>,
-) -> Result<Option<RoutingKeySpec>, PolicyDocumentError> {
+) -> Result<Option<RoutingKeySpec>, RoutingSettingsError> {
     let of_session = |source: &&KeySourceSpec| !source.client;
     let mut keys = keys.into_iter();
     let Some((first, mut key)) = keys.next() else {
@@ -1261,7 +1262,7 @@ fn one_list(
         let same = other.strip_lineage == key.strip_lineage
             && (other.sources.iter().filter(of_session)).eq(key.sources.iter().filter(of_session));
         if !same {
-            return Err(unsaid(
+            return Err(unsupported(
                 "policy",
                 format!("{first} and {second}"),
                 "the two sides read two lists of key sources and a binding names one",
@@ -1279,9 +1280,9 @@ fn one_list(
 fn within_a_block(
     key: &RoutingKeySpec,
     config: &RoutingSettings,
-) -> Result<(), PolicyDocumentError> {
+) -> Result<(), RoutingSettingsError> {
     if key.sources.iter().filter(|source| !source.client).count() > MAX_KEY_SOURCES {
-        return Err(unsaid(
+        return Err(unsupported(
             "routing_key_override.headers",
             spelled(&config.routing_key_override.headers),
             "a binding names eight sources of its key at most",
@@ -1319,7 +1320,7 @@ const CLIENT_HEADERS: [&str; 2] = ["x-forwarded-for", "cookie"];
 fn key_sources(
     policy: &PolicySettings,
     config: &RoutingSettings,
-) -> Result<Option<RoutingKeySpec>, PolicyDocumentError> {
+) -> Result<Option<RoutingKeySpec>, RoutingSettingsError> {
     let overridden = config.routing_key_override.enabled;
     let hint = match policy {
         PolicySettings::Manual { .. } | PolicySettings::ConsistentHashing => true,
@@ -1334,7 +1335,7 @@ fn key_sources(
         | PolicySettings::LeastLoad { .. }
         | PolicySettings::Bucket { .. } => {
             return if overridden {
-                Err(unsaid(
+                Err(unsupported(
                     "routing_key_override.enabled",
                     true,
                     "the controller holds no recorded form of the sticky sessions' rule yet",
@@ -1363,7 +1364,7 @@ fn key_sources(
     }
     if hint && !reads(&sources, MANUAL_SESSION_HEADER) {
         if overridden {
-            return Err(unsaid(
+            return Err(unsupported(
                 "routing_key_override.headers",
                 spelled(&config.routing_key_override.headers),
                 "under the override the routing key header is read as sent behind these headers, and a binding strips every source or none",
@@ -1388,7 +1389,7 @@ fn key_sources(
 
 /// The binding's overload block, or none where the configuration stands at
 /// the block's own defaults.
-fn overload(config: &RoutingSettings) -> Result<Option<OverloadSpec>, PolicyDocumentError> {
+fn overload(config: &RoutingSettings) -> Result<Option<OverloadSpec>, RoutingSettingsError> {
     // A threshold at none switches its signal off in the gateway. The
     // document reads an absent threshold as the controller's own number, so
     // it cannot say one signal off alone. Both off is the block off.
@@ -1398,10 +1399,14 @@ fn overload(config: &RoutingSettings) -> Result<Option<OverloadSpec>, PolicyDocu
     if enabled {
         let one_off = "the document's overload block cannot switch one signal off alone";
         if waiting.is_none() {
-            return Err(unsaid("worker_overload_waiting_requests", "null", one_off));
+            return Err(unsupported(
+                "worker_overload_waiting_requests",
+                "null",
+                one_off,
+            ));
         }
         if usage.is_none() {
-            return Err(unsaid("worker_overload_token_usage", "null", one_off));
+            return Err(unsupported("worker_overload_token_usage", "null", one_off));
         }
     }
     let written = OverloadSpec {
@@ -1631,7 +1636,7 @@ mod tests {
         };
         assert_eq!(
             config.policy_document_in_force(&defaults()),
-            Err(PolicyDocumentError::Disagree {
+            Err(RoutingSettingsError::Disagreement {
                 at: "profiles.prefill.pick".to_owned(),
                 flags: r#""round-robin""#.to_owned(),
                 document: r#""random""#.to_owned(),
@@ -1650,7 +1655,7 @@ mod tests {
         };
         assert_eq!(
             config.policy_document_in_force(&defaults()),
-            Err(PolicyDocumentError::Disagree {
+            Err(RoutingSettingsError::Disagreement {
                 at: "bindings[0].shadow".to_owned(),
                 flags: "nothing".to_owned(),
                 document: r#""round_robin""#.to_owned(),
@@ -1663,7 +1668,7 @@ mod tests {
         config.policy_spec = Some(document);
         assert_eq!(
             config.policy_document_in_force(&defaults()),
-            Err(PolicyDocumentError::Disagree {
+            Err(RoutingSettingsError::Disagreement {
                 at: "bindings[0]".to_owned(),
                 flags: binding,
                 document: "nothing".to_owned(),
@@ -1682,7 +1687,7 @@ mod tests {
         };
         assert_eq!(
             config.policy_document_in_force(&defaults()),
-            Err(PolicyDocumentError::Preset(SpecError::Kind(
+            Err(RoutingSettingsError::Document(SpecError::Kind(
                 "PolicySpec".to_owned()
             )))
         );
@@ -1697,7 +1702,9 @@ mod tests {
 
     fn refusal(config: &RoutingSettings) -> (&'static str, String) {
         match config.policy_document() {
-            Err(PolicyDocumentError::Unsaid { setting, value, .. }) => (setting, value),
+            Err(RoutingSettingsError::UnsupportedSetting { setting, value, .. }) => {
+                (setting, value)
+            }
             other => panic!("expected a setting refused by name, got {other:?}"),
         }
     }
@@ -2412,7 +2419,7 @@ mod tests {
         };
         assert!(matches!(
             given.policy_document_in_force(&defaults()),
-            Err(PolicyDocumentError::Unsaid {
+            Err(RoutingSettingsError::UnsupportedSetting {
                 setting: "grouped_dp_sticky",
                 ..
             })
@@ -2636,7 +2643,7 @@ mod tests {
             };
             assert!(matches!(
                 other.policy_document_in_force(&defaults()),
-                Err(PolicyDocumentError::Disagree { .. })
+                Err(RoutingSettingsError::Disagreement { .. })
             ));
             let same = RoutingSettings {
                 policy_spec: Some(said.clone()),

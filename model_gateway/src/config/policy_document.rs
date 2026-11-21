@@ -15,9 +15,8 @@
 //! carries it.
 
 use smg_policy_controller::document::{
-    AppliedSpec, Assignment, IndexKind, LoadMetricSetting, ModeSettings, Pairing,
-    PolicyDocumentError, PolicySettings, PolicySpec, RoutingKeyOverrideSettings, RoutingSettings,
-    SpecError,
+    AppliedSpec, Assignment, IndexKind, LoadMetricSetting, ModeSettings, Pairing, PolicySettings,
+    PolicySpec, RoutingKeyOverrideSettings, RoutingSettings, RoutingSettingsError, SpecError,
 };
 
 use super::{
@@ -33,7 +32,7 @@ impl RouterConfig {
     /// A pure function of the configuration. The document is not validated
     /// here: the controller validates a document where it is applied, and
     /// names there a stage its build does not run yet.
-    pub fn policy_document(&self) -> Result<PolicySpec, PolicyDocumentError> {
+    pub fn policy_document(&self) -> Result<PolicySpec, RoutingSettingsError> {
         self.routing_settings().policy_document()
     }
 
@@ -45,7 +44,7 @@ impl RouterConfig {
     ///
     /// Both launchers refuse a routing setting beside a document before
     /// this runs, so the comparison judges a configuration built by hand.
-    pub fn policy_document_in_force(&self) -> Result<PolicySpec, PolicyDocumentError> {
+    pub fn policy_document_in_force(&self) -> Result<PolicySpec, RoutingSettingsError> {
         let defaults = Self::default().routing_settings();
         self.routing_settings().policy_document_in_force(&defaults)
     }
@@ -365,7 +364,7 @@ mod tests {
         };
         assert_eq!(
             given.policy_document_in_force(),
-            Err(PolicyDocumentError::Unsaid {
+            Err(RoutingSettingsError::UnsupportedSetting {
                 setting: "grouped_dp_sticky",
                 value: "hash".to_owned(),
                 reason: "beside a supplied document the pin would read the gateway's own key, which that document's key sources need not be",
@@ -441,6 +440,62 @@ mod tests {
             };
             assert_eq!(config.routing_settings().pd_pairing_mode, pairing);
         }
+    }
+
+    /// The policy crate's tests of the translation run over two literals of
+    /// this gateway's defaults: `defaults()` and `cache_aware()` in its
+    /// `document/routing_settings.rs`. The two literals below are those. A
+    /// default that moves here fails this case, and the crate's literal
+    /// moves with it.
+    #[test]
+    fn the_gateways_defaults_are_the_policy_crates_fixtures_of_them() {
+        assert_eq!(
+            RouterConfig::default().routing_settings(),
+            RoutingSettings {
+                mode: ModeSettings::Regular,
+                policy: PolicySettings::Random,
+                enable_igw: false,
+                policy_spec: None,
+                grouped_dp_sticky: None,
+                dp_minimum_tokens_scheduler: false,
+                pd_pairing_mode: Pairing::Lenient,
+                worker_warmup_secs: 60,
+                worker_warmup_share: 0.25,
+                worker_warmup_blocks: 1024,
+                worker_warmup_thin_ratio: 0.5,
+                worker_warmup_divert_every: 8,
+                routing_key_override: RoutingKeyOverrideSettings {
+                    enabled: false,
+                    headers: vec!["x-smg-routing-key".to_owned()],
+                },
+                worker_overload_protection: true,
+                worker_overload_waiting_requests: Some(8),
+                worker_overload_token_usage: Some(0.8),
+                worker_overload_shed: false,
+            }
+        );
+        assert_eq!(
+            policy_settings(&PolicyConfig::cache_aware(0.3, 64, 1.5, 120, 67_108_864)),
+            PolicySettings::CacheAware {
+                cache_threshold: 0.3,
+                balance_abs_threshold: 64,
+                balance_rel_threshold: 1.5,
+                balance_prefix_margin_tokens: 0,
+                balance_uncached_credit: false,
+                eviction_interval_secs: 120,
+                max_tree_size: 67_108_864,
+                block_size: 16,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
+                cache_index: IndexKind::Tree,
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
+                selection_policy: None,
+                selection_accounting_ttl_ms: 0,
+            }
+        );
     }
 
     #[test]
@@ -653,7 +708,7 @@ mod tests {
             assert_eq!(alone.routing_settings().mode, ModeSettings::Provider(name));
             assert!(matches!(
                 alone.policy_document(),
-                Err(PolicyDocumentError::Unsaid { setting: "mode", value, .. }) if value == name
+                Err(RoutingSettingsError::UnsupportedSetting { setting: "mode", value, .. }) if value == name
             ));
             let beside = RouterConfig {
                 enable_igw: true,
@@ -688,7 +743,7 @@ mod tests {
         );
         assert!(matches!(
             selecting("another").policy_document(),
-            Err(PolicyDocumentError::Unsaid {
+            Err(RoutingSettingsError::UnsupportedSetting {
                 setting: "selection_policy",
                 ..
             })
