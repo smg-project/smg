@@ -18,7 +18,7 @@ use crate::{
             Trace, MAX_TARGETS, TRACE_TOP,
         },
         prefix_pass::forget_prefix_pass,
-        sticky_sessions::{self, Claim, SessionExpiry, SessionRule, SessionTable, SessionVerdict},
+        sticky_sessions::{self, Claim, SessionRule, SessionTable, SessionVerdict},
         view::{
             mean_in_flight, AffinityFacts, AffinityRows, Candidate, Constraints, LoadReportCutoff,
             Phase, PoolFacts, RequestFacts, WorkerId,
@@ -43,11 +43,13 @@ use crate::{
 mod alone;
 mod encode;
 mod engines;
+mod keyed;
 mod vetoed;
 
 pub use alone::{AloneProfile, InTheWay, NotAlone, Place};
 pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
 use engines::{run_engines, run_owned};
+pub use keyed::PoolRows;
 use vetoed::AllVetoed;
 
 /// Drops candidates before scoring. A `soft` filter steps aside when it would
@@ -3036,6 +3038,12 @@ pub struct Engine {
     /// and its sessions rule, folded per phase ([`Self::needs_for_phase`]),
     /// indexed by [`slot`].
     phase_needs: [Needs; PHASES.len()],
+    /// Per phase, whether a binding that covers it under the single plan
+    /// pins a key or reads a ring: the phases whose requests the keyed
+    /// decision over rows read one at a time answers or lends a ring
+    /// ([`Self::decide_keyed`]), indexed by [`slot`]. Every other phase's
+    /// request is turned away there by this one read.
+    keyed: [bool; PHASES.len()],
     sessions: SessionTable,
     assignment: AssignmentStages,
     /// Per profile, what its stages ask of a decision beyond the profile's
@@ -4085,6 +4093,7 @@ impl Engine {
         // phase and adds nothing (the gateway's own document binds every
         // model's pair phases before its catch-all for the regular ones).
         let mut phase_needs = [Needs::default(); PHASES.len()];
+        let mut keyed = [false; PHASES.len()];
         for phase in PHASES {
             for binding in bindings
                 .iter()
@@ -4097,6 +4106,12 @@ impl Engine {
                         .and_then(|i| profile_needs.get(usize::from(i)))
                         .copied()
                         .unwrap_or_default();
+                    // A rule that pins a key, or a stage that places by a
+                    // ring, the profile's or its shadow's: what a keyed
+                    // decision answers for, or lends a ring for.
+                    let reads_ring = own.ring || shadow.ring;
+                    keyed[slot(phase)] |=
+                        binding.plan == Plan::Single && (binding.sessions.is_some() || reads_ring);
                     phase_needs[slot(phase)] = phase_needs[slot(phase)]
                         .or(own)
                         .or(shadow)
@@ -4248,6 +4263,7 @@ impl Engine {
             generation,
             needs,
             phase_needs,
+            keyed,
             sessions,
             assignment: AssignmentStages::default(),
             marks,
@@ -4834,11 +4850,25 @@ impl Engine {
         facts: &'a RequestFacts<'a>,
         cx: &'a Constraints<'a>,
     ) -> Option<RowTest<'a>> {
-        let at = usize::from(index);
-        let filters = &self.profiles.get(at)?.filters[..];
-        if self.marks.get(at)?.keyed() {
+        if self.marks.get(usize::from(index))?.keyed() {
             return None;
         }
+        self.row_test_at(index, facts, cx)
+    }
+
+    /// The test the profile at `index` asks of one row under `cx`, whatever
+    /// the key's mark says: [`Self::keeps_at`] for a caller that reads the
+    /// overload veto as its own pass does, lifted in `cx` for a kept key
+    /// ([`Self::decide_keyed`]). `None` where the pass alone can say which
+    /// rows stay ([`Profile::asked_by_row`]).
+    fn row_test_at<'a>(
+        &'a self,
+        index: u16,
+        facts: &'a RequestFacts<'a>,
+        cx: &'a Constraints<'a>,
+    ) -> Option<RowTest<'a>> {
+        let at = usize::from(index);
+        let filters = &self.profiles.get(at)?.filters[..];
         let tests = match self.named_by.get(at)?.held {
             Held::Unasked => return None,
             Held::Folded(tests) => Some(tests),
@@ -5389,11 +5419,7 @@ impl Engine {
         } else if handed {
             found.pins
         } else {
-            match self.sessions.held(key) {
-                Some((pins, SessionExpiry::At(at))) if facts.now_micros < at => pins,
-                Some((pins, SessionExpiry::Never)) if facts.now_micros < u64::MAX => pins,
-                _ => [WorkerId(0); 2],
-            }
+            self.sessions.pins_at(key, facts.now_micros)
         };
         if WRITE_SESSIONS && KEEPS {
             // What the table gave at the read: the shadow starts from it.

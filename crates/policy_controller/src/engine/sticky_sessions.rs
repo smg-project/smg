@@ -748,6 +748,19 @@ impl SessionTable {
         drop(held);
     }
 
+    /// The pins of `key` as a decision at `now_micros` finds them, with
+    /// nothing written: a key the table never read, or one whose TTL
+    /// passed, has none, as at [`Self::lookup`]. The key's idle time is not
+    /// renewed and no sweep runs: a decision that goes on to follow one of
+    /// these pins renews it by that read.
+    pub(crate) fn pins_at(&self, key: Session, now_micros: u64) -> SessionPins {
+        let key = key.get();
+        match self.shard(key).lock().get(&key) {
+            Some(entry) if entry.expires_at_micros > now_micros => entry.pins,
+            _ => [WorkerId(0); 2],
+        }
+    }
+
     /// The pins of `key`, for tests and dumps.
     pub fn pins(&self, key: Session) -> Option<SessionPins> {
         let key = key.get();
