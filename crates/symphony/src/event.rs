@@ -312,10 +312,11 @@ impl MalformedReason {
     /// Every other reason loses one. A reason a syntax gives in more than one way is classed by
     /// the use that loses a call, since the reason alone does not tell them apart:
     /// [`TagOutOfPlace`](Self::TagOutOfPlace) also names a closing tag that closes nothing open,
-    /// which costs its call nothing; [`TagCutShort`](Self::TagCutShort) also names a declared
-    /// list or object written empty where the tag around it closed first; and
+    /// which costs its call nothing, and [`TagCutShort`](Self::TagCutShort) also names a
+    /// declared list or object written empty where the tag around it closed first.
     /// [`TextBetweenCalls`](Self::TextBetweenCalls) names text where a call should begin and
-    /// prose between two whole calls alike.
+    /// prose beside whole calls alike, and loses one for both: prose inside a call block is no
+    /// part of a block the syntax reads whole.
     ///
     /// The match names every reason, so a reason added to the crate is classed here before the
     /// crate builds.
