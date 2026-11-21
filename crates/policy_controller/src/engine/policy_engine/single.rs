@@ -39,7 +39,7 @@ use super::{keys, overlap, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
         decision::{Decision, Shed, ShedReason, Target, Trace},
-        decision_engine::{AlonePick, HeldDecision, Plain},
+        decision_engine::{AlonePick, HeldDecision, Plain, PromptLent},
         framework::Engine,
         records,
         sticky_sessions::SessionVerdict,
@@ -147,11 +147,18 @@ pub(super) fn noted(
 /// request that states what no stage here runs is declined under that
 /// stage's name. The list is borrowed as long as the request: its ring is
 /// lent into the request's facts.
-pub(super) fn decide<'r>(
+///
+/// `prompt` lends the request's tokens or text
+/// ([`RequestMaker::prompt`](crate::engine::RequestMaker::prompt)). The
+/// naming of who was sent the prompt's prefix calls it, once, and only
+/// where the request's place reads the record of sent prefixes
+/// ([`overlap::decide`]): a keyed answer and every other place never do.
+pub(super) fn decide<'r, 'p>(
     own: &PolicyEngine,
     request: &mut Request<'r>,
     members: &'r PoolMembers,
     loads: Option<&Arc<LoadSnapshot>>,
+    prompt: impl FnOnce() -> Option<PromptLent<'p>>,
     now: Instant,
 ) -> Decision {
     let spec = &own.spec;
@@ -181,8 +188,8 @@ pub(super) fn decide<'r>(
     }
     // A profile whose stages read who holds the prompt is named its rows
     // from the gateway's own data, at the decision's instant the keyed
-    // entry wrote, and its pick is recorded behind it; any other passes
-    // straight to the whole pass.
+    // entry wrote, and its pick is recorded as the prefix's worker; any
+    // other passes straight to the whole pass.
     overlap::decide(
         &own.affinity,
         members.affinity(),
@@ -190,6 +197,7 @@ pub(super) fn decide<'r>(
         workers,
         records.ids(),
         facts,
+        prompt,
         |facts| records::decide(engine, records, workers, &live, facts, &cx),
     )
 }
@@ -370,6 +378,9 @@ mod tests {
         request: Request<'a>,
         members: Option<&'a PoolMembers>,
         loads: Option<Arc<LoadSnapshot>>,
+        /// The prompt the host lends, and how many times it was asked for.
+        prompt: Option<PromptLent<'a>>,
+        lent: Cell<u32>,
         made: Cell<u32>,
     }
 
@@ -379,6 +390,8 @@ mod tests {
                 request,
                 members,
                 loads: None,
+                prompt: None,
+                lent: Cell::new(0),
                 made: Cell::new(0),
             }
         }
@@ -404,6 +417,11 @@ mod tests {
 
         fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
             self.loads.as_ref()
+        }
+
+        fn prompt(&self) -> Option<PromptLent<'_>> {
+            self.lent.set(self.lent.get() + 1);
+            self.prompt
         }
     }
 
@@ -731,10 +749,12 @@ mod tests {
     }
 
     /// The default policy's single request is named the worker its prompt
-    /// was sent to. The whole pass reads the engine's record of sent
-    /// prefixes, which the pick before it wrote: a prompt goes back to its
-    /// worker whatever the request's seed, other prompts are not held to
-    /// that worker, and a worker told gone holds no prompt.
+    /// was sent to. The whole pass walks the engine's record of sent
+    /// prefixes with the tokens the request's maker lends, and the walk of
+    /// the pick before it recorded them: a prompt goes back to its worker
+    /// whatever the request's seed, other prompts are not held to that
+    /// worker, and a worker told gone holds no prompt. The maker is asked
+    /// for the prompt once a decision.
     #[test]
     fn the_default_policy_sends_a_prompt_back_to_the_worker_it_was_sent_to() {
         let engine = preset("cache_aware");
@@ -746,8 +766,15 @@ mod tests {
             let mut asked = request();
             asked.facts.seed = seed;
             hashes.write_to(&mut asked.facts);
-            let asks = Asks::of(asked, Some(&members));
+            let asks = Asks {
+                prompt: Some(PromptLent {
+                    tokens: Some(tokens),
+                    ..PromptLent::default()
+                }),
+                ..Asks::of(asked, Some(&members))
+            };
             let decided = decided(&engine, &asks);
+            assert_eq!(asks.lent.get(), 1, "the prompt is lent once");
             let pick = decided.decision.pick().expect("a pick");
             pick.targets.first().expect("a target").position
         };
@@ -769,7 +796,6 @@ mod tests {
             sent(&asked, seed) != first
         });
         assert!(moved, "a forgotten worker holds no prompt");
-        assert_eq!(engine.affinity().left_out(), 0);
     }
 
     /// What a stage heard of a lease: the word, the worker the lease told

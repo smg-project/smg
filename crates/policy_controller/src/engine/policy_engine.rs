@@ -70,7 +70,7 @@ use super::{
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
     store_backed_engine::{DecideOutcome, DecisionRefused, Request, SweepOutcome},
-    view::{fingerprint, Phase, WireModes, WorkerId},
+    view::{Phase, WireModes},
 };
 use crate::{
     document::spec::AppliedSpec,
@@ -300,21 +300,19 @@ impl PolicyEngine {
 
     /// What the engine keeps for its affinity stages: the gateway hands its
     /// indexes of cache events here, once, at its start
-    /// ([`Affinity::set_indexes`]), and reads the record's own count
-    /// ([`Affinity::left_out`]).
+    /// ([`Affinity::set_indexes`]).
     #[must_use]
     pub fn affinity(&self) -> &Affinity {
         &self.affinity
     }
 
     /// The worker at `address` left its pool or was replaced: the records
-    /// of sent prefixes forget it, so no later request is named a worker
+    /// of sent prefixes drop it, so no later request is named a worker
     /// that is gone. The gateway says it where it tells its classic
-    /// policies. A worker no record holds costs one lookup a model.
+    /// policies, and the trees are walked on the thread that says it, as
+    /// the classic policy's are.
     pub fn forget(&self, address: &str) {
-        // The id every decision knew the worker by ([`records::worker_id`]).
-        self.affinity
-            .forget(WorkerId(fingerprint(address.as_bytes())));
+        self.affinity.forget(address);
     }
 
     /// The clock of the engine's decisions. A caller that makes a list's
@@ -568,7 +566,10 @@ impl PolicyEngine {
         let later = request.constraints.decode_later;
         let decided = match (request.facts.phase, maker.workers()) {
             (Phase::Single, WorkerLists::Single(members)) => {
-                single::decide(self, &mut request, members, maker.loads(), now)
+                // The naming asks for the prompt where the place reads the
+                // record of sent prefixes, and nowhere else.
+                let prompt = || maker.prompt();
+                single::decide(self, &mut request, members, maker.loads(), prompt, now)
             }
             // A pair is decided at its prefill, over its host's two
             // lists.
@@ -677,12 +678,13 @@ impl DecisionEngine for PolicyEngine {
     // No lease is filed, so no pass ends one: a lease ends at its guard's
     // word or drop. The session keys past their end leave the engine's
     // table here, off the path of a request: from this pass's first run no
-    // read of a key sweeps the table. The records of sent prefixes take a
-    // bounded step of the work they left waiting.
+    // read of a key sweeps the table. The records of sent prefixes are
+    // evicted down to their bound where their interval has passed.
     fn sweep(&self, now: Instant) -> SweepOutcome {
         let sessions = self.spec.engine().sessions();
-        sessions.sweep_due(self.clock.micros(now));
-        self.affinity.sweep();
+        let now = self.clock.micros(now);
+        sessions.sweep_due(now);
+        self.affinity.sweep(now);
         SweepOutcome::default()
     }
 
