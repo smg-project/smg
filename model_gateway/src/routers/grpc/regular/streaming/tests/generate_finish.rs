@@ -25,6 +25,7 @@ async fn finish_event(reason: &str, completion_tokens: u32, with_logprobs: bool)
         backend_type: "test",
         model: "eof-test".to_string(),
         expected_choices: 1,
+        dispatch_wait: None,
     };
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let (tx, rx) = sse_channel();

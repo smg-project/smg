@@ -56,7 +56,10 @@ use crate::{
                 ProtoGenerateComplete, ProtoGenerateResponse, ProtoGenerateStreamChunk,
                 ProtoResponseVariant, ProtoStream,
             },
-            regular::streaming::frames::{assistant_choice, ChatChunkFrame},
+            regular::{
+                processor::generation_start,
+                streaming::frames::{assistant_choice, ChatChunkFrame},
+            },
             utils,
         },
     },
@@ -187,6 +190,10 @@ impl HarmonyStreamingProcessor {
     ) -> Response {
         let source = source.with_backend(metrics_labels::BACKEND_HARMONY);
         let guards = body_guards(load_guards, reservation.as_ref());
+        // The request's wait ahead of the dispatch the stream's clocks start
+        // at, read here: the reading runs outside the request's scope (see
+        // `context::dispatch_wait`).
+        let dispatch_wait = context::dispatch_wait(generation_start(&execution_result));
         // The body's channel (see `driven_channel`).
         let (tx, rx) = driven_channel();
         // Read for this client: the moment the response body is dropped, the
@@ -205,6 +212,7 @@ impl HarmonyStreamingProcessor {
                 // polling the body (see `utils::isolation`).
                 let result = utils::isolation::isolated(Self::process_single_stream(
                     dispatch_start,
+                    dispatch_wait,
                     stream,
                     dispatch,
                     chat_request,
@@ -238,6 +246,7 @@ impl HarmonyStreamingProcessor {
                     &tx,
                     router_stop_strings,
                     pd_timing,
+                    dispatch_wait,
                     prefill_guards,
                     reservation,
                 ))
@@ -291,6 +300,7 @@ impl HarmonyStreamingProcessor {
     )]
     async fn process_single_stream(
         start_time: Instant,
+        dispatch_wait: context::DispatchWait,
         grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
@@ -303,6 +313,7 @@ impl HarmonyStreamingProcessor {
         let mut cached_tokens = HashMap::new();
         Self::process_chat_decode_stream(
             start_time,
+            dispatch_wait,
             grpc_stream,
             &dispatch,
             &original_request,
@@ -330,6 +341,7 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         router_stop_strings: Vec<String>,
         pd_timing: context::PdTiming,
+        dispatch_wait: context::DispatchWait,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
@@ -348,6 +360,7 @@ impl HarmonyStreamingProcessor {
         // token yields honest PD TTFT.
         Self::process_chat_decode_stream(
             pd_timing.prefill_start,
+            dispatch_wait,
             decode_stream,
             &dispatch,
             &original_request,
@@ -375,10 +388,13 @@ impl HarmonyStreamingProcessor {
     /// and `cached_tokens` maps may be pre-populated from a prefill phase
     /// (prefill/decode stream) or empty (single stream). Values from `Complete` messages
     /// are inserted only if not already present. `pd_timing` is `Some` only in PD mode and
-    /// yields honest PD TTFT (prefill start to first decode token).
+    /// yields honest PD TTFT (prefill start to first decode token). `dispatch_wait` is the
+    /// request's wait ahead of the dispatch at `start_time`, read by the entry point inside
+    /// the request's scope (see [`context::dispatch_wait`]).
     #[expect(clippy::too_many_arguments)]
     async fn process_chat_decode_stream(
         start_time: Instant,
+        dispatch_wait: context::DispatchWait,
         mut decode_stream: ProtoStream,
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
@@ -390,7 +406,7 @@ impl HarmonyStreamingProcessor {
         reservation: Option<Arc<SharedReservationHandle>>,
         source: Option<&utils::StreamSource>,
     ) -> Result<(), utils::StreamFailure> {
-        let mut decode = ChatDecode::new(start_time, pd_timing, dispatch);
+        let mut decode = ChatDecode::new(start_time, dispatch_wait, pd_timing, dispatch);
         while let Some(result) = decode_stream.next().await {
             let response = result.map_err(|e| {
                 utils::StreamFailure::upstream(e, decode.completion_tokens.delivered())
@@ -1528,6 +1544,9 @@ impl ResponsesDecode {
 struct ChatDecode {
     // Timing for metrics
     start_time: Instant,
+    /// The request's wait ahead of the dispatch at `start_time`, recorded with the TTFT (see
+    /// [`context::dispatch_wait`]).
+    dispatch_wait: context::DispatchWait,
     first_token_time: Option<Instant>,
     /// The PD dispatch instants, in PD mode: the first token records the PD pair against
     /// them and the metrics anchor at the prefill dispatch.
@@ -1576,11 +1595,13 @@ struct ChatDecode {
 impl ChatDecode {
     fn new(
         start_time: Instant,
+        dispatch_wait: context::DispatchWait,
         pd_timing: Option<context::PdTiming>,
         dispatch: &context::DispatchMetadata,
     ) -> Self {
         Self {
             start_time,
+            dispatch_wait,
             first_token_time: None,
             pd_timing,
             parsers: HashMap::new(),
@@ -2049,6 +2070,7 @@ impl ChatDecode {
             model_id: &original_request.model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: self.first_token_time.map(|t| t.duration_since(stream_base)),
+            dispatch_wait: self.dispatch_wait,
             generation_duration: stream_base.elapsed(),
             input_tokens: Some(counts.prompt as u64),
             cached_tokens: Some(u64::from(counts.cached)),

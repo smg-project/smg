@@ -72,6 +72,7 @@ fn streamed_scrape(with_logprobs: bool) -> String {
                 backend_type: "test",
                 model: MODEL.to_string(),
                 expected_choices: 2,
+                dispatch_wait: None,
             };
             let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
             let (tx, rx) = sse_channel();
