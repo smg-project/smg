@@ -61,7 +61,7 @@ pub(crate) use smg_policy_controller::document::PlanName;
 use smg_policy_controller::{
     document::{
         operator::{dry_run_against, DocumentManager, Format, SpecRejected},
-        AppliedSpec, PolicySpec, RoutingSettingsError,
+        AppliedSpec, IndexKind, PolicySpec, RoutingSettingsError,
     },
     stages::StageRegistry,
     store::MemoryStore,
@@ -175,6 +175,17 @@ pub(crate) enum StartError {
         because: &'static str,
         instead: String,
     },
+    /// The document keeps a model's prefix index as a placement map by a
+    /// prompt's head (`index.<key>.kind: hash`), which nothing in this
+    /// process runs ([`hash_index`]): the start names the index's key and
+    /// says which setting starts.
+    #[error(
+        "the policy document states `index.{model}.kind: hash`, which is not run in this \
+         process yet: no placement map by a prompt's head is kept here. Start with \
+         `--cache-index tree` or leave the flag out (in a document, state `kind: tree` \
+         or remove the field)"
+    )]
+    HashIndexNotRun { model: String },
 }
 
 /// What a start in this process leaves it ([`start_in_process`]): the
@@ -353,6 +364,7 @@ fn engine_for(
     let stages = stages.unwrap_or_else(|| Arc::new(StageRegistry::builtin()));
     let written = serde_yaml::to_string(&document)?;
     let spec = checked(config, &stages, &document, &written)?;
+    hash_index(&document)?;
     let engine = Arc::new(smg_policy_controller::engine::PolicyEngine::new(spec));
     // The document is its operator's own where it says another thing than
     // the routing settings mean. The number is no part of what it says.
@@ -381,6 +393,29 @@ fn engine_for(
         applied: SystemTime::now(),
         stages,
     }))
+}
+
+/// Refuses `document` by its first prefix index kept as a placement map
+/// (`index.<key>.kind: hash`), whoever wrote it: the routing settings
+/// (`--cache-index hash`) or its operator.
+///
+/// The engine keeps the prefixes a model's workers were sent as a tree,
+/// with no lifetime and no boundary, and it keeps that record for the tree
+/// kind alone. Under the hash kind nothing here would keep a placement:
+/// every request would read as held by no worker, and no line would say
+/// so. The classic policy runs the kind, so the refusal says which setting
+/// starts.
+fn hash_index(document: &PolicySpec) -> Result<(), StartError> {
+    let kept_as_map = document
+        .index
+        .iter()
+        .find(|(_, index)| index.kind == IndexKind::Hash);
+    match kept_as_map {
+        Some((model, _)) => Err(StartError::HashIndexNotRun {
+            model: model.clone(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Refuses a supplied `document` by its first rule that nothing in this
