@@ -194,8 +194,10 @@ outgrew it; its rows are edited by hand, and `tests/readme.rs` checks them again
 build. It runs newest first: **Released** is the day the
 primary's Hugging Face repository was created. The registry behind `formats::for_model` keeps its
 groups as data, `src/formats/groups.json` (one group per line: the table, the group's own turn
-opener and its own text after the thought's close where its template differs from the table's;
-compiled in by the crate's build script), and the test checks this table against it.
+opener and its own text after the thought's close where its template differs from the table's,
+and `thinks_first` on a group that opens its turn with a thought of its own, which
+`formats::thinks_first` answers for a model id; compiled in by the crate's build script), and the
+test checks this table against it.
 
 A group is **ready** when its table is on main, bellwether's `main` holds the group's
 benchmark-scale set (the count in **bellwether set**), and a run of the fixture test

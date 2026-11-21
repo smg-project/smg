@@ -3,7 +3,8 @@
 //! `src/formats/groups.json` is the one place a group is spelled: the primary's id, its other
 //! checkpoints, the table that reads the group by name, the group's own turn opener and what its
 //! template writes after the thought's close where that is not the table's, one group per line in
-//! bellwether's slug order. This script reads the file and writes the constant
+//! bellwether's slug order; a group that opens its turn with a thought of its own says
+//! `thinks_first`. This script reads the file and writes the constant
 //! `formats::registry` includes, so the compiled tables are the literals they were when they were
 //! written by hand, and a tool that records a group writes a line of data, not Rust.
 
@@ -23,6 +24,9 @@ struct Group {
     table: String,
     opener: Option<String>,
     after: Option<String>,
+    /// Spelled only on a group it is true for, so every other line stays as it was.
+    #[serde(default)]
+    thinks_first: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -56,6 +60,7 @@ fn render(groups: &[Group]) -> Result<String, std::fmt::Error> {
             Some(after) => writeln!(out, "        after: Some({after:?}),")?,
             None => writeln!(out, "        after: None,")?,
         }
+        writeln!(out, "        thinks_first: {},", group.thinks_first)?;
         writeln!(out, "    }},")?;
     }
     writeln!(out, "];")?;

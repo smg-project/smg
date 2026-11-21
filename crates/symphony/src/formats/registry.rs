@@ -239,6 +239,10 @@ struct Group {
     /// newline where the Qwen 3.5 template writes two): the group's tags write it in the table's place
     /// ([`Format::with_thought_after`]).
     after: Option<&'static str>,
+    /// Whether the group opens its turn with a thought of its own: its template opens the
+    /// thought, or the model writes the opener as its first piece, so the first token is the
+    /// answer's only after a prompt that closed the thought ([`thinks_first`]).
+    thinks_first: bool,
 }
 
 impl Group {
@@ -301,8 +305,9 @@ const fn table_named(name: &str) -> Table {
 // Every group whose table is on main, in bellwether's slug order, as `const GROUPS: &[Group]`:
 // `groups.json` beside this module is the one place a group is spelled (the primary's id, its
 // other checkpoints, its table by name, its own turn opener, its own text after the thought's
-// close where the template writes other than the table's), one group per line, and `build.rs`
-// writes it as this constant, so the compiled tables are the literals they were.
+// close where the template writes other than the table's, `thinks_first` where it is true), one
+// group per line, and `build.rs` writes it as this constant, so the compiled tables are the
+// literals they were.
 include!(concat!(env!("OUT_DIR"), "/groups.rs"));
 
 /// Every group's checkpoints by repository name, each with its group's index, keyed without
@@ -386,6 +391,15 @@ pub fn table_for(model: &str) -> Option<Table> {
     group_for(model).map(|(_, group)| group.table)
 }
 
+/// Whether `model`'s group opens its turn with a thought of its own (DeepSeek R1, Kimi K2
+/// Thinking, MiniMax M2): its template opens the thought, or the model writes the opener as its
+/// first piece, so the first token is the answer's only after a prompt that closed the thought.
+/// A fact of the group and not of its table, which reads other groups too and finds a thought
+/// only in the prompt it replays; `None` for a model the registry does not know.
+pub fn thinks_first(model: &str) -> Option<bool> {
+    group_for(model).map(|(_, group)| group.thinks_first)
+}
+
 /// Every group the registry knows: the primary's id, its other checkpoints by repository name,
 /// and the table, in the registry's order. The README test checks its groups against these.
 pub fn groups() -> impl Iterator<Item = (&'static str, &'static [&'static str], Table)> {
@@ -400,7 +414,8 @@ mod tests {
     use crate::format::Emits;
 
     /// `groups.json` as the registry spells it: one group per line, in the registry's order,
-    /// every field written, so that a diff is a group and a tool records a group as one line.
+    /// every field written but `thinks_first`, which only a group it is true for spells, so that
+    /// a diff is a group and a tool records a group as one line.
     fn groups_json() -> String {
         fn text(text: &str) -> String {
             serde_json::to_string(text).expect("a JSON string")
@@ -410,12 +425,17 @@ mod tests {
             .map(|group| {
                 let also: Vec<String> = group.also.iter().map(|also| text(also)).collect();
                 format!(
-                    r#"  {{"model": {}, "also": [{}], "table": {}, "opener": {}, "after": {}}}"#,
+                    r#"  {{"model": {}, "also": [{}], "table": {}, "opener": {}, "after": {}{}}}"#,
                     text(group.model),
                     also.join(", "),
                     text(group.table.name()),
                     group.opener.map_or_else(|| "null".to_string(), text),
                     group.after.map_or_else(|| "null".to_string(), text),
+                    if group.thinks_first {
+                        r#", "thinks_first": true"#
+                    } else {
+                        ""
+                    },
                 )
             })
             .collect();
@@ -429,6 +449,23 @@ mod tests {
             include_str!("groups.json") == expected,
             "groups.json is not written in the registry's form; replace it with:\n{expected}"
         );
+    }
+
+    #[test]
+    fn a_group_that_opens_its_turn_with_a_thought_says_so_for_each_of_its_checkpoints() {
+        // DeepSeek-R1-0528's template writes no thought marker: the model opens the thought.
+        assert_eq!(thinks_first("deepseek-ai/DeepSeek-R1-0528"), Some(true));
+        assert_eq!(
+            thinks_first("deepseek-r1-distill-qwen-32b"),
+            Some(true),
+            "a checkpoint the group lists under also, in any case"
+        );
+        assert_eq!(
+            thinks_first("deepseek-ai/DeepSeek-V3-0324"),
+            Some(false),
+            "the same table reads a group that answers at once"
+        );
+        assert_eq!(thinks_first("an-organisation/an-unknown-model"), None);
     }
 
     #[test]

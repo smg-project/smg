@@ -119,7 +119,8 @@ A family of a known call syntax costs a table and evidence, and no engine change
    (`formats/registry.rs`), its module and re-export (`formats/mod.rs`), and the checkpoint groups
    it reads, one line each in `formats/groups.json` (the table by its name, with each group's own
    turn opener where the template writes one the table does not, and its own text after the
-   thought's close where the template writes other than the table's; the build script compiles
+   thought's close where the template writes other than the table's, and `"thinks_first": true`
+   where the group opens its turn with a thought of its own; the build script compiles
    the file into `GROUPS`). A group that names no table fails the build; the registry's tests hold the
    names unique, every table buildable and the file in the registry's form.
 3. Give it a subject in `tests/parser/contract.rs` (the test `every_registry_table_has_a_subject` refuses a
