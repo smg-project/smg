@@ -720,6 +720,34 @@ impl PolicyEngine {
         self.door.faults()
     }
 
+    /// Whether the engine of this process decides: `false` where the asks
+    /// reach the engine over the store that follows a controller.
+    pub(crate) fn in_process(&self) -> bool {
+        matches!(*self.door, Decider::Own(_))
+    }
+
+    /// Whether the placement of a single request reads the request's body
+    /// under the document in force: some stage that may decide one reads
+    /// the prompt. The document's needs say it, as the engine folded them
+    /// over its bindings when the document was applied: nothing is worked
+    /// out here.
+    ///
+    /// A stage reads the prompt as its block hashes, which a route makes
+    /// from the body's token ids or text. A valid tokens hint states the
+    /// ids in a header, so `hinted` lifts the read: it is asked only where
+    /// a stage reads the hashes. The text itself, which no stage of this
+    /// build reads, is in the body alone.
+    ///
+    /// A key source that is the request's own id reads the body too. The
+    /// routing settings name one under the sticky override alone, and the
+    /// route holds the body for that setting by its own name.
+    pub(crate) fn reads_body(&self, hinted: impl FnOnce() -> bool) -> bool {
+        let needs = self
+            .door
+            .with_spec(|spec| spec.engine().needs_for_phase(Phase::Single));
+        needs.text || ((needs.token_hashes || needs.text_hashes) && !hinted())
+    }
+
     /// An attempt's prompt hashes for `model`, under the generation in force.
     /// The stage holding the tokens calls this once before the first ask.
     /// Each ask borrows the same result through [`Ask::hashes`].
