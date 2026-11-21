@@ -34,7 +34,7 @@
     Cache Namespaces (cache_salt / extra_key / LoRA)
     -------------------------------------------
     A request that carries cache-partition fields keys the approximate trees
-    and the hash index under a namespace marker (see cache_namespace.rs), so
+    and the hash index under a namespace marker (see kv_index::namespace), so
     requests the engine cannot serve from one cache never match each other.
     Every live namespace holds its own copy of a shared prefix: max_tree_size
     bounds the SUM across namespaces, so size it for tenants x working set,
@@ -91,7 +91,6 @@
 */
 
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -104,7 +103,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use kv_index::{
     compute_request_content_hashes, request_prefix_hashes, salt::request_content_hashes_with_seed,
-    ContentHash, OverlapScores, TenantId, TokenTree, Tree,
+    ContentHash, OverlapScores, PrefixSource, TenantId, TokenTree, Tree,
 };
 use parking_lot::RwLock;
 use rand::RngExt;
@@ -125,7 +124,7 @@ use super::{
     prefix_hash::CHARS_PER_TOKEN,
     utils::PeriodicTask,
     CacheAwareConfig, CacheNamespace, LeastLoadPolicy, LoadBalancingPolicy, NamedList,
-    SelectWorkerInfo, WorkerRole, TEXT_MARKER_LEN,
+    SelectWorkerInfo, WorkerRole,
 };
 use crate::{
     config::CacheIndexKind,
@@ -502,7 +501,7 @@ impl CacheAwarePolicy {
     /// Token tree sized to the backend's KV page (`block_size`): affinity
     /// below one backend page is unusable by the engine.
     fn new_token_tree(&self) -> TokenTree {
-        TokenTree::with_config(self.config.block_size.max(1), Default::default())
+        TokenTree::with_config(self.page_size(), Default::default())
     }
 
     fn mesh_attached(&self) -> bool {
@@ -514,45 +513,16 @@ impl CacheAwarePolicy {
     // A request in a cache namespace is keyed under the namespace's marker
     // and an unpartitioned request under its plain key with any marker
     // material stripped, so the two key spaces are disjoint by construction
-    // (see cache_namespace.rs). The approximate trees read the rule through
-    // `keyed_tokens` / `keyed_text`, hash mode through `placement_tokens`,
-    // the event-driven index through `event_content_hashes`.
+    // (see kv_index::namespace). The approximate trees read the rule through
+    // `CacheNamespace::keyed_tokens` / `CacheNamespace::keyed_text`, which
+    // live beside the trees, hash mode through `placement_tokens`, the
+    // event-driven index through `event_content_hashes`.
 
-    /// The token tree's key for `tokens` and the length of the marker at its
-    /// head. A partitioned request keys under its namespace marker: another
-    /// namespace diverges at position 0 and can never match, and the marker
-    /// never counts toward the match ratio, so a match count read from the
-    /// tree has the marker length subtracted. The marker fills whole pages,
-    /// so the prompt's page grid is the unpartitioned one. An unpartitioned
-    /// request keys under its tokens stripped of marker material, marker
-    /// length 0.
+    /// The page size of this policy's token trees, which a token key's
+    /// marker is padded to ([`CacheNamespace::keyed_tokens`]).
     #[inline]
-    fn keyed_tokens<'a>(
-        &self,
-        info: &SelectWorkerInfo,
-        tokens: &'a [u32],
-    ) -> (Cow<'a, [u32]>, usize) {
-        let page_size = self.config.block_size.max(1);
-        match info.cache_namespace {
-            Some(namespace) => (
-                Cow::Owned(namespace.prefixed_tokens(tokens, page_size)),
-                CacheNamespace::token_marker_len(page_size),
-            ),
-            None => (
-                Cow::Borrowed(CacheNamespace::unpartitioned_tokens(tokens)),
-                0,
-            ),
-        }
-    }
-
-    /// The string tree's key for `text` and the length of the marker at its
-    /// head: the rule of [`Self::keyed_tokens`], in chars.
-    #[inline]
-    fn keyed_text<'a>(info: &SelectWorkerInfo, text: &'a str) -> (Cow<'a, str>, usize) {
-        match info.cache_namespace {
-            Some(namespace) => (Cow::Owned(namespace.prefixed_text(text)), TEXT_MARKER_LEN),
-            None => (Cow::Borrowed(CacheNamespace::unpartitioned_text(text)), 0),
-        }
+    fn page_size(&self) -> usize {
+        self.config.block_size.max(1)
     }
 
     /// Hash mode's key material: a namespaced request's tokens as sent (its
@@ -882,7 +852,8 @@ impl CacheAwarePolicy {
         // never seeds affinity for other partitions. Prefer the token tree for
         // gRPC requests, fall back to the string tree for HTTP.
         if let Some(tokens) = info.tokens {
-            let (keyed, _marker_len) = self.keyed_tokens(info, tokens);
+            let (keyed, _marker_len) =
+                CacheNamespace::keyed_tokens(info.cache_namespace, tokens, self.page_size());
             let tokens: &[u32] = &keyed;
             // gRPC request: update token tree
             let tree = self
@@ -907,7 +878,7 @@ impl CacheAwarePolicy {
                 }
             }
         } else if let Some(text) = info.request_text {
-            let (keyed, _marker_len) = Self::keyed_text(info, text);
+            let (keyed, _marker_len) = CacheNamespace::keyed_text(info.cache_namespace, text);
             let text: &str = &keyed;
             // HTTP request: update string tree
             let tree = self
@@ -1603,37 +1574,41 @@ impl CacheAwarePolicy {
             return self.select_worker_fallback(workers, info, &healthy_indices, model_id);
         }
 
-        // Cache-aware routing when balanced — three types (mutually exclusive):
+        // Cache-aware routing when balanced — three types (mutually exclusive),
+        // chosen where the index crate states the choice (`PrefixSource::of`):
         //   1. Event-driven: KV index overlap scoring (gRPC + KV events)
         //   2. Approximate token tree: TokenTree prefix matching (gRPC, no events)
         //   3. Approximate string tree: Tree prefix matching (HTTP)
-        if let Some(tokens) = request_tokens {
+        let index = || self.event_index_for(model_id);
+        match PrefixSource::of(request_tokens, request_text, index) {
             // Event-driven mode re-hashes engine-reported blocks from their
             // token ids on both sides, so it keys a namespace through the
-            // hash seed rather than a marker (see cache_namespace.rs); the
+            // hash seed rather than a marker (see kv_index::namespace); the
             // approximate and hash modes below key under the marker.
-            if let Some(index) = self.event_index_for(model_id) {
-                self.select_worker_event_driven(
-                    workers,
-                    tokens,
-                    &healthy_indices,
-                    avg_load,
-                    &index,
-                    info,
-                )
-            } else {
-                self.select_worker_with_tokens(
-                    workers,
-                    tokens,
-                    &healthy_indices,
-                    avg_load,
-                    model_id,
-                    info,
-                )
-            }
-        } else {
-            let text = request_text.unwrap_or("");
-            self.select_worker_with_text(workers, text, &healthy_indices, avg_load, model_id, info)
+            PrefixSource::Events { tokens, index } => self.select_worker_event_driven(
+                workers,
+                tokens,
+                &healthy_indices,
+                avg_load,
+                &index,
+                info,
+            ),
+            PrefixSource::TokenTree(tokens) => self.select_worker_with_tokens(
+                workers,
+                tokens,
+                &healthy_indices,
+                avg_load,
+                model_id,
+                info,
+            ),
+            PrefixSource::StringTree(text) => self.select_worker_with_text(
+                workers,
+                text,
+                &healthy_indices,
+                avg_load,
+                model_id,
+                info,
+            ),
         }
     }
 
@@ -3537,9 +3512,10 @@ impl CacheAwarePolicy {
     ) -> Option<usize> {
         let tree = tree_for_model(&self.token_trees, model_id, || self.new_token_tree());
 
-        // The namespaced key (see `keyed_tokens`); a match count read from
-        // the tree has `marker_len` subtracted.
-        let (keyed, marker_len) = self.keyed_tokens(info, tokens);
+        // The namespaced key (see `CacheNamespace::keyed_tokens`); a match
+        // count read from the tree has `marker_len` subtracted.
+        let (keyed, marker_len) =
+            CacheNamespace::keyed_tokens(info.cache_namespace, tokens, self.page_size());
         let keyed: &[u32] = &keyed;
 
         // With the mesh attached the path's hash rides on the insert (the tree
@@ -3627,7 +3603,7 @@ impl CacheAwarePolicy {
         let tree = tree_for_model(&self.string_trees, model_id, Tree::new);
 
         // Same partition rule as the token tree, in chars.
-        let (keyed, marker_len) = Self::keyed_text(info, text);
+        let (keyed, marker_len) = CacheNamespace::keyed_text(info.cache_namespace, text);
         let keyed: &str = &keyed;
 
         // The hash rides on the insert and the delta while the mesh is

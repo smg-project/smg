@@ -59,7 +59,7 @@ use smg_worker::{
 
 use crate::{
     observability::metrics::CACHE_AWARE_MATCH_RATIO_BUCKETS,
-    policies::kv_index::index_backend::WorkerBlocks,
+    policies::{kv_index::index_backend::WorkerBlocks, namespace_of},
     routers::{
         common::snapshot::test_support::worker_of, grpc::backend_client::BasicWorkerBuilder,
     },
@@ -4839,7 +4839,7 @@ fn with_config_normalizes_boundaries() {
 // ---- cache namespaces (cache_salt / extra_key / LoRA partitioning) ----
 
 fn salted(salt: &str) -> Option<CacheNamespace> {
-    CacheNamespace::derive(&openai_protocol::common::CachePartition {
+    namespace_of(&openai_protocol::common::CachePartition {
         cache_salt: Some(salt),
         extra_key: None,
         lora_path: None,
@@ -4888,73 +4888,6 @@ fn head_hash_is_unchanged_without_a_namespace_and_keys_like_the_tree_with_one() 
         hash_token_head(Some(tenant_a), &head),
         hash_token_head(Some(tenant_b), &head)
     );
-}
-
-/// The trees' keying rule is written once: a namespaced and an
-/// unpartitioned request of one prompt get the keys the trees expect,
-/// and the marker length that comes with a namespaced key is exactly
-/// what a match count read from the tree subtracts.
-#[test]
-fn a_request_is_keyed_once_for_both_trees_and_the_marker_length_is_what_a_match_subtracts() {
-    let block_size = 16;
-    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
-        eviction_interval_secs: 0,
-        block_size,
-        ..Default::default()
-    });
-    let tenant_a = salted("tenant-a").unwrap();
-    // Two whole pages, so the tree matches the key in full.
-    let prompt: Vec<u32> = (100..132).collect();
-    let text = "shared system prompt";
-    let namespaced = SelectWorkerInfo {
-        tokens: Some(&prompt),
-        request_text: Some(text),
-        cache_namespace: Some(tenant_a),
-        ..Default::default()
-    };
-    let plain = SelectWorkerInfo {
-        tokens: Some(&prompt),
-        request_text: Some(text),
-        ..Default::default()
-    };
-
-    let (keyed, marker_len) = policy.keyed_tokens(&namespaced, &prompt);
-    assert_eq!(marker_len, CacheNamespace::token_marker_len(block_size));
-    assert_eq!(
-        &keyed[..],
-        &tenant_a.prefixed_tokens(&prompt, block_size)[..]
-    );
-    assert_eq!(&keyed[marker_len..], &prompt[..]);
-    let (plain_key, plain_len) = policy.keyed_tokens(&plain, &prompt);
-    assert_eq!((&plain_key[..], plain_len), (&prompt[..], 0));
-
-    // What the token tree reads back for the namespaced key is the
-    // prompt plus the marker: the match count minus the marker length
-    // is the prompt's own match, and the plain key sees none of it.
-    let tree = policy.new_token_tree();
-    tree.insert_tokens(&keyed, "http://w1:8000");
-    let hit = tree.match_and_insert(&keyed, "http://w1:8000");
-    assert_eq!(hit.matched_token_count - marker_len, prompt.len());
-    assert_eq!(hit.input_token_count - marker_len, prompt.len());
-    let miss = tree.match_and_insert(&plain_key, "http://w2:8000");
-    assert_eq!(miss.matched_token_count, 0);
-
-    let (keyed_text, text_marker_len) = CacheAwarePolicy::keyed_text(&namespaced, text);
-    assert_eq!(text_marker_len, TEXT_MARKER_LEN);
-    assert_eq!(&*keyed_text, tenant_a.prefixed_text(text));
-    assert_eq!(&keyed_text[text_marker_len..], text);
-    let (plain_text, plain_text_len) = CacheAwarePolicy::keyed_text(&plain, text);
-    assert_eq!((&*plain_text, plain_text_len), (text, 0));
-
-    let string_tree = Tree::new();
-    string_tree.insert_text(&keyed_text, "http://w1:8000");
-    let hit = string_tree.match_and_insert(&keyed_text, "http://w1:8000");
-    assert_eq!(
-        hit.matched_char_count - text_marker_len,
-        text.chars().count()
-    );
-    let miss = string_tree.match_and_insert(&plain_text, "http://w2:8000");
-    assert_eq!(miss.matched_char_count, 0);
 }
 
 #[test]
@@ -5370,7 +5303,7 @@ fn event_driven_salted_request_matches_only_its_namespace() {
     policy.set_kv_event_monitor(Some(monitor));
 
     let namespace = |salt: &'static str| {
-        CacheNamespace::derive(&CachePartition {
+        namespace_of(&CachePartition {
             cache_salt: Some(salt),
             extra_key: None,
             lora_path: Some("adapter"),

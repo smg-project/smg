@@ -328,7 +328,7 @@ async fn a_retry_states_the_retained_prompt() -> anyhow::Result<()> {
 #[tokio::test]
 async fn a_prompt_under_a_cache_partition_hashes_under_its_seed() -> anyhow::Result<()> {
     let adapter = "adapter";
-    let namespace = CacheNamespace::derive(&CachePartition {
+    let namespace = namespace_of(&CachePartition {
         lora_path: Some(adapter),
         ..CachePartition::default()
     })

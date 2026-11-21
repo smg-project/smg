@@ -174,7 +174,7 @@ async fn lora_initial_selection_and_retry_stay_on_sglang_in_a_mixed_pool() {
         ctx.input.request_type = request;
         stage.execute(&mut ctx).await.unwrap();
         let namespace = ctx.state.routing_snapshot.as_ref().unwrap().cache_namespace;
-        assert_eq!(namespace, CacheNamespace::derive(&CachePartition {
+        assert_eq!(namespace, namespace_of(&CachePartition {
             cache_salt: None, extra_key: None, lora_path: Some(selector),
         }));
         assert!(namespace.is_some(), "adapter affinity must be separate from the base model");

@@ -69,7 +69,7 @@ use crate::{
         metrics::{bool_to_static_str, error_reason_from_status, metrics_labels, Metrics},
         otel_trace::{inject_trace_context_http, with_trace_context_http},
     },
-    policies::{CacheNamespace, PolicyRegistry},
+    policies::{namespace_of, CacheNamespace, PolicyRegistry},
     policy_controller::engine::{self, Ask, BehindAnswer, Placed, PolicyEngine, Prompt, Sent},
     rate_limit::RateLimitManager,
     routers::{
@@ -596,7 +596,7 @@ impl Router {
             .policy_registry
             .derive_rid_key(typed_req.rid())
             .map(str::to_string);
-        let cache_namespace = CacheNamespace::derive(&typed_req.cache_partition());
+        let cache_namespace = namespace_of(&typed_req.cache_partition());
         RoutingDerivatives {
             tokens,
             text,
