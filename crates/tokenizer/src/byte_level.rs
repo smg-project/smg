@@ -268,8 +268,8 @@ impl ByteLevelTable {
     }
 
     /// Decode a complete HF sequence using the same bytes as incremental decode.
-    /// Unknown IDs are dropped, as in tokenizers; lossy UTF-8 conversion happens
-    /// only after concatenation so characters may span token boundaries.
+    /// Unknown IDs are dropped, as in tokenizers; bytes that are not whole on
+    /// their own are converted per run, so characters may span token boundaries.
     pub(crate) fn decode(&self, ids: &[TokenIdType], skip_special_tokens: bool) -> String {
         self.concat(ids, skip_special_tokens, false)
             .unwrap_or_default()
@@ -396,11 +396,11 @@ impl ByteLevelTable {
     }
 
     /// The bytes of `id` from whichever store holds them, and whether it is
-    /// special. The whole-sequence decode reads every id through this rather
-    /// than through [`Self::entry`]: its loop stays one kind test, one span
-    /// and one slice of the store the kind picks; the step's piece, with the
-    /// text slice's boundary checks, is not built for a decode that only
-    /// concatenates bytes.
+    /// special. The sizing pass of a chunk's decode ([`Self::decoded_len`])
+    /// reads every id through this rather than through [`Self::entry`]: one
+    /// kind test, one span and one slice of the store the kind picks; the
+    /// step's piece, with the text slice's boundary checks, is not built for
+    /// a pass that only sums lengths.
     #[inline]
     fn token_bytes(&self, id: TokenIdType) -> Option<(&[u8], bool)> {
         let (kind, span) = self.locate(id)?;
