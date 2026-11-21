@@ -25,7 +25,9 @@
 use std::borrow::Cow;
 
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
-use ndarray::{Array2, Array3};
+use ndarray::Array2;
+#[cfg(test)]
+use ndarray::Array3;
 
 use crate::{
     buffer_pool,
@@ -847,7 +849,8 @@ impl QwenVLProcessorBase {
     ///
     /// Each "merged patch" covers a `(merge_size * patch_size)²` spatial region.
     /// Within it, `merge_size²` sub-patches are emitted, each containing all channels.
-    pub fn patchify_into(
+    #[cfg(test)]
+    fn patchify_into(
         &self,
         tensor: &Array3<f32>,
         grid_t: usize,
@@ -917,6 +920,7 @@ impl QwenVLProcessorBase {
     /// `[block_start, block_start + band.len()/block_out)` in (gt, pr, pc)
     /// row-major order. Pure gather/copy from `planes`; deterministic and
     /// independent per block (safe to call concurrently on disjoint bands).
+    #[cfg(test)]
     #[expect(
         clippy::too_many_arguments,
         reason = "block-band patchifier: planes + grid dims + output band"
@@ -967,7 +971,8 @@ impl QwenVLProcessorBase {
     /// `tensors` must already be resized and normalized to the same spatial
     /// shape. If the frame count is not divisible by `temporal_patch_size`,
     /// the caller should pad by repeating the final frame before calling this.
-    pub fn patchify_video_into(
+    #[cfg(test)]
+    fn patchify_video_into(
         &self,
         tensors: &[Array3<f32>],
         grid_t: usize,
