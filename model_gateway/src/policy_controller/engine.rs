@@ -139,9 +139,20 @@ fn labels(decision: Option<&Decision>) -> PolicyDecision {
 
 /// The next ask's process-local number, in eight bytes. The gateway assigns
 /// it independently of any request id supplied by a client.
+///
+/// A thread counts its own asks under a number it takes once: the high 24
+/// bits name the thread and the low 40 count its asks. So no word is
+/// written by two asks of different threads.
 pub(crate) fn mark() -> [u8; 8] {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    NEXT.fetch_add(1, Ordering::Relaxed).to_be_bytes()
+    static THREADS: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        static NEXT: Cell<u64> = Cell::new(THREADS.fetch_add(1, Ordering::Relaxed) << 40);
+    }
+    NEXT.with(|next| {
+        let mark = next.get();
+        next.set(mark.wrapping_add(1));
+        mark.to_be_bytes()
+    })
 }
 
 /// What an attempt states of its request.
@@ -785,6 +796,15 @@ impl PolicyEngine {
         matches!(*self.door, Decider::Own(_))
     }
 
+    /// The id a retry names `worker` by as tried, where its route kept no
+    /// placement of it: a placement that owed the engine of this process
+    /// nothing is its worker alone to its route ([`Sent::of`]), and its
+    /// [`Placed::id`] is read here. `None` under a followed controller's
+    /// engine: its every placement is kept and names its own row.
+    pub(crate) fn row_of(&self, worker: &dyn Worker) -> Option<WorkerId> {
+        self.in_process().then(|| worker_id(worker))
+    }
+
     /// Whether the placement of a single request reads the request's body
     /// under the document in force: some stage that may decide one reads
     /// the prompt. The document's needs say it, as the engine folded them
@@ -1405,13 +1425,63 @@ impl PolicyEngine {
         holds: impl Fn(&dyn Worker) -> bool + Send + Sync,
         now: Instant,
     ) -> Result<Placed, Unplaced> {
-        if let (Workers::Listed(registry), Decider::Own(engine)) = (&self.workers, &*self.door) {
-            return self.place_listed(registry, engine, ask, &holds, now);
+        {
+            // The attempt's first decision is dated at the instant handed.
+            // A later ask of the attempt reads the clock.
+            let handed = Cell::new(Some(now));
+            let clock = || handed.take().unwrap_or_else(Instant::now);
+            if let Some(placed) = self.place_here(ask, &holds, clock) {
+                return placed;
+            }
         }
+        self.place_followed(ask, &holds, now).await
+    }
+
+    /// [`Self::place_where`] for a route that hands a clock and no instant.
+    /// `clock` is read where the attempt's decision is dated, and not at
+    /// all where the engine of this process answers a place: a request
+    /// nothing is dated for reads no clock.
+    pub(crate) async fn place_at(
+        &self,
+        ask: &Ask<'_>,
+        holds: impl Fn(&dyn Worker) -> bool + Send + Sync,
+        clock: impl Fn() -> Instant + Send + Sync,
+    ) -> Result<Placed, Unplaced> {
+        if let Some(placed) = self.place_here(ask, &holds, &clock) {
+            return placed;
+        }
+        self.place_followed(ask, &holds, clock()).await
+    }
+
+    /// A regular attempt's worker with no wait, where the engine of this
+    /// process decides: [`Self::place_at`] as one pass on the calling
+    /// thread ([`Self::place_listed`]), for a route that asks while it
+    /// holds a borrow no wait may hold. `None` under a followed
+    /// controller's engine, whose ask waits.
+    pub(crate) fn place_here(
+        &self,
+        ask: &Ask<'_>,
+        holds: impl Fn(&dyn Worker) -> bool,
+        clock: impl Fn() -> Instant,
+    ) -> Option<Result<Placed, Unplaced>> {
+        let (Workers::Listed(registry), Decider::Own(engine)) = (&self.workers, &*self.door) else {
+            return None;
+        };
+        Some(self.place_listed(registry, engine, ask, &holds, &clock))
+    }
+
+    /// The ask and the commit of a followed controller's engine, three
+    /// asks at most.
+    async fn place_followed(
+        &self,
+        ask: &Ask<'_>,
+        holds: &(impl Fn(&dyn Worker) -> bool + Send + Sync),
+        now: Instant,
+    ) -> Result<Placed, Unplaced> {
         let mut missed: Vec<WorkerId> = Vec::new();
         for _ in 0..ASKS {
             let asked = self.ask(ask, &missed, now).await?;
-            if let Some(placed) = self.commit_where(asked, &holds, &mut missed, now) {
+            if let Some(placed) = self.commit_where(asked, holds, &mut missed, now) {
                 return Ok(placed);
             }
         }
@@ -1437,10 +1507,11 @@ impl PolicyEngine {
     /// worker of the list and nothing else: no stage of the document takes
     /// a word of the request, so the placement holds no guard, names no id
     /// and reads no clock, and its decision is counted and not timed. A
-    /// whole decision is timed from the instant its ask was handed, and its
-    /// targets are walked best first: a target's worker is the one at the
-    /// target's place in the list, and the first the gateway can send to is
-    /// taken on one read of the worker's state. It rides in a guard where
+    /// whole decision is dated by one read of `clock`, where the engine
+    /// dates it, and timed from that instant. Its targets are walked best
+    /// first: a target's worker is the one at the target's place in the
+    /// list, and the first the gateway can send to is taken on one read of
+    /// the worker's state. It rides in a guard where
     /// it is leased, and where it is not, nothing is owed of it. Where no
     /// target holds, the lease is given up by name and the targets join the
     /// next ask's missed.
@@ -1458,7 +1529,7 @@ impl PolicyEngine {
         engine: &OwnEngine,
         ask: &Ask<'_>,
         holds: &impl Fn(&dyn Worker) -> bool,
-        now: Instant,
+        clock: &impl Fn() -> Instant,
     ) -> Result<Placed, Unplaced> {
         let mut missed: Vec<WorkerId> = Vec::new();
         // The workers the route's rule holds, from its first refusal of a
@@ -1466,9 +1537,6 @@ impl PolicyEngine {
         let mut ruled: Option<Arc<[Arc<dyn Worker>]>> = None;
         for asked in 0..ASKS {
             let first = asked == 0;
-            // An attempt's first ask is timed from the instant it was
-            // handed: a place reads no clock.
-            let started = if first { now } else { Instant::now() };
             let among = ruled.as_ref().or(ask.among);
             // The model's workers as the registry lists them: the snapshot
             // the route read, where the attempt's first ask states one,
@@ -1519,7 +1587,14 @@ impl PolicyEngine {
                 loads: lent.snapshot(),
                 source: Cell::new(None),
             };
-            let decided = engine.decide_under(GATEWAY, &made, now);
+            // The decision's instant, where the engine dated one: a place
+            // reads no clock.
+            let dated = Cell::new(None);
+            let decided = engine.decide_at(&made, || {
+                let now = clock();
+                dated.set(Some(now));
+                now
+            });
             // A key's source counts once an attempt, at its first ask, as
             // an ask of a followed controller counts it.
             if let Some(source) = made.source.get().filter(|_| first) {
@@ -1562,12 +1637,22 @@ impl PolicyEngine {
                 }
                 Ok(Decided::Whole(decided, later)) => (decided, later),
                 Err(refused) => {
-                    let seconds = started.elapsed().as_secs_f64();
-                    Metrics::record_policy_decision(ask.model, labels(None), || None, seconds);
+                    // A refusal ahead of the decision's instant ran no
+                    // stage: it is counted and not timed.
+                    match dated.get() {
+                        Some(at) => Metrics::record_policy_decision(
+                            ask.model,
+                            labels(None),
+                            || None,
+                            at.elapsed().as_secs_f64(),
+                        ),
+                        None => Metrics::count_policy_decision(ask.model, labels(None), || None),
+                    }
                     return Err(Unplaced::Refused(refused));
                 }
             };
-            let seconds = started.elapsed().as_secs_f64();
+            let now = dated.get().unwrap_or_else(clock);
+            let seconds = now.elapsed().as_secs_f64();
             Metrics::record_policy_decision(
                 ask.model,
                 labels(Some(&decided.decision)),
@@ -1889,6 +1974,19 @@ impl Placed {
     /// The worker the request goes to.
     pub(crate) fn worker(&self) -> &Arc<dyn Worker> {
         &self.worker
+    }
+
+    /// Whether the placement is more to its route than its worker: a word
+    /// of the request is owed to its engine (it holds its decision's
+    /// guard), or it is a pair's. One that owes nothing is its worker and
+    /// nothing else: each report below says nothing.
+    pub(crate) fn owes(&self) -> bool {
+        self.handle.is_some() || self.pair.is_some()
+    }
+
+    /// The worker alone, of a placement its route keeps nothing else of.
+    pub(crate) fn into_worker(self) -> Arc<dyn Worker> {
+        self.worker
     }
 
     /// The worker's id: the store's row of it, and what a retry names as

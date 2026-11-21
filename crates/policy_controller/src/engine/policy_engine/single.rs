@@ -536,6 +536,36 @@ mod tests {
         assert_eq!(asks.made.get(), 1);
     }
 
+    /// The entry reads its host's clock where a decision is dated and
+    /// nowhere else: a place reads none, and a retry's whole pass, a profile
+    /// that scores and a place noted for a stage that takes a word read it
+    /// once each.
+    #[test]
+    fn a_place_reads_no_clock_and_a_dated_decision_reads_it_once() {
+        let list = pool(4);
+        let tried = [worker_id(list[0].as_ref())];
+        let read = |engine: &PolicyEngine, retried: bool| {
+            let members = engine.pool_members(&list);
+            let mut stated = request();
+            if retried {
+                stated.facts.tried = &tried;
+            }
+            let asks = Asks::of(stated, Some(&members));
+            let reads = Cell::new(0_u32);
+            let decided = engine.decide_at(&asks, || {
+                reads.set(reads.get() + 1);
+                Instant::now()
+            });
+            let place = matches!(decided.expect("an answer"), Decided::Alone(_));
+            (place, reads.get())
+        };
+        assert_eq!(read(&preset("round_robin"), false), (true, 0));
+        assert_eq!(read(&preset("round_robin"), true), (false, 1));
+        assert_eq!(read(&preset("least_load"), false), (false, 1));
+        let (noting, _) = hearing_as(false, true, EventSet::LEASE);
+        assert_eq!(read(&noting, false), (false, 1));
+    }
+
     /// A place whose profile scores is never picked ahead of its request:
     /// the request is made for every decision, plain or not.
     #[test]
@@ -831,8 +861,7 @@ mod tests {
     fn hearing_as(panics: bool, alone: bool, takes: EventSet) -> (PolicyEngine, Heard) {
         let heard = Heard::default();
         let kept = Arc::clone(&heard);
-        let mut stages = StageRegistry::builtin();
-        let added = stages.picker("hears", move || {
+        let engine = picked_by("hears", move || {
             Box::new(Hears {
                 heard: Arc::clone(&kept),
                 panics,
@@ -840,16 +869,102 @@ mod tests {
                 takes,
             })
         });
+        (engine, heard)
+    }
+
+    /// The engine of the `random` preset with the picker `make` builds, a
+    /// stage of the host's own build under `name`, in its pick's place.
+    fn picked_by(
+        name: &'static str,
+        make: impl Fn() -> Box<dyn Picker> + Send + Sync + 'static,
+    ) -> PolicyEngine {
+        let mut stages = StageRegistry::builtin();
+        let added = stages.picker(name, make);
         added.expect("a free name");
         let mut document = PolicySpec::preset("random").expect("a built-in preset");
         document.generation = 1;
         let profile = document.profiles.get_mut("random");
-        profile.expect("the preset's profile").pick = "hears".into();
+        profile.expect("the preset's profile").pick = name.into();
         let spec = AppliedSpec::validate_in(&document, &stages, &[]);
-        (
-            PolicyEngine::new(spec.expect("the stages hold the picker")),
-            heard,
-        )
+        PolicyEngine::new(spec.expect("the stages hold the picker"))
+    }
+
+    /// [`Hears`] as a stage of a host's own build that says it needs the
+    /// lifecycle's calls and names no word of its own.
+    #[derive(Debug)]
+    struct Declares(Hears);
+
+    impl Lifecycle for Declares {
+        fn needs_lifecycle(&self) -> bool {
+            true
+        }
+
+        fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
+            self.0.on_decision_issued(lease, decision);
+        }
+
+        fn on_dispatched(&self, lease: &Lease, target: &Target, side: Side, since: u32) {
+            self.0.on_dispatched(lease, target, side, since);
+        }
+
+        fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
+            self.0.on_completed(lease, outcome);
+        }
+
+        fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+            self.0.on_released(lease, reason);
+        }
+    }
+
+    impl Picker for Declares {
+        fn name(&self) -> &'static str {
+            "declares"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            self.0.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// The words a stage of `engine` put into `heard` of two requests: one
+    /// sent to its first target and completed, and one given up unsent.
+    fn told(engine: &PolicyEngine, heard: &Heard) -> Vec<&'static str> {
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        let asks = Asks::of(request(), Some(&members));
+        let now = Instant::now();
+        let mut handle =
+            DecisionGuard::decide_under(engine, GatewayId::LOCAL, &asks, now).expect("a decision");
+        let first = handle.take(0).expect("the first target");
+        handle.dispatched(now);
+        handle.completed(
+            &Outcome {
+                side: Side::Single,
+                served: first.id,
+                status: 200,
+                class: TransportClass::Ok,
+                ttft_micros: 0,
+                tokens_in: 0,
+                tokens_out: 0,
+                duration_micros: 0,
+            },
+            now,
+        );
+        drop(handle);
+        let unsent =
+            DecisionGuard::decide_under(engine, GatewayId::LOCAL, &asks, now).expect("a decision");
+        drop(unsent);
+        assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+        let words = heard.lock().iter().map(|heard| heard.0).collect();
+        words
     }
 
     /// A stage hears a single's words from what the request's guard lends,
@@ -911,41 +1026,37 @@ mod tests {
     /// are told apart.
     #[test]
     fn a_word_no_stage_takes_is_told_to_nobody() {
-        let told = |kind: EventKind| {
+        let told_of = |kind: EventKind| {
             let (engine, heard) = hearing_as(false, false, EventSet::NONE.with(kind));
-            let list = pool(4);
-            let members = engine.pool_members(&list);
-            let asks = Asks::of(request(), Some(&members));
-            let now = Instant::now();
-            let mut handle = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now)
-                .expect("a decision");
-            let first = handle.take(0).expect("the first target");
-            handle.dispatched(now);
-            handle.completed(
-                &Outcome {
-                    side: Side::Single,
-                    served: first.id,
-                    status: 200,
-                    class: TransportClass::Ok,
-                    ttft_micros: 0,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    duration_micros: 0,
-                },
-                now,
-            );
-            drop(handle);
-            let unsent = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now)
-                .expect("a decision");
-            drop(unsent);
-            assert_eq!((engine.faults(), engine.unheard()), (0, 0));
-            let words: Vec<&'static str> = heard.lock().iter().map(|heard| heard.0).collect();
-            words
+            told(&engine, &heard)
         };
-        assert_eq!(told(EventKind::Issued), ["issued", "issued"]);
-        assert_eq!(told(EventKind::Dispatched), ["dispatched"]);
-        assert_eq!(told(EventKind::Completed), ["completed"]);
-        assert_eq!(told(EventKind::Released), ["released"]);
+        assert_eq!(told_of(EventKind::Issued), ["issued", "issued"]);
+        assert_eq!(told_of(EventKind::Dispatched), ["dispatched"]);
+        assert_eq!(told_of(EventKind::Completed), ["completed"]);
+        assert_eq!(told_of(EventKind::Released), ["released"]);
+    }
+
+    /// A stage of a host's own build that says it needs the lifecycle's
+    /// calls and names no word of its own is told every word on a lease:
+    /// the issue, the dispatch and the completion of a request sent, and
+    /// the issue and the release of one given up.
+    #[test]
+    fn a_stage_that_needs_the_calls_and_names_no_word_is_told_each() {
+        let heard = Heard::default();
+        let kept = Arc::clone(&heard);
+        let engine = picked_by("declares", move || {
+            Box::new(Declares(Hears {
+                heard: Arc::clone(&kept),
+                panics: false,
+                alone: false,
+                takes: EventSet::NONE,
+            }))
+        });
+        assert_eq!(engine.hears, EventSet::LEASE);
+        assert_eq!(
+            told(&engine, &heard),
+            ["issued", "dispatched", "completed", "issued", "released"]
+        );
     }
 
     /// A decision that panics costs its request alone and is counted.
