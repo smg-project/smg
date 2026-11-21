@@ -142,8 +142,14 @@ pub(crate) struct ChatResponseSpec {
 /// model may call (its own list or a message's dynamic tools, non-empty), or
 /// its history holds a call and it leaves `tool_choice` to the model; never
 /// under `tool_choice: none`, where every call is dropped whole. `provider`
-/// is the model's profile as the request's preparation derived it once.
-fn expects_tool_calls(request: &ChatCompletionRequest, provider: ProviderProfile) -> bool {
+/// is the model's profile as the request's preparation derived it once, and
+/// `history_tool_calls` the count of the calls in the history, which the spec
+/// has taken already: the history is walked once for both.
+fn expects_tool_calls(
+    request: &ChatCompletionRequest,
+    provider: ProviderProfile,
+    history_tool_calls: usize,
+) -> bool {
     if matches!(
         request.tool_choice,
         Some(ToolChoice::Value(ToolChoiceValue::None))
@@ -151,7 +157,7 @@ fn expects_tool_calls(request: &ChatCompletionRequest, provider: ProviderProfile
         return false;
     }
     request.effective_tools_for(provider).next().is_some()
-        || (request.tool_choice.is_none() && request.history_tool_calls_count() > 0)
+        || (request.tool_choice.is_none() && history_tool_calls > 0)
 }
 
 /// Whether the response to a chat `request` is scanned for tool calls: the
@@ -192,6 +198,7 @@ impl ChatResponseSpec {
     /// request's preparation derived it once; `From` derives the profile for
     /// a request that carries none.
     pub(crate) fn for_request(request: &ChatCompletionRequest, provider: ProviderProfile) -> Self {
+        let history_tool_calls_count = request.history_tool_calls_count();
         Self {
             wire: Wire::of(provider),
             separate_reasoning: request.separate_reasoning,
@@ -206,7 +213,7 @@ impl ChatResponseSpec {
             // them (`scans_for_tool_calls_for`).
             tools: scans_for_tool_calls_for(request, provider)
                 .then(|| request.shared_tool_list_for(provider)),
-            history_tool_calls_count: request.history_tool_calls_count(),
+            history_tool_calls_count,
             stream_options: request.stream_options.clone(),
             first_tool_call_only: request.disables_parallel_tool_calls(),
             expected_choices: request.choices(),
@@ -222,7 +229,7 @@ impl ChatResponseSpec {
             reasoning_in_prefill: false,
             symphony: None,
             parser_names: None,
-            expects_tool_calls: expects_tool_calls(request, provider),
+            expects_tool_calls: expects_tool_calls(request, provider, history_tool_calls_count),
         }
     }
 
