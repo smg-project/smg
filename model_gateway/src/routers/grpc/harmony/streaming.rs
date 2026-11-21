@@ -18,6 +18,8 @@ use openai_protocol::{
     },
 };
 use serde_json::json;
+use smg_external_router::retry::REQUEST_TIMEOUT_CODE;
+use smg_grpc_client::is_request_timeout;
 use smg_mcp::{McpToolSession, DEFAULT_SERVER_LABEL};
 use tracing::{debug, error};
 
@@ -90,6 +92,36 @@ pub(crate) struct HarmonyStreamingProcessor;
 const CLIENT_LEFT: &str = "Client disconnected";
 const RETAIN_OUTPUT_ITEM: bool = true;
 const OMIT_OUTPUT_ITEM: bool = false;
+
+/// A Responses iteration that ended without a result: the message and the
+/// code of the `error` event its caller ends the stream with.
+#[derive(Debug)]
+pub(crate) struct IterationError {
+    pub(crate) message: String,
+    pub(crate) code: &'static str,
+}
+
+impl IterationError {
+    /// The engine's stream on `side` ended with `status`: one the gateway's
+    /// request timeout cut names the timeout's code, as the 504 and the
+    /// other streams do.
+    fn upstream(side: &str, status: &tonic::Status) -> Self {
+        let mut error = Self::from(format!("{side} stream error: {}", status.message()));
+        if is_request_timeout(status) {
+            error.code = REQUEST_TIMEOUT_CODE;
+        }
+        error
+    }
+}
+
+impl From<String> for IterationError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            code: "processing_error",
+        }
+    }
+}
 
 /// One read of the engine stream for the client of a Responses iteration
 /// (see [`next_response`]).
@@ -552,7 +584,7 @@ impl HarmonyStreamingProcessor {
         format_registry: Option<&FormatRegistry>,
         router_stop_strings: &[String],
         server_call_allowance: Option<usize>,
-    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
+    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), IterationError> {
         match execution_result {
             context::ExecutionResult::Single { stream, .. } => {
                 debug!("Processing Responses API single stream mode");
@@ -591,11 +623,15 @@ impl HarmonyStreamingProcessor {
                 .await
             }
             context::ExecutionResult::Embedding { .. } => {
-                Err("Embeddings not supported in Responses API streaming".to_string())
+                Err("Embeddings not supported in Responses API streaming"
+                    .to_string()
+                    .into())
             }
             // Batch results exist only on the completions pipeline.
             context::ExecutionResult::Batch { .. } => {
-                Err("Batched results not supported in Responses API streaming".to_string())
+                Err("Batched results not supported in Responses API streaming"
+                    .to_string()
+                    .into())
             }
         }
     }
@@ -612,7 +648,7 @@ impl HarmonyStreamingProcessor {
         pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         server_call_allowance: Option<usize>,
-    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
+    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), IterationError> {
         // Phase 1: Drain prefill stream, for the client (see `next_response`):
         // a client that leaves during the prefill ends both sides at once. The
         // client's prompt-side usage is the prefill side's prefix-cache hit:
@@ -633,10 +669,10 @@ impl HarmonyStreamingProcessor {
                 response_id = %emitter.response_id,
                 "Client left during the prefill of the Responses stream; the request is aborted on the engines"
             );
-            return Err(CLIENT_LEFT.to_string());
+            return Err(CLIENT_LEFT.to_string().into());
         };
         let prefill_cached_tokens =
-            drained.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+            drained.map_err(|status| IterationError::upstream("Prefill", &status))?;
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         // Phase 2: Process decode stream. Pass pd_timing so the first decode
@@ -670,7 +706,7 @@ impl HarmonyStreamingProcessor {
         router_stop_strings: &[String],
         pd_timing: Option<context::PdTiming>,
         server_call_allowance: Option<usize>,
-    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
+    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), IterationError> {
         let mut decode =
             ResponsesDecode::new(pd_timing, router_stop_strings, server_call_allowance)?;
         // A fresh iteration: no finish until its terminal frame names one, so the finish of an
@@ -690,11 +726,11 @@ impl HarmonyStreamingProcessor {
                         response_id = %emitter.response_id,
                         "Client left during the Responses stream; the request is aborted on the engine"
                     );
-                    return Err(CLIENT_LEFT.to_string());
+                    return Err(CLIENT_LEFT.to_string().into());
                 }
             };
             decode.frames += 1;
-            let response = result.map_err(|e| format!("Decode stream error: {}", e.message()))?;
+            let response = result.map_err(|status| IterationError::upstream("Decode", &status))?;
             match response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
                     decode
