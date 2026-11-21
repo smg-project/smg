@@ -19,9 +19,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use openai_protocol::worker::WorkerSpec;
+use openai_protocol::worker::{WorkerSpec, WorkerStatus};
 use smg_worker::{
-    identity::endpoint::{Endpoint, EndpointKey},
+    identity::{
+        basic::ConnectionMode,
+        endpoint::{Endpoint, EndpointKey},
+    },
     jobs::{WorkerJobAsker, WorkerRegistrationMode},
     registry::{WorkerId, WorkerOrigin},
 };
@@ -97,6 +100,9 @@ pub(super) struct OwnedWorker {
     /// Revision guard for removal: a concurrently replaced worker is skipped
     /// and re-evaluated on the next pass instead of removed blindly.
     pub(super) revision: u64,
+    /// Whether a removal drains the registration and an addition would put
+    /// it back in service (see [`owned_workers`]).
+    pub(super) draining: bool,
 }
 
 /// One canonical endpoint to remove, carrying every registry worker that
@@ -125,6 +131,7 @@ pub(super) struct RemovalTarget {
 /// statically configured workers carry no provider label and are never
 /// touched, and neither are workers another provider owns.
 fn owned_workers(host: &dyn DiscoveryHost, kind: DiscoveryKind) -> Vec<OwnedWorker> {
+    let jobs = host.jobs();
     host.workers()
         .into_iter()
         .filter_map(|(worker_id, worker)| {
@@ -157,12 +164,22 @@ fn owned_workers(host: &dyn DiscoveryHost, kind: DiscoveryKind) -> Vec<OwnedWork
                     return None;
                 }
             };
+            // Not read where an addition would not bring the worker back: the
+            // registration workflow leaves a ZMQ worker in the state it
+            // replaced, and a `DELETE` holds the worker's own URL (a DP
+            // rank's carries its rank) and removes what stands there.
+            let draining = worker.status() == WorkerStatus::Draining
+                && *worker.connection_mode() != ConnectionMode::Zmq
+                && !jobs
+                    .as_ref()
+                    .is_some_and(|jobs| jobs.job_in_flight(worker.url()));
             Some(OwnedWorker {
                 worker_id,
                 discovery_id,
                 spec_hash,
                 endpoint,
                 revision: worker.revision(),
+                draining,
             })
         })
         .collect()
@@ -187,9 +204,11 @@ pub(super) struct ReconcileActions {
 ///
 /// An owned worker is current when it is the instance the provider describes
 /// (same `discovery_id`) registered with the configuration it now publishes
-/// (same fingerprint). An endpoint with a current worker is left alone, and
-/// one without is added. Owned workers that are not current are handled by
-/// what they are:
+/// (same fingerprint), and no removal drains it: published again, a draining
+/// worker is added again, the Upsert puts it back in service, and the removal,
+/// pinned to what it selected, leaves it. An endpoint with a current worker is
+/// left alone, and one without is added. Owned workers that are not current
+/// are handled by what they are:
 ///
 /// - **A different instance** (or none recorded) is removed, and the published
 ///   one added in its place.
@@ -226,7 +245,9 @@ pub(super) fn compute_actions(
                 if worker.discovery_id.as_deref() == Some(published.discovery_id.as_str()) =>
             {
                 if worker.spec_hash.as_deref() == fingerprints.get(&key).map(String::as_str) {
-                    has_current.insert(key);
+                    if !worker.draining {
+                        has_current.insert(key);
+                    }
                 } else {
                     not_current.push((key, worker, true));
                 }
@@ -369,10 +390,20 @@ pub(super) async fn reconcile(
         .iter()
         .filter(|target| !in_flight(&target.endpoint.lookup_form()))
         .collect();
+    // A worker listed again is added under the hold of the removal that
+    // drains it: a scheme-less address is published in the form its removal
+    // was asked under. A registration's hold is the queue's to refuse.
+    let draining: HashSet<EndpointKey> = registered
+        .iter()
+        .filter(|worker| worker.draining)
+        .map(|worker| worker.endpoint.key())
+        .collect();
     let additions: Vec<&DiscoveredWorker> = actions
         .add
         .iter()
-        .filter(|worker| !in_flight(&worker.endpoint.render()))
+        .filter(|worker| {
+            draining.contains(&worker.endpoint.key()) || !in_flight(&worker.endpoint.render())
+        })
         .collect();
 
     if removals.is_empty() && additions.is_empty() {

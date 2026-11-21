@@ -1858,9 +1858,10 @@ impl<G: Generation> WorkerRegistry<G> {
     /// Remove the worker only while `condition` reads true of the worker as
     /// it stands, the read and the removal under the same per-worker lock.
     /// The removal workflow's final step removes the incarnation it drained
-    /// (the pinned revision, or a rebuild of it that still reads `Draining`:
-    /// that state is the removal's own mark, inherited through a rebuild
-    /// nothing re-activated) and leaves a replacement that stands on its own.
+    /// (the pinned revision, or a rebuild of it that still reads `Draining`
+    /// under a mark entered at or below that revision, inherited through a
+    /// rebuild nothing re-activated) and leaves a replacement that stands on
+    /// its own.
     /// Returns `None` when the worker is gone or the condition reads false.
     pub fn remove_if<F>(&self, worker_id: &WorkerId, condition: F) -> Option<Arc<dyn Worker>>
     where

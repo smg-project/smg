@@ -683,6 +683,7 @@ fn owned(url: &str, discovery_id: &str) -> reconciler::OwnedWorker {
         spec_hash: None,
         endpoint: Endpoint::parse_with_rank(url).expect(url).0,
         revision: 1,
+        draining: false,
     }
 }
 

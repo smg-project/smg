@@ -47,6 +47,7 @@ fn owned_rank(url: &str, discovery_id: &str, worker_id: &str, revision: u64) -> 
         spec_hash: Some(published(url, discovery_id).fingerprint()),
         endpoint: Endpoint::parse_with_rank(url).expect(url).0,
         revision,
+        draining: false,
     }
 }
 
@@ -294,14 +295,14 @@ fn owned_workers_read_back_the_spec_hash() {
     assert!(actions.remove.is_empty());
 }
 
-/// Today's behaviour, held here so that a change of it is a choice and not
-/// an accident: a pass reads no worker state. A worker that left the
-/// published list and is listed again while its removal still drains it
-/// counts as registered, so the pass queues nothing for it. The removal
-/// goes on and removes it, and the first pass after that registers it again.
-#[test]
-fn a_worker_listed_again_while_it_drains_counts_as_registered() {
-    let host = TestHost::without_a_queue();
+/// A worker that left the published list and is listed again while its
+/// removal still drains it is registered again at that pass, under that
+/// removal's hold of the address, and nothing is queued to remove it: the
+/// removal in flight is pinned to the registration it selected. A worker a
+/// `DELETE` drains stays that removal's.
+#[tokio::test]
+async fn a_worker_listed_again_while_it_drains_is_registered_again() {
+    let (host, jobs) = TestHost::recording();
     let worker = published("10.0.0.1:8080", "f-1");
     register_with_labels(
         &host,
@@ -312,16 +313,21 @@ fn a_worker_listed_again_while_it_drains_counts_as_registered() {
             (DISCOVERY_SPEC_HASH_LABEL, &worker.fingerprint()),
         ],
     );
-    // What the removal's drain step writes while its window runs.
+    // What the removal's drain step writes while its window runs, and the
+    // hold of that removal: asked under the form the address is published in.
     for registered in host.registry.get_all() {
         registered.set_status(WorkerStatus::Draining);
     }
+    jobs.hold_for_another_job("10.0.0.1:8080");
+    let desired = desired_state_of(&[worker]);
 
-    let owned = owned_workers(&*host, DiscoveryKind::File);
-    assert_eq!(owned.len(), 1);
-    let actions = compute_actions(&desired_state_of(&[worker]), &owned);
-    assert!(actions.add.is_empty());
-    assert!(actions.remove.is_empty());
+    reconcile(&desired, DiscoveryKind::File, &*host, time::Instant::now()).await;
+    assert!(matches!(jobs.queued().as_slice(), [Queued::Add { .. }]));
+
+    // A `DELETE` queues its removal under the worker's own URL.
+    jobs.hold_for_another_job("http://10.0.0.1:8080");
+    reconcile(&desired, DiscoveryKind::File, &*host, time::Instant::now()).await;
+    assert_eq!(jobs.queued().len(), 1);
 }
 
 /// An owned worker missing its fingerprint label cannot be shown current,
