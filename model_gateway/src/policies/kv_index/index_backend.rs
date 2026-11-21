@@ -20,6 +20,7 @@ use kv_index::{
     GroupViews, OverlapScores, SequenceHash, ShardedChainIndex, StoredBlock, WorkerGroups,
     WorkerIdExhausted,
 };
+use smg_policy_controller::engine::CacheIndex;
 use smg_worker::kv_events::apply::{BlockIndex, HeldBlocks};
 
 /// Workers one chain index interns at once: the index's own ceiling per shard.
@@ -460,6 +461,122 @@ impl fmt::Debug for KvIndex {
     }
 }
 
+// The policy engine's capped lookup reads the chain index's one shard, whose
+// ids are the index's own.
+const _: () = assert!(CHAIN_INDEX_SHARDS == 1);
+
+/// Whether `within` names `worker`, a bit an id. A word past its end names
+/// none.
+fn names(within: &[u64], worker: u32) -> bool {
+    within
+        .get((worker / 64) as usize)
+        .is_some_and(|word| word & (1 << (worker % 64)) != 0)
+}
+
+/// Keeps the deepest of `kept`, at most `cap`, as the chain index's capped
+/// lookup does: every holder of a depth that fits whole, from the deepest
+/// down, and of the depth the cap cuts as many as fit, each as likely as
+/// another by `below`, which is asked for a value under its argument.
+fn keep_deepest(kept: &mut Vec<(u32, u32)>, cap: usize, below: &mut dyn FnMut(u32) -> u32) {
+    if kept.len() <= cap {
+        return;
+    }
+    kept.sort_unstable_by_key(|&(_, depth)| std::cmp::Reverse(depth));
+    let Some(&(_, cut)) = kept.get(cap) else {
+        return;
+    };
+    // The holders of the depth the cap cuts, and those of them that fit.
+    let from = kept.partition_point(|&(_, depth)| depth > cut);
+    let until = kept.partition_point(|&(_, depth)| depth >= cut);
+    let room = cap.saturating_sub(from);
+    for taken in 0..room {
+        let left = until - from - taken;
+        if left < 2 {
+            break;
+        }
+        let left = u32::try_from(left).unwrap_or(u32::MAX);
+        let drawn = below(left).min(left - 1) as usize;
+        kept.swap(from + taken, from + taken + drawn);
+    }
+    kept.truncate(cap);
+}
+
+/// The policy engine's reads of the index, where it decides in the
+/// gateway's own process: a worker's id and its block count once a list of
+/// workers is read, and one lookup a request.
+impl CacheIndex for KvIndex {
+    fn worker_number(&self, address: &str) -> Option<u32> {
+        self.worker_id(address)
+    }
+
+    fn worker_blocks(&self, number: u32) -> usize {
+        self.worker_block_count(number)
+    }
+
+    /// On a fleet with no hybrid worker the chain index keeps the deepest
+    /// holders itself, and nothing is allocated. Where a worker keeps cache
+    /// groups, every holder's depth is first lowered to what its groups can
+    /// serve ([`Self::cap_by_groups`]'s rule), as the classic decision
+    /// lowers it, and the deepest are kept after.
+    fn deepest_into(
+        &self,
+        block_hashes: &[u64],
+        block_size: u32,
+        within: &[u64],
+        cap: usize,
+        below: &mut dyn FnMut(u32) -> u32,
+        kept: &mut Vec<(u32, u32)>,
+    ) {
+        let grouped = !self.groups().is_empty();
+        match self {
+            Self::Chain(chain) if !grouped => {
+                let index = chain.index.shard(0);
+                index.deepest_into(block_hashes, |hash| *hash, within, cap, below, kept);
+                return;
+            }
+            Self::Chain(chain) => {
+                kept.clear();
+                chain.index.score_into(
+                    block_hashes,
+                    |hash| *hash,
+                    false,
+                    |worker, depth| {
+                        if names(within, worker) {
+                            kept.push((worker, depth));
+                        }
+                    },
+                );
+            }
+            #[cfg(test)]
+            Self::Reference(_) => {
+                kept.clear();
+                let contents: Vec<ContentHash> =
+                    block_hashes.iter().map(|&hash| ContentHash(hash)).collect();
+                let scores = self.find_matches(&contents, false).scores;
+                let holders = scores.into_iter();
+                kept.extend(holders.filter(|&(worker, _)| names(within, worker)));
+            }
+        }
+        if grouped {
+            let table = self.groups().read();
+            let mut prefixes = Vec::new();
+            kept.retain_mut(|(worker, depth)| {
+                let Some(view) = table.view(*worker) else {
+                    return true;
+                };
+                if prefixes.is_empty() {
+                    let contents: Vec<ContentHash> =
+                        block_hashes.iter().map(|&hash| ContentHash(hash)).collect();
+                    prefixes = request_prefix_hashes(&contents);
+                }
+                *depth = (*depth).min(view.cap(&prefixes, *depth, block_size as usize).depth);
+                *depth > 0
+            });
+        }
+        keep_deepest(kept, cap, below);
+    }
+}
+
 #[cfg(test)]
 mod apply_tests;
 
@@ -745,5 +862,68 @@ mod tests {
             format!("{:?}", KvIndex::chain()),
             "KvIndex { kind: \"chain\", blocks: 0 }"
         );
+    }
+
+    /// A mask that names `ids`, a bit an id.
+    fn naming(ids: &[u32]) -> Vec<u64> {
+        let mut mask = vec![0u64; 1];
+        for &id in ids {
+            let word = (id / 64) as usize;
+            if mask.len() <= word {
+                mask.resize(word + 1, 0);
+            }
+            mask[word] |= 1 << (id % 64);
+        }
+        mask
+    }
+
+    /// The policy engine's lookup: the holders of a request among the
+    /// workers its mask names, the deepest first under a cap, and the depth
+    /// the cap cuts drawn from. Both backends answer alike.
+    #[test]
+    fn the_engines_lookup_keeps_the_deepest_holders_its_mask_names() {
+        let blocks = chain(&[&[1, 2, 3, 4], &[5, 6, 7, 8], &[9, 10, 11, 12]]);
+        let request: Vec<u64> = blocks.iter().map(|b| b.content_hash.0).collect();
+        for index in backends() {
+            let name = index.name();
+            let ids: Vec<u32> = (0..4)
+                .map(|at| index.intern_worker(&format!("grpc://w{at}")).unwrap())
+                .collect();
+            // Three blocks, two, two and one.
+            for (&id, depth) in ids.iter().zip([3, 2, 2, 1]) {
+                let mut held = WorkerBlocks::default();
+                index
+                    .apply_stored(id, &blocks[..depth], None, &mut held)
+                    .unwrap();
+            }
+            assert_eq!(index.worker_number("grpc://w2"), Some(ids[2]), "{name}");
+            assert_eq!(index.worker_number("grpc://nobody"), None, "{name}");
+            assert_eq!(index.worker_blocks(ids[0]), 3, "{name}");
+            let lookup = |within: &[u32], cap: usize, drawn: u32| {
+                let mut kept = vec![(u32::MAX, 0)];
+                index.deepest_into(&request, 4, &naming(within), cap, &mut |_| drawn, &mut kept);
+                kept.sort_unstable();
+                kept
+            };
+            let whole = [(ids[0], 3), (ids[1], 2), (ids[2], 2), (ids[3], 1)];
+            assert_eq!(lookup(&ids, 16, 0), whole, "{name}");
+            // The deepest fits, and the cap cuts the two of the next depth:
+            // one of them stands, by the draw.
+            let cut: Vec<_> = (0..2).map(|drawn| lookup(&ids, 2, drawn)).collect();
+            for kept in &cut {
+                assert_eq!(kept.len(), 2, "{name}");
+                assert!(kept.contains(&whole[0]), "{name}: {kept:?}");
+                assert!(
+                    kept.iter().all(|&(_, depth)| depth >= 2),
+                    "{name}: {kept:?}"
+                );
+            }
+            assert_ne!(cut[0], cut[1], "{name}: the draw chooses");
+            assert_eq!(lookup(&ids, 1, 0), [whole[0]], "{name}");
+            // A worker the mask does not name is no holder, whatever it holds.
+            assert_eq!(lookup(&ids[1..], 16, 0), whole[1..], "{name}");
+            assert!(lookup(&ids, 0, 0).is_empty(), "{name}");
+            assert!(lookup(&[], 16, 0).is_empty(), "{name}");
+        }
     }
 }
