@@ -23,11 +23,11 @@
 //! - **Once a model** ([`Affinity`]): the record of the prefixes sent to the
 //!   workers the index does not speak for ([`PrefixPredictor`]), behind one
 //!   reader-writer lock. A naming takes it as a reader, and only where the
-//!   list holds such a worker. A pick takes it by a try for its first
-//!   sixteen blocks, so a pick that meets a held lock writes nothing and
-//!   waits for nobody; a longer prompt's later blocks wait their turn. The
-//!   map of the records is behind a mutex that only the read of a list's
-//!   table, a removed worker and the timer's sweep take.
+//!   list holds such a worker. A pick writes behind the blocks its worker
+//!   already holds, sixteen blocks a turn, and takes each turn by a try: a
+//!   turn that meets a held lock ends the write there, so a pick waits for
+//!   nobody. The map of the records is behind a mutex that only the read of
+//!   a list's table, a removed worker and the timer's sweep take.
 //! - **Once a thread**: the buffers a naming writes into. A decision
 //!   allocates nothing once they have grown.
 //!
@@ -214,10 +214,10 @@ impl Affinity {
         }
     }
 
-    /// How many picks' prefixes the records left out, every model's
-    /// together: a write that met a held record at its first turn waits for
-    /// nobody and records nothing. For a host's own count beside its count
-    /// of decisions, never for a decision.
+    /// How many picks' prefixes the records left out in whole or in part,
+    /// every model's together: a write that meets a held record ends there
+    /// and waits for nobody. For a host's own count beside its count of
+    /// decisions, never for a decision.
     pub fn left_out(&self) -> u64 {
         let records = self.records.lock();
         let left_out = |record: &Arc<PrefixRecord>| record.left_out.load(Ordering::Relaxed);
@@ -255,9 +255,9 @@ struct PrefixRecord {
     /// How many workers were told gone. Written under the record's write
     /// guard: a write in parts stops where it moved since its naming.
     left: AtomicU64,
-    /// How many writes were left out whole, their first turn having met a
-    /// held lock. Written by such a write alone, so a pick that records
-    /// writes no shared word for it.
+    /// How many writes ended before the request's last block, a turn of
+    /// theirs having met a held lock. Written by such a write alone, so a
+    /// pick that records whole writes no shared word for it.
     left_out: AtomicU64,
 }
 
@@ -265,6 +265,9 @@ struct PrefixRecord {
 #[derive(Clone, Copy, Debug)]
 struct RecordRead {
     tick: u16,
+    /// The leading blocks of the request the record holds for a worker of
+    /// the list: the depth its deepest holders were sent.
+    blocks: u32,
     /// The record holds the whole request for a worker of the list.
     whole: bool,
     /// The request's last block was used at this tick.
@@ -357,28 +360,35 @@ impl PrefixRecord {
     }
 
     /// Records the request of `keys` as sent to `target`, behind the naming
-    /// that read `read`. Not for a repeat ([`Self::repeats`]).
+    /// that read `read`. Not for a repeat ([`Self::repeats`]). `held` says
+    /// the naming found the target among the workers sent the request's
+    /// deepest recorded block.
     ///
-    /// The request is written sixteen blocks a turn of the lock. An entry
-    /// is a prediction, so a write that meets a held lock at its first turn
-    /// is left out whole and waits for no thread; its later turns wait, so
-    /// a prompt begun is recorded to its end. A worker that left since the
-    /// naming stops the write: the record gives no place to a worker told
-    /// gone.
-    fn write(&self, keys: &[u64], read: RecordRead, target: WorkerId) {
+    /// The write begins behind the blocks the target already holds: a turn
+    /// of a conversation writes the blocks the turn added. It takes the
+    /// lock sixteen blocks a turn, each turn by a try. An entry is a
+    /// prediction and a leading part of a request is a true one, so a turn
+    /// that meets a held lock ends the write there and waits for no thread:
+    /// the next request of the prefix writes on from where this one
+    /// stopped. A worker that left since the naming stops the write too:
+    /// the record gives no place to a worker told gone.
+    fn write(&self, keys: &[u64], read: RecordRead, held: bool, target: WorkerId) {
         if keys.is_empty() {
             return;
         }
-        let ends = (Self::SLICE..keys.len())
-            .step_by(Self::SLICE)
-            .chain(std::iter::once(keys.len()));
-        for end in ends {
-            let mut predictor = if end > Self::SLICE {
-                self.predictor.write()
-            } else if let Some(predictor) = self.predictor.try_write() {
-                predictor
-            } else {
-                self.left_out.fetch_add(1, Ordering::Relaxed);
+        // The target holds the naming's depth where the naming found it
+        // there, and nothing the naming knows of otherwise.
+        let known = if held { read.blocks as usize } else { 0 };
+        let mut end = known.min(keys.len());
+        // A request the target holds whole has its last use to move and
+        // no block to add: left undone, it leaves nothing out.
+        let adds = end < keys.len();
+        loop {
+            end = (end + Self::SLICE).min(keys.len());
+            let Some(mut predictor) = self.predictor.try_write() else {
+                if adds {
+                    self.left_out.fetch_add(1, Ordering::Relaxed);
+                }
                 return;
             };
             if self.left.load(Ordering::Relaxed) != read.left {
@@ -387,6 +397,7 @@ impl PrefixRecord {
             predictor.record(&keys[..end], target, read.tick);
             if end == keys.len() {
                 self.sweep(&mut predictor);
+                return;
             }
             RwLockWriteGuard::unlock_fair(predictor);
         }
@@ -744,6 +755,7 @@ impl Table {
         deepest.extend(found.holders());
         let read = RecordRead {
             tick,
+            blocks: found.blocks(),
             whole: found.blocks() as usize == keys.len(),
             fresh: found.fresh(tick),
             left: record.left.load(Ordering::Relaxed),
@@ -1106,13 +1118,14 @@ pub fn record_prefix(
     let (Some(record), Some(row)) = (table.record.as_deref(), table.spoken_row(id)) else {
         return;
     };
-    if record.repeats(read.read, read.deepest.contains(&row)) {
+    let held = read.deepest.contains(&row);
+    if record.repeats(read.read, held) {
         return;
     }
     with_buffers(|buffers| {
         // The keys are the request's own, whichever list was filled last.
         PrefixPredictor::fold_into(&mut buffers.keys, facts.namespace_seed, facts.block_hashes);
-        record.write(&buffers.keys, read.read, id);
+        record.write(&buffers.keys, read.read, held, id);
     });
 }
 
@@ -1184,8 +1197,9 @@ impl Table {
         let Some(target) = target.filter(|target| !self.heard(target.position)) else {
             return decision;
         };
-        if !record.repeats(read, buffers.deepest.contains(&target.id)) {
-            record.write(&buffers.keys, read, target.id);
+        let held = buffers.deepest.contains(&target.id);
+        if !record.repeats(read, held) {
+            record.write(&buffers.keys, read, held, target.id);
         }
         decision
     }
@@ -1213,8 +1227,9 @@ impl Table {
         let Some(target) = target.filter(|target| !self.heard(target.position)) else {
             return decision;
         };
-        if !record.repeats(read.read, read.deepest.contains(&target.position)) {
-            record.write(&buffers.keys, read.read, target.id);
+        let held = read.deepest.contains(&target.position);
+        if !record.repeats(read.read, held) {
+            record.write(&buffers.keys, read.read, held, target.id);
         }
         decision
     }
