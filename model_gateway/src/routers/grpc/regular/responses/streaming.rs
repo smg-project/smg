@@ -127,6 +127,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             // No startup barrier: the status is checked below before the
             // stream is forwarded.
             None,
+            Some(TextValueReader(())),
         )
         .await;
 
@@ -381,6 +382,76 @@ struct FunctionView<'a> {
     arguments: Option<JsonText<'a>>,
 }
 
+/// Says that a chat stream's reader is [`chat_frame_events`], which takes a
+/// bare text delta as a value in place of a JSON chunk. The field is
+/// private, so this module alone can make one: a chat stream that any other
+/// caller asks for, and so every stream a client reads, carries no value.
+#[derive(Clone, Copy)]
+pub(crate) struct TextValueReader(());
+
+impl<'a> ChatChunkView<'a> {
+    /// A bare text delta the chat stage handed as a value (the tag, `c` or
+    /// `r`, the text's length in bytes, a line feed, the text) and what
+    /// follows it in the frame.
+    fn text_value(frame: &'a str) -> Option<(Self, &'a str)> {
+        let (head, rest) = frame.strip_prefix('\u{1}')?.split_once('\n')?;
+        let (field, length) = head.split_at_checked(1)?;
+        let (text, rest) = rest.split_at_checked(length.parse().ok()?)?;
+        let text = Some(JsonText(Cow::Borrowed(text)));
+        let (content, reasoning_content) = match field {
+            "r" => (None, text),
+            _ => (text, None),
+        };
+        Some((
+            Self {
+                _id: JsonText(Cow::Borrowed("")),
+                _object: JsonText(Cow::Borrowed("")),
+                _created: 0,
+                _model: JsonText(Cow::Borrowed("")),
+                choices: FirstElement(Some(ChoiceView {
+                    _index: 0,
+                    delta: DeltaView {
+                        content,
+                        reasoning_content,
+                        tool_calls: None,
+                    },
+                    finish_reason: None,
+                })),
+                usage: None,
+            },
+            rest,
+        ))
+    }
+}
+
+/// The events of one frame of a chat stream that hands its bare text deltas
+/// as values: a value is read where it stands, the text between two values
+/// by [`chat_sse_events`]. A value's text is read by its length, whatever
+/// bytes it holds; JSON text holds no raw control byte (a string escapes
+/// it), so past an event the next value starts at the next tag.
+fn chat_frame_events<'a>(
+    frame: &'a str,
+) -> impl Iterator<Item = ChatSseEvent<'a, ChatChunkView<'a>>> {
+    let mut rest = frame;
+    let mut events = None;
+    std::iter::from_fn(move || loop {
+        if let Some(event) = events.as_mut().and_then(Iterator::next) {
+            return Some(event);
+        }
+        if rest.is_empty() {
+            return None;
+        }
+        if let Some((chunk, after)) = ChatChunkView::text_value(rest) {
+            rest = after;
+            return Some(ChatSseEvent::Chunk(chunk));
+        }
+        let end = memchr::memchr(1, &rest.as_bytes()[1..]).map_or(rest.len(), |at| at + 1);
+        let (text, after) = rest.split_at(end);
+        rest = after;
+        events = Some(chat_sse_events(text));
+    })
+}
+
 impl ChatChunkParts for ChatChunkView<'_> {
     fn reasoning(&self) -> Option<&str> {
         self.choices.0.as_ref()?.delta.reasoning_content.as_deref()
@@ -588,7 +659,7 @@ async fn process_and_transform_sse_stream(
         };
 
         let frame = frame_text(&chunk);
-        for event in chat_sse_events::<ChatChunkView<'_>>(&frame) {
+        for event in chat_frame_events(&frame) {
             match event {
                 ChatSseEvent::Done => break 'frames,
                 ChatSseEvent::Chunk(chat_chunk) => {
@@ -1099,6 +1170,7 @@ async fn execute_tool_loop_streaming_internal(
             // Tool-loop iterations are not retried.
             None,
             startup.take(),
+            None,
         );
         // Dispatched under the turn's stamp: the chat stream reads its
         // dispatch wait from it where it is built.
@@ -1493,13 +1565,17 @@ impl ChatResponseAccumulator {
 
 #[cfg(test)]
 mod tests {
+    use bytes::BytesMut;
     use smg_external_router::retry::REQUEST_TIMEOUT_CODE;
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
 
     use super::*;
-    use crate::routers::grpc::common::responses::utils::{
-        assert_responses_api_usage, namespace_test_request, responses_api_test_usage,
+    use crate::routers::grpc::{
+        common::responses::utils::{
+            assert_responses_api_usage, namespace_test_request, responses_api_test_usage,
+        },
+        regular::streaming::frames::{ChatChunkFrame, TextDelta},
     };
 
     /// Runs chat SSE frames through the Responses transform as an unstored
@@ -2599,6 +2675,52 @@ mod tests {
                 "choices":[{"index":0,"delta":delta,"finish_reason":finish_reason}]
             })
         )
+    }
+
+    /// A frame whose bare text deltas the chat stage wrote as values reads as
+    /// the frame that carries them as JSON chunks: the same events in the same
+    /// order, a text that holds the tag byte, a blank line or an escape whole.
+    #[test]
+    fn a_frame_of_text_values_reads_as_its_json_frame() {
+        let mut frame = ChatChunkFrame::new("chat_test", "test-model", 0, None);
+        let mut written = |reader| {
+            frame.text_values = reader;
+            let mut buffer = BytesMut::new();
+            buffer.extend_from_slice(chat_event(json!({"role": "assistant"}), None).as_bytes());
+            for (field, text) in [
+                (TextDelta::Reasoning, "th\u{e9} \"why\"\n"),
+                (TextDelta::Content, "Hello"),
+                (TextDelta::Content, ""),
+                (TextDelta::Content, "\u{1}c2\n\n\ndata: [DONE]\n\n"),
+            ] {
+                frame.write_text_delta(&mut buffer, 0, field, text, None, false);
+            }
+            buffer.extend_from_slice(chat_event(json!({}), Some("stop")).as_bytes());
+            buffer.extend_from_slice(b"data: [DONE]\n\n");
+            String::from_utf8(buffer.to_vec()).unwrap()
+        };
+        let json = written(None);
+        let values = written(Some(TextValueReader(())));
+        // Four values, and the tag byte the last text holds.
+        assert_eq!(values.matches('\u{1}').count(), 5);
+        let reads = |frame: &str| -> Vec<String> {
+            chat_frame_events(frame)
+                .map(|event| match event {
+                    ChatSseEvent::Chunk(chunk) => format!(
+                        "chunk: {:?} {:?} {:?} {}",
+                        chunk.reasoning(),
+                        chunk.content(),
+                        chunk.finish_reason(),
+                        chunk.usage.is_some()
+                    ),
+                    ChatSseEvent::UpstreamError(error) => format!("error: {error}"),
+                    ChatSseEvent::Done => "done".to_string(),
+                    ChatSseEvent::Other(event) => format!("other: {event}"),
+                })
+                .collect()
+        };
+        assert_eq!(reads(&json).len(), 7);
+        assert_eq!(reads(&values), reads(&json));
     }
 
     /// The chat stream hands the body every chunk the engine had ready as one

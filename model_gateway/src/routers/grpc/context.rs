@@ -53,6 +53,7 @@ use super::{
         ProtoInputLogProbs, ProtoRequest, ProtoStream,
     },
     regular::{
+        responses::TextValueReader,
         stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
         symphony::{PromptReplay, Reading},
     },
@@ -260,6 +261,8 @@ pub(crate) struct SharedComponents {
 /// client acquisition, encode, and request building).
 #[derive(Default)]
 pub(crate) struct ProcessingState {
+    /// See `ChatResponseSpec::text_values`: set by the chat entry.
+    pub text_values: Option<TextValueReader>,
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
 

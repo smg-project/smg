@@ -22,7 +22,10 @@ use openai_protocol::{
 };
 
 use crate::routers::grpc::{
-    regular::{stages::decisions::scoring::DecisionScoring, symphony::Assignment},
+    regular::{
+        responses::TextValueReader, stages::decisions::scoring::DecisionScoring,
+        symphony::Assignment,
+    },
     utils::Names,
     wire::Wire,
 };
@@ -86,6 +89,9 @@ pub(crate) struct TranscriptionResponseSpec {
 
 #[derive(Clone)]
 pub(crate) struct ChatResponseSpec {
+    /// Set where the stream's reader is the Responses stage, which takes a
+    /// bare text delta as a value.
+    pub text_values: Option<TextValueReader>,
     /// The wire the answer leaves in, selected by the profile of the model
     /// the client asked for ([`Wire::of`]): the stream's shape follows it.
     pub wire: Wire,
@@ -201,6 +207,7 @@ impl ChatResponseSpec {
             reasoning_in_prefill: false,
             symphony: None,
             parser_names: None,
+            text_values: None,
         }
     }
 }
