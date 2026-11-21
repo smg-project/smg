@@ -25,6 +25,9 @@ SIZES = ("256", "2k", "32k", "128k", "500k", "1m")
 BAND = 0.20
 # A change between two releases of this crate counts as faster or slower beyond this much.
 LEVEL = 0.05
+# A batch verdict needs ten successful, interleaved rounds in both release columns because
+# normal run-to-run spread can move a three-round median beyond LEVEL.
+_BATCH_VERDICT_ROUNDS = 10
 # The step and first-delta cells time one call between two reads of a clock that moves in steps of
 # about this many nanoseconds: a change of one step or less is below what those cells resolve.
 TICK = 10.0
@@ -104,14 +107,17 @@ class Run:
     def other(self, family, cell, name, arm):
         return median(self.misc.get((family, cell, name, arm), []))
 
+    def _batch_values(self, family, arm):
+        if arm == "v1" and not self.v1_encodes(family):
+            return []
+        api = self.misc.get((family, "batch1000", "batch_api_tok_per_s_p50", arm), [])
+        if api:
+            return api
+        return self.misc.get((family, "batch1000", "batch_loop_tok_per_s_p50", arm), [])
+
     def batch(self, family, arm):
         """Tokens per second of the batch call where the column has one, else of the plain loop."""
-        if arm == "v1" and not self.v1_encodes(family):
-            return None
-        api = self.other(family, "batch1000", "batch_api_tok_per_s_p50", arm)
-        if api is not None:
-            return api
-        return self.other(family, "batch1000", "batch_loop_tok_per_s_p50", arm)
+        return median(self._batch_values(family, arm))
 
 
 def encode_table(run, mode):
@@ -208,7 +214,9 @@ def moves(run, family):
         now, before = (run.other(family, cell, name, arm) for arm in (run.new, run.old))
         found.append((title, now, before, ratio(now, before), False, 1.0, unit))
     now, before = run.batch(family, run.new), run.batch(family, run.old)
-    found.append((BATCH, now, before, ratio(now, before), True, 1e6, "Mtok/s"))
+    rounds = (len(run._batch_values(family, arm)) for arm in (run.new, run.old))
+    change = ratio(now, before) if min(rounds) >= _BATCH_VERDICT_ROUNDS else None
+    found.append((BATCH, now, before, change, True, 1e6, "Mtok/s"))
     return found
 
 
