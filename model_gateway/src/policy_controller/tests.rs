@@ -1200,10 +1200,11 @@ async fn a_pair_family_serves_in_process_and_refuses_by_name_under_an_address() 
             Arc::ptr_eq(&policies.get_decode_policy(), &unset),
             "{family}"
         );
-        // An encode policy nobody registered is made anew at each read. A
-        // registered one is one object.
+        // No encode policy was registered either: the read is the
+        // registry's fall-back, built at the first read and kept.
+        let encode = policies.get_encode_policy();
         assert!(
-            !Arc::ptr_eq(&policies.get_encode_policy(), &policies.get_encode_policy()),
+            Arc::ptr_eq(&encode, &policies.get_encode_policy()),
             "{family}"
         );
         stop_follower(&context).await?;
