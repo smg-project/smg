@@ -11,6 +11,7 @@
 use std::fmt;
 
 use rustc_hash::FxHashMap;
+use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 /// Seed for XXH3 hashing.
 pub const XXH3_SEED: u64 = 1337;
@@ -111,40 +112,61 @@ pub struct OverlapScores {
     pub scores: FxHashMap<u32, u32>,
 }
 
-/// One-shot over a stack buffer for blocks up to 256 tokens: the streaming
-/// hasher derives a seeded secret per instance before it sees a byte, which
-/// outweighs hashing a 16-token block. Same digest either way (the test
-/// below pins that). The buffer is the smallest of three sizes that holds
-/// the block: zeroing one sized for 256 tokens costs as much as hashing a
-/// 16-token block.
+/// One shot over the block's bytes: the streaming hasher derives a seeded
+/// secret per instance before it sees a byte, which outweighs hashing a
+/// 16-token block. Same digest either way (the test below pins that).
 pub fn compute_content_hash(token_ids: &[u32]) -> ContentHash {
+    ContentHash(hash_token_ids(token_ids, XXH3_SEED))
+}
+
+/// XXH3 under `seed` over a block's token ids, each as four little-endian
+/// bytes.
+///
+/// On a little-endian target the ids' own bytes are those bytes, so the
+/// block is hashed where it lies. A copy onto the stack costs more than its
+/// instructions: the hash reads the buffer back at once, and that read waits
+/// for the copy's store whenever the callers' frames put the buffer across
+/// a cache line. Another target has to copy the ids out first
+/// ([`hash_copied_token_ids`]).
+#[inline]
+pub(crate) fn hash_token_ids(token_ids: &[u32], seed: u64) -> u64 {
+    if cfg!(target_endian = "little") {
+        xxh3_64_with_seed(bytemuck::cast_slice(token_ids), seed)
+    } else {
+        hash_copied_token_ids(token_ids, seed)
+    }
+}
+
+/// [`hash_token_ids`] where an id's own bytes are not little-endian: one
+/// shot over a copy of the ids' little-endian bytes, on the stack for a
+/// block of up to 256 tokens. The buffer is the smallest of three sizes that
+/// holds the block: zeroing one sized for 256 tokens costs as much as
+/// hashing a 16-token block.
+fn hash_copied_token_ids(token_ids: &[u32], seed: u64) -> u64 {
     const STACK_BYTES: usize = 1024;
     let len = token_ids.len() * 4;
     if len <= STACK_BYTES {
         return match len {
-            0..=128 => hash_on_stack::<128>(token_ids),
-            129..=256 => hash_on_stack::<256>(token_ids),
-            _ => hash_on_stack::<STACK_BYTES>(token_ids),
+            0..=128 => hash_on_stack::<128>(token_ids, seed),
+            129..=256 => hash_on_stack::<256>(token_ids, seed),
+            _ => hash_on_stack::<STACK_BYTES>(token_ids, seed),
         };
     }
     let bytes: Vec<u8> = token_ids.iter().flat_map(|t| t.to_le_bytes()).collect();
-    ContentHash(xxhash_rust::xxh3::xxh3_64_with_seed(&bytes, XXH3_SEED))
+    xxh3_64_with_seed(&bytes, seed)
 }
 
-/// [`compute_content_hash`] over a zeroed stack buffer of `N` bytes, which
+/// [`hash_copied_token_ids`] over a zeroed stack buffer of `N` bytes, which
 /// holds the block.
 #[inline]
-fn hash_on_stack<const N: usize>(token_ids: &[u32]) -> ContentHash {
+fn hash_on_stack<const N: usize>(token_ids: &[u32], seed: u64) -> u64 {
     let mut bytes = [0u8; N];
     let len = token_ids.len() * 4;
     let (slots, _) = bytes[..len].as_chunks_mut::<4>();
     for (slot, token) in slots.iter_mut().zip(token_ids) {
         *slot = token.to_le_bytes();
     }
-    ContentHash(xxhash_rust::xxh3::xxh3_64_with_seed(
-        &bytes[..len],
-        XXH3_SEED,
-    ))
+    xxh3_64_with_seed(&bytes[..len], seed)
 }
 
 /// Rolling prefix hash over content hashes: `XXH3(prev || current)`, the
@@ -172,7 +194,7 @@ pub fn chain_prefix_hash(prev: SequenceHash, current: ContentHash) -> SequenceHa
     let mut bytes = [0u8; 16];
     bytes[..8].copy_from_slice(&prev.0.to_le_bytes());
     bytes[8..].copy_from_slice(&current.0.to_le_bytes());
-    SequenceHash(xxhash_rust::xxh3::xxh3_64_with_seed(&bytes, XXH3_SEED))
+    SequenceHash(xxh3_64_with_seed(&bytes, XXH3_SEED))
 }
 
 /// Chunk request tokens by block size and compute a [`ContentHash`] per full block.
@@ -204,12 +226,42 @@ mod tests {
     /// The streaming hasher this function used before; the one-shot path must
     /// stay bit-identical because workers report hashes computed the old way.
     fn streaming_content_hash(token_ids: &[u32]) -> ContentHash {
+        ContentHash(streaming_hash(token_ids, XXH3_SEED))
+    }
+
+    /// The streaming hasher under `seed`, fed each id's little-endian bytes.
+    fn streaming_hash(token_ids: &[u32], seed: u64) -> u64 {
         use std::hash::Hasher;
-        let mut hasher = xxhash_rust::xxh3::Xxh3::with_seed(XXH3_SEED);
+        let mut hasher = xxhash_rust::xxh3::Xxh3::with_seed(seed);
         for &t in token_ids {
             hasher.write(&t.to_le_bytes());
         }
-        ContentHash(hasher.finish())
+        hasher.finish()
+    }
+
+    /// A target of another byte order hashes a copy of the block. That copy
+    /// gives the streaming hasher's digest, and so the digest of the block
+    /// hashed in place, at every length across its three stack buffers and
+    /// its heap copy.
+    #[test]
+    fn a_copied_blocks_hash_is_the_hash_of_the_block_in_place() {
+        let tokens: Vec<u32> = (0..300).map(|i| i * 7919 + 3).collect();
+        for seed in [0, XXH3_SEED, u64::MAX] {
+            for len in 0..=tokens.len() {
+                let block = &tokens[..len];
+                let copied = hash_copied_token_ids(block, seed);
+                assert_eq!(
+                    copied,
+                    streaming_hash(block, seed),
+                    "seed {seed}, {len} tokens"
+                );
+                assert_eq!(
+                    copied,
+                    hash_token_ids(block, seed),
+                    "seed {seed}, {len} tokens"
+                );
+            }
+        }
     }
 
     #[test]
