@@ -329,11 +329,15 @@ malformed_reasons! {
 
 impl MalformedReason {
     /// Whether the reason says that the model wrote a tool call the syntax could not read
-    /// whole: bytes written for a call that are in no call the output delivers (refused as a
-    /// malformed call's, or returned as text where the syntax has a call, a name, a key, a value
-    /// or arguments), or a call that ends without its whole arguments. A driver that fails its
-    /// request on a call it could not read asks this of every `Malformed` event, beside the word
-    /// a call's end carries on a call the model did not end ([`CallEnd`]).
+    /// whole: bytes of a member, a name or arguments written for a call that are in no call
+    /// the output delivers (refused as a malformed call's, or returned as text where the
+    /// syntax has a call, a name, a key, a value or arguments), or a call that ends without
+    /// its whole arguments. A call the syntax repaired is not one: where the model slipped on
+    /// a tag and every member it wrote is in the call (a closing tag ignored, misnamed or left
+    /// out, a string closed where its close was missing), the call is all there and is
+    /// delivered, under a reason that says which repair was made. A driver that fails its
+    /// request on a call it could not read asks this of every `Malformed` event, beside the
+    /// word a call's end carries on a call the model did not end ([`CallEnd`]).
     ///
     /// The reasons that lose no call, each for its own cause:
     ///
@@ -356,9 +360,9 @@ impl MalformedReason {
     ///   [`TextAfterTheList`](Self::TextAfterTheList): text after a call, or a list of calls,
     ///   that was read whole; the text is returned and no call is short of it.
     ///
-    /// Every other reason loses one. [`TextBetweenCalls`](Self::TextBetweenCalls) is classed by
-    /// the use that loses a call, since the reason alone does not tell its two apart: it names
-    /// text where a call should begin and prose between two whole calls alike.
+    /// Every other reason loses one. [`TextBetweenCalls`](Self::TextBetweenCalls) names text
+    /// where a call should begin and prose beside whole calls alike, and is classed as losing
+    /// one for both: prose inside a call block is no part of a block the syntax reads whole.
     ///
     /// The bytes a syntax refuses leave as `Dropped { MalformedCall }` behind the `Malformed`
     /// event of no bytes that gives the reason, so the reason is the word on whether a call was

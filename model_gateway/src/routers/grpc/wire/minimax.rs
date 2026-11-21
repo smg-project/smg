@@ -57,8 +57,11 @@ pub(crate) const INVALID_TOOL_CALL_FORMAT: &str = metrics_labels::ERROR_INVALID_
 /// How a MiniMax M3 request ends when the model wrote a tool call the reader
 /// could not read and the request expects calls
 /// (`ChatResponseSpec::fails_on_unreadable_call`): the request's outcome, not
-/// the worker's failure, in place of an answer with a partial or repaired
-/// call. A whole response is a 400 ([`Self::response`]). A stream, whose
+/// the worker's failure, in place of an answer that ends on a call the model
+/// did not finish or the table could not read. A call the table repaired and
+/// read whole (a closing tag ignored, misnamed or left out, a string closed
+/// where its close was missing) is no such call: it is delivered. A whole
+/// response is a 400 ([`Self::response`]). A stream, whose
 /// status is out, ends with the usage chunk when the request asked for one,
 /// then one `event: error` frame ([`Self::sse_frame`]), with no finish chunk
 /// ahead of it and no `[DONE]` after it. Both carry the same body:
