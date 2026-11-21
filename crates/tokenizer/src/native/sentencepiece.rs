@@ -74,10 +74,10 @@ pub(super) struct CharSymbols {
     ascii: [u32; 128],
     /// The token of each other character the vocabulary has, by scalar value.
     beyond: FxHashMap<u32, u32>,
-    /// `true` at [`pair_entry`] of `prev` and `cur`: no piece cut goes between the
-    /// raw bytes `prev` and `cur`: some vocabulary token holds them adjacent
-    /// (a space read as the marker, its last byte before the cut and its
-    /// first byte after it), or `cur` continues a UTF-8 character. Read
+    /// `true` at [`pair_entry`] of `prev` and `cur`: no piece cut goes between
+    /// the raw bytes `prev` and `cur`: some vocabulary token holds them
+    /// adjacent (a space read as the marker, its last byte before the cut and
+    /// its first byte after it), or `cur` continues a UTF-8 character. Read
     /// from the tokens' text, then rewritten for the raw text by
     /// [`Self::bridge_raw_text`].
     bridge: Box<[bool; BRIDGE_PAIRS]>,
