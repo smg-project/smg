@@ -246,6 +246,8 @@ mod tests {
     fn test_worker_routing_key_load_builds_its_map_on_the_first_key() {
         let load = WorkerRoutingKeyLoad::new("http://test:8000");
         assert_eq!(load.key_inflight("key1"), 0);
+        load.decrement("key1");
+        assert_eq!(load.value(), 0);
         assert!(load.active_routing_keys.get().is_none());
 
         load.increment("key1");
