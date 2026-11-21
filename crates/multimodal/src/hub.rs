@@ -45,6 +45,8 @@ const HUB_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Resolve a model source to a local directory containing `config.json`.
 ///
 /// If the source is already a local directory with `config.json`, returns it as-is.
+/// A source that is a file (a tokenizer file) resolves to its directory when
+/// `config.json` stands beside it.
 /// Any other source that names a path fails here as a [`LocalSourceWithoutConfig`]:
 /// the Hub is never asked for a path.
 /// Otherwise, treats the source as a HuggingFace model ID and downloads
@@ -63,6 +65,12 @@ async fn resolve_within(source: &str, bound: Duration) -> anyhow::Result<PathBuf
     let path = Path::new(source);
     if path.join("config.json").exists() {
         return Ok(path.to_path_buf());
+    }
+    let beside = path
+        .parent()
+        .filter(|dir| path.is_file() && dir.join("config.json").exists());
+    if let Some(dir) = beside {
+        return Ok(dir.to_path_buf());
     }
     if is_local_source(source) {
         return Err(LocalSourceWithoutConfig {
@@ -803,5 +811,31 @@ mod tests {
             !repo.join("blobs").exists() && !repo.join("snapshots").exists(),
             "nothing of the file is in the cache"
         );
+    }
+
+    /// A tokenizer source may be a file: the model's `config.json` is the one
+    /// beside it. A file with none beside it is a local source without one.
+    #[tokio::test]
+    async fn a_source_that_is_a_file_resolves_to_its_directory() {
+        let model = tempfile::tempdir().expect("a model directory");
+        std::fs::write(model.path().join("config.json"), "{}").expect("a config");
+        let tokenizer = model.path().join("tokenizer.json");
+        std::fs::write(&tokenizer, "{}").expect("a tokenizer file");
+
+        let resolved = resolve_within(&tokenizer.to_string_lossy(), Duration::from_secs(1))
+            .await
+            .expect("the configuration beside the file");
+
+        assert_eq!(resolved, model.path());
+
+        let lone = tempfile::tempdir().expect("a directory");
+        let tokenizer = lone.path().join("tokenizer.json");
+        std::fs::write(&tokenizer, "{}").expect("a tokenizer file");
+
+        let failed = resolve_within(&tokenizer.to_string_lossy(), Duration::from_secs(1))
+            .await
+            .expect_err("no config.json beside the file");
+
+        assert!(super::LocalSourceWithoutConfig::is(&failed));
     }
 }
