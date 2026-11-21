@@ -273,8 +273,13 @@ impl ShortPieceTable {
 
     /// The slots a table for about `entries` pieces has: a power of two that
     /// holds them under the fill bound, [`MIN_SLOTS`] at least.
-    pub(super) fn slots_for(entries: usize) -> usize {
-        (entries * 4 / 3 + 1).next_power_of_two().max(MIN_SLOTS)
+    pub(super) const fn slots_for(entries: usize) -> usize {
+        let slots = (entries * 4 / 3 + 1).next_power_of_two();
+        if slots < MIN_SLOTS {
+            MIN_SLOTS
+        } else {
+            slots
+        }
     }
 
     /// A table of `slots` slots with room for `reserved` before it has to
