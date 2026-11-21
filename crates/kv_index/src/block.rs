@@ -125,9 +125,8 @@ pub fn compute_content_hash(token_ids: &[u32]) -> ContentHash {
 /// On a little-endian target the ids' own bytes are those bytes, so the
 /// block is hashed where it lies. A copy onto the stack costs more than its
 /// instructions: the hash reads the buffer back at once, and that read waits
-/// for the copy's store whenever the callers' frames put the buffer across
-/// a cache line. Another target has to copy the ids out first
-/// ([`hash_copied_token_ids`]).
+/// for the copy's store at some stack depths of the caller. Another target
+/// has to copy the ids out first ([`hash_copied_token_ids`]).
 #[inline]
 pub(crate) fn hash_token_ids(token_ids: &[u32], seed: u64) -> u64 {
     if cfg!(target_endian = "little") {
@@ -273,8 +272,9 @@ mod tests {
             state ^= state << 17;
             state
         };
-        // Every length across the stack/heap boundary (256 tokens), including
-        // the short-input, mid-input and long-input XXH3 regimes.
+        // Every length through each regime of the hash: up to 16 bytes, up
+        // to 128, up to 240 and beyond. On a target of another byte order
+        // they also cross every bound of its copy (32, 64 and 256 tokens).
         for len in 0..=300usize {
             let tokens: Vec<u32> = (0..len).map(|_| (next() % 160_000) as u32).collect();
             assert_eq!(

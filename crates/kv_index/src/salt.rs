@@ -215,7 +215,9 @@ mod tests {
         let tokens: Vec<u32> = (0..300).map(|i| i * 7919 + 3).collect();
         let namespace = namespace_seed(Some("adapter"), Some("salty"));
         for seed in [0, XXH3_SEED, namespace, u64::MAX] {
-            // Both sides of every buffer bound (32, 64 and 256 tokens).
+            // Each regime of the hash (up to 16 bytes, up to 128, up to 240
+            // and beyond). On a target of another byte order, both sides of
+            // every bound of its copy too (32, 64 and 256 tokens).
             for len in [0, 1, 16, 32, 33, 64, 65, 255, 256, 257, 300] {
                 assert_eq!(
                     content_hash_with_seed(&tokens[..len], seed),
