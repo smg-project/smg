@@ -2568,6 +2568,208 @@ fn run_drawn(
     decision
 }
 
+/// The crate's own pickers that draw first, by name. Each one's draw reads
+/// a row of the pool through the test it is handed and in no other way: it
+/// reads the pool's size, draws places, and asks the test about the row at
+/// each. So its draw may be asked over rows whose records are not written
+/// yet ([`run_drawn_written`]). A host's stage takes no built-in's name and
+/// states its own ([`StageRegistry`](crate::stages::StageRegistry)), so a
+/// picker of one of these names is the crate's, and a host's own picker
+/// that draws first is handed every record written.
+#[cfg(feature = "in-process")]
+const DRAWS_BY_ITS_TEST: [&str; 6] = [
+    "power-of-two",
+    "power-of-two-count-first",
+    "best",
+    "random",
+    "passthrough",
+    "round-robin",
+];
+
+/// A plain single decision that is a draw's, as [`Engine::drawn_for`] found
+/// it: the profile that draws and its binding's word for a pool the
+/// overload veto empties.
+#[cfg(feature = "in-process")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Drawn {
+    index: u16,
+    vetoed: AllVetoed,
+}
+
+/// A record no decision wrote, as a debug build leaves every row before a
+/// draw over unwritten rows: its fixed half, every veto set and a count no
+/// worker holds. A stage that read it would refuse the row or cost it past
+/// every written one, and the cases that hold such a draw to the whole
+/// write's pick would part.
+#[cfg(all(debug_assertions, feature = "in-process"))]
+fn unwritten(fixed: &Candidate) -> Candidate {
+    let mut row = *fixed;
+    row.health.healthy = false;
+    row.health.breaker_open = true;
+    row.health.stalled = true;
+    row.health.draining = true;
+    row.health.overloaded = true;
+    row.in_flight = u32::MAX;
+    row
+}
+
+/// [`run_drawn`] for a host that keeps the fixed half of its rows and
+/// writes a row's record when the decision asks about the row: the picker
+/// draws over `fixed`, the rows as they stand with no live value, and the
+/// row a draw lands on is written into `rows` at its own place (`write`,
+/// handed the fixed row and the place, writes the whole record there)
+/// before the profile's filters are asked about the written record. The scorers and the picker's order
+/// then read `rows` at the places the draw kept, and nowhere else: the
+/// profile draws first, so each of its filters and scorers answers row by
+/// row ([`draws_first`]), and its picker is one whose draw reads a row
+/// through its test alone ([`DRAWS_BY_ITS_TEST`]). The rows a host named
+/// are written before they join the rows drawn. A draw that keeps nobody
+/// widens to the whole pass as [`run_drawn`]'s does, over every row
+/// written.
+///
+/// The decision is the one [`run_drawn`] makes over the same rows written
+/// whole: the same draws of the seed's stream, the same test of each row
+/// drawn, the same scores of the rows kept. A row the draw did not ask
+/// about holds whatever an earlier decision of the thread left in `rows`;
+/// a debug build overwrites it first ([`unwritten`]).
+///
+/// In a gateway's own process alone: no other host keeps its rows in two
+/// halves.
+#[cfg(feature = "in-process")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the draw's inputs and the host's two halves of a row: the fixed rows, the buffer and the write"
+)]
+#[inline(never)]
+fn run_drawn_written(
+    engine: &Engine,
+    drawn: Drawn,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    fixed: &[Candidate],
+    rows: &mut [Candidate],
+    write: &mut dyn FnMut(&Candidate, &mut Candidate),
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+) -> Decision {
+    let Drawn { index, vetoed } = drawn;
+    let at = usize::from(index);
+    let (profile, tests) = (&engine.profiles[at], engine.row_tests[at]);
+    debug_assert_eq!(fixed.len(), rows.len(), "one buffer row a fixed row");
+    #[cfg(debug_assertions)]
+    for (row, fixed) in rows.iter_mut().zip(fixed) {
+        *row = unwritten(fixed);
+    }
+    buf.reserve(fixed.len());
+    buf.kept.clear();
+    let mut draw = Draw::new(facts.seed);
+    let masked = tests.is_some_and(|tests| tests.masked(cx));
+    let drew = {
+        // The row a draw lands on, written at its place: the written
+        // record is the one the filters are asked about.
+        let mut ask = |fixed: &Candidate| {
+            let Some(row) = rows.get_mut(fixed.position as usize) else {
+                return false;
+            };
+            write(fixed, row);
+            let row = &*row;
+            match tests {
+                Some(tests) => tests.keeps(facts, row, cx) && !(masked && cx.masks(row.position)),
+                None => profile.filters.iter().all(|f| f.keep(facts, row, cx)),
+            }
+        };
+        profile
+            .picker
+            .draw_first(facts, pool, fixed, &mut ask, &mut buf.kept, &mut draw)
+    };
+    // The host caps both lists at the profile's sample, as it does for a
+    // draw over written rows: a debug build alone asserts it.
+    debug_assert!(
+        facts.named.is_none_or(|named| {
+            let cap = engine.profile_needs[at].sample as usize;
+            cap == 0 || named.holders.len().max(named.warming.len()) <= cap
+        }),
+        "each list of rows named stands at or under the profile's sample"
+    );
+    // A picker that read no value of the stream left the seed as it was.
+    let resumed;
+    let after = if draw.state() == facts.seed {
+        facts
+    } else {
+        resumed = RequestFacts {
+            seed: draw.state(),
+            ..*facts
+        };
+        &resumed
+    };
+    if drew {
+        let mut targets = Targets::new();
+        match after.named {
+            Some(named) if profile.picker.joined_by_named() => {
+                // The rows named are few: each is written before the join
+                // asks about it, but a row the draw kept, which is written.
+                let holders = named.holders.iter().map(|holder| holder.row);
+                for place in holders.chain(named.warming.iter().copied()) {
+                    if buf.kept.contains(&place) {
+                        continue;
+                    }
+                    let at = place as usize;
+                    if let (Some(fixed), Some(row)) = (fixed.get(at), rows.get_mut(at)) {
+                        write(fixed, row);
+                    }
+                }
+                let mut keep = |c: &Candidate| profile.filters.iter().all(|f| f.keep(facts, c, cx));
+                order_joined(profile, after, named, rows, &mut keep, buf, &mut targets);
+            }
+            _ => {
+                let band = combine(
+                    profile,
+                    after,
+                    rows,
+                    &buf.kept,
+                    &mut buf.scores,
+                    &mut buf.stage,
+                );
+                profile
+                    .picker
+                    .order_drawn(after, rows, &buf.kept, &buf.scores, band, &mut targets);
+            }
+        }
+        if !targets.is_empty() {
+            let trace = trace_drawn(index, facts, pool, rows, &buf.kept, &buf.scores);
+            return Decision::Pick(Pick {
+                targets,
+                trace,
+                session_verdict: SessionVerdict::None,
+            });
+        }
+    }
+    // The draw says nothing of the pool: the whole pass reads every row,
+    // and the pool's facts say of the rows written what a host that wrote
+    // them first says ([`PoolFacts::reported`]).
+    let mut reported = true;
+    for (row, fixed) in rows.iter_mut().zip(fixed) {
+        write(fixed, row);
+        reported &= row.load.is_some();
+    }
+    let pool = &PoolFacts { reported, ..*pool };
+    let set = Set {
+        candidates: rows,
+        class: None,
+        partnered: None,
+        fold: None,
+        encode: false,
+        vetoed,
+    };
+    let mut decision = run_whole(engine, index, after, pool, set, cx, buf);
+    match &mut decision {
+        Decision::Pick(pick) => pick.trace.seed = facts.seed,
+        Decision::Shed(shed) => shed.trace.seed = facts.seed,
+        Decision::Queue(queue) => queue.trace.seed = facts.seed,
+    }
+    decision
+}
+
 /// The whole pass of an encode item of the `epd` plan: the plan's rules
 /// filter the encode pool before the profile's ([`filter`]). Out of line,
 /// so the decision's entry builds one set for every other request and the
@@ -3061,6 +3263,12 @@ pub struct Engine {
     /// decision reads it where the profile's mark says so, and no other
     /// decision does.
     orders: Vec<Order>,
+    /// Per profile, whether its draw may be asked before a row's record is
+    /// written ([`Engine::drawn_for`]): it draws first, and its picker is
+    /// one of the crate's own, whose draw reads a row through the test it
+    /// is handed and in no other way ([`DRAWS_BY_ITS_TEST`]).
+    #[cfg(feature = "in-process")]
+    written_draws: Box<[bool]>,
     /// What the door needs of a seat, zero on the plain path.
     seat_flags: u8,
     explain_sample: u32,
@@ -4144,6 +4352,13 @@ impl Engine {
             .map(|(profile, &order)| Marks::of(profile, order))
             .collect();
         let keeping = marks.iter().any(|marks| marks.scoped());
+        #[cfg(feature = "in-process")]
+        let written_draws = profiles
+            .iter()
+            .map(|profile| {
+                draws_first(profile) && DRAWS_BY_ITS_TEST.contains(&profile.picker.name())
+            })
+            .collect();
         let stating = profiles
             .iter()
             .map(|profile| {
@@ -4255,6 +4470,8 @@ impl Engine {
             named_by,
             row_tests,
             orders,
+            #[cfg(feature = "in-process")]
+            written_draws,
             seat_flags: (u8::from(keeping) * KEEPS_SLOT_STATE) | (u8::from(shadows) * SHADOWS),
             explain_sample: 0,
             max_report_age_ms: None,
@@ -4927,6 +5144,110 @@ impl Engine {
         // request, which may answer before it reads its key.
         scratch.sessions_found.forget();
         self.decide_as::<true>(facts, pool, candidates, cx, scratch)
+    }
+
+    /// The draw a plain single decision of `facts` is, over a pool of
+    /// `rows` rows whose host writes a row's record when the decision asks
+    /// about the row ([`Self::decide_drawn`]). `None` where
+    /// [`Self::decide`] would not decide these facts by its draw at once,
+    /// or the profile's draw may not be asked before the records
+    /// ([`DRAWS_BY_ITS_TEST`]): that host writes every row and asks
+    /// [`Self::decide`].
+    ///
+    /// The conditions are the ones [`Self::decide`] comes to its draw
+    /// under, in its order: the binding the request resolves to; no column
+    /// of affinity facts, which is one entry a written row; no scope to
+    /// open, no assignment that places and no key that lifts a veto; no
+    /// sessions rule over a keyed request; no encode item; no list of the
+    /// pool's engines for a profile that decides over them; a pool of
+    /// [`DRAW_FROM`] rows or more; and a profile that draws for every
+    /// request, or for this one, which names rows. `pool` is read for its
+    /// list of engines alone.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn drawn_for(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        rows: usize,
+    ) -> Option<Drawn> {
+        if rows < DRAW_FROM || !facts.affinity.is_empty() {
+            return None;
+        }
+        let (entry, index, _) = self.resolve(facts.model, facts.phase)?;
+        let at = usize::from(index);
+        if !self.written_draws.get(at).copied().unwrap_or(false) {
+            return None;
+        }
+        let marks = self.marks[at];
+        let binding = &entry.binding;
+        let keyed = binding.sessions.is_some()
+            && binding.plan == Plan::Single
+            && !facts.session_key.is_none();
+        let encode = matches!(
+            (binding.plan, facts.phase),
+            (Plan::Epd { .. }, Phase::Encode)
+        );
+        if !marks.asks_nothing_first() || keyed || encode {
+            return None;
+        }
+        if marks.first() & (Marks::ENGINES | Marks::OWNS) != 0 && !pool.engines.is_empty() {
+            return None;
+        }
+        let ahead = marks.ahead();
+        let draws =
+            ahead == Marks::DRAWS_FIRST || (facts.named.is_some() && ahead & Marks::JOINED != 0);
+        draws.then_some(Drawn {
+            index,
+            vetoed: entry.vetoed,
+        })
+    }
+
+    /// [`Self::decide`] for a decision that is a draw's ([`Self::drawn_for`]
+    /// said so of these facts and this pool), by a host that keeps the
+    /// fixed half of its rows and writes a row's record when the decision
+    /// asks about the row.
+    ///
+    /// `fixed` are the pool's rows with no live value, in the pool's order,
+    /// and `rows` is the host's buffer of as many rows. `write` is handed a
+    /// fixed row and the buffer's row at its place, and writes the whole
+    /// record there: it is called for each row the draw asks about, for
+    /// each row the request names, and for every row where the draw keeps
+    /// nobody and the whole pass decides. The decision is the one
+    /// [`Self::decide`] makes over the same rows written whole. No lock
+    /// and no allocation beyond the stages' own.
+    #[cfg(feature = "in-process")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one decision's inputs, and the host's two halves of a row: the fixed rows, the buffer and the write"
+    )]
+    pub(crate) fn decide_drawn(
+        &self,
+        drawn: Drawn,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        fixed: &[Candidate],
+        rows: &mut [Candidate],
+        write: &mut dyn FnMut(&Candidate, &mut Candidate),
+        cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Decision {
+        // The plain entry decides: a debug build keeps it for the shadow's
+        // stop on a mix of the two.
+        #[cfg(debug_assertions)]
+        {
+            scratch.kept_last = false;
+        }
+        run_drawn_written(
+            self,
+            drawn,
+            facts,
+            pool,
+            fixed,
+            rows,
+            write,
+            cx,
+            &mut scratch.single,
+        )
     }
 
     /// The body of the two entries. `KEEPS` is the keeping entry's form.

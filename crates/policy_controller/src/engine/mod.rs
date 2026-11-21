@@ -56,7 +56,7 @@ pub use policy_engine::pair::{prefills_full, PairAdmission, PairLists};
 pub use policy_engine::{PolicyEngine, PoolMembers};
 pub use prompt_hashes::{HashSeeds, PromptHashes};
 #[cfg(feature = "in-process")]
-pub use records::{decide, worker_id, DecisionClock, PoolRecords};
+pub use records::{decide, worker_id, DecisionClock, Live, PoolRecords};
 pub use sticky_sessions::{
     SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
     ABSENT_WORKER_PIN_TTL_MICROS,

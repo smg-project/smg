@@ -226,9 +226,12 @@ pub(crate) fn attach_sized_body(
 pub mod bench_support {
     use std::{sync::Arc, time::Instant};
 
+    use axum::http::{HeaderMap, HeaderValue};
     use rand::RngExt;
     use smg_policy_controller::{
-        engine::{decide, Constraints, DecisionClock, Phase, PolicyEngine, RequestFacts},
+        engine::{
+            decide, Constraints, DecisionClock, Identity, Live, Phase, PolicyEngine, RequestFacts,
+        },
         stages::Lifecycle,
         tracking::{Lease, Outcome, Side as EngineSide, TransportClass},
     };
@@ -327,13 +330,16 @@ pub mod bench_support {
     /// placement over the route's own pool, the dispatch-time read of the
     /// chosen worker's overload veto, and the worker's load guard from the
     /// send to the request's end, whose drop tells the model's policy.
-    /// `false` where the request had no worker.
+    /// `headers` are the request's, where it carries any: a routing key is
+    /// read from them as a router reads it, for the placement and for the
+    /// load guard. `false` where the request had no worker.
     pub fn route_classic(
         registry: &WorkerRegistry,
         policies: &PolicyRegistry,
         model: &str,
         route: Route,
         tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
     ) -> bool {
         let pool = match route {
             Route::Http => RoutingPool::HttpRegular,
@@ -341,6 +347,7 @@ pub mod bench_support {
         };
         let inputs = PlacementInputs {
             tokens,
+            headers,
             ..Default::default()
         };
         let Some(worker) = select_single(registry, policies, model, pool, None, inputs) else {
@@ -354,7 +361,7 @@ pub mod bench_support {
         if shed.is_some() {
             return false;
         }
-        let guard = WorkerLoadGuard::with_key(worker, policies.sticky_key(None, None));
+        let guard = WorkerLoadGuard::with_key(worker, policies.sticky_key(headers, None));
         drop(guard);
         true
     }
@@ -427,7 +434,10 @@ pub mod bench_support {
     /// snapshot: the decision, the word of its issue, its dispatch and its
     /// end to the engine's stages, the dispatch-time read of the chosen
     /// worker's overload veto, and the worker's load guard from the send to
-    /// the request's end. `false` where the request had no worker.
+    /// the request's end. `headers` are the request's, where it carries
+    /// any: its routing key is read from them by the sources its binding
+    /// names, as a router's ask reads it. `false` where the request had no
+    /// worker.
     ///
     /// What [`route_classic`] does under a classic policy, with the engine
     /// deciding: no classic policy and no classic placement pass runs.
@@ -437,6 +447,7 @@ pub mod bench_support {
         model: &str,
         route: Route,
         tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
     ) -> bool {
         let pool = match route {
             Route::Http => RoutingPool::HttpRegular,
@@ -451,25 +462,48 @@ pub mod bench_support {
         let records = members.records(spec, &engine.clock);
         // Borrowed once a decision, as a classic policy borrows it.
         let loads = engine.loads.as_ref().map(|loads| loads.borrow().clone());
+        // The request's two keys by the sources its binding names: its
+        // routing key from the first source that holds a value, and its
+        // client's key where it carries no routing key.
+        let (key, client_key) = match spec.key_sources_for(model, Phase::Single) {
+            Some(sources) => {
+                let header = |name: &str| headers?.get(name).map(HeaderValue::as_bytes);
+                match sources.derive(header, None) {
+                    Some(derived) => (derived.key, 0),
+                    None => (Identity::NONE, sources.derive_client(header)),
+                }
+            }
+            None => (Identity::NONE, 0),
+        };
         let mut facts = RequestFacts {
             model,
             phase: Phase::Single,
             prompt_tokens: tokens
                 .map_or(0, |tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX)),
+            session_key: key,
+            client_key,
             seed: rand::rng().random(),
             ..RequestFacts::default()
         };
+        let live = Live::at(
+            spec.engine(),
+            &engine.clock,
+            Instant::now(),
+            loads.as_ref(),
+            key.plain,
+        );
         let decision = decide(
             spec.engine(),
             records,
             workers,
-            loads.as_deref(),
-            &engine.clock,
-            Instant::now(),
+            &live,
             &mut facts,
             &Constraints::default(),
         );
-        let Some(target) = decision.pick().and_then(|pick| pick.targets.first()) else {
+        let Some(pick) = decision.pick() else {
+            return false;
+        };
+        let Some(target) = pick.targets.first() else {
             return false;
         };
         let Some(worker) = workers.get(target.position as usize) else {
@@ -482,6 +516,8 @@ pub mod bench_support {
             side: EngineSide::Single,
             booked: target.id,
             generation: spec.generation(),
+            session: facts.session(),
+            session_verdict: pick.session_verdict,
             issued_micros: facts.now_micros,
             tokens: facts.prompt_tokens,
             ..Lease::default()
@@ -496,7 +532,7 @@ pub mod bench_support {
         if shed.is_some() {
             return false;
         }
-        let guard = WorkerLoadGuard::with_key(Arc::clone(worker), None);
+        let guard = WorkerLoadGuard::with_key(Arc::clone(worker), key.plain);
         drop(guard);
         stages.on_completed(
             &lease,

@@ -42,6 +42,15 @@
 //! two side policies the classic ones or the objects that ask the engine.
 //! `--not-ready` and `--ready` then hold for each side.
 //!
+//! `--keys N` gives each request one of `N` routing keys in turn, in the
+//! header `x-smg-routing-key`: a policy that places by a key places by it,
+//! on both paths. `0`, the default, sends no key.
+//!
+//! `--prompts N` gives each request one of `N` prompts in turn, each of
+//! 1,024 tokens: the first 32 are the same in every prompt, as a chat
+//! template's head is, and the rest are the prompt's own. `1`, the default,
+//! sends one prompt over and over.
+//!
 //! `--models N` serves `N` models, each with a fleet of its own of the
 //! cell's size: a caller's requests name the models in turn, as the
 //! requests of a gateway that serves many models do, so no two requests in
@@ -72,6 +81,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use axum::http::{HeaderMap, HeaderValue};
 use openai_protocol::{
     model_card::ModelCard,
     worker::{HealthCheckConfig, WorkerLoadResponse, WorkerStatus},
@@ -139,6 +149,10 @@ struct Cell {
     /// A pair gateway: `workers` prefill workers and as many decode
     /// workers a model, and a request placed as a pair.
     pair: bool,
+    /// The routing keys the requests carry in turn; `0` for none.
+    keys: usize,
+    /// The prompts the requests carry in turn.
+    prompts: usize,
 }
 
 fn cell() -> Cell {
@@ -155,6 +169,8 @@ fn cell() -> Cell {
         overloaded: false,
         models: 1,
         pair: false,
+        keys: 0,
+        prompts: 1,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -184,6 +200,8 @@ fn cell() -> Cell {
             "--overloaded" => cell.overloaded = value.parse().unwrap(),
             "--models" => cell.models = value.parse().unwrap(),
             "--pair" => cell.pair = value.parse().unwrap(),
+            "--keys" => cell.keys = value.parse().unwrap(),
+            "--prompts" => cell.prompts = value.parse().unwrap(),
             other => panic!("no flag {other}"),
         }
     }
@@ -191,6 +209,11 @@ fn cell() -> Cell {
 }
 
 fn policy_config(name: &str) -> PolicyConfig {
+    // The cache-aware policy has no form of one word: its thresholds are
+    // the ones the command line gives it with every switch left out.
+    if name == "cache_aware" {
+        return PolicyConfig::cache_aware(0.3, 64, 1.5, 120, 67_108_864);
+    }
     serde_json::from_value(serde_json::json!({ "type": name }))
         .unwrap_or_else(|error| panic!("no policy {name}: {error}"))
 }
@@ -319,8 +342,45 @@ fn reports(fleet: &[Arc<dyn Worker>]) -> Vec<(Arc<dyn Worker>, WorkerLoadRespons
 }
 
 /// A path's one routing call, shared by the callers: the request's tokens
-/// and its turn among its caller's requests, which names its model.
+/// and its turn among its caller's requests, which names its model and its
+/// routing key.
 type Routing = Box<dyn Fn(&[u32], u64) -> bool + Send + Sync>;
+
+/// The header a routing key travels in.
+const ROUTING_KEY: &str = "x-smg-routing-key";
+
+/// The headers of `keys` requests, each with a routing key of its own.
+fn keyed_headers(keys: usize) -> Vec<HeaderMap> {
+    (0..keys)
+        .map(|key| {
+            let mut headers = HeaderMap::new();
+            let value = HeaderValue::from_str(&format!("session-{key:06}")).unwrap();
+            headers.insert(ROUTING_KEY, value);
+            headers
+        })
+        .collect()
+}
+
+/// The shared head of every prompt, in tokens.
+const PROMPT_HEAD: usize = 32;
+
+/// `prompts` prompts of 1,024 tokens: a head every prompt shares, then
+/// tokens of the prompt's own. One prompt is the tokens `0..1024`.
+fn prompts(prompts: usize) -> Vec<Vec<u32>> {
+    (0..prompts.max(1))
+        .map(|prompt| {
+            (0..1_024usize)
+                .map(|at| {
+                    if prompt == 0 || at < PROMPT_HEAD {
+                        at as u32
+                    } else {
+                        (mix((prompt * 1_024 + at) as u64) % 100_000) as u32
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
 
 /// Who decides a cell's requests: the classic placement over a registry's
 /// policies (the classic ones, or the objects that ask the engine), or the
@@ -416,17 +476,26 @@ fn build(cell: &Cell) -> (Routing, Option<TestFeed>) {
         None => Decider::Records(EngineOverRecords::of(&config, receiver).unwrap()),
     };
     let (route, pair) = (cell.route, cell.pair);
+    assert!(
+        !(pair && cell.keys != 0),
+        "a pair cell sends no routing key"
+    );
+    let keys = keyed_headers(cell.keys);
     let routing: Routing = Box::new(move |tokens, turn| {
         let model = &models[(turn % models.len() as u64) as usize];
+        let headers = match keys.len() {
+            0 => None,
+            count => keys.get((turn % count as u64) as usize),
+        };
         match &decider {
             Decider::Policies(policies) if pair => {
                 route_pair(&registry, policies, model, Some(tokens))
             }
             Decider::Policies(policies) => {
-                route_classic(&registry, policies, model, route, Some(tokens))
+                route_classic(&registry, policies, model, route, Some(tokens), headers)
             }
             Decider::Records(engine) => {
-                route_records(&registry, engine, model, route, Some(tokens))
+                route_records(&registry, engine, model, route, Some(tokens), headers)
             }
         }
     });
@@ -436,14 +505,15 @@ fn build(cell: &Cell) -> (Routing, Option<TestFeed>) {
 fn main() {
     let cell = cell();
     let recorder = start_prometheus(PrometheusConfig::default());
-    let tokens: Vec<u32> = (0..1_024).collect();
+    let prompts = prompts(cell.prompts);
+    let tokens_at = |turn: u64| &prompts[(turn % prompts.len() as u64) as usize][..];
     let (routing, _feed) = build(&cell);
     // The path's first sight of the pool, untimed: what a registration and
     // the first request after it build once.
     let warm = (cell.workers as u64 * 8).max(4_096) * cell.models.max(1) as u64;
     for turn in 0..warm {
         assert!(
-            routing(&tokens, turn),
+            routing(tokens_at(turn), turn),
             "a fleet with a ready worker takes every request"
         );
     }
@@ -463,7 +533,7 @@ fn main() {
         for _ in 0..cell.callers {
             scope.spawn(|| {
                 for turn in 0..CALLER_WARM * cell.models.max(1) as u64 {
-                    black_box(routing(black_box(&tokens), turn));
+                    black_box(routing(black_box(tokens_at(turn)), turn));
                 }
                 loop {
                     start.wait();
@@ -474,8 +544,10 @@ fn main() {
                     let started = Instant::now();
                     let mut took_placed = 0u64;
                     for turn in 0..decisions {
-                        took_placed +=
-                            u64::from(black_box(routing(black_box(&tokens), black_box(turn))));
+                        took_placed += u64::from(black_box(routing(
+                            black_box(tokens_at(turn)),
+                            black_box(turn),
+                        )));
                     }
                     let took = started.elapsed();
                     busy_nanos.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
@@ -508,7 +580,7 @@ fn main() {
     let per_second = total as f64 / wall.as_secs_f64();
     let nanos = busy.as_nanos() as f64 / total as f64;
     println!(
-        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
+        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} keys={} prompts={} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
         cell.path,
         cell.route,
         cell.policy,
@@ -520,6 +592,8 @@ fn main() {
         cell.overloaded,
         cell.models,
         cell.pair,
+        cell.keys,
+        cell.prompts,
         total,
         wall.as_secs_f64(),
         per_second,

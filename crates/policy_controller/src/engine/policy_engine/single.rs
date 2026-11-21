@@ -89,16 +89,10 @@ pub(super) fn decide(
         }
     }
     let records = members.records(spec, &own.clock);
-    records::decide(
-        spec.engine(),
-        records,
-        members.workers(),
-        None,
-        &own.clock,
-        now,
-        facts,
-        &cx,
-    )
+    // No load snapshot and no session key's text are handed to this call
+    // yet: a record carries no report and no count of a key's requests.
+    let live = records::Live::at(spec.engine(), &own.clock, now, None, None);
+    records::decide(spec.engine(), records, members.workers(), &live, facts, &cx)
 }
 
 /// The short path's pick as a decision: the worker at `position` of the

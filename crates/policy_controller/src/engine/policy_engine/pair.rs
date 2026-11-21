@@ -40,7 +40,7 @@
     )
 )]
 
-use std::{cell::RefCell, fmt, time::Instant};
+use std::{cell::RefCell, fmt, sync::Arc, time::Instant};
 
 use smg_worker::load::state::LoadSnapshot;
 
@@ -52,7 +52,7 @@ use crate::{
         decision_engine::HeldDecision,
         framework::{Engine, PairPools, Scratch},
         pair_classes::PartnerClasses,
-        records::DecisionClock,
+        records::{DecisionClock, Live},
         store_backed_engine::{shed, Request, SUBSET_HINT, WIRES},
         view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Session, WorkerId},
     },
@@ -124,20 +124,25 @@ impl PairLists<'_> {
     pub fn decide(
         &self,
         spec: &AppliedSpec,
-        loads: Option<&LoadSnapshot>,
+        loads: Option<&Arc<LoadSnapshot>>,
         clock: &DecisionClock,
         now: Instant,
         request: &mut Request<'_>,
         held: Option<WorkerId>,
     ) -> Decision {
-        request.facts.now_micros = clock.micros(now);
+        // One value for both lists' records: this call's instant on the
+        // clock and the host's snapshot, as the host holds it. No session
+        // key's text is handed to it: a pair's records carry no count of a
+        // key's requests.
+        let live = Live::at(spec.engine(), clock, now, loads, None);
+        request.facts.now_micros = live.now_micros();
         let (facts, cx) = (&request.facts, &request.constraints);
         let decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
             let (workers, records) = (self.prefill.workers(), self.prefill.records(spec, clock));
-            let (prefills, prefill_facts) = records.write(workers, loads, clock, now, prefills);
+            let (prefills, prefill_facts) = records.write(workers, &live, prefills);
             let (workers, records) = (self.decode.workers(), self.decode.records(spec, clock));
-            let (decodes, decode_facts) = records.write(workers, loads, clock, now, decodes);
+            let (decodes, decode_facts) = records.write(workers, &live, decodes);
             stamp(prefills, decodes, self.classes, self.admission);
             let pools = PairPools {
                 prefills,
