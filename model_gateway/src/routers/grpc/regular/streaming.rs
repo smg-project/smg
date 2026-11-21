@@ -1657,7 +1657,7 @@ impl StreamingProcessor {
         index: u32,
         reasoning_parser: &mut Option<Box<dyn ReasoningParser>>,
         thinking_override: bool,
-        think_in_prefill: bool,
+        prefill_opens_think_block: bool,
         // A structured JSON response: a typed parser keeps its framing
         // spellings inside JSON strings.
         json_mode: bool,
@@ -1682,7 +1682,7 @@ impl StreamingProcessor {
             parser.set_json_mode(json_mode);
             if thinking_override {
                 parser.mark_reasoning_started();
-                if think_in_prefill {
+                if prefill_opens_think_block {
                     parser.mark_think_start_stripped();
                 }
             }
@@ -2545,7 +2545,7 @@ impl StreamingProcessor {
         delta: Option<&str>,
         reasoning_parser: &mut Option<Box<dyn ReasoningParser>>,
         thinking_override: bool,
-        think_in_prefill: bool,
+        prefill_opens_think_block: bool,
         // Resolved once per request by the caller (see process_reasoning_stream).
         reasoning_parser_name: Option<&str>,
         model: &str,
@@ -2559,7 +2559,7 @@ impl StreamingProcessor {
             ) {
                 if thinking_override {
                     parser.mark_reasoning_started();
-                    if think_in_prefill {
+                    if prefill_opens_think_block {
                         parser.mark_think_start_stripped();
                     }
                 }
@@ -3578,7 +3578,7 @@ struct ChatStream<'a> {
     /// Request building decided whether the rendered prompt ends inside the
     /// model's thinking block; the parsers then start in reasoning mode.
     thinking_override: bool,
-    think_in_prefill: bool,
+    prefill_opens_think_block: bool,
     /// Whether a JSON schema constraint was used (specific function or
     /// required mode), and whether it is the specific-function case (the
     /// model generates the parameters only, no name field; native formats
@@ -3726,7 +3726,7 @@ impl<'a> ChatStream<'a> {
             spec,
             dispatch,
             tx,
-            think_in_prefill: tokenizer.think_in_prefill(),
+            prefill_opens_think_block: tokenizer.prefill_opens_think_block(),
             tokenizer,
             stop_rules,
             skip_special_tokens,
@@ -4597,7 +4597,7 @@ impl<'a> ChatStream<'a> {
                     index,
                     &mut self.choices[index as usize].reasoning_parser,
                     self.thinking_override,
-                    self.think_in_prefill,
+                    self.prefill_opens_think_block,
                     self.spec.json_mode,
                     self.reasoning_parser_name.as_deref(),
                     model,
@@ -5350,7 +5350,7 @@ struct MessagesStream<'a> {
     /// Request building decided whether the rendered prompt ends inside the
     /// model's thinking block; the parser then starts in reasoning mode.
     thinking_override: bool,
-    think_in_prefill: bool,
+    prefill_opens_think_block: bool,
     /// Whether the model output is arguments-only for a specific function
     /// (`ToolChoice::Tool`); only when a JSON schema is used, native formats
     /// include framing tokens.
@@ -5424,7 +5424,7 @@ impl<'a> MessagesStream<'a> {
             );
 
         let thinking_override = spec.reasoning_in_prefill;
-        let think_in_prefill = tokenizer.think_in_prefill();
+        let prefill_opens_think_block = tokenizer.prefill_opens_think_block();
 
         let tool_choice_enabled = !matches!(&spec.tool_choice, Some(messages::ToolChoice::None));
 
@@ -5527,7 +5527,7 @@ impl<'a> MessagesStream<'a> {
             reasoning_parser_name,
             reasoning_parser_available,
             thinking_override,
-            think_in_prefill,
+            prefill_opens_think_block,
             is_specific_function,
             decoder_finished_at_eof: false,
         })
@@ -5935,7 +5935,7 @@ impl<'a> MessagesStream<'a> {
                 (!final_chunk).then_some(chunk_text.as_str()),
                 &mut self.reasoning_parser,
                 self.thinking_override,
-                self.think_in_prefill,
+                self.prefill_opens_think_block,
                 self.reasoning_parser_name.as_deref(),
                 &self.dispatch.model,
             )
