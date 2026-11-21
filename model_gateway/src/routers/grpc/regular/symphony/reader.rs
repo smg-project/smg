@@ -763,7 +763,7 @@ impl Reader {
     /// changes how the driver ends the answer, not what the reader hands on.
     ///
     /// The first event that says a call was not read ([`unread`]: a call the model's stop found
-    /// open or a cut ended, a reason that loses a call, bytes dropped as a malformed call's) is
+    /// open or a cut ended, a reason that loses a call) is
     /// the verdict, asked of the table's own events before the request's filters rewrite a
     /// forbidden or a later call. It costs one pass over a step's events until the verdict is
     /// known; nothing is held, delayed or copied. A reader without the rule pays one branch per
@@ -1170,17 +1170,18 @@ pub(crate) enum UnreadableCall {
 }
 
 /// Whether `event`, as the table gave it, says that the model wrote a tool call the reader did
-/// not read whole, by the three words Symphony's events carry: a call's end that is not the
-/// model's own (`CallEnd::Stop`, `CallEnd::Cut`), a malformed reason that loses a call
-/// (`MalformedReason::loses_a_call`), and bytes dropped as a malformed call's
-/// (`DropReason::MalformedCall`). What loses no call passes: a call to a function the request
-/// did not declare, a marker kept as text, a string the table closed at the call's own closing
-/// marker, text after a call that was read whole.
+/// not read whole, by the two words Symphony's events carry: a call's end that is not the
+/// model's own (`CallEnd::Stop`, `CallEnd::Cut`), and a malformed reason that loses a call
+/// (`MalformedReason::loses_a_call`). The reason is the word on every refusal: the bytes a
+/// syntax refuses are dropped behind the `Malformed` event that gives it, whether a call lost
+/// them or not. What loses no call passes: a call to a function the request did not declare,
+/// a marker kept as text, an element the table closed where the model left its close out (at
+/// the closing tag of the element around it, at the call's own closing marker), a closing tag
+/// that names nothing open, text after a call that was read whole.
 fn unread(event: &Event<'_>) -> bool {
     match event {
         Event::ToolCallEnd { ended, .. } => !ended.is_closed(),
         Event::Malformed { why, .. } => why.loses_a_call(),
-        Event::Dropped { why, .. } => matches!(why, DropReason::MalformedCall),
         _ => false,
     }
 }
@@ -1580,7 +1581,7 @@ mod tests {
     }
 
     /// What loses no call is no verdict: a call to a function the request did not declare, and
-    /// a string the invoke's close found open. A call the request's own choice drops is judged
+    /// a closing tag that names nothing open. A call the request's own choice drops is judged
     /// as the table read it: whole, it is dropped as before with no verdict; cut, it is the
     /// verdict, and it stays dropped.
     #[test]
@@ -1596,6 +1597,23 @@ mod tests {
         assert_eq!(verdict, None);
         let delivered: Vec<Event<'static>> = steps.into_iter().flatten().collect();
         assert_eq!(call_events(&delivered)[0], "start 0 other");
+        // A closing tag that names nothing open is ignored, its bytes dropped as a malformed
+        // call's: the reason says no call lost them, and the reason is the word.
+        let stray = [
+            "<tool_call>\n<invoke name=\"lookup\"><city>Paris</city></town></invoke>\n</tool_call>",
+        ];
+        let (steps, verdict) =
+            read_noting(minimax_m3(), Forbids::Nothing, &stray, EngineFinish::Stop);
+        assert_eq!(verdict, None);
+        let delivered: Vec<Event<'static>> = steps.into_iter().flatten().collect();
+        assert!(delivered.iter().any(|event| matches!(
+            event,
+            Event::Dropped { text, why: DropReason::MalformedCall } if text.text == "</town>"
+        )));
+        assert_eq!(
+            call_events(&delivered).last().map(String::as_str),
+            Some("end 0 Closed")
+        );
         let (steps, verdict) =
             read_noting(minimax_m3(), Forbids::Every, &M3_PIECES, EngineFinish::Stop);
         assert_eq!(verdict, None);

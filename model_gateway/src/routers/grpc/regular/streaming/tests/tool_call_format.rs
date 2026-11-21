@@ -77,8 +77,8 @@ const SERVED: &str = "served-model";
 const CUT_BY_THE_LIMIT: &str = "{\"error\":{\"message\":\"Treat this response as failed. The model stopped due to max_tokens before it completed the tool call. Retry the request.\",\"type\":\"invalid_tool_call_format\",\"code\":\"invalid_tool_call_format\",\"finish_reason\":\"length\"}}";
 
 /// The spec of a chat request for `model`, read by `table`: with the `lookup`
-/// tool (one string parameter, `city`) and the `other` tool declared or
-/// none, asking for the usage or not, under `tool_choice` or none. The model
+/// tool (a string parameter, `city`, and an integer, `days`) and the `other`
+/// tool declared or none, asking for the usage or not, under `tool_choice` or none. The model
 /// id selects the provider profile, and so the wire.
 fn spec_of(
     model: &str,
@@ -94,8 +94,8 @@ fn spec_of(
     if tools {
         request["tools"] = json!([
             {"type": "function", "function": {
-                "name": "lookup", "parameters": {
-                    "type": "object", "properties": {"city": {"type": "string"}}}}},
+                "name": "lookup", "parameters": {"type": "object", "properties": {
+                    "city": {"type": "string"}, "days": {"type": "integer"}}}}},
             {"type": "function", "function": {
                 "name": "other", "parameters": {"type": "object", "properties": {}}}},
         ]);
@@ -417,6 +417,128 @@ async fn the_output_after_a_malformed_block_streams_and_the_failure_ends_it() {
             events.last().is_some_and(|last| last["usage"].is_object()),
             "{events:?}"
         );
+    }
+}
+
+/// One block with one `lookup` invoke whose elements are `body`, the
+/// template's separator before every tag.
+fn lookup_block(body: &str) -> String {
+    format!("<tool_call>\n<invoke name=\"lookup\">{body}</invoke>\n</tool_call>")
+        .replace('<', "]<]minimax[>[<")
+}
+
+/// What the M3 table reads past a slip of the model's is a whole call, and is
+/// delivered under the contract as outside it: a closing tag that names
+/// nothing open (a value's close misnamed, a second close, one between two
+/// invokes), and an element left open where the element around it, the
+/// invoke, the block or the next invoke ends. The stream ends with the
+/// `tool_calls` finish, the arguments read as JSON, and the whole answer is
+/// the same call.
+#[tokio::test]
+async fn a_call_the_table_reads_past_a_slip_is_delivered() {
+    let paris = json!({"city": "Paris"});
+    for (output, arguments) in [
+        (lookup_block("<city>Paris</town>"), paris.clone()),
+        (lookup_block("<city>Paris</town></city>"), paris.clone()),
+        (lookup_block("<city>Paris</city></town>"), paris.clone()),
+        (lookup_block("<days>3</day>"), json!({"days": 3})),
+        (lookup_block("<days>3"), json!({"days": 3})),
+        (lookup_block("<city>Paris"), paris.clone()),
+        (
+            lookup_block("<where><city>Paris</city><zip></where>"),
+            json!({"where": {"city": "Paris", "zip": ""}}),
+        ),
+        (
+            lookup_block("<where><city>Paris</where><days>3</days>"),
+            json!({"where": {"city": "Paris"}, "days": 3}),
+        ),
+        (
+            "<tool_call>\n<invoke name=\"lookup\"><days>3</tool_call>".replace('<', "]<]minimax[>[<"),
+            json!({"days": 3}),
+        ),
+        (
+            "<tool_call>\n<invoke name=\"lookup\"><city>Paris</city></invoke>\n</invoke>\n</tool_call>"
+                .replace('<', "]<]minimax[>[<"),
+            paris.clone(),
+        ),
+    ] {
+        for frames in [
+            vec![chunk(0, &output), complete(0, "stop")],
+            by_character(&output, "stop"),
+        ] {
+            let covered = spec(true, false);
+            assert!(covered.fails_on_unreadable_call());
+            let (result, events) = streamed(frames.clone(), covered).await;
+            assert!(
+                result.is_ok(),
+                "{output}: {:?}",
+                result.err().map(|e| e.to_string())
+            );
+            assert_eq!(finish_reasons(&events), vec!["tool_calls"], "{output}");
+            assert_eq!(tool_names(&events), vec!["lookup"], "{output}");
+            assert_eq!(
+                serde_json::from_str::<Value>(&tool_arguments(&events)).expect("whole arguments"),
+                arguments,
+                "{output}"
+            );
+            assert_eq!(content(&events), "", "{output}");
+            assert_eq!(
+                deliveries(&events),
+                deliveries(&without_the_contract(frames, None).await),
+                "{output}"
+            );
+        }
+        let choice = whole_answer(M3, &output, "stop", &spec(true, false))
+            .await
+            .unwrap_or_else(|failure| panic!("{output}: {failure}"));
+        let calls = choice.message.tool_calls.expect("the call");
+        assert_eq!(calls.len(), 1, "{output}");
+        assert_eq!(
+            serde_json::from_str::<Value>(calls[0].function.arguments.as_deref().expect("arguments"))
+                .expect("whole arguments"),
+            arguments,
+            "{output}"
+        );
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+    }
+}
+
+/// What the table cannot read past still fails the request. The end of the
+/// output closes nothing for the model: the element the invoke's closing tag
+/// would have closed is an incomplete call where the output ends in it, at
+/// the model's stop and at the limit. Text between a call's elements, and a
+/// tag cut short there, are malformed structure.
+#[tokio::test]
+async fn what_the_table_cannot_read_past_still_fails_the_request() {
+    let open = "<tool_call>\n<invoke name=\"lookup\"><days>3".replace('<', "]<]minimax[>[<");
+    for (finish, at_limit) in [("stop", false), ("length", true)] {
+        let failure = InvalidToolCallFormat::new(UnreadableCall::Incomplete, at_limit);
+        let frames = vec![chunk(0, &open), complete(0, finish)];
+        let (result, events) = streamed(frames, spec(true, false)).await;
+        assert_eq!(the_contracts_failure(result), failure, "{finish}");
+        assert!(finish_reasons(&events).is_empty(), "{events:?}");
+        let read = whole_answer(M3, &open, finish, &spec(true, false)).await;
+        let Err(ChoiceFailure::ToolCallFormat(whole)) = read else {
+            panic!("the contract's failure under {finish}");
+        };
+        assert_eq!(whole, failure, "{finish}");
+    }
+    for body in [
+        "<city>Paris</city> and <days>3</days>",
+        "<city>Paris</city><da",
+        "<days>3<b</day>",
+    ] {
+        let output = lookup_block(body);
+        let failure = InvalidToolCallFormat::new(UnreadableCall::Malformed, false);
+        let frames = by_character(&output, "stop");
+        let (result, events) = streamed(frames, spec(true, false)).await;
+        assert_eq!(the_contracts_failure(result), failure, "{body}");
+        assert!(finish_reasons(&events).is_empty(), "{events:?}");
+        let read = whole_answer(M3, &output, "stop", &spec(true, false)).await;
+        let Err(ChoiceFailure::ToolCallFormat(whole)) = read else {
+            panic!("the contract's failure for {body}");
+        };
+        assert_eq!(whole, failure, "{body}");
     }
 }
 
