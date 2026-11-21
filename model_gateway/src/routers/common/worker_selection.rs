@@ -40,21 +40,40 @@ pub struct WorkerSelector<'a> {
 
 pub use smg_external_router::worker::SelectWorkerRequest;
 
-/// One in-progress prewarm inventory read for this listener. The result
-/// expires when its callers leave. If the initiator disconnects during the
-/// read, a waiting caller can take over without a detached task.
+const MODEL_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Share a prewarm refresh for the same set of worker handles. Callers hold
+/// it for the duration of the refresh, so results do not outlive requests and
+/// a waiting caller can take over when the initiator disconnects.
 #[derive(Default)]
-pub(crate) struct OpenAiInventoryRefresh(Mutex<Weak<OnceCell<bool>>>);
+pub(crate) struct OpenAiInventoryRefresh(Mutex<Weak<InventoryRead>>);
+
+struct InventoryRead {
+    workers: Vec<Arc<dyn Worker>>,
+    complete: OnceCell<bool>,
+}
 
 impl OpenAiInventoryRefresh {
-    fn current(&self) -> Arc<OnceCell<bool>> {
+    fn current(&self, workers: Vec<Arc<dyn Worker>>) -> Arc<InventoryRead> {
         let mut slot = self.0.lock();
-        slot.upgrade().unwrap_or_else(|| {
-            let refresh = Arc::new(OnceCell::new());
-            *slot = Arc::downgrade(&refresh);
-            refresh
-        })
+        if let Some(refresh) = slot.upgrade() {
+            if same_workers(&refresh.workers, &workers) {
+                return refresh;
+            }
+        }
+        let refresh = Arc::new(InventoryRead {
+            workers,
+            complete: OnceCell::new(),
+        });
+        *slot = Arc::downgrade(&refresh);
+        refresh
     }
+}
+
+/// The callers sort by handle, so a rebuild or a replacement at the same
+/// URL cannot make a result ambiguous about which workers it covers.
+fn same_workers(left: &[Arc<dyn Worker>], right: &[Arc<dyn Worker>]) -> bool {
+    left.len() == right.len() && left.iter().zip(right).all(|(a, b)| Arc::ptr_eq(a, b))
 }
 
 impl<'a> WorkerSelector<'a> {
@@ -70,33 +89,62 @@ impl<'a> WorkerSelector<'a> {
         inventory: &OpenAiInventoryRefresh,
     ) -> Result<(), Response> {
         let router = smg_external_router::known::OPENAI;
-        // A lazy refresh updates the worker's cards without changing the
-        // registration's model index. Read those cards directly on a miss.
-        let has_model = || {
-            self.registry.contains_model(model_id)
-                || self.registry.get_routing_workers().iter().any(|worker| {
-                    worker.metadata().spec.runtime_type == RuntimeType::External
-                        && worker.is_healthy()
-                        && router.takes(worker.default_provider())
-                        && worker.any_model(&mut |card| card.matches(model_id))
-                })
+        let workers_now = || {
+            let mut workers = self.external_model_workers(Some(&router));
+            workers.sort_unstable_by_key(|worker| Arc::as_ptr(worker).cast::<()>());
+            workers
         };
-        if has_model() {
+        // A lazy refresh sets model cards without changing the model index.
+        let has_model = |workers: &[Arc<dyn Worker>]| {
+            self.registry.contains_model(model_id)
+                || workers
+                    .iter()
+                    .any(|worker| worker.any_model(&mut |card| card.matches(model_id)))
+        };
+        if self.registry.contains_model(model_id) {
             return Ok(());
         }
-        let refresh = inventory.current();
-        let complete = *refresh
-            .get_or_init(|| self.refresh_external_models(None, Some(&router)))
-            .await;
-        if has_model() {
-            Ok(())
-        } else if complete {
-            Err(error::model_not_found(model_id))
-        } else {
-            Err(error::service_unavailable(
+        let mut workers = workers_now();
+        if has_model(&workers) {
+            return Ok(());
+        }
+
+        let unavailable = || {
+            error::service_unavailable(
                 "model_inventory_unavailable",
                 "Model discovery was incomplete. Retry the request.",
-            ))
+            )
+        };
+        let result = tokio::time::timeout(MODEL_REFRESH_TIMEOUT, async {
+            // Allow one retry on membership/health changes within the same
+            // deadline. Further churn leaves the answer inconclusive.
+            for _ in 0..2 {
+                let refresh = inventory.current(workers);
+                let complete = *refresh
+                    .complete
+                    .get_or_init(|| self.refresh_external_models(&refresh.workers, None))
+                    .await;
+                workers = workers_now();
+                if has_model(&workers) {
+                    return Ok(());
+                }
+                if same_workers(&refresh.workers, &workers) {
+                    return Err(if complete {
+                        error::model_not_found(model_id)
+                    } else {
+                        unavailable()
+                    });
+                }
+            }
+            Err(unavailable())
+        })
+        .await;
+
+        match result {
+            Ok(result) => result,
+            // Workers can publish their cards before all reads finish.
+            Err(_) if has_model(&workers_now()) => Ok(()),
+            Err(_) => Err(unavailable()),
         }
     }
 
@@ -144,7 +192,8 @@ impl<'a> WorkerSelector<'a> {
         );
 
         let auth = extract_auth_header(req.headers, None);
-        self.refresh_external_models(auth.as_ref(), req.router.as_ref())
+        let external_workers = self.external_model_workers(req.router.as_ref());
+        self.refresh_external_models(&external_workers, auth.as_ref())
             .await;
 
         self.find_best_worker(req).ok_or_else(|| {
@@ -235,33 +284,28 @@ impl<'a> WorkerSelector<'a> {
         })
     }
 
-    /// Refresh model lists for healthy external workers in parallel.
-    ///
-    /// When `router` is set, only workers it takes are refreshed, so a caller's
-    /// key never reaches another provider's workers. Each worker falls back to
-    /// its own configured API key when the caller provides no auth.
-    /// Returns whether all eligible workers supplied their inventories.
-    async fn refresh_external_models(
-        &self,
-        auth_header: Option<&HeaderValue>,
-        router: Option<&ExternalRouterSpec>,
-    ) -> bool {
-        let mut external_workers: Vec<_> = self
-            .registry
+    /// Only include workers the router takes, so a caller's key stays
+    /// within its provider.
+    fn external_model_workers(&self, router: Option<&ExternalRouterSpec>) -> Vec<Arc<dyn Worker>> {
+        self.registry
             .get_routing_workers()
             .iter()
             .filter(|worker| {
-                worker.metadata().spec.runtime_type == RuntimeType::External && worker.is_healthy()
+                worker.metadata().spec.runtime_type == RuntimeType::External
+                    && worker.is_healthy()
+                    && router.is_none_or(|router| router.takes(worker.default_provider()))
             })
             .cloned()
-            .collect();
+            .collect()
+    }
 
-        // Only refresh workers matching the request's provider to avoid sending
-        // e.g. an OpenAI key to Anthropic workers during model discovery.
-        if let Some(router) = router {
-            external_workers.retain(|w| router.takes(w.default_provider()));
-        }
-
+    /// Each worker uses its own configured key when the caller sends none.
+    /// Returns whether every worker in the supplied scope gave its inventory.
+    async fn refresh_external_models(
+        &self,
+        external_workers: &[Arc<dyn Worker>],
+        auth_header: Option<&HeaderValue>,
+    ) -> bool {
         if external_workers.is_empty() {
             return true;
         }
@@ -278,8 +322,7 @@ impl<'a> WorkerSelector<'a> {
 
         // Timeout prevents a slow/unresponsive worker from blocking all
         // requests that trigger refresh-on-miss.
-        const REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
-        tokio::time::timeout(REFRESH_TIMEOUT, join_all(futures))
+        tokio::time::timeout(MODEL_REFRESH_TIMEOUT, join_all(futures))
             .await
             .is_ok_and(|results| results.iter().all(Result::is_ok))
     }
@@ -694,6 +737,89 @@ mod tests {
             .unwrap_err();
         assert_eq!(confirmed_miss.status(), StatusCode::NOT_FOUND);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn prewarm_refreshes_workers_registered_during_a_read_before_confirming_a_miss() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        use tokio::sync::Notify;
+
+        let active = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let new_reads = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/original/v1/models",
+                get({
+                    let active = active.clone();
+                    let release = release.clone();
+                    move || {
+                        let active = active.clone();
+                        let release = release.clone();
+                        async move {
+                            active.notify_one();
+                            release.notified().await;
+                            Json(serde_json::json!({"data":[]}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/recent/v1/models",
+                get({
+                    let new_reads = new_reads.clone();
+                    move || {
+                        let new_reads = new_reads.clone();
+                        async move {
+                            new_reads.fetch_add(1, Ordering::Relaxed);
+                            Json(serde_json::json!({"data":[{"id":"recent-fixture-model"}]}))
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "owned synthetic inventory server"
+        )]
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let registry = WorkerRegistry::new();
+        let register = |prefix| {
+            registry
+                .register(provider_worker(
+                    &format!("http://{address}/{prefix}"),
+                    "openai",
+                    &format!("declared-{prefix}"),
+                ))
+                .unwrap();
+        };
+        register("original");
+        let inventory = OpenAiInventoryRefresh::default();
+        let selector = WorkerSelector::new(&registry);
+        let missing = "missing-fixture-model";
+        let (request, ()) = tokio::time::timeout(Duration::from_secs(4), async {
+            tokio::join!(selector.discover_openai_model(missing, &inventory), async {
+                active.notified().await;
+                register("recent");
+                release.notify_one();
+                // The second snapshot also refreshes the original worker.
+                active.notified().await;
+                release.notify_one();
+            },)
+        })
+        .await
+        .unwrap();
+        assert_eq!(request.unwrap_err().status(), StatusCode::NOT_FOUND);
+        assert_eq!(new_reads.load(Ordering::Relaxed), 1);
+        assert!(selector
+            .discover_openai_model("recent-fixture-model", &inventory)
+            .await
+            .is_ok());
         server.abort();
     }
 

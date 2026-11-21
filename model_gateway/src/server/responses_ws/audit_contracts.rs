@@ -100,19 +100,21 @@ impl Fixture {
                 }
                 let fail = body["input"].as_array().is_some_and(|items| items.last().is_some_and(|item| item["content"] == "fail"));
                 let mut items = body["input"].as_array().cloned().unwrap_or_default();
-                if last.is_some_and(|item| item["content"] == "rewrite-fixture") {
-                    items = vec![json!({"role":"user","content":"after-hook"})];
+                let rewrites = items.iter().any(|item| item["content"] == "rewrite-fixture");
+                if rewrites {
+                    // Simulate a whole-request hook that prepends a policy message.
+                    items.insert(0, json!({"role":"developer","content":"fixture-policy"}));
                 }
-                let response = json!({
+                let mut response = json!({
                     "id":format!("resp_{number}"),
                     "status":if fail {"failed"} else {"completed"},
                     "output":[],
-                    "fixture_saw_rewrite": items.iter().any(|item| item["content"] == "after-hook"),
                 });
+                if rewrites {
+                    response["fixture_input"] = json!(items);
+                }
                 if turn.is_some_and(|Extension(turn)| turn.prewarm.is_some()) {
-                    let mut response = axum::Json(response).into_response();
-                    response.extensions_mut().insert(RetainedInput(items));
-                    return response;
+                    return axum::Json(response).into_response();
                 }
                 let event = json!({"type":if fail {"response.failed"} else {"response.completed"},"response":response});
                 let data = match last.and_then(|item| item["content"].as_str()) {
@@ -120,9 +122,7 @@ impl Fixture {
                     Some("leading-fixture") => format!("data: malformed\n\ndata: {event}\n\n"),
                     _ => format!("data: {event}\n\n"),
                 };
-                let mut response = ([("content-type","text/event-stream")], data).into_response();
-                response.extensions_mut().insert(RetainedInput(items));
-                response
+                ([("content-type","text/event-stream")], data).into_response()
             }
         }));
         let dispatch = Dispatch {
@@ -247,11 +247,8 @@ impl Fixture {
             let release = release.clone();
             async move {
                 let number = counted.fetch_add(1, Ordering::SeqCst);
-                let retained = RetainedInput::capture(&body.input).unwrap();
                 if turn.is_some_and(|Extension(turn)| turn.prewarm.is_some()) {
-                    let mut response = prewarm_response(body);
-                    response.extensions_mut().insert(retained);
-                    return response;
+                    return prewarm_response(body);
                 }
                 if serde_json::to_string(&body.input).unwrap().contains("stall-fixture") {
                     let probe = DropProbe(dropped);
@@ -282,9 +279,7 @@ impl Fixture {
                 }
                 let tenant = meta.tenant_key().as_str().to_owned();
                 let event = json!({"type":"response.completed","response":{"id":format!("resp_native_{number}"),"status":"completed","output":[{"type":"message","id":"msg_fixture","role":"assistant","content":[{"type":"output_text","text":tenant}]}]}});
-                let mut response = ([("content-type","text/event-stream")], format!("data: {event}\n\n")).into_response();
-                response.extensions_mut().insert(retained);
-                response
+                ([("content-type","text/event-stream")], format!("data: {event}\n\n")).into_response()
             }
         }))
         .layer(crate::middleware::ConcurrencyLimitLayer::new(admission.clone()))
@@ -625,7 +620,7 @@ async fn a_provider_401_preserves_the_socket_and_its_history() {
 }
 
 #[tokio::test]
-async fn continuation_uses_the_input_consumed_by_the_post_for_generation_and_prewarm() {
+async fn continuation_and_full_replay_apply_a_request_hook_to_the_same_transcript() {
     let mut fixture = Fixture::new(false).await;
     for generate in [true, false] {
         let first = fixture.turn(json!({
@@ -639,7 +634,18 @@ async fn continuation_uses_the_input_consumed_by_the_post_for_generation_and_pre
             }))
             .await;
         assert_eq!(continued["type"], "response.completed", "{continued}");
-        assert_eq!(continued["response"]["fixture_saw_rewrite"], true);
+        let replayed = fixture.turn(json!({
+            "type":"response.create","model":"fixture-model",
+            "input":[{"role":"user","content":"rewrite-fixture"},{"role":"user","content":"next"}],
+        })).await;
+        assert_eq!(replayed["type"], "response.completed", "{replayed}");
+        let expected = json!([
+            {"role":"developer","content":"fixture-policy"},
+            {"role":"user","content":"rewrite-fixture"},
+            {"role":"user","content":"next"},
+        ]);
+        assert_eq!(continued["response"]["fixture_input"], expected);
+        assert_eq!(replayed["response"]["fixture_input"], expected);
     }
 }
 

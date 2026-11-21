@@ -26,8 +26,7 @@ use axum::{
 };
 use futures::StreamExt;
 use openai_protocol::responses::{
-    ResponseInput, ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse,
-    ResponsesUsage,
+    ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
 };
 use parking_lot::Mutex;
 use serde::{Serialize, Serializer as _};
@@ -163,21 +162,6 @@ pub(super) async fn tenant_binding_guard(
         }
     }
     next.run(request).await
-}
-
-/// The validated input the POST handler used, after request hooks.
-/// An extension keeps it off the wire and avoids rereading the request body.
-#[derive(Clone)]
-pub(super) struct RetainedInput(Vec<Value>);
-
-impl RetainedInput {
-    pub(super) fn capture(input: &ResponseInput) -> Option<Self> {
-        let items = match input {
-            ResponseInput::Items(items) => serde_json::to_value(items).ok()?,
-            ResponseInput::Text(text) => Value::String(text.clone()),
-        };
-        input_items(Some(items)).ok().map(Self)
-    }
 }
 
 /// Called by the normal POST handler after auth, tenant resolution, admission,
@@ -822,9 +806,16 @@ async fn serve(
             }
             continue;
         }
-        let generate = prepared.generate;
-        let full_replacement = prepared.full_replacement;
-        drop(prepared);
+        // Keep the client transcript for replay. Each protected POST runs
+        // the current hooks once over the assembled transcript, just as a
+        // client sending the entire conversation would.
+        let Prepared {
+            body: fields,
+            input,
+            generate,
+            full_replacement,
+        } = prepared;
+        drop(fields);
         drop(message);
         let mut body = Request::new(Body::from(payload.writer));
         *body.method_mut() = Method::POST;
@@ -860,7 +851,7 @@ async fn serve(
         // hop, alternative tokenizer, parser, routing or generation path.
         let future = dispatch.service.clone().oneshot(body);
         tokio::pin!(future);
-        let mut response = loop {
+        let response = loop {
             tokio::select! {
                 () = tokio::time::sleep_until(expires) => {
                     let _ = send(&mut socket, &connection_expired_error()).await;
@@ -890,7 +881,6 @@ async fn serve(
             }
             continue;
         }
-        let retained_input = response.extensions_mut().remove::<RetainedInput>();
         if !generate {
             let response =
                 match read_response_json(response.into_body(), dispatch.max_payload_bytes).await {
@@ -930,9 +920,7 @@ async fn serve(
             if full_replacement {
                 cache.clear();
             }
-            if let Some(input) = retained_input {
-                cache.remember(id, &input.0, &[]);
-            }
+            cache.remember(id, &input, &[]);
             if !send(
                 &mut socket,
                 &json!({"type":"response.completed","sequence_number":1,"response":response}),
@@ -980,10 +968,8 @@ async fn serve(
                                     cache.clear();
                                 }
                                 let response = &event["response"];
-                                if let (Some(input), Some(id), Some(output)) = (
-                                    &retained_input, response["id"].as_str(), response["output"].as_array(),
-                                ) {
-                                    cache.remember(id, &input.0, output);
+                                if let (Some(id), Some(output)) = (response["id"].as_str(), response["output"].as_array()) {
+                                    cache.remember(id, &input, output);
                                 }
                                 complete = true;
                             }

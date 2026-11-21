@@ -352,10 +352,7 @@ async fn v1_responses(
             "Responses WebSockets require a streamed, non-stored request with connection-local history",
         );
     }
-    let input = turn
-        .as_ref()
-        .and_then(|_| responses_ws::RetainedInput::capture(&body.input));
-    let mut response = cancel
+    cancel
         .guard(async {
             if let Some(refresh) = turn.and_then(|turn| turn.prewarm) {
                 if let Err(unavailable) = WorkerSelector::new(&state.context.worker_registry)
@@ -372,11 +369,7 @@ async fn v1_responses(
                 .route_responses(Some(&headers), &tenant_meta, body, &model)
                 .await
         })
-        .await;
-    if let Some(input) = input.filter(|_| response.status().is_success()) {
-        response.extensions_mut().insert(input);
-    }
-    response
+        .await
 }
 
 async fn v1_interactions(

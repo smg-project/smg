@@ -129,6 +129,8 @@ gateway bearer header. Use TLS at the gateway or at the proxy.
 A session handles one `response.create` at a time. Set `store: false` or omit
 `store`. `previous_response_id` refers to a recent response on the same socket.
 After reconnecting or losing an entry to eviction, resend the full input.
+Each continuation replays client input and prior model output through the
+current request hooks, just as sending the full transcript would.
 `generate: false` accepts context and returns a typed response without
 dispatching inference. For a model absent from its registry, the gateway first
 checks the model inventory of OpenAI-compatible workers. Background responses,
