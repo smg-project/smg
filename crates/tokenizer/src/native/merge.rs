@@ -1105,7 +1105,6 @@ impl<const N: usize> ShortMerge<N> {
     }
 
     /// Merges until no live pair is a merge, and appends the ids to `ids`.
-    /// The first round keeps its least key: no scan of the keys follows it.
     #[inline(always)]
     fn run(mut self, table: &MergeTable, ids: &mut Vec<u32>) {
         let pairs = self.n.saturating_sub(1);
@@ -1119,7 +1118,7 @@ impl<const N: usize> ShortMerge<N> {
 
     /// Merges from `best`, the least key of the first round, until no live
     /// pair is a merge, and appends the ids to `ids`. It borrows the state:
-    /// taken by value, the state was copied here.
+    /// taken by value it is copied here, even with both functions inlined.
     #[inline(always)]
     fn settle(&mut self, table: &MergeTable, mut best: i32, ids: &mut Vec<u32>) {
         while best != NO_KEY {
