@@ -427,6 +427,10 @@ pub fn available_cpus() -> usize {
     std::thread::available_parallelism().map_or(1, usize::from)
 }
 
+/// The paths of the controller connection's TLS files: the authority's, and
+/// the certificate with its key where the gateway presents one.
+pub(crate) type ControllerTlsFiles<'a> = (&'a str, Option<(&'a str, &'a str)>);
+
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 impl ConfigValidator {
@@ -1918,6 +1922,37 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// The TLS files of the controller's connection as they go together:
+    /// the authority's file, with the certificate and its key where both
+    /// are set. No file at all is a plain connection. Every other pairing
+    /// is refused. The follower's settings are made from this answer alone,
+    /// so a gateway built without this check refuses the same files in the
+    /// same words.
+    pub(crate) fn policy_controller_tls_files(
+        config: &RouterConfig,
+    ) -> ConfigResult<Option<ControllerTlsFiles<'_>>> {
+        let refuse = |reason: &str| {
+            Err(ConfigError::IncompatibleConfig {
+                reason: reason.to_owned(),
+            })
+        };
+        let identity = match (
+            config.policy_controller_tls_cert.as_deref(),
+            config.policy_controller_tls_key.as_deref(),
+        ) {
+            (Some(cert), Some(key)) => Some((cert, key)),
+            (None, None) => None,
+            _ => return refuse("--policy-controller-tls-cert and --policy-controller-tls-key must be given together"),
+        };
+        // The connection trusts the authority's file and no other root: a
+        // client certificate without it could verify no controller.
+        match (config.policy_controller_tls_ca_cert.as_deref(), identity) {
+            (Some(ca_cert), identity) => Ok(Some((ca_cert, identity))),
+            (None, None) => Ok(None),
+            (None, Some(_)) => refuse("--policy-controller-tls-cert requires --policy-controller-tls-ca-cert, the one root the connection trusts"),
+        }
+    }
+
     fn validate_policy_controller(config: &RouterConfig) -> ConfigResult<()> {
         let refuse = |reason: &str| {
             Err(ConfigError::IncompatibleConfig {
@@ -1960,17 +1995,7 @@ impl ConfigValidator {
         if !valid_address {
             return refuse("--policy-controller-address must be host:port with a port from 1 to 65535 and brackets around IPv6");
         }
-        if config.policy_controller_tls_cert.is_some() != config.policy_controller_tls_key.is_some()
-        {
-            return refuse("--policy-controller-tls-cert and --policy-controller-tls-key must be given together");
-        }
-        // The connection trusts the authority's file and no other root: a
-        // client certificate without it could verify no controller.
-        if config.policy_controller_tls_cert.is_some()
-            && config.policy_controller_tls_ca_cert.is_none()
-        {
-            return refuse("--policy-controller-tls-cert requires --policy-controller-tls-ca-cert, the one root the connection trusts");
-        }
+        Self::policy_controller_tls_files(config)?;
         // Nothing of a gateway whose every router is a provider's is placed
         // through a controller: the address would be dropped unsaid.
         if let Some(mode) = config.provider_alone() {
@@ -2323,6 +2348,43 @@ mod tests {
         }
         .validate()
         .expect("a pair beside its authority's file is taken");
+    }
+
+    /// The one rule over all eight pairings of the three files: three go
+    /// together and give their paths, five are refused in the two messages.
+    #[test]
+    fn the_controller_tls_files_go_together_in_three_pairings_of_eight() {
+        let together =
+            "--policy-controller-tls-cert and --policy-controller-tls-key must be given together";
+        let authority = "--policy-controller-tls-cert requires --policy-controller-tls-ca-cert";
+        let files = |ca_cert: bool, cert: bool, key: bool| RouterConfig {
+            policy_controller_tls_ca_cert: ca_cert.then(|| "ca.pem".to_owned()),
+            policy_controller_tls_cert: cert.then(|| "cert.pem".to_owned()),
+            policy_controller_tls_key: key.then(|| "key.pem".to_owned()),
+            ..RouterConfig::default()
+        };
+        let rule = ConfigValidator::policy_controller_tls_files;
+        assert_eq!(rule(&files(false, false, false)).ok(), Some(None));
+        assert_eq!(
+            rule(&files(true, false, false)).ok(),
+            Some(Some(("ca.pem", None)))
+        );
+        assert_eq!(
+            rule(&files(true, true, true)).ok(),
+            Some(Some(("ca.pem", Some(("cert.pem", "key.pem")))))
+        );
+        for (ca_cert, cert, key, words) in [
+            (false, false, true, together),
+            (false, true, false, together),
+            (true, true, false, together),
+            (true, false, true, together),
+            (false, true, true, authority),
+        ] {
+            let refusal = rule(&files(ca_cert, cert, key))
+                .expect_err("files that do not go together")
+                .to_string();
+            assert!(refusal.contains(words), "{refusal}");
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
