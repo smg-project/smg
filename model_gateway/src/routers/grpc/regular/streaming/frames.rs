@@ -16,7 +16,9 @@ use serde::Serialize;
 use serde_json::json;
 use tracing::error;
 
-use crate::routers::grpc::{proto_wrapper::ProtoOutputLogProbs, spec::ChatResponseSpec};
+use crate::routers::grpc::{
+    proto_wrapper::ProtoOutputLogProbs, regular::responses::TextValueReader, spec::ChatResponseSpec,
+};
 
 /// The frame buffer as serde's sink: every write is one `extend_from_slice`,
 /// the shape a `Vec<u8>` gives serde. The `bytes` writer adapter instead slices
@@ -92,6 +94,9 @@ pub(super) const CHAT_BURST_ROOM: usize = CHUNK_FLUSH_BYTES + 2 * CHAT_BURST_MAR
 /// placeholder where the wire asks for one.
 pub(crate) struct ChatChunkFrame {
     head: Vec<u8>,
+    // Set where the reader is the Responses stage: a bare text delta goes to
+    // it as the text, with no JSON written here and read back there.
+    pub(crate) text_values: Option<TextValueReader>,
 }
 
 impl ChatChunkFrame {
@@ -113,7 +118,10 @@ impl ChatChunkFrame {
             push_json(&mut head, system_fingerprint);
         }
         head.extend_from_slice(b",\"choices\":[");
-        Self { head }
+        Self {
+            head,
+            text_values: None,
+        }
     }
 
     /// Append `data: {...}\n\n` for `choice` (and `usage`, or the `null`
@@ -137,7 +145,7 @@ impl ChatChunkFrame {
     /// and the text alone, instead of walking the five keys and the two nulls
     /// of the struct on every token. The bytes are those [`Self::write_chunk`]
     /// writes for the same choice (pinned by test).
-    pub(super) fn write_text_delta(
+    pub(crate) fn write_text_delta(
         &self,
         buffer: &mut BytesMut,
         index: u32,
@@ -146,6 +154,16 @@ impl ChatChunkFrame {
         usage: Option<&Usage>,
         emit_usage_null: bool,
     ) {
+        if self.text_values.is_some() && usage.is_none() {
+            buffer.extend_from_slice(match field {
+                TextDelta::Content => b"\x01c",
+                TextDelta::Reasoning => b"\x01r",
+            });
+            push_json(FrameSink(buffer), &text.len());
+            buffer.extend_from_slice(b"\n");
+            buffer.extend_from_slice(text.as_bytes());
+            return;
+        }
         let start = buffer.len();
         buffer.extend_from_slice(&self.head);
         buffer.extend_from_slice(b"{\"index\":");
@@ -240,7 +258,7 @@ impl ChatChunkFrame {
 
 /// The one text field a bare per-token chat delta carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TextDelta {
+pub(crate) enum TextDelta {
     Content,
     Reasoning,
 }
