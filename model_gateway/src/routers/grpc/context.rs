@@ -2281,6 +2281,29 @@ impl ExecutionResult {
     }
 }
 
+/// A request's wait ahead of the dispatch its answer's clocks start at, as
+/// [`dispatch_wait`] reads it; `None` outside a request's entry stamp.
+pub(crate) type DispatchWait = Option<std::time::Duration>;
+
+/// The wait of the request whose answering attempt was dispatched at
+/// `dispatched` (the single RPC's dispatch, the prefill dispatch of a pair):
+/// the time since its entry at the edge ([`RequestStarted`]). The body read,
+/// auth, admission, tokenizing, templating and worker selection are in it,
+/// and so are a refused attempt with its backoff and an encode call that
+/// runs ahead of the pair.
+///
+/// The stamp is scoped to the request's future. The streaming entry points
+/// run inside it, so they read the wait there, against the dispatch instant
+/// their stream's clocks start at, and hand it to the reading they build:
+/// the response body drives that reading once the request's future has
+/// returned, outside the scope. `None` outside a request's stamp: a turn of
+/// a Responses tool loop, which a spawned task dispatches, and a pipeline a
+/// test runs bare.
+pub(crate) fn dispatch_wait(dispatched: Instant) -> DispatchWait {
+    let entered = RequestStarted::current()?;
+    Some(dispatched.saturating_duration_since(entered))
+}
+
 /// Timing context threaded from PD execution into the streaming layer so the
 /// first decode token can be measured against the prefill and decode dispatch
 /// instants.
@@ -2294,49 +2317,16 @@ pub(crate) struct PdTiming {
     pub decode_sent: Instant,
     /// Backend runtime label (e.g. "sglang", "vllm") for the PD metric set.
     pub runtime: &'static str,
-    /// The request's wait ahead of this prefill dispatch, in microseconds:
-    /// from its entry at the edge to `prefill_start`
-    /// ([`Self::wait_from_entry`]). `None` for a dispatch made outside the
-    /// request's entry stamp. Microseconds in 32 bits (about 71 minutes,
-    /// saturating) keep the timing narrow: it rides in the dispatch
-    /// context's box.
-    pub dispatch_wait_micros: Option<u32>,
 }
 
 impl PdTiming {
-    /// The wait of the request whose prefill is dispatched at
-    /// `prefill_start`: the time since its entry at the edge
-    /// ([`RequestStarted`]), the gateway's own time ahead of the engines
-    /// (body read, auth, admission, tokenize, template, worker selection, an
-    /// earlier attempt, and an encode call that runs ahead of the pair).
-    /// `None` where the dispatch runs outside the request's task and so
-    /// outside its stamp: a spawned Responses run and each iteration of its
-    /// tool loop, whose wait would count time the client was already being
-    /// answered in.
-    pub(crate) fn wait_from_entry(prefill_start: Instant) -> Option<u32> {
-        let entered = RequestStarted::current()?;
-        let wait = prefill_start.saturating_duration_since(entered);
-        Some(u32::try_from(wait.as_micros()).unwrap_or(u32::MAX))
-    }
-
     /// Record the PD time-to-first-token pair at the first decode token: the
     /// end-to-end value from the prefill dispatch (`smg_pd_ttft_seconds`) and
     /// the decode phase from the decode dispatch (`smg_pd_decode_ttft_seconds`),
     /// off one clock reading so that the prefill, relay and decode phases add
-    /// up to the end-to-end value exactly. The dispatch wait
-    /// (`smg_pd_dispatch_wait_seconds`) is recorded here too, under the same
-    /// labels and for the same requests, so the wait and the end-to-end value
-    /// add up to the TTFT from the gateway's receipt of the request.
+    /// up to the end-to-end value exactly.
     pub(crate) fn record_first_decode_token(&self, backend_type: &'static str, model: &str) {
         let now = Instant::now();
-        if let Some(micros) = self.dispatch_wait_micros {
-            Metrics::record_pd_dispatch_wait(
-                backend_type,
-                model,
-                self.runtime,
-                std::time::Duration::from_micros(u64::from(micros)),
-            );
-        }
         Metrics::record_pd_ttft(
             backend_type,
             model,

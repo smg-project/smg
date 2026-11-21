@@ -40,7 +40,6 @@ fn pd_timing() -> context::PdTiming {
         prefill_start: Instant::now(),
         decode_sent: Instant::now(),
         runtime: "test",
-        dispatch_wait_micros: None,
     }
 }
 
@@ -92,6 +91,7 @@ async fn stream_pd(
             spec(continuous_usage),
             &tx,
             pd_timing(),
+            None,
             vec![None],
             None,
         )

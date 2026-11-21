@@ -1645,7 +1645,6 @@ async fn execute_parallel_pd(
                     prefill_start,
                     decode_sent: prefill_start,
                     runtime,
-                    dispatch_wait_micros: PdTiming::wait_from_entry(prefill_start),
                 },
             )
             .await

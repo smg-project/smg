@@ -241,6 +241,7 @@ fn first_token_and_per_output_token_families_render_on_their_own_edges() {
             model_id: "m1",
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: Some(Duration::from_millis(120)),
+            dispatch_wait: None,
             generation_duration: Duration::from_millis(156),
             input_tokens: Some(10),
             cached_tokens: None,
@@ -293,6 +294,56 @@ fn first_token_and_per_output_token_families_render_on_their_own_edges() {
     }
 }
 
+/// The dispatch wait renders as a histogram on the request-duration edges
+/// once the buckets are registered the way `start_prometheus` does. Its name
+/// ends in `_wait_seconds`, which no suffix matcher covers: without its own
+/// matcher the exporter renders a summary. A 7 ms wait lands under the 10 ms
+/// edge and not under the 5 ms one, beside the TTFT it is recorded with.
+#[test]
+fn the_dispatch_wait_renders_on_the_request_duration_edges() {
+    let mut builder = PrometheusBuilder::new();
+    for (matcher, buckets) in histogram_bucket_overrides(None) {
+        builder = builder
+            .set_buckets_for_metric(matcher, &buckets)
+            .expect("bucket override");
+    }
+    let recorder = builder.build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_REGULAR,
+            model_id: "m1",
+            endpoint: metrics_labels::ENDPOINT_CHAT,
+            ttft: Some(Duration::from_millis(120)),
+            dispatch_wait: Some(Duration::from_millis(7)),
+            generation_duration: Duration::from_millis(156),
+            input_tokens: Some(10),
+            cached_tokens: None,
+            output_tokens: 3,
+        });
+    });
+    let rendered = handle.render();
+
+    let labels = "router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"";
+    for series in [
+        format!("{DISPATCH_WAIT_SECONDS}_bucket{{{labels},le=\"0.005\"}} 0"),
+        format!("{DISPATCH_WAIT_SECONDS}_bucket{{{labels},le=\"0.01\"}} 1"),
+        format!("{DISPATCH_WAIT_SECONDS}_count{{{labels}}} 1"),
+        format!("smg_router_ttft_seconds_count{{{labels}}} 1"),
+    ] {
+        assert!(
+            rendered.lines().any(|l| l == series),
+            "{series} missing; rendered:\n{rendered}"
+        );
+    }
+    let summary = format!("{DISPATCH_WAIT_SECONDS}{{");
+    assert!(
+        !rendered.contains(&summary),
+        "{DISPATCH_WAIT_SECONDS} rendered as a summary; rendered:\n{rendered}"
+    );
+}
+
 /// An operator's `--prometheus-duration-buckets` list replaces the
 /// request-duration edges, the ones `smg_router_ttft_seconds` and
 /// `smg_router_tpot_seconds` share with it, and leaves the first-token and
@@ -308,9 +359,9 @@ fn duration_bucket_override_leaves_the_token_timing_families_alone() {
             "{suffix}"
         );
     }
-    // The PD dispatch wait ends in `_wait_seconds`: it is matched by its full
+    // The dispatch wait ends in `_wait_seconds`: it is matched by its full
     // name and follows the same list.
-    let dispatch_wait = Matcher::Full(String::from("smg_pd_dispatch_wait_seconds"));
+    let dispatch_wait = Matcher::Full(String::from(DISPATCH_WAIT_SECONDS));
     assert_eq!(overridden[&dispatch_wait], custom);
     let defaults = histogram_bucket_overrides(None);
     let duration = &defaults[&Matcher::Suffix(String::from("duration_seconds"))];
@@ -659,25 +710,6 @@ fn test_record_pd_prefill_duration_emits_histogram() {
 }
 
 #[test]
-fn test_record_pd_dispatch_wait_emits_histogram() {
-    let (rendered, ()) = with_test_recorder(|| {
-        Metrics::record_pd_dispatch_wait(
-            metrics_labels::BACKEND_PD,
-            "test-model",
-            "vllm",
-            Duration::from_millis(17),
-        );
-    });
-    assert!(
-        rendered.contains("smg_pd_dispatch_wait_seconds_count{")
-            && rendered.contains(r#"backend_type="pd""#)
-            && rendered.contains(r#"model="test-model""#)
-            && rendered.contains(r#"runtime="vllm""#),
-        "dispatch wait histogram not emitted; rendered:\n{rendered}"
-    );
-}
-
-#[test]
 fn test_record_pd_kv_transfer_duration_emits_histogram() {
     let (rendered, ()) = with_test_recorder(|| {
         Metrics::record_pd_kv_transfer_duration(
@@ -784,6 +816,7 @@ fn router_stream_families_name_the_attempt_anchor() {
             model_id: "m",
             endpoint: "chat",
             ttft: Some(Duration::from_millis(5)),
+            dispatch_wait: None,
             generation_duration: Duration::from_millis(9),
             input_tokens: None,
             cached_tokens: None,
@@ -821,6 +854,103 @@ fn router_stream_families_name_the_attempt_anchor() {
             "{family}: {text}"
         );
     }
+}
+
+/// The dispatch wait says on `/metrics` what its clock is (the request's
+/// entry at the edge to the answering attempt's RPC dispatch, where the TTFT
+/// clock starts), which requests it observes (those the TTFT observes, under
+/// the same labels) and that the two add up to the time to first token from
+/// the request's receipt.
+#[test]
+fn the_dispatch_wait_help_names_its_clock_its_requests_and_its_sum_with_the_ttft() {
+    let (rendered, ()) = with_test_recorder(|| {
+        init_metrics();
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_REGULAR,
+            model_id: "m",
+            endpoint: "chat",
+            ttft: Some(Duration::from_millis(5)),
+            dispatch_wait: Some(Duration::from_millis(2)),
+            generation_duration: Duration::from_millis(9),
+            input_tokens: None,
+            cached_tokens: None,
+            output_tokens: 2,
+        });
+    });
+    let help = rendered
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("# HELP {DISPATCH_WAIT_SECONDS} ")))
+        .unwrap_or_else(|| panic!("no # HELP for {DISPATCH_WAIT_SECONDS}; rendered:\n{rendered}"));
+    for phrase in [
+        "by router_type, backend_type, model, endpoint",
+        "from the request's entry at the edge to the answering attempt's RPC dispatch",
+        "the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes",
+        "a refused attempt's wait and its backoff are here",
+        "observed with smg_router_ttft_seconds, once per observation of it and under the same labels",
+        "the two add up to the time to first token from the request's receipt",
+    ] {
+        assert!(help.contains(phrase), "{phrase:?} is not in: {help}");
+    }
+}
+
+/// The dispatch wait is recorded where the TTFT is and only with it: once,
+/// under the TTFT's four labels, for a stream that has a first token and a
+/// wait. A stream with no first token records neither family though it
+/// carries a wait, and a stream dispatched outside a request's entry stamp
+/// records its TTFT alone.
+#[test]
+fn the_dispatch_wait_is_recorded_with_the_ttft_and_only_with_it() {
+    let record = |model_id: &str, ttft: Option<Duration>, dispatch_wait: Option<Duration>| {
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_PD,
+            model_id,
+            endpoint: metrics_labels::ENDPOINT_MESSAGES,
+            ttft,
+            dispatch_wait,
+            generation_duration: Duration::from_millis(90),
+            input_tokens: Some(4),
+            cached_tokens: None,
+            output_tokens: 2,
+        });
+    };
+    let (rendered, ()) = with_test_recorder(|| {
+        let (ttft, wait) = (Duration::from_millis(40), Duration::from_millis(17));
+        record("stamped", Some(ttft), Some(wait));
+        record("no-first-token", None, Some(wait));
+        record("unstamped", Some(ttft), None);
+    });
+    let labels = |model: &str| {
+        format!("router_type=\"grpc\",backend_type=\"pd\",model=\"{model}\",endpoint=\"messages\"")
+    };
+    let stamped = labels("stamped");
+    for series in [
+        format!("smg_router_ttft_seconds_count{{{stamped}}} 1"),
+        format!("{DISPATCH_WAIT_SECONDS}_count{{{stamped}}} 1"),
+        format!("{DISPATCH_WAIT_SECONDS}_sum{{{stamped}}} 0.017"),
+        format!("smg_router_ttft_seconds_count{{{}}} 1", labels("unstamped")),
+    ] {
+        assert!(
+            rendered.lines().any(|line| line == series),
+            "{series} missing; rendered:\n{rendered}"
+        );
+    }
+    for model in ["no-first-token", "unstamped"] {
+        let wait = format!("{DISPATCH_WAIT_SECONDS}_count{{{}}}", labels(model));
+        assert!(
+            !rendered.contains(&wait),
+            "{model} recorded a dispatch wait; rendered:\n{rendered}"
+        );
+    }
+    let ttft = format!(
+        "smg_router_ttft_seconds_count{{{}}}",
+        labels("no-first-token")
+    );
+    assert!(
+        !rendered.contains(&ttft),
+        "a stream with no first token recorded a TTFT; rendered:\n{rendered}"
+    );
 }
 
 #[test]
@@ -971,14 +1101,23 @@ fn time_per_http_record() {
 /// as it does with a key built per record: the same series with the
 /// same values, and no series a stream had nothing for (no TTFT or
 /// TPOT for a model whose streams gave no token, no input tokens for an
-/// endpoint that reports none).
+/// endpoint that reports none, no dispatch wait for a stream with no
+/// first token or no wait).
 #[test]
 fn the_stream_timing_set_renders_the_same_through_kept_handles() {
     let records = || {
-        for (ttft, output_tokens, input_tokens) in [
-            (Some(Duration::from_millis(10)), 5, Some(100)),
-            (None, 1, None),
-            (Some(Duration::from_millis(5)), 1, Some(7)),
+        // The dispatch wait rides the first record, which has a first token
+        // to be recorded with, and the second, which has none; the third is
+        // a stream dispatched outside a request's entry stamp.
+        for (ttft, dispatch_wait, output_tokens, input_tokens) in [
+            (
+                Some(Duration::from_millis(10)),
+                Some(Duration::from_millis(3)),
+                5,
+                Some(100),
+            ),
+            (None, Some(Duration::from_millis(4)), 1, None),
+            (Some(Duration::from_millis(5)), None, 1, Some(7)),
         ] {
             Metrics::record_streaming_metrics(StreamingMetricsParams {
                 router_type: metrics_labels::ROUTER_GRPC,
@@ -986,6 +1125,7 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
                 model_id: "m1",
                 endpoint: metrics_labels::ENDPOINT_CHAT,
                 ttft,
+                dispatch_wait,
                 generation_duration: Duration::from_millis(50),
                 input_tokens,
                 cached_tokens: input_tokens.map(|input| input / 10),
@@ -998,6 +1138,7 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
             model_id: "m2",
             endpoint: metrics_labels::ENDPOINT_GENERATE,
             ttft: None,
+            dispatch_wait: None,
             generation_duration: Duration::from_millis(20),
             input_tokens: None,
             cached_tokens: None,
@@ -1021,6 +1162,8 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\",token_type=\"cached\"} 10",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\",endpoint=\"generate\",token_type=\"output\"} 1",
         "smg_router_ttft_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 2",
+        "smg_router_dispatch_wait_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 1",
+        "smg_router_dispatch_wait_seconds_sum{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 0.003",
         "smg_router_tpot_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 1",
         "smg_router_time_to_first_token_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 2",
         "smg_router_request_time_per_output_token_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 1",
@@ -1034,6 +1177,7 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
     }
     for absent in [
         "smg_router_ttft_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
+        "smg_router_dispatch_wait_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
         "smg_router_tpot_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
         "smg_router_time_to_first_token_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
         "smg_router_request_time_per_output_token_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
@@ -1075,7 +1219,8 @@ fn upkeep_forgets_the_retired_addresses_whose_workers_are_gone() {
 /// kept handles, for the Numbers table: the request counter, the
 /// worker counter (through the per-worker store) and the duration
 /// histogram of a unary request, and the stream-timing set on top for a
-/// streamed one; run with `--ignored --nocapture`.
+/// streamed one, without and with the dispatch wait a request under the
+/// edge's entry stamp records; run with `--ignored --nocapture`.
 #[test]
 #[ignore = "a timing, not a check"]
 #[expect(clippy::print_stdout, reason = "the timing is the output")]
@@ -1118,7 +1263,7 @@ fn time_per_router_record() {
         request(STREAMING_FALSE);
         duration();
     };
-    let streamed = || {
+    let streamed = |dispatch_wait: Option<Duration>| {
         request(STREAMING_TRUE);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
@@ -1126,6 +1271,7 @@ fn time_per_router_record() {
             model_id: MODEL,
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: Some(Duration::from_millis(50)),
+            dispatch_wait,
             generation_duration: Duration::from_secs(1),
             input_tokens: Some(128),
             cached_tokens: Some(64),
@@ -1133,11 +1279,17 @@ fn time_per_router_record() {
         });
         duration();
     };
+    let unstamped = || streamed(None);
+    let stamped = || streamed(Some(Duration::from_millis(2)));
     let time = |label: &str| {
         metrics::with_local_recorder(&recorder, || {
             for (name, records) in [
                 ("unary (3 records)", &unary as &dyn Fn()),
-                ("streamed (8 records)", &streamed as &dyn Fn()),
+                ("streamed (8 records)", &unstamped as &dyn Fn()),
+                (
+                    "streamed (8 records and the dispatch wait)",
+                    &stamped as &dyn Fn(),
+                ),
             ] {
                 let start = Instant::now();
                 for _ in 0..ROUNDS {

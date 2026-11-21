@@ -477,6 +477,7 @@ impl StreamBench {
             backend_type: "bench",
             model: MODEL.to_string(),
             expected_choices: 1,
+            dispatch_wait: None,
         };
         let (tx, rx) = sse_channel();
         let driven = async {
