@@ -471,7 +471,7 @@ fn engine_for(
                 phase: place.phase.name(),
             });
         }
-        rule_not_run(config, &settings, &document)?;
+        rule_not_run(config, &settings, &document, whole)?;
     }
     Ok(Some(InProcess {
         engine,
@@ -532,10 +532,17 @@ fn hash_index(document: &PolicySpec) -> Result<(), StartError> {
 /// explain. So a pair plan's `pairing` other than the settings' mode, a
 /// pair plan's `decode: after-prefill` and an `explain.sample` other than
 /// zero are refused by the field ([`StartError::FieldNotRun`]).
+///
+/// `whole` says the routers ask the engine for every request of the
+/// document ([`InProcess::decides_whole`]). No registry policy places a
+/// pair then: the engine finds a pair's binding by the request's model, so
+/// a pair binding that names some models and a second pair binding are run
+/// as written, and start.
 fn rule_not_run(
     config: &RouterConfig,
     settings: &PolicySpec,
     document: &PolicySpec,
+    whole: bool,
 ) -> Result<(), StartError> {
     use smg_policy_controller::{
         document::{BindingSpec, DecodePick, Pairing, PlanName},
@@ -586,10 +593,10 @@ fn rule_not_run(
             return Err(refused("shadow", "no shadow profile runs here"));
         }
         if matches!(binding.plan, Some(PlanName::PdPair | PlanName::Epd)) {
-            if binding.matcher.model != "*" {
+            if !whole && binding.matcher.model != "*" {
                 return Err(refused("match.model", ONE_A_SIDE));
             }
-            if pair_planned {
+            if !whole && pair_planned {
                 return Err(refused("plan", "an earlier binding plans the pair"));
             }
             // A list that names no phase covers every phase.

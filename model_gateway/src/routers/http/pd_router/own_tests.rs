@@ -4,7 +4,7 @@
 use std::{error::Error, time::Duration};
 
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
-use serde_json::json;
+use serde_json::{json, Value};
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
     engine::PolicyEngine as OwnEngine,
@@ -20,11 +20,19 @@ use crate::{routers::grpc::backend_client::BasicWorkerBuilder, tenant::TenantKey
 
 const MODEL: &str = "model-a";
 
+/// The stock pair document, round robin on both sides.
+fn pair_document() -> PolicySpec {
+    PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets")
+}
+
 /// A pair router over `registry` whose attempts ask the engine of this
 /// process, round robin on both sides, with no real back-off between them.
 fn own_router(registry: Arc<WorkerRegistry>) -> PDRouter {
-    let document = PolicySpec::pair_presets("round_robin", "round_robin");
-    let mut document = document.expect("the pair presets");
+    own_router_under(registry, pair_document())
+}
+
+/// [`own_router`] under `document`.
+fn own_router_under(registry: Arc<WorkerRegistry>, mut document: PolicySpec) -> PDRouter {
     document.generation = 1;
     let spec = AppliedSpec::validate(&document).expect("the presets validate");
     let engine = PolicyEngine::own(Arc::new(OwnEngine::new(spec)), Arc::clone(&registry));
@@ -165,5 +173,32 @@ async fn a_retry_leaves_the_decode_that_refused_though_its_turn_comes_again(
     assert_eq!(held.await?, StatusCode::OK, "the retry was served");
     let reached = reached.load(Ordering::Acquire);
     assert_eq!(reached, 1, "the retry went back to the decode that refused");
+    Ok(())
+}
+
+/// A pair of a model that no pair binding of the document names is declined
+/// by its binding. The router answers 503 `policy_declined`, as every route
+/// answers a request its policy declined, and neither worker is sent it.
+#[tokio::test]
+async fn a_pair_of_a_model_no_pair_binding_names_is_declined() -> Result<(), Box<dyn Error>> {
+    let (prefill, to_prefill) = spawn_recording_stub("{}").await;
+    let (decode, to_decode) = spawn_recording_stub(r#"{"text":"done"}"#).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    listed(&registry, WorkerType::Prefill, &prefill);
+    listed(&registry, WorkerType::Decode, &decode);
+    let mut document = pair_document();
+    document.bindings[0].matcher.model = "another-model".to_owned();
+    let router = own_router_under(registry, document);
+
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    let request = serde_json::from_value(json!({"text": "hi"}))?;
+    let answer = router.route_generate(None, &meta, request, MODEL).await;
+    assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(answer.into_body(), 4096).await?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["error"]["code"], "policy_declined", "{body}");
+    for sent in [to_prefill, to_decode] {
+        assert!(sent.lock().expect("the stub's log").is_empty());
+    }
     Ok(())
 }

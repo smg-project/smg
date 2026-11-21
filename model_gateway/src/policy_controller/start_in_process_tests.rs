@@ -57,6 +57,14 @@ fn pair_sides() -> Result<PolicySpec, Box<dyn Error>> {
     Ok(document)
 }
 
+/// An encode pair document whose binding holds its three sides' phases
+/// alone: a plan the engine of this process does not decide whole.
+fn encode_sides() -> Result<PolicySpec, Box<dyn Error>> {
+    let mut document = PolicySpec::epd_presets("round_robin", "round_robin", "round_robin")?;
+    document.bindings[0].matcher.phase = vec![Phase::Encode, Phase::Prefill, Phase::Decode];
+    Ok(document)
+}
+
 /// The gateway's own placement runs a binding's overload thresholds, its
 /// key sources and its sessions rule from the routing settings, and runs no
 /// shadow. A supplied document that states one of them otherwise would
@@ -177,8 +185,9 @@ fn a_document_the_gateway_does_not_run_is_answered_as_a_start_under_it() -> Case
     assert_eq!(answer(&running, &ruled), Some(words.clone()));
     assert_eq!(words, refusal(&supplied(ruled))?);
 
-    // A second pair binding.
-    let mut twice = pair_sides()?;
+    // A second pair binding, under a plan the engine of this process does
+    // not decide whole.
+    let mut twice = encode_sides()?;
     let again = twice.bindings[0].clone();
     twice.bindings.push(again);
     let words = not_run(2, "*", "plan", "an earlier binding plans the pair");
@@ -207,19 +216,34 @@ fn a_document_the_gateway_does_not_run_is_answered_as_a_start_under_it() -> Case
     Ok(())
 }
 
-/// The registry keeps one policy for each side of a pair, for every model.
-/// A pair binding that names some models would never be found, and a
-/// second pair binding never asked: the start refuses each by name.
+/// Where the routers ask the engine for every request of a document, the
+/// engine finds a pair's binding by the request's model: a pair binding
+/// that names some models and a second pair binding are run as written,
+/// and start. Where a registry policy still places the pair, one policy
+/// stands for each side, for every model. Such a binding would never be
+/// found, and a second one never asked: the start refuses each by name.
 #[test]
-fn a_supplied_pair_binding_names_every_model_and_stands_alone() -> Case {
-    let pair = pair_sides;
-    assert!(start_in_process(&supplied(pair()?), None)?.is_some());
+fn a_pair_binding_of_some_models_starts_where_the_engine_decides_whole() -> Case {
+    let whole = |document: PolicySpec| -> Result<bool, Box<dyn Error>> {
+        let started = start_in_process(&supplied(document), None)?;
+        Ok(started.is_some_and(|started| started.decides_whole()))
+    };
+    assert!(whole(pair_sides()?)?);
 
-    let mut document = pair()?;
-    document.bindings[0].matcher.model = "alpha-*".to_owned();
-    assert_eq!(document.bindings[0].plan, Some(PlanName::PdPair));
+    let mut named = pair_sides()?;
+    named.bindings[0].matcher.model = "alpha-*".to_owned();
+    assert_eq!(named.bindings[0].plan, Some(PlanName::PdPair));
+    assert!(whole(named.clone())?);
+
+    let mut twice = named;
+    twice.bindings.push(pair_sides()?.bindings.remove(0));
+    assert!(whole(twice)?);
+
+    // The encode plan is decided whole by no engine of this process.
+    let mut named = encode_sides()?;
+    named.bindings[0].matcher.model = "alpha-*".to_owned();
     assert_eq!(
-        refusal(&supplied(document))?,
+        refusal(&supplied(named))?,
         not_run(
             1,
             "alpha-*",
@@ -228,11 +252,11 @@ fn a_supplied_pair_binding_names_every_model_and_stands_alone() -> Case {
         )
     );
 
-    let mut document = pair()?;
-    let again = document.bindings[0].clone();
-    document.bindings.push(again);
+    let mut twice = encode_sides()?;
+    let again = twice.bindings[0].clone();
+    twice.bindings.push(again);
     assert_eq!(
-        refusal(&supplied(document))?,
+        refusal(&supplied(twice))?,
         not_run(2, "*", "plan", "an earlier binding plans the pair")
     );
     Ok(())

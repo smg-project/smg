@@ -51,11 +51,23 @@ fn own_stage(registry: &Arc<WorkerRegistry>, policy: PolicyConfig) -> WorkerSele
     classic_stage(registry, policy).with_policy_engine(Some(own_engine(registry, document)))
 }
 
+/// The stock pair document, round robin on both sides.
+fn pair_document() -> PolicySpec {
+    PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets")
+}
+
 /// The prefill-decode stage of `registry`, round robin on both sides, over
 /// the engine of this process under the stock pair document.
 fn own_pair_stage(registry: &Arc<WorkerRegistry>) -> WorkerSelectionStage {
-    let document = PolicySpec::pair_presets("round_robin", "round_robin");
-    let engine = own_engine(registry, document.expect("the pair presets"));
+    own_pair_stage_under(registry, pair_document())
+}
+
+/// [`own_pair_stage`] under `document`.
+fn own_pair_stage_under(
+    registry: &Arc<WorkerRegistry>,
+    document: PolicySpec,
+) -> WorkerSelectionStage {
+    let engine = own_engine(registry, document);
     round_robin_pd_stage(Arc::clone(registry)).with_policy_engine(Some(engine))
 }
 
@@ -524,4 +536,24 @@ async fn a_pairs_retry_keeps_its_decoding_rule_and_its_context_demand() {
     let refused = stage.reselect(&mut retry, &plan).await;
     let refused = refused.expect_err("the one decode left is not ready");
     assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// A pair of a model that no pair binding of the document names is declined
+/// by its binding. The stage answers 503 `policy_declined`, as every route
+/// answers a request its policy declined.
+#[tokio::test]
+async fn a_pair_of_a_model_no_pair_binding_names_is_declined() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let vllm = RuntimeType::Vllm;
+    let (prefill, decode) = (WorkerType::Prefill, WorkerType::Decode);
+    listed_as(&registry, "grpc://p:8000", prefill, vllm, None, UNLABELED);
+    listed_as(&registry, "grpc://d:8000", decode, vllm, None, UNLABELED);
+    let mut document = pair_document();
+    document.bindings[0].matcher.model = "another-model".to_owned();
+    let stage = own_pair_stage_under(&registry, document);
+    let declined = stage.execute(&mut prompt_of(&registry, 3)).await;
+    let declined = declined.expect_err("no binding names the model");
+    let (status, body) = answer_of(declined).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "policy_declined", "{body}");
 }
