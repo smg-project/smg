@@ -154,6 +154,8 @@ impl RoundRobin {
     /// fingerprint where the request carries it and its name's bytes where
     /// it does not: a host that carries it on some requests alone turns two
     /// rotations of the pool, each whole.
+    // In line in the draw over either kind of rows, as it was in its one caller.
+    #[inline(always)]
     fn pool_key(facts: &RequestFacts<'_>, pool: &PoolFacts<'_>, rows: usize) -> u64 {
         let mut key = FxHasher::default();
         if facts.model_fingerprint == ModelFingerprint::NONE {
@@ -224,7 +226,7 @@ impl Picker for RoundRobin {
     }
 
     // Reads no fact of a row: its rotation is its whole rule.
-    fn live_wise(&self) -> bool {
+    fn reads_no_live_fact(&self) -> bool {
         true
     }
 

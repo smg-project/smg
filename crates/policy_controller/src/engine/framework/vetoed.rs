@@ -345,16 +345,9 @@ pub(super) fn emptied(
     // veto is lifted: that tier is one look at the whole set.
     if steers
         && veto_ran(profile, NotOverloaded.name(), emptied_by)
-        && match facts.live_rows {
-            None => candidates
-                .iter()
-                .any(|row| !NotOverloaded.keep(facts, row, cx)),
-            // Beside rows that carry no live fact the look reads the
-            // decision's kept reads, and the facts are asked which once.
-            Some(live) => {
-                !cx.overload_lifted && live.whole().iter().any(|cell| cell.row().overloaded())
-            }
-        }
+        && candidates
+            .iter()
+            .any(|row| !NotOverloaded.keep(facts, row, cx))
     {
         let whole = RequestFacts {
             tried: &[],
@@ -377,17 +370,9 @@ pub(super) fn emptied(
     // harder veto refuses too gains nobody when it is lifted. Nor does a
     // row a hold of the host stands on, whichever doubt it carries: it
     // stays masked, and both tests pass it by.
-    let own = match facts.live_rows {
-        None => candidates
-            .iter()
-            .any(|row| doubted_alone(row.health) && cx.held.binary_search(&row.position).is_err()),
-        // Rows that carry no live fact come with no hold beside them
-        // ([`Engine::decide_live`]): the doubt is the read's own bit.
-        Some(live) => live
-            .whole()
-            .iter()
-            .any(|cell| doubted_alone(cell.row().health())),
-    };
+    let own = candidates
+        .iter()
+        .any(|row| doubted_alone(row.health) && cx.held.binary_search(&row.position).is_err());
     // The two lengths answer for the rows only where every held row is a
     // row of the mask, named once: the store's view keeps that, and a host
     // that fills the constraints by hand owes it.
@@ -470,23 +455,12 @@ fn doubted(
     };
     let stage = if own {
         let mut rows = std::mem::take(&mut buf.undoubted);
-        undoubted(&whole, set.candidates, &mut rows);
+        undoubted(set.candidates, &mut rows);
         let lifted = Set {
             candidates: &rows,
             ..set.shedding()
         };
-        let stage = match whole.live_rows {
-            None => filter(profile, &whole, &pass, buf, lifted),
-            // The rows written for this pass carry the bits and the counts
-            // the decision read: no reader stands beside them.
-            Some(_) => {
-                let written = RequestFacts {
-                    live_rows: None,
-                    ..whole
-                };
-                filter(profile, &written, &pass, buf, lifted)
-            }
-        };
+        let stage = filter(profile, &whole, &pass, buf, lifted);
         buf.undoubted = rows;
         stage
     } else {
@@ -511,33 +485,16 @@ fn doubted(
 /// host's mask alone doubts are read as they are, with the mask cut to the
 /// rows a hold stands on. A stage that answers from its own scope answers
 /// as it did: the scope was opened over the decision's rows. One pool of
-/// rows a scratch, sized at the first pass that needs it. Beside rows that
-/// carry no live fact ([`RequestFacts::live_rows`]) each row is written
-/// with the bits and the count the decision read of it, the doubt lifted
-/// the same way.
-fn undoubted(facts: &RequestFacts<'_>, candidates: &[Candidate], rows: &mut Vec<Candidate>) {
+/// rows a scratch, sized at the first pass that needs it.
+fn undoubted(candidates: &[Candidate], rows: &mut Vec<Candidate>) {
     rows.clear();
-    match facts.live_rows {
-        None => rows.extend(candidates.iter().map(|row| Candidate {
-            health: Health {
-                stalled: row.health.stalled && row.health.breaker_open,
-                ..row.health
-            },
-            ..*row
-        })),
-        Some(live) => rows.extend(candidates.iter().zip(live.whole()).map(|(row, cell)| {
-            let read = cell.row();
-            let health = read.health();
-            Candidate {
-                health: Health {
-                    stalled: health.stalled && health.breaker_open,
-                    ..health
-                },
-                in_flight: read.in_flight(),
-                ..*row
-            }
-        })),
-    }
+    rows.extend(candidates.iter().map(|row| Candidate {
+        health: Health {
+            stalled: row.health.stalled && row.health.breaker_open,
+            ..row.health
+        },
+        ..*row
+    }));
 }
 
 /// Whether the liveness veto alone refuses a row of these bits: the row

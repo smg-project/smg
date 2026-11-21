@@ -1020,18 +1020,20 @@ impl LiveTest {
 }
 
 /// The live facts of a pool's rows for one decision, read where their owner
-/// keeps them ([`RequestFacts::live_rows`]). A gateway that keeps a
-/// worker's health and its requests in flight on the worker object writes
-/// its rows once a membership, with no live fact in them, and lends this
-/// beside them.
+/// keeps them. A gateway that keeps a worker's health and its requests in
+/// flight on the worker object writes its rows once a membership, with no
+/// live fact in them, and hands this beside them
+/// ([`Engine::decide_live`](crate::engine::Engine::decide_live)). No other decision
+/// is handed one: the rows a store publishes and the rows written for a
+/// decision carry their own facts.
 ///
 /// A decision is made from one value a row: a row's read is kept for the
 /// decision ([`Self::read`], [`Self::whole`]), and every later read of it
-/// returns that. So one read of a worker answers every test of its row and
-/// every stage that reads its count, whatever the worker says meanwhile. A
-/// row the decision does not ask about is not read. The one read that is
-/// not kept is of a row a whole pass refuses ([`Self::pass`]): nothing is
-/// decided from it but that the row does not stand.
+/// returns that. So one read of a worker answers every test of its row,
+/// whatever the worker says meanwhile. A row the decision does not ask
+/// about is not read. The one read that is not kept is of a row a whole
+/// pass refuses ([`Self::pass`]): nothing is decided from it but that the
+/// row does not stand.
 pub trait LiveRows: std::fmt::Debug + Sync {
     /// The live facts of the row at `position` in the rows the decision
     /// is made over. A position past the rows reads as a row that is not
@@ -1056,9 +1058,8 @@ pub trait LiveRows: std::fmt::Debug + Sync {
     ///
     /// The read of a row that passes is kept, and the read of a row that is
     /// refused is not, so a pool mostly refused costs one read and one test
-    /// a row and no more. A decision that goes on to ask about a refused
-    /// row (a pool the pass left nobody) reads the pool through
-    /// [`Self::whole`] and decides by those reads.
+    /// a row and no more. Nothing is decided from a refused row's read: a
+    /// pool the pass leaves nobody is decided over rows written for it.
     ///
     /// The default is the pass over [`Self::whole`], which keeps every
     /// read and tests a named row by the read the decision holds of it.
@@ -1212,17 +1213,6 @@ pub struct RequestFacts<'a> {
     /// The wire's request facts carry it to a controller, and a plugin's
     /// frame keeps `0` under every exposure.
     pub client_key: u64,
-    /// The live facts of the rows, where the rows carry none
-    /// ([`LiveRows`]): a gateway that keeps a worker's health and its
-    /// requests in flight on the worker object writes its rows once a
-    /// membership and lends their reader here. Such a decision is made
-    /// through [`Engine::decide_live`](crate::engine::Engine::decide_live), by a
-    /// profile whose stages read a row's count through
-    /// [`RequestFacts::in_flight`] and none of its health bits
-    /// ([`Engine::decides_live`](crate::engine::Engine::decides_live)). `None`
-    /// where the rows carry their own facts: the rows a store publishes,
-    /// and rows written for the decision. In-process only.
-    pub live_rows: Option<&'a dyn LiveRows>,
 }
 
 /// The multiplier that spreads a session's model and phase over its key.
@@ -1299,17 +1289,12 @@ impl<'a> RequestFacts<'a> {
     /// the row's own count otherwise. Every reader of a row's count asks
     /// here, and none learns which rows it was given. A decision reads one
     /// count a row: beside lent rows the first read is kept, and every
-    /// later read returns it. Beside rows that carry no live fact the
-    /// count is the one their reader read with the row's health bits
-    /// ([`RequestFacts::live_rows`]), kept for the decision as well.
+    /// later read returns it.
     #[inline]
     pub fn in_flight(&self, row: &Candidate) -> u32 {
         match self.lent_in_flight {
             Some(lent) => lent.at(row.position),
-            None => match self.live_rows {
-                None => row.in_flight,
-                Some(live) => live.read(row.position).in_flight(),
-            },
+            None => row.in_flight,
         }
     }
 
@@ -1667,14 +1652,13 @@ mod tests {
 
     /// A request's facts are copied where a decision narrows or resumes
     /// them, so their size is a cost of those decisions: the pin is exact.
-    /// The signal cells are one word, for every signal, the client's key
-    /// is one word more, and the reader of live rows two (a reference to a
-    /// trait object): a field the facts gain moves this number and carries
-    /// the decision bench's cells that copy the facts
+    /// The signal cells are one word, for every signal, and the client's
+    /// key is one word more: a field the facts gain moves this number and
+    /// carries the decision bench's cells that copy the facts
     /// (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 312);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 296);
     }
 
     #[test]

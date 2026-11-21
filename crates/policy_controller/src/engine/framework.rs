@@ -391,12 +391,11 @@ pub trait Scorer: Lifecycle + Debug {
     }
 
     /// Whether the scorer answers over rows that carry no live fact
-    /// ([`Engine::decide_live`]): it reads no health bit and no report off
-    /// a row, and a row's count through the request's facts alone
-    /// ([`RequestFacts::in_flight`]). The default is no, and a profile
-    /// that holds such a scorer is decided over rows written for the
-    /// decision. The engine reads it once per profile when it is built.
-    fn live_wise(&self) -> bool {
+    /// ([`Engine::decide_live`]): it reads no health bit, no count and no
+    /// report off a row. The default is no, and a profile that holds a
+    /// scorer that says no is decided over rows written for the decision.
+    /// The engine reads it once per profile when it is built.
+    fn reads_no_live_fact(&self) -> bool {
         false
     }
 }
@@ -643,13 +642,12 @@ pub trait Picker: Lifecycle + Debug {
     }
 
     /// Whether the picker decides over rows that carry no live fact
-    /// ([`Engine::decide_live`]): it reads no health bit and no report off
-    /// a row, a row's count through the request's facts alone
-    /// ([`RequestFacts::in_flight`]), and it draws its pick by
-    /// [`Picker::draw_live`]. The default is no, and a profile under such a
-    /// picker is decided over rows written for the decision. The engine
-    /// reads it once per profile when it is built.
-    fn live_wise(&self) -> bool {
+    /// ([`Engine::decide_live`]): it reads no health bit, no count and no
+    /// report off a row, and it draws its pick by [`Picker::draw_live`].
+    /// The default is no, and a profile under a picker that says no is
+    /// decided over rows written for the decision. The engine reads it
+    /// once per profile when it is built.
+    fn reads_no_live_fact(&self) -> bool {
         false
     }
 
@@ -1054,10 +1052,6 @@ struct Buffers {
     /// The veto the rule lifted for the rows it kept ([`vetoed::emptied`]):
     /// the mark of its pick's trace ([`vetoed::steered`]).
     lifted: Lifted,
-    /// The rows a draw over live rows landed on and refused, for the whole
-    /// pass it widens to ([`live`]): a picker's own bound of them at the
-    /// most, so a thread's first such draws size it.
-    refused: Vec<u32>,
     /// The pool size every buffer holds room for ([`Buffers::reserve`]).
     room: usize,
 }
@@ -3018,9 +3012,10 @@ pub struct Engine {
     /// ([`keep_folded`]).
     row_tests: Vec<Option<RowTests>>,
     /// Per profile, whether its stages decide over rows that carry no live
-    /// fact ([`live::live_wise`]), said once at the build. A decision over
-    /// live rows reads it ([`Self::decide_live`]), and no other does.
-    live_wise: Vec<bool>,
+    /// fact ([`live::reads_no_live_fact`]), said once at the build. A
+    /// decision over live rows reads it ([`Self::decide_live`]), and no
+    /// other does.
+    reads_no_live_fact: Vec<bool>,
     /// Per profile, which of its leading stages are ranks ([`Order`]). A
     /// decision reads it where the profile's mark says so, and no other
     /// decision does.
@@ -4105,10 +4100,10 @@ impl Engine {
             .iter()
             .map(|profile| RowTests::of(&profile.filters))
             .collect();
-        let live_wise: Vec<bool> = profiles
+        let reads_no_live_fact: Vec<bool> = profiles
             .iter()
             .zip(&row_tests)
-            .map(|(profile, &folded)| live::live_wise(profile, folded))
+            .map(|(profile, &folded)| live::reads_no_live_fact(profile, folded))
             .collect();
         let named_by: Vec<NamedBy> = profiles
             .iter()
@@ -4209,7 +4204,7 @@ impl Engine {
             profile_needs,
             named_by,
             row_tests,
-            live_wise,
+            reads_no_live_fact,
             orders,
             seat_flags: (u8::from(keeping) * KEEPS_DECIDERS) | (u8::from(shadows) * SHADOWS),
             explain_sample: 0,
@@ -4912,11 +4907,6 @@ impl Engine {
         debug_assert_cells(facts.signal_cells, candidates);
         debug_assert_named(facts, candidates);
         debug_assert_keyed(facts, candidates);
-        // This entry's passes read a row's bits as the row's own.
-        debug_assert!(
-            facts.live_rows.is_none(),
-            "rows that carry no live fact are decided through decide_live"
-        );
         if !column_fits(facts.affinity, candidates) {
             return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
         }

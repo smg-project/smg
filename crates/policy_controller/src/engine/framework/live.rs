@@ -1,34 +1,31 @@
 //! A decision over live rows: the rows of a gateway that keeps a worker's
 //! health and its requests in flight on the worker object. Such rows are
 //! written once a membership, with no live fact in them, and their reader
-//! is lent beside them ([`RequestFacts::live_rows`]): a row the decision
-//! asks about is one read of its worker, a row it does not ask about is not
-//! read, and what it decides it decides from one read of each worker.
+//! is handed beside them ([`LiveRows`]): a row the decision asks about is
+//! one read of its worker, a row it does not ask about is not read, and
+//! what it decides it decides from one read of each worker.
 //!
-//! The decision is the profile's own, by the same tests, the same picker
-//! and the same rule for a pool every worker of which is vetoed. Each pass
-//! is compiled once for each kind of rows, and the request's facts are
-//! asked which once a pass:
+//! The decision is the profile's own, by the same tests and the same
+//! picker. The draw and the whole pass by the profile's one test of a row
+//! are written here for live rows ([`run_drawn_live`],
+//! [`keep_folded_live`]). Every pass of a decision over rows that carry
+//! their facts is left as it was: none is entered from here, and none
+//! holds anything of these rows or asks which rows it was handed.
 //!
-//! - The draw and the whole pass by the profile's one test of a row are
-//!   written here for live rows ([`run_drawn_live`], [`keep_folded_live`]).
-//!   Those of rows that carry their facts are not entered from here and
-//!   hold nothing of these: they read a row's bits as the row's own.
-//! - The staged pass and the all-vetoed rule are the ones every decision
-//!   runs. The two filters that read a row's health bits, the rule's two
-//!   looks at the pool and the count's reader each hold a loop for live
-//!   rows beside their own, as the count's reader holds one for a lent
-//!   table. They run over a pool the whole pass left nobody, which is read
-//!   once more for them, every worker's read kept.
+//! What live rows do not decide is handed back ([`Engine::decide_live`]
+//! returns `None`), and its caller writes rows for that decision
+//! ([`Engine::decide`]):
 //!
-//! A profile is decided so where its stages read no live fact off a row
-//! ([`Engine::decides_live`]). Any other is handed back
-//! ([`Engine::decide_live`] returns `None`), and its caller writes rows for
-//! that decision.
+//! - A profile whose stages read a live fact off a row
+//!   ([`Engine::decides_live`]).
+//! - A pool the whole pass leaves nobody. The stages one by one, the soft
+//!   filter that steps aside and the rule for a pool every worker of which
+//!   is vetoed read a row's bits and its count off the row, so they are
+//!   asked over rows that carry them.
 
 use super::{
-    combine, debug_assert_indexed, run_single, score_survivors, shed, trace_drawn, trace_ordered,
-    Buffers, Engine, Entry, Marks, Plan, Profile, Scratch, Set,
+    combine, debug_assert_indexed, score_survivors, shed, trace_by, trace_ordered, Buffers, Engine,
+    Entry, Marks, Plan, Profile, Scratch,
 };
 use crate::{
     document::spec::Needs,
@@ -60,6 +57,46 @@ pub const LIVE_DRAW_FROM: usize = 1;
 /// [`Picker::draw_live`]: super::Picker::draw_live
 /// [`DRAW_BOUND`]: super::DRAW_BOUND
 pub const LIVE_DRAWS: u32 = 16;
+
+/// The refused rows a draw over live rows names to the whole pass it widens
+/// to ([`Refused`]): the most draws a stock picker makes for one row
+/// ([`LIVE_DRAWS`]).
+const REFUSED_NAMED: usize = LIVE_DRAWS as usize;
+
+/// The rows a draw over live rows landed on and refused, kept on the draw's
+/// own stack for the whole pass it widens to ([`LiveRows::pass`]): a
+/// picker's own bound of them at the most. A draw that refuses more names
+/// none, and the pass then tests each row by the read the decision holds.
+struct Refused {
+    rows: [u32; REFUSED_NAMED],
+    len: usize,
+}
+
+impl Refused {
+    const fn new() -> Self {
+        Self {
+            rows: [0; REFUSED_NAMED],
+            len: 0,
+        }
+    }
+
+    /// One more row the draw refused.
+    fn push(&mut self, row: u32) {
+        if let Some(slot) = self.rows.get_mut(self.len) {
+            *slot = row;
+        }
+        // A count past the list's room says a refused row is not named.
+        self.len += 1;
+    }
+
+    /// The rows in rising order, where every refused row is named: what the
+    /// whole pass leaves out. A row the draw landed on twice stands twice.
+    fn named(&mut self) -> Option<&[u32]> {
+        let rows = self.rows.get_mut(..self.len)?;
+        rows.sort_unstable();
+        Some(rows)
+    }
+}
 
 /// [`LIVE_DRAW_FROM`] as the run that sets it turns it: a bench asks the
 /// same decision under each floor in one build.
@@ -103,32 +140,33 @@ fn live_draw_from() -> usize {
 /// Whether a profile's stages decide over rows that carry no live fact: the
 /// build folded its filters into the one test of a row the passes here ask
 /// ([`RowTests::of`]), and its picker and every scorer say they read no
-/// live fact off a row ([`Picker::live_wise`], [`Scorer::live_wise`]).
+/// live fact off a row ([`Picker::reads_no_live_fact`],
+/// [`Scorer::reads_no_live_fact`]).
 ///
-/// [`Picker::live_wise`]: super::Picker::live_wise
-/// [`Scorer::live_wise`]: super::Scorer::live_wise
-pub(super) fn live_wise(profile: &Profile, tests: Option<RowTests>) -> bool {
+/// [`Picker::reads_no_live_fact`]: super::Picker::reads_no_live_fact
+/// [`Scorer::reads_no_live_fact`]: super::Scorer::reads_no_live_fact
+pub(super) fn reads_no_live_fact(profile: &Profile, tests: Option<RowTests>) -> bool {
     tests.is_some()
-        && profile.picker.live_wise()
+        && profile.picker.reads_no_live_fact()
         && profile
             .scorers
             .iter()
-            .all(|weighted| weighted.scorer.live_wise())
+            .all(|weighted| weighted.scorer.reads_no_live_fact())
 }
 
 impl Engine {
     /// Whether a decision for `model` in `phase` is one live rows make
     /// ([`Self::decide_live`]). Its profile's stages read no live fact off
-    /// a row ([`Picker::live_wise`]) and ask nothing of a decision beyond
-    /// the profile's own run but the draw: no scope to open, no rows named,
-    /// no ranks, no engines listed. Its binding is of the single plan and
-    /// holds no sessions rule. A model no binding matches reads so too: its
-    /// decision is a decline, and reads no row.
+    /// a row ([`Picker::reads_no_live_fact`]) and ask nothing of a decision
+    /// beyond the profile's own run but the draw: no scope to open, no rows
+    /// named, no ranks, no engines listed. Its binding is of the single
+    /// plan and holds no sessions rule. A model no binding matches reads so
+    /// too: its decision is a decline, and reads no row.
     ///
     /// A caller asks once a membership, and writes rows for every decision
     /// this says no to.
     ///
-    /// [`Picker::live_wise`]: super::Picker::live_wise
+    /// [`Picker::reads_no_live_fact`]: super::Picker::reads_no_live_fact
     #[must_use]
     pub fn decides_live(&self, model: &str, phase: Phase) -> bool {
         self.resolve(model, phase)
@@ -155,18 +193,16 @@ impl Engine {
     /// binding.
     fn live_at(&self, entry: &Entry, index: u16) -> bool {
         let at = usize::from(index);
-        self.live_wise[at]
+        self.reads_no_live_fact[at]
             && self.marks[at].0 & !Marks::DRAWS_FIRST == 0
             && entry.binding.plan == Plan::Single
             && entry.binding.sessions.is_none()
     }
 
     /// [`Self::decide`] over rows that carry no live fact: `candidates`
-    /// hold no health bit and no count, and the reader lent in the facts
-    /// reads both of a row the decision asks about
-    /// ([`RequestFacts::live_rows`]). No mask and no constraint stand
-    /// beside such rows: a worker's vetoes are its own bits, as its reader
-    /// reads them.
+    /// hold no health bit and no count, and `live` reads both of a row the
+    /// decision asks about. No mask and no constraint stand beside such
+    /// rows: a worker's vetoes are its own bits, as its reader reads them.
     ///
     /// The decision is the profile's own. A row is asked about through the
     /// profile's one test of a row, over the one read of its worker. Over a
@@ -174,16 +210,15 @@ impl Engine {
     /// ([`Picker::draw_live`]). A draw that keeps nobody widens to one pass
     /// over the pool, a read of every worker not read yet, whose survivors
     /// the scorers and the picker are handed as [`Self::decide`] hands
-    /// them. A pool that pass leaves nobody is put to the profile's stages
-    /// one by one, as [`Self::decide`] puts it: they name the stage that
-    /// emptied the pool, let a soft filter step aside and ask the
-    /// all-vetoed rule. They read the pool once more, whole, and decide by
-    /// that one read of each worker: the pass kept no read of a row it
-    /// refused. No row is written.
+    /// them. No row is written.
     ///
-    /// `None` where the decision is not one live rows make
-    /// ([`Self::decides_live`]), or the facts lend no reader: the caller
-    /// writes rows for it and asks [`Self::decide`].
+    /// `None` where live rows do not make the decision: its profile is not
+    /// one they decide ([`Self::decides_live`]), or the whole pass left
+    /// nobody. The caller writes rows for it and asks [`Self::decide`],
+    /// whose stages name the stage that emptied the pool, let a soft filter
+    /// step aside and ask the all-vetoed rule, each over a row's own facts.
+    /// A pool is then read once more for them, as the gateway's own
+    /// placement reads a pool its policy placed nobody in.
     ///
     /// [`Picker::draw_live`]: super::Picker::draw_live
     pub fn decide_live(
@@ -191,6 +226,7 @@ impl Engine {
         facts: &RequestFacts<'_>,
         pool: &PoolFacts<'_>,
         candidates: &[Candidate],
+        live: &dyn LiveRows,
         scratch: &mut Scratch,
     ) -> Option<Decision> {
         #[cfg(debug_assertions)]
@@ -198,7 +234,6 @@ impl Engine {
             scratch.kept_last = false;
         }
         debug_assert_indexed(candidates);
-        let live = facts.live_rows?;
         let Some((entry, index, profile)) = self.resolve(facts.model, facts.phase) else {
             let bare = Trace {
                 seed: facts.seed,
@@ -213,16 +248,6 @@ impl Engine {
         let at = usize::from(index);
         let cx = Constraints::default();
         let tests = self.row_tests[at]?.asked(facts, &cx);
-        // The single plan's rows, under the binding's word for a pool the
-        // overload veto empties, as [`Self::decide`] sets them.
-        let set = Set {
-            candidates,
-            class: None,
-            partnered: None,
-            fold: None,
-            encode: false,
-            vetoed: entry.vetoed,
-        };
         let asked = Asked {
             profile,
             index,
@@ -230,15 +255,12 @@ impl Engine {
             live,
         };
         let buf = &mut scratch.single;
-        let decision = if self.marks[at].ahead() == Marks::DRAWS_FIRST
-            && candidates.len() >= live_draw_from()
-        {
-            run_drawn_live(&asked, facts, pool, set, &cx, buf)
+        if self.marks[at].ahead() == Marks::DRAWS_FIRST && candidates.len() >= live_draw_from() {
+            run_drawn_live(&asked, facts, pool, candidates, &cx, buf)
         } else {
             // No row is read yet.
-            run_whole_live(&asked, facts, pool, set, &cx, buf, Some(&[]))
-        };
-        Some(decision)
+            run_whole_live(&asked, facts, pool, candidates, &cx, buf, Some(&[]))
+        }
     }
 }
 
@@ -290,13 +312,10 @@ fn keep_folded_live(
 /// The whole pass of a decision over live rows, and the one its draw widens
 /// to ([`run_drawn_live`]): the rows the profile's one test keeps
 /// ([`keep_folded_live`]), then the scoring half of the profile's run, as
-/// over rows that carry their facts. Where the test keeps no row the stages
-/// run one by one ([`run_single`]), as they do behind
-/// [`keep_folded`](super::keep_folded): they alone name the stage that
-/// emptied the pool, let a soft filter step aside and ask the all-vetoed
-/// rule. Each reads the pool through [`LiveRows::whole`], which reads once
-/// more every worker the pass refused and keeps each read: what they
-/// decide, they decide from that one read of each worker.
+/// over rows that carry their facts. `None` where the test keeps no row:
+/// what decides such a pool reads a row's facts off the row, and the pass
+/// kept no read of a row it refused, so the decision is handed back for
+/// rows written for it ([`Engine::decide_live`]).
 ///
 /// `refused` is [`LiveRows::pass`]'s: the rows a draw read before this
 /// pass, where it refused each and the decision read no other.
@@ -305,23 +324,20 @@ fn run_whole_live(
     asked: &Asked<'_>,
     facts: &RequestFacts<'_>,
     pool: &PoolFacts<'_>,
-    set: Set<'_>,
+    candidates: &[Candidate],
     cx: &Constraints<'_>,
     buf: &mut Buffers,
     refused: Option<&[u32]>,
-) -> Decision {
+) -> Option<Decision> {
     let &Asked {
         profile,
         index,
         tests,
         live,
     } = asked;
-    let candidates = set.candidates;
     buf.reserve(candidates.len());
-    if keep_folded_live(tests, live, refused, facts, candidates, cx, &mut buf.kept) {
-        return score_survivors(profile, index, facts, pool, candidates, buf);
-    }
-    run_single(profile, index, facts, pool, set, cx, buf)
+    keep_folded_live(tests, live, refused, facts, candidates, cx, &mut buf.kept)
+        .then(|| score_survivors(profile, index, facts, pool, candidates, buf))
 }
 
 /// A decision over live rows by a picker that draws first
@@ -335,31 +351,31 @@ fn run_whole_live(
 /// ([`run_drawn`](super::run_drawn)). The pass is told the rows the draw
 /// refused and reads the others: a row the draw landed on is not read
 /// again, and no row of the pool is looked up for a read it does not hold.
+/// `None` where that pass keeps nobody, as it says.
 #[inline(never)]
 fn run_drawn_live(
     asked: &Asked<'_>,
     facts: &RequestFacts<'_>,
     pool: &PoolFacts<'_>,
-    set: Set<'_>,
+    candidates: &[Candidate],
     cx: &Constraints<'_>,
     buf: &mut Buffers,
-) -> Decision {
+) -> Option<Decision> {
     let &Asked {
         profile,
         index,
         tests,
         live,
     } = asked;
-    let candidates = set.candidates;
     buf.reserve(candidates.len());
     buf.kept.clear();
-    buf.refused.clear();
+    let mut refused = Refused::new();
     let mut draw = Draw::new(facts.seed);
     // Whether the draw kept a row it asked about: one that keeps a row and
     // gives up holds a read the refused rows do not name.
     let mut kept_one = false;
     let drew = {
-        let refused = &mut buf.refused;
+        let refused = &mut refused;
         let mut ask = |c: &Candidate| {
             let keeps = tests.keeps_live(live.read(c.position), facts, c, cx);
             if keeps {
@@ -404,8 +420,10 @@ fn run_drawn_live(
         );
         if !targets.is_empty() {
             // Rows no scorer ordered all score zero, and their best are
-            // the first drawn: the trace [`trace_drawn`] reads off the
-            // scores, with no pass over them.
+            // the first drawn: the trace a draw reads off the scores, with
+            // no pass over them. Scored rows are read as a draw's, by the
+            // body the draw over rows that carry their facts enters through
+            // its own one caller (`trace_drawn`), which stays that.
             let trace = if profile.scorers.is_empty() {
                 let drawn = buf
                     .kept
@@ -413,26 +431,23 @@ fn run_drawn_live(
                     .map(|&row| (candidates[row as usize].id, 0.0));
                 trace_ordered(index, facts, pool, drawn)
             } else {
-                trace_drawn(index, facts, pool, candidates, &buf.kept, &buf.scores)
+                trace_by::<true>(index, facts, pool, candidates, &buf.kept, &buf.scores)
             };
-            return Decision::Pick(Pick {
+            return Some(Decision::Pick(Pick {
                 targets,
                 trace,
                 session_verdict: SessionVerdict::None,
-            });
+            }));
         }
     }
-    // The pass borrows every buffer: the refused rows stand apart for it.
-    let mut refused = std::mem::take(&mut buf.refused);
-    refused.sort_unstable();
-    let named = (!kept_one).then_some(refused.as_slice());
-    let mut decision = run_whole_live(asked, after, pool, set, cx, buf, named);
-    buf.refused = refused;
+    let named = if kept_one { None } else { refused.named() };
+    let mut decision = run_whole_live(asked, after, pool, candidates, cx, buf, named);
     // The trace keeps the request's seed, from which the decision replays.
     match &mut decision {
-        Decision::Pick(pick) => pick.trace.seed = facts.seed,
-        Decision::Shed(shed) => shed.trace.seed = facts.seed,
-        Decision::Queue(queue) => queue.trace.seed = facts.seed,
+        Some(Decision::Pick(pick)) => pick.trace.seed = facts.seed,
+        Some(Decision::Shed(shed)) => shed.trace.seed = facts.seed,
+        Some(Decision::Queue(queue)) => queue.trace.seed = facts.seed,
+        None => {}
     }
     decision
 }
@@ -448,7 +463,7 @@ mod tests {
     use crate::{
         document::spec::PolicySpec,
         engine::{
-            decision::{Decision, Lifted, ShedReason},
+            decision::{Decision, ShedReason},
             view::{
                 Candidate, Constraints, Health, LiveCell, LiveRow, LiveRows, LiveTest, Phase,
                 PoolFacts, RequestFacts, WorkerId,
@@ -622,11 +637,7 @@ mod tests {
         facts: &RequestFacts<'_>,
         scratch: &mut Scratch,
     ) -> (Option<Decision>, usize) {
-        let lent = RequestFacts {
-            live_rows: Some(rows),
-            ..*facts
-        };
-        let decision = engine.decide_live(&lent, &pool_of(bare), bare, scratch);
+        let decision = engine.decide_live(facts, &pool_of(bare), bare, rows, scratch);
         (decision, rows.next())
     }
 
@@ -879,6 +890,66 @@ mod tests {
         }
     }
 
+    /// A pool that earns turns ahead, with a run of rows not ready longer
+    /// than those turns: 64 rows, 16 in a row not ready, three turns a
+    /// decision. A decision whose turns all land in the run reads the pool
+    /// whole and takes the survivors' own turn, and every other is placed
+    /// by the pool's turn. Both rotations are exact, so the shares are.
+    /// Each turn of the pool places 53 requests: one on each of the 48
+    /// ready rows by the pool's turn, and five by the survivors' rotation,
+    /// whose turns were the first fifteen rows of the run. Over 48 turns of
+    /// the pool the survivors' rotation comes round five times, so each
+    /// ready row is named 53 times and no row of the run once.
+    #[test]
+    fn a_run_of_rows_not_ready_longer_than_the_turns_keeps_the_shares_exact() {
+        const ROWS: u32 = 64;
+        const RUN: std::ops::Range<u32> = 20..36;
+        assert_eq!(live_turns(ROWS as usize), 3);
+        let engine = preset("round_robin");
+        let bare = bare(ROWS);
+        let live = (0..ROWS).map(|at| {
+            if RUN.contains(&at) {
+                not_ready()
+            } else {
+                ready()
+            }
+        });
+        let rows = Rows::of(live.collect());
+        let mut scratch = Scratch::default();
+        let mut seed = 0;
+        let mut next = || {
+            seed += 1;
+            let (decision, reads) = decide(&engine, &rows, &bare, &facts(seed), &mut scratch);
+            let row = named(&decision.expect("live rows decide it")).expect("a row is named");
+            (row, reads)
+        };
+        // Up to the pool's turn on the row in front of the run: the pool's
+        // next turn enters the run.
+        while next() != (RUN.start - 1, 1) {}
+        let mut times = [0u32; ROWS as usize];
+        let (mut by_turn, mut by_pass) = (0u32, 0u32);
+        for _ in 0..48 * 53 {
+            let (row, reads) = next();
+            times[row as usize] += 1;
+            // A decision that reads the pool whole reads every worker once:
+            // its turns' three, and the pass's others.
+            if reads == ROWS as usize {
+                by_pass += 1;
+            } else {
+                assert!(
+                    reads <= 2,
+                    "a decision placed by a turn read {reads} workers"
+                );
+                by_turn += 1;
+            }
+        }
+        assert_eq!((by_turn, by_pass), (48 * 48, 48 * 5));
+        for (at, &times) in (0u32..).zip(&times) {
+            let expected = if RUN.contains(&at) { 0 } else { 53 };
+            assert_eq!(times, expected, "row {at}");
+        }
+    }
+
     /// The turns a pool's size earns: a small pool goes to the whole pass
     /// at once, as the survivors' rotation always did, and a larger pool
     /// takes one more turn for each 32 rows, eight more at the most.
@@ -975,73 +1046,43 @@ mod tests {
         }
     }
 
-    /// A pool none of whose rows passes every filter is put to the stages
-    /// and the all-vetoed rule, which read the pool once more, whole, and
-    /// decide by that one read of each worker: a worker the pass refused is
-    /// read a second time, as the classic placement reads it, and none a
-    /// third. A pool nobody serves is shed at the health filter. A pool over
-    /// its thresholds on every row is steered to the row with the fewest
-    /// requests in flight, and so is a pool the liveness doubt alone
-    /// refuses: each trace says the veto lifted.
+    /// A pool none of whose rows passes every filter is handed back: what
+    /// decides such a pool reads a row's facts off the row, so the caller
+    /// writes rows for it. Each worker was read once by then: the rows the
+    /// draw landed on by the draw, the others by the pass. So with a pool
+    /// nobody serves, a pool over its thresholds on every row and a pool
+    /// the liveness doubt alone refuses.
     #[test]
-    fn a_pool_every_row_of_which_is_refused_is_read_once_more_and_put_to_the_rule() {
-        // Every worker once, and once more each the pass refused unkept.
-        let twice = |reads: usize| (24..48).contains(&reads);
+    fn a_pool_every_row_of_which_is_refused_is_handed_back_after_one_read_a_worker() {
         for name in ["round_robin", "random"] {
             let engine = preset(name);
             let bare = bare(24);
             let mut scratch = Scratch::default();
-
-            let nobody = Rows::of(vec![not_ready(); 24]);
-            let (decision, reads) = decide(&engine, &nobody, &bare, &facts(3), &mut scratch);
-            let Some(Decision::Shed(shed)) = decision else {
-                panic!("{name}: a pool nobody serves is shed");
+            let doubted = Health {
+                stalled: true,
+                ..READY
             };
-            assert_eq!(
-                (shed.reason, shed.emptied_by),
-                (ShedReason::NoEndpoints, "healthy")
-            );
-            assert!(twice(reads), "{name}: {reads} reads");
-
-            // Every row over its thresholds, the fewest requests on row 17.
-            let busy = (0..24u32).map(|at| overloaded((at + 7) % 24));
-            let busy = Rows::of(busy.collect());
-            for seed in 1..=16 {
-                let (decision, reads) = decide(&engine, &busy, &bare, &facts(seed), &mut scratch);
-                let Some(Decision::Pick(pick)) = decision else {
-                    panic!("{name}: a pool over its thresholds is steered");
-                };
-                assert_eq!(
-                    pick.targets.as_slice().first().map(|t| t.position),
-                    Some(17)
-                );
-                assert_eq!(pick.trace.lifted, Lifted::Overload);
-                assert!(twice(reads), "{name}: {reads} reads");
+            let pools = [
+                ("nobody serves", vec![not_ready(); 24]),
+                ("over its thresholds", (0..24).map(overloaded).collect()),
+                ("doubted", vec![LiveRow::new(doubted, 3); 24]),
+            ];
+            for (pool, live) in pools {
+                let rows = Rows::of(live);
+                for seed in 1..=16 {
+                    let (decision, reads) =
+                        decide(&engine, &rows, &bare, &facts(seed), &mut scratch);
+                    assert!(decision.is_none(), "{name}, {pool}: handed back");
+                    assert_eq!(reads, 24, "{name}, {pool}: one read a worker");
+                }
             }
-
-            // Every row doubted and nothing harder, the fewest on row 5.
-            let doubted = (0..24u32).map(|at| {
-                let health = Health {
-                    stalled: true,
-                    ..READY
-                };
-                LiveRow::new(health, (at + 19) % 24)
-            });
-            let doubted = Rows::of(doubted.collect());
-            let (decision, reads) = decide(&engine, &doubted, &bare, &facts(9), &mut scratch);
-            let Some(Decision::Pick(pick)) = decision else {
-                panic!("{name}: a doubted pool still takes the request");
-            };
-            assert_eq!(pick.targets.as_slice().first().map(|t| t.position), Some(5));
-            assert_eq!(pick.trace.lifted, Lifted::Liveness);
-            assert!(twice(reads), "{name}: {reads} reads");
         }
     }
 
     /// What live rows do not decide is handed back: a profile whose stages
-    /// read a row's facts off the row, and facts that lend no reader. A
+    /// read a row's facts off the row, and no worker is read for it. A
     /// model no binding matches is declined at once, and no worker is read
-    /// for it.
+    /// for it either.
     #[test]
     fn a_decision_live_rows_do_not_make_is_handed_back() {
         let bare = bare(8);
@@ -1051,10 +1092,6 @@ mod tests {
         let (asked, reads) = decide(&by_load, &rows, &bare, &facts(1), &mut scratch);
         assert!(asked.is_none(), "least load reads a row's reports");
         assert_eq!(reads, 0);
-
-        let rotation = preset("round_robin");
-        let unlent = rotation.decide_live(&facts(1), &pool_of(&bare), &bare, &mut scratch);
-        assert!(unlent.is_none(), "no reader is lent");
 
         let mut bound = PolicySpec::preset("round_robin").expect("a built-in preset");
         bound.generation = 1;
@@ -1075,8 +1112,9 @@ mod tests {
     }
 
     /// A retry names the rows it tried and is placed on another while one
-    /// stands. Where it tried every row the soft filter steps aside, as
-    /// over rows that carry their facts, and a tried row takes the request.
+    /// stands. Where it tried every row the test keeps nobody and the
+    /// decision is handed back: over rows written for it the soft filter
+    /// steps aside, and a tried row takes the request.
     #[test]
     fn a_retry_over_live_rows_is_placed_on_a_row_it_did_not_try() {
         let engine = preset("round_robin");
@@ -1097,7 +1135,7 @@ mod tests {
                 ..facts(seed)
             };
             let (decision, reads) = decide(&engine, &rows, &bare, &last, &mut scratch);
-            assert!(named(&decision.expect("live rows decide it")).is_some());
+            assert!(decision.is_none(), "every row is tried: handed back");
             assert_eq!(reads, 3, "one read a worker");
         }
     }

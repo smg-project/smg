@@ -47,7 +47,7 @@ impl Picker for Random {
     }
 
     // Reads no fact of a row: its draw is its whole rule.
-    fn live_wise(&self) -> bool {
+    fn reads_no_live_fact(&self) -> bool {
         true
     }
 

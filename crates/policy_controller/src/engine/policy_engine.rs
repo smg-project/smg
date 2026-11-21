@@ -20,16 +20,17 @@
 //!   decision asks about are read: one where the rotation's worker takes
 //!   the request, and the whole pool only where no worker near the turn
 //!   does. A pass over the whole pool is the classic policy's: one read
-//!   and one test a worker. Where it finds nobody, the pool is read once
-//!   more for the rule that decides such a pool, as the classic placement
-//!   reads it. The decision's scratch is the calling thread's own: no lock
-//!   is taken and nothing is allocated after a thread's first decisions.
-//! - **Rows written for a decision.** Two kinds of decision are made over
-//!   rows written for them, one read of each worker left: a request its
-//!   router limits to some of the pool's workers
-//!   ([`PlacementRequest::refused`]), and a profile whose stages read a
-//!   row's facts off the row ([`Engine::decides_live`]). The rows go into
-//!   a list the thread keeps.
+//!   and one test a worker. The decision's scratch is the calling thread's
+//!   own: no lock is taken and nothing is allocated after a thread's first
+//!   decisions.
+//! - **Rows written for a decision.** Three kinds of decision are made
+//!   over rows written for them, one read of each worker left: a request
+//!   its router limits to some of the pool's workers
+//!   ([`PlacementRequest::refused`]), a profile whose stages read a row's
+//!   facts off the row ([`Engine::decides_live`]), and a pool the pass
+//!   over its own rows left nobody, which is read once more for the rule
+//!   that decides such a pool, as the classic placement reads it. The rows
+//!   go into a list the thread keeps.
 //!
 //! The engine keeps no worker list, no health and no count of requests in
 //! flight. What it keeps is its stages' own: a rotation, a session's pins.
@@ -376,6 +377,15 @@ impl PolicyEngine {
         } else {
             u64::try_from(self.origin.elapsed().as_micros()).unwrap_or(u64::MAX)
         };
+        let facts = RequestFacts {
+            model: request.model,
+            model_fingerprint: spelled.model,
+            phase: request.phase,
+            tried: request.tried,
+            seed,
+            now_micros,
+            ..RequestFacts::default()
+        };
         if in_place {
             let rows = WorkerRows {
                 workers: &members.workers,
@@ -383,15 +393,15 @@ impl PolicyEngine {
                 mark,
                 whole: AtomicBool::new(false),
             };
-            let lent = facts_of(request, spelled.model, seed, now_micros, Some(&rows));
-            if let Some(decision) = engine.decide_live(&lent, &pool, &members.rows, scratch) {
+            let decided = engine.decide_live(&facts, &pool, &members.rows, &rows, scratch);
+            if let Some(decision) = decided {
                 return placed(decision, members, None);
             }
         }
-        let facts = facts_of(request, spelled.model, seed, now_micros, None);
         // Rows written for this decision, each with one read of its worker:
-        // a request held to some of the pool's workers, or a profile whose
-        // stages read a row's facts off the row.
+        // a request held to some of the pool's workers, a profile whose
+        // stages read a row's facts off the row, or a pool the pass over
+        // its own rows left nobody.
         write(members, request.refused, written, positions);
         let pool = PoolFacts {
             reach: reach_of(request.refused),
@@ -454,29 +464,6 @@ impl PolicyEngine {
             labels: listed.labels,
             ..Candidate::default()
         }
-    }
-}
-
-/// The facts of one decision for `request`, built once: with the reader of
-/// the pool's live rows where the decision is made over the pool's own
-/// rows, and with none where rows are written for it.
-#[inline(always)]
-fn facts_of<'a>(
-    request: &PlacementRequest<'a>,
-    model_fingerprint: ModelFingerprint,
-    seed: u64,
-    now_micros: u64,
-    live_rows: Option<&'a dyn LiveRows>,
-) -> RequestFacts<'a> {
-    RequestFacts {
-        model: request.model,
-        model_fingerprint,
-        phase: request.phase,
-        tried: request.tried,
-        seed,
-        now_micros,
-        live_rows,
-        ..RequestFacts::default()
     }
 }
 
@@ -1009,10 +996,12 @@ mod tests {
     /// The pool's own rows and rows written with the same facts decide
     /// alike: two engines of one document, one asked over the reader and
     /// one over written rows, give the same answer for the same seeds.
-    /// Over a pool all ready each names the same worker. Over a pool every
-    /// worker of which is over its thresholds each is steered to the one
-    /// worker with the fewest requests in flight. Over a pool nobody
-    /// serves each sheds at the health filter.
+    /// Over a pool all ready each names the same worker. A pool the pass
+    /// leaves nobody is handed back by the reader's engine, and the front
+    /// places it as the engine asked over written rows decides it: a pool
+    /// every worker of which is over its thresholds is steered to the one
+    /// worker with the fewest requests in flight, and a pool nobody serves
+    /// is shed at the health filter.
     #[test]
     fn the_pools_own_rows_and_written_rows_decide_alike() {
         // What sets a fleet's worker at a place of its list.
@@ -1073,20 +1062,13 @@ mod tests {
                         mark,
                         whole: AtomicBool::new(false),
                     };
-                    let lent = RequestFacts {
-                        live_rows: Some(&reader),
-                        ..facts
-                    };
-                    let by_reader = live
-                        .spec()
-                        .engine()
-                        .decide_live(
-                            &lent,
-                            &pool_of(&members),
-                            &members.rows,
-                            &mut workspace.scratch,
-                        )
-                        .expect("the pool's own rows decide it");
+                    let by_reader = live.spec().engine().decide_live(
+                        &facts,
+                        &pool_of(&members),
+                        &members.rows,
+                        &reader,
+                        &mut workspace.scratch,
+                    );
                     let by_rows = written.spec().engine().decide(
                         &facts,
                         &pool_of(&other),
@@ -1102,14 +1084,25 @@ mod tests {
                         Decision::Shed(shed) => (None, shed.emptied_by, shed.trace.lifted),
                         Decision::Queue(queue) => (None, "queue", queue.trace.lifted),
                     };
-                    assert_eq!(
-                        said(&by_reader),
-                        said(&by_rows),
-                        "{name}, {fleet}, seed {seed}"
-                    );
+                    let (first, emptied_by, _) = said(&by_rows);
+                    match by_reader {
+                        Some(by_reader) => {
+                            assert_eq!(fleet, "all ready", "{name}: a worker stands");
+                            assert_eq!(said(&by_reader), said(&by_rows), "{name}, seed {seed}");
+                        }
+                        None => {
+                            assert_ne!(fleet, "all ready", "{name}: handed back");
+                            match live.place(&PlacementRequest::of(MODEL), &members) {
+                                Ok(placed) => assert_eq!(Some(placed.id()), first, "{name}"),
+                                Err(unplaced) => {
+                                    assert_eq!((None, unplaced.emptied_by), (first, emptied_by));
+                                }
+                            }
+                        }
+                    }
                     if fleet == "all over their thresholds" {
                         let idle = members.id_at(7).expect("a row");
-                        assert_eq!(said(&by_reader).0, Some(idle), "{name}, seed {seed}");
+                        assert_eq!(first, Some(idle), "{name}, seed {seed}");
                     }
                 }
             }
@@ -1304,15 +1297,15 @@ mod tests {
         }
     }
 
-    /// A pool none of whose workers passes every filter is decided by the
-    /// engine's staged pass and its rule for such a pool, over the same
-    /// reads: a pool nobody serves places the request on no worker and
-    /// names the filter that left none, a pool over its overload
-    /// thresholds is steered to the worker with the fewest requests in
-    /// flight, and a retry that tried every worker is placed on one of
-    /// them again.
+    /// A pool none of whose workers passes every filter is decided over
+    /// rows written for it, by the engine's stages one by one and its rule
+    /// for such a pool: a pool nobody serves places the request on no
+    /// worker and names the filter that left none, a pool over its
+    /// overload thresholds is steered to the worker with the fewest
+    /// requests in flight, and a retry that tried every worker is placed
+    /// on one of them again.
     #[test]
-    fn a_pool_no_worker_of_which_passes_is_decided_by_the_staged_pass() {
+    fn a_pool_no_worker_of_which_passes_is_decided_over_written_rows() {
         let engine = preset("round_robin");
         let request = PlacementRequest::of(MODEL);
 
