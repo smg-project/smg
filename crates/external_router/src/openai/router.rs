@@ -68,6 +68,7 @@ pub struct OpenAIRouter {
     healthy: AtomicBool,
     shared_components: Arc<SharedComponents>,
     responses_components: Arc<ResponsesComponents>,
+    request_timeout: std::time::Duration,
     retry_config: RetryConfig,
     realtime_registry: Arc<RealtimeRegistry>,
     webrtc_bind_addr: Option<IpAddr>,
@@ -113,6 +114,7 @@ impl OpenAIRouter {
             healthy: AtomicBool::new(true),
             shared_components,
             responses_components,
+            request_timeout: ctx.request_timeout,
             retry_config: ctx.retry.clone(),
             realtime_registry: ctx.realtime.clone(),
             webrtc_bind_addr: ctx.webrtc_bind_addr,
@@ -184,7 +186,15 @@ impl ExternalRouter for OpenAIRouter {
             provider_registry: &self.provider_registry,
             responses_components: &self.responses_components,
         };
-        responses_route::route_responses(&deps, headers, tenant_meta, &body, model_id).await
+        responses_route::route_responses(
+            &deps,
+            headers,
+            tenant_meta,
+            &body,
+            model_id,
+            self.request_timeout,
+        )
+        .await
     }
 
     async fn route_realtime_session(

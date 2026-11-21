@@ -45,6 +45,10 @@ pub(crate) enum StreamAction {
     /// [`StreamAction::ExecuteTools`], this variant does NOT kick the tool
     /// loop — native passthrough items are not tracked in the handler's
     /// pending-call registry, so there is nothing to dispatch.
+    ///
+    /// Also used for the upstream's own `output_item.done` of a call the
+    /// tool loop took already (the relay reads a turn on after a
+    /// hand-over): the loop writes that call's umbrella itself.
     Drop,
     /// The upstream signalled tool-call completion — run the MCP tool now.
     ///
@@ -158,6 +162,11 @@ pub(crate) struct StreamingToolHandler {
     /// path and drop the duplicate/mis-ordered umbrella without kicking the
     /// tool loop.
     native_passthrough_tool_call_indices: HashSet<usize>,
+    /// Upstream output indices of the calls [`Self::take_pending_calls`]
+    /// handed to the tool loop. The loop writes each call's
+    /// `output_item.done` itself, so the upstream's own umbrella for such a
+    /// call, read when the relay goes on with the turn, is dropped.
+    dispatched_tool_call_indices: HashSet<usize>,
 }
 
 impl StreamingToolHandler {
@@ -168,6 +177,7 @@ impl StreamingToolHandler {
             output_index_mapper: OutputIndexMapper::with_start(start),
             original_response_id: None,
             native_passthrough_tool_call_indices: HashSet::new(),
+            dispatched_tool_call_indices: HashSet::new(),
         }
     }
 
@@ -301,6 +311,15 @@ impl StreamingToolHandler {
                     StreamAction::ExecuteTools {
                         forward_triggering_event: false,
                     }
+                } else if is_tool_call_done
+                    && done_output_index
+                        .is_some_and(|idx| self.dispatched_tool_call_indices.contains(&idx))
+                {
+                    // The tool loop took this call and wrote its
+                    // `output_item.done` itself: the upstream's own
+                    // umbrella, read after the hand-over, is dropped and
+                    // does not kick the loop again.
+                    StreamAction::Drop
                 } else if is_tool_call_done
                     && done_output_index
                         .is_some_and(|idx| self.native_passthrough_tool_call_indices.remove(&idx))
@@ -506,6 +525,8 @@ impl StreamingToolHandler {
     }
 
     pub fn take_pending_calls(&mut self) -> Vec<FunctionCallInProgress> {
+        self.dispatched_tool_call_indices
+            .extend(self.pending_calls.iter().map(|call| call.output_index));
         std::mem::take(&mut self.pending_calls)
     }
 }
@@ -728,6 +749,47 @@ mod tests {
             ),
             other => panic!("expected ExecuteTools, got {other:?}"),
         }
+    }
+
+    /// The relay reads a turn on after the loop took a call: the upstream's
+    /// own `output_item.done` of that call is dropped (the loop writes the
+    /// call's umbrella itself) and does not kick the loop again.
+    #[test]
+    fn the_upstreams_done_of_a_call_the_loop_took_is_dropped() {
+        let mut handler = StreamingToolHandler::with_starting_index(0);
+        bootstrap_function_call_added(&mut handler);
+        let args_done = r#"{
+          "type": "response.function_call_arguments.done",
+          "output_index": 0,
+          "item_id": "fc_test",
+          "arguments": "{}"
+        }"#;
+        let action =
+            handler.process_event(Some("response.function_call_arguments.done"), args_done);
+        assert!(
+            matches!(action, StreamAction::ExecuteTools { .. }),
+            "{action:?}"
+        );
+        assert_eq!(handler.take_pending_calls().len(), 1);
+
+        let item_done = r#"{
+          "type": "response.output_item.done",
+          "output_index": 0,
+          "item": {
+            "type": "function_call",
+            "id": "fc_test",
+            "call_id": "call_test",
+            "name": "image_generation",
+            "arguments": "{}",
+            "status": "completed"
+          }
+        }"#;
+        let action = handler.process_event(Some("response.output_item.done"), item_done);
+        assert!(
+            matches!(action, StreamAction::Drop),
+            "expected Drop for the umbrella of a call the loop took, got {action:?}"
+        );
+        assert!(handler.take_pending_calls().is_empty());
     }
 
     #[test]

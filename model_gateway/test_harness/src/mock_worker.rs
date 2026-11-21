@@ -1173,6 +1173,78 @@ async fn completions_handler(
     }
 }
 
+/// A Responses request whose `instructions` hold this text makes the mock's
+/// streamed tool turn ask for two tools, each call streamed whole before the
+/// next opens, the way the public API streams a turn of parallel calls.
+const TWO_CALL_TURN: &str = "ask for two tools in one turn";
+
+fn asks_for_two_calls(payload: &serde_json::Value) -> bool {
+    payload
+        .get("instructions")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|text| text.contains(TWO_CALL_TURN))
+}
+
+/// The second call of a two-call turn: its item opened at output index 1,
+/// its arguments, its item closed.
+fn second_function_call_events() -> Vec<Result<Event, Infallible>> {
+    let call_id = format!("call_{}", &Uuid::now_v7().simple().to_string()[..24]);
+    let item_id = format!("fc_{}", Uuid::now_v7().simple());
+    let arguments = "{\"query\":\"a second search\"}";
+    let event = |name: &str, data: serde_json::Value| {
+        Ok(Event::default().event(name).data(data.to_string()))
+    };
+    vec![
+        event(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "id": item_id,
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": "brave_web_search",
+                    "arguments": "",
+                    "status": "in_progress"
+                }
+            }),
+        ),
+        event(
+            "response.function_call_arguments.delta",
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 1,
+                "item_id": item_id,
+                "delta": arguments
+            }),
+        ),
+        event(
+            "response.function_call_arguments.done",
+            json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": 1,
+                "item_id": item_id
+            }),
+        ),
+        event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "id": item_id,
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": "brave_web_search",
+                    "arguments": arguments,
+                    "status": "completed"
+                }
+            }),
+        ),
+    ]
+}
+
 #[expect(
     clippy::unwrap_used,
     reason = "test helper - panicking on failure is intentional"
@@ -1262,7 +1334,7 @@ async fn responses_handler(
             let item_id = format!("fc_{}", Uuid::now_v7().simple());
             let rid = request_id.clone();
 
-            let events = vec![
+            let mut events = vec![
                 // response.created
                 Ok::<_, Infallible>(
                     Event::default().event("response.created").data(
@@ -1398,6 +1470,11 @@ async fn responses_handler(
                 // [DONE]
                 Ok(Event::default().data("[DONE]")),
             ];
+            if asks_for_two_calls(&payload) {
+                // Before `response.completed` and `[DONE]`.
+                let at = events.len() - 2;
+                events.splice(at..at, second_function_call_events());
+            }
 
             let stream = stream::iter(events);
             Sse::new(stream)

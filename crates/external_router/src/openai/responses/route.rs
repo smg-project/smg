@@ -4,7 +4,10 @@
 //! `router.rs` packs borrowed references into [`ResponsesRouterContext`] and
 //! delegates to [`route_responses`].
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{http::HeaderMap, response::Response};
 use openai_protocol::{
@@ -45,6 +48,7 @@ pub(in crate::openai) async fn route_responses(
     tenant_meta: &TenantRequestMeta,
     body: &ResponsesRequest,
     model_id: &str,
+    request_timeout: Duration,
 ) -> Response {
     let start = Instant::now();
     let model = model_id;
@@ -174,7 +178,9 @@ pub(in crate::openai) async fn route_responses(
     });
 
     let response = if ctx.is_streaming() {
-        handle_streaming_response(ctx).await
+        super::STREAMING_REQUEST_TIMEOUT
+            .scope(request_timeout, handle_streaming_response(ctx))
+            .await
     } else {
         handle_non_streaming_response(ctx).await
     };
