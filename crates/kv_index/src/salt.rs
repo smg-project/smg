@@ -249,4 +249,32 @@ mod tests {
             }
         }
     }
+
+    /// Six blocks' hashes as values, plain and under a namespace. Workers
+    /// report their blocks under these hashes and stored snapshots hold
+    /// them, so a change in how a block is hashed may not move one. The
+    /// lengths take each regime of the hash: up to 16 bytes, up to 128, up
+    /// to 240, and beyond that up to 1,200.
+    #[test]
+    fn block_hashes_are_the_recorded_values() {
+        let tokens: Vec<u32> = (0..300).map(|i| i * 7919 + 3).collect();
+        let namespace = namespace_seed(Some("adapter"), Some("salty"));
+        let recorded: [(usize, u64, u64); 6] = [
+            (1, 0x8020_bf96_9d17_68ca, 0xeb4c_1e87_7ab1_a673),
+            (16, 0x5232_5333_90ea_4d1e, 0x24cf_7f3e_4dd1_08b1),
+            (33, 0x6822_087f_c70d_046a, 0x1b6c_1dfb_43f0_3eb1),
+            (64, 0x4baf_d877_ac9f_d0a1, 0xf325_60f0_3962_ee10),
+            (256, 0x1bb3_97e2_fe40_51ec, 0x2db7_b5a4_7ed0_6f9a),
+            (300, 0xc837_2a8c_c85e_f860, 0xf164_947b_61d5_fd41),
+        ];
+        for (len, plain, namespaced) in recorded {
+            let block = &tokens[..len];
+            assert_eq!(compute_content_hash(block).0, plain, "{len} tokens");
+            assert_eq!(
+                content_hash_with_seed(block, namespace).0,
+                namespaced,
+                "{len} tokens under a namespace"
+            );
+        }
+    }
 }
