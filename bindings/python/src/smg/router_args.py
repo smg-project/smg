@@ -446,6 +446,7 @@ class RouterArgs:
     enable_igw: bool = False  # Enable IGW (Inference Gateway) mode for multi-model support
     # The mesh server (the mesh_* fields configure it)
     enable_mesh: bool = False
+    enable_responses_websocket: bool = False
     enable_rl: bool = False  # Mount the RL control plane under /v1/rl
     # Tracing (otlp_traces_endpoint names the collector)
     enable_trace: bool = False
@@ -2332,6 +2333,12 @@ class RouterArgs:
                 " not pre-open. 0 keeps idle connections open until the client"
                 " closes them"
             ),
+        )
+        request_group.add_argument(
+            f"--{prefix}enable-responses-websocket",
+            action="store_true",
+            default=RouterArgs.enable_responses_websocket,
+            help="Enable authenticated GET upgrades on /v1/responses for store:false sessions",
         )
         request_group.add_argument(
             f"--{prefix}max-connections",

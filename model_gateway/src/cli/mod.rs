@@ -1362,6 +1362,10 @@ struct ServingArgs {
     #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
     max_connections: usize,
 
+    /// Enable authenticated GET upgrades on /v1/responses for store:false sessions
+    #[arg(long, help_heading = "Request Handling")]
+    enable_responses_websocket: bool,
+
     /// Most client connections the admin listener (--admin-port) holds open
     /// at once, the bound --max-connections puts on the data listener: a
     /// connection beyond it is closed at accept, unanswered, and counted in
@@ -3593,6 +3597,17 @@ mod tests {
 
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.max_connections, 0);
+    }
+
+    #[test]
+    fn responses_websocket_requires_the_cli_flag() {
+        let config = |flags: &[&str]| {
+            cli_args_from(flags)
+                .to_router_config(vec![], vec![])
+                .unwrap()
+        };
+        assert!(!config(&[]).enable_responses_websocket);
+        assert!(config(&["--enable-responses-websocket"]).enable_responses_websocket);
     }
 
     /// `--admin-max-connections` is the admin listener's own bound and must

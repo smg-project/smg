@@ -245,6 +245,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn enable_responses_websocket(mut self, enable: bool) -> Self {
+        self.config.enable_responses_websocket = enable;
+        self
+    }
+
     /// Most client connections the admin listener holds open at once; `0`
     /// is no bound.
     pub fn admin_max_connections(mut self, admin_max_connections: usize) -> Self {
