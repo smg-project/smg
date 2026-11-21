@@ -114,3 +114,47 @@ def test_a_worker_off_the_grpc_path_keeps_the_inherited_setting(
     monkeypatch.delenv(lane_setting, raising=False)
     assert _worker(engine, ConnectionMode.HTTP)._build_env()[variable] == "rust"
     assert hook_checks == []
+
+
+@pytest.mark.parametrize(
+    "inherited,override,enabled",
+    [
+        (None, None, False),
+        ("  ", None, False),
+        (" kv-v1 ", None, True),
+        ("kv-v1", "", False),
+        (None, "kv-v2", True),
+        ("kv-v1", " kv-v2 ", True),
+    ],
+)
+def test_vllm_http_pairing_middleware_follows_effective_engine_environment(
+    monkeypatch, inherited, override, enabled
+):
+    if inherited is None:
+        monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
+    else:
+        monkeypatch.setenv("SMG_PAIRING_PROTOCOL", inherited)
+    worker = _worker("vllm", ConnectionMode.HTTP)
+    if override is not None:
+        worker.extra_env = {"SMG_PAIRING_PROTOCOL": override}
+    monkeypatch.setattr(
+        worker, "_build_vllm_base_cmd", lambda entrypoint, *_: ["python3", "-m", entrypoint]
+    )
+    cmd = worker._build_vllm_http_cmd("m", 1, {})
+    middleware = "smg_grpc_servicer.http_metadata.PairingProtocolMiddleware"
+    assert (middleware in cmd) is enabled
+    assert ("--middleware" in cmd) is enabled
+    assert bool(worker._build_env().get("SMG_PAIRING_PROTOCOL", "").strip()) is enabled
+    assert cmd[:3] == ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+
+
+@pytest.mark.parametrize("spelling", ["separate", "equals"])
+def test_vllm_http_pairing_middleware_is_not_duplicated(monkeypatch, spelling):
+    monkeypatch.setenv("SMG_PAIRING_PROTOCOL", "kv-v1")
+    middleware = "smg_grpc_servicer.http_metadata.PairingProtocolMiddleware"
+    worker = _worker("vllm", ConnectionMode.HTTP)
+    worker.extra_engine_args = (
+        ["--middleware", middleware] if spelling == "separate" else [f"--middleware={middleware}"]
+    )
+    monkeypatch.setattr(worker, "_build_vllm_base_cmd", lambda *_: ["base"])
+    assert worker._build_vllm_http_cmd("m", 1, {}) == ["base"]

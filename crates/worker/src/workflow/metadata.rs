@@ -73,6 +73,15 @@ struct ModelInfo {
     pub architectures: Option<Vec<String>>,
 }
 
+// The optional SMG extension belongs only to the vLLM model-list read;
+// info-route/SGLang model-list parsing keeps its existing schema.
+#[derive(Debug, Deserialize)]
+struct VllmModelsResponse {
+    #[serde(flatten)]
+    models: ModelsResponse,
+    pairing_protocol: Option<String>,
+}
+
 /// `/version` response.
 #[derive(Debug, Deserialize)]
 struct VersionResponse {
@@ -85,19 +94,20 @@ struct VersionResponse {
 
 /// Why a metadata endpoint gave no answer: the engine does not offer it (a
 /// 404 on every spelling), or the read failed (transport, timeout, a non-2xx
-/// other than 404, an unparsable body). Registration tolerates both; a strict
-/// refresh tolerates only the first.
+/// other than 404, an unparsable body). Registration tolerates optional
+/// failures; an explicitly invalid SMG extension fails in both modes.
 #[derive(Debug)]
 enum MetadataError {
     NotOffered,
     Failed(String),
+    InvalidExtension(String),
 }
 
 impl std::fmt::Display for MetadataError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotOffered => f.write_str("not offered (404)"),
-            Self::Failed(reason) => f.write_str(reason),
+            Self::Failed(reason) | Self::InvalidExtension(reason) => f.write_str(reason),
         }
     }
 }
@@ -132,11 +142,11 @@ async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
 
 /// GET JSON with optional bearer auth under the metadata timeout: a 404 is
 /// `NotOffered`, any other failure `Failed`, each text naming the address masked.
-async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
+async fn http_get_response_classified(
     client: &Client,
     url: &str,
     api_key: Option<&str>,
-) -> Result<T, MetadataError> {
+) -> Result<reqwest::Response, MetadataError> {
     let shown = Endpoint::redacted_str(url);
     let mut req = client.get(url).timeout(METADATA_TIMEOUT);
     if let Some(key) = api_key {
@@ -148,6 +158,16 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(MetadataError::NotOffered);
     }
+    Ok(resp)
+}
+
+async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> Result<T, MetadataError> {
+    let shown = Endpoint::redacted_str(url);
+    let resp = http_get_response_classified(client, url, api_key).await?;
     if !resp.status().is_success() {
         return Err(MetadataError::Failed(format!(
             "status {} from {shown}",
@@ -157,6 +177,69 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     resp.json::<T>()
         .await
         .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {}", e.without_url())))
+}
+
+async fn http_get_vllm_models_classified(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> Result<VllmModelsResponse, MetadataError> {
+    let shown = Endpoint::redacted_str(url);
+    let resp = http_get_response_classified(client, url, api_key).await?;
+    let status = resp.status();
+    if !status.is_success() {
+        if status == reqwest::StatusCode::BAD_GATEWAY
+            && resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .is_some_and(|body| {
+                    body.pointer("/error/code")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("smg_http_metadata_invalid")
+                })
+        {
+            return Err(MetadataError::InvalidExtension(
+                "smg_http_metadata_invalid response".to_string(),
+            ));
+        }
+        return Err(MetadataError::Failed(format!(
+            "status {status} from {shown}"
+        )));
+    }
+    let bytes = resp.bytes().await.map_err(|e| {
+        MetadataError::Failed(format!("Failed to read {shown}: {}", e.without_url()))
+    })?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))?;
+    #[derive(Deserialize)]
+    struct PairingExtension {
+        pairing_protocol: Option<String>,
+    }
+    // Parse the field from the original wire so duplicate declarations cannot
+    // be hidden by a JSON map's last-value-wins normalization.
+    let extension = if body.get("pairing_protocol").is_some() {
+        serde_json::from_slice::<PairingExtension>(&bytes).map_err(|e| {
+            MetadataError::InvalidExtension(format!("Invalid pairing_protocol: {e}"))
+        })?
+    } else {
+        PairingExtension {
+            pairing_protocol: None,
+        }
+    };
+    let declares_protocol = extension
+        .pairing_protocol
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    serde_json::from_slice(&bytes).map_err(|e| {
+        if declares_protocol {
+            MetadataError::InvalidExtension(format!(
+                "Invalid model list with pairing_protocol: {e}"
+            ))
+        } else {
+            MetadataError::Failed(format!("Failed to parse {shown}: {e}"))
+        }
+    })
 }
 
 pub(super) async fn get_server_info(
@@ -175,7 +258,8 @@ pub(super) async fn get_server_info(
 /// back into service or finishes loading. Returns the labels and, for a gRPC
 /// engine, the runtime the probe confirmed. Registration reads tolerantly
 /// (`strict == false`: a failed endpoint leaves a gap); a refresh reads
-/// strictly, because a gap would read as labels the engine dropped: a read
+/// strictly, because a gap would read as labels the engine dropped. An invalid
+/// explicit SMG extension fails in either mode. A read
 /// that fails (transport, timeout, a non-2xx other than 404, an unparsable
 /// body, an unknown gRPC error) is an error, while an endpoint the engine does
 /// not offer (404 on every spelling, gRPC `Unimplemented`) is tolerated in
@@ -283,15 +367,35 @@ async fn read_model_list_and_path(
     strict: bool,
     path: &str,
 ) -> Result<HashMap<String, String>, String> {
-    let base = http_base_url(url);
     let mut labels = HashMap::new();
+    read_model_list_and_path_into(client, url, api_key, strict, path, &mut labels).await?;
+    Ok(labels)
+}
+
+// Keep validated model/protocol labels outside the optional-version future.
+// This is the model-list metadata row (vLLM); the table still supplies its path.
+pub(super) async fn read_model_list_and_path_into(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+    strict: bool,
+    path: &str,
+    labels: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    let base = http_base_url(url);
 
     // /v1/models: `root` is the model path, `id` the served model name
-    match http_get_json_classified::<ModelsResponse>(client, &format!("{base}/v1/models"), api_key)
-        .await
-    {
+    match http_get_vllm_models_classified(client, &format!("{base}/v1/models"), api_key).await {
         Ok(models) => {
-            if let Some(m) = models.data.first() {
+            if let Some(protocol) = models
+                .pairing_protocol
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                labels.insert("pairing_protocol".to_string(), protocol.to_string());
+            }
+            if let Some(m) = models.models.data.first() {
                 if let Some(ref root) = m.root {
                     labels.insert("model_path".to_string(), root.clone());
                 }
@@ -303,6 +407,7 @@ async fn read_model_list_and_path(
                 }
             }
         }
+        Err(MetadataError::InvalidExtension(e)) => return Err(format!("/v1/models: {e}")),
         Err(MetadataError::Failed(e)) if strict => return Err(format!("/v1/models: {e}")),
         Err(_) => {}
     }
@@ -320,7 +425,7 @@ async fn read_model_list_and_path(
         Err(_) => {}
     }
 
-    Ok(labels)
+    Ok(())
 }
 
 /// The gRPC model and server info as labels. Registration tolerates a

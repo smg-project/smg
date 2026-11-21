@@ -285,22 +285,42 @@ def wait_for_process_group_exit(pgid: int, timeout: float, kill_after: float) ->
         time.sleep(0.2)
 
 
-def gpu_memory_used_mib(gpu_ids: list[int]) -> dict[int, int] | None:
-    """Used memory per GPU index via ``nvidia-smi``, else ``amd-smi``; ``None`` when neither works."""
+def gpu_memory_used_mib(gpu_ids: list[int], timeout: float | None = None) -> dict[int, int] | None:
+    """Read used MiB; an optional total budget covers all three SMI commands."""
     if not gpu_ids:
         return {}
-    used = _nvidia_smi_used_mib(gpu_ids)
-    return used if used is not None else _amd_smi_used_mib(gpu_ids)
+    if timeout is None:
+        # Preserve the original per-command timeouts and legacy callers.
+        used = _nvidia_smi_used_mib(gpu_ids)
+        return used if used is not None else _amd_smi_used_mib(gpu_ids)
+    if isinstance(timeout, bool) or not 0 < timeout < float("inf"):
+        raise ValueError("A finite positive GPU readback timeout is required")
+    if any(type(gpu) is not int or gpu < 0 for gpu in gpu_ids) or len(set(gpu_ids)) != len(gpu_ids):
+        return None
+    deadline = time.monotonic() + timeout
+    used = _nvidia_smi_used_mib(gpu_ids, deadline=deadline)
+    if used is None:
+        used = _amd_smi_used_mib(gpu_ids, deadline=deadline)
+    return used if time.monotonic() < deadline else None
 
 
-def _amd_smi(*args: str) -> list[dict] | None:
+def _smi_timeout(deadline: float | None) -> float:
+    if deadline is None:
+        return 15
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired("GPU readback total budget", 0)
+    return min(15, remaining)
+
+
+def _amd_smi(*args: str, deadline: float | None = None) -> list[dict] | None:
     """The per-GPU entries of ``amd-smi <args> --json``."""
     try:
         out = subprocess.run(
             ["amd-smi", *args, "--json"],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=_smi_timeout(deadline),
             check=True,
         ).stdout
         data = json.loads(out)
@@ -311,7 +331,7 @@ def _amd_smi(*args: str) -> list[dict] | None:
     return entries if isinstance(entries, list) else None
 
 
-def _amd_smi_used_mib(gpu_ids: list[int]) -> dict[int, int] | None:
+def _amd_smi_used_mib(gpu_ids: list[int], deadline: float | None = None) -> dict[int, int] | None:
     """VRAM in use per GPU from ``amd-smi``, which reports MiB under the unit "MB".
 
     ``gpu_ids`` are HIP device numbers. amd-smi numbers GPUs by PCI address
@@ -319,9 +339,15 @@ def _amd_smi_used_mib(gpu_ids: list[int]) -> dict[int, int] | None:
     is amd-smi's GPU 3), so the two are matched through each GPU's KFD node id,
     after the visibility variables a worker would also see.
     """
-    listed, metrics = _amd_smi("list"), _amd_smi("metric", "--mem-usage")
+    if deadline is None:
+        listed, metrics = _amd_smi("list"), _amd_smi("metric", "--mem-usage")
+    else:
+        listed = _amd_smi("list", deadline=deadline)
+        metrics = _amd_smi("metric", "--mem-usage", deadline=deadline)
     if listed is None or metrics is None:
         return None
+    if deadline is not None:
+        return _strict_amd_memory(gpu_ids, listed, metrics)
     try:
         hip_order = [int(e["gpu"]) for e in sorted(listed, key=lambda e: int(e["node_id"]))]
         for var in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
@@ -343,7 +369,57 @@ def _amd_smi_used_mib(gpu_ids: list[int]) -> dict[int, int] | None:
     }
 
 
-def _nvidia_smi_used_mib(gpu_ids: list[int]) -> dict[int, int] | None:
+def _nonnegative_smi_integer(value) -> int:
+    # JSON bool/float must never be normalized into a valid memory or GPU ID.
+    if type(value) is int and value >= 0:
+        return value
+    if type(value) is str and value.isascii() and value.isdecimal():
+        parsed = int(value)
+        if str(parsed) == value:
+            return parsed
+    raise ValueError("Expected a nonnegative integer or canonical decimal string")
+
+
+def _strict_amd_memory(
+    gpu_ids: list[int], listed: list[dict], metrics: list[dict]
+) -> dict[int, int] | None:
+    try:
+        nodes = [
+            (_nonnegative_smi_integer(e["node_id"]), _nonnegative_smi_integer(e["gpu"]))
+            for e in listed
+        ]
+        if (
+            not nodes
+            or len({node for node, _ in nodes}) != len(nodes)
+            or len({gpu for _, gpu in nodes}) != len(nodes)
+        ):
+            return None
+        hip_order = [gpu for _, gpu in sorted(nodes)]
+        listed_ids = set(hip_order)
+        for var in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
+            if os.environ.get(var, "").strip():
+                indices = [_nonnegative_smi_integer(i) for i in os.environ[var].split(",")]
+                if len(set(indices)) != len(indices) or any(i >= len(hip_order) for i in indices):
+                    return None
+                hip_order = [hip_order[i] for i in indices]
+        used = {}
+        for entry in metrics:
+            gpu = _nonnegative_smi_integer(entry["gpu"])
+            value = entry["mem_usage"]["used_vram"]
+            value = _nonnegative_smi_integer(value["value"] if isinstance(value, dict) else value)
+            if gpu not in listed_ids or gpu in used:
+                return None
+            used[gpu] = value
+        if any(gpu >= len(hip_order) or hip_order[gpu] not in used for gpu in gpu_ids):
+            return None
+        return {gpu: used[hip_order[gpu]] for gpu in gpu_ids}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _nvidia_smi_used_mib(
+    gpu_ids: list[int], deadline: float | None = None
+) -> dict[int, int] | None:
     try:
         out = subprocess.run(
             [
@@ -355,7 +431,7 @@ def _nvidia_smi_used_mib(gpu_ids: list[int]) -> dict[int, int] | None:
             ],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=_smi_timeout(deadline),
             check=True,
         ).stdout
     except (OSError, subprocess.SubprocessError):

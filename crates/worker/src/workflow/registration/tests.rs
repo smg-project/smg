@@ -148,6 +148,7 @@ fn the_metadata_read_waits_on_the_runtime_detection() {
     assert_eq!(step.depends_on, vec![StepId::new(DETECT_RUNTIME_STEP)]);
     assert_eq!(step.retry_policy.as_ref().unwrap().max_attempts, 3);
     assert_eq!(step.timeout, Some(Duration::from_secs(10)));
+    assert!(matches!(step.on_failure, FailureAction::FailWorkflow));
 }
 
 /// The DP read waits on the metadata read alone, whatever gate the host

@@ -625,3 +625,176 @@ async fn a_text_that_names_no_runtime_is_refused_before_a_connect() {
     );
     assert_eq!(connector.connects(), 0);
 }
+
+// Compatibility name for the unchanged original assertions after the reader
+// moved to the worker crate and the runtime row took ownership of its path.
+async fn fetch_vllm_http_metadata_checked(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+    strict: bool,
+) -> Result<HashMap<String, String>, String> {
+    read_model_list_and_path(client, url, api_key, strict, ROW_PATH).await
+}
+#[tokio::test]
+async fn strict_vllm_refresh_still_rejects_optional_version_failure() {
+    use crate::workflow::host::testing::serve_json_routes;
+
+    let base = serve_json_routes(vec![
+        (
+            "/v1/models",
+            http::StatusCode::OK,
+            serde_json::json!({"data": [{"id": "model"}], "pairing_protocol": "kv-v1"}),
+        ),
+        (
+            "/version",
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({}),
+        ),
+    ])
+    .await;
+    let client = worker_client();
+    let (labels, _) = discover_engine_labels(
+        &client,
+        &ScriptedConnector::default(),
+        &base,
+        ConnectionMode::Http,
+        "vllm",
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        labels.get("pairing_protocol").map(String::as_str),
+        Some("kv-v1")
+    );
+    let error = discover_engine_labels(
+        &client,
+        &ScriptedConnector::default(),
+        &base,
+        ConnectionMode::Http,
+        "vllm",
+        None,
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.starts_with("/version: status 503"), "{error}");
+}
+
+#[tokio::test]
+async fn vllm_smg_http_extension_reaches_pairing_and_preserves_explicit_priority() {
+    use http::StatusCode;
+
+    use crate::{
+        pd::pairing::PdPairing, worker::WorkerSpec, workflow::host::testing::serve_json_routes,
+    };
+
+    for (value, expected) in [
+        (None, None),
+        (Some(serde_json::Value::Null), None),
+        (Some(serde_json::json!("   ")), None),
+        (Some(serde_json::json!(" kv-v1 ")), Some("kv-v1")),
+        (Some(serde_json::json!("kv-v2")), Some("kv-v2")),
+    ] {
+        let mut models = serde_json::json!({"object": "list", "data": [{"id": "m"}]});
+        if let Some(value) = value {
+            models["pairing_protocol"] = value;
+        }
+        let base = serve_json_routes(vec![("/v1/models", StatusCode::OK, models)]).await;
+        let (labels, _) = discover_engine_labels(
+            &worker_client(),
+            &ScriptedConnector::default(),
+            &base,
+            ConnectionMode::Http,
+            "vllm",
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(label(&labels, "pairing_protocol"), expected);
+        assert_eq!(label(&labels, "served_model_name"), Some("m"));
+        let mut spec = WorkerSpec::new(base);
+        spec.labels = labels;
+        assert_eq!(PdPairing::derive(&spec).explicit(), expected);
+        spec.labels
+            .insert("pairing_protocol".into(), "operator".into());
+        assert_eq!(PdPairing::derive(&spec).explicit(), Some("operator"));
+        spec.pairing_protocol = Some("spec-override".into());
+        assert_eq!(PdPairing::derive(&spec).explicit(), Some("spec-override"));
+    }
+}
+
+#[tokio::test]
+async fn malformed_smg_http_extension_fails_both_modes_without_changing_sglang_schema() {
+    use http::StatusCode;
+
+    use crate::workflow::host::testing::serve_json_routes;
+    for invalid in [
+        serde_json::json!(4),
+        serde_json::json!([]),
+        serde_json::json!({}),
+    ] {
+        let models = serde_json::json!({"data": [{"id": "m"}], "pairing_protocol": invalid});
+        // This field is interpreted only on the opted-in vLLM path.
+        assert!(serde_json::from_value::<ModelsResponse>(models.clone()).is_ok());
+        let base = serve_json_routes(vec![("/v1/models", StatusCode::OK, models)]).await;
+        let client = worker_client();
+        let error = fetch_vllm_http_metadata_checked(&client, &base, None, true)
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("/v1/models: "), "{error}");
+        assert!(
+            fetch_vllm_http_metadata_checked(&client, &base, None, false)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_truncated_vllm_models_body_goes_without_the_clients_url() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only truncated HTTP server; its handle is joined below"
+    )]
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(count, 0, "client must send the HTTP request");
+            request.extend_from_slice(&chunk[..count]);
+            assert!(request.len() <= 8192, "bounded test request headers");
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 128\r\nConnection: close\r\n\r\n{",
+            )
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+    });
+
+    let err = http_get_vllm_models_classified(
+        &worker_client(),
+        &format!("http://127.0.0.1:{port}/v1/models?token=body-read-canary"),
+        None,
+    )
+    .await
+    .expect_err("the declared response body must be truncated");
+    server.await.unwrap();
+
+    assert!(matches!(err, MetadataError::Failed(_)), "{err:?}");
+    let message = err.to_string();
+    assert!(message.contains("Failed to read"), "{message}");
+    assert!(!message.contains("body-read-canary"), "{message}");
+    assert!(!message.contains("token="), "{message}");
+}

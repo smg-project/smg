@@ -2611,19 +2611,21 @@ mod tests {
             "test",
         );
         w.set_status(WorkerStatus::NotReady);
-        // The proof bounds the age by the time elapsed on the same clock
-        // since just before the probe: a contact stamps at or after that
-        // read, so the age cannot exceed the elapsed time whatever the
-        // scheduling stall between the probe and the read; without a
-        // contact the age is the sleep on top of it.
+        let runtime = w.runtime_state().expect("a BasicWorker runtime");
+        let previous_contact = runtime.contact_stamp_ms_for_test();
         thread::sleep(Duration::from_millis(15));
-        let probed_at = now_ms();
+        let before_probe = now_ms();
         on_probe_passed(&w);
-        // Age first, elapsed second: a stall between the two reads only
-        // widens the bound; the other way round it would shrink it.
-        let age = w.runtime_state().unwrap().contact_age();
-        let elapsed = Duration::from_millis(now_ms() - probed_at);
-        assert!(age <= elapsed, "a passing probe is a contact");
+        let after_probe = now_ms();
+        let contact = runtime.contact_stamp_ms_for_test();
+        assert!(
+            contact > previous_contact,
+            "a passing probe records a new contact: {previous_contact} -> {contact}"
+        );
+        assert!(
+            (before_probe..=after_probe).contains(&contact),
+            "the contact is recorded during this probe: {contact} in {before_probe}..={after_probe}"
+        );
         assert!(w.stall_reason().is_none(), "and ends an unreachable veto");
         assert!(
             connected(&mut rx).is_none(),

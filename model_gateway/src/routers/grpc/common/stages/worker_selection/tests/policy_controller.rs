@@ -984,7 +984,7 @@ async fn a_failed_attempt_lets_its_worker_go_and_names_its_row() {
 
     // A dispatched attempt: the row is read from the guards before they go.
     stage.reselect(&mut ctx, &plan).await.expect("a placement");
-    let placed = ctx.placed.take().expect("the placement");
+    let placed = *ctx.placed.take().expect("the placement");
     let sent = placed.id();
     let worker = Arc::clone(placed.worker());
     let selection = WorkerSelection::Single {

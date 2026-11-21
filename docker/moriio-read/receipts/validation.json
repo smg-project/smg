@@ -1,0 +1,34 @@
+{
+  "local_image_config": "sha256:7945a23db04454c00ec4f8acbdfd54cb73937159376ac28a0314e1f71f5b89b1",
+  "node2_OCI_manifest": "sha256:78154fed5bd77b3b3e09f7549acf174355caa0bccf098b77db2f0821c265b2ef",
+  "public_image_reference": null,
+  "qualification": {
+    "capability_scope": "SingleNode 2 actualMI300XVF/gfx942, xGMI, Qwen3-32B architecture with ORIGINALharnessnum_hidden_layers=4/wideDUMMYweights; notfull32B-layercount orfullrealweights. WRITE/READ matchdirectlogits original1e-5, plusbothoriginalcorruptedprefillnegativecases; FULL_AND_PIECEWISEgraphs/oracles/sourceunchanged. NotRDMA/heteroTP/SMGrouterPD/continuousCI/GPU-MRphysical-lifetimecontract.",
+    "outcome": {
+      "collected": 4,
+      "errors": 0,
+      "failed": 0,
+      "junit_sha256": "a73282c8397c953b7a0e25209690f62ce751c57ed6dfc52c1f99828334ee13c5",
+      "original_caseIDs": [
+        "tests/v1/kv_connector/moriio_integration/test_write_dummy_e2e_rocm.py::test_write_matches_direct_serve[qwen3_dense-TRITON_ATTN-P_FULL_AND_PIECEWISE-D_FULL_AND_PIECEWISE]",
+        "tests/v1/kv_connector/moriio_integration/test_write_dummy_e2e_rocm.py::test_read_matches_direct_serve[qwen3_dense-TRITON_ATTN-P_FULL_AND_PIECEWISE-D_FULL_AND_PIECEWISE-READ]",
+        "tests/v1/kv_connector/moriio_integration/test_write_dummy_e2e_rocm.py::test_corrupted_prefill_state_is_detected[qwen3_dense]",
+        "tests/v1/kv_connector/moriio_integration/test_write_dummy_e2e_rocm.py::test_corrupted_prefill_state_is_detected_read[qwen3_dense]"
+      ],
+      "passed": 4,
+      "pytest_log_sha256": "52c0df53231d9b6e20630ae9f7fe7ecda7508929d4ff5910ece98a3ab85afe96",
+      "seconds": 517.756,
+      "skipped": 0,
+      "warnings": 17
+    },
+    "warnings_retained": "17pytestwarnings and capturednonfataltelemetrythread readonly/root/.config/vllm errors; optionaltorchDLPackJITfallback warning, loopbackGloo/queueintercept warnings. No assertion/oracle weakened; no runtimecleanliness/perf claim."
+  },
+  "qualification_receipt_sha256": "43df18d6dfe5269a3b75cfaed66798f1e3c1bbfa6f2132aa13d84a58ad2a3a9c",
+  "rebuild_claim": "Recipe/material provenance only; neither bit-reproducible output nor a public pullable image is asserted.",
+  "source_publication": {
+    "head": "f9e4ca9653da9bd731c8b5bf83483cb2083c8dc9",
+    "receipt_sha256": "fffc9e95a9876340c0fbc17daac158de609c5a5b5cd23e7c67b032cf7c4e8b57",
+    "source_URL": "https://github.com/chunfangamd/vllm/commit/f9e4ca9653da9bd731c8b5bf83483cb2083c8dc9",
+    "tree": "d6f385d091f1c45a5ca836fd6c44a57d9051ecf0"
+  }
+}

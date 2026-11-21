@@ -1050,15 +1050,10 @@ mod tests {
         assert!(access_after_miss > access_after_hit);
     }
 
-    /// The eviction thread wakes once per interval (`PeriodicTask`: one timed
-    /// wait per interval), so an entry idle for `max_idle` leaves the map at the
-    /// first tick after that, up to one interval later. The test waits for that
-    /// tick with a deadline instead of a fixed sleep: a sleep of exactly
-    /// interval + max_idle ended in the same instant as the tick that evicts,
-    /// and lost the race on a loaded host. Once the entry is gone the test
-    /// also asserts that at least `max_idle` passed since the insert: an
-    /// eviction thread that ignored `max_idle` would clear the map at its
-    /// first tick, one interval early.
+    /// Exercise the real PeriodicTask with an interval shorter than max_idle.
+    /// Wait boundedly for both the map and entry count to report removal, then
+    /// check the age of the entry's actual stored last_access. A fixed sleep
+    /// of interval + max_idle can race the eviction tick on a loaded host.
     #[test]
     fn test_manual_ttl_eviction_logic() {
         let config = ManualConfig {
@@ -1066,35 +1061,75 @@ mod tests {
             max_idle_secs: 2,
             assignment_mode: ManualAssignmentMode::Random,
         };
+        let max_idle = Duration::from_secs(config.max_idle_secs);
         let policy = ManualPolicy::with_config(config);
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let headers = headers_with_routing_key("key-0");
         let info = with_headers(&headers);
-        let inserted = Instant::now();
         policy.select_worker_impl(&workers, &info);
 
         assert_eq!(policy.routing_map.len(), 1);
+        let last_access = policy
+            .routing_map
+            .get(&RoutingId::new("key-0"))
+            .expect("the selected key")
+            .last_access;
 
-        // Idle for max_idle (2 s), evicted by the tick that follows (at 3 s at
-        // the latest); the deadline leaves four more seconds for a loaded host.
-        let deadline = Instant::now() + Duration::from_secs(7);
-        while !policy.routing_map.is_empty() {
+        assert!(policy._eviction_task.is_some());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !policy.routing_map.is_empty() || policy.entry_count() != 0 {
             assert!(
                 Instant::now() < deadline,
-                "the idle entry was not evicted within the deadline ({} left)",
-                policy.routing_map.len()
+                "the background task did not evict the idle key: map={}, entries={}",
+                policy.routing_map.len(),
+                policy.entry_count()
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        // The lower bound: an eviction thread that ignored `max_idle` would
-        // clear the map at its first tick, one second in. Time since the
-        // insert only grows, so this never reads red on a slow host.
+
+        assert_eq!(policy.routing_map.len(), 0);
+        assert_eq!(policy.entry_count(), 0);
+        let observed_age = last_access.elapsed();
         assert!(
-            inserted.elapsed() >= Duration::from_secs(2),
-            "the entry was evicted before max_idle ({:?} after the insert)",
-            inserted.elapsed()
+            observed_age >= max_idle,
+            "the background task evicted the key before its TTL: age={observed_age:?}, max_idle={max_idle:?}"
         );
+    }
+
+    #[test]
+    fn test_manual_ttl_boundary_is_strict() {
+        let max_idle = Duration::from_secs(2);
+        let stamp = Instant::now();
+        let workers = make_workers(&["http://w1:8000"]);
+        let headers = headers_with_routing_key("ttl-boundary");
+        let info = with_headers(&headers);
+
+        // This controlled clock complements the live background-task test above.
+        for (age, expected_removed) in [
+            (max_idle - Duration::from_nanos(1), 0),
+            (max_idle, 1),
+            (max_idle + Duration::from_nanos(1), 1),
+        ] {
+            let policy = ManualPolicy::with_config(ManualConfig {
+                eviction_interval_secs: 0,
+                max_idle_secs: 2,
+                assignment_mode: ManualAssignmentMode::Random,
+            });
+            policy.select_worker_impl(&workers, &info);
+            policy
+                .routing_map
+                .get_mut(&RoutingId::new("ttl-boundary"))
+                .expect("the selected key")
+                .last_access = stamp;
+
+            assert_eq!(
+                evict_idle(&policy.routing_map, &policy.entries, max_idle, stamp + age),
+                expected_removed
+            );
+            assert_eq!(policy.routing_map.len(), 1 - expected_removed);
+            assert_eq!(policy.entry_count(), 1 - expected_removed);
+        }
     }
 
     #[test]
