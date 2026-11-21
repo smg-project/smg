@@ -1,12 +1,13 @@
 //! The `random` policy: how it is composed, and the picker only it uses.
 
 use crate::{
-    document::spec::{standard_filters, ProfileSpec},
+    document::spec::ProfileSpec,
     engine::{
         decision::{Targets, MAX_TARGETS},
         framework::{Picker, TieBand},
         view::{Candidate, PoolFacts, RequestFacts},
     },
+    policies::standard_filters,
     stages::builtins::{draw_kept, push_drawn, target_of},
     tracking::lease::Lifecycle,
     Draw,

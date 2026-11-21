@@ -269,13 +269,11 @@ pub(crate) mod tests {
         engine::{
             decision::{Pair, Target, Targets},
             framework::{Picker, TieBand},
+            sticky_sessions::{SessionRule, SessionVerdict},
             view::{Candidate, Health, Phase, RequestFacts, Session, WorkerId},
             Constraints, PoolFacts, Scratch,
         },
-        policies::{
-            random::Random,
-            sticky_sessions::{SessionRule, SessionVerdict},
-        },
+        policies::random::Random,
         service::{
             controller::gateways::tests::lease,
             proto::{

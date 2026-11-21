@@ -1,12 +1,13 @@
 //! The `passthrough` policy: how it is composed, and the picker only it uses.
 
 use crate::{
-    document::spec::{standard_filters, ProfileSpec},
+    document::spec::ProfileSpec,
     engine::{
         decision::{Targets, MAX_TARGETS},
         framework::{Picker, TieBand, DRAW_BOUND},
         view::{Candidate, PoolFacts, RequestFacts},
     },
+    policies::standard_filters,
     stages::builtins::target_of,
     tracking::lease::Lifecycle,
     Draw,

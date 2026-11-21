@@ -4872,7 +4872,7 @@ impl MemoryStore {
 impl MemoryStore {
     /// The store with a file of leases a decider, for a host that decides
     /// on `deciders` threads and names them
-    /// ([`crate::engine::decider::Decider`]): each decider issues into its own
+    /// ([`crate::engine::Decider`]): each decider issues into its own
     /// file under its own turn, and a lease's events are told under the
     /// name of the decider whose file it is on. The files start empty,
     /// under the store's term, and keep the word to the engine and the

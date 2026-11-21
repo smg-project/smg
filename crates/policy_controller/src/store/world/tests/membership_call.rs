@@ -3,8 +3,10 @@
 
 use super::{facts, member, MODEL};
 use crate::{
-    engine::view::{Role, Session, WorkerId},
-    policies::sticky_sessions::SessionVerdict,
+    engine::{
+        sticky_sessions::SessionVerdict,
+        view::{Role, Session, WorkerId},
+    },
     store::{MemoryStore, WorkerFacts, WorkersStore},
 };
 

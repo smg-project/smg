@@ -1,4 +1,7 @@
-//! The consistent-hash scorer and the ring it owns (design 4.4): the ring
+//! The `consistent_hashing` policy: how it is composed, and its scorer with
+//! the ring the scorer owns.
+//!
+//! The consistent-hash scorer and the ring it owns: the ring
 //! owner of a decision's key scores first and the ring's next members after
 //! it, so a commit that misses the owner falls to the member the key would
 //! walk to. The ring is the engine's. Its members are the worker ids the
@@ -52,10 +55,7 @@ use parking_lot::{RwLock, RwLockReadGuard};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    document::spec::{
-        standard_filters, BoundedLoadParams, KeySourceSpec, Needs, ProfileSpec,
-        MANUAL_SESSION_HEADER,
-    },
+    document::spec::{BoundedLoadParams, KeySourceSpec, Needs, ProfileSpec, MANUAL_SESSION_HEADER},
     engine::{
         decision::MAX_TARGETS,
         framework::{Scorer, TieBand, DRAW_BOUND},
@@ -64,6 +64,7 @@ use crate::{
     policies::{
         cache_aware::Gates,
         prefix_hash::{prefix_key, Prefix},
+        standard_filters,
     },
     tracking::{
         counts::with_counts,

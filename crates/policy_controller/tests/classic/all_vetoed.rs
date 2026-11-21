@@ -12,12 +12,11 @@
 
 use serde::Deserialize;
 use smg_policy_controller::{
-    document::{OverloadSpec, PolicySpec},
+    document::{Assignment, OverloadSpec, PolicySpec},
     engine::{
         Candidate, Constraints, Decision, Engine, Health, Identity, PoolFacts, RequestFacts,
         Scratch, ShedReason, WorkerId,
     },
-    policies::sticky_sessions::Assignment,
     tracking::{Lease, Lifecycle, Side},
 };
 

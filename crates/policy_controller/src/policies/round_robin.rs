@@ -8,12 +8,13 @@ use std::{
 use rustc_hash::FxHasher;
 
 use crate::{
-    document::spec::{standard_filters, ProfileSpec},
+    document::spec::ProfileSpec,
     engine::{
         decision::{Targets, MAX_TARGETS},
         framework::{Picker, TieBand, DRAW_BOUND},
         view::{Candidate, ModelFingerprint, PoolFacts, RequestFacts},
     },
+    policies::standard_filters,
     stages::builtins::{push_drawn, target_of},
     tracking::lease::Lifecycle,
     Draw,

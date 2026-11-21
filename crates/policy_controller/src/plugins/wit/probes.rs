@@ -16,13 +16,13 @@
 use crate::{
     engine::{
         decision::{Pair, Target},
+        sticky_sessions::SessionVerdict,
         view::{
             AffinityFacts, Candidate, Engines, HashKind, Header, Health, Identity, LoadRow,
             MediaCounts, ModelFingerprint, NamedAffinity, OverloadRegime, Phase, PoolFacts,
             RequestFacts, Role, Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
         },
     },
-    policies::sticky_sessions::SessionVerdict,
     tracking::lease::{Lease, LeaseId, LeaseKind, Outcome, Side, TransportClass},
 };
 

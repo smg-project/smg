@@ -3,6 +3,10 @@
 //!
 //! `power_of_two` and `cache_aware` name the scorer too, by its stage name
 //! `least-load`.
+//!
+//! Most of the scorer's mechanism is the credit of the sends since a worker's
+//! last report. That credit is shared code: `SinceReport` among the shared
+//! stages, and the sent record in `tracking`.
 
 #[cfg(test)]
 use std::sync::atomic::Ordering;
@@ -13,12 +17,13 @@ use crate::stages::builtins::HeldCredit;
 #[cfg(test)]
 use crate::stages::builtins::SinceReport;
 use crate::{
-    document::spec::{standard_filters, Needs, ProfileSpec},
+    document::spec::{Needs, ProfileSpec},
     engine::{
         decision::Target,
         framework::{Front, Scorer, TieBand},
         view::{Candidate, LoadRow, RequestFacts, WorkerId},
     },
+    policies::standard_filters,
     stages::builtins::{normalize_costs, ReadsLoad, PENDING, TIE_EPSILON_SECS},
     tracking::{
         counts::with_counts,
@@ -111,8 +116,8 @@ impl LeastLoad {
             .load()
             .get(&(worker, dp_rank))
             .map_or((0, 0), |since| {
-                let HeldCredit { tokens, requests } = since.held_credit();
-                let unsized_held = u64::from(since.unsized_held.load(Ordering::Relaxed));
+                let (HeldCredit { tokens, requests }, unsized_held) = since.held_for_test();
+                let unsized_held = u64::from(unsized_held);
                 (
                     tokens + unsized_held * u64::from(self.mean_prefill_tokens),
                     requests,
@@ -125,7 +130,7 @@ impl LeastLoad {
     #[cfg(test)]
     fn retire_oldest_batch_of(&self, worker: WorkerId, dp_rank: u16) {
         if let Some(since) = self.sent.credits.tally.load().get(&(worker, dp_rank)) {
-            since.retire_oldest_batch();
+            since.retire_for_test();
         }
     }
 
@@ -1260,7 +1265,7 @@ mod tests {
         let bound = SINCE_REPORT_KEPT as usize;
         book(0, 2_000, SINCE_REPORT_KEPT);
         let row = ll.row(pool[0].id, 0);
-        let in_progress = row.retiring.lock();
+        let in_progress = row.retiring_for_test();
         book(1, 20_000, RETIRE_BATCH as u64);
         assert_eq!(
             ll.held(pool[0].id),

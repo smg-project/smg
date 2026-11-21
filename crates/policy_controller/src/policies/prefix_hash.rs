@@ -6,11 +6,11 @@
 
 use crate::{
     document::spec::{
-        standard_filters, BoundedLoadParams, ConsistentHashParams, KeySourceSpec, ProfileSpec,
-        ScoreStage, MANUAL_SESSION_HEADER,
+        BoundedLoadParams, ConsistentHashParams, KeySourceSpec, ProfileSpec, ScoreStage,
+        MANUAL_SESSION_HEADER,
     },
     engine::view::{fold_block, RequestFacts},
-    policies::cache_aware::Gates,
+    policies::{cache_aware::Gates, standard_filters},
 };
 
 /// How the `prefix_hash` policy is composed: its filters, its scorers and its

@@ -1,28 +1,21 @@
 //! The `manual` policy: how it is composed, its session rule, and the picker
-//! that leaves the placement to that rule. The session table lives in
-//! `sticky_sessions`.
+//! that leaves the placement to that rule. The session table is the engine's
+//! ([`SessionTable`](crate::engine::SessionTable)).
 
 use crate::{
-    document::spec::{
-        standard_filters, Assignment, ProfileSpec, Recovery, SessionsSpec, MANUAL_SESSION_HEADER,
-    },
+    document::spec::{Assignment, ProfileSpec, Recovery, SessionsSpec, MANUAL_SESSION_HEADER},
     engine::{
         decision::Targets,
         framework::{Picker, TieBand},
         view::{Candidate, RequestFacts},
     },
+    policies::standard_filters,
     tracking::lease::Lifecycle,
 };
 
 /// How the `manual` policy is composed: its filters, its scorers and its
 /// picker.
 pub(crate) fn profile() -> ProfileSpec {
-    // Sticky sessions over a random assignment: a key stays with the
-    // first worker it was placed on, no in-flight cap, the first
-    // worker back in the lead when it recovers; the idle TTL of four
-    // hours swept each minute, as the keyed policy of today. The
-    // picker leaves the placement to the rule, so another assignment
-    // is the rule's one field and no other profile.
     ProfileSpec {
         filter: standard_filters(),
         score: vec![],
@@ -33,6 +26,12 @@ pub(crate) fn profile() -> ProfileSpec {
 
 /// The session rule of the `manual` policy.
 pub(crate) fn sessions() -> SessionsSpec {
+    // Sticky sessions over a random assignment: a key stays with the
+    // first worker it was placed on, no in-flight cap, the first
+    // worker back in the lead when it recovers; the idle TTL of four
+    // hours swept each minute, as the keyed policy of today. The
+    // picker leaves the placement to the rule, so another assignment
+    // is the rule's one field and no other profile.
     SessionsSpec {
         sticky_header: MANUAL_SESSION_HEADER.into(),
         headers: vec![],

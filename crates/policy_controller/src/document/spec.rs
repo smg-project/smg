@@ -41,6 +41,7 @@ use crate::{
         framework::{
             Binding, Engine, Filter, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted,
         },
+        sticky_sessions::SessionRule,
         terms::{signal_named, Term, SIGNAL_FAMILY},
         view::{threshold_permille, HashKind, Phase, MAX_REPORT_AGE_MS},
     },
@@ -48,13 +49,12 @@ use crate::{
         reports::Reports,
         signals::{column_named, SignalColumn},
     },
-    policies,
     policies::{
+        self,
         bucket::Bucket,
         cache_aware::{blocks_within, Gates, KvPressure, PrefixAffinity, WarmupSlice},
         consistent_hashing::ConsistentHash,
         least_load::LeastLoad,
-        sticky_sessions::SessionRule,
     },
     stages::{
         builtins::{
@@ -4714,14 +4714,6 @@ fn preset_routing_key(name: &str) -> Option<RoutingKeySpec> {
         sources,
         strip_lineage: false,
     })
-}
-
-pub(crate) fn standard_filters() -> Vec<FilterSpec> {
-    vec![
-        "healthy".into(),
-        "not-overloaded".into(),
-        "not-tried".into(),
-    ]
 }
 
 impl PolicySpec {

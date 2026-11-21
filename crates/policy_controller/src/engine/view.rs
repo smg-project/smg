@@ -902,7 +902,7 @@ pub struct RequestFacts<'a> {
     /// Time left for the whole decision, relative to the host's receipt; a
     /// plugin's own share of it rides its frame, clamped to at most this.
     /// A host that asks in process states no budget by `0`
-    /// ([`crate::engine::door::Request`]); on the wire a frame's `0` says none is
+    /// ([`crate::engine::Request`]); on the wire a frame's `0` says none is
     /// left.
     pub budget_micros: u32,
     /// Allow-listed headers only.

@@ -4,12 +4,11 @@
 
 use serde::Deserialize;
 use smg_policy_controller::{
-    document::PolicySpec,
+    document::{Assignment, PolicySpec},
     engine::{
         Candidate, Constraints, Engine, Health, Identity, PoolFacts, RequestFacts, Scratch,
         WorkerId,
     },
-    policies::sticky_sessions::Assignment,
     tracking::{Lease, Lifecycle, Side},
 };
 

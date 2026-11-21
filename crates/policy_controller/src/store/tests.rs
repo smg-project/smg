@@ -22,12 +22,11 @@ use crate::{
     document::spec,
     engine::{
         decider::Decider,
-        decision,
-        decision::{Target, Targets},
+        decision::{self, Target, Targets},
         demands::DemandFacts,
+        sticky_sessions::{self, SessionVerdict},
         view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
     },
-    policies::{sticky_sessions, sticky_sessions::SessionVerdict},
     service::replication::Log,
     tracking::lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
 };

@@ -4,7 +4,7 @@
 //! served controller gives a model's requests one decider. A door in
 //! process gives a calling thread one, and a model's requests one under a
 //! generation that holds a stage keeping state a decider
-//! ([`crate::engine::door::Door`]). Whoever decides for a decider holds its turn:
+//! ([`crate::engine::Door`]). Whoever decides for a decider holds its turn:
 //! the decider's own thread, or another thread the host lets take the
 //! turn. What a stage kind keeps a decider (a WebAssembly plugin's
 //! instance) is that decider's, behind its turn, whichever thread holds

@@ -10,13 +10,13 @@
 //! contracts, field for field, so a plugin host needs no second definition.
 //! Section by section:
 //!
-//! - 4.1, the view ([`engine::view`]): [`RequestFacts`], [`Candidate`] rows with their
+//! - 4.1, the view ([`engine`]): [`RequestFacts`], [`Candidate`] rows with their
 //!   [`LoadRow`], the [`AffinityFacts`] column beside the rows, [`Constraints`]
 //!   and [`PoolFacts`]. Built once per decision by the host into a reused
 //!   buffer; no handle, no callback into the host. The values a report
 //!   states under a name the document declares stand beside the rows too
-//!   ([`load::signals`]): a stage reads one by its [`SignalColumn`].
-//! - 4.2, the decision ([`engine::decision`]): an ordered [`Pick`] of up to
+//!   ([`load`]): a stage reads one by its [`SignalColumn`].
+//! - 4.2, the decision ([`engine`]): an ordered [`Pick`] of up to
 //!   [`MAX_TARGETS`] targets, a [`Shed`] with its reason and the stage that
 //!   emptied the pool, or a [`Queue`] ticket (specified in v1; no built-in
 //!   issues one yet). A decision books nothing by itself: its door files
@@ -24,25 +24,26 @@
 //!   host reports the lifecycle back. One issue books another target: a
 //!   pair's decode asked for later and sent with no decode call is issued
 //!   at its dispatch, on the target that dispatch took.
-//! - 4.3, the lifecycle ([`tracking::lease`]): the [`Lease`] a decision carries and the
+//! - 4.3, the lifecycle ([`tracking`]): the [`Lease`] a decision carries and the
 //!   [`Lifecycle`] hooks a stateful stage learns from (issued, dispatched,
 //!   completed, released, membership, signal).
-//! - 4.4, the framework ([`engine::framework`]): a [`Profile`] runs [`Filter`]s,
+//! - 4.4, the framework ([`engine`]): a [`Profile`] runs [`Filter`]s,
 //!   weighted [`Scorer`]s and one [`Picker`]; a [`Plan`] sequences profiles for
 //!   a request; the [`Engine`] resolves a request to its binding and decides.
 //!   A scorer or picker allocates nothing per decision. The consistent-hash
-//!   scorer owns its ring ([`policies::consistent_hashing`]), fed by the membership hooks. The
+//!   scorer owns its ring ([`policies::consistent_hashing`]), fed by the
+//!   membership hooks. The
 //!   prefixes sent to a model's workers without cache events are kept by
 //!   the sent-prefix predictor ([`predictor`]). A profile that reads sent
 //!   prefixes reads that record at the naming through the in-process door.
-//! - 4.5, the stages in code ([`stages::catalog`]): the [`Catalog`] of the stages a
+//! - 4.5, the stages in code ([`stages`]): the [`Catalog`] of the stages a
 //!   build knows by name, the stock build's and the ones a host registers.
 //!   A document names either kind the same way, and the validator resolves
 //!   every name once ([`PolicySpec::validate_in`]).
-//! - 4.6, the schema ([`document::spec`]): [`PolicySpec`] (`apiVersion: smg.policy/v1`,
+//! - 4.6, the schema ([`document`]): [`PolicySpec`] (`apiVersion: smg.policy/v1`,
 //!   no `kind`), its validator and the [`Needs`] summary the host reads at
 //!   apply, before any request exists. A binding names where a request's
-//!   routing key comes from, and one function derives it ([`document::routing_key`]).
+//!   routing key comes from, and one function derives it ([`document`]).
 //!
 //! - 5.1 and appendix A, the store ingress ([`store`]): the traits through
 //!   which the controller's store is fed (membership, health, loads, KV
@@ -83,16 +84,16 @@
 //! - Behind the `operator` feature, `document::operator::SpecDoor` applies a
 //!   host's start document and serves its status, document and dry run.
 //!   The feature also serves worker snapshots over the host's store.
-//! - The door ([`engine::door`]): the order of one decision's calls, written once
-//!   for every host. A host that embeds the engine asks [`engine::door::Door`],
+//! - The door ([`engine`]): the order of one decision's calls, written once
+//!   for every host. A host that embeds the engine asks [`engine::Door`],
 //!   which runs the order on the caller's thread over a
 //!   [`store::MemoryStore`]: the lease is filed at the issue, the host says
-//!   what became of it ([`engine::door::Door::report`]), itself or through a
-//!   handle, and its timer calls the door's clock ([`engine::door::Door::sweep`]).
+//!   what became of it ([`engine::Door::report`]), itself or through a
+//!   handle, and its timer calls the door's clock ([`engine::Door::sweep`]).
 //!   The standalone controller runs the same order on its deciders'
 //!   threads.
-//! - The handle ([`tracking::handle`]): one decision held until its request ends.
-//!   A host that holds a [`tracking::handle::Handle`] says the target it took, the
+//! - The handle ([`tracking`]): one decision held until its request ends.
+//!   A host that holds a [`tracking::Handle`] says the target it took, the
 //!   dispatch, and the completion or the release. The handle reports to
 //!   the in-process door or, with the `client` feature, over a link.
 //! - Behind the `controller` feature, the standalone controller
@@ -126,39 +127,35 @@
 //! The in-process view carries two host instants (the decision's clock and a
 //! report's sample instant); the wire carries durations only.
 //!
+//! Import paths follow two rules. The folders `engine`, `document`, `load`,
+//! `tracking` and `stages` list their public items themselves, so an item is
+//! at its folder: `engine::WorkerId`. A folder of named things keeps the name
+//! in the path: a policy (`policies::least_load::LeastLoad`), a plugin kind
+//! (`plugins::wasm::Plugin`).
+//!
 //! [`RequestFacts`]: engine::RequestFacts
 //! [`Candidate`]: engine::Candidate
-//! [`engine::view`]: crate::engine
 //! [`LoadRow`]: engine::LoadRow
 //! [`AffinityFacts`]: engine::AffinityFacts
 //! [`Constraints`]: engine::Constraints
 //! [`PoolFacts`]: engine::PoolFacts
 //! [`SignalColumn`]: load::SignalColumn
-//! [`load::signals`]: crate::load
 //! [`Pick`]: engine::Pick
-//! [`engine::decision`]: crate::engine
 //! [`MAX_TARGETS`]: engine::MAX_TARGETS
 //! [`Shed`]: engine::Shed
 //! [`Queue`]: engine::Queue
 //! [`Lease`]: tracking::Lease
-//! [`tracking::lease`]: crate::tracking
 //! [`Lifecycle`]: tracking::Lifecycle
 //! [`Profile`]: engine::Profile
 //! [`Filter`]: engine::Filter
-//! [`engine::framework`]: crate::engine
 //! [`Scorer`]: engine::Scorer
 //! [`Picker`]: engine::Picker
 //! [`Plan`]: engine::Plan
 //! [`Engine`]: engine::Engine
 //! [`Catalog`]: stages::Catalog
-//! [`stages::catalog`]: crate::stages
 //! [`PolicySpec::validate_in`]: document::PolicySpec::validate_in
 //! [`PolicySpec`]: document::PolicySpec
-//! [`document::spec`]: crate::document
 //! [`Needs`]: document::Needs
-//! [`document::routing_key`]: crate::document
-//! [`engine::door`]: crate::engine
-//! [`tracking::handle`]: crate::tracking
 
 #[cfg(any(feature = "ingest", feature = "operator"))]
 mod address;

@@ -6,9 +6,9 @@
 
 use std::fmt;
 
+use crate::engine::{sticky_sessions::SessionVerdict, view::WorkerId};
 #[cfg(feature = "controller")]
 use crate::service::proto::{self, LiftedVeto};
-use crate::{engine::view::WorkerId, policies::sticky_sessions::SessionVerdict};
 
 /// Targets a decision carries at most: the pick and its alternates.
 pub const MAX_TARGETS: usize = 4;

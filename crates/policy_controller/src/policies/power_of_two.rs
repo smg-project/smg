@@ -2,14 +2,13 @@
 //! pickers only it uses.
 
 use crate::{
-    document::spec::{
-        standard_filters, PolicySpec, ProfileSpec, ResidentWorkParams, ScoreStage, SpecError,
-    },
+    document::spec::{PolicySpec, ProfileSpec, ResidentWorkParams, ScoreStage, SpecError},
     engine::{
         decision::Targets,
         framework::{Narrowed, Picker, TieBand, Unit},
         view::{Candidate, PoolFacts, RequestFacts},
     },
+    policies::standard_filters,
     stages::builtins::{below_band, draw_kept, target_of},
     tracking::lease::Lifecycle,
     Draw,

@@ -23,16 +23,16 @@ use super::{
 };
 use crate::{
     document::spec::{
-        AffinitySource, AppliedSpec, BestParams, PickStage, PolicySpec, PrefixAffinityParams,
-        ProfileSpec, ScoreStage, ShadowSpec, WarmupSliceParams,
+        AffinitySource, AppliedSpec, Assignment, BestParams, PickStage, PolicySpec,
+        PrefixAffinityParams, ProfileSpec, ScoreStage, ShadowSpec, WarmupSliceParams,
     },
     engine::{
         decision::{Decision, ShadowKind, Targets},
         door::{Decided, Door, ON_SHADOW, SHADOW_FLOOR},
         framework::{EncodePlaced, PairSide, Picker, TieBand},
+        sticky_sessions::SessionVerdict,
         view::{Candidate, LoadRow, Phase, RequestFacts, Role, WorkerId},
     },
-    policies::sticky_sessions::{Assignment, SessionVerdict},
     stages::{builtins::target_of, catalog::Catalog},
     store::{
         BatchFacts, BatchOutcome, ContentHash, Dispatch, KvEvent, KvEventSink, LeasesStore,

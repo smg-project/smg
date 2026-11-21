@@ -9,12 +9,11 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 use smg_policy_controller::{
-    document::{PolicySpec, SessionsSpec},
+    document::{Assignment, PolicySpec, Recovery, SessionsSpec},
     engine::{
         Candidate, Constraints, Engine, Health, Identity, PoolFacts, RequestFacts, Scratch,
         WorkerId,
     },
-    policies::sticky_sessions::{Assignment, Recovery},
     tracking::{Lease, Lifecycle, Side},
 };
 

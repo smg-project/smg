@@ -1211,7 +1211,7 @@ pub(crate) struct SinceReport {
     /// loads the two words apart: across a record or a release it may see
     /// one without the other for the dispatch in flight, and across a
     /// retirement for its batch.
-    pub(crate) unsized_held: AtomicU16,
+    unsized_held: AtomicU16,
     /// The lowest of the lanes' front instants; `u64::MAX` when none. A
     /// dispatch lowers it under its lane's lock; a release recomputes it
     /// under every lane's lock, so it never reads above any lane's front.
@@ -1220,7 +1220,7 @@ pub(crate) struct SinceReport {
     /// the bound together, the first retires and the rest land while the row
     /// is within a batch above the bound; past that a deciding thread lands
     /// one and waits for the retirement.
-    pub(crate) retiring: Mutex<()>,
+    retiring: Mutex<()>,
     lanes: [DispatchLane; DISPATCH_LANES],
     /// What a stage that keeps the row's cost as one number was last told
     /// of the row. A report's tell, its first decision and a dispatch hold
@@ -1470,7 +1470,7 @@ impl SinceReport {
     /// the bound in the meantime keeps its dispatches. The row's oldest
     /// instant stays where it was: a value too low costs a release walk,
     /// never a missed one.
-    pub(crate) fn retire_oldest_batch(&self) {
+    fn retire_oldest_batch(&self) {
         // One retirement at a time: a dispatch that finds one in progress
         // lands while the row is within a batch above the bound, and past
         // that waits for the retirement and runs its own, so the row never
@@ -1574,7 +1574,7 @@ impl SinceReport {
 
     /// The held token-work and requests, as the word stands.
     #[inline(always)]
-    pub(crate) fn held_credit(&self) -> HeldCredit {
+    fn held_credit(&self) -> HeldCredit {
         Self::credit_of(self.held.load(Ordering::Relaxed))
     }
 
@@ -1660,6 +1660,29 @@ impl SinceReport {
             .iter()
             .map(|lane| lane.dispatches.lock().len())
             .sum()
+    }
+}
+
+// What a test in another file reads of a row. The row's words and its
+// retirement lock stay this file's own.
+#[cfg(test)]
+impl SinceReport {
+    /// The held token-work and requests, and the sends of no stated size.
+    pub(crate) fn held_for_test(&self) -> (HeldCredit, u16) {
+        (
+            self.held_credit(),
+            self.unsized_held.load(Ordering::Relaxed),
+        )
+    }
+
+    /// One retirement, as a dispatch that read the bound runs it.
+    pub(crate) fn retire_for_test(&self) {
+        self.retire_oldest_batch();
+    }
+
+    /// The retirement lock, held as a retirement in progress holds it.
+    pub(crate) fn retiring_for_test(&self) -> MutexGuard<'_, ()> {
+        self.retiring.lock()
     }
 }
 

@@ -1323,7 +1323,7 @@ pub(crate) mod tests {
                 Role, WireModes, WorkerId,
             },
         },
-        policies::{power_of_two::PowerOfTwoMetric, random::Random, sticky_sessions},
+        policies::{power_of_two::PowerOfTwoMetric, random::Random},
         service::{
             controller::{
                 election::Standing,
@@ -4784,7 +4784,7 @@ pub(crate) mod tests {
     /// whatever the request's seed.
     #[test]
     fn a_placement_by_the_fewest_requests_reads_the_leases_on_file() {
-        let ruled = |assignment: sticky_sessions::Assignment, pick: &str| {
+        let ruled = |assignment: crate::document::Assignment, pick: &str| {
             let mut document = PolicySpec::preset("manual").expect("a preset of this build");
             let rule = document.bindings[0].sessions.as_mut();
             rule.expect("the preset's rule").assignment = assignment;
@@ -4796,8 +4796,8 @@ pub(crate) mod tests {
         let mut unruled: PolicySpec = serde_json::from_str(unruled).expect("a document");
         unruled.generation = 1;
         let (delegate, min_load) = (
-            sticky_sessions::Assignment::Delegate,
-            sticky_sessions::Assignment::MinLoad,
+            crate::document::Assignment::Delegate,
+            crate::document::Assignment::MinLoad,
         );
         let cases = [
             ("no rule", unruled, false),
@@ -6770,7 +6770,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_keyed_session_keeps_its_worker_across_an_apply() {
         use crate::{
-            policies::sticky_sessions::SessionVerdict,
+            engine::sticky_sessions::SessionVerdict,
             service::controller::lifecycle::{self, tests::a_dispatched},
         };
         const KEYS: u64 = 24;
@@ -6844,7 +6844,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_service_hands_a_key_on_at_its_rules_cap() {
         use crate::{
-            policies::sticky_sessions::SessionVerdict,
+            engine::sticky_sessions::SessionVerdict,
             service::controller::lifecycle::{self, tests::a_dispatched},
         };
         let mut document = PolicySpec::preset("manual").expect("a preset of this build");
@@ -6853,7 +6853,7 @@ pub(crate) mod tests {
         rule.inflight_cap = 2;
         // The rule places a key on the worker with the fewest requests: a
         // request placed again at the cap leaves the key's worker.
-        rule.assignment = sticky_sessions::Assignment::MinLoad;
+        rule.assignment = crate::document::Assignment::MinLoad;
         let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
         let at = bed.script.taken;
         let verdict = |bed: &Bed, answer: &proto::DecideAnswer| {

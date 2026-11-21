@@ -48,12 +48,12 @@ use crate::{
             release, EncodeItems, EncodePlaced, Engine, PairSide, Plan, Scratch, ShadowRows,
             KEEPS_DECIDERS, SAMPLES_DECISIONS, SHADOWS,
         },
+        sticky_sessions::{Forgets, SessionVerdict},
         view::{
             fingerprint, AffinityFacts, Candidate, Constraints, HashKind, KeyedRow, NamedAffinity,
             Phase, PinSource, PoolFacts, RequestFacts, Role, Session, WireModes, WorkerId,
         },
     },
-    policies::sticky_sessions::{Forgets, SessionVerdict},
     store::{
         leases::DISPATCH_TTL, Ask, AtWork, Built, DecodeIssue, DecodeRefused, DecodeSide, Dispatch,
         EncodePairBuffers, GatewayId, Hand, HealthSink, LeaseRecord, LeaseRefused, LeaseState,
@@ -3484,7 +3484,7 @@ impl Door {
     /// gateway's completed dispatch on the worker that served is the
     /// host's to write ([`HealthSink::completed`]). A host that holds a
     /// handle over this door says one completion and the handle writes both
-    /// ([`crate::tracking::handle::Handle::completed`]).
+    /// ([`crate::tracking::Handle::completed`]).
     pub fn report(&self, gateway: GatewayId, lease: LeaseId, said: Said) {
         let at = self.store.file_of(lease);
         let hand = Hand::new(gateway);
@@ -4522,13 +4522,14 @@ pub(crate) mod tests {
             decision::{Decision, Lifted, ShedReason, Target, Targets},
             demands::{DemandFacts, Demands},
             framework::{self, DecisionScope, EncodeItems, EncodePlaced, Filter, Picker, TieBand},
+            sticky_sessions::SessionVerdict,
             view::{
                 Candidate, Constraints, Identity, KeyedRow, LoadRow, Phase, PoolFacts,
                 RequestFacts, Role, Session, WireModes, WorkerId,
             },
             DecisionRecord, References, Unmet,
         },
-        policies::{random::Random, sticky_sessions, sticky_sessions::SessionVerdict},
+        policies::random::Random,
         stages::{builtins::Best, catalog::Catalog},
         store::{
             Ask, DecodeMark, DecodeRefused, Dispatch, EncodeHandoff, EncodeOffer, GatewayId,
@@ -8178,7 +8179,7 @@ pub(crate) mod tests {
         let rule = document.bindings[0].sessions.as_mut();
         let rule = rule.expect("the preset's rule");
         rule.inflight_cap = cap;
-        rule.assignment = sticky_sessions::Assignment::MinLoad;
+        rule.assignment = crate::document::Assignment::MinLoad;
         document
     }
 
@@ -8359,7 +8360,7 @@ pub(crate) mod tests {
         let profile = document.profiles.get_mut("manual");
         profile.expect("the preset's profile").pick = "counted".into();
         let rule = document.bindings[0].sessions.as_mut();
-        rule.expect("the preset's rule").assignment = sticky_sessions::Assignment::Delegate;
+        rule.expect("the preset's rule").assignment = crate::document::Assignment::Delegate;
         let digest = document.digest().expect("the document digests");
         let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
         let applied = store.apply(spec.expect("the catalog holds the stage"));

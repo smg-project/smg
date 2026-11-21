@@ -6,9 +6,9 @@ use std::{collections::hash_map::Entry, time::Instant};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
-use crate::{
-    engine::view::{Session, WorkerId},
-    policies::sticky_sessions::{shard_of, SHARDS},
+use crate::engine::{
+    sticky_sessions::{shard_of, SHARDS},
+    view::{Session, WorkerId},
 };
 
 /// A session's pin.
@@ -151,7 +151,7 @@ pub(super) struct Shard {
 /// nothing is taken under one, so no path takes two of them the other
 /// way. The engine's own table is told each leave and join under the
 /// workers lock too, and takes its absent list's lock, then a shard of
-/// its own ([`crate::policies::sticky_sessions::SessionTable`]).
+/// its own ([`crate::engine::SessionTable`]).
 #[derive(Default)]
 pub(super) struct SessionTables {
     shards: [Mutex<Shard>; SHARDS],

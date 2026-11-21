@@ -13,9 +13,9 @@ use std::fmt;
 use crate::{
     engine::{
         decision::{Decision, Target},
+        sticky_sessions::SessionVerdict,
         view::{Health, LoadRow, Session, WorkerId},
     },
-    policies::sticky_sessions::SessionVerdict,
     tracking::counts::Slot,
 };
 

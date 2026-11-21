@@ -6,12 +6,13 @@
 use std::{any::Any, collections::HashMap, fmt::Debug, sync::Arc};
 
 use crate::{
-    document::spec::Needs,
+    document::spec::{Assignment, Needs},
     engine::{
         decision::{
             Decision, Lifted, Overlap, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace,
             MAX_TARGETS, TRACE_TOP,
         },
+        sticky_sessions::{self, Claim, Forgets, SessionRule, SessionTable, SessionVerdict},
         view::{
             mean_in_flight, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PoolFacts,
             ReportCutoff, RequestFacts, WorkerId,
@@ -21,8 +22,6 @@ use crate::{
     policies::{
         cache_aware::{forget_judged, WarmRule},
         random::Random,
-        sticky_sessions,
-        sticky_sessions::{Assignment, Claim, Forgets, SessionRule, SessionTable, SessionVerdict},
     },
     stages::builtins::{target_of, Best, FewestSessions, LeastRequests, RowTests},
     tracking::{
@@ -3424,7 +3423,7 @@ fn shortest_sweep(bindings: &[Binding]) -> u64 {
 /// rules, a rule with none counting as [`ABSENCE_MICROS`], which is the
 /// time too where no binding has a rule.
 ///
-/// [`ABSENCE_MICROS`]: crate::policies::sticky_sessions::ABSENCE_MICROS
+/// [`ABSENCE_MICROS`]: crate::engine::sticky_sessions::ABSENCE_MICROS
 fn absence(bindings: &[Binding]) -> u64 {
     let stated = sticky_sessions::ABSENCE_MICROS;
     let rules = bindings.iter().filter_map(|b| b.sessions.as_ref());
@@ -4301,7 +4300,7 @@ impl Engine {
     }
 
     /// Whether any profile of this generation holds a stage that keeps
-    /// state a decider ([`crate::engine::decider`](crate::engine)): a plugin's kept instance is
+    /// state a decider ([`crate::engine`]): a plugin's kept instance is
     /// its decider's, and every profile's stages hear every lease. Under
     /// such a generation a host that seats its callers by thread decides
     /// each request at its model's decider, so that state has one writer
@@ -6472,7 +6471,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        document::spec::{self, PolicySpec, PrefixAffinityParams, SpillParams},
+        document::spec::{self, PolicySpec, PrefixAffinityParams, Recovery, SpillParams},
         engine::{
             decision::{self, Pair},
             view::{self, Health, Identity, MediaCounts, Role, Session, WorkerId},
@@ -6484,7 +6483,6 @@ mod tests {
             power_of_two::{PowerOfTwo, PowerOfTwoCountFirst, PowerOfTwoMetric},
             random::Random,
             round_robin::RoundRobin,
-            sticky_sessions::Recovery,
         },
         stages::builtins::{
             self, Best, CountFirst, Healthy, LeastRequests, NotOverloaded, NotTried,

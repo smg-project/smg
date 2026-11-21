@@ -1,3 +1,6 @@
+//! The `cache_aware` policy: how it is composed, and the affinity stages
+//! written for it.
+//!
 //! The affinity stages of a profile: `prefix-affinity` (the holders of the
 //! request's prefix, with the match threshold and the spill gate),
 //! `warmup-slice` (the slice of misses and the diverted hits a worker with a
@@ -27,8 +30,8 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     document::spec::{
-        standard_filters, AffinitySource, BestParams, KvPressureParams, Needs, PickStage,
-        PrefixAffinityParams, ProfileSpec, ScoreStage, WarmupSliceParams,
+        AffinitySource, BestParams, KvPressureParams, Needs, PickStage, PrefixAffinityParams,
+        ProfileSpec, ScoreStage, WarmupSliceParams,
     },
     engine::{
         decision::{Overlap, OverlapSource},
@@ -38,6 +41,7 @@ use crate::{
             Phase, RequestFacts, Walk, WorkerId, TEXT_BYTES_PER_TOKEN,
         },
     },
+    policies::standard_filters,
     stages::builtins::ReadsLoad,
     tracking::{
         counts::with_counts,

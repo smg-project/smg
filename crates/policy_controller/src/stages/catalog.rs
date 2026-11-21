@@ -335,8 +335,8 @@ fn of<T: ?Sized + 'static, F>(build: fn() -> Box<T>) -> Build<T, F> {
 
 impl Catalog {
     /// The stock build's stages, in the order the spec lists them
-    /// ([`crate::document::spec::FILTERS`], [`crate::document::spec::SCORERS`],
-    /// [`crate::document::spec::PICKERS`]).
+    /// ([`crate::document::FILTERS`], [`crate::document::SCORERS`],
+    /// [`crate::document::PICKERS`]).
     pub fn builtin() -> Self {
         Self {
             filters: vec![
